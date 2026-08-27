@@ -867,7 +867,11 @@ impl ToolMiddleware for CCExternalHooks {
         gate
     }
 
-    async fn after(&self, result: &mut ToolResult) -> AfterOutcome {
+    async fn after(
+        &self,
+        result: &mut ToolResult,
+        _tool: Option<&std::sync::Arc<dyn atomcode_kernel::tool::Tool>>,
+    ) -> AfterOutcome {
         // Recover the tool name `before` stashed for this call_id (kernel doesn't thread
         // it into `after`), so PostToolUse / PostToolUseFailure tool-name matchers are
         // honored. Absent ⇒ the call never ran our `before` (e.g. denied earlier) ⇒ only
@@ -1645,7 +1649,7 @@ mod tests {
             is_error: false,
             images: vec![],
         };
-        cc.after(&mut result).await;
+        cc.after(&mut result, None).await;
         assert_eq!(
             result.content, "REWRITTEN",
             "matcher 'bash' must fire for tool bash"
@@ -1664,7 +1668,7 @@ mod tests {
             is_error: false,
             images: vec![],
         };
-        cc.after(&mut result).await;
+        cc.after(&mut result, None).await;
         assert_eq!(
             result.content, "orig",
             "matcher 'bash' must NOT fire for tool grep"
@@ -1708,7 +1712,7 @@ mod tests {
             is_error: false,
             images: vec![],
         };
-        cc.after(&mut ok).await;
+        cc.after(&mut ok, None).await;
         assert_eq!(ok.content, "OK-REWRITE", "success must fire PostToolUse, not PostToolUseFailure");
 
         // A FAILED call: only the PostToolUseFailure hook may rewrite.
@@ -1724,7 +1728,7 @@ mod tests {
             is_error: true,
             images: vec![],
         };
-        cc.after(&mut failed).await;
+        cc.after(&mut failed, None).await;
         assert_eq!(
             failed.content, "FAIL-REWRITE",
             "failed call must fire PostToolUseFailure, not PostToolUse"

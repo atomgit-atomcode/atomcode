@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Keybindings</h1>
+<h1 id="keybindings">Keybindings</h1>
       <p class="lede">AtomCode's TUI is built on ratatui + crossterm; common keybindings stick close to the conventions of mainstream terminal tools. Run <code>/keys</code> in a session to dump this table into the current scrollback, or <code>/help</code> for the slash-command list.</p>
 
-      <h2>Input editing</h2>
+      <h2 id="input-editing">Input editing</h2>
       <table>
         <thead>
           <tr><th>Key</th><th>Action</th></tr>
@@ -105,7 +105,7 @@
         </tbody>
       </table>
 
-      <h2>Browse &amp; scroll</h2>
+      <h2 id="browse-scroll">Browse &amp; scroll</h2>
       <table>
         <thead>
           <tr><th>Key</th><th>Action</th></tr>
@@ -120,7 +120,7 @@
         </tbody>
       </table>
 
-      <h2>Selection &amp; copy</h2>
+      <h2 id="selection-copy">Selection &amp; copy</h2>
       <table>
         <thead>
           <tr><th>Key / action</th><th>Effect</th></tr>
@@ -133,7 +133,7 @@
         </tbody>
       </table>
 
-      <h2>Control flow</h2>
+      <h2 id="control-flow">Control flow</h2>
       <table>
         <thead>
           <tr><th>Key</th><th>Action</th></tr>
@@ -146,7 +146,7 @@
         </tbody>
       </table>
 
-      <h2>Tool permission dialog</h2>
+      <h2 id="tool-permission-dialog">Tool permission dialog</h2>
       <p>When the model is about to execute a dangerous action (destructive bash, writing sensitive files, deleting source code, etc.), AtomCode pops a confirmation dialog:</p>
       <table>
         <thead>
@@ -164,7 +164,7 @@
         <p>"Always allow" is granted per <em>tool name + argument pattern</em> and only for the current session — it resets next launch. For permanent cross-session exceptions, manage them in config (e.g. allowlists for specific paths).</p>
       </div>
 
-      <h2>Next steps</h2>
+      <h2 id="next-steps">Next steps</h2>
       <ul>
         <li><a href="./slash-commands.html">Slash Commands</a> — pair keybindings with command completion</li>
         <li><a href="./sessions.html">Sessions &amp; Undo</a> — what <code>/undo</code> actually undoes</li>

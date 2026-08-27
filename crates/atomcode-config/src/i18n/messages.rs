@@ -843,6 +843,11 @@ pub enum Msg<'a> {
     McpClearedNoServers,
     McpToolsUsage,
     McpServersHeader,
+    /// Discoverability hint appended to `/mcp` status when one or more
+    /// project-source servers are withheld because the project is untrusted.
+    McpBlockedTrustHint {
+        count: usize,
+    },
     McpReloadFailed {
         error: &'a str,
     },
@@ -1529,6 +1534,11 @@ pub enum Msg<'a> {
     CompactMarkStub {
         saved: &'a str,
     },
+    /// Acknowledgement for a MANUAL `/compact` that committed but only shaved a
+    /// negligible amount (a tiny stub fold). Reads as a clean "nothing to do"
+    /// so it doesn't look like a "success" the way `CompactMarkStub` does, and
+    /// avoids the misleading "conversation is short" wording.
+    CompactNegligibleSavings,
 
     // ── /goal ──
     /// The full `/goal help` usage block (header + Usage + Notes).
@@ -1915,6 +1925,16 @@ pub enum Msg<'a> {
         max_attempts: u32,
     },
     StreamRecoverySucceeded,
+    OutputTruncationRunning {
+        attempt: u32,
+        max_attempts: u32,
+    },
+    OutputTruncationHeader,
+    OutputTruncationQuestion,
+    OutputTruncationContinue,
+    OutputTruncationContinueDesc,
+    OutputTruncationStop,
+    OutputTruncationStopDesc,
 
     // ── legacy Windows console (conhost) one-shot hint ──
     /// Shown once at startup ONLY on the classic Windows console host

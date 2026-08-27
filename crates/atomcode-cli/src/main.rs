@@ -8,11 +8,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
+mod headless_json;
 mod schedule_cmd;
 mod schedule_os;
 mod telemetry_cmd;
@@ -102,6 +104,14 @@ fn headless_completion_exit_code(
     }
 }
 
+fn headless_denial_exit_code(current: i32, had_denial: bool) -> i32 {
+    if current == 0 && had_denial {
+        2
+    } else {
+        current
+    }
+}
+
 fn headless_completion_notify_reason(
     completion: &atomcode_coding::TurnCompletion,
 ) -> atomcode_capabilities::notify::NotifyStopReason {
@@ -136,6 +146,50 @@ fn resolve_working_dir(cli_dir: Option<PathBuf>) -> PathBuf {
     } else {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
+}
+
+/// The on-exit "how to resume this session" hint, mirroring codex's
+/// `To continue this session, run …`. Headless shows the `-p … --resume <id>`
+/// form (what continues a pipe run); the TUI shows the `resume <id>` subcommand.
+/// Pure so the wording/forms are unit-tested.
+fn resume_hint_line(session_id: &str, headless: bool, zh: bool) -> String {
+    let cmd = if headless {
+        format!("{BIN_NAME} -p \"…\" --resume {session_id}")
+    } else {
+        format!("{BIN_NAME} resume {session_id}")
+    };
+    if zh {
+        format!("继续此会话，运行：{cmd}")
+    } else {
+        format!("To resume this session, run: {cmd}")
+    }
+}
+
+/// What session to resume at launch, unified across `--continue`, `--resume`,
+/// and the `resume` subcommand so one code path (see the launch flow) drives it.
+enum ResumeSelector {
+    /// The most recent session with messages (`--continue` / bare `resume`).
+    Latest,
+    /// An explicit id or name (`--resume <x>` / `resume <x>`).
+    Specific(String),
+}
+
+/// Resolve a `--resume`/`resume <selector>` value to a concrete session id within
+/// a project's scanned catalog: an exact `id` match wins; otherwise the
+/// most-recently-updated session whose `name` equals the selector. `None` when
+/// nothing matches. Pure over the catalog so it is unit-tested without the store.
+fn resolve_in_catalog(
+    catalog: &[atomcode_capabilities::session::CatalogEntry],
+    selector: &str,
+) -> Option<String> {
+    if let Some(entry) = catalog.iter().find(|e| e.id == selector) {
+        return Some(entry.id.clone());
+    }
+    catalog
+        .iter()
+        .filter(|e| e.name == selector)
+        .max_by_key(|e| e.updated_at_ms)
+        .map(|e| e.id.clone())
 }
 
 /// Truncate a string to at most `max_chars` *characters* (not bytes), replacing
@@ -637,6 +691,11 @@ const BIN_NAME: &str = env!("CARGO_BIN_NAME");
 
 #[derive(Parser)]
 #[command(name = BIN_NAME, version = VERSION, about = "AI coding assistant in your terminal")]
+#[command(group(
+    ArgGroup::new("headless_input")
+        .args(["prompt", "prompt_file"])
+        .multiple(false)
+))]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -644,6 +703,12 @@ struct Cli {
     /// Continue the previous session instead of starting a new one
     #[arg(short = 'c', long = "continue")]
     continue_last: bool,
+
+    /// Resume a SPECIFIC session by id or name (vs `--continue` = the last one).
+    /// Headless: `-p "…" --resume <id>`. Interactive: `--resume <id>` (no `-p`)
+    /// launches the TUI resumed on it — same as the `resume` subcommand.
+    #[arg(long = "resume", value_name = "ID_OR_NAME", conflicts_with_all = ["continue_last", "ephemeral"])]
+    resume: Option<String>,
 
     /// Provider to use (overrides config default)
     #[arg(long)]
@@ -690,6 +755,24 @@ struct Cli {
     )]
     prompt_file: Option<std::path::PathBuf>,
 
+    /// Run without creating, resuming, or writing session state (headless only).
+    #[arg(long, requires = "headless_input", conflicts_with = "continue_last")]
+    ephemeral: bool,
+
+    /// Expose no tools, MCP servers, skills tools, or child-agent tools to the model
+    /// (headless only).
+    #[arg(long, requires = "headless_input")]
+    no_tools: bool,
+
+    /// Headless stdout format: assistant text (default) or versioned JSON Lines.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = HeadlessOutputFormat::Text,
+        requires = "headless_input"
+    )]
+    output_format: HeadlessOutputFormat,
+
     /// Show tool calls, token usage, and turn summary on stderr (headless mode only).
     /// Without this flag, headless output is the assistant reply only — Claude Code -p style.
     #[arg(short = 'v', long)]
@@ -720,6 +803,13 @@ struct Cli {
     pub dangerously_skip_permissions: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum HeadlessOutputFormat {
+    #[default]
+    Text,
+    Jsonl,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Sign in with AtomGit OAuth and claim CodingPlan models in one
@@ -730,6 +820,13 @@ enum Commands {
     Logout,
     /// Show current login status
     Status,
+    /// Resume a session by id or name (launches the TUI on it). With no
+    /// argument, resumes the most recent session. Add `-p "<prompt>"` to run
+    /// headless instead. Mirrors `--resume`; the exit hint prints this form.
+    Resume {
+        /// Session id or name to resume (default: the most recent session).
+        session: Option<String>,
+    },
     /// Upgrade atomcode in-place to the latest released version
     Upgrade {
         /// Reinstall even when already on the latest version
@@ -1402,8 +1499,28 @@ async fn run() -> Result<i32> {
     // TUI.
 
     let force_verbose = false;
+    // Capture the resume intent BEFORE the dispatch below moves `cli.command`.
+    // `--resume`/`--continue` are plain flags; the `resume` subcommand is NOT a
+    // terminal command — it falls through to the normal TUI/headless launch with
+    // this selector applied (see the launch flow).
+    let resume_selector: Option<ResumeSelector> = if let Some(sel) = cli.resume.clone() {
+        Some(ResumeSelector::Specific(sel))
+    } else if let Some(Commands::Resume { session }) = &cli.command {
+        Some(match session {
+            Some(s) => ResumeSelector::Specific(s.clone()),
+            None => ResumeSelector::Latest,
+        })
+    } else if cli.continue_last {
+        Some(ResumeSelector::Latest)
+    } else {
+        None
+    };
     if let Some(cmd) = cli.command {
         match cmd {
+            // Not a terminal command: fall through to the TUI/headless launch with
+            // `resume_selector` already captured above (interactive by default; add
+            // `-p` to run headless resumed).
+            Commands::Resume { .. } => {}
             Commands::Login | Commands::Codingplan => {
                 // Unified login flow: OAuth (if needed) → claim → fetch
                 // models → register providers → fetch status. Falls
@@ -1612,6 +1729,148 @@ async fn run() -> Result<i32> {
                 let engine = atomcode::acp::engine::EngineConfig::from_coding_config(
                     runtime_cfg.agent_config(),
                 );
+                // Session config option catalog (`session/set_config_option`):
+                // a `mode` select over the kernel execution modes, a
+                // `reasoning_effort` select mirroring the TUI `/effort` ladder,
+                // and a `model` select over the configured model catalog. The
+                // resolvers re-resolve a selected value into a kernel config for
+                // the live runtime's provider reload.
+                use agent_client_protocol::schema::v1::{
+                    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+                };
+                let session_config_options: Vec<SessionConfigOption> = {
+                    let mut options: Vec<SessionConfigOption> = Vec::new();
+                    // Execution mode: always available, same ids/names as the
+                    // `modes` advertised in the session setup response.
+                    let modes = atomcode::acp::options::session_modes();
+                    options.push(
+                        SessionConfigOption::select(
+                            atomcode::acp::options::MODE_CONFIG_ID,
+                            "Mode",
+                            atomcode_coding::RuntimeMode::Build.wire(),
+                            modes
+                                .iter()
+                                .map(|m| {
+                                    SessionConfigSelectOption::new(
+                                        m.id.0.as_ref().to_string(),
+                                        m.name.clone(),
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .category(SessionConfigOptionCategory::Mode),
+                    );
+                    // Reasoning effort: always available; the active provider
+                    // adapter decides whether the tier has an effect.
+                    let current_effort = config
+                        .effective_model_selection()
+                        .and_then(|sel| config.provider_config_for_selection(&sel))
+                        .and_then(|provider| provider.reasoning_effort.clone())
+                        .unwrap_or_else(|| "off".to_string());
+                    let effort_tiers: [(&str, &str); 3] = [
+                        ("off", "Off (API default)"),
+                        ("high", "High"),
+                        ("max", "Max"),
+                    ];
+                    options.push(
+                        SessionConfigOption::select(
+                            atomcode::acp::options::REASONING_EFFORT_CONFIG_ID,
+                            "Reasoning effort",
+                            current_effort,
+                            effort_tiers
+                                .into_iter()
+                                .map(|(value, name)| {
+                                    SessionConfigSelectOption::new(
+                                        value.to_string(),
+                                        name.to_string(),
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .category(SessionConfigOptionCategory::ThoughtLevel),
+                    );
+                    // Model selector: only when a model catalog is configured.
+                    let mut ids: Vec<String> = config.logical_models().keys().cloned().collect();
+                    ids.sort();
+                    if !ids.is_empty() {
+                        let current = config
+                            .effective_model_selection()
+                            .filter(|id| ids.contains(id))
+                            .unwrap_or_else(|| ids[0].clone());
+                        options.push(
+                            SessionConfigOption::select(
+                                atomcode::acp::options::MODEL_CONFIG_ID,
+                                "Model",
+                                current,
+                                ids.into_iter()
+                                    .map(|id| SessionConfigSelectOption::new(id.clone(), id))
+                                    .collect::<Vec<_>>(),
+                            )
+                            .category(SessionConfigOptionCategory::Model),
+                        );
+                    }
+                    options
+                };
+                let session_model_resolver: Option<Arc<atomcode::acp::SessionModelResolver>> =
+                    if config.logical_models().is_empty() {
+                        None
+                    } else {
+                        let base = config.clone();
+                        let provider = cli.provider.clone();
+                        let dir = working_dir.clone();
+                        let skip = cli.dangerously_skip_permissions;
+                        let resolver: Arc<atomcode::acp::SessionModelResolver> = Arc::new(
+                            move |model: &str| -> Option<atomcode_coding::CodingAgentConfig> {
+                                let mut cfg = base.clone();
+                                cfg.default_model = Some(model.to_string());
+                                let runtime = runtime_config_from(
+                                    &cfg,
+                                    &dir,
+                                    provider.as_deref(),
+                                    None,
+                                    skip,
+                                    true,
+                                );
+                                if runtime.model.is_empty() {
+                                    return None;
+                                }
+                                Some(runtime.agent_config())
+                            },
+                        );
+                        Some(resolver)
+                    };
+                let session_effort_resolver: Option<Arc<atomcode::acp::SessionModelResolver>> =
+                    Some({
+                        let base = config.clone();
+                        let provider = cli.provider.clone();
+                        let dir = working_dir.clone();
+                        let skip = cli.dangerously_skip_permissions;
+                        let resolver: Arc<atomcode::acp::SessionModelResolver> = Arc::new(
+                            move |effort: &str| -> Option<atomcode_coding::CodingAgentConfig> {
+                                let mut cfg = base.clone();
+                                let selection = cfg.effective_model_selection()?;
+                                cfg.update_selection_reasoning(&selection, |fields| {
+                                    *fields.reasoning_effort = match effort {
+                                        "off" => None,
+                                        other => Some(other.to_string()),
+                                    };
+                                });
+                                let runtime = runtime_config_from(
+                                    &cfg,
+                                    &dir,
+                                    provider.as_deref(),
+                                    None,
+                                    skip,
+                                    true,
+                                );
+                                if runtime.model.is_empty() {
+                                    return None;
+                                }
+                                Some(runtime.agent_config())
+                            },
+                        );
+                        resolver
+                    });
                 // Flush telemetry before the long-running stdio loop.
                 telemetry
                     .shutdown(std::time::Duration::from_millis(500))
@@ -1620,6 +1879,9 @@ async fn run() -> Result<i32> {
                     engine: Some(engine),
                     provider_factory: Some(provider_factory),
                     auto_approve,
+                    session_config_options,
+                    session_model_resolver,
+                    session_effort_resolver,
                 })
                 .await
                 .map(|_| 0);
@@ -1739,10 +2001,7 @@ async fn run() -> Result<i32> {
     // string (e.g. the Welcome banner) already shows the configured brand.
     // Idempotent (`OnceLock` keeps the first value); a mid-session `/reload`
     // does NOT flip the brand, matching `theme`'s startup-only semantics.
-    atomcode_config::i18n::set_brand(
-        &config.ui.brand_name,
-        &config.ui.oauth_provider_name,
-    );
+    atomcode_config::i18n::set_brand(&config.ui.brand_name, &config.ui.oauth_provider_name);
 
     // ── Plugin marketplace bootstrap + post-upgrade refresh ──
     //
@@ -1770,13 +2029,24 @@ async fn run() -> Result<i32> {
     // session — no auto-resume, no scrollback replay. Users who want to
     // pick a specific older session can still use `/resume` inside the
     // TUI.
-    let resume_session_id = if cli.continue_last {
-        atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)?
-            .into_iter()
-            .find(|entry| entry.message_count > 0)
-            .map(|entry| entry.id)
-    } else {
-        None
+    let resume_session_id = match &resume_selector {
+        Some(ResumeSelector::Specific(sel)) => {
+            let catalog = atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)?;
+            match resolve_in_catalog(&catalog, sel) {
+                Some(id) => Some(id),
+                None => anyhow::bail!(
+                    "no session matches id or name {sel:?} in this project — run `{} resume` to list, or check the working directory (-C)",
+                    BIN_NAME
+                ),
+            }
+        }
+        Some(ResumeSelector::Latest) => {
+            atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)?
+                .into_iter()
+                .find(|entry| entry.message_count > 0)
+                .map(|entry| entry.id)
+        }
+        None => None,
     };
 
     // The native runtime builds its own provider + tools from
@@ -1805,12 +2075,19 @@ async fn run() -> Result<i32> {
         &runtime_cfg,
         resume_session_id,
         provider_bootstrap,
+        cli.ephemeral,
+        cli.no_tools,
         !is_headless,
         // TUI-only: the interactive checkpoint replaces the hard round-cap
         // error. Headless (`-p`) keeps the fail-closed hard error (no picker).
         !is_headless,
     )
     .await?;
+    // The active session id (fresh or resumed) for the on-exit resume hint,
+    // captured before the runtime is moved into the headless/TUI arms below.
+    // `None` for an ephemeral run (no persisted session → nothing to resume).
+    let active_session_id: Option<String> =
+        native_runtime.session.as_ref().map(|s| s.id.clone());
     tracing::info!(
         target: "atomcode::startup",
         stage = "runtime_start",
@@ -1952,6 +2229,15 @@ async fn run() -> Result<i32> {
             dangerously_skip_permissions: cli.dangerously_skip_permissions,
         });
 
+        // Language for the on-exit resume hint (mirrors the resolved UI locale).
+        let hint_zh = cli
+            .lang
+            .as_deref()
+            .map(|l| l.starts_with("zh"))
+            .unwrap_or(matches!(
+                config.language,
+                Some(atomcode_config::locale::Locale::ZhCn)
+            ));
         // Headless mode: -p / --prompt-file triggers non-interactive execution.
         let exit_code = if let Some(prompt) = effective_prompt {
             let verbose = cli.verbose || force_verbose;
@@ -1964,12 +2250,14 @@ async fn run() -> Result<i32> {
             let engine_runtime = native_headless_runtime
                 .take()
                 .expect("native headless runtime built above");
-            match run_native_headless(
+            let result = match run_native_headless(
                 notifications_cfg,
                 engine_runtime,
                 prompt,
-                cli.provider.as_deref(),
+                runtime_cfg.provider_name.clone(),
+                runtime_cfg.model.clone(),
                 verbose,
+                cli.output_format,
                 capture,
                 working_dir.clone(),
                 cli.dangerously_skip_permissions,
@@ -1980,7 +2268,13 @@ async fn run() -> Result<i32> {
             {
                 Err(e) => Err(e),
                 Ok((ec, _captured)) => Ok::<i32, anyhow::Error>(ec),
+            };
+            // Codex-style discovery hint on STDERR so the piped stdout stays the
+            // clean assistant reply. Skipped for ephemeral runs (no session id).
+            if let Some(id) = &active_session_id {
+                eprintln!("\n{}", resume_hint_line(id, true, hint_zh));
             }
+            result
         } else {
             // Fire-and-forget: spawn a setsid'd subprocess to stage the next
             // release if one is out. Detached so a Ctrl+C in this parent doesn't
@@ -2037,7 +2331,7 @@ async fn run() -> Result<i32> {
                 total_ms = run_start.elapsed().as_millis() as u64,
                 "handing control to TUI"
             );
-            match atomcode_tuix::run(
+            let tui_result = match atomcode_tuix::run(
                 config,
                 provider_selection,
                 model_name,
@@ -2056,7 +2350,13 @@ async fn run() -> Result<i32> {
             {
                 Ok(()) => Ok(0),
                 Err(e) => Err(e.into()),
+            };
+            // Codex-style resume hint to STDOUT, after the TUI restored the
+            // terminal, so `atomcode resume <id>` is discoverable on exit.
+            if let Some(id) = &active_session_id {
+                println!("\n{}", resume_hint_line(id, false, hint_zh));
             }
+            tui_result
         };
 
         // Flush telemetry on EVERY exit path — Ok and Err alike. Both session
@@ -2389,6 +2689,8 @@ pub(crate) async fn spawn_native_cli_runtime(
     cfg: &atomcode_coding::CodingRuntimeConfig,
     resume_session_id: Option<String>,
     bootstrap: atomcode_coding::ProviderBootstrap,
+    ephemeral: bool,
+    no_tools: bool,
     fork_on_session_in_use: bool,
     // TUI-only opt-in: turn a `max_rounds` hit into the interactive
     // continue/stop checkpoint. The checkpoint render arm lives in the TUI
@@ -2402,48 +2704,75 @@ pub(crate) async fn spawn_native_cli_runtime(
 )> {
     let mut agent = cfg.agent_config();
     agent.round_cap_checkpoint = round_cap_checkpoint;
-    let (session, imported_lease, continued_session) = match resume_session_id {
-        Some(id) => {
-            let manager =
-                atomcode_capabilities::session::SessionManager::for_project(&agent.working_dir);
-            match manager.acquire_lease(&id) {
-                Ok(lease) => {
-                    atomcode_daemon::legacy_convert::converge_session(&manager, &lease)?;
-                    (
-                        atomcode_coding::SessionMode::Resume(id.clone()),
-                        Some(lease),
-                        Some(ContinuedCliSession {
-                            id,
-                            forked_from: None,
-                        }),
-                    )
+    let (session, imported_lease, continued_session) = if ephemeral {
+        (atomcode_coding::SessionMode::Disabled, None, None)
+    } else {
+        match resume_session_id {
+            Some(id) => {
+                let manager =
+                    atomcode_capabilities::session::SessionManager::for_project(&agent.working_dir);
+                match manager.acquire_lease(&id) {
+                    Ok(lease) => {
+                        atomcode_daemon::legacy_convert::converge_session(&manager, &lease)?;
+                        (
+                            atomcode_coding::SessionMode::Resume(id.clone()),
+                            Some(lease),
+                            Some(ContinuedCliSession {
+                                id,
+                                forked_from: None,
+                            }),
+                        )
+                    }
+                    Err(error) if should_fork_busy_continue(fork_on_session_in_use, &error) => {
+                        let fork_id = uuid::Uuid::new_v4().to_string();
+                        let (forked, lease) = manager.fork_native_session(
+                            &id,
+                            &fork_id,
+                            atomcode_capabilities::session::now_ms(),
+                        )?;
+                        (
+                            atomcode_coding::SessionMode::Resume(forked.meta.id.clone()),
+                            Some(lease),
+                            Some(ContinuedCliSession {
+                                id: forked.meta.id,
+                                forked_from: Some(id),
+                            }),
+                        )
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) if should_fork_busy_continue(fork_on_session_in_use, &error) => {
-                    let fork_id = uuid::Uuid::new_v4().to_string();
-                    let (forked, lease) = manager.fork_native_session(
-                        &id,
-                        &fork_id,
-                        atomcode_capabilities::session::now_ms(),
-                    )?;
-                    (
-                        atomcode_coding::SessionMode::Resume(forked.meta.id.clone()),
-                        Some(lease),
-                        Some(ContinuedCliSession {
-                            id: forked.meta.id,
-                            forked_from: Some(id),
-                        }),
-                    )
-                }
-                Err(error) => return Err(error.into()),
             }
+            None => (atomcode_coding::SessionMode::Fresh, None, None),
         }
-        None => (atomcode_coding::SessionMode::Fresh, None, None),
     };
+    // External-agent subagents (Claude Code / Codex) from `[[subagent.external]]`.
+    // Interactive TUI ⇒ dangerous (`bypass`) modes are allowed to be configured
+    // (each risky call is still approval-gated); headless/daemon paths pass none.
+    let external_subagents = cfg
+        .subagent_config
+        .as_ref()
+        .map(|c| atomcode_coding::parts::resolve_external_subagents(&c.subagent, true))
+        .unwrap_or_default();
     let prepare = atomcode_coding::PrepareOptions {
         subagents: atomcode_coding::SubagentPolicy::Enabled,
         session,
-        plugin_skill_dirs: atomcode_daemon::gather_plugin_skill_dirs_for(&cfg.working_dir),
-        mcp: cfg.mcp,
+        tools: !no_tools,
+        skill_dirs: no_tools.then(Vec::new),
+        plugin_skill_dirs: if no_tools {
+            Vec::new()
+        } else {
+            atomcode_daemon::gather_plugin_skill_dirs_for(&cfg.working_dir)
+        },
+        mcp: cfg.mcp && !no_tools,
+        external_subagents: if no_tools {
+            Vec::new()
+        } else {
+            external_subagents
+        },
+        memory: !no_tools,
+        web: !no_tools,
+        review: !no_tools,
+        request_user_input: !no_tools,
         rate_limit_source: Some(atomcode_daemon::coding_plan_rate_limit_source()),
         ..atomcode_coding::PrepareOptions::default()
     };
@@ -2514,12 +2843,21 @@ pub(crate) fn headless_auto_approve(
     skip_permissions || tool == "bash" // -p: current behaviour unchanged
 }
 
+fn write_headless_json_event(event: &headless_json::HeadlessEvent) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    output.write_all(&headless_json::line(event)?)?;
+    output.flush()
+}
+
 pub(crate) async fn run_native_headless(
     notifications_cfg: atomcode_config::config::NotificationConfig,
     runtime: atomcode_coding::CodingRuntime,
     prompt: String,
-    _provider_name: Option<&str>,
+    provider_name: String,
+    model_name: String,
     verbose: bool,
+    output_format: HeadlessOutputFormat,
     capture: bool,
     working_dir: PathBuf,
     skip_permissions: bool,
@@ -2550,20 +2888,70 @@ pub(crate) async fn run_native_headless(
         task,
         ..
     } = runtime;
-    handle
+    let jsonl = output_format == HeadlessOutputFormat::Jsonl;
+    let captured = capture.then(String::new);
+    if jsonl {
+        write_headless_json_event(&headless_json::HeadlessEvent::RunStarted {
+            schema_version: 1,
+            provider: provider_name,
+            model: model_name,
+        })?;
+    }
+    if let Err(error) = handle
         .wait_mcp_ready(atomcode_capabilities::mcp::CONNECT_TIMEOUT)
         .await
-        .map_err(anyhow::Error::new)?;
-    handle
-        .submit(UserInput::from(prompt))
-        .await
-        .map_err(anyhow::Error::new)?;
+    {
+        if jsonl {
+            let message = error.to_string();
+            write_headless_json_event(&headless_json::HeadlessEvent::Error {
+                message: message.clone(),
+                http_status: None,
+                code: Some("mcp_not_ready".into()),
+                retryable: None,
+            })?;
+            write_headless_json_event(&headless_json::HeadlessEvent::RunFailed {
+                exit_code: 1,
+                message,
+            })?;
+            let _ = handle.shutdown().await;
+            let _ = task.await;
+            return Ok((1, captured));
+        }
+        let _ = handle.shutdown().await;
+        let _ = task.await;
+        return Err(anyhow::Error::new(error));
+    }
     let started = std::time::Instant::now();
-    let mut captured = capture.then(String::new);
+    if let Err(error) = handle.submit(UserInput::from(prompt)).await {
+        if jsonl {
+            let message = error.to_string();
+            write_headless_json_event(&headless_json::HeadlessEvent::Error {
+                message: message.clone(),
+                http_status: None,
+                code: Some("submit_failed".into()),
+                retryable: None,
+            })?;
+            write_headless_json_event(&headless_json::HeadlessEvent::RunFailed {
+                exit_code: 1,
+                message,
+            })?;
+            let _ = handle.shutdown().await;
+            let _ = task.await;
+            return Ok((1, captured));
+        }
+        let _ = handle.shutdown().await;
+        let _ = task.await;
+        return Err(anyhow::Error::new(error));
+    }
+    let mut captured = captured;
     let mut last_text_ended_with_newline = true;
     let mut tool_calls = 0usize;
     let mut total_tokens = 0usize;
+    let mut prompt_tokens = 0usize;
+    let mut completion_tokens = 0usize;
+    let mut cached_tokens = 0usize;
     let mut rounds = 0usize;
+    let mut ttft_ms: Option<u64> = None;
     let mut had_denial = false;
     let mut exit_code = 0;
     let mut saw_turn_terminal = false;
@@ -2581,6 +2969,7 @@ pub(crate) async fn run_native_headless(
     while let Some(envelope) = events.recv().await {
         match envelope.event {
             CodingRuntimeEvent::Agent(KernelEvent::TextDelta(text)) => {
+                ttft_ms.get_or_insert_with(|| started.elapsed().as_millis() as u64);
                 close_native_thinking(&mut thinking_line_open);
                 if !text.is_empty() {
                     last_text_ended_with_newline = text.ends_with('\n');
@@ -2588,19 +2977,39 @@ pub(crate) async fn run_native_headless(
                 if let Some(buffer) = captured.as_mut() {
                     buffer.push_str(&text);
                 }
-                print!("{text}");
-                io::stdout().flush()?;
+                if jsonl {
+                    write_headless_json_event(&headless_json::HeadlessEvent::MessageDelta {
+                        text,
+                    })?;
+                } else {
+                    print!("{text}");
+                    io::stdout().flush()?;
+                }
             }
-            CodingRuntimeEvent::Agent(KernelEvent::Reasoning(text)) if verbose => {
-                let mut output = String::new();
-                format_thinking_chunk(&mut output, &mut thinking_line_open, &text);
-                eprint!("{output}");
-                let _ = io::stderr().flush();
+            CodingRuntimeEvent::Agent(KernelEvent::Reasoning(text)) => {
+                ttft_ms.get_or_insert_with(|| started.elapsed().as_millis() as u64);
+                if jsonl {
+                    write_headless_json_event(&headless_json::HeadlessEvent::ReasoningDelta {
+                        text,
+                    })?;
+                } else if verbose {
+                    let mut output = String::new();
+                    format_thinking_chunk(&mut output, &mut thinking_line_open, &text);
+                    eprint!("{output}");
+                    let _ = io::stderr().flush();
+                }
             }
             CodingRuntimeEvent::Agent(KernelEvent::ToolStarted { call }) => {
+                ttft_ms.get_or_insert_with(|| started.elapsed().as_millis() as u64);
                 close_native_thinking(&mut thinking_line_open);
                 tool_calls += 1;
-                if verbose {
+                if jsonl {
+                    write_headless_json_event(&headless_json::HeadlessEvent::ToolStarted {
+                        id: call.id,
+                        name: call.name,
+                        arguments: call.arguments,
+                    })?;
+                } else if verbose {
                     eprintln!(
                         "[tool→ {}] {}",
                         call.name,
@@ -2608,34 +3017,123 @@ pub(crate) async fn run_native_headless(
                     );
                 }
             }
-            CodingRuntimeEvent::Agent(KernelEvent::ToolResult { result }) if verbose => {
+            CodingRuntimeEvent::Agent(KernelEvent::ToolResult { result }) => {
                 close_native_thinking(&mut thinking_line_open);
-                eprintln!(
-                    "[tool← {}] {} chars",
-                    if result.is_error { "error" } else { "ok" },
-                    format_verbose_tool_chunk(&result.content).chars().count()
-                );
+                if jsonl {
+                    write_headless_json_event(&headless_json::HeadlessEvent::ToolCompleted {
+                        id: result.call_id,
+                        content: result.content,
+                        is_error: result.is_error,
+                    })?;
+                } else if verbose {
+                    eprintln!(
+                        "[tool← {}] {} chars",
+                        if result.is_error { "error" } else { "ok" },
+                        format_verbose_tool_chunk(&result.content).chars().count()
+                    );
+                }
             }
             CodingRuntimeEvent::Agent(KernelEvent::Usage(meta)) => {
                 rounds += 1;
                 total_tokens = total_tokens
                     .saturating_add((meta.tokens.prompt + meta.tokens.completion) as usize);
-                if verbose {
+                prompt_tokens = prompt_tokens.saturating_add(meta.tokens.prompt as usize);
+                completion_tokens =
+                    completion_tokens.saturating_add(meta.tokens.completion as usize);
+                cached_tokens = cached_tokens.saturating_add(meta.tokens.cached as usize);
+                if jsonl {
+                    write_headless_json_event(&headless_json::HeadlessEvent::Usage {
+                        round: meta.round,
+                        turn_id: meta.turn_id,
+                        request_id: meta.request_id,
+                        prompt_tokens: meta.tokens.prompt,
+                        completion_tokens: meta.tokens.completion,
+                        cached_tokens: meta.tokens.cached,
+                        elapsed_ms: meta.elapsed_ms,
+                        reasoning_elapsed_ms: meta.reasoning_elapsed_ms,
+                    })?;
+                } else if verbose {
                     eprintln!(
                         "[tokens] prompt={} completion={} cached={}",
                         meta.tokens.prompt, meta.tokens.completion, meta.tokens.cached
                     );
                 }
             }
-            CodingRuntimeEvent::Agent(KernelEvent::Error { message, .. }) => {
+            CodingRuntimeEvent::Agent(KernelEvent::Error {
+                message,
+                http_status,
+                code,
+                retryable,
+            }) => {
                 close_native_thinking(&mut thinking_line_open);
-                eprintln!("[error] {message}");
+                if jsonl {
+                    write_headless_json_event(&headless_json::HeadlessEvent::Error {
+                        message,
+                        http_status,
+                        code,
+                        retryable,
+                    })?;
+                } else {
+                    eprintln!("[error] {message}");
+                }
                 exit_code = 1;
+            }
+            CodingRuntimeEvent::Agent(KernelEvent::StreamRecovery {
+                attempt,
+                max_attempts,
+                recovered,
+            }) if jsonl => {
+                write_headless_json_event(&headless_json::HeadlessEvent::Retry {
+                    kind: "stream_recovery".into(),
+                    attempt,
+                    max_attempts,
+                    recovered: Some(recovered),
+                    backoff_secs: None,
+                    reason: None,
+                })?;
+            }
+            CodingRuntimeEvent::Agent(KernelEvent::OutputTruncationRecovery {
+                attempt,
+                max_attempts,
+            }) if jsonl => {
+                write_headless_json_event(&headless_json::HeadlessEvent::Retry {
+                    kind: "output_truncation".into(),
+                    attempt,
+                    max_attempts,
+                    recovered: None,
+                    backoff_secs: None,
+                    reason: None,
+                })?;
+            }
+            CodingRuntimeEvent::Agent(KernelEvent::ProviderRetry {
+                attempt,
+                max_attempts,
+                backoff_secs,
+                reason,
+            }) => {
+                if jsonl {
+                    write_headless_json_event(&headless_json::HeadlessEvent::Retry {
+                        kind: "provider_open".into(),
+                        attempt,
+                        max_attempts,
+                        recovered: None,
+                        backoff_secs: Some(backoff_secs),
+                        reason: Some(reason),
+                    })?;
+                } else {
+                    eprintln!(
+                        "API error {reason}，{backoff_secs} 秒后重试({attempt}/{max_attempts})..."
+                    );
+                }
             }
             CodingRuntimeEvent::Agent(KernelEvent::Warning(message))
             | CodingRuntimeEvent::ControllerWarning(message)
             | CodingRuntimeEvent::PersistenceWarning(message) => {
-                eprintln!("[warning] {message}")
+                if jsonl {
+                    write_headless_json_event(&headless_json::HeadlessEvent::Warning { message })?;
+                } else {
+                    eprintln!("[warning] {message}")
+                }
             }
             CodingRuntimeEvent::Agent(KernelEvent::RateLimited {
                 reset_at_display,
@@ -2644,6 +3142,16 @@ pub(crate) async fn run_native_headless(
                 auto_resuming,
                 server_message,
             }) => {
+                if jsonl {
+                    write_headless_json_event(&headless_json::HeadlessEvent::RateLimit {
+                        reset_at: reset_at_display,
+                        reset_label,
+                        seconds_until_reset: secs_until_reset,
+                        auto_resuming,
+                        server_message,
+                    })?;
+                    continue;
+                }
                 let is_coding_plan = !reset_at_display.is_empty() || !reset_label.is_empty();
                 if auto_resuming {
                     eprintln!(
@@ -2729,7 +3237,7 @@ pub(crate) async fn run_native_headless(
                     TurnCompletion::Completed { reason, .. }
                     | TurnCompletion::SnapshotUnavailable { reason, .. } => *reason,
                 };
-                if !last_text_ended_with_newline {
+                if !jsonl && !last_text_ended_with_newline {
                     println!();
                     io::stdout().flush()?;
                 }
@@ -2765,6 +3273,33 @@ pub(crate) async fn run_native_headless(
                     );
                 }
                 exit_code = headless_completion_exit_code(&completion, exit_code);
+                exit_code = headless_denial_exit_code(exit_code, had_denial);
+                if jsonl {
+                    let snapshot_error = match &completion {
+                        TurnCompletion::Completed { .. } => None,
+                        TurnCompletion::SnapshotUnavailable { error, .. } => {
+                            Some(error.message.clone())
+                        }
+                    };
+                    write_headless_json_event(&headless_json::HeadlessEvent::TurnCompleted {
+                        stop_reason: reason,
+                        exit_code,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        rounds,
+                        tool_calls,
+                        total_tokens,
+                        prompt_tokens,
+                        completion_tokens,
+                        cached_tokens,
+                        cache_hit_rate: if prompt_tokens == 0 {
+                            None
+                        } else {
+                            Some(cached_tokens as f64 / prompt_tokens as f64)
+                        },
+                        ttft_ms,
+                        snapshot_error,
+                    })?;
+                }
                 break;
             }
             CodingRuntimeEvent::RuntimeStopped(_) => {
@@ -2776,12 +3311,15 @@ pub(crate) async fn run_native_headless(
     }
     if !saw_turn_terminal {
         exit_code = exit_code.max(1);
+        if jsonl {
+            write_headless_json_event(&headless_json::HeadlessEvent::RunFailed {
+                exit_code,
+                message: "runtime stopped before a turn terminal".into(),
+            })?;
+        }
     }
     let _ = handle.shutdown().await;
     let _ = task.await;
-    if exit_code == 0 && had_denial {
-        exit_code = 2;
-    }
     Ok((exit_code, captured))
 }
 
@@ -2827,6 +3365,11 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
             // flow and falling through to the TUI. This arm is
             // unreachable in normal execution but kept defensive.
             unreachable!("Login is handled inline in run() before handle_command")
+        }
+        Commands::Resume { .. } => {
+            // Resume falls through to the TUI/headless launch in run() before
+            // handle_command is reached; kept defensive like the Login arm.
+            unreachable!("Resume is handled inline in run() before handle_command")
         }
         Commands::Logout => {
             auth::logout()?;
@@ -3399,13 +3942,9 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                     );
                 }
                 many => {
-                    let mut msg =
-                        format!("plugin `{name}` has hooks in multiple installations:\n");
+                    let mut msg = format!("plugin `{name}` has hooks in multiple installations:\n");
                     for s in many {
-                        msg.push_str(&format!(
-                            "  {}@{} ({})\n",
-                            s.plugin, s.marketplace, s.scope
-                        ));
+                        msg.push_str(&format!("  {}@{} ({})\n", s.plugin, s.marketplace, s.scope));
                     }
                     msg.push_str("Use /plugin to inspect the installation scopes.\n");
                     anyhow::bail!(msg);
@@ -3427,13 +3966,9 @@ fn handle_plugin_cli(sub: PluginCli) -> Result<()> {
                     println!("Untrusted hooks from `{name}`.");
                 }
                 many => {
-                    let mut msg =
-                        format!("plugin `{name}` has hooks in multiple installations:\n");
+                    let mut msg = format!("plugin `{name}` has hooks in multiple installations:\n");
                     for s in many {
-                        msg.push_str(&format!(
-                            "  {}@{} ({})\n",
-                            s.plugin, s.marketplace, s.scope
-                        ));
+                        msg.push_str(&format!("  {}@{} ({})\n", s.plugin, s.marketplace, s.scope));
                     }
                     msg.push_str("Use /plugin to inspect the installation scopes.\n");
                     anyhow::bail!(msg);
@@ -3636,7 +4171,11 @@ fn run_codingplan_core(
     // the user sees the report ending in "claim failed — run `atomcode
     // login` again" and has to do manually what `codingplan` could
     // do itself.
-    let mut report = atomcode_codingplan::run(&mut config, telemetry)?;
+    let mut report = atomcode_codingplan::run(
+        &mut config,
+        telemetry,
+        atomcode_codingplan::DefaultModelPolicy::AdoptServerDefault,
+    )?;
     if report.auth_expired {
         use atomcode_config::i18n::{t, Msg};
         print!("{}", t(Msg::CpReauthAfter401));
@@ -3644,7 +4183,11 @@ fn run_codingplan_core(
             .and_then(|auth| atomcode_auth::save_auth(&auth).map(|_| auth))
         {
             Ok(_) => {
-                report = atomcode_codingplan::run(&mut config, telemetry)?;
+                report = atomcode_codingplan::run(
+                    &mut config,
+                    telemetry,
+                    atomcode_codingplan::DefaultModelPolicy::AdoptServerDefault,
+                )?;
             }
             Err(e) => {
                 // Re-OAuth itself failed (user pressed Ctrl+C, network
@@ -3657,9 +4200,14 @@ fn run_codingplan_core(
     }
 
     if report.should_persist_config() {
-        let persisted = match atomcode_config::ConfigStore::new(&path)
-            .update(|latest| atomcode_codingplan::merge_successful_config(latest, &config, &report))
-        {
+        let persisted = match atomcode_config::ConfigStore::new(&path).update(|latest| {
+            atomcode_codingplan::merge_successful_config(
+                latest,
+                &config,
+                &report,
+                atomcode_codingplan::DefaultModelPolicy::AdoptServerDefault,
+            )
+        }) {
             Ok(_) => true,
             Err(e) => {
                 eprintln!("  ⚠ Failed to save config to {}: {:#}", path.display(), e);
@@ -3805,14 +4353,89 @@ mod tests {
     use super::{
         apply_cli_runtime_overrides, atomcode_log_path, close_thinking_chunk,
         format_thinking_chunk, format_verbose_tool_chunk, headless_completion_exit_code,
-        headless_completion_notify_reason, is_completion_invocation, merge_startup_notices,
-        interactive_provider_bootstrap, print_shell_completion, resolve_working_dir,
-        runtime_config_from,
-        should_fork_busy_continue, truncate_log_line, Cli, Commands, DEFAULT_LOG_DIRECTIVES,
+        headless_completion_notify_reason, headless_denial_exit_code,
+        interactive_provider_bootstrap, is_completion_invocation, merge_startup_notices,
+        print_shell_completion, resolve_working_dir, runtime_config_from,
+        resolve_in_catalog, resume_hint_line, should_fork_busy_continue, truncate_log_line, Cli,
+        Commands, HeadlessOutputFormat, DEFAULT_LOG_DIRECTIVES,
     };
     use clap::Parser;
     use clap_complete::Shell;
     use std::path::PathBuf;
+
+    fn catalog_entry(
+        id: &str,
+        name: &str,
+        updated_at_ms: i64,
+    ) -> atomcode_capabilities::session::CatalogEntry {
+        atomcode_capabilities::session::CatalogEntry {
+            id: id.to_string(),
+            name: name.to_string(),
+            fork_root_id: None,
+            project_bucket: "0123456789abcdef".to_string(),
+            working_dir: PathBuf::from("/w"),
+            created_at_ms: 0,
+            updated_at_ms,
+            message_count: 1,
+            turn_count: 1,
+            presence: atomcode_capabilities::session::CatalogPresence::NativeOnly,
+        }
+    }
+
+    #[test]
+    fn resolve_in_catalog_prefers_exact_id_then_most_recent_name() {
+        let catalog = vec![
+            catalog_entry("aaa", "review", 100),
+            catalog_entry("bbb", "review", 300), // newer duplicate name
+            catalog_entry("ccc", "deploy", 200),
+        ];
+        // Exact id wins even when a name also matches something.
+        assert_eq!(resolve_in_catalog(&catalog, "ccc").as_deref(), Some("ccc"));
+        // Ambiguous name resolves to the most-recently-updated session.
+        assert_eq!(resolve_in_catalog(&catalog, "review").as_deref(), Some("bbb"));
+        // Unique name.
+        assert_eq!(resolve_in_catalog(&catalog, "deploy").as_deref(), Some("ccc"));
+        // No match.
+        assert_eq!(resolve_in_catalog(&catalog, "nope"), None);
+        assert_eq!(resolve_in_catalog(&[], "review"), None);
+    }
+
+    #[test]
+    fn resume_hint_line_forms_match_headless_vs_tui_and_language() {
+        // Headless continues a pipe run with `-p … --resume <id>`.
+        assert_eq!(
+            resume_hint_line("abc", true, false),
+            "To resume this session, run: atomcode -p \"…\" --resume abc"
+        );
+        // TUI shows the `resume <id>` subcommand (codex parity).
+        assert_eq!(
+            resume_hint_line("abc", false, false),
+            "To resume this session, run: atomcode resume abc"
+        );
+        // Chinese locale.
+        assert_eq!(
+            resume_hint_line("abc", false, true),
+            "继续此会话，运行：atomcode resume abc"
+        );
+    }
+
+    #[test]
+    fn resume_flag_and_subcommand_parse() {
+        // `-p "…" --resume <id>` → headless resume.
+        let c = Cli::try_parse_from(["atomcode", "-p", "hi", "--resume", "sid"]).unwrap();
+        assert_eq!(c.resume.as_deref(), Some("sid"));
+        // `resume <id>` subcommand.
+        let c = Cli::try_parse_from(["atomcode", "resume", "sid"]).unwrap();
+        assert!(matches!(
+            c.command,
+            Some(Commands::Resume { session: Some(s) }) if s == "sid"
+        ));
+        // bare `resume` → most recent.
+        let c = Cli::try_parse_from(["atomcode", "resume"]).unwrap();
+        assert!(matches!(c.command, Some(Commands::Resume { session: None })));
+        // `--resume` conflicts with `--continue`.
+        assert!(Cli::try_parse_from(["atomcode", "-p", "hi", "-c", "--resume", "x"]).is_err());
+    }
 
     #[test]
     fn completion_subcommand_defaults_to_bash_and_accepts_all_supported_shells() {
@@ -3826,6 +4449,37 @@ mod tests {
             let parsed = Cli::try_parse_from(["atomcode", "completion", shell]).unwrap();
             assert!(matches!(parsed.command, Some(Commands::Completion(_))));
         }
+    }
+
+    #[test]
+    fn headless_eval_flags_accept_inline_or_file_prompts() {
+        let inline =
+            Cli::try_parse_from(["atomcode", "-p", "answer", "--ephemeral", "--no-tools"]).unwrap();
+        assert!(inline.ephemeral);
+        assert!(inline.no_tools);
+
+        let jsonl =
+            Cli::try_parse_from(["atomcode", "-p", "answer", "--output-format", "jsonl"]).unwrap();
+        assert_eq!(jsonl.output_format, HeadlessOutputFormat::Jsonl);
+
+        let file =
+            Cli::try_parse_from(["atomcode", "--prompt-file", "prompt.txt", "--no-tools"]).unwrap();
+        assert!(file.no_tools);
+    }
+
+    #[test]
+    fn headless_eval_flags_reject_interactive_and_resume_combinations() {
+        assert!(Cli::try_parse_from(["atomcode", "--ephemeral"]).is_err());
+        assert!(Cli::try_parse_from(["atomcode", "--no-tools"]).is_err());
+        assert!(Cli::try_parse_from(["atomcode", "--output-format", "jsonl"]).is_err());
+        assert!(Cli::try_parse_from(["atomcode", "-p", "answer", "-c", "--ephemeral"]).is_err());
+    }
+
+    #[test]
+    fn denied_headless_turn_reports_the_process_exit_code_in_its_terminal() {
+        assert_eq!(headless_denial_exit_code(0, true), 2);
+        assert_eq!(headless_denial_exit_code(1, true), 1);
+        assert_eq!(headless_denial_exit_code(0, false), 0);
     }
 
     #[test]
@@ -3931,8 +4585,8 @@ mod tests {
     #[test]
     fn verbose_tool_chunk_strips_ephemeral_activity_marker() {
         assert_eq!(
-            format_verbose_tool_chunk("\u{1e}review · round 2 · read_file"),
-            "[progress] review · round 2 · read_file\n"
+            format_verbose_tool_chunk("\u{1e}review · 2 findings · read_file"),
+            "[progress] review · 2 findings · read_file\n"
         );
     }
 
@@ -4014,8 +4668,14 @@ mod tests {
             "#,
         )
         .unwrap();
-        let runtime_cfg =
-            runtime_config_from(&config, std::path::Path::new("/tmp"), None, None, false, true);
+        let runtime_cfg = runtime_config_from(
+            &config,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
 
         assert!(config.providers.is_empty(), "legacy table stays empty");
         assert_eq!(
@@ -4064,8 +4724,14 @@ mod tests {
             "#,
         )
         .unwrap();
-        let runtime_cfg =
-            runtime_config_from(&config, std::path::Path::new("/tmp"), None, None, false, true);
+        let runtime_cfg = runtime_config_from(
+            &config,
+            std::path::Path::new("/tmp"),
+            None,
+            None,
+            false,
+            true,
+        );
 
         assert_eq!(runtime_cfg.model, "fallback-model");
         assert_eq!(

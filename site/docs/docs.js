@@ -204,6 +204,11 @@
 
     triggers.forEach(t=>t.addEventListener('click',e=>{e.preventDefault();open()}));
     bg.addEventListener('click',close);
+    // Close the modal when a result is chosen. Without this, a SAME-PAGE anchor
+    // hit (a section on the page you're already on) scrolls UNDER the still-open
+    // overlay and looks completely dead. The `<a>` still navigates (no
+    // preventDefault); we only drop the overlay.
+    results.addEventListener('click',e=>{if(e.target.closest('.search-item')) close()});
 
     addEventListener('keydown',e=>{
       const isModK=(e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k';
@@ -217,7 +222,9 @@
       else if(e.key==='Enter'){
         e.preventDefault();
         const hit=CUR_RESULTS[CUR_SEL];
-        if(hit) location.href=hit.href;
+        // Close first: a same-page `#anchor` hit won't reload, so the overlay
+        // would otherwise stay up and hide the scroll.
+        if(hit){close();location.href=hit.href}
       }
     });
     input.addEventListener('input',()=>render(input.value));

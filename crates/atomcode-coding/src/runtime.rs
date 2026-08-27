@@ -1060,6 +1060,23 @@ impl CompactionOutcome {
         matches!(self.trigger, CompactTrigger::Manual { .. })
     }
 
+    /// Whether this is a silent, cache-friendly in-place tool-output fold: an
+    /// AUTOMATIC compaction that only stubbed stale tool results with no turns drained
+    /// (`removed_messages == 0`). This is invisible transcript maintenance — the
+    /// "Tool output folded · saved ~N tok" mark is noise that also misreads as "wasting
+    /// tokens" when it is in fact SAVING context. The daemon/webui projectors call this to
+    /// suppress the mark, keeping it only for real drains (`removed_messages > 0`) and
+    /// manual/overflow compactions (other triggers). An auto drain/summarize normally
+    /// removes ≥1 turn, so `Auto && removed_messages == 0` is the pure-stub case.
+    ///
+    /// CAVEAT: an auto re-summarize can net zero removals yet is NOT a pure stub fold; the
+    /// TUI distinguishes it via the announce (`CompactionStarted`) signal, which this outcome
+    /// does not carry. Fully unifying both drivers onto one discriminator would need a kernel
+    /// `stub_only` flag threaded onto the compaction event.
+    pub fn is_silent_auto_tool_fold(&self) -> bool {
+        matches!(self.trigger, CompactTrigger::Auto { .. }) && self.removed_messages == 0
+    }
+
     /// Whether the proposed compacted conversation was larger than the input.
     pub fn summary_would_grow(&self) -> bool {
         self.bytes_after > self.bytes_before
@@ -8543,9 +8560,9 @@ mod tests {
             _config: &CodingAgentConfig,
             _session_id: Option<&str>,
         ) -> Result<Arc<dyn LlmProvider>, crate::ProviderBuildError> {
-            Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(vec![vec![
-                atomcode_kernel::stream::StreamEvent::Done { truncated: false },
-            ]])))
+            Ok(Arc::new(atomcode_kernel::testkit::MockProvider::new(vec![
+                vec![atomcode_kernel::stream::StreamEvent::Done { truncated: false }],
+            ])))
         }
     }
 
@@ -8833,9 +8850,12 @@ mod tests {
             prepare: PrepareOptions {
                 request_user_input: true,
                 session: crate::SessionMode::Disabled,
+                tools: true,
                 skill_dirs: Some(Vec::new()),
                 plugin_skill_dirs: Vec::new(),
                 mcp: false,
+                extra_mcp_servers: Vec::new(),
+                external_subagents: Vec::new(),
                 memory: false,
                 web: false,
                 review: false,
@@ -10795,6 +10815,45 @@ mod tests {
         );
 
         assert_eq!(outcome.estimated_tokens_after, 11_103);
+    }
+
+    #[test]
+    fn silent_auto_tool_fold_only_for_auto_in_place_stubbing() {
+        // Auto + no messages drained = pure in-place tool-output stubbing → silent.
+        let auto_stub = CompactionOutcome::from_kernel(
+            CompactTrigger::Auto { utilization: 0.5 },
+            1,
+            0,
+            10_000,
+            2_000,
+            true,
+            None,
+        );
+        assert!(auto_stub.is_silent_auto_tool_fold());
+
+        // Auto drain (messages removed) is a real reduction → keep the mark.
+        let auto_drain = CompactionOutcome::from_kernel(
+            CompactTrigger::Auto { utilization: 0.8 },
+            1,
+            5,
+            10_000,
+            2_000,
+            true,
+            None,
+        );
+        assert!(!auto_drain.is_silent_auto_tool_fold());
+
+        // Manual compactions always stay visible, even a stub-only one.
+        let manual_stub = CompactionOutcome::from_kernel(
+            CompactTrigger::Manual { focus: None },
+            1,
+            0,
+            10_000,
+            2_000,
+            true,
+            None,
+        );
+        assert!(!manual_stub.is_silent_auto_tool_fold());
     }
 
     #[test]

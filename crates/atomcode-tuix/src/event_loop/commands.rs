@@ -78,7 +78,10 @@ pub(super) fn dispatch_rewind(state: &UiState, ctx: &LoopCtx, renderer: &mut dyn
         .runtime
         .refresh_rewind_catalog(ctx.foreground_runtime_id, ctx.runtime_event_tx.clone())
     {
-        renderer.render(UiLine::Error(format!("{}: {error}", t(Msg::CmdRewindUnavailable))));
+        renderer.render(UiLine::Error(format!(
+            "{}: {error}",
+            t(Msg::CmdRewindUnavailable)
+        )));
         renderer.flush();
     }
 }
@@ -88,24 +91,38 @@ pub(super) fn dispatch_rewind(state: &UiState, ctx: &LoopCtx, renderer: &mut dyn
 /// legacy top-level `base` form whose diff included the working tree as an accidental side
 /// effect. `/review <base>` now consistently means the committed `<base>..HEAD` range.
 fn review_prompt(arg: &str) -> String {
-    let scope = arg.trim();
-    if scope.is_empty() {
-        return "Review my current uncommitted changes: call the `code_review` tool with \
-                {\"scope\":{\"kind\":\"working_tree\"}}, then give me a concise summary of \
-                its findings."
-            .to_string();
-    }
-    if scope.eq_ignore_ascii_case("staged") {
-        return "Review my staged changes: call the `code_review` tool with \
-                {\"scope\":{\"kind\":\"staged\"}}, then give me a concise summary of its \
-                findings."
-            .to_string();
-    }
+    let arg = arg.trim();
+    // A leading `deep+verify` or `deep` keyword (alone or before a scope) sets depth.
+    let (depth, scope): (Option<&str>, &str) = if let Some(rest) = arg
+        .strip_prefix("deep+verify")
+        .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+    {
+        (Some("deep+verify"), rest.trim())
+    } else if let Some(rest) = arg
+        .strip_prefix("deep")
+        .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+    {
+        (Some("deep"), rest.trim())
+    } else {
+        (None, arg)
+    };
+    let scope_json = if scope.is_empty() {
+        r#"{"kind":"working_tree"}"#.to_string()
+    } else if scope.eq_ignore_ascii_case("staged") {
+        r#"{"kind":"staged"}"#.to_string()
+    } else {
+        format!(
+            r#"{{"kind":"range","base":{base},"head":"HEAD"}}"#,
+            base = serde_json::to_string(scope).expect("serializing a string cannot fail")
+        )
+    };
+    let args = match depth {
+        Some(d) => format!(r#"{{"scope":{scope_json},"depth":"{d}"}}"#),
+        None => format!(r#"{{"scope":{scope_json}}}"#),
+    };
     format!(
-        "Review the requested committed range: call the `code_review` tool with \
-         {{\"scope\":{{\"kind\":\"range\",\"base\":{base},\"head\":\"HEAD\"}}}}, then give \
-         me a concise summary of its findings.",
-        base = serde_json::to_string(scope).expect("serializing a string cannot fail")
+        "Review the requested changes: call the `code_review` tool with {args}, then give me a \
+         concise summary of its findings."
     )
 }
 
@@ -295,6 +312,47 @@ mod bg_live_guard_tests {
     use crate::event_loop::bg_runtime::{BgRuntimeManager, RuntimeEventPayload, RuntimeState};
     use crate::session::Session;
     use crate::state::{UiPhase, UiState};
+
+    #[test]
+    fn take_marker_matched_images_keeps_only_surviving_markers() {
+        use atomcode_kernel::message::ImageContent;
+        let mut state = UiState::new();
+        state.pending_images = vec![
+            ImageContent {
+                media_type: "image/png".into(),
+                data: "AAA".into(),
+            },
+            ImageContent {
+                media_type: "image/png".into(),
+                data: "BBB".into(),
+            },
+        ];
+        state.pending_image_markers = vec![1, 2];
+        state.pending_image_hashes = vec![0x1111, 0x2222];
+        // Only marker #2 survives in the objective text.
+        let images = super::take_marker_matched_images(&mut state, "trend of [Image #2]");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, "BBB");
+        // Pending fully drained — nothing lingers onto the next message.
+        assert!(state.pending_images.is_empty());
+        assert!(state.pending_image_markers.is_empty());
+        assert!(state.pending_image_hashes.is_empty());
+    }
+
+    #[test]
+    fn take_marker_matched_images_drops_all_when_no_marker() {
+        use atomcode_kernel::message::ImageContent;
+        let mut state = UiState::new();
+        state.pending_images = vec![ImageContent {
+            media_type: "image/png".into(),
+            data: "AAA".into(),
+        }];
+        state.pending_image_markers = vec![1];
+        state.pending_image_hashes = vec![0x1111];
+        let images = super::take_marker_matched_images(&mut state, "no marker here");
+        assert!(images.is_empty());
+        assert!(state.pending_images.is_empty(), "still drained");
+    }
 
     #[test]
     fn live_binding_blocks_only_foreground_bg_switches() {
@@ -579,9 +637,7 @@ fn current_live_goal(state: &UiState) -> Option<atomcode_coding::GoalProgress> {
     let phase = state.goal_phase;
     let terminal = match phase {
         atomcode_coding::GoalPhase::Satisfied => Some(atomcode_coding::GoalTerminal::Met),
-        atomcode_coding::GoalPhase::PausedAtCap => {
-            Some(atomcode_coding::GoalTerminal::Stopped)
-        }
+        atomcode_coding::GoalPhase::PausedAtCap => Some(atomcode_coding::GoalTerminal::Stopped),
         _ => None,
     };
     Some(atomcode_coding::GoalProgress {
@@ -628,7 +684,7 @@ pub(crate) fn attach_live_runtime(
     // it in the first snapshot even when no GoalChanged event is replayable.
     if let Some(goal) = current_live_goal(state) {
         atomcode_daemon::native_live::seed_goal_progress(&binding, goal)
-        .map_err(|error| format!("同步当前 Goal 状态失败：{error:?}"))?;
+            .map_err(|error| format!("同步当前 Goal 状态失败：{error:?}"))?;
     }
     // The runtime binding owns execution; the process-level mode seeds the first
     // live snapshot before any ModeChanged event exists.
@@ -811,14 +867,39 @@ pub(crate) fn submit_agent_turn(ctx: &LoopCtx, state: &mut UiState, text: String
     }
 }
 
-fn submit_agent_text(ctx: &LoopCtx, text: String) -> bool {
+fn submit_agent_input(ctx: &LoopCtx, input: atomcode_coding::UserInput) -> bool {
     if ctx.live_binding.is_some() {
-        atomcode_daemon::native_live::submit(atomcode_coding::UserInput::from(text)).is_ok()
+        atomcode_daemon::native_live::submit(input).is_ok()
     } else {
         ctx.runtime
-            .dispatch(atomcode_coding::DriverCommand::Submit(text.into()))
+            .dispatch(atomcode_coding::DriverCommand::Submit(input))
             .is_ok()
     }
+}
+
+fn submit_agent_text(ctx: &LoopCtx, text: String) -> bool {
+    submit_agent_input(ctx, atomcode_coding::UserInput::from(text))
+}
+
+/// Drain the pasted images whose `[Image #N]` marker still appears in
+/// `marker_source`, mirroring the normal-message submit filter (a deleted
+/// marker drops its image). The matched images leave `pending_images` (so they
+/// don't linger onto the next message); unmatched pasted images are dropped the
+/// same way the message path drops a marker the user deleted. Used by
+/// image-aware slash arms (`/goal`) that submit their own turn.
+fn take_marker_matched_images(
+    state: &mut UiState,
+    marker_source: &str,
+) -> Vec<atomcode_kernel::message::ImageContent> {
+    let pending = std::mem::take(&mut state.pending_images);
+    let markers = std::mem::take(&mut state.pending_image_markers);
+    let _hashes = std::mem::take(&mut state.pending_image_hashes);
+    pending
+        .into_iter()
+        .zip(markers)
+        .filter(|(_, n)| marker_source.contains(&format!("[Image #{}]", n)))
+        .map(|(img, _)| img)
+        .collect()
 }
 
 /// Fire one iteration of a fixed-interval `/loop`.
@@ -3221,8 +3302,15 @@ fn execute_slash_command_impl(
                 }
                 Ok(status) => {
                     let mut txt = t(Msg::McpServersHeader).into_owned();
-                    for (name, server_status) in status.servers {
+                    let blocked = count_blocked_untrusted(&status.servers);
+                    for (name, server_status) in &status.servers {
                         txt.push_str(&format!("    {}  {}\n", name, server_status));
+                    }
+                    // When any project-source server is withheld, surface how to
+                    // unblock it — the raw `blocked: untrusted project` lines never
+                    // mention that `/mcp trust` exists.
+                    if blocked > 0 {
+                        txt.push_str(&t(Msg::McpBlockedTrustHint { count: blocked }));
                     }
                     renderer.render(UiLine::CommandOutput(txt));
                 }
@@ -3499,6 +3587,10 @@ fn execute_slash_command_impl(
                     // (Empty input is unreachable here — `head` would be ""
                     // and the `"" | "status"` arm above would have matched.)
                     let condition = trimmed.to_owned();
+                    // Attach any pasted reference images whose `[Image #N]`
+                    // marker survived in the objective text — the goal's first
+                    // turn submits with them (a text-only model captions via VL).
+                    let images = take_marker_matched_images(state, arg);
                     if ctx
                         .runtime
                         .dispatch(atomcode_coding::DriverCommand::StartGoal(condition.clone()))
@@ -3519,20 +3611,30 @@ fn execute_slash_command_impl(
                     // LiveHub's controller snapshot/view and deliberately does
                     // not consume a runtime sequence number; the later native
                     // event remains authoritative for replay and ordering.
-                    if let (Some(binding), Some(goal)) = (
-                        ctx.live_binding.as_ref(),
-                        current_live_goal(state),
-                    ) {
-                        if let Err(error) = atomcode_daemon::native_live::seed_goal_progress(
-                            binding, goal,
-                        ) {
+                    if let (Some(binding), Some(goal)) =
+                        (ctx.live_binding.as_ref(), current_live_goal(state))
+                    {
+                        if let Err(error) =
+                            atomcode_daemon::native_live::seed_goal_progress(binding, goal)
+                        {
                             renderer.render(UiLine::Error(format!(
                                 "Live Goal synchronization failed: {error:?}"
                             )));
                             renderer.flush();
                         }
                     }
-                    if submit_agent_text(ctx, condition) {
+                    let submitted = if images.is_empty() {
+                        submit_agent_text(ctx, condition)
+                    } else {
+                        submit_agent_input(
+                            ctx,
+                            atomcode_coding::UserInput {
+                                text: condition,
+                                images,
+                            },
+                        )
+                    };
+                    if submitted {
                         state.on_submit();
                     }
                 }
@@ -5443,7 +5545,9 @@ mod schedule_list_text_tests {
             title: title.to_string(),
             prompt: "do something".to_string(),
             cwd: "/tmp".to_string(),
-            schedule: Schedule::Daily { time: "09:00".to_string() },
+            schedule: Schedule::Daily {
+                time: "09:00".to_string(),
+            },
             permission_mode: "plan".to_string(),
             notify: "important".to_string(),
             enabled,
@@ -5475,10 +5579,16 @@ mod schedule_list_text_tests {
         let now = 1785657600_i64; // 2026-07-31 08:00 UTC
         let out = build_schedule_list_text(&tasks, now);
         assert!(out.contains("task-1"), "should contain first task id");
-        assert!(out.contains("Daily brief"), "should contain first task title");
+        assert!(
+            out.contains("Daily brief"),
+            "should contain first task title"
+        );
         assert!(out.contains("on"), "enabled task should show 'on'");
         assert!(out.contains("task-2"), "should contain second task id");
-        assert!(out.contains("Weekly report"), "should contain second task title");
+        assert!(
+            out.contains("Weekly report"),
+            "should contain second task title"
+        );
         assert!(out.contains("off"), "disabled task should show 'off'");
         // Order: task-1 line comes before task-2 line
         let pos1 = out.find("task-1").unwrap();
@@ -5701,9 +5811,7 @@ where
     let catalog_dirs = catalog_dirs
         .into_iter()
         .map(|path| atomcode_capabilities::pathnorm::strip_verbatim_path(&path))
-        .filter(|path| {
-            catalog_seen.insert(atomcode_capabilities::pathnorm::path_case_key(path))
-        })
+        .filter(|path| catalog_seen.insert(atomcode_capabilities::pathnorm::path_case_key(path)))
         .filter(|path| is_dir(path))
         .collect::<Vec<_>>();
     let current_key = atomcode_capabilities::pathnorm::path_case_key(&current);
@@ -6327,6 +6435,22 @@ pub(crate) enum McpSub {
     Untrust,
 }
 
+/// Count servers withheld because the project is untrusted. Drives the
+/// `/mcp trust` discoverability hint appended to the status listing.
+pub(crate) fn count_blocked_untrusted(
+    servers: &[(String, atomcode_capabilities::mcp::ServerStatus)],
+) -> usize {
+    servers
+        .iter()
+        .filter(|(_, s)| {
+            matches!(
+                s,
+                atomcode_capabilities::mcp::ServerStatus::BlockedUntrusted
+            )
+        })
+        .count()
+}
+
 /// Parse the argument string following `/mcp` into a known subcommand.
 /// Returns `None` for unrecognised inputs (which fall through to status display).
 pub(crate) fn parse_mcp_subcommand(sub: &str) -> Option<McpSub> {
@@ -6809,7 +6933,7 @@ fn run_oauth_with_renderer(
     ctx: &mut LoopCtx,
 ) -> Result<atomcode_auth::AuthInfo> {
     use crossterm::event::KeyCode;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use tokio::sync::mpsc::error::TryRecvError;
 
     let session = atomcode_auth::start_login()?;
@@ -6828,22 +6952,37 @@ fn run_oauth_with_renderer(
 
     session.open_browser_best_effort();
 
-    // Poll loop. We stay in raw mode and consume keyboard events from
-    // the existing reader thread via `input_rx`. The main event loop is
-    // blocked while we run, so non-ESC events queue harmlessly — we
-    // drain them here so they don't fire as stale input the moment
-    // we return.
+    // Poll loop. The network `/auth/check` runs on a DETACHED background
+    // thread (`spawn_poller`) and reports outcomes over `poll_rx`; the
+    // foreground here only drains that channel and the input channel. This
+    // is the fix for the Windows "pressing ESC to cancel /login freezes the
+    // console" bug: the previous `session.poll_once().join()` blocked this
+    // very thread on the HTTP request, so a wedged socket (hung DNS/connect
+    // that reqwest's timeout can't interrupt) meant ESC was never observed.
+    // Now ESC is checked every ~50ms regardless of network state.
+    //
+    // We stay in raw mode and consume keyboard events from the existing
+    // reader thread via `input_rx`. The main event loop is blocked while we
+    // run, so non-ESC events queue harmlessly — we drain them here so they
+    // don't fire as stale input the moment we return.
+    let poll_rx = session.spawn_poller(Duration::from_secs(2));
     loop {
-        match session.poll_once()? {
-            atomcode_auth::PollOutcome::Authorized => break,
-            atomcode_auth::PollOutcome::Pending => {}
+        match poll_rx.try_recv() {
+            Ok(Ok(atomcode_auth::PollOutcome::Authorized)) => break,
+            Ok(Ok(atomcode_auth::PollOutcome::Pending)) => {}
+            Ok(Err(e)) => {
+                // Dropping `poll_rx` on the way out stops the poller.
+                return Err(e);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                anyhow::bail!("login poller stopped unexpectedly");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // Drain ALL pending input each tick so a queued ESC cancels
+        // immediately rather than one-event-per-sleep.
         loop {
-            if Instant::now() >= deadline {
-                break;
-            }
             match ctx.input_rx.try_recv() {
                 Ok(crate::input::InputEvent::Key(k)) if k.code == KeyCode::Esc => {
                     anyhow::bail!("login cancelled by user");
@@ -6855,15 +6994,17 @@ fn run_oauth_with_renderer(
                     // the loop would replay stale state.
                     continue;
                 }
-                Err(TryRecvError::Empty) => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
+                Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     anyhow::bail!("input channel closed");
                 }
             }
         }
+
+        std::thread::sleep(Duration::from_millis(50));
     }
+    // Stop the poller before the token exchange.
+    drop(poll_rx);
 
     session.finish(Some(&ctx.telemetry))
 }
@@ -6894,7 +7035,12 @@ fn run_coding_plan_blocking(
     // (`run_login_flow` isn't async) and avoids the need to
     // `Handle::block_on`.
     std::thread::spawn(move || {
-        let report = atomcode_codingplan::run(&mut cfg, Some(&tel));
+        // Interactive `/login`: reset the active default to the server's primary model.
+        let report = atomcode_codingplan::run(
+            &mut cfg,
+            Some(&tel),
+            atomcode_codingplan::DefaultModelPolicy::AdoptServerDefault,
+        );
         (cfg, report)
     })
     .join()
@@ -7006,14 +7152,26 @@ pub(crate) fn run_login_flow(renderer: &mut dyn Renderer, ctx: &mut LoopCtx) -> 
         // Config mutation only persists when critical steps passed —
         // don't write a half-set-up config if login or models failed.
         match ctx.config_store.update(|latest| {
-            atomcode_codingplan::merge_successful_config(latest, &prepared_config, &report)
+            atomcode_codingplan::merge_successful_config(
+                latest,
+                &prepared_config,
+                &report,
+                atomcode_codingplan::DefaultModelPolicy::AdoptServerDefault,
+            )
         }) {
-            Ok(commit) => apply_persisted_config(
-                ctx,
-                commit.snapshot.config,
-                commit.snapshot.revision,
-                renderer,
-            ),
+            Ok(commit) => {
+                // Interactive `/login` overrides any runtime pin: drop back to
+                // FollowGlobalDefault so applying the freshly-persisted config
+                // switches the live session to the new server default. (A pin is
+                // a runtime-only state; cross-window sessions keep their own mode.)
+                ctx.provider_selection_mode = crate::ProviderSelectionMode::FollowGlobalDefault;
+                apply_persisted_config(
+                    ctx,
+                    commit.snapshot.config,
+                    commit.snapshot.revision,
+                    renderer,
+                )
+            }
             Err(error) => {
                 renderer.render(UiLine::Error(
                     t(Msg::ConfigSaveFailed {
@@ -7602,7 +7760,10 @@ mod tests {
         struct DeniedWriter;
         impl std::io::Write for DeniedWriter {
             fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
             }
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
@@ -7690,9 +7851,7 @@ mod tests {
     #[test]
     fn live_user_text_shaped_like_a_reminder_is_still_echoed() {
         let input = atomcode_coding::UserInput {
-            text: atomcode_capabilities::reminder::system_reminder(
-                "Explain why this appears.",
-            ),
+            text: atomcode_capabilities::reminder::system_reminder("Explain why this appears."),
             images: Vec::new(),
         };
 
@@ -7792,16 +7951,12 @@ mod tests {
 
     #[test]
     fn review_prompt_uses_explicit_tool_scopes() {
-        assert!(review_prompt("").contains(
-            r#"{"scope":{"kind":"working_tree"}}"#
-        ));
-        assert!(review_prompt("staged").contains(
-            r#"{"scope":{"kind":"staged"}}"#
-        ));
+        assert!(review_prompt("").contains(r#"{"scope":{"kind":"working_tree"}}"#));
+        assert!(review_prompt("staged").contains(r#"{"scope":{"kind":"staged"}}"#));
         let range = review_prompt("release/v5.0.8");
-        assert!(range.contains(
-            r#"{"scope":{"kind":"range","base":"release/v5.0.8","head":"HEAD"}}"#
-        ));
+        assert!(
+            range.contains(r#"{"scope":{"kind":"range","base":"release/v5.0.8","head":"HEAD"}}"#)
+        );
         assert!(!range.contains(r#"{"base":"#));
     }
 
@@ -7810,6 +7965,56 @@ mod tests {
         let prompt = review_prompt("odd\"ref");
         assert!(prompt.contains(r#""base":"odd\"ref""#));
         assert!(!prompt.contains("`odd\"ref..HEAD`"));
+    }
+
+    #[test]
+    fn review_prompt_deep_adds_depth_and_keeps_scope() {
+        // `deep` alone → working-tree + depth.
+        let wt = review_prompt("deep");
+        assert!(wt.contains(r#""scope":{"kind":"working_tree"}"#), "{wt}");
+        assert!(wt.contains(r#""depth":"deep""#), "{wt}");
+
+        // `deep staged` → staged + depth.
+        let st = review_prompt("deep staged");
+        assert!(st.contains(r#""scope":{"kind":"staged"}"#), "{st}");
+        assert!(st.contains(r#""depth":"deep""#), "{st}");
+
+        // `deep <ref>` → range + depth.
+        let rng = review_prompt("deep main");
+        assert!(
+            rng.contains(r#""scope":{"kind":"range","base":"main","head":"HEAD"}"#),
+            "{rng}"
+        );
+        assert!(rng.contains(r#""depth":"deep""#), "{rng}");
+
+        // Plain scope carries NO depth (default single).
+        assert!(!review_prompt("").contains("depth"));
+        assert!(!review_prompt("staged").contains("depth"));
+    }
+
+    #[test]
+    fn review_prompt_deep_verify_sets_depth_and_keeps_scope() {
+        let wt = review_prompt("deep+verify");
+        assert!(wt.contains(r#""scope":{"kind":"working_tree"}"#), "{wt}");
+        assert!(wt.contains(r#""depth":"deep+verify""#), "{wt}");
+
+        let st = review_prompt("deep+verify staged");
+        assert!(st.contains(r#""scope":{"kind":"staged"}"#), "{st}");
+        assert!(st.contains(r#""depth":"deep+verify""#), "{st}");
+
+        let rng = review_prompt("deep+verify main");
+        assert!(
+            rng.contains(r#""scope":{"kind":"range","base":"main","head":"HEAD"}"#),
+            "{rng}"
+        );
+        assert!(rng.contains(r#""depth":"deep+verify""#), "{rng}");
+
+        // Plain `deep` still maps to depth "deep" (not deep+verify).
+        let d = review_prompt("deep");
+        assert!(
+            d.contains(r#""depth":"deep""#) && !d.contains("deep+verify"),
+            "{d}"
+        );
     }
 
     #[test]
@@ -8653,8 +8858,7 @@ mod todo_command_tests {
         let mut msgs = vec![tool_call_msg(vec![ToolCall {
             id: "ok".into(),
             name: "todowrite".into(),
-            arguments:
-                r#"{"todos":[{"content":"keep","status":"in_progress"}]}"#.into(),
+            arguments: r#"{"todos":[{"content":"keep","status":"in_progress"}]}"#.into(),
         }])];
         msgs.push(Message::tool_result("ok", "1 task", false));
         msgs.push(tool_call_msg(vec![ToolCall {
@@ -8975,7 +9179,29 @@ mod todo_command_tests {
 
 #[cfg(test)]
 mod mcp_subcommand_tests {
-    use super::{parse_mcp_subcommand, McpSub};
+    use super::{count_blocked_untrusted, parse_mcp_subcommand, McpSub};
+    use atomcode_capabilities::mcp::ServerStatus;
+
+    #[test]
+    fn count_blocked_untrusted_counts_only_withheld() {
+        let servers = vec![
+            ("a".to_string(), ServerStatus::Connected),
+            ("b".to_string(), ServerStatus::BlockedUntrusted),
+            ("c".to_string(), ServerStatus::Failed("boom".to_string())),
+            ("d".to_string(), ServerStatus::BlockedUntrusted),
+            ("e".to_string(), ServerStatus::Connecting),
+        ];
+        assert_eq!(count_blocked_untrusted(&servers), 2);
+    }
+
+    #[test]
+    fn count_blocked_untrusted_zero_when_all_trusted() {
+        let servers = vec![
+            ("a".to_string(), ServerStatus::Connected),
+            ("b".to_string(), ServerStatus::Disconnected),
+        ];
+        assert_eq!(count_blocked_untrusted(&servers), 0);
+    }
 
     #[test]
     fn mcp_trust_subcommands_recognized() {

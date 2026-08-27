@@ -164,6 +164,14 @@ pub struct ModelEntry {
     /// models is server-driven and needs no client release.
     #[serde(default)]
     pub capable_model: Option<i64>,
+    /// Ordered reasoning-effort levels this model supports (e.g. `["low","medium",
+    /// "xhigh"]`), advertised by `models-v2`. A NON-EMPTY list is authoritative and is
+    /// persisted verbatim into `ProviderConfig::reasoning_effort_levels`, overriding the
+    /// client-side `codingplan_builtin_effort_levels` table. An EMPTY list means "no
+    /// effort switching". `None` (field omitted on older / production servers) keeps the
+    /// builtin fallback so effort switching still works before the server ships this field.
+    #[serde(default)]
+    pub reasoning_effort_levels: Option<Vec<String>>,
     /// Credential for gateways that authenticate with an API key rather than
     /// the OAuth bearer. `None` ⇒ the model keeps today's behaviour: no key is
     /// persisted and the gateway is reached with the login token.

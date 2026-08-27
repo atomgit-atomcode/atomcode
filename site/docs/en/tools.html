@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Built-in Tools</h1>
+<h1 id="built-in-tools">Built-in Tools</h1>
       <p class="lede">AtomCode ships built-in tools for filesystem &amp; shell, code graph, web, automation, and native AtomGit operations. The model picks tools per task — you almost never need to specify them by hand.</p>
 
-      <h2>Filesystem &amp; shell (9)</h2>
+      <h2 id="filesystem-shell-9">Filesystem &amp; shell (9)</h2>
       <table>
         <thead>
           <tr><th>Tool</th><th>Purpose</th><th>Confirmation?</th></tr>
@@ -111,7 +111,7 @@
         <p>High-risk commands like <code>rm -rf</code>, <code>dd</code>, <code>mkfs</code>, and <code>sudo</code>, plus schema-destroying database migrations (e.g. <code>migrate:fresh</code>, <code>db:reset</code>), always force a permission prompt. This confirmation <strong>always</strong> fires — even a prior "always allow" on <code>bash</code> cannot skip it.</p>
       </div>
 
-      <h2>Code graph (8)</h2>
+      <h2 id="code-graph-8">Code graph (8)</h2>
       <p>This is what sets AtomCode apart from generic agents. With the code-graph index, the model can pinpoint symbols, references, and call relationships without scanning the entire tree — especially valuable on large repos.</p>
       <table>
         <thead>
@@ -129,14 +129,14 @@
         </tbody>
       </table>
 
-      <h3>Typical scenarios</h3>
+      <h3 id="typical-scenarios">Typical scenarios</h3>
       <ul>
         <li><strong>Pre-refactor risk assessment</strong> — "How big is the blast if I change <code>formatDate</code>'s signature?" The model calls <code>blast_radius</code> + <code>find_references</code>.</li>
         <li><strong>Bug root-causing</strong> — "Why doesn't this button respond?" Start at the entry function and <code>trace_callees</code> downward.</li>
         <li><strong>Understanding unfamiliar code</strong> — "Walk me through <code>AuthService.login</code>" &rarr; <code>read_symbol</code> + <code>trace_callees</code>.</li>
       </ul>
 
-      <h2>Web (2)</h2>
+      <h2 id="web-2">Web (2)</h2>
       <table>
         <thead>
           <tr><th>Tool</th><th>Purpose</th></tr>
@@ -148,7 +148,7 @@
       </table>
       <p>Typical uses: looking up the latest docs, comparing library APIs, reading a GitHub issue. In offline environments or to save cost, disable them with <code>--disable-tools web_search,web_fetch</code>.</p>
 
-      <h2>Automation (2)</h2>
+      <h2 id="automation-2">Automation (2)</h2>
       <table>
         <thead>
           <tr><th>Tool</th><th>Purpose</th></tr>
@@ -174,15 +174,15 @@
       </table>
       <pre><code>Ask: Create an AtomGit issue for this bug, including the reproduction steps and environment.</code></pre>
 
-      <h2>Large tool outputs</h2>
+      <h2 id="large-tool-outputs">Large tool outputs</h2>
       <p>When a tool result is too large, AtomCode shows a stable preview and stores the full content with the current session. The model can page through the remainder with <code>fetch_output</code>, so “output truncated” does not mean the result was lost. Stored output is removed when its session is deleted.</p>
 
-      <h2>Disabling specific tools</h2>
+      <h2 id="disabling-specific-tools">Disabling specific tools</h2>
       <p>Use the <code>--disable-tools</code> flag at launch to hide tools from the model entirely. For example, inside the SWE-bench sandbox:</p>
       <pre><code>atomcode -p "solve this issue" --disable-tools web_search,web_fetch</code></pre>
       <p>Disabled tools don't appear in the tool schemas, so the model won't attempt to call a tool guaranteed to fail.</p>
 
-      <h2>Next steps</h2>
+      <h2 id="next-steps">Next steps</h2>
       <ul>
         <li><a href="./sessions.html">Sessions &amp; Undo</a> — every file-edit tool routes through file-history, so <code>/undo</code> can roll back changes</li>
         <li><a href="./skills.html">Skills</a> — wrap your own workflows with <code>use_skill</code></li>

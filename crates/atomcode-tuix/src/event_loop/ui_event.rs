@@ -105,6 +105,10 @@ pub enum UiEvent {
         max_attempts: u32,
         recovered: bool,
     },
+    OutputTruncationRecovery {
+        attempt: u32,
+        max_attempts: u32,
+    },
     RateLimited {
         reset_at_display: String,
         reset_label: String,

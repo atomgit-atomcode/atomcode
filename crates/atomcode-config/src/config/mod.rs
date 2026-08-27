@@ -162,6 +162,26 @@ pub struct SubAgentConfig {
     /// Per-subtask model-round high-water mark. Default 200; `0` means unbounded.
     /// Overridden by `ATOMCODE_SUBAGENT_MAX_ROUNDS` when set.
     pub max_rounds: u32,
+    /// Convenience switch for a built-in Codex subagent, editable from `/config`:
+    /// `"off"` (default) / `"read-only"` / `"accept-edits"` / `"auto"`. Any level
+    /// other than off mounts a `subagent_codex` tool at that permission. For
+    /// multiple instances / a model / a timeout / bypass, use `external` instead.
+    #[serde(default = "default_subagent_level")]
+    pub codex: String,
+    /// Convenience switch for a built-in Claude Code subagent (see [`Self::codex`]).
+    #[serde(default = "default_subagent_level")]
+    pub claude: String,
+    /// External-agent subagent instances (`[[subagent.external]]`). Each drives
+    /// Claude Code / Codex as a named subagent tool. Empty by default. Merged with
+    /// the `codex`/`claude` convenience switches (an explicit entry with the same
+    /// name wins).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external: Vec<ExternalSubagentConfig>,
+}
+
+/// Default for the `codex`/`claude` convenience switches: off.
+fn default_subagent_level() -> String {
+    "off".to_string()
 }
 
 impl Default for SubAgentConfig {
@@ -174,8 +194,37 @@ impl Default for SubAgentConfig {
             // Retained only so existing config files continue to deserialize unchanged.
             timeout_secs: 900,
             max_rounds: 200,
+            codex: default_subagent_level(),
+            claude: default_subagent_level(),
+            external: Vec::new(),
         }
     }
+}
+
+/// One `[[subagent.external]]` entry: a named external coding agent driven as a
+/// subagent. Plain config data — string enums are validated/converted in the
+/// coding layer (which owns the `SubagentKind` / `PermissionMode` types).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalSubagentConfig {
+    /// Instance name, e.g. `"codex-primary"` → tool `subagent_codex_primary`.
+    pub name: String,
+    /// `"codex"` or `"claude-code"`.
+    pub kind: String,
+    /// Optional model override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `"read-only"` (default) / `"accept-edits"` / `"auto"` / `"bypass"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<String>,
+    /// Permit the dangerous `bypass` permission mode for this instance.
+    #[serde(default)]
+    pub allow_dangerous: bool,
+    /// Overall run timeout in seconds (`None` → adapter default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// Set `false` to keep the profile in config but not mount it.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1179,7 +1228,7 @@ pub fn codingplan_group_account_id(provider_type: &str) -> &'static str {
 /// `/provider` panel, `/effort`, the daemon, and the webui can never disagree
 /// about which levels exist. (`"auto"`/`None` are capability states handled
 /// separately, not levels.)
-pub const REASONING_EFFORT_LEVELS: [&str; 4] = ["low", "medium", "high", "max"];
+pub const REASONING_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 /// Built-in reasoning levels advertised by an official CodingPlan model.
 /// `None` means the model has no product-owned restriction and should use its
@@ -1191,20 +1240,40 @@ pub fn codingplan_builtin_effort_levels(model: &str) -> Option<Vec<String>> {
         .then(|| vec!["high".to_string(), "max".to_string()])
 }
 
-/// Resolve a model's effective level declaration. Official CodingPlan
-/// capabilities are authoritative; custom providers retain their configured
-/// list (or unrestricted `None`).
+/// Resolve a model's effective level declaration. A `declared` list (persisted
+/// from the CodingPlan gateway's `reasoning_effort_levels`, or a custom provider's
+/// own config) is AUTHORITATIVE. The client-side [`codingplan_builtin_effort_levels`]
+/// table is only a FALLBACK for CodingPlan models on older/production servers that
+/// don't advertise the field yet — once the server sends a list, it wins.
 pub fn effective_reasoning_effort_levels(
     codingplan_managed: bool,
     model: &str,
     declared: Option<&[String]>,
 ) -> Option<Vec<String>> {
-    if codingplan_managed {
-        if let Some(levels) = codingplan_builtin_effort_levels(model) {
-            return Some(levels);
-        }
+    // A NON-EMPTY declared list is authoritative. An empty list is "no opinion"
+    // (matching `build_codingplan_provider`'s empty→None filter), so it falls through
+    // rather than being taken as an authoritative "unrestricted" that would widen a
+    // CodingPlan model past its builtin.
+    if let Some(levels) = declared.filter(|l| !l.is_empty()) {
+        return Some(levels.to_vec());
     }
-    declared.map(<[String]>::to_vec)
+    if codingplan_managed {
+        return codingplan_builtin_effort_levels(model);
+    }
+    None
+}
+
+/// Whether an endpoint exposes a reasoning-effort control, derived purely from CONFIG:
+/// an explicitly configured `reasoning_effort`, OR a non-empty `reasoning_effort_levels`
+/// (server-advertised via `models-v2`, or the CodingPlan builtin already folded into it).
+/// The SINGLE source of truth for every "does this model support effort" gate — the webui
+/// selector, the TUI `/effort`, and the wire capability — so none can disagree, and no
+/// hardcoded model name (`deepseek-v4-flash`) is needed anywhere.
+pub fn endpoint_supports_reasoning_effort(
+    reasoning_effort: Option<&str>,
+    reasoning_effort_levels: Option<&[String]>,
+) -> bool {
+    reasoning_effort.is_some() || reasoning_effort_levels.is_some_and(|levels| !levels.is_empty())
 }
 
 /// The ordered subset of reasoning-effort levels an endpoint exposes.
@@ -1237,7 +1306,7 @@ pub fn allowed_effort_levels(declared: Option<&[String]>) -> Vec<&'static str> {
 
 /// Clamp a persisted `reasoning_effort` VALUE to an endpoint's allowed levels, so
 /// the wire (and every display) can never carry a level the endpoint declares
-/// unsupported. A concrete level (`low`/`medium`/`high`/`max`) outside
+/// unsupported. A concrete level (`low`/`medium`/`high`/`xhigh`/`max`) outside
 /// [`allowed_effort_levels`] becomes `None` (the API default); `"auto"` and
 /// `None` are capability states, not levels, and pass through unchanged. A valid
 /// value is returned verbatim (no normalization).
@@ -2098,16 +2167,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn subagent_external_entries_deserialize_with_defaults() {
+        let toml = r#"
+[subagent]
+
+[[subagent.external]]
+name = "codex-primary"
+kind = "codex"
+permission = "accept-edits"
+model = "gpt-5-codex"
+
+[[subagent.external]]
+name = "claude-review"
+kind = "claude-code"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.subagent.external.len(), 2);
+        let a = &cfg.subagent.external[0];
+        assert_eq!(a.name, "codex-primary");
+        assert_eq!(a.kind, "codex");
+        assert_eq!(a.permission.as_deref(), Some("accept-edits"));
+        assert_eq!(a.model.as_deref(), Some("gpt-5-codex"));
+        assert!(!a.allow_dangerous, "defaults to fail-closed");
+        assert!(a.enabled, "defaults enabled");
+        assert!(a.timeout_secs.is_none());
+        let b = &cfg.subagent.external[1];
+        assert_eq!(b.kind, "claude-code");
+        assert_eq!(b.permission, None, "absent permission stays None (→ read-only downstream)");
+    }
+
+    #[test]
+    fn subagent_external_absent_is_empty() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.subagent.external.is_empty());
+    }
+
+    #[test]
+    fn subagent_codex_claude_switches_default_off_and_deserialize() {
+        // Absent → "off" (the /config convenience switches).
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.subagent.codex, "off");
+        assert_eq!(cfg.subagent.claude, "off");
+        // Explicit levels round-trip.
+        let cfg: Config = toml::from_str(
+            "[subagent]\ncodex = \"read-only\"\nclaude = \"accept-edits\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.subagent.codex, "read-only");
+        assert_eq!(cfg.subagent.claude, "accept-edits");
+    }
+
+    #[test]
     fn allowed_effort_levels_defaults_to_all_and_filters_a_subset() {
         // No declared subset ⇒ the full canonical set, in cycle order.
         assert_eq!(
             allowed_effort_levels(None),
-            vec!["low", "medium", "high", "max"]
+            vec!["low", "medium", "high", "xhigh", "max"]
         );
         // An empty list is treated as "unrestricted", not "no levels".
         assert_eq!(
             allowed_effort_levels(Some(&[])),
-            vec!["low", "medium", "high", "max"]
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        // `xhigh` is a recognized canonical level (motivating case: an AtomGit Qwen
+        // endpoint declaring low/medium/xhigh keeps all three, in canonical order).
+        let with_xhigh = ["xhigh".to_string(), "low".to_string(), "medium".to_string()];
+        assert_eq!(
+            allowed_effort_levels(Some(&with_xhigh)),
+            vec!["low", "medium", "xhigh"]
         );
         // A declared subset keeps CANONICAL order (not the config's order),
         // is case-insensitive, and drops unknown tokens.
@@ -2133,7 +2260,7 @@ mod tests {
         let only_unknown = ["none".to_string(), "bogus".to_string()];
         assert_eq!(
             allowed_effort_levels(Some(&only_unknown)),
-            vec!["low", "medium", "high", "max"]
+            vec!["low", "medium", "high", "xhigh", "max"]
         );
     }
 
@@ -2204,6 +2331,49 @@ mod tests {
             Some(expected.as_slice())
         );
         assert_eq!(codingplan_builtin_effort_levels("GLM-5.2"), None);
+    }
+
+    // Once the CodingPlan gateway advertises per-model `reasoning_effort_levels`, that
+    // server list is authoritative: it must override the client-side builtin (which knew
+    // only `deepseek-v4-flash -> [high, max]`). With NO server list the builtin remains
+    // the fallback for older/production servers that don't send the field yet.
+    #[test]
+    fn server_declared_effort_levels_win_over_the_client_builtin() {
+        let declared = [
+            "low".to_string(),
+            "medium".to_string(),
+            "xhigh".to_string(),
+        ];
+        assert_eq!(
+            effective_reasoning_effort_levels(true, "deepseek-v4-flash", Some(&declared)),
+            Some(declared.to_vec()),
+            "a server-advertised effort list must win over the builtin"
+        );
+        assert_eq!(
+            effective_reasoning_effort_levels(true, "deepseek-v4-flash", None),
+            Some(vec!["high".to_string(), "max".to_string()]),
+            "with no server list, the builtin stays the CodingPlan fallback"
+        );
+        // An EMPTY declared list is "no authoritative opinion" (same as build's
+        // empty→None filter), NOT an authoritative "unrestricted" that would widen a
+        // CodingPlan model past its builtin — fall through to the builtin.
+        assert_eq!(
+            effective_reasoning_effort_levels(true, "deepseek-v4-flash", Some(&[])),
+            Some(vec!["high".to_string(), "max".to_string()]),
+            "an empty declared list falls through to the CodingPlan builtin"
+        );
+    }
+
+    #[test]
+    fn endpoint_supports_reasoning_effort_is_config_driven() {
+        let levels = ["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        // Non-empty levels (server-advertised) → supported, regardless of a set effort.
+        assert!(endpoint_supports_reasoning_effort(None, Some(&levels)));
+        // An explicit effort → supported even with no declared levels.
+        assert!(endpoint_supports_reasoning_effort(Some("high"), None));
+        // Neither → not supported. Empty levels → not supported (no switching).
+        assert!(!endpoint_supports_reasoning_effort(None, None));
+        assert!(!endpoint_supports_reasoning_effort(None, Some(&[])));
     }
 
     #[test]

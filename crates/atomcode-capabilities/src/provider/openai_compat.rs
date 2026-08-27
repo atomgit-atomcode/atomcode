@@ -30,6 +30,78 @@ use serde_json::{json, Map, Value};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
+// OpenRouter app attribution
+// ---------------------------------------------------------------------------
+
+/// App-attribution headers sent to OpenRouter so real user traffic is credited
+/// to a public "AtomCode" app entry on openrouter.ai (rankings / app page).
+///
+/// Per OpenRouter's app-attribution contract:
+///   - `HTTP-Referer` is the app's STABLE identifier (primary domain) — it alone
+///     creates the app page;
+///   - `X-OpenRouter-Title` is the display name on the rankings;
+///   - `X-OpenRouter-Categories` places the app in the marketplace categories.
+///
+/// These are sent ONLY when the request actually targets `openrouter.ai` (see
+/// [`is_openrouter_url`]) so other OpenAI-compatible endpoints — including
+/// AtomGit's own signing gateway — never receive them.
+pub const OPENROUTER_ATTRIBUTION_HEADERS: &[(&str, &str); 3] = &[
+    ("HTTP-Referer", "https://gitcode.com/atomgit_atomcode/atomcode"),
+    ("X-OpenRouter-Title", "AtomCode"),
+    ("X-OpenRouter-Categories", "cli-agent"),
+];
+
+/// True when `url` targets the OpenRouter API (any path under the `openrouter.ai`
+/// host). Used to gate the attribution headers — they are meaningless, and would
+/// only leak product identity, on any other OpenAI-compatible endpoint.
+///
+/// Hand-rolled host extraction (no `url` crate — that dep is optional to this
+/// crate, pulled only by `web`/`mcp`, while the provider adapter compiles under
+/// `provider` alone). The label-aware suffix match reuses
+/// [`atomcode_config::endpoints::host_matches_domain`] so it agrees with the rest
+/// of the codebase and can't drift.
+pub fn is_openrouter_url(url: &str) -> bool {
+    let authority = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url);
+    // Host = the authority minus path/query/fragment...
+    let host_port = authority
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(authority);
+    // ...minus any `userinfo@` prefix. Without this, a crafted
+    // `https://openrouter.ai:x@evil.com/…` would parse the userinfo `openrouter.ai`
+    // as the host and leak the attribution headers to `evil.com`.
+    let host_port = host_port
+        .rsplit_once('@')
+        .map(|(_userinfo, host)| host)
+        .unwrap_or(host_port);
+    // ...minus an explicit `:port`.
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    atomcode_config::endpoints::host_matches_domain(host, "openrouter.ai")
+}
+
+/// Attach the OpenRouter app-attribution headers to `req` when `url` targets
+/// OpenRouter. Credit real user traffic to the public "AtomCode" app entry so
+/// it can appear in openrouter.ai rankings. Gated to `openrouter.ai` only —
+/// the headers are meaningless on any other OpenAI-compatible endpoint and
+/// would only leak product identity there.
+fn apply_openrouter_attribution(
+    url: &str,
+    req: reqwest::RequestBuilder,
+) -> reqwest::RequestBuilder {
+    if !is_openrouter_url(url) {
+        return req;
+    }
+    let mut req = req;
+    for (name, value) in OPENROUTER_ATTRIBUTION_HEADERS {
+        req = req.header(*name, *value);
+    }
+    req
+}
+
+// ---------------------------------------------------------------------------
 // Config + provider
 // ---------------------------------------------------------------------------
 
@@ -704,6 +776,7 @@ async fn open_stream(
         if !session_id.is_empty() {
             req = req.header("x-atomcode-session-id", session_id);
         }
+        req = apply_openrouter_attribution(url, req);
         let was_capped = tls12_probe || atomcode_config::tls::should_cap_url(url);
         // TTFB watchdog for THIS attempt. `send()` resolves as soon as the response
         // HEAD arrives, so wrapping it never truncates a slow streaming body — it only
@@ -1207,6 +1280,7 @@ fn effort_str(e: ReasoningEffort) -> &'static str {
         ReasoningEffort::Low => "low",
         ReasoningEffort::Medium => "medium",
         ReasoningEffort::High => "high",
+        ReasoningEffort::XHigh => "xhigh",
         ReasoningEffort::Max => "max",
     }
 }
@@ -1219,9 +1293,8 @@ fn open_error(e: reqwest::Error) -> ProviderError {
     ProviderError {
         // Broadened: also retry stale-keep-alive resets (is_connect()==false).
         retryable: retry::is_retryable_reqwest_error(&e),
-        // Surface the full source chain so the cause (connection reset / dns /
-        // proxy) is visible in the error line instead of the opaque shell.
-        message: format!("open failed: {}", retry::err_chain(&e)),
+        // Shared builder surfaces the full chain + an unreachable-proxy hint.
+        message: retry::open_failed_message(&e),
         ..Default::default()
     }
 }
@@ -1568,8 +1641,16 @@ fn map_usage(u: ChunkUsage) -> TokenUsage {
         .or(u.cached_tokens) // GLM / Zhipu
         .or_else(|| u.prompt_tokens_details.and_then(|d| d.cached_tokens)) // OpenAI
         .unwrap_or(0);
+    // DeepSeek-compatible gateways may omit the aggregate while still reporting
+    // the exact cache split. Normalize that wire variant to the kernel contract:
+    // `prompt` is total input and `cached` is the cache-read subset.
+    let prompt = u.prompt_tokens.unwrap_or_else(|| {
+        u.prompt_cache_hit_tokens
+            .unwrap_or(0)
+            .saturating_add(u.prompt_cache_miss_tokens.unwrap_or(0))
+    });
     TokenUsage {
-        prompt: u.prompt_tokens.unwrap_or(0),
+        prompt,
         completion: u.completion_tokens.unwrap_or(0),
         cached,
     }
@@ -1641,6 +1722,8 @@ struct ChunkUsage {
     completion_tokens: Option<u32>,
     #[serde(default)]
     prompt_cache_hit_tokens: Option<u32>,
+    #[serde(default)]
+    prompt_cache_miss_tokens: Option<u32>,
     #[serde(default)]
     cached_tokens: Option<u32>,
     #[serde(default)]
@@ -3019,6 +3102,22 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_cache_split_recovers_missing_prompt_total() {
+        let usage = map_usage(ChunkUsage {
+            prompt_tokens: None,
+            completion_tokens: Some(7),
+            prompt_cache_hit_tokens: Some(80),
+            prompt_cache_miss_tokens: Some(20),
+            cached_tokens: None,
+            prompt_tokens_details: None,
+        });
+
+        assert_eq!(usage.prompt, 100);
+        assert_eq!(usage.cached, 80);
+        assert_eq!(usage.completion, 7);
+    }
+
+    #[test]
     fn sse_emits_provider_response_id_once() {
         let mut d = SseDecoder::new();
         let mut ev = Vec::new();
@@ -3677,6 +3776,72 @@ mod tests {
             head.contains("user-agent: atomcode"),
             "UA fallback must still be present: {head}"
         );
+    }
+
+    // ---- OpenRouter app attribution ----
+
+    #[test]
+    fn is_openrouter_url_matches_only_openrouter_hosts() {
+        // Real OpenRouter endpoints (any path, http or https, explicit port).
+        assert!(is_openrouter_url("https://openrouter.ai/api/v1"));
+        assert!(is_openrouter_url("https://openrouter.ai"));
+        assert!(is_openrouter_url("http://openrouter.ai:443/api/v1/chat/completions"));
+        assert!(is_openrouter_url("https://openrouter.ai/api/v1/chat/completions"));
+        // Subdomains count as OpenRouter too.
+        assert!(is_openrouter_url("https://api.openrouter.ai/v1"));
+        // Legit userinfo on the real host still matches (host is after `@`).
+        assert!(is_openrouter_url("https://user:pass@openrouter.ai/v1"));
+        // Look-alikes / other endpoints must NOT match.
+        assert!(!is_openrouter_url("https://api.deepseek.com/v1"));
+        assert!(!is_openrouter_url("https://llm-api.atomgit.com/v1"));
+        assert!(!is_openrouter_url("https://evilopenrouter.ai/v1"));
+        assert!(!is_openrouter_url("https://notopenrouter.ai/v1"));
+        assert!(!is_openrouter_url("https://openrouter.ai.evil.com/v1"));
+        // Userinfo spoof: real host is evil.com — the `openrouter.ai:x@` is
+        // userinfo, NOT the host. Must not leak attribution headers to evil.com.
+        assert!(!is_openrouter_url("https://openrouter.ai:x@evil.com/v1"));
+        assert!(!is_openrouter_url("https://openrouter.ai@evil.com/v1"));
+        assert!(!is_openrouter_url("not a url"));
+    }
+
+    #[test]
+    fn apply_openrouter_attribution_only_targets_openrouter() {
+        let client = reqwest::Client::new();
+
+        // OpenRouter endpoint → all three attribution headers present.
+        let req = client
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        let built = apply_openrouter_attribution(
+            "https://openrouter.ai/api/v1/chat/completions",
+            req,
+        )
+        .build()
+        .expect("request must build");
+        for (name, value) in OPENROUTER_ATTRIBUTION_HEADERS {
+            assert_eq!(
+                built.headers().get(*name).and_then(|v| v.to_str().ok()),
+                Some(*value),
+                "{name} must be set on openrouter.ai"
+            );
+        }
+
+        // Non-OpenRouter endpoint → NONE of the attribution headers leak.
+        let req = client
+            .post("https://api.deepseek.com/v1/chat/completions")
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        let built = apply_openrouter_attribution(
+            "https://api.deepseek.com/v1/chat/completions",
+            req,
+        )
+        .build()
+        .expect("request must build");
+        for (name, _) in OPENROUTER_ATTRIBUTION_HEADERS {
+            assert!(
+                !built.headers().contains_key(*name),
+                "{name} must not be sent to non-OpenRouter endpoints"
+            );
+        }
     }
 
     // ---- reasoning_effort 400 self-heal (b2) ----

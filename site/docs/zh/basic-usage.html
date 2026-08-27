@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>基本使用</h1>
+<h1 id="基本使用">基本使用</h1>
       <p class="lede">掌握 CLI 参数、如何描述任务、如何给模型提供上下文、如何在多个任务之间切换。</p>
 
-      <h2>启动方式</h2>
+      <h2 id="启动方式">启动方式</h2>
       <pre><code># 在当前目录启动 TUI
 atomcode
 
@@ -99,7 +99,7 @@ atomcode --config ./custom.toml
 atomcode -y
 atomcode --dangerously-skip-permissions</code></pre>
 
-      <h2>CLI 参数总览</h2>
+      <h2 id="cli-参数总览">CLI 参数总览</h2>
       <table>
         <thead>
           <tr><th>参数</th><th>简写</th><th>作用</th></tr>
@@ -134,7 +134,7 @@ atomcode --dangerously-skip-permissions</code></pre>
         </ul>
       </div>
 
-      <h2>描述任务的原则</h2>
+      <h2 id="描述任务的原则">描述任务的原则</h2>
       <p>AtomCode 的 Agent 循环能力主要取决于你给出的任务描述的质量。几条经验:</p>
       <ul>
         <li><strong>说目标,不说步骤</strong> —— "修复登录后跳 404 的 bug",而不是"打开 src/auth/callback.ts,删除第 27 行,再…"。模型有足够的探索能力。</li>
@@ -143,7 +143,7 @@ atomcode --dangerously-skip-permissions</code></pre>
         <li><strong>先问后改</strong> —— 不确定方向时,先让它"分析这个模块的结构并提出重构方案",对齐之后再让它动手。</li>
       </ul>
 
-      <h2>示例任务</h2>
+      <h2 id="示例任务">示例任务</h2>
       <pre><code># Bug 修复
 &gt; 修复 OAuth 回调后用户被重定向到 404 的问题,确保回调完整恢复原始路径
 
@@ -159,7 +159,7 @@ atomcode --dangerously-skip-permissions</code></pre>
 # 代码理解
 &gt; 简要说明这个仓库的目录结构、构建入口和核心模块职责</code></pre>
 
-      <h2>多行输入</h2>
+      <h2 id="多行输入">多行输入</h2>
       <p>在 TUI 中:</p>
       <ul>
         <li><code>Enter</code> 发送消息</li>
@@ -173,7 +173,7 @@ atomcode --dangerously-skip-permissions</code></pre>
       <h2 id="at-mention"><code>@</code> 引用文件</h2>
       <p>在输入框里敲一个 <code>@</code>(前面是空白或行首)就会弹出项目内文件/目录的候选菜单。这是把代码里某个具体路径"指给模型看"最快的方式 — 你只负责定位,要不要展开、读多少由模型按需调 <code>read_file</code> 决定。</p>
 
-      <h3>交互</h3>
+      <h3 id="交互">交互</h3>
       <ul>
         <li><strong>触发</strong> —— <code>@</code> 前面是空白或行首才生效。<code>email@host.com</code> 这种中间出现的 <code>@</code> 不会触发,避免误弹。</li>
         <li><strong>过滤</strong> —— 继续敲字符做子串匹配(大小写不敏感)。例如 <code>@cra</code> 能命中 <code>crates/</code>;<code>@toml</code> 能命中所有 <code>*.toml</code>。</li>
@@ -183,7 +183,7 @@ atomcode --dangerously-skip-permissions</code></pre>
         <li><strong>回退继续选</strong> —— 删掉尾随空格后,菜单会就地重开,方便从当前目录继续往下钻。</li>
       </ul>
 
-      <h3>候选来自哪里</h3>
+      <h3 id="候选来自哪里">候选来自哪里</h3>
       <ul>
         <li>项目根目录下的<strong>所有文件和目录</strong> — 文件、目录都能选;目录用尾随 <code>/</code> 标识。</li>
         <li><strong>尊重 <code>.gitignore</code></strong>(以及全局 ignore、<code>.git/info/exclude</code>),被忽略的路径不会出现在菜单里。</li>
@@ -193,7 +193,7 @@ atomcode --dangerously-skip-permissions</code></pre>
         <li><strong>排序</strong>:当前 scope 的直接子项优先 → 目录优先于文件 → 字母序。</li>
       </ul>
 
-      <h3>对模型意味着什么</h3>
+      <h3 id="对模型意味着什么">对模型意味着什么</h3>
       <p>提交时,<code>@crates/atomcode-cli/src/main.rs</code> 作为<strong>字面文本</strong>一同发给模型 — AtomCode <em>不会</em>在前端预读文件内容并内联。模型看到这段路径后,会按需调用内置的 <code>read_file</code> 工具去读。这样:</p>
       <ul>
         <li>大文件不会无脑塞进上下文,token 预算更可控。</li>
@@ -205,7 +205,7 @@ atomcode --dangerously-skip-permissions</code></pre>
         <p>如果想强制把文件内容直接喂进对话(比如让模型针对某段代码做精读、不希望它再走一次 <code>read_file</code>),用粘贴 — 直接把内容粘进输入框,bracketed paste 会把它折叠成 <em>[paste #N]</em> 标记,提交时整段带入。</p>
       </div>
 
-      <h3>限制</h3>
+      <h3 id="限制">限制</h3>
       <ul>
         <li>候选菜单一次最多展示 <strong>30 条</strong>,继续打过滤字符可以缩小命中范围。</li>
         <li><strong>路径中含空格的文件不会出现在候选里</strong> — 因为 <code>@</code> 引用以空白作为终止符。</li>
@@ -214,7 +214,7 @@ atomcode --dangerously-skip-permissions</code></pre>
         <li>没有大小、类型过滤 — 所有未被 ignore 的文件都会出现。</li>
       </ul>
 
-      <h2>粘贴长文本</h2>
+      <h2 id="粘贴长文本">粘贴长文本</h2>
       <p>AtomCode 支持 bracketed paste。当你粘贴一段很长的内容(比如一堆日志)时,TUI 会把它折叠成一个紧凑的 <em>[paste #N · 132 lines]</em> 指示器,避免输入框被撑爆。发送时会完整带入。</p>
 
       <h2 id="image-attach">图片附件 / 截图</h2>
@@ -226,7 +226,7 @@ atomcode --dangerously-skip-permissions</code></pre>
       </ul>
       <p>每次成功 attach 时,输入框会就地插入一个 <code>[Image #N]</code> 标记,提交时图片字节随消息一起发。状态栏右侧也会出现 <em>Image in clipboard · ctrl+v to paste</em> 的提示(剪贴板还有未粘的图时)。</p>
 
-      <h3>非视觉模型怎么处理图片?</h3>
+      <h3 id="非视觉模型怎么处理图片">非视觉模型怎么处理图片?</h3>
       <p>当前 active provider 不支持图片输入(比如 DeepSeek-V3 / Kimi 等纯文本模型)时,AtomCode 不会直接拒绝,而是会自动调用一个独立的 <strong>VL preprocessor</strong>(视觉模型,比如 Qwen3-VL / GLM-4V)对图片做 OCR + 描述,把结果作为文本 splice 到用户消息里再发给主模型。这样无论主模型支不支持图片,你都能"贴张截图问问题"。</p>
       <ul>
         <li>preprocessor 用哪个模型?由配置文件里的 <code>vision_preprocessor_provider</code> 决定 — 详见 <a href="./configuration.html#vision-preprocessor">配置文件 · 视觉预处理器</a>。</li>
@@ -238,7 +238,7 @@ atomcode --dangerously-skip-permissions</code></pre>
         <p>如果当前模型本身就支持视觉输入(Claude 3+ / GPT-4o / Gemini / Qwen-VL 等),会直接发原始图片字节,不走 preprocessor。</p>
       </div>
 
-      <h2>切换会话和目录</h2>
+      <h2 id="切换会话和目录">切换会话和目录</h2>
       <ul>
         <li><code>/resume</code> —— 在不同会话之间切换或恢复</li>
         <li><code>/session</code> —— 新建一个干净会话</li>
@@ -248,14 +248,14 @@ atomcode --dangerously-skip-permissions</code></pre>
       </ul>
       <p>详细行为见 <a href="./sessions.html">会话与撤销</a>。</p>
 
-      <h2>查看 Token 用量和 diff</h2>
+      <h2 id="查看-token-用量和-diff">查看 Token 用量和 diff</h2>
       <ul>
         <li><code>/cost</code> —— 按模型显示本次会话累计的提示、补全和缓存 Token</li>
         <li><code>/diff</code> —— 当前工作目录未提交改动的 git diff</li>
         <li><code>/undo</code> —— 回滚上一轮的所有文件编辑</li>
       </ul>
 
-      <h2>下一步</h2>
+      <h2 id="下一步">下一步</h2>
       <ul>
         <li><a href="./slash-commands.html">斜杠命令</a> —— 30+ 个命令的完整参考</li>
         <li><a href="./keybindings.html">快捷键</a> —— 熟练使用键盘将大幅提升效率</li>

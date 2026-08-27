@@ -38,7 +38,9 @@ atomcode-daemon = { path = "../atomcode-daemon" }
 # lives in `src/acp/`. It composes the v2 stack directly, so cli pulls the layers acp
 # uses (kernel + coding + capabilities) + the protocol SDK. capabilities is all-platform
 # here (acp is cross-platform); it also covers the unix-only `::askpass` helper below.
-agent-client-protocol = { workspace = true }
+# `unstable_protocol_v2`: the ACP v2 draft is opt-in (official guidance); the dual
+# protocol router keeps the stable v1 chain as the default path.
+agent-client-protocol = { workspace = true, features = ["unstable_protocol_v2", "unstable_elicitation"] }
 atomcode-kernel = { path = "../atomcode-kernel" }
 atomcode-coding = { path = "../atomcode-coding", features = ["atomgit"] }
 atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify", "setup", "plugin", "mcp", "atomgit", "cc-hooks"] }

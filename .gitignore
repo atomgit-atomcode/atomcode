@@ -125,3 +125,6 @@ extensions/jetbrains/.spec_docs
 .superpowers/
 
 .liftoff/
+
+# Codex 子代理在项目目录生成的运行时目录(external subagent driver)
+.codex/

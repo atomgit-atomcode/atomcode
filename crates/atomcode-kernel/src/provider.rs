@@ -65,6 +65,9 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    /// Extra-high effort — some endpoints (e.g. AtomGit Qwen) accept
+    /// `reasoning_effort: "xhigh"` between the standard `high` and the ceiling `max`.
+    XHigh,
     /// Maximum effort — DeepSeek V4 accepts `reasoning_effort: "max"` beyond the
     /// OpenAI low/medium/high ladder.
     Max,
@@ -76,11 +79,12 @@ impl ReasoningEffort {
             ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
+            ReasoningEffort::XHigh => "xhigh",
             ReasoningEffort::Max => "max",
         }
     }
 
-    /// Parse a config string (`"low"|"medium"|"high"|"max"`, case-insensitive) into an
+    /// Parse a config string (`"low"|"medium"|"high"|"xhigh"|"max"`, case-insensitive) into an
     /// effort level. `None`/empty/`"off"` ⇒ `None` (no opinion); an UNKNOWN value also ⇒
     /// `None` (effort is a non-critical optimization — unlike `reasoning_history`, a typo
     /// degrades to the adapter default rather than failing the turn). Lets a driver plumb
@@ -90,6 +94,7 @@ impl ReasoningEffort {
             "low" => Some(ReasoningEffort::Low),
             "medium" => Some(ReasoningEffort::Medium),
             "high" => Some(ReasoningEffort::High),
+            "xhigh" => Some(ReasoningEffort::XHigh),
             "max" => Some(ReasoningEffort::Max),
             _ => None,
         }
@@ -169,6 +174,11 @@ mod tests {
             ReasoningEffort::from_config(Some("high")),
             Some(ReasoningEffort::High)
         );
+        assert_eq!(
+            ReasoningEffort::from_config(Some("xhigh")),
+            Some(ReasoningEffort::XHigh)
+        );
+        assert_eq!(ReasoningEffort::XHigh.as_str(), "xhigh");
         assert_eq!(
             ReasoningEffort::from_config(Some("MAX")),
             Some(ReasoningEffort::Max),

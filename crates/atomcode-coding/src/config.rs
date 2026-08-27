@@ -58,9 +58,16 @@ pub struct CodingAgentConfig {
     /// `[coding].max_rounds` or `ATOMCODE_TURN_MAX_ROUNDS`; exact repetition guards remain
     /// active independently.
     pub max_rounds: u32,
-    /// When true, the kernel turns the `max_rounds` cap into an interactive
-    /// checkpoint (see AgentBuilder). Default false; only the TUI driver sets it.
+    /// Enables the kernel's fixed interactive safety checkpoints (round cap and
+    /// exhausted output-limit recovery). Default false; only the TUI sets it.
     pub round_cap_checkpoint: bool,
+    /// Whether a HUMAN is attending this run (interactive TUI, ACP editor, webui-live) and
+    /// reviews edits as they happen — as opposed to a headless / scheduled / daemon run. Set by
+    /// every driver that also parks approvals for a present human (it mirrors the same intent as
+    /// clearing `request_timeout`, but is a first-class signal so consumers don't overload the
+    /// approval-timeout field). Consumed by [`Self::is_attended`] to gate the forced post-edit
+    /// verify cadence. Default false (unattended → keep forcing verification).
+    pub interactive: bool,
     /// Generate an ephemeral next-prompt suggestion after a naturally completed
     /// turn. The coding runtime owns the auxiliary request and cancellation;
     /// drivers only project the resulting neutral event. Default false so
@@ -179,6 +186,10 @@ pub struct CodingRuntimeConfig {
     pub datalog: atomcode_config::config::DatalogConfig,
     pub reasoning_history: Option<String>,
     pub reasoning_effort: Option<String>,
+    /// The effort levels this endpoint exposes (server-advertised or folded builtin).
+    /// Carried so `agent_config` can derive `supports_reasoning_effort` from CONFIG
+    /// (via `endpoint_supports_reasoning_effort`) instead of a hardcoded model name.
+    pub reasoning_effort_levels: Option<Vec<String>>,
     pub provider_type: String,
     pub thinking_enabled: Option<bool>,
     pub thinking_type: Option<String>,
@@ -196,11 +207,10 @@ pub struct CodingRuntimeConfig {
     pub loop_max_rounds: u32,
     pub turn_max_rounds: u32,
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
-    /// When true, a `max_rounds` hit becomes an interactive continue/stop
-    /// checkpoint (the kernel sends a `ROUND_CAP_CHECKPOINT_KIND` Request)
-    /// instead of a hard error. Only the TUI implements the picker, so this
-    /// must stay `false` for headless / ACP / daemon runtimes (there is no
-    /// requester to answer the Request → the kernel fail-closes to a stop).
+    /// Enables TUI-owned interactive safety checkpoints. A `max_rounds` hit
+    /// sends `ROUND_CAP_CHECKPOINT_KIND`; exhausted output-limit recovery sends
+    /// `OUTPUT_TRUNCATION_CHECKPOINT_KIND`. This must stay `false` for headless /
+    /// ACP / daemon runtimes that do not implement these fixed pickers.
     pub round_cap_checkpoint: bool,
     /// Driver opt-in for ephemeral next-prompt sampling. Default false;
     /// currently only the interactive TUI renders and accepts the result.
@@ -296,6 +306,7 @@ impl CodingRuntimeConfig {
             datalog: config.datalog.clone(),
             reasoning_history: r.and_then(|r| r.reasoning_history.clone()),
             reasoning_effort: r.and_then(|r| r.reasoning_effort.clone()),
+            reasoning_effort_levels: r.and_then(|r| r.reasoning_effort_levels.clone()),
             provider_type: r
                 .map(|r| r.provider_type.clone())
                 .unwrap_or_else(|| "openai".into()),
@@ -337,9 +348,11 @@ impl CodingRuntimeConfig {
         );
         config.context_window = self.context_window;
         config.supports_vision = self.supports_vision;
-        config.supports_reasoning_effort = self.reasoning_effort.is_some()
-            || (atomcode_config::config::is_codingplan_provider_name(&self.provider_name)
-                && self.model.eq_ignore_ascii_case("deepseek-v4-flash"));
+        config.supports_reasoning_effort =
+            atomcode_config::config::endpoint_supports_reasoning_effort(
+                self.reasoning_effort.as_deref(),
+                self.reasoning_effort_levels.as_deref(),
+            );
         config.preferred_language = self.preferred_language;
         config.todo = self.todo.clone();
         config.provider_name = self.provider_name.clone();
@@ -361,6 +374,7 @@ impl CodingRuntimeConfig {
         config.loop_max_rounds = self.loop_max_rounds;
         config.max_rounds = self.turn_max_rounds;
         config.subagent_config = self.subagent_config.clone();
+        config.interactive = self.interactive;
         if self.interactive {
             config.request_timeout = None;
         }
@@ -390,7 +404,10 @@ pub fn apply_provider_config(
     config.chat_options.reasoning_effort = atomcode_kernel::provider::ReasoningEffort::from_config(
         provider.reasoning_effort.as_deref(),
     );
-    config.supports_reasoning_effort = provider.reasoning_effort.is_some();
+    config.supports_reasoning_effort = atomcode_config::config::endpoint_supports_reasoning_effort(
+        provider.reasoning_effort.as_deref(),
+        provider.reasoning_effort_levels.as_deref(),
+    );
     config.provider_type = provider.provider_type.clone();
     config.reasoning_history = provider.reasoning_history.clone();
     config.thinking_enabled = provider.thinking_enabled;
@@ -741,6 +758,15 @@ pub fn resolve_turn_max_rounds(configured: u32, env: Option<&str>) -> u32 {
 }
 
 impl CodingAgentConfig {
+    /// Whether a present human is attending this run (see [`Self::interactive`]). The verify
+    /// mount sites gate on THIS accessor — not on a raw field — so the "is a human here to ask
+    /// for a check?" decision and its rationale live in one place: attended → don't FORCE a
+    /// post-edit verify continuation (the human can request one); unattended (headless /
+    /// scheduled) → keep the forcing cadence.
+    pub fn is_attended(&self) -> bool {
+        self.interactive
+    }
+
     /// Construct with the required fields and sane defaults for the rest.
     pub fn new(
         api_key: impl Into<String>,
@@ -766,6 +792,7 @@ impl CodingAgentConfig {
             max_rounds: default_turn_max_rounds(),
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
+            interactive: false,
             tool_loop_policy: default_tool_loop_policy(),
             goal_max_rounds: default_goal_max_rounds(),
             goal_max_duration_secs: default_goal_max_duration_secs(),
@@ -1347,6 +1374,7 @@ impl std::fmt::Debug for CodingAgentConfig {
             .field("context_window", &self.context_window)
             .field("stream_timeout", &self.stream_timeout)
             .field("request_timeout", &self.request_timeout)
+            .field("interactive", &self.interactive)
             .field("max_continuations", &self.max_continuations)
             .field("max_rounds", &self.max_rounds)
             .field("tool_loop_policy", &self.tool_loop_policy)

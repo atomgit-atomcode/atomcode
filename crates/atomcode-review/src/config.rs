@@ -50,6 +50,11 @@ pub struct ReviewAgentConfig {
     /// Optional live progress sink for an embedding tool/driver. Standalone callers leave it
     /// `None`; the in-session `code_review` tool forwards its parent `ToolContext` sink.
     pub progress: Option<atomcode_kernel::tool::ProgressSink>,
+    /// Optional stage label for the live activity line — the deep-mode dimension
+    /// id (e.g. `security`) or `verify` — so concurrent reviewers are
+    /// distinguishable in the shared progress sink. `None` (default) ⇒ the single
+    /// reviewer, shown without a label.
+    pub progress_label: Option<String>,
     /// Disable the `web_search` tool for this review. `false` (default) ⇒ web_search is
     /// mounted as before (behavior unchanged). `true` ⇒ the tool is registered but NOT
     /// mounted, so the model cannot call it — used by runtimes where web egress is blocked
@@ -98,6 +103,7 @@ impl ReviewAgentConfig {
             tool_loop_policy: default_tool_loop_policy(),
             max_turn_duration: None,
             progress: None,
+            progress_label: None,
             no_web: false,
             graph_max_indexed_files: usize::MAX, // no degrade by default (bare-CLI behavior)
             skill_dirs: Vec::new(), // no skills by default (bare-CLI behavior)

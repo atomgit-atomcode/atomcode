@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>内置工具</h1>
+<h1 id="内置工具">内置工具</h1>
       <p class="lede">AtomCode 内置文件与 Shell、代码图谱、Web、自动化和 AtomGit 原生操作等工具。模型会根据任务自动挑选，大多数情况下你不需要手动指定。</p>
 
-      <h2>文件与 Shell(9 个)</h2>
+      <h2 id="文件与-shell9-个">文件与 Shell(9 个)</h2>
       <table>
         <thead>
           <tr><th>工具</th><th>作用</th><th>需要确认</th></tr>
@@ -111,7 +111,7 @@
         <p><code>rm -rf</code>、<code>dd</code>、<code>mkfs</code>、<code>sudo</code> 等高危命令,以及会清库重建表的数据库迁移(如 <code>migrate:fresh</code>、<code>db:reset</code>)都会强制弹出权限确认。这类确认<strong>始终</strong>触发 —— 即便之前对 <code>bash</code> 选过"始终允许"也不能跳过。</p>
       </div>
 
-      <h2>代码图谱(8 个)</h2>
+      <h2 id="代码图谱8-个">代码图谱(8 个)</h2>
       <p>这是 AtomCode 区别于一般 agent 的最大亮点。借助代码图谱索引,模型无需读遍整棵代码树就能精准定位符号、引用和调用关系,在大型仓库上效果尤其明显。</p>
       <table>
         <thead>
@@ -129,14 +129,14 @@
         </tbody>
       </table>
 
-      <h3>典型使用场景</h3>
+      <h3 id="典型使用场景">典型使用场景</h3>
       <ul>
         <li><strong>重构前评估风险</strong> —— "我想改 <code>formatDate</code> 的签名,影响面有多大?"模型会调用 <code>blast_radius</code> + <code>find_references</code>。</li>
         <li><strong>定位 Bug 根源</strong> —— "用户点击按钮为什么没响应?" 从入口函数开始 <code>trace_callees</code>,一路下探。</li>
         <li><strong>读懂陌生代码</strong> —— "帮我讲讲 <code>AuthService.login</code> 是怎么跑的" &rarr; <code>read_symbol</code> + <code>trace_callees</code>。</li>
       </ul>
 
-      <h2>Web(2 个)</h2>
+      <h2 id="web2-个">Web(2 个)</h2>
       <table>
         <thead>
           <tr><th>工具</th><th>作用</th></tr>
@@ -148,7 +148,7 @@
       </table>
       <p>典型用途:查最新的文档、对比不同库的 API、读取一篇 GitHub issue。在离线环境或想省钱时可以用 <code>--disable-tools web_search,web_fetch</code> 关掉它们。</p>
 
-      <h2>自动化(2 个)</h2>
+      <h2 id="自动化2-个">自动化(2 个)</h2>
       <table>
         <thead>
           <tr><th>工具</th><th>作用</th></tr>
@@ -174,15 +174,15 @@
       </table>
       <pre><code>示例：为这个 Bug 创建一个 AtomGit Issue，并附上复现步骤和环境信息。</code></pre>
 
-      <h2>大型工具输出</h2>
+      <h2 id="大型工具输出">大型工具输出</h2>
       <p>当工具结果太长时，AtomCode 会在界面中显示稳定的摘要，并把完整内容保存到当前会话。模型可通过 <code>fetch_output</code> 分页读取后续内容，因此“输出已截断”不代表结果丢失；删除会话时对应的完整输出也会一并清理。</p>
 
-      <h2>禁用特定工具</h2>
+      <h2 id="禁用特定工具">禁用特定工具</h2>
       <p>用 <code>--disable-tools</code> 参数可以在启动时把某些工具对模型完全隐藏。例如在 SWE-bench 沙箱里:</p>
       <pre><code>atomcode -p "solve this issue" --disable-tools web_search,web_fetch</code></pre>
       <p>禁用后的工具不会出现在 tool schemas 里,模型不会尝试去调用一个必然失败的工具。</p>
 
-      <h2>下一步</h2>
+      <h2 id="下一步">下一步</h2>
       <ul>
         <li><a href="./sessions.html">会话与撤销</a> —— 文件编辑工具都会走 file-history,<code>/undo</code> 可以回滚</li>
         <li><a href="./skills.html">Skills 扩展</a> —— 用 <code>use_skill</code> 包装你自己的工作流</li>

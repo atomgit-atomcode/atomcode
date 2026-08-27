@@ -72,6 +72,33 @@ test('malformed and unsupported todo calls do not corrupt prior state', () => {
   assert.deepEqual(applyTodoCall(initial, 'read_file', plan), initial);
 });
 
+test('incremental update accepts lenient status variants (issue #1456)', () => {
+  // The Rust backend loosened the incremental `update` status parse; the webview
+  // fold must match or the panel goes stale while the backend advances the task.
+  const base = applyTodoCall([], 'todowrite', plan); // [completed, in_progress, pending]
+
+  const statusAt = (args: string, index: number) =>
+    applyTodoCall(base, 'todowrite', args).at(index)?.status;
+
+  assert.equal(statusAt('{"action":"update","id":3,"status":"done"}', 2), 'completed');
+  assert.equal(statusAt('{"action":"update","id":3,"status":"In Progress"}', 2), 'in_progress');
+  assert.equal(statusAt('{"action":"update","id":3,"status":"进行中"}', 2), 'in_progress');
+  assert.equal(statusAt('{"action":"update","id":3,"status":" completed "}', 2), 'completed');
+
+  // A lenient update must fold into the panel, not render as a stray tool row.
+  const lenientUpdate: ToolCallData = {
+    id: 'u',
+    name: 'todowrite',
+    args: '{"action":"update","id":3,"status":"done"}',
+    status: 'done',
+  };
+  assert.equal(shouldRenderToolCall(lenientUpdate), false);
+
+  // Garbage is still rejected: state unchanged and the row stays visible.
+  assert.deepEqual(applyTodoCall(base, 'todowrite', '{"action":"update","id":3,"status":"nope"}'), base);
+  assert.equal(shouldRenderToolCall({ ...lenientUpdate, args: '{"action":"update","id":3,"status":"nope"}' }), true);
+});
+
 test('history projection folds todo calls across assistant messages', () => {
   const messages: ChatMessage[] = [
     {

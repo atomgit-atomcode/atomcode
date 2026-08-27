@@ -6,10 +6,40 @@
 //! engineering layer (gitcode-assist-service) appends domain-specific sections via
 //! `--append-system-prompt-file` instead of copying this text.
 
-/// Build the reviewer system prompt for `model`.
+/// Build the reviewer system prompt for `model`. Weak models additionally get the
+/// [`FIRM_REVIEW_DISCIPLINE`] restatement of the tool-loop mechanics.
 pub fn review_persona(model: &str) -> String {
-    format!("You are AtomCode Reviewer, a rigorous, meticulous, read-only code reviewer (model: {model}). You will receive a DIFF provided by the review tool, and you have read-only access to the surrounding codebase.\n{RULES}")
+    let base = format!("You are AtomCode Reviewer, a rigorous, meticulous, read-only code reviewer (model: {model}). You will receive a DIFF provided by the review tool, and you have read-only access to the surrounding codebase.\n{RULES}");
+    if model_needs_firm_execution(model) {
+        format!("{base}{FIRM_REVIEW_DISCIPLINE}")
+    } else {
+        base
+    }
 }
+
+/// Weak models (DeepSeek + Qwen) follow the soft reviewer rules above unreliably. In the
+/// `deep` fan-out each dimension is its own child reviewer that must drive a read/search →
+/// `report_finding` → clean-stop loop; a weak model that loops on exploration, repeats an
+/// identical tool call (tripping the loop fuse), or never reaches a clean stop comes back
+/// with `completed == false`, and since all dimensions share one model they fail together —
+/// the "every dimension failed (0/N)" outcome. This gate MUST mirror the coding layer's
+/// `model_needs_firm_execution` (DeepSeek + Qwen; GLM/Claude excluded — strong enough
+/// without it) so the two stay in lockstep.
+fn model_needs_firm_execution(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("deepseek") || m.contains("qwen")
+}
+
+/// Hard restatement of the reviewer's TOOL-LOOP mechanics (not "what to report" — that is
+/// already in `RULES`). Deliberately narrow: signpost, land findings through the tool, never
+/// repeat an identical call, stop cleanly, and treat an empty result as success. It names no
+/// mutating tool, so the reviewer stays read-only. Frozen per session → prompt-cache-stable.
+const FIRM_REVIEW_DISCIPLINE: &str = "\n\n## REVIEWER EXECUTION DISCIPLINE (MANDATORY):\n\
+- SIGNPOST BEFORE ACTING: before each batch of read/search tool calls, say in ONE short sentence (≤12 words, in the user's language) what you are about to inspect. Never fire a run of tool calls with zero text.\n\
+- REPORT THROUGH THE TOOL: the moment you confirm an issue, call `report_finding` ONCE for it with every field filled (file_path, line_start, line_end, priority, confidence, suggestion). A problem described only in prose does NOT count — if it is real, it must go through `report_finding`.\n\
+- NEVER REPEAT AN IDENTICAL CALL: do not issue the same read/search/`report_finding` call twice — repeating an identical tool call trips the loop fuse and fails this entire review. If a call already gave what you need, move on; two DIFFERENT findings are of course two separate `report_finding` calls.\n\
+- STOP WHEN DONE: once every issue you found is reported (or you have confirmed there are none), write the brief Closing Summary and STOP. Do NOT keep re-reading or re-searching after nothing is left to report — reaching a clean stop is what makes this dimension count as completed.\n\
+- EMPTY IS A VALID RESULT: if the diff is clean, report nothing and stop cleanly. Finding zero issues is a SUCCESSFUL review, not a failure — never invent a finding to have output, and never loop hunting for one.";
 
 const RULES: &str = r#"Your task: find the real problems introduced by this diff and report each one as a structured finding. You must not edit, build, run, or modify anything; you may only perform read-only review.
 
@@ -210,13 +240,51 @@ mod tests {
 
     #[test]
     fn persona_does_not_invite_mutation() {
-        let p = review_persona("m");
-        // The reviewer must not advertise write/edit/bash — it is read-only.
-        for forbidden in ["write_file", "edit_file", "`bash`"] {
+        // Check BOTH a strong model (no firm block) and a weak one (firm block present),
+        // so the appended discipline can never smuggle in a mutating-tool reference.
+        for model in ["m", "qwen3.8-27b", "deepseek-v4-flash"] {
+            let p = review_persona(model);
+            for forbidden in ["write_file", "edit_file", "`bash`"] {
+                assert!(
+                    !p.contains(forbidden),
+                    "reviewer persona ({model}) must not advertise `{forbidden}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weak_models_get_firm_execution_block() {
+        for m in ["qwen3.8-27b", "Qwen/Qwen3-VL-8B-Instruct", "deepseek-v4-flash", "deepseek-chat"] {
+            let p = review_persona(m);
             assert!(
-                !p.contains(forbidden),
-                "reviewer persona must not advertise `{forbidden}`"
+                p.contains("REVIEWER EXECUTION DISCIPLINE"),
+                "{m} must get the firm reviewer discipline"
+            );
+            // The mechanics that fix the deep-fanout "0/N" failure must be present.
+            assert!(p.contains("STOP WHEN DONE"), "{m}: must restate clean-stop");
+            assert!(p.contains("NEVER REPEAT AN IDENTICAL CALL"), "{m}: must guard the loop fuse");
+            assert!(p.contains("EMPTY IS A VALID RESULT"), "{m}: empty must count as success");
+        }
+    }
+
+    #[test]
+    fn strong_models_skip_the_firm_block() {
+        for m in ["glm-5.2", "GLM-4.6", "claude-opus-4-8", "gpt-4"] {
+            assert!(
+                !review_persona(m).contains("REVIEWER EXECUTION DISCIPLINE"),
+                "{m} must NOT get the firm block (strong enough without it)"
             );
         }
+    }
+
+    #[test]
+    fn firm_gate_mirrors_coding_layer() {
+        // Lockstep with atomcode-coding's model_needs_firm_execution: DeepSeek + Qwen only.
+        assert!(model_needs_firm_execution("deepseek-v4-flash"));
+        assert!(model_needs_firm_execution("qwen3.8-27b"));
+        assert!(model_needs_firm_execution("Qwen/Qwen3-VL-8B-Instruct"));
+        assert!(!model_needs_firm_execution("glm-5.2"));
+        assert!(!model_needs_firm_execution("claude-opus-4-8"));
     }
 }

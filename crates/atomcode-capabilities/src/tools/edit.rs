@@ -181,7 +181,38 @@ impl Tool for EditFileTool {
                     diff,
                 ));
             }
-            // Tier 2: block-anchor match (first+last line anchors, ONE interior line's drift
+            // Tier 2: whitespace-INSENSITIVE match (interior spaces/tabs deleted before
+            // comparing). Rescues the single dense line whose interior spacing the model got
+            // wrong — or dropped entirely (`["a","b"]` vs `["a", "b"]`) — which edge-trim
+            // fuzzy can't absorb and block-anchor can't reach (needs ≥3 lines). Same ≥10-char
+            // + uniqueness guards as the fuzzy tier.
+            if let Some((ws_result, ws_count)) = try_whitespace_insensitive_replace(
+                &content,
+                &a.old_string,
+                &a.new_string,
+                a.replace_all,
+            ) {
+                if ws_result == content {
+                    return err(
+                        "edit_file: the whitespace-insensitive match produced no change — \
+                         old_string and new_string differ only in whitespace."
+                            .to_string(),
+                    );
+                }
+                if let Err(msg) =
+                    write_encoded_if_unchanged(&path, &raw, &ws_result, file_encoding).await
+                {
+                    return err(msg);
+                }
+                let diff = build_compact_diff(&content, &ws_result);
+                return ok(format!(
+                    "Edited {} (whitespace-insensitive match, {ws_count} replacement{})\n{}",
+                    crate::pathnorm::to_display(&path),
+                    if ws_count == 1 { "" } else { "s" },
+                    diff,
+                ));
+            }
+            // Tier 3: block-anchor match (first+last line anchors, ONE interior line's drift
             // tolerated). Absorbs the "model got one interior line slightly wrong" case that
             // otherwise sends a weak model reaching for `sed`. Unique + at-most-one-drift guarded.
             if let Some((anchor_result, _)) =
@@ -435,7 +466,62 @@ fn try_fuzzy_replace(
     new_string: &str,
     replace_all: bool,
 ) -> Option<(String, usize)> {
-    let old_normalized: Vec<&str> = old_string.lines().map(|l| l.trim()).collect();
+    try_normalized_replace(content, old_string, new_string, replace_all, |l| {
+        l.trim().to_string()
+    })
+}
+
+/// Trim a line AND delete every interior space/tab, so a line matches regardless of how
+/// much interior whitespace it has OR whether it has any at all: `["json","stream"]`,
+/// `["json", "stream"]`, and `["json",  "stream"]` all normalize to the same string.
+///
+/// Deliberately MORE lenient than opencode's/oh-my-pi's `[ \t]+` → single-space COLLAPSE:
+/// collapse equalizes the AMOUNT of whitespace but still distinguishes present-vs-absent
+/// (`,"` ≠ `, "`), which is the exact drift a weak model makes on a dense config line — so
+/// collapse wouldn't rescue it. Full deletion does, and stays safe via the caller-tier
+/// guards (≥ 10 chars in the whitespace-STRIPPED fragment, UNIQUE unless replace_all,
+/// window == old's line count so the matched span can't balloon).
+fn strip_interior_ws(line: &str) -> String {
+    line.trim()
+        .chars()
+        .filter(|c| *c != ' ' && *c != '\t')
+        .collect()
+}
+
+/// Whitespace-INSENSITIVE fuzzy replace: the tier below [`try_fuzzy_replace`]'s
+/// edge-trim, for the interior-spacing drift a weak model makes on a single dense line
+/// (a comma/bracket with the wrong — or no — spaces) that edge-trim can't absorb and
+/// block-anchor can't reach (it needs ≥ 3 lines). Works for a SINGLE line. See
+/// [`strip_interior_ws`] for why deletion (not collapse) is used.
+fn try_whitespace_insensitive_replace(
+    content: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> Option<(String, usize)> {
+    try_normalized_replace(
+        content,
+        old_string,
+        new_string,
+        replace_all,
+        strip_interior_ws,
+    )
+}
+
+/// Shared window-match engine for the whitespace-tolerant tiers: normalize `old_string`
+/// and each content window line-by-line via `normalize`, match where the normalized
+/// windows are equal, and re-anchor the replacement to the file's REAL indent. Guards:
+/// normalized content < 10 chars → `None` (too short to match safely); no window → `None`;
+/// more than one window but `!replace_all` → `None` (ambiguous; the caller's "not found"
+/// path is safer than guessing).
+fn try_normalized_replace(
+    content: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+    normalize: impl Fn(&str) -> String,
+) -> Option<(String, usize)> {
+    let old_normalized: Vec<String> = old_string.lines().map(&normalize).collect();
     if old_normalized.is_empty() || old_normalized.iter().all(|l| l.is_empty()) {
         return None;
     }
@@ -445,18 +531,18 @@ fn try_fuzzy_replace(
     let mut matches: Vec<(usize, usize)> = Vec::new();
 
     // Only attempt a fuzzy match if old_string has substantial content (guards against
-    // a short fragment matching the wrong place after trimming).
+    // a short fragment matching the wrong place after normalizing).
     let total_non_ws: usize = old_normalized.iter().map(|l| l.len()).sum();
     if total_non_ws < 10 {
         return None;
     }
 
-    // Slide a window over content lines (trimmed), skipping past each match.
+    // Slide a window over content lines (normalized), skipping past each match.
     let mut i = 0;
     while i + old_normalized.len() <= content_lines.len() {
-        let window: Vec<&str> = content_lines[i..i + old_normalized.len()]
+        let window: Vec<String> = content_lines[i..i + old_normalized.len()]
             .iter()
-            .map(|l| l.trim())
+            .map(|l| normalize(l))
             .collect();
         if window == old_normalized {
             matches.push((i, i + old_normalized.len()));
@@ -1001,6 +1087,98 @@ mod tests {
             std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
             "\tx\n",
             "unchanged"
+        );
+    }
+
+    // WHITESPACE-INSENSITIVE tier: a weak model (longcat) reproduced a dense SINGLE line
+    // but dropped the spaces after commas (`["json","stream"]` vs the file's `["json",
+    // "stream"]`). Edge-trim fuzzy can't absorb interior spacing and block-anchor needs
+    // ≥3 lines, so this used to hard-fail and the model looped / reached for `sed`.
+    #[tokio::test]
+    async fn whitespace_insensitive_matches_missing_comma_spaces_singleline() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("Cargo.toml"),
+            "[dependencies]\nreqwest = { version = \"0.12\", features = [\"json\", \"stream\", \"gzip\"] }\nmysql = { version = \"25\" }\n",
+        )
+        .unwrap();
+        let r = EditFileTool
+            .execute(
+                r#"{"file_path":"Cargo.toml","old_string":"reqwest = { version = \"0.12\", features = [\"json\",\"stream\",\"gzip\"] }","new_string":"reqwest = { version = \"0.12\", default-features = false, features = [\"json\", \"stream\", \"gzip\"] }"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "whitespace-insensitive edit must succeed: {}", r.content);
+        let after = std::fs::read_to_string(d.path().join("Cargo.toml")).unwrap();
+        assert!(
+            after.contains("default-features = false"),
+            "edit not applied: {after}"
+        );
+        // Untouched neighbors preserved exactly.
+        assert!(after.contains("mysql = { version = \"25\" }"), "{after}");
+    }
+
+    // MULTI-LINE whitespace-insensitive: a YAML block where the model got the interior
+    // spacing wrong on more than one line (`run:  rm` vs the file's `run: rm`) — more drift
+    // than block-anchor's ≤1-line tolerance, but every line matches once whitespace is
+    // ignored. Re-anchors to the file's real (6-space) indent.
+    #[tokio::test]
+    async fn whitespace_insensitive_matches_multiline_block() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("android.yml"),
+            "steps:\n      - name: Remove local Cargo config for CI\n        run: rm -f .cargo/config.toml\n        shell: bash\n      - name: Build\n",
+        )
+        .unwrap();
+        let r = EditFileTool
+            .execute(
+                r#"{"file_path":"android.yml","old_string":"- name: Remove local Cargo config for CI\n  run:  rm -f .cargo/config.toml\n  shell:  bash","new_string":"- name: Copy CI Cargo config\n  run: cp ci/config.toml .cargo/config.toml\n  shell: bash"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "multi-line whitespace-insensitive edit must succeed: {}", r.content);
+        let after = std::fs::read_to_string(d.path().join("android.yml")).unwrap();
+        assert!(after.contains("      - name: Copy CI Cargo config"), "indent not re-anchored: {after}");
+        assert!(after.contains("cp ci/config.toml"), "{after}");
+        assert!(after.contains("      - name: Build"), "neighbor preserved: {after}");
+    }
+
+    // The whitespace-insensitive tier must NOT fire on a short fragment (< 10 non-ws chars),
+    // or stripping all whitespace could match the wrong dense line.
+    #[tokio::test]
+    async fn whitespace_insensitive_skips_short_fragment() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.txt"), "a = [1, 2]\nb = 9\n").unwrap();
+        let r = EditFileTool
+            .execute(
+                r#"{"file_path":"a.txt","old_string":"a=[1,2]","new_string":"a=[3]"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(r.is_error, "short whitespace-insensitive fragment must not match: {}", r.content);
+        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "a = [1, 2]\nb = 9\n", "unchanged");
+    }
+
+    // The whitespace-insensitive tier must still REFUSE when the normalized fragment is
+    // ambiguous (matches >1 place) — guessing which to rewrite is unsafe.
+    #[tokio::test]
+    async fn whitespace_insensitive_refuses_ambiguous() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("a.toml"),
+            "alpha = [\"one\", \"two\", \"three\"]\nbeta = 1\nalpha = [\"one\", \"two\", \"three\"]\n",
+        )
+        .unwrap();
+        let r = EditFileTool
+            .execute(
+                r#"{"file_path":"a.toml","old_string":"alpha = [\"one\",\"two\",\"three\"]","new_string":"alpha = [\"one\"]"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(r.is_error, "ambiguous whitespace-insensitive match must be refused: {}", r.content);
+        assert!(
+            std::fs::read_to_string(d.path().join("a.toml")).unwrap().matches("alpha").count() == 2,
+            "file must be untouched"
         );
     }
 

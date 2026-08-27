@@ -15,6 +15,12 @@ pub struct Command {
     /// aliases that must keep working for muscle memory / scripting without
     /// cluttering the discovery surfaces.
     pub hidden: bool,
+    /// Whether this command is safe/meaningful on non-interactive channels
+    /// such as the `atomcode acp` (Agent Client Protocol) server. Commands that
+    /// depend on TUI-only UI (pick a modal, render a panel, manage auth
+    /// flows) stay `false`; the ACP channel advertises and executes exactly
+    /// the `acp: true` subset so the slash surface stays one source of truth.
+    pub acp: bool,
 }
 
 pub struct CommandRegistry {
@@ -65,9 +71,8 @@ impl CommandRegistry {
             .unwrap_or(6);
         let mut out = t(Msg::HelpAvailableCommands).into_owned();
         for c in self.commands.iter().filter(|c| !c.hidden) {
-            let desc = cmd_desc_i18n(c.name).unwrap_or_else(|| {
-                atomcode_config::i18n::substitute_placeholders(c.desc.into())
-            });
+            let desc = cmd_desc_i18n(c.name)
+                .unwrap_or_else(|| atomcode_config::i18n::substitute_placeholders(c.desc.into()));
             out.push_str(&format!(
                 "    /{:<width$}  {}\n",
                 c.name,
@@ -76,6 +81,18 @@ impl CommandRegistry {
             ));
         }
         out
+    }
+
+    /// The command subset usable on non-interactive channels (the `atomcode
+    /// acp` server): `acp: true` and not hidden. The ACP channel advertises
+    /// these via `available_commands_update` and executes them locally — the
+    /// names and descriptions remain sourced from the single table above.
+    pub fn acp_commands(&self) -> Vec<Command> {
+        self.commands
+            .iter()
+            .filter(|c| c.acp && !c.hidden)
+            .copied()
+            .collect()
     }
 }
 
@@ -132,86 +149,86 @@ pub fn command_display_name(canonical: &str) -> String {
 }
 
 const BUILTIN_COMMANDS: &[Command] = &[
-    Command { name: "login",   desc: "Sign in with {oauth} and claim CodingPlan models", needs_args: false, hidden: false },
+    Command { name: "login",   desc: "Sign in with AtomGit OAuth and claim CodingPlan models", needs_args: false, hidden: false, acp: false },
     // needs_args=true so selecting it only completes to `/webui ` (does NOT
     // launch) — lets the user append a subcommand (stop / lan / --host <addr>)
     // before Enter. A bare `/webui ` + Enter still launches on 127.0.0.1.
-    Command { name: "webui",   desc: "Launch the browser webui (subcommands: stop, lan, --host <addr>)", needs_args: true, hidden: false },
-    Command { name: "sync",    desc: "Attach to live webui session (/sync off to detach)", needs_args: false, hidden: false },
-    Command { name: "app", desc: "Expose this session to the mobile App via relay (QR pairing; /app stop to detach)", needs_args: true, hidden: false },
-    Command { name: "setup",      desc: "First run: install recommender skill + run it. Extra text forwarded as a steering hint", needs_args: true, hidden: false },
-    Command { name: "resume",  desc: "Resume a previous session", needs_args: false, hidden: false },
-    Command { name: "rename",  desc: "Rename current session", needs_args: true, hidden: false },
-    Command { name: "logout",  desc: "Sign out", needs_args: false, hidden: false },
-    Command { name: "whoami",  desc: "Show current logged-in user", needs_args: false, hidden: false },
-    Command { name: "model",   desc: "Switch provider / model", needs_args: false, hidden: false },
-    Command { name: "provider", desc: "Manage providers (add / edit / delete)", needs_args: false, hidden: false },
-    Command { name: "proxy",   desc: "Switch outbound proxy mode", needs_args: false, hidden: false },
-    Command { name: "status",  desc: "Show session status", needs_args: false, hidden: false },
-    Command { name: "config",  desc: "Show config path", needs_args: false, hidden: false },
-    Command { name: "reload",  desc: "Reload ~/.atomcode/config.toml from disk", needs_args: false, hidden: false },
-    Command { name: "cd",      desc: "Change working directory and start a new session", needs_args: false, hidden: false },
-    Command { name: "init",    desc: "Analyze the project and generate AGENTS.md", needs_args: false, hidden: false },
-    Command { name: "bg",      desc: "Background sessions: /bg, /bg list, /bg <N>, /bg drop <N>", needs_args: false, hidden: false },
-    Command { name: "background", desc: "Compatibility alias: start a one-shot task in a /bg slot", needs_args: true, hidden: false },
-    Command { name: "diff",    desc: "Show git diff", needs_args: false, hidden: false },
-    Command { name: "clear",   desc: "Start a new conversation (clears context + screen)", needs_args: false, hidden: false },
-    Command { name: "session", desc: "Start a new session (clears conversation)", needs_args: false, hidden: false },
-    Command { name: "usage",   desc: "Show CodingPlan usage (tabs: current / overview / models)", needs_args: false, hidden: false },
+    Command { name: "webui",   desc: "Launch the browser webui (subcommands: stop, lan, --host <addr>)", needs_args: true, hidden: false, acp: false },
+    Command { name: "sync",    desc: "Attach to live webui session (/sync off to detach)", needs_args: false, hidden: false, acp: false },
+    Command { name: "app", desc: "Expose this session to the mobile App via relay (QR pairing; /app stop to detach)", needs_args: true, hidden: false, acp: false },
+    Command { name: "setup",      desc: "First run: install recommender skill + run it. Extra text forwarded as a steering hint", needs_args: true, hidden: false, acp: false },
+    Command { name: "resume",  desc: "Resume a previous session", needs_args: false, hidden: false, acp: false },
+    Command { name: "rename",  desc: "Rename current session", needs_args: true, hidden: false, acp: false },
+    Command { name: "logout",  desc: "Sign out of AtomGit", needs_args: false, hidden: false, acp: false },
+    Command { name: "whoami",  desc: "Show current logged-in user", needs_args: false, hidden: false, acp: false },
+    Command { name: "model",   desc: "Switch provider / model", needs_args: false, hidden: false, acp: true },
+    Command { name: "provider", desc: "Manage providers (add / edit / delete)", needs_args: false, hidden: false, acp: false },
+    Command { name: "proxy",   desc: "Switch outbound proxy mode", needs_args: false, hidden: false, acp: false },
+    Command { name: "status",  desc: "Show session status", needs_args: false, hidden: false, acp: true },
+    Command { name: "config",  desc: "Show config path", needs_args: false, hidden: false, acp: true },
+    Command { name: "reload",  desc: "Reload ~/.atomcode/config.toml from disk", needs_args: false, hidden: false, acp: false },
+    Command { name: "cd",      desc: "Change working directory and start a new session", needs_args: false, hidden: false, acp: false },
+    Command { name: "init",    desc: "Analyze the project and generate AGENTS.md", needs_args: false, hidden: false, acp: false },
+    Command { name: "bg",      desc: "Background sessions: /bg, /bg list, /bg <N>, /bg drop <N>", needs_args: false, hidden: false, acp: false },
+    Command { name: "background", desc: "Compatibility alias: start a one-shot task in a /bg slot", needs_args: true, hidden: false, acp: false },
+    Command { name: "diff",    desc: "Show git diff", needs_args: false, hidden: false, acp: true },
+    Command { name: "clear",   desc: "Start a new conversation (clears context + screen)", needs_args: false, hidden: false, acp: false },
+    Command { name: "session", desc: "Start a new session (clears conversation)", needs_args: false, hidden: false, acp: false },
+    Command { name: "usage",   desc: "Show CodingPlan usage (tabs: current / overview / models)", needs_args: false, hidden: false, acp: true },
     // `/cost` reports THIS SESSION's local token accounting for any model,
     // including self-integrated ones the gateway-only `/usage` modal can't see.
-    Command { name: "cost",    desc: "Show this session's token usage (any model)", needs_args: false, hidden: false },
-    Command { name: "context", desc: "Show context budget breakdown", needs_args: false, hidden: false },
-    Command { name: "compact", desc: "Compact conversation history", needs_args: false, hidden: false },
-    Command { name: "remember", desc: "Save a fact to memory (/remember --global for global)", needs_args: true, hidden: false },
-    Command { name: "forget", desc: "Remove matching memories", needs_args: true, hidden: false },
-    Command { name: "memory", desc: "Show all saved memories", needs_args: false, hidden: false },
-    Command { name: "mcp",     desc: "Show MCP server status (subcommands: reload, tools, login, logout, trust, untrust)", needs_args: false, hidden: false },
-    Command { name: "undo",    desc: "Undo a turn (memory rollback): /undo or /undo N", needs_args: true, hidden: false },
+    Command { name: "cost",    desc: "Show this session's token usage (any model)", needs_args: false, hidden: false, acp: true },
+    Command { name: "context", desc: "Show context budget breakdown", needs_args: false, hidden: false, acp: true },
+    Command { name: "compact", desc: "Compact conversation history", needs_args: false, hidden: false, acp: true },
+    Command { name: "remember", desc: "Save a fact to memory (/remember --global for global)", needs_args: true, hidden: false, acp: false },
+    Command { name: "forget", desc: "Remove matching memories", needs_args: true, hidden: false, acp: false },
+    Command { name: "memory", desc: "Show all saved memories", needs_args: false, hidden: false, acp: false },
+    Command { name: "mcp",     desc: "Show MCP server status (subcommands: reload, tools, login, logout, trust, untrust)", needs_args: false, hidden: false, acp: false },
+    Command { name: "undo",    desc: "Undo a turn (memory rollback): /undo or /undo N", needs_args: true, hidden: false, acp: true },
     // Opens the checkpoint picker — the same modal the double-Esc gesture opens —
     // so the feature is discoverable without knowing the keybind. needs_args=false:
     // selection happens in the modal, not on the command line.
-    Command { name: "rewind",  desc: "Restore the conversation to an earlier checkpoint", needs_args: false, hidden: false },
-    Command { name: "worktree", desc: "Git worktree isolation (create/list/done/cleanup)", needs_args: true, hidden: false },
-    Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)", needs_args: false, hidden: false },
-    Command { name: "plan",    desc: "Switch to Plan mode (read-only exploration)", needs_args: false, hidden: false },
-    Command { name: "build",   desc: "Switch to Build mode (full execution)", needs_args: false, hidden: false },
-    Command { name: "auto",    desc: "Switch to Auto mode (auto-approve all tools)", needs_args: false, hidden: false },
-    Command { name: "review",  desc: "Code review the current changes (/review · /review staged · /review <base>)", needs_args: false, hidden: false },
-    Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false, hidden: false },
-    // Gateway entry: opens a second-level palette (low / medium / high / max / default).
+    Command { name: "rewind",  desc: "Restore the conversation to an earlier checkpoint", needs_args: false, hidden: false, acp: false },
+    Command { name: "worktree", desc: "Git worktree isolation (create/list/done/cleanup)", needs_args: true, hidden: false, acp: false },
+    Command { name: "upgrade", desc: "Upgrade atomcode to latest (subcommand: rollback)", needs_args: false, hidden: false, acp: false },
+    Command { name: "plan",    desc: "Switch to Plan mode (read-only exploration)", needs_args: false, hidden: false, acp: true },
+    Command { name: "build",   desc: "Switch to Build mode (full execution)", needs_args: false, hidden: false, acp: true },
+    Command { name: "auto",    desc: "Switch to Auto mode (auto-approve all tools)", needs_args: false, hidden: false, acp: true },
+    Command { name: "review",  desc: "Code review the current changes (/review · /review staged · /review <base>)", needs_args: false, hidden: false, acp: false },
+    Command { name: "think",   desc: "Extended thinking control (on/off/budget N)", needs_args: false, hidden: false, acp: false },
+    // Gateway entry: opens a second-level palette (low / medium / high / xhigh / max / default).
     // needs_args=true so Enter rewrites the buffer to `/effort ` and the
     // sub-mode menu renders the choices. Selecting one commits as
     // `/effort <choice>` → dispatched by the `effort` arm. Runtime label comes
     // from `Msg::CmdDescEffort`; this static `desc` is only a fallback.
-    Command { name: "effort",  desc: "Model reasoning effort control (low / medium / high / max / default)", needs_args: true, hidden: false },
+    Command { name: "effort",  desc: "Model reasoning effort control (low / medium / high / xhigh / max / default)", needs_args: true, hidden: false, acp: true },
     // needs_args=true so selecting `/goal` from the palette only completes to
     // `/goal ` and waits for the user to type the goal — it must NOT execute
     // immediately (a bare `/goal` would just print status). Setting a goal
     // requires the condition text; `/goal status` / `/goal clear` still work by
     // typing the sub-command + Enter.
-    Command { name: "goal",    desc: "Set a completion goal (autonomous loop until met)", needs_args: true, hidden: false },
+    Command { name: "goal",    desc: "Set a completion goal (autonomous loop until met)", needs_args: true, hidden: false, acp: false },
     // Palette selection completes to `/team ` and waits for the management
     // subcommand instead of immediately executing the default status action.
-    Command { name: "team",    desc: "Show or manage the Team Agent panel", needs_args: true, hidden: false },
-    Command { name: "loop",    desc: "Repeat a prompt/command on an interval, or let the model self-pace", needs_args: true, hidden: false },
-    Command { name: "help",    desc: "Show this help", needs_args: false, hidden: false },
-    Command { name: "guide",   desc: "Ask atomcode-guide how to use", needs_args: true, hidden: false },
-    Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false, hidden: false },
-    Command { name: "language", desc: "Switch display and commit language", needs_args: false, hidden: false },
-    Command { name: "welcome", desc: "Re-run the onboarding wizard", needs_args: false, hidden: false },
-    Command { name: "quit",    desc: "Exit {brand}", needs_args: false, hidden: false },
+    Command { name: "team",    desc: "Show or manage the Team Agent panel", needs_args: true, hidden: false, acp: false },
+    Command { name: "loop",    desc: "Repeat a prompt/command on an interval, or let the model self-pace", needs_args: true, hidden: false, acp: false },
+    Command { name: "help",    desc: "Show this help", needs_args: false, hidden: false, acp: true },
+    Command { name: "guide",   desc: "Ask atomcode-guide how to use", needs_args: true, hidden: false, acp: false },
+    Command { name: "keys",    desc: "Show keyboard shortcuts", needs_args: false, hidden: false, acp: false },
+    Command { name: "language", desc: "Switch display and commit language", needs_args: false, hidden: false, acp: false },
+    Command { name: "welcome", desc: "Re-run the onboarding wizard", needs_args: false, hidden: false, acp: false },
+    Command { name: "quit",    desc: "Exit AtomCode", needs_args: false, hidden: false, acp: false },
     // Gateway entry that opens a second-level palette listing all
     // user-invocable skills. needs_args=true so Enter rewrites the
     // buffer to `/skills ` and lets the sub-mode menu render the
     // skill list. Selecting a skill commits as `/skills <name>` →
     // dispatched by the `skills` arm in execute_slash_command.
-    Command { name: "skills",  desc: "Browse loaded skills", needs_args: true, hidden: false },
+    Command { name: "skills",  desc: "Browse loaded skills", needs_args: true, hidden: false, acp: false },
     // needs_args=false so selecting `/plugin` opens the manager modal on the
     // first Enter (like /model, /provider, /session). Subcommands
     // (`/plugin install x@mp`, `uninstall`, `marketplace`, `list`) still work
     // by typing the full line — needs_args only changes the menu-Enter behavior.
-    Command { name: "plugin",  desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)", needs_args: false, hidden: false },
+    Command { name: "plugin",  desc: "Plugin marketplace (subcommands: marketplace, install, uninstall, list)", needs_args: false, hidden: false, acp: false },
     // Windows fallback for Ctrl+V: Windows Terminal / conhost
     // intercept Ctrl+V as their own `paste` action (which forwards
     // only `CF_UNICODETEXT`) before the keystroke reaches atomcode,
@@ -219,13 +236,13 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // `/paste` calls the same `try_paste_clipboard_image` →
     // `attach_image_to_input` pipeline directly so the user has a
     // terminal-agnostic way to attach an image. Works on every OS.
-    Command { name: "paste",   desc: "Attach an image from the clipboard (Windows fallback for Ctrl+V)", needs_args: false, hidden: false },
-    Command { name: "copy",    desc: "Copy a code block from the last reply to the clipboard (/copy, /copy N, /copy all, /copy msg)", needs_args: false, hidden: false },
-    Command { name: "save",    desc: "Save the current conversation to a markdown file (/save, /save [filename])", needs_args: false, hidden: false },
-    Command { name: "view",    desc: "View file content in an overlay modal", needs_args: true, hidden: false },
-    Command { name: "todo",    desc: "Show the todo list; /todo add <task> appends one, /todo clear wipes it", needs_args: false, hidden: false },
-    Command { name: "schedule", desc: "List scheduled tasks and next run times", needs_args: false, hidden: false },
-    Command { name: "desktop", desc: "Open the {brand} desktop app (or show the download link)", needs_args: false, hidden: false },
+    Command { name: "paste",   desc: "Attach an image from the clipboard (Windows fallback for Ctrl+V)", needs_args: false, hidden: false, acp: false },
+    Command { name: "copy",    desc: "Copy a code block from the last reply to the clipboard (/copy, /copy N, /copy all, /copy msg)", needs_args: false, hidden: false, acp: false },
+    Command { name: "save",    desc: "Save the current conversation to a markdown file (/save, /save [filename])", needs_args: false, hidden: false, acp: false },
+    Command { name: "view",    desc: "View file content in an overlay modal", needs_args: true, hidden: false, acp: false },
+    Command { name: "todo",    desc: "Show the todo list; /todo add <task> appends one, /todo clear wipes it", needs_args: false, hidden: false, acp: true },
+    Command { name: "schedule", desc: "List scheduled tasks and next run times", needs_args: false, hidden: false, acp: false },
+    Command { name: "desktop", desc: "Open the AtomCode desktop app (or show the download link)", needs_args: false, hidden: false, acp: false },
 ];
 
 /// Look up the i18n translation for a built-in command description.
@@ -324,8 +341,7 @@ pub fn complete_commands(
                 description: cmd_desc_i18n(cmd.name)
                     .map(|cow| cow.into_owned())
                     .unwrap_or_else(|| {
-                        atomcode_config::i18n::substitute_placeholders(cmd.desc.into())
-                            .into_owned()
+                        atomcode_config::i18n::substitute_placeholders(cmd.desc.into()).into_owned()
                     }),
                 is_custom: false,
             });
@@ -397,7 +413,9 @@ mod tests {
     #[test]
     fn rewind_is_a_registered_command_with_i18n_desc() {
         assert!(
-            BUILTIN_COMMANDS.iter().any(|c| c.name == "rewind" && !c.needs_args),
+            BUILTIN_COMMANDS
+                .iter()
+                .any(|c| c.name == "rewind" && !c.needs_args),
             "/rewind must be a registered, no-arg builtin command"
         );
         assert!(

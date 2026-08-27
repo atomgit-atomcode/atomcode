@@ -904,6 +904,8 @@ pub struct RoundCapPanel {
     /// Re-arm increment (rounds granted per "continue"); may differ from `cap`
     /// after the first continuation, when `cap` has grown but the step stays.
     pub base: u32,
+    /// False = round-cap checkpoint; true = output-limit recovery checkpoint.
+    pub output_truncation: bool,
     pub cursor: usize, // 0=继续 1=停止
 }
 impl RoundCapPanel {
@@ -912,6 +914,16 @@ impl RoundCapPanel {
             id,
             cap,
             base,
+            output_truncation: false,
+            cursor: 0,
+        }
+    }
+    pub fn output_truncation(id: u64, attempts: u32, max_attempts: u32) -> Self {
+        Self {
+            id,
+            cap: attempts,
+            base: max_attempts,
+            output_truncation: true,
             cursor: 0,
         }
     }
@@ -1806,7 +1818,7 @@ impl UiState {
     /// The spinner word to DISPLAY. Tool-execution labels (`Running X`,
     /// `Preparing X`) are mapped back to the turn's thinking word so the footer
     /// spinner never flashes tool names — tool progress is shown by the body
-    /// `▸ Tool(detail)` rows instead. Every other label (`Sub-agents N/M`,
+    /// `▸ Tool(detail)` rows instead. Every other label (`SubAgents N/M`,
     /// `Waiting approval`, …) passes through unchanged. Display-only: the stored
     /// `spinner_label` and all phase-clock timing logic are untouched.
     pub(crate) fn display_spinner_label(&self) -> &str {
@@ -2085,7 +2097,7 @@ impl UiState {
         self.sub_agent_total = tasks.len();
         self.sub_agent_done = 0;
         self.sub_agent_failed = 0;
-        self.spinner_label = format!("Sub-agents 0/{}", tasks.len());
+        self.spinner_label = format!("SubAgents 0/{}", tasks.len());
         self.phase_started_at = Some(std::time::Instant::now());
         self.sub_agent_started_at = Some(std::time::Instant::now());
         self.sub_agent_tasks = tasks;
@@ -2117,7 +2129,7 @@ impl UiState {
 
     fn refresh_sub_agent_label(&mut self) {
         self.spinner_label = format!(
-            "Sub-agents {}/{}",
+            "SubAgents {}/{}",
             self.sub_agent_done, self.sub_agent_total
         );
     }
@@ -2236,17 +2248,22 @@ impl UiState {
         self.toggle_tool_output();
     }
 
-    /// Cycle through reasoning_effort values:
-    /// None → "low" → "medium" → "high" → "max" → None.
-    /// Returns the new value (None = use API default).
+    /// Cycle through reasoning_effort values in canonical order, then back to the
+    /// API default: None → each [`REASONING_EFFORT_LEVELS`] level in order → None
+    /// (e.g. None → low → medium → high → xhigh → max → None). Derived from the
+    /// canonical set so adding a level can never leave a hardcoded ladder skipping
+    /// it. Returns the new value (None = use API default).
+    ///
+    /// [`REASONING_EFFORT_LEVELS`]: atomcode_config::config::REASONING_EFFORT_LEVELS
     pub fn cycle_reasoning_effort(&mut self) -> Option<&'static str> {
+        let levels = atomcode_config::config::REASONING_EFFORT_LEVELS;
         let next: Option<&'static str> = match self.reasoning_effort.as_deref() {
-            None => Some("low"),
-            Some("low") => Some("medium"),
-            Some("medium") => Some("high"),
-            Some("high") => Some("max"),
-            Some("max") => None,
-            _ => Some("low"),
+            None => levels.first().copied(),
+            Some(cur) => match levels.iter().position(|l| l.eq_ignore_ascii_case(cur)) {
+                Some(i) if i + 1 < levels.len() => Some(levels[i + 1]),
+                Some(_) => None,                 // last level → API default
+                None => levels.first().copied(), // unknown value → restart the chain
+            },
         };
         self.reasoning_effort = next.map(|s| s.to_string());
         next
@@ -3048,7 +3065,7 @@ mod tests {
             .map(|i| task_info(&format!("a{}.rs", i), ""))
             .collect();
         s.on_sub_agent_dispatch_start(tasks);
-        assert_eq!(s.spinner_label, "Sub-agents 0/6");
+        assert_eq!(s.spinner_label, "SubAgents 0/6");
     }
 
     #[test]
@@ -3061,10 +3078,10 @@ mod tests {
         ];
         s.on_sub_agent_dispatch_start(tasks);
         s.on_sub_agent_task_done();
-        assert_eq!(s.spinner_label, "Sub-agents 1/3");
+        assert_eq!(s.spinner_label, "SubAgents 1/3");
         s.on_sub_agent_task_done();
         s.on_sub_agent_task_done();
-        assert_eq!(s.spinner_label, "Sub-agents 3/3");
+        assert_eq!(s.spinner_label, "SubAgents 3/3");
         assert_eq!(s.sub_agent_failed, 0);
     }
 
@@ -3107,7 +3124,7 @@ mod tests {
         assert!(s.sub_agent_tasks.is_empty());
         assert!(s.sub_agent_started_at.is_none());
         s.on_thinking();
-        assert!(!s.spinner_label.starts_with("Sub-agents"));
+        assert!(!s.spinner_label.starts_with("SubAgents"));
     }
 
     #[test]
@@ -3536,6 +3553,7 @@ mod tests {
         assert_eq!(state.cycle_reasoning_effort(), Some("low"));
         assert_eq!(state.cycle_reasoning_effort(), Some("medium"));
         assert_eq!(state.cycle_reasoning_effort(), Some("high"));
+        assert_eq!(state.cycle_reasoning_effort(), Some("xhigh"));
         assert_eq!(state.cycle_reasoning_effort(), Some("max"));
         assert_eq!(state.cycle_reasoning_effort(), None);
     }
@@ -3627,6 +3645,15 @@ mod tests {
         assert!(!p.chosen_continue());
         p.move_up();
         assert!(p.chosen_continue());
+    }
+
+    #[test]
+    fn output_truncation_checkpoint_reuses_continue_stop_navigation() {
+        let mut p = crate::state::RoundCapPanel::output_truncation(11, 2, 2);
+        assert!(p.output_truncation);
+        assert!(p.chosen_continue());
+        p.move_down();
+        assert!(!p.chosen_continue());
     }
 
     #[test]

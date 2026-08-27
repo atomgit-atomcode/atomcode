@@ -721,6 +721,10 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  用法：/mcp tools <服务器名>\n  示例：/mcp tools filesystem\n".into(),
         Msg::McpServersHeader =>
             "  MCP 服务器：\n".into(),
+        Msg::McpBlockedTrustHint { count } =>
+            format!(
+                "  有 {count} 个服务器因本项目未被信任而被拦截。\n  运行 /mcp trust 可加载本项目的 MCP 服务器。\n"
+            ).into(),
         Msg::McpReloadFailed { error } =>
             format!("MCP 重载失败：无法加载 .mcp.json / $ATOMCODE_HOME/mcp.json：{:#}", error).into(),
         // /mcp login / logout
@@ -989,7 +993,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescBuild => "切换到 Build 模式（完整执行）".into(),
         Msg::CmdDescAuto => "切换到 Auto 模式（所有工具自动批准）".into(),
         Msg::CmdDescThink => "深度思考控制（on/off/budget N）".into(),
-        Msg::CmdDescEffort => "模型推理强度控制（low / medium / high / max / auto）".into(),
+        Msg::CmdDescEffort => "模型推理强度控制（low / medium / high / xhigh / max / auto）".into(),
         Msg::CmdDescHelp => "显示帮助".into(),
         Msg::CmdDescKeys => "显示键盘快捷键".into(),
         Msg::CmdDescLanguage => "切换显示语言".into(),
@@ -1163,6 +1167,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("已压缩 · 摘要 {} 条 · ~{}→~{} tok", messages, before, after).into(),
         Msg::CompactMarkStub { saved } =>
             format!("已折叠工具输出 · 节省 ~{} tok", saved).into(),
+        Msg::CompactNegligibleSavings => "（当前会话无需压缩）\n".into(),
         Msg::GoalHelp =>
             "  /goal — 朝着设定的条件自主进行多轮工作。\n  \
              用法：\n  \
@@ -1391,6 +1396,15 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         )
         .into(),
         Msg::StreamRecoverySucceeded => "✓ 已从流中断处恢复".into(),
+        Msg::OutputTruncationRunning { attempt, max_attempts } =>
+            format!("输出达到上限，正在自动续写（{attempt}/{max_attempts}）").into(),
+        Msg::OutputTruncationHeader => "输出达到上限".into(),
+        Msg::OutputTruncationQuestion =>
+            "模型的单次输出达到上限，自动续写仍未完成。下一步如何处理？".into(),
+        Msg::OutputTruncationContinue => "继续完成".into(),
+        Msg::OutputTruncationContinueDesc => "从已保留的内容继续，并改用分段写入".into(),
+        Msg::OutputTruncationStop => "停止".into(),
+        Msg::OutputTruncationStopDesc => "保留当前已生成的内容并结束回合".into(),
         Msg::ConhostScrollHint =>
             "提示：经典 Windows 控制台功能受限——任务执行中无法上滚查看历史，字符与吉祥物也会降级显示。\
              换用 \x1b[1;96mWindows Terminal\x1b[0m 体验更佳。"

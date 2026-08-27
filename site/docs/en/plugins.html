@@ -75,17 +75,17 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Plugin System</h1>
+<h1 id="plugin-system">Plugin System</h1>
       <p class="lede">A plugin is a bundle of skills / commands / hooks distributed over a git repository. One <code>/plugin install</code> drops someone else's workflow into AtomCode and you can use it immediately. AtomCode's plugin protocol is compatible with Claude Code — CC-ecosystem plugin repos install and run out of the box.</p>
 
-      <h2>Core concepts</h2>
+      <h2 id="core-concepts">Core concepts</h2>
       <ul>
         <li><strong>Marketplace</strong> — a git repository whose root contains <code>.atomcode-plugin/marketplace.json</code> or <code>.claude-plugin/marketplace.json</code>, declaring the plugins it provides.</li>
         <li><strong>Plugin</strong> — an entry in a marketplace. It can be a subdirectory of the same repo, or it can point to an <strong>external git repository</strong> (<code>url</code> / <code>github</code> / <code>git</code>) or a <strong>local path</strong> (<code>local</code>).</li>
         <li><strong>Skill / Command / Hook</strong> — the three asset types a plugin contributes. Skills and commands are namespaced with <code>plugin-name:</code> (to avoid collisions); hooks fire on events.</li>
       </ul>
 
-      <h2>Command reference</h2>
+      <h2 id="command-reference">Command reference</h2>
       <table>
         <thead>
           <tr><th>Command</th><th>Purpose</th></tr>
@@ -103,9 +103,9 @@
         </tbody>
       </table>
 
-      <h2>Install a plugin</h2>
+      <h2 id="install-a-plugin">Install a plugin</h2>
 
-      <h3>Method 1: interactive manager (recommended)</h3>
+      <h3 id="method-1-interactive-manager-recommended">Method 1: interactive manager (recommended)</h3>
       <p>Type <code>/plugin</code> in the TUI (no subcommand) to open a full-screen interactive manager. Navigate with arrow keys, confirm with Enter:</p>
       <pre><code>/plugin
 # → Opens the manager home screen:
@@ -115,7 +115,7 @@
 #   Installed (N)      — View installed plugins, Enter to uninstall</code></pre>
       <p>Installed plugins show a ✓ mark; pressing Enter toggles install/uninstall. Cloning and installing are async — a status line appears at the bottom during the operation and the list refreshes automatically when done.</p>
 
-      <h3>Method 2: slash-command subcommands</h3>
+      <h3 id="method-2-slash-command-subcommands">Method 2: slash-command subcommands</h3>
       <pre><code># 1. Register the marketplace (clones its git repo locally)
 /plugin marketplace add https://gitcode.com/gmq123/ascend-model-agent-plugin
 
@@ -125,7 +125,7 @@
 # 3. List installed plugins
 /plugin list</code></pre>
 
-      <h3>Method 3: CLI</h3>
+      <h3 id="method-3-cli">Method 3: CLI</h3>
       <pre><code>atomcode plugin marketplace add &lt;git-url&gt;
 atomcode plugin install &lt;plugin&gt;@&lt;marketplace&gt;
 atomcode plugin list
@@ -133,14 +133,14 @@ atomcode plugin uninstall &lt;plugin&gt;@&lt;marketplace&gt;
 atomcode plugin marketplace remove|update|list</code></pre>
       <p>The CLI and TUI share the <code>~/.atomcode/plugins/</code> directory; anything installed on one side is visible on the other immediately.</p>
 
-      <h3>After install</h3>
+      <h3 id="after-install">After install</h3>
       <ul>
         <li>Skills contributed by the plugin appear in the <code>/</code> menu with a <code>&lt;plugin-name&gt;:</code> prefix, e.g. <code>/ascend-model-agent-plugin:ascend-model-verification</code>.</li>
         <li>The model can also invoke these skills through the <code>UseSkill</code> tool.</li>
         <li>Hooks require explicit trust before they activate — run <code>atomcode plugin trust &lt;name&gt;</code> after reviewing the printed notice; hooks load on the next session. See <a href="#hook-trust-flow">Hook trust flow</a> below.</li>
       </ul>
 
-      <h2>Directory layout</h2>
+      <h2 id="directory-layout">Directory layout</h2>
       <pre><code>~/.atomcode/plugins/
 ├── marketplaces.json              # Registered marketplace metadata
 ├── installed_plugins.json         # Status records for installed plugins
@@ -151,7 +151,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
 └── installed/
     └── &lt;marketplace&gt;/&lt;plugin&gt;/    # Clones of plugins from external sources</code></pre>
 
-      <h2>plugin.json shape</h2>
+      <h2 id="pluginjson-shape">plugin.json shape</h2>
       <p>The <code>plugin.json</code> in each plugin's root (or its <code>.claude-plugin/</code> / <code>.atomcode-plugin/</code> subdirectory):</p>
       <pre><code>{
   "name": "my-plugin",
@@ -170,7 +170,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
   }
 }</code></pre>
 
-      <h2>Hook events</h2>
+      <h2 id="hook-events">Hook events</h2>
       <p>Plugins can hook the following events (matching CC). Event names are case/style-insensitive — the loader accepts both PascalCase (<code>PreToolUse</code>, <code>SessionStart</code>) and snake_case (<code>pre_tool_use</code>, <code>session_start</code>); the two spellings are equivalent.</p>
       <table>
         <thead>
@@ -189,7 +189,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
       </table>
       <p>Every turn end fires <strong>exactly one</strong> of <code>Stop</code> / <code>StopFailure</code> — never both, never none. <code>StopFailure</code> is reserved for turns that ended <em>because of</em> an API/provider failure; a tool error mid-turn does <strong>not</strong> fire it (the turn continues and ends with its real terminal instead). The stdin payload carries <code>hook_event_name</code>, <code>session_id</code>, <code>cwd</code>, the session's <code>transcript_path</code> (the append-only JSONL transcript, <code>null</code> for non-persistent runs), a CC-style <code>stop_hook_active</code> flag (true when <em>another</em> terminal hook is configured and fires alongside — use it to avoid a Stop hook recursively re-triggering itself), and a kernel <code>stop_reason</code> (e.g. <code>Stopped</code>, <code>ProviderError</code>, <code>Timeout</code>, <code>Cancelled</code>) so a hook can refine the outcome without parsing anything else.
 
-      <h3>Default-directory auto-discovery</h3>
+      <h3 id="default-directory-auto-discovery">Default-directory auto-discovery</h3>
       <p>A plugin's assets are discovered from default directories automatically — no need to declare them in <code>plugin.json</code>:</p>
       <ul>
         <li><strong>Hooks</strong> — loaded from <code>hooks/hooks.json</code> first (CC layout), falling back to a root-level <code>hooks.json</code>.</li>
@@ -211,7 +211,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
       <p>To revoke trust:</p>
       <pre><code>atomcode plugin untrust &lt;plugin-name&gt;</code></pre>
 
-      <h3>UserPromptSubmit IO protocol</h3>
+      <h3 id="userpromptsubmit-io-protocol">UserPromptSubmit IO protocol</h3>
       <p>The hook receives JSON on stdin and decides what to do via stdout:</p>
       <pre><code>{
   "session_id": "...",
@@ -229,7 +229,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
       </ul>
       <p>When parsing stdout, AtomCode first tries the <strong>last non-empty line</strong> as JSON; on failure it falls back to whole-text injection — so a hook script can print debug output earlier without affecting the final decision.</p>
 
-      <h3>Path variables</h3>
+      <h3 id="path-variables">Path variables</h3>
       <p>Hook command strings can reference these environment variables (injected by the executor):</p>
       <ul>
         <li><code>${CLAUDE_PLUGIN_ROOT}</code> — absolute path of the plugin install directory (CC compatible).</li>
@@ -237,7 +237,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
       </ul>
       <p>These are <strong>real environment variables</strong> expanded by the shell itself, not string substitutions — install paths with spaces, quotes, <code>$</code>, or <code>;</code> won't break the command.</p>
 
-      <h2>Marketplace management</h2>
+      <h2 id="marketplace-management">Marketplace management</h2>
       <pre><code># List registered marketplaces
 /plugin marketplace list
 
@@ -247,7 +247,7 @@ atomcode plugin marketplace remove|update|list</code></pre>
 # Remove (refuses if any plugin from this marketplace is still installed)
 /plugin marketplace remove &lt;name&gt;</code></pre>
 
-      <h2>Walkthrough: installing the Ascend plugin</h2>
+      <h2 id="walkthrough-installing-the-ascend-plugin">Walkthrough: installing the Ascend plugin</h2>
       <pre><code>/plugin marketplace add https://gitcode.com/gmq123/ascend-model-agent-plugin
 # &gt; cloning marketplace from https://gitcode.com/...
 # &gt; marketplace `ascend-model-agent-plugin` added at 7a59537 (1 plugins)
@@ -262,14 +262,14 @@ atomcode plugin marketplace remove|update|list</code></pre>
 # skill pipeline.
 help me verify Qwen3 adaptation on Ascend</code></pre>
 
-      <h2>Known limits</h2>
+      <h2 id="known-limits">Known limits</h2>
       <ul>
         <li><strong>Unsupported CC events</strong>: <code>PreCompact</code> / <code>SubagentStop</code> are silently skipped.</li>
         <li><strong>Multi-line indented JSON output</strong>: when a hook prints with <code>print(json.dumps(..., indent=2))</code>, the last line is <code>}</code>, which our last-line JSON parser fails on — falling back to plain-text injection. Functionally it still works (the LLM still reads the content) but it's not on the structured path. Hook authors should use single-line <code>json.dumps(...)</code> output.</li>
         <li><strong>Strict skill-name validation</strong>: <code>[a-z0-9_-]</code>, matching CC. Skill names with <code>/</code> or mixed case are skipped.</li>
       </ul>
 
-      <h2>Next steps</h2>
+      <h2 id="next-steps">Next steps</h2>
       <ul>
         <li><a href="./skills.html">Skills</a> — write your own skills; they work inside plugins too.</li>
         <li><a href="./slash-commands.html">Slash Commands</a> — full <code>/plugin</code> command list.</li>

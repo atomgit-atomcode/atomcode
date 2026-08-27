@@ -67,6 +67,7 @@ async fn full_assembly_repairs_tool_arguments_before_execution() {
         &cfg,
         PrepareOptions {
             session: SessionMode::Disabled,
+            tools: true,
             skill_dirs: Some(vec![project.path().join("skills")]),
             mcp: false,
             memory: false,
@@ -100,6 +101,7 @@ async fn full_assembly_approval_sees_the_repaired_arguments_that_execute() {
         &cfg,
         PrepareOptions {
             session: SessionMode::Disabled,
+            tools: true,
             skill_dirs: Some(vec![project.path().join("skills")]),
             mcp: false,
             memory: false,

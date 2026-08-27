@@ -292,6 +292,94 @@ fn connection_reset_hint(err: &(dyn std::error::Error + 'static)) -> &'static st
     ""
 }
 
+/// Strip any `user:pass@` userinfo from a proxy URL so credentials never land
+/// in a user-facing error line or the log file. Best-effort string surgery (not
+/// a full URL parse): drops the authority's userinfo, keeping scheme, host:port
+/// and any path. Schemeless / userinfo-free input is returned trimmed, verbatim.
+fn sanitize_proxy_url(raw: &str) -> String {
+    let raw = raw.trim();
+    let (scheme, rest) = match raw.find("://") {
+        Some(i) => (&raw[..i + 3], &raw[i + 3..]),
+        None => ("", raw),
+    };
+    // Split off only the query/fragment; the userinfo (and a host never carries
+    // an unencoded '@') sits before it. Dropping up to the LAST '@' strips the
+    // credential even when a raw '/' sits inside the password — bounding the
+    // search at the first '/' would leave `user:pa/ss@` exposed. Over-stripping
+    // a stray '@' in a path is harmless (host cosmetically wrong, no leak); a
+    // proxy URL has no such path in practice.
+    let tail_start = rest.find(['?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(tail_start);
+    let host = match authority.rfind('@') {
+        Some(i) => &authority[i + 1..],
+        None => authority,
+    };
+    format!("{scheme}{host}{tail}")
+}
+
+/// The sanitized proxy address reqwest most likely used for an HTTPS request, read
+/// from the process proxy env published by `atomcode_config` policy. Best-effort:
+/// the value is for a diagnostic hint, not a claim of exactly which proxy reqwest
+/// resolved (scheme/`ALL_PROXY`/`NO_PROXY` precedence can differ). `None` when no
+/// proxy env is set.
+pub(crate) fn effective_proxy_env() -> Option<String> {
+    for key in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(sanitize_proxy_url(v));
+            }
+        }
+    }
+    None
+}
+
+/// When a connect failure is really a failure to reach the configured HTTP proxy
+/// (reqwest's CONNECT tunnel could not open its underlying socket — e.g. a local
+/// VPN/proxy client that has been shut down), lead with an actionable Chinese hint
+/// naming the proxy and pointing at `/proxy`. Empty for every other connect
+/// failure, where a proxy hint would misdirect.
+///
+/// Keyed on hyper-util's locale-independent `TunnelError::ConnectFailed` marker
+/// ("failed to create underlying connection"), emitted ONLY on the proxy-tunnel
+/// path — a direct connect failure never contains it, so this cannot false-fire.
+///
+/// NOTE: the marker is a transitive-dep Display string, not a stable contract.
+/// A future hyper-util bump could reword it; the failure mode is fail-open (the
+/// hint silently vanishes and the message reverts to the plain chain), never a
+/// crash or misfire. If a `cargo update` bumps hyper-util, re-check this literal.
+pub(crate) fn proxy_unreachable_hint(chain: &str, proxy: Option<&str>) -> String {
+    if !chain.contains("failed to create underlying connection") {
+        return String::new();
+    }
+    // Name the affected proxy when we can read it, else a generic reference; the
+    // shared tail names the exact `/proxy` menu option (`no_proxy`) to pick —
+    // the bare term "直连" is jargon users won't map to an action.
+    let who = match proxy {
+        Some(p) if !p.is_empty() => format!("代理 {p}"),
+        _ => "配置的代理".to_string(),
+    };
+    format!(
+        "无法连接到{who}(代理可能未运行或地址不可达)。若你不需要代理,请运行 /proxy 并选择 no_proxy(不使用代理)后重试。"
+    )
+}
+
+/// The user-facing `open failed: …` message for a connection-open failure,
+/// shared by every provider's `open_error`. Surfaces the full source chain so
+/// the cause (connection reset / dns / proxy) is visible instead of reqwest's
+/// opaque shell, and when the failure is really an unreachable HTTP proxy leads
+/// with an actionable `/proxy` hint. Message-only — callers keep owning the
+/// `retryable` decision via [`is_retryable_reqwest_error`].
+pub(crate) fn open_failed_message(e: &reqwest::Error) -> String {
+    let chain = err_chain(e);
+    let hint = proxy_unreachable_hint(&chain, effective_proxy_env().as_deref());
+    if hint.is_empty() {
+        format!("open failed: {chain}")
+    } else {
+        format!("open failed: {hint}详情: {chain}")
+    }
+}
+
 /// Parse `Retry-After` (RFC 7231 §7.1.3) into a wait duration. Handles BOTH forms:
 /// delta-seconds (a bare integer) and an HTTP-date (e.g. some Anthropic 429s) — for the
 /// date form the wait is `date - now`, clamped to zero for a past date. `None` only when
@@ -895,5 +983,98 @@ mod tests {
         // It stays covered by is_connect(); behavior unchanged.
         assert!(e.is_connect());
         assert!(is_retryable_reqwest_error(&e));
+    }
+
+    #[test]
+    fn sanitize_proxy_url_strips_embedded_credentials() {
+        // A proxy URL can carry `user:pass@` userinfo; it must never reach a
+        // user-facing error line or the log file.
+        assert_eq!(
+            sanitize_proxy_url("http://user:pass@10.0.0.1:8080"),
+            "http://10.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn sanitize_proxy_url_leaves_a_plain_proxy_untouched() {
+        assert_eq!(
+            sanitize_proxy_url("http://127.0.0.1:7890"),
+            "http://127.0.0.1:7890"
+        );
+        // Schemeless authority is preserved verbatim (trimmed).
+        assert_eq!(sanitize_proxy_url("  127.0.0.1:7890 "), "127.0.0.1:7890");
+    }
+
+    #[test]
+    fn sanitize_proxy_url_strips_userinfo_but_keeps_path() {
+        // The `@` we strip is the authority's userinfo, not a later path char.
+        assert_eq!(
+            sanitize_proxy_url("http://u:p@proxy.corp:3128/pac"),
+            "http://proxy.corp:3128/pac"
+        );
+    }
+
+    #[test]
+    fn sanitize_proxy_url_strips_userinfo_even_with_a_slash_in_the_password() {
+        // A malformed-but-possible env value with an unencoded `/` inside the
+        // password must NOT leak the credential (no `user:...@` may survive).
+        assert_eq!(
+            sanitize_proxy_url("http://user:pa/ss@host:8080"),
+            "http://host:8080"
+        );
+    }
+
+    #[test]
+    fn proxy_hint_is_empty_for_a_non_tunnel_connect_failure() {
+        // A direct connect failure never contains hyper-util's ConnectFailed
+        // marker, so the proxy hint must not fire and misdirect.
+        let chain = "error sending request for url (https://x): \
+                     tcp connect error: connection refused (os error 61)";
+        assert!(proxy_unreachable_hint(chain, Some("http://127.0.0.1:7890")).is_empty());
+    }
+
+    #[test]
+    fn proxy_hint_names_the_proxy_and_points_at_slash_proxy() {
+        // hyper-util emits "tunnel error: failed to create underlying connection"
+        // ONLY on the proxy CONNECT path — the definitive "we couldn't reach the
+        // proxy" signal.
+        let chain = "error sending request for url (https://llm-api.atomgit.com): \
+                     tunnel error: failed to create underlying connection: \
+                     tcp connect error: connection refused (os error 10061)";
+        let hint = proxy_unreachable_hint(chain, Some("http://127.0.0.1:7890"));
+        assert!(hint.contains("http://127.0.0.1:7890"), "names the proxy: {hint}");
+        // Name the concrete `/proxy` menu option the user must pick, not the
+        // jargon "直连" — users don't know what that means.
+        assert!(hint.contains("/proxy"), "points at the command: {hint}");
+        assert!(hint.contains("no_proxy"), "names the exact menu option: {hint}");
+    }
+
+    #[test]
+    fn proxy_hint_still_fires_without_a_known_proxy_address() {
+        // The env var may be unreadable (reqwest resolved the proxy some other
+        // way); the hint must still lead the user to `/proxy` without naming an
+        // address it cannot vouch for.
+        let chain = "tunnel error: failed to create underlying connection: \
+                     tcp connect error: connection refused (os error 10061)";
+        let hint = proxy_unreachable_hint(chain, None);
+        assert!(!hint.is_empty());
+        assert!(hint.contains("/proxy"), "points at the command: {hint}");
+        assert!(hint.contains("no_proxy"), "names the exact menu option: {hint}");
+    }
+
+    #[tokio::test]
+    async fn open_failed_message_keeps_the_plain_form_for_a_direct_connect_failure() {
+        // A direct (non-proxy) connection refusal never carries the tunnel
+        // marker, so the shared builder must NOT inject the proxy hint — it
+        // stays byte-for-byte `open failed: <chain>`.
+        let e = reqwest::Client::new()
+            .post("http://127.0.0.1:1/nothing")
+            .body("{}")
+            .send()
+            .await
+            .expect_err("connection refused");
+        let msg = open_failed_message(&e);
+        assert!(msg.starts_with("open failed: "), "{msg}");
+        assert!(!msg.contains("无法连接到"), "no proxy hint on a direct failure: {msg}");
     }
 }

@@ -3064,7 +3064,7 @@ pub struct ModelInfo {
     pub is_default: bool,
     /// Whether this concrete model endpoint accepts `reasoning_effort`.
     pub effort_applicable: bool,
-    /// Current `reasoning_effort`: `"low"`, `"medium"`, `"high"`, `"max"`,
+    /// Current `reasoning_effort`: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`,
     /// or `null` (the model's own default). Lets the webui reflect the active
     /// effort in the selector.
     pub reasoning_effort: Option<String>,
@@ -3090,9 +3090,13 @@ fn models_from_config(config: &Config) -> Vec<ModelInfo> {
                 model: p.model.clone(),
                 provider_type: p.provider_type.clone(),
                 is_default: id == &default_selection,
-                effort_applicable: p.reasoning_effort.is_some()
-                    || (atomcode_config::config::is_codingplan_provider_name(id)
-                        && p.model.eq_ignore_ascii_case("deepseek-v4-flash")),
+                // Driven by CONFIG — an explicit effort, or a non-empty server-advertised
+                // `reasoning_effort_levels` — never a hardcoded model name. Single source of
+                // truth shared with the TUI `/effort` and the wire capability.
+                effort_applicable: atomcode_config::config::endpoint_supports_reasoning_effort(
+                    p.reasoning_effort.as_deref(),
+                    p.reasoning_effort_levels.as_deref(),
+                ),
                 // Clamp to the allowed levels so the webui trigger never shows a
                 // level the dropdown hides (then drop the `auto` sentinel).
                 reasoning_effort: atomcode_config::config::clamp_effort_to_levels(
@@ -3996,6 +4000,11 @@ impl ChatRuntimeProjector {
                     arguments: approval.args,
                 }]
             }
+            // Silent, cache-friendly tool-output folding is invisible transcript
+            // maintenance — suppress its mark (mirrors the TUI `silent_tool_fold`).
+            CodingRuntimeEvent::CompactionFinished {
+                completion: CompactionCompletion::Completed(outcome),
+            } if outcome.committed && outcome.is_silent_auto_tool_fold() => Vec::new(),
             CodingRuntimeEvent::CompactionFinished {
                 completion: CompactionCompletion::Completed(outcome),
             } if outcome.committed => vec![ChatEvent::Warning {
@@ -4165,6 +4174,24 @@ impl ChatRuntimeProjector {
                 vec![ChatEvent::Warning { message }]
             }
             Agent::Warning(message) => vec![ChatEvent::Warning { message }],
+            Agent::ProviderRetry {
+                attempt,
+                max_attempts,
+                backoff_secs,
+                reason,
+            } => vec![ChatEvent::Warning {
+                message: format!(
+                    "API error {reason}，{backoff_secs} 秒后重试({attempt}/{max_attempts})..."
+                ),
+            }],
+            Agent::OutputTruncationRecovery {
+                attempt,
+                max_attempts,
+            } => vec![ChatEvent::Warning {
+                message: format!(
+                    "output limit reached; automatically continuing ({attempt}/{max_attempts})"
+                ),
+            }],
             Agent::PolicyIntervention { intervention } => {
                 vec![ChatEvent::PolicyIntervention {
                     intervention_id: intervention.id,
@@ -5876,6 +5903,51 @@ async fn fs_list(
 }
 
 #[derive(serde::Deserialize)]
+pub struct FsSearchQuery {
+    pub path: String,
+    /// The raw token typed after `@` (may embed a scope, e.g. `src/apply`).
+    #[serde(default)]
+    pub q: String,
+}
+
+/// Core of [`fs_search`], split out so it can be unit-tested without spinning
+/// the router: split the raw `@` token into `(scope_dir, filter)` and run the
+/// SAME gitignore-aware index the TUI popup uses, then shape the matches as
+/// JSON (`path` relative to `dir`, forward-slashed, dirs suffixed `/`). This is
+/// what guarantees the webui `@`-mention picker matches the CLI exactly.
+fn search_at_mention(dir: &std::path::Path, token: &str) -> Vec<serde_json::Value> {
+    let (scope, filter) = atomcode_capabilities::file_index::split_token(token);
+    atomcode_capabilities::file_index::FileIndex::search_blocking(dir, &scope, &filter)
+        .into_iter()
+        .map(|e| serde_json::json!({ "path": e.rel_path, "is_dir": e.is_dir }))
+        .collect()
+}
+
+/// Recursive, gitignore-aware `@`-mention search for the webui picker. Mirrors
+/// the CLI popup by sharing `FileIndex` with the TUI (see [`search_at_mention`]).
+/// The blocking full-tree walk runs on a blocking thread so it never stalls the
+/// async runtime. Path normalization matches [`fs_list`] so a match handed back
+/// to `/cd`/`/fs/open` lands in the same session bucket.
+async fn fs_search(
+    State(_state): State<AppState>,
+    Query(q): Query<FsSearchQuery>,
+) -> impl IntoResponse {
+    let expanded = normalize_dir_arg(&q.path);
+    let dir = expanded.canonicalize().unwrap_or(expanded);
+    let dir = atomcode_capabilities::pathnorm::strip_verbatim_path(&dir);
+    let search_dir = dir.clone();
+    let token = q.q.clone();
+    let matches = tokio::task::spawn_blocking(move || search_at_mention(&search_dir, &token))
+        .await
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "path": dir.to_string_lossy(),
+        "matches": matches,
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
 pub struct FsMkdirRequest {
     pub path: String,
 }
@@ -6267,6 +6339,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/skills", get(get_skills))
         // Filesystem API
         .route("/fs/list", get(fs_list))
+        .route("/fs/search", get(fs_search))
         .route("/fs/mkdir", post(fs_mkdir))
         .route("/fs/open", post(fs_open))
         // MCP API
@@ -6311,6 +6384,14 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route("/auth/logout", post(api_auth::auth_logout))
         // CodingPlan API (P0)
         .route("/codingplan/setup", post(api_codingplan::codingplan_setup))
+        .route(
+            "/codingplan/usage/summary",
+            get(api_codingplan::codingplan_usage_summary),
+        )
+        .route(
+            "/codingplan/usage/daily",
+            get(api_codingplan::codingplan_usage_daily),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_token::require_webui_token,
@@ -6406,6 +6487,8 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         println!("  DELETE /auth/login/:login_id           - Cancel login session");
         println!("  POST   /auth/logout                    - Logout");
         println!("  POST   /codingplan/setup               - Run CodingPlan setup");
+        println!("  GET    /codingplan/usage/summary       - CodingPlan quota summary");
+        println!("  GET    /codingplan/usage/daily         - CodingPlan daily usage");
         println!("\nChange directory body:");
         println!("  {{\"path\": \"/path/to/project\"}}  or {{\"path\": \"-\"}} to go back");
         println!("\nChat request body:");
@@ -6626,6 +6709,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chat_projector_keeps_output_truncation_recovery_visible() {
+        let mut projector = ChatRuntimeProjector::default();
+        let events = projector.project_agent(
+            atomcode_kernel::event::AgentEvent::OutputTruncationRecovery {
+                attempt: 1,
+                max_attempts: 2,
+            },
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [ChatEvent::Warning { message }]
+                if message == "output limit reached; automatically continuing (1/2)"
+        ));
+    }
+
+    #[test]
     fn display_filter_preserves_snapshot_anchor_coordinates() {
         use atomcode_capabilities::session::{
             DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole, SessionMeta,
@@ -6794,6 +6894,46 @@ mod tests {
         );
         assert!(displayed[1].synthetic);
         assert!(displayed[1].content.is_empty());
+    }
+
+    #[test]
+    fn models_from_config_shows_effort_for_any_model_that_advertises_levels() {
+        // A CodingPlan model whose server-advertised `reasoning_effort_levels` is
+        // non-empty (e.g. qwen3.8-27b) must be effort_applicable in the webui — driven
+        // by config, not a hardcoded `deepseek-v4-flash` name. A level-less model stays off.
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "provider_accounts": {
+                "AtomGit": { "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1" }
+            },
+            "models": {
+                "AtomGit-qwen3.8-27b": {
+                    "account": "AtomGit", "model": "qwen3.8-27b",
+                    "reasoning_effort_levels": ["low", "medium", "xhigh"]
+                },
+                "AtomGit-GLM-5.2": { "account": "AtomGit", "model": "GLM-5.2" }
+            }
+        }))
+        .unwrap();
+
+        let models = models_from_config(&config);
+        let qwen = models
+            .iter()
+            .find(|m| m.model == "qwen3.8-27b")
+            .expect("qwen model listed");
+        assert!(
+            qwen.effort_applicable,
+            "a model advertising effort levels must show the selector"
+        );
+        assert_eq!(qwen.effort_levels, vec!["low", "medium", "xhigh"]);
+
+        let glm = models
+            .iter()
+            .find(|m| m.model == "GLM-5.2")
+            .expect("glm model listed");
+        assert!(
+            !glm.effort_applicable,
+            "a model with no effort levels must not show the selector"
+        );
     }
 
     #[test]
@@ -8683,6 +8823,40 @@ mod tests {
         assert_eq!(files, vec!["a.txt".to_string(), "b.txt".to_string()]);
         // 目录不混入文件列表，但仍出现在 list_subdirs。
         assert!(list_subdirs(&tmp).unwrap().contains(&"subdir".to_string()));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // `/fs/search` core: a `@`-mention token must resolve to cross-level,
+    // gitignore-aware matches (the fuzzy behavior the webui was missing), shaped
+    // as `{path, is_dir}` relative to the search dir. Mirrors the CLI popup.
+    #[test]
+    fn search_at_mention_finds_cross_level_and_skips_gitignored() {
+        let tmp =
+            std::env::temp_dir().join(format!("atomcode_fs_search_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let deep = tmp.join("src/main/java/cn");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("ApplyStockController.java"), b"x").unwrap();
+        std::fs::write(tmp.join(".gitignore"), b"target/\n").unwrap();
+        std::fs::create_dir_all(tmp.join("target")).unwrap();
+        std::fs::write(tmp.join("target/ApplyStockGenerated.java"), b"x").unwrap();
+
+        let matches = search_at_mention(&tmp, "applystock");
+        let paths: Vec<String> = matches
+            .iter()
+            .map(|m| m["path"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            paths.iter().any(|p| p.ends_with("ApplyStockController.java")),
+            "must find the deep controller across levels: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("target/")),
+            "gitignored match must be excluded: {paths:?}"
+        );
+        // is_dir is carried through so the webui can keep drilling into a dir hit.
+        assert!(matches.iter().all(|m| m["is_dir"].is_boolean()));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

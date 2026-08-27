@@ -75,32 +75,32 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>FAQ</h1>
+<h1 id="faq">FAQ</h1>
       <p class="lede">A roundup of questions that keep coming up in user channels and issues. If yours isn't here, ask AtomCode to create an Issue with its built-in AtomGit tool (after <code>/login</code>), or open it on the <a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">AtomGit repository</a>.</p>
 
-      <h2>Install &amp; launch</h2>
+      <h2 id="install-launch">Install &amp; launch</h2>
 
-      <h3>The install script fails or times out</h3>
+      <h3 id="the-install-script-fails-or-times-out">The install script fails or times out</h3>
       <p>The one-click installer pulls the binary from GitCode releases by default. If the network blocks it:</p>
       <ul>
         <li>Download the archive for your platform manually from the <a href="https://atomgit.com/atomgit_atomcode/atomcode/releases" target="_blank">releases page</a> and drop <code>atomcode</code> onto your <code>PATH</code>;</li>
         <li>or build from source: <code>cargo install --path crates/atomcode-cli --locked</code> (requires Rust 1.88+).</li>
       </ul>
 
-      <h3>Running <code>atomcode</code> says "command not found"</h3>
+      <h3 id="running-atomcode-says-command-not-found">Running <code>atomcode</code> says "command not found"</h3>
       <p>The install directory isn't on your <code>PATH</code>. The default location is <code>~/.atomcode/bin</code> — add it to your shell rc file:</p>
       <pre><code>export PATH="$HOME/.atomcode/bin:$PATH"</code></pre>
 
-      <h3>macOS says "cannot be opened because the developer cannot be verified"</h3>
+      <h3 id="macos-says-cannot-be-opened-because-the-developer-cannot-be-">macOS says "cannot be opened because the developer cannot be verified"</h3>
       <p>Either click "Open Anyway" under System Settings → Privacy &amp; Security, or run:</p>
       <pre><code>xattr -d com.apple.quarantine $(which atomcode)</code></pre>
 
-      <h2>Login &amp; models</h2>
+      <h2 id="login-models">Login &amp; models</h2>
 
-      <h3>The browser doesn't open during OAuth login</h3>
+      <h3 id="the-browser-doesnt-open-during-oauth-login">The browser doesn't open during OAuth login</h3>
       <p>Check whether you're on a remote server without a desktop session. For remote environments, prefer API-key login (see <a href="./login.html">Login Methods</a>), or finish OAuth locally and copy <code>~/.atomcode/auth.toml</code> to the same path on the server.</p>
 
-      <h3>Can't reach the model / hangs forever / timeouts</h3>
+      <h3 id="cant-reach-the-model-hangs-forever-timeouts">Can't reach the model / hangs forever / timeouts</h3>
       <ul>
         <li>First check that <code>base_url</code> in <code>~/.atomcode/config.toml</code> is reachable — <code>curl</code> the matching <code>/v1/models</code> endpoint;</li>
         <li>On corporate networks it's usually a proxy issue — set <code>HTTPS_PROXY</code> and retry;</li>
@@ -108,64 +108,64 @@
         <li>If you're in mainland China hitting an overseas model, verify your egress network. You can run <code>/model</code> to switch to AtomGit's official channel first to prove the whole pipeline works.</li>
       </ul>
 
-      <h3>How do I switch models?</h3>
+      <h3 id="how-do-i-switch-models">How do I switch models?</h3>
       <p>Type <code>/model</code> and pick from the menu. The command switches the current session and saves the choice as the default for sessions opened later; other already-open sessions keep their current model. See <a href="./configuration.html">Configuration</a>.</p>
 
-      <h3>Context overflow / "context length exceeded"</h3>
+      <h3 id="context-overflow-context-length-exceeded">Context overflow / "context length exceeded"</h3>
       <ul>
         <li>Run <code>/compact</code> to have the model summarise the conversation so far and keep going;</li>
         <li>or <code>/clear</code> to wipe the current context and start over (history is kept as a session — you can <code>/resume</code> at any time);</li>
         <li>Avoid pasting a whole giant file into a prompt; let AtomCode use its file tools to read what it needs.</li>
       </ul>
 
-      <h2>Permissions &amp; safety</h2>
+      <h2 id="permissions-safety">Permissions &amp; safety</h2>
 
-      <h3>Confirming every command gets annoying</h3>
+      <h3 id="confirming-every-command-gets-annoying">Confirming every command gets annoying</h3>
       <p>That's the default safety policy. You can:</p>
       <ul>
         <li>Allow ad-hoc: pick "Always allow this kind of action" in the confirmation prompt;</li>
         <li>Allow via config: add commands to the <code>[permissions]</code> allowlist in <code>config.toml</code>.</li>
       </ul>
 
-      <h3>Where does AtomCode send my code?</h3>
+      <h3 id="where-does-atomcode-send-my-code">Where does AtomCode send my code?</h3>
       <p>Only to the model endpoint you've configured in <code>config.toml</code>. Project files are read locally by tools and shipped as part of the prompt; AtomCode itself does not upload or telemeter code content.</p>
 
-      <h3>Can I disable specific tools?</h3>
+      <h3 id="can-i-disable-specific-tools">Can I disable specific tools?</h3>
       <p>Yes — under <code>[tools]</code> in <code>config.toml</code>, set <code>disabled = ["shell", "web_fetch"]</code> to block tools you don't want the model to use.</p>
 
-      <h2>Usage &amp; interaction</h2>
+      <h2 id="usage-interaction">Usage &amp; interaction</h2>
 
-      <h3>How do I point it at a specific file?</h3>
+      <h3 id="how-do-i-point-it-at-a-specific-file">How do I point it at a specific file?</h3>
       <p>Type <code>@</code> in the input to trigger file completion, e.g. <code>walk me through @src/main.rs entry logic</code>. You can also just describe the path and the tool will call <code>read_file</code> on its own.</p>
 
-      <h3>How do I enter a multiline prompt?</h3>
+      <h3 id="how-do-i-enter-a-multiline-prompt">How do I enter a multiline prompt?</h3>
       <p><kbd>Shift</kbd>+<kbd>Enter</kbd>, <kbd>Alt</kbd>+<kbd>Enter</kbd>, or <kbd>Ctrl</kbd>+<kbd>Enter</kbd> insert a newline; <kbd>Enter</kbd> sends. Full reference at <a href="./keybindings.html">Keybindings</a>.</p>
 
-      <h3>How do I roll back a bad edit?</h3>
+      <h3 id="how-do-i-roll-back-a-bad-edit">How do I roll back a bad edit?</h3>
       <p>Run <code>/undo</code> to revert the file changes produced by the last tool turn. See <a href="./sessions.html">Sessions &amp; Undo</a>.</p>
 
-      <h3>Can I resume the previous session?</h3>
+      <h3 id="can-i-resume-the-previous-session">Can I resume the previous session?</h3>
       <p>Yes. Launch with <code>--continue</code> (or <code>-c</code>) to pick up the last session, or run <code>/resume</code> from inside a new session and pick one from the history list.</p>
 
-      <h2>Skills &amp; project instructions</h2>
+      <h2 id="skills-project-instructions">Skills &amp; project instructions</h2>
 
-      <h3>My skill doesn't show up in the menu</h3>
+      <h3 id="my-skill-doesnt-show-up-in-the-menu">My skill doesn't show up in the menu</h3>
       <ul>
         <li>Check the path: globally <code>~/.atomcode/skills/&lt;name&gt;/SKILL.md</code>, per-project <code>.atomcode/skills/&lt;name&gt;/SKILL.md</code>;</li>
         <li>Check the frontmatter: both <code>name</code> and <code>description</code> are required;</li>
         <li>Restart atomcode or run <code>/reload</code> to rescan.</li>
       </ul>
 
-      <h3>What's the difference between <code>.atomcode.md</code> and a skill?</h3>
+      <h3 id="whats-the-difference-between-atomcodemd-and-a-skill">What's the difference between <code>.atomcode.md</code> and a skill?</h3>
       <p>The former is an "always on" project-level convention; the latter is an explicitly invoked workflow. See <a href="./skills.html#与项目指令的分工">Skills · Versus project instructions</a>.</p>
 
-      <h2>Troubleshooting</h2>
+      <h2 id="troubleshooting">Troubleshooting</h2>
       <div class="callout callout-tip">
         <strong>Logs first</strong>
         <p>For any problem, step one is to look at <code>~/.atomcode/logs/</code>. Launching with <code>--log-level debug</code> prints far more detailed request/response logs.</p>
       </div>
 
-      <h3>When filing an issue, please include</h3>
+      <h3 id="when-filing-an-issue-please-include">When filing an issue, please include</h3>
       <ul>
         <li>The output of <code>atomcode --version</code>;</li>
         <li>Your OS and architecture;</li>
@@ -173,7 +173,7 @@
         <li>Relevant logs (redact your API key).</li>
       </ul>
 
-      <h2>Next steps</h2>
+      <h2 id="next-steps">Next steps</h2>
       <ul>
         <li><a href="./index.html">Back to overview</a></li>
         <li><a href="./getting-started.html">Quickstart</a> — install from scratch</li>

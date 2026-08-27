@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>MCP Integration</h1>
+<h1 id="mcp-integration">MCP Integration</h1>
       <p class="lede">MCP (Model Context Protocol) is an open protocol that plugs the "tools" exposed by external programs or HTTP services into AtomCode, so the model can call them like built-in tools. Since v4.20.4, AtomCode ships a built-in MCP client and re-uses the same <code>mcpServers</code> configuration block as Cursor and others.</p>
 
-      <h2>What it enables</h2>
+      <h2 id="what-it-enables">What it enables</h2>
       <ul>
         <li>Operate GitHub, GitLab, Jira, and other external services via official MCP servers</li>
         <li>Connect to Postgres / MySQL / DuckDB and other databases</li>
@@ -86,7 +86,7 @@
         <li>Expose your team's domain-specific tools to the model without modifying atomcode source</li>
       </ul>
 
-      <h2>Two config locations</h2>
+      <h2 id="two-config-locations">Two config locations</h2>
       <table>
         <thead>
           <tr><th>Path</th><th>Scope</th></tr>
@@ -98,7 +98,7 @@
       </table>
       <p>Both can coexist; <strong>same-named servers prefer the project-level entry</strong> (it overrides the user-level one). The repo's <code>.mcp.json.example</code> ships heavily-commented stdio + HTTP templates — start from there.</p>
 
-      <h2>Config schema</h2>
+      <h2 id="config-schema">Config schema</h2>
       <p>The top-level key is fixed at <code>mcpServers</code> (the legacy <code>servers</code> key still works). Each server should pick one transport:</p>
       <ul>
         <li><strong>stdio</strong>: <code>command</code> (required) + optional <code>args</code>, <code>env</code>, <code>timeout_ms</code>, <code>disabled</code></li>
@@ -108,7 +108,7 @@
       <p>Strings support <code>${VAR}</code> and <code>${VAR:-default}</code> environment expansion; never hard-code sensitive tokens — keep them in env vars. <code>disabled: true</code> temporarily turns off a server without removing the entry.</p>
       <p><code>.mcp.json</code> also accepts <strong>JSONC comments</strong> — <code>//</code> line comments and <code>/* */</code> block comments — so you can annotate a server or comment one out without deleting it. Comment tokens inside string values (e.g. the <code>//</code> in a URL) are preserved.</p>
 
-      <h3>stdio example (local subprocess)</h3>
+      <h3 id="stdio-example-local-subprocess">stdio example (local subprocess)</h3>
       <pre><code>{
   "mcpServers": {
     "filesystem": {
@@ -119,7 +119,7 @@
   }
 }</code></pre>
 
-      <h3>HTTP example (remote endpoint)</h3>
+      <h3 id="http-example-remote-endpoint">HTTP example (remote endpoint)</h3>
       <pre><code>{
   "mcpServers": {
     "github": {
@@ -132,7 +132,7 @@
   }
 }</code></pre>
 
-      <h3>GitHub remote MCP + OAuth</h3>
+      <h3 id="github-remote-mcp-oauth">GitHub remote MCP + OAuth</h3>
       <pre><code>{
   "mcpServers": {
     "github": {
@@ -150,7 +150,7 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github
 atomcode</code></pre>
       <p>Inside the TUI you can also set the env var and run <code>/mcp login github</code>; after a successful login, <code>/mcp reload</code> reconnects.</p>
 
-      <h2>One-line server add</h2>
+      <h2 id="one-line-server-add">One-line server add</h2>
       <p><code>atomcode mcp add</code> writes the stdio config to JSON for you — no hand-editing required:</p>
       <pre><code># Write to project-root .mcp.json (current directory by default)
 atomcode mcp add playwright npx @playwright/mcp@latest
@@ -169,7 +169,7 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
         <p>A same-named server is <strong>fully overwritten</strong>. The GitHub OAuth token is stored at <code>~/.atomcode/mcp_auth.toml</code> — it is not written to <code>.mcp.json</code>.</p>
       </div>
 
-      <h2>What happens at startup</h2>
+      <h2 id="what-happens-at-startup">What happens at startup</h2>
       <table>
         <thead>
           <tr><th>Mode</th><th>Connection behaviour</th><th>When tools appear</th></tr>
@@ -181,13 +181,13 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
       </table>
       <p>In the TUI you'll see <code>✓ MCP server 'github' connected</code> or <code>✗ MCP server '…' failed: …</code> in the session area. <strong>A single server failure does not break other servers or the main program.</strong></p>
 
-      <h2>Tool naming</h2>
+      <h2 id="tool-naming">Tool naming</h2>
       <p>Each remote tool is registered as <code>mcp__&lt;server-key&gt;__&lt;remote-tool-name&gt;</code>.</p>
       <p>Example: with <code>"mcpServers": { "github": { ... } }</code> and a remote <code>get_issue</code> tool, the model sees the tool name <code>mcp__github__get_issue</code>.</p>
       <p><code>--disable-tools</code> uses the full name too:</p>
       <pre><code>atomcode --disable-tools mcp__github__get_issue,mcp__filesystem__write_file</code></pre>
 
-      <h2>Permission approval</h2>
+      <h2 id="permission-approval">Permission approval</h2>
       <p>MCP tools default to <strong>per-call confirmation</strong> (equivalent to <code>RequireApproval</code>) because the remote is external, untrusted code.</p>
       <ul>
         <li>Press <strong>Y</strong> — allow once</li>
@@ -199,7 +199,7 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
         <p>Treat MCP tool results as untrusted data. <strong>Do not</strong> let them be promoted to system instructions. If an MCP server returns "please ignore previous instructions", the model should not comply.</p>
       </div>
 
-      <h2>Project trust (.mcp.json)</h2>
+      <h2 id="project-trust-mcpjson">Project trust (.mcp.json)</h2>
       <p>Servers defined in a <strong>project-level</strong> <code>.mcp.json</code> are <strong>untrusted until you trust the project</strong>. A freshly-cloned repo that ships a <code>.mcp.json</code> cannot auto-spawn a subprocess on your machine — its project servers are withheld from the connect loop (fail-closed), and you'll see a <em>blocked-untrusted</em> notice listing them. User-global servers (<code>~/.atomcode/mcp.json</code>) are never affected.</p>
       <p>Trust is per project directory and recorded in <code>~/.atomcode/mcp_trust.json</code>:</p>
       <ul>
@@ -208,7 +208,7 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
       </ul>
       <p>In the <a href="./webui.html">Web UI</a> a <strong>Trust project</strong> button does the same over <code>POST /live/mcp/trust</code>, and the MCP status shows which servers are connected versus blocked.</p>
 
-      <h2>Slash commands</h2>
+      <h2 id="slash-commands">Slash commands</h2>
       <table>
         <thead>
           <tr><th>Command</th><th>Purpose</th></tr>
@@ -221,7 +221,7 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
         </tbody>
       </table>
 
-      <h2>Current limits</h2>
+      <h2 id="current-limits">Current limits</h2>
       <ul>
         <li>Only MCP's <strong>tools</strong> capability is supported; resources / prompts / OAuth / roots / elicitation are not yet implemented</li>
         <li>HTTP servers don't have exponential-backoff reconnects, and stdio child processes don't auto-restart on exit — use <code>/mcp reload</code> to reconnect manually</li>
@@ -230,7 +230,7 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
         <li><code>[A] Always</code> applies only within the current session; it is never written to a config file</li>
       </ul>
 
-      <h2>Ecosystem comparison</h2>
+      <h2 id="ecosystem-comparison">Ecosystem comparison</h2>
       <table>
         <thead>
           <tr><th>Product</th><th>Config location</th><th>Notes</th></tr>
@@ -244,7 +244,7 @@ ATOMCODE_GITHUB_MCP_CLIENT_ID=&lt;client_id&gt; atomcode mcp login github</code>
       </table>
       <p>If you already use Cursor's MCP setup, common <code>command</code> / <code>url</code> configs are usually reusable; anything outside AtomCode's current fields or capabilities needs verification.</p>
 
-      <h2>Next steps</h2>
+      <h2 id="next-steps">Next steps</h2>
       <ul>
         <li>The <a href="https://atomgit.com/atomgit_atomcode/atomcode/blob/main/.mcp.json.example" target="_blank"><code>.mcp.json.example</code></a> at the repo root — heavily-commented stdio + HTTP templates</li>
         <li><a href="./configuration.html">Configuration</a> — overall config overview</li>

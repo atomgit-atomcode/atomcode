@@ -10,6 +10,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// (model-initiated, in atomcode-capabilities).
 pub const ROUND_CAP_CHECKPOINT_KIND: &str = "round_cap_checkpoint";
 
+/// Driver round-trip `kind` emitted after the bounded automatic recovery for an
+/// output-token truncation has been exhausted. Interactive drivers may offer a
+/// continue/stop choice; unknown or unattended drivers must answer fail-closed.
+pub const OUTPUT_TRUNCATION_CHECKPOINT_KIND: &str = "output_truncation_checkpoint";
+
 pub type RequestId = u64;
 
 /// Stable machine-readable reason for a hard policy intervention. Drivers use
@@ -293,6 +298,22 @@ pub enum AgentEvent {
         attempt: u32,
         max_attempts: u32,
         recovered: bool,
+    },
+    /// A retryable provider OPEN failure is backing off before reopening the
+    /// same logical round. Structured so non-interactive drivers do not parse a
+    /// localized warning string to recover attempt metadata.
+    ProviderRetry {
+        attempt: u32,
+        max_attempts: u32,
+        backoff_secs: u64,
+        reason: String,
+    },
+    /// The provider ended a text response with `finish_reason=length`, and the
+    /// kernel is using one of its bounded automatic continuation attempts.
+    /// Purely observational: drivers may update transient progress UI.
+    OutputTruncationRecovery {
+        attempt: u32,
+        max_attempts: u32,
     },
     /// A 429 rate-limit PAUSE (host decided the reset is too far to auto-wait).
     /// A driver renders this as a non-error pause line with the reset time, NOT

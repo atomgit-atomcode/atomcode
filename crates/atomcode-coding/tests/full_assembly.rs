@@ -147,10 +147,9 @@ async fn full_assembly_lifecycle() {
             shape()
         );
         assert!(first[2].text.contains("prefers tabs"));
-        // StatusReminderHook is SKIPPED on a turn's round 1 (this is a single-round text
-        // turn), so NO status tail rides this request — the last message is the user turn,
-        // not a "<system-reminder>". (The reminder appears from round 2 onward; covered by
-        // the hook's own unit tests.)
+        // No per-round status/date <system-reminder> tail rides any request: the date lives in
+        // the frozen persona anchor and the per-round StatusReminderHook was removed from the
+        // production hook chain, so the last message here is the user turn, not a reminder.
         assert_eq!(
             first.last().unwrap().role,
             Role::User,

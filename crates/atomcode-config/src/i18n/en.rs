@@ -746,6 +746,10 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Usage: /mcp tools <server>\n  Example: /mcp tools filesystem\n".into(),
         Msg::McpServersHeader =>
             "  MCP Servers:\n".into(),
+        Msg::McpBlockedTrustHint { count } =>
+            format!(
+                "  {count} server(s) blocked because this project is untrusted.\n  Run /mcp trust to load this project's MCP servers.\n"
+            ).into(),
         Msg::McpReloadFailed { error } =>
             format!("mcp reload failed: failed to load .mcp.json / $ATOMCODE_HOME/mcp.json: {:#}", error).into(),
         // /mcp login / logout
@@ -1017,7 +1021,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescBuild => "Switch to Build mode (full execution)".into(),
         Msg::CmdDescAuto => "Switch to Auto mode (auto-approve all tools)".into(),
         Msg::CmdDescThink => "Extended thinking control (on/off/budget N)".into(),
-        Msg::CmdDescEffort => "Model reasoning effort control (low / medium / high / max / auto)".into(),
+        Msg::CmdDescEffort => "Model reasoning effort control (low / medium / high / xhigh / max / auto)".into(),
         Msg::CmdDescHelp => "Show this help".into(),
         Msg::CmdDescKeys => "Show keyboard shortcuts".into(),
         Msg::CmdDescLanguage => "Switch display language".into(),
@@ -1196,6 +1200,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         }
         Msg::CompactMarkStub { saved } =>
             format!("Tool output folded · saved ~{} tok", saved).into(),
+        Msg::CompactNegligibleSavings => "(this conversation doesn't need compacting)\n".into(),
         Msg::GoalHelp =>
             "  /goal — autonomous multi-round work toward a stated condition.\n  \
              Usage:\n  \
@@ -1429,6 +1434,17 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         )
         .into(),
         Msg::StreamRecoverySucceeded => "✓ recovered from the interrupted stream".into(),
+        Msg::OutputTruncationRunning { attempt, max_attempts } =>
+            format!("Output limit reached; automatically continuing ({attempt}/{max_attempts})").into(),
+        Msg::OutputTruncationHeader => "Output limit reached".into(),
+        Msg::OutputTruncationQuestion =>
+            "The model reached its per-response output limit and automatic continuation is still incomplete. What should happen next?".into(),
+        Msg::OutputTruncationContinue => "Continue".into(),
+        Msg::OutputTruncationContinueDesc =>
+            "Continue from the preserved output and write the remainder incrementally".into(),
+        Msg::OutputTruncationStop => "Stop".into(),
+        Msg::OutputTruncationStopDesc =>
+            "Keep the output produced so far and end this turn".into(),
         Msg::ConhostScrollHint =>
             "Tip: the classic Windows console is limited — no scroll-back while a task runs, \
              and glyphs/the mascot render degraded. \x1b[1;96mWindows Terminal\x1b[0m gives the full experience."

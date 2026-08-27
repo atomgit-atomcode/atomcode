@@ -27,6 +27,38 @@ test('openWorkspaceFile scopes the host opener to the owning session', async () 
   }
 });
 
+test('searchFiles URL-encodes the dir and the raw @ token, returns matches', async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(url), init });
+    return new Response(
+      JSON.stringify({
+        path: '/work/erp',
+        matches: [
+          { path: 'src/main/java/ApplyStockController.java', is_dir: false },
+          { path: 'src/apply/', is_dir: true },
+        ],
+      }),
+      { status: 200 },
+    );
+  }) as typeof fetch;
+
+  try {
+    const { searchFiles } = await import('./api.ts');
+    const r = await searchFiles('/work/erp', 'src/apply stock');
+    // dir → path param; the raw token (incl. the space) → q param, both encoded.
+    assert.equal(
+      calls[0].url,
+      '/fs/search?path=%2Fwork%2Ferp&q=src%2Fapply%20stock',
+    );
+    assert.equal(r.matches.length, 2);
+    assert.deepEqual(r.matches[1], { path: 'src/apply/', is_dir: true });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('postLiveMessage does not send approval_mode because live mode is global', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const originalFetch = globalThis.fetch;

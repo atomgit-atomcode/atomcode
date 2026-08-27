@@ -88,6 +88,31 @@ fn submit_foreground_runtime(ctx: &LoopCtx, input: atomcode_coding::UserInput) -
     }
 }
 
+/// The slash commands that ONLY switch agent mode (`/plan`, `/build`, `/auto`),
+/// as opposed to content commands. Returns the mode each selects.
+fn mode_setter_mode(cmd: &str) -> Option<crate::state::AgentMode> {
+    match cmd {
+        "plan" => Some(crate::state::AgentMode::Plan),
+        "build" => Some(crate::state::AgentMode::Build),
+        "auto" => Some(crate::state::AgentMode::Auto),
+        _ => None,
+    }
+}
+
+/// Decide whether a mode-setter submission carries trailing content that should
+/// be forwarded as a normal message after switching mode. `Some(mode)` when
+/// `cmd` is a mode-setter AND `arg` has non-whitespace residual (text and/or an
+/// `[Image #N]` marker); `None` for a bare toggle (`/plan` alone) or any
+/// non-mode-setter. Pure so the forward decision is unit-testable.
+fn mode_setter_residual_message(cmd: &str, arg: &str) -> Option<crate::state::AgentMode> {
+    let mode = mode_setter_mode(cmd)?;
+    if arg.trim().is_empty() {
+        None
+    } else {
+        Some(mode)
+    }
+}
+
 fn reload_runtime_provider(ctx: &LoopCtx) -> Result<(), atomcode_coding::RuntimeUnavailable> {
     reload_runtime_provider_from(ctx, &ctx.config)
 }
@@ -5642,6 +5667,37 @@ mod buffer_tests {
     }
 
     #[test]
+    fn compaction_spinner_shows_parenthesized_clock_no_tokens_no_slow_variant() {
+        let mut s = UiState::new();
+        s.on_submit();
+        s.compacting = true;
+        // Parenthesized elapsed clock, matching the thinking spinner's shape (was
+        // a bare ` · 4s`, no parens).
+        let bare = format_spinner_label(&s, 0, None);
+        assert!(bare.contains("(0s)"), "parenthesized clock, got {bare:?}");
+        // Even with a non-zero `turn_output_chars` (a leftover from the
+        // pre-compaction generation — the compaction summary never feeds it), the
+        // compaction spinner must NOT surface a `↑ N tokens` count, or it would
+        // show a frozen/misleading number.
+        s.turn_output_chars = 49_600;
+        let active = format_spinner_label(&s, 0, None);
+        assert!(
+            !active.contains("tokens") && !active.contains('\u{2191}'),
+            "compaction must not show a (stale) token count, got {active:?}"
+        );
+        assert!(active.contains("(0s)"), "just the clock, got {active:?}");
+        // Even silent past the stall threshold there is NO "较慢/slow" label any
+        // more — the ticking clock already shows it's alive.
+        s.last_stream_activity =
+            Some(std::time::Instant::now() - crate::state::STREAM_STALL_HINT);
+        let stalled = format_spinner_label(&s, 0, None);
+        assert!(
+            !stalled.contains("较慢") && !stalled.to_lowercase().contains("slow"),
+            "no slow variant, got {stalled:?}"
+        );
+    }
+
+    #[test]
     fn spinner_label_shows_subagent_activity_when_present() {
         // While a `task` fan-out is running, the spinner shows the children's latest
         // live activity in place of the generic thinking word — and reverts when cleared.
@@ -5672,13 +5728,14 @@ mod buffer_tests {
 
     #[test]
     fn review_activity_marker_is_ephemeral_for_code_review() {
-        let chunk = "\u{1e}review · round 3 · read_file · compaction.rs";
+        // New activity format: no `round N`, a stage label in deep mode.
+        let chunk = "\u{1e}review [security] · read_file · compaction.rs";
 
         let activity = ephemeral_tool_activity(Some("CodeReview"), chunk);
 
         assert_eq!(
             activity,
-            Some("review · round 3 · read_file · compaction.rs")
+            Some("review [security] · read_file · compaction.rs")
         );
     }
 
@@ -6119,6 +6176,42 @@ mod buffer_tests {
     }
 
     #[test]
+    fn next_prompt_suggestion_accept_keys_are_tab_and_right_arrow() {
+        use crossterm::event::KeyModifiers;
+        // Right-arrow (existing) and bare Tab (new) both accept. A bare Tab
+        // classifies to `Action::Complete` (key_action.rs), so the predicate must
+        // accept it via the `code == Tab` branch even though the action isn't
+        // CursorRight — pass the REAL classified action here to prove that path.
+        assert!(accepts_next_prompt_suggestion(
+            Action::CursorRight,
+            KeyCode::Right,
+            KeyModifiers::NONE
+        ));
+        assert!(accepts_next_prompt_suggestion(
+            Action::Complete,
+            KeyCode::Tab,
+            KeyModifiers::NONE
+        ));
+        // Shift+Tab classifies to NoOp and stays a mode-cycle key, never an accept.
+        assert!(!accepts_next_prompt_suggestion(
+            Action::NoOp,
+            KeyCode::Tab,
+            KeyModifiers::SHIFT
+        ));
+        // Unrelated keys / modified arrows do not accept.
+        assert!(!accepts_next_prompt_suggestion(
+            Action::Submit,
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        ));
+        assert!(!accepts_next_prompt_suggestion(
+            Action::CursorRight,
+            KeyCode::Right,
+            KeyModifiers::CONTROL
+        ));
+    }
+
+    #[test]
     fn restore_cancelled_text_prepends_before_existing_draft() {
         let mut b = Buffer::new();
         // User started typing a new message while the previous turn ran.
@@ -6331,6 +6424,49 @@ mod menu_tests {
     use super::*;
     use crate::custom_commands::CustomCommand;
     use crate::custom_commands::CustomCommandRegistry;
+
+    #[test]
+    fn goal_hatch_only_traps_keys_while_pursuing() {
+        use atomcode_coding::GoalPhase;
+        use crossterm::event::KeyModifiers;
+        let ctrl_c = (KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let esc = (KeyCode::Esc, KeyModifiers::NONE);
+
+        // Actively pursuing: Ctrl+C cancels, bare Esc pauses.
+        assert_eq!(
+            goal_escape_hatch_action(true, GoalPhase::Pursuing, ctrl_c.0, ctrl_c.1, true),
+            Some(GoalHatchAction::Cancel)
+        );
+        assert_eq!(
+            goal_escape_hatch_action(true, GoalPhase::Pursuing, esc.0, esc.1, true),
+            Some(GoalHatchAction::Pause)
+        );
+        // Esc with a non-empty draft is NOT stolen from clearing the buffer.
+        assert_eq!(
+            goal_escape_hatch_action(true, GoalPhase::Pursuing, esc.0, esc.1, false),
+            None
+        );
+
+        // The regression: goal Satisfied (achieved) but still Some until
+        // `/goal clear` — Ctrl+C must fall through so exit can arm.
+        for phase in [
+            GoalPhase::Satisfied,
+            GoalPhase::Paused,
+            GoalPhase::PausedAtCap,
+            GoalPhase::Ended,
+        ] {
+            assert_eq!(
+                goal_escape_hatch_action(true, phase, ctrl_c.0, ctrl_c.1, true),
+                None,
+                "Ctrl+C must not be trapped in {phase:?}"
+            );
+        }
+        // No goal at all → never traps.
+        assert_eq!(
+            goal_escape_hatch_action(false, GoalPhase::Pursuing, ctrl_c.0, ctrl_c.1, true),
+            None
+        );
+    }
 
     #[test]
     fn main_composer_reserves_plain_tab_for_completion() {
@@ -6774,31 +6910,47 @@ mod menu_tests {
     }
 
     #[test]
-    fn effort_applicable_ignores_provider_type_and_matches_webui() {
-        // Any endpoint with an explicitly configured effort is applicable — the
-        // TUI must no longer hide the control behind a `{deepseek, openai}`
-        // provider_type gate the webui/wire never applied.
-        assert!(effort_applicable(
-            Some("medium"),
-            "internal-anthropic",
-            "claude-x"
-        ));
-        assert!(effort_applicable(Some("high"), "internal-ollama", "qwen"));
-        // Unconfigured custom endpoint → not applicable.
-        assert!(!effort_applicable(None, "internal-glm", "glm-5.2"));
-        // Built-in CodingPlan DeepSeek V4 Flash → applicable without a config value
-        // (matches `models_from_config`); a codingplan name with another model is not.
-        assert!(effort_applicable(
+    fn effort_menu_respects_configured_levels_and_includes_xhigh() {
+        let reg = CommandRegistry::builtin();
+        let custom = CustomCommandRegistry::empty();
+        // Endpoint exposing only low/medium/xhigh (the AtomGit Qwen case): the
+        // dropdown lists exactly those (+ default), never high/max.
+        let items = build_menu_items_with_efforts(
+            "/effort ",
+            0,
+            &reg,
+            &custom,
             None,
-            "AtomGit-deepseek-v4-flash",
-            "deepseek-v4-flash"
-        ));
-        assert!(!effort_applicable(
             None,
-            "AtomGit-deepseek-v4-flash",
-            "glm-5.2"
-        ));
+            Some(&["low", "medium", "xhigh"]),
+        )
+        .expect("effort dropdown");
+        let names: Vec<&str> = items.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"low") && names.contains(&"medium") && names.contains(&"xhigh"));
+        assert!(!names.contains(&"high") && !names.contains(&"max"), "got: {names:?}");
+        assert!(names.contains(&"default"), "default is always offered");
+        // `None` ⇒ full canonical set, now including xhigh.
+        let all = build_menu_items_with_efforts("/effort ", 0, &reg, &custom, None, None, None)
+            .expect("canonical dropdown");
+        let all_names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
+        for lvl in ["low", "medium", "high", "xhigh", "max"] {
+            assert!(all_names.contains(&lvl), "canonical must include {lvl}: {all_names:?}");
+        }
+        // Prefix narrowing still works against the configured set.
+        let x = build_menu_items_with_efforts(
+            "/effort x",
+            0,
+            &reg,
+            &custom,
+            None,
+            None,
+            Some(&["low", "xhigh"]),
+        )
+        .expect("`x` matches xhigh");
+        assert_eq!(x.len(), 1);
+        assert_eq!(x[0].0, "xhigh");
     }
+
 
     #[test]
     fn no_skill_registry_is_no_op() {
@@ -7725,6 +7877,48 @@ mod menu_tests {
     }
 
     #[test]
+    fn mode_setter_mode_identifies_toggle_commands() {
+        use crate::state::AgentMode;
+        assert!(matches!(
+            super::mode_setter_mode("plan"),
+            Some(AgentMode::Plan)
+        ));
+        assert!(matches!(
+            super::mode_setter_mode("build"),
+            Some(AgentMode::Build)
+        ));
+        assert!(matches!(
+            super::mode_setter_mode("auto"),
+            Some(AgentMode::Auto)
+        ));
+        assert!(super::mode_setter_mode("goal").is_none());
+        assert!(super::mode_setter_mode("plans").is_none());
+    }
+
+    #[test]
+    fn mode_setter_forwards_residual_only_when_present() {
+        use crate::state::AgentMode;
+        // Residual text or an [Image #N] marker → forward after switching mode.
+        assert!(matches!(
+            super::mode_setter_residual_message("plan", "分析趋势"),
+            Some(AgentMode::Plan)
+        ));
+        assert!(matches!(
+            super::mode_setter_residual_message("plan", "[Image #1]"),
+            Some(AgentMode::Plan)
+        ));
+        assert!(matches!(
+            super::mode_setter_residual_message("build", "fix"),
+            Some(AgentMode::Build)
+        ));
+        // Bare toggle → no forward.
+        assert!(super::mode_setter_residual_message("plan", "").is_none());
+        assert!(super::mode_setter_residual_message("plan", "   ").is_none());
+        // Non-mode-setter never forwards.
+        assert!(super::mode_setter_residual_message("goal", "x").is_none());
+    }
+
+    #[test]
     fn project_history_hydrates_legacy_image_cache_without_copying_it() {
         use crate::input::history::{History, HistoryImageRef};
         use crate::platform::ProjectHistoryPaths;
@@ -8001,13 +8195,10 @@ mod tool_format_tests {
     /// middle-dot separators instead.
     #[test]
     fn display_tool_name_splits_mcp_server_and_tool() {
-        assert_eq!(
-            display_tool_name("mcp__zouwu__query"),
-            "mcp · zouwu · query"
-        );
+        assert_eq!(display_tool_name("mcp__zouwu__query"), "zouwu · query");
         assert_eq!(
             display_tool_name("mcp__zouwu-mcp-server__query_requirements"),
-            "mcp · zouwu-mcp-server · query_requirements"
+            "zouwu-mcp-server · query_requirements"
         );
     }
 
@@ -8051,13 +8242,10 @@ mod tool_format_tests {
     /// `mcp · fs · read`.
     #[test]
     fn display_tool_name_short_keeps_mcp_suffix() {
-        assert_eq!(
-            display_tool_name_short("mcp__fs__read_file"),
-            "mcp · fs · read_file"
-        );
+        assert_eq!(display_tool_name_short("mcp__fs__read_file"), "fs · read_file");
         assert_eq!(
             display_tool_name_short("mcp__playwright-mcp-server__browser_snapshot"),
-            "mcp · playwright-mcp-server · browser_snapshot"
+            "playwright-mcp-server · browser_snapshot"
         );
     }
 
@@ -8065,6 +8253,20 @@ mod tool_format_tests {
     fn format_tool_detail_read_file_basename() {
         let args = r#"{"file_path":"/abs/path/to/foo.rs"}"#;
         assert_eq!(format_tool_detail("read_file", args), "foo.rs");
+    }
+
+    #[test]
+    fn format_tool_detail_external_subagent_shows_prompt_first_line() {
+        let args = r#"{"prompt":"Dead-code audit of the workspace\nfull details follow"}"#;
+        assert_eq!(
+            format_tool_detail("subagent_codex", args),
+            "Dead-code audit of the workspace"
+        );
+        // Skips leading blank lines; truncates long first lines.
+        let long = format!("{{\"prompt\":\"\\n\\n{}\"}}", "x".repeat(200));
+        let detail = format_tool_detail("subagent_claude_review", &long);
+        assert!(detail.starts_with('x') && detail.ends_with('…'));
+        assert!(detail.chars().count() <= 101);
     }
 
     #[test]
@@ -8123,6 +8325,32 @@ mod tool_format_tests {
     fn format_tool_detail_invalid_json_returns_empty() {
         let out = format_tool_detail("read_file", "not json");
         assert_eq!(out, "");
+    }
+
+    #[test]
+    fn format_tool_detail_mcp_string_arg_is_unescaped_and_truncated() {
+        // A JSON string value must NOT be quote-escaped (no `\"` leak) and long
+        // values truncate rather than flooding the row.
+        let args = r#"{"regex":"Create pull request|Open a pull request"}"#;
+        let out = format_tool_detail("mcp__playwright__browser_find", args);
+        assert_eq!(out, "regex: Create pull request|Open a pull request");
+        assert!(!out.contains("\\\""), "must not escape quotes: {out}");
+
+        let long = format!(r#"{{"code":"{}"}}"#, "x".repeat(300));
+        let out = format_tool_detail("mcp__playwright__browser_run_code_unsafe", &long);
+        assert!(out.starts_with("code: "));
+        assert!(out.chars().count() < 100, "long code must truncate: {out}");
+        assert!(out.contains('…'));
+    }
+
+    #[test]
+    fn format_tool_detail_mcp_nested_args_collapse_to_counts() {
+        // Arrays/objects summarize to `[N items]` / `{N keys}` (no JSON dump).
+        let args = r#"{"fields":[{"name":"a"},{"name":"b"}],"opts":{"x":1,"y":2,"z":3}}"#;
+        let out = format_tool_detail("mcp__playwright__browser_fill_form", args);
+        assert!(out.contains("fields: [2 items]"), "{out}");
+        assert!(out.contains("opts: {3 keys}"), "{out}");
+        assert!(!out.contains('\\'), "no escaped JSON dump: {out}");
     }
 
     #[test]
@@ -8422,6 +8650,19 @@ mod tool_format_tests {
     #[test]
     fn summarise_single_line_returned_as_is() {
         assert_eq!(summarise("ok"), "ok");
+    }
+
+    #[test]
+    fn summarise_mcp_result_strips_markdown_heading() {
+        // MCP markdown result: `### Result` → `Result (N lines)`.
+        assert_eq!(
+            summarise_mcp_result("### Result\na\nb"),
+            "Result (3 lines)"
+        );
+        assert_eq!(summarise_mcp_result("### Error\nboom"), "Error (2 lines)");
+        // A `#` with no following space (shell shebang / comment) is untouched.
+        assert_eq!(summarise_mcp_result("#!/bin/sh"), "#!/bin/sh");
+        assert_eq!(summarise_mcp_result("#nospace"), "#nospace");
     }
 
     #[test]
@@ -12523,8 +12764,14 @@ fn handle_transcript_pointer(
                             let (start, end) =
                                 pointer_select::word_bounds(&run.text, endpoint.byte);
                             (
-                                SemanticEndpoint { run_id: endpoint.run_id, byte: start },
-                                SemanticEndpoint { run_id: endpoint.run_id, byte: end },
+                                SemanticEndpoint {
+                                    run_id: endpoint.run_id,
+                                    byte: start,
+                                },
+                                SemanticEndpoint {
+                                    run_id: endpoint.run_id,
+                                    byte: end,
+                                },
                             )
                         }
                         None => (endpoint, endpoint),
@@ -12532,7 +12779,10 @@ fn handle_transcript_pointer(
                 } else {
                     match pointer_select::line_run_span(&frame.copy_runs, endpoint.run_id) {
                         Some((first, last)) => (
-                            SemanticEndpoint { run_id: frame.copy_runs[first].id, byte: 0 },
+                            SemanticEndpoint {
+                                run_id: frame.copy_runs[first].id,
+                                byte: 0,
+                            },
                             SemanticEndpoint {
                                 run_id: frame.copy_runs[last].id,
                                 byte: frame.copy_runs[last].text.len(),
@@ -13521,6 +13771,11 @@ fn handle_input(
                 }
                 let streaming = matches!(app.state.phase, UiPhase::Streaming);
                 if let Some(modal) = app.active_modal.as_mut() {
+                    // Normalize ^H/^? backspace-delete aliases once at the modal
+                    // boundary so every modal's text fields behave the same as the
+                    // main composer on terminals that emit them (see normalize_edit_key).
+                    let (code, modifiers) =
+                        crate::input::key_action::normalize_edit_key(code, modifiers);
                     let action = modal.handle_key(
                         code,
                         modifiers,
@@ -13569,6 +13824,9 @@ fn handle_input(
             }
             if matches!(app.state.phase, UiPhase::Idle) {
                 if let Some(modal) = app.active_modal.as_mut() {
+                    // See the sibling dispatch above: normalize ^H/^? at the boundary.
+                    let (code, modifiers) =
+                        crate::input::key_action::normalize_edit_key(code, modifiers);
                     let action = modal.handle_key(
                         code,
                         modifiers,
@@ -13814,7 +14072,10 @@ mod tests {
         let (ev, trailing) = super::coalesce_drag_events(pointer_ev(PointerKind::Down), &mut rx);
         assert!(matches!(ev, crate::input::InputEvent::Pointer(p) if p.kind == PointerKind::Down));
         assert!(trailing.is_none());
-        assert!(rx.try_recv().is_ok(), "a non-drag input must not drain the queue");
+        assert!(
+            rx.try_recv().is_ok(),
+            "a non-drag input must not drain the queue"
+        );
     }
 
     fn pointer_interaction() -> InteractionFrame {
@@ -14097,7 +14358,11 @@ mod tests {
         let publisher = crate::render::interaction::InteractionPublisher::default();
         // run 1 soft-wraps into run 2 (copy_run sets next_run_id = Some(2)):
         // together they are one logical line "foo bar" (no newline between).
-        let frame = transcript_frame(1, 5, vec![copy_run(1, "foo ", true), copy_run(2, "bar", false)]);
+        let frame = transcript_frame(
+            1,
+            5,
+            vec![copy_run(1, "foo ", true), copy_run(2, "bar", false)],
+        );
         let mut selection = None;
         let route = super::handle_transcript_pointer(
             &mut selection,
@@ -15189,6 +15454,9 @@ fn build_skill_menu_items(
 /// start with '/' or has whitespace, meaning the user has moved on to args).
 /// Custom commands are appended after built-in matches; duplicates (custom
 /// command with the same name as a built-in) are suppressed.
+/// Thin wrapper preserving the historic 6-arg signature: `None` effort levels ⇒
+/// the `/effort ` dropdown falls back to all canonical levels (unchanged for every
+/// existing caller/test). Endpoint-aware callers use [`build_menu_items_with_efforts`].
 fn build_menu_items(
     buf: &str,
     cursor: usize,
@@ -15196,6 +15464,22 @@ fn build_menu_items(
     custom: &crate::custom_commands::CustomCommandRegistry,
     skill_registry: Option<&std::sync::RwLock<atomcode_capabilities::skills::SkillRegistry>>,
     file_index: Option<&file_index::FileIndex>,
+) -> Option<Vec<(String, String)>> {
+    build_menu_items_with_efforts(buf, cursor, commands, custom, skill_registry, file_index, None)
+}
+
+/// Like [`build_menu_items`], but the `/effort ` dropdown lists exactly
+/// `effort_levels` (the current selection's `reasoning_effort_levels`, canonical
+/// order) instead of the hardcoded four — so the dropdown, the Ctrl+T cycle, and
+/// `/effort <x>` validation all offer the same set. `None` ⇒ every canonical level.
+fn build_menu_items_with_efforts(
+    buf: &str,
+    cursor: usize,
+    commands: &CommandRegistry,
+    custom: &crate::custom_commands::CustomCommandRegistry,
+    skill_registry: Option<&std::sync::RwLock<atomcode_capabilities::skills::SkillRegistry>>,
+    file_index: Option<&file_index::FileIndex>,
+    effort_levels: Option<&[&'static str]>,
 ) -> Option<Vec<(String, String)>> {
     // `@`-mention branch — checked first so it takes priority over any
     // `/` interpretation.
@@ -15273,17 +15557,30 @@ fn build_menu_items(
             return None;
         }
         let prefix = after.to_ascii_lowercase();
-        let items: Vec<(String, String)> = [
+        // Descriptions for every canonical level; the dropdown shows only those in
+        // `allowed` (the selection's exposed levels) so it never offers a level the
+        // endpoint rejects. `None` ⇒ all canonical levels (unchanged behavior).
+        const DESCRIPTIONS: &[(&str, &str)] = &[
             ("low", "Minimal reasoning effort"),
             ("medium", "Moderate reasoning effort"),
             ("high", "Deeper reasoning"),
+            ("xhigh", "Extra-high reasoning effort"),
             ("max", "Maximum reasoning depth"),
-            ("default", "Return to the API default (keeps capability)"),
-        ]
-        .into_iter()
-        .filter(|(n, _)| n.starts_with(prefix.as_str()))
-        .map(|(n, d)| (n.to_string(), d.to_string()))
-        .collect();
+        ];
+        let allowed: &[&str] =
+            effort_levels.unwrap_or(&atomcode_config::config::REASONING_EFFORT_LEVELS);
+        let mut items: Vec<(String, String)> = DESCRIPTIONS
+            .iter()
+            .filter(|(n, _)| allowed.contains(n) && n.starts_with(prefix.as_str()))
+            .map(|(n, d)| (n.to_string(), d.to_string()))
+            .collect();
+        // `default` (return to the API default) is always offered — it is not a level.
+        if "default".starts_with(prefix.as_str()) {
+            items.push((
+                "default".to_string(),
+                "Return to the API default (keeps capability)".to_string(),
+            ));
+        }
         return if items.is_empty() { None } else { Some(items) };
     }
 
@@ -15328,13 +15625,17 @@ fn menu_for_display(buf: &Buffer, ctx: &LoopCtx) -> Option<Vec<(String, String)>
     if buf.is_in_history() || buf.menu_suppressed() {
         return None;
     }
-    build_menu_items(
+    // The steady-state display funnel: make the `/effort ` dropdown reflect exactly
+    // the current selection's exposed levels.
+    let efforts = selection_allowed_efforts(ctx);
+    build_menu_items_with_efforts(
         &buf.text,
         buf.cursor,
         &ctx.commands,
         &ctx.custom_commands,
         Some(&ctx.skill_registry),
         Some(&ctx.file_index),
+        Some(efforts.as_slice()),
     )
 }
 
@@ -15358,6 +15659,18 @@ fn menu_handles_selection_key(
     matches!(code, KeyCode::Enter | KeyCode::Tab)
         && !modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
         && (code != KeyCode::Enter || idle_menu_confirmation_allowed(commit_gate_pending))
+}
+
+/// Keys that accept the next-prompt ghost suggestion when the composer is empty:
+/// Right-arrow (`CursorRight`) or a bare `Tab`, both without modifiers. Shift+Tab
+/// is excluded so it keeps cycling input modes; the caller still gates on an empty
+/// buffer, so a bare Tab is otherwise inert here (no menu/mode owns it).
+fn accepts_next_prompt_suggestion(
+    action: Action,
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> bool {
+    modifiers.is_empty() && (action == Action::CursorRight || code == KeyCode::Tab)
 }
 
 fn idle_menu_confirmation_allowed(commit_gate_pending: bool) -> bool {
@@ -15434,13 +15747,15 @@ fn confirm_idle_menu_selected(
     if needs_args {
         app.buf.replace_all_text(format!("/{name} "));
         if matches!(name.as_str(), "skills" | "effort") {
-            if let Some(next_items) = build_menu_items(
+            let efforts = selection_allowed_efforts(ctx);
+            if let Some(next_items) = build_menu_items_with_efforts(
                 &app.buf.text,
                 app.buf.cursor,
                 &ctx.commands,
                 &ctx.custom_commands,
                 Some(&ctx.skill_registry),
                 Some(&ctx.file_index),
+                Some(efforts.as_slice()),
             ) {
                 redraw_with_menu(&app.buf, &next_items, 0, &app.state, ctx, renderer);
                 return Ok(());
@@ -15489,6 +15804,43 @@ fn confirm_idle_menu_selected(
     Ok(())
 }
 
+/// What the idle goal escape hatch does with an intercepted key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoalHatchAction {
+    /// Ctrl+C → cancel the active turn / server-side goal loop.
+    Cancel,
+    /// Bare Esc → pause the goal at its current round.
+    Pause,
+}
+
+/// Decide whether the IDLE goal escape hatch intercepts this key. It fires ONLY
+/// while the goal is actively [`GoalPhase::Pursuing`](atomcode_coding::GoalPhase)
+/// — the one state with a server-side loop to interrupt. After the goal is
+/// Satisfied / Paused / PausedAtCap / Ended, `goal_condition` stays `Some` until
+/// `/goal clear`, but there is nothing to cancel, so the key (notably Ctrl+C)
+/// must fall through to normal handling (exit arming) instead of being trapped
+/// in a no-op cancel. Returns `None` when the hatch does not apply.
+fn goal_escape_hatch_action(
+    goal_condition_some: bool,
+    goal_phase: atomcode_coding::GoalPhase,
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+    buffer_empty: bool,
+) -> Option<GoalHatchAction> {
+    if !goal_condition_some || goal_phase != atomcode_coding::GoalPhase::Pursuing {
+        return None;
+    }
+    let is_ctrl_c =
+        code == KeyCode::Char('c') && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+    if is_ctrl_c {
+        Some(GoalHatchAction::Cancel)
+    } else if code == KeyCode::Esc && buffer_empty {
+        Some(GoalHatchAction::Pause)
+    } else {
+        None
+    }
+}
+
 fn handle_idle_key(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -15533,31 +15885,35 @@ fn handle_idle_key(
     // from clearing a draft) pauses the goal and cancels only its current round.
     // The runtime owns both transitions so pending requests, snapshots, and the
     // next-submit resume stay synchronized.
-    if app.state.goal_condition.is_some() {
-        let is_ctrl_c = code == KeyCode::Char('c')
-            && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
-        let is_bare_esc = code == KeyCode::Esc && app.buf.text.is_empty();
-        let should_pause =
-            is_bare_esc && app.state.goal_phase == atomcode_coding::GoalPhase::Pursuing;
-        if is_ctrl_c || should_pause {
-            let has_active_turn = ctx.runtime.has_active_turn();
-            let sent = if is_ctrl_c {
-                cancel_active_turn(ctx)
-            } else {
-                pause_active_goal(ctx)
-            };
-            if should_arm_interrupt_wait(sent, has_active_turn) {
-                app.interrupt_drain_pending = true;
-            }
-            clear_capturing_modal_on_cancel(app);
-            crate::tuix_trace!(
-                "KEY",
-                "idle goal-active {} -> {}",
-                if is_ctrl_c { "Ctrl+C" } else { "Esc" },
-                if is_ctrl_c { "Cancel" } else { "PauseGoal" }
-            );
-            return Ok(());
+    // GOAL ESCAPE HATCH (Idle) — only while the goal is actively Pursuing. See
+    // `goal_escape_hatch_action`: an achieved/paused/ended-but-uncleared goal
+    // (goal_condition still Some) must NOT trap Ctrl+C, or the user can never arm
+    // exit.
+    if let Some(action) = goal_escape_hatch_action(
+        app.state.goal_condition.is_some(),
+        app.state.goal_phase,
+        code,
+        modifiers,
+        app.buf.text.is_empty(),
+    ) {
+        let is_cancel = action == GoalHatchAction::Cancel;
+        let has_active_turn = ctx.runtime.has_active_turn();
+        let sent = if is_cancel {
+            cancel_active_turn(ctx)
+        } else {
+            pause_active_goal(ctx)
+        };
+        if should_arm_interrupt_wait(sent, has_active_turn) {
+            app.interrupt_drain_pending = true;
         }
+        clear_capturing_modal_on_cancel(app);
+        crate::tuix_trace!(
+            "KEY",
+            "idle goal-active {} -> {}",
+            if is_cancel { "Ctrl+C" } else { "Esc" },
+            if is_cancel { "Cancel" } else { "PauseGoal" }
+        );
+        return Ok(());
     }
     // If the menu is active (buf starts with '/'), intercept navigation keys.
     // Suppress while scrolling history / right after a restore (see
@@ -15769,13 +16125,15 @@ fn handle_idle_key(
                     // `/effort` gateway: render the high/max/off sub-menu
                     // immediately so it doesn't blink out and reappear.
                     if name == "effort" {
-                        if let Some(items) = build_menu_items(
+                        let efforts = selection_allowed_efforts(ctx);
+                        if let Some(items) = build_menu_items_with_efforts(
                             &app.buf.text,
                             app.buf.cursor,
                             &ctx.commands,
                             &ctx.custom_commands,
                             Some(&ctx.skill_registry),
                             Some(&ctx.file_index),
+                            Some(efforts.as_slice()),
                         ) {
                             app.menu.selected = 0;
                             redraw_with_menu(&app.buf, &items, 0, &app.state, ctx, renderer);
@@ -16100,7 +16458,7 @@ fn handle_idle_key(
 
     let action = classify(code, modifiers);
 
-    if action == Action::CursorRight && modifiers.is_empty() && app.buf.text.is_empty() {
+    if accepts_next_prompt_suggestion(action, code, modifiers) && app.buf.text.is_empty() {
         if let Some(suggestion) = app.state.next_prompt_suggestion.clone() {
             if app.buf.accept_next_prompt_suggestion(&suggestion) {
                 app.state.next_prompt_suggestion = None;
@@ -16161,7 +16519,7 @@ fn handle_idle_key(
                 redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
             }
         }
-        BufferResult::Commit(line) => {
+        BufferResult::Commit(mut line) => {
             if provider_transition_pending(ctx) && !provider_transition_allows_idle_commit(&line) {
                 renderer.render(UiLine::Error(
                     crate::i18n::t(crate::i18n::Msg::CmdProviderReloading).into_owned(),
@@ -16256,6 +16614,20 @@ fn handle_idle_key(
                 }
                 // Not a known skill: fall through so `$foo` is sent as a
                 // normal message (e.g. "$5 budget" keeps working).
+            }
+            // A mode-setter slash (`/plan`/`/build`/`/auto`) carrying trailing
+            // content: switch mode NOW, then rewrite `line` to the residual so it
+            // flows through the normal message path below — with its pending
+            // images and full VL/echo/queue machinery — instead of the toggle
+            // swallowing the image+text. A bare `/plan` (no residual) is left
+            // untouched and falls through to the plain toggle in the slash arm.
+            if let Some((mode, residual)) = parse_slash_line(&line).and_then(|(cmd, arg)| {
+                mode_setter_residual_message(cmd, arg)
+                    .filter(|_| ctx.commands.find(cmd).is_some())
+                    .map(|mode| (mode, arg.to_string()))
+            }) {
+                set_agent_mode(app, ctx, renderer, mode);
+                line = residual;
             }
             // Only treat `/name …` as a slash command when `name` is
             // actually registered. Unrecognised `/foo …` (e.g. the user
@@ -16512,6 +16884,14 @@ fn handle_idle_key(
                             // has entered the first condition. The first TUI
                             // text submit is therefore the Goal condition.
                             app.state.goal_armed = false;
+                            // This branch already drained `pending_images` into
+                            // the local `images`; restore the marker-matched ones
+                            // so the /goal arm re-attaches them to the objective
+                            // turn — parity with a direct `/goal <cond> [Image #N]`
+                            // (the block returns below, so `images`/`kept_markers`
+                            // are unused past here on this path).
+                            app.state.pending_images = images;
+                            app.state.pending_image_markers = kept_markers;
                             execute_slash_command(
                                 "goal",
                                 &expanded,
@@ -22414,6 +22794,14 @@ fn project_kernel_event(
             snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
         }),
         Kernel::Warning(message) => Some(AgentEvent::Warning(message)),
+        Kernel::ProviderRetry {
+            attempt,
+            max_attempts,
+            backoff_secs,
+            reason,
+        } => Some(AgentEvent::Warning(format!(
+            "API error {reason}，{backoff_secs} 秒后重试({attempt}/{max_attempts})..."
+        ))),
         Kernel::StreamRecovery {
             attempt,
             max_attempts,
@@ -22422,6 +22810,13 @@ fn project_kernel_event(
             attempt,
             max_attempts,
             recovered,
+        }),
+        Kernel::OutputTruncationRecovery {
+            attempt,
+            max_attempts,
+        } => Some(AgentEvent::OutputTruncationRecovery {
+            attempt,
+            max_attempts,
         }),
         Kernel::RateLimited {
             reset_at_display,
@@ -22978,6 +23373,28 @@ fn handle_runtime_event(
                         }
                         state.round_cap_panel =
                             Some(crate::state::RoundCapPanel::new(request.id, cap, base));
+                        state.phase = UiPhase::RoundCap;
+                        redraw_idle_plain(buf, state, ctx, renderer);
+                        return;
+                    }
+                    if request.kind == atomcode_kernel::OUTPUT_TRUNCATION_CHECKPOINT_KIND {
+                        let attempts = request
+                            .payload
+                            .get("attempts")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0) as u32;
+                        let max_attempts = request
+                            .payload
+                            .get("max_attempts")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(attempts as u64)
+                            as u32;
+                        state.round_cap_panel =
+                            Some(crate::state::RoundCapPanel::output_truncation(
+                                request.id,
+                                attempts,
+                                max_attempts,
+                            ));
                         state.phase = UiPhase::RoundCap;
                         redraw_idle_plain(buf, state, ctx, renderer);
                         return;
@@ -24700,6 +25117,12 @@ fn persist_native_compaction_snapshot(
     persist_current_session(ctx, snapshot.clone(), renderer)
 }
 
+/// A manual `/compact` that saves fewer than this many estimated tokens is
+/// treated as a near-no-op: it gets an honest "nothing worth compacting"
+/// acknowledgement instead of a "已折叠 · 节省 ~N tok" success mark. A meaningful
+/// fold (e.g. a single 16KB tool result ≈ 4K tokens) clears this floor easily.
+const COMPACT_NEGLIGIBLE_SAVED_TOKENS: usize = 500;
+
 fn handle_coding_runtime_event(
     event: CodingRuntimeEvent,
     state: &mut UiState,
@@ -24719,30 +25142,52 @@ fn handle_coding_runtime_event(
             }
         }
         CodingRuntimeEvent::CompactionFinished { completion } => {
-            let compaction_was_announced = state.compacting;
             state.compacting = false;
             match completion {
                 CompactionCompletion::Completed(outcome) if outcome.committed => {
                     state.on_compaction_committed(outcome.estimated_tokens_after);
-                    // Match OpenCode/Codex: cheap, automatic pruning of stale
-                    // tool output is invisible transcript maintenance. Keep the
-                    // context gauge authoritative, but do not append a body row
-                    // or flush while the foreground turn is preparing its next
-                    // model request. Slow drain/summarize compaction announces
-                    // itself before running and remains visible even when replacing
-                    // one message with one summary produces zero net removals.
-                    // Manual and overflow paths retain their existing feedback.
-                    let silent_tool_fold = matches!(&outcome.trigger, CompactTrigger::Auto { .. })
-                        && !compaction_was_announced;
+                    // Match OpenCode/Codex: ALL automatic compaction — cheap stub
+                    // folds AND slow drain/summarize — is invisible transcript
+                    // maintenance. Keep the context gauge authoritative, but never
+                    // append a body row: a "saved ~N tok" mark is noise and misreads
+                    // as "wasting tokens" when it is in fact SAVING context. Only
+                    // MANUAL and OVERFLOW compactions keep their feedback (separate
+                    // arms below).
+                    let silent_tool_fold = matches!(&outcome.trigger, CompactTrigger::Auto { .. });
                     if mirror_persisted && !silent_tool_fold {
-                        renderer.render(UiLine::CompactionMark(
-                            atomcode_config::i18n::format_compaction_mark(
-                                outcome.removed_messages,
-                                outcome.estimated_tokens_before,
-                                outcome.estimated_tokens_after,
-                            ),
-                        ));
-                        renderer.flush();
+                        // A MANUAL /compact that committed but only shaved a
+                        // negligible amount (a tiny STUB fold — the user asked to
+                        // compact and there was essentially nothing to fold)
+                        // shouldn't flash a "已折叠 · 节省 ~N tok" success mark; that
+                        // overstates a near-no-op. Show an honest acknowledgement
+                        // instead. OVERFLOW keeps its mark (any emergency shrink is
+                        // real progress). A manual DRAIN (removed_messages > 0)
+                        // ALSO keeps its marker even when the net token delta is
+                        // small — messages/turns were genuinely dropped, so
+                        // `removed_messages == 0` gates this to pure stub folds.
+                        let saved = outcome
+                            .estimated_tokens_before
+                            .saturating_sub(outcome.estimated_tokens_after);
+                        if outcome.is_manual()
+                            && outcome.removed_messages == 0
+                            && saved < COMPACT_NEGLIGIBLE_SAVED_TOKENS
+                        {
+                            render_assistant_text(
+                                atomcode_config::i18n::format_compaction_negligible(),
+                                state,
+                                think,
+                                renderer,
+                            );
+                        } else {
+                            renderer.render(UiLine::CompactionMark(
+                                atomcode_config::i18n::format_compaction_mark(
+                                    outcome.removed_messages,
+                                    outcome.estimated_tokens_before,
+                                    outcome.estimated_tokens_after,
+                                ),
+                            ));
+                            renderer.flush();
+                        }
                     }
                 }
                 CompactionCompletion::Completed(outcome) if outcome.is_manual() => {
@@ -24913,6 +25358,118 @@ mod coding_runtime_event_tests {
     }
 
     #[test]
+    fn manual_compaction_with_negligible_savings_shows_honest_line_not_success_mark() {
+        // A manual /compact that only shaved ~40 tok (a tiny stub fold, nothing
+        // worth folding) must NOT flash the "已折叠 · 节省 ~N tok" success mark —
+        // it renders an honest "nothing worth compacting" acknowledgement.
+        let mut state = UiState::default();
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        let tiny = CompactionOutcome {
+            trigger: CompactTrigger::Manual { focus: None },
+            epoch: 1,
+            removed_messages: 0,
+            bytes_before: 41_000,
+            bytes_after: 40_840,
+            committed: true,
+            estimated_tokens_before: 10_000,
+            estimated_tokens_after: 9_960, // saved 40 < COMPACT_NEGLIGIBLE_SAVED_TOKENS
+            committed_snapshot: None,
+        };
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(tiny),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+        }
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("无需压缩") || text.contains("doesn't need compacting"),
+            "clean no-op wording: {text:?}"
+        );
+        assert!(
+            !text.contains("已折叠") && !text.contains("folded"),
+            "must not show the stub-fold success mark: {text:?}"
+        );
+    }
+
+    #[test]
+    fn manual_drain_with_small_token_delta_still_keeps_the_marker() {
+        // A manual /compact that DRAINED messages (removed_messages > 0) but whose
+        // summary nearly matched the drained span (tiny net token savings) must
+        // still show its marker — messages were genuinely dropped, so it is NOT a
+        // no-op. The negligible-savings guard is gated to `removed_messages == 0`.
+        let mut state = UiState::default();
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        let drained = CompactionOutcome {
+            trigger: CompactTrigger::Manual { focus: None },
+            epoch: 1,
+            removed_messages: 4,
+            bytes_before: 41_000,
+            bytes_after: 40_840,
+            committed: true,
+            estimated_tokens_before: 10_000,
+            estimated_tokens_after: 9_960, // saved 40 < floor, but a real drain
+            committed_snapshot: None,
+        };
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(drained),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+        }
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            !text.contains("无需压缩") && !text.contains("doesn't need compacting"),
+            "a drain must not be downgraded to a no-op line: {text:?}"
+        );
+        assert!(!output.is_empty(), "a marker is rendered");
+    }
+
+    #[test]
+    fn manual_compaction_with_meaningful_savings_keeps_the_marker() {
+        // A manual /compact that folds a real chunk (saved 7.5K) still gets its
+        // "已压缩 · …" marker — the negligible-savings guard must not swallow it.
+        let mut state = UiState::default();
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(outcome(
+                        CompactTrigger::Manual { focus: None },
+                        true,
+                    )),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+        }
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            !text.contains("无需压缩") && !text.contains("doesn't need compacting"),
+            "meaningful compaction must not be downgraded to a no-op line: {text:?}"
+        );
+        assert!(!output.is_empty(), "a marker is rendered");
+    }
+
+    #[test]
     fn interrupted_manual_compaction_clears_spinner_and_restores_idle() {
         let mut state = UiState::default();
         let mut think = ThinkStripper::default();
@@ -25013,7 +25570,7 @@ mod coding_runtime_event_tests {
     }
 
     #[test]
-    fn announced_automatic_summary_with_zero_net_removals_remains_visible() {
+    fn announced_automatic_summary_is_silent() {
         let mut state = UiState::default();
         state.phase = UiPhase::Streaming;
         let mut think = ThinkStripper::default();
@@ -25045,8 +25602,9 @@ mod coding_runtime_event_tests {
         assert!(!state.compacting);
         assert!(matches!(state.phase, UiPhase::Streaming));
         assert!(
-            !output.is_empty(),
-            "an announced automatic summary must render its completion marker"
+            output.is_empty(),
+            "automatic compaction is silent transcript maintenance — no completion marker (got: {})",
+            String::from_utf8_lossy(&output)
         );
     }
 
@@ -25628,7 +26186,10 @@ fn handle_agent_event(
                 renderer.render(UiLine::ToolGroupChildUpdate {
                     batch_id,
                     call_id: call_id.clone(),
-                    new_text: format!("  {} {}{}", child_glyph, prefix, suffix),
+                    // `└ • Tool … → result`: the `•` status dot is coloured by
+                    // outcome in the renderer; `└` stays the muted connector.
+                    new_text: format!("  {} \u{2022} {}{}", child_glyph, prefix, suffix),
+                    outcome: Some(tool_bullet_outcome(success)),
                 });
                 // Batch children normally collapse failures to a compact `✗`.
                 // A local security denial is different: hiding its reason leaves
@@ -25673,8 +26234,12 @@ fn handle_agent_event(
             // it. Pass the call_id so we only freeze if the inflight_tool matches.
             // This prevents freezing a different tool's spinner when multiple
             // tools are in flight (e.g., WriteFile result arrives while Bash spinner is active).
+            // Colours the frozen `●`: only SUCCESS greens it (see
+            // `tool_bullet_style_for`); failures/denials stay neutral, so no
+            // special-casing of denial/plan-block/calm gates is needed.
             renderer.render(UiLine::ToolCallCommit {
                 call_id: Some(call_id.clone()),
+                outcome: Some(tool_bullet_outcome(success)),
             });
 
             // Prefer the display-name we stored at ToolCallStarted time;
@@ -25727,6 +26292,8 @@ fn handle_agent_event(
                 renderer.render(UiLine::ToolCall {
                     name: safe_name.clone(),
                     detail: detail.clone(),
+                    // Result-driven static path — outcome is known; greens on success.
+                    outcome: Some(tool_bullet_outcome(success)),
                 });
             }
             if !suppress_body_echo {
@@ -25760,6 +26327,10 @@ fn handle_agent_event(
                         // Collapse the `{line}\t{indented content}` preview so a
                         // deeply-indented line doesn't render as a big left gap.
                         summarise_read_result(&output)
+                    } else if name.starts_with("mcp__") {
+                        // MCP results are often markdown — strip a leading `###`
+                        // so `### Result` folds to `Result (N lines)`.
+                        summarise_mcp_result(&output)
                     } else {
                         summarise(&output)
                     };
@@ -25894,22 +26465,27 @@ fn handle_agent_event(
                     // ToolCallInFlight is animating — commit it to a static row
                     // so the approval prompt appears below a frozen `▸ Bash(...)`.
                     // Pass the call_id to ensure we only freeze the matching tool.
+                    // No result yet → neutral bullet.
                     renderer.render(UiLine::ToolCallCommit {
                         call_id: Some(call.id.clone()),
+                        outcome: None,
                     });
                 } else {
-                    // Not yet rendered, emit it now
+                    // Not yet rendered, emit it now (approval prompt — no result
+                    // yet, so the bullet stays neutral).
                     renderer.render(UiLine::ToolCall {
                         name: disp.clone(),
                         detail: det.clone(),
+                        outcome: None,
                     });
                     *rendered = true;
                 }
             } else {
-                // No entry from ToolCallStarted, render and insert
+                // No entry from ToolCallStarted, render and insert (pre-result).
                 renderer.render(UiLine::ToolCall {
                     name: display.clone(),
                     detail: detail.clone(),
+                    outcome: None,
                 });
                 pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
             }
@@ -26220,9 +26796,11 @@ fn handle_agent_event(
                     name
                 };
                 if !call_rendered {
+                    // Cancelled tool — not a success, so neutral bullet.
                     renderer.render(UiLine::ToolCall {
                         name: safe_name,
                         detail,
+                        outcome: None,
                     });
                 }
                 renderer.render(UiLine::ToolResult {
@@ -26328,6 +26906,17 @@ fn handle_agent_event(
             }
             // Keep the running state transient in the existing streaming row;
             // only the recovered marker enters scrollback.
+            renderer.flush();
+        }
+        AgentEvent::OutputTruncationRecovery {
+            attempt,
+            max_attempts,
+        } => {
+            state.spinner_label = crate::i18n::t(crate::i18n::Msg::OutputTruncationRunning {
+                attempt,
+                max_attempts,
+            })
+            .into_owned();
             renderer.flush();
         }
         AgentEvent::HookWarningHint(msg) => {
@@ -26676,12 +27265,15 @@ fn handle_agent_event(
                 .zip(final_details.iter())
                 .map(|(c, detail)| crate::render::ToolGroupChild {
                     call_id: c.id.clone(),
+                    // Pending child: `└ • Tool(detail)`. The `•` starts neutral
+                    // and is coloured by ToolGroupChildUpdate when the result lands.
                     text: format!(
-                        "  {} {}({})",
+                        "  {} \u{2022} {}({})",
                         child_glyph,
                         display_tool_name_short(&c.name),
                         detail
                     ),
+                    outcome: None,
                 })
                 .collect();
             renderer.render(UiLine::AssistantLineBreak);
@@ -28111,7 +28703,11 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         approval,
         user_input,
         round_cap_panel: state.round_cap_panel.as_ref().map(|p| {
-            crate::render::round_cap_view(p.cap, p.base, p.cursor, &round_cap_stats(state))
+            if p.output_truncation {
+                crate::render::output_truncation_view(p.cursor)
+            } else {
+                crate::render::round_cap_view(p.cap, p.base, p.cursor, &round_cap_stats(state))
+            }
         }),
     }
 }
@@ -28301,18 +28897,18 @@ fn format_spinner_label(
     queue_len: usize,
     reasoning_effort: Option<&str>,
 ) -> String {
-    // Compaction takes over the spinner: show "Compacting…" (or a slow variant
-    // past the stall threshold) with the phase elapsed appended, instead of a
-    // thinking label. Unified for auto + manual /compact.
+    // Compaction takes over the spinner: show "Compacting…" with a parenthesized
+    // elapsed clock, matching the thinking spinner's shape (`正在压缩 (4s)`).
+    // Unified for auto + manual /compact. NO `↑ N tokens` counter here: the
+    // compaction summary is generated silently inside the kernel and never feeds
+    // `turn_output_chars`, so a count would be a FROZEN leftover from the
+    // pre-compaction generation (misleading, especially for auto-compaction that
+    // fires mid-turn). The ticking clock is the liveness proof. (The "较慢/slow"
+    // stall variant was also dropped — the clock already shows it's alive.)
     if state.compacting {
-        let base = if state.compaction_stalled() {
-            crate::i18n::t(crate::i18n::Msg::CompactingSlow)
-        } else {
-            crate::i18n::t(crate::i18n::Msg::Compacting)
-        };
-        let mut out = base.into_owned();
+        let mut out = crate::i18n::t(crate::i18n::Msg::Compacting).into_owned();
         if let Some(d) = state.phase_elapsed() {
-            out.push_str(&format!(" · {}", fmt_elapsed(d.as_millis() as u64)));
+            out.push_str(&format!(" ({})", fmt_elapsed(d.as_millis() as u64)));
         }
         return out;
     }
@@ -28380,6 +28976,17 @@ fn format_spinner_label(
 /// `ReadFile`, `EditFile`, `WebFetch` — a CC-style convention that reads
 /// more cleanly at a glance.
 ///
+/// Map a tool's success to the `●` header-bullet outcome. Only success is
+/// coloured (green); every failure renders neutral (the `✗` result line carries
+/// the detail), so no failure-class distinction is needed here.
+pub(crate) fn tool_bullet_outcome(success: bool) -> crate::render::ToolOutcome {
+    if success {
+        crate::render::ToolOutcome::Success
+    } else {
+        crate::render::ToolOutcome::Failure
+    }
+}
+
 /// MCP tools arrive on the wire as `mcp__<server>__<tool>`. Naive
 /// PascalCase collapses the three parts into `McpZouwuQueryRequirements`
 /// where the server / tool boundary disappears. Render them with a
@@ -28388,7 +28995,10 @@ fn format_spinner_label(
 pub fn display_tool_name(snake: &str) -> String {
     if let Some(rest) = snake.strip_prefix("mcp__") {
         if let Some((server, tool)) = rest.split_once("__") {
-            return format!("mcp · {} · {}", server, tool);
+            // `<server> · <tool>` — the server name (e.g. `playwright`) already
+            // signals this is an external MCP call, so the literal `mcp ·` prefix
+            // was redundant (opencode/codex/omp all omit it).
+            return format!("{} · {}", server, tool);
         }
     }
     pascal_case(snake)
@@ -28702,35 +29312,60 @@ pub(crate) fn format_tool_detail(name: &str, args_json: &str) -> String {
                 _ => String::new(),
             }
         }
+        name if name.starts_with("subagent_") => {
+            // External-agent subagent (subagent_codex / subagent_claude_code…):
+            // show the first line of the delegated prompt so the row reads
+            // "SubagentCodex(<task>) · Running · …" WHILE the agent runs, instead
+            // of a bare "SubagentCodex" with no hint of what it is doing.
+            get_str("prompt")
+                .map(|p| {
+                    let first = p
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("")
+                        .trim();
+                    crate::width::truncate_with_ellipsis(first, 100)
+                })
+                .unwrap_or_default()
+        }
         _ => {
             // For MCP tools (name starts with mcp__), render the
             // arguments as key=value pairs so users can see what
             // parameters are being passed to the external server.
             if name.starts_with("mcp__") {
                 if let Some(obj) = v.as_object() {
+                    // Compact, readable `key: value` — NOT escaped JSON. A long
+                    // string (e.g. a `code` blob) is truncated per-value; nested
+                    // arrays/objects collapse to a `[N items]` / `{N keys}` summary
+                    // (oh-my-pi style) so a big `fields` payload never floods the
+                    // row. The whole detail is then capped so one MCP call can't
+                    // span several transcript lines.
                     let pairs: Vec<String> = obj
                         .iter()
                         .filter_map(|(k, val)| {
                             let s = match val {
-                                serde_json::Value::String(s) => s.clone(),
+                                serde_json::Value::String(s) if !s.is_empty() => {
+                                    crate::width::truncate_with_ellipsis(s, 80)
+                                }
                                 serde_json::Value::Number(n) => n.to_string(),
                                 serde_json::Value::Bool(b) => b.to_string(),
-                                serde_json::Value::Array(a) => {
-                                    serde_json::to_string(a).unwrap_or_default()
-                                }
-                                serde_json::Value::Object(o) => {
-                                    serde_json::to_string(o).unwrap_or_default()
-                                }
+                                serde_json::Value::Array(a) => match a.len() {
+                                    0 => return None,
+                                    1 => "[1 item]".to_string(),
+                                    n => format!("[{n} items]"),
+                                },
+                                serde_json::Value::Object(o) => match o.len() {
+                                    0 => return None,
+                                    1 => "{1 key}".to_string(),
+                                    n => format!("{{{n} keys}}"),
+                                },
                                 _ => return None,
                             };
-                            if s.is_empty() {
-                                return None;
-                            }
-                            Some(format!("{}: \"{}\"", k, s.replace('"', "\\\"")))
+                            Some(format!("{k}: {s}"))
                         })
                         .collect();
                     if !pairs.is_empty() {
-                        return crate::width::truncate_with_ellipsis(&pairs.join(", "), 450);
+                        return crate::width::truncate_with_ellipsis(&pairs.join(", "), 160);
                     }
                 }
             }
@@ -29099,7 +29734,12 @@ pub(crate) fn build_replay_tool_batch(
             };
             crate::render::ToolGroupChild {
                 call_id: c.id.clone(),
-                text: format!("  {} {}{}", child_glyph, body, suffix),
+                // `└ • Tool … → result` (matches live); the `•` is coloured by the
+                // stored outcome so a resumed batch keeps its green success dots.
+                text: format!("  {} \u{2022} {}{}", child_glyph, body, suffix),
+                outcome: result_of
+                    .get(&c.id)
+                    .map(|(ok, _)| tool_bullet_outcome(*ok)),
             }
         })
         .collect();
@@ -29119,6 +29759,35 @@ pub(crate) fn summarise(output: &str) -> String {
     // `truncate_with_ellipsis` (not bare `truncate_to_width`) so that if
     // the safety bound ever does bite, the cut is visibly marked.
     let trimmed = crate::width::truncate_with_ellipsis(first, 512);
+    if n > 1 {
+        format!("{} ({} lines)", trimmed, n)
+    } else {
+        trimmed
+    }
+}
+
+/// Strip a leading ATX markdown heading marker (`#`..`######` followed by a
+/// space) from a line. MCP servers often return markdown, so a result whose
+/// first line is `### Result` should preview as `Result`, not leak the `###`.
+/// Requires the trailing space so a shell first line like `#!/bin/sh` or
+/// `#comment` (no space after `#`) is left untouched.
+fn strip_atx_heading(line: &str) -> &str {
+    let hashes = line.len() - line.trim_start_matches('#').len();
+    let rest = &line[hashes..];
+    if (1..=6).contains(&hashes) && rest.starts_with(' ') {
+        rest.trim_start()
+    } else {
+        line
+    }
+}
+
+/// Like [`summarise`], but for MCP tool results: the folded preview's first line
+/// has any leading markdown heading stripped (see [`strip_atx_heading`]) so a
+/// server returning `### Result\n…` folds to `Result (N lines)`.
+pub(crate) fn summarise_mcp_result(output: &str) -> String {
+    let first = output.lines().next().unwrap_or("(no output)");
+    let n = output.lines().count();
+    let trimmed = crate::width::truncate_with_ellipsis(strip_atx_heading(first), 512);
     if n > 1 {
         format!("{} ({} lines)", trimmed, n)
     } else {
@@ -29174,11 +29843,52 @@ fn split_head_by_width(s: &str, max: usize) -> (&str, &str) {
     (s, "")
 }
 
-/// 把一条 shell 命令软折成多行,按续行边界优先断行,续行缩进 4 空格。
-/// 优先在空格处断;当**单个 token 本身就比可用宽度还宽**(窄窗口下的长路径/长 URL)、
-/// 空格断不开时,退化为按显示宽度**字符级折断**(CJK 安全),让整段可见而不被 paint
-/// 层无省略地硬裁。绝不加省略/截断标记——命令必须看得全。
+/// Wrap a shell command into display rows. Splits on REAL newlines FIRST so a
+/// multi-line script / heredoc keeps its line structure — without this,
+/// `cmd.split(' ')` glues a `\n`-joined pair into one token (e.g. `base64\ndef`)
+/// and the cell renderer drops the newline, producing an unreadable `base64def`
+/// run-on. Each logical line is then segmented at shell boundaries and
+/// width-wrapped by [`format_shell_command_line`]; non-first logical lines are
+/// indented to align under the command text.
 pub(crate) fn format_shell_command(cmd: &str, width: usize) -> Vec<String> {
+    let cmd = cmd.trim_end();
+    if cmd.is_empty() {
+        return vec![String::new()];
+    }
+    if !cmd.contains('\n') {
+        return format_shell_command_line(cmd, width);
+    }
+    let indent = "    ";
+    let mut out: Vec<String> = Vec::new();
+    for logical in cmd.split('\n') {
+        let logical = logical.trim_end();
+        if logical.is_empty() {
+            continue; // drop blank lines so a spaced-out script doesn't waste rows
+        }
+        let mut rows = format_shell_command_line(logical, width);
+        if !out.is_empty() {
+            // Non-first logical line: indent its first row (continuation rows are
+            // already indented by format_shell_command_line).
+            if let Some(first) = rows.first_mut() {
+                if !first.starts_with(indent) {
+                    *first = format!("{indent}{first}");
+                }
+            }
+        }
+        out.append(&mut rows);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// 把**一条逻辑行**软折成多行,按续行边界(`&&`/`||`/`|`/`\`/`-e`)优先断行,续行
+/// 缩进 4 空格。优先在空格处断;当**单个 token 本身就比可用宽度还宽**(窄窗口下的长
+/// 路径/长 URL)、空格断不开时,退化为按显示宽度**字符级折断**(CJK 安全)。本函数
+/// **不**加省略/截断标记——是否封顶由渲染层(`build_bash_command_rows` 的
+/// `… +N lines`)决定。
+fn format_shell_command_line(cmd: &str, width: usize) -> Vec<String> {
     let cmd = cmd.trim_end();
     if cmd.is_empty() {
         return vec![String::new()];
@@ -29618,29 +30328,17 @@ fn persist_reasoning_effort(ctx: &mut LoopCtx) {
     }
 }
 
-/// Whether the current selection exposes a reasoning-effort control. Mirrors the
-/// daemon's `models_from_config` derivation EXACTLY (an explicitly configured
-/// value declares the capability, plus the one built-in CodingPlan DeepSeek V4
-/// Flash fallback) so the TUI `/effort`, the webui selector, and the wire gate
-/// never disagree. Deliberately NOT gated on `provider_type`: the old
-/// `{deepseek, openai}` restriction hid the control in the TUI for any other
-/// endpoint the user had explicitly configured with an effort, while the webui
-/// still showed it.
-fn effort_applicable(reasoning_effort: Option<&str>, selection: &str, model: &str) -> bool {
-    reasoning_effort.is_some()
-        || (atomcode_config::config::is_codingplan_provider_name(selection)
-            && model.eq_ignore_ascii_case("deepseek-v4-flash"))
-}
-
 pub(crate) fn reasoning_effort_applicable_on_provider(ctx: &LoopCtx) -> bool {
     let selection = ctx.config.effective_model_selection().unwrap_or_default();
     let Some(provider) = ctx.config.provider_config_for_selection(&selection) else {
         return false;
     };
-    effort_applicable(
+    // Drive the control from the endpoint's CONFIG (an explicit effort, or a non-empty
+    // server-advertised `reasoning_effort_levels`) — never a hardcoded model name. Single
+    // source of truth shared with the webui selector and the wire capability.
+    atomcode_config::config::endpoint_supports_reasoning_effort(
         provider.reasoning_effort.as_deref(),
-        &selection,
-        &ctx.model_name,
+        provider.reasoning_effort_levels.as_deref(),
     )
 }
 
@@ -30237,6 +30935,24 @@ mod format_shell_command_tests {
     }
 
     #[test]
+    fn splits_on_real_newlines_no_runon() {
+        // A multi-line heredoc/script keeps its line structure: each `\n` starts
+        // a new row, so `base64` and `def` are NOT glued into `base64def`.
+        let cmd = "python3 - <<'EOF'\nimport urllib.request, json, base64\ndef gh(url): pass";
+        let out = format_shell_command(cmd, 100);
+        assert_eq!(out.len(), 3, "one row per logical line: {out:?}");
+        assert!(out[0].contains("<<'EOF'"), "{out:?}");
+        assert!(out[1].contains("import urllib.request, json, base64"), "{out:?}");
+        assert!(out[2].contains("def gh(url):"), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.contains("base64def")),
+            "must not glue across newline: {out:?}"
+        );
+        // Continuation lines are indented under the command text.
+        assert!(out[1].starts_with("    "), "{out:?}");
+    }
+
+    #[test]
     fn token_that_fits_is_never_split() {
         // 能装下的 token(width 60 容得下)绝不被切,整体留一行。
         let long = "s/mb-2.5/mb-VERYLONGTOKENWITHOUTSPACES-0123456789/g";
@@ -30477,6 +31193,24 @@ mod user_input_mode_tests {
 //     (`round_cap_panel_toggle_and_choice`)
 //   • `chosen_continue` contract used by Enter / Esc → tests below (pure)
 //   • Key-routing stub replacement → verified by `cargo build` (compile check)
+#[cfg(test)]
+mod tool_bullet_outcome_tests {
+    use super::tool_bullet_outcome;
+    use crate::render::ToolOutcome;
+
+    #[test]
+    fn success_maps_to_success() {
+        assert_eq!(tool_bullet_outcome(true), ToolOutcome::Success);
+    }
+
+    #[test]
+    fn any_failure_maps_to_failure() {
+        // No failure-class distinction: only success is coloured, so every
+        // failure is the same neutral `Failure`.
+        assert_eq!(tool_bullet_outcome(false), ToolOutcome::Failure);
+    }
+}
+
 #[cfg(test)]
 mod round_cap_key_tests {
     use super::round_cap_key_decision;

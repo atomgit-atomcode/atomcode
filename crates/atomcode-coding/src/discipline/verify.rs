@@ -35,6 +35,13 @@ pub struct VerifyCadenceHook {
     workspace: PathBuf,
     execution_policy: Arc<TurnExecutionPolicy>,
     state: Mutex<State>,
+    /// When `true`, the hook does NOT force a post-edit verify continuation — the run is
+    /// ATTENDED (interactive TUI), so a present human sees the edit and can ask for a check,
+    /// matching codex's "hold off on tests in interactive modes; run them proactively only when
+    /// unattended". Default `false` (unattended / headless / scheduled) keeps the forcing
+    /// cadence. Set via [`VerifyCadenceHook::attended`], which also honors the `ATOMCODE_VERIFY`
+    /// override (`0`/`off` → always suppress, `1`/`on` → always force).
+    suppress_verify_continuation: bool,
 }
 
 #[derive(Default)]
@@ -59,6 +66,7 @@ impl VerifyCadenceHook {
             workspace: workspace.into(),
             execution_policy: Arc::new(TurnExecutionPolicy::new()),
             state: Mutex::new(State::default()),
+            suppress_verify_continuation: false,
         }
     }
 
@@ -70,7 +78,47 @@ impl VerifyCadenceHook {
             workspace: workspace.into(),
             execution_policy,
             state: Mutex::new(State::default()),
+            suppress_verify_continuation: false,
         }
+    }
+
+    /// Mark whether this run is ATTENDED (interactive). An attended run SUPPRESSES the forced
+    /// post-edit verify continuation (a present human can request a check); an unattended run
+    /// keeps forcing it. The `ATOMCODE_VERIFY` env overrides either way — see
+    /// [`should_suppress_verify`]. Additive builder: existing call sites that don't call this
+    /// keep the default (`false` → force), so behavior is unchanged unless opted in.
+    pub(crate) fn attended(self, interactive: bool) -> Self {
+        let suppress = should_suppress_verify(
+            std::env::var("ATOMCODE_VERIFY").ok().as_deref(),
+            interactive,
+        );
+        self.with_suppression(suppress)
+    }
+
+    fn with_suppression(mut self, suppress: bool) -> Self {
+        self.suppress_verify_continuation = suppress;
+        self
+    }
+}
+
+/// Parse the `ATOMCODE_VERIFY` override into an explicit force decision: `0`/`false`/`off`/`no`
+/// → force OFF, `1`/`true`/`on`/`yes` → force ON, anything else / empty / unset → `None` (fall
+/// back to the attended default).
+fn parse_verify_env(env: Option<&str>) -> Option<bool> {
+    match env?.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => Some(false),
+        "1" | "true" | "on" | "yes" => Some(true),
+        _ => None,
+    }
+}
+
+/// Whether to SUPPRESS the forced post-edit verify continuation. The `ATOMCODE_VERIFY` override
+/// wins; otherwise suppress iff the run is attended (interactive) — matching codex's "hold off on
+/// tests in interactive modes, run them proactively only when unattended".
+fn should_suppress_verify(env: Option<&str>, interactive: bool) -> bool {
+    match parse_verify_env(env) {
+        Some(force) => !force,
+        None => interactive,
     }
 }
 
@@ -348,6 +396,12 @@ impl LifecycleHooks for VerifyCadenceHook {
     }
 
     async fn offer_typed_continuation(&self, convo: &Conversation) -> Option<Continuation> {
+        // Attended (interactive) runs — or an explicit `ATOMCODE_VERIFY=0` — do not FORCE a
+        // post-edit verify continuation: a present human can ask for the check. Unattended /
+        // headless / scheduled runs keep the cadence. (See `should_suppress_verify`.)
+        if self.suppress_verify_continuation {
+            return None;
+        }
         if self.execution_policy.current().skips_verification()
             || execution_policy_for_messages(&convo.messages).skips_verification()
         {
@@ -420,6 +474,52 @@ mod tests {
     /// never suppresses these path-agnostic cases (they use relative / empty targets).
     fn hook_any_ws() -> VerifyCadenceHook {
         VerifyCadenceHook::new("/")
+    }
+
+    #[test]
+    fn should_suppress_verify_resolves_env_and_attendedness() {
+        // No env → follow attendedness: interactive suppresses the forced check, headless forces it.
+        assert!(should_suppress_verify(None, true), "interactive → suppress");
+        assert!(!should_suppress_verify(None, false), "headless → force");
+        // `ATOMCODE_VERIFY` wins in BOTH directions, regardless of attendedness.
+        assert!(
+            should_suppress_verify(Some("0"), false),
+            "=0 suppresses even in an unattended run"
+        );
+        assert!(should_suppress_verify(Some("off"), false));
+        assert!(
+            !should_suppress_verify(Some("1"), true),
+            "=1 forces even in an interactive run"
+        );
+        assert!(!should_suppress_verify(Some("on"), true));
+        // Unrecognized / empty → fall back to attendedness (not an override).
+        assert!(should_suppress_verify(Some(""), true));
+        assert!(!should_suppress_verify(Some("maybe"), false));
+    }
+
+    #[tokio::test]
+    async fn attended_run_suppresses_verify_continuation() {
+        // An unverified edit that WOULD nudge unattended must NOT force a continuation when
+        // attended (interactive) — the human present sees the edit and can request a check.
+        let hook = hook_any_ws().with_suppression(true);
+        let mut convo = Conversation::new();
+        convo.messages = vec![assistant_call("e1", "edit_file"), tool_result("e1", false)];
+        assert!(
+            hook.offer_continuation(&convo).await.is_none(),
+            "attended run must not force a post-edit verify continuation"
+        );
+    }
+
+    #[tokio::test]
+    async fn unattended_run_still_nudges() {
+        // The default (unattended / headless) keeps the forcing cadence.
+        let hook = hook_any_ws().with_suppression(false);
+        let mut convo = Conversation::new();
+        convo.messages = vec![assistant_call("e1", "edit_file"), tool_result("e1", false)];
+        assert!(
+            hook.offer_continuation(&convo).await.is_some(),
+            "unattended run keeps the verify cadence"
+        );
     }
 
     async fn nudge_of(msgs: Vec<Message>) -> (VerifyCadenceHook, Option<String>) {

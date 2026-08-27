@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>会话与撤销</h1>
+<h1 id="会话与撤销">会话与撤销</h1>
       <p class="lede">AtomCode 默认持久化每一次对话,允许你随时恢复、继续、清空或压缩。一条 <code>/undo</code> 就能把对话记忆回退到此前任意一轮。</p>
 
-      <h2>会话的生命周期</h2>
+      <h2 id="会话的生命周期">会话的生命周期</h2>
       <p>每次启动 atomcode 都会自动创建一个会话,会话包含:</p>
       <ul>
         <li>完整消息历史(用户 prompt、AI 回复、工具调用)</li>
@@ -89,16 +89,16 @@
       </ul>
       <p>会话数据落盘在 <code>~/.atomcode/sessions/</code> 下,按项目(工作目录 hash)分组存储。</p>
 
-      <h2>恢复会话</h2>
-      <h3>命令行继续上次</h3>
+      <h2 id="恢复会话">恢复会话</h2>
+      <h3 id="命令行继续上次">命令行继续上次</h3>
       <pre><code>atomcode -c        # 或 atomcode --continue</code></pre>
       <p>最常见的需求:接着昨天停下来的地方继续。</p>
 
-      <h3>TUI 内切换会话</h3>
+      <h3 id="tui-内切换会话">TUI 内切换会话</h3>
       <pre><code>/resume</code></pre>
       <p>弹出会话选择器,按时间倒序显示当前项目的历史会话,可以快速跳到任一会话。每一条都带有最近的用户提问作为标题,便于识别。</p>
 
-      <h3>新开一个干净会话</h3>
+      <h3 id="新开一个干净会话">新开一个干净会话</h3>
       <pre><code>/session</code></pre>
       <p>在不切换工作目录的前提下开启全新的上下文。适合"刚刚那个任务已经收尾,我要开始完全不相关的另一件事"。</p>
 
@@ -117,7 +117,7 @@
         </tbody>
       </table>
 
-      <h3>会话状态</h3>
+      <h3 id="会话状态">会话状态</h3>
       <p><code>/bg list</code> 的"状态"列对应会话在后台时的运行情况:</p>
       <ul>
         <li><strong>运行中</strong> —— 模型还在执行,工具调用 / 输出在后台继续推进</li>
@@ -127,7 +127,7 @@
       </ul>
       <p>所以 <code>/bg</code> 后台并不只是"挂起"——模型真的会在后台继续干活,切回来时直接拿到结果。</p>
 
-      <h3><code>/background &lt;任务&gt;</code> —— 一次性后台派发</h3>
+      <h3 id="background-任务-一次性后台派发"><code>/background &lt;任务&gt;</code> —— 一次性后台派发</h3>
       <p>如果你不想专门切换前后台、只是"顺手让它跑一下查个东西",用 <code>/background</code> 兼容入口:</p>
       <pre><code>/background 列出 src 下未使用的依赖</code></pre>
       <p>会在一个 <code>/bg</code> 槽位里启动一次性任务(默认配置为只读工具子集,不污染主对话上下文)。跑完后用 <code>/bg list</code> 看状态,<code>/bg &lt;N&gt;</code> 切过去读结果,<code>/bg drop &lt;N&gt;</code> 丢弃。</p>
@@ -137,7 +137,7 @@
         <p>主前台正在调试 A 模块,模型一边改一边跑 <code>cargo check</code>(耗时)。这时想到要顺便重构 B 模块——直接 <code>/bg</code> 切到新前台开始 B;A 那边的 build 在后台跑完状态切到"已完成",<code>/bg 1</code> 切回去拿结果。</p>
       </div>
 
-      <h2>清空 vs 压缩 vs 新建</h2>
+      <h2 id="清空-vs-压缩-vs-新建">清空 vs 压缩 vs 新建</h2>
       <table>
         <thead>
           <tr><th>命令</th><th>保留历史</th><th>保留会话 ID</th><th>何时使用</th></tr>
@@ -149,7 +149,7 @@
         </tbody>
       </table>
 
-      <h2>对话记忆回退 <code>/undo</code></h2>
+      <h2 id="对话记忆回退-undo">对话记忆回退 <code>/undo</code></h2>
       <p><code>/undo</code> 把<strong>对话记忆</strong>回退到某一轮之前,删除那一轮及其后的全部消息,并把那一轮你输入的 prompt 还原回输入框,方便你修改后重发。</p>
       <pre><code>/undo      # 回退最后一轮
 /undo N    # 回退到第 N 轮(N 从 1 开始,只计你真实输入的轮次)</code></pre>
@@ -160,13 +160,13 @@
         <p><code>/undo</code> <em>只</em>回滚对话记忆,<strong>不会恢复磁盘上的文件</strong>。如果那几轮里 AI 改过代码,这些改动仍保留在工作区——需要还原请用 <code>/diff</code> 查看后手动处理,或借助 git。当前回合进行中时无法 <code>/undo</code>,请先按 Esc 取消。</p>
       </div>
 
-      <h2>用 <code>/rewind</code> 安全回退</h2>
+      <h2 id="用-rewind-安全回退">用 <code>/rewind</code> 安全回退</h2>
       <p><code>/rewind</code> 会列出最近的用户提示，并让你选择回退范围：仅对话、仅代码，或对话与代码。代码回退需要 Git 工作区；执行前会显示确认界面。只想撤销最近一轮对话时仍可使用更轻量的 <code>/undo</code>。</p>
 
-      <h2>异常退出后的恢复</h2>
+      <h2 id="异常退出后的恢复">异常退出后的恢复</h2>
       <p>回合进行中，AtomCode 会保存临时进度。终端异常退出或网络中断后，使用 <code>/resume</code> 会尽量恢复最后一条用户输入、已经生成的回复和工具调用进度，而不是只回到上一个完整回合。待确认的权限和问题不会被自动批准。</p>
 
-      <h2>查看和控制 Token 用量</h2>
+      <h2 id="查看和控制-token-用量">查看和控制 Token 用量</h2>
       <pre><code>/cost</code></pre>
       <p>显示当前会话累计输入 / 输出 tokens。当数字逼近 provider 的 <code>context_window</code> 时:</p>
       <ul>
@@ -175,14 +175,14 @@
         <li>不想用上下文窗口中的工具调用结果,可以让模型在 prompt 里明确"别再读那些大文件"</li>
       </ul>
 
-      <h2>多项目工作流</h2>
+      <h2 id="多项目工作流">多项目工作流</h2>
       <p>AtomCode 的会话是按工作目录分组的。切换目录的推荐方式:</p>
       <ul>
         <li>从命令行启动时用 <code>-C</code> 指定</li>
         <li>运行中用 <code>/cd</code> 切换,<code>default_workdir</code> 会自动落盘</li>
       </ul>
 
-      <h2>下一步</h2>
+      <h2 id="下一步">下一步</h2>
       <ul>
         <li><a href="./project-instructions.html">项目指令文件</a> —— 用 <code>.atomcode.md</code> 为每个项目固化上下文</li>
       </ul>

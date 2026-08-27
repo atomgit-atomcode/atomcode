@@ -750,10 +750,24 @@ fn render_wrapped_table(
 }
 
 fn render_table_boundary(col_widths: &[usize], caps: TerminalCaps) -> String {
+    render_table_rule(col_widths, '━', caps)
+}
+
+/// One CONTINUOUS horizontal rule spanning the FULL table width — the sum of the
+/// column widths, both cell paddings per column, AND the inter-column gaps. Used
+/// for the top/bottom boundaries AND the header/inter-row separators alike, so
+/// every horizontal line shares the exact same solid style. Filling the
+/// inter-column gaps (rather than leaving them blank, per-column segments) keeps
+/// the rule from reading as a broken/dashed line — which looked inconsistent with
+/// the solid boundary, glaring under the Windows ASCII (`=`/`-`) fallback and
+/// unpolished under ligature-capable fonts. There are still no vertical borders,
+/// corners, or junction glyphs. `preferred` selects the weight (`━` heavy for
+/// boundaries / the header rule, `─` light for inter-row separators).
+fn render_table_rule(col_widths: &[usize], preferred: char, caps: TerminalCaps) -> String {
     let width = col_widths.iter().sum::<usize>()
         + TABLE_CELL_PADDING * 2 * col_widths.len()
         + TABLE_COLUMN_GAP * col_widths.len().saturating_sub(1);
-    let rule = stable_table_rule_char('━').to_string().repeat(width);
+    let rule = stable_table_rule_char(preferred, caps).to_string().repeat(width);
     if caps.colors {
         format!("{}{}{}", theme::md_border_open(), rule, theme::MD_MUTED_CLOSE)
     } else {
@@ -761,42 +775,38 @@ fn render_table_boundary(col_widths: &[usize], caps: TerminalCaps) -> String {
     }
 }
 
-/// Prefer Codex's Unicode rules where their width is reliable. Windows console
-/// hosts (including WSL sessions rendered by Windows Terminal) have historically
-/// disagreed with Unicode's East Asian Ambiguous width for box-drawing glyphs;
-/// use invariant-width ASCII there and whenever the configured width model says
-/// the preferred glyph occupies more than one cell.
-fn stable_table_rule_char(preferred: char) -> char {
-    let windows_console = cfg!(windows)
-        || std::env::var_os("WSL_DISTRO_NAME").is_some()
-        || std::env::var_os("WSL_INTEROP").is_some();
-    if windows_console || crate::width::cell_char_width(preferred).unwrap_or(1) != 1 {
-        if preferred == '━' { '=' } else { '-' }
-    } else {
+/// Pick the box-drawing rule glyph only when the terminal can actually render it,
+/// else fall back to invariant-width ASCII. Two independent gates:
+///
+/// 1. `caps.unicode_symbols` — the SAME capability that governs every other
+///    decorative glyph (`❯`, `◆`, box-drawing corners). It is on for modern
+///    emulators (Windows Terminal via `WT_SESSION`, any `TERM_PROGRAM`, UTF-8
+///    locales) and off for legacy Windows conhost, `TERM=dumb`, POSIX/`C`
+///    locales, and `ATOMCODE_ASCII=1`. Gating tables on this (instead of a blunt
+///    `cfg!(windows)`) lets a modern Windows Terminal show `━`/`─` like macOS,
+///    while legacy conhost still drops to `=`/`-` so it never renders `□` tofu.
+/// 2. Width safety — even on a Unicode-capable host, a glyph our width model
+///    scores at ≠1 cell would desync column alignment, so force ASCII there too.
+fn stable_table_rule_char(preferred: char, caps: TerminalCaps) -> char {
+    let width_safe = crate::width::cell_char_width(preferred).unwrap_or(1) == 1;
+    if caps.unicode_symbols && width_safe {
         preferred
+    } else if preferred == '━' {
+        '='
+    } else {
+        '-'
     }
 }
 
-/// Render the same open table rules as Codex: every column owns one rule
-/// segment, with the normal inter-column gap left blank. There are no vertical
-/// borders, corners, or junction glyphs, so content stays readable without
-/// recreating the ambiguous-width boxed layout.
+/// Inter-row / header separator: a continuous full-width rule (see
+/// [`render_table_rule`]). No vertical borders, corners, or junction glyphs —
+/// content stays readable without recreating the ambiguous-width boxed layout.
 fn render_table_separator(
     col_widths: &[usize],
     separator_char: char,
     caps: TerminalCaps,
 ) -> String {
-    let segment = stable_table_rule_char(separator_char).to_string();
-    let rule = col_widths
-        .iter()
-        .map(|width| segment.repeat(*width + TABLE_CELL_PADDING * 2))
-        .collect::<Vec<_>>()
-        .join(&" ".repeat(TABLE_COLUMN_GAP));
-    if caps.colors {
-        format!("{}{}{}", theme::md_border_open(), rule, theme::MD_MUTED_CLOSE)
-    } else {
-        rule
-    }
+    render_table_rule(col_widths, separator_char, caps)
 }
 
 /// Width-aware variant. When `max_width > 0` and the table can't fit at its
@@ -1692,6 +1702,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn table_rules_are_continuous_across_column_gaps() {
+        // The header underline and inter-row separators must be ONE solid rule
+        // spanning the full table width — NOT per-column segments joined by blank
+        // inter-column gaps (which read as a broken/dashed line and, under
+        // ligature-capable fonts, look inconsistent with the solid top/bottom
+        // boundary). Every rule line must therefore contain NO interior space.
+        let rows = vec![
+            "| 命令 | 行为 | 前台会话 |".to_string(),
+            "| --- | --- | --- |".to_string(),
+            "| /fork | 分叉新会话 | 原会话保留 |".to_string(),
+            "| /bg | 挪到后台 | 全新空会话 |".to_string(),
+        ];
+        let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
+        let rule_lines: Vec<&str> = out
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && t.chars().all(|c| matches!(c, '━' | '─' | '=' | '-'))
+            })
+            .collect();
+        // top boundary + header separator + 1 inter-row separator + bottom boundary
+        assert!(
+            rule_lines.len() >= 4,
+            "expected top/header/row/bottom rules, got {}:\n{out}",
+            rule_lines.len()
+        );
+        for line in &rule_lines {
+            assert!(
+                !line.trim().contains(' '),
+                "rule line must be continuous (no interior gap): {:?}\n{out}",
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn table_rule_char_follows_unicode_symbols_capability() {
+        // A Unicode-capable terminal (modern engine + UTF-8 locale) keeps the
+        // box-drawing rules — the same `unicode_symbols` gate that governs ❯/◆.
+        let uni = TerminalCaps::from_env(EnvView {
+            is_stdout_tty: true,
+            term: Some("xterm-256color".to_string()),
+            lang: Some("en_US.UTF-8".to_string()),
+            ..Default::default()
+        });
+        assert!(uni.unicode_symbols, "UTF-8 xterm must be unicode-capable");
+        // Width model must also agree the glyph is one cell (true on the test host).
+        if crate::width::cell_char_width('━') == Some(1) {
+            assert_eq!(stable_table_rule_char('━', uni), '━');
+            assert_eq!(stable_table_rule_char('─', uni), '─');
+        }
+        // A host that can't render Unicode symbols (legacy conhost / POSIX locale /
+        // ATOMCODE_ASCII / dumb) must drop to invariant-width ASCII — no □ tofu.
+        let ascii = TerminalCaps::from_env(EnvView {
+            is_stdout_tty: true,
+            term: Some("xterm".to_string()),
+            lang: Some("C".to_string()),
+            ..Default::default()
+        });
+        assert!(!ascii.unicode_symbols, "C locale must force ASCII fallback");
+        assert_eq!(stable_table_rule_char('━', ascii), '=');
+        assert_eq!(stable_table_rule_char('─', ascii), '-');
+    }
+
     /// Regression for issue #708: Markdown tables with CJK characters must
     /// have aligned borders regardless of whether East Asian Ambiguous
     /// box-drawing glyphs (`│` `─` `┌` etc.) render at width 1 or 2.
@@ -2345,33 +2421,36 @@ mod tests {
         assert_eq!(
             out.lines().count(),
             7,
-            "outer boundaries, header, segmented rules, and two data rows:\n{out}"
+            "outer boundaries, header, continuous rules, and two data rows:\n{out}"
         );
+        let header_rule = stable_table_rule_char('━', plain_caps());
+        let body_rule = stable_table_rule_char('─', plain_caps());
+        // Three heavy continuous rules now: top boundary, header separator, and
+        // bottom boundary — the header separator shares the solid boundary style.
         assert_eq!(
             out.lines()
                 .filter(|line| {
-                    line.trim()
-                        .chars()
-                        .all(|ch| ch == stable_table_rule_char('━'))
+                    let t = line.trim();
+                    !t.is_empty() && t.chars().all(|ch| ch == header_rule)
                 })
                 .count(),
-            2,
-            "top and bottom boundaries missing:\n{out}"
+            3,
+            "top boundary, header separator, and bottom boundary missing:\n{out}"
         );
-        let header_rule = stable_table_rule_char('━');
-        let body_rule = stable_table_rule_char('─');
-        assert!(
-            out.lines().any(|line| {
-                line.contains("  ")
-                    && line
-                        .chars()
-                        .all(|ch| ch == header_rule || ch.is_ascii_whitespace())
-            }),
-            "segmented header rule missing:\n{out}"
-        );
+        // Every rule is continuous — no per-column segment leaves an interior gap.
         assert!(
             has_table_rule(&out, body_rule),
             "body rule missing:\n{out}"
+        );
+        assert!(
+            !out.lines().any(|line| {
+                let t = line.trim();
+                !t.is_empty()
+                    && t.contains(' ')
+                    && t.chars()
+                        .all(|ch| ch == header_rule || ch == body_rule || ch == ' ')
+            }),
+            "rules must be continuous (no interior gap):\n{out}"
         );
         let styled = flush_aligned_table_with_width(&rows, caps(), 80);
         assert!(

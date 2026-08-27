@@ -33,6 +33,78 @@ const MAX_TIMEOUT_SECS: u64 = 300;
 /// patterns benefits. Tradeoff: genuine deadlocks wait 60s longer than before.
 const SILENT_KILL_SECS: u64 = 90;
 
+/// Environment injected into every model-run shell child so interactive programs
+/// degrade to non-interactive behavior instead of blocking on our closed stdin or
+/// scribbling terminal-control sequences onto the TUI (the oh-my-pi approach —
+/// the one portable, low-risk mitigation the reference implementations converge on):
+///
+/// * `TERM=dumb` — REPLs, editors, pagers, `git`, and progress UIs detect a
+///   non-capable terminal and drop line-editing / full-screen / color modes.
+/// * `PAGER=cat` / `GIT_PAGER=cat` — `git log`, `less`, `man` don't page (paging
+///   would wait for a keypress that can never arrive on our null stdin).
+/// * `GIT_TERMINAL_PROMPT=0` — git fails fast on a missing credential instead of
+///   blocking on a username/password prompt.
+///
+/// Deliberately does NOT set `SSH_ASKPASS`/`SUDO_ASKPASS`/`EDITOR`: atomcode wires
+/// the askpass vars to a SECURE user prompt (see `apply_askpass_env`), so clobbering
+/// them — as oh-my-pi does with `SSH_ASKPASS=false`, safe only because it has no such
+/// helper — would break interactive ssh/sudo here. Pure so it is unit-testable.
+fn non_interactive_env_vars() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("TERM", "dumb"),
+        ("PAGER", "cat"),
+        ("GIT_PAGER", "cat"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+    ]
+}
+
+/// Apply [`non_interactive_env_vars`] to a spawn command. Called on BOTH shell paths
+/// (`BashTool::execute` and `run_shell`) so the two can't drift.
+fn apply_non_interactive_env(cmd: &mut tokio::process::Command) {
+    for (key, value) in non_interactive_env_vars() {
+        cmd.env(key, value);
+    }
+}
+
+/// Detach the just-forked child from the controlling terminal. Called from BOTH
+/// shell paths' `pre_exec` (`BashTool::execute` and `run_shell`) so the two can't
+/// drift — previously only `run_shell` had the full detach while the agent path had
+/// bare `setsid()`, leaving the model's own `git push` hooks free to scribble ANSI
+/// (the AtomGit `[PASSED]` box) onto the TUI past our piped stdout/stderr.
+///
+/// `setsid()` puts the child in a new session with no controlling tty; the explicit
+/// `open("/dev/tty")` + `TIOCNOTTY` is belt-and-suspenders for the case `setsid()`
+/// fails with `EPERM` (child already a pgroup leader), where it would otherwise keep
+/// the tty. Failures are ignored — the worst case is the pre-existing (bare-setsid)
+/// behavior.
+///
+/// SAFETY: runs in the forked child before `exec` — async-signal-safe libc ONLY
+/// (`setsid`/`open`/`ioctl`/`close`). No allocation, locks, panics, or non-reentrant
+/// calls, or the child can deadlock.
+#[cfg(unix)]
+unsafe fn detach_child_from_controlling_tty() {
+    // `c_char` (not a hard-coded `i8`) so the `c"…"` pointer matches without a cast on
+    // targets where `c_char` is `u8` (e.g. aarch64-linux).
+    use std::ffi::c_char;
+    extern "C" {
+        fn setsid() -> i32;
+        fn open(path: *const c_char, oflag: i32, ...) -> i32;
+        fn close(fd: i32) -> i32;
+        fn ioctl(fd: i32, request: u64, ...) -> i32;
+    }
+    setsid();
+    const O_RDWR: i32 = 2;
+    #[cfg(target_os = "macos")]
+    const TIOCNOTTY: u64 = 0x20007471;
+    #[cfg(not(target_os = "macos"))]
+    const TIOCNOTTY: u64 = 0x5422;
+    let tty_fd = open(c"/dev/tty".as_ptr(), O_RDWR);
+    if tty_fd >= 0 {
+        ioctl(tty_fd, TIOCNOTTY);
+        close(tty_fd);
+    }
+}
+
 #[derive(Default)]
 pub struct BashTool;
 
@@ -138,6 +210,10 @@ impl Tool for BashTool {
         };
         #[cfg(unix)]
         crate::process_utils::apply_utf8_locale_env(&mut cmd);
+        // Coax interactive programs (REPLs, pagers, git prompts) into non-interactive
+        // behavior so they can't block on our closed stdin or paint the TUI. Both
+        // platforms (git honors GIT_TERMINAL_PROMPT; Git Bash honors TERM).
+        apply_non_interactive_env(&mut cmd);
         // Windows GBK locale (CP936): a Python child the model runs (python -c, scripts)
         // defaults its `subprocess` text pipes AND stdio to the console code page, so reading
         // UTF-8 output with the GBK codec dies with UnicodeDecodeError (#876). `PYTHONUTF8=1`
@@ -172,26 +248,18 @@ impl Tool for BashTool {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true); // dropping the wait future (cancel/timeout) SIGKILLs the child
 
-        // Unix only: detach from controlling tty (setsid) so sudo/ssh don't fight the TUI
-        // for /dev/tty, and inject the askpass env vars so they use our password prompt.
+        // Unix only: detach from the controlling tty so neither the child nor a
+        // grandchild (ssh, git hooks) can grab /dev/tty and fight the TUI, and inject
+        // the askpass env vars so password prompts use our secure modal. Full detach
+        // (setsid + TIOCNOTTY) shared with run_shell via `detach_child_from_controlling_tty`.
         #[cfg(unix)]
         {
             if let Some(env) = crate::askpass::current_env() {
                 apply_askpass_env(&mut cmd, env);
             }
-            // Mirror exactly how atomcode-core/src/tool/bash.rs attaches setsid:
-            // call the setsid(2) syscall in a pre_exec hook so every bash child gets a
-            // new session/pgroup and loses the controlling tty. Failure (already a
-            // pgroup leader) is harmless — ignore the return value.
             unsafe {
                 cmd.pre_exec(|| {
-                    // SAFETY(pre_exec): runs in the forked child before exec —
-                    // async-signal-safe libc ONLY. No allocation, locks, panics,
-                    // or non-reentrant calls, or the child can deadlock. setsid() is safe.
-                    extern "C" {
-                        fn setsid() -> i32;
-                    }
-                    setsid();
+                    detach_child_from_controlling_tty();
                     Ok(())
                 });
             }
@@ -326,7 +394,13 @@ fn shell_tool_description(
              text, or rewrite the whole file with write_file — do not fall back to sed. \
              Reserve bash for real shell work — git, builds, package managers, running \
              commands — and for pipelines / aggregation (wc, sort, uniq, awk, git log) \
-             the dedicated tools can't do."
+             the dedicated tools can't do.\n\
+             This shell is NON-INTERACTIVE: stdin is not connected to a terminal, so a \
+             program cannot be driven with typed input once started. Do NOT launch REPLs (python/node/irb), \
+             editors (vim/nano), pagers (less/more), or full-screen/monitor programs \
+             (top/htop, the mysql/psql prompt) — they can't receive input and just block \
+             until the timeout. Run the work non-interactively instead: `python3 -c '…'` \
+             (or a script file), `git --no-pager …`, `mysql -e '…'`."
         };
     }
     macro_rules! cmd_suffix {
@@ -2506,6 +2580,7 @@ pub async fn run_shell(
             // cancel / hard timeout. The descendant tree is reaped by the Job
             // Object assigned below (see `job_guard`).
             .kill_on_drop(true);
+        apply_non_interactive_env(&mut cmd);
         crate::process_utils::suppress_console_window(&mut cmd);
         match cmd.spawn() {
             Ok(c) => c,
@@ -2542,35 +2617,19 @@ pub async fn run_shell(
             // grandchildren that setsid() detached from us).
             .kill_on_drop(true);
         crate::process_utils::apply_utf8_locale_env(&mut cmd);
+        // Same non-interactive env as BashTool::execute — keep the two shell paths
+        // from drifting (a REPL run via `!cmd` should degrade the same way).
+        apply_non_interactive_env(&mut cmd);
         // Detach child from the controlling terminal so neither it nor any
         // grandchild (ssh, git credential helpers, server-side hook output
         // rendered by git) can write directly to /dev/tty.  Without this,
         // programs that open /dev/tty bypass our piped stdout/stderr and
         // scribble ANSI escape sequences onto the TUI — producing artifacts
-        // like the [PASSED] box from AtomGit push hooks.
+        // like the [PASSED] box from AtomGit push hooks. Shared with
+        // BashTool::execute so the two paths can't drift.
         unsafe {
             cmd.pre_exec(|| {
-                // SAFETY(pre_exec): runs in the forked child before exec —
-                // async-signal-safe libc ONLY. No allocation, locks, panics, or
-                // non-reentrant calls, or the child can deadlock.
-                // setsid()/open()/close()/ioctl() below are async-signal-safe.
-                extern "C" {
-                    fn setsid() -> i32;
-                    fn open(path: *const i8, oflag: i32, ...) -> i32;
-                    fn close(fd: i32) -> i32;
-                    fn ioctl(fd: i32, request: u64, ...) -> i32;
-                }
-                setsid();
-                const O_RDWR: i32 = 2;
-                #[cfg(target_os = "macos")]
-                const TIOCNOTTY: u64 = 0x20007471;
-                #[cfg(not(target_os = "macos"))]
-                const TIOCNOTTY: u64 = 0x5422;
-                let tty_fd = open(b"/dev/tty\0".as_ptr() as *const i8, O_RDWR);
-                if tty_fd >= 0 {
-                    ioctl(tty_fd, TIOCNOTTY);
-                    close(tty_fd);
-                }
+                detach_child_from_controlling_tty();
                 Ok(())
             });
         }
@@ -2863,6 +2922,91 @@ mod tests {
             "stdout was: {:?}",
             outcome.stdout
         );
+    }
+
+    // Children of `run_shell` (the `!cmd` streaming path) must inherit the
+    // non-interactive env so REPLs/pagers/git degrade instead of blocking on our
+    // closed stdin. Asserts the child actually SEES the injected values.
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))] // uses `$VAR` expansion (bash-ism)
+    async fn run_shell_injects_non_interactive_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = run_shell(
+            r#"echo "TERM=$TERM PAGER=$PAGER GIT_PAGER=$GIT_PAGER GTP=$GIT_TERMINAL_PROMPT""#,
+            dir.path(),
+            30,
+            |_| {},
+        )
+        .await;
+        for expect in ["TERM=dumb", "PAGER=cat", "GIT_PAGER=cat", "GTP=0"] {
+            assert!(
+                outcome.stdout.contains(expect),
+                "run_shell child missing {expect}; stdout: {:?}",
+                outcome.stdout
+            );
+        }
+    }
+
+    // The AGENT bash path (`BashTool::execute`) must detach its child into a NEW
+    // session (setsid), so the child — and grandchildren like ssh / git hooks —
+    // lose the controlling tty and can't scribble on the TUI. Observable proxy:
+    // setsid makes the child its own session/pgroup leader, so its pid == pgid
+    // (without the detach it would inherit atomcode's pgroup). This guards that the
+    // shared `detach_child_from_controlling_tty` pre_exec stays wired into execute.
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn bash_tool_child_runs_in_new_session() {
+        let d = tempfile::tempdir().unwrap();
+        let r = BashTool
+            .execute(
+                r#"{"command":"echo \"$$ $(ps -o pgid= -p $$ | tr -d ' ')\""}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        let nums: Vec<&str> = r.content.split_whitespace().collect();
+        assert_eq!(nums.len(), 2, "expected `pid pgid`, got: {:?}", r.content);
+        assert_eq!(
+            nums[0], nums[1],
+            "child must be its own pgroup leader (setsid ran): {:?}",
+            r.content
+        );
+    }
+
+    // The AGENT bash path (`BashTool::execute`) must ALSO inject the non-interactive
+    // env — separate spawn site from run_shell, so it needs its own coverage or a
+    // missed wiring slips through.
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn bash_tool_injects_non_interactive_env() {
+        let d = tempfile::tempdir().unwrap();
+        let r = BashTool
+            .execute(
+                r#"{"command":"echo \"TERM=$TERM GTP=$GIT_TERMINAL_PROMPT\""}"#,
+                &ctx(d.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("TERM=dumb"), "{}", r.content);
+        assert!(r.content.contains("GTP=0"), "{}", r.content);
+    }
+
+    // Invariant guard: the non-interactive env must NOT clobber the askpass helper's
+    // vars. atomcode wires SSH_ASKPASS/SUDO_ASKPASS to a secure USER prompt (unlike
+    // oh-my-pi, which sets SSH_ASKPASS=false BECAUSE it has no such helper); setting
+    // those here would silently break interactive ssh/sudo. EDITOR is likewise left
+    // alone (git commit without -m relies on it).
+    #[test]
+    fn non_interactive_env_does_not_clobber_askpass() {
+        let keys: Vec<&str> = non_interactive_env_vars().iter().map(|(k, _)| *k).collect();
+        for forbidden in ["SSH_ASKPASS", "SUDO_ASKPASS", "EDITOR", "VISUAL"] {
+            assert!(
+                !keys.contains(&forbidden),
+                "{forbidden} must not be in non_interactive_env_vars (breaks askpass/editor)"
+            );
+        }
+        // And it must actually carry the intended signals.
+        assert!(keys.contains(&"TERM"), "TERM must be set");
     }
 
     /// PROBE (kept as a living record): dumps the node kinds tree-sitter-bash produces
@@ -3307,6 +3451,31 @@ mod tests {
         // mutated — a possible stray file beats silently corrupting written content.
         let heredoc = "cat > build.bat <<'EOF'\ncl a.c > nul\nEOF";
         assert_eq!(rewrite_nul_redirect(heredoc), heredoc);
+    }
+
+    // The shell is non-interactive (stdin is closed). The description must tell the
+    // model NOT to launch REPLs / editors / pagers, which can't be driven and just
+    // burn the timeout — and to run work non-interactively instead. Shared base
+    // paragraph, so the guidance must appear on every platform.
+    #[test]
+    fn description_warns_off_interactive_programs() {
+        for (win, bash, askpass) in [
+            (false, false, false),
+            (false, false, true),
+            (true, false, false),
+            (true, true, false),
+        ] {
+            let d = shell_tool_description(win, bash, askpass);
+            let lc = d.to_lowercase();
+            assert!(
+                lc.contains("non-interactive") || lc.contains("not interactive"),
+                "desc must state the shell is non-interactive (win={win},bash={bash},askpass={askpass}): {d}"
+            );
+            assert!(
+                lc.contains("repl"),
+                "desc must warn off REPLs (win={win},bash={bash},askpass={askpass}): {d}"
+            );
+        }
     }
 
     // On Windows the description must explicitly tell the model it runs via

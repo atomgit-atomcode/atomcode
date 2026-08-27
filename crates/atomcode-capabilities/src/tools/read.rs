@@ -15,12 +15,23 @@ use serde_json::json;
 /// UTF-8/GB18030 detection and codeintel. Refuse pathological inputs uniformly,
 /// including callers that supplied an offset/limit.
 const MAX_IN_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
-/// Default page size when the caller omits `limit`. This is large enough to give
-/// the model useful context while still encouraging deliberate continuation.
-const DEFAULT_READ_LIMIT: usize = 300;
-/// Keep the complete read result (body plus continuation) below the generic
-/// 16 KiB artifact threshold so `read_file` retains line-based pagination.
-const MAX_READ_OUTPUT_BYTES: usize = 10 * 1024;
+/// Default page size when the caller omits `limit`. Sized SO THE 50 KiB byte budget
+/// (`MAX_READ_OUTPUT_BYTES`) — not the line count — is what usually bounds a page: a
+/// default read returns a substantial window in ONE call instead of truncating early at a
+/// small line cap and forcing pagination round-trips (each re-sends the whole context).
+/// Large CODE files read bare still return a symbol skeleton first (`SKELETON_THRESHOLD`),
+/// so this mainly governs offset reads and large non-code files (logs / JSON). Aligned to
+/// the ~1.5–3k peer baseline (opencode 2000 / oh-my-pi 3000).
+const DEFAULT_READ_LIMIT: usize = 1500;
+/// Per-call output budget for a read. `read_file` is EXEMPT from the artifact
+/// head/tail truncation middleware (`ArtifactMiddleware`), so THIS budget — not the
+/// 16 KiB artifact threshold — is what bounds a read, and it may exceed that threshold
+/// while keeping full line-based pagination intact. Sized to the ~50 KiB peer baseline
+/// (opencode/oh-my-pi) so a normal window — a symbol, or the default page —
+/// comes back in ONE call instead of forcing pagination round-trips, each of which
+/// re-sends the whole growing context for nothing. Pathologically long single lines are
+/// still capped by `MAX_LINE_LEN`.
+const MAX_READ_OUTPUT_BYTES: usize = 50 * 1024;
 /// Per-line display cap (very long minified lines are truncated with a marker).
 const MAX_LINE_LEN: usize = 2000;
 /// Above this line count, an un-sliced read of a CODE file returns a symbol skeleton
@@ -261,15 +272,17 @@ impl Tool for ReadFileTool {
         "read_file"
     }
     fn description(&self) -> &str {
-        "Read a file from the filesystem. Returns the contents prefixed with 1-based \
-         line numbers (`<n>\\t<content>`). By default returns up to 300 lines; an output \
-         budget may return fewer. When a result shows a continuation offset, continue from \
-         that offset instead of rereading line 1. Use `offset` (1-based start line) and \
-         `limit` (max lines) when a larger relevant window is needed; avoid many tiny \
-         overlapping reads. To grab several disjoint windows at once (e.g. multiple \
-         symbols listed in a skeleton), pass `ranges` instead of paginating. If the path \
-         is a directory its entries are listed instead. Relative paths resolve against \
-         the working directory."
+        "Read a file — or any slice of one — from the filesystem. This is the way to read \
+         or slice files: prefer it over `bash cat`/`head`/`tail` or a `python`/`awk` script, \
+         which return partial content and bypass paging, caching, and history retention. \
+         Returns the contents prefixed with 1-based line numbers (`<n>\\t<content>`). By \
+         default returns up to 1500 lines; a ~50 KiB output budget may return fewer. When a result \
+         shows a continuation offset, continue from that offset instead of rereading line 1. \
+         Use `offset` (1-based start line) and `limit` (max lines) when a larger relevant \
+         window is needed; avoid many tiny overlapping reads. To grab several disjoint \
+         windows at once (e.g. multiple symbols listed in a skeleton), pass `ranges` instead \
+         of paginating or splitting the file yourself. If the path is a directory its entries \
+         are listed instead. Relative paths resolve against the working directory."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -285,7 +298,7 @@ impl Tool for ReadFileTool {
                     "type": "integer",
                     "minimum": 1,
                     "default": DEFAULT_READ_LIMIT,
-                    "description": "Maximum lines to read. Defaults to 300; the output byte budget may return fewer."
+                    "description": "Maximum lines to read. Defaults to 1500; the ~50 KiB output byte budget may return fewer."
                 },
                 "ranges": {
                     "type": "array",
@@ -306,6 +319,12 @@ impl Tool for ReadFileTool {
     /// No side effects — a pure read. Makes it `parallel_safe` (concurrent
     /// execution) and allowed in plan mode.
     fn read_only_hint(&self) -> bool {
+        true
+    }
+    /// Self-capped at `MAX_READ_OUTPUT_BYTES` with 1-based line numbers and offset/limit
+    /// pagination — the artifact head/tail middleware must pass it through WHOLE, or the
+    /// line numbering breaks. This is why the read budget may exceed the artifact threshold.
+    fn self_bounds_output(&self) -> bool {
         true
     }
     // read is non-destructive → risk() defaults to Safe.
@@ -359,8 +378,10 @@ impl Tool for ReadFileTool {
         if meta.len() > MAX_IN_MEMORY_BYTES {
             return err(format!(
                 "File too large for read_file's in-memory decoder: {} bytes ({:.1} MB; \
-                 limit is {:.0} MB). Use grep/list_symbols to locate relevant content, or \
-                 bash (sed -n / rg) to read a bounded range.",
+                 limit is {:.0} MB). Use grep/list_symbols to locate the relevant content \
+                 first; ONLY for a file this oversized is `bash sed -n`/`rg` an acceptable \
+                 way to read a bounded range (for normal-sized files always use read_file \
+                 with offset/limit).",
                 meta.len(),
                 meta.len() as f64 / 1_048_576.0,
                 MAX_IN_MEMORY_BYTES as f64 / 1_048_576.0,
@@ -846,7 +867,9 @@ mod tests {
     #[tokio::test]
     async fn omitted_limit_uses_a_bounded_page_with_an_actionable_continuation() {
         let d = tempfile::tempdir().unwrap();
-        let text = (1..=305)
+        // Just over the 1500-line default page (short lines, so the LINE cap binds before
+        // the 50 KiB byte budget) → one bounded page + an actionable continuation.
+        let text = (1..=1600)
             .map(|n| format!("line {n}"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -857,11 +880,11 @@ mod tests {
             .await;
 
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("300\tline 300"), "{}", r.content);
-        assert!(!r.content.contains("301\tline 301"), "{}", r.content);
+        assert!(r.content.contains("1500\tline 1500"), "{}", r.content);
+        assert!(!r.content.contains("1501\tline 1501"), "{}", r.content);
         assert!(
             r.content.contains(
-                r#"Continue with read_file({"file_path":"notes.txt","limit":300,"offset":301})"#
+                r#"Continue with read_file({"file_path":"notes.txt","limit":1500,"offset":1501})"#
             ),
             "{}",
             r.content
@@ -869,9 +892,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_page_stays_below_the_generic_artifact_threshold() {
+    async fn read_page_is_bounded_by_its_own_budget_not_the_artifact_threshold() {
         let d = tempfile::tempdir().unwrap();
-        let text = (1..=100)
+        // ~200 wide lines (~100 KiB) so the page overflows the 50 KiB read budget and must
+        // paginate — proving the bound is the read budget, not the artifact threshold.
+        let text = (1..=200)
             .map(|n| format!("line {n} {}", "x".repeat(500)))
             .collect::<Vec<_>>()
             .join("\n");
@@ -882,9 +907,17 @@ mod tests {
             .await;
 
         assert!(!r.is_error, "{}", r.content);
+        // read_file is EXEMPT from the artifact head/tail middleware, so a page is bounded
+        // by its OWN budget and may exceed the generic 16 KiB artifact threshold while
+        // keeping full line-based pagination.
         assert!(
-            r.content.len() < crate::tools::output_artifact::THRESHOLD_BYTES,
-            "read_file must emit its line continuation before generic artifact truncation: {} bytes",
+            r.content.len() <= MAX_READ_OUTPUT_BYTES,
+            "page must stay within the read budget: {} bytes",
+            r.content.len()
+        );
+        assert!(
+            r.content.len() > crate::tools::output_artifact::THRESHOLD_BYTES,
+            "a wide page now legitimately exceeds the artifact threshold: {} bytes",
             r.content.len()
         );
         assert!(
@@ -919,7 +952,9 @@ mod tests {
 
     #[test]
     fn oversized_continuation_path_uses_a_compact_footer() {
-        let footer = continuation_footer(&"x".repeat(20_000), 1, 10, 100, 300);
+        // Path long enough that the detailed footer exceeds the read budget (now 50 KiB),
+        // forcing the compact, path-free continuation line.
+        let footer = continuation_footer(&"x".repeat(60_000), 1, 10, 100, 300);
         assert!(!footer.contains("file_path"), "{footer}");
         assert!(footer.contains("offset=11"), "{footer}");
         assert!(footer.len() < MAX_READ_OUTPUT_BYTES, "{}", footer.len());

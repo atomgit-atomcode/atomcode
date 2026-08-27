@@ -591,15 +591,36 @@ pub struct ModelsInfo {
     pub all_models: Vec<ModelEntry>,
 }
 
+/// How a catalog refresh decides the active default model.
+///
+/// Interactive `/login` (TUI + CLI) uses [`AdoptServerDefault`](Self::AdoptServerDefault):
+/// the user asked to (re-)login, so we reset the default to the server's primary model
+/// (list-first) — the historical behavior. Background / cross-client sync (daemon/webui)
+/// uses [`PreservePrevious`](Self::PreservePrevious): a refresh triggered by ANOTHER client
+/// must not clobber the model this client is on (see commit a63f6591, "reconcile auth and
+/// provider state across clients").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultModelPolicy {
+    /// Reset the active default to the server's primary (list-first) model.
+    AdoptServerDefault,
+    /// Keep the previously-selected model when it still exists in the new list.
+    PreservePrevious,
+}
+
 /// Entry point. Mutates `config` in place (providers + default_provider);
 /// the caller is responsible for persisting it to disk after a successful
 /// run. This keeps the core free of I/O concerns — tests can call `run`
 /// against a `Config::default()` without touching the filesystem.
 ///
+/// `default_policy` controls whether the active default is reset to the server's
+/// primary model (interactive login) or the user's previous choice is preserved
+/// (background sync) — see [`DefaultModelPolicy`].
+///
 /// Emits exactly one `TakeCodingplan { Success | Fail }` event at each exit path.
 pub fn run(
     config: &mut Config,
     tel: Option<&Arc<atomcode_telemetry::Telemetry>>,
+    default_policy: DefaultModelPolicy,
 ) -> Result<SetupReport> {
     // Step 1: login
     let login = step_login(tel);
@@ -666,7 +687,8 @@ pub fn run(
     };
 
     // Step 3: models — critical. Without models there's nothing to set up.
-    let (models, models_auth_expired) = step_models_and_register(config, plan_type_for_models);
+    let (models, models_auth_expired) =
+        step_models_and_register(config, plan_type_for_models, default_policy);
     if models.is_err() {
         if let Some(t) = tel {
             t.track(atomcode_telemetry::Event::TakeCodingplan {
@@ -896,6 +918,7 @@ fn step_claim() -> (StepResult<ClaimInfo>, Vec<TierAttempt>, bool) {
 fn step_models_and_register(
     config: &mut Config,
     plan_type: PlanType,
+    default_policy: DefaultModelPolicy,
 ) -> (StepResult<ModelsInfo>, bool) {
     let client = match Client::from_stored_auth() {
         Ok(c) => c,
@@ -971,13 +994,27 @@ fn step_models_and_register(
         let pc = build_codingplan_provider(m);
         config.providers.insert(pname.clone(), pc);
     }
-    let default_provider = refreshed_default_provider(
-        config,
-        &previous_default,
-        previous_model.as_deref(),
-        &names,
-        &provider_names,
-    );
+    // A non-CodingPlan custom provider is preserved under both policies (never clobbered
+    // by a CodingPlan refresh); the report must mirror the persisted default exactly.
+    let previous_is_custom_provider = !is_codingplan_provider_name(&previous_default)
+        && config.providers.contains_key(&previous_default);
+    let default_provider = match default_policy {
+        // Interactive login resets to the server's primary (list-first) model.
+        DefaultModelPolicy::AdoptServerDefault if !previous_is_custom_provider => provider_names
+            .first()
+            .cloned()
+            .unwrap_or_else(|| provider_prefix().to_string()),
+        // Background sync (or a preserved custom provider) keeps the previous selection.
+        DefaultModelPolicy::AdoptServerDefault | DefaultModelPolicy::PreservePrevious => {
+            refreshed_default_provider(
+                config,
+                &previous_default,
+                previous_model.as_deref(),
+                &names,
+                &provider_names,
+            )
+        }
+    };
     config.default_provider = default_provider.clone();
 
     // Auto-detect a vision_preprocessor candidate from the freshly
@@ -1066,6 +1103,7 @@ pub fn merge_successful_config(
     latest: &mut Config,
     prepared: &Config,
     report: &SetupReport,
+    default_policy: DefaultModelPolicy,
 ) -> Result<()> {
     let StepResult::Ok(models) = &report.models else {
         anyhow::bail!("CodingPlan model refresh did not complete");
@@ -1086,24 +1124,50 @@ pub fn merge_successful_config(
             .ok_or_else(|| anyhow::anyhow!("prepared provider {name:?} is missing"))?;
         latest.providers.insert(name.clone(), provider.clone());
     }
-    latest.default_provider = refreshed_default_provider(
-        latest,
-        &previous_default,
-        previous_model.as_deref(),
-        &models.display_names,
-        &models.provider_names,
-    );
-
-    let custom_vision = latest
-        .vision_preprocessor_provider
-        .as_deref()
-        .is_some_and(|name| !name.is_empty() && !is_codingplan_provider_name(name));
-    if !custom_vision {
-        latest.vision_preprocessor_provider = prepared.vision_preprocessor_provider.clone();
+    // A non-CodingPlan provider the user configured themselves (their own API key)
+    // is preserved under BOTH policies — `/login` refreshes CodingPlan models but must
+    // never clobber a custom provider selection.
+    let previous_is_custom_provider = !is_codingplan_provider_name(&previous_default)
+        && latest.providers.contains_key(&previous_default);
+    match default_policy {
+        DefaultModelPolicy::AdoptServerDefault if !previous_is_custom_provider => {
+            // Interactive login: force the active selection to the server's primary
+            // (list-first) model. Set BOTH the legacy `default_provider` and the
+            // canonical `default_model`, otherwise `persist_codingplan_as_new_schema`
+            // below keeps a still-valid old `default_model` and syncs the provider
+            // back to it — the model wouldn't actually change.
+            if let Some(server_default) = models.provider_names.first() {
+                latest.default_provider = server_default.clone();
+                latest.default_model = Some(server_default.clone());
+            }
+        }
+        DefaultModelPolicy::AdoptServerDefault | DefaultModelPolicy::PreservePrevious => {
+            latest.default_provider = refreshed_default_provider(
+                latest,
+                &previous_default,
+                previous_model.as_deref(),
+                &models.display_names,
+                &models.provider_names,
+            );
+        }
     }
+
     // Materialize the flat CodingPlan providers onto disk in the new
     // account+model schema (one account per wire format).
     persist_codingplan_as_new_schema(latest);
+
+    // Keep the user's chosen VL preprocessor if it STILL RESOLVES — even a CodingPlan
+    // model they deliberately selected. The old code treated any CodingPlan-named
+    // selection as "not custom" and overwrote it from the server every sync (the bug:
+    // `AtomGit-qwen3.8-27b` kept reverting). Only fill an EMPTY or now-dangling slot
+    // from the server's suggestion. Checked AFTER `persist_codingplan_as_new_schema`
+    // so the freshly-folded CodingPlan models are in place to resolve against.
+    let keep_current = latest.vision_preprocessor_provider.as_deref().is_some_and(|name| {
+        !name.is_empty() && latest.provider_config_for_selection(name).is_some()
+    });
+    if !keep_current {
+        latest.vision_preprocessor_provider = prepared.vision_preprocessor_provider.clone();
+    }
     Ok(())
 }
 
@@ -1125,6 +1189,47 @@ fn persist_codingplan_as_new_schema(config: &mut Config) {
     {
         return;
     }
+    // Remember the prior per-model `supports_vision` before dropping the entries.
+    // A refresh whose flat provider OMITS the field (`None` = server has no opinion
+    // this time — the background auto-sync response can lack it even though the full
+    // interactive login carried it) must NOT null a capability we already know: that
+    // would demote a VL model (e.g. `qwen3.8-27b`, whose name the heuristic doesn't
+    // recognise) to text-only and silently route its images through the VL detour.
+    // Restored below ONLY where the fresh value is `None`; an EXPLICIT fresh value
+    // (`Some(true)`/`Some(false)`) stays authoritative. Keyed by (account, wire model)
+    // — NOT the model id: the id changes when the model count transitions (the last
+    // remaining model folds to the bare prefix), which an id key would miss. The
+    // (account, model) pair is stable across that transition AND unique per provider
+    // (a same-named model under a different wire protocol has a different account), so
+    // it can't cross-contaminate two providers that happen to share a wire model name.
+    // Filter by ACCOUNT (not the model id) so the snapshot covers exactly the set the
+    // rebuild below restores into (`filter(|(_, m)| is_codingplan_provider_name(&m.account))`).
+    // The two must use the same predicate or a model present in one set but not the other
+    // silently misses the restore.
+    let prior_supports_vision: std::collections::HashMap<(String, String), bool> = config
+        .models
+        .iter()
+        .filter(|(_, m)| is_codingplan_provider_name(&m.account))
+        .filter_map(|(_, m)| {
+            m.supports_vision
+                .map(|v| ((m.account.clone(), m.model.clone()), v))
+        })
+        .collect();
+    // Same preservation for the gateway-advertised `reasoning_effort_levels`: a later
+    // refresh that OMITS the field falls back to the client builtin, which would revert
+    // the richer persisted server list. Remember the prior NON-EMPTY list keyed by
+    // (account, wire model); restored below only when the fold fell back to the builtin.
+    let prior_effort_levels: std::collections::HashMap<(String, String), Vec<String>> = config
+        .models
+        .iter()
+        .filter(|(_, m)| is_codingplan_provider_name(&m.account))
+        .filter_map(|(_, m)| {
+            m.reasoning_effort_levels
+                .as_ref()
+                .filter(|levels| !levels.is_empty())
+                .map(|levels| ((m.account.clone(), m.model.clone()), levels.clone()))
+        })
+        .collect();
     // Drop any prior new-schema CodingPlan entries FIRST, so the freshly-merged
     // flat providers are the sole (authoritative) source for the projection.
     // Otherwise `logical_models`' new-schema precedence would mask updated
@@ -1151,7 +1256,33 @@ fn persist_codingplan_as_new_schema(config: &mut Config) {
     for (id, a) in accounts {
         config.provider_accounts.insert(id, a);
     }
-    for (id, m) in models {
+    for (id, mut m) in models {
+        // Fresh server silence (`None`) shouldn't erase a capability we already knew.
+        if m.supports_vision.is_none() {
+            if let Some(&prior) = prior_supports_vision.get(&(m.account.clone(), m.model.clone()))
+            {
+                m.supports_vision = Some(prior);
+            }
+        }
+        // Effort levels: ONLY for a model whose silence-fallback is a concrete NON-EMPTY
+        // builtin list (currently just deepseek-v4-flash) — that's the only case where a
+        // refresh omitting the field folds back to a WRONG concrete list, reverting the
+        // richer persisted server list. When the folded value equals that builtin (the
+        // signal this refresh carried no server list) we restore the prior server list.
+        // Models with NO builtin (builtin == None) reflect the fold directly, so an
+        // EXPLICIT server `[]` (effort removed) is honored, not masked by a stale prior.
+        // (Residual: the server re-sending exactly the builtin list is treated as silence
+        // — contrived, and merely keeps an equal-or-wider prior, never a crash.)
+        if let Some(builtin) = atomcode_config::config::codingplan_builtin_effort_levels(&m.model) {
+            let key = (m.account.clone(), m.model.clone());
+            if m.reasoning_effort_levels.as_deref() == Some(builtin.as_slice()) {
+                if let Some(prior) = prior_effort_levels.get(&key) {
+                    if prior != &builtin {
+                        m.reasoning_effort_levels = Some(prior.clone());
+                    }
+                }
+            }
+        }
         config.models.insert(id, m);
     }
 
@@ -1324,8 +1455,17 @@ fn build_codingplan_provider(entry: &ModelEntry) -> ProviderConfig {
         thinking_keep: None,
         reasoning_history: None,
         reasoning_effort: None,
-        reasoning_effort_levels:
-            atomcode_config::config::codingplan_builtin_effort_levels(&entry.display_model_name),
+        // Prefer the gateway's advertised per-model list (non-empty) verbatim; fall back
+        // to the client builtin when the server omits it or sends an empty list (older /
+        // production servers, or models with no effort switching).
+        reasoning_effort_levels: entry
+            .reasoning_effort_levels
+            .as_deref()
+            .filter(|levels| !levels.is_empty())
+            .map(<[String]>::to_vec)
+            .or_else(|| {
+                atomcode_config::config::codingplan_builtin_effort_levels(&entry.display_model_name)
+            }),
         thinking_enabled: None,
         thinking_budget: None,
         skip_tls_verify: false,
@@ -1558,6 +1698,240 @@ mod tests {
         assert_eq!(glm.reasoning_effort_levels, None);
     }
 
+    // models-v2 now advertises per-model `reasoning_effort_levels`. A NON-EMPTY server
+    // list is persisted verbatim and overrides the client builtin (deepseek -> [high,max]);
+    // an EMPTY list means "no effort switching" and falls back to the builtin (which is
+    // None for a non-builtin model), never persisting a bare empty vec.
+    #[test]
+    fn build_provider_prefers_server_effort_levels_over_builtin() {
+        let served = super::super::types::ModelEntry {
+            reasoning_effort_levels: Some(vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "xhigh".to_string(),
+            ]),
+            ..entry("deepseek-v4-flash")
+        };
+        assert_eq!(
+            build_codingplan_provider(&served)
+                .reasoning_effort_levels
+                .as_deref(),
+            Some(
+                [
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "xhigh".to_string()
+                ]
+                .as_slice()
+            ),
+            "a non-empty server list must be persisted and win over the builtin"
+        );
+
+        let empty = super::super::types::ModelEntry {
+            reasoning_effort_levels: Some(Vec::new()),
+            ..entry("GLM-5.2")
+        };
+        assert_eq!(
+            build_codingplan_provider(&empty).reasoning_effort_levels,
+            None,
+            "an empty server list is not persisted as an empty vec"
+        );
+    }
+
+    // The exact models-v2 payload shape from the (pre-prod) gateway must deserialize,
+    // carrying `reasoning_effort_levels` through to the `ModelEntry`.
+    #[test]
+    fn model_entry_deserializes_server_reasoning_effort_levels() {
+        let e: super::super::types::ModelEntry = serde_json::from_value(serde_json::json!({
+            "display_model_name": "deepseek-v4-flash",
+            "type": "openai",
+            "plan_available": true,
+            "reasoning_effort_levels": ["low", "medium", "xhigh"]
+        }))
+        .unwrap();
+        assert_eq!(
+            e.reasoning_effort_levels.as_deref(),
+            Some(
+                [
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "xhigh".to_string()
+                ]
+                .as_slice()
+            )
+        );
+        // Absent field (older/production server) → None, so the builtin fallback applies.
+        let old: super::super::types::ModelEntry = serde_json::from_value(serde_json::json!({
+            "display_model_name": "deepseek-v4-flash", "type": "openai", "plan_available": true
+        }))
+        .unwrap();
+        assert_eq!(old.reasoning_effort_levels, None);
+    }
+
+    // Same class as the supports_vision revert: once the server list is persisted, a
+    // LATER refresh whose flat provider OMITS `reasoning_effort_levels` (the background
+    // auto-sync response can lack it) must NOT revert the richer persisted list to the
+    // client builtin. The fold falls back to the builtin on silence; we restore the
+    // prior server list keyed by (account, wire model).
+    #[test]
+    fn persist_preserves_server_effort_levels_when_a_later_refresh_omits_them() {
+        let mut cfg = blank_config();
+        cfg.provider_accounts.insert(
+            "AtomGit".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1"
+            }))
+            .unwrap(),
+        );
+        // A prior full login persisted the gateway's richer list.
+        cfg.models.insert(
+            pxn("deepseek-v4-flash"),
+            serde_json::from_value(serde_json::json!({
+                "account": "AtomGit", "model": "deepseek-v4-flash",
+                "context_window": 1_000_000,
+                "reasoning_effort_levels": ["low", "medium", "xhigh"]
+            }))
+            .unwrap(),
+        );
+        // This refresh's flat provider carries NO server list → falls back to the builtin
+        // [high, max] (server silent this sync).
+        let fresh = build_codingplan_provider(&entry("deepseek-v4-flash"));
+        assert_eq!(
+            fresh.reasoning_effort_levels.as_deref(),
+            Some(["high".to_string(), "max".to_string()].as_slice()),
+            "no server list → builtin fallback"
+        );
+        cfg.providers.insert(pxn("deepseek-v4-flash"), fresh);
+
+        persist_codingplan_as_new_schema(&mut cfg);
+
+        assert_eq!(
+            cfg.models[&pxn("deepseek-v4-flash")]
+                .reasoning_effort_levels
+                .as_deref(),
+            Some(
+                [
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "xhigh".to_string()
+                ]
+                .as_slice()
+            ),
+            "a fieldless refresh must not revert the persisted server list to the builtin"
+        );
+    }
+
+    // Guard: for a model with NO builtin fallback (e.g. GLM-5.2), the fold reflects the
+    // server directly — an EXPLICIT server `[]` (effort removed) folds to `None` and must
+    // be honored, NOT masked by restoring a stale prior list. Preservation is only for
+    // models whose silence-fallback is a concrete builtin list (which would wrongly revert).
+    #[test]
+    fn persist_honors_server_removing_effort_for_a_non_builtin_model() {
+        let mut cfg = blank_config();
+        cfg.provider_accounts.insert(
+            "AtomGit".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1"
+            }))
+            .unwrap(),
+        );
+        // GLM once had a server-advertised list persisted.
+        cfg.models.insert(
+            pxn("GLM-5.2"),
+            serde_json::from_value(serde_json::json!({
+                "account": "AtomGit", "model": "GLM-5.2",
+                "reasoning_effort_levels": ["low", "high"]
+            }))
+            .unwrap(),
+        );
+        // This refresh the server sends GLM an EMPTY list (effort removed).
+        let served = super::super::types::ModelEntry {
+            reasoning_effort_levels: Some(Vec::new()),
+            ..entry("GLM-5.2")
+        };
+        cfg.providers
+            .insert(pxn("GLM-5.2"), build_codingplan_provider(&served));
+
+        persist_codingplan_as_new_schema(&mut cfg);
+
+        assert_eq!(
+            cfg.models[&pxn("GLM-5.2")].reasoning_effort_levels, None,
+            "server removing effort (via []) on a non-builtin model must be honored, not reverted"
+        );
+    }
+
+    // Guard: a FRESH server list (differing from the builtin) is authoritative — it must
+    // override a stale prior, not be masked by the preservation.
+    #[test]
+    fn persist_lets_a_fresh_server_effort_list_override_a_prior() {
+        let mut cfg = blank_config();
+        cfg.provider_accounts.insert(
+            "AtomGit".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1"
+            }))
+            .unwrap(),
+        );
+        cfg.models.insert(
+            pxn("deepseek-v4-flash"),
+            serde_json::from_value(serde_json::json!({
+                "account": "AtomGit", "model": "deepseek-v4-flash",
+                "reasoning_effort_levels": ["low", "medium", "xhigh"]
+            }))
+            .unwrap(),
+        );
+        // Fresh refresh advertises a DIFFERENT (narrowed) list.
+        let served = super::super::types::ModelEntry {
+            reasoning_effort_levels: Some(vec!["low".to_string(), "max".to_string()]),
+            ..entry("deepseek-v4-flash")
+        };
+        cfg.providers
+            .insert(pxn("deepseek-v4-flash"), build_codingplan_provider(&served));
+
+        persist_codingplan_as_new_schema(&mut cfg);
+
+        assert_eq!(
+            cfg.models[&pxn("deepseek-v4-flash")]
+                .reasoning_effort_levels
+                .as_deref(),
+            Some(["low".to_string(), "max".to_string()].as_slice()),
+            "a fresh server list wins over the prior"
+        );
+    }
+
+    // End-to-end: a server-advertised effort list must reach `config.models` (persisted to
+    // config.toml) through register → fold, overriding the builtin the whole way.
+    #[test]
+    fn server_effort_levels_persist_into_config_models_through_the_fold() {
+        let mut cfg = blank_config();
+        let served = super::super::types::ModelEntry {
+            reasoning_effort_levels: Some(vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "xhigh".to_string(),
+            ]),
+            ..entry("deepseek-v4-flash")
+        };
+        // Two models keeps the id in the `<prefix>-<model>` form.
+        run_register(&mut cfg, vec![served, entry("GLM-5.2")]);
+        persist_codingplan_as_new_schema(&mut cfg);
+
+        assert_eq!(
+            cfg.models[&pxn("deepseek-v4-flash")]
+                .reasoning_effort_levels
+                .as_deref(),
+            Some(
+                [
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "xhigh".to_string()
+                ]
+                .as_slice()
+            ),
+            "the server's effort list must land in config.models, not the builtin [high,max]"
+        );
+    }
+
     #[test]
     fn build_provider_floors_conservative_server_window() {
         // The gateway reports a conservative 64k for several models; we floor
@@ -1616,6 +1990,7 @@ mod tests {
             supports_vision: Some(true),
             plan_available: true,
             capable_model: None,
+            reasoning_effort_levels: None,
             api_key: None,
         };
         let p = build_codingplan_provider(&e);
@@ -2633,7 +3008,13 @@ mod tests {
         );
         latest.default_provider = "custom".into();
 
-        merge_successful_config(&mut latest, &prepared, &report).unwrap();
+        merge_successful_config(
+            &mut latest,
+            &prepared,
+            &report,
+            DefaultModelPolicy::PreservePrevious,
+        )
+        .unwrap();
 
         assert_eq!(latest.default_provider, "custom");
         assert!(latest.providers.contains_key("custom"));
@@ -2644,6 +3025,90 @@ mod tests {
         assert!(latest.models.contains_key(px()));
         assert!(!latest.providers.contains_key(px()));
         // The user's concurrent non-CodingPlan default is untouched.
+        assert_eq!(latest.default_model, None);
+    }
+
+    #[test]
+    fn interactive_login_adopts_server_default_over_a_codingplan_pin() {
+        // prepared carries the fresh catalog; "first-model" is the server's primary
+        // (list-first) model.
+        let mut prepared = blank_config();
+        let models = run_register(
+            &mut prepared,
+            vec![
+                vl_model_entry("first-model"),
+                vl_model_entry("second-model"),
+            ],
+        );
+        let report = SetupReport {
+            login: StepResult::Skipped("test".into()),
+            claim: StepResult::Skipped("test".into()),
+            claim_attempts: Vec::new(),
+            models: StepResult::Ok(models),
+            status: StepResult::Skipped("test".into()),
+            auth_expired: false,
+        };
+        // latest: the user previously pinned the SECOND (non-first) CodingPlan model,
+        // which still exists in the new list.
+        let mut latest = blank_config();
+        run_register(
+            &mut latest,
+            vec![
+                vl_model_entry("first-model"),
+                vl_model_entry("second-model"),
+            ],
+        );
+        latest.default_provider = pxn("second-model");
+        latest.default_model = Some(pxn("second-model"));
+
+        merge_successful_config(
+            &mut latest,
+            &prepared,
+            &report,
+            DefaultModelPolicy::AdoptServerDefault,
+        )
+        .unwrap();
+
+        // AdoptServerDefault resets to the server's first model, overriding the pin —
+        // in BOTH the legacy `default_provider` and the canonical `default_model`, so
+        // `persist_codingplan_as_new_schema` can't sync the provider back to the old pin.
+        assert_eq!(latest.default_provider, pxn("first-model"));
+        assert_eq!(
+            latest.default_model.as_deref(),
+            Some(pxn("first-model").as_str())
+        );
+    }
+
+    #[test]
+    fn interactive_login_still_preserves_a_custom_non_codingplan_provider() {
+        // Even under AdoptServerDefault, a user's own (non-CodingPlan) provider is never
+        // clobbered — `/login` refreshes CodingPlan models but respects a custom pick.
+        let mut prepared = blank_config();
+        let models = run_register(&mut prepared, vec![vl_model_entry("plan-model")]);
+        let report = SetupReport {
+            login: StepResult::Skipped("test".into()),
+            claim: StepResult::Skipped("test".into()),
+            claim_attempts: Vec::new(),
+            models: StepResult::Ok(models),
+            status: StepResult::Skipped("test".into()),
+            auth_expired: false,
+        };
+        let mut latest = blank_config();
+        latest.providers.insert(
+            "custom".into(),
+            build_codingplan_provider(&vl_model_entry("custom-model")),
+        );
+        latest.default_provider = "custom".into();
+
+        merge_successful_config(
+            &mut latest,
+            &prepared,
+            &report,
+            DefaultModelPolicy::AdoptServerDefault,
+        )
+        .unwrap();
+
+        assert_eq!(latest.default_provider, "custom");
         assert_eq!(latest.default_model, None);
     }
 
@@ -2858,6 +3323,196 @@ mod tests {
         assert_eq!(cfg.models[&pxn("GLM-5.2")].context_window, 200_000);
         assert!(!cfg.models.contains_key(&pxn("Dropped")));
         assert!(!cfg.providers.contains_key(&pxn("GLM-5.2")));
+    }
+
+    // A prior login wrote `supports_vision: true` (server-sent then). A later refresh
+    // whose flat provider OMITS the field (`None` = server has no opinion this time,
+    // e.g. the background auto-sync response) must NOT null the known capability —
+    // otherwise it falls back to the name heuristic and a VL model like "qwen3.8-27b"
+    // is wrongly demoted to text-only, silently sending images through the VL detour.
+    #[test]
+    fn persist_preserves_known_supports_vision_when_fresh_data_omits_it() {
+        let mut cfg = blank_config();
+        cfg.provider_accounts.insert(
+            "AtomGit".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1"
+            }))
+            .unwrap(),
+        );
+        cfg.models.insert(
+            pxn("qwen3.8-27b"),
+            serde_json::from_value(serde_json::json!({
+                "account": "AtomGit", "model": "qwen3.8-27b",
+                "context_window": 64000, "supports_vision": true
+            }))
+            .unwrap(),
+        );
+        // This refresh's flat provider carries NO supports_vision (server silent).
+        let fresh = build_codingplan_provider(&entry("qwen3.8-27b"));
+        assert_eq!(fresh.supports_vision, None, "entry() omits supports_vision");
+        cfg.providers.insert(pxn("qwen3.8-27b"), fresh);
+
+        persist_codingplan_as_new_schema(&mut cfg);
+
+        assert_eq!(
+            cfg.models[&pxn("qwen3.8-27b")].supports_vision,
+            Some(true),
+            "server silence must not erase the last-known capability"
+        );
+    }
+
+    // Guard: when the fresh server data has an EXPLICIT opinion, the server stays
+    // authoritative — an explicit `false` overrides a prior `true`.
+    #[test]
+    fn persist_lets_server_explicitly_override_supports_vision() {
+        let mut cfg = blank_config();
+        cfg.provider_accounts.insert(
+            "AtomGit".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1"
+            }))
+            .unwrap(),
+        );
+        cfg.models.insert(
+            pxn("m"),
+            serde_json::from_value(serde_json::json!({
+                "account": "AtomGit", "model": "m", "context_window": 64000, "supports_vision": true
+            }))
+            .unwrap(),
+        );
+        let mut fresh = build_codingplan_provider(&entry("m"));
+        fresh.supports_vision = Some(false); // server explicitly says NO this time
+        cfg.providers.insert(pxn("m"), fresh);
+
+        persist_codingplan_as_new_schema(&mut cfg);
+
+        assert_eq!(
+            cfg.models[&pxn("m")].supports_vision,
+            Some(false),
+            "an explicit server value wins over the prior local value"
+        );
+    }
+
+    // The prior->fresh id can CHANGE when the model count transitions: with 2+ models
+    // the id is `<prefix>-<model>`, but the last remaining model folds to the BARE
+    // prefix (`provider_names_for`). Keying the capability snapshot by id would then
+    // miss on that transition. Keying by (account, wire model) — stable across the
+    // count change AND unique per provider (a same-named model under a different wire
+    // protocol has a different account) — restores it correctly.
+    #[test]
+    fn persist_preserves_supports_vision_across_model_count_transition() {
+        let mut cfg = blank_config();
+        cfg.provider_accounts.insert(
+            "AtomGit".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider": "openai", "base_url": "https://llm-api.atomgit.com/v1"
+            }))
+            .unwrap(),
+        );
+        // Prior era had 2+ models, so this model's id was the `<prefix>-<model>` form.
+        cfg.models.insert(
+            pxn("qwen3.8-27b"),
+            serde_json::from_value(serde_json::json!({
+                "account": "AtomGit", "model": "qwen3.8-27b",
+                "context_window": 64000, "supports_vision": true
+            }))
+            .unwrap(),
+        );
+        // This refresh has only ONE model left → it folds to the BARE prefix id, and
+        // the fresh flat provider omits supports_vision (server silent).
+        let fresh = build_codingplan_provider(&entry("qwen3.8-27b"));
+        assert_eq!(fresh.supports_vision, None);
+        cfg.providers.insert(px().to_string(), fresh);
+
+        persist_codingplan_as_new_schema(&mut cfg);
+
+        // The single remaining model now lives under the bare-prefix id.
+        assert_eq!(
+            cfg.models[px()].supports_vision,
+            Some(true),
+            "capability must survive the id change caused by the model-count transition"
+        );
+    }
+
+    // A user who deliberately picked a CodingPlan model as their VL preprocessor must
+    // keep it across a sync. The old code treated any CodingPlan-named selection as
+    // "not custom" and overwrote it from the server every refresh (the reported bug:
+    // `AtomGit-qwen3.8-27b` kept reverting).
+    #[test]
+    fn merge_keeps_user_codingplan_vision_preprocessor_that_still_exists() {
+        let mut prepared = blank_config();
+        let models = run_register(
+            &mut prepared,
+            vec![vl_model_entry("qwen-vl"), vl_model_entry("other-vl")],
+        );
+        // The server's own auto-suggestion is a DIFFERENT model.
+        prepared.vision_preprocessor_provider = Some(pxn("other-vl"));
+        let report = SetupReport {
+            login: StepResult::Skipped("test".into()),
+            claim: StepResult::Skipped("test".into()),
+            claim_attempts: Vec::new(),
+            models: StepResult::Ok(models),
+            status: StepResult::Skipped("test".into()),
+            auth_expired: false,
+        };
+
+        let mut latest = blank_config();
+        run_register(
+            &mut latest,
+            vec![vl_model_entry("qwen-vl"), vl_model_entry("other-vl")],
+        );
+        // The user deliberately chose the CodingPlan VL model.
+        latest.vision_preprocessor_provider = Some(pxn("qwen-vl"));
+
+        merge_successful_config(
+            &mut latest,
+            &prepared,
+            &report,
+            DefaultModelPolicy::PreservePrevious,
+        )
+        .unwrap();
+
+        assert_eq!(
+            latest.vision_preprocessor_provider.as_deref(),
+            Some(pxn("qwen-vl").as_str()),
+            "the user's still-valid CodingPlan VL preprocessor must survive the sync"
+        );
+    }
+
+    // Guard: a VL preprocessor pointing at a model that no longer exists in the fresh
+    // catalog is dangling — it should be replaced by the server's suggestion, not kept.
+    #[test]
+    fn merge_replaces_dangling_vision_preprocessor() {
+        let mut prepared = blank_config();
+        let models = run_register(&mut prepared, vec![vl_model_entry("fresh-vl")]);
+        prepared.vision_preprocessor_provider = Some(px().into()); // single model → bare prefix
+        let report = SetupReport {
+            login: StepResult::Skipped("test".into()),
+            claim: StepResult::Skipped("test".into()),
+            claim_attempts: Vec::new(),
+            models: StepResult::Ok(models),
+            status: StepResult::Skipped("test".into()),
+            auth_expired: false,
+        };
+
+        let mut latest = blank_config();
+        // Points at a CodingPlan model absent from the fresh catalog.
+        latest.vision_preprocessor_provider = Some(pxn("gone-vl"));
+
+        merge_successful_config(
+            &mut latest,
+            &prepared,
+            &report,
+            DefaultModelPolicy::PreservePrevious,
+        )
+        .unwrap();
+
+        assert_eq!(
+            latest.vision_preprocessor_provider.as_deref(),
+            Some(px()),
+            "a dangling VL preprocessor is replaced by the server's suggestion"
+        );
     }
 
     #[test]

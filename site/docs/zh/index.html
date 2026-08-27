@@ -77,7 +77,7 @@
   <main class="dmain prose-docs">
 <div class="doc-hero">
       <div class="eyebrow"><span class="dot"></span><span data-i18n="hero.eyebrow">AtomCode · 开源终端 AI 编码助手</span></div>
-      <h1>AtomCode 使用指南</h1>
+      <h1 id="atomcode-使用指南">AtomCode 使用指南</h1>
       <p class="lede">住在终端里的 AI 编码助手。给它一个自然语言任务，它会自主读取、编辑、运行并自我验证。本文档带你从零开始，逐步掌握 AtomCode 的每一项能力。</p>
       <div class="tags">
         <span class="tag accent">v5.0.8</span>
@@ -88,7 +88,7 @@
       </div>
     </div>
 
-      <h2>三步开始</h2>
+      <h2 id="三步开始">三步开始</h2>
       <ol>
         <li><strong>安装</strong> —— 一条 curl 命令或者从源码构建，参见 <a href="./getting-started.html">快速开始</a>。</li>
         <li><strong>登录或配置模型</strong> —— AtomGit OAuth 一键登录最省事，也支持任意 OpenAI 兼容 API Key，参见 <a href="./login.html">登录方式</a> 和 <a href="./configuration.html">配置文件</a>。</li>
@@ -100,63 +100,63 @@
         <p>如果只是想快速体验，跑一条命令即可：<code>atomcode -p "简要介绍一下这个仓库"</code>，一次性执行并把结果输出到 stdout。</p>
       </div>
 
-      <h2>文档导览</h2>
+      <h2 id="文档导览">文档导览</h2>
       <div class="doc-grid">
         <a class="doc-card" href="./getting-started.html">
-          <h3>快速开始</h3>
+          <h3 id="快速开始">快速开始</h3>
           <p>安装方式、首次运行的 3 步启动向导、完成第一个任务,以及 <code>atomcode uninstall</code> 卸载流程。</p>
         </a>
         <a class="doc-card" href="./configuration.html">
-          <h3>配置文件</h3>
+          <h3 id="配置文件">配置文件</h3>
           <p><code>~/.atomcode/config.toml</code> 字段说明、各家 provider 配置示例,含视觉预处理器(非视觉模型也能问图)。</p>
         </a>
         <a class="doc-card" href="./login.html">
-          <h3>登录方式</h3>
+          <h3 id="登录方式">登录方式</h3>
           <p>AtomGit OAuth 一键登录(自动持久化)与 API Key 配置对比。</p>
         </a>
         <a class="doc-card" href="./basic-usage.html">
-          <h3>基本使用</h3>
+          <h3 id="基本使用">基本使用</h3>
           <p>如何描述任务、常用 CLI 参数、文件引用、多行输入,以及图片附件 / 截图(Ctrl+V / 拖拽)。</p>
         </a>
         <a class="doc-card" href="./slash-commands.html">
-          <h3>斜杠命令</h3>
+          <h3 id="斜杠命令">斜杠命令</h3>
           <p>30+ 个内置斜杠命令参考表,涵盖会话、模型、撤销、Issue、对话模式、扩展生态等操作。</p>
         </a>
         <a class="doc-card" href="./keybindings.html">
-          <h3>快捷键</h3>
+          <h3 id="快捷键">快捷键</h3>
           <p>输入、导航、选区复制等全部 TUI 快捷键。</p>
         </a>
         <a class="doc-card" href="./tools.html">
-          <h3>内置工具</h3>
+          <h3 id="内置工具">内置工具</h3>
           <p>21 个内置工具:文件/Shell、代码图谱、Web、自动化分类说明。</p>
         </a>
         <a class="doc-card" href="./sessions.html">
-          <h3>会话与撤销</h3>
+          <h3 id="会话与撤销">会话与撤销</h3>
           <p>持久化会话恢复、<code>/undo</code> 回滚、清空与压缩上下文。</p>
         </a>
         <a class="doc-card" href="./project-instructions.html">
-          <h3>项目指令文件</h3>
+          <h3 id="项目指令文件">项目指令文件</h3>
           <p>用 <code>.atomcode.md</code> 给 AtomCode 定制项目级规范。</p>
         </a>
         <a class="doc-card" href="./skills.html">
-          <h3>Skills 扩展</h3>
+          <h3 id="skills-扩展">Skills 扩展</h3>
           <p>编写用户自定义 skill,扩展斜杠命令生态。</p>
         </a>
         <a class="doc-card" href="./plugins.html">
-          <h3>Plugin 系统</h3>
+          <h3 id="plugin-系统">Plugin 系统</h3>
           <p>从 git 仓库一键安装别人写好的 skill / 命令 / hook 套件,与 Claude Code 生态兼容。</p>
         </a>
         <a class="doc-card" href="./mcp.html">
-          <h3>MCP 集成</h3>
+          <h3 id="mcp-集成">MCP 集成</h3>
           <p>通过 <code>.mcp.json</code> 接入外部 MCP server,把 GitHub、数据库、Playwright 等生态工具暴露给模型。</p>
         </a>
         <a class="doc-card" href="./faq.html">
-          <h3>常见问题</h3>
+          <h3 id="常见问题">常见问题</h3>
           <p>安装、连不上模型、权限确认、上下文超限等常见疑问解答。</p>
         </a>
       </div>
 
-      <h2>反馈与参与</h2>
+      <h2 id="反馈与参与">反馈与参与</h2>
       <p>AtomCode 是开源项目,欢迎提交 issue 或 PR:</p>
       <ul>
         <li>开源仓库:<a href="https://atomgit.com/atomgit_atomcode/atomcode" target="_blank">https://atomgit.com/atomgit_atomcode/atomcode</a></li>

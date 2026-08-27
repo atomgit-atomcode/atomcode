@@ -1311,9 +1311,8 @@ mod tests {
 
     #[test]
     fn resume_returns_the_selected_runtime_context_window() {
-        let mut manager = BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from(
-            "/tmp/project",
-        )));
+        let mut manager =
+            BgRuntimeManager::new_for_test(Session::default_session(PathBuf::from("/tmp/project")));
         manager.foreground.context_window = 1_000_000;
         manager.foreground_session_mut().messages =
             vec![atomcode_kernel::message::Message::user("old model")];

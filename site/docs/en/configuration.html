@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Configuration</h1>
+<h1 id="configuration">Configuration</h1>
       <p class="lede">AtomCode's config is TOML, supports any number of providers side by side, and lets you switch on the fly. This page explains every field and shows examples for common providers.</p>
 
-      <h2>Config file location</h2>
+      <h2 id="config-file-location">Config file location</h2>
       <p>Default path:</p>
       <ul>
         <li>macOS / Linux / HarmonyOS PC: <code>~/.atomcode/config.toml</code></li>
@@ -86,7 +86,7 @@
       </ul>
       <p>You can also use <code>--config /path/to/config.toml</code> to point at any file. On the first run, if the file is missing, the 3-step wizard walks you through initial setup.</p>
 
-      <h2>Minimal example</h2>
+      <h2 id="minimal-example">Minimal example</h2>
       <pre><code>default_provider = "deepseek"
 
 [providers.deepseek]
@@ -101,7 +101,7 @@ context_window = 64000</code></pre>
         <p>The recommended path is <code>/provider</code>: add a provider account, then add one or more models under it. Protocol, base URL, and API key are shared by the account; model name and context window are stored per model. Legacy <code>[providers.*]</code> entries remain supported and are projected automatically.</p>
       </div>
 
-      <h2>Top-level fields</h2>
+      <h2 id="top-level-fields">Top-level fields</h2>
       <table>
         <thead>
           <tr><th>Field</th><th>Type</th><th>Description</th></tr>
@@ -134,7 +134,7 @@ context_window = 64000</code></pre>
         </tbody>
       </table>
 
-      <h2>Environment Variables & Dynamic API Key Resolution</h2>
+      <h2 id="environment-variables-dynamic-api-key-resolution">Environment Variables & Dynamic API Key Resolution</h2>
       <p>To avoid storing sensitive credentials in plain text and to share environment variables with other tools, AtomCode supports flexible environment variable syntax in <code>config.toml</code>:</p>
       <ul>
         <li><strong>Environment Variable Expansion (<code>$VAR</code> / <code>${VAR}</code>)</strong>:
@@ -167,7 +167,7 @@ api_key = "ANTHROPIC_API_KEY" # Automatically read from environment variable ANT
         <p>Even when a model advertises 128K+, its effective attention window is usually much smaller. An oversized context triggers "lost in the middle" failures and disables AtomCode's compaction strategy. 64K is empirically the most robust default; bump it yourself if your model is solid at higher values.</p>
       </div>
 
-      <h2>Network &amp; proxy</h2>
+      <h2 id="network-proxy">Network &amp; proxy</h2>
       <p>By default AtomCode follows your system's proxy configuration, so it works out of the box behind a corporate proxy. Tune it under <code>[network.proxy]</code>:</p>
       <pre><code>[network.proxy]
 mode = "follow_system"    # default — honor env vars + OS system proxy
@@ -187,23 +187,23 @@ mode = "follow_system"    # default — honor env vars + OS system proxy
       </table>
       <p>IPv6 proxy hosts are bracketed automatically (<code>::1</code> → <code>http://[::1]:8080</code>). If a login attempt fails to connect or times out, the error message points at your proxy / network settings so you can tell a proxy problem apart from bad credentials.</p>
 
-      <h2>Common provider examples</h2>
+      <h2 id="common-provider-examples">Common provider examples</h2>
 
-      <h3>Claude (Anthropic)</h3>
+      <h3 id="claude-anthropic">Claude (Anthropic)</h3>
       <pre><code>[providers.claude]
 type = "claude"
 api_key = "sk-ant-..."
 model = "claude-sonnet-4-6"
 context_window = 128000</code></pre>
 
-      <h3>OpenAI</h3>
+      <h3 id="openai">OpenAI</h3>
       <pre><code>[providers.openai]
 type = "openai"
 api_key = "sk-..."
 model = "gpt-4o"
 context_window = 128000</code></pre>
 
-      <h3>DeepSeek</h3>
+      <h3 id="deepseek">DeepSeek</h3>
       <pre><code>[providers.deepseek]
 type = "openai"
 api_key = "sk-..."
@@ -211,7 +211,7 @@ model = "deepseek-chat"
 base_url = "https://api.deepseek.com/v1"
 context_window = 64000</code></pre>
 
-      <h3>Zhipu GLM</h3>
+      <h3 id="zhipu-glm">Zhipu GLM</h3>
       <pre><code>[providers.glm]
 type = "openai"
 api_key = "..."
@@ -219,7 +219,7 @@ model = "glm-4-plus"
 base_url = "https://open.bigmodel.cn/api/paas/v4"
 context_window = 128000</code></pre>
 
-      <h3>Tongyi Qianwen (Qwen)</h3>
+      <h3 id="tongyi-qianwen-qwen">Tongyi Qianwen (Qwen)</h3>
       <pre><code>[providers.qwen]
 type = "openai"
 api_key = "sk-..."
@@ -227,14 +227,14 @@ model = "qwen-plus"
 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 context_window = 128000</code></pre>
 
-      <h3>SiliconFlow</h3>
+      <h3 id="siliconflow">SiliconFlow</h3>
       <pre><code>[providers.siliconflow]
 type = "openai"
 api_key = "sk-..."
 model = "Qwen/Qwen2.5-72B-Instruct"
 base_url = "https://api.siliconflow.cn/v1"</code></pre>
 
-      <h3>Ollama (local)</h3>
+      <h3 id="ollama-local">Ollama (local)</h3>
       <pre><code>[providers.ollama]
 type = "ollama"
 model = "llama3.2"
@@ -245,7 +245,7 @@ context_window = 8000</code></pre>
         <p>Function-calling support varies a lot across Ollama models; weaker local models may not invoke tools reliably. Prefer the Instruct variants of Qwen2.5 / Llama3.2.</p>
       </div>
 
-      <h2>Multiple providers and quick switching</h2>
+      <h2 id="multiple-providers-and-quick-switching">Multiple providers and quick switching</h2>
       <p>Config files can host any number of providers in parallel:</p>
       <pre><code>default_provider = "claude"
 
@@ -267,12 +267,12 @@ base_url = "http://localhost:11434"</code></pre>
       <p>In the TUI, use <code>/provider</code> to manage provider accounts and their models. Built-in presets fill in the protocol and base URL for vendors such as AtomGit and TaoToken; choose Custom for another endpoint. Use <code>/model</code> to switch the current session and save the selected model as the default for sessions opened later; other already-open sessions are unchanged. The CLI also accepts one-shot overrides:</p>
       <pre><code>atomcode --provider deepseek --model deepseek-reasoner</code></pre>
 
-      <h2>Turn round limit</h2>
+      <h2 id="turn-round-limit">Turn round limit</h2>
       <pre><code>[coding]
 max_rounds = 200</code></pre>
       <p>When the limit is reached, the TUI asks whether to continue or stop instead of dropping the task. Set it to <code>0</code> for no limit.</p>
 
-      <h2>Todo eagerness</h2>
+      <h2 id="todo-eagerness">Todo eagerness</h2>
       <pre><code>[tools.todo]
 enabled = true
 eager = "auto"</code></pre>
@@ -303,14 +303,14 @@ base_url = "https://api.siliconflow.cn/v1"</code></pre>
       </ul>
       <p>For usage-level details see <a href="./basic-usage.html#image-attach">Basic Usage · Image attachments / screenshots</a>.</p>
 
-      <h2>Three ways to edit the config</h2>
+      <h2 id="three-ways-to-edit-the-config">Three ways to edit the config</h2>
       <ul>
         <li><strong>Hand-edit</strong> — open <code>~/.atomcode/config.toml</code> in your favourite editor.</li>
         <li><strong><code>/config</code> in the TUI</strong> — search and edit safe settings in place. The dynamic <em>Retry attempts (current model)</em> row writes <code>retry_max_attempts</code> to the active model; press Delete twice to restore the default.</li>
         <li><strong><code>/provider</code> in the TUI</strong> — interactively manage provider accounts and their models; changes are written back to disk.</li>
       </ul>
 
-      <h2>Next steps</h2>
+      <h2 id="next-steps">Next steps</h2>
       <ul>
         <li><a href="./login.html">Login Methods</a> — skip manual key management with AtomGit OAuth.</li>
         <li><a href="./basic-usage.html">Basic Usage</a> — see how CLI flags can override config for one run.</li>

@@ -169,8 +169,11 @@ const EMPTY_RESPONSE_MAX_RETRIES: u32 = 5;
 /// is almost always unfinished work; v1 (atomcode-core/src/agent/mod.rs:3064) nudged
 /// the model to resume rather than silently ending the turn. BOUNDED (tightly — the
 /// nudge tells the model to switch to incremental file writes, so it should not need
-/// many) so a model that truncates every round cannot livelock the loop.
-const MAX_TRUNCATION_CONTINUATIONS: u32 = 2;
+/// many) so a model that truncates every round cannot livelock the loop. Set to 4:
+/// a weak model writing a large deliverable often needs several incremental resume
+/// rounds to finish, and each recovered round suppresses the truncation warning; the
+/// bound still caps a genuinely stuck (re-dumping) model at a few wasted rounds.
+const MAX_TRUNCATION_CONTINUATIONS: u32 = 4;
 
 /// Always-on, coarse cross-round repetition fuse. The opt-in exact guard below
 /// compares the executed call, effective cwd, result and success state; this fuse
@@ -2083,13 +2086,17 @@ impl RunningAgent {
                     && est(&messages) >= limit as u64
                     && attempts < MAX_OVERFLOW_ATTEMPTS
                 {
-                    let before = est(&convo.messages);
                     self.run_compaction(convo, CompactTrigger::Overflow { attempt: attempts })
                         .await;
                     attempts += 1;
-                    if est(&convo.messages) >= before {
-                        break; // nothing drained (sacred floor / single huge input) — warn below
-                    }
+                    // Re-project after EVERY pass and do NOT break when a single tier drains
+                    // nothing. The overflow tiers are a LADDER (stub tool results → truncate a
+                    // monster single message → drain+summarize the older prefix, splitting a
+                    // giant single turn). A middle tier that can't help — e.g. no
+                    // >budget-char message to truncate, the common case — must NOT stop the
+                    // loop before the more-aggressive drain-split tier runs. Termination is
+                    // bounded by `est < limit` and `attempts < MAX_OVERFLOW_ATTEMPTS`; a tier
+                    // with nothing to do returns a cheap noop plan (no LLM call).
                     messages = convo.messages.clone();
                     self.hooks.pre_request(&mut messages, &turn_ctx).await;
                     appended_only &= messages.len() >= convo.messages.len()
@@ -2306,11 +2313,12 @@ impl RunningAgent {
                 Err(e) if e.retryable && provider_retry < self.max_provider_retries => {
                     provider_retry += 1;
                     let wait = (provider_retry as u64 * 3).min(15); // 3 / 6 / 9s, matching v1
-                    self.rt.emit(AgentEvent::Warning(format!(
-                        "API error {}，{wait} 秒后重试({provider_retry}/{})...",
-                        retry_reason(&e),
-                        self.max_provider_retries
-                    )));
+                    self.rt.emit(AgentEvent::ProviderRetry {
+                        attempt: provider_retry,
+                        max_attempts: self.max_provider_retries,
+                        backoff_secs: wait,
+                        reason: retry_reason(&e).to_string(),
+                    });
                     // Cancellable backoff: Esc during the wait aborts the turn instead
                     // of forcing the user to sit through the full delay.
                     tokio::select! {
@@ -3049,6 +3057,10 @@ impl RunningAgent {
                 // does not pre-empt finishing the truncated content.
                 if truncated && truncation_continuations < MAX_TRUNCATION_CONTINUATIONS {
                     truncation_continuations += 1;
+                    self.rt.emit(AgentEvent::OutputTruncationRecovery {
+                        attempt: truncation_continuations,
+                        max_attempts: MAX_TRUNCATION_CONTINUATIONS,
+                    });
                     self.compact_before_internal_continuation(
                         convo,
                         &mut internal_auto_compaction_attempted_stages,
@@ -3091,13 +3103,53 @@ impl RunningAgent {
                     convo.push(Message::synthetic_user(text));
                     continue;
                 }
+                // Automatic recovery and host continuation hooks both had their
+                // chance. Interactive drivers may now hand control to the user.
+                if truncated && self.round_cap_checkpoint {
+                    let resp = self
+                        .rt
+                        .request(
+                            crate::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND,
+                            serde_json::json!({
+                                "attempts": truncation_continuations,
+                                "max_attempts": MAX_TRUNCATION_CONTINUATIONS,
+                            }),
+                        )
+                        .await;
+                    let cont = resp
+                        .get("continue")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    if !cont && cancel.is_cancelled() {
+                        self.finish_cancelled(
+                            convo,
+                            rollback_len,
+                            &turn_ctx,
+                            internal_cancel.load(Ordering::Acquire),
+                        )
+                        .await;
+                        return;
+                    }
+                    if cont {
+                        self.compact_before_internal_continuation(
+                            convo,
+                            &mut internal_auto_compaction_attempted_stages,
+                        )
+                        .await;
+                        convo.push(Message::synthetic_user(TRUNCATION_RESUME_NUDGE.to_string()));
+                        continue;
+                    }
+                    // The interactive driver already presented the truncation and
+                    // the user chose to stop. Do not append a duplicate warning.
+                    truncated = false;
+                }
                 // The turn is ENDING. If it ends because the output was truncated and
                 // we could NOT recover (auto-continuation budget exhausted, no hook
                 // continuation), surface the warning now — this is the one case the
                 // user needs to see: real work was cut off and is not being finished.
                 if truncated {
                     self.rt.emit(AgentEvent::Warning(
-                        "response truncated: finish_reason=length".into(),
+                        "模型这次回复达到了长度上限，内容可能没写完。可以让它「继续」，会接着把剩下的部分补完。".into(),
                     ));
                 }
                 if partial_stream_recoveries > 0 {
@@ -3650,8 +3702,18 @@ impl RunningAgent {
                 // collect any CONTINUATION decision. Middleware sees the RAW
                 // (uncapped) result. The first `Block` reason wins.
                 let mut post_block: Option<String> = None;
+                // The resolved tool travels on the Execute plan; ready results (blocked /
+                // stub / unknown) have no tool. A result transformer keyed on tool
+                // identity (e.g. the artifact middleware honoring `self_bounds_output`)
+                // reads it here rather than pairing before/after state.
+                let plan_tool = match plan {
+                    CallPlan::Execute { tool, .. } => Some(tool),
+                    _ => None,
+                };
                 for mw in &self.middlewares {
-                    if let AfterOutcome::Block { reason } = mw.after(&mut result).await {
+                    if let AfterOutcome::Block { reason } =
+                        mw.after(&mut result, plan_tool).await
+                    {
                         post_block.get_or_insert(reason);
                     }
                 }
@@ -3914,11 +3976,9 @@ pub struct AgentBuilder {
     clock: Arc<dyn Clock>,
     /// See `Agent::keep_interrupted_context`. Default `false`.
     keep_interrupted_context: bool,
-    /// When true, the `max_rounds` fuse becomes an interactive CHECKPOINT: instead
-    /// of `emit(Error)+MaxRounds`, it round-trips the driver (kind
-    /// `ROUND_CAP_CHECKPOINT_KIND`) and only stops on a non-continue answer. Default
-    /// `false` → today's hard-stop (so a driver that doesn't implement the kind can
-    /// never park). Only a driver that renders the checkpoint sets this true.
+    /// When true, interactive safety stops (round cap and exhausted output-limit
+    /// recovery) round-trip the driver through fixed checkpoint request kinds.
+    /// Default `false` ensures an unimplemented driver can never park.
     round_cap_checkpoint: bool,
 }
 

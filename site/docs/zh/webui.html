@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>WebUI 界面</h1>
+<h1 id="webui-界面">WebUI 界面</h1>
       <p class="lede">除了终端 TUI，AtomCode 还内置一个<strong>浏览器界面</strong>：在 TUI 里输入 <code>/webui</code> 即可一键启动，在浏览器里聊天、翻看历史会话、增删改模型配置、上传图片，并通过 <code>/sync</code> 让终端与浏览器<strong>实时同步</strong>同一个会话。它复用本机的登录态、模型与会话历史，不需要另外配置。</p>
 
-      <h2>启动与关闭</h2>
+      <h2 id="启动与关闭">启动与关闭</h2>
       <p>在 AtomCode 的 TUI 输入框里运行：</p>
       <pre><code># 启动 webui 并自动打开浏览器（默认绑定 127.0.0.1:13457，仅本机可访问）
 /webui
@@ -92,7 +92,7 @@
         <p>webui 默认绑定 <code>127.0.0.1</code>，只有本机能访问。要让手机等设备访问，<strong>不要</strong>直接用 <code>--host 0.0.0.0</code> 暴露到公网，请走蒲公英虚拟局域网方案 —— 见 <a href="./webui-remote-access.html">远程访问指南</a>。</p>
       </div>
 
-      <h2>界面功能</h2>
+      <h2 id="界面功能">界面功能</h2>
       <p>浏览器界面把终端里的能力搬到了图形界面上，主要包括：</p>
       <table>
         <thead>
@@ -121,7 +121,7 @@
       </ul>
       <p>这让「终端里发起、手机 / 平板上盯进度」或「多人围观同一个 agent 会话」成为可能。</p>
 
-      <h2>审批模式</h2>
+      <h2 id="审批模式">审批模式</h2>
       <p>底栏有一个 pill 用来设置 agent 操作的门控方式 —— 相当于终端审批模式在浏览器里的镜像。默认是 <strong>Build</strong>。</p>
       <table>
         <thead><tr><th>模式</th><th>行为</th></tr></thead>
@@ -135,10 +135,10 @@
       <p>该模式是进程级的,并通过实时通道广播,所以在一个标签页里切换会同步到所有已连接的视图。它不写入配置 —— 重启后回到 <strong>Build</strong>。</p>
       <p>当 agent 在任务中途需要你拍板时,会弹出一张<strong>交互提问</strong>卡片(单选、多选或自由文本),回合会暂停到你作答为止。完整行为见 <a href="./interactive-questions.html">交互提问</a>。</p>
 
-      <h2>远程访问</h2>
+      <h2 id="远程访问">远程访问</h2>
       <p>想从手机等设备打开 webui，又不暴露公网？借助蒲公英（Oray PGY）组建的虚拟局域网，用 <code>/webui --host &lt;虚拟 IP&gt;</code> 把服务绑定到虚拟 IP，再在「远程访问」面板扫码即可。完整流程见 <a href="./webui-remote-access.html">远程访问指南</a>。</p>
 
-      <h2>下一步</h2>
+      <h2 id="下一步">下一步</h2>
       <ul>
         <li><a href="./webui-remote-access.html">远程访问指南</a> —— 用蒲公英从手机安全打开 webui</li>
         <li><a href="./headless-daemon.html">Headless 与 Daemon</a> —— webui 背后的 daemon 与 HTTP/SSE 接口</li>

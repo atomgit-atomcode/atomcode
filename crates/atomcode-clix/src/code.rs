@@ -172,12 +172,31 @@ pub async fn code(args: CodeArgs) -> Result<()> {
         SessionMode::Fresh
     };
 
+    // Mount configured `[[subagent.external]]` instances (Codex / Claude Code as
+    // named subagent tools) so `atomcodex code` honors the same config the TUI
+    // and `atomcode` CLI do. A missing config file means "no external agents";
+    // a present-but-malformed one surfaces (same contract as provider loading).
+    let loaded_config = match &args.config {
+        Some(path) => atomcode_config::Config::load(path)
+            .with_context(|| format!("failed to load config: {}", path.display()))?,
+        None => match crate::default_config_path() {
+            Some(path) if path.exists() => atomcode_config::Config::load(&path)
+                .with_context(|| format!("failed to load config: {}", path.display()))?,
+            _ => atomcode_config::Config::default(),
+        },
+    };
+    let external_subagents =
+        atomcode_coding::parts::resolve_external_subagents(&loaded_config.subagent, true);
+
     let opts = PrepareOptions {
         subagents: atomcode_coding::SubagentPolicy::Enabled,
         session,
+        tools: true,
         skill_dirs: None,
         plugin_skill_dirs: Vec::new(),
         mcp: !args.no_mcp,
+        extra_mcp_servers: Vec::new(),
+        external_subagents,
         memory: !args.no_memory,
         web: !args.no_web,
         // The `code` agent can also review the current changes in-session (the dedicated
@@ -417,6 +436,14 @@ async fn drive_turn(
                 eprintln!("\n[error] {message}")
             }
             CodingRuntimeEvent::Agent(AgentEvent::Warning(w)) => eprintln!("[warn] {w}"),
+            CodingRuntimeEvent::Agent(AgentEvent::ProviderRetry {
+                attempt,
+                max_attempts,
+                backoff_secs,
+                reason,
+            }) => eprintln!(
+                "[retry] API error {reason}; retrying in {backoff_secs}s ({attempt}/{max_attempts})"
+            ),
             CodingRuntimeEvent::Agent(AgentEvent::StreamRecovery {
                 attempt,
                 max_attempts,

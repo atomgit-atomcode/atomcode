@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Basic Usage</h1>
+<h1 id="basic-usage">Basic Usage</h1>
       <p class="lede">Get fluent with CLI flags, how to phrase tasks, how to give the model context, and how to move between several tasks.</p>
 
-      <h2>Launching</h2>
+      <h2 id="launching">Launching</h2>
       <pre><code># Launch the TUI in the current directory
 atomcode
 
@@ -99,7 +99,7 @@ atomcode --config ./custom.toml
 atomcode -y
 atomcode --dangerously-skip-permissions</code></pre>
 
-      <h2>CLI flag reference</h2>
+      <h2 id="cli-flag-reference">CLI flag reference</h2>
       <table>
         <thead>
           <tr><th>Flag</th><th>Short</th><th>Purpose</th></tr>
@@ -134,7 +134,7 @@ atomcode --dangerously-skip-permissions</code></pre>
         </ul>
       </div>
 
-      <h2>How to phrase tasks</h2>
+      <h2 id="how-to-phrase-tasks">How to phrase tasks</h2>
       <p>AtomCode's agent loop is only as good as the task description you provide. A few rules of thumb:</p>
       <ul>
         <li><strong>State goals, not steps</strong> — "Fix the 404 after login", not "Open src/auth/callback.ts, delete line 27, then…". The model has plenty of exploration ability.</li>
@@ -143,7 +143,7 @@ atomcode --dangerously-skip-permissions</code></pre>
         <li><strong>Discuss before editing</strong> — when direction is unclear, first ask it to "analyse this module and propose a refactor plan"; once aligned, let it implement.</li>
       </ul>
 
-      <h2>Example tasks</h2>
+      <h2 id="example-tasks">Example tasks</h2>
       <pre><code># Bug fix
 &gt; Fix the bug where users are redirected to 404 after OAuth callback; restore the original path after callback.
 
@@ -159,7 +159,7 @@ atomcode --dangerously-skip-permissions</code></pre>
 # Code understanding
 &gt; Briefly explain this repo's directory layout, build entry point, and the responsibilities of the core modules.</code></pre>
 
-      <h2>Multiline input</h2>
+      <h2 id="multiline-input">Multiline input</h2>
       <p>In the TUI:</p>
       <ul>
         <li><code>Enter</code> sends the message.</li>
@@ -173,7 +173,7 @@ atomcode --dangerously-skip-permissions</code></pre>
       <h2 id="at-mention"><code>@</code> file references</h2>
       <p>Type <code>@</code> in the input (preceded by whitespace or line start) to pop up a menu of files and directories in the project. This is the fastest way to point the model at a specific path — you handle locating, the model decides via <code>read_file</code> what to expand and how much to read.</p>
 
-      <h3>Interaction</h3>
+      <h3 id="interaction">Interaction</h3>
       <ul>
         <li><strong>Trigger</strong> — <code>@</code> only triggers when preceded by whitespace or line start. A mid-string <code>@</code> like <code>email@host.com</code> won't pop the menu — avoiding accidental triggers.</li>
         <li><strong>Filtering</strong> — type to substring-match (case-insensitive). <code>@cra</code> hits <code>crates/</code>; <code>@toml</code> hits every <code>*.toml</code>.</li>
@@ -183,7 +183,7 @@ atomcode --dangerously-skip-permissions</code></pre>
         <li><strong>Backspace to keep picking</strong> — delete the trailing space and the menu re-opens in place, handy for drilling further from the current directory.</li>
       </ul>
 
-      <h3>Where candidates come from</h3>
+      <h3 id="where-candidates-come-from">Where candidates come from</h3>
       <ul>
         <li><strong>All files and directories</strong> under the project root — both files and dirs can be selected; dirs are marked with a trailing <code>/</code>.</li>
         <li><strong>Honours <code>.gitignore</code></strong> (and global ignore, <code>.git/info/exclude</code>); ignored paths never appear.</li>
@@ -193,7 +193,7 @@ atomcode --dangerously-skip-permissions</code></pre>
         <li><strong>Ordering</strong>: direct children of the current scope first → directories before files → alphabetical.</li>
       </ul>
 
-      <h3>What it means for the model</h3>
+      <h3 id="what-it-means-for-the-model">What it means for the model</h3>
       <p>On submit, <code>@crates/atomcode-cli/src/main.rs</code> is sent to the model as <strong>literal text</strong> — AtomCode does <em>not</em> read and inline the file content in the frontend. The model sees the path and decides to call the built-in <code>read_file</code> tool as needed. Benefits:</p>
       <ul>
         <li>Large files don't get blindly stuffed into context — the token budget stays predictable.</li>
@@ -205,7 +205,7 @@ atomcode --dangerously-skip-permissions</code></pre>
         <p>If you want to force a file's contents into the conversation directly (e.g. a tight code review where you don't want another <code>read_file</code> round trip), use paste — drop the content into the input. Bracketed paste collapses it to an <em>[paste #N]</em> placeholder and ships the full payload on submit.</p>
       </div>
 
-      <h3>Limits</h3>
+      <h3 id="limits">Limits</h3>
       <ul>
         <li>The candidate menu shows at most <strong>30 entries</strong>; typing more filter characters narrows the results.</li>
         <li><strong>Paths with spaces don't appear in candidates</strong> — the <code>@</code> reference uses whitespace as a terminator.</li>
@@ -214,7 +214,7 @@ atomcode --dangerously-skip-permissions</code></pre>
         <li>No size or type filtering — every non-ignored file shows up.</li>
       </ul>
 
-      <h2>Pasting long text</h2>
+      <h2 id="pasting-long-text">Pasting long text</h2>
       <p>AtomCode supports bracketed paste. When you paste a chunky block (e.g. a wall of logs), the TUI collapses it to a compact <em>[paste #N · 132 lines]</em> indicator so the input doesn't blow up. The full payload is sent on submit.</p>
 
       <h2 id="image-attach">Image attachments / screenshots</h2>
@@ -226,7 +226,7 @@ atomcode --dangerously-skip-permissions</code></pre>
       </ul>
       <p>On a successful attach, an <code>[Image #N]</code> marker is inserted in the input; the bytes ride along with the message on submit. The status bar also shows <em>Image in clipboard · ctrl+v to paste</em> when an unpasted image is sitting in the clipboard.</p>
 
-      <h3>How non-vision models handle images</h3>
+      <h3 id="how-non-vision-models-handle-images">How non-vision models handle images</h3>
       <p>When the active provider can't take image input (text-only models like DeepSeek-V3 / Kimi), AtomCode doesn't refuse — it routes the image to a separate <strong>VL preprocessor</strong> (a vision model like Qwen3-VL / GLM-4V) for OCR + description, then splices the result into the user message as text before sending to the main model. So you can "drop a screenshot and ask" regardless of the main model.</p>
       <ul>
         <li>Which model does the preprocessor use? Controlled by <code>vision_preprocessor_provider</code> in the config — see <a href="./configuration.html#vision-preprocessor">Configuration · Vision preprocessor</a>.</li>
@@ -238,7 +238,7 @@ atomcode --dangerously-skip-permissions</code></pre>
         <p>If the current model supports vision (Claude 3+ / GPT-4o / Gemini / Qwen-VL, etc.), the raw image bytes are sent directly — the preprocessor is skipped.</p>
       </div>
 
-      <h2>Switching sessions and directories</h2>
+      <h2 id="switching-sessions-and-directories">Switching sessions and directories</h2>
       <ul>
         <li><code>/resume</code> — switch between or restore previous sessions</li>
         <li><code>/session</code> — start a clean session</li>
@@ -248,14 +248,14 @@ atomcode --dangerously-skip-permissions</code></pre>
       </ul>
       <p>Full behaviour at <a href="./sessions.html">Sessions &amp; Undo</a>.</p>
 
-      <h2>Inspecting token usage and diff</h2>
+      <h2 id="inspecting-token-usage-and-diff">Inspecting token usage and diff</h2>
       <ul>
         <li><code>/cost</code> — prompt, completion, and cached tokens accumulated per model in this session</li>
         <li><code>/diff</code> — git diff of uncommitted changes in the working directory</li>
         <li><code>/undo</code> — roll back every file edit from the last turn</li>
       </ul>
 
-      <h2>Next steps</h2>
+      <h2 id="next-steps">Next steps</h2>
       <ul>
         <li><a href="./slash-commands.html">Slash Commands</a> — full reference for the 30+ commands</li>
         <li><a href="./keybindings.html">Keybindings</a> — fluency at the keyboard pays off quickly</li>

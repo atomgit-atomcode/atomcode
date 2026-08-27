@@ -75,17 +75,17 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Skills 扩展</h1>
+<h1 id="skills-扩展">Skills 扩展</h1>
       <p class="lede">Skill 是用户自定义的、可复用的命令,它本质上是一段带 frontmatter 的 markdown 指令,告诉 AI"在这种任务下应该怎么做"。写好 skill 之后,它会像内置斜杠命令一样出现在菜单里,或者被 <code>use_skill</code> 工具按需调用。</p>
 
-      <h2>Skill 能做什么</h2>
+      <h2 id="skill-能做什么">Skill 能做什么</h2>
       <ul>
         <li>把常见工作流固化下来:<em>发布 release、写 changelog、跑回归测试、生成周报…</em></li>
         <li>封装需要一步一步引导的复杂任务:<em>代码重构流程、bug 根因分析、性能调优</em></li>
         <li>让模型在特定话题下遵循你定义的步骤和校验规则</li>
       </ul>
 
-      <h2>Skill 文件结构</h2>
+      <h2 id="skill-文件结构">Skill 文件结构</h2>
       <p>一个 skill 通常是一个目录,里面至少包含一个 <code>SKILL.md</code>:</p>
       <pre><code>my-skills/
 ├── release/
@@ -122,7 +122,7 @@ description: 发布一个新的 release tag,更新 changelog,并打包
 - 不允许绕过测试,任何失败都必须先修复
 - 发布失败时,回滚所有本地 tag 和 changelog 改动</code></pre>
 
-      <h2>Skill 目录</h2>
+      <h2 id="skill-目录">Skill 目录</h2>
       <p>AtomCode 会从若干约定位置加载 skills:</p>
       <ul>
         <li><strong>全局</strong>:<code>~/.atomcode/skills/</code></li>
@@ -130,22 +130,22 @@ description: 发布一个新的 release tag,更新 changelog,并打包
       </ul>
       <p>项目级会覆盖同名全局 skill,方便你在不同项目用同一个名字定义不同流程。</p>
 
-      <h2>调用方式</h2>
+      <h2 id="调用方式">调用方式</h2>
 
-      <h3>通过斜杠命令</h3>
+      <h3 id="通过斜杠命令">通过斜杠命令</h3>
       <p>所有加载成功的 skill 会自动出现在斜杠命令补全菜单里:</p>
       <pre><code>&gt; /release
 &gt; /write-changelog
 &gt; /debug-flaky-test</code></pre>
 
-      <h3>通过 <code>$</code> 菜单</h3>
+      <h3 id="通过-菜单">通过 <code>$</code> 菜单</h3>
       <p>在输入框行首打一个 <code>$</code>,会弹出一个 skills 菜单(和 <code>/skills</code> 列出的是同一批可调用技能);继续输入可过滤,<code>Tab</code> 补全高亮项的名字,提交 <code>$&lt;name&gt; [参数]</code> 即调用该 skill。它和斜杠命令是两套并行入口:<code>/</code> 走斜杠命令补全,<code>$</code> 专门用来挑 skill,后面还能直接带参数,例如 <code>$brainstorming 帮我想登录方案</code>。</p>
       <p>v5.0.3 的 <code>/skills</code> 支持用多个名称或片段一次选择多个 Skill，并会回显实际加载结果。新安装的 Skill 也会自动刷新，通常不需要重启 AtomCode。</p>
 
-      <h3>模型自动触发</h3>
+      <h3 id="模型自动触发">模型自动触发</h3>
       <p>模型可以主动调用 <code>use_skill</code> 工具,把一个与任务相关的 skill 作为子流程运行。比如你说"帮我发布新版本",即便不显式打 <code>/release</code>,模型也可能自动选择调用这个 skill。</p>
 
-      <h2>写好一个 skill 的几条经验</h2>
+      <h2 id="写好一个-skill-的几条经验">写好一个 skill 的几条经验</h2>
       <ul>
         <li><strong>description 要具体</strong> —— 它决定了菜单里的描述文本,也是模型判断"要不要用这个 skill"的主要依据。</li>
         <li><strong>步骤要有序</strong> —— 模型会按顺序读,把强依赖步骤放在前面。</li>
@@ -154,7 +154,7 @@ description: 发布一个新的 release tag,更新 changelog,并打包
         <li><strong>必要时用子文档</strong> —— 把很长的参考资料放到 <code>references/*.md</code>,只在 <code>SKILL.md</code> 里留一句"必要时参见…"。</li>
       </ul>
 
-      <h2>与项目指令的分工</h2>
+      <h2 id="与项目指令的分工">与项目指令的分工</h2>
       <table>
         <thead>
           <tr><th>场景</th><th>放在</th></tr>
@@ -166,7 +166,7 @@ description: 发布一个新的 release tag,更新 changelog,并打包
         </tbody>
       </table>
 
-      <h2>下一步</h2>
+      <h2 id="下一步">下一步</h2>
       <ul>
         <li><a href="./basic-usage.html">基本使用</a> —— 回到日常使用场景</li>
         <li><a href="./faq.html">常见问题</a> —— 为什么我的 skill 没出现在菜单里?</li>

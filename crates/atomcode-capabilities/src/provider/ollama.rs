@@ -459,6 +459,7 @@ fn effort_str(e: ReasoningEffort) -> &'static str {
         ReasoningEffort::Low => "low",
         ReasoningEffort::Medium => "medium",
         ReasoningEffort::High => "high",
+        ReasoningEffort::XHigh => "xhigh",
         ReasoningEffort::Max => "max",
     }
 }
@@ -470,7 +471,8 @@ fn effort_str(e: ReasoningEffort) -> &'static str {
 fn open_error(e: reqwest::Error) -> ProviderError {
     ProviderError {
         retryable: retry::is_retryable_reqwest_error(&e),
-        message: format!("open failed: {}", retry::err_chain(&e)),
+        // Shared builder surfaces the full chain + an unreachable-proxy hint.
+        message: retry::open_failed_message(&e),
         ..Default::default()
     }
 }

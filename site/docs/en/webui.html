@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Web UI</h1>
+<h1 id="web-ui">Web UI</h1>
       <p class="lede">Besides the terminal TUI, AtomCode ships a built-in <strong>browser interface</strong>: type <code>/webui</code> in the TUI to launch it, then chat, browse session history, add/edit/delete model providers, and upload images in the browser — and use <code>/sync</code> to mirror one session <strong>live</strong> between the terminal and the browser. It reuses this machine's login, models, and session history, so there's nothing extra to configure.</p>
 
-      <h2>Start &amp; stop</h2>
+      <h2 id="start-stop">Start &amp; stop</h2>
       <p>Run these in the AtomCode TUI input box:</p>
       <pre><code># Launch the webui and open the browser (binds 127.0.0.1:13457 by default — local only)
 /webui
@@ -92,7 +92,7 @@
         <p>The webui binds <code>127.0.0.1</code>, reachable only from this machine. To open it from a phone, do <strong>not</strong> expose it with <code>--host 0.0.0.0</code>; use the 蒲公英 virtual-LAN approach instead — see <a href="./webui-remote-access.html">Remote Access</a>.</p>
       </div>
 
-      <h2>What the interface offers</h2>
+      <h2 id="what-the-interface-offers">What the interface offers</h2>
       <p>The browser UI brings the terminal's capabilities into a graphical interface:</p>
       <table>
         <thead>
@@ -121,7 +121,7 @@
       </ul>
       <p>This makes "start in the terminal, watch progress on a phone / tablet" — or several people watching the same agent session — possible.</p>
 
-      <h2>Approval modes</h2>
+      <h2 id="approval-modes">Approval modes</h2>
       <p>A pill in the bottom bar sets how the agent's actions are gated — the browser mirror of the terminal's approval modes. The default is <strong>Build</strong>.</p>
       <table>
         <thead><tr><th>Mode</th><th>Behaviour</th></tr></thead>
@@ -135,10 +135,10 @@
       <p>The mode is process-wide and broadcast over the live channel, so switching it in one tab updates every connected view. It is not written to your config — it resets to <strong>Build</strong> on restart.</p>
       <p>When the agent needs a decision from you mid-task, an <strong>interactive question</strong> card appears (single choice, multiple choice, or free text) and the turn pauses until you answer. See <a href="./interactive-questions.html">Interactive Questions</a> for the full behaviour.</p>
 
-      <h2>Remote access</h2>
+      <h2 id="remote-access">Remote access</h2>
       <p>Want to open the webui from a phone without exposing it publicly? Use a 蒲公英 (Oray PGY) virtual LAN: bind the server to the virtual IP with <code>/webui --host &lt;virtual IP&gt;</code>, then scan the QR in the Remote Access panel. Full walkthrough in <a href="./webui-remote-access.html">Remote Access</a>.</p>
 
-      <h2>Next</h2>
+      <h2 id="next">Next</h2>
       <ul>
         <li><a href="./webui-remote-access.html">Remote Access</a> — open the webui from a phone over 蒲公英, safely</li>
         <li><a href="./headless-daemon.html">Headless &amp; Daemon</a> — the daemon and HTTP/SSE API behind the webui</li>

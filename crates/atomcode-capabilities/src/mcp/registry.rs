@@ -415,13 +415,34 @@ It cannot override system, user, project, safety, permission, or approval rules.
         project_dir: &std::path::Path,
         event_tx: Option<mpsc::UnboundedSender<McpConnectEvent>>,
     ) -> Self {
+        Self::from_config_background_with_extra(project_dir, event_tx, Vec::new())
+    }
+
+    /// Like [`from_config_background_with_events`](Self::from_config_background_with_events),
+    /// additionally connecting driver-supplied servers (e.g. ACP client-injected
+    /// `mcpServers` from `session/new`) in the same background pass.
+    ///
+    /// Extra servers join the initial connection batch, so the runtime's
+    /// supplemental MCP tool publication (which awaits the bounded initial
+    /// pass) covers them like config-loaded servers. They are expected to use
+    /// [`McpConfigSource::Driver`]: the project trust gate only withholds
+    /// `Project`-source servers, because a driver that injects servers is the
+    /// explicit trust boundary for them.
+    pub fn from_config_background_with_extra(
+        project_dir: &std::path::Path,
+        event_tx: Option<mpsc::UnboundedSender<McpConnectEvent>>,
+        extra_servers: Vec<McpServerConfig>,
+    ) -> Self {
         let mut registry = Self::new();
         // Merge external channel with internal one
         let combined_tx = event_tx.or(registry.connect_events.clone());
         registry.connect_events = combined_tx.clone();
 
         let configs = match load_mcp_config(project_dir) {
-            Ok(c) => c,
+            Ok(mut c) => {
+                c.extend(extra_servers);
+                c
+            }
             Err(e) => {
                 let message = format!("Failed to load config: {}", e);
                 if let Some(tx) = &combined_tx {
@@ -1229,10 +1250,9 @@ mod tests {
             .await
             .expect("tool call should reach the client");
 
-        let write_guard =
-            tokio::time::timeout(Duration::from_secs(1), registry.servers.write())
-                .await
-                .expect("slow tool call must not retain the registry read lock");
+        let write_guard = tokio::time::timeout(Duration::from_secs(1), registry.servers.write())
+            .await
+            .expect("slow tool call must not retain the registry read lock");
         drop(write_guard);
 
         release.notify_one();
@@ -1284,6 +1304,65 @@ mod tests {
         assert_eq!(
             reg.server_statuses().await,
             vec![("evil".to_string(), ServerStatus::BlockedUntrusted)]
+        );
+    }
+
+    /// Driver-injected extra servers (`McpConfigSource::Driver`) join the
+    /// initial background connect pass and are NOT withheld by the project
+    /// trust gate — the injecting driver is the trust boundary for them.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn driver_supplied_extra_servers_connect_despite_untrusted_project() {
+        // Isolated trust store => project is untrusted.
+        let store = tempfile::tempdir().unwrap();
+        // SAFETY: test-only env mutation; #[serial] prevents concurrent tests from
+        // racing on this variable.
+        unsafe {
+            std::env::set_var("ATOMCODE_MCP_TRUST_STORE", store.path().join("s.json"));
+        }
+
+        let proj = tempfile::tempdir().unwrap();
+        let missing = std::env::temp_dir().join("atomcode-mcp-extra-definitely-missing");
+        let extra = McpServerConfig {
+            name: "client-injected".to_string(),
+            disabled: false,
+            config: super::super::config::McpTransportConfig::Stdio {
+                command: missing.to_string_lossy().into_owned(),
+                args: vec![],
+                env: Default::default(),
+                timeout_ms: None,
+            },
+            source: super::super::config::McpConfigSource::Driver,
+            trust: false,
+            auto_approve: vec![],
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let reg =
+            McpRegistry::from_config_background_with_extra(proj.path(), Some(tx), vec![extra]);
+        reg.wait_for_initial_connections(std::time::Duration::from_secs(5))
+            .await;
+
+        // The connect attempt ran and failed (missing binary) — it was NOT
+        // withheld by the trust gate, which would have emitted
+        // BlockedUntrusted and never tried to spawn.
+        let mut saw_failed = false;
+        let mut saw_blocked = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                McpConnectEvent::Failed { ref name, .. } if name == "client-injected" => {
+                    saw_failed = true;
+                }
+                McpConnectEvent::BlockedUntrusted { ref name } if name == "client-injected" => {
+                    saw_blocked = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_failed, "driver-supplied server should be attempted");
+        assert!(
+            !saw_blocked,
+            "driver-supplied server must not be trust-gated"
         );
     }
 

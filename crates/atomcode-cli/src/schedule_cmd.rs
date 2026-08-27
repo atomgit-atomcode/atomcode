@@ -514,6 +514,8 @@ async fn run_task(id: &str) -> Result<i32> {
         ProviderBootstrap::Required,
         false,
         false,
+        false,
+        false,
     )
     .await?;
 
@@ -558,12 +560,16 @@ async fn run_task(id: &str) -> Result<i32> {
     //    strict_unattended=true: any tool escalated to approval is denied — no human
     //    is available to vet destructive or out-of-workspace commands.
     //    auto permission_mode is equivalent to accept-edits + strict bash gating.
+    let provider_name = runtime_cfg.provider_name.clone();
+    let model_name = runtime_cfg.model.clone();
     let (exit_code, _captured) = crate::run_native_headless(
         notifications_cfg,
         runtime,
         task.prompt.clone(),
-        None,
+        provider_name,
+        model_name,
         false,
+        crate::HeadlessOutputFormat::Text,
         false,
         cwd.clone(),
         false, // skip_permissions=false — never bypass for scheduled runs

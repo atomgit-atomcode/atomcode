@@ -75,7 +75,7 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Interactive Questions</h1>
+<h1 id="interactive-questions">Interactive Questions</h1>
       <p class="lede">At a genuine fork in the road — ambiguous requirements, a choice between two workable designs — the agent can pause and ask you a structured question instead of guessing. You answer inline; it resumes with your choice. This is backed by the <code>request_user_input</code> tool and is <strong>on by default</strong>.</p>
 
       <div class="callout callout-info">
@@ -83,7 +83,7 @@
         <p>A <a href="./approvals.html">permission approval</a> asks whether the agent may <em>run a tool</em> (a command, a file edit). An interactive question asks for <em>your decision</em> — a preference or a choice between approaches. Different panel, different keys, different meaning. Declining a question is never an error; declining an approval blocks the tool.</p>
       </div>
 
-      <h2>The three question types</h2>
+      <h2 id="the-three-question-types">The three question types</h2>
       <table>
         <thead>
           <tr><th>Type</th><th>Behaviour</th></tr>
@@ -96,7 +96,7 @@
       </table>
       <p>For <code>single</code> and <code>multiple</code>, an <strong>“Other — type your own answer”</strong> row is offered as well, so you are never trapped inside the listed options. The agent can suppress it only when it marks the options as exhaustive.</p>
 
-      <h2>Answering in the terminal</h2>
+      <h2 id="answering-in-the-terminal">Answering in the terminal</h2>
       <table>
         <thead>
           <tr><th>Key</th><th>Action</th></tr>
@@ -113,13 +113,13 @@
       </table>
       <p>A <code>single</code> question needs just one keystroke to answer (highlight, then <kbd>Enter</kbd>). A <code>multiple</code> question toggles rows with <kbd>Enter</kbd>/<kbd>Space</kbd> and only confirms when you activate the dedicated <strong>Submit</strong> row.</p>
 
-      <h2>Several questions at once</h2>
+      <h2 id="several-questions-at-once">Several questions at once</h2>
       <p>When the agent has more than one thing to ask at the same decision point, it batches them — up to four — into a single panel instead of interrupting you repeatedly. Use <kbd>Tab</kbd> to move between questions, answer each, and submit them together in one round-trip. A lone question renders exactly as before.</p>
 
-      <h2>In the Web UI</h2>
+      <h2 id="in-the-web-ui">In the Web UI</h2>
       <p>The same questions surface as a <strong>UserInputCard</strong> in the <a href="./webui.html">Web UI</a>: radio buttons, checkboxes, or a text box, plus the same optional free-text row. A batch becomes a small stepper — step forward / back with the <kbd>→</kbd> / <kbd>←</kbd> buttons, then one <strong>Submit</strong> that posts every answer at once. <strong>Skip</strong> declines. Answers stream back over the live SSE channel, so a turn driven from the browser pauses and resumes just like the terminal.</p>
 
-      <h2>Turning it off</h2>
+      <h2 id="turning-it-off">Turning it off</h2>
       <p>The feature is enabled by default. To opt out, set the environment variable before launching:</p>
       <pre><code>ATOMCODE_REQUEST_USER_INPUT=0 atomcode</code></pre>
       <p>Any of <code>0</code>, <code>false</code>, <code>off</code>, or an empty value disables it; unset (or any other value) leaves it on. When disabled, the agent never asks — it always proceeds with its best judgment.</p>
@@ -128,7 +128,7 @@
         <p>In <strong>Bypass / 免审批</strong> mode the panel is skipped automatically and the agent proceeds without waiting. <strong>Build</strong>, <strong>Plan</strong>, and <strong>Accept Edits</strong> modes all show the question as normal.</p>
       </div>
 
-      <h2>Related</h2>
+      <h2 id="related">Related</h2>
       <ul>
         <li><a href="./approvals.html">Permissions &amp; Approvals</a> — the separate permission-gate system</li>
         <li><a href="./webui.html">Web UI</a> — approval modes and the browser experience</li>

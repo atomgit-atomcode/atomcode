@@ -27,6 +27,27 @@ pub enum Action {
     NoOp,
 }
 
+/// Normalize the POSIX/readline backspace-delete aliases that some terminals emit
+/// as Ctrl-chords instead of dedicated keys: `^H` (`Ctrl+Char('h')`) → Backspace,
+/// `^?` (`Ctrl+Char('?')`) → Delete. These arrive over SSH and on Linux terminals
+/// with `stty erase ^H`, where the physical Backspace key is reported as `Ctrl+h`
+/// rather than `KeyCode::Backspace` (see the `Char('h')`/`Char('?')` arms in
+/// [`classify`], which the main composer relies on).
+///
+/// The composer routes keys through `classify`, but MODALS handle raw `KeyCode`
+/// directly, so without this their text fields become append-only on those
+/// terminals (a `^H` even echoes a literal `h` in an unguarded insert arm). The
+/// event loop applies this once at the modal-dispatch boundary so every modal —
+/// current and future — gets consistent backspace/delete behavior. No modal binds
+/// `^H`/`^?` for anything else, so the remap is unambiguous.
+pub(crate) fn normalize_edit_key(code: KeyCode, modifiers: KeyModifiers) -> (KeyCode, KeyModifiers) {
+    match (code, modifiers.contains(KeyModifiers::CONTROL)) {
+        (KeyCode::Char('h'), true) => (KeyCode::Backspace, KeyModifiers::NONE),
+        (KeyCode::Char('?'), true) => (KeyCode::Delete, KeyModifiers::NONE),
+        _ => (code, modifiers),
+    }
+}
+
 pub fn classify(code: KeyCode, modifiers: KeyModifiers) -> Action {
     let ctrl = modifiers.contains(KeyModifiers::CONTROL);
     let shift = modifiers.contains(KeyModifiers::SHIFT);
@@ -94,6 +115,37 @@ mod tests {
 
     fn k(code: KeyCode, modifiers: KeyModifiers) -> Action {
         classify(code, modifiers)
+    }
+
+    #[test]
+    fn normalize_edit_key_maps_ctrl_h_and_ctrl_question() {
+        assert_eq!(
+            normalize_edit_key(KeyCode::Char('h'), KeyModifiers::CONTROL),
+            (KeyCode::Backspace, KeyModifiers::NONE),
+            "^H is the readline Backspace alias"
+        );
+        assert_eq!(
+            normalize_edit_key(KeyCode::Char('?'), KeyModifiers::CONTROL),
+            (KeyCode::Delete, KeyModifiers::NONE),
+            "^? is the Delete alias"
+        );
+    }
+
+    #[test]
+    fn normalize_edit_key_leaves_other_keys_untouched() {
+        // Plain text, a real Backspace, and unrelated Ctrl-chords all pass through.
+        assert_eq!(
+            normalize_edit_key(KeyCode::Char('h'), KeyModifiers::NONE),
+            (KeyCode::Char('h'), KeyModifiers::NONE)
+        );
+        assert_eq!(
+            normalize_edit_key(KeyCode::Backspace, KeyModifiers::NONE),
+            (KeyCode::Backspace, KeyModifiers::NONE)
+        );
+        assert_eq!(
+            normalize_edit_key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL)
+        );
     }
 
     #[test]

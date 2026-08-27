@@ -35,6 +35,6 @@ repository = "https://atomgit.com/atomgit_atomcode/atomcode"
 description = "Open-source terminal AI coding agent"
 
 [workspace.dependencies]
-agent-client-protocol = "=1.0.1"
+agent-client-protocol = "=2.0.0"
 anyhow = "1"
 similar = "2"

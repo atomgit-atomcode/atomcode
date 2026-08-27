@@ -711,6 +711,34 @@ export async function listDir(path: string): Promise<FsListResult> {
   return resp.json();
 }
 
+/** One `@`-mention search hit: `path` is relative to the searched dir,
+ * forward-slashed; directories end with `/`. */
+export interface FsSearchMatch {
+  path: string;
+  is_dir: boolean;
+}
+
+export interface FsSearchResult {
+  path: string;
+  matches: FsSearchMatch[];
+}
+
+/** Recursive, gitignore-aware `@`-mention search under `dir`. `token` is the raw
+ * text typed after `@` (may embed a scope like `src/apply`); the daemon splits
+ * and matches it with the SAME cross-level substring logic as the CLI popup.
+ * Pass an `AbortSignal` so a superseded keystroke's request can be cancelled. */
+export async function searchFiles(
+  dir: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<FsSearchResult> {
+  const resp = await fetch(
+    '/fs/search?path=' + encodeURIComponent(dir) + '&q=' + encodeURIComponent(token),
+    { headers: authHeaders(), signal },
+  );
+  return resp.json();
+}
+
 // --- Create directory ---
 
 export async function mkdir(path: string): Promise<{ path: string }> {

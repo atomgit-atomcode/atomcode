@@ -694,10 +694,9 @@
 
       <div class="install-box" id="heroInstall">
         <div class="install-tabs" id="osTabs">
-          <div class="install-tab" data-os="mac"><span>macOS</span><span class="ind">●</span></div>
-          <div class="install-tab" data-os="linux"><span>Linux</span><span class="ind">●</span></div>
-          <div class="install-tab" data-os="win"><span>Windows</span><span class="ind">●</span></div>
-          <div class="install-tab" data-os="harmony"><span>HarmonyOS</span><span class="ind">●</span></div>
+          <div class="install-tab" data-method="curl"><span>curl</span><span class="ind">●</span></div>
+          <div class="install-tab" data-method="npm"><span>npm</span></div>
+          <div class="install-tab" data-method="brew"><span>brew</span></div>
         </div>
         <div class="install-body">
           <pre class="install-cmd" id="osCmd"></pre>
@@ -1063,7 +1062,9 @@
       <div>
         <div class="install-block">
           <div class="install-tabs">
-            <div class="install-tab active" data-method="oneclick"><span data-i18n="inst.oneclick">一键脚本</span></div>
+            <div class="install-tab active" data-method="curl"><span>curl</span></div>
+            <div class="install-tab" data-method="npm"><span>npm</span></div>
+            <div class="install-tab" data-method="brew"><span>brew</span></div>
             <div class="install-tab" data-method="source"><span data-i18n="inst.source">从源码构建</span></div>
             <div class="install-tab" data-method="binary"><span data-i18n="inst.binary">下载二进制</span></div>
           </div>
@@ -1338,7 +1339,11 @@ const T={
   'os.win':{zh:'Windows · PowerShell / Git-Bash',en:'Windows · PowerShell / Git-Bash'},
   'os.harmony':{zh:'HarmonyOS PC · arm64',en:'HarmonyOS PC · arm64'},
   'os.auto':{zh:'✓ 自动检测 · ',en:'✓ Auto-detected · '},
-  'method.oneclick':{zh:'macOS / Linux / HarmonyOS PC + Windows · 自动选 PATH',en:'macOS / Linux / HarmonyOS PC + Windows · auto PATH'},
+  'hint.npm':{zh:'跨平台 · npm 全局安装',en:'Cross-platform · global npm'},
+  'hint.brew':{zh:'仅 macOS / Linux',en:'macOS / Linux only'},
+  'method.curl':{zh:'macOS / Linux / HarmonyOS · 脚本自动识别系统与架构',en:'macOS / Linux / HarmonyOS · script auto-detects OS + arch'},
+  'method.npm':{zh:'跨平台 · 需要 Node.js 环境',en:'Cross-platform · needs Node.js'},
+  'method.brew':{zh:'仅 macOS / Linux · Homebrew Cask',en:'macOS / Linux only · Homebrew Cask'},
   'method.source':{zh:'需要 Rust 1.88+ · cargo install 到 ~/.cargo/bin/atomcode',en:'Rust 1.88+ required · cargo install to ~/.cargo/bin/atomcode'},
   'method.binary':{zh:'6 个平台 · 预编译 · 单文件运行',en:'6 platforms · prebuilt · single-file run'},
 };
@@ -1376,18 +1381,28 @@ function winInstallCmd(){
     ? `$env:ATOMCODE_INVITE='${INVITE_CODE}'; irm ${SCRIPT_BASE}/install.ps1 | iex`
     : `irm ${SCRIPT_BASE}/install.ps1 | iex`;
 }
-const OS_CMDS={
-  mac:unixInstallCmd(),
-  linux:unixInstallCmd(),
-  // PowerShell is the primary Windows path (system PATH); the curl|sh line is for users
-  // living in a Unix shell on Windows (Git-Bash / MSYS / Cygwin) — install.sh detects it.
-  win:`# PowerShell\n${winInstallCmd()}\n\n# Git-Bash / MSYS\n${unixInstallCmd()}`,
-  harmony:unixInstallCmd(),
-};
+function npmInstallCmd(){return 'npm install -g @atomgit.com/atomcode';}
+function brewInstallCmd(){return 'brew install --cask atomcode';}
+// Hero box renders ONE detected line per method. `install.sh` auto-detects OS +
+// CPU arch itself, so the same curl line serves macOS / Linux / HarmonyOS /
+// Git-Bash; only NATIVE Windows (no Unix shell) needs the PowerShell `install.ps1`
+// path — so `os==='win'` is the sole branch that diverges.
+function heroMethodCmd(method,os){
+  if(method==='npm') return npmInstallCmd();
+  if(method==='brew') return brewInstallCmd();
+  return os==='win' ? winInstallCmd() : unixInstallCmd();
+}
 function osHint(os){return t('os.'+os);}
 const METHOD_CMDS={
-  oneclick:{zh:`# macOS / Linux / HarmonyOS PC\n${unixInstallCmd()}\n\n# Windows · PowerShell\n${winInstallCmd()}`,
-            en:`# macOS / Linux / HarmonyOS PC\n${unixInstallCmd()}\n\n# Windows · PowerShell\n${winInstallCmd()}`},
+  // Reference section (bottom) shows ALL platforms at once, so curl carries both
+  // the universal Unix line and the Windows PowerShell line — no OS detection
+  // needed here (that's the hero box's job).
+  curl:{zh:`# macOS · Linux · HarmonyOS PC · Windows (Git-Bash)\n${unixInstallCmd()}\n\n# Windows · PowerShell\n${winInstallCmd()}`,
+        en:`# macOS · Linux · HarmonyOS PC · Windows (Git-Bash)\n${unixInstallCmd()}\n\n# Windows · PowerShell\n${winInstallCmd()}`},
+  npm:{zh:`# 跨平台 · npm 全局安装\n${npmInstallCmd()}`,
+       en:`# Cross-platform · global npm\n${npmInstallCmd()}`},
+  brew:{zh:`# 仅 macOS / Linux\n${brewInstallCmd()}`,
+        en:`# macOS / Linux only\n${brewInstallCmd()}`},
   source:{zh:`# 需要 Rust 1.88+\ngit clone https://atomgit.com/atomgit_atomcode/atomcode.git\ncd atomcode\ncargo build --release\ncp target/release/atomcode ~/.local/bin/\natomcode --version  # 验证安装`,
           en:`# Requires Rust 1.88+\ngit clone https://atomgit.com/atomgit_atomcode/atomcode.git\ncd atomcode\ncargo build --release\ncp target/release/atomcode ~/.local/bin/\natomcode --version  # verify install`},
   binary:{zh:`# 从 Releases 页面下载\nhttps://atomgit.com/atomgit_atomcode/atomcode/releases/latest\n\n# 或直接 curl 取对应平台\ncurl -L -o atomcode \\\n  ${RELEASE_BASE}/atomcode-${VERSION}-darwin-arm64\nchmod +x atomcode && mv atomcode /usr/local/bin/`,
@@ -1502,8 +1517,11 @@ function copyText(text){
   return Promise.resolve(legacyCopy(text));
 }
 
-/* ========== hero install — auto-detect OS ========== */
-let HERO_AUTO=true,HERO_OS='mac';
+/* ========== hero install — method tabs (curl / npm / brew) ========== */
+// Single-layer, opencode-style: the tabs pick the install METHOD, not the OS.
+// `install.sh` sniffs OS + arch itself, so curl needs no OS switcher — we only
+// auto-detect to swap the ONE line to PowerShell on native Windows.
+let HERO_METHOD='curl',HERO_OS='mac';
 (function(){
   const tabs=document.getElementById('osTabs');
   const cmd=document.getElementById('osCmd');
@@ -1523,18 +1541,24 @@ let HERO_AUTO=true,HERO_OS='mac';
   function highlight(text){
     const stash=[];
     text=text.replace(/(https?:\/\/\S+)/g,(m)=>{stash.push(['str',m]);return '\x00'+(stash.length-1)+'\x00';});
-    text=text.replace(/\b(curl|irm|iex|bash|wget|git|cd|cargo|npm|export)\b/g,'<span class="accent">$1</span>');
+    text=text.replace(/\b(curl|irm|iex|bash|wget|git|cd|cargo|npm|brew|export)\b/g,'<span class="accent">$1</span>');
     return text.replace(/\x00(\d+)\x00/g,(_,i)=>`<span class="${stash[i][0]}">${stash[i][1]}</span>`);
   }
+  function heroHint(){
+    if(HERO_METHOD==='npm') return t('hint.npm');
+    if(HERO_METHOD==='brew') return t('hint.brew');
+    // curl: show the detected OS (only Windows changes the actual command).
+    return t('os.auto')+osHint(HERO_OS);
+  }
   window.applyHeroInstall=function(){
-    tabs.querySelectorAll('.install-tab').forEach(t=>t.classList.toggle('active',t.dataset.os===HERO_OS));
-    cmd.innerHTML=highlight(OS_CMDS[HERO_OS]);
-    hint.textContent=(HERO_AUTO?t('os.auto'):'')+osHint(HERO_OS);
+    tabs.querySelectorAll('.install-tab').forEach(t=>t.classList.toggle('active',t.dataset.method===HERO_METHOD));
+    cmd.innerHTML=highlight(heroMethodCmd(HERO_METHOD,HERO_OS));
+    hint.textContent=heroHint();
   };
-  HERO_OS=detect();HERO_AUTO=true;applyHeroInstall();
-  tabs.addEventListener('click',e=>{const tb=e.target.closest('.install-tab');if(!tb)return;HERO_OS=tb.dataset.os;HERO_AUTO=false;applyHeroInstall();});
+  HERO_OS=detect();applyHeroInstall();
+  tabs.addEventListener('click',e=>{const tb=e.target.closest('.install-tab');if(!tb)return;HERO_METHOD=tb.dataset.method;applyHeroInstall();});
   document.getElementById('copyInstall').addEventListener('click',()=>{
-    copyText(OS_CMDS[HERO_OS]);
+    copyText(heroMethodCmd(HERO_METHOD,HERO_OS));
     const btn=document.getElementById('copyInstall');btn.classList.add('copied');btn.textContent=LANG==='zh'?'✓ 已复制':'✓ Copied';
     toast.textContent=t('toast.install.copied');toast.classList.add('show');
     setTimeout(()=>{toast.classList.remove('show')},1800);
@@ -1695,7 +1719,7 @@ window.renderFtab=null;
 })();
 
 /* ========== install method tabs + downloads + wizard ========== */
-let CUR_METHOD='oneclick',CUR_WIZ_STEP=1;
+let CUR_METHOD='curl',CUR_WIZ_STEP=1;
 window.applyMethod=null;
 window.applyWizardNav=null;
 (function(){
@@ -1707,7 +1731,7 @@ window.applyWizardNav=null;
     const stash=[];
     text=text.replace(/(#[^\n]*)/g,(m)=>{stash.push(['com',m]);return '\x00'+(stash.length-1)+'\x00';});
     text=text.replace(/(https?:\/\/\S+)/g,(m)=>{stash.push(['str',m]);return '\x00'+(stash.length-1)+'\x00';});
-    text=text.replace(/\b(curl|irm|iex|bash|wget|git|cd|cargo|npm|export|chmod|mv)\b/g,'<span class="accent">$1</span>');
+    text=text.replace(/\b(curl|irm|iex|bash|wget|git|cd|cargo|npm|brew|export|chmod|mv)\b/g,'<span class="accent">$1</span>');
     return text.replace(/\x00(\d+)\x00/g,(_,i)=>`<span class="${stash[i][0]}">${stash[i][1]}</span>`);
   }
   // Split a section into [label, body]. Leading whole-line `#`
@@ -1760,7 +1784,7 @@ window.applyWizardNav=null;
     hint.textContent=methodHint(m);
   }
   window.applyMethod=()=>show(CUR_METHOD);
-  show('oneclick');
+  show('curl');
   tabs.addEventListener('click',e=>{const tb=e.target.closest('.install-tab');if(!tb)return;show(tb.dataset.method);});
   // Delegated click handler — section buttons are re-rendered on every
   // tab switch + language toggle, so binding on the container survives

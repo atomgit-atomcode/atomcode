@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>子代理</h1>
+<h1 id="子代理">子代理</h1>
       <p class="lede">当一个任务能被干净地切分——可并行的编辑、机械重复的改动、或只读的调查——主代理可以通过 <code>task</code> 工具把子任务交给短生命周期的<strong>子代理</strong>。每个子代理在自己独立的上下文里运行；跨文件的推理和最终结果仍由主代理掌控。<code>task</code> 工具<strong>默认开启</strong>。</p>
 
-      <h2>两种子代理</h2>
+      <h2 id="两种子代理">两种子代理</h2>
       <table>
         <thead>
           <tr><th>类型</th><th>能做什么</th></tr>
@@ -89,14 +89,14 @@
         </tbody>
       </table>
 
-      <h2>它们如何运行</h2>
+      <h2 id="它们如何运行">它们如何运行</h2>
       <ul>
         <li>子代理并行运行，同时最多 <code>max_concurrent</code> 个，各自独立上下文。</li>
         <li>每个子任务带一个难度：<code>simple</code> 路由到你的<strong>快速</strong>模型，<code>hard</code> 路由到<strong>能力更强</strong>的模型——依据你所配置各 provider 的 <code>capable_model</code> 档位来选。只有单个 provider 时，子代理使用当前模型。</li>
         <li>主代理在继续前会审阅每个结果——子代理提议，主代理定夺。</li>
       </ul>
 
-      <h2>Worker 范围与安全</h2>
+      <h2 id="worker-范围与安全">Worker 范围与安全</h2>
       <p><code>worker</code> 子任务<strong>必须</strong>声明一个 <code>scope</code>：一组相对工作目录、允许写入的 glob，例如 <code>["src/auth/**", "Cargo.toml"]</code>。这是强制的，不是建议：</p>
       <ul>
         <li>范围之外的写入（<code>edit_file</code>、<code>write_file</code>、<code>search_replace</code>）会被 WorkerScopeGate <strong>直接拒绝</strong>——不弹审批。</li>
@@ -105,7 +105,7 @@
         <li>多个 worker 同时跑时，给它们互不重叠的范围，避免相互覆盖。</li>
       </ul>
 
-      <h2>配置</h2>
+      <h2 id="配置">配置</h2>
       <p>在 <code>~/.atomcode/config.toml</code> 中调整子代理池：</p>
       <pre><code>[subagent]
 max_concurrent = 3     # 同时并行的子代理数（最小 1）
@@ -123,12 +123,12 @@ max_rounds     = 200   # 每个子任务的模型轮次上限（0 = 不限）</c
       </table>
       <p>环境变量覆盖：<code>ATOMCODE_SUBAGENT_TIMEOUT</code> 和 <code>ATOMCODE_SUBAGENT_MAX_ROUNDS</code> 优先于配置值。</p>
 
-      <h2>关闭该功能</h2>
+      <h2 id="关闭该功能">关闭该功能</h2>
       <p><code>task</code> 工具默认开启。若要彻底移除它，设置：</p>
       <pre><code>ATOMCODE_SUBAGENT=0 atomcode</code></pre>
       <p><code>0</code>、<code>false</code>、<code>off</code> 任一都会关闭；不设置（或其它值）则保持开启。</p>
 
-      <h2>相关</h2>
+      <h2 id="相关">相关</h2>
       <ul>
         <li><a href="./tools.html">内置工具</a> —— 子代理可用的工具</li>
         <li><a href="./approvals.html">权限审批</a> —— 为什么 worker 派发会请求审批</li>

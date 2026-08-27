@@ -68,6 +68,12 @@ pub struct McpServerConfig {
 pub enum McpConfigSource {
     Project,
     User,
+    /// Supplied at runtime by a driver (e.g. an ACP client injecting
+    /// `mcpServers` in `session/new`). The client is the trust boundary for
+    /// these servers, so [`crate::mcp::trust::partition_by_trust`] never
+    /// withholds them — only `Project`-source servers are gated on project
+    /// trust.
+    Driver,
 }
 
 impl McpConfigSource {
@@ -76,6 +82,7 @@ impl McpConfigSource {
         match self {
             McpConfigSource::Project => "project",
             McpConfigSource::User => "global",
+            McpConfigSource::Driver => "driver",
         }
     }
 }

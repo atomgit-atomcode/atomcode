@@ -29,9 +29,12 @@ async fn always_allow_grants_survive_reassembly() {
     cfg.request_timeout = Some(Duration::from_secs(5));
     let opts = PrepareOptions {
         session: SessionMode::Disabled,
+        tools: true,
         skill_dirs: Some(vec![project.path().join("skills")]),
         plugin_skill_dirs: Vec::new(),
         mcp: false,
+        extra_mcp_servers: Vec::new(),
+        external_subagents: Vec::new(),
         memory: false,
         web: false,
         review: false,

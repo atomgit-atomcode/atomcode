@@ -8,11 +8,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use atomcode_capabilities::mcp::McpServerConfig;
 use atomcode_coding::config::CodingAgentConfig;
 use atomcode_coding::parts::PrepareOptions;
 use atomcode_coding::{
     CodingProviderFactory, CodingRuntime, CodingRuntimeStart, DefaultCodingProviderFactory,
-    StaticPluginHookSource,
+    RuntimeStartError, SessionMode, StaticPluginHookSource,
 };
 
 /// Complete agent configuration template for ACP sessions.
@@ -36,22 +37,35 @@ impl EngineConfig {
     pub fn to_coding_config(&self, cwd: PathBuf) -> CodingAgentConfig {
         let mut cfg = self.config.clone();
         cfg.working_dir = cwd;
-        // ACP sessions are long-lived and interactive: park on approval, not fail-closed.
+        // ACP sessions are long-lived and interactive: park on approval, not fail-closed, and a
+        // human in the editor reviews edits — so mark them attended (mirrors the request_timeout
+        // clear above; keeps the two intents in sync for the verify-cadence gate).
         cfg.request_timeout = None;
+        cfg.interactive = true;
         cfg
     }
 }
 
-/// Spawn a kernel-native agent for a new ACP session.
+/// Spawn a kernel-native agent for an ACP session.
 ///
 /// Runs the two-phase `prepare → assemble → spawn` pipeline and returns a live
-/// [`CodingRuntime`] the session dispatcher can drive.
+/// [`CodingRuntime`] the session dispatcher can drive. `session` selects a
+/// fresh session (`SessionMode::Fresh`, the `session/new` path) or a resume of
+/// an existing native session (`SessionMode::Resume(native_id)`, the
+/// `session/resume` path) — the coding runtime owns lease acquisition, native
+/// aggregate loading, and snapshot version checks, failing closed on any
+/// problem (missing session, `SessionInUse`, corrupt snapshot).
 ///
+/// `extra_mcp_servers` are client-injected ACP `mcpServers` (stdio), connected
+/// alongside the config-derived catalog; they carry `McpConfigSource::Driver`
+/// and are not project-trust gated.
 pub async fn spawn_session(
     engine: &EngineConfig,
     cwd: PathBuf,
     provider_factory: Option<Arc<dyn CodingProviderFactory>>,
-) -> anyhow::Result<CodingRuntime> {
+    extra_mcp_servers: Vec<McpServerConfig>,
+    session: SessionMode,
+) -> Result<CodingRuntime, RuntimeStartError> {
     let cfg = engine.to_coding_config(cwd);
     let provider_factory = provider_factory.unwrap_or_else(|| {
         Arc::new(DefaultCodingProviderFactory::new(concat!(
@@ -62,10 +76,14 @@ pub async fn spawn_session(
     CodingRuntime::start(CodingRuntimeStart {
         agent: cfg,
         prepare: PrepareOptions {
+            session,
+            tools: true,
             subagents: atomcode_coding::SubagentPolicy::Enabled,
-            // ACP 1.0.1 has no general elicitation request/response. Do not expose a
-            // tool whose only possible driver result would be a synthetic Null.
-            request_user_input: false,
+            // SDK 2.0.0 的 stable v1 已支持通用 elicitation(表单/URL)。ACP 端通过
+            // `elicitation/create`(form) 回环把 `request_user_input` 工具的
+            // 结构化提问呈现给客户端,见 `crate::acp::elicitation`。
+            request_user_input: true,
+            extra_mcp_servers,
             ..PrepareOptions::default()
         },
         provider_factory,
@@ -73,7 +91,6 @@ pub async fn spawn_session(
         image_preprocessor: None,
     })
     .await
-    .map_err(|e| anyhow::anyhow!("acp runtime start failed: {e}"))
 }
 
 #[cfg(test)]
@@ -167,12 +184,24 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let factory = Arc::new(RecordingProviderFactory::default());
 
-        let first = spawn_session(&engine, cwd.path().to_path_buf(), Some(factory.clone()))
-            .await
-            .unwrap();
-        let second = spawn_session(&engine, cwd.path().to_path_buf(), Some(factory.clone()))
-            .await
-            .unwrap();
+        let first = spawn_session(
+            &engine,
+            cwd.path().to_path_buf(),
+            Some(factory.clone()),
+            Vec::new(),
+            SessionMode::Fresh,
+        )
+        .await
+        .unwrap();
+        let second = spawn_session(
+            &engine,
+            cwd.path().to_path_buf(),
+            Some(factory.clone()),
+            Vec::new(),
+            SessionMode::Fresh,
+        )
+        .await
+        .unwrap();
 
         let ids = factory.session_ids.lock().unwrap().clone();
         assert_eq!(ids.len(), 2);

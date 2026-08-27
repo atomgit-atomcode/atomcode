@@ -164,6 +164,7 @@ pub fn build_review_agent_with_cancel(
     if let Some(progress) = cfg.progress.clone() {
         builder = builder.hook(Arc::new(crate::review_tool::ReviewProgressHook::new(
             progress,
+            cfg.progress_label.clone(),
         )));
     }
     // Turn total-time cap via the kernel's cancel seam. The TOKEN is now caller-owned

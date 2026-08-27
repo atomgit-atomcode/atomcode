@@ -845,7 +845,11 @@ pub struct TruncateMiddleware;
 
 #[async_trait]
 impl ToolMiddleware for TruncateMiddleware {
-    async fn after(&self, result: &mut ToolResult) -> AfterOutcome {
+    async fn after(
+        &self,
+        result: &mut ToolResult,
+        _tool: Option<&std::sync::Arc<dyn crate::tool::Tool>>,
+    ) -> AfterOutcome {
         result.content = format!("[truncated] {}", result.content);
         AfterOutcome::Proceed
     }

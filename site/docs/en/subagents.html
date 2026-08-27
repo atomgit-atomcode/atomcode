@@ -75,10 +75,10 @@
   </aside>
 
   <main class="dmain prose-docs">
-<h1>Subagents</h1>
+<h1 id="subagents">Subagents</h1>
       <p class="lede">When a task splits cleanly — parallel edits, mechanical repetition, or read-only investigation — the main agent can hand subtasks to short-lived <strong>subagents</strong> through the <code>task</code> tool. Each subagent runs in its own isolated context; the main agent keeps the cross-file reasoning and owns the final result. The <code>task</code> tool is <strong>on by default</strong>.</p>
 
-      <h2>Two kinds of subagent</h2>
+      <h2 id="two-kinds-of-subagent">Two kinds of subagent</h2>
       <table>
         <thead>
           <tr><th>Type</th><th>What it can do</th></tr>
@@ -89,14 +89,14 @@
         </tbody>
       </table>
 
-      <h2>How they run</h2>
+      <h2 id="how-they-run">How they run</h2>
       <ul>
         <li>Subagents run in parallel, up to <code>max_concurrent</code> at a time, each in an isolated context.</li>
         <li>Each subtask carries a difficulty: <code>simple</code> routes to your <strong>fast</strong> model, <code>hard</code> routes to your <strong>capable</strong> model — chosen by the <code>capable_model</code> rank across your configured providers. With a single provider, the subagent uses the current model.</li>
         <li>The main agent reviews each result before continuing — a subagent proposes, the main agent decides.</li>
       </ul>
 
-      <h2>Worker scope &amp; safety</h2>
+      <h2 id="worker-scope-safety">Worker scope &amp; safety</h2>
       <p>A <code>worker</code> subtask <strong>must</strong> declare a <code>scope</code>: a list of working-directory-relative globs it is allowed to write, e.g. <code>["src/auth/**", "Cargo.toml"]</code>. This is enforced, not advisory:</p>
       <ul>
         <li>Writes outside the scope (<code>edit_file</code>, <code>write_file</code>, <code>search_replace</code>) are <strong>hard-denied</strong> — not prompted — by the WorkerScopeGate.</li>
@@ -105,7 +105,7 @@
         <li>When several workers run at once, give them non-overlapping scopes so they cannot clobber each other.</li>
       </ul>
 
-      <h2>Configuration</h2>
+      <h2 id="configuration">Configuration</h2>
       <p>Tune the subagent pool in <code>~/.atomcode/config.toml</code>:</p>
       <pre><code>[subagent]
 max_concurrent = 3     # parallel subagents at once (min 1)
@@ -123,12 +123,12 @@ max_rounds     = 200   # per-subtask model-round cap (0 = unbounded)</code></pre
       </table>
       <p>Environment overrides: <code>ATOMCODE_SUBAGENT_TIMEOUT</code> and <code>ATOMCODE_SUBAGENT_MAX_ROUNDS</code> take precedence over the config values.</p>
 
-      <h2>Turning it off</h2>
+      <h2 id="turning-it-off">Turning it off</h2>
       <p>The <code>task</code> tool is enabled by default. To remove it entirely, set:</p>
       <pre><code>ATOMCODE_SUBAGENT=0 atomcode</code></pre>
       <p>Any of <code>0</code>, <code>false</code>, or <code>off</code> disables it; unset (or any other value) leaves it on.</p>
 
-      <h2>Related</h2>
+      <h2 id="related">Related</h2>
       <ul>
         <li><a href="./tools.html">Built-in Tools</a> — the tools a subagent has access to</li>
         <li><a href="./approvals.html">Permissions &amp; Approvals</a> — why a worker dispatch asks for approval</li>

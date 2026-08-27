@@ -78,16 +78,6 @@ fn leading_system(messages: &[Message]) -> &[Message] {
     &messages[..n]
 }
 
-/// Strip the CurrentDateHook tail: its `pre_request` appends exactly one trailing
-/// `user` "Current date: …" message — ephemeral (not stored, not part of the cached
-/// prefix). Everything before it is the byte-stable prefix.
-fn without_date_tail(messages: &[Message]) -> &[Message] {
-    match messages.last() {
-        Some(m) if m.text.starts_with("Current date:") => &messages[..messages.len() - 1],
-        _ => messages,
-    }
-}
-
 fn text_turn(t: &str) -> Vec<StreamEvent> {
     vec![
         StreamEvent::TextDelta(t.into()),
@@ -125,9 +115,12 @@ async fn full_assembly_wire_prefix_is_cacheable_across_turns() {
     // Memory ON — the hook that rewrites the leading-system run is the main risk.
     let opts = PrepareOptions {
         session: SessionMode::Disabled,
+        tools: true,
         skill_dirs: Some(vec![project.path().join("skills")]),
         plugin_skill_dirs: Vec::new(),
         mcp: false,
+        extra_mcp_servers: Vec::new(),
+        external_subagents: Vec::new(),
         memory: true,
         web: false,
         review: false,
@@ -187,11 +180,12 @@ async fn full_assembly_wire_prefix_is_cacheable_across_turns() {
         );
     }
 
-    // (3) append-only: each call's stored history (minus the ephemeral date tail) is a
-    //     STRICT byte prefix of the next — no head mutation, no mid-session rewrite.
+    // (3) append-only: each call's stored history is a STRICT byte prefix of the next — no head
+    //     mutation, no mid-session rewrite. (No ephemeral date tail to strip: the per-round
+    //     status reminder was removed; the date now lives in the frozen persona prefix.)
     for w in calls.windows(2) {
-        let prev = history_repr(without_date_tail(&w[0].0));
-        let next = history_repr(without_date_tail(&w[1].0));
+        let prev = history_repr(&w[0].0);
+        let next = history_repr(&w[1].0);
         assert!(
             is_strict_prefix(&prev, &next),
             "history must be append-only (strict byte prefix).\n  prev = {prev:?}\n  next = {next:?}"
@@ -215,9 +209,12 @@ async fn tool_block_and_system_are_deterministic_across_independent_assemblies()
     let cfg = cfg(project.path());
     let opts = || PrepareOptions {
         session: SessionMode::Disabled,
+        tools: true,
         skill_dirs: Some(vec![project.path().join("skills")]),
         plugin_skill_dirs: Vec::new(),
         mcp: false,
+        extra_mcp_servers: Vec::new(),
+        external_subagents: Vec::new(),
         memory: true,
         web: true, // include web tools too — more tools = a stronger ordering check
         review: false,

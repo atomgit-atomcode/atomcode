@@ -22,9 +22,9 @@ use super::rewind::{
     TRANSACTION_VERSION,
 };
 use super::{
-    now_ms, ModelUsageStat, PresentationFile, SessionLease, SessionManager,
-    SessionMeta, SessionStoreError, TokenBreakdown, TurnStat, WorkspaceCheckpoint,
-    WorkspaceCheckpointError, WorkspaceRestoreReceipt,
+    now_ms, ModelUsageStat, PresentationFile, SessionLease, SessionManager, SessionMeta,
+    SessionStoreError, TokenBreakdown, TurnStat, WorkspaceCheckpoint, WorkspaceCheckpointError,
+    WorkspaceRestoreReceipt,
 };
 
 /// Per-turn accumulation (reset each turn): duration, round/tool counts, and the final
@@ -634,6 +634,18 @@ impl SnapshotHook {
         }
     }
 
+    /// Surface a RECOVERABLE persistence failure (the last committed state is
+    /// intact but THIS turn was not saved). Unlike an uncertain commit — which
+    /// fail-stops loudly — a recoverable failure keeps the runtime running, so
+    /// without this the unsaved turn would be lost silently on the next
+    /// restart/resume. The wording stays cause-agnostic: `{error}` already
+    /// carries the specifics (e.g. "磁盘空间不足"/no space, permission denied).
+    fn warn_turn_not_persisted(&self, error: &SessionStoreError) {
+        self.persistence_status.report_auxiliary_warning(format!(
+            "this turn could not be saved ({error}); the last saved state is intact — resolve the error and retry"
+        ));
+    }
+
     fn compaction_error(&self, error: SessionStoreError) -> CompactionCheckpointError {
         self.record_persistence_error(&error);
         CompactionCheckpointError::new(error.to_string())
@@ -935,6 +947,10 @@ impl LifecycleHooks for SnapshotHook {
             )
         } else {
             if let Err(error) = self.mgr.save_snapshot(&self.session_id, &snap) {
+                // Same recoverable-loss guarantee as the leased path below: warn
+                // instead of dropping the unsaved turn silently. `save_snapshot`
+                // is a single atomic write, so it never yields an uncertain commit.
+                self.warn_turn_not_persisted(&error);
                 eprintln!("[SnapshotHook] save_snapshot failed: {error}");
                 return;
             }
@@ -944,6 +960,12 @@ impl LifecycleHooks for SnapshotHook {
         };
         if let Err(error) = result {
             self.record_persistence_error(&error);
+            // An uncertain commit already fail-stops loudly; only a recoverable
+            // failure needs a user-visible warning so the unsaved turn isn't lost
+            // silently.
+            if !error.is_uncertain_commit() {
+                self.warn_turn_not_persisted(&error);
+            }
             eprintln!("[SnapshotHook] update_meta failed: {error}");
             // Preserve the accepted-prompt checkpoint until a later successful
             // aggregate commit supersedes it.

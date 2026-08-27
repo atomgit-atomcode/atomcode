@@ -106,7 +106,7 @@ pub async fn check(mw: Arc<dyn ToolMiddleware>) -> ConformanceReport {
         is_error: false,
         images: vec![],
     };
-    let after_fut = async { mw.after(&mut result).await };
+    let after_fut = async { mw.after(&mut result, None).await };
     match with_timeout(DEFAULT_CHECK_TIMEOUT, catch_async(after_fut)).await {
         Ok(Ok(_)) => r.record("after_returns", true, ""),
         Ok(Err(p)) => r.record(
