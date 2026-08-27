@@ -924,7 +924,7 @@ fn review_prompt(arg: &str) -> String {
 }
 ```
 
-Note: this preserves the existing substrings the current tests assert (`{"scope":{"kind":"working_tree"}}`, `{"scope":{"kind":"staged"}}`, `{"scope":{"kind":"range","base":"release/v5.0.8","head":"HEAD"}}`, and JSON-escaped odd refs), so `review_prompt_uses_explicit_tool_scopes` and `review_prompt_json_escapes_the_base_ref` stay green.
+Note: this preserves the existing substrings the current tests assert (`{"scope":{"kind":"working_tree"}}`, `{"scope":{"kind":"staged"}}`, `{"scope":{"kind":"range","base":"release/v5.0.9","head":"HEAD"}}`, and JSON-escaped odd refs), so `review_prompt_uses_explicit_tool_scopes` and `review_prompt_json_escapes_the_base_ref` stay green.
 
 - [ ] **Step 4: Run test to verify it passes**
 
