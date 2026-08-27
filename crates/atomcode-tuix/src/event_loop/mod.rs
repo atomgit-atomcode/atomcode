@@ -5667,6 +5667,34 @@ mod buffer_tests {
     }
 
     #[test]
+    fn compaction_spinner_matches_thinking_format_and_has_no_slow_variant() {
+        let mut s = UiState::new();
+        s.on_submit();
+        s.compacting = true;
+        // Consistent with the thinking spinner: a parenthesized clock (was a bare
+        // ` · 4s`, no parens/tokens), no tokens before any output.
+        let bare = format_spinner_label(&s, 0, None);
+        assert!(bare.contains("(0s)"), "parenthesized clock, got {bare:?}");
+        // Once output streams, the `↑ N tokens` counter joins inside the parens —
+        // the SAME `(0s · ↑ 12.40K tokens)` shape as the thinking spinner.
+        s.turn_output_chars = 49_600;
+        let active = format_spinner_label(&s, 0, None);
+        assert!(
+            active.contains("(0s \u{b7} \u{2191} 12.40K tokens)"),
+            "expected `(0s · ↑ 12.40K tokens)`, got {active:?}"
+        );
+        // Even silent past the stall threshold there is NO "较慢/slow" label any
+        // more — the live token counter is the liveness proof.
+        s.last_stream_activity =
+            Some(std::time::Instant::now() - crate::state::STREAM_STALL_HINT);
+        let stalled = format_spinner_label(&s, 0, None);
+        assert!(
+            !stalled.contains("较慢") && !stalled.to_lowercase().contains("slow"),
+            "no slow variant, got {stalled:?}"
+        );
+    }
+
+    #[test]
     fn spinner_label_shows_subagent_activity_when_present() {
         // While a `task` fan-out is running, the spinner shows the children's latest
         // live activity in place of the generic thinking word — and reverts when cleared.
@@ -28866,18 +28894,24 @@ fn format_spinner_label(
     queue_len: usize,
     reasoning_effort: Option<&str>,
 ) -> String {
-    // Compaction takes over the spinner: show "Compacting…" (or a slow variant
-    // past the stall threshold) with the phase elapsed appended, instead of a
-    // thinking label. Unified for auto + manual /compact.
+    // Compaction takes over the spinner: show "Compacting…" with the SAME
+    // phase-clock + token parenthetical as the thinking spinner, so it reads
+    // consistently (`正在压缩 (4s · ↑ 145 tokens)`). Unified for auto + manual
+    // /compact. (The "较慢/slow" stall variant was dropped — the live token
+    // counter below is the liveness proof, so a separate slow label is redundant.)
     if state.compacting {
-        let base = if state.compaction_stalled() {
-            crate::i18n::t(crate::i18n::Msg::CompactingSlow)
-        } else {
-            crate::i18n::t(crate::i18n::Msg::Compacting)
-        };
-        let mut out = base.into_owned();
+        let mut out = crate::i18n::t(crate::i18n::Msg::Compacting).into_owned();
         if let Some(d) = state.phase_elapsed() {
-            out.push_str(&format!(" · {}", fmt_elapsed(d.as_millis() as u64)));
+            let elapsed = fmt_elapsed(d.as_millis() as u64);
+            let tokens = state.turn_output_token_estimate();
+            if tokens > 0 {
+                out.push_str(&format!(
+                    " ({elapsed} · \u{2191} {} tokens)",
+                    crate::i18n::fmt_tokens(tokens)
+                ));
+            } else {
+                out.push_str(&format!(" ({elapsed})"));
+            }
         }
         return out;
     }
