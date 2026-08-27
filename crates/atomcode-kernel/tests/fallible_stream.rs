@@ -538,9 +538,9 @@ impl LlmProvider for FlakyProvider {
 }
 
 // A RETRYABLE open failure must NOT hard-fail the turn: the agent loop re-opens
-// the same round, emits a VISIBLE Warning ("…秒后重试…") per attempt, and the turn
-// SUCCEEDS once the provider recovers. `start_paused` advances the 3/6/9s backoff
-// on virtual time so the test is instant.
+// the same round, emits a VISIBLE ProviderRetry event ("…秒后重试…" once the driver
+// renders it) per attempt, and the turn SUCCEEDS once the provider recovers.
+// `start_paused` advances the 3/6/9s backoff on virtual time so the test is instant.
 #[tokio::test(start_paused = true)]
 async fn retryable_open_failure_retries_visibly_then_succeeds() {
     let reg = ToolRegistry::new();
@@ -560,12 +560,16 @@ async fn retryable_open_failure_retries_visibly_then_succeeds() {
     handle.commands.send(send("go")).unwrap();
 
     let mut events = handle.events;
-    let mut warnings: Vec<String> = Vec::new();
+    let mut retries: Vec<(u32, u32)> = Vec::new(); // (attempt, max_attempts)
     let mut errored = false;
     let mut stop: Option<String> = None;
     while let Some(ev) = events.recv().await {
         match ev {
-            AgentEvent::Warning(w) => warnings.push(w),
+            AgentEvent::ProviderRetry {
+                attempt,
+                max_attempts,
+                ..
+            } => retries.push((attempt, max_attempts)),
             AgentEvent::Error { .. } => errored = true,
             AgentEvent::TurnComplete { reason } => {
                 stop = Some(format!("{reason:?}"));
@@ -575,16 +579,16 @@ async fn retryable_open_failure_retries_visibly_then_succeeds() {
         }
     }
 
-    let retry_notes: Vec<&String> = warnings.iter().filter(|w| w.contains("秒后重试")).collect();
     assert_eq!(
-        retry_notes.len(),
+        retries.len(),
         2,
-        "two retryable failures must emit two visible retry notices; got {warnings:?}"
+        "two retryable failures must emit two visible retry notices; got {retries:?}"
     );
-    assert!(
-        retry_notes[0].contains("(1/3)") && retry_notes[1].contains("(2/3)"),
-        "retry notices must be numbered 1/3 then 2/3; got {retry_notes:?}"
+    assert_eq!(
+        retries[0], (1, 3),
+        "retry notices must be numbered 1/3 then 2/3; got {retries:?}"
     );
+    assert_eq!(retries[1], (2, 3), "got {retries:?}");
     assert!(
         !errored,
         "a recovered turn must NOT surface a terminal Error"
