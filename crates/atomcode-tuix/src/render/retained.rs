@@ -9426,13 +9426,15 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
             }
             UiLine::CompactionMark(label) => {
                 // Dim, left-aligned rule marking where compaction folded
-                // history. Faint DarkGrey (not bold) so it reads as structure,
-                // not an alert — deliberately distinct from Warning's bold
-                // yellow. Unified for auto + manual /compact.
-                let style = CellStyle {
-                    fg: Some(crossterm::style::Color::DarkGrey),
-                    ..CellStyle::default()
-                };
+                // history — reads as structure, not an alert (distinct from
+                // Warning's bold yellow). Use the THEME-AWARE muted role, NOT a
+                // hardcoded DarkGrey: DarkGrey is SGR 90 ("bright black") which
+                // collapses into the background on dark terminals and is
+                // illegible (the sibling `UiLine::Muted` branch fixed the same
+                // trap). `Role::Muted` → SGR 37 (readable grey) on dark, keeps
+                // DarkGrey on light, and honours NO_COLOR. Unified for auto +
+                // manual /compact.
+                let style = self.style_for(Role::Muted);
                 let body = crate::render::compaction_rule(
                     &scrub_controls(&label),
                     self.caps.unicode_symbols,
