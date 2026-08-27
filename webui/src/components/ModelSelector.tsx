@@ -10,6 +10,7 @@ const EFFORT_OPTIONS: { val: string | null; key: MsgKey }[] = [
   { val: 'low', key: 'effort.low' },
   { val: 'medium', key: 'effort.medium' },
   { val: 'high', key: 'effort.high' },
+  { val: 'xhigh', key: 'effort.xhigh' },
   { val: 'max', key: 'effort.max' },
 ];
 

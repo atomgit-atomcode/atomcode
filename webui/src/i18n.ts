@@ -119,6 +119,7 @@ const zh = {
   'effort.low': 'Low',
   'effort.medium': 'Medium',
   'effort.high': 'High',
+  'effort.xhigh': 'xHigh',
   'effort.max': 'Max',
 
   // Chat
@@ -543,6 +544,7 @@ const en: Record<MsgKey, string> = {
   'effort.low': 'Low',
   'effort.medium': 'Medium',
   'effort.high': 'High',
+  'effort.xhigh': 'xHigh',
   'effort.max': 'Max',
 
   'chat.startHint': 'Send a message to start a conversation…',
