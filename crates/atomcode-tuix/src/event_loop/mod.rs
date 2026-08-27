@@ -5667,24 +5667,27 @@ mod buffer_tests {
     }
 
     #[test]
-    fn compaction_spinner_matches_thinking_format_and_has_no_slow_variant() {
+    fn compaction_spinner_shows_parenthesized_clock_no_tokens_no_slow_variant() {
         let mut s = UiState::new();
         s.on_submit();
         s.compacting = true;
-        // Consistent with the thinking spinner: a parenthesized clock (was a bare
-        // ` · 4s`, no parens/tokens), no tokens before any output.
+        // Parenthesized elapsed clock, matching the thinking spinner's shape (was
+        // a bare ` · 4s`, no parens).
         let bare = format_spinner_label(&s, 0, None);
         assert!(bare.contains("(0s)"), "parenthesized clock, got {bare:?}");
-        // Once output streams, the `↑ N tokens` counter joins inside the parens —
-        // the SAME `(0s · ↑ 12.40K tokens)` shape as the thinking spinner.
+        // Even with a non-zero `turn_output_chars` (a leftover from the
+        // pre-compaction generation — the compaction summary never feeds it), the
+        // compaction spinner must NOT surface a `↑ N tokens` count, or it would
+        // show a frozen/misleading number.
         s.turn_output_chars = 49_600;
         let active = format_spinner_label(&s, 0, None);
         assert!(
-            active.contains("(0s \u{b7} \u{2191} 12.40K tokens)"),
-            "expected `(0s · ↑ 12.40K tokens)`, got {active:?}"
+            !active.contains("tokens") && !active.contains('\u{2191}'),
+            "compaction must not show a (stale) token count, got {active:?}"
         );
+        assert!(active.contains("(0s)"), "just the clock, got {active:?}");
         // Even silent past the stall threshold there is NO "较慢/slow" label any
-        // more — the live token counter is the liveness proof.
+        // more — the ticking clock already shows it's alive.
         s.last_stream_activity =
             Some(std::time::Instant::now() - crate::state::STREAM_STALL_HINT);
         let stalled = format_spinner_label(&s, 0, None);
@@ -28894,24 +28897,18 @@ fn format_spinner_label(
     queue_len: usize,
     reasoning_effort: Option<&str>,
 ) -> String {
-    // Compaction takes over the spinner: show "Compacting…" with the SAME
-    // phase-clock + token parenthetical as the thinking spinner, so it reads
-    // consistently (`正在压缩 (4s · ↑ 145 tokens)`). Unified for auto + manual
-    // /compact. (The "较慢/slow" stall variant was dropped — the live token
-    // counter below is the liveness proof, so a separate slow label is redundant.)
+    // Compaction takes over the spinner: show "Compacting…" with a parenthesized
+    // elapsed clock, matching the thinking spinner's shape (`正在压缩 (4s)`).
+    // Unified for auto + manual /compact. NO `↑ N tokens` counter here: the
+    // compaction summary is generated silently inside the kernel and never feeds
+    // `turn_output_chars`, so a count would be a FROZEN leftover from the
+    // pre-compaction generation (misleading, especially for auto-compaction that
+    // fires mid-turn). The ticking clock is the liveness proof. (The "较慢/slow"
+    // stall variant was also dropped — the clock already shows it's alive.)
     if state.compacting {
         let mut out = crate::i18n::t(crate::i18n::Msg::Compacting).into_owned();
         if let Some(d) = state.phase_elapsed() {
-            let elapsed = fmt_elapsed(d.as_millis() as u64);
-            let tokens = state.turn_output_token_estimate();
-            if tokens > 0 {
-                out.push_str(&format!(
-                    " ({elapsed} · \u{2191} {} tokens)",
-                    crate::i18n::fmt_tokens(tokens)
-                ));
-            } else {
-                out.push_str(&format!(" ({elapsed})"));
-            }
+            out.push_str(&format!(" ({})", fmt_elapsed(d.as_millis() as u64)));
         }
         return out;
     }
