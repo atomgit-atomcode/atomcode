@@ -29643,11 +29643,52 @@ fn split_head_by_width(s: &str, max: usize) -> (&str, &str) {
     (s, "")
 }
 
-/// 把一条 shell 命令软折成多行,按续行边界优先断行,续行缩进 4 空格。
-/// 优先在空格处断;当**单个 token 本身就比可用宽度还宽**(窄窗口下的长路径/长 URL)、
-/// 空格断不开时,退化为按显示宽度**字符级折断**(CJK 安全),让整段可见而不被 paint
-/// 层无省略地硬裁。绝不加省略/截断标记——命令必须看得全。
+/// Wrap a shell command into display rows. Splits on REAL newlines FIRST so a
+/// multi-line script / heredoc keeps its line structure — without this,
+/// `cmd.split(' ')` glues a `\n`-joined pair into one token (e.g. `base64\ndef`)
+/// and the cell renderer drops the newline, producing an unreadable `base64def`
+/// run-on. Each logical line is then segmented at shell boundaries and
+/// width-wrapped by [`format_shell_command_line`]; non-first logical lines are
+/// indented to align under the command text.
 pub(crate) fn format_shell_command(cmd: &str, width: usize) -> Vec<String> {
+    let cmd = cmd.trim_end();
+    if cmd.is_empty() {
+        return vec![String::new()];
+    }
+    if !cmd.contains('\n') {
+        return format_shell_command_line(cmd, width);
+    }
+    let indent = "    ";
+    let mut out: Vec<String> = Vec::new();
+    for logical in cmd.split('\n') {
+        let logical = logical.trim_end();
+        if logical.is_empty() {
+            continue; // drop blank lines so a spaced-out script doesn't waste rows
+        }
+        let mut rows = format_shell_command_line(logical, width);
+        if !out.is_empty() {
+            // Non-first logical line: indent its first row (continuation rows are
+            // already indented by format_shell_command_line).
+            if let Some(first) = rows.first_mut() {
+                if !first.starts_with(indent) {
+                    *first = format!("{indent}{first}");
+                }
+            }
+        }
+        out.append(&mut rows);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// 把**一条逻辑行**软折成多行,按续行边界(`&&`/`||`/`|`/`\`/`-e`)优先断行,续行
+/// 缩进 4 空格。优先在空格处断;当**单个 token 本身就比可用宽度还宽**(窄窗口下的长
+/// 路径/长 URL)、空格断不开时,退化为按显示宽度**字符级折断**(CJK 安全)。本函数
+/// **不**加省略/截断标记——是否封顶由渲染层(`build_bash_command_rows` 的
+/// `… +N lines`)决定。
+fn format_shell_command_line(cmd: &str, width: usize) -> Vec<String> {
     let cmd = cmd.trim_end();
     if cmd.is_empty() {
         return vec![String::new()];
@@ -30691,6 +30732,24 @@ mod format_shell_command_tests {
             "got {:?}",
             out
         );
+    }
+
+    #[test]
+    fn splits_on_real_newlines_no_runon() {
+        // A multi-line heredoc/script keeps its line structure: each `\n` starts
+        // a new row, so `base64` and `def` are NOT glued into `base64def`.
+        let cmd = "python3 - <<'EOF'\nimport urllib.request, json, base64\ndef gh(url): pass";
+        let out = format_shell_command(cmd, 100);
+        assert_eq!(out.len(), 3, "one row per logical line: {out:?}");
+        assert!(out[0].contains("<<'EOF'"), "{out:?}");
+        assert!(out[1].contains("import urllib.request, json, base64"), "{out:?}");
+        assert!(out[2].contains("def gh(url):"), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.contains("base64def")),
+            "must not glue across newline: {out:?}"
+        );
+        // Continuation lines are indented under the command text.
+        assert!(out[1].starts_with("    "), "{out:?}");
     }
 
     #[test]

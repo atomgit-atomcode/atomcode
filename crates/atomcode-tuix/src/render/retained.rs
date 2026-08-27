@@ -1796,6 +1796,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let shortened = crate::platform::collapse_home_in_command(safe_detail);
         let safe_cmd = crate::glyph::downgrade_glyphs(&shortened, self.caps.unicode_symbols);
         let lines = crate::event_loop::format_shell_command(&safe_cmd, width);
+        // Cap a long / multi-line command at a few visual rows so a big heredoc
+        // or script doesn't flood the transcript; a `… +N lines` marker replaces
+        // the omitted rows (the full command stays in scrollback history above).
+        const MAX_CMD_ROWS: usize = 3;
+        let lines: Vec<String> = if lines.len() > MAX_CMD_ROWS + 1 {
+            let omitted = lines.len() - MAX_CMD_ROWS;
+            let mut kept = lines[..MAX_CMD_ROWS].to_vec();
+            kept.push(format!("… +{omitted} lines"));
+            kept
+        } else {
+            lines
+        };
         let last = lines.len().saturating_sub(1);
         let mut rows = Vec::with_capacity(lines.len());
         for (idx, line) in lines.iter().enumerate() {
@@ -15618,6 +15630,41 @@ mod tests {
     /// Bash ToolCall renders `● Bash(<cmd>)` — command inline in parens on the
     /// header line (matching other tools) — while still wrapping along shell
     /// boundaries (not mid-token), with no truncation and no NBSP sentinel.
+
+    #[test]
+    fn bash_multiline_command_preserves_lines_and_caps_at_three_rows() {
+        let (mut r, buf) = new_capturing(80, 24);
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        // A heredoc/script with real newlines: rows follow logical lines (no
+        // `base64def` run-on), and a long one caps at 3 rows + `… +N lines`.
+        r.render(UiLine::ToolCall {
+            name: "Bash".into(),
+            detail: "python3 - <<'EOF'\nimport json, base64\ndef gh(u): pass\ndef text(r): pass\nfor f in xs: pass\nprint(done)".into(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            vterm.any_row(|row| row.contains("● Bash(python3 - <<'EOF'")),
+            "first row is the heredoc opener\ndump:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            vterm.any_row(|row| row.contains("import json, base64")),
+            "second logical line stands alone (no base64def run-on)\ndump:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            !vterm.any_row(|row| row.contains("base64def")),
+            "newline must not glue words\ndump:\n{}",
+            vterm.dump()
+        );
+        assert!(
+            vterm.any_row(|row| row.contains("… +") && row.contains("lines")),
+            "long command capped with a `… +N lines` marker\ndump:\n{}",
+            vterm.dump()
+        );
+    }
+
     #[test]
     fn bash_command_wraps_on_shell_boundaries_not_mid_token() {
         let (mut r, buf) = new_capturing(60, 24);
