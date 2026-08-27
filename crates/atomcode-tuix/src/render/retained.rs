@@ -3472,7 +3472,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let panel_title = if subtasks.call_id.starts_with("team:") {
             " Team"
         } else {
-            " Subtasks"
+            " SubTasks"
         };
         push_str_cells(&mut header, panel_title, &bold);
         let failed = subtasks
@@ -8282,7 +8282,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let kind = if progress.call_id.starts_with("team:") {
             "Team agents"
         } else {
-            "Subagents"
+            "SubAgents"
         };
         let marker = if self.caps.unicode_symbols {
             "●"
@@ -18634,7 +18634,7 @@ mod tests {
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
         let grid = vterm.dump();
-        assert!(grid.contains("Subtasks · 1/3 finished · 2 running · 0 pending"));
+        assert!(grid.contains("SubTasks · 1/3 finished · 2 running · 0 pending"));
         assert!(grid.contains("explore#2"));
         assert!(grid.contains("\u{25cf} explore#2"));
         assert!(grid.contains("explore#2 · deepseek-v4-flash · inspect codex"));
@@ -18648,7 +18648,7 @@ mod tests {
             "subtask footer height math must mirror the painted rows"
         );
         let subtask_header = (0..vterm.height() as usize)
-            .find(|&row| vterm.row_text(row).contains("Subtasks"))
+            .find(|&row| vterm.row_text(row).contains("SubTasks"))
             .expect("subtask header rendered");
         assert!(
             subtask_header > 0 && vterm.row_text(subtask_header - 1).trim().is_empty(),
@@ -19295,7 +19295,7 @@ mod tests {
         assert_eq!(r.current_footer_rows(), r.last_painted_footer_rows);
         assert!(vterm
             .dump()
-            .contains("Subtasks · 0/3 finished · 3 running · 0 pending"));
+            .contains("SubTasks · 0/3 finished · 3 running · 0 pending"));
     }
 
     #[test]
@@ -19402,7 +19402,7 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         let grid = vterm.dump();
-        assert!(grid.contains("Subtasks · 0/1 finished · 1 running · 0 pending"));
+        assert!(grid.contains("SubTasks · 0/1 finished · 1 running · 0 pending"));
         assert!(!grid.contains("Thinking"));
         assert!(!r.live_spinner_active);
     }
@@ -19447,7 +19447,7 @@ mod tests {
 
         let grid = vterm.dump();
         assert!(grid.contains("Allow"));
-        assert!(!grid.contains("Subtasks"));
+        assert!(!grid.contains("SubTasks"));
         assert_eq!(r.current_footer_rows(), r.last_painted_footer_rows);
     }
 

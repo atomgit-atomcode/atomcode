@@ -1818,7 +1818,7 @@ impl UiState {
     /// The spinner word to DISPLAY. Tool-execution labels (`Running X`,
     /// `Preparing X`) are mapped back to the turn's thinking word so the footer
     /// spinner never flashes tool names — tool progress is shown by the body
-    /// `▸ Tool(detail)` rows instead. Every other label (`Sub-agents N/M`,
+    /// `▸ Tool(detail)` rows instead. Every other label (`SubAgents N/M`,
     /// `Waiting approval`, …) passes through unchanged. Display-only: the stored
     /// `spinner_label` and all phase-clock timing logic are untouched.
     pub(crate) fn display_spinner_label(&self) -> &str {
@@ -2097,7 +2097,7 @@ impl UiState {
         self.sub_agent_total = tasks.len();
         self.sub_agent_done = 0;
         self.sub_agent_failed = 0;
-        self.spinner_label = format!("Sub-agents 0/{}", tasks.len());
+        self.spinner_label = format!("SubAgents 0/{}", tasks.len());
         self.phase_started_at = Some(std::time::Instant::now());
         self.sub_agent_started_at = Some(std::time::Instant::now());
         self.sub_agent_tasks = tasks;
@@ -2129,7 +2129,7 @@ impl UiState {
 
     fn refresh_sub_agent_label(&mut self) {
         self.spinner_label = format!(
-            "Sub-agents {}/{}",
+            "SubAgents {}/{}",
             self.sub_agent_done, self.sub_agent_total
         );
     }
@@ -3065,7 +3065,7 @@ mod tests {
             .map(|i| task_info(&format!("a{}.rs", i), ""))
             .collect();
         s.on_sub_agent_dispatch_start(tasks);
-        assert_eq!(s.spinner_label, "Sub-agents 0/6");
+        assert_eq!(s.spinner_label, "SubAgents 0/6");
     }
 
     #[test]
@@ -3078,10 +3078,10 @@ mod tests {
         ];
         s.on_sub_agent_dispatch_start(tasks);
         s.on_sub_agent_task_done();
-        assert_eq!(s.spinner_label, "Sub-agents 1/3");
+        assert_eq!(s.spinner_label, "SubAgents 1/3");
         s.on_sub_agent_task_done();
         s.on_sub_agent_task_done();
-        assert_eq!(s.spinner_label, "Sub-agents 3/3");
+        assert_eq!(s.spinner_label, "SubAgents 3/3");
         assert_eq!(s.sub_agent_failed, 0);
     }
 
@@ -3124,7 +3124,7 @@ mod tests {
         assert!(s.sub_agent_tasks.is_empty());
         assert!(s.sub_agent_started_at.is_none());
         s.on_thinking();
-        assert!(!s.spinner_label.starts_with("Sub-agents"));
+        assert!(!s.spinner_label.starts_with("SubAgents"));
     }
 
     #[test]
