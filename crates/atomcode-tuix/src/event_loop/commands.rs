@@ -7953,9 +7953,9 @@ mod tests {
     fn review_prompt_uses_explicit_tool_scopes() {
         assert!(review_prompt("").contains(r#"{"scope":{"kind":"working_tree"}}"#));
         assert!(review_prompt("staged").contains(r#"{"scope":{"kind":"staged"}}"#));
-        let range = review_prompt("release/v5.0.8");
+        let range = review_prompt("release/v5.0.9");
         assert!(
-            range.contains(r#"{"scope":{"kind":"range","base":"release/v5.0.8","head":"HEAD"}}"#)
+            range.contains(r#"{"scope":{"kind":"range","base":"release/v5.0.9","head":"HEAD"}}"#)
         );
         assert!(!range.contains(r#"{"base":"#));
     }
