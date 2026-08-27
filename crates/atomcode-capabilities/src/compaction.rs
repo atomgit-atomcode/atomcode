@@ -892,6 +892,15 @@ fn recent_keep_boundary_splitting(
     while boundary < msgs.len() && msgs[boundary].role == Role::Tool {
         boundary += 1;
     }
+    // Guard: if the whole kept tail was `Role::Tool` the snap reaches `len` → we'd drain
+    // EVERYTHING, leaving only the summary. Instead keep at least the most-recent non-Tool
+    // message (an assistant/user) and its trailing results, so the model retains one real
+    // recent exchange to continue from.
+    if boundary >= msgs.len() {
+        if let Some(keep_from) = (floor..msgs.len()).rev().find(|&i| msgs[i].role != Role::Tool) {
+            boundary = keep_from;
+        }
+    }
     boundary.max(floor).min(msgs.len())
 }
 
@@ -987,6 +996,22 @@ mod tests {
         );
         let kept: usize = msgs[b..].iter().map(|m| m.estimate_tokens() as usize).sum();
         assert!(kept <= budget, "kept {kept} must fit budget {budget}");
+    }
+
+    #[test]
+    fn recent_keep_boundary_splitting_never_drains_the_entire_tail() {
+        // Budget fits only the trailing tool result → snap would reach len (drain all).
+        // The guard must back off to keep the most-recent non-Tool message + its result.
+        let msgs = vec![
+            Message::user("go"),
+            asst_call("c1", "bash"),
+            Message::tool_result("c1", &big("out"), false),
+        ];
+        let budget = 1; // absurdly small → would keep only the last (Tool) message
+        let b = recent_keep_boundary_splitting(&msgs, budget, 0);
+        assert!(b < msgs.len(), "must keep at least one message (b={b})");
+        assert_ne!(msgs[b].role, Role::Tool, "kept span starts at a real message");
+        assert_eq!(b, 1, "keeps the last assistant + its result, drains the User (b={b})");
     }
 
     #[test]
