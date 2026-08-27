@@ -291,13 +291,17 @@ impl OverflowCompaction {
                 }
             }
             _ => {
-                // Emergency recovery (the provider ALREADY rejected the request as too long)
-                // must be maximally aggressive to fit NOW — keep only the active turn. The
-                // proactive auto/manual drain (manual_plan) keeps ~25% recent for working
-                // context, but the emergency ladder can't afford that headroom.
-                let drain_to = active_turn_start(msgs, 1).max(floor);
+                // Emergency recovery (the provider ALREADY rejected the request as too
+                // long) must fit NOW. Drain everything older than the recent keep-budget
+                // — and, crucially, SPLIT the active turn when it alone exceeds the budget
+                // (a single long agentic loop's accumulated assistant messages + tool
+                // calls, which stubbing tool results alone can't reduce). Without the
+                // split, `active_turn_start` returns the turn start → noop on a one-turn
+                // overflow → the doomed request fires anyway.
+                let drain_to =
+                    recent_keep_boundary_splitting(msgs, recent_keep_budget(view.ctx_window), floor);
                 if drain_to <= floor {
-                    return CompactionPlan::noop(); // nothing older than the active turn
+                    return CompactionPlan::noop(); // nothing older than the kept window
                 }
                 let rewrites = Self::aggressive_stub_rewrites(msgs, drain_to, msgs.len());
                 if !span_has_non_anchor(&msgs[floor..drain_to]) {
@@ -346,7 +350,11 @@ impl OverflowCompaction {
     async fn manual_plan(&self, view: &CompactionView<'_>, focus: Option<&str>) -> CompactionPlan {
         let msgs = view.messages;
         let floor = view.sacred_floor;
-        let drain_to = recent_keep_boundary(msgs, recent_keep_budget(view.ctx_window), floor);
+        // Splitting variant: when the active turn ALONE exceeds the keep-budget (a single
+        // long turn), drain its older prefix rather than falling back to the gentle stub
+        // (which noops on one turn → the misleading "conversation is short").
+        let drain_to =
+            recent_keep_boundary_splitting(msgs, recent_keep_budget(view.ctx_window), floor);
         if drain_to <= floor || !span_has_non_anchor(&msgs[floor..drain_to]) {
             // Nothing older than the active turn, OR the only drainable content is a prior
             // anchor (re-summarizing it alone is wasteful and only degrades it) — fall back
@@ -846,6 +854,47 @@ fn recent_keep_boundary(msgs: &[Message], keep_budget_tokens: usize, floor: usiz
     boundary.max(floor)
 }
 
+/// Like [`recent_keep_boundary`], but when the ACTIVE turn ALONE still exceeds
+/// `keep_budget_tokens` (a single long agentic loop whose accumulated assistant
+/// messages + tool calls can't be reduced by stubbing tool results — the
+/// 246K-in-one-turn case), it SPLITS the active turn: keep the most-recent
+/// messages that fit the budget, drain the older prefix into a summary. The split
+/// is snapped FORWARD past any leading `Role::Tool` results so the kept span never
+/// starts with an orphan result whose call was drained (belt-and-suspenders on top
+/// of `repair_pairing`). Falls through to the turn-aligned boundary whenever the
+/// active turn fits, so normal multi-turn behaviour is unchanged.
+fn recent_keep_boundary_splitting(
+    msgs: &[Message],
+    keep_budget_tokens: usize,
+    floor: usize,
+) -> usize {
+    let turn_boundary = recent_keep_boundary(msgs, keep_budget_tokens, floor);
+    let kept: usize = msgs[turn_boundary..]
+        .iter()
+        .map(|m| m.estimate_tokens() as usize)
+        .sum();
+    if kept <= keep_budget_tokens {
+        return turn_boundary; // active turn fits — keep turn-aligned (normal path)
+    }
+    // Active turn alone is over budget → split within it. Keep most-recent messages
+    // that fit; ALWAYS keep at least the final message so the kept span isn't empty.
+    let mut acc = 0usize;
+    let mut boundary = msgs.len();
+    for i in (turn_boundary..msgs.len()).rev() {
+        let t = msgs[i].estimate_tokens() as usize;
+        if boundary < msgs.len() && acc + t > keep_budget_tokens {
+            break;
+        }
+        acc += t;
+        boundary = i;
+    }
+    // Snap forward past leading orphan tool results (their call is in the drained prefix).
+    while boundary < msgs.len() && msgs[boundary].role == Role::Tool {
+        boundary += 1;
+    }
+    boundary.max(floor).min(msgs.len())
+}
+
 /// Map each tool-call id → the tool NAME the model used, harvested from the assistant
 /// messages' own `tool_calls` (zero hardcoded tool knowledge). Unknown ids default to
 /// `"tool"` at the call site.
@@ -915,6 +964,46 @@ mod tests {
             utilization: 0.5,
             sacred_floor,
         }
+    }
+
+    #[test]
+    fn recent_keep_boundary_splitting_cuts_within_a_single_giant_turn() {
+        // ONE user turn, many big call+result pairs (the 246K-in-one-turn shape).
+        let mut msgs = vec![Message::user("go")];
+        for i in 0..10 {
+            msgs.push(asst_call(&format!("c{i}"), "bash"));
+            msgs.push(Message::tool_result(&format!("c{i}"), &big("out"), false));
+        }
+        let floor = 0;
+        let total: usize = msgs.iter().map(|m| m.estimate_tokens() as usize).sum();
+        let budget = total / 4; // active turn alone far exceeds this → must split
+        let b = recent_keep_boundary_splitting(&msgs, budget, floor);
+        assert!(b > floor, "must drain the older prefix of the giant turn (b={b})");
+        assert!(b < msgs.len(), "must keep some recent messages (b={b})");
+        assert_ne!(
+            msgs[b].role,
+            Role::Tool,
+            "kept span must not start with an orphan tool result (b={b})"
+        );
+        let kept: usize = msgs[b..].iter().map(|m| m.estimate_tokens() as usize).sum();
+        assert!(kept <= budget, "kept {kept} must fit budget {budget}");
+    }
+
+    #[test]
+    fn recent_keep_boundary_splitting_stays_turn_aligned_when_active_turn_fits() {
+        let msgs = vec![
+            Message::user("t1"),
+            asst_call("c1", "bash"),
+            Message::tool_result("c1", &big("o1"), false),
+            Message::user("t2"),
+            asst_call("c2", "bash"),
+            Message::tool_result("c2", "small", false),
+        ];
+        let budget = 1_000_000; // huge → active turn fits → identical to turn-aligned
+        assert_eq!(
+            recent_keep_boundary_splitting(&msgs, budget, 0),
+            recent_keep_boundary(&msgs, budget, 0),
+        );
     }
 
     fn overflow_view<'a>(

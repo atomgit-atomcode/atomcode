@@ -2086,13 +2086,17 @@ impl RunningAgent {
                     && est(&messages) >= limit as u64
                     && attempts < MAX_OVERFLOW_ATTEMPTS
                 {
-                    let before = est(&convo.messages);
                     self.run_compaction(convo, CompactTrigger::Overflow { attempt: attempts })
                         .await;
                     attempts += 1;
-                    if est(&convo.messages) >= before {
-                        break; // nothing drained (sacred floor / single huge input) — warn below
-                    }
+                    // Re-project after EVERY pass and do NOT break when a single tier drains
+                    // nothing. The overflow tiers are a LADDER (stub tool results → truncate a
+                    // monster single message → drain+summarize the older prefix, splitting a
+                    // giant single turn). A middle tier that can't help — e.g. no
+                    // >budget-char message to truncate, the common case — must NOT stop the
+                    // loop before the more-aggressive drain-split tier runs. Termination is
+                    // bounded by `est < limit` and `attempts < MAX_OVERFLOW_ATTEMPTS`; a tier
+                    // with nothing to do returns a cheap noop plan (no LLM call).
                     messages = convo.messages.clone();
                     self.hooks.pre_request(&mut messages, &turn_ctx).await;
                     appended_only &= messages.len() >= convo.messages.len()
