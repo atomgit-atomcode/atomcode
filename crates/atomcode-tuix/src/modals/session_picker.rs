@@ -1038,6 +1038,11 @@ pub(crate) fn replay_session(
                         renderer.render(UiLine::ToolCall {
                             name: crate::event_loop::display_tool_name(&tc.name),
                             detail: format_tool_detail(&tc.name, &tc.arguments),
+                            // Colour the resumed `●` by the stored result so a
+                            // reopened transcript keeps its green success dots.
+                            outcome: result_of
+                                .get(&tc.id)
+                                .map(|(ok, _)| crate::event_loop::tool_bullet_outcome(*ok)),
                         });
                     }
                 }

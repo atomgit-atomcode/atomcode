@@ -24,6 +24,17 @@ pub enum MarkKind {
     ToolResult,
 }
 
+/// Outcome of a tool call, used to colour the `●` header bullet (and the
+/// parallel-child `•` dot). Only `Success` is coloured (green); `Failure` — like
+/// a `None`/unknown outcome — renders NEUTRAL, because the red/yellow `✗` result
+/// line already carries the failure signal. Kept as an enum (not a bool) so the
+/// "failed" state is named and could be coloured later without re-threading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOutcome {
+    Success,
+    Failure,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MessageMark {
     /// Index into the renderer's visible body buffer (`Vec<Vec<Cell>>`).
@@ -57,6 +68,10 @@ pub enum UiLine {
     ToolCall {
         name: String,
         detail: String,
+        /// Colours the `●` header when the outcome is known at render time (the
+        /// non-animated result path, and `/resume` history replay — both emit
+        /// the static ToolCall). `None` = unknown yet (approval prompt) → neutral.
+        outcome: Option<ToolOutcome>,
     },
     /// Animated tool-call line. Pushed on `AgentEvent::ToolCallStarted`
     /// instead of the static `ToolCall`, so the user sees the call land
@@ -83,6 +98,11 @@ pub enum UiLine {
     /// If `call_id` is provided, only commits if the inflight_tool matches.
     ToolCallCommit {
         call_id: Option<String>,
+        /// The tool's outcome when this commit is driven by a result (freezes
+        /// AND colours the `●`). `None` for commits with no result yet (a
+        /// preempt by the next in-flight tool, or a turn-end freeze) — the
+        /// bullet stays neutral.
+        outcome: Option<ToolOutcome>,
     },
     /// Push a parallel-tool batch as a live multi-row group: one
     /// header line + N child rows (one per tool call), all visible
@@ -104,6 +124,9 @@ pub enum UiLine {
         batch_id: String,
         call_id: String,
         new_text: String,
+        /// Colours the child row's `•` status dot when the child completes
+        /// (green/yellow/red). `None` while still pending → neutral dot.
+        outcome: Option<ToolOutcome>,
     },
     /// One-shot summary line for a completed tool batch — rendered
     /// with bold + brand-color emphasis so it stands out as the
@@ -967,6 +990,10 @@ pub struct DiffEntry {
 pub struct ToolGroupChild {
     pub call_id: String,
     pub text: String,
+    /// Colours the child's `•` dot at initial render — used by `/resume` replay
+    /// where children are rebuilt already-complete. `None` for a live pending
+    /// child (coloured later by `ToolGroupChildUpdate`).
+    pub outcome: Option<ToolOutcome>,
 }
 
 /// True when the live input buffer puts the user in `!` shell mode: a `!` leads

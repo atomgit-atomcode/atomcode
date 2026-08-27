@@ -249,7 +249,11 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 self.drop_transient();
                 let _ = self.out.write_all(b"\n");
             }
-            UiLine::ToolCall { name, detail }
+            UiLine::ToolCall {
+                name,
+                detail,
+                outcome: _,
+            }
             | UiLine::ToolCallInFlight {
                 id: _,
                 name,
@@ -305,7 +309,10 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 }
             }
             UiLine::AgentGroupsFreeze => {}
-            UiLine::ToolCallCommit { call_id: _ } => {
+            UiLine::ToolCallCommit {
+                call_id: _,
+                outcome: _,
+            } => {
                 // Plain mode never animated the row, so there is
                 // nothing to freeze. Skip silently.
             }
@@ -330,6 +337,7 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                 batch_id: _,
                 call_id: _,
                 new_text,
+                outcome: _,
             } => {
                 self.drop_transient();
                 let _ = writeln!(self.out, "{}", self.dg(&new_text));
@@ -739,6 +747,7 @@ mod tests {
         r.render(UiLine::ToolCall {
             name: "read_file".into(),
             detail: "x.rs".into(),
+            outcome: None,
         });
         r.render(UiLine::ToolResult {
             success: true,

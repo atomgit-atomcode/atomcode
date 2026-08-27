@@ -26021,7 +26021,10 @@ fn handle_agent_event(
                 renderer.render(UiLine::ToolGroupChildUpdate {
                     batch_id,
                     call_id: call_id.clone(),
-                    new_text: format!("  {} {}{}", child_glyph, prefix, suffix),
+                    // `└ • Tool … → result`: the `•` status dot is coloured by
+                    // outcome in the renderer; `└` stays the muted connector.
+                    new_text: format!("  {} \u{2022} {}{}", child_glyph, prefix, suffix),
+                    outcome: Some(tool_bullet_outcome(success)),
                 });
                 // Batch children normally collapse failures to a compact `✗`.
                 // A local security denial is different: hiding its reason leaves
@@ -26066,8 +26069,12 @@ fn handle_agent_event(
             // it. Pass the call_id so we only freeze if the inflight_tool matches.
             // This prevents freezing a different tool's spinner when multiple
             // tools are in flight (e.g., WriteFile result arrives while Bash spinner is active).
+            // Colours the frozen `●`: only SUCCESS greens it (see
+            // `tool_bullet_style_for`); failures/denials stay neutral, so no
+            // special-casing of denial/plan-block/calm gates is needed.
             renderer.render(UiLine::ToolCallCommit {
                 call_id: Some(call_id.clone()),
+                outcome: Some(tool_bullet_outcome(success)),
             });
 
             // Prefer the display-name we stored at ToolCallStarted time;
@@ -26120,6 +26127,8 @@ fn handle_agent_event(
                 renderer.render(UiLine::ToolCall {
                     name: safe_name.clone(),
                     detail: detail.clone(),
+                    // Result-driven static path — outcome is known; greens on success.
+                    outcome: Some(tool_bullet_outcome(success)),
                 });
             }
             if !suppress_body_echo {
@@ -26291,22 +26300,27 @@ fn handle_agent_event(
                     // ToolCallInFlight is animating — commit it to a static row
                     // so the approval prompt appears below a frozen `▸ Bash(...)`.
                     // Pass the call_id to ensure we only freeze the matching tool.
+                    // No result yet → neutral bullet.
                     renderer.render(UiLine::ToolCallCommit {
                         call_id: Some(call.id.clone()),
+                        outcome: None,
                     });
                 } else {
-                    // Not yet rendered, emit it now
+                    // Not yet rendered, emit it now (approval prompt — no result
+                    // yet, so the bullet stays neutral).
                     renderer.render(UiLine::ToolCall {
                         name: disp.clone(),
                         detail: det.clone(),
+                        outcome: None,
                     });
                     *rendered = true;
                 }
             } else {
-                // No entry from ToolCallStarted, render and insert
+                // No entry from ToolCallStarted, render and insert (pre-result).
                 renderer.render(UiLine::ToolCall {
                     name: display.clone(),
                     detail: detail.clone(),
+                    outcome: None,
                 });
                 pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
             }
@@ -26617,9 +26631,11 @@ fn handle_agent_event(
                     name
                 };
                 if !call_rendered {
+                    // Cancelled tool — not a success, so neutral bullet.
                     renderer.render(UiLine::ToolCall {
                         name: safe_name,
                         detail,
+                        outcome: None,
                     });
                 }
                 renderer.render(UiLine::ToolResult {
@@ -27084,12 +27100,15 @@ fn handle_agent_event(
                 .zip(final_details.iter())
                 .map(|(c, detail)| crate::render::ToolGroupChild {
                     call_id: c.id.clone(),
+                    // Pending child: `└ • Tool(detail)`. The `•` starts neutral
+                    // and is coloured by ToolGroupChildUpdate when the result lands.
                     text: format!(
-                        "  {} {}({})",
+                        "  {} \u{2022} {}({})",
                         child_glyph,
                         display_tool_name_short(&c.name),
                         detail
                     ),
+                    outcome: None,
                 })
                 .collect();
             renderer.render(UiLine::AssistantLineBreak);
@@ -28792,6 +28811,17 @@ fn format_spinner_label(
 /// `ReadFile`, `EditFile`, `WebFetch` — a CC-style convention that reads
 /// more cleanly at a glance.
 ///
+/// Map a tool's success to the `●` header-bullet outcome. Only success is
+/// coloured (green); every failure renders neutral (the `✗` result line carries
+/// the detail), so no failure-class distinction is needed here.
+pub(crate) fn tool_bullet_outcome(success: bool) -> crate::render::ToolOutcome {
+    if success {
+        crate::render::ToolOutcome::Success
+    } else {
+        crate::render::ToolOutcome::Failure
+    }
+}
+
 /// MCP tools arrive on the wire as `mcp__<server>__<tool>`. Naive
 /// PascalCase collapses the three parts into `McpZouwuQueryRequirements`
 /// where the server / tool boundary disappears. Render them with a
@@ -29539,7 +29569,12 @@ pub(crate) fn build_replay_tool_batch(
             };
             crate::render::ToolGroupChild {
                 call_id: c.id.clone(),
-                text: format!("  {} {}{}", child_glyph, body, suffix),
+                // `└ • Tool … → result` (matches live); the `•` is coloured by the
+                // stored outcome so a resumed batch keeps its green success dots.
+                text: format!("  {} \u{2022} {}{}", child_glyph, body, suffix),
+                outcome: result_of
+                    .get(&c.id)
+                    .map(|(ok, _)| tool_bullet_outcome(*ok)),
             }
         })
         .collect();
@@ -30993,6 +31028,24 @@ mod user_input_mode_tests {
 //     (`round_cap_panel_toggle_and_choice`)
 //   • `chosen_continue` contract used by Enter / Esc → tests below (pure)
 //   • Key-routing stub replacement → verified by `cargo build` (compile check)
+#[cfg(test)]
+mod tool_bullet_outcome_tests {
+    use super::tool_bullet_outcome;
+    use crate::render::ToolOutcome;
+
+    #[test]
+    fn success_maps_to_success() {
+        assert_eq!(tool_bullet_outcome(true), ToolOutcome::Success);
+    }
+
+    #[test]
+    fn any_failure_maps_to_failure() {
+        // No failure-class distinction: only success is coloured, so every
+        // failure is the same neutral `Failure`.
+        assert_eq!(tool_bullet_outcome(false), ToolOutcome::Failure);
+    }
+}
+
 #[cfg(test)]
 mod round_cap_key_tests {
     use super::round_cap_key_decision;

@@ -1042,7 +1042,7 @@ fn is_recoverable_tool_failure(success: bool, summary: &str) -> bool {
 /// Leading gutter glyphs that anchor a tool block (`● bash`, `└ cmd`,
 /// `⎿ [elapsed…]`, …). Stripped from a tool row's COPY text so a drag copy
 /// carries the command/output, not the decorative anchor.
-const TOOL_GUTTER_GLYPHS: &[char] = &['●', '└', '⎿', '↳', '✓', '▸'];
+const TOOL_GUTTER_GLYPHS: &[char] = &['●', '└', '⎿', '↳', '✓', '▸', '•'];
 
 /// ASCII stand-ins the gutter glyphs downgrade to on non-unicode terminals
 /// (`●`→`*`, `└`/`⎿`→`` ` ``, `▸`/`↳`→`>` — see `glyph::ascii_for`). These chars
@@ -1077,7 +1077,9 @@ fn copy_text_from_tool_row(row: &[Cell]) -> (String, usize) {
     let is_gutter = |ch: char| {
         TOOL_GUTTER_GLYPHS.contains(&ch) || (allow_ascii_gutter && TOOL_GUTTER_ASCII.contains(&ch))
     };
-    if row.get(col).is_some_and(|cell| is_gutter(cell.ch)) {
+    // Loop so a doubly-anchored row (`└ • Tool …`, parallel child) strips BOTH
+    // the `└` connector and the `•` status dot — not just the first glyph.
+    while row.get(col).is_some_and(|cell| is_gutter(cell.ch)) {
         let mut index = col + 1;
         while row.get(index).is_some_and(|cell| cell.width == 0) {
             index += 1; // width-2 glyph's continuation cell
@@ -1087,6 +1089,8 @@ fn copy_text_from_tool_row(row: &[Cell]) -> (String, usize) {
                 index += 1;
             }
             col = index;
+        } else {
+            break;
         }
     }
     let end = row
@@ -1761,6 +1765,25 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.style_bold(Role::ToolName)
     }
 
+    /// Bold style for the tool-call `●` bullet, coloured by the call's outcome:
+    /// green success / yellow recoverable / red hard failure, or the neutral
+    /// `ToolName` shade when the outcome is not yet known (in-flight, preempt,
+    /// turn-end freeze). Applied at commit time so the colour is part of the
+    /// committed cell — it survives resize/reflow and never needs an in-place
+    /// repaint, and a result that belongs to no header (batch child, cancel)
+    /// simply never reaches here.
+    fn tool_bullet_style_for(&self, outcome: Option<crate::render::ToolOutcome>) -> CellStyle {
+        // Only a confirmed SUCCESS colours the bullet (green). Failures — hard or
+        // recoverable — and "not yet known" (pending / preempt / denial) all stay
+        // NEUTRAL: the red/yellow `✗` result line already carries the failure
+        // signal, so the bullet is a positive "done ok" marker, nothing more.
+        let role = match outcome {
+            Some(crate::render::ToolOutcome::Success) => Role::Success,
+            _ => Role::ToolName,
+        };
+        self.style_bold(role)
+    }
+
     /// Build `<prefix><Name>(<cmd>)<meta>` rows for a bash tool call. The
     /// command sits in parens on the header line to match other tools
     /// (`● Read(arg)`), while `format_shell_command` keeps the shell-boundary
@@ -1835,15 +1858,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// wrapper over `build_bash_command_rows`. Used by both the static
     /// `UiLine::ToolCall` arm and `commit_inflight_tool` so the live and static
     /// paths produce identical output.
-    fn push_bash_command_block(&mut self, safe_name: &str, safe_detail: &str) {
-        let bullet_style = self.tool_bullet_style();
+    fn push_bash_command_block(
+        &mut self,
+        bullet_style: &CellStyle,
+        safe_name: &str,
+        safe_detail: &str,
+    ) {
         let tool_name_style = self.style_bold(Role::ToolName);
         // Parens + command render in Secondary, same as the `(detail)` other
         // tools show.
         let detail_style = self.style_for(Role::Secondary);
         let rows = self.build_bash_command_rows(
             "● ",
-            &bullet_style,
+            bullet_style,
             safe_name,
             &tool_name_style,
             &detail_style,
@@ -7193,7 +7220,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// `ToolResult` fallback — same wrapping pipeline as
     /// `render_inflight_tool` but pushes a frozen `▸` icon and clears
     /// `inflight_tool_rows` so the next live tick starts fresh.
-    fn commit_inflight_tool(&mut self) {
+    fn commit_inflight_tool(&mut self, outcome: Option<crate::render::ToolOutcome>) {
         if let Some((_id, name, detail)) = self.inflight_tool.take() {
             let safe_name = scrub_controls(&name);
             let safe_detail = scrub_controls(&detail);
@@ -7250,14 +7277,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
             // double-gap in screenshots). Use `remove` (not just 1)
             // so multi-row inflight spinners are fully covered.
             self.skip_body_scroll_count = self.skip_body_scroll_count.saturating_add(remove as u16);
+            // Colour the committed `●` by the call's outcome (green/yellow/red),
+            // or neutral when this commit has no result yet (preempt / turn-end).
+            let bullet_style = self.tool_bullet_style_for(outcome);
             if safe_name.eq_ignore_ascii_case("bash") && !safe_detail.is_empty() {
                 // Live bash commit: produce the same `● Bash` + `  └ <cmd>` block as
                 // the static `UiLine::ToolCall` arm, via the shared helper.
-                self.push_bash_command_block(&safe_name, &safe_detail);
+                self.push_bash_command_block(&bullet_style, &safe_name, &safe_detail);
             } else if safe_detail.is_empty() {
                 self.push_body_prefixed(
                     "\u{25cf} ",
-                    &self.tool_bullet_style(),
+                    &bullet_style,
                     &safe_name,
                     &self.style_bold(Role::ToolName),
                 );
@@ -7266,7 +7296,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let body_str = format!("{}({})", safe_name, safe_detail);
                 let body_str = truncate_body_str(&body_str, 500);
                 let detail_str = format!("({})", safe_detail);
-                let prefix_style = self.tool_bullet_style();
+                let prefix_style = bullet_style.clone();
                 let name_style = self.style_bold(Role::ToolName);
                 let detail_style = self.style_for(Role::Secondary);
                 let rows = self.build_mixed_style_rows(
@@ -8248,12 +8278,30 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// child (no `$` prefix / accent). Called from both the initial
     /// `ToolGroupRender` child loop and the `ToolGroupChildUpdate` in-place
     /// rewrite path so both share identical width and styling behaviour.
-    fn build_group_child_row(&self, text: &str, muted: &CellStyle) -> Vec<Cell> {
+    fn build_group_child_row(
+        &self,
+        text: &str,
+        muted: &CellStyle,
+        outcome: Option<crate::render::ToolOutcome>,
+    ) -> Vec<Cell> {
         let unicode = self.caps.unicode_symbols;
         let screen_w = self.screen.width();
         let downgr = crate::glyph::downgrade_glyphs(text, unicode);
         let safe = scrub_controls(&downgr);
-        build_one_row(&safe, muted, screen_w, unicode)
+        let mut row = build_one_row(&safe, muted, screen_w, unicode);
+        // Colour the child's `•` status dot by outcome, leaving the `└` tree
+        // connector and the rest muted. Matched on the unicode glyph — on a
+        // non-unicode terminal the dot downgrades to `*` (ambiguous with real
+        // output), so it simply stays muted there. `None` = pending → neutral.
+        if let Some(oc) = outcome {
+            let fg = self.tool_bullet_style_for(Some(oc)).fg;
+            if let Some(cell) = row.iter_mut().find(|c| c.ch == '\u{2022}') {
+                cell.style.fg = fg;
+                cell.style.bold = true;
+                cell.style.faint = false;
+            }
+        }
+        row
     }
 
     fn agent_group_rows(
@@ -8533,7 +8581,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // is in flight. Committing first keeps that safe even if a future
                 // change lets both be active at once (`clear_live_spinner` pops a
                 // single row; a stale strip would then mis-truncate).
-                self.commit_inflight_tool();
+                self.commit_inflight_tool(None);
                 // Returning to idle input: any remaining (non-tool) spinner row
                 // served its purpose — clear it so the user sees a clean input
                 // prompt, not a stale `⠋ Pondering…` row above the input box.
@@ -8725,12 +8773,12 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // set and the next user turn's spinner would mistake
                 // the stale tool detail for the in-flight payload.
                 // Use push_body_prefixed for proper line wrapping.
-                self.commit_inflight_tool();
+                self.commit_inflight_tool(None);
             }
             UiLine::TurnCancelled => {
                 self.flush_assistant_remainder();
                 self.flush_reasoning_remainder();
-                self.commit_inflight_tool();
+                self.commit_inflight_tool(None);
                 // (cancelled) is a state-change marker — must remain
                 // visible. Default fg, not Muted.
                 let style = self.style_for(Role::Secondary);
@@ -8766,7 +8814,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 if self.inflight_tool.is_some() {
                     // Commit the previous tool (freezes it as ▸ in
                     // the body transcript) before starting a new one.
-                    self.commit_inflight_tool();
+                    self.commit_inflight_tool(None);
                 }
                 // The hint (e.g. bash "Press Ctrl+o …") rides INSIDE the
                 // inflight strip so the spinner tick / commit erase cover it
@@ -8790,7 +8838,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // StreamingBox tick (~80ms later) supplies the meta.
                 self.render_inflight_tool(initial, &name, &detail, "");
             }
-            UiLine::ToolCallCommit { call_id } => {
+            UiLine::ToolCallCommit { call_id, outcome } => {
                 // Only commit if the inflight_tool matches the expected call_id,
                 // or if no call_id was provided (legacy behavior).
                 let should_commit = match (call_id, &self.inflight_tool) {
@@ -8799,7 +8847,9 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     _ => false,
                 };
                 if should_commit {
-                    self.commit_inflight_tool();
+                    // `outcome` colours the frozen `●` (green/yellow/red) when this
+                    // commit is result-driven; None leaves it neutral.
+                    self.commit_inflight_tool(outcome);
                 }
             }
             UiLine::ToolGroupRender {
@@ -8863,7 +8913,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 let mut child_indices: std::collections::HashMap<String, usize> =
                     std::collections::HashMap::new();
                 for c in &children {
-                    let row = self.build_group_child_row(&c.text, &muted);
+                    // Live pending children carry `outcome: None` (coloured later by
+                    // ToolGroupChildUpdate); `/resume` children carry their final
+                    // outcome so the dot is coloured immediately.
+                    let row = self.build_group_child_row(&c.text, &muted, c.outcome);
                     self.push_copyable_tool_row(row);
                     child_indices.insert(c.call_id.clone(), self.body_lines.len() - 1);
                 }
@@ -8877,6 +8930,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 batch_id,
                 call_id,
                 new_text,
+                outcome,
             } => {
                 // CRITICAL: do NOT call flush_assistant_remainder here.
                 // It would push pending assistant text via push_body_row,
@@ -8913,9 +8967,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                     None => return,
                 };
 
-                // Match the initial render: solid muted (readable on both themes).
+                // Match the initial render: solid muted (readable on both themes),
+                // with the `•` dot coloured by the child's outcome.
                 let muted = self.style_for(Role::Muted);
-                let new_row = self.build_group_child_row(&new_text, &muted);
+                let new_row = self.build_group_child_row(&new_text, &muted, outcome);
 
                 // Update in-memory.
                 if let Some(slot) = self.body_lines.get_mut(row_idx) {
@@ -8971,7 +9026,11 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 self.render_agent_group(progress, finished);
             }
             UiLine::AgentGroupsFreeze => self.freeze_agent_groups(),
-            UiLine::ToolCall { name, detail } => {
+            UiLine::ToolCall {
+                name,
+                detail,
+                outcome,
+            } => {
                 // Capture BEFORE the arm mutates `last_mark_was_assistant`.
                 // We need the entry-time value to decide whether to insert a
                 // leading blank row for breathing room.
@@ -8988,7 +9047,10 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 if prev_was_assistant {
                     self.push_body_row(Vec::new());
                 }
-                let bullet_style = self.tool_bullet_style();
+                // Static tool header (non-animated result path + `/resume` replay):
+                // colour the `●` by the carried outcome so a resumed transcript
+                // keeps its green success dots. `None` (approval prompt) → neutral.
+                let bullet_style = self.tool_bullet_style_for(outcome);
                 let tool_name_style = self.style_bold(Role::ToolName);
                 let detail_style = self.style_for(Role::Secondary);
                 let safe_name = scrub_controls(&name);
@@ -9000,7 +9062,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // as a shell command, so the command text renders plainly.
                 let is_bash = safe_name.eq_ignore_ascii_case("bash");
                 if is_bash && !safe_detail.is_empty() {
-                    self.push_bash_command_block(&safe_name, &safe_detail);
+                    self.push_bash_command_block(&bullet_style, &safe_name, &safe_detail);
                 } else {
                     let body_str = if safe_detail.is_empty() {
                         safe_name.clone()
@@ -9056,8 +9118,15 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // the upcoming `⎿ ...` body push doesn't itself become
                 // the next animation target on the next spinner tick.
                 // Use commit_inflight_tool for proper line wrapping
-                // (see method doc).
-                self.commit_inflight_tool();
+                // (see method doc). Pass the outcome so a fallback commit
+                // (no preceding ToolCallCommit) still greens a success `●`; a
+                // no-op when the header was already committed+coloured.
+                let fallback_outcome = if success {
+                    crate::render::ToolOutcome::Success
+                } else {
+                    crate::render::ToolOutcome::Failure
+                };
+                self.commit_inflight_tool(Some(fallback_outcome));
                 // Style policy (header line of a failure body):
                 //   * `Error: ...` — bold red. Tool-dispatch failures
                 //     (bad JSON args, unknown tool name, etc.) are real
@@ -9323,7 +9392,7 @@ impl<W: Write + Send> Renderer for RetainedRenderer<W> {
                 // Commit BEFORE the error line so the frozen `▸` tool row lands
                 // above it, matching the transcript order of a normal commit.
                 self.flush_assistant_remainder();
-                self.commit_inflight_tool();
+                self.commit_inflight_tool(None);
                 let err_style = self.style_for(Role::Error);
                 let safe = scrub_controls(&msg);
                 let body = t(Msg::ErrorPrefix { msg: &safe });
@@ -11272,6 +11341,12 @@ mod tests {
         // Gutter glyph + space at col 0 is stripped → the command text alone.
         assert_eq!(copy_text_from_tool_row(&row("● bash")).0, "bash");
         assert_eq!(copy_text_from_tool_row(&row("└ cargo build")).0, "cargo build");
+        // Parallel child row is doubly-anchored (`└ • Tool …`): BOTH the `└`
+        // connector and the `•` status dot must be stripped from the copy.
+        assert_eq!(
+            copy_text_from_tool_row(&row("  └ • Grep(pat) → 1 line")).0,
+            "Grep(pat) → 1 line"
+        );
         assert_eq!(
             copy_text_from_tool_row(&row("⎿ [elapsed: 0.0s] (4 lines)")).0,
             "[elapsed: 0.0s] (4 lines)"
@@ -11381,6 +11456,7 @@ mod tests {
         renderer.render(UiLine::ToolCall {
             name: "bash".into(),
             detail: "echo hello".into(),
+            outcome: None,
         });
         renderer.render(UiLine::ToolResult {
             success: true,
@@ -14485,6 +14561,7 @@ mod tests {
         // paint so the user sees their input-box caret again.
         r.render(UiLine::ToolCallCommit {
             call_id: Some("call_1".into()),
+            outcome: None,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -15314,6 +15391,7 @@ mod tests {
         r.render(UiLine::ToolCall {
             name: "EditFile".into(),
             detail: "X".repeat(100),
+            outcome: None,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -15515,6 +15593,7 @@ mod tests {
         r.render(UiLine::ToolCall {
             name: "bash".into(),
             detail: "ls -la".into(),
+            outcome: None,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -15547,6 +15626,7 @@ mod tests {
         r.render(UiLine::ToolCall {
             name: "bash".into(),
             detail: "ls -la".into(),
+            outcome: None,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -15577,6 +15657,7 @@ mod tests {
         static_r.render(UiLine::ToolCall {
             name: "EditFile".into(),
             detail: "test.txt ← \"10\"".into(),
+            outcome: None,
         });
         let static_row = static_r.body_lines.last().expect("static tool row");
 
@@ -15589,6 +15670,7 @@ mod tests {
         });
         inflight_r.render(UiLine::ToolCallCommit {
             call_id: Some("call-edit-1".into()),
+            outcome: None,
         });
         let committed_row = inflight_r.body_lines.last().expect("committed tool row");
 
@@ -15640,6 +15722,7 @@ mod tests {
         r.render(UiLine::ToolCall {
             name: "Bash".into(),
             detail: "python3 - <<'EOF'\nimport json, base64\ndef gh(u): pass\ndef text(r): pass\nfor f in xs: pass\nprint(done)".into(),
+            outcome: None,
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -15674,6 +15757,7 @@ mod tests {
             detail:
                 "cd /tmp && sed -i '' \\ -e 's/mb-2.5/mb-[10px]/g' \\ -e 's/mb-3.5/mb-[14px]/g'"
                     .into(),
+            outcome: None,
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -15737,6 +15821,7 @@ mod tests {
         // Commit (as ToolCallCommit would):
         r.render(UiLine::ToolCallCommit {
             call_id: Some("call-1".into()),
+            outcome: None,
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -15795,6 +15880,211 @@ mod tests {
         assert!(found, "tool result missing\ndump:\n{}", vterm.dump());
     }
 
+    /// Find the `●` tool-call header bullet's foreground colour after a
+    /// ToolCall + ToolResult pair. `None` when no bullet cell exists.
+    fn bullet_fg(r: &RetainedRenderer<CapturingSink>) -> Option<Option<Color>> {
+        r.body_lines
+            .iter()
+            .flatten()
+            .find(|cell| cell.ch == '●')
+            .map(|cell| cell.style.fg)
+    }
+
+    /// Drive the COMMON path (ToolCallInFlight → ToolCallCommit{outcome}) and
+    /// assert the committed `●` bullet's fg equals `expected`. Colour is applied
+    /// AT COMMIT from the outcome the event loop passes — not at ToolResult — so
+    /// a result that belongs to no header can never miscolour one.
+    fn assert_commit_bullet(outcome: Option<crate::render::ToolOutcome>, expected: Role, label: &str) {
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false); // dark
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        r.render(UiLine::ToolCallInFlight {
+            id: "c1".into(),
+            name: "Grep".into(),
+            detail: "pat".into(),
+            hint: None,
+        });
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("c1".into()),
+            outcome,
+        });
+        assert_eq!(bullet_fg(&r), Some(r.style_for(expected).fg), "{label}");
+    }
+
+    #[test]
+    fn tool_bullet_green_on_success_at_commit() {
+        assert_commit_bullet(
+            Some(crate::render::ToolOutcome::Success),
+            Role::Success,
+            "success = green",
+        );
+    }
+
+    #[test]
+    fn tool_bullet_neutral_on_failure_at_commit() {
+        // Only success greens the bullet; a failure stays neutral (the red/yellow
+        // `✗` result line carries the failure signal).
+        assert_commit_bullet(
+            Some(crate::render::ToolOutcome::Failure),
+            Role::ToolName,
+            "failure = neutral",
+        );
+    }
+
+    #[test]
+    fn tool_bullet_neutral_when_commit_has_no_outcome() {
+        // A preempt / turn-end / approval freeze carries no outcome → neutral.
+        assert_commit_bullet(None, Role::ToolName, "no outcome = neutral");
+    }
+
+    #[test]
+    fn static_tool_call_bullet_greens_on_success_for_resume() {
+        // `/resume` replays each tool via the STATIC UiLine::ToolCall carrying the
+        // stored outcome — the resumed transcript keeps its green success dots
+        // instead of reverting to neutral.
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false); // dark
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        r.render(UiLine::ToolCall {
+            name: "Grep".into(),
+            detail: "pat".into(),
+            outcome: Some(crate::render::ToolOutcome::Success),
+        });
+        assert_eq!(
+            bullet_fg(&r),
+            Some(r.style_for(Role::Success).fg),
+            "resumed success bullet must be green"
+        );
+    }
+
+    #[test]
+    fn parallel_child_dots_coloured_by_outcome() {
+        // In a "Running N in parallel" batch, each child's `•` status dot is
+        // coloured by ITS OWN outcome (green success / red failure); the `└`
+        // connector and header `●` stay neutral.
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false); // dark
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        r.render(UiLine::ToolGroupRender {
+            batch_id: "b1".into(),
+            header: "\u{25cf} Running 2 tools in parallel".into(),
+            children: vec![
+                crate::render::ToolGroupChild {
+                    call_id: "c1".into(),
+                    text: "  \u{2514} \u{2022} Grep(pat)".into(),
+                    outcome: None,
+                },
+                crate::render::ToolGroupChild {
+                    call_id: "c2".into(),
+                    text: "  \u{2514} \u{2022} Bash(cmd)".into(),
+                    outcome: None,
+                },
+            ],
+        });
+        r.render(UiLine::ToolGroupChildUpdate {
+            batch_id: "b1".into(),
+            call_id: "c1".into(),
+            new_text: "  \u{2514} \u{2022} Grep(pat) \u{2192} 1 line".into(),
+            outcome: Some(crate::render::ToolOutcome::Success),
+        });
+        r.render(UiLine::ToolGroupChildUpdate {
+            batch_id: "b1".into(),
+            call_id: "c2".into(),
+            new_text: "  \u{2514} \u{2022} Bash(cmd) \u{2192} \u{2717}".into(),
+            outcome: Some(crate::render::ToolOutcome::Failure),
+        });
+        let dots: Vec<Option<Color>> = r
+            .body_lines
+            .iter()
+            .flatten()
+            .filter(|c| c.ch == '\u{2022}')
+            .map(|c| c.style.fg)
+            .collect();
+        assert_eq!(dots.len(), 2, "two child status dots");
+        assert_eq!(dots[0], r.style_for(Role::Success).fg, "c1 dot green (success)");
+        assert_eq!(dots[1], r.style_for(Role::ToolName).fg, "c2 dot neutral (failure)");
+    }
+
+    #[test]
+    fn resumed_parallel_child_dot_greens_on_success() {
+        // `/resume` rebuilds batch children already-complete via ToolGroupRender
+        // carrying per-child outcome — the `•` dot is coloured at initial render
+        // (no ToolGroupChildUpdate), so a resumed batch keeps its green dots.
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false); // dark
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        r.render(UiLine::ToolGroupRender {
+            batch_id: "b1".into(),
+            header: "\u{25cf} Running 2 tools in parallel".into(),
+            children: vec![
+                crate::render::ToolGroupChild {
+                    call_id: "c1".into(),
+                    text: "  \u{2514} \u{2022} Grep(pat) \u{2192} 1 line".into(),
+                    outcome: Some(crate::render::ToolOutcome::Success),
+                },
+                crate::render::ToolGroupChild {
+                    call_id: "c2".into(),
+                    text: "  \u{2514} \u{2022} Bash(cmd) \u{2192} \u{2717}".into(),
+                    outcome: Some(crate::render::ToolOutcome::Failure),
+                },
+            ],
+        });
+        let dots: Vec<Option<Color>> = r
+            .body_lines
+            .iter()
+            .flatten()
+            .filter(|c| c.ch == '\u{2022}')
+            .map(|c| c.style.fg)
+            .collect();
+        assert_eq!(dots.len(), 2, "two child dots at initial render");
+        assert_eq!(dots[0], r.style_for(Role::Success).fg, "c1 green (success)");
+        assert_eq!(dots[1], r.style_for(Role::ToolName).fg, "c2 neutral (failure)");
+    }
+
+    #[test]
+    fn sequential_tool_bullets_coloured_independently() {
+        // Two commit pairs colour their OWN header from their OWN outcome — the
+        // colour is baked at commit, so there is no shared slot to cross-wire.
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false); // dark
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        r.render(UiLine::ToolCallInFlight {
+            id: "c1".into(),
+            name: "Grep".into(),
+            detail: "a".into(),
+            hint: None,
+        });
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("c1".into()),
+            outcome: Some(crate::render::ToolOutcome::Failure),
+        });
+        r.render(UiLine::ToolCallInFlight {
+            id: "c2".into(),
+            name: "Read".into(),
+            detail: "b".into(),
+            hint: None,
+        });
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("c2".into()),
+            outcome: Some(crate::render::ToolOutcome::Success),
+        });
+        let bullets: Vec<Option<Color>> = r
+            .body_lines
+            .iter()
+            .flatten()
+            .filter(|c| c.ch == '●')
+            .map(|c| c.style.fg)
+            .collect();
+        assert_eq!(bullets.len(), 2, "two committed tool headers");
+        assert_eq!(bullets[0], r.style_for(Role::ToolName).fg, "first (fail) = neutral");
+        assert_eq!(bullets[1], r.style_for(Role::Success).fg, "second (ok) = green");
+    }
+
     /// Dark-theme color hierarchy: the `└` result line (leaf glyph +
     /// summary metadata) renders FAINT so it reads as subordinate to
     /// the bold tool-call header above it. On dark themes `Role::Muted`
@@ -15814,6 +16104,7 @@ mod tests {
         r.render(UiLine::ToolCall {
             name: "ListDirectory".into(),
             detail: ".".into(),
+            outcome: None,
         });
         r.render(UiLine::ToolResult {
             success: true,
@@ -16026,6 +16317,7 @@ mod tests {
             r.render(UiLine::ToolCall {
                 name: (*tool_name).into(),
                 detail: "args".into(),
+                outcome: None,
             });
             r.render(UiLine::ToolResult {
                 success: true,
@@ -16791,10 +17083,12 @@ mod tests {
                 ToolGroupChild {
                     call_id: "call-1".into(),
                     text: "└ Bash(first)".into(),
+                    outcome: None,
                 },
                 ToolGroupChild {
                     call_id: "call-2".into(),
                     text: "└ Bash(second)".into(),
+                    outcome: None,
                 },
             ],
         });
@@ -16970,6 +17264,7 @@ mod tests {
         r.render(UiLine::ToolCall {
             name: "WriteFile".into(),
             detail: "test.txt".into(),
+            outcome: None,
         });
 
         let row_texts: Vec<String> = r
@@ -17353,6 +17648,7 @@ mod tests {
         r.render(UiLine::ToolCall {
             name: "Read".into(),
             detail: "src/lib.rs".into(),
+            outcome: None,
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -18351,14 +18647,17 @@ mod tests {
                 ToolGroupChild {
                     call_id: "c1".into(),
                     text: "  ↳ Read File foo.rs".into(),
+                    outcome: None,
                 },
                 ToolGroupChild {
                     call_id: "c2".into(),
                     text: "  ↳ Read File bar.rs".into(),
+                    outcome: None,
                 },
                 ToolGroupChild {
                     call_id: "c3".into(),
                     text: "  ↳ Read File baz.rs".into(),
+                    outcome: None,
                 },
             ],
         });
@@ -18394,6 +18693,7 @@ mod tests {
             batch_id: "b1".into(),
             call_id: "c2".into(),
             new_text: "  ↳ ✓ Read File bar.rs".into(),
+            outcome: None,
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -18431,10 +18731,12 @@ mod tests {
                 ToolGroupChild {
                     call_id: "c1".into(),
                     text: "  ↳ child one".into(),
+                    outcome: None,
                 },
                 ToolGroupChild {
                     call_id: "c2".into(),
                     text: "  ↳ child two".into(),
+                    outcome: None,
                 },
             ],
         });
@@ -18446,6 +18748,7 @@ mod tests {
             batch_id: "b1".into(),
             call_id: "c1".into(),
             new_text: "  ↳ ✓ child one (should NOT appear)".into(),
+            outcome: None,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -18491,10 +18794,12 @@ mod tests {
                     call_id: "bash1".into(),
                     // event_loop format for bash children: name + cmd (no `$`).
                     text: "  \u{2514} Bash cd /tmp && ls".into(),
+                    outcome: None,
                 },
                 ToolGroupChild {
                     call_id: "grep1".into(),
                     text: "  \u{2514} Grep(foo)".into(),
+                    outcome: None,
                 },
             ],
         });
@@ -20825,6 +21130,7 @@ mod tests {
         // Now commit the inflight spinner (simulates ApprovalNeeded → ToolCallCommit).
         r.render(UiLine::ToolCallCommit {
             call_id: Some("call-1".into()),
+            outcome: None,
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -21127,6 +21433,7 @@ mod tests {
         r.render(UiLine::ToolCall {
             name: "web_search".into(),
             detail: "长沙天气".into(),
+            outcome: None,
         });
         r.render(UiLine::ToolResult {
             success: true,
@@ -21170,6 +21477,7 @@ mod tests {
         r.render(UiLine::ToolCall {
             name: "web_search".into(),
             detail: "Agora CLI multi-agent debate terminal moderator consensus github".into(),
+            outcome: None,
         });
         r.render(UiLine::ToolResult {
             success: true,
@@ -22251,6 +22559,7 @@ mod tests {
         // Commit (truncates inflight rows — must NOT clobber markers).
         r.render(UiLine::ToolCallCommit {
             call_id: Some("call-1".into()),
+            outcome: None,
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -22326,6 +22635,7 @@ mod tests {
         // Commit the tool (ToolCallResult → ToolCallCommit).
         r.render(UiLine::ToolCallCommit {
             call_id: Some("call-1".into()),
+            outcome: None,
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -22502,6 +22812,7 @@ mod tests {
         // since the body ApprovalPrompt variant has been removed.)
         r.render(UiLine::ToolCallCommit {
             call_id: Some("call-7".into()),
+            outcome: None,
         });
         r.render(UiLine::CommandOutput(
             "wrote atomcode_smoke_replace.txt".into(),
@@ -22579,6 +22890,7 @@ mod tests {
         //   ToolCallCommit (line 6813) + ToolResult (line 6859)
         r.render(UiLine::ToolCallCommit {
             call_id: Some("call-edit-1".into()),
+            outcome: None,
         });
         r.render(UiLine::ToolResult {
             success: true,
@@ -22674,6 +22986,7 @@ mod tests {
         // first ToolCallCommit that freezes the spinner to ●.)
         r.render(UiLine::ToolCallCommit {
             call_id: Some("call-edit-1".into()),
+            outcome: None,
         });
         r.flush_deferred();
 
@@ -22697,6 +23010,7 @@ mod tests {
         r.render(UiLine::AssistantLineBreak);
         r.render(UiLine::ToolCallCommit {
             call_id: Some("call-edit-1".into()),
+            outcome: None,
         });
         r.render(UiLine::ToolResult {
             success: true,
@@ -24713,6 +25027,7 @@ mod tests {
         r.render(UiLine::ToolCall {
             name: "Bash".into(),
             detail: "ls".into(),
+            outcome: None,
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
@@ -24756,6 +25071,7 @@ mod tests {
         r.render(UiLine::ToolCall {
             name: "Bash".into(),
             detail: "ls".into(),
+            outcome: None,
         });
         r.render(UiLine::ToolResult {
             success: true,
@@ -24766,6 +25082,7 @@ mod tests {
         r.render(UiLine::ToolCall {
             name: "Bash".into(),
             detail: "pwd".into(),
+            outcome: None,
         });
         r.flush_deferred();
         drain_into_vterm(&buf, &mut vterm);
