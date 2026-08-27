@@ -25086,6 +25086,12 @@ fn persist_native_compaction_snapshot(
     persist_current_session(ctx, snapshot.clone(), renderer)
 }
 
+/// A manual `/compact` that saves fewer than this many estimated tokens is
+/// treated as a near-no-op: it gets an honest "nothing worth compacting"
+/// acknowledgement instead of a "已折叠 · 节省 ~N tok" success mark. A meaningful
+/// fold (e.g. a single 16KB tool result ≈ 4K tokens) clears this floor easily.
+const COMPACT_NEGLIGIBLE_SAVED_TOKENS: usize = 500;
+
 fn handle_coding_runtime_event(
     event: CodingRuntimeEvent,
     state: &mut UiState,
@@ -25118,14 +25124,39 @@ fn handle_coding_runtime_event(
                     // arms below).
                     let silent_tool_fold = matches!(&outcome.trigger, CompactTrigger::Auto { .. });
                     if mirror_persisted && !silent_tool_fold {
-                        renderer.render(UiLine::CompactionMark(
-                            atomcode_config::i18n::format_compaction_mark(
-                                outcome.removed_messages,
-                                outcome.estimated_tokens_before,
-                                outcome.estimated_tokens_after,
-                            ),
-                        ));
-                        renderer.flush();
+                        // A MANUAL /compact that committed but only shaved a
+                        // negligible amount (a tiny STUB fold — the user asked to
+                        // compact and there was essentially nothing to fold)
+                        // shouldn't flash a "已折叠 · 节省 ~N tok" success mark; that
+                        // overstates a near-no-op. Show an honest acknowledgement
+                        // instead. OVERFLOW keeps its mark (any emergency shrink is
+                        // real progress). A manual DRAIN (removed_messages > 0)
+                        // ALSO keeps its marker even when the net token delta is
+                        // small — messages/turns were genuinely dropped, so
+                        // `removed_messages == 0` gates this to pure stub folds.
+                        let saved = outcome
+                            .estimated_tokens_before
+                            .saturating_sub(outcome.estimated_tokens_after);
+                        if outcome.is_manual()
+                            && outcome.removed_messages == 0
+                            && saved < COMPACT_NEGLIGIBLE_SAVED_TOKENS
+                        {
+                            render_assistant_text(
+                                atomcode_config::i18n::format_compaction_negligible(),
+                                state,
+                                think,
+                                renderer,
+                            );
+                        } else {
+                            renderer.render(UiLine::CompactionMark(
+                                atomcode_config::i18n::format_compaction_mark(
+                                    outcome.removed_messages,
+                                    outcome.estimated_tokens_before,
+                                    outcome.estimated_tokens_after,
+                                ),
+                            ));
+                            renderer.flush();
+                        }
                     }
                 }
                 CompactionCompletion::Completed(outcome) if outcome.is_manual() => {
@@ -25293,6 +25324,118 @@ mod coding_runtime_event_tests {
         assert!(!state.compaction_forced_streaming);
         assert!(matches!(state.phase, UiPhase::Idle));
         assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn manual_compaction_with_negligible_savings_shows_honest_line_not_success_mark() {
+        // A manual /compact that only shaved ~40 tok (a tiny stub fold, nothing
+        // worth folding) must NOT flash the "已折叠 · 节省 ~N tok" success mark —
+        // it renders an honest "nothing worth compacting" acknowledgement.
+        let mut state = UiState::default();
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        let tiny = CompactionOutcome {
+            trigger: CompactTrigger::Manual { focus: None },
+            epoch: 1,
+            removed_messages: 0,
+            bytes_before: 41_000,
+            bytes_after: 40_840,
+            committed: true,
+            estimated_tokens_before: 10_000,
+            estimated_tokens_after: 9_960, // saved 40 < COMPACT_NEGLIGIBLE_SAVED_TOKENS
+            committed_snapshot: None,
+        };
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(tiny),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+        }
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("无需压缩") || text.contains("doesn't need compacting"),
+            "clean no-op wording: {text:?}"
+        );
+        assert!(
+            !text.contains("已折叠") && !text.contains("folded"),
+            "must not show the stub-fold success mark: {text:?}"
+        );
+    }
+
+    #[test]
+    fn manual_drain_with_small_token_delta_still_keeps_the_marker() {
+        // A manual /compact that DRAINED messages (removed_messages > 0) but whose
+        // summary nearly matched the drained span (tiny net token savings) must
+        // still show its marker — messages were genuinely dropped, so it is NOT a
+        // no-op. The negligible-savings guard is gated to `removed_messages == 0`.
+        let mut state = UiState::default();
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        let drained = CompactionOutcome {
+            trigger: CompactTrigger::Manual { focus: None },
+            epoch: 1,
+            removed_messages: 4,
+            bytes_before: 41_000,
+            bytes_after: 40_840,
+            committed: true,
+            estimated_tokens_before: 10_000,
+            estimated_tokens_after: 9_960, // saved 40 < floor, but a real drain
+            committed_snapshot: None,
+        };
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(drained),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+        }
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            !text.contains("无需压缩") && !text.contains("doesn't need compacting"),
+            "a drain must not be downgraded to a no-op line: {text:?}"
+        );
+        assert!(!output.is_empty(), "a marker is rendered");
+    }
+
+    #[test]
+    fn manual_compaction_with_meaningful_savings_keeps_the_marker() {
+        // A manual /compact that folds a real chunk (saved 7.5K) still gets its
+        // "已压缩 · …" marker — the negligible-savings guard must not swallow it.
+        let mut state = UiState::default();
+        let mut think = ThinkStripper::default();
+        let mut output = Vec::new();
+        {
+            let mut renderer = crate::render::plain::PlainRenderer::with_writer(&mut output);
+            handle_coding_runtime_event(
+                CodingRuntimeEvent::CompactionFinished {
+                    completion: CompactionCompletion::Completed(outcome(
+                        CompactTrigger::Manual { focus: None },
+                        true,
+                    )),
+                },
+                &mut state,
+                &mut think,
+                &mut renderer,
+                true,
+            );
+        }
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            !text.contains("无需压缩") && !text.contains("doesn't need compacting"),
+            "meaningful compaction must not be downgraded to a no-op line: {text:?}"
+        );
+        assert!(!output.is_empty(), "a marker is rendered");
     }
 
     #[test]

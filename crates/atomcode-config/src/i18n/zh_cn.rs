@@ -1167,6 +1167,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
             format!("已压缩 · 摘要 {} 条 · ~{}→~{} tok", messages, before, after).into(),
         Msg::CompactMarkStub { saved } =>
             format!("已折叠工具输出 · 节省 ~{} tok", saved).into(),
+        Msg::CompactNegligibleSavings => "（当前会话无需压缩）\n".into(),
         Msg::GoalHelp =>
             "  /goal — 朝着设定的条件自主进行多轮工作。\n  \
              用法：\n  \

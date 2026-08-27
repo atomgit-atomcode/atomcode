@@ -1200,6 +1200,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         }
         Msg::CompactMarkStub { saved } =>
             format!("Tool output folded · saved ~{} tok", saved).into(),
+        Msg::CompactNegligibleSavings => "(this conversation doesn't need compacting)\n".into(),
         Msg::GoalHelp =>
             "  /goal — autonomous multi-round work toward a stated condition.\n  \
              Usage:\n  \

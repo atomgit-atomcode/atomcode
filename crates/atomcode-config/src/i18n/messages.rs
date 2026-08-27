@@ -1534,6 +1534,11 @@ pub enum Msg<'a> {
     CompactMarkStub {
         saved: &'a str,
     },
+    /// Acknowledgement for a MANUAL `/compact` that committed but only shaved a
+    /// negligible amount (a tiny stub fold). Reads as a clean "nothing to do"
+    /// so it doesn't look like a "success" the way `CompactMarkStub` does, and
+    /// avoids the misleading "conversation is short" wording.
+    CompactNegligibleSavings,
 
     // ── /goal ──
     /// The full `/goal help` usage block (header + Usage + Notes).

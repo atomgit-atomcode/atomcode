@@ -149,6 +149,14 @@ pub fn format_compaction_mark(
     }
 }
 
+/// Format the localized acknowledgement for a MANUAL `/compact` that committed
+/// but only shaved a negligible amount of context (a trivial stub fold). Reads
+/// as a clean "nothing to do" so it doesn't look like a "success" the way the
+/// stub mark does, and avoids the misleading "conversation is short" wording.
+pub fn format_compaction_negligible() -> String {
+    t(Msg::CompactNegligibleSavings).into_owned()
+}
+
 /// Format the localized acknowledgement for a user-requested compaction that
 /// left the conversation unchanged.
 pub fn format_compaction_noop(
@@ -588,6 +596,27 @@ mod tests {
         let s = format_compaction_noop(5_000, 7_500, true);
 
         assert!(s.contains("5.0K") && s.contains("7.5K") && s.contains('→'));
+    }
+
+    #[test]
+    fn format_compaction_negligible_is_a_clean_no_op_without_success_wording() {
+        // A manual /compact that only shaved a trivial amount gets a clean
+        // "no need to compact" line — NOT the "已折叠 · 节省" success mark, and NOT
+        // the misleading "conversation is short".
+        let s = format_compaction_negligible();
+
+        assert!(
+            s.contains("无需压缩") || s.contains("doesn't need compacting"),
+            "clean no-op wording: {s}"
+        );
+        assert!(
+            !s.contains("已折叠") && !s.contains("folded"),
+            "must not reuse the stub-fold success mark: {s}"
+        );
+        assert!(
+            !s.contains("较短") && !s.contains("is short"),
+            "must not claim the conversation is short: {s}"
+        );
     }
 
     #[test]
