@@ -378,6 +378,11 @@ impl SnapshotHook {
                         compensation: format!("could not clear recovery journal: {clear}"),
                     });
                 }
+                // prepare_restore pinned refs/atomcode/recovery/current; unpin it
+                // best-effort so the ref does not strand a dead object on disk.
+                if let Some(cp) = rewind.checkpoint.as_ref() {
+                    let _ = cp.unpin_recovery_ref();
+                }
                 return Err(error);
             }
         };
@@ -397,16 +402,28 @@ impl SnapshotHook {
                 })
                 .transpose();
             if let Err(compensation) = compensation {
+                // Unpin best-effort before returning the double-failure error.
+                if let Some(cp) = rewind.checkpoint.as_ref() {
+                    let _ = cp.unpin_recovery_ref();
+                }
                 return Err(WorkspaceCheckpointError::Compensation {
                     operation: error.to_string(),
                     compensation: compensation.to_string(),
                 });
             }
             if let Err(clear) = self.clear_rewind_transaction() {
+                // Unpin best-effort before returning the clear-failure error.
+                if let Some(cp) = rewind.checkpoint.as_ref() {
+                    let _ = cp.unpin_recovery_ref();
+                }
                 return Err(WorkspaceCheckpointError::Compensation {
                     operation: error.to_string(),
                     compensation: format!("could not clear recovery journal: {clear}"),
                 });
+            }
+            // Unpin best-effort: transaction is being unwound cleanly.
+            if let Some(cp) = rewind.checkpoint.as_ref() {
+                let _ = cp.unpin_recovery_ref();
             }
             return Err(error);
         }
@@ -1230,6 +1247,155 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner())
             .checkpoint
             .is_none());
+    }
+
+    /// Assert that the recovery ref (`refs/atomcode/recovery/current`) is pinned
+    /// by `prepare_restore` and released on every normal transaction-end path
+    /// (`commit_rewind`, `compensate_rewind`).
+    ///
+    /// Failure-arm unpin (the new fix): the two arms of `begin_rewind` that
+    /// return an error AFTER `prepare_restore` has already pinned the ref
+    /// (`apply_workspace_plan` failure and `replace_rewind_points_locked` failure)
+    /// are not exercised here because there is no injection point between
+    /// `prepare_restore` (which runs inside `begin_rewind`) and the two failure
+    /// arms — the only observable failure conditions require corrupting the store
+    /// mid-call, which is not safe in a unit test.  The fix is guarded by code
+    /// inspection and by the fact that the same `unpin_recovery_ref` call-site
+    /// pattern is used everywhere.  The common-path assertions below provide a
+    /// smoke-test that the ref lifecycle is correct end-to-end.
+    #[test]
+    fn recovery_ref_is_released_after_commit_and_compensate_rewind() {
+        // ── helpers ──────────────────────────────────────────────────────────
+        fn setup_worktree(name: &str) -> (tempfile::TempDir, Arc<WorkspaceCheckpoint>) {
+            let worktree = tempfile::tempdir().unwrap();
+            git(worktree.path(), &["init", "--quiet"]);
+            std::fs::write(worktree.path().join("f.txt"), "before\n").unwrap();
+            git(worktree.path(), &["add", "f.txt"]);
+            git(
+                worktree.path(),
+                &[
+                    "-c", "user.name=AtomCode",
+                    "-c", "user.email=atomcode@example.invalid",
+                    "commit", "--quiet", "-m", "initial",
+                ],
+            );
+            let cp = Arc::new(WorkspaceCheckpoint::for_session(worktree.path(), name).unwrap());
+            (worktree, cp)
+        }
+
+        fn ref_exists(git_dir: &std::path::Path, refname: &str) -> bool {
+            std::process::Command::new("git")
+                .arg("--git-dir").arg(git_dir)
+                .args(["for-each-ref", "--format=%(refname)", refname])
+                .output()
+                .map(|o| !o.stdout.is_empty())
+                .unwrap_or(false)
+        }
+
+        fn make_hook(
+            name: &str,
+            manager: &Arc<SessionManager>,
+            worktree: &std::path::Path,
+            cp: Arc<WorkspaceCheckpoint>,
+            points: &[RewindPoint],
+        ) -> SnapshotHook {
+            manager
+                .save_rewind_ledger(
+                    name,
+                    &RewindLedger {
+                        version: LEDGER_VERSION,
+                        points: points.to_vec(),
+                    },
+                )
+                .unwrap();
+            let lease = manager.acquire_lease(name).unwrap();
+            let hook =
+                SnapshotHook::new(manager.clone(), name, worktree.to_string_lossy().as_ref());
+            hook.rewind
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .checkpoint = Some(cp);
+            hook.with_lease(lease)
+        }
+
+        // ── Part 1: commit_rewind releases the recovery ref ──────────────────
+        {
+            let (worktree, cp) = setup_worktree("ref-lifecycle-commit");
+            let git_dir = cp.git_dir_path().to_path_buf();
+            let before = cp.capture().unwrap().unwrap();
+            std::fs::write(worktree.path().join("f.txt"), "after\n").unwrap();
+            let after = cp.capture().unwrap().unwrap();
+            let file_change = super::super::FileChangeSummary {
+                path: "f.txt".into(),
+                additions: 1,
+                deletions: 1,
+                binary: false,
+            };
+            let point = RewindPoint {
+                before_tree: Some(before),
+                after_tree: Some(after),
+                files: vec![file_change],
+                ..rewind_point(1, 1)
+            };
+            let session_store = tempfile::tempdir().unwrap();
+            let manager = Arc::new(SessionManager::with_root(session_store.path()));
+            let hook =
+                make_hook("ref-lifecycle-commit", &manager, worktree.path(), cp, &[point.clone()]);
+
+            let receipt = hook.begin_rewind(&point, true, None).unwrap();
+            // After begin_rewind the ref must be pinned.
+            assert!(
+                ref_exists(&git_dir, "refs/atomcode/recovery/current"),
+                "recovery ref must be present after prepare_restore"
+            );
+            hook.commit_rewind(receipt).unwrap();
+            // After commit_rewind the ref must be gone.
+            assert!(
+                !ref_exists(&git_dir, "refs/atomcode/recovery/current"),
+                "recovery ref must be absent after commit_rewind"
+            );
+        }
+
+        // ── Part 2: compensate_rewind releases the recovery ref ───────────────
+        {
+            let (worktree, cp) = setup_worktree("ref-lifecycle-compensate");
+            let git_dir = cp.git_dir_path().to_path_buf();
+            let before = cp.capture().unwrap().unwrap();
+            std::fs::write(worktree.path().join("f.txt"), "after\n").unwrap();
+            let after = cp.capture().unwrap().unwrap();
+            let file_change = super::super::FileChangeSummary {
+                path: "f.txt".into(),
+                additions: 1,
+                deletions: 1,
+                binary: false,
+            };
+            let point = RewindPoint {
+                before_tree: Some(before),
+                after_tree: Some(after),
+                files: vec![file_change],
+                ..rewind_point(1, 1)
+            };
+            let session_store = tempfile::tempdir().unwrap();
+            let manager = Arc::new(SessionManager::with_root(session_store.path()));
+            let hook = make_hook(
+                "ref-lifecycle-compensate",
+                &manager,
+                worktree.path(),
+                cp,
+                &[point.clone()],
+            );
+
+            let receipt = hook.begin_rewind(&point, true, None).unwrap();
+            assert!(
+                ref_exists(&git_dir, "refs/atomcode/recovery/current"),
+                "recovery ref must be present after prepare_restore"
+            );
+            hook.compensate_rewind(receipt).unwrap();
+            assert!(
+                !ref_exists(&git_dir, "refs/atomcode/recovery/current"),
+                "recovery ref must be absent after compensate_rewind"
+            );
+        }
     }
 
     #[test]

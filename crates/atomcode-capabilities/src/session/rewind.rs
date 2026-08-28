@@ -557,6 +557,15 @@ impl WorkspaceCheckpoint {
         })
     }
 
+    /// Path to the shadow Git store managed by this checkpoint.
+    ///
+    /// Exposed for tests that need to inspect git refs without going through
+    /// the `WorkspaceCheckpoint` API.
+    #[cfg(test)]
+    pub(crate) fn git_dir_path(&self) -> &Path {
+        &self.git_dir
+    }
+
     /// Drop the temporary recovery ref created by [`prepare_restore`](Self::prepare_restore).
     ///
     /// Call this when the durable transaction is committed or compensated so
