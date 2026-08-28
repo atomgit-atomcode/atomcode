@@ -3957,6 +3957,57 @@ fn execute_slash_command_impl(
                 renderer.flush();
             }
         }
+        "worklog" => {
+            // `/worklog [date]`: deterministically gather the day's completed turns
+            // across ALL projects (with computed agent-active durations), then hand
+            // the model a structured recap to fill the 工作内容/时长/问题与评价 table.
+            use chrono::{Local, TimeZone};
+            let english =
+                matches!(atomcode_config::i18n::current_locale(), atomcode_config::i18n::Locale::En);
+            let Some(date) = atomcode_capabilities::session::resolve_worklog_date(
+                arg,
+                Local::now().date_naive(),
+            ) else {
+                renderer.render(UiLine::CommandOutput(
+                    if english {
+                        "Usage: /worklog [date]  (today / yesterday / 8/27 / 2026-08-27)".to_string()
+                    } else {
+                        "用法：/worklog [日期]（默认今天；支持 today / yesterday / 8/27 / 2026-08-27）"
+                            .to_string()
+                    },
+                ));
+                renderer.flush();
+                return Ok(());
+            };
+            // Local-day [midnight, next-midnight) → epoch ms. `.earliest()` resolves a
+            // DST-gap midnight; the UTC fallback is only for that rare ambiguity.
+            let to_ms = |ndt: chrono::NaiveDateTime| -> i64 {
+                Local
+                    .from_local_datetime(&ndt)
+                    .earliest()
+                    .map(|dt| dt.timestamp_millis())
+                    .unwrap_or_else(|| ndt.and_utc().timestamp_millis())
+            };
+            let after_ms = to_ms(date.and_hms_opt(0, 0, 0).unwrap());
+            let before_ms = to_ms(
+                date.succ_opt()
+                    .unwrap_or(date)
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+            );
+            let sessions_root = atomcode_capabilities::session::SessionManager::sessions_root();
+            let turns = atomcode_capabilities::session::collect_day_turns(
+                &sessions_root,
+                after_ms,
+                before_ms,
+            );
+            let label = date.format("%-m/%-d").to_string();
+            let prompt =
+                atomcode_capabilities::session::build_worklog_prompt(&label, &turns, english);
+            submit_agent_turn(ctx, state, prompt);
+            return Ok(());
+        }
+
         other => {
             // Before reporting "unknown", check user-defined custom commands,
             // then user-invocable skills (loaded from .claude/skills,

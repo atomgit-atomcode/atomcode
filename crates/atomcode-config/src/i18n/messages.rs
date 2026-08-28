@@ -1196,6 +1196,7 @@ pub enum Msg<'a> {
     /// Description for the `/usage` slash command — opens the CodingPlan usage modal.
     CmdDescUsage,
     CmdDescContext,
+    CmdDescWorklog,
     CmdDescCompact,
     CmdDescRemember,
     CmdDescForget,

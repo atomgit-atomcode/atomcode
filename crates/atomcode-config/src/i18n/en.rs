@@ -1020,6 +1020,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescCost => "Show session token usage".into(),
         Msg::CmdDescUsage => "Show CodingPlan usage (tabs: current / overview / models)".into(),
         Msg::CmdDescContext => "Show context budget breakdown".into(),
+        Msg::CmdDescWorklog => "Daily work recap across all projects (/worklog [today|yesterday|8/27])".into(),
         Msg::CmdDescCompact => "Compact conversation history".into(),
         Msg::CmdDescRemember => "Save a fact to memory (/remember --global for global)".into(),
         Msg::CmdDescForget => "Remove matching memories".into(),
