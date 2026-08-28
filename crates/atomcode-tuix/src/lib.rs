@@ -611,6 +611,11 @@ pub async fn run(
     // empty here.
     let (oauth_event_tx, oauth_event_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::event_loop::oauth_poll::OauthEvent>();
+    // Channel for OpenRouter background connect results. Unbounded — at most one
+    // event per `/openrouter` invocation (network thread, can't await).
+    let (openrouter_event_tx, openrouter_event_rx) = tokio::sync::mpsc::unbounded_channel::<
+        crate::event_loop::openrouter_connect::OpenRouterConnectEvent,
+    >();
 
     // Seed the hint from any prior-session staged upgrade so the user
     // sees the pending status on the very first frame rather than
@@ -856,6 +861,9 @@ pub async fn run(
         wake_tx: wake_tx.clone(),
         oauth_event_rx,
         oauth_event_tx,
+        openrouter_event_rx,
+        openrouter_event_tx,
+        openrouter_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         reader: reader_handle,
         upgrade_tx,
         upgrade_rx,

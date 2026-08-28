@@ -1,5 +1,4 @@
-//! OpenRouter 一键接入:把 key + top5 免费模型装配进 Config(幂等纯函数)。
-#![allow(dead_code)]
+//! OpenRouter 一键接入:后台连接任务 + 事件 + Config 装配(幂等纯函数)。
 
 use atomcode_auth::openrouter::FreeModel;
 use atomcode_config::config::provider::{
@@ -7,14 +6,96 @@ use atomcode_config::config::provider::{
 };
 use atomcode_config::config::provider_preset::preset_or_compatible;
 use atomcode_config::config::Config;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 const OPENROUTER_ACCOUNT_ID: &str = "openrouter";
+
+/// 接入模式:空 arg → OAuth PKCE 浏览器流,非空 → 直接使用已有 key。
+/// 由 `/openrouter` 命令处理器(另一 task)构造并传给 `spawn_openrouter_connect`。
+#[allow(dead_code)]
+pub enum ConnectMode {
+    Oauth,
+    ProvidedKey(String),
+}
+
+/// 解析 `/openrouter [arg]` 的参数:trim 后为空则走 OAuth,否则为 ProvidedKey。
+/// 由 `/openrouter` 命令处理器调用(另一 task 接线)。
+#[allow(dead_code)]
+pub fn parse_connect_mode(arg: &str) -> ConnectMode {
+    let t = arg.trim();
+    if t.is_empty() {
+        ConnectMode::Oauth
+    } else {
+        ConnectMode::ProvidedKey(t.to_string())
+    }
+}
+
+/// 后台连接任务发给主循环 select! 臂的事件。
+pub enum OpenRouterConnectEvent {
+    Ready {
+        api_key: String,
+        models: Vec<FreeModel>,
+    },
+    Failed(String),
+}
 
 #[allow(dead_code)]
 pub struct ProvisionOutcome {
     pub account_id: String,
     pub added: Vec<String>,
     pub default_model: String,
+}
+
+#[allow(dead_code)]
+const FREE_MODEL_LIMIT: usize = 5;
+
+/// 后台线程:取 key(OAuth 或直传)+ 发现 top5 免费模型 → 发事件 + 唤醒循环。
+/// 网络操作全在此线程,装配+存盘+reload 在主循环 select! 臂。
+/// 由 `/openrouter` 命令处理器调用(另一 task 接线)。
+#[allow(dead_code)]
+pub fn spawn_openrouter_connect(
+    mode: ConnectMode,
+    event_tx: mpsc::UnboundedSender<OpenRouterConnectEvent>,
+    wake_tx: mpsc::Sender<()>,
+    cancel: Arc<AtomicBool>,
+) {
+    use atomcode_auth::openrouter as or;
+    std::thread::spawn(move || {
+        let result: Result<(String, Vec<or::FreeModel>), String> = (|| {
+            let key = match mode {
+                ConnectMode::ProvidedKey(k) => k,
+                ConnectMode::Oauth => {
+                    let pkce = or::generate_pkce();
+                    let cb = or::start_local_callback().map_err(|e| format!("{e:#}"))?;
+                    let callback_url = format!("http://localhost:{}/callback", cb.port());
+                    let auth_url = or::build_auth_url(Some(&callback_url), &pkce.challenge);
+                    let _ = atomcode_auth::oauth::open_browser(&auth_url);
+                    // 等最长 3 分钟;cancel 由 ESC 置位。
+                    let code = cb
+                        .wait_for_code(std::time::Duration::from_secs(180), &cancel)
+                        .map_err(|e| format!("{e:#}"))?
+                        .ok_or_else(|| "已取消或超时".to_string())?;
+                    or::exchange_code_for_key(&code, &pkce.verifier)
+                        .map_err(|e| format!("{e:#}"))?
+                }
+            };
+            let models = or::fetch_top_free_models(&key, FREE_MODEL_LIMIT)
+                .map_err(|e| format!("{e:#}"))?;
+            if models.is_empty() {
+                return Err("OpenRouter 未返回可用免费模型".to_string());
+            }
+            Ok((key, models))
+        })();
+
+        let event = match result {
+            Ok((api_key, models)) => OpenRouterConnectEvent::Ready { api_key, models },
+            Err(reason) => OpenRouterConnectEvent::Failed(reason),
+        };
+        let _ = event_tx.send(event);
+        let _ = wake_tx.blocking_send(());
+    });
 }
 
 /// 幂等装配:account 固定 id,存在则更新 key;模型 selection `openrouter/<model>`,
@@ -98,8 +179,6 @@ mod tests {
     use super::*;
     use atomcode_auth::openrouter::FreeModel;
     use atomcode_config::config::Config;
-    #[allow(unused_imports)]
-    use atomcode_config::config::provider::{ModelProfileConfig, ProviderAccountConfig};
 
     fn models() -> Vec<FreeModel> {
         vec![
@@ -114,6 +193,16 @@ mod tests {
                 context_length: 8000,
             },
         ]
+    }
+
+    #[test]
+    fn arg_parsing_selects_mode() {
+        assert!(matches!(parse_connect_mode(""), ConnectMode::Oauth));
+        assert!(matches!(parse_connect_mode("   "), ConnectMode::Oauth));
+        match parse_connect_mode("  sk-or-v1-abc  ") {
+            ConnectMode::ProvidedKey(k) => assert_eq!(k, "sk-or-v1-abc"),
+            _ => panic!("expected ProvidedKey"),
+        }
     }
 
     #[test]
