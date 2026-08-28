@@ -1,7 +1,9 @@
 //! OpenRouter 免费模型快捷接入:OAuth PKCE 取 key、免费模型发现。
 //! 独立于 atomgit 自家 OAuth(那是 state 轮询式,协议不同)。
 
+use anyhow::{Context as _, Result};
 use base64::Engine as _;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 pub const OPENROUTER_AUTH_URL: &str = "https://openrouter.ai/auth";
@@ -56,6 +58,80 @@ fn urlencoding_component(s: &str) -> String {
     out
 }
 
+#[derive(Debug, Clone)]
+pub struct FreeModel {
+    pub id: String,
+    pub name: Option<String>,
+    pub context_length: u64,
+}
+
+pub fn parse_key_response(body: &str) -> Result<String> {
+    #[derive(Deserialize)]
+    struct KeyResp {
+        key: Option<String>,
+    }
+    let parsed: KeyResp = serde_json::from_str(body).context("parse /auth/keys response")?;
+    parsed
+        .key
+        .filter(|k| !k.trim().is_empty())
+        .context("/auth/keys response missing `key`")
+}
+
+pub fn select_top_free_models(models_json: &str, limit: usize) -> Result<Vec<FreeModel>> {
+    #[derive(Deserialize)]
+    struct ModelsResp {
+        data: Vec<RawModel>,
+    }
+    #[derive(Deserialize)]
+    struct RawModel {
+        id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        context_length: u64,
+        #[serde(default)]
+        pricing: Option<Pricing>,
+    }
+    #[derive(Deserialize)]
+    struct Pricing {
+        #[serde(default)]
+        prompt: String,
+        #[serde(default)]
+        completion: String,
+    }
+
+    fn is_zero(p: &str) -> bool {
+        // "0" / "0.0" / "0.00" 都算零价。
+        p.trim().parse::<f64>().map(|v| v == 0.0).unwrap_or(false)
+    }
+
+    let resp: ModelsResp = serde_json::from_str(models_json).context("parse /models response")?;
+    let mut free: Vec<FreeModel> = resp
+        .data
+        .into_iter()
+        .filter(|m| {
+            m.id.ends_with(":free")
+                || m.pricing
+                    .as_ref()
+                    .map(|p| is_zero(&p.prompt) && is_zero(&p.completion))
+                    .unwrap_or(false)
+        })
+        .map(|m| FreeModel {
+            id: m.id,
+            name: m.name,
+            context_length: m.context_length,
+        })
+        .collect();
+    // context 降序;并列时按 id 稳定排序,保证测试确定性。
+    free.sort_by(|a, b| {
+        b.context_length
+            .cmp(&a.context_length)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    free.truncate(limit);
+    Ok(free)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +172,50 @@ mod tests {
         let url = build_auth_url(None, "CHAL");
         assert!(!url.contains("callback_url="));
         assert!(url.contains("code_challenge=CHAL"));
+    }
+
+    #[test]
+    fn parse_key_extracts_field() {
+        assert_eq!(parse_key_response(r#"{"key":"sk-or-v1-abc"}"#).unwrap(), "sk-or-v1-abc");
+    }
+
+    #[test]
+    fn parse_key_errors_on_missing() {
+        assert!(parse_key_response(r#"{"error":"bad"}"#).is_err());
+    }
+
+    const MODELS_FIXTURE: &str = r#"{
+      "data": [
+        {"id":"vendor/big:free","name":"Big Free","context_length":128000,
+         "pricing":{"prompt":"0","completion":"0"}},
+        {"id":"vendor/paid","name":"Paid","context_length":200000,
+         "pricing":{"prompt":"0.001","completion":"0.002"}},
+        {"id":"vendor/small:free","name":"Small Free","context_length":8000,
+         "pricing":{"prompt":"0","completion":"0"}},
+        {"id":"vendor/zero-priced","name":"Zero Priced","context_length":32000,
+         "pricing":{"prompt":"0","completion":"0"}},
+        {"id":"vendor/nopricing","context_length":16000}
+      ]
+    }"#;
+
+    #[test]
+    fn top_free_filters_paid_and_sorts_by_context_desc() {
+        let got = select_top_free_models(MODELS_FIXTURE, 5).unwrap();
+        // paid 被剔除;nopricing 无 pricing 字段 → 不视为 free(保守),被剔除。
+        let ids: Vec<&str> = got.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["vendor/big:free", "vendor/zero-priced", "vendor/small:free"]);
+    }
+
+    #[test]
+    fn top_free_respects_limit() {
+        let got = select_top_free_models(MODELS_FIXTURE, 2).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].id, "vendor/big:free"); // 最大 context 优先
+    }
+
+    #[test]
+    fn top_free_empty_when_none_free() {
+        let json = r#"{"data":[{"id":"x/paid","context_length":9,"pricing":{"prompt":"0.01","completion":"0"}}]}"#;
+        assert!(select_top_free_models(json, 5).unwrap().is_empty());
     }
 }
