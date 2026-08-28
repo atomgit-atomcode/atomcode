@@ -1029,7 +1029,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescCopy => "复制上一条回复里的代码块，或用 /copy msg 复制整条回复（/copy、/copy N、/copy all、/copy msg）".into(),
         Msg::CopyOk { lines, chars } => format!("已复制代码块到剪贴板（{lines} 行，{chars} 字符）").into(),
         Msg::CopyOkMsg { lines, chars } => format!("已复制回复到剪贴板（{lines} 行，{chars} 字符）").into(),
-        Msg::CopyNoCodeBlock => "上一条回复里没有可复制的代码块".into(),
+        Msg::CopyNoCodeBlock => "上一条回复里没有代码块——用 /copy msg 复制整条回复".into(),
         Msg::CopyMsgEmpty => "上一条回复为空，没有可复制的内容".into(),
         Msg::CopyBadIndex { count } => format!("没有这个代码块——上一条回复共 {count} 个（用 /copy N，范围 1..={count}）").into(),
         Msg::CopyFailed => "剪贴板不可用——复制失败".into(),
