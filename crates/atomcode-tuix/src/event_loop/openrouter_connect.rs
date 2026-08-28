@@ -180,9 +180,11 @@ pub fn quota_exhausted(usage: &atomcode_codingplan::types::UsageInfo) -> bool {
 ///
 /// 检测两类配置写法:
 /// - 旧 schema `[providers.AtomGit*]`:key 名匹配 CodingPlan 前缀规则。
-/// - 新 schema `[provider_accounts.*]`:base_url 指向 CodingPlan LLM 网关。
+/// - 新 schema `[provider_accounts.*]`:base_url 指向 CodingPlan LLM 网关,
+///   或 provider 字段指向 atomgit preset(preset 默认 base_url 即网关)。
 pub fn has_codingplan(config: &Config) -> bool {
     use atomcode_config::config::is_codingplan_provider_name;
+    use atomcode_config::config::provider_preset::preset_or_compatible;
     use atomcode_config::endpoints::is_codingplan_llm_gateway;
 
     // 旧 schema:provider 名直接是 AtomGit / AtomGit-* 等。
@@ -194,9 +196,13 @@ pub fn has_codingplan(config: &Config) -> bool {
         return true;
     }
     // 新 schema:账号的 base_url 指向 CodingPlan 网关。
+    // 若账号未显式写 base_url,则按 preset 的默认值回落(与
+    // Config::account_is_codingplan_managed 保持一致)。
     config.provider_accounts.values().any(|a| {
+        let preset = preset_or_compatible(&a.provider);
         a.base_url
             .as_deref()
+            .or(preset.default_base_url)
             .is_some_and(is_codingplan_llm_gateway)
     })
 }
@@ -235,6 +241,24 @@ base_url = "https://llm-api.atomgit.com/v1"
         )
         .expect("valid new-schema config");
         assert!(has_codingplan(&new_schema));
+    }
+
+    /// 新 schema 账号 provider="atomgit" 但未写 base_url:应通过 preset 默认值
+    /// `https://llm-api.atomgit.com/v1` 回落判定为有 CodingPlan。
+    #[test]
+    fn has_codingplan_atomgit_preset_no_base_url() {
+        let cfg: Config = toml::from_str(
+            r#"
+[provider_accounts.my-atomgit]
+provider = "atomgit"
+"#,
+        )
+        .expect("valid config");
+        // 此账号无显式 base_url,应依 preset 回落判定为 true。
+        assert!(
+            has_codingplan(&cfg),
+            "atomgit preset 账号(无 base_url)应被识别为 CodingPlan"
+        );
     }
 
     fn models() -> Vec<FreeModel> {

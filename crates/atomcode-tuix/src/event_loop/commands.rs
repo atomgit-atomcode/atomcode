@@ -3358,6 +3358,9 @@ fn execute_slash_command_impl(
                 crate::modals::OnboardingWizard::new_with_confirm()
                     .with_initial_language(ctx.config.language),
             ));
+            // Arm the nudge so that when this wizard closes the event
+            // loop evaluates whether to show the /openrouter hint.
+            ctx.pending_onboarding_nudge = true;
         }
         "worktree" => {
             handle_worktree(arg, ctx, renderer)?;

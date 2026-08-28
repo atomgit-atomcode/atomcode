@@ -871,6 +871,7 @@ pub async fn run(
         plugin_job_rx,
         pending_run_login_setup: false,
         pending_open_provider_wizard: false,
+        pending_onboarding_nudge: false,
         telemetry,
         worktree_original_dir: None,
         custom_commands,

@@ -4033,6 +4033,11 @@ pub struct LoopCtx {
     /// Modal-to-Modal transition that needs mutable `active_modal`
     /// access only the event loop has.
     pub pending_open_provider_wizard: bool,
+    /// Set to `true` just before an `OnboardingWizard` is installed as
+    /// `active_modal`.  Drained (via `std::mem::take`) in the
+    /// `ModalAction::Close` handler so the /openrouter nudge fires only
+    /// when the wizard — not an arbitrary modal — closes.
+    pub pending_onboarding_nudge: bool,
     /// Telemetry handle — used to emit `UseCommand` at each slash dispatch.
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     /// Original working dir before `/worktree create`, for `/worktree done`.
@@ -9652,6 +9657,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         }
         wizard.draw(&app.buf, &app.state, &ctx, renderer);
         app.active_modal = Some(Box::new(wizard));
+        // Mark that the onboarding wizard is open so the ModalAction::Close
+        // handler knows to evaluate the /openrouter nudge when it closes.
+        ctx.pending_onboarding_nudge = true;
     } else {
         // One-shot legacy-conhost scroll hint. The classic Windows console
         // host snaps the viewport back to the bottom on every write, so the
@@ -13996,8 +14004,11 @@ fn handle_input(
                             return Ok(());
                         }
                         // 新用户未领 CodingPlan 时一次性引导接入 OpenRouter。
-                        // 此处两个向导 flag 已被 take,用 has_codingplan 判断当前实际状态。
-                        if !app.state.openrouter_noplan_nudge_shown
+                        // 仅在 onboarding 向导关闭时触发——其它 modal(/model、
+                        // /resume、/config 等)关闭不得触发。pending_onboarding_nudge
+                        // 在向导安装为 active_modal 时置位、此处 take 消费。
+                        if std::mem::take(&mut ctx.pending_onboarding_nudge)
+                            && !app.state.openrouter_noplan_nudge_shown
                             && !crate::event_loop::openrouter_connect::has_codingplan(
                                 &ctx.config,
                             )
