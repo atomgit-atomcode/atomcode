@@ -1799,6 +1799,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.style_bold(Role::ToolName)
     }
 
+    /// Bullet style for a LIVE subtask/subagent `●`: a white↔gray breathing
+    /// pulse (identical to the in-flight tool bullet) on modern colour
+    /// terminals, else a static white — never the old magenta accent. The
+    /// footer repaints on each spinner tick while subagents run, so the pulse
+    /// animates; on legacy terminals it degrades to a steady white dot.
+    fn breathing_bullet_style(&self) -> CellStyle {
+        let mut s = CellStyle::default();
+        if self.caps.colors && self.caps.modern_emulator && self.caps.unicode_symbols {
+            s.fg = Some(Color::AnsiValue(breath_gray(self.breath_anchor.elapsed())));
+        } else {
+            s.fg = Some(Color::White);
+        }
+        s
+    }
+
     /// Bold style for the tool-call `●` bullet, coloured by the call's outcome:
     /// green success / yellow recoverable / red hard failure, or the neutral
     /// `ToolName` shade when the outcome is not yet known (in-flight, preempt,
@@ -3484,30 +3499,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .iter()
             .filter(|item| item.status == crate::render::SubtaskStatus::Stopped)
             .count();
-        let pending_items = subtasks
-            .items
-            .iter()
-            .filter(|item| item.status == crate::render::SubtaskStatus::Pending)
-            .count();
-        let terminal = subtasks
-            .items
-            .iter()
-            .filter(|item| {
-                matches!(
-                    item.status,
-                    crate::render::SubtaskStatus::Completed
-                        | crate::render::SubtaskStatus::Stopped
-                        | crate::render::SubtaskStatus::Failed
-                )
-            })
-            .count();
-        let pending = if subtasks.call_id.starts_with("team:") {
-            subtasks.total.saturating_sub(terminal + running)
-        } else {
-            pending_items
-        };
+        // Pending is NOT a summary trigger: it's already counted in the header,
+        // and the (up to 3) running children are the active work that owns the
+        // rows. A summary row only surfaces failed/stopped or hidden running
+        // (>3 concurrent), so pending never steals a running slot.
         let needs_summary =
-            failed > 0 || stopped > 0 || pending > 0 || running > MAX_VISIBLE_RUNNING_SUBTASKS;
+            failed > 0 || stopped > 0 || running > MAX_VISIBLE_RUNNING_SUBTASKS;
         // Mirror `build_subtask_rows` exactly: no spacer, 1 header, each running
         // child = 2 rows, plus an optional summary row.
         let summary_rows = usize::from(needs_summary && cap >= 2);
@@ -3545,7 +3542,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             "*"
         };
-        push_str_cells(&mut header, marker, &self.style_for(Role::Brand));
+        push_str_cells(&mut header, marker, &self.breathing_bullet_style());
         let panel_title = if subtasks.call_id.starts_with("team:") {
             " Team"
         } else {
@@ -3596,10 +3593,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         );
         rows.push(header);
 
-        let needs_summary = failed > 0
-            || stopped > 0
-            || pending_count > 0
-            || running.len() > MAX_VISIBLE_RUNNING_SUBTASKS;
+        // Pending stays in the header count; only failed/stopped or hidden
+        // running (>3 concurrent) warrant a summary row (see the mirror in
+        // `subtask_panel_row_count`), so the 3 running slots are never displaced.
+        let needs_summary =
+            failed > 0 || stopped > 0 || running.len() > MAX_VISIBLE_RUNNING_SUBTASKS;
         let summary_rows = usize::from(needs_summary && cap >= rows.len() + 1);
         // Each running child owns TWO rows (primary + connected detail), so the
         // running budget is halved. Mirror this exactly in `subtask_panel_row_count`.
@@ -3647,7 +3645,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 format_subtask_progress(&content, &elapsed, item.output_tokens, content_width);
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ", &CellStyle::default());
-            push_str_cells(&mut row, glyph, &self.style_for(Role::Brand));
+            push_str_cells(&mut row, glyph, &self.breathing_bullet_style());
             push_str_cells(&mut row, " ", &CellStyle::default());
             push_str_cells(&mut row, &fitted, &self.style_for(Role::Secondary));
             rows.push(row);
@@ -3665,27 +3663,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
             rows.push(sub_row);
         }
         if needs_summary && rows.len() < cap {
+            // Fold what isn't shown as a row into one muted line. Running slots
+            // are only hidden when concurrency exceeds 3; pending stays a count.
             let mut parts = Vec::new();
             let hidden_running = running.len().saturating_sub(visible_running);
-            let expands_single_pending =
-                pending.len() == 1 && pending_count == 1 && hidden_running == 0 && failed == 0;
             if hidden_running > 0 {
                 parts.push(format!("{hidden_running} running"));
             }
-            if expands_single_pending {
-                let item = pending[0];
-                let mut identity = if item.description.is_empty() {
-                    item.label.clone()
-                } else {
-                    format!("{} \u{b7} {}", item.label, item.description)
-                };
-                if !item.model.is_empty() {
-                    let label_len = item.label.len();
-                    let remainder = identity.split_off(label_len);
-                    identity.push_str(&format!(" \u{b7} {}{}", item.model, remainder));
-                }
-                parts.push(format!("{} \u{b7} pending", scrub_controls(&identity)));
-            } else if pending_count > 0 {
+            if pending_count > 0 {
                 parts.push(format!("{pending_count} pending"));
             }
             if failed > 0 {
@@ -3694,23 +3679,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
             if stopped > 0 {
                 parts.push(format!("{stopped} stopped"));
             }
+            let ellipsis = if self.caps.unicode_symbols {
+                "\u{2026}"
+            } else {
+                "..."
+            };
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ", &CellStyle::default());
             push_str_cells(
                 &mut row,
-                &format!(
-                    "{} {}",
-                    if expands_single_pending && self.caps.unicode_symbols {
-                        "\u{25cb}"
-                    } else if expands_single_pending {
-                        "[ ]"
-                    } else if self.caps.unicode_symbols {
-                        "\u{2026}"
-                    } else {
-                        "..."
-                    },
-                    parts.join(" \u{b7} ")
-                ),
+                &format!("{ellipsis} {}", parts.join(" \u{b7} ")),
                 &self.style_for(Role::Muted),
             );
             rows.push(row);
@@ -19463,9 +19441,10 @@ mod tests {
             status: state,
         };
         for call_id in ["call-task", "team:runtime"] {
-            // Two running (both fit as 2-row children, no hidden running) + one
-            // pending: the lone pending EXPANDS into its identity instead of a
-            // bare "1 pending" count.
+            // Two running (both fit as 2-row children) + one pending. The running
+            // children own the rows; the pending is carried by the header count
+            // only (it promotes to running via events when a slot frees), so it
+            // never takes a row or a summary line.
             let progress = SubtaskProgress {
                 call_id: call_id.into(),
                 completed: 0,
@@ -19484,14 +19463,14 @@ mod tests {
                 .collect::<Vec<_>>();
 
             assert!(text.len() <= MAX_SUBTASK_PANEL_ROWS);
-            // No leading spacer; the header is row 0.
             assert!(text[0].contains("0/3 finished · 2 running · 1 pending"));
-            let summary = text
-                .iter()
-                .find(|line| line.contains("explore#4"))
-                .expect("expanded pending row present");
-            assert!(summary.contains("explore#4 · GLM-5.2 · inspect explore#4 · pending"));
-            assert!(!summary.contains("1 pending"));
+            assert!(text.iter().any(|l| l.contains("explore#1")));
+            assert!(text.iter().any(|l| l.contains("explore#2")));
+            // Pending is header-only: no row, no summary line for it.
+            assert!(
+                text.iter().all(|l| !l.contains("explore#4")),
+                "pending stays in the header count, not a row"
+            );
         }
     }
 
@@ -20011,7 +19990,14 @@ mod tests {
 
         assert_eq!(r.subtask_panel_cap(), 2, "exercise the exact edge case");
         let rows = r.build_subtask_rows(&progress, 80);
-        assert_eq!(rows.len(), 2, "spacer + header fit; summary must fold");
+        // No spacer, and a lone pending is carried by the header count (not a
+        // summary row), so only the header renders here.
+        assert_eq!(rows.len(), 1, "header only; pending folds into its count");
+        assert!(rows[0]
+            .iter()
+            .map(|c| c.ch)
+            .collect::<String>()
+            .contains("1 pending"));
         assert_eq!(
             r.subtask_panel_row_count(&progress),
             rows.len(),
