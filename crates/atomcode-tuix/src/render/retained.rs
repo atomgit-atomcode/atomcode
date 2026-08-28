@@ -1039,6 +1039,32 @@ fn is_recoverable_tool_failure(success: bool, summary: &str) -> bool {
     !success && (summary.starts_with("[elapsed:") || summary.contains("The file was NOT modified"))
 }
 
+/// The "breathing" pulse for an in-flight tool's `●` bullet: a full white↔gray
+/// cycle every [`BREATH_PERIOD_MS`]. Applied only on unicode + colour terminals;
+/// non-unicode / no-colour fall back to the raw spinner glyph (see
+/// `render_inflight_tool`).
+const BREATH_PERIOD_MS: u128 = 1200;
+/// Trough (mid-grey) and peak (near-white) of the breath, as 256-colour grey-ramp
+/// AnsiValue indices (232 = darkest … 255 = lightest). A calm, contained pulse —
+/// bright enough to read as "alive", dim enough to not blink harshly. Rendered
+/// via the 256-colour grey ramp so it looks right on both truecolor and 256-colour
+/// terminals without probing the exact depth.
+const BREATH_DIM: u8 = 242;
+const BREATH_BRIGHT: u8 = 255;
+
+/// The grey-ramp AnsiValue for the breathing bullet at `elapsed` into a
+/// CONTINUOUS breath (not reset per tool — all in-flight bullets pulse in sync).
+/// Cosine-eased so it fades in/out smoothly (a "breath"), not a linear blink:
+/// starts at [`BREATH_DIM`], peaks at [`BREATH_BRIGHT`] mid-cycle, returns to dim.
+/// Pure fn of `elapsed` so the curve is unit-tested without a clock.
+fn breath_gray(elapsed: std::time::Duration) -> u8 {
+    let phase = (elapsed.as_millis() % BREATH_PERIOD_MS) as f64 / BREATH_PERIOD_MS as f64; // 0..1
+    // cos goes 1 → -1 → 1 over the cycle; (1-cos)/2 gives 0 → 1 → 0 (dim→bright→dim).
+    let t = (1.0 - (phase * std::f64::consts::TAU).cos()) / 2.0;
+    let span = (BREATH_BRIGHT - BREATH_DIM) as f64;
+    BREATH_DIM + (t * span).round() as u8
+}
+
 /// Leading gutter glyphs that anchor a tool block (`● bash`, `└ cmd`,
 /// `⎿ [elapsed…]`, …). Stripped from a tool row's COPY text so a drag copy
 /// carries the command/output, not the decorative anchor.
@@ -1168,6 +1194,10 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
 pub struct RetainedRenderer<W: Write + Send> {
     out: W,
     caps: TerminalCaps,
+    /// Anchor for the in-flight bullet's continuous "breathing" pulse (see
+    /// `breath_gray`). Set once at construction so all in-flight tools breathe in
+    /// sync and the phase never jumps between renders.
+    breath_anchor: std::time::Instant,
     mouse_capture_enabled: bool,
     interaction_publisher: crate::render::interaction::InteractionPublisher,
     pending_interactions: Vec<crate::render::interaction::HitRegion>,
@@ -1546,6 +1576,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         Self {
             out,
             caps,
+            breath_anchor: std::time::Instant::now(),
             mouse_capture_enabled,
             interaction_publisher,
             pending_interactions: Vec::new(),
@@ -1946,9 +1977,29 @@ impl<W: Write + Send> RetainedRenderer<W> {
             safe_name.to_ascii_lowercase().as_str(),
             "task" | "team" | "codereview" | "code_review"
         );
-        let prefix = format!("{} ", icon);
+        // A regular in-flight tool shows a static `●` whose colour "breathes"
+        // white↔grey (a calm running pulse), instead of the raw spinner frame —
+        // matching the committed `●` and Claude Code's running indicator. Gated
+        // on unicode + a MODERN emulator (the 256-colour grey ramp AnsiValue
+        // 242-255 needs real 256-colour support — same gate the mascot's AnsiValue
+        // art uses; bare/SSH/16-colour ttys claiming `xterm-256color` don't
+        // qualify). Subagent fan-outs keep their Brand spinner; everything else
+        // falls back to the passed spinner `icon` unchanged.
+        let breathe = !is_subagent_fanout
+            && self.caps.unicode_symbols
+            && self.caps.colors
+            && self.caps.modern_emulator;
+        let prefix = if breathe {
+            "\u{25cf} ".to_string()
+        } else {
+            format!("{} ", icon)
+        };
         let prefix_style = if is_subagent_fanout {
             self.style_for(Role::Brand)
+        } else if breathe {
+            let mut s = self.tool_bullet_style();
+            s.fg = Some(Color::AnsiValue(breath_gray(self.breath_anchor.elapsed())));
+            s
         } else {
             self.tool_bullet_style()
         };
@@ -15912,6 +15963,78 @@ mod tests {
             outcome,
         });
         assert_eq!(bullet_fg(&r), Some(r.style_for(expected).fg), "{label}");
+    }
+
+    #[test]
+    fn breath_gray_pulses_dim_to_bright_and_wraps() {
+        use std::time::Duration;
+        // Cosine-eased breath: starts DIM, peaks BRIGHT at mid-cycle, back to
+        // DIM at the end, then wraps continuously.
+        assert_eq!(breath_gray(Duration::from_millis(0)), BREATH_DIM, "start = dim");
+        assert_eq!(
+            breath_gray(Duration::from_millis(600)),
+            BREATH_BRIGHT,
+            "mid-cycle = bright"
+        );
+        assert_eq!(
+            breath_gray(Duration::from_millis(1200)),
+            BREATH_DIM,
+            "full cycle wraps back to dim"
+        );
+        // Rising and falling quarters sit strictly between dim and bright.
+        let up = breath_gray(Duration::from_millis(300));
+        let down = breath_gray(Duration::from_millis(900));
+        assert!(up > BREATH_DIM && up < BREATH_BRIGHT, "quarter up mid-range: {up}");
+        assert!(
+            down > BREATH_DIM && down < BREATH_BRIGHT,
+            "three-quarter down mid-range: {down}"
+        );
+        // Continuous: a second cycle matches the first.
+        assert_eq!(
+            breath_gray(Duration::from_millis(1200 + 300)),
+            up,
+            "breath is periodic across cycles"
+        );
+    }
+
+    #[test]
+    fn inflight_tool_bullet_breathes_on_unicode_colour_and_falls_back_otherwise() {
+        // unicode + colour → the raw spinner frame `⠙` is replaced by a `●`
+        // whose fg is a grey-ramp breath value (the running bullet "breathes").
+        // Use a non-bash tool (`Read`): its spinner frame IS the bullet, so the
+        // `⠙`→breathing-`●` swap is direct. (Bash has a separate static `● Bash`
+        // block + its own spinner-timer row; its `●` still breathes via the same
+        // prefix style, just not exercised here.)
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.unicode_symbols = true;
+        r.caps.colors = true;
+        r.caps.modern_emulator = true; // 256-colour grey ramp needs a modern emulator
+        r.render_inflight_tool("\u{2819}", "Read", "src/lib.rs", "");
+        let bullet = r.body_lines.iter().flatten().find(|c| c.ch == '\u{25cf}');
+        assert!(bullet.is_some(), "breathing bullet is ●, not the raw frame");
+        assert!(
+            matches!(bullet.unwrap().style.fg, Some(Color::AnsiValue(v)) if (BREATH_DIM..=BREATH_BRIGHT).contains(&v)),
+            "bullet fg is a grey-ramp breath value, got {:?}",
+            bullet.unwrap().style.fg
+        );
+        assert!(
+            !r.body_lines.iter().flatten().any(|c| c.ch == '\u{2819}'),
+            "raw spinner frame glyph is gone"
+        );
+
+        // no colour → keep the raw spinner frame glyph, no `●`, no breath.
+        let (mut r2, _b2) = new_capturing(80, 24);
+        r2.caps.unicode_symbols = true;
+        r2.caps.colors = false;
+        r2.render_inflight_tool("\u{2819}", "Read", "src/lib.rs", "");
+        assert!(
+            r2.body_lines.iter().flatten().any(|c| c.ch == '\u{2819}'),
+            "no-colour keeps the spinner frame"
+        );
+        assert!(
+            !r2.body_lines.iter().flatten().any(|c| c.ch == '\u{25cf}'),
+            "no ● fallback on a no-colour terminal"
+        );
     }
 
     #[test]
