@@ -3489,29 +3489,24 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .iter()
             .filter(|item| item.status == crate::render::SubtaskStatus::Running)
             .count();
-        let failed = subtasks
+        let terminal = subtasks
             .items
             .iter()
-            .filter(|item| item.status == crate::render::SubtaskStatus::Failed)
+            .filter(|item| {
+                matches!(
+                    item.status,
+                    crate::render::SubtaskStatus::Completed
+                        | crate::render::SubtaskStatus::Stopped
+                        | crate::render::SubtaskStatus::Failed
+                )
+            })
             .count();
-        let stopped = subtasks
-            .items
-            .iter()
-            .filter(|item| item.status == crate::render::SubtaskStatus::Stopped)
-            .count();
-        // Pending is NOT a summary trigger: it's already counted in the header,
-        // and the (up to 3) running children are the active work that owns the
-        // rows. A summary row only surfaces failed/stopped or hidden running
-        // (>3 concurrent), so pending never steals a running slot.
-        let needs_summary =
-            failed > 0 || stopped > 0 || running > MAX_VISIBLE_RUNNING_SUBTASKS;
-        // Mirror `build_subtask_rows` exactly: no spacer, 1 header, each running
-        // child = 2 rows, plus an optional summary row.
-        let summary_rows = usize::from(needs_summary && cap >= 2);
-        let visible_running = running
-            .min(MAX_VISIBLE_RUNNING_SUBTASKS)
-            .min(cap.saturating_sub(1 + summary_rows) / 2);
-        1 + visible_running * 2 + summary_rows
+        // Mirror `build_subtask_rows` exactly: no spacer, 1 header, and up to 3
+        // visible children (running first, then finished fill) × 2 rows each.
+        // Pending are header-only and never take a row.
+        let slots = MAX_VISIBLE_RUNNING_SUBTASKS.min(cap.saturating_sub(1) / 2);
+        let visible = slots.min(running + terminal);
+        1 + visible * 2
     }
 
     /// Build the fixed Task fan-out panel. Only running children own detailed
@@ -3593,24 +3588,45 @@ impl<W: Write + Send> RetainedRenderer<W> {
         );
         rows.push(header);
 
-        // Pending stays in the header count; only failed/stopped or hidden
-        // running (>3 concurrent) warrant a summary row (see the mirror in
-        // `subtask_panel_row_count`), so the 3 running slots are never displaced.
-        let needs_summary =
-            failed > 0 || stopped > 0 || running.len() > MAX_VISIBLE_RUNNING_SUBTASKS;
-        let summary_rows = usize::from(needs_summary && cap >= rows.len() + 1);
-        // Each running child owns TWO rows (primary + connected detail), so the
-        // running budget is halved. Mirror this exactly in `subtask_panel_row_count`.
-        let visible_running = running
-            .len()
-            .min(MAX_VISIBLE_RUNNING_SUBTASKS)
-            .min(cap.saturating_sub(rows.len() + summary_rows) / 2);
+        // Keep up to 3 subagents on the panel: running children first, then the
+        // most-recently-FINISHED ones fill any empty slot so a completed subagent
+        // lingers (showing `完成`) instead of vanishing — the panel never shrinks
+        // below the active-child count. Pending stay in the header count and
+        // promote into a slot when they actually start.
+        let mut terminal_items: Vec<&crate::render::SubtaskItem> = subtasks
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.status,
+                    SubtaskStatus::Completed | SubtaskStatus::Stopped | SubtaskStatus::Failed
+                )
+            })
+            .collect();
+        terminal_items.sort_by(|a, b| b.finished_at.cmp(&a.finished_at));
+        let slots = MAX_VISIBLE_RUNNING_SUBTASKS.min(cap.saturating_sub(1) / 2);
+        let mut visible: Vec<&crate::render::SubtaskItem> = running.iter().copied().take(slots).collect();
+        for item in terminal_items {
+            if visible.len() >= slots {
+                break;
+            }
+            visible.push(item);
+        }
         let sub_glyph = if self.caps.unicode_symbols { "\u{2514}" } else { "`" };
-        for item in running.iter().take(visible_running).copied() {
-            let glyph = if self.caps.unicode_symbols {
-                "\u{25cf}"
-            } else {
-                "[>]"
+        let dot = if self.caps.unicode_symbols { "\u{25cf}" } else { "[>]" };
+        for item in visible {
+            // Running dots breathe; terminal dots take the status colour.
+            let (row_style, dot_style) = match item.status {
+                SubtaskStatus::Running => {
+                    (self.style_for(Role::Secondary), self.breathing_bullet_style())
+                }
+                SubtaskStatus::Stopped => {
+                    (self.style_for(Role::Warning), self.style_for(Role::Warning))
+                }
+                SubtaskStatus::Failed => {
+                    (self.style_for(Role::Error), self.style_for(Role::Error))
+                }
+                _ => (self.style_for(Role::Muted), self.style_for(Role::Muted)),
             };
             let mut identity = if item.description.is_empty() {
                 item.label.clone()
@@ -3639,59 +3655,36 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     })
                 ));
             }
-            let glyph_width = crate::width::display_width(glyph);
+            let glyph_width = crate::width::display_width(dot);
             let content_width = rule_width.saturating_sub(2 + glyph_width + 1);
             let fitted =
                 format_subtask_progress(&content, &elapsed, item.output_tokens, content_width);
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ", &CellStyle::default());
-            push_str_cells(&mut row, glyph, &self.breathing_bullet_style());
+            push_str_cells(&mut row, dot, &dot_style);
             push_str_cells(&mut row, " ", &CellStyle::default());
-            push_str_cells(&mut row, &fitted, &self.style_for(Role::Secondary));
+            push_str_cells(&mut row, &fitted, &row_style);
             rows.push(row);
-            // Detail row: the current action on its own full-width line so it is
-            // never truncated by the identity/elapsed/token fields above it.
-            let activity: std::borrow::Cow<str> = if item.activity.is_empty() {
-                crate::i18n::t(crate::i18n::Msg::SubagentStatusRunning)
-            } else {
-                std::borrow::Cow::Borrowed(item.activity.as_str())
+            // Detail row: the current action while running (its own full-width
+            // line so it is never truncated), else a terminal status word.
+            let detail: std::borrow::Cow<str> = match item.status {
+                SubtaskStatus::Running => {
+                    if item.activity.is_empty() {
+                        crate::i18n::t(crate::i18n::Msg::SubagentStatusRunning)
+                    } else {
+                        std::borrow::Cow::Borrowed(item.activity.as_str())
+                    }
+                }
+                SubtaskStatus::Completed => crate::i18n::t(crate::i18n::Msg::SubagentStatusDone),
+                SubtaskStatus::Stopped => crate::i18n::t(crate::i18n::Msg::SubagentStatusStopped),
+                SubtaskStatus::Failed => crate::i18n::t(crate::i18n::Msg::SubagentStatusFailed),
+                SubtaskStatus::Pending => crate::i18n::t(crate::i18n::Msg::SubagentStatusWaiting),
             };
-            let sub_text = format!("    {sub_glyph} {}", scrub_controls(&activity));
+            let sub_text = format!("    {sub_glyph} {}", scrub_controls(&detail));
             let sub = crate::width::truncate_with_ellipsis(&sub_text, rule_width);
             let mut sub_row = Vec::new();
-            push_str_cells(&mut sub_row, &sub, &self.style_for(Role::Muted));
+            push_str_cells(&mut sub_row, &sub, &row_style);
             rows.push(sub_row);
-        }
-        if needs_summary && rows.len() < cap {
-            // Fold what isn't shown as a row into one muted line. Running slots
-            // are only hidden when concurrency exceeds 3; pending stays a count.
-            let mut parts = Vec::new();
-            let hidden_running = running.len().saturating_sub(visible_running);
-            if hidden_running > 0 {
-                parts.push(format!("{hidden_running} running"));
-            }
-            if pending_count > 0 {
-                parts.push(format!("{pending_count} pending"));
-            }
-            if failed > 0 {
-                parts.push(format!("{failed} failed"));
-            }
-            if stopped > 0 {
-                parts.push(format!("{stopped} stopped"));
-            }
-            let ellipsis = if self.caps.unicode_symbols {
-                "\u{2026}"
-            } else {
-                "..."
-            };
-            let mut row = Vec::new();
-            push_str_cells(&mut row, "  ", &CellStyle::default());
-            push_str_cells(
-                &mut row,
-                &format!("{ellipsis} {}", parts.join(" \u{b7} ")),
-                &self.style_for(Role::Muted),
-            );
-            rows.push(row);
         }
         for row in &mut rows {
             clamp_cell_row(row, rule_width);
@@ -19157,7 +19150,10 @@ mod tests {
         assert!(grid.contains("explore#2 · deepseek-v4-flash · inspect codex"));
         assert!(grid.contains("reading files"));
         assert!(grid.contains("↑ 420 tokens"));
-        assert!(!grid.contains("explore#1"));
+        // The completed explore#1 fills the third slot (lingers with `Done`)
+        // instead of vanishing, so the panel keeps showing three subagents.
+        assert!(grid.contains("explore#1"));
+        assert!(grid.contains("Done") || grid.contains("完成"));
         assert!(!grid.contains("standing todo"));
         assert_eq!(
             r.current_footer_rows(),
@@ -19234,7 +19230,7 @@ mod tests {
     }
 
     #[test]
-    fn subtask_panel_prioritizes_live_rows_and_truthfully_aggregates_hidden_rows() {
+    fn subtask_panel_fills_empty_slots_with_recently_finished_children() {
         use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
 
         let (mut r, buf) = new_capturing(100, 24);
@@ -19277,10 +19273,13 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         let grid = vterm.dump();
+        // 1 running + 2 finished fill the 3 slots so the panel stays full; the
+        // finished children linger instead of vanishing. Pending stay a header
+        // count and there is no separate summary aggregation line.
         assert!(grid.contains("running#1"));
-        assert!(!grid.contains("failed#1"));
+        assert!(grid.contains("done#1") && grid.contains("done#2"));
         assert!(grid.contains("5/8 finished · 1 running · 2 pending"));
-        assert!(grid.contains("2 pending · 1 failed"));
+        assert!(!grid.contains("2 pending · 1 failed"), "no summary line");
     }
 
     #[test]
@@ -19323,7 +19322,11 @@ mod tests {
 
         let grid = vterm.dump();
         assert!(grid.contains("3/3 finished · 0 running · 0 pending"));
-        assert!(grid.contains("1 failed · 1 stopped"));
+        // With no running children, the terminal ones fill the slots and report
+        // their distinct status words (stopped is not conflated with failed).
+        assert!(grid.contains("Stopped") || grid.contains("已停止"));
+        assert!(grid.contains("Failed") || grid.contains("失败"));
+        assert!(grid.contains("Done") || grid.contains("完成"));
     }
 
     #[test]
@@ -19363,25 +19366,20 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
             .collect::<Vec<_>>();
 
-        // No spacer; header is row 0. A summary row is needed (failed/pending),
-        // so within the 7-row budget the two-row children leave room for 2 of the
-        // 3 running (the 3rd folds into the summary): 1 header + 2×2 + 1 summary.
-        assert!(text.len() <= MAX_SUBTASK_PANEL_ROWS);
+        // 3 running fill all 3 slots (header + 3×2 = 7), so the finished/pending
+        // children stay header-only. No summary aggregation line any more.
+        assert_eq!(text.len(), 7, "{text:#?}");
         assert!(text[0].contains("3/7 finished · 3 running · 1 pending"));
-        assert!(text.iter().any(|line| line.contains("explore#4")));
-        assert!(text.iter().any(|line| line.contains("explore#5")));
-        assert!(
-            text.iter().all(|line| !line.contains("explore#6")),
-            "the 3rd running child folds into the summary under the tight budget"
-        );
-        let summary = text
-            .iter()
-            .find(|line| line.contains("running") && line.contains("failed"))
-            .expect("summary row present");
-        assert!(summary.contains("1 running"));
-        assert!(summary.contains("1 pending") && summary.contains("1 failed"));
-        assert!(text.iter().all(|line| !line.contains("failed#1")));
-        assert!(text.iter().all(|line| !line.contains("pending#1")));
+        for w in ["explore#4", "explore#5", "explore#6"] {
+            assert!(text.iter().any(|l| l.contains(w)), "{w} shown");
+        }
+        for hidden in ["done#1", "done#2", "failed#1", "pending#1"] {
+            assert!(
+                text.iter().all(|l| !l.contains(hidden)),
+                "{hidden} is header-only while 3 running fill the slots"
+            );
+        }
+        assert!(text.iter().all(|l| !l.contains("· 1 failed")), "no summary line");
     }
 
     #[test]
