@@ -1330,6 +1330,8 @@ pub enum Msg<'a> {
     CmdDescSchedule,
     /// Description for the `/desktop` slash command.
     CmdDescDesktop,
+    /// Description for the `/openrouter` slash command — connect via OpenRouter.
+    CmdDescOpenrouter,
     /// `/desktop` — launching the found app (`name` = app, `path` = its location).
     DesktopOpening {
         name: &'a str,

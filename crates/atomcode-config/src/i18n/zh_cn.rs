@@ -1052,6 +1052,8 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescSchedule => "查看定时任务列表和下次运行时间".into(),
         Msg::CmdDescDesktop =>
             "打开 {brand} 桌面端（已安装则启动，否则显示下载地址）".into(),
+        Msg::CmdDescOpenrouter =>
+            "接入 OpenRouter 免费模型（/openrouter 走 OAuth，/openrouter <key> 直传已有密钥）".into(),
         Msg::DesktopOpening { name, path } =>
             format!("正在打开 {}…\n  {}\n", name, path).into(),
         Msg::DesktopNotInstalled { url } =>

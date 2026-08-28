@@ -307,6 +307,7 @@ pub fn cmd_desc_i18n(name: &str) -> Option<std::borrow::Cow<'static, str>> {
         "sync" => Msg::CmdDescSync,
         "review" => Msg::CmdDescReview,
         "goal" => Msg::CmdDescGoal,
+        "openrouter" => Msg::CmdDescOpenrouter,
         "proxy" => Msg::CmdDescProxy,
         "todo" => Msg::CmdDescTodo,
         "team" => Msg::CmdDescTeam,

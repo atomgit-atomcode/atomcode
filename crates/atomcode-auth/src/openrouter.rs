@@ -33,7 +33,10 @@ pub fn generate_pkce() -> PkcePair {
     rand::thread_rng().fill_bytes(&mut bytes);
     let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
     let challenge = code_challenge_s256(&verifier);
-    PkcePair { verifier, challenge }
+    PkcePair {
+        verifier,
+        challenge,
+    }
 }
 
 /// 拼 OpenRouter 授权 URL。`callback_url=None` 走 headless(不带回调,code 上屏)。
@@ -172,11 +175,7 @@ impl LocalCallback {
     ///
     /// 无 code 的连接(浏览器预检、favicon 等)会收到一个响应但被跳过,循环继续等待真正
     /// 带 code 的回调。慢连接建立后若 2s 内不发送请求,视为无效连接同样跳过。
-    pub fn wait_for_code(
-        self,
-        timeout: Duration,
-        cancel: &AtomicBool,
-    ) -> Result<Option<String>> {
+    pub fn wait_for_code(self, timeout: Duration, cancel: &AtomicBool) -> Result<Option<String>> {
         let deadline = Instant::now() + timeout;
         let success_body = "<html><body>已接入 OpenRouter,可关闭此页返回终端。</body></html>";
         let waiting_body = "<html><body>等待授权中,请稍候...</body></html>";
@@ -300,8 +299,15 @@ mod tests {
     fn generated_pair_roundtrips() {
         let p = generate_pkce();
         // verifier 满足 RFC 7636 长度(43..=128)与 unreserved 字符集。
-        assert!((43..=128).contains(&p.verifier.len()), "len={}", p.verifier.len());
-        assert!(p.verifier.chars().all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)));
+        assert!(
+            (43..=128).contains(&p.verifier.len()),
+            "len={}",
+            p.verifier.len()
+        );
+        assert!(p
+            .verifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)));
         // challenge 与 verifier 自洽,且 base64url 无填充(不含 '=' '+' '/')。
         assert_eq!(p.challenge, code_challenge_s256(&p.verifier));
         assert!(!p.challenge.contains(['=', '+', '/']));
@@ -326,7 +332,10 @@ mod tests {
 
     #[test]
     fn parse_key_extracts_field() {
-        assert_eq!(parse_key_response(r#"{"key":"sk-or-v1-abc"}"#).unwrap(), "sk-or-v1-abc");
+        assert_eq!(
+            parse_key_response(r#"{"key":"sk-or-v1-abc"}"#).unwrap(),
+            "sk-or-v1-abc"
+        );
     }
 
     #[test]
@@ -353,7 +362,10 @@ mod tests {
         let got = select_top_free_models(MODELS_FIXTURE, 5).unwrap();
         // paid 被剔除;nopricing 无 pricing 字段 → 不视为 free(保守),被剔除。
         let ids: Vec<&str> = got.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["vendor/big:free", "vendor/zero-priced", "vendor/small:free"]);
+        assert_eq!(
+            ids,
+            vec!["vendor/big:free", "vendor/zero-priced", "vendor/small:free"]
+        );
     }
 
     #[test]
@@ -372,7 +384,10 @@ mod tests {
     #[test]
     fn code_parsed_from_request_line() {
         let line = "GET /callback?code=abc123&scope=x HTTP/1.1";
-        assert_eq!(parse_code_from_request_line(line).as_deref(), Some("abc123"));
+        assert_eq!(
+            parse_code_from_request_line(line).as_deref(),
+            Some("abc123")
+        );
     }
 
     #[test]
@@ -414,7 +429,8 @@ mod tests {
         let h = std::thread::spawn(move || {
             // 第一个连接:无 code(模拟 favicon 预检)。
             let mut s1 = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-            s1.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+            s1.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
             drop(s1);
 
             // 稍等,让 wait_for_code 处理完第一个连接并 continue。

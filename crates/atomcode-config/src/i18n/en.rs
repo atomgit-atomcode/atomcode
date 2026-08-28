@@ -1082,6 +1082,8 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescSchedule => "List scheduled tasks and next run times".into(),
         Msg::CmdDescDesktop =>
             "Open the {brand} desktop app (launch it if installed, else show the download link)".into(),
+        Msg::CmdDescOpenrouter =>
+            "Connect to OpenRouter free models (/openrouter for OAuth, /openrouter <key> with existing key)".into(),
         Msg::DesktopOpening { name, path } =>
             format!("Opening {}…\n  {}\n", name, path).into(),
         Msg::DesktopNotInstalled { url } =>

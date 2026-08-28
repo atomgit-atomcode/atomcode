@@ -3991,11 +3991,9 @@ pub struct LoopCtx {
     /// One event per `/openrouter` invocation (Ready or Failed). The
     /// `tokio::select!` arm that reads this channel assembles the provider
     /// config, persists it, and reloads the runtime.
-    pub openrouter_event_rx:
-        mpsc::UnboundedReceiver<openrouter_connect::OpenRouterConnectEvent>,
+    pub openrouter_event_rx: mpsc::UnboundedReceiver<openrouter_connect::OpenRouterConnectEvent>,
     /// Sender cloned into each spawned connect task.
-    pub openrouter_event_tx:
-        mpsc::UnboundedSender<openrouter_connect::OpenRouterConnectEvent>,
+    pub openrouter_event_tx: mpsc::UnboundedSender<openrouter_connect::OpenRouterConnectEvent>,
     /// Cancellation flag for the active OpenRouter connect task. Set to
     /// `true` on ESC to abort the OAuth wait. A new `Arc` is created on
     /// each `/openrouter` invocation so prior-task cancellation does not
@@ -5709,8 +5707,7 @@ mod buffer_tests {
         assert!(active.contains("(0s)"), "just the clock, got {active:?}");
         // Even silent past the stall threshold there is NO "较慢/slow" label any
         // more — the ticking clock already shows it's alive.
-        s.last_stream_activity =
-            Some(std::time::Instant::now() - crate::state::STREAM_STALL_HINT);
+        s.last_stream_activity = Some(std::time::Instant::now() - crate::state::STREAM_STALL_HINT);
         let stalled = format_spinner_label(&s, 0, None);
         assert!(
             !stalled.contains("较慢") && !stalled.to_lowercase().contains("slow"),
@@ -6948,14 +6945,20 @@ mod menu_tests {
         .expect("effort dropdown");
         let names: Vec<&str> = items.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"low") && names.contains(&"medium") && names.contains(&"xhigh"));
-        assert!(!names.contains(&"high") && !names.contains(&"max"), "got: {names:?}");
+        assert!(
+            !names.contains(&"high") && !names.contains(&"max"),
+            "got: {names:?}"
+        );
         assert!(names.contains(&"default"), "default is always offered");
         // `None` ⇒ full canonical set, now including xhigh.
         let all = build_menu_items_with_efforts("/effort ", 0, &reg, &custom, None, None, None)
             .expect("canonical dropdown");
         let all_names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
         for lvl in ["low", "medium", "high", "xhigh", "max"] {
-            assert!(all_names.contains(&lvl), "canonical must include {lvl}: {all_names:?}");
+            assert!(
+                all_names.contains(&lvl),
+                "canonical must include {lvl}: {all_names:?}"
+            );
         }
         // Prefix narrowing still works against the configured set.
         let x = build_menu_items_with_efforts(
@@ -6971,7 +6974,6 @@ mod menu_tests {
         assert_eq!(x.len(), 1);
         assert_eq!(x[0].0, "xhigh");
     }
-
 
     #[test]
     fn no_skill_registry_is_no_op() {
@@ -8263,7 +8265,10 @@ mod tool_format_tests {
     /// `mcp · fs · read`.
     #[test]
     fn display_tool_name_short_keeps_mcp_suffix() {
-        assert_eq!(display_tool_name_short("mcp__fs__read_file"), "fs · read_file");
+        assert_eq!(
+            display_tool_name_short("mcp__fs__read_file"),
+            "fs · read_file"
+        );
         assert_eq!(
             display_tool_name_short("mcp__playwright-mcp-server__browser_snapshot"),
             "playwright-mcp-server · browser_snapshot"
@@ -8676,10 +8681,7 @@ mod tool_format_tests {
     #[test]
     fn summarise_mcp_result_strips_markdown_heading() {
         // MCP markdown result: `### Result` → `Result (N lines)`.
-        assert_eq!(
-            summarise_mcp_result("### Result\na\nb"),
-            "Result (3 lines)"
-        );
+        assert_eq!(summarise_mcp_result("### Result\na\nb"), "Result (3 lines)");
         assert_eq!(summarise_mcp_result("### Error\nboom"), "Error (2 lines)");
         // A `#` with no following space (shell shebang / comment) is untouched.
         assert_eq!(summarise_mcp_result("#!/bin/sh"), "#!/bin/sh");
@@ -14009,9 +14011,7 @@ fn handle_input(
                         // 在向导安装为 active_modal 时置位、此处 take 消费。
                         if std::mem::take(&mut ctx.pending_onboarding_nudge)
                             && !app.state.openrouter_noplan_nudge_shown
-                            && !crate::event_loop::openrouter_connect::has_codingplan(
-                                &ctx.config,
-                            )
+                            && !crate::event_loop::openrouter_connect::has_codingplan(&ctx.config)
                         {
                             app.state.openrouter_noplan_nudge_shown = true;
                             render_or_defer_background_notice(
@@ -15627,7 +15627,15 @@ fn build_menu_items(
     skill_registry: Option<&std::sync::RwLock<atomcode_capabilities::skills::SkillRegistry>>,
     file_index: Option<&file_index::FileIndex>,
 ) -> Option<Vec<(String, String)>> {
-    build_menu_items_with_efforts(buf, cursor, commands, custom, skill_registry, file_index, None)
+    build_menu_items_with_efforts(
+        buf,
+        cursor,
+        commands,
+        custom,
+        skill_registry,
+        file_index,
+        None,
+    )
 }
 
 /// Like [`build_menu_items`], but the `/effort ` dropdown lists exactly
@@ -16010,6 +16018,12 @@ fn handle_idle_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    // ESC 取消后台 OpenRouter 连接任务(幂等:未在跑时置位无副作用,
+    // 每次 /openrouter 分派前已复位为 false)。
+    if code == KeyCode::Esc {
+        ctx.openrouter_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let cancel_resume = code == KeyCode::Esc && modifiers.is_empty()
         || code == KeyCode::Char('c')
             && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
@@ -17288,10 +17302,7 @@ fn command_arg_hint_with(buf: &str, today: chrono::NaiveDate) -> Option<String> 
         None => (rest, ""),
     };
     if name.eq_ignore_ascii_case("worklog") && arg.is_empty() {
-        return Some(format!(
-            "today | yesterday | {}",
-            today.format("%-m/%-d")
-        ));
+        return Some(format!("today | yesterday | {}", today.format("%-m/%-d")));
     }
     None
 }
@@ -17312,7 +17323,10 @@ mod bash_input_hint_tests {
         // advertising the accepted forms, with TODAY as the example date.
         for buf in ["/worklog", "/worklog ", "/WorkLog"] {
             let h = command_arg_hint_with(buf, today).expect("hint before arg");
-            assert!(h.contains("today") && h.contains("yesterday") && h.contains("8/28"), "{h}");
+            assert!(
+                h.contains("today") && h.contains("yesterday") && h.contains("8/28"),
+                "{h}"
+            );
         }
         // Once an argument is present, the affordance disappears.
         assert_eq!(command_arg_hint_with("/worklog 8/27", today), None);
@@ -26311,8 +26325,7 @@ fn handle_agent_event(
                                 } else {
                                     crate::render::SubtaskStatus::Failed
                                 };
-                                item.finished_at
-                                    .get_or_insert_with(std::time::Instant::now);
+                                item.finished_at.get_or_insert_with(std::time::Instant::now);
                                 item.activity = if success { "done" } else { "failed" }.into();
                             }
                         }
@@ -29973,9 +29986,7 @@ pub(crate) fn build_replay_tool_batch(
                 // `└ • Tool … → result` (matches live); the `•` is coloured by the
                 // stored outcome so a resumed batch keeps its green success dots.
                 text: format!("  {} \u{2022} {}{}", child_glyph, body, suffix),
-                outcome: result_of
-                    .get(&c.id)
-                    .map(|(ok, _)| tool_bullet_outcome(*ok)),
+                outcome: result_of.get(&c.id).map(|(ok, _)| tool_bullet_outcome(*ok)),
             }
         })
         .collect();
@@ -31178,7 +31189,10 @@ mod format_shell_command_tests {
         let out = format_shell_command(cmd, 100);
         assert_eq!(out.len(), 3, "one row per logical line: {out:?}");
         assert!(out[0].contains("<<'EOF'"), "{out:?}");
-        assert!(out[1].contains("import urllib.request, json, base64"), "{out:?}");
+        assert!(
+            out[1].contains("import urllib.request, json, base64"),
+            "{out:?}"
+        );
         assert!(out[2].contains("def gh(url):"), "{out:?}");
         assert!(
             !out.iter().any(|l| l.contains("base64def")),

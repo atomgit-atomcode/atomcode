@@ -78,8 +78,8 @@ pub fn spawn_openrouter_connect(
                         .map_err(|e| format!("{e:#}"))?
                 }
             };
-            let models = or::fetch_top_free_models(&key, FREE_MODEL_LIMIT)
-                .map_err(|e| format!("{e:#}"))?;
+            let models =
+                or::fetch_top_free_models(&key, FREE_MODEL_LIMIT).map_err(|e| format!("{e:#}"))?;
             if models.is_empty() {
                 return Err("OpenRouter 未返回可用免费模型".to_string());
             }
@@ -327,7 +327,10 @@ provider = "atomgit"
             Some("sk-or-v1-NEW")
         );
         assert_eq!(
-            c.models.keys().filter(|k| k.starts_with("openrouter/")).count(),
+            c.models
+                .keys()
+                .filter(|k| k.starts_with("openrouter/"))
+                .count(),
             2
         );
         assert!(out.added.is_empty()); // 二次运行无新增
