@@ -613,7 +613,10 @@ fn format_loop_row(
 /// `todo_panel_rows`). No blank padding — a short list shows short.
 const MAX_TODO_PANEL_ROWS: usize = 7;
 /// Header + at most three live children + one folded terminal/pending summary.
-const MAX_SUBTASK_PANEL_ROWS: usize = 6;
+/// Footer height ceiling: 1 header + up to 3 running children × 2 rows each
+/// (primary + connected detail) = 7. Terminal/pending children fold into the
+/// header counts + a summary row rather than taking space.
+const MAX_SUBTASK_PANEL_ROWS: usize = 7;
 const MAX_VISIBLE_RUNNING_SUBTASKS: usize = 3;
 
 fn format_subtask_progress(activity: &str, elapsed: &str, tokens: u64, width: usize) -> String {
@@ -3505,12 +3508,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         };
         let needs_summary =
             failed > 0 || stopped > 0 || pending > 0 || running > MAX_VISIBLE_RUNNING_SUBTASKS;
-        let spacer_rows = usize::from(cap >= 2);
-        let summary_rows = usize::from(needs_summary && cap >= spacer_rows + 2);
+        // Mirror `build_subtask_rows` exactly: no spacer, 1 header, each running
+        // child = 2 rows, plus an optional summary row.
+        let summary_rows = usize::from(needs_summary && cap >= 2);
         let visible_running = running
             .min(MAX_VISIBLE_RUNNING_SUBTASKS)
-            .min(cap.saturating_sub(spacer_rows + 1 + summary_rows));
-        spacer_rows + 1 + visible_running + summary_rows
+            .min(cap.saturating_sub(1 + summary_rows) / 2);
+        1 + visible_running * 2 + summary_rows
     }
 
     /// Build the fixed Task fan-out panel. Only running children own detailed
@@ -3528,13 +3532,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return Vec::new();
         }
         let mut rows = Vec::new();
-        // Keep the transient task panel visually separate from the conversation
-        // above it. On very short terminals the single available row remains
-        // the header, so cosmetic spacing never displaces useful status.
-        if cap >= 2 {
-            rows.push(Vec::new());
-        }
-
+        // No leading spacer: the two-row children already need every row of the
+        // tight budget (header + 3×2 = 7). The header itself separates the panel.
         let bold = CellStyle {
             bold: true,
             ..CellStyle::default()
@@ -3602,16 +3601,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || pending_count > 0
             || running.len() > MAX_VISIBLE_RUNNING_SUBTASKS;
         let summary_rows = usize::from(needs_summary && cap >= rows.len() + 1);
-        // The footer is a TIGHT budget (a handful of rows). Unlike the unbounded
-        // scrollback `agent_group_rows`, going two-rows-per-child here would show
-        // FEWER concurrent subagents (a 2-row child halves the visible count and
-        // folds the rest into "N running"), which is worse for at-a-glance status.
-        // So the footer stays one row per running child, with the current action
-        // inline; the two-row connected layout lives in the scrollback view.
+        // Each running child owns TWO rows (primary + connected detail), so the
+        // running budget is halved. Mirror this exactly in `subtask_panel_row_count`.
         let visible_running = running
             .len()
             .min(MAX_VISIBLE_RUNNING_SUBTASKS)
-            .min(cap.saturating_sub(rows.len() + summary_rows));
+            .min(cap.saturating_sub(rows.len() + summary_rows) / 2);
+        let sub_glyph = if self.caps.unicode_symbols { "\u{2514}" } else { "`" };
         for item in running.iter().take(visible_running).copied() {
             let glyph = if self.caps.unicode_symbols {
                 "\u{25cf}"
@@ -3634,12 +3630,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
             } else {
                 format!("{elapsed}s")
             };
-            let activity = if item.activity.is_empty() {
-                "analyzing task"
-            } else {
-                item.activity.as_str()
-            };
-            let content = format!("{} \u{b7} {activity}", scrub_controls(&identity));
+            // Primary row: identity (+ cumulative tool count); elapsed + tokens
+            // ride the right edge. The current action moves to its own row below.
+            let mut content = scrub_controls(&identity).to_string();
+            if item.tool_uses > 0 {
+                content.push_str(&format!(
+                    " \u{b7} {}",
+                    crate::i18n::t(crate::i18n::Msg::SubagentToolUses {
+                        count: item.tool_uses,
+                    })
+                ));
+            }
             let glyph_width = crate::width::display_width(glyph);
             let content_width = rule_width.saturating_sub(2 + glyph_width + 1);
             let fitted =
@@ -3650,6 +3651,18 @@ impl<W: Write + Send> RetainedRenderer<W> {
             push_str_cells(&mut row, " ", &CellStyle::default());
             push_str_cells(&mut row, &fitted, &self.style_for(Role::Secondary));
             rows.push(row);
+            // Detail row: the current action on its own full-width line so it is
+            // never truncated by the identity/elapsed/token fields above it.
+            let activity: std::borrow::Cow<str> = if item.activity.is_empty() {
+                crate::i18n::t(crate::i18n::Msg::SubagentStatusRunning)
+            } else {
+                std::borrow::Cow::Borrowed(item.activity.as_str())
+            };
+            let sub_text = format!("    {sub_glyph} {}", scrub_controls(&activity));
+            let sub = crate::width::truncate_with_ellipsis(&sub_text, rule_width);
+            let mut sub_row = Vec::new();
+            push_str_cells(&mut sub_row, &sub, &self.style_for(Role::Muted));
+            rows.push(sub_row);
         }
         if needs_summary && rows.len() < cap {
             let mut parts = Vec::new();
@@ -19173,14 +19186,14 @@ mod tests {
             r.last_painted_footer_rows,
             "subtask footer height math must mirror the painted rows"
         );
-        let subtask_header = (0..vterm.height() as usize)
+        // The two running children each own a primary + connected detail row.
+        assert!(grid.contains("inspect codex"));
+        assert!(grid.contains("inspect opencode"));
+        // No leading spacer any more (dropped so the tight 7-row budget fits
+        // three 2-row children); the bold header is the top of the panel.
+        let _ = (0..vterm.height() as usize)
             .find(|&row| vterm.row_text(row).contains("SubTasks"))
             .expect("subtask header rendered");
-        assert!(
-            subtask_header > 0 && vterm.row_text(subtask_header - 1).trim().is_empty(),
-            "subtask panel must leave one blank row below the conversation:\n{}",
-            vterm.dump()
-        );
     }
 
     #[test]
@@ -19372,15 +19385,65 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
             .collect::<Vec<_>>();
 
-        assert_eq!(text.len(), MAX_SUBTASK_PANEL_ROWS);
-        assert!(text[0].trim().is_empty());
-        assert!(text[1].contains("3/7 finished · 3 running · 1 pending"));
+        // No spacer; header is row 0. A summary row is needed (failed/pending),
+        // so within the 7-row budget the two-row children leave room for 2 of the
+        // 3 running (the 3rd folds into the summary): 1 header + 2×2 + 1 summary.
+        assert!(text.len() <= MAX_SUBTASK_PANEL_ROWS);
+        assert!(text[0].contains("3/7 finished · 3 running · 1 pending"));
         assert!(text.iter().any(|line| line.contains("explore#4")));
         assert!(text.iter().any(|line| line.contains("explore#5")));
-        assert!(text.iter().any(|line| line.contains("explore#6")));
-        assert!(text[5].contains("1 pending · 1 failed"));
+        assert!(
+            text.iter().all(|line| !line.contains("explore#6")),
+            "the 3rd running child folds into the summary under the tight budget"
+        );
+        let summary = text
+            .iter()
+            .find(|line| line.contains("running") && line.contains("failed"))
+            .expect("summary row present");
+        assert!(summary.contains("1 running"));
+        assert!(summary.contains("1 pending") && summary.contains("1 failed"));
         assert!(text.iter().all(|line| !line.contains("failed#1")));
         assert!(text.iter().all(|line| !line.contains("pending#1")));
+    }
+
+    #[test]
+    fn subtask_panel_fits_three_two_row_running_children_in_seven_rows() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (r, _buf) = new_capturing(120, 24);
+        let item = |label: &str| SubtaskItem {
+            label: label.into(),
+            description: format!("inspect {label}"),
+            model: "deepseek-v4-flash".into(),
+            activity: "正在执行 grep".into(),
+            started_at: Some(std::time::Instant::now()),
+            finished_at: None,
+            tool_uses: 7,
+            output_tokens: 128,
+            status: SubtaskStatus::Running,
+        };
+        let progress = SubtaskProgress {
+            call_id: "call-task".into(),
+            completed: 0,
+            total: 3,
+            items: vec![item("worker#1"), item("worker#2"), item("worker#3")],
+        };
+        let text = r
+            .build_subtask_rows(&progress, 120)
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>();
+        // 1 header + 3 running × 2 rows (primary + detail) = 7, no spacer/summary.
+        assert_eq!(text.len(), 7);
+        assert!(text[0].contains("0/3 finished · 3 running · 0 pending"));
+        for w in ["worker#1", "worker#2", "worker#3"] {
+            assert!(text.iter().any(|l| l.contains(w)), "{w} shown");
+        }
+        // The current action rides its own detail row; tool count on the primary.
+        // (Wide CJK chars reconstruct with continuation cells, so assert on the
+        // ASCII fragments that survive: the tool count and the "grep" action.)
+        assert!(text.iter().any(|l| l.contains("grep")), "current action on a detail row");
+        assert!(text.iter().any(|l| l.contains("tool use")), "tool count on a primary row");
     }
 
     #[test]
@@ -19400,14 +19463,16 @@ mod tests {
             status: state,
         };
         for call_id in ["call-task", "team:runtime"] {
+            // Two running (both fit as 2-row children, no hidden running) + one
+            // pending: the lone pending EXPANDS into its identity instead of a
+            // bare "1 pending" count.
             let progress = SubtaskProgress {
                 call_id: call_id.into(),
                 completed: 0,
-                total: 4,
+                total: 3,
                 items: vec![
                     item("explore#1", SubtaskStatus::Running),
                     item("explore#2", SubtaskStatus::Running),
-                    item("explore#3", SubtaskStatus::Running),
                     item("explore#4", SubtaskStatus::Pending),
                 ],
             };
@@ -19418,10 +19483,15 @@ mod tests {
                 .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
                 .collect::<Vec<_>>();
 
-            assert_eq!(text.len(), MAX_SUBTASK_PANEL_ROWS);
-            assert!(text[0].trim().is_empty());
-            assert!(text[5].contains("explore#4 · GLM-5.2 · inspect explore#4 · pending"));
-            assert!(!text[5].contains("1 pending"));
+            assert!(text.len() <= MAX_SUBTASK_PANEL_ROWS);
+            // No leading spacer; the header is row 0.
+            assert!(text[0].contains("0/3 finished · 2 running · 1 pending"));
+            let summary = text
+                .iter()
+                .find(|line| line.contains("explore#4"))
+                .expect("expanded pending row present");
+            assert!(summary.contains("explore#4 · GLM-5.2 · inspect explore#4 · pending"));
+            assert!(!summary.contains("1 pending"));
         }
     }
 
