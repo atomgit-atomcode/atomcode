@@ -263,6 +263,12 @@ struct UserInputRows {
     rows: Vec<Vec<Cell>>,
     /// Full rendered range belonging to the active option/input/submit row.
     active: std::ops::Range<usize>,
+    /// When the active row is a TEXT-input field (the Single/Multiple
+    /// custom-answer row, or a Text-mode box), the 0-indexed display column of
+    /// its caret within `rows[active.start]`. `None` for options-only /
+    /// non-text-focused rows. Lets the footer park the REAL terminal cursor
+    /// there so an OS IME anchors its preedit correctly (see paint_footer).
+    caret_col: Option<usize>,
 }
 
 /// Final physical-row budget for the retained footer. Individual widgets cap
@@ -4030,7 +4036,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         screen_height: usize,
         scroll_offset: isize,
     ) -> Vec<Vec<Cell>> {
-        let UserInputRows { rows, active } = built;
+        let UserInputRows {
+            rows,
+            active,
+            caret_col: _,
+        } = built;
         let max_rows = screen_height.saturating_sub(1);
         if max_rows == 0 {
             return Vec::new();
@@ -4112,6 +4122,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let unicode = self.caps.unicode_symbols;
         let mut out: Vec<Vec<Cell>> = Vec::new();
         let mut active = 0..1;
+        // 0-indexed caret column within the active row when it is a text field
+        // (custom-answer / Text box). Drives the real-cursor park for IME anchoring.
+        let mut caret_col: Option<usize> = None;
 
         // A blank spacer row (empty cells).
         let blank_row = |out: &mut Vec<Vec<Cell>>| out.push(Vec::new());
@@ -4350,6 +4363,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     out.push(row);
                     if on_cursor {
                         active = custom_start..out.len();
+                        // Caret sits after the marker/checkbox/number prefix; for a
+                        // non-empty field advance by the visible width before the cursor.
+                        let before_w = if panel.custom_text.trim().is_empty() {
+                            0
+                        } else {
+                            let b = panel
+                                .custom_text_cursor_byte
+                                .min(panel.custom_text.len());
+                            let slice = if panel.custom_text.is_char_boundary(b) {
+                                &panel.custom_text[..b]
+                            } else {
+                                ""
+                            };
+                            crate::width::display_width(&scrub_controls(slice))
+                                .min(budget.saturating_sub(1))
+                        };
+                        caret_col = Some(prefix_width + before_w);
                     }
                 }
 
@@ -4420,6 +4450,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     }
                     out.push(row);
                     active = out.len().saturating_sub(1)..out.len();
+                    caret_col = Some(if field_width > 0 { 1 } else { 0 });
                 } else {
                     let inner_width = field_width.saturating_sub(2);
                     let (top_left, horizontal, top_right, bottom_left, bottom_right, prompt, caret) =
@@ -4482,6 +4513,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     push_str_cells(&mut row, if unicode { "│" } else { "|" }, &border_style);
                     out.push(row);
                     active = out.len().saturating_sub(1)..out.len();
+                    // Real-cursor park for IME: left border (1) + prompt + text
+                    // before the cursor. Empty field → caret right after the prompt.
+                    let before_w = if panel.text.is_empty() {
+                        0
+                    } else {
+                        let b = panel.text_cursor_byte.min(panel.text.len());
+                        let slice = if panel.text.is_char_boundary(b) {
+                            &panel.text[..b]
+                        } else {
+                            ""
+                        };
+                        crate::width::display_width(&scrub_controls(slice)).min(text_budget)
+                    };
+                    caret_col = Some(1 + crate::width::display_width(prompt) + before_w);
 
                     let mut bottom = Vec::new();
                     push_str_cells(&mut bottom, bottom_left, &border_style);
@@ -4526,7 +4571,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         push_str_cells(&mut hint_row, &hint_truncated, &hint_style);
         out.push(hint_row);
 
-        UserInputRows { rows: out, active }
+        UserInputRows {
+            rows: out,
+            active,
+            caret_col,
+        }
     }
 
     /// Batch-aware wrapper over [`Self::build_user_input_rows`]. A standalone question
@@ -4675,10 +4724,43 @@ impl<W: Write + Send> RetainedRenderer<W> {
             push_line(&mut out, hint, &hint_style);
         }
         self.fit_user_input_rows(
-            UserInputRows { rows: out, active },
+            UserInputRows {
+                rows: out,
+                active,
+                // Batch (multi-question) IME caret parking is a follow-up; the
+                // single-question / Text paths carry it via build_user_input_rows.
+                caret_col: None,
+            },
             screen_height,
             view.scroll_offset,
         )
+    }
+
+    /// When the `request_user_input` panel's cursor is on a TEXT-input row (the
+    /// Single/Multiple custom-answer row, or a Text-mode box), returns
+    /// `(row_offset_in_panel, caret_col)` so the footer can park the REAL
+    /// terminal cursor there — otherwise an OS IME (e.g. a Chinese input method)
+    /// anchors its composing preedit at a stale position and the caret looks
+    /// misaligned. `None` for options-only navigation, batch (multi-question)
+    /// panels, or a scrolled panel (row offsets no longer map 1:1 to drawn rows
+    /// → safe fallback to the pre-existing hidden-cursor behavior).
+    fn user_input_text_caret(
+        &self,
+        view: &crate::render::UserInputPanelView,
+        rule_width: usize,
+        screen_width: usize,
+        screen_height: usize,
+    ) -> Option<(usize, usize)> {
+        if matches!(&view.batch, Some(m) if m.total > 1) {
+            return None;
+        }
+        let built = self.build_user_input_rows(view, rule_width, screen_width);
+        let caret_col = built.caret_col?;
+        let max_rows = screen_height.saturating_sub(1);
+        if built.rows.len() > max_rows {
+            return None;
+        }
+        Some((built.active.start, caret_col))
     }
 
     /// Row count matching [`Self::build_user_input_panel_view`].
@@ -5701,6 +5783,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // `post_approval` is the row index immediately after whatever occupies the
         // slot between the top rule and the attachment rows — either the approval
         // panel (when active) or the input box + bot_rule (normal case).
+        // Set when the user_input panel's cursor is on a text field: keeps the
+        // real cursor VISIBLE and parked at the caret (for IME), overriding the
+        // blanket "hide caret while approval_active" below.
+        let mut user_input_text_focused = false;
         let post_approval = if approval_active {
             // Approval replaces input box: draw approval rows directly after the
             // top rule (skip middle rows, skip bot_rule, skip status).
@@ -5710,7 +5796,17 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 Self::pad_row_to_width(&mut padded, w, CellStyle::default());
                 self.screen.draw_row(approval_top + i, 0, &padded);
             }
-            // Cursor visibility handled by the common suppress_cursor block below.
+            // Park the real terminal cursor on the user_input custom-answer /
+            // Text field so an OS IME anchors its preedit there. Options-only
+            // panels return None and keep the caret hidden.
+            if let Some(view) = status_clone.user_input.as_ref() {
+                if let Some((row_off, col)) = self.user_input_text_caret(view, rule_width, w, h) {
+                    let abs_row = (approval_top + row_off + 1) as u16;
+                    let abs_col = (col + 1) as u16;
+                    self.screen.set_cursor(abs_row, abs_col);
+                    user_input_text_focused = true;
+                }
+            }
             rules_top + 1 + approval_rows
         } else if hide_input_box {
             rules_top + 1
@@ -5884,7 +5980,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // hide the caret (user navigates with ↑↓/Enter/Tab).
         let suppress_cursor = self.inflight_tool.is_some()
             || subtask_fanout_idle
-            || approval_active
+            // A user_input TEXT field (custom-answer / Text box) keeps the caret
+            // visible + parked for IME; options-only panels stay hidden.
+            || (approval_active && !user_input_text_focused)
             || self.diff_overlay_active
             || (hide_input_box && !is_add_url && !is_search_box_focused);
         self.screen.set_cursor_visible(!suppress_cursor);
@@ -20495,6 +20593,84 @@ mod tests {
         assert!(
             caret < placeholder,
             "caret ▏ must render BEFORE the placeholder (输入自己的答案…)\nrow={row:?}\n{dump}"
+        );
+    }
+
+    #[test]
+    fn custom_answer_focus_reports_caret_col_for_ime() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        let mk = |cursor: usize| crate::render::UserInputPanelView {
+            header: "Library".into(),
+            question: "Which?".into(),
+            mode: UserInputMode::Single,
+            options: vec![("date-fns".into(), None), ("Day.js".into(), None)],
+            cursor,
+            checked: vec![false, false, false],
+            text: String::new(),
+            text_cursor_byte: 0,
+            custom_text: String::new(),
+            custom_text_cursor_byte: 0,
+            custom: true,
+            scroll_offset: 0,
+            batch: None,
+        };
+        // Cursor on the custom-answer row (index 2, after 2 options): the caret
+        // parks after `❯ ` (2) + `3. ` (3) = column 5, so an IME anchors there.
+        let built = r.build_user_input_rows(&mk(2), 70, 80);
+        assert_eq!(built.caret_col, Some(5));
+        // Cursor on a regular option: navigation, no text caret to park.
+        let built_opt = r.build_user_input_rows(&mk(0), 70, 80);
+        assert_eq!(built_opt.caret_col, None);
+    }
+
+    #[test]
+    fn custom_answer_text_field_keeps_cursor_visible_for_ime() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        // Regression: typing a custom answer via an IME needs the REAL terminal
+        // cursor visible + parked at the field. `approval_active` previously
+        // blanket-hid it, so the IME preedit anchored at a stale position.
+        let render_visible = |cursor: usize| -> bool {
+            let (mut r, buf) = new_capturing(80, 24);
+            r.caps.colors = true;
+            let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+            let mut status = status_basic();
+            status.user_input = Some(crate::render::UserInputPanelView {
+                header: "Library".into(),
+                question: "Which?".into(),
+                mode: UserInputMode::Single,
+                options: vec![("date-fns".into(), None), ("Day.js".into(), None)],
+                cursor,
+                checked: vec![false, false, false],
+                text: String::new(),
+                text_cursor_byte: 0,
+                custom_text: String::new(),
+                custom_text_cursor_byte: 0,
+                custom: true,
+                scroll_offset: 0,
+                batch: None,
+            });
+            r.render(UiLine::InputPrompt {
+                buf: String::new(),
+                cursor_byte: 0,
+                menu: None,
+                status,
+                attachments: Vec::new(),
+            });
+            r.flush_deferred();
+            drain_into_vterm(&buf, &mut vterm);
+            vterm.cursor_visible()
+        };
+        // On the custom-answer text row → cursor stays visible (IME anchor).
+        assert!(
+            render_visible(2),
+            "cursor must stay visible on the custom-answer text field"
+        );
+        // On a regular option (arrow navigation) → cursor hidden.
+        assert!(
+            !render_visible(0),
+            "cursor hidden while navigating options"
         );
     }
 
