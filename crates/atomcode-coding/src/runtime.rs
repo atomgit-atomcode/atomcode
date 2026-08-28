@@ -14143,7 +14143,10 @@ mod tests {
         assert!(catalog
             .code_unavailable
             .as_deref()
-            .is_some_and(|reason| reason.contains("ATOMCODE_CODE_REWIND")));
+            // "off by default" is UNIQUE to the disabled reason; the
+            // opted-in-setup-failed error also mentions ATOMCODE_CODE_REWIND, so
+            // that substring can't prove we're in the disabled state.
+            .is_some_and(|reason| reason.contains("off by default")));
 
         let code_error = runtime
             .handle

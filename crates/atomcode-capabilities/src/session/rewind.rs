@@ -37,8 +37,11 @@ pub fn code_rewind_opt_in() -> bool {
     )
 }
 
-/// Minimum free disk space (bytes) required before attempting a rewind capture.
-const DISK_FLOOR_BYTES: u64 = 2_000_000;
+/// Minimum free disk space (bytes) required before attempting a rewind capture
+/// (or a rewind restore, which also writes a recovery tree). 2 GiB — a 2 MB
+/// floor would only trip once the disk is already full, re-enabling the exact
+/// disk-exhaustion incident this circuit breaker exists to prevent.
+const DISK_FLOOR_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 /// Maximum size (bytes) of an individual file that will be included in a rewind snapshot.
 const MAX_SNAPSHOT_FILE_BYTES: u64 = 5 * 1024 * 1024;
@@ -71,27 +74,6 @@ fn dir_size_bytes(path: &Path) -> u64 {
     total
 }
 
-fn eviction_targets(
-    points_oldest_first: &[(u64, u64)],
-    current_store: u64,
-    incoming: u64,
-    budget: u64,
-) -> Vec<u64> {
-    if current_store.saturating_add(incoming) <= budget {
-        return Vec::new();
-    }
-    let mut freed = 0u64;
-    let mut out = Vec::new();
-    for (id, bytes) in points_oldest_first {
-        out.push(*id);
-        freed = freed.saturating_add(*bytes);
-        if current_store.saturating_sub(freed).saturating_add(incoming) <= budget {
-            break;
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod guard_tests {
     use super::*;
@@ -101,22 +83,6 @@ mod guard_tests {
         assert!(!disk_floor_ok(Some(1_999), 2_000));   // below floor → skip
         assert!(disk_floor_ok(Some(2_000), 2_000));    // exactly floor → ok
         assert!(disk_floor_ok(Some(9_999), 2_000));
-    }
-    #[test]
-    fn eviction_frees_oldest_until_incoming_fits_budget() {
-        // store=90, incoming=30, budget=100 → must free >=20 → evict oldest (id 1 = 15, id 2 = 10) → 25 freed.
-        let pts = [(1u64, 15u64), (2, 10), (3, 40), (4, 25)]; // oldest first
-        let evict = eviction_targets(&pts, 90, 30, 100);
-        assert_eq!(evict, vec![1, 2]);
-    }
-    #[test]
-    fn eviction_empty_when_already_fits() {
-        assert!(eviction_targets(&[(1, 10)], 10, 5, 100).is_empty());
-    }
-    #[test]
-    fn eviction_returns_all_when_incoming_alone_exceeds_budget() {
-        // incoming (150) alone > budget (100): evict everything, capture will still be skipped by caller.
-        assert_eq!(eviction_targets(&[(1, 10), (2, 20)], 30, 150, 100), vec![1, 2]);
     }
 }
 
@@ -184,6 +150,10 @@ pub struct RewindPoint {
 #[derive(Debug)]
 pub enum WorkspaceCheckpointError {
     Unsupported(String),
+    /// Free disk is below the safety floor, so a rewind restore — which must
+    /// write a recovery tree before touching the worktree — is refused rather
+    /// than risking a half-restored worktree from a mid-restore disk-full.
+    InsufficientDisk(String),
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -205,6 +175,7 @@ impl fmt::Display for WorkspaceCheckpointError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unsupported(reason) => write!(f, "{reason}"),
+            Self::InsufficientDisk(reason) => write!(f, "{reason}"),
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
             Self::Git { operation, stderr } => write!(f, "{operation} failed: {stderr}"),
             Self::InvalidPath(path) => write!(f, "unsafe workspace checkpoint path: {path}"),
@@ -450,10 +421,50 @@ impl WorkspaceCheckpoint {
         &self.worktree
     }
 
+    /// Refuse a rewind restore when free disk is below the safety floor.
+    ///
+    /// Every restore path (`restore`, `prepare_restore`, `apply_prepared_restore`)
+    /// writes a recovery tree via `capture_locked` before mutating the worktree.
+    /// On a critically-low disk that write can exhaust the disk mid-restore and
+    /// leave a half-restored worktree. Guarding all three entries with this check
+    /// turns an unsafe restore into a clean `Err` instead.
+    fn ensure_restore_disk_floor(&self) -> Result<(), WorkspaceCheckpointError> {
+        self.ensure_restore_disk_floor_bounded(DISK_FLOOR_BYTES)
+    }
+
+    /// Floor-parameterized core of [`ensure_restore_disk_floor`](Self::ensure_restore_disk_floor);
+    /// lets tests force the guard with an unsatisfiable floor without a real
+    /// low-disk simulation.
+    fn ensure_restore_disk_floor_bounded(
+        &self,
+        floor: u64,
+    ) -> Result<(), WorkspaceCheckpointError> {
+        if disk_floor_ok(available_disk_bytes(&self.git_dir), floor) {
+            Ok(())
+        } else {
+            Err(WorkspaceCheckpointError::InsufficientDisk(
+                "insufficient free disk for a safe rewind (need ≥2 GiB)".into(),
+            ))
+        }
+    }
+
     pub fn capture(&self) -> Result<Option<String>, WorkspaceCheckpointError> {
         self.capture_bounded(DISK_FLOOR_BYTES, STORE_BUDGET_BYTES)
     }
 
+    /// Capture the working tree into the shadow store, bounded by two guards.
+    ///
+    /// Invariant A (disk floor): if free space is below `floor` (or unknown),
+    /// the capture is skipped (`Ok(None)`) — never write when the disk is
+    /// critically low.
+    ///
+    /// Invariant B (size budget): when the store exceeds `budget`,
+    /// `gc --prune=now` reclaims unreferenced objects; if the store is still
+    /// over budget after that, the capture is skipped (`Ok(None)`). The store is
+    /// therefore bounded at ~budget, but old rewind points are NOT auto-evicted:
+    /// LRU eviction of retained points is a follow-up feature (it requires
+    /// coordinating with the caller-owned ledger so an evicted point's tree is
+    /// not left referenced by a stale ledger entry).
     pub(crate) fn capture_bounded(
         &self,
         floor: u64,
@@ -496,12 +507,14 @@ impl WorkspaceCheckpoint {
         dir_size_bytes(&self.git_dir)
     }
 
-    /// Delete every `refs/atomcode/*` ref and run `gc --prune=now`, leaving the
-    /// shadow store empty.
+    /// Delete every `refs/atomcode/*` rewind-point ref and run `gc --prune=now`,
+    /// leaving the shadow store empty of retained points.
     ///
-    /// This is a user-initiated "clear all" operation.  Unlike [`retain_points`],
-    /// it deletes recovery refs too — the caller is explicitly requesting a full
-    /// wipe, so in-flight recovery protection does not apply.
+    /// This is a user-initiated "clear all" operation. Like [`retain_points`], it
+    /// EXCLUDES `refs/atomcode/recovery/*`: a concurrent restore transaction pins
+    /// its recovery tree there, and pruning it mid-restore would break crash
+    /// recovery (worst case: a half-restored worktree with no way back). Recovery
+    /// refs self-clean via the transaction end paths (commit/compensate/recover).
     pub fn purge(&self) -> Result<(), WorkspaceCheckpointError> {
         let _guard = self.guard();
         self.with_process_lock(|| {
@@ -509,9 +522,14 @@ impl WorkspaceCheckpoint {
                 self.run(["for-each-ref", "--format=%(refname)", "refs/atomcode/"])?;
             let mut transaction = String::new();
             for reference in String::from_utf8_lossy(&existing.stdout).lines() {
-                if !reference.is_empty() {
-                    transaction.push_str(&format!("delete {reference}\n"));
+                if reference.is_empty() {
+                    continue;
                 }
+                // Never delete an in-flight recovery ref (see retain_points).
+                if reference.starts_with("refs/atomcode/recovery/") {
+                    continue;
+                }
+                transaction.push_str(&format!("delete {reference}\n"));
             }
             if !transaction.is_empty() {
                 self.run_with_input(["update-ref", "--stdin"], transaction.as_bytes())?;
@@ -545,6 +563,7 @@ impl WorkspaceCheckpoint {
         before: &str,
         after: &str,
     ) -> Result<WorkspaceRestoreReceipt, WorkspaceCheckpointError> {
+        self.ensure_restore_disk_floor()?;
         let _guard = self.guard();
         self.with_process_lock(|| {
             let recovery_tree = self.capture_locked()?;
@@ -582,6 +601,7 @@ impl WorkspaceCheckpoint {
         before: &str,
         after: &str,
     ) -> Result<WorkspaceRestorePlan, WorkspaceCheckpointError> {
+        self.ensure_restore_disk_floor()?;
         let _guard = self.guard();
         self.with_process_lock(|| {
             let recovery_tree = self.capture_locked()?;
@@ -643,6 +663,7 @@ impl WorkspaceCheckpoint {
         &self,
         plan: &WorkspaceRestorePlan,
     ) -> Result<WorkspaceRestoreReceipt, WorkspaceCheckpointError> {
+        self.ensure_restore_disk_floor()?;
         let _guard = self.guard();
         self.with_process_lock(|| {
             let current = self.capture_locked()?;
@@ -807,7 +828,7 @@ impl WorkspaceCheckpoint {
             source,
         })?;
         let alternates = info.join("alternates");
-        let line = format!("{}\n", objects.to_string_lossy());
+        let line = format!("{}\n", git_alternate_path(&objects));
         fs::write(&alternates, line).map_err(|source| WorkspaceCheckpointError::Io {
             path: alternates,
             source,
@@ -820,7 +841,18 @@ impl WorkspaceCheckpoint {
         let untracked =
             self.list_user_files(["ls-files", "--others", "--exclude-standard", "-z"])?;
         let mut paths = Vec::new();
-        for path in tracked.into_iter().chain(untracked) {
+        // Tracked files: keep ALL of them (minus sensitive paths). Their blobs
+        // are shared with the real repo via alternates, so retaining them costs
+        // ~no disk; excluding a committed dist/ or build/ file would silently
+        // lose restore fidelity for it. The dir/size filter is for UNTRACKED
+        // files only, where a large build artifact would actually bloat the store.
+        for path in tracked {
+            validate_relative_path(&path)?;
+            if !is_sensitive_path(&path) {
+                paths.push(path);
+            }
+        }
+        for path in untracked {
             validate_relative_path(&path)?;
             if !is_sensitive_path(&path) {
                 if is_excluded_dir(&path) {
@@ -1124,6 +1156,26 @@ fn git_worktree_root(path: &Path) -> Result<PathBuf, WorkspaceCheckpointError> {
     })
 }
 
+/// Render a canonicalized objects path for `objects/info/alternates`.
+///
+/// On Windows `fs::canonicalize` yields a `\\?\C:\...` verbatim path (and
+/// `\\?\UNC\server\share\...` for UNC paths) that git rejects when reading an
+/// alternates file. Strip that verbatim prefix and normalize backslashes to
+/// forward slashes so git can resolve the alternate. On non-Windows the input
+/// has neither a `\\?\` prefix nor backslashes, so this is a no-op.
+fn git_alternate_path(p: &Path) -> String {
+    let raw = p.to_string_lossy();
+    let stripped = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        // \\?\UNC\server\share\… → \\server\share\…
+        format!(r"\\{unc}")
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        raw.into_owned()
+    };
+    stripped.replace('\\', "/")
+}
+
 fn is_excluded_dir(rel: &str) -> bool {
     const EXCLUDED: &[&str] = &[
         "node_modules",
@@ -1353,6 +1405,55 @@ mod tests {
     }
 
     #[test]
+    fn tracked_files_in_excluded_dirs_are_retained() {
+        // A repo that COMMITS a file under an excluded dir (e.g. dist/) must not
+        // lose restore fidelity for it: the dir filter applies to UNTRACKED files
+        // only. Untracked files under the same dir are still excluded.
+        let (worktree, _store, checkpoint) = fixture();
+        fs::create_dir_all(worktree.path().join("dist")).unwrap();
+        fs::write(worktree.path().join("dist/committed.js"), "v1\n").unwrap();
+        git(worktree.path(), &["add", "dist/committed.js"]);
+        git(
+            worktree.path(),
+            &[
+                "-c",
+                "user.name=AtomCode",
+                "-c",
+                "user.email=atomcode@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "commit dist",
+            ],
+        );
+        let before = checkpoint.capture().unwrap().unwrap();
+        // Edit the tracked dist file and drop an UNTRACKED artifact next to it.
+        fs::write(worktree.path().join("dist/committed.js"), "v2\n").unwrap();
+        fs::write(worktree.path().join("dist/artifact.js"), "junk\n").unwrap();
+        let after = checkpoint.capture().unwrap().unwrap();
+
+        let diff = checkpoint.diff(&before, &after).unwrap();
+        // The tracked file's change is captured; the untracked artifact is not.
+        assert!(
+            diff.iter().any(|f| f.path == "dist/committed.js"),
+            "tracked dist file must be captured: {diff:?}"
+        );
+        assert!(
+            !diff.iter().any(|f| f.path == "dist/artifact.js"),
+            "untracked dist artifact must stay excluded: {diff:?}"
+        );
+
+        // Restoring the before→after range reverts the tracked file to its
+        // `before` content (v1), proving the excluded-dir tracked file was
+        // actually captured and is restorable — not silently dropped.
+        checkpoint.restore(&before, &after).unwrap();
+        assert_eq!(
+            fs::read_to_string(worktree.path().join("dist/committed.js")).unwrap(),
+            "v1\n"
+        );
+    }
+
+    #[test]
     fn sensitive_files_are_not_persisted_even_when_unignored() {
         let (worktree, _store, checkpoint) = fixture();
         let before = checkpoint.capture().unwrap().unwrap();
@@ -1486,6 +1587,26 @@ mod alternates_tests {
             "alternates points at real objects: {contents}",
         );
         drop(cp);
+    }
+
+    #[test]
+    fn git_alternate_path_strips_windows_verbatim_prefix() {
+        // A \\?\ verbatim prefix (Windows canonicalize output) must be stripped
+        // and backslashes normalized so git can read the alternates file.
+        assert_eq!(
+            git_alternate_path(Path::new(r"\\?\C:\repo\.git\objects")),
+            "C:/repo/.git/objects"
+        );
+        // \\?\UNC\server\share\… → \\server\share\… (forward-slashed).
+        assert_eq!(
+            git_alternate_path(Path::new(r"\\?\UNC\server\share\repo\objects")),
+            "//server/share/repo/objects"
+        );
+        // A plain POSIX path is unchanged (no prefix, no backslashes).
+        assert_eq!(
+            git_alternate_path(Path::new("/home/user/repo/.git/objects")),
+            "/home/user/repo/.git/objects"
+        );
     }
 }
 
@@ -1632,6 +1753,41 @@ mod bounded_capture_tests {
 
         // Cleanup: drop the recovery pin (mirrors commit/compensate_rewind).
         cp.unpin_recovery_ref().unwrap();
+    }
+
+    #[test]
+    fn restore_disk_floor_guard_refuses_when_below_floor_and_passes_otherwise() {
+        let (work, store, _tmp) = temp_git_workspace();
+        let cp = WorkspaceCheckpoint::with_store(&work, &store).unwrap();
+        // Below floor → InsufficientDisk, and the message is the safe-rewind text.
+        let err = cp
+            .ensure_restore_disk_floor_bounded(u64::MAX)
+            .expect_err("an unsatisfiable floor must refuse the restore");
+        assert!(matches!(err, WorkspaceCheckpointError::InsufficientDisk(_)));
+        assert!(err.to_string().contains("insufficient free disk"));
+        // A zero floor always passes (disk has ≥0 free).
+        cp.ensure_restore_disk_floor_bounded(0)
+            .expect("a zero floor must pass");
+    }
+
+    #[test]
+    fn restore_refuses_when_disk_below_real_floor() {
+        // End-to-end: with the real (2 GiB) guard active but a store on a disk
+        // that reports less than the floor free, restore must abort with
+        // InsufficientDisk before writing any recovery tree. We can't force the
+        // real available_space, so this asserts the guard is wired: on a normal
+        // CI disk (≥2 GiB free) restore does NOT spuriously refuse.
+        let (work, store, _tmp) = temp_git_workspace();
+        let cp = WorkspaceCheckpoint::with_store(&work, &store).unwrap();
+        let before = cp.capture_bounded(0, u64::MAX).unwrap().expect("before");
+        fs::write(work.join("hello.txt"), "after\n").unwrap();
+        let after = cp.capture_bounded(0, u64::MAX).unwrap().expect("after");
+        // Guard passes on a real disk → restore proceeds (no InsufficientDisk).
+        let result = cp.restore(&before, &after);
+        assert!(
+            !matches!(result, Err(WorkspaceCheckpointError::InsufficientDisk(_))),
+            "restore must not refuse on a disk with ample free space"
+        );
     }
 
     #[test]

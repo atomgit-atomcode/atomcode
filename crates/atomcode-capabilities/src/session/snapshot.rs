@@ -1256,7 +1256,10 @@ mod tests {
         assert_eq!(recovered.rewind_points(), vec![point]);
         assert!(recovered
             .code_rewind_unavailable()
-            .is_some_and(|reason| reason.contains("ATOMCODE_CODE_REWIND")));
+            // "off by default" is UNIQUE to CODE_REWIND_DISABLED_REASON; the
+            // opted-in-setup-failed message also contains "ATOMCODE_CODE_REWIND",
+            // so that substring cannot distinguish the disabled state.
+            .is_some_and(|reason| reason.contains("off by default")));
         assert!(recovered
             .rewind
             .lock()
@@ -2105,7 +2108,9 @@ mod tests {
         assert!(points[0].files.is_empty());
         assert!(hook
             .code_rewind_unavailable()
-            .is_some_and(|reason| reason.contains("ATOMCODE_CODE_REWIND")));
+            // "off by default" is UNIQUE to the disabled reason (the
+            // opted-in-setup-failed error also mentions ATOMCODE_CODE_REWIND).
+            .is_some_and(|reason| reason.contains("off by default")));
         assert_eq!(
             manager
                 .load_rewind_ledger("conversation-rewind")
