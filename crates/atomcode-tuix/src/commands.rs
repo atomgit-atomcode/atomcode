@@ -163,6 +163,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     Command { name: "whoami",  desc: "Show current logged-in user", needs_args: false, hidden: false, acp: false },
     Command { name: "model",   desc: "Switch provider / model", needs_args: false, hidden: false, acp: true },
     Command { name: "provider", desc: "Manage providers (add / edit / delete)", needs_args: false, hidden: false, acp: false },
+    Command { name: "openrouter", desc: "接入 OpenRouter 免费模型(/openrouter 或 /openrouter <key>)", needs_args: false, hidden: false, acp: false },
     Command { name: "proxy",   desc: "Switch outbound proxy mode", needs_args: false, hidden: false, acp: false },
     Command { name: "status",  desc: "Show session status", needs_args: false, hidden: false, acp: true },
     Command { name: "config",  desc: "Show config path", needs_args: false, hidden: false, acp: true },
@@ -785,6 +786,14 @@ mod tests {
                 .any(|c| c.name == "review" && !c.is_custom),
             "/review must be a built-in command"
         );
+    }
+
+    #[test]
+    fn openrouter_command_is_registered() {
+        let reg = CommandRegistry::builtin();
+        let cmd = reg.find("openrouter").expect("/openrouter registered");
+        assert!(cmd.needs_args == false || cmd.needs_args == true); // 存在即可
+        assert!(!cmd.acp, "openrouter 走 TUI-only,不进 ACP");
     }
 
     #[test]

@@ -1961,6 +1961,22 @@ fn execute_slash_command_impl(
         "provider" => {
             *active_modal = Some(Box::new(crate::modals::ProviderPanel::open()));
         }
+        "openrouter" => {
+            let mode = crate::event_loop::openrouter_connect::parse_connect_mode(arg);
+            // 每次接入前清取消标志。
+            ctx.openrouter_cancel
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            crate::event_loop::openrouter_connect::spawn_openrouter_connect(
+                mode,
+                ctx.openrouter_event_tx.clone(),
+                ctx.wake_tx.clone(),
+                ctx.openrouter_cancel.clone(),
+            );
+            renderer.render(UiLine::CommandOutput(
+                "正在连接 OpenRouter…(浏览器授权,或稍候)".to_string(),
+            ));
+            renderer.flush();
+        }
         "proxy" => {
             *active_modal = Some(Box::new(ProxyPicker::open(&ctx.config)));
         }

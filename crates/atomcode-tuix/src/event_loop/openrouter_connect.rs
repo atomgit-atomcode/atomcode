@@ -13,16 +13,14 @@ use tokio::sync::mpsc;
 const OPENROUTER_ACCOUNT_ID: &str = "openrouter";
 
 /// 接入模式:空 arg → OAuth PKCE 浏览器流,非空 → 直接使用已有 key。
-/// 由 `/openrouter` 命令处理器(另一 task)构造并传给 `spawn_openrouter_connect`。
-#[allow(dead_code)]
+/// 由 `/openrouter` 命令处理器构造并传给 `spawn_openrouter_connect`。
 pub enum ConnectMode {
     Oauth,
     ProvidedKey(String),
 }
 
 /// 解析 `/openrouter [arg]` 的参数:trim 后为空则走 OAuth,否则为 ProvidedKey。
-/// 由 `/openrouter` 命令处理器调用(另一 task 接线)。
-#[allow(dead_code)]
+/// 由 `/openrouter` 命令处理器调用。
 pub fn parse_connect_mode(arg: &str) -> ConnectMode {
     let t = arg.trim();
     if t.is_empty() {
@@ -53,8 +51,7 @@ const FREE_MODEL_LIMIT: usize = 5;
 
 /// 后台线程:取 key(OAuth 或直传)+ 发现 top5 免费模型 → 发事件 + 唤醒循环。
 /// 网络操作全在此线程,装配+存盘+reload 在主循环 select! 臂。
-/// 由 `/openrouter` 命令处理器调用(另一 task 接线)。
-#[allow(dead_code)]
+/// 由 `/openrouter` 命令处理器调用。
 pub fn spawn_openrouter_connect(
     mode: ConnectMode,
     event_tx: mpsc::UnboundedSender<OpenRouterConnectEvent>,
