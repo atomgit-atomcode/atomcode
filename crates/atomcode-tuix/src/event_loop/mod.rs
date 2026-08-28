@@ -21,6 +21,7 @@ pub(crate) mod loop_ctrl;
 pub(crate) mod loop_parse;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
+pub(crate) mod openrouter_connect;
 pub(crate) mod pointer_select;
 pub(crate) mod ui_event;
 pub(crate) mod usage_monitor;
