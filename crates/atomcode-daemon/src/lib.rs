@@ -80,6 +80,43 @@ pub fn resolve_daemon_token(
     }
 }
 
+/// Resolves daemon authentication state for an entrypoint.
+///
+/// When authentication is disabled, neither token enforcement nor the local
+/// token file is enabled. Otherwise the returned store contains the resolved
+/// token and the same token is returned for persistence.
+pub fn resolve_daemon_auth(
+    no_auth: bool,
+    env_token: Option<String>,
+) -> (Option<auth_token::WebuiTokenStore>, Option<String>) {
+    if no_auth {
+        return (None, None);
+    }
+
+    let store = auth_token::WebuiTokenStore::new();
+    let token = resolve_daemon_token(env_token, &store);
+    (Some(store), Some(token))
+}
+
+#[cfg(test)]
+mod daemon_auth_tests {
+    use super::*;
+
+    #[test]
+    fn no_auth_disables_enforcement_and_token_file() {
+        let (store, token_file) = resolve_daemon_auth(true, Some("ignored".into()));
+        assert!(store.is_none() && token_file.is_none());
+    }
+
+    #[test]
+    fn auth_uses_the_configured_token() {
+        let (store, token_file) = resolve_daemon_auth(false, Some("fixed-token".into()));
+        let store = store.expect("authentication should create a token store");
+        assert!(store.is_valid("fixed-token"));
+        assert_eq!(token_file.as_deref(), Some("fixed-token"));
+    }
+}
+
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, request::Parts as RequestParts, HeaderValue, Method, StatusCode},
@@ -6107,7 +6144,7 @@ pub struct ServerOpts {
     pub idle_timeout_secs: u64,
     /// Session mode reported to telemetry on startup.
     pub startup_mode: SessionMode,
-    /// webui token 存储；进程内启动器传入以共享同一 store，独立二进制传 None。
+    /// WebUI token store. `None` disables API token authentication.
     pub webui_tokens: Option<auth_token::WebuiTokenStore>,
     /// 启动时的工作目录覆盖。进程内 `atomcode webui` 传入其启动 cwd，使 daemon
     /// 初始项目目录为用户实际运行命令的目录，而非 config 里陈旧的 default_workdir。

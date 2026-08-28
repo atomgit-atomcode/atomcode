@@ -855,6 +855,9 @@ enum Commands {
         /// ATOMCODE_DAEMON_IDLE_TIMEOUT overrides. Default 1800 (30 min).
         #[arg(long)]
         idle_timeout: Option<u64>,
+        /// Disable daemon API token authentication.
+        #[arg(long)]
+        no_auth: bool,
     },
     /// 启动本地浏览器 webui（进程内起 server，无需额外二进制）
     Webui {
@@ -1585,6 +1588,7 @@ async fn run() -> Result<i32> {
                 port,
                 client,
                 idle_timeout,
+                no_auth,
             } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
                 eprintln!("Starting AtomCode daemon on port {}...", port);
@@ -1592,11 +1596,8 @@ async fn run() -> Result<i32> {
                 // Run the bundled server IN-PROCESS (same `run_server` the webui uses),
                 // instead of re-exec'ing into a separate `atomcode-daemon` binary that
                 // may not be installed. This is an equivalent daemon entrypoint to the
-                // standalone `atomcode-daemon` binary, so it MUST enforce the local token
-                // identically (mirror of `atomcode-daemon/src/main.rs`): mint/resolve a
-                // token, enable enforcement, and write `~/.atomcode/daemon-<port>.json`.
-                // Otherwise `atomcode daemon` would be an unauthenticated bypass of the
-                // very surface the token guards.
+                // standalone `atomcode-daemon` binary. Authentication is enabled by
+                // default; `--no-auth` explicitly disables it in both entrypoints.
                 let idle = idle_timeout
                     .or_else(|| {
                         std::env::var("ATOMCODE_DAEMON_IDLE_TIMEOUT")
@@ -1611,11 +1612,15 @@ async fn run() -> Result<i32> {
                     Some("atomcode-air") => atomcode_telemetry::SessionMode::AtomcodeAir,
                     _ => atomcode_telemetry::SessionMode::Ide,
                 };
-                let token_store = atomcode_daemon::auth_token::WebuiTokenStore::new();
-                let daemon_token = atomcode_daemon::resolve_daemon_token(
+                let (webui_tokens, daemon_token_file) = atomcode_daemon::resolve_daemon_auth(
+                    no_auth,
                     std::env::var("ATOMCODE_DAEMON_TOKEN").ok(),
-                    &token_store,
                 );
+                if no_auth {
+                    eprintln!(
+                        "WARNING: daemon authentication is disabled; all API endpoints are accessible without a token"
+                    );
+                }
                 let res = atomcode_daemon::run_server(atomcode_daemon::ServerOpts {
                     host: "127.0.0.1".to_string(),
                     port,
@@ -1624,12 +1629,12 @@ async fn run() -> Result<i32> {
                     },
                     idle_timeout_secs: idle,
                     startup_mode,
-                    webui_tokens: Some(token_store),
+                    webui_tokens,
                     quiet: false,
                     working_dir_override: None,
                     prebound_listener: None,
                     app_user_id: None,
-                    daemon_token_file: Some(daemon_token),
+                    daemon_token_file,
                 })
                 .await;
                 telemetry
