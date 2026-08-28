@@ -176,11 +176,66 @@ pub fn quota_exhausted(usage: &atomcode_codingplan::types::UsageInfo) -> bool {
     usage.usage_percent >= 100.0
 }
 
+/// 用户是否已有 CodingPlan 权益(据 config 里的账号判定)。
+///
+/// 检测两类配置写法:
+/// - 旧 schema `[providers.AtomGit*]`:key 名匹配 CodingPlan 前缀规则。
+/// - 新 schema `[provider_accounts.*]`:base_url 指向 CodingPlan LLM 网关。
+pub fn has_codingplan(config: &Config) -> bool {
+    use atomcode_config::config::is_codingplan_provider_name;
+    use atomcode_config::endpoints::is_codingplan_llm_gateway;
+
+    // 旧 schema:provider 名直接是 AtomGit / AtomGit-* 等。
+    if config
+        .providers
+        .keys()
+        .any(|k| is_codingplan_provider_name(k))
+    {
+        return true;
+    }
+    // 新 schema:账号的 base_url 指向 CodingPlan 网关。
+    config.provider_accounts.values().any(|a| {
+        a.base_url
+            .as_deref()
+            .is_some_and(is_codingplan_llm_gateway)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use atomcode_auth::openrouter::FreeModel;
     use atomcode_config::config::Config;
+
+    #[test]
+    fn has_codingplan_detects_atomgit_account() {
+        // 空配置:无 CodingPlan 账号。
+        let empty = Config::default();
+        assert!(!has_codingplan(&empty));
+
+        // Legacy 旧 schema:key "AtomGit" 匹配 is_codingplan_provider_name。
+        let legacy: Config = toml::from_str(
+            r#"
+[providers.AtomGit]
+type = "openai"
+model = "chatglm"
+base_url = "https://llm-api.atomgit.com/v1"
+"#,
+        )
+        .expect("valid legacy config");
+        assert!(has_codingplan(&legacy));
+
+        // 新 schema provider_accounts:base_url 指向 CodingPlan 网关。
+        let new_schema: Config = toml::from_str(
+            r#"
+[provider_accounts.AtomGit]
+provider = "openai"
+base_url = "https://llm-api.atomgit.com/v1"
+"#,
+        )
+        .expect("valid new-schema config");
+        assert!(has_codingplan(&new_schema));
+    }
 
     fn models() -> Vec<FreeModel> {
         vec![

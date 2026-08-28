@@ -1133,6 +1133,8 @@ pub struct UiState {
     pub(crate) deferred_background_notices: Vec<String>,
     /// 本会话是否已弹过"额度用尽 → 接入 OpenRouter"提示(一次性去重)。
     pub(crate) openrouter_quota_nudge_shown: bool,
+    /// 本会话是否已弹过"未领 CodingPlan → 接入 OpenRouter"提示(一次性去重)。
+    pub(crate) openrouter_noplan_nudge_shown: bool,
     /// Per-turn token tallies (reset at turn end). Feed the footer's billable
     /// token count + cache-hit annotation via [`turn_token_summary`]; kept
     /// separate from the session-cumulative `*_tokens` above.
@@ -1537,6 +1539,7 @@ impl UiState {
             footer_usage: None,
             deferred_background_notices: Vec::new(),
             openrouter_quota_nudge_shown: false,
+            openrouter_noplan_nudge_shown: false,
             turn_prompt_tokens: 0,
             turn_completion_tokens: 0,
             turn_cached_tokens: 0,

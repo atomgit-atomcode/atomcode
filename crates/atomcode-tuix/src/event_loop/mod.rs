@@ -13995,6 +13995,21 @@ fn handle_input(
                             // redraw below so we don't clobber it.
                             return Ok(());
                         }
+                        // 新用户未领 CodingPlan 时一次性引导接入 OpenRouter。
+                        // 此处两个向导 flag 已被 take,用 has_codingplan 判断当前实际状态。
+                        if !app.state.openrouter_noplan_nudge_shown
+                            && !crate::event_loop::openrouter_connect::has_codingplan(
+                                &ctx.config,
+                            )
+                        {
+                            app.state.openrouter_noplan_nudge_shown = true;
+                            render_or_defer_background_notice(
+                                &mut app.state,
+                                renderer,
+                                "还没有可用模型?输入 /openrouter 一键接入 OpenRouter 免费模型"
+                                    .to_string(),
+                            );
+                        }
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     }
                     return Ok(());
