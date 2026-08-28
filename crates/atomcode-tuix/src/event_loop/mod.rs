@@ -9923,6 +9923,21 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // Preserve an active `/` command menu — don't blindly call
             // `redraw_idle_plain(menu: None)` which would erase it.
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
+                // 额度用尽一次性提示:usage_slot 刚被 spawn_check 写入时触发。
+                if !app.state.openrouter_quota_nudge_shown {
+                    if let Some((usage_info, _)) =
+                        ctx.usage_slot.lock().ok().as_deref().and_then(|g| g.clone())
+                    {
+                        if crate::event_loop::openrouter_connect::quota_exhausted(&usage_info) {
+                            app.state.openrouter_quota_nudge_shown = true;
+                            render_or_defer_background_notice(
+                                &mut app.state,
+                                renderer,
+                                "CodingPlan 额度已用尽 —— 输入 /openrouter 一键接入 OpenRouter 免费模型".to_string(),
+                            );
+                        }
+                    }
+                }
                 if let Some(modal) = app.active_modal.as_mut() {
                     if modal.poll_background() {
                         modal.draw(&app.buf, &app.state, &ctx, renderer);
@@ -10393,6 +10408,21 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // `redraw_idle_plain` — otherwise the menu gets erased when
             // this fires a second or two after the user types `/`.
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
+                // 额度用尽一次性提示:usage_slot 刚被 spawn_check 写入时触发。
+                if !app.state.openrouter_quota_nudge_shown {
+                    if let Some((usage_info, _)) =
+                        ctx.usage_slot.lock().ok().as_deref().and_then(|g| g.clone())
+                    {
+                        if crate::event_loop::openrouter_connect::quota_exhausted(&usage_info) {
+                            app.state.openrouter_quota_nudge_shown = true;
+                            render_or_defer_background_notice(
+                                &mut app.state,
+                                renderer,
+                                "CodingPlan 额度已用尽 —— 输入 /openrouter 一键接入 OpenRouter 免费模型".to_string(),
+                            );
+                        }
+                    }
+                }
                 if let Some(modal) = app.active_modal.as_mut() {
                     if modal.poll_background() {
                         modal.draw(&app.buf, &app.state, &ctx, renderer);

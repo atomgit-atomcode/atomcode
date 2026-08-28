@@ -171,6 +171,11 @@ pub fn provision_openrouter(
     }
 }
 
+/// CodingPlan 当前窗口是否耗尽。usage_percent 以百分比计(0..=100+)。
+pub fn quota_exhausted(usage: &atomcode_codingplan::types::UsageInfo) -> bool {
+    usage.usage_percent >= 100.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +195,16 @@ mod tests {
                 context_length: 8000,
             },
         ]
+    }
+
+    #[test]
+    fn quota_predicate_fires_at_full_usage() {
+        use atomcode_codingplan::types::UsageInfo;
+        let mut u: UsageInfo = serde_json::from_str("{}").unwrap();
+        u.usage_percent = 100.0;
+        assert!(quota_exhausted(&u));
+        u.usage_percent = 87.0;
+        assert!(!quota_exhausted(&u));
     }
 
     #[test]
