@@ -9976,6 +9976,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // extension (as_any_mut + downcast) we don't yet have.
             Some(ev) = ctx.oauth_event_rx.recv() => {
                 use oauth_poll::OauthEvent;
+                // QR 登录经此臂关闭 onboarding 向导(绕过 ModalAction::Close),
+                // 清掉 nudge 标记,否则它会泄漏到下一个无关 modal 的关闭时误弹。
+                ctx.pending_onboarding_nudge = false;
                 let was_modal_open = app.active_modal.is_some();
                 if was_modal_open {
                     app.active_modal = None;
@@ -10456,6 +10459,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // extension (as_any_mut + downcast) we don't yet have.
             Some(ev) = ctx.oauth_event_rx.recv() => {
                 use oauth_poll::OauthEvent;
+                // QR 登录经此臂关闭 onboarding 向导(绕过 ModalAction::Close),
+                // 清掉 nudge 标记,否则它会泄漏到下一个无关 modal 的关闭时误弹。
+                ctx.pending_onboarding_nudge = false;
                 let was_modal_open = app.active_modal.is_some();
                 if was_modal_open {
                     app.active_modal = None;
@@ -13969,6 +13975,15 @@ fn handle_input(
                     )?;
                     if matches!(action, ModalAction::Close) {
                         app.active_modal = None;
+                        // Consume the onboarding-nudge marker FIRST: the
+                        // provider-wizard follow-up below returns early, and
+                        // deferring the take until after it would strand the
+                        // flag onto an unrelated modal's later close (e.g. the
+                        // ProviderPanel), firing the nudge at the wrong time.
+                        // Only a clean onboarding dismissal (no login-setup /
+                        // provider-wizard follow-up) should evaluate the nudge.
+                        let onboarding_closed =
+                            std::mem::take(&mut ctx.pending_onboarding_nudge);
                         // OnboardingWizard signals its follow-up via two bool
                         // flags. Drain one, execute it here — the
                         // CodingPlan flow (which internally handles
@@ -13993,9 +14008,10 @@ fn handle_input(
                         }
                         // 新用户未领 CodingPlan 时一次性引导接入 OpenRouter。
                         // 仅在 onboarding 向导关闭时触发——其它 modal(/model、
-                        // /resume、/config 等)关闭不得触发。pending_onboarding_nudge
-                        // 在向导安装为 active_modal 时置位、此处 take 消费。
-                        if std::mem::take(&mut ctx.pending_onboarding_nudge)
+                        // /resume、/config 等)关闭不得触发。onboarding_closed 已在
+                        // 本臂顶部消费(见上),这里只是求值,provider-wizard 早 return
+                        // 不会再泄漏该标记。
+                        if onboarding_closed
                             && !app.state.openrouter_noplan_nudge_shown
                             && !crate::event_loop::openrouter_connect::has_codingplan(&ctx.config)
                         {

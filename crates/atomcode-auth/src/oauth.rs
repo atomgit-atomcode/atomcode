@@ -120,7 +120,7 @@ fn blocking_client() -> Result<reqwest::blocking::Client> {
     blocking_client_with_tls12(atomcode_config::tls::should_cap_url(platform_base_url()))
 }
 
-fn blocking_client_with_tls12(force_tls12: bool) -> Result<reqwest::blocking::Client> {
+pub(crate) fn blocking_client_with_tls12(force_tls12: bool) -> Result<reqwest::blocking::Client> {
     // Hard timeouts here too — the `get_valid_token` path calls
     // `refresh_access_token` synchronously whenever a stored token
     // looks expired, and that runs on the main TUI thread (via

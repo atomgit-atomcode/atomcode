@@ -185,6 +185,11 @@ impl LocalCallback {
             }
             match self.listener.accept() {
                 Ok((mut stream, _)) => {
+                    // 关键:listener 是非阻塞的,macOS/BSD 上 accept 出的 stream 会
+                    // 继承 O_NONBLOCK。此时 set_read_timeout 无效、read 会在浏览器
+                    // 的 HTTP 请求到达前立即返回 WouldBlock,导致真实回调被当作无效
+                    // 连接丢弃、OAuth 卡到超时。显式转回阻塞,让下方的 read 超时生效。
+                    let _ = stream.set_nonblocking(false);
                     // F1: 设置 read 超时,防止慢连接建立后迟迟不发请求时无限阻塞,
                     // 使 cancel/deadline 轮询得以继续。
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -237,12 +242,12 @@ impl LocalCallback {
 }
 
 fn blocking_client() -> Result<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .user_agent(crate::ATOMCODE_USER_AGENT)
-        .build()
-        .context("build OpenRouter HTTP client")
+    // Reuse the shared proxy-aware factory (connect 5s / total 10s / user-agent
+    // + system-proxy policy). A bare `Client::builder()` here would bypass the
+    // `/proxy` / no-proxy handling, so on corporate networks the code→key
+    // exchange and /models fetch could ignore the configured proxy. OpenRouter
+    // is a standard TLS 1.3 endpoint, so no TLS 1.2 cap (force_tls12 = false).
+    crate::oauth::blocking_client_with_tls12(false)
 }
 
 /// POST /api/v1/auth/keys {code, code_verifier, code_challenge_method:"S256"} → key。
@@ -413,6 +418,31 @@ mod tests {
             .unwrap();
         h.join().unwrap();
         assert_eq!(code.as_deref(), Some("deadbeef"));
+    }
+
+    /// 回归:模拟真实浏览器——TCP 握手完成(accept 返回)后隔一段延迟才发送
+    /// HTTP 请求。若 accept 出的 stream 继承了 listener 的非阻塞标志(macOS/BSD),
+    /// read 会在请求到达前 WouldBlock 而丢弃连接,本测试会失败/超时。
+    /// 直连写立即到达的 `..._over_loopback` 测试掩盖不了这个平台差异。
+    #[test]
+    fn delayed_request_after_handshake_still_returns_code() {
+        use std::io::Write;
+        use std::sync::atomic::AtomicBool;
+        let cb = start_local_callback().unwrap();
+        let port = cb.port();
+        let h = std::thread::spawn(move || {
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            // 握手后延迟再发请求,复现浏览器"连接已建立、请求稍后到"的时序。
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            s.write_all(b"GET /callback?code=cafef00d HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+        });
+        let cancel = AtomicBool::new(false);
+        let code = cb
+            .wait_for_code(std::time::Duration::from_secs(4), &cancel)
+            .unwrap();
+        h.join().unwrap();
+        assert_eq!(code.as_deref(), Some("cafef00d"));
     }
 
     /// F2 回归:无 code 的请求(如浏览器预检 favicon)不应终止等待;

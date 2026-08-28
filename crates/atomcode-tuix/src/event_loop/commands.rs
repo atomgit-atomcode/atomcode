@@ -1963,14 +1963,20 @@ fn execute_slash_command_impl(
         }
         "openrouter" => {
             let mode = crate::event_loop::openrouter_connect::parse_connect_mode(arg);
-            // 每次接入前清取消标志。
+            // 取消任何仍在跑的上一次连接,再给本次分派一个全新的 cancel flag。
+            // 复用同一 Arc + store(false) 会让"ESC 取消旧任务后立刻再 /openrouter"
+            // 的 store(false) 把旧任务反取消,两个后台线程都发 Ready → 重复装配。
+            // 每次新建 Arc 兑现字段契约:ESC 只作用于当前任务,旧任务持有已被置真
+            // 的旧 Arc,自然退出。
             ctx.openrouter_cancel
-                .store(false, std::sync::atomic::Ordering::Relaxed);
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            ctx.openrouter_cancel = cancel.clone();
             crate::event_loop::openrouter_connect::spawn_openrouter_connect(
                 mode,
                 ctx.openrouter_event_tx.clone(),
                 ctx.wake_tx.clone(),
-                ctx.openrouter_cancel.clone(),
+                cancel,
             );
             renderer.render(UiLine::CommandOutput(
                 "正在连接 OpenRouter…(浏览器授权,或稍候)".to_string(),
