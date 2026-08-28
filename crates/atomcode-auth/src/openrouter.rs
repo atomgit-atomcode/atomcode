@@ -207,6 +207,51 @@ impl LocalCallback {
     }
 }
 
+fn blocking_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .user_agent(crate::ATOMCODE_USER_AGENT)
+        .build()
+        .context("build OpenRouter HTTP client")
+}
+
+/// POST /api/v1/auth/keys {code, code_verifier, code_challenge_method:"S256"} → key。
+pub fn exchange_code_for_key(code: &str, verifier: &str) -> Result<String> {
+    let client = blocking_client()?;
+    let resp = client
+        .post(OPENROUTER_KEYS_URL)
+        .json(&serde_json::json!({
+            "code": code,
+            "code_verifier": verifier,
+            "code_challenge_method": "S256",
+        }))
+        .send()
+        .context("call OpenRouter /auth/keys")?;
+    let status = resp.status();
+    let body = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("OpenRouter /auth/keys 返回 HTTP {}", status.as_u16());
+    }
+    parse_key_response(&body)
+}
+
+/// GET /api/v1/models(Bearer)→ 过滤 free、按 context 降序、取 limit。
+pub fn fetch_top_free_models(api_key: &str, limit: usize) -> Result<Vec<FreeModel>> {
+    let client = blocking_client()?;
+    let resp = client
+        .get(OPENROUTER_MODELS_URL)
+        .bearer_auth(api_key)
+        .send()
+        .context("call OpenRouter /models")?;
+    let status = resp.status();
+    let body = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("OpenRouter /models 返回 HTTP {}", status.as_u16());
+    }
+    select_top_free_models(&body, limit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
