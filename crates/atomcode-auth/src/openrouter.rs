@@ -146,11 +146,35 @@ pub fn parse_code_from_request_line(line: &str) -> Option<String> {
     for pair in query.split('&') {
         if let Some(v) = pair.strip_prefix("code=") {
             if !v.is_empty() {
-                return Some(v.to_string());
+                // query 值可能被 percent-encode(如 code 含 '+' → %2B);
+                // 解码后再交换,否则编码后的字符串与服务端 code 不匹配 → 401。
+                return Some(percent_decode(v));
             }
         }
     }
     None
+}
+
+/// 最小 percent-decode:`%XX` → 字节,`+` 保持原样(query 值里 '+' 不代表空格,
+/// OAuth code 用的是 application/x-www-form 之外的原始 query)。非法 `%XX` 原样保留。
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 pub struct LocalCallback {
@@ -392,6 +416,20 @@ mod tests {
         assert_eq!(
             parse_code_from_request_line(line).as_deref(),
             Some("abc123")
+        );
+    }
+
+    #[test]
+    fn code_percent_decoded() {
+        // code=abc%2Bxyz → abc+xyz(服务端 code 含 '+' 被浏览器 percent-encode)。
+        assert_eq!(
+            parse_code_from_request_line("GET /callback?code=abc%2Bxyz HTTP/1.1").as_deref(),
+            Some("abc+xyz")
+        );
+        // 非法/不完整 %XX 原样保留,不 panic。
+        assert_eq!(
+            parse_code_from_request_line("GET /callback?code=ab%2 HTTP/1.1").as_deref(),
+            Some("ab%2")
         );
     }
 

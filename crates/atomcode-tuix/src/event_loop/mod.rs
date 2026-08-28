@@ -9411,6 +9411,55 @@ pub(crate) fn handle_loop_decision(
     }
 }
 
+/// 处理一次后台 OpenRouter 连接事件。抽出来供 Unix/Windows 两个 `select!` 块
+/// 共用,避免 Ready/Failed/AwaitingBrowser 逻辑复制两份、改一处漏另一处。
+fn handle_openrouter_connect_event(
+    ctx: &mut LoopCtx,
+    ev: openrouter_connect::OpenRouterConnectEvent,
+    renderer: &mut dyn Renderer,
+) {
+    use openrouter_connect::OpenRouterConnectEvent;
+    match ev {
+        OpenRouterConnectEvent::AwaitingBrowser { auth_url } => {
+            renderer.render(UiLine::Muted(format!(
+                "浏览器未自动打开?手动访问完成授权:{auth_url}"
+            )));
+            renderer.flush();
+        }
+        OpenRouterConnectEvent::Ready { api_key, models } => {
+            let mut added_count = 0usize;
+            match ctx.config_store.update(|latest| {
+                let out = openrouter_connect::provision_openrouter(latest, &api_key, &models);
+                added_count = out.added.len();
+                Ok(())
+            }) {
+                Ok(commit) => {
+                    apply_persisted_config(
+                        ctx,
+                        commit.snapshot.config,
+                        commit.snapshot.revision,
+                        renderer,
+                    );
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "已接入 OpenRouter,新增 {added_count} 个免费模型。/model 可切换。"
+                    )));
+                    renderer.flush();
+                }
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("OpenRouter 配置保存失败: {e}")));
+                    renderer.flush();
+                }
+            }
+        }
+        OpenRouterConnectEvent::Failed(reason) => {
+            renderer.render(UiLine::Error(format!(
+                "OpenRouter 接入失败: {reason}。可重试 /openrouter,或 /openrouter <你的key> 直接接入。"
+            )));
+            renderer.flush();
+        }
+    }
+}
+
 pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<ExitReason> {
     let mut app = App::new(&ctx.caps);
     // The active runtime/model owns the context-window denominator. Seed it
@@ -10032,42 +10081,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 
             // ── OpenRouter 后台连接结果 ──
             Some(ev) = ctx.openrouter_event_rx.recv() => {
-                use openrouter_connect::OpenRouterConnectEvent;
-                match ev {
-                    OpenRouterConnectEvent::Ready { api_key, models } => {
-                        let mut added_count = 0usize;
-                        match ctx.config_store.update(|latest| {
-                            let out = openrouter_connect::provision_openrouter(latest, &api_key, &models);
-                            added_count = out.added.len();
-                            Ok(())
-                        }) {
-                            Ok(commit) => {
-                                apply_persisted_config(
-                                    &mut ctx,
-                                    commit.snapshot.config,
-                                    commit.snapshot.revision,
-                                    renderer,
-                                );
-                                renderer.render(UiLine::CommandOutput(format!(
-                                    "已接入 OpenRouter,新增 {added_count} 个免费模型。/model 可切换。"
-                                )));
-                                renderer.flush();
-                            }
-                            Err(e) => {
-                                renderer.render(UiLine::Error(format!(
-                                    "OpenRouter 配置保存失败: {e}"
-                                )));
-                                renderer.flush();
-                            }
-                        }
-                    }
-                    OpenRouterConnectEvent::Failed(reason) => {
-                        renderer.render(UiLine::Error(format!(
-                            "OpenRouter 接入失败: {reason}。可重试 /openrouter,或 /openrouter <你的key> 直接接入。"
-                        )));
-                        renderer.flush();
-                    }
-                }
+                handle_openrouter_connect_event(&mut ctx, ev, renderer);
             }
 
             // ── /upgrade progress ──
@@ -10515,42 +10529,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
 
             // ── OpenRouter 后台连接结果 ──
             Some(ev) = ctx.openrouter_event_rx.recv() => {
-                use openrouter_connect::OpenRouterConnectEvent;
-                match ev {
-                    OpenRouterConnectEvent::Ready { api_key, models } => {
-                        let mut added_count = 0usize;
-                        match ctx.config_store.update(|latest| {
-                            let out = openrouter_connect::provision_openrouter(latest, &api_key, &models);
-                            added_count = out.added.len();
-                            Ok(())
-                        }) {
-                            Ok(commit) => {
-                                apply_persisted_config(
-                                    &mut ctx,
-                                    commit.snapshot.config,
-                                    commit.snapshot.revision,
-                                    renderer,
-                                );
-                                renderer.render(UiLine::CommandOutput(format!(
-                                    "已接入 OpenRouter,新增 {added_count} 个免费模型。/model 可切换。"
-                                )));
-                                renderer.flush();
-                            }
-                            Err(e) => {
-                                renderer.render(UiLine::Error(format!(
-                                    "OpenRouter 配置保存失败: {e}"
-                                )));
-                                renderer.flush();
-                            }
-                        }
-                    }
-                    OpenRouterConnectEvent::Failed(reason) => {
-                        renderer.render(UiLine::Error(format!(
-                            "OpenRouter 接入失败: {reason}。可重试 /openrouter,或 /openrouter <你的key> 直接接入。"
-                        )));
-                        renderer.flush();
-                    }
-                }
+                handle_openrouter_connect_event(&mut ctx, ev, renderer);
             }
 
             // ── /upgrade progress ──
@@ -18722,6 +18701,10 @@ fn handle_streaming_key(
     // Placed before menu navigation because stopping the stream is the higher
     // value action mid-turn (Ctrl+U remains available for clearing input).
     if code == KeyCode::Esc {
+        // 若在回合进行中还有后台 OpenRouter 连接在等授权(用户开了 /openrouter 后又
+        // 发了 prompt),这里的 ESC 也一并取消它——幂等,无在跑任务时是 no-op。
+        ctx.openrouter_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let had_active_turn = ctx.runtime.has_active_turn();
         let send_ok = if app.state.goal_condition.is_some()
             && app.state.goal_phase == atomcode_coding::GoalPhase::Pursuing

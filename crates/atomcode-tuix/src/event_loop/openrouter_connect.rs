@@ -32,6 +32,10 @@ pub fn parse_connect_mode(arg: &str) -> ConnectMode {
 
 /// 后台连接任务发给主循环 select! 臂的事件。
 pub enum OpenRouterConnectEvent {
+    /// OAuth 授权 URL 已打开浏览器,回传供用户在浏览器未自动打开时手动访问。
+    AwaitingBrowser {
+        auth_url: String,
+    },
     Ready {
         api_key: String,
         models: Vec<FreeModel>,
@@ -69,6 +73,10 @@ pub fn spawn_openrouter_connect(
                     let callback_url = format!("http://127.0.0.1:{}/callback", cb.port());
                     let auth_url = or::build_auth_url(Some(&callback_url), &pkce.challenge);
                     let _ = atomcode_auth::oauth::open_browser(&auth_url);
+                    // 把授权 URL 回传主循环显给用户:浏览器没自动打开(headless /
+                    // 无 DISPLAY / SSH)时用户仍能手动复制访问,而不是干等超时。
+                    let _ = event_tx.send(OpenRouterConnectEvent::AwaitingBrowser { auth_url });
+                    let _ = wake_tx.blocking_send(());
                     // 等最长 3 分钟;cancel 由 ESC 置位。
                     let code = cb
                         .wait_for_code(std::time::Duration::from_secs(180), &cancel)
@@ -187,12 +195,13 @@ pub fn has_codingplan(config: &Config) -> bool {
     use atomcode_config::config::provider_preset::preset_or_compatible;
     use atomcode_config::endpoints::is_codingplan_llm_gateway;
 
-    // 旧 schema:provider 名直接是 AtomGit / AtomGit-* 等。
-    if config
-        .providers
-        .keys()
-        .any(|k| is_codingplan_provider_name(k))
-    {
+    // 旧 schema:provider 名是 AtomGit / AtomGit-* 等,或(自定义命名但)
+    // base_url 指向 CodingPlan 网关(与新 schema / account_is_codingplan_managed
+    // 判定口径一致,避免"名字非 AtomGit 但确是 CodingPlan"被漏判致误弹 nudge)。
+    if config.providers.iter().any(|(k, p)| {
+        is_codingplan_provider_name(k)
+            || p.base_url.as_deref().is_some_and(is_codingplan_llm_gateway)
+    }) {
         return true;
     }
     // 新 schema:账号的 base_url 指向 CodingPlan 网关。
