@@ -2970,14 +2970,16 @@ fn execute_slash_command_impl(
             let sub = arg.trim();
             match parse_mcp_subcommand(sub) {
                 Some(McpSub::Login) => {
-                    let server = sub.strip_prefix("login").map(str::trim).unwrap_or("");
-                    if server.is_empty() {
+                    // Exactly one token is the server key; missing or a stray extra
+                    // arg (`/mcp login rvs new-file`) → usage, not a bogus key.
+                    let args = sub.strip_prefix("login").map(str::trim).unwrap_or("");
+                    let Some(server) = mcp_single_server_arg(args) else {
                         renderer.render(UiLine::CommandOutput(
                             t(Msg::McpOAuthLoginUsage).into_owned(),
                         ));
                         renderer.flush();
                         return Ok(());
-                    }
+                    };
                     let configs =
                         match atomcode_capabilities::mcp::load_mcp_config(&ctx.working_dir) {
                             Ok(configs) => configs,
@@ -2992,11 +2994,17 @@ fn execute_slash_command_impl(
                                 return Ok(());
                             }
                         };
+                    let mut available: Vec<String> =
+                        configs.iter().map(|config| config.name.clone()).collect();
+                    available.sort();
                     let Some(config) = configs.into_iter().find(|config| config.name == server)
                     else {
-                        renderer.render(UiLine::Error(
-                            t(Msg::McpOAuthServerNotFound { server }).into_owned(),
-                        ));
+                        // Unknown key: name it + list the real servers (shared with
+                        // `/mcp tools`), instead of a bare "not found".
+                        renderer.render(UiLine::CommandOutput(format_unknown_server(
+                            server,
+                            &available,
+                        )));
                         renderer.flush();
                         return Ok(());
                     };
@@ -3057,14 +3065,16 @@ fn execute_slash_command_impl(
                 }
 
                 Some(McpSub::Logout) => {
-                    let server = sub.strip_prefix("logout").map(str::trim).unwrap_or("");
-                    if server.is_empty() {
+                    // Exactly one token is the server key; missing or a stray extra
+                    // arg (`/mcp logout rvs new-file`) → usage, not a bogus key.
+                    let args = sub.strip_prefix("logout").map(str::trim).unwrap_or("");
+                    let Some(server) = mcp_single_server_arg(args) else {
                         renderer.render(UiLine::CommandOutput(
                             t(Msg::McpOAuthLogoutUsage).into_owned(),
                         ));
                         renderer.flush();
                         return Ok(());
-                    }
+                    };
                     let token_store = atomcode_capabilities::mcp::McpTokenStore::default();
                     match token_store.load_token(server) {
                         Ok(None) => {
@@ -3261,7 +3271,7 @@ fn execute_slash_command_impl(
                     // `/mcp tools <server>`: list remote tool names for a connected server.
                     // This is intentionally separate from a global `/tools` so we keep the surface minimal.
                     let args = sub.strip_prefix("tools").map(str::trim).unwrap_or("");
-                    let Some(server) = mcp_tools_server_arg(args) else {
+                    let Some(server) = mcp_single_server_arg(args) else {
                         // Zero, or a stray extra arg (e.g. `/mcp tools rvs new-file`) →
                         // arg-count error; reuse the usage hint.
                         renderer.render(UiLine::CommandOutput(t(Msg::McpToolsUsage).into_owned()));
@@ -6454,14 +6464,32 @@ pub(crate) fn count_blocked_untrusted(
 
 /// Parse the argument string following `/mcp` into a known subcommand.
 /// Returns `None` for unrecognised inputs (which fall through to status display).
-/// Parse the argument list after `/mcp tools`: EXACTLY one whitespace token is a
-/// server key. Zero (missing) or more than one (a stray extra arg like
-/// `/mcp tools rvs new-file`) returns `None` so the caller shows the usage hint.
-pub(crate) fn mcp_tools_server_arg(args: &str) -> Option<&str> {
+/// Parse the single-server argument shared by `/mcp tools|login|logout <server>`:
+/// EXACTLY one whitespace token is a server key. Zero (missing) or more than one
+/// (a stray extra arg like `/mcp tools rvs new-file`) returns `None` so the
+/// caller shows that subcommand's usage hint.
+pub(crate) fn mcp_single_server_arg(args: &str) -> Option<&str> {
     let mut it = args.split_whitespace();
     match (it.next(), it.next()) {
         (Some(server), None) => Some(server),
         _ => None,
+    }
+}
+
+/// Shared "you named a server that isn't configured" guidance for
+/// `/mcp tools|login|logout`: name the bad key and list the real ones (shell-style
+/// "not found → here's what exists"), or report nothing configured. NEVER says
+/// "not configured" for a key when servers DO exist (the reported bug).
+pub(crate) fn format_unknown_server(server: &str, available: &[String]) -> String {
+    if available.is_empty() {
+        t(Msg::McpNoServersConfigured).trim_end().to_string()
+    } else {
+        t(Msg::McpUnknownServer {
+            name: server,
+            available: &available.join(", "),
+        })
+        .trim_end()
+        .to_string()
     }
 }
 
@@ -6487,13 +6515,7 @@ pub(crate) fn format_mcp_tools_snapshot(
     }
     match status {
         Some(status) => format!("tools:\n  (none — {status})"),
-        None if available.is_empty() => t(Msg::McpNoServersConfigured).trim_end().to_string(),
-        None => t(Msg::McpUnknownServer {
-            name: server,
-            available: &available.join(", "),
-        })
-        .trim_end()
-        .to_string(),
+        None => format_unknown_server(server, available),
     }
 }
 
@@ -9310,15 +9332,25 @@ mod mcp_subcommand_tests {
     }
 
     #[test]
-    fn mcp_tools_arg_requires_exactly_one_token() {
-        use super::mcp_tools_server_arg;
-        assert_eq!(mcp_tools_server_arg("rvs"), Some("rvs"));
-        assert_eq!(mcp_tools_server_arg("  rvs  "), Some("rvs"));
+    fn mcp_single_server_arg_requires_exactly_one_token() {
+        use super::mcp_single_server_arg;
+        assert_eq!(mcp_single_server_arg("rvs"), Some("rvs"));
+        assert_eq!(mcp_single_server_arg("  rvs  "), Some("rvs"));
         // Missing → usage.
-        assert_eq!(mcp_tools_server_arg(""), None);
-        // Stray extra arg (the reported `/mcp tools rvs new-file`) → usage, NOT a
-        // bogus "rvs new-file" key that then reads as "not configured".
-        assert_eq!(mcp_tools_server_arg("rvs new-file"), None);
+        assert_eq!(mcp_single_server_arg(""), None);
+        // Stray extra arg (the reported `/mcp tools rvs new-file`, and the same
+        // class for `/mcp login|logout`) → usage, NOT a bogus "rvs new-file" key.
+        assert_eq!(mcp_single_server_arg("rvs new-file"), None);
+    }
+
+    #[test]
+    fn format_unknown_server_lists_available_or_reports_none() {
+        use super::format_unknown_server;
+        let listed = format_unknown_server("rvs new-file", &["a".into(), "b".into()]);
+        assert!(listed.contains("rvs new-file") && listed.contains("a") && listed.contains("b"));
+        assert!(!listed.contains("not configured") && !listed.contains("未配置"));
+        let none = format_unknown_server("x", &[]);
+        assert!(none.contains("未配置") || none.contains("no MCP") || none.contains("No MCP"));
     }
 
     #[test]

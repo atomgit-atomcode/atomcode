@@ -748,8 +748,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  用法：/mcp logout <服务名>\n  示例：/mcp logout github\n".into(),
         Msg::McpOAuthLoadConfigFailed { error } =>
             format!("  MCP OAuth 登录失败：无法加载配置：{error}\n").into(),
-        Msg::McpOAuthServerNotFound { server } =>
-            format!("  MCP OAuth 登录失败：配置中未找到服务 '{server}'。\n").into(),
         Msg::McpOAuthStarting { server } =>
             format!("  正在浏览器中启动 '{server}' 的 MCP OAuth 流程...\n").into(),
         Msg::McpOAuthSaved { provider, server } =>

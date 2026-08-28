@@ -773,8 +773,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Usage: /mcp logout <server>\n  Example: /mcp logout github\n".into(),
         Msg::McpOAuthLoadConfigFailed { error } =>
             format!("  MCP OAuth login failed to load config: {error}\n").into(),
-        Msg::McpOAuthServerNotFound { server } =>
-            format!("  MCP OAuth login failed: server '{server}' not found in config.\n").into(),
         Msg::McpOAuthStarting { server } =>
             format!("  Starting MCP OAuth for '{server}' in your browser...\n").into(),
         Msg::McpOAuthSaved { provider, server } =>

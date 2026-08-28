@@ -867,9 +867,6 @@ pub enum Msg<'a> {
     McpOAuthLoadConfigFailed {
         error: &'a str,
     },
-    McpOAuthServerNotFound {
-        server: &'a str,
-    },
     McpOAuthStarting {
         server: &'a str,
     },
