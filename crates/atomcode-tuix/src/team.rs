@@ -27,6 +27,7 @@ struct MemberProjection {
     activity: String,
     status: SubtaskStatus,
     started_at: Option<std::time::Instant>,
+    finished_at: Option<std::time::Instant>,
     output_tokens: u64,
 }
 
@@ -39,6 +40,7 @@ impl Default for MemberProjection {
             activity: String::new(),
             status: SubtaskStatus::Pending,
             started_at: None,
+            finished_at: None,
             output_tokens: 0,
         }
     }
@@ -134,6 +136,9 @@ impl TeamProjection {
                 } else {
                     SubtaskStatus::Failed
                 };
+                // Freeze elapsed at the terminal transition so a finished member's
+                // row stops ticking while sibling members keep the group live.
+                member.finished_at.get_or_insert_with(std::time::Instant::now);
                 run.total = run.total.max(run.members.len());
             }
             TeamEventPayload::RunFinished { total, .. } => {
@@ -214,6 +219,7 @@ impl TeamProjection {
                     model: member.model.clone(),
                     activity: member.activity.clone(),
                     started_at: member.started_at,
+                    finished_at: member.finished_at,
                     output_tokens: member.output_tokens,
                     status: member.status,
                 });
@@ -245,6 +251,7 @@ impl TeamProjection {
                 model: member.model.clone(),
                 activity: member.activity.clone(),
                 started_at: member.started_at,
+                finished_at: member.finished_at,
                 output_tokens: member.output_tokens,
                 status: member.status,
             })

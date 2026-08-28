@@ -405,6 +405,27 @@ pub enum Msg<'a> {
     ProviderPanelAccountFormHint,
     ProviderPanelModelFormHint,
     ProviderPanelEffortLevelsHint,
+    // ── Subagent / task fan-out progress ──
+    /// Detail-row status words shown under a subagent/task member row.
+    SubagentStatusRunning,
+    SubagentStatusDone,
+    SubagentStatusStopped,
+    SubagentStatusFailed,
+    SubagentStatusWaiting,
+    /// Agent-group header once every member has reached a terminal state.
+    /// `kind` is the product label (`SubAgents`/`Team agents`), left verbatim.
+    SubagentGroupFinished {
+        kind: &'a str,
+        done: usize,
+        total: usize,
+        failed: usize,
+    },
+    /// Agent-group header while members are still running.
+    SubagentGroupRunning {
+        kind: &'a str,
+        running: usize,
+        total: usize,
+    },
     // ── Model picker ──
     ModelSwitched {
         provider: &'a str,

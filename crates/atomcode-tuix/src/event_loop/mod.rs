@@ -22010,6 +22010,7 @@ fn subtask_progress_from_args(
                 model: String::new(),
                 activity: String::new(),
                 started_at: None,
+                finished_at: None,
                 output_tokens: 0,
                 status: crate::render::SubtaskStatus::Pending,
             }
@@ -22107,6 +22108,15 @@ fn update_subtask_progress(
     item.status = status;
     if started && item.started_at.is_none() {
         item.started_at = Some(std::time::Instant::now());
+    }
+    // Freeze elapsed at the terminal transition. Without this, a done member's
+    // row keeps ticking with `now` because the group re-renders live while its
+    // sibling members are still running.
+    if matches!(
+        status,
+        SubtaskStatus::Completed | SubtaskStatus::Stopped | SubtaskStatus::Failed
+    ) {
+        item.finished_at.get_or_insert_with(std::time::Instant::now);
     }
     if let Some(model) = model.filter(|model| !model.is_empty()) {
         item.model = model.to_string();
@@ -22381,6 +22391,7 @@ mod subtask_progress_projection_tests {
                     model: "model".into(),
                     activity: "done".into(),
                     started_at: None,
+                    finished_at: None,
                     output_tokens: 10,
                     status: SubtaskStatus::Completed,
                 }],
@@ -26082,6 +26093,8 @@ fn handle_agent_event(
                                 } else {
                                     crate::render::SubtaskStatus::Failed
                                 };
+                                item.finished_at
+                                    .get_or_insert_with(std::time::Instant::now);
                                 item.activity = if success { "done" } else { "failed" }.into();
                             }
                         }
@@ -26481,13 +26494,17 @@ fn handle_agent_event(
                     *rendered = true;
                 }
             } else {
-                // No entry from ToolCallStarted, render and insert (pre-result).
-                renderer.render(UiLine::ToolCall {
-                    name: display.clone(),
-                    detail: detail.clone(),
-                    outcome: None,
-                });
-                pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
+                // Approval precedes ToolStarted in v2, so there is no transcript
+                // row yet. DON'T commit a neutral `● Tool(detail)` row here:
+                // nothing recolours a pre-result committed bullet — the
+                // result-time `ToolCallCommit` finds no inflight to freeze, and
+                // `commit_inflight_tool` is a no-op — so a committed row would
+                // strand white even on success (bash-approval green-dot bug).
+                // Defer the row exactly like task/team (`rendered = false`): the
+                // approval panel already restates `Allow Tool(detail)?`, and once
+                // approved ToolCallStarted renders the live inflight whose result
+                // greens the bullet through the normal path.
+                pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), false));
             }
 
             // Warn when the command about to be approved would trip the credential
@@ -26764,6 +26781,7 @@ fn handle_agent_event(
                                 | crate::render::SubtaskStatus::Running
                         ) {
                             item.status = crate::render::SubtaskStatus::Stopped;
+                            item.finished_at.get_or_insert_with(std::time::Instant::now);
                             item.activity = "cancelled".into();
                         }
                     }

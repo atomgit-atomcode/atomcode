@@ -368,6 +368,15 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "Tab 下一项  ←→ 切选项  空格切换  ↵ 保存  Esc 返回".into(),
         Msg::ProviderPanelEffortLevelsHint =>
             "空格 启用/禁用此档位（[✓] 启用 · [ ] 未启用）  Tab 下一项  Esc 返回".into(),
+        Msg::SubagentStatusRunning => "运行中".into(),
+        Msg::SubagentStatusDone => "完成".into(),
+        Msg::SubagentStatusStopped => "已停止".into(),
+        Msg::SubagentStatusFailed => "失败".into(),
+        Msg::SubagentStatusWaiting => "排队中".into(),
+        Msg::SubagentGroupFinished { kind, done, total, failed } =>
+            format!("{kind} · {done}/{total} 已完成 · {failed} 失败").into(),
+        Msg::SubagentGroupRunning { kind, running, total } =>
+            format!("运行中 {running}/{total} {kind}…").into(),
         // ── Model 选择器 ──
         Msg::ModelSwitched { provider, model } =>
             format!("  当前会话已切换到 {provider} · {model}\n").into(),

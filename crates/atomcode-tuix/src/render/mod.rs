@@ -911,8 +911,27 @@ pub struct SubtaskItem {
     pub model: String,
     pub activity: String,
     pub started_at: Option<std::time::Instant>,
+    /// Wall-clock instant the subtask reached a terminal status (Completed/
+    /// Stopped/Failed). `None` while pending or running. Stamped at the
+    /// terminal transition so a done row's elapsed FREEZES instead of ticking
+    /// with `now` — a live agent-group re-renders every frame while OTHER
+    /// members still run, and without this a finished row kept counting up.
+    pub finished_at: Option<std::time::Instant>,
     pub output_tokens: u64,
     pub status: SubtaskStatus,
+}
+
+impl SubtaskItem {
+    /// Wall-clock the subtask has been (running) or was (terminal) active.
+    /// FROZEN once `finished_at` is stamped, so a completed row stops ticking;
+    /// a still-running row (no `finished_at`) reads live elapsed.
+    pub fn elapsed(&self) -> std::time::Duration {
+        match (self.started_at, self.finished_at) {
+            (Some(start), Some(end)) => end.saturating_duration_since(start),
+            (Some(start), None) => start.elapsed(),
+            _ => std::time::Duration::ZERO,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1042,6 +1061,37 @@ pub fn fmt_dur(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn subtask(started: Option<std::time::Instant>, finished: Option<std::time::Instant>, status: SubtaskStatus) -> SubtaskItem {
+        SubtaskItem {
+            label: "worker".into(),
+            description: String::new(),
+            model: String::new(),
+            activity: String::new(),
+            started_at: started,
+            finished_at: finished,
+            output_tokens: 0,
+            status,
+        }
+    }
+
+    #[test]
+    fn subtask_elapsed_freezes_once_finished() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        // A terminal item with a stamped finish reads the FROZEN span, not `now`.
+        let done = subtask(Some(start), Some(start + Duration::from_secs(90)), SubtaskStatus::Completed);
+        assert_eq!(done.elapsed(), Duration::from_secs(90));
+        // Re-reading later must NOT grow (the whole point of the freeze).
+        assert_eq!(done.elapsed(), Duration::from_secs(90));
+
+        // A running item (no finish) still reads live elapsed (≈ time since start).
+        let running = subtask(Some(start), None, SubtaskStatus::Running);
+        assert!(running.elapsed() >= Duration::ZERO);
+
+        // No start yet → zero, never a panic.
+        assert_eq!(subtask(None, None, SubtaskStatus::Pending).elapsed(), Duration::ZERO);
+    }
 
     #[test]
     fn shell_mode_is_a_leading_bang_including_bare() {

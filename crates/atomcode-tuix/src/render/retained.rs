@@ -3620,10 +3620,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let remainder = identity.split_off(label_len);
                 identity.push_str(&format!(" \u{b7} {}{}", item.model, remainder));
             }
-            let elapsed = item
-                .started_at
-                .map(|started_at| started_at.elapsed().as_secs())
-                .unwrap_or(0);
+            let elapsed = item.elapsed().as_secs();
             let elapsed = if elapsed >= 60 {
                 format!("{}m{}s", elapsed / 60, elapsed % 60)
             } else {
@@ -8390,11 +8387,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         };
         let header = if finished && terminal >= progress.total {
             format!(
-                "{marker} {kind} · {terminal}/{} finished · {failed} failed",
-                progress.total
+                "{marker} {}",
+                crate::i18n::t(crate::i18n::Msg::SubagentGroupFinished {
+                    kind,
+                    done: terminal,
+                    total: progress.total,
+                    failed,
+                })
             )
         } else {
-            format!("{marker} Running {running}/{} {kind}…", progress.total)
+            format!(
+                "{marker} {}",
+                crate::i18n::t(crate::i18n::Msg::SubagentGroupRunning {
+                    kind,
+                    running,
+                    total: progress.total,
+                })
+            )
         };
         let header_style = self.style_bold(Role::Secondary);
         let header_row = build_one_row(
@@ -8409,42 +8418,36 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let active_child_style = self.style_for(Role::Secondary);
         let stopped_child_style = self.style_for(Role::Warning);
         let failed_child_style = self.style_for(Role::Error);
+        // Two rows per member (stable count → the live in-place rewrite keeps
+        // working across status transitions): a primary identity/stats row and a
+        // connected detail row. The detail row carries the CURRENT action on its
+        // own full-width line (no longer truncated by competing fields) while
+        // running, and a terminal `Done`/`完成` word once the member finishes.
         let child_rows = progress
             .items
             .iter()
             .enumerate()
-            .map(|(index, item)| {
-                let branch = if index + 1 == progress.items.len() {
-                    "└"
-                } else {
-                    "├"
-                };
-                let state = match item.status {
-                    SubtaskStatus::Pending => "pending",
-                    SubtaskStatus::Running => {
-                        if item.activity.is_empty() {
-                            "running"
-                        } else {
-                            item.activity.as_str()
-                        }
-                    }
-                    SubtaskStatus::Completed => "done",
-                    SubtaskStatus::Stopped => "stopped",
-                    SubtaskStatus::Failed => "failed",
+            .flat_map(|(index, item)| {
+                let is_last = index + 1 == progress.items.len();
+                let branch = if is_last { "\u{2514}" } else { "\u{251c}" };
+                let cont = if is_last { " " } else { "\u{2502}" };
+                let child_style = match item.status {
+                    SubtaskStatus::Pending | SubtaskStatus::Running => &active_child_style,
+                    SubtaskStatus::Completed => &completed_child_style,
+                    SubtaskStatus::Stopped => &stopped_child_style,
+                    SubtaskStatus::Failed => &failed_child_style,
                 };
                 let mut text = format!("  {branch} {}", item.label);
                 if !item.description.is_empty() {
                     text.push_str(&format!(": {}", item.description));
                 }
                 if !item.model.is_empty() {
-                    text.push_str(&format!(" · {}", item.model));
+                    text.push_str(&format!(" \u{b7} {}", item.model));
                 }
-                text.push_str(&format!(" · {state}"));
-                let text = if item.started_at.is_some() || item.output_tokens > 0 {
-                    let elapsed = item
-                        .started_at
-                        .map(|started_at| crate::render::fmt_dur(started_at.elapsed()))
-                        .unwrap_or_else(|| "0s".into());
+                let primary = if item.started_at.is_some() || item.output_tokens > 0 {
+                    // `item.elapsed()` freezes once the item is terminal, so a done
+                    // row stops ticking even while the live group keeps re-rendering.
+                    let elapsed = crate::render::fmt_dur(item.elapsed());
                     format_subtask_progress(
                         &text,
                         &elapsed,
@@ -8454,18 +8457,44 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 } else {
                     crate::width::truncate_with_ellipsis(&text, self.screen.width() as usize)
                 };
-                let child_style = match item.status {
-                    SubtaskStatus::Pending | SubtaskStatus::Running => &active_child_style,
-                    SubtaskStatus::Completed => &completed_child_style,
-                    SubtaskStatus::Stopped => &stopped_child_style,
-                    SubtaskStatus::Failed => &failed_child_style,
+                let detail: std::borrow::Cow<str> = match item.status {
+                    SubtaskStatus::Running => {
+                        if item.activity.is_empty() {
+                            crate::i18n::t(crate::i18n::Msg::SubagentStatusRunning)
+                        } else {
+                            std::borrow::Cow::Borrowed(item.activity.as_str())
+                        }
+                    }
+                    SubtaskStatus::Completed => {
+                        crate::i18n::t(crate::i18n::Msg::SubagentStatusDone)
+                    }
+                    SubtaskStatus::Stopped => {
+                        crate::i18n::t(crate::i18n::Msg::SubagentStatusStopped)
+                    }
+                    SubtaskStatus::Failed => {
+                        crate::i18n::t(crate::i18n::Msg::SubagentStatusFailed)
+                    }
+                    SubtaskStatus::Pending => {
+                        crate::i18n::t(crate::i18n::Msg::SubagentStatusWaiting)
+                    }
                 };
-                build_one_row(
-                    &text,
-                    child_style,
-                    self.screen.width(),
-                    self.caps.unicode_symbols,
-                )
+                let sub_text = format!("  {cont} \u{2514} {}", scrub_controls(&detail));
+                let sub =
+                    crate::width::truncate_with_ellipsis(&sub_text, self.screen.width() as usize);
+                [
+                    build_one_row(
+                        &primary,
+                        child_style,
+                        self.screen.width(),
+                        self.caps.unicode_symbols,
+                    ),
+                    build_one_row(
+                        &sub,
+                        child_style,
+                        self.screen.width(),
+                        self.caps.unicode_symbols,
+                    ),
+                ]
             })
             .collect();
         (header_row, child_rows)
@@ -10610,6 +10639,7 @@ mod tests {
                     model: "test-model".into(),
                     activity: "running".into(),
                     started_at: None,
+                    finished_at: None,
                     output_tokens: 0,
                     status: SubtaskStatus::Running,
                 })
@@ -14650,6 +14680,7 @@ mod tests {
                 model: "deepseek-v4-flash".into(),
                 activity: "analyzing".into(),
                 started_at: Some(std::time::Instant::now()),
+                finished_at: None,
                 output_tokens: 1000,
                 status: SubtaskStatus::Running,
             }],
@@ -16061,6 +16092,47 @@ mod tests {
     fn tool_bullet_neutral_when_commit_has_no_outcome() {
         // A preempt / turn-end / approval freeze carries no outcome → neutral.
         assert_commit_bullet(None, Role::ToolName, "no outcome = neutral");
+    }
+
+    #[test]
+    fn committed_tool_bullet_is_not_retro_recoloured_by_a_later_commit() {
+        // Locks the stateless invariant behind the approval green-dot fix: once a
+        // `● Tool(detail)` row is committed neutral, a LATER ToolCallCommit with a
+        // real outcome canNOT green it — there is no inflight to freeze and
+        // `commit_inflight_tool` is a no-op on an already-committed row.
+        //
+        // This is exactly why the event loop must DEFER an approval-gated tool's
+        // transcript row (v2 asks approval BEFORE ToolStarted) instead of
+        // committing it up front: deferring lets the post-approval ToolStarted
+        // render a live inflight whose result greens the bullet through the normal
+        // path. If someone "fixes" the bug by retro-recolouring committed rows
+        // (the fragile pending-slot approach rejected twice before), this test
+        // fails — pushing the fix back to the event-loop defer.
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false); // dark
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        // Static pre-result row, as an early approval commit would have produced.
+        r.render(UiLine::ToolCall {
+            name: "Bash".into(),
+            detail: "ls".into(),
+            outcome: None,
+        });
+        // The successful result arrives later — but there is no inflight to recolour.
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("c1".into()),
+            outcome: Some(crate::render::ToolOutcome::Success),
+        });
+        assert_eq!(
+            bullet_fg(&r),
+            Some(r.tool_bullet_style().fg),
+            "a committed bullet stays neutral; the renderer never retro-greens it"
+        );
+        assert_ne!(
+            bullet_fg(&r),
+            Some(r.style_for(Role::Success).fg),
+            "specifically NOT green — the fix defers the row so the live path greens it"
+        );
     }
 
     #[test]
@@ -19031,6 +19103,7 @@ mod tests {
                     model: "deepseek-v4-flash".into(),
                     activity: "completed".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
                     output_tokens: 900,
                     status: SubtaskStatus::Completed,
                 },
@@ -19040,6 +19113,7 @@ mod tests {
                     model: "deepseek-v4-flash".into(),
                     activity: "reading files".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
                     output_tokens: 420,
                     status: SubtaskStatus::Running,
                 },
@@ -19049,6 +19123,7 @@ mod tests {
                     model: "deepseek-v4-flash".into(),
                     activity: "thinking".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
                     output_tokens: 210,
                     status: SubtaskStatus::Running,
                 },
@@ -19122,6 +19197,7 @@ mod tests {
                     model: "deepseek-v4-flash".into(),
                     activity: "已定位命令注册入口，正在核对补全与权限机制".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
                     output_tokens: 12_345,
                     status: SubtaskStatus::Running,
                 })
@@ -19157,6 +19233,7 @@ mod tests {
             model: "deepseek-v4-flash".into(),
             activity: String::new(),
             started_at: Some(std::time::Instant::now()),
+            finished_at: None,
             output_tokens: 0,
             status: state,
         };
@@ -19205,6 +19282,7 @@ mod tests {
             model: String::new(),
             activity: String::new(),
             started_at: None,
+            finished_at: None,
             output_tokens: 0,
             status: state,
         };
@@ -19244,6 +19322,7 @@ mod tests {
             model: "GLM-5.2".into(),
             activity: "正在分析结果".into(),
             started_at: Some(std::time::Instant::now()),
+            finished_at: None,
             output_tokens: 128,
             status: state,
         };
@@ -19290,6 +19369,7 @@ mod tests {
             model: "GLM-5.2".into(),
             activity: "working".into(),
             started_at: Some(std::time::Instant::now()),
+            finished_at: None,
             output_tokens: 128,
             status: state,
         };
@@ -19335,6 +19415,7 @@ mod tests {
                     model: "GLM-5.2".into(),
                     activity: "thinking".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
                     output_tokens: 128,
                     status: SubtaskStatus::Running,
                 },
@@ -19344,6 +19425,7 @@ mod tests {
                     model: "GLM-5.2".into(),
                     activity: "queued".into(),
                     started_at: None,
+                    finished_at: None,
                     output_tokens: 0,
                     status: SubtaskStatus::Pending,
                 },
@@ -19375,8 +19457,10 @@ mod tests {
             "token metadata must survive clipping"
         );
         assert!(running_text.contains('↑'), "token marker must stay visible");
+        // Each member spans two rows now (primary + connected detail), so the
+        // second member's PRIMARY row is at child_indices[2].
         assert!(
-            r.body_lines[group.child_indices[1]]
+            r.body_lines[group.child_indices[2]]
                 .iter()
                 .filter(|cell| !cell.ch.is_whitespace())
                 .all(|cell| cell.style == active_style),
@@ -19403,12 +19487,16 @@ mod tests {
             String::from_utf8_lossy(&buf.lock().unwrap()).contains("\x1b["),
             "Agent update must immediately rewrite visible terminal rows"
         );
-        let child = r.body_lines[group.child_indices[1]]
-            .iter()
-            .map(|cell| cell.ch)
-            .collect::<String>();
-        assert!(child.contains("reading files"));
-        assert!(child.contains("256 tokens"));
+        // Member 2: tokens ride the PRIMARY row (child_indices[2]); the current
+        // action ("reading files") is on its own connected DETAIL row (…[3]).
+        let row_text = |idx: usize| {
+            r.body_lines[idx]
+                .iter()
+                .map(|cell| cell.ch)
+                .collect::<String>()
+        };
+        assert!(row_text(group.child_indices[2]).contains("256 tokens"));
+        assert!(row_text(group.child_indices[3]).contains("reading files"));
 
         for item in &mut progress.items {
             item.status = SubtaskStatus::Completed;
@@ -19450,6 +19538,55 @@ mod tests {
     }
 
     #[test]
+    fn completed_agent_row_shows_frozen_elapsed_not_live_wall_clock() {
+        // Regression: a done member's row must FREEZE its elapsed. The bug was a
+        // finished row ticking with `now` (started_at.elapsed()) while sibling
+        // members kept the group live — so `implementer#1 done · 45m27s` matched
+        // the wall clock instead of its real ~14m completion span.
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+        use std::time::{Duration, Instant};
+
+        let (r, _buf) = new_capturing(120, 24);
+        let start = Instant::now();
+        let progress = SubtaskProgress {
+            call_id: "task:freeze".into(),
+            completed: 1,
+            total: 2,
+            items: vec![
+                SubtaskItem {
+                    label: "implementer#1".into(),
+                    description: String::new(),
+                    model: "deepseek-v4-flash".into(),
+                    activity: "done".into(),
+                    started_at: Some(start),
+                    // Finished 90s after start — a LIVE recompute would read ~0s
+                    // (the test just started), so `1m30s` proves the freeze.
+                    finished_at: Some(start + Duration::from_secs(90)),
+                    output_tokens: 100,
+                    status: SubtaskStatus::Completed,
+                },
+                SubtaskItem {
+                    label: "implementer#2".into(),
+                    description: String::new(),
+                    model: "deepseek-v4-flash".into(),
+                    activity: "running".into(),
+                    started_at: Some(start),
+                    finished_at: None,
+                    output_tokens: 50,
+                    status: SubtaskStatus::Running,
+                },
+            ],
+        };
+        let (_, rows) = r.agent_group_rows(&progress, false);
+        let text = |row: &[Cell]| row.iter().map(|c| c.ch).collect::<String>();
+        let done_row = text(&rows[0]);
+        assert!(
+            done_row.contains("1m30s"),
+            "done row must show its frozen 90s span, got: {done_row}"
+        );
+    }
+
+    #[test]
     fn failed_and_stopped_agent_rows_remain_visually_distinct_from_completed() {
         use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
 
@@ -19470,6 +19607,7 @@ mod tests {
                 model: String::new(),
                 activity: label.into(),
                 started_at: None,
+                finished_at: None,
                 output_tokens: 0,
                 status,
             })
@@ -19483,9 +19621,18 @@ mod tests {
                 .style
                 .clone()
         };
-        assert_ne!(first_style(&rows[0]), first_style(&rows[1]));
-        assert_eq!(first_style(&rows[1]).fg, r.style_for(Role::Warning).fg);
-        assert_eq!(first_style(&rows[2]).fg, r.style_for(Role::Error).fg);
+        // Each member now spans TWO rows (primary + connected detail), so the
+        // three members' primary rows are at indices 0, 2, 4.
+        assert_ne!(first_style(&rows[0]), first_style(&rows[2]));
+        assert_eq!(first_style(&rows[2]).fg, r.style_for(Role::Warning).fg);
+        assert_eq!(first_style(&rows[4]).fg, r.style_for(Role::Error).fg);
+        // The detail row shows a terminal status word (localized `Done`/`完成`).
+        let text = |row: &[Cell]| row.iter().map(|c| c.ch).collect::<String>();
+        assert!(
+            text(&rows[1]).contains("Done") || text(&rows[1]).contains("完成"),
+            "completed member's detail row shows a done word: {}",
+            text(&rows[1])
+        );
     }
 
     #[test]
@@ -19503,6 +19650,7 @@ mod tests {
                 model: "GLM-5.2".into(),
                 activity: "thinking".into(),
                 started_at: Some(std::time::Instant::now()),
+                finished_at: None,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19559,6 +19707,7 @@ mod tests {
                         model: String::new(),
                         activity: "thinking".into(),
                         started_at: None,
+                        finished_at: None,
                         output_tokens: 0,
                         status: SubtaskStatus::Running,
                     }],
@@ -19601,6 +19750,7 @@ mod tests {
                 model: String::new(),
                 activity: "thinking".into(),
                 started_at: None,
+                finished_at: None,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19641,6 +19791,7 @@ mod tests {
                 model: String::new(),
                 activity: "thinking".into(),
                 started_at: None,
+                finished_at: None,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19703,6 +19854,7 @@ mod tests {
                     model: "deepseek-v4-flash".into(),
                     activity: "thinking".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
                     output_tokens: 0,
                     status: SubtaskStatus::Running,
                 })
@@ -19744,6 +19896,7 @@ mod tests {
                 model: "GLM-5.2".into(),
                 activity: String::new(),
                 started_at: None,
+                finished_at: None,
                 output_tokens: 0,
                 status: SubtaskStatus::Pending,
             }],
@@ -19781,6 +19934,7 @@ mod tests {
                 model: "deepseek-v4-flash".into(),
                 activity: "thinking".into(),
                 started_at: Some(std::time::Instant::now()),
+                finished_at: None,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19815,6 +19969,7 @@ mod tests {
                 model: "deepseek-v4-flash".into(),
                 activity: "thinking".into(),
                 started_at: Some(std::time::Instant::now()),
+                finished_at: None,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19854,6 +20009,7 @@ mod tests {
                 model: "deepseek-v4-flash".into(),
                 activity: "waiting".into(),
                 started_at: Some(std::time::Instant::now()),
+                finished_at: None,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],

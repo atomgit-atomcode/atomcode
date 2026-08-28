@@ -386,6 +386,15 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Tab Next  ←→ Switch option  Space Toggle  ↵ Save  Esc Back".into(),
         Msg::ProviderPanelEffortLevelsHint =>
             "Space Enable/disable level ([✓] on · [ ] off)  Tab Next  Esc Back".into(),
+        Msg::SubagentStatusRunning => "running".into(),
+        Msg::SubagentStatusDone => "Done".into(),
+        Msg::SubagentStatusStopped => "Stopped".into(),
+        Msg::SubagentStatusFailed => "Failed".into(),
+        Msg::SubagentStatusWaiting => "waiting".into(),
+        Msg::SubagentGroupFinished { kind, done, total, failed } =>
+            format!("{kind} · {done}/{total} finished · {failed} failed").into(),
+        Msg::SubagentGroupRunning { kind, running, total } =>
+            format!("Running {running}/{total} {kind}…").into(),
         // ── Model picker ──
         Msg::ModelSwitched { provider, model } =>
             format!("  Switched to {provider} · {model} for this session\n").into(),
