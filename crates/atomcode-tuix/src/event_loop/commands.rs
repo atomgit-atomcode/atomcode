@@ -67,7 +67,7 @@ fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
 /// modal (or a "no rewind points" notice) via `install_pending_rewind_modal`.
 /// Idle-only: rewinding mutates conversation history, so it must not race a
 /// running turn (mirrors the double-Esc gate and `dispatch_undo`). Workspace/code
-/// Rewind is disabled in v5.0.5.
+/// Rewind is opt-in via `ATOMCODE_CODE_REWIND=1` (off by default).
 ///
 /// Subcommand: `/rewind purge` — deletes all `refs/atomcode/*` refs and runs
 /// `gc --prune=now`, clearing the shadow store. Reports store size before and
@@ -101,6 +101,14 @@ pub(super) fn dispatch_rewind(arg: &str, state: &UiState, ctx: &LoopCtx, rendere
 /// need to go through the async coding runtime.
 fn dispatch_rewind_purge(ctx: &LoopCtx, renderer: &mut dyn Renderer) {
     use atomcode_capabilities::session::WorkspaceCheckpoint;
+    if !atomcode_capabilities::session::rewind::code_rewind_opt_in() {
+        renderer.render(UiLine::CommandOutput(
+            "Code Rewind is off (set ATOMCODE_CODE_REWIND=1 to enable); nothing to purge."
+                .to_string(),
+        ));
+        renderer.flush();
+        return;
+    }
     let session_id = ctx.current_session.id.as_str();
     let cp = match WorkspaceCheckpoint::for_session(&ctx.working_dir, session_id) {
         Ok(cp) => cp,

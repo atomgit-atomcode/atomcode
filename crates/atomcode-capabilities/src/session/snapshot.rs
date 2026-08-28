@@ -643,10 +643,10 @@ impl SnapshotHook {
             } else {
                 self.replace_rewind_points_locked(&mut rewind, journal.previous_points)?;
                 if let Some(tree) = journal.recovery_tree.as_deref() {
-                    // v5.0.5 disables the live workspace backend, but an
-                    // interrupted v5.0.3 transaction may have already changed
-                    // files. Open its existing store only long enough to
-                    // compensate; never retain it for future turn capture.
+                    // Code Rewind is opt-in (default off), but an interrupted
+                    // prior transaction may have already changed files. Open its
+                    // existing store only long enough to compensate; never retain
+                    // it for future turn capture.
                     if let Some(checkpoint) = rewind.checkpoint.as_ref() {
                         checkpoint.compensate(tree, &journal.restored_files)?;
                         let _ = checkpoint.unpin_recovery_ref();

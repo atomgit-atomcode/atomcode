@@ -318,8 +318,8 @@ impl WorkspaceCheckpoint {
     }
 
     /// Open an already-existing v1 store only for crash recovery. This never
-    /// initializes a Git directory or publishes new checkpoint objects, so the
-    /// v5.0.5 safety stop remains in force for ordinary turns.
+    /// initializes a Git directory or publishes new checkpoint objects; the
+    /// opt-in flag gate for ordinary turns is unaffected.
     pub(crate) fn for_session_recovery(
         worktree: &Path,
         session_id: &str,
