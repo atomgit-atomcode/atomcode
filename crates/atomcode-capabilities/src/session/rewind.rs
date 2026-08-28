@@ -30,6 +30,9 @@ pub(crate) const TRANSACTION_VERSION: u32 = 1;
 /// Minimum free disk space (bytes) required before attempting a rewind capture.
 const DISK_FLOOR_BYTES: u64 = 2_000_000;
 
+/// Maximum size (bytes) of an individual file that will be included in a rewind snapshot.
+const MAX_SNAPSHOT_FILE_BYTES: u64 = 5 * 1024 * 1024;
+
 fn available_disk_bytes(path: &Path) -> Option<u64> {
     fs2::available_space(path).ok()
 }
@@ -674,6 +677,14 @@ impl WorkspaceCheckpoint {
         for path in tracked.into_iter().chain(untracked) {
             validate_relative_path(&path)?;
             if !is_sensitive_path(&path) {
+                if is_excluded_dir(&path) {
+                    continue;
+                }
+                let abs = self.worktree.join(&path);
+                if std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0) > MAX_SNAPSHOT_FILE_BYTES
+                {
+                    continue;
+                }
                 paths.push(path);
             }
         }
@@ -965,6 +976,20 @@ fn git_worktree_root(path: &Path) -> Result<PathBuf, WorkspaceCheckpointError> {
         path: PathBuf::from(root),
         source,
     })
+}
+
+fn is_excluded_dir(rel: &str) -> bool {
+    const EXCLUDED: &[&str] = &[
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        ".venv",
+        "__pycache__",
+        ".next",
+        ".cache",
+    ];
+    rel.split('/').any(|c| EXCLUDED.contains(&c))
 }
 
 fn is_sensitive_path(path: &str) -> bool {
@@ -1302,5 +1327,18 @@ mod alternates_tests {
             "alternates points at real objects: {contents}",
         );
         drop(cp);
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    #[test]
+    fn excludes_common_build_and_dep_dirs() {
+        assert!(is_excluded_dir("node_modules/react/index.js"));
+        assert!(is_excluded_dir("crate/target/debug/foo"));
+        assert!(is_excluded_dir(".venv/lib/x"));
+        assert!(!is_excluded_dir("src/main.rs"));
+        assert!(!is_excluded_dir("targeted/thing.rs")); // must match a full component, not substring
     }
 }
