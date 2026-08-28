@@ -27,6 +27,16 @@ const STORE_VERSION: &str = "atomcode-rewind-v1";
 pub(crate) const LEDGER_VERSION: u32 = 2;
 pub(crate) const TRANSACTION_VERSION: u32 = 1;
 
+/// Returns true if `ATOMCODE_CODE_REWIND` environment variable is set to one of
+/// the recognized opt-in values: "1", "true", "on", or "yes" (case-sensitive).
+/// Returns false if unset or set to any other value.
+pub fn code_rewind_opt_in() -> bool {
+    matches!(
+        std::env::var("ATOMCODE_CODE_REWIND").ok().as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
 /// Minimum free disk space (bytes) required before attempting a rewind capture.
 const DISK_FLOOR_BYTES: u64 = 2_000_000;
 
@@ -1385,6 +1395,19 @@ mod tests {
             result,
             Err(WorkspaceCheckpointError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn code_rewind_is_off_by_default_and_on_when_opted_in() {
+        let prev = std::env::var("ATOMCODE_CODE_REWIND").ok();
+        std::env::remove_var("ATOMCODE_CODE_REWIND");
+        assert!(!crate::session::rewind::code_rewind_opt_in());
+        std::env::set_var("ATOMCODE_CODE_REWIND", "1");
+        assert!(crate::session::rewind::code_rewind_opt_in());
+        match prev {
+            Some(v) => std::env::set_var("ATOMCODE_CODE_REWIND", v),
+            None => std::env::remove_var("ATOMCODE_CODE_REWIND"),
+        }
     }
 }
 
