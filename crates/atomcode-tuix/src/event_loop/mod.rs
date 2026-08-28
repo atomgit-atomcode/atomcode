@@ -17115,10 +17115,50 @@ fn shell_mode_hint(buf: &str) -> Option<(crate::i18n::Msg<'static>, crate::rende
     Some((msg, crate::render::HintSeverity::Shell))
 }
 
+/// A faint composer hint advertising a command's accepted arguments, shown while
+/// the buffer is JUST the command with no argument typed yet. `/worklog`'s example
+/// date is resolved from `today` (injected for testing) so it never looks stale
+/// and makes clear a bare `/worklog` means today. `None` otherwise.
+fn command_arg_hint_with(buf: &str, today: chrono::NaiveDate) -> Option<String> {
+    let rest = buf.trim_start().strip_prefix('/')?;
+    let (name, arg) = match rest.split_once(char::is_whitespace) {
+        Some((n, a)) => (n, a.trim()),
+        None => (rest, ""),
+    };
+    if name.eq_ignore_ascii_case("worklog") && arg.is_empty() {
+        return Some(format!(
+            "today | yesterday | {}",
+            today.format("%-m/%-d")
+        ));
+    }
+    None
+}
+
+fn command_arg_hint(buf: &str) -> Option<String> {
+    command_arg_hint_with(buf, chrono::Local::now().date_naive())
+}
+
 #[cfg(test)]
 mod bash_input_hint_tests {
-    use super::{bash_input_hint, shell_mode_hint};
+    use super::{bash_input_hint, command_arg_hint_with, shell_mode_hint};
     use crate::render::HintSeverity;
+
+    #[test]
+    fn worklog_arg_hint_shows_forms_with_todays_date_only_before_an_arg() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
+        // Bare command (and with the trailing space after menu selection) → hint
+        // advertising the accepted forms, with TODAY as the example date.
+        for buf in ["/worklog", "/worklog ", "/WorkLog"] {
+            let h = command_arg_hint_with(buf, today).expect("hint before arg");
+            assert!(h.contains("today") && h.contains("yesterday") && h.contains("8/28"), "{h}");
+        }
+        // Once an argument is present, the affordance disappears.
+        assert_eq!(command_arg_hint_with("/worklog 8/27", today), None);
+        assert_eq!(command_arg_hint_with("/worklog yesterday", today), None);
+        // Other commands / plain text get no worklog hint.
+        assert_eq!(command_arg_hint_with("/model", today), None);
+        assert_eq!(command_arg_hint_with("hello", today), None);
+    }
 
     // Resolve to (text, severity) — `Msg` has no PartialEq/Debug, so compare the
     // observable output instead (locale-agnostic: we assert bare ≠ runnable, not
@@ -17281,6 +17321,12 @@ fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mu
         let slot_is_free = status.hint.is_none();
         if slot_is_free {
             status.hint = Some((crate::i18n::t(msg).into_owned(), severity));
+        }
+    } else if status.hint.is_none() {
+        // Faint arg affordance for a bare arg-accepting command (e.g. `/worklog`),
+        // yielding to any higher-priority hint already in the slot.
+        if let Some(hint) = command_arg_hint(&buf.text) {
+            status.hint = Some((hint, crate::render::HintSeverity::Info));
         }
     }
     renderer.render(UiLine::InputPrompt {
@@ -22011,6 +22057,7 @@ fn subtask_progress_from_args(
                 activity: String::new(),
                 started_at: None,
                 finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: crate::render::SubtaskStatus::Pending,
             }
@@ -22130,6 +22177,14 @@ fn update_subtask_progress(
         .and_then(|tokens| tokens.parse::<u64>().ok())
     {
         item.output_tokens = item.output_tokens.max(tokens);
+    }
+    if let Some(tools) = parts
+        .iter()
+        .find_map(|part| part.strip_prefix("tools="))
+        .and_then(|tools| tools.parse::<u64>().ok())
+    {
+        // Monotonic: a reordered/late chunk can't lower the count.
+        item.tool_uses = item.tool_uses.max(tools);
     }
     let terminal_line = if matches!(
         status,
@@ -22392,6 +22447,7 @@ mod subtask_progress_projection_tests {
                     activity: "done".into(),
                     started_at: None,
                     finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 10,
                     status: SubtaskStatus::Completed,
                 }],

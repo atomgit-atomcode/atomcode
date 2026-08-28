@@ -918,6 +918,9 @@ pub struct SubtaskItem {
     /// members still run, and without this a finished row kept counting up.
     pub finished_at: Option<std::time::Instant>,
     pub output_tokens: u64,
+    /// Cumulative count of tool calls this member has started — the "N tool
+    /// uses" progress signal. Monotonic; a late/reordered event can't lower it.
+    pub tool_uses: u64,
     pub status: SubtaskStatus,
 }
 
@@ -1070,6 +1073,7 @@ mod tests {
             activity: String::new(),
             started_at: started,
             finished_at: finished,
+            tool_uses: 0,
             output_tokens: 0,
             status,
         }

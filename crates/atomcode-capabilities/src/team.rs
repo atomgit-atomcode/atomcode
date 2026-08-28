@@ -354,6 +354,9 @@ pub enum TeamEventPayload {
         /// subagent panel so both render a live token count consistently.
         #[serde(default)]
         output_tokens: u64,
+        /// Cumulative tool-call count so far — the "N tool uses" progress signal.
+        #[serde(default)]
+        tool_uses: u64,
     },
     MemberFinished {
         member_id: TeamMemberId,
@@ -578,6 +581,7 @@ mod tests {
                 member_id: TeamMemberId::new("architect#1"),
                 activity: "inspect runtime ownership".into(),
                 output_tokens: 128,
+                tool_uses: 4,
             },
         );
         let encoded = encode_team_event(&event).unwrap();

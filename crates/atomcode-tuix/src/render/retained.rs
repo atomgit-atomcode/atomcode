@@ -3585,10 +3585,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
         push_str_cells(
             &mut header,
             &format!(
-                " \u{b7} {finished}/{} finished \u{b7} {} running \u{b7} {pending} pending",
-                subtasks.total,
-                running.len(),
-                pending = pending_count
+                " \u{b7} {}",
+                crate::i18n::t(crate::i18n::Msg::SubtaskPanelCounts {
+                    finished,
+                    total: subtasks.total,
+                    running: running.len(),
+                    pending: pending_count,
+                })
             ),
             &detail,
         );
@@ -3599,14 +3602,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
             || pending_count > 0
             || running.len() > MAX_VISIBLE_RUNNING_SUBTASKS;
         let summary_rows = usize::from(needs_summary && cap >= rows.len() + 1);
+        // The footer is a TIGHT budget (a handful of rows). Unlike the unbounded
+        // scrollback `agent_group_rows`, going two-rows-per-child here would show
+        // FEWER concurrent subagents (a 2-row child halves the visible count and
+        // folds the rest into "N running"), which is worse for at-a-glance status.
+        // So the footer stays one row per running child, with the current action
+        // inline; the two-row connected layout lives in the scrollback view.
         let visible_running = running
             .len()
             .min(MAX_VISIBLE_RUNNING_SUBTASKS)
             .min(cap.saturating_sub(rows.len() + summary_rows));
         for item in running.iter().take(visible_running).copied() {
-            let glyph = "\u{25cf}";
             let glyph = if self.caps.unicode_symbols {
-                glyph
+                "\u{25cf}"
             } else {
                 "[>]"
             };
@@ -8444,6 +8452,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 if !item.model.is_empty() {
                     text.push_str(&format!(" \u{b7} {}", item.model));
                 }
+                if item.tool_uses > 0 {
+                    text.push_str(&format!(
+                        " \u{b7} {}",
+                        crate::i18n::t(crate::i18n::Msg::SubagentToolUses {
+                            count: item.tool_uses,
+                        })
+                    ));
+                }
                 let primary = if item.started_at.is_some() || item.output_tokens > 0 {
                     // `item.elapsed()` freezes once the item is terminal, so a done
                     // row stops ticking even while the live group keeps re-rendering.
@@ -10640,6 +10656,7 @@ mod tests {
                     activity: "running".into(),
                     started_at: None,
                     finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 0,
                     status: SubtaskStatus::Running,
                 })
@@ -14681,6 +14698,7 @@ mod tests {
                 activity: "analyzing".into(),
                 started_at: Some(std::time::Instant::now()),
                 finished_at: None,
+                tool_uses: 0,
                 output_tokens: 1000,
                 status: SubtaskStatus::Running,
             }],
@@ -19104,6 +19122,7 @@ mod tests {
                     activity: "completed".into(),
                     started_at: Some(std::time::Instant::now()),
                     finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 900,
                     status: SubtaskStatus::Completed,
                 },
@@ -19114,6 +19133,7 @@ mod tests {
                     activity: "reading files".into(),
                     started_at: Some(std::time::Instant::now()),
                     finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 420,
                     status: SubtaskStatus::Running,
                 },
@@ -19124,6 +19144,7 @@ mod tests {
                     activity: "thinking".into(),
                     started_at: Some(std::time::Instant::now()),
                     finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 210,
                     status: SubtaskStatus::Running,
                 },
@@ -19198,6 +19219,7 @@ mod tests {
                     activity: "已定位命令注册入口，正在核对补全与权限机制".into(),
                     started_at: Some(std::time::Instant::now()),
                     finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 12_345,
                     status: SubtaskStatus::Running,
                 })
@@ -19234,6 +19256,7 @@ mod tests {
             activity: String::new(),
             started_at: Some(std::time::Instant::now()),
             finished_at: None,
+            tool_uses: 0,
             output_tokens: 0,
             status: state,
         };
@@ -19283,6 +19306,7 @@ mod tests {
             activity: String::new(),
             started_at: None,
             finished_at: None,
+            tool_uses: 0,
             output_tokens: 0,
             status: state,
         };
@@ -19323,6 +19347,7 @@ mod tests {
             activity: "正在分析结果".into(),
             started_at: Some(std::time::Instant::now()),
             finished_at: None,
+            tool_uses: 0,
             output_tokens: 128,
             status: state,
         };
@@ -19370,6 +19395,7 @@ mod tests {
             activity: "working".into(),
             started_at: Some(std::time::Instant::now()),
             finished_at: None,
+            tool_uses: 0,
             output_tokens: 128,
             status: state,
         };
@@ -19416,6 +19442,7 @@ mod tests {
                     activity: "thinking".into(),
                     started_at: Some(std::time::Instant::now()),
                     finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 128,
                     status: SubtaskStatus::Running,
                 },
@@ -19426,6 +19453,7 @@ mod tests {
                     activity: "queued".into(),
                     started_at: None,
                     finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 0,
                     status: SubtaskStatus::Pending,
                 },
@@ -19562,6 +19590,7 @@ mod tests {
                     // Finished 90s after start — a LIVE recompute would read ~0s
                     // (the test just started), so `1m30s` proves the freeze.
                     finished_at: Some(start + Duration::from_secs(90)),
+                    tool_uses: 0,
                     output_tokens: 100,
                     status: SubtaskStatus::Completed,
                 },
@@ -19572,6 +19601,7 @@ mod tests {
                     activity: "running".into(),
                     started_at: Some(start),
                     finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 50,
                     status: SubtaskStatus::Running,
                 },
@@ -19608,6 +19638,7 @@ mod tests {
                 activity: label.into(),
                 started_at: None,
                 finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status,
             })
@@ -19651,6 +19682,7 @@ mod tests {
                 activity: "thinking".into(),
                 started_at: Some(std::time::Instant::now()),
                 finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19708,6 +19740,7 @@ mod tests {
                         activity: "thinking".into(),
                         started_at: None,
                         finished_at: None,
+                        tool_uses: 0,
                         output_tokens: 0,
                         status: SubtaskStatus::Running,
                     }],
@@ -19751,6 +19784,7 @@ mod tests {
                 activity: "thinking".into(),
                 started_at: None,
                 finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19792,6 +19826,7 @@ mod tests {
                 activity: "thinking".into(),
                 started_at: None,
                 finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19855,6 +19890,7 @@ mod tests {
                     activity: "thinking".into(),
                     started_at: Some(std::time::Instant::now()),
                     finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 0,
                     status: SubtaskStatus::Running,
                 })
@@ -19897,6 +19933,7 @@ mod tests {
                 activity: String::new(),
                 started_at: None,
                 finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Pending,
             }],
@@ -19935,6 +19972,7 @@ mod tests {
                 activity: "thinking".into(),
                 started_at: Some(std::time::Instant::now()),
                 finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19970,6 +20008,7 @@ mod tests {
                 activity: "thinking".into(),
                 started_at: Some(std::time::Instant::now()),
                 finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -20010,6 +20049,7 @@ mod tests {
                 activity: "waiting".into(),
                 started_at: Some(std::time::Instant::now()),
                 finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],

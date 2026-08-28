@@ -406,6 +406,17 @@ pub enum Msg<'a> {
     ProviderPanelModelFormHint,
     ProviderPanelEffortLevelsHint,
     // ── Subagent / task fan-out progress ──
+    /// Cumulative tool-call count on a member's primary row ("N tool uses").
+    SubagentToolUses {
+        count: u64,
+    },
+    /// Live footer panel header counts (`N/M finished · R running · P pending`).
+    SubtaskPanelCounts {
+        finished: usize,
+        total: usize,
+        running: usize,
+        pending: usize,
+    },
     /// Detail-row status words shown under a subagent/task member row.
     SubagentStatusRunning,
     SubagentStatusDone,

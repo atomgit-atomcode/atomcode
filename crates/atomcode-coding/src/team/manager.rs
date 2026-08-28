@@ -535,6 +535,9 @@ impl TeamRunManager {
                 member_id: member_id.clone(),
                 activity,
                 output_tokens,
+                // The Team runtime does not yet track per-member tool counts;
+                // the `task` fan-out path populates this. 0 here = "unknown".
+                tool_uses: 0,
             },
         );
     }

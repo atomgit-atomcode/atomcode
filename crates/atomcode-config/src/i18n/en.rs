@@ -386,6 +386,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "Tab Next  ←→ Switch option  Space Toggle  ↵ Save  Esc Back".into(),
         Msg::ProviderPanelEffortLevelsHint =>
             "Space Enable/disable level ([✓] on · [ ] off)  Tab Next  Esc Back".into(),
+        Msg::SubagentToolUses { count } => {
+            format!("{count} tool use{}", if count == 1 { "" } else { "s" }).into()
+        }
+        Msg::SubtaskPanelCounts { finished, total, running, pending } =>
+            format!("{finished}/{total} finished · {running} running · {pending} pending").into(),
         Msg::SubagentStatusRunning => "running".into(),
         Msg::SubagentStatusDone => "Done".into(),
         Msg::SubagentStatusStopped => "Stopped".into(),

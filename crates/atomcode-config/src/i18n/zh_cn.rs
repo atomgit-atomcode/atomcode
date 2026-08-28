@@ -368,6 +368,9 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "Tab 下一项  ←→ 切选项  空格切换  ↵ 保存  Esc 返回".into(),
         Msg::ProviderPanelEffortLevelsHint =>
             "空格 启用/禁用此档位（[✓] 启用 · [ ] 未启用）  Tab 下一项  Esc 返回".into(),
+        Msg::SubagentToolUses { count } => format!("{count} 次工具").into(),
+        Msg::SubtaskPanelCounts { finished, total, running, pending } =>
+            format!("{finished}/{total} 已完成 · {running} 运行中 · {pending} 排队").into(),
         Msg::SubagentStatusRunning => "运行中".into(),
         Msg::SubagentStatusDone => "完成".into(),
         Msg::SubagentStatusStopped => "已停止".into(),

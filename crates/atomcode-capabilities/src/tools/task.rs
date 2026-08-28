@@ -1266,6 +1266,9 @@ struct SubtaskLiveState {
     round_chars: usize,
     text_tail: String,
     active_tools: BTreeMap<String, String>,
+    /// Cumulative count of tool calls this subagent has started (the "N tool
+    /// uses" signal). Counts starts, not concurrent depth, so it only grows.
+    tool_uses: u64,
     last_emit: Option<std::time::Instant>,
 }
 
@@ -1328,6 +1331,7 @@ impl SubtaskProgressHook {
                 return;
             };
             live.active_tools.insert(call.id.clone(), summary.clone());
+            live.tool_uses = live.tool_uses.saturating_add(1);
             if live.active_tools.len() == 1 {
                 self.running_tool_label(&summary)
             } else if self.localized_zh {
@@ -1394,11 +1398,11 @@ impl SubtaskProgressHook {
             let tokens = live.total_tokens.saturating_add(estimated);
             (
                 format!(
-                    "{SUBAGENT_ACTIVITY_MARKER}{} \u{b7} {} \u{b7} tokens={}",
-                    self.label, live.activity, tokens
+                    "{SUBAGENT_ACTIVITY_MARKER}{} \u{b7} {} \u{b7} tokens={} \u{b7} tools={}",
+                    self.label, live.activity, tokens, live.tool_uses
                 ),
                 live.activity.clone(),
-                tokens,
+                (tokens, live.tool_uses),
             )
         };
         self.progress.emit(message);
@@ -1406,7 +1410,8 @@ impl SubtaskProgressHook {
             events.emit(crate::team::TeamEventPayload::MemberActivity {
                 member_id: self.member_id.clone(),
                 activity: event_activity,
-                output_tokens: event_tokens,
+                output_tokens: event_tokens.0,
+                tool_uses: event_tokens.1,
             });
         }
     }
