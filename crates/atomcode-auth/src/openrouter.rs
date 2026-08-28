@@ -169,34 +169,64 @@ impl LocalCallback {
 
     /// 阻塞等待浏览器命中回调,取 `code`。轮询 accept 以便 `cancel`/`timeout` 生效。
     /// `Ok(None)` = 取消或超时(不视为错误)。
+    ///
+    /// 无 code 的连接(浏览器预检、favicon 等)会收到一个响应但被跳过,循环继续等待真正
+    /// 带 code 的回调。慢连接建立后若 2s 内不发送请求,视为无效连接同样跳过。
     pub fn wait_for_code(
         self,
         timeout: Duration,
         cancel: &AtomicBool,
     ) -> Result<Option<String>> {
         let deadline = Instant::now() + timeout;
+        let success_body = "<html><body>已接入 OpenRouter,可关闭此页返回终端。</body></html>";
+        let waiting_body = "<html><body>等待授权中,请稍候...</body></html>";
         loop {
             if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
                 return Ok(None);
             }
             match self.listener.accept() {
                 Ok((mut stream, _)) => {
+                    // F1: 设置 read 超时,防止慢连接建立后迟迟不发请求时无限阻塞,
+                    // 使 cancel/deadline 轮询得以继续。
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+
                     let mut buf = [0u8; 2048];
-                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let n = match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => {
+                            // F1: 读超时(WouldBlock/TimedOut)或连接提前关闭 → 无效连接,
+                            // 丢弃并 continue 重新检查 cancel/deadline。
+                            continue;
+                        }
+                        Ok(n) => n,
+                    };
+
                     let text = String::from_utf8_lossy(&buf[..n]);
                     let first_line = text.lines().next().unwrap_or("");
                     let code = parse_code_from_request_line(first_line);
-                    // 回一页让用户知道可以关掉标签。
-                    let body = "<html><body>已接入 OpenRouter,可关闭此页返回终端。</body></html>";
+
+                    if let Some(ref c) = code {
+                        // 真正的回调:回成功页面,返回 code。
+                        let _ = stream.write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                success_body.as_bytes().len(),
+                                success_body,
+                            )
+                            .as_bytes(),
+                        );
+                        return Ok(Some(c.clone()));
+                    }
+
+                    // F2: 无 code(预检、favicon 等)→ 写一个响应后 continue,继续等待。
                     let _ = stream.write_all(
                         format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body.as_bytes().len(),
-                            body
+                            waiting_body.as_bytes().len(),
+                            waiting_body,
                         )
                         .as_bytes(),
                     );
-                    return Ok(code);
+                    // 继续外层循环,等待真正带 code 的回调。
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(50));
@@ -368,5 +398,40 @@ mod tests {
             .unwrap();
         h.join().unwrap();
         assert_eq!(code.as_deref(), Some("deadbeef"));
+    }
+
+    /// F2 回归:无 code 的请求(如浏览器预检 favicon)不应终止等待;
+    /// 第二个连接带真正 code 时才返回。
+    #[test]
+    fn no_code_request_is_skipped_real_code_returned() {
+        use std::io::Write;
+        use std::sync::atomic::AtomicBool;
+
+        let cb = start_local_callback().unwrap();
+        let port = cb.port();
+
+        // 后台线程:先发无 code 请求,短暂等待后发带 code 请求。
+        let h = std::thread::spawn(move || {
+            // 第一个连接:无 code(模拟 favicon 预检)。
+            let mut s1 = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s1.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+            drop(s1);
+
+            // 稍等,让 wait_for_code 处理完第一个连接并 continue。
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            // 第二个连接:带真正 code。
+            let mut s2 = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s2.write_all(b"GET /callback?code=realcode42 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+        });
+
+        let cancel = AtomicBool::new(false);
+        let code = cb
+            .wait_for_code(std::time::Duration::from_secs(5), &cancel)
+            .unwrap();
+        h.join().unwrap();
+        // 必须返回第二个连接的 code,不能因无 code 的第一个连接而提前返回 None。
+        assert_eq!(code.as_deref(), Some("realcode42"));
     }
 }
