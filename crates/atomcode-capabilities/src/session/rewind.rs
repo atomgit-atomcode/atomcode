@@ -27,6 +27,83 @@ const STORE_VERSION: &str = "atomcode-rewind-v1";
 pub(crate) const LEDGER_VERSION: u32 = 2;
 pub(crate) const TRANSACTION_VERSION: u32 = 1;
 
+/// Minimum free disk space (bytes) required before attempting a rewind capture.
+const DISK_FLOOR_BYTES: u64 = 2_000_000;
+
+fn available_disk_bytes(path: &Path) -> Option<u64> {
+    fs2::available_space(path).ok()
+}
+
+fn disk_floor_ok(available: Option<u64>, floor: u64) -> bool {
+    matches!(available, Some(a) if a >= floor)
+}
+
+fn dir_size_bytes(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if let Ok(md) = entry.metadata() {
+                total = total.saturating_add(md.len());
+            }
+        }
+    }
+    total
+}
+
+fn eviction_targets(
+    points_oldest_first: &[(u64, u64)],
+    current_store: u64,
+    incoming: u64,
+    budget: u64,
+) -> Vec<u64> {
+    if current_store.saturating_add(incoming) <= budget {
+        return Vec::new();
+    }
+    let mut freed = 0u64;
+    let mut out = Vec::new();
+    for (id, bytes) in points_oldest_first {
+        out.push(*id);
+        freed = freed.saturating_add(*bytes);
+        if current_store.saturating_sub(freed).saturating_add(incoming) <= budget {
+            break;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    #[test]
+    fn disk_floor_unknown_is_treated_as_below_floor() {
+        assert!(!disk_floor_ok(None, 2_000));          // unknown → skip (fail-safe)
+        assert!(!disk_floor_ok(Some(1_999), 2_000));   // below floor → skip
+        assert!(disk_floor_ok(Some(2_000), 2_000));    // exactly floor → ok
+        assert!(disk_floor_ok(Some(9_999), 2_000));
+    }
+    #[test]
+    fn eviction_frees_oldest_until_incoming_fits_budget() {
+        // store=90, incoming=30, budget=100 → must free >=20 → evict oldest (id 1 = 15, id 2 = 10) → 25 freed.
+        let pts = [(1u64, 15u64), (2, 10), (3, 40), (4, 25)]; // oldest first
+        let evict = eviction_targets(&pts, 90, 30, 100);
+        assert_eq!(evict, vec![1, 2]);
+    }
+    #[test]
+    fn eviction_empty_when_already_fits() {
+        assert!(eviction_targets(&[(1, 10)], 10, 5, 100).is_empty());
+    }
+    #[test]
+    fn eviction_returns_all_when_incoming_alone_exceeds_budget() {
+        // incoming (150) alone > budget (100): evict everything, capture will still be skipped by caller.
+        assert_eq!(eviction_targets(&[(1, 10), (2, 20)], 30, 150, 100), vec![1, 2]);
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RewindLedger {
     pub version: u32,
