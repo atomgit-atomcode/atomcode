@@ -10036,18 +10036,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 use openrouter_connect::OpenRouterConnectEvent;
                 match ev {
                     OpenRouterConnectEvent::Ready { api_key, models } => {
+                        let mut added_count = 0usize;
                         match ctx.config_store.update(|latest| {
-                            openrouter_connect::provision_openrouter(latest, &api_key, &models);
+                            let out = openrouter_connect::provision_openrouter(latest, &api_key, &models);
+                            added_count = out.added.len();
                             Ok(())
                         }) {
                             Ok(commit) => {
-                                let count = models.len();
-                                let default_model = commit
-                                    .snapshot
-                                    .config
-                                    .default_model
-                                    .clone()
-                                    .unwrap_or_default();
                                 apply_persisted_config(
                                     &mut ctx,
                                     commit.snapshot.config,
@@ -10055,7 +10050,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                                     renderer,
                                 );
                                 renderer.render(UiLine::CommandOutput(format!(
-                                    "已接入 OpenRouter,添加 {count} 个免费模型,已切到 {default_model}。/model 可切换。"
+                                    "已接入 OpenRouter,新增 {added_count} 个免费模型。/model 可切换。"
                                 )));
                                 renderer.flush();
                             }
@@ -10521,18 +10516,13 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 use openrouter_connect::OpenRouterConnectEvent;
                 match ev {
                     OpenRouterConnectEvent::Ready { api_key, models } => {
+                        let mut added_count = 0usize;
                         match ctx.config_store.update(|latest| {
-                            openrouter_connect::provision_openrouter(latest, &api_key, &models);
+                            let out = openrouter_connect::provision_openrouter(latest, &api_key, &models);
+                            added_count = out.added.len();
                             Ok(())
                         }) {
                             Ok(commit) => {
-                                let count = models.len();
-                                let default_model = commit
-                                    .snapshot
-                                    .config
-                                    .default_model
-                                    .clone()
-                                    .unwrap_or_default();
                                 apply_persisted_config(
                                     &mut ctx,
                                     commit.snapshot.config,
@@ -10540,7 +10530,7 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                                     renderer,
                                 );
                                 renderer.render(UiLine::CommandOutput(format!(
-                                    "已接入 OpenRouter,添加 {count} 个免费模型,已切到 {default_model}。/model 可切换。"
+                                    "已接入 OpenRouter,新增 {added_count} 个免费模型。/model 可切换。"
                                 )));
                                 renderer.flush();
                             }

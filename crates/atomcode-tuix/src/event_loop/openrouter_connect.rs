@@ -39,14 +39,14 @@ pub enum OpenRouterConnectEvent {
     Failed(String),
 }
 
-#[allow(dead_code)]
 pub struct ProvisionOutcome {
+    #[allow(dead_code)]
     pub account_id: String,
     pub added: Vec<String>,
+    #[allow(dead_code)]
     pub default_model: String,
 }
 
-#[allow(dead_code)]
 const FREE_MODEL_LIMIT: usize = 5;
 
 /// 后台线程:取 key(OAuth 或直传)+ 发现 top5 免费模型 → 发事件 + 唤醒循环。
@@ -66,7 +66,7 @@ pub fn spawn_openrouter_connect(
                 ConnectMode::Oauth => {
                     let pkce = or::generate_pkce();
                     let cb = or::start_local_callback().map_err(|e| format!("{e:#}"))?;
-                    let callback_url = format!("http://localhost:{}/callback", cb.port());
+                    let callback_url = format!("http://127.0.0.1:{}/callback", cb.port());
                     let auth_url = or::build_auth_url(Some(&callback_url), &pkce.challenge);
                     let _ = atomcode_auth::oauth::open_browser(&auth_url);
                     // 等最长 3 分钟;cancel 由 ESC 置位。
