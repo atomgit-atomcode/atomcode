@@ -33,6 +33,9 @@ const DISK_FLOOR_BYTES: u64 = 2_000_000;
 /// Maximum size (bytes) of an individual file that will be included in a rewind snapshot.
 const MAX_SNAPSHOT_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
+/// Maximum total size (bytes) of the rewind shadow Git store before eager gc is triggered.
+const STORE_BUDGET_BYTES: u64 = 500 * 1024 * 1024;
+
 fn available_disk_bytes(path: &Path) -> Option<u64> {
     fs2::available_space(path).ok()
 }
@@ -437,9 +440,37 @@ impl WorkspaceCheckpoint {
         &self.worktree
     }
 
-    pub fn capture(&self) -> Result<String, WorkspaceCheckpointError> {
+    pub fn capture(&self) -> Result<Option<String>, WorkspaceCheckpointError> {
+        self.capture_bounded(DISK_FLOOR_BYTES, STORE_BUDGET_BYTES)
+    }
+
+    pub(crate) fn capture_bounded(
+        &self,
+        floor: u64,
+        budget: u64,
+    ) -> Result<Option<String>, WorkspaceCheckpointError> {
+        // Invariant A: physical disk floor. Unknown free space → skip.
+        if !disk_floor_ok(available_disk_bytes(&self.git_dir), floor) {
+            return Ok(None);
+        }
+        // Invariant B: store must not exceed budget. Evict old objects first; if
+        // still over budget, skip rather than grow the store further.
+        let store_bytes = dir_size_bytes(&self.git_dir);
+        if store_bytes > budget {
+            let _ = self.gc_prune_now();
+            if dir_size_bytes(&self.git_dir) > budget {
+                return Ok(None);
+            }
+        }
         let _guard = self.guard();
-        self.with_process_lock(|| self.capture_locked())
+        let tree = self.with_process_lock(|| self.capture_locked())?;
+        Ok(Some(tree))
+    }
+
+    fn gc_prune_now(&self) -> Result<(), WorkspaceCheckpointError> {
+        // Best-effort: reclaim unreferenced objects immediately (not on a timer).
+        let _ = self.run(["gc", "--prune=now", "--quiet"]);
+        Ok(())
     }
 
     pub fn diff(
@@ -568,9 +599,11 @@ impl WorkspaceCheckpoint {
                 wanted.insert(after_ref);
             }
             let existing = self.run(["for-each-ref", "--format=%(refname)", "refs/atomcode/"])?;
+            let mut had_deletions = false;
             for reference in String::from_utf8_lossy(&existing.stdout).lines() {
                 if !reference.is_empty() && !wanted.contains(reference) {
                     updates.push(format!("delete {reference}\n"));
+                    had_deletions = true;
                 }
             }
             let mut transaction = String::new();
@@ -578,6 +611,12 @@ impl WorkspaceCheckpoint {
                 transaction.push_str(&update);
             }
             self.run_with_input(["update-ref", "--stdin"], transaction.as_bytes())?;
+            // Only run gc when we actually deleted refs; a gc that runs while a
+            // caller holds a loose recovery-tree object (not yet pinned by any ref)
+            // would prune it before crash-recovery can use it.
+            if had_deletions {
+                let _ = self.gc_prune_now();
+            }
             Ok(())
         })
     }
@@ -1166,10 +1205,10 @@ mod tests {
     #[test]
     fn captures_diff_and_restores_tracked_and_untracked_files() {
         let (worktree, _store, checkpoint) = fixture();
-        let before = checkpoint.capture().unwrap();
+        let before = checkpoint.capture().unwrap().unwrap();
         fs::write(worktree.path().join("tracked.txt"), "one\ntwo\n").unwrap();
         fs::write(worktree.path().join("new.txt"), "new\n").unwrap();
-        let after = checkpoint.capture().unwrap();
+        let after = checkpoint.capture().unwrap().unwrap();
 
         let diff = checkpoint.diff(&before, &after).unwrap();
         assert_eq!(diff.len(), 2);
@@ -1200,28 +1239,28 @@ mod tests {
     fn ignored_files_are_not_tracked() {
         let (worktree, _store, checkpoint) = fixture();
         fs::write(worktree.path().join(".gitignore"), "secret.txt\n").unwrap();
-        let before = checkpoint.capture().unwrap();
+        let before = checkpoint.capture().unwrap().unwrap();
         fs::write(worktree.path().join("secret.txt"), "secret\n").unwrap();
-        let after = checkpoint.capture().unwrap();
+        let after = checkpoint.capture().unwrap().unwrap();
         assert!(checkpoint.diff(&before, &after).unwrap().is_empty());
     }
 
     #[test]
     fn sensitive_files_are_not_persisted_even_when_unignored() {
         let (worktree, _store, checkpoint) = fixture();
-        let before = checkpoint.capture().unwrap();
+        let before = checkpoint.capture().unwrap().unwrap();
         fs::write(worktree.path().join(".env"), "TOKEN=secret\n").unwrap();
         fs::write(worktree.path().join("id_rsa"), "private\n").unwrap();
-        let after = checkpoint.capture().unwrap();
+        let after = checkpoint.capture().unwrap().unwrap();
         assert_eq!(before, after);
     }
 
     #[test]
     fn later_user_edit_fails_closed() {
         let (worktree, _store, checkpoint) = fixture();
-        let before = checkpoint.capture().unwrap();
+        let before = checkpoint.capture().unwrap().unwrap();
         fs::write(worktree.path().join("tracked.txt"), "agent\n").unwrap();
-        let after = checkpoint.capture().unwrap();
+        let after = checkpoint.capture().unwrap().unwrap();
         fs::write(worktree.path().join("tracked.txt"), "user\n").unwrap();
 
         let error = checkpoint.restore(&before, &after).unwrap_err();
@@ -1239,11 +1278,11 @@ mod tests {
     #[test]
     fn restores_the_cumulative_range_to_an_older_turn() {
         let (worktree, _store, checkpoint) = fixture();
-        let before_first = checkpoint.capture().unwrap();
+        let before_first = checkpoint.capture().unwrap().unwrap();
         fs::write(worktree.path().join("tracked.txt"), "first turn\n").unwrap();
-        let _after_first = checkpoint.capture().unwrap();
+        let _after_first = checkpoint.capture().unwrap().unwrap();
         fs::write(worktree.path().join("second.txt"), "second turn\n").unwrap();
-        let after_latest = checkpoint.capture().unwrap();
+        let after_latest = checkpoint.capture().unwrap().unwrap();
 
         checkpoint.restore(&before_first, &after_latest).unwrap();
         assert_eq!(
@@ -1256,9 +1295,9 @@ mod tests {
     #[test]
     fn retained_points_survive_git_gc() {
         let (worktree, _store, checkpoint) = fixture();
-        let before = checkpoint.capture().unwrap();
+        let before = checkpoint.capture().unwrap().unwrap();
         fs::write(worktree.path().join("tracked.txt"), "after\n").unwrap();
-        let after = checkpoint.capture().unwrap();
+        let after = checkpoint.capture().unwrap().unwrap();
         let point = RewindPoint {
             turn_id: 1,
             prompt_number: 1,
@@ -1340,5 +1379,56 @@ mod filter_tests {
         assert!(is_excluded_dir(".venv/lib/x"));
         assert!(!is_excluded_dir("src/main.rs"));
         assert!(!is_excluded_dir("targeted/thing.rs")); // must match a full component, not substring
+    }
+}
+
+#[cfg(test)]
+mod bounded_capture_tests {
+    use super::*;
+
+    /// Build a minimal git worktree + separate store directory; return both as
+    /// `PathBuf`s kept alive by the returned `TempDir`.
+    fn temp_git_workspace() -> (PathBuf, PathBuf, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("worktree");
+        let store = tmp.path().join("store").join("git");
+        fs::create_dir_all(&work).unwrap();
+        let git = |args: &[&str]| {
+            let out = git_command().arg("-C").arg(&work).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        fs::write(work.join("hello.txt"), "hello\n").unwrap();
+        git(&["add", "hello.txt"]);
+        git(&[
+            "-c", "user.name=AtomCode",
+            "-c", "user.email=atomcode@example.invalid",
+            "commit", "--quiet", "-m", "initial",
+        ]);
+        (work, store, tmp)
+    }
+
+    #[test]
+    fn capture_skips_when_disk_below_floor() {
+        let (work, store, _tmp) = temp_git_workspace();
+        let cp = WorkspaceCheckpoint::with_store(&work, &store).unwrap();
+        // An absurd floor forces the disk check to fail → Ok(None).
+        assert!(
+            cp.capture_bounded(u64::MAX, 0).unwrap().is_none(),
+            "floor=u64::MAX forces skip"
+        );
+    }
+
+    #[test]
+    fn capture_writes_a_tree_when_within_limits() {
+        let (work, store, _tmp) = temp_git_workspace();
+        let cp = WorkspaceCheckpoint::with_store(&work, &store).unwrap();
+        // floor=0 (always passes), budget=u64::MAX (never over) → Ok(Some(_)).
+        let tree = cp.capture_bounded(0, u64::MAX).unwrap();
+        assert!(tree.is_some(), "expected a tree id, got None");
     }
 }

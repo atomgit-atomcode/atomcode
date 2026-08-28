@@ -761,7 +761,8 @@ impl LifecycleHooks for SnapshotHook {
             Some(checkpoint) => tokio::task::spawn_blocking(move || checkpoint.capture())
                 .await
                 .ok()
-                .and_then(Result::ok),
+                .and_then(Result::ok)
+                .flatten(),
             None => None,
         };
         {
@@ -841,7 +842,7 @@ impl LifecycleHooks for SnapshotHook {
                 let workspace = match (pending.before_tree, checkpoint) {
                     (Some(before_tree), Some(checkpoint)) => {
                         tokio::task::spawn_blocking(move || {
-                            let after_tree = checkpoint.capture().ok()?;
+                            let after_tree = checkpoint.capture().ok()??;
                             let files = checkpoint.diff(&before_tree, &after_tree).ok()?;
                             Some((before_tree, after_tree, files))
                         })
@@ -1145,9 +1146,9 @@ mod tests {
         let checkpoint = Arc::new(
             WorkspaceCheckpoint::for_session(worktree.path(), "rewind-code-crash").unwrap(),
         );
-        let before = checkpoint.capture().unwrap();
+        let before = checkpoint.capture().unwrap().unwrap();
         std::fs::write(worktree.path().join("tracked.txt"), "after\n").unwrap();
-        let after = checkpoint.capture().unwrap();
+        let after = checkpoint.capture().unwrap().unwrap();
         let point = RewindPoint {
             before_tree: Some(before),
             after_tree: Some(after),
