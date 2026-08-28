@@ -404,6 +404,7 @@ pub enum Msg<'a> {
     ProviderPanelProviderFormHint,
     ProviderPanelAccountFormHint,
     ProviderPanelModelFormHint,
+    ProviderPanelEffortLevelsHint,
     // ── Model picker ──
     ModelSwitched {
         provider: &'a str,
@@ -843,6 +844,15 @@ pub enum Msg<'a> {
     McpClearedNoServers,
     McpToolsUsage,
     McpServersHeader,
+    /// `/mcp tools <name>` referenced a server key that is not configured.
+    /// `available` is the comma-joined list of real server keys (never empty —
+    /// the caller uses `McpNoServersConfigured` when nothing is configured).
+    McpUnknownServer {
+        name: &'a str,
+        available: &'a str,
+    },
+    /// `/mcp help` — the full list of `/mcp` subcommands.
+    McpHelp,
     /// Discoverability hint appended to `/mcp` status when one or more
     /// project-source servers are withheld because the project is untrusted.
     McpBlockedTrustHint {

@@ -3251,36 +3251,36 @@ fn execute_slash_command_impl(
                     return Ok(());
                 }
 
+                Some(McpSub::Help) => {
+                    renderer.render(UiLine::CommandOutput(t(Msg::McpHelp).into_owned()));
+                    renderer.flush();
+                    return Ok(());
+                }
+
                 Some(McpSub::Tools) => {
                     // `/mcp tools <server>`: list remote tool names for a connected server.
                     // This is intentionally separate from a global `/tools` so we keep the surface minimal.
-                    let server = sub.strip_prefix("tools").map(str::trim).unwrap_or("");
-                    if server.is_empty() {
+                    let args = sub.strip_prefix("tools").map(str::trim).unwrap_or("");
+                    let Some(server) = mcp_tools_server_arg(args) else {
+                        // Zero, or a stray extra arg (e.g. `/mcp tools rvs new-file`) →
+                        // arg-count error; reuse the usage hint.
                         renderer.render(UiLine::CommandOutput(t(Msg::McpToolsUsage).into_owned()));
                         renderer.flush();
                         return Ok(());
-                    }
+                    };
                     let result = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current()
                             .block_on(ctx.runtime.mcp_tools(server.to_string()))
                     });
                     match result {
-                        Ok(snapshot) => {
-                            let mut message = String::from("tools:\n");
-                            if snapshot.tools.is_empty() {
-                                match snapshot.status {
-                                    Some(status) => {
-                                        message.push_str(&format!("  (none — {status})\n"));
-                                    }
-                                    None => message.push_str("  (none — server not configured)\n"),
-                                }
-                            } else {
-                                for tool in snapshot.tools {
-                                    message.push_str(&format!("  - {tool}\n"));
-                                }
-                            }
-                            renderer.render(UiLine::CommandOutput(message.trim_end().to_string()));
-                        }
+                        Ok(snapshot) => renderer.render(UiLine::CommandOutput(
+                            format_mcp_tools_snapshot(
+                                server,
+                                &snapshot.tools,
+                                snapshot.status.as_ref(),
+                                &snapshot.available,
+                            ),
+                        )),
                         Err(error) => renderer.render(UiLine::Error(error.to_string())),
                     }
                     renderer.flush();
@@ -6433,6 +6433,7 @@ pub(crate) enum McpSub {
     Logout,
     Trust,
     Untrust,
+    Help,
 }
 
 /// Count servers withheld because the project is untrusted. Drives the
@@ -6453,6 +6454,49 @@ pub(crate) fn count_blocked_untrusted(
 
 /// Parse the argument string following `/mcp` into a known subcommand.
 /// Returns `None` for unrecognised inputs (which fall through to status display).
+/// Parse the argument list after `/mcp tools`: EXACTLY one whitespace token is a
+/// server key. Zero (missing) or more than one (a stray extra arg like
+/// `/mcp tools rvs new-file`) returns `None` so the caller shows the usage hint.
+pub(crate) fn mcp_tools_server_arg(args: &str) -> Option<&str> {
+    let mut it = args.split_whitespace();
+    match (it.next(), it.next()) {
+        (Some(server), None) => Some(server),
+        _ => None,
+    }
+}
+
+/// Render the `/mcp tools <server>` body from the runtime snapshot fields.
+/// - non-empty tools → the tool list;
+/// - empty + a known `status` → the server's connection status (configured, but
+///   currently exposing nothing: connecting / disconnected / failed / blocked);
+/// - empty + `status == None` → the key is NOT among the configured servers (a
+///   typo / wrong key), so name it and list the real keys — NOT "not configured"
+///   (which wrongly points the user at config/trust when the server IS connected).
+pub(crate) fn format_mcp_tools_snapshot(
+    server: &str,
+    tools: &[String],
+    status: Option<&atomcode_capabilities::mcp::ServerStatus>,
+    available: &[String],
+) -> String {
+    if !tools.is_empty() {
+        let mut message = String::from("tools:\n");
+        for tool in tools {
+            message.push_str(&format!("  - {tool}\n"));
+        }
+        return message.trim_end().to_string();
+    }
+    match status {
+        Some(status) => format!("tools:\n  (none — {status})"),
+        None if available.is_empty() => t(Msg::McpNoServersConfigured).trim_end().to_string(),
+        None => t(Msg::McpUnknownServer {
+            name: server,
+            available: &available.join(", "),
+        })
+        .trim_end()
+        .to_string(),
+    }
+}
+
 pub(crate) fn parse_mcp_subcommand(sub: &str) -> Option<McpSub> {
     let s = sub.trim();
     if s.eq_ignore_ascii_case("reload") {
@@ -6461,6 +6505,11 @@ pub(crate) fn parse_mcp_subcommand(sub: &str) -> Option<McpSub> {
         Some(McpSub::Trust)
     } else if s.eq_ignore_ascii_case("untrust") {
         Some(McpSub::Untrust)
+    } else if s.eq_ignore_ascii_case("help")
+        || s.eq_ignore_ascii_case("--help")
+        || s.eq_ignore_ascii_case("-h")
+    {
+        Some(McpSub::Help)
     } else if s.starts_with("tools") {
         Some(McpSub::Tools)
     } else if s.starts_with("login") {
@@ -9246,6 +9295,81 @@ mod mcp_subcommand_tests {
         assert!(parse_mcp_subcommand("").is_none());
         assert!(parse_mcp_subcommand("status").is_none());
         assert!(parse_mcp_subcommand("foobar").is_none());
+    }
+
+    #[test]
+    fn mcp_help_subcommand_recognized() {
+        // `/mcp help`, `--help`, `-h` all reach the help arm instead of falling
+        // through to the default status list.
+        for arg in ["help", "HELP", "--help", "-h"] {
+            assert!(
+                matches!(parse_mcp_subcommand(arg), Some(McpSub::Help)),
+                "{arg:?} should parse as Help"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_tools_arg_requires_exactly_one_token() {
+        use super::mcp_tools_server_arg;
+        assert_eq!(mcp_tools_server_arg("rvs"), Some("rvs"));
+        assert_eq!(mcp_tools_server_arg("  rvs  "), Some("rvs"));
+        // Missing → usage.
+        assert_eq!(mcp_tools_server_arg(""), None);
+        // Stray extra arg (the reported `/mcp tools rvs new-file`) → usage, NOT a
+        // bogus "rvs new-file" key that then reads as "not configured".
+        assert_eq!(mcp_tools_server_arg("rvs new-file"), None);
+    }
+
+    #[test]
+    fn mcp_tools_unknown_key_names_it_and_lists_available_not_not_configured() {
+        use super::format_mcp_tools_snapshot;
+        // Empty tools + status None = the key isn't among configured servers.
+        let out = format_mcp_tools_snapshot(
+            "rvs new-file",
+            &[],
+            None,
+            &["filesystem".to_string(), "rvs".to_string()],
+        );
+        assert!(out.contains("rvs new-file"), "names the bad key: {out:?}");
+        assert!(out.contains("filesystem") && out.contains("rvs"), "lists available: {out:?}");
+        assert!(
+            !out.contains("not configured") && !out.contains("未配置"),
+            "must NOT claim not-configured when servers exist: {out:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_tools_no_servers_configured_when_available_empty() {
+        use super::format_mcp_tools_snapshot;
+        let out = format_mcp_tools_snapshot("rvs", &[], None, &[]);
+        assert!(
+            out.contains("未配置") || out.contains("No MCP servers") || out.contains("no MCP"),
+            "empty available → not-configured message: {out:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_tools_known_server_with_no_tools_shows_status_not_unknown() {
+        use super::format_mcp_tools_snapshot;
+        use atomcode_capabilities::mcp::ServerStatus;
+        // Configured + connected but exposing zero tools: show the status, and do
+        // NOT misreport it as an unknown key.
+        let out = format_mcp_tools_snapshot("rvs", &[], Some(&ServerStatus::Connected), &["rvs".into()]);
+        assert!(out.contains("none"), "shows the (none — status) form: {out:?}");
+        assert!(!out.contains("未找到") && !out.contains("named"), "not an unknown-key message: {out:?}");
+    }
+
+    #[test]
+    fn mcp_tools_lists_tools_when_present() {
+        use super::format_mcp_tools_snapshot;
+        let out = format_mcp_tools_snapshot(
+            "rvs",
+            &["new-file".to_string(), "read".to_string()],
+            None,
+            &["rvs".into()],
+        );
+        assert!(out.contains("- new-file") && out.contains("- read"), "lists tools: {out:?}");
     }
 }
 

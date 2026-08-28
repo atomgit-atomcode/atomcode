@@ -186,6 +186,10 @@ pub struct McpToolsSnapshot {
     pub server: String,
     pub status: Option<atomcode_capabilities::mcp::ServerStatus>,
     pub tools: Vec<String>,
+    /// Every configured server key (sorted), so a caller can tell an UNKNOWN key
+    /// (`status == None`) apart from a configured-but-empty one and suggest the
+    /// real names — shell-style "not found → here's what exists".
+    pub available: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4213,17 +4217,19 @@ fn spawn_runtime_owner_with_optional_agent(
                             continue;
                         };
                         let tools = runtime.parts.mcp_tools_for_server(&server);
-                        let status = runtime
-                            .parts
-                            .mcp_statuses()
-                            .await
-                            .into_iter()
-                            .find_map(|(name, status)| (name == server).then_some(status));
+                        let statuses = runtime.parts.mcp_statuses().await;
+                        let status = statuses
+                            .iter()
+                            .find_map(|(name, status)| (*name == server).then(|| status.clone()));
+                        let mut available: Vec<String> =
+                            statuses.into_iter().map(|(name, _)| name).collect();
+                        available.sort();
                         let _ = done.send(Ok(McpToolsSnapshot {
                             generation: RuntimeGeneration(generation),
                             server,
                             status,
                             tools,
+                            available,
                         }));
                     }
                     Some(CodingRuntimeControl::WithdrawMcpTools {

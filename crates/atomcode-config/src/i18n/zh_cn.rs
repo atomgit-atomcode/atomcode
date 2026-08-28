@@ -366,6 +366,8 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelAccountFormHint => "Tab 切换  ↵ 保存  Esc 返回".into(),
         Msg::ProviderPanelModelFormHint =>
             "Tab 下一项  ←→ 切选项  空格切换  ↵ 保存  Esc 返回".into(),
+        Msg::ProviderPanelEffortLevelsHint =>
+            "空格 启用/禁用此档位（[✓] 启用 · [ ] 未启用）  Tab 下一项  Esc 返回".into(),
         // ── Model 选择器 ──
         Msg::ModelSwitched { provider, model } =>
             format!("  当前会话已切换到 {provider} · {model}\n").into(),
@@ -721,6 +723,18 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  用法：/mcp tools <服务器名>\n  示例：/mcp tools filesystem\n".into(),
         Msg::McpServersHeader =>
             "  MCP 服务器：\n".into(),
+        Msg::McpUnknownServer { name, available } =>
+            format!("  未找到名为 '{name}' 的 MCP 服务器 —— 可用：{available}\n").into(),
+        Msg::McpHelp =>
+            "  /mcp 用法：\n    \
+             /mcp                    列出已配置的 MCP 服务器及状态\n    \
+             /mcp tools <服务器名>    列出某个服务器的工具\n    \
+             /mcp reload             重新加载 MCP 配置\n    \
+             /mcp trust              信任本项目的 MCP 服务器\n    \
+             /mcp untrust            取消信任本项目的 MCP 服务器\n    \
+             /mcp login <服务器名>    对远程服务器进行 OAuth 登录\n    \
+             /mcp logout <服务器名>   注销 OAuth 登录\n    \
+             /mcp help               显示本帮助\n".into(),
         Msg::McpBlockedTrustHint { count } =>
             format!(
                 "  有 {count} 个服务器因本项目未被信任而被拦截。\n  运行 /mcp trust 可加载本项目的 MCP 服务器。\n"

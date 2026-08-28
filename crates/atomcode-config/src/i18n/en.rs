@@ -384,6 +384,8 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelAccountFormHint => "Tab Switch  ↵ Save  Esc Back".into(),
         Msg::ProviderPanelModelFormHint =>
             "Tab Next  ←→ Switch option  Space Toggle  ↵ Save  Esc Back".into(),
+        Msg::ProviderPanelEffortLevelsHint =>
+            "Space Enable/disable level ([✓] on · [ ] off)  Tab Next  Esc Back".into(),
         // ── Model picker ──
         Msg::ModelSwitched { provider, model } =>
             format!("  Switched to {provider} · {model} for this session\n").into(),
@@ -746,6 +748,18 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Usage: /mcp tools <server>\n  Example: /mcp tools filesystem\n".into(),
         Msg::McpServersHeader =>
             "  MCP Servers:\n".into(),
+        Msg::McpUnknownServer { name, available } =>
+            format!("  no MCP server named '{name}' — available: {available}\n").into(),
+        Msg::McpHelp =>
+            "  /mcp usage:\n    \
+             /mcp                 list configured MCP servers and status\n    \
+             /mcp tools <server>  list a server's tools\n    \
+             /mcp reload          reload MCP configuration\n    \
+             /mcp trust           trust this project's MCP servers\n    \
+             /mcp untrust         untrust this project's MCP servers\n    \
+             /mcp login <server>  OAuth-login to a remote server\n    \
+             /mcp logout <server> log out of OAuth\n    \
+             /mcp help            show this help\n".into(),
         Msg::McpBlockedTrustHint { count } =>
             format!(
                 "  {count} server(s) blocked because this project is untrusted.\n  Run /mcp trust to load this project's MCP servers.\n"
