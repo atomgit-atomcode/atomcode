@@ -450,21 +450,27 @@ impl WorkspaceCheckpoint {
         budget: u64,
     ) -> Result<Option<String>, WorkspaceCheckpointError> {
         // Invariant A: physical disk floor. Unknown free space → skip.
+        // This check is read-only and safe to perform outside the lock.
         if !disk_floor_ok(available_disk_bytes(&self.git_dir), floor) {
             return Ok(None);
         }
-        // Invariant B: store must not exceed budget. Evict old objects first; if
-        // still over budget, skip rather than grow the store further.
-        let store_bytes = dir_size_bytes(&self.git_dir);
-        if store_bytes > budget {
-            let _ = self.gc_prune_now();
-            if dir_size_bytes(&self.git_dir) > budget {
-                return Ok(None);
-            }
-        }
+        // Invariant B: store must not exceed budget. The size check AND any gc
+        // that evicts loose objects MUST run inside the process lock, at parity
+        // with retain_points — an unlocked gc could prune loose objects written
+        // by a concurrent capture_locked that has not yet pinned them with a ref.
         let _guard = self.guard();
-        let tree = self.with_process_lock(|| self.capture_locked())?;
-        Ok(Some(tree))
+        let tree = self.with_process_lock(|| {
+            let store_bytes = dir_size_bytes(&self.git_dir);
+            if store_bytes > budget {
+                let _ = self.gc_prune_now();
+                if dir_size_bytes(&self.git_dir) > budget {
+                    return Ok(None);
+                }
+            }
+            let tree = self.capture_locked()?;
+            Ok(Some(tree))
+        })?;
+        Ok(tree)
     }
 
     fn gc_prune_now(&self) -> Result<(), WorkspaceCheckpointError> {
@@ -517,6 +523,12 @@ impl WorkspaceCheckpoint {
 
     /// Capture and validate a restore without changing the worktree. The caller
     /// can durably persist the returned recovery tree before applying it.
+    ///
+    /// The recovery tree is immediately pinned at `refs/atomcode/recovery/current`
+    /// so that a `git gc --prune=now` running concurrently (e.g. from `retain_points`
+    /// evicting later-turn refs) cannot reclaim it before the transaction commits or
+    /// compensates. Call [`unpin_recovery_ref`](Self::unpin_recovery_ref) when the
+    /// transaction is finalised.
     pub(crate) fn prepare_restore(
         &self,
         before: &str,
@@ -525,6 +537,13 @@ impl WorkspaceCheckpoint {
         let _guard = self.guard();
         self.with_process_lock(|| {
             let recovery_tree = self.capture_locked()?;
+            // Pin the loose recovery tree with a ref so that any gc that runs between
+            // now and the transaction's commit/compensate cannot prune the object.
+            // retain_points excludes refs/atomcode/recovery/* from its deletion sweep.
+            self.run_with_input(
+                ["update-ref", "--stdin"],
+                format!("update refs/atomcode/recovery/current {recovery_tree}\n").as_bytes(),
+            )?;
             let files = self.changed_files_locked(before, after)?;
             let conflicts = self.conflicts_locked(after, &recovery_tree, &files)?;
             if !conflicts.is_empty() {
@@ -535,6 +554,29 @@ impl WorkspaceCheckpoint {
                 recovery_tree,
                 files,
             })
+        })
+    }
+
+    /// Drop the temporary recovery ref created by [`prepare_restore`](Self::prepare_restore).
+    ///
+    /// Call this when the durable transaction is committed or compensated so
+    /// subsequent gc runs can reclaim the (now unnecessary) recovery object.
+    pub(crate) fn unpin_recovery_ref(&self) -> Result<(), WorkspaceCheckpointError> {
+        let _guard = self.guard();
+        self.with_process_lock(|| {
+            // Enumerate all recovery refs and delete them; best-effort.
+            let existing =
+                self.run(["for-each-ref", "--format=%(refname)", "refs/atomcode/recovery/"])?;
+            let mut transaction = String::new();
+            for reference in String::from_utf8_lossy(&existing.stdout).lines() {
+                if !reference.is_empty() {
+                    transaction.push_str(&format!("delete {reference}\n"));
+                }
+            }
+            if !transaction.is_empty() {
+                self.run_with_input(["update-ref", "--stdin"], transaction.as_bytes())?;
+            }
+            Ok(())
         })
     }
 
@@ -601,10 +643,18 @@ impl WorkspaceCheckpoint {
             let existing = self.run(["for-each-ref", "--format=%(refname)", "refs/atomcode/"])?;
             let mut had_deletions = false;
             for reference in String::from_utf8_lossy(&existing.stdout).lines() {
-                if !reference.is_empty() && !wanted.contains(reference) {
-                    updates.push(format!("delete {reference}\n"));
-                    had_deletions = true;
+                if reference.is_empty() || wanted.contains(reference) {
+                    continue;
                 }
+                // Never delete the in-flight recovery ref: it pins the loose recovery
+                // tree written by prepare_restore between journal-save and commit/compensate.
+                // Pruning it would break crash recovery on the dangerous path where
+                // had_deletions is true (restoring an older turn drops later-turn refs).
+                if reference.starts_with("refs/atomcode/recovery/") {
+                    continue;
+                }
+                updates.push(format!("delete {reference}\n"));
+                had_deletions = true;
             }
             let mut transaction = String::new();
             for update in updates {
@@ -1430,5 +1480,87 @@ mod bounded_capture_tests {
         // floor=0 (always passes), budget=u64::MAX (never over) → Ok(Some(_)).
         let tree = cp.capture_bounded(0, u64::MAX).unwrap();
         assert!(tree.is_some(), "expected a tree id, got None");
+    }
+
+    /// Regression test for Finding 1: eager gc in retain_points must NOT prune
+    /// the loose recovery tree written by prepare_restore.
+    ///
+    /// The dangerous path:
+    ///   prepare_restore → capture_locked (loose recovery tree, no ref yet)
+    ///   → retain_points(&retained) deletes later-turn refs → had_deletions=true
+    ///   → gc --prune=now → recovery tree pruned (BUG: crash recovery broken)
+    ///
+    /// The fix: prepare_restore pins refs/atomcode/recovery/current; retain_points
+    /// excludes refs/atomcode/recovery/* from its deletion sweep.
+    #[test]
+    fn recovery_tree_survives_retain_points_gc() {
+        let (work, store, _tmp) = temp_git_workspace();
+        let cp = WorkspaceCheckpoint::with_store(&work, &store).unwrap();
+
+        // Capture state before any agent edits.
+        let before = cp.capture_bounded(0, u64::MAX).unwrap().expect("before");
+
+        // Simulate an agent edit.
+        fs::write(work.join("hello.txt"), "after\n").unwrap();
+        let after = cp.capture_bounded(0, u64::MAX).unwrap().expect("after");
+
+        // Create two rewind points in the shadow store so retain_points has refs to delete.
+        let point1 = RewindPoint {
+            turn_id: 1,
+            prompt_number: 1,
+            prompt_preview: "turn 1".into(),
+            before_tree: Some(before.clone()),
+            after_tree: Some(after.clone()),
+            files: vec![],
+        };
+        let point2 = RewindPoint {
+            turn_id: 2,
+            prompt_number: 2,
+            prompt_preview: "turn 2".into(),
+            before_tree: Some(after.clone()),
+            after_tree: Some(before.clone()),
+            files: vec![],
+        };
+        // Pin both points with refs so the objects are referenced.
+        cp.retain_points(&[point1.clone(), point2.clone()]).unwrap();
+
+        // prepare_restore captures a recovery tree and pins it at
+        // refs/atomcode/recovery/current (the fix under test).
+        let plan = cp.prepare_restore(&before, &after).unwrap();
+        let recovery_tree = plan.recovery_tree.clone();
+
+        // Now simulate begin_rewind calling retain_points(&retained) for the
+        // earlier subset only — this DELETES point2's refs (had_deletions=true)
+        // and triggers gc --prune=now.  Under the old bug the recovery tree
+        // (loose, no ref) would be pruned here.
+        cp.retain_points(&[point1.clone()]).unwrap();
+
+        // Assert: the recovery tree is still reachable in the shadow store.
+        let cat_file = git_command()
+            .arg("--git-dir")
+            .arg(&cp.git_dir)
+            .args(["cat-file", "-e", &recovery_tree])
+            .output()
+            .expect("git cat-file");
+        assert!(
+            cat_file.status.success(),
+            "recovery tree {recovery_tree} was pruned by retain_points gc — Finding 1 regression"
+        );
+
+        // Assert: compensate can still restore from the recovery tree.
+        // The recovery_tree was captured while hello.txt = "after\n" (the
+        // current state at the time prepare_restore ran), so compensating
+        // from it must produce "after\n" (not "hello\n").
+        let files = vec!["hello.txt".to_string()];
+        cp.compensate(&recovery_tree, &files)
+            .expect("compensate must succeed when recovery tree survives gc");
+        assert_eq!(
+            fs::read_to_string(work.join("hello.txt")).unwrap(),
+            "after\n",
+            "compensate restored wrong content"
+        );
+
+        // Cleanup: drop the recovery pin (mirrors commit/compensate_rewind).
+        cp.unpin_recovery_ref().unwrap();
     }
 }

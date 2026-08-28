@@ -441,6 +441,14 @@ impl SnapshotHook {
             committed: true,
         };
         self.save_rewind_transaction(&journal)?;
+        // Drop the temporary recovery ref that prepare_restore pinned: the
+        // transaction is committed so gc can reclaim the object if needed.
+        {
+            let rewind = self.rewind.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(checkpoint) = rewind.checkpoint.as_ref() {
+                let _ = checkpoint.unpin_recovery_ref();
+            }
+        }
         self.clear_rewind_transaction()
     }
 
@@ -461,6 +469,9 @@ impl SnapshotHook {
                 )
             })?;
             checkpoint.compensate(&workspace.recovery_tree, &workspace.restored_files)?;
+            // Drop the temporary recovery ref: workspace is restored so the object
+            // is no longer needed for crash recovery.
+            let _ = checkpoint.unpin_recovery_ref();
         }
         self.clear_rewind_transaction()
     }
@@ -595,6 +606,11 @@ impl SnapshotHook {
             });
             if journal.committed || conversation_committed {
                 self.replace_rewind_points_locked(&mut rewind, journal.retained_points)?;
+                // Transaction was committed — drop the recovery pin so gc can
+                // reclaim the object.
+                if let Some(checkpoint) = rewind.checkpoint.as_ref() {
+                    let _ = checkpoint.unpin_recovery_ref();
+                }
             } else {
                 self.replace_rewind_points_locked(&mut rewind, journal.previous_points)?;
                 if let Some(tree) = journal.recovery_tree.as_deref() {
@@ -604,12 +620,14 @@ impl SnapshotHook {
                     // compensate; never retain it for future turn capture.
                     if let Some(checkpoint) = rewind.checkpoint.as_ref() {
                         checkpoint.compensate(tree, &journal.restored_files)?;
+                        let _ = checkpoint.unpin_recovery_ref();
                     } else {
                         let checkpoint = WorkspaceCheckpoint::for_session_recovery(
                             std::path::Path::new(&self.working_dir),
                             &self.session_id,
                         )?;
                         checkpoint.compensate(tree, &journal.restored_files)?;
+                        let _ = checkpoint.unpin_recovery_ref();
                     }
                 }
             }
