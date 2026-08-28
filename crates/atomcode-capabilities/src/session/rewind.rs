@@ -474,6 +474,10 @@ impl WorkspaceCheckpoint {
             if store_bytes > budget {
                 let _ = self.gc_prune_now();
                 if dir_size_bytes(&self.git_dir) > budget {
+                    tracing::warn!(
+                        git_dir = %self.git_dir.display(),
+                        "code rewind capture skipped: store still over budget after gc"
+                    );
                     return Ok(None);
                 }
             }
@@ -481,6 +485,40 @@ impl WorkspaceCheckpoint {
             Ok(Some(tree))
         })?;
         Ok(tree)
+    }
+
+    /// Returns the total number of bytes consumed by the shadow Git store on disk.
+    ///
+    /// This is a best-effort recursive directory walk; it does not hold the
+    /// process lock, so the value is a snapshot that may be slightly stale when
+    /// gc is running concurrently.
+    pub fn store_size_bytes(&self) -> u64 {
+        dir_size_bytes(&self.git_dir)
+    }
+
+    /// Delete every `refs/atomcode/*` ref and run `gc --prune=now`, leaving the
+    /// shadow store empty.
+    ///
+    /// This is a user-initiated "clear all" operation.  Unlike [`retain_points`],
+    /// it deletes recovery refs too — the caller is explicitly requesting a full
+    /// wipe, so in-flight recovery protection does not apply.
+    pub fn purge(&self) -> Result<(), WorkspaceCheckpointError> {
+        let _guard = self.guard();
+        self.with_process_lock(|| {
+            let existing =
+                self.run(["for-each-ref", "--format=%(refname)", "refs/atomcode/"])?;
+            let mut transaction = String::new();
+            for reference in String::from_utf8_lossy(&existing.stdout).lines() {
+                if !reference.is_empty() {
+                    transaction.push_str(&format!("delete {reference}\n"));
+                }
+            }
+            if !transaction.is_empty() {
+                self.run_with_input(["update-ref", "--stdin"], transaction.as_bytes())?;
+            }
+            let _ = self.gc_prune_now();
+            Ok(())
+        })
     }
 
     fn gc_prune_now(&self) -> Result<(), WorkspaceCheckpointError> {
@@ -1594,5 +1632,44 @@ mod bounded_capture_tests {
 
         // Cleanup: drop the recovery pin (mirrors commit/compensate_rewind).
         cp.unpin_recovery_ref().unwrap();
+    }
+
+    #[test]
+    fn purge_empties_the_store_refs() {
+        let (work, store, _tmp) = temp_git_workspace();
+        let cp = WorkspaceCheckpoint::with_store(&work, &store).unwrap();
+        let tree = cp.capture_bounded(0, u64::MAX).unwrap().unwrap();
+        let point = RewindPoint {
+            turn_id: 1,
+            prompt_number: 1,
+            prompt_preview: "initial".into(),
+            before_tree: Some(tree.clone()),
+            after_tree: Some(tree.clone()),
+            files: vec![],
+        };
+        cp.retain_points(&[point]).unwrap();
+
+        // Verify at least one ref exists before purge.
+        let before = git_command()
+            .arg("--git-dir")
+            .arg(cp.git_dir_path())
+            .args(["for-each-ref", "--format=%(refname)", "refs/atomcode/"])
+            .output()
+            .expect("git for-each-ref before purge");
+        assert!(
+            !before.stdout.is_empty(),
+            "expected refs to exist before purge"
+        );
+
+        cp.purge().unwrap();
+
+        // After purge, no refs/atomcode/ refs must remain.
+        let after = git_command()
+            .arg("--git-dir")
+            .arg(cp.git_dir_path())
+            .args(["for-each-ref", "--format=%(refname)", "refs/atomcode/"])
+            .output()
+            .expect("git for-each-ref after purge");
+        assert!(after.stdout.is_empty(), "all rewind refs deleted after purge");
     }
 }

@@ -68,7 +68,15 @@ fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
 /// Idle-only: rewinding mutates conversation history, so it must not race a
 /// running turn (mirrors the double-Esc gate and `dispatch_undo`). Workspace/code
 /// Rewind is disabled in v5.0.5.
-pub(super) fn dispatch_rewind(state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+///
+/// Subcommand: `/rewind purge` — deletes all `refs/atomcode/*` refs and runs
+/// `gc --prune=now`, clearing the shadow store. Reports store size before and
+/// after. Works regardless of phase (no conversation mutation, read + delete only).
+pub(super) fn dispatch_rewind(arg: &str, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    if arg.trim() == "purge" {
+        dispatch_rewind_purge(ctx, renderer);
+        return;
+    }
     if state.phase != crate::state::UiPhase::Idle {
         renderer.render(UiLine::CommandOutput(t(Msg::CmdRewindBusy).into_owned()));
         renderer.flush();
@@ -83,6 +91,57 @@ pub(super) fn dispatch_rewind(state: &UiState, ctx: &LoopCtx, renderer: &mut dyn
             t(Msg::CmdRewindUnavailable)
         )));
         renderer.flush();
+    }
+}
+
+/// `/rewind purge`: clear all shadow-store refs and report freed bytes.
+///
+/// Constructs a `WorkspaceCheckpoint` for the current session directly — this
+/// is a pure file-system operation (no conversation mutation) so it does not
+/// need to go through the async coding runtime.
+fn dispatch_rewind_purge(ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    use atomcode_capabilities::session::WorkspaceCheckpoint;
+    let session_id = ctx.current_session.id.as_str();
+    let cp = match WorkspaceCheckpoint::for_session(&ctx.working_dir, session_id) {
+        Ok(cp) => cp,
+        Err(e) => {
+            renderer.render(UiLine::Error(format!("Code Rewind store unavailable: {e}")));
+            renderer.flush();
+            return;
+        }
+    };
+    let before_bytes = cp.store_size_bytes();
+    match cp.purge() {
+        Ok(()) => {
+            let after_bytes = cp.store_size_bytes();
+            renderer.render(UiLine::CommandOutput(format!(
+                "Code Rewind store purged: {} → {}",
+                format_store_bytes(before_bytes),
+                format_store_bytes(after_bytes),
+            )));
+        }
+        Err(e) => {
+            renderer.render(UiLine::Error(format!("Code Rewind purge failed: {e}")));
+        }
+    }
+    renderer.flush();
+}
+
+/// Format a byte count as a human-readable string (B / KB / MB / GB).
+fn format_store_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if bytes == 0 {
+        "0 B".to_string()
+    } else if bytes < KB {
+        format!("{bytes} B")
+    } else if bytes < MB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else if bytes < GB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
     }
 }
 
@@ -2028,7 +2087,7 @@ fn execute_slash_command_impl(
             dispatch_undo(arg, state, ctx, renderer);
         }
         "rewind" => {
-            dispatch_rewind(state, ctx, renderer);
+            dispatch_rewind(arg, state, ctx, renderer);
         }
         "usage" => {
             // Mid-turn (Streaming): keep a text snapshot in the footer directly
