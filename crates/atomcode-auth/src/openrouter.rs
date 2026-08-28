@@ -5,6 +5,10 @@ use anyhow::{Context as _, Result};
 use base64::Engine as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 pub const OPENROUTER_AUTH_URL: &str = "https://openrouter.ai/auth";
 pub const OPENROUTER_KEYS_URL: &str = "https://openrouter.ai/api/v1/auth/keys";
@@ -132,6 +136,77 @@ pub fn select_top_free_models(models_json: &str, limit: usize) -> Result<Vec<Fre
     Ok(free)
 }
 
+pub fn parse_code_from_request_line(line: &str) -> Option<String> {
+    // "GET /callback?code=XXX&foo=bar HTTP/1.1" → XXX
+    let target = line.split_whitespace().nth(1)?; // "/callback?code=..."
+    let query = target.split_once('?')?.1;
+    for pair in query.split('&') {
+        if let Some(v) = pair.strip_prefix("code=") {
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub struct LocalCallback {
+    listener: TcpListener,
+}
+
+pub fn start_local_callback() -> Result<LocalCallback> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind loopback callback port")?;
+    listener
+        .set_nonblocking(true)
+        .context("set callback listener non-blocking")?;
+    Ok(LocalCallback { listener })
+}
+
+impl LocalCallback {
+    pub fn port(&self) -> u16 {
+        self.listener.local_addr().map(|a| a.port()).unwrap_or(0)
+    }
+
+    /// 阻塞等待浏览器命中回调,取 `code`。轮询 accept 以便 `cancel`/`timeout` 生效。
+    /// `Ok(None)` = 取消或超时(不视为错误)。
+    pub fn wait_for_code(
+        self,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<Option<String>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                return Ok(None);
+            }
+            match self.listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let text = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = text.lines().next().unwrap_or("");
+                    let code = parse_code_from_request_line(first_line);
+                    // 回一页让用户知道可以关掉标签。
+                    let body = "<html><body>已接入 OpenRouter,可关闭此页返回终端。</body></html>";
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.as_bytes().len(),
+                            body
+                        )
+                        .as_bytes(),
+                    );
+                    return Ok(code);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => return Err(anyhow::Error::new(e).context("accept callback connection")),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +292,36 @@ mod tests {
     fn top_free_empty_when_none_free() {
         let json = r#"{"data":[{"id":"x/paid","context_length":9,"pricing":{"prompt":"0.01","completion":"0"}}]}"#;
         assert!(select_top_free_models(json, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn code_parsed_from_request_line() {
+        let line = "GET /callback?code=abc123&scope=x HTTP/1.1";
+        assert_eq!(parse_code_from_request_line(line).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn code_none_when_absent() {
+        assert_eq!(parse_code_from_request_line("GET /callback HTTP/1.1"), None);
+    }
+
+    #[test]
+    fn local_callback_receives_code_over_loopback() {
+        use std::io::Write;
+        use std::sync::atomic::AtomicBool;
+        let cb = start_local_callback().unwrap();
+        let port = cb.port();
+        // 后台线程模拟浏览器回调命中 127.0.0.1:<port>。
+        let h = std::thread::spawn(move || {
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.write_all(b"GET /callback?code=deadbeef HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+        });
+        let cancel = AtomicBool::new(false);
+        let code = cb
+            .wait_for_code(std::time::Duration::from_secs(3), &cancel)
+            .unwrap();
+        h.join().unwrap();
+        assert_eq!(code.as_deref(), Some("deadbeef"));
     }
 }
