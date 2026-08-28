@@ -627,6 +627,7 @@ impl WorkspaceCheckpoint {
             self.run(["config", "core.filemode", "true"])?;
             self.run(["config", "core.symlinks", "true"])?;
         }
+        self.write_alternates()?;
         let marker = self.git_dir.join("atomcode-rewind-version");
         if !marker.exists() {
             fs::write(&marker, STORE_VERSION).map_err(|source| WorkspaceCheckpointError::Io {
@@ -634,6 +635,34 @@ impl WorkspaceCheckpoint {
                 source,
             })?;
         }
+        Ok(())
+    }
+
+    fn write_alternates(&self) -> Result<(), WorkspaceCheckpointError> {
+        // Point the shadow store at the real repo's object database so capture
+        // stores only NEW blobs instead of duplicating the entire working tree.
+        // Skip silently for non-git worktrees (no baseline to share).
+        let real_git = self.worktree.join(".git");
+        let objects = if real_git.is_dir() {
+            real_git.join("objects")
+        } else {
+            return Ok(()); // worktree file (submodule/worktree) or non-repo: no alternates
+        };
+        let objects = match fs::canonicalize(&objects) {
+            Ok(p) => p,
+            Err(_) => return Ok(()), // real objects missing → do NOT full-copy silently; just no share
+        };
+        let info = self.git_dir.join("objects").join("info");
+        fs::create_dir_all(&info).map_err(|source| WorkspaceCheckpointError::Io {
+            path: info.clone(),
+            source,
+        })?;
+        let alternates = info.join("alternates");
+        let line = format!("{}\n", objects.to_string_lossy());
+        fs::write(&alternates, line).map_err(|source| WorkspaceCheckpointError::Io {
+            path: alternates,
+            source,
+        })?;
         Ok(())
     }
 
@@ -1233,5 +1262,45 @@ mod tests {
             result,
             Err(WorkspaceCheckpointError::Unsupported(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod alternates_tests {
+    use super::*;
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let output = git_command()
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn initialize_writes_alternates_to_real_objects_dir() {
+        let work_tmp = tempfile::tempdir().unwrap();
+        let work = work_tmp.path();
+        run_git(work, &["init", "--quiet"]);
+        fs::write(work.join("a.txt"), b"hi").unwrap();
+        run_git(work, &["add", "."]);
+        let store_tmp = tempfile::tempdir().unwrap();
+        let store = store_tmp.path().join("git");
+        let cp = WorkspaceCheckpoint::with_store(work, &store).unwrap();
+        let alt = store.join("objects/info/alternates");
+        let contents = fs::read_to_string(&alt).unwrap();
+        let real_objects = fs::canonicalize(work.join(".git/objects")).unwrap();
+        assert!(
+            contents.trim().ends_with(&*real_objects.to_string_lossy()),
+            "alternates points at real objects: {contents}",
+        );
+        drop(cp);
     }
 }
