@@ -179,7 +179,7 @@ const BUILTIN_COMMANDS: &[Command] = &[
     // including self-integrated ones the gateway-only `/usage` modal can't see.
     Command { name: "cost",    desc: "Show this session's token usage (any model)", needs_args: false, hidden: false, acp: true },
     Command { name: "context", desc: "Show context budget breakdown", needs_args: false, hidden: false, acp: true },
-    Command { name: "worklog", desc: "Daily work recap across all projects (/worklog [today|yesterday|8/27])", needs_args: false, hidden: false, acp: false },
+    Command { name: "worklog", desc: "Daily work recap across all projects (/worklog [today|yesterday|M/D])", needs_args: true, hidden: false, acp: false },
     Command { name: "compact", desc: "Compact conversation history", needs_args: false, hidden: false, acp: true },
     Command { name: "remember", desc: "Save a fact to memory (/remember --global for global)", needs_args: true, hidden: false, acp: false },
     Command { name: "forget", desc: "Remove matching memories", needs_args: true, hidden: false, acp: false },

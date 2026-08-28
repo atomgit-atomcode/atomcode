@@ -280,17 +280,19 @@ pub fn build_worklog_prompt(date_label: &str, turns: &[WorklogTurn], english: bo
 
 const INSTRUCTION_ZH: &str = "\
 以下是这一天（跨所有项目）从 AtomCode 会话记录里确定性提取的工作痕迹。请据此生成一张 Markdown 表格,列为:\n\
-`工作内容` | `时长` | `问题与评价`。要求:\n\
+`序号` | `工作内容` | `时长` | `问题与评价`。要求:\n\
+- 序号:从 1 开始递增。\n\
 - 工作内容:按主题归并同类轮次(可跨项目/会话),用简洁的动宾短语,合并重复。\n\
 - 时长:填我给出的每项聚合时长(标了 ≈ 的是 agent 活跃墙钟,是工作量的近似、非真实工时;\
 带「含等待/挂起」的更不可信)。用户会手改成真实工时,你照原样填即可、不要自己编。\n\
 - 问题与评价:根据当天出现的报错/取消/反复重试,提炼遇到的问题与简短评价;没有则留「—」。\n\
-只输出表格,不要额外解释。\n";
+先用一句话概括这一天的整体工作(以「今日小结:」开头),空一行,再输出表格。除此之外不要多余解释。\n";
 
 const INSTRUCTION_EN: &str = "\
 Below is a deterministic extract of this day's activity (across all projects) from AtomCode's \
-session records. Produce ONE Markdown table with columns: `Work item` | `Time` | `Issues & notes`. \
+session records. Produce ONE Markdown table with columns: `#` | `Work item` | `Time` | `Issues & notes`. \
 Rules:\n\
+- #: sequential number starting at 1.\n\
 - Work item: merge related turns by topic (across projects/sessions) into concise action phrases; \
 deduplicate.\n\
 - Time: fill in the aggregated duration I give per item (a `≈` value is agent-active wall-clock — \
@@ -298,7 +300,8 @@ an approximation of effort, NOT real work time; `(incl. wait/hang)` is even less
 will hand-edit these to real hours, so copy them as-is; do NOT invent times.\n\
 - Issues & notes: from the day's errors/cancellations/retries, summarize problems and a brief \
 assessment; use `—` when none.\n\
-Output only the table, no extra prose.\n";
+First write a one-sentence overview of the day (start it with \"Summary:\"), then a blank line, \
+then the table. No other prose.\n";
 
 /// Collapse to a single trimmed line, truncated to `max` chars with an ellipsis.
 fn one_line(s: &str, max: usize) -> String {
