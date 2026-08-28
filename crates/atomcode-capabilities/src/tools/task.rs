@@ -435,8 +435,6 @@ fn subagent_child_middlewares_with_policy(
     if is_worker {
         mw.extend(inherited_worker_middlewares.iter().cloned());
     }
-    #[cfg(feature = "atomgit")]
-    mw.push(Arc::new(super::AtomgitBashGate::new()));
     if is_worker || (confine_reads && !scope.is_empty()) {
         let gate = if confine_reads {
             WorkerScopeGate::new_with_read_policy(scope, working_dir, true)
@@ -3090,9 +3088,6 @@ mod tests {
     fn child_middlewares_add_the_scope_gate_only_for_workers() {
         use super::{subagent_child_middlewares, DenySensitivePaths};
         use std::path::Path;
-        #[cfg(feature = "atomgit")]
-        let base = 3; // DenySensitivePaths + CredentialBashGate + AtomgitBashGate.
-        #[cfg(not(feature = "atomgit"))]
         let base = 2; // DenySensitivePaths + CredentialBashGate.
         assert_eq!(
             subagent_child_middlewares(false, &[], Path::new("/w"), &[]).len(),
@@ -3120,10 +3115,7 @@ mod tests {
     fn team_middlewares_scope_explore_only_when_scope_is_declared() {
         use super::team_child_middlewares;
         use std::path::Path;
-        #[cfg(feature = "atomgit")]
-        let base = 3;
-        #[cfg(not(feature = "atomgit"))]
-        let base = 2;
+        let base = 2; // DenySensitivePaths + CredentialBashGate.
         assert_eq!(team_child_middlewares(false, &[], Path::new("/w"), &[]).len(), base);
         assert_eq!(
             team_child_middlewares(false, &["src/**".into()], Path::new("/w"), &[]).len(),

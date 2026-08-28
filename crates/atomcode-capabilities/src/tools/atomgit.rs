@@ -509,7 +509,8 @@ fn validate_api_path(path: &str) -> Result<(), String> {
 /// `atomgit_api` — credential-safe passthrough for AtomGit REST endpoints that
 /// have no dedicated typed tool. The bearer token is injected by the client, so
 /// it never appears in model-visible arguments (unlike a raw `bash`/`curl` call,
-/// which the `AtomgitBashGate` blocks for exactly that reason).
+/// where the model would have to pass the credential through the shell itself —
+/// which `CredentialBashGate` blocks).
 pub struct AtomgitApiTool {
     client: Arc<AtomgitClient>,
 }

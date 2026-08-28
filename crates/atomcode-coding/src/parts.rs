@@ -1739,14 +1739,11 @@ pub fn assemble(
         .middleware(Arc::new(SensitivePathGate::with_store(
             parts.sensitive_path_grants.clone(),
         )));
-    #[cfg(feature = "atomgit")]
-    {
-        // Typed AtomGit tools are the only supported API path: they keep credentials
-        // outside model-visible arguments and retain action-aware approval semantics.
-        builder = builder.middleware(Arc::new(
-            atomcode_capabilities::tools::AtomgitBashGate::new(),
-        ));
-    }
+    // NOTE: raw AtomGit API calls through bash are intentionally NOT blocked —
+    // read-only/public queries are legitimate, and credential exposure (the real
+    // risk) is already caught by CredentialBashGate above (its `*_token` detection
+    // covers `$ATOMGIT_TOKEN`). The typed AtomGit tools remain available and are
+    // steered by the persona for credential-bearing / write operations.
     // CC external hooks (PreToolUse gate). Runs AFTER the hard PlanMode/SensitivePath gates
     // (which must stay un-bypassable by a hook `allow`) but BEFORE every auto-approve
     // convenience gate — OpenFileWorkspaceGate and especially WriteApprovalGate, which

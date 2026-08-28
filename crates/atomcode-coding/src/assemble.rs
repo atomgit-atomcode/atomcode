@@ -127,10 +127,6 @@ fn build_coding_agent_from_tools(
         .middleware(Arc::new(
             atomcode_capabilities::tools::CredentialBashGate::new(cfg.credential_shell_policy),
         ));
-    #[cfg(feature = "atomgit")]
-    let builder = builder.middleware(Arc::new(
-        atomcode_capabilities::tools::AtomgitBashGate::new(),
-    ));
     let mut builder = builder
         // Auto-approve in-workspace open_file (it's Risky → would otherwise prompt on every
         // preview). This path pins an immutable working_dir, so the gate pins the same root.
