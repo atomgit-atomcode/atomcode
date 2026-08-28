@@ -14143,7 +14143,7 @@ mod tests {
         assert!(catalog
             .code_unavailable
             .as_deref()
-            .is_some_and(|reason| reason.contains("temporarily disabled")));
+            .is_some_and(|reason| reason.contains("ATOMCODE_CODE_REWIND")));
 
         let code_error = runtime
             .handle

@@ -123,7 +123,8 @@ struct PendingRewindPoint {
 }
 
 const CODE_REWIND_DISABLED_REASON: &str =
-    "Code Rewind is temporarily disabled in v5.0.5 to protect disk space; conversation Rewind remains available.";
+    "Code Rewind (workspace file restore) is off by default to protect disk space; \
+     set ATOMCODE_CODE_REWIND=1 to opt in. Conversation Rewind remains available.";
 
 #[derive(Clone, Debug)]
 pub struct RewindTransactionReceipt {
@@ -161,12 +162,23 @@ impl SnapshotHook {
     ) -> Self {
         let session_id = session_id.into();
         let working_dir = working_dir.into();
-        // v5.0.5 safety stop: the per-session shadow Git store could grow without
-        // a quota or object collection and exhaust the system disk. Keep the
-        // conversation checkpoint ledger active, but do not initialize or write
-        // a workspace object database until the bounded shared-store design lands.
-        let checkpoint = None;
-        let unavailable = Some(CODE_REWIND_DISABLED_REASON.to_string());
+        // Code Rewind is off by default.  When the user opts in via
+        // ATOMCODE_CODE_REWIND=1 we construct the bounded workspace checkpoint
+        // whose store lives under $ATOMCODE_HOME/rewind/<bucket>/<session_id> —
+        // NOT inside the worktree or on a hard-coded C: path.
+        let (checkpoint, unavailable) = if crate::session::rewind::code_rewind_opt_in() {
+            match WorkspaceCheckpoint::for_session(
+                std::path::Path::new(&working_dir),
+                &session_id,
+            ) {
+                Ok(cp) => (Some(Arc::new(cp)), None),
+                Err(e) => (None, Some(format!(
+                    "Code Rewind unavailable (ATOMCODE_CODE_REWIND=1 is set but setup failed): {e}"
+                ))),
+            }
+        } else {
+            (None, Some(CODE_REWIND_DISABLED_REASON.to_string()))
+        };
         let points = mgr
             .load_rewind_ledger(&session_id)
             .map(|ledger| ledger.points)
@@ -1160,7 +1172,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(atomcode_code_rewind_env)]
     fn pending_code_rewind_restores_workspace_after_interrupted_transaction() {
+        // Ensure Code Rewind is off so the recovered hook reports unavailable.
+        let prev = std::env::var("ATOMCODE_CODE_REWIND").ok();
+        std::env::remove_var("ATOMCODE_CODE_REWIND");
         let worktree = tempfile::tempdir().unwrap();
         git(worktree.path(), &["init", "--quiet"]);
         std::fs::write(worktree.path().join("tracked.txt"), "before\n").unwrap();
@@ -1240,13 +1256,17 @@ mod tests {
         assert_eq!(recovered.rewind_points(), vec![point]);
         assert!(recovered
             .code_rewind_unavailable()
-            .is_some_and(|reason| reason.contains("temporarily disabled")));
+            .is_some_and(|reason| reason.contains("ATOMCODE_CODE_REWIND")));
         assert!(recovered
             .rewind
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .checkpoint
             .is_none());
+        match prev {
+            Some(v) => std::env::set_var("ATOMCODE_CODE_REWIND", v),
+            None => std::env::remove_var("ATOMCODE_CODE_REWIND"),
+        }
     }
 
     /// Assert that the recovery ref (`refs/atomcode/recovery/current`) is pinned
@@ -2085,7 +2105,7 @@ mod tests {
         assert!(points[0].files.is_empty());
         assert!(hook
             .code_rewind_unavailable()
-            .is_some_and(|reason| reason.contains("temporarily disabled")));
+            .is_some_and(|reason| reason.contains("ATOMCODE_CODE_REWIND")));
         assert_eq!(
             manager
                 .load_rewind_ledger("conversation-rewind")
@@ -2108,6 +2128,66 @@ mod tests {
         assert!(
             manager.has_inflight_snapshot("inflight-save-failure"),
             "the recovery checkpoint must survive a failed canonical save"
+        );
+    }
+
+    /// Build a SnapshotHook over a real git worktree so the Code Rewind
+    /// opt-in path (which calls `WorkspaceCheckpoint::for_session`) succeeds.
+    fn make_test_hook_with_worktree(
+        id: &str,
+    ) -> (SnapshotHook, Arc<SessionManager>, tempfile::TempDir, tempfile::TempDir) {
+        let worktree = tempfile::tempdir().unwrap();
+        git(worktree.path(), &["init", "--quiet"]);
+        // A bare init has no commits; for_session only needs a valid git dir.
+        let store_dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(SessionManager::with_root(store_dir.path()));
+        let hook = SnapshotHook::new(
+            mgr.clone(),
+            id,
+            worktree.path().to_string_lossy(),
+        );
+        (hook, mgr, worktree, store_dir)
+    }
+
+    #[test]
+    #[serial_test::serial(atomcode_code_rewind_env)]
+    fn snapshot_hook_keeps_code_rewind_off_by_default() {
+        let prev = std::env::var("ATOMCODE_CODE_REWIND").ok();
+        std::env::remove_var("ATOMCODE_CODE_REWIND");
+        let (hook, _mgr, _worktree, _store) =
+            make_test_hook_with_worktree("hook-default-off");
+        assert!(
+            hook.code_rewind_unavailable().is_some(),
+            "Code Rewind must be unavailable when ATOMCODE_CODE_REWIND is unset"
+        );
+        match prev {
+            Some(v) => std::env::set_var("ATOMCODE_CODE_REWIND", v),
+            None => std::env::remove_var("ATOMCODE_CODE_REWIND"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(atomcode_code_rewind_env)]
+    fn snapshot_hook_enables_code_rewind_when_opted_in_and_bounded_store_builds() {
+        let prev = std::env::var("ATOMCODE_CODE_REWIND").ok();
+        std::env::set_var("ATOMCODE_CODE_REWIND", "1");
+        let (hook, _mgr, _worktree, _store) =
+            make_test_hook_with_worktree("hook-opted-in");
+        assert!(
+            hook.code_rewind_unavailable().is_none(),
+            "Code Rewind must be available when ATOMCODE_CODE_REWIND=1 and worktree is valid"
+        );
+        match prev {
+            Some(v) => std::env::set_var("ATOMCODE_CODE_REWIND", v),
+            None => std::env::remove_var("ATOMCODE_CODE_REWIND"),
+        }
+    }
+
+    #[test]
+    fn disabled_reason_does_not_pin_a_stale_version() {
+        assert!(
+            !CODE_REWIND_DISABLED_REASON.contains("v5.0.5"),
+            "CODE_REWIND_DISABLED_REASON must not contain a stale version string"
         );
     }
 }
