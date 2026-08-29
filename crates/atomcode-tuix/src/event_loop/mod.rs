@@ -24025,15 +24025,15 @@ fn handle_runtime_event(
                 CodingRuntimeEvent::ContextStatsRefreshed(result) => {
                     match result {
                         Ok(stats) => {
-                            state.on_context_stats(
-                                0,
+                            // Gauge-only: update live occupancy + window, but PRESERVE
+                            // the fine-grained breakdown (system/tool/cold/message
+                            // counts) from the last rich emission — the runtime refresh
+                            // does not carry them, and feeding 0s here used to zero out
+                            // "Messages in window" the moment the user ran /context.
+                            state.on_context_gauge_refresh(
                                 stats.used_tokens as usize,
-                                0,
-                                0,
-                                0,
                                 stats.context_window as usize,
                                 "coding-runtime",
-                                "",
                             );
                             if let Some(show_prompt) = state.pending_context_render.take() {
                                 renderer.render(UiLine::CommandOutput(

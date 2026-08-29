@@ -1678,6 +1678,38 @@ impl UiState {
         }
     }
 
+    /// Gauge-only refresh for `/context`'s `RefreshContextStats` round-trip.
+    ///
+    /// The runtime's `RuntimeContextStats` carries ONLY live occupancy + window;
+    /// it has no fine-grained breakdown (system/tool/cold/message counts). The
+    /// old path fed those as hardcoded `0` through the rich `on_context_stats`
+    /// arm, which unconditionally overwrote them — so running `/context` zeroed
+    /// out "Messages in window" (and the system/tool/cold buckets) whenever the
+    /// last emission was a failed (over-length) turn that never produced a rich
+    /// `AgentEvent::ContextStats`. Here we update the gauge (and window/ctx-name)
+    /// and PRESERVE the breakdown from the last real rich emission.
+    pub fn on_context_gauge_refresh(
+        &mut self,
+        sent_tokens: usize,
+        ctx_window: usize,
+        ctx_name: &str,
+    ) {
+        let snap = self
+            .last_context
+            .get_or_insert_with(ContextSnapshot::default);
+        // Same guard as the rich arm: a genuine turn always sends `sent > 0`, and
+        // a post-compaction gauge must not be re-inflated by a stale round-trip.
+        if sent_tokens > 0 && self.post_compaction_used_tokens.is_none() {
+            snap.sent_tokens = sent_tokens;
+        }
+        if ctx_window > 0 {
+            snap.ctx_window = ctx_window;
+        }
+        if !ctx_name.is_empty() {
+            snap.ctx_name = ctx_name.to_string();
+        }
+    }
+
     /// Rehydrate the context gauge for the session being replayed, from its
     /// persisted last-turn usage (`TurnStat.used_tokens` / `ctx_window`).
     /// `replay_session` re-renders the transcript but never sees live
@@ -2461,11 +2493,29 @@ mod tests {
         // "unknown" 0 must not wipe the value restored from the persisted session.
         let mut s = UiState::new();
         s.restore_context(42_000, 200_000);
-        // Simulate the RefreshContextStats reply (rich: window > 0, sent = 0).
-        s.on_context_stats(0, 0, 0, 0, 0, 200_000, "engine-v2", "");
+        // Simulate the RefreshContextStats reply (window > 0, sent = 0).
+        s.on_context_gauge_refresh(0, 200_000, "engine-v2");
         let snap = s.last_context.as_ref().unwrap();
         assert_eq!(snap.sent_tokens, 42_000, "restored occupancy preserved");
         assert_eq!(snap.ctx_window, 200_000);
+    }
+
+    #[test]
+    fn gauge_refresh_preserves_message_breakdown() {
+        // Regression: `/context` after a run of FAILED (over-length) turns used to
+        // show "Messages in window: 0" because RefreshContextStats fed 0 through
+        // the rich arm, clobbering the count the last successful turn had set. The
+        // gauge-only refresh must PRESERVE the breakdown while updating occupancy.
+        let mut s = UiState::new();
+        // A real (successful) turn: 33 messages, full breakdown.
+        s.on_context_stats(5_000, 400_000, 2_000, 1_000, 33, 512_000, "coding-runtime", "sys");
+        // A later /context refresh reports a higher (over-limit) occupancy only.
+        s.on_context_gauge_refresh(697_300, 512_000, "coding-runtime");
+        let snap = s.last_context.as_ref().unwrap();
+        assert_eq!(snap.sent_tokens, 697_300, "gauge updated to latest occupancy");
+        assert_eq!(snap.total_messages, 33, "message count preserved, not zeroed");
+        assert_eq!(snap.system_tokens, 5_000, "system bucket preserved");
+        assert_eq!(snap.cold_zone_tokens, 1_000, "cold bucket preserved");
     }
 
     #[test]
@@ -2474,7 +2524,7 @@ mod tests {
         s.on_context_stats(0, 40_000, 0, 0, 10, 128_000, "engine-v2", "");
         s.on_compaction_committed(12_000);
 
-        s.on_context_stats(0, 40_000, 0, 0, 6, 128_000, "engine-v2", "");
+        s.on_context_gauge_refresh(40_000, 128_000, "engine-v2");
 
         assert_eq!(s.last_context.as_ref().unwrap().sent_tokens, 12_000);
         assert_eq!(s.post_compaction_used_tokens, Some(12_000));
