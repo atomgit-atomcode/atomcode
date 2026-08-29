@@ -4310,6 +4310,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     }
                     push_str_cells(&mut row, &num, &chrome_style);
 
+                    // Caret column WITHIN the field content (0 = front of field).
+                    let mut field_caret_col = 0usize;
                     if panel.custom_text.trim().is_empty() {
                         // Faint placeholder when no text has been typed yet
                         // (consistent with build_response which trims before checking).
@@ -4350,11 +4352,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         };
                         let safe_text = scrub_controls(&panel.custom_text);
                         let text = if on_cursor {
-                            crate::width::editable_value_projection(
-                                &safe_text,
-                                panel.custom_text_cursor_byte,
-                                budget,
-                            )
+                            let (projected, caret_in_field) =
+                                crate::width::editable_value_projection_with_caret(
+                                    &safe_text,
+                                    panel.custom_text_cursor_byte,
+                                    budget,
+                                );
+                            field_caret_col = caret_in_field;
+                            projected
                         } else {
                             crate::width::truncate_with_ellipsis(&safe_text, text_budget)
                         };
@@ -4363,23 +4368,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     out.push(row);
                     if on_cursor {
                         active = custom_start..out.len();
-                        // Caret sits after the marker/checkbox/number prefix; for a
-                        // non-empty field advance by the visible width before the cursor.
-                        let before_w = if panel.custom_text.trim().is_empty() {
-                            0
-                        } else {
-                            let b = panel
-                                .custom_text_cursor_byte
-                                .min(panel.custom_text.len());
-                            let slice = if panel.custom_text.is_char_boundary(b) {
-                                &panel.custom_text[..b]
-                            } else {
-                                ""
-                            };
-                            crate::width::display_width(&scrub_controls(slice))
-                                .min(budget.saturating_sub(1))
-                        };
-                        caret_col = Some(prefix_width + before_w);
+                        // Prefix (marker/checkbox/number) + the caret's column WITHIN the
+                        // field. Empty → 0 (front); non-empty → from the projection, so it
+                        // tracks windowing/ellipsis exactly and never drifts on long text.
+                        caret_col = Some(prefix_width + field_caret_col);
                     }
                 }
 
@@ -4473,14 +4465,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     let text_budget = inner_width
                         .saturating_sub(crate::width::display_width(prompt))
                         .saturating_sub(crate::width::display_width(caret));
+                    // Caret column WITHIN the projected text (0 for empty field).
+                    let mut text_field_caret = 0usize;
                     let buf = if panel.text.is_empty() {
                         String::new()
                     } else {
-                        crate::width::editable_value_projection(
-                            &safe_text,
-                            panel.text_cursor_byte,
-                            text_budget + crate::width::display_width(caret),
-                        )
+                        let (projected, caret_in_field) =
+                            crate::width::editable_value_projection_with_caret(
+                                &safe_text,
+                                panel.text_cursor_byte,
+                                text_budget + crate::width::display_width(caret),
+                            );
+                        text_field_caret = caret_in_field;
+                        projected
                     };
                     let visible_text = if buf.is_empty() {
                         crate::width::truncate_with_ellipsis(placeholder, text_budget)
@@ -4513,20 +4510,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     push_str_cells(&mut row, if unicode { "│" } else { "|" }, &border_style);
                     out.push(row);
                     active = out.len().saturating_sub(1)..out.len();
-                    // Real-cursor park for IME: left border (1) + prompt + text
-                    // before the cursor. Empty field → caret right after the prompt.
-                    let before_w = if panel.text.is_empty() {
-                        0
-                    } else {
-                        let b = panel.text_cursor_byte.min(panel.text.len());
-                        let slice = if panel.text.is_char_boundary(b) {
-                            &panel.text[..b]
-                        } else {
-                            ""
-                        };
-                        crate::width::display_width(&scrub_controls(slice)).min(text_budget)
-                    };
-                    caret_col = Some(1 + crate::width::display_width(prompt) + before_w);
+                    // Real-cursor park for IME: left border (1) + prompt + the caret's
+                    // column within the projected text (0 for empty → right after the
+                    // prompt). Projection-derived so long/scrolled text never drifts.
+                    caret_col = Some(1 + crate::width::display_width(prompt) + text_field_caret);
 
                     let mut bottom = Vec::new();
                     push_str_cells(&mut bottom, bottom_left, &border_style);
@@ -5798,13 +5785,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
             // Park the real terminal cursor on the user_input custom-answer /
             // Text field so an OS IME anchors its preedit there. Options-only
-            // panels return None and keep the caret hidden.
-            if let Some(view) = status_clone.user_input.as_ref() {
-                if let Some((row_off, col)) = self.user_input_text_caret(view, rule_width, w, h) {
-                    let abs_row = (approval_top + row_off + 1) as u16;
-                    let abs_col = (col + 1) as u16;
-                    self.screen.set_cursor(abs_row, abs_col);
-                    user_input_text_focused = true;
+            // panels return None and keep the caret hidden. Gated on
+            // `approval.is_none()` because the approval panel wins the draw slot
+            // (see approval_cells) — without this, a simultaneously-set
+            // user_input would show a stray caret over the approval panel.
+            if status_clone.approval.is_none() {
+                if let Some(view) = status_clone.user_input.as_ref() {
+                    if let Some((row_off, col)) = self.user_input_text_caret(view, rule_width, w, h)
+                    {
+                        let abs_row = (approval_top + row_off + 1) as u16;
+                        let abs_col = (col + 1) as u16;
+                        self.screen.set_cursor(abs_row, abs_col);
+                        user_input_text_focused = true;
+                    }
                 }
             }
             rules_top + 1 + approval_rows
