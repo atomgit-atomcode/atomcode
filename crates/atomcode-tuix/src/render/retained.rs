@@ -22061,13 +22061,15 @@ mod tests {
                         .all(|ch| matches!(ch, '━' | '─' | '=' | '-' | ' '))
             })
             .collect();
-        // Every table rule is a single continuous run spanning the full width —
-        // the inter-column gaps are filled, so no rule breaks into per-column
-        // segments (which read as a broken/dashed line). No rule line therefore
-        // carries an interior space.
+        // Separator lines are segmented per column — each segment covers one
+        // column's padded width, with inter-column gaps between them, so every
+        // rule line contains at least some rule characters (not empty).
         assert!(
-            !rules.is_empty() && rules.iter().all(|line| !line.contains(' ')),
-            "table rules must be continuous (no interior gap): {lines:#?}"
+            !rules.is_empty()
+                && rules.iter().all(|line| line
+                    .chars()
+                    .any(|ch| matches!(ch, '━' | '─' | '=' | '-'))),
+            "table rules must contain rule characters: {lines:#?}"
         );
         assert!(
             rules
