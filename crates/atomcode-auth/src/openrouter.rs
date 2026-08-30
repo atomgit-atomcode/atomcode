@@ -98,6 +98,21 @@ pub fn select_top_free_models(models_json: &str, limit: usize) -> Result<Vec<Fre
         context_length: u64,
         #[serde(default)]
         pricing: Option<Pricing>,
+        /// OpenRouter's per-model capability list (e.g. `"tools"`, `"reasoning"`).
+        /// A model WITHOUT `"tools"` 404s a coding agent's first (tool-carrying)
+        /// request with "No endpoints found that support tool use".
+        #[serde(default)]
+        supported_parameters: Vec<String>,
+        #[serde(default)]
+        architecture: Option<Architecture>,
+    }
+    #[derive(Deserialize)]
+    struct Architecture {
+        /// What the model EMITS. A chat model outputs `"text"`; a media model
+        /// (e.g. Google Lyria music-gen) outputs `"audio"`/`"image"` — free and
+        /// large-context, but unusable for chat/tool use, so it must be excluded.
+        #[serde(default)]
+        output_modalities: Vec<String>,
     }
     #[derive(Deserialize)]
     struct Pricing {
@@ -122,6 +137,22 @@ pub fn select_top_free_models(models_json: &str, limit: usize) -> Result<Vec<Fre
                     .as_ref()
                     .map(|p| is_zero(&p.prompt) && is_zero(&p.completion))
                     .unwrap_or(false)
+        })
+        // Capability gate — only surface models a coding agent can actually use,
+        // so the auto-added set never includes a model that 404/403s on the first
+        // message (the reported symptom: Google Lyria music-gen 404'd "no tool
+        // use", picked purely because it was free with a huge context window).
+        .filter(|m| {
+            // 1) Must support tool calls (atomcode's first request carries tools).
+            m.supported_parameters.iter().any(|p| p == "tools")
+                // 2) Must EMIT text (chat), not audio/image. Absent architecture
+                //    (older/partial API rows) is not judged on modality.
+                && match &m.architecture {
+                    Some(a) if !a.output_modalities.is_empty() => {
+                        a.output_modalities.iter().any(|x| x == "text")
+                    }
+                    _ => true,
+                }
         })
         .map(|m| FreeModel {
             id: m.id,
@@ -375,14 +406,29 @@ mod tests {
     const MODELS_FIXTURE: &str = r#"{
       "data": [
         {"id":"vendor/big:free","name":"Big Free","context_length":128000,
-         "pricing":{"prompt":"0","completion":"0"}},
+         "pricing":{"prompt":"0","completion":"0"},
+         "supported_parameters":["tools","temperature"],
+         "architecture":{"output_modalities":["text"]}},
         {"id":"vendor/paid","name":"Paid","context_length":200000,
-         "pricing":{"prompt":"0.001","completion":"0.002"}},
+         "pricing":{"prompt":"0.001","completion":"0.002"},
+         "supported_parameters":["tools"]},
         {"id":"vendor/small:free","name":"Small Free","context_length":8000,
-         "pricing":{"prompt":"0","completion":"0"}},
+         "pricing":{"prompt":"0","completion":"0"},
+         "supported_parameters":["tools"],
+         "architecture":{"output_modalities":["text"]}},
         {"id":"vendor/zero-priced","name":"Zero Priced","context_length":32000,
-         "pricing":{"prompt":"0","completion":"0"}},
-        {"id":"vendor/nopricing","context_length":16000}
+         "pricing":{"prompt":"0","completion":"0"},
+         "supported_parameters":["tools"],
+         "architecture":{"output_modalities":["text"]}},
+        {"id":"vendor/nopricing","context_length":16000,
+         "supported_parameters":["tools"]},
+        {"id":"vendor/music:free","name":"Music Gen","context_length":256000,
+         "pricing":{"prompt":"0","completion":"0"},
+         "supported_parameters":["temperature"],
+         "architecture":{"output_modalities":["audio"]}},
+        {"id":"vendor/notools:free","name":"No Tools","context_length":300000,
+         "pricing":{"prompt":"0","completion":"0"},
+         "architecture":{"output_modalities":["text"]}}
       ]
     }"#;
 
@@ -395,6 +441,17 @@ mod tests {
             ids,
             vec!["vendor/big:free", "vendor/zero-priced", "vendor/small:free"]
         );
+    }
+
+    #[test]
+    fn top_free_excludes_non_tool_and_non_text_models() {
+        // `music:free` (audio output) and `notools:free` (no `tools` support)
+        // are the LARGEST free contexts, so a price-only filter would surface
+        // them first — but they 404 on chat/tool use. They must be excluded.
+        let got = select_top_free_models(MODELS_FIXTURE, 5).unwrap();
+        let ids: Vec<&str> = got.iter().map(|m| m.id.as_str()).collect();
+        assert!(!ids.contains(&"vendor/music:free"), "audio-gen model excluded");
+        assert!(!ids.contains(&"vendor/notools:free"), "non-tool model excluded");
     }
 
     #[test]
