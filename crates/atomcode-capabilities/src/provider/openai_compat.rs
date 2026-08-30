@@ -629,6 +629,32 @@ impl LlmProvider for OpenAiCompatProvider {
                             return;
                         }
                         Ok(Some(Err(e))) => {
+                            // Message already logically complete (a real, non-empty
+                            // finish_reason arrived) AND the error is a benign transport
+                            // drop — a gateway closing the keep-alive after the final
+                            // event but before the `[DONE]` sentinel, which rustls
+                            // surfaces as a missing TLS close_notify / UnexpectedEof.
+                            // Treat it as a CLEAN stream end (flush + Done), not a
+                            // spurious mid-turn "响应中断": deepseek-v4-flash relies on
+                            // `[DONE]` to terminate, so a keep-alive drop between the
+                            // finish_reason chunk and `[DONE]` otherwise killed a
+                            // fully-generated 20-minute turn.
+                            if dec.seen_finish() && retry::is_stale_connection_error(&e) {
+                                for ev in dec.finish() {
+                                    if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
+                                        pending_metadata.push(ev);
+                                        continue;
+                                    }
+                                    if retry::is_replay_sensitive_event(&ev)
+                                        || matches!(ev, StreamEvent::Done { .. } | StreamEvent::Error(_))
+                                    {
+                                        for metadata in pending_metadata.drain(..) { yield metadata; }
+                                    }
+                                    emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
+                                    yield ev;
+                                }
+                                return;
+                            }
                             // No replay-sensitive output reached the consumer yet → re-open
                             // the whole request transparently (bounded by MAX_STREAM_ATTEMPTS).
                             if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
@@ -1460,6 +1486,15 @@ impl SseDecoder {
             }
         }
         out
+    }
+
+    /// True once a NON-EMPTY `finish_reason` has been seen — the model's own
+    /// "message complete" signal. After this point a trailing transport EOF
+    /// (e.g. a gateway closing the keep-alive after the final event but before
+    /// the `[DONE]` sentinel, which rustls surfaces as a missing TLS
+    /// close_notify / `UnexpectedEof`) is benign, not a truncation.
+    fn seen_finish(&self) -> bool {
+        self.seen_finish
     }
 
     /// Stream ended WITHOUT a `[DONE]` sentinel: flush buffered tool calls + usage,
@@ -2839,6 +2874,24 @@ mod tests {
         assert_eq!(tc.id, "c1");
         assert_eq!(tc.name, "read");
         assert_eq!(tc.arguments, "{\"path\":\"a\"}");
+    }
+
+    #[test]
+    fn seen_finish_gates_benign_trailing_eof_swallow() {
+        // The mid-stream "gateway dropped keep-alive before `[DONE]`" swallow is
+        // gated on `seen_finish()`. A NON-EMPTY finish_reason means the message is
+        // complete → a trailing close_notify / UnexpectedEof is benign. An EMPTY
+        // finish_reason (deepseek-v4-flash sends `""` on every content chunk) must
+        // NOT arm it, or a genuine mid-content truncation would be silently
+        // accepted as a complete turn.
+        let mut d = SseDecoder::new();
+        let _ = d.feed(
+            line(json!({"choices":[{"delta":{"content":"hi"},"finish_reason":""}]})).as_bytes(),
+        );
+        assert!(!d.seen_finish(), "empty finish_reason must NOT arm seen_finish");
+        let _ =
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})).as_bytes());
+        assert!(d.seen_finish(), "non-empty finish_reason arms seen_finish");
     }
 
     #[test]
