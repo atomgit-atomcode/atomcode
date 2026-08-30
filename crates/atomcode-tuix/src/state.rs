@@ -1943,6 +1943,12 @@ impl UiState {
         // leave a stale `explore#4 · …` pinned onto the next turn's spinner.
         self.subagent_activity = None;
         self.active_subtasks = None;
+        // The Team strip is a live in-turn artifact that only self-hides on a
+        // `RunFinished` for every run. A hung member (never emits RunFinished) or
+        // a turn that ends first would otherwise pin the strip onto every idle
+        // round via the footer's `active_subtasks.or_else(|| team.panel())`
+        // fallback. Hide (not clear) so `/team show` can still resurrect it.
+        self.team.hide();
         self.pending_todo_preview = None;
         // Safety clear: if a turn ends without resolving an approval (e.g. error
         // path or session switch), ensure the panel is not left stale.
@@ -1973,6 +1979,11 @@ impl UiState {
         self.turn_saw_reasoning = false;
         self.subagent_activity = None;
         self.active_subtasks = None;
+        // A cancelled turn tears down any still-"running" Team members; the
+        // strip only auto-hides on `RunFinished`, which a hung/interrupted run
+        // never sends. Hide it here so Esc actually dismisses it (hide, not
+        // clear, keeps the run available to `/team show`).
+        self.team.hide();
         self.pending_todo_preview = None;
         self.approval_panel = None;
         self.user_input_panel = None;
@@ -3729,6 +3740,61 @@ mod tests {
         assert!(
             s.user_input_batch.is_none(),
             "user_input_batch must not be touched"
+        );
+    }
+
+    // A live Team run whose members never emit `RunFinished` (subagent hung, or
+    // the turn was cancelled/errored first) leaves `TeamProjection::visible`
+    // true. The footer renders `active_subtasks.or_else(|| team.panel())`, so
+    // once `active_subtasks` clears at turn-end the stale Team strip pins itself
+    // onto every subsequent idle round with no way to dismiss it. Turn terminals
+    // must hide it, mirroring how they drop `active_subtasks`.
+    fn run_started_event(run: &str) -> atomcode_capabilities::team::TeamEvent {
+        atomcode_capabilities::team::TeamEvent::new(
+            atomcode_capabilities::team::TeamRunId::new(run),
+            1,
+            atomcode_capabilities::team::TeamEventPayload::RunStarted { total: 1 },
+        )
+    }
+
+    #[test]
+    fn on_turn_cancelled_hides_unfinished_team_panel() {
+        let mut s = UiState::new();
+        s.team.apply(1, run_started_event("hung"));
+        assert!(
+            s.team.panel().is_some(),
+            "an in-flight run without RunFinished shows the live strip"
+        );
+        s.on_turn_cancelled();
+        assert!(
+            s.team.panel().is_none(),
+            "Esc-cancelling the turn must dismiss the stuck Team strip"
+        );
+    }
+
+    #[test]
+    fn on_turn_complete_hides_unfinished_team_panel() {
+        let mut s = UiState::new();
+        s.team.apply(1, run_started_event("lost-finish"));
+        assert!(s.team.panel().is_some());
+        s.on_turn_complete();
+        assert!(
+            s.team.panel().is_none(),
+            "a turn that ends without a RunFinished must not pin the Team strip"
+        );
+    }
+
+    #[test]
+    fn turn_terminal_preserves_team_history_for_team_show() {
+        // `hide()`, not `clear()`: `/team show` must still resurrect the run.
+        let mut s = UiState::new();
+        s.team.apply(1, run_started_event("history"));
+        s.on_turn_cancelled();
+        assert!(s.team.panel().is_none());
+        s.team.show();
+        assert!(
+            s.team.panel().is_some(),
+            "run data survives turn-end so /team show can re-open it"
         );
     }
 }
