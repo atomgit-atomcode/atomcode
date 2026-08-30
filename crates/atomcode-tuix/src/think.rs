@@ -10,6 +10,15 @@ pub struct ThinkStripper {
     carry: String,
     /// When true, we're inside a <think*> block and waiting for </>.
     inside: bool,
+    /// True once any NON-whitespace visible text has been emitted this turn.
+    /// A real inline `<think>` reasoning block always LEADS the response (the
+    /// model thinks, then answers), so once visible content has streamed a
+    /// later `<think>` is the model writing the tag as LITERAL text (e.g.
+    /// describing a reasoning-model's output format). We stop stripping then
+    /// — otherwise a literal, unclosed `<think>` swallows the rest of the
+    /// answer, and the user sees the response cut off mid-sentence (only the
+    /// full text on `/resume`, which re-renders the stored raw message).
+    seen_visible: bool,
 }
 
 impl Default for ThinkStripper {
@@ -23,6 +32,7 @@ impl ThinkStripper {
         Self {
             carry: String::new(),
             inside: false,
+            seen_visible: false,
         }
     }
 
@@ -39,6 +49,7 @@ impl ThinkStripper {
     pub fn reset(&mut self) {
         self.carry.clear();
         self.inside = false;
+        self.seen_visible = false;
     }
 
     /// Feed a chunk, return the visible portion (outside of think blocks).
@@ -51,6 +62,9 @@ impl ThinkStripper {
             flushed.push_str(delta);
             if self.inside {
                 return String::new(); // still in block, discard
+            }
+            if flushed.chars().any(|c| !c.is_whitespace()) {
+                self.seen_visible = true;
             }
             return flushed;
         }
@@ -83,18 +97,41 @@ impl ThinkStripper {
                     }
                 }
             } else {
+                // After real content has streamed, stop treating `<think>` as a
+                // reasoning block — a leading block is the only real one, so this
+                // is now literal text. Pass everything through untouched.
+                if self.seen_visible {
+                    out.push_str(&self.carry);
+                    self.carry.clear();
+                    return;
+                }
                 match find_open_tag(&self.carry) {
                     TagScan::None => {
+                        if self.carry.chars().any(|c| !c.is_whitespace()) {
+                            self.seen_visible = true;
+                        }
                         out.push_str(&self.carry);
                         self.carry.clear();
                         return;
                     }
                     TagScan::Complete { start, end } => {
-                        out.push_str(&self.carry[..start]);
+                        // NON-whitespace content before this `<think>` means it is
+                        // NOT a leading reasoning block — it's literal text. Latch
+                        // `seen_visible` and pass the rest through untouched.
+                        if self.carry[..start].chars().any(|c| !c.is_whitespace()) {
+                            self.seen_visible = true;
+                            out.push_str(&self.carry);
+                            self.carry.clear();
+                            return;
+                        }
+                        out.push_str(&self.carry[..start]); // leading whitespace only
                         self.carry.drain(..end);
                         self.inside = true;
                     }
                     TagScan::PartialAt(pos) => {
+                        if self.carry[..pos].chars().any(|c| !c.is_whitespace()) {
+                            self.seen_visible = true;
+                        }
                         out.push_str(&self.carry[..pos]);
                         self.carry.drain(..pos);
                         return;
@@ -204,21 +241,22 @@ mod tests {
 
     #[test]
     fn complete_block_in_one_feed() {
+        // A LEADING reasoning block (nothing but the tag first) is stripped.
         let mut s = ThinkStripper::new();
-        assert_eq!(s.feed("a<think>secret</think>b"), "ab");
+        assert_eq!(s.feed("<think>secret</think>b"), "b");
     }
 
     #[test]
     fn tag_split_across_feeds() {
         let mut s = ThinkStripper::new();
-        assert_eq!(s.feed("hello <thi"), "hello ");
+        assert_eq!(s.feed("<thi"), "");
         assert_eq!(s.feed("nk>secret</think> world"), " world");
     }
 
     #[test]
     fn utf8_boundary_at_feed_edge_no_panic() {
         let mut s = ThinkStripper::new();
-        assert_eq!(s.feed("abc<thi"), "abc");
+        assert_eq!(s.feed("<thi"), "");
         assert_eq!(s.feed("nk>密</think>你好"), "你好");
     }
 
@@ -258,9 +296,37 @@ mod tests {
     }
 
     #[test]
-    fn multiple_blocks() {
+    fn literal_think_in_answer_is_not_swallowed() {
+        // Real-world bug: a model DESCRIBING reasoning-model output writes a
+        // literal, UNCLOSED `<think>` deep in its answer. The old stripper
+        // entered `inside` and swallowed the rest — the response cut off
+        // mid-sentence live, only whole on /resume. It must pass through now.
         let mut s = ThinkStripper::new();
-        assert_eq!(s.feed("a<think>x</think>b<think>y</think>c"), "abc");
+        let ans = "完整生成文本 (<think> 推理链 + <answer> 答案):";
+        assert_eq!(s.feed(ans), ans);
+    }
+
+    #[test]
+    fn literal_think_across_streaming_feeds_is_not_swallowed() {
+        // The tag arrives in a LATER delta than the preceding content — the
+        // common streaming shape. `seen_visible` from the first delta keeps
+        // the `<think>` in the second delta from truncating the answer.
+        let mut s = ThinkStripper::new();
+        assert_eq!(s.feed("每题提取完整 "), "每题提取完整 ");
+        assert_eq!(s.feed("<think> 推理链"), "<think> 推理链");
+    }
+
+    #[test]
+    fn only_the_leading_block_is_stripped() {
+        // The leading `<think>x</think>` is stripped; once real content ("b")
+        // has streamed, a later `<think>` is literal text and passes through
+        // (a reasoning model emits its ONE reasoning block up front, so a
+        // second, mid-answer tag is the model quoting `<think>`, not thinking).
+        let mut s = ThinkStripper::new();
+        assert_eq!(
+            s.feed("<think>x</think>b<think>y</think>c"),
+            "b<think>y</think>c"
+        );
     }
 
     /// Regression: an unclosed `<think>` from a previous turn would leave
@@ -276,7 +342,7 @@ mod tests {
         let mut s = ThinkStripper::new();
         // Turn 1: opens a think block but never closes it (stream ended /
         // got cancelled).
-        let _ = s.feed("prefix <think>still thinking when we got cut");
+        let _ = s.feed("<think>still thinking when we got cut");
         // Turn 2 from a different provider that doesn't use <think> tags.
         // Without reset, this text gets swallowed.
         assert_eq!(
