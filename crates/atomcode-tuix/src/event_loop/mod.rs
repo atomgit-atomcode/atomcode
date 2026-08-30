@@ -18596,6 +18596,20 @@ fn provider_transition_blocks_streaming_command(cmd: &str, pending: bool) -> boo
     pending && cmd == "bg"
 }
 
+/// While a turn is streaming, a bare Esc with a NON-empty composer clears the
+/// input first (mainstream-agent behavior) rather than interrupting the turn;
+/// the turn is only stopped by a subsequent Esc on an empty composer. Modified
+/// Esc and non-Esc keys never take this path. Folded pastes / images leave a
+/// `[Pasted #N]` / `[Image #N]` marker in `text`, so a trim-non-empty check also
+/// treats an attachment-only composer as "has content".
+fn esc_clears_composer_before_interrupt(
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+    composer_text: &str,
+) -> bool {
+    code == KeyCode::Esc && modifiers.is_empty() && !composer_text.trim().is_empty()
+}
+
 fn handle_streaming_key(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -18685,6 +18699,27 @@ fn handle_streaming_key(
     // `/usage` or `/cost` can never make Esc stop the running response.
     if code == KeyCode::Esc && modifiers.is_empty() && dismiss_footer_command_output(&mut app.state)
     {
+        draw_spinner_now(
+            &mut app.state,
+            &app.buf,
+            ctx,
+            renderer,
+            app.message_queue.len(),
+            app.menu.selected,
+        );
+        return Ok(());
+    }
+
+    // Task running + composer has content: the FIRST bare Esc clears the input
+    // (aligning with mainstream agents) instead of stopping the turn. Only a
+    // subsequent Esc on an EMPTY composer interrupts. This prevents an accidental
+    // task kill while the user edits a steering message — a real hazard reported
+    // on Windows. (Ctrl+U still clears the input at any time; folded pastes /
+    // images leave a `[Pasted #N]` / `[Image #N]` marker in `text`, so the
+    // trim-empty check also catches an attachment-only composer.)
+    if esc_clears_composer_before_interrupt(code, modifiers, &app.buf.text) {
+        app.buf.clear_text();
+        app.buf.clear_pastes();
         draw_spinner_now(
             &mut app.state,
             &app.buf,
@@ -31435,6 +31470,50 @@ mod tool_bullet_outcome_tests {
         // No failure-class distinction: only success is coloured, so every
         // failure is the same neutral `Failure`.
         assert_eq!(tool_bullet_outcome(false), ToolOutcome::Failure);
+    }
+}
+
+#[cfg(test)]
+mod streaming_esc_clear_tests {
+    use super::esc_clears_composer_before_interrupt;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn bare_esc_with_content_clears_first() {
+        assert!(esc_clears_composer_before_interrupt(
+            KeyCode::Esc,
+            KeyModifiers::empty(),
+            "steer the AI"
+        ));
+    }
+
+    #[test]
+    fn empty_or_whitespace_composer_interrupts() {
+        // Empty / whitespace-only → fall through to the interrupt path.
+        assert!(!esc_clears_composer_before_interrupt(
+            KeyCode::Esc,
+            KeyModifiers::empty(),
+            ""
+        ));
+        assert!(!esc_clears_composer_before_interrupt(
+            KeyCode::Esc,
+            KeyModifiers::empty(),
+            "   \n\t"
+        ));
+    }
+
+    #[test]
+    fn modified_esc_and_non_esc_never_clear() {
+        assert!(!esc_clears_composer_before_interrupt(
+            KeyCode::Esc,
+            KeyModifiers::CONTROL,
+            "content"
+        ));
+        assert!(!esc_clears_composer_before_interrupt(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+            "content"
+        ));
     }
 }
 
