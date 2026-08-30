@@ -753,17 +753,18 @@ fn render_wrapped_table(
 /// background: `AnsiValue(240)` on dark themes, `AnsiValue(250)` on light themes.
 /// Legacy 16-color terminals get SGR 2 (faint), which most terminals render as a
 /// dimmed version of the default foreground.
-fn md_table_rule_wrap(caps: TerminalCaps) -> (&'static str, &'static str) {
-    if caps.modern_emulator {
-        if crate::highlight::theme::is_light_for_render() {
-            ("\x1b[38;5;250m", "\x1b[39m")
-        } else {
-            ("\x1b[38;5;240m", "\x1b[39m")
-        }
-    } else {
-        // SGR 2 = faint; SGR 22 = normal intensity (correct close for faint)
-        ("\x1b[2m", "\x1b[22m")
-    }
+/// Low-contrast wrap for table rules: FAINT (SGR 2) over the theme-muted grey
+/// (`md_border_open`: SGR 37 on dark / SGR 90 on light). The markdown→cells
+/// parser (`parse_markdown_to_cells`) supports SGR 2 and SGR 37/90 but SILENTLY
+/// DROPS 256-colour (`38;5;N`) — a 256-colour grey would render at the DEFAULT
+/// foreground (brighter, not dimmer) in the TUI. Faint over the muted grey is
+/// the recessed look that actually survives that parser, on 16-colour and
+/// modern terminals alike. Close: SGR 22 (clear faint) + SGR 39 (reset fg).
+fn md_table_rule_wrap() -> (String, &'static str) {
+    (
+        format!("\x1b[2m{}", crate::highlight::theme::md_border_open()),
+        "\x1b[22m\x1b[39m",
+    )
 }
 
 /// Segmented horizontal rule for table separators — one segment per column
@@ -781,7 +782,7 @@ fn render_table_rule(col_widths: &[usize], preferred: char, caps: TerminalCaps) 
         .collect();
     let rule = segments.join(&gap);
     if caps.colors {
-        let (open, close) = md_table_rule_wrap(caps);
+        let (open, close) = md_table_rule_wrap();
         format!("{}{}{}", open, rule, close)
     } else {
         rule
@@ -1489,6 +1490,30 @@ mod tests {
         })
     }
 
+    #[test]
+    fn table_rule_colours_with_faint_not_dropped_256() {
+        // `parse_markdown_to_cells` honours SGR 2 (faint) + SGR 37/90 but SILENTLY
+        // DROPS 256-colour (`38;5;N`) — a 256-colour rule would render at full
+        // brightness in the TUI. Guard: the coloured rule uses faint, never 256.
+        let caps = TerminalCaps::from_env(EnvView {
+            is_stdout_tty: true,
+            no_color: false,
+            term: Some("xterm-256color".to_string()),
+            lang: Some("en_US.UTF-8".to_string()),
+            ..Default::default()
+        });
+        assert!(caps.colors, "test needs colours on");
+        let rule = render_table_rule(&[3, 4], '─', caps);
+        assert!(
+            rule.contains("\x1b[2m"),
+            "coloured rule must use faint (SGR 2): {rule:?}"
+        );
+        assert!(
+            !rule.contains("38;5"),
+            "must not use 256-colour (parser drops it): {rule:?}"
+        );
+    }
+
     /// The synthetic separator the circled-list spacing inserts between a
     /// circled number and its label, under THIS host's width model. Circled
     /// digits ①–⑳ are widened to 2 cells on emoji-capable terminals (macOS
@@ -1726,30 +1751,25 @@ mod tests {
         ];
         let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
 
-        // No top/bottom boundary rows — every line is either a data row or a
-        // segmented separator (containing spaces between segments).
-        let data_or_sep_only = out.lines().all(|l| {
+        let is_rule = |t: &str| {
+            !t.is_empty()
+                && t.chars().all(|c| matches!(c, '━' | '─' | '=' | '-' | ' '))
+                && t.chars().any(|c| matches!(c, '━' | '─' | '=' | '-'))
+        };
+        let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+        // No top/bottom boundary: the table starts with the header ROW and ends
+        // with the last DATA ROW — neither the first nor last line is a rule.
+        assert!(!is_rule(lines.first().unwrap().trim()), "no top boundary row");
+        assert!(!is_rule(lines.last().unwrap().trim()), "no bottom boundary row");
+        // Every rule line is SEGMENTED (3 columns → inter-segment gaps), not a
+        // solid full-width bar (a regression to the old solid rule has NO spaces).
+        for l in &lines {
             let t = l.trim();
-            // data row: contains non-rule characters (spaces + cell content)
-            // segmented rule: may contain spaces between rule segments
-            // Neither is an empty-only or purely-rule-no-space full-width bar
-            // unless it's a genuine separator line.
-            !t.is_empty() || true // blank lines are fine (shouldn't appear, but tolerate)
-        });
-        assert!(data_or_sep_only);
-
-        // Collect separator lines (lines whose trimmed content consists only of
-        // rule chars and ASCII spaces — the inter-segment gaps).
-        let rule_lines: Vec<&str> = out
-            .lines()
-            .filter(|l| {
-                let t = l.trim();
-                !t.is_empty()
-                    && t.chars()
-                        .all(|c| matches!(c, '━' | '─' | '=' | '-' | ' '))
-                    && t.chars().any(|c| matches!(c, '━' | '─' | '=' | '-'))
-            })
-            .collect();
+            if is_rule(t) {
+                assert!(t.contains(' '), "rule must be segmented (gaps present): {t:?}");
+            }
+        }
+        let rule_lines: Vec<&str> = lines.iter().copied().filter(|l| is_rule(l.trim())).collect();
 
         // Borderless design: header separator + 1 inter-row separator only (no top/bottom).
         assert!(
