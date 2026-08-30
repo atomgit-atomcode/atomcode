@@ -63,7 +63,7 @@ impl ThinkStripper {
             if self.inside {
                 return String::new(); // still in block, discard
             }
-            if flushed.chars().any(|c| !c.is_whitespace()) {
+            if flushed.chars().any(is_visible) {
                 self.seen_visible = true;
             }
             return flushed;
@@ -107,7 +107,7 @@ impl ThinkStripper {
                 }
                 match find_open_tag(&self.carry) {
                     TagScan::None => {
-                        if self.carry.chars().any(|c| !c.is_whitespace()) {
+                        if self.carry.chars().any(is_visible) {
                             self.seen_visible = true;
                         }
                         out.push_str(&self.carry);
@@ -118,7 +118,7 @@ impl ThinkStripper {
                         // NON-whitespace content before this `<think>` means it is
                         // NOT a leading reasoning block — it's literal text. Latch
                         // `seen_visible` and pass the rest through untouched.
-                        if self.carry[..start].chars().any(|c| !c.is_whitespace()) {
+                        if self.carry[..start].chars().any(is_visible) {
                             self.seen_visible = true;
                             out.push_str(&self.carry);
                             self.carry.clear();
@@ -129,7 +129,7 @@ impl ThinkStripper {
                         self.inside = true;
                     }
                     TagScan::PartialAt(pos) => {
-                        if self.carry[..pos].chars().any(|c| !c.is_whitespace()) {
+                        if self.carry[..pos].chars().any(is_visible) {
                             self.seen_visible = true;
                         }
                         out.push_str(&self.carry[..pos]);
@@ -222,6 +222,25 @@ fn find_close_tag(s: &str) -> Option<(usize, usize)> {
     }
 }
 
+/// True for a char a reader actually SEES. Used to decide whether real content
+/// has streamed (which latches off `<think>` stripping — see `seen_visible`).
+/// Excludes whitespace, control chars, AND zero-width / format chars (BOM,
+/// ZWSP/ZWNJ/ZWJ, word-joiner) that some providers prepend to the first chunk:
+/// those are invisible, so they must NOT count as content or a genuine LEADING
+/// reasoning block after them would leak through unstripped.
+fn is_visible(c: char) -> bool {
+    !c.is_whitespace()
+        && !c.is_control()
+        && !matches!(
+            c,
+            '\u{200B}' // zero-width space
+                | '\u{200C}' // zero-width non-joiner
+                | '\u{200D}' // zero-width joiner
+                | '\u{2060}' // word joiner
+                | '\u{FEFF}' // BOM / zero-width no-break space
+        )
+}
+
 fn prev_boundary(s: &str, mut idx: usize) -> usize {
     while idx > 0 && !s.is_char_boundary(idx) {
         idx -= 1;
@@ -304,6 +323,21 @@ mod tests {
         let mut s = ThinkStripper::new();
         let ans = "完整生成文本 (<think> 推理链 + <answer> 答案):";
         assert_eq!(s.feed(ans), ans);
+    }
+
+    #[test]
+    fn leading_bom_or_zero_width_does_not_defeat_stripping() {
+        // A provider prepending a BOM / zero-width char before a genuine
+        // LEADING reasoning block must not count as visible content — the block
+        // still strips (these chars are not `is_whitespace()`, so a naive check
+        // would latch `seen_visible` and leak the reasoning).
+        let mut s = ThinkStripper::new();
+        assert_eq!(
+            s.feed("\u{FEFF}<think>secret</think>answer"),
+            "\u{FEFF}answer"
+        );
+        let mut s2 = ThinkStripper::new();
+        assert_eq!(s2.feed("\u{200B}<think>x</think>y"), "\u{200B}y");
     }
 
     #[test]
