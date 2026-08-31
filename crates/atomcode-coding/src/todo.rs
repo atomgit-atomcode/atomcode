@@ -5,9 +5,11 @@
 
 use async_trait::async_trait;
 use atomcode_capabilities::reminder::synthetic_system_reminder;
+use atomcode_capabilities::session::manager::{SessionManager, TodoSidecarItem};
 use atomcode_capabilities::tools::todo::{
     derive_current_todos, is_todo_plan, render_todos_numbered, TodoItem, TodoStatus,
 };
+use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message, Role};
 use atomcode_kernel::provider::{ChatOptions, ToolChoice};
@@ -25,7 +27,27 @@ If you have actually completed them, mark each one done now with `todowrite` \
 through them. Only stop with open items if you genuinely need approval/input, are stuck, or the \
 request is ambiguous — in that case say so briefly.";
 
-pub struct TodoHook;
+pub struct TodoHook {
+    /// Project root for locating the session todo sidecar
+    /// (`<session_root>/<project_bucket>/<session_id>.todos.json`). `None` in
+    /// tests / headless drivers: sidecar persistence is skipped and the hook
+    /// stays transcript-derived only (matches the pre-sidecar behavior).
+    working_dir: Option<std::path::PathBuf>,
+}
+
+impl TodoHook {
+    pub fn new(working_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            working_dir: Some(working_dir.into()),
+        }
+    }
+}
+
+impl Default for TodoHook {
+    fn default() -> Self {
+        Self { working_dir: None }
+    }
+}
 
 /// High-recency todo activation policy. Unlike `TodoHook`, this only acts on
 /// round one of a real user turn and only while no structured list exists.
@@ -337,8 +359,25 @@ fn just_wrote_full_list(messages: &[Message]) -> bool {
 
 #[async_trait]
 impl LifecycleHooks for TodoHook {
-    async fn pre_request(&self, messages: &mut Vec<Message>, _ctx: &TurnCtx) {
+    async fn pre_request(&self, messages: &mut Vec<Message>, ctx: &TurnCtx) {
         let todos = derive_current_todos(messages);
+        // Transcript-derived list may be EMPTY after a compaction drained the old
+        // turns (incl. the early todowrite plan call) — recover from the persisted
+        // sidecar so the model keeps seeing its plan (issue #1503). Fall back to
+        // the sidecar ONLY when the transcript has nothing; otherwise the live
+        // transcript is the authoritative source.
+        let todos = if todos.is_empty() {
+            // Only reach for the sidecar when a session context exists.
+            let Some(working_dir) = self.working_dir.as_deref() else {
+                return;
+            };
+            let Some(session_id) = ctx.session_id.as_deref() else {
+                return;
+            };
+            sidecar_todos_for(working_dir, session_id).unwrap_or_default()
+        } else {
+            todos
+        };
         if todos.is_empty() {
             return;
         }
@@ -376,6 +415,77 @@ impl LifecycleHooks for TodoHook {
         }
         Some(TODO_COMPLETION_NUDGE.to_string())
     }
+
+    /// Turn ended: persist the CURRENT todo list to the session sidecar so a later
+    /// compaction (which drains the transcript's todowrite calls) can't erase the
+    /// list the model / vscode panel rely on (issue #1503). Best-effort and only
+    /// when the transcript still yields todos (a turn that never planned has
+    /// nothing to persist; a rollback/undo that truncated the transcript past the
+    /// plan will simply not reach a `turn_complete` write with that stale state).
+    /// `ctx.session_id` is `None` for headless drivers — nothing to key the file on.
+    async fn turn_complete(&self, convo: &Conversation, _reason: &StopReason, ctx: &TurnCtx) {
+        let Some(working_dir) = self.working_dir.as_deref() else {
+            return;
+        };
+        let Some(session_id) = ctx.session_id.as_deref() else {
+            return;
+        };
+        let todos = derive_current_todos(&convo.messages);
+        if todos.is_empty() {
+            return;
+        }
+        let items: Vec<TodoSidecarItem> = todos
+            .iter()
+            .map(|t| TodoSidecarItem {
+                content: t.content.clone(),
+                status: todo_status_str(&t.status).to_string(),
+            })
+            .collect();
+        let manager = SessionManager::for_project(working_dir);
+        let _ = manager.write_todo_sidecar(session_id, &items, convo.messages.len());
+    }
+}
+
+/// Recover the todo list from the persisted sidecar when the transcript-derived
+/// list is empty (post-compaction). Stale sidecars (written against MORE messages
+/// than the current transcript — a rollback/undo truncated history) are discarded
+/// by `read_todo_sidecar`'s marker check, so a rolled-back session never shows an
+/// outdated list.
+fn sidecar_todos_for(
+    working_dir: &std::path::Path,
+    session_id: &str,
+) -> Option<Vec<TodoItem>> {
+    let manager = SessionManager::for_project(working_dir);
+    let sidecar = manager.read_todo_sidecar(session_id).ok()??;
+    Some(
+        sidecar
+            .todos
+            .into_iter()
+            .map(|item| TodoItem {
+                content: item.content,
+                status: parse_todo_status(&item.status),
+            })
+            .collect(),
+    )
+}
+
+/// Map the canonical sidecar status strings back to [`TodoStatus`].
+fn parse_todo_status(status: &str) -> TodoStatus {
+    match status {
+        "in_progress" => TodoStatus::InProgress,
+        "completed" => TodoStatus::Completed,
+        _ => TodoStatus::Pending,
+    }
+}
+
+/// Canonical sidecar status string for a [`TodoStatus`] (matches the vscode
+/// frontend's `pending` / `in_progress` / `completed`).
+fn todo_status_str(status: &TodoStatus) -> &'static str {
+    match status {
+        TodoStatus::Pending => "pending",
+        TodoStatus::InProgress => "in_progress",
+        TodoStatus::Completed => "completed",
+    }
 }
 
 #[cfg(test)]
@@ -412,7 +522,7 @@ mod tests {
         let list = r#"{"todos":[{"content":"step one","status":"in_progress"},{"content":"step two","status":"pending"}]}"#;
         // Right after a full (re)plan: the drive rules ARE included.
         let mut fresh = vec![Message::user("go"), todowrite_msg(list)];
-        TodoHook.pre_request(&mut fresh, &TurnCtx::default()).await;
+        TodoHook::default().pre_request(&mut fresh, &TurnCtx::default()).await;
         let after_plan = fresh.last().unwrap().text.clone();
         assert!(
             after_plan.contains("The MOMENT you START"),
@@ -430,7 +540,7 @@ mod tests {
             todowrite_msg(list),
             todo_update_msg(r#"{"action":"update","id":1,"status":"completed"}"#),
         ];
-        TodoHook.pre_request(&mut exec, &TurnCtx::default()).await;
+        TodoHook::default().pre_request(&mut exec, &TurnCtx::default()).await;
         let after_update = exec.last().unwrap().text.clone();
         assert!(
             !after_update.contains("The MOMENT you START"),
@@ -448,7 +558,7 @@ mod tests {
             todowrite_msg(list),
             todowrite_msg(r#"{"action":"update","id":1,"status":"completed"}"#),
         ];
-        TodoHook
+        TodoHook::default()
             .pre_request(&mut merged_update, &TurnCtx::default())
             .await;
         assert!(
@@ -515,7 +625,7 @@ mod tests {
             Message::user("do it"),
             todowrite_msg(r#"{"todos":[{"content":"step one","status":"in_progress"}]}"#),
         ];
-        TodoHook.pre_request(&mut msgs, &TurnCtx::default()).await;
+        TodoHook::default().pre_request(&mut msgs, &TurnCtx::default()).await;
         let last = &msgs[msgs.len() - 1];
         assert!(
             last.text.contains("currently ON task #1"),
@@ -544,7 +654,7 @@ mod tests {
             todowrite_msg(r#"{"todos":[{"content":"step one","status":"in_progress"}]}"#),
         ];
         let before = msgs.len();
-        TodoHook.pre_request(&mut msgs, &TurnCtx::default()).await;
+        TodoHook::default().pre_request(&mut msgs, &TurnCtx::default()).await;
         assert_eq!(msgs.len(), before + 1, "one reminder appended");
         let last = &msgs[msgs.len() - 1];
         assert_eq!(last.role, Role::User);
@@ -557,7 +667,7 @@ mod tests {
     async fn no_injection_when_no_list() {
         let mut msgs = vec![Message::user("hi"), Message::assistant("hello", vec![])];
         let before = msgs.len();
-        TodoHook.pre_request(&mut msgs, &TurnCtx::default()).await;
+        TodoHook::default().pre_request(&mut msgs, &TurnCtx::default()).await;
         assert_eq!(msgs.len(), before, "empty list → no injection");
     }
 
@@ -781,7 +891,7 @@ mod tests {
             Message::assistant("here is the summary…", vec![]),
         ]);
         assert!(
-            TodoHook.offer_continuation(&convo).await.is_some(),
+            TodoHook::default().offer_continuation(&convo).await.is_some(),
             "open item on stop must nudge"
         );
     }
@@ -796,7 +906,7 @@ mod tests {
             Message::assistant("all done", vec![]),
         ]);
         assert!(
-            TodoHook.offer_continuation(&convo).await.is_none(),
+            TodoHook::default().offer_continuation(&convo).await.is_none(),
             "all completed → let it stop"
         );
     }
@@ -807,7 +917,7 @@ mod tests {
             Message::user("hi"),
             Message::assistant("hi there", vec![]),
         ]);
-        assert!(TodoHook.offer_continuation(&convo).await.is_none());
+        assert!(TodoHook::default().offer_continuation(&convo).await.is_none());
     }
 
     #[tokio::test]
@@ -822,7 +932,7 @@ mod tests {
             Message::assistant("foo does X.", vec![]),
         ]);
         assert!(
-            TodoHook.offer_continuation(&convo).await.is_none(),
+            TodoHook::default().offer_continuation(&convo).await.is_none(),
             "a stale open list not touched this turn must not force a continuation"
         );
     }
@@ -835,7 +945,7 @@ mod tests {
             Message::assistant("summary", vec![]),
         ]);
         assert!(
-            TodoHook.offer_continuation(&convo).await.is_some(),
+            TodoHook::default().offer_continuation(&convo).await.is_some(),
             "first stop nudges"
         );
         // Kernel injected the nudge as a synthetic user message; model stops again without closing.
@@ -846,7 +956,7 @@ mod tests {
             .messages
             .push(Message::assistant("still open", vec![]));
         assert!(
-            TodoHook.offer_continuation(&convo).await.is_none(),
+            TodoHook::default().offer_continuation(&convo).await.is_none(),
             "already nudged this turn → let it stop (no spin)"
         );
     }

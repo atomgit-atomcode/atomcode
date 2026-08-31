@@ -983,7 +983,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // through prepare()/assemble() here; `assemble.rs::build_coding_agent` (which also registers
     // it) is reachable only from tests + examples, so there is no double-registration.
     if todo_enabled {
-        hooks.push(Arc::new(crate::todo::TodoHook));
+        hooks.push(Arc::new(crate::todo::TodoHook::new(&cfg.working_dir)));
     }
     // DeepSeek-only opening-turn skill-first reminder. A weak model (deepseek) skips
     // use_skill and dives straight into exploring/solutioning; a static persona line did

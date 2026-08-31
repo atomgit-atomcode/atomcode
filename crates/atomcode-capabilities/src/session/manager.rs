@@ -34,8 +34,36 @@ pub const META_VERSION: u32 = 1;
 pub const MAX_SESSION_ID_BYTES: usize = 128;
 pub const MAX_META_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+/// Bounded size for the todo-list sidecar: a todo list is small (a few dozen
+/// items), so a generous-but-bounded cap prevents a corrupt file from ballooning
+/// memory on read.
+pub const MAX_TODO_SIDECAR_BYTES: usize = 256 * 1024;
 const MAX_REWIND_TRANSACTION_BYTES: usize = MAX_SNAPSHOT_BYTES + MAX_META_BYTES;
 const INFLIGHT_SNAPSHOT_VERSION: u32 = 1;
+
+/// Serializable todo-list sidecar. Independent of the transcript so a compaction
+/// that drains old turns (including the early todowrite plan call) does not erase
+/// the todo state the model (`TodoHook` pre-request anchor) and the vscode panel
+/// rely on (issue #1503). `message_count` is a stale marker: readers discard the
+/// sidecar when the CURRENT conversation message count is smaller (a rollback /
+/// undo truncated history).
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct TodoSidecar {
+    #[serde(default)]
+    pub todos: Vec<TodoSidecarItem>,
+    /// Conversation message count at write time (stale-detection marker).
+    #[serde(default)]
+    pub message_count: usize,
+}
+
+/// One todo row in the sidecar. `status` uses the canonical strings
+/// `pending` / `in_progress` / `completed` (matches the vscode frontend).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TodoSidecarItem {
+    pub content: String,
+    pub status: String,
+}
+
 pub const MAX_LEGACY_SESSION_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_JSONL_BYTES: usize = 512 * 1024 * 1024;
@@ -987,6 +1015,41 @@ impl SessionManager {
     }
     pub fn meta_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "meta")
+    }
+    /// Todo-list sidecar path: `<root>/<id>.todos.json` (sibling of meta/snapshot).
+    pub fn todo_sidecar_path(&self, id: &str) -> SessionResult<PathBuf> {
+        self.path_for(id, "todos.json")
+    }
+    /// Write the todo-list sidecar atomically. Best-effort by callers: a failure
+    /// only means the todo panel/anchor may fall back to transcript derivation.
+    pub fn write_todo_sidecar(
+        &self,
+        id: &str,
+        todos: &[TodoSidecarItem],
+        message_count: usize,
+    ) -> SessionResult<()> {
+        let sidecar = TodoSidecar {
+            todos: todos.to_vec(),
+            message_count,
+        };
+        let bytes = serialize_bounded(&sidecar, "todo sidecar", MAX_TODO_SIDECAR_BYTES)?;
+        atomic_write(&self.todo_sidecar_path(id)?, &bytes)
+    }
+    /// Read the todo-list sidecar. The sidecar is written ONLY on a normal
+    /// `turn_complete` — the cancel/undo path (`finish_cancelled`) never reaches
+    /// `turn_complete`, so a truncated history never leaves a freshly-written
+    /// stale list behind. Message count is intentionally NOT used as a staleness
+    /// check here: a compaction ALSO shrinks the transcript (121 → 24 messages)
+    /// and must NOT invalidate the todo list — that is exactly the scenario this
+    /// sidecar exists for (issue #1503). `Ok(None)` when absent.
+    pub fn read_todo_sidecar(&self, id: &str) -> SessionResult<Option<TodoSidecar>> {
+        let path = self.todo_sidecar_path(id)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = read_regular_file_bounded(&path, "todo sidecar", MAX_TODO_SIDECAR_BYTES)?;
+        let sidecar: TodoSidecar = deserialize(&bytes, "todo sidecar")?;
+        Ok(Some(sidecar))
     }
     fn meta_lock_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "meta.lock")

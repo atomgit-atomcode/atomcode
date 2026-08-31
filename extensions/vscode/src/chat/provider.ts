@@ -510,6 +510,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           type: 'sessionMessages',
           messages,
           terminal: this._terminalForWebview(targetRuntime.terminal),
+          todos: detail.todos,
         }, targetRuntime.streamGeneration ?? 0);
         return messages;
       })

@@ -387,6 +387,12 @@ pub struct SessionDetail {
     pub updated_at: u64,
     pub message_count: usize,
     pub messages: Vec<MessageInfo>,
+    /// Persisted todo list (from the `<id>.todos.json` sidecar). Empty when the
+    /// session has no sidecar or it is stale (a rollback truncated history) —
+    /// vscode then falls back to deriving todos from the messages. This survives
+    /// a compaction that drained the transcript's todowrite calls (issue #1503).
+    #[serde(default)]
+    pub todos: Vec<atomcode_capabilities::session::manager::TodoSidecarItem>,
 }
 
 /// Global project state store (current working directory)
@@ -2044,6 +2050,10 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
                         return (StatusCode::NOT_FOUND, Json(msg)).into_response();
                     }
                 };
+            // Read the todo sidecar BEFORE moving fields out of `session` below.
+            // (Survives compaction that drained the transcript's todowrite calls;
+            // the stale marker check happens inside `read_todo_sidecar`.)
+            let todos = read_todo_sidecar_for_detail(&session);
             let detail = SessionDetail {
                 id: session.meta.id,
                 name: session.meta.name,
@@ -2052,6 +2062,7 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
                 updated_at: u64::try_from(session.meta.updated_at.max(0)).unwrap_or(0),
                 message_count: messages.len(),
                 messages,
+                todos,
             };
             Json(detail).into_response()
         }
@@ -2251,6 +2262,25 @@ pub(crate) fn attach_snapshot_message_timestamps(
     {
         info.created_at = snapshot_message_timestamp(meta, message, index, turn_timestamps);
     }
+}
+
+/// Read the persisted todo-list sidecar for a catalog session detail response.
+/// `current_message_count` is the snapshot message count: the sidecar's own
+/// `message_count` marker must be ≤ it, otherwise a rollback/undo truncated the
+/// history and the stale list is discarded (vscode falls back to transcript
+/// derivation). Returns an empty vec on absence / staleness / any error.
+fn read_todo_sidecar_for_detail(
+    session: &crate::legacy_convert::CatalogSessionView,
+) -> Vec<atomcode_capabilities::session::manager::TodoSidecarItem> {
+    let manager = atomcode_capabilities::session::SessionManager::for_project(
+        std::path::Path::new(&session.meta.working_dir),
+    );
+    manager
+        .read_todo_sidecar(&session.meta.id)
+        .ok()
+        .flatten()
+        .map(|sidecar| sidecar.todos)
+        .unwrap_or_default()
 }
 
 fn merge_catalog_session_messages_for_display(
