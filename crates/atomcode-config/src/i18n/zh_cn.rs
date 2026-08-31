@@ -203,7 +203,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Right                            接受下一步建议（不会自动发送）
 
   ── 模式与模型 ──
-    Shift+Tab                        无补全菜单时切换到下一个执行模式
+    Shift+Tab                        无补全菜单时切换到下一个执行模式（终端不支持 Shift+Tab 时，用 /plan /build /auto）
     F2 / Shift+F2                    下一个 / 上一个模型（Mac：Fn+F2 / Fn+Shift+F2）
     Ctrl+T                           切换 reasoning_effort
 
