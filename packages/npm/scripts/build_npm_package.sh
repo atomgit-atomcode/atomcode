@@ -75,16 +75,19 @@ publish_platform() {
   local dir="$WORK_DIR/$tag"
   mkdir -p "$dir/bin"
 
-  # generate package.json dynamically — 就几行
-  cat > "$dir/package.json" <<EOF
-{"name":"@atomgit.com/atomcode","version":"${VERSION}-${tag}","os":["${os}"],"cpu":["${arch}"],"files":["bin/"]}
-EOF
-
   # download binary
   local dl_os="$os"
   [ "$os" = "win32" ] && dl_os="windows"
   local bin_name="atomcode$([ "$os" = "win32" ] && echo ".exe")"
   local url="https://atomgit.com/atomgit_atomcode/atomcode/releases/download/v${VERSION}/atomcode-v${VERSION}-${dl_os}-${arch}$([ "$os" = "win32" ] && echo ".exe")"
+
+  # generate package.json dynamically — 独立平台包名 + bin 入口。
+  # 修复 #1515：平台包此前与 core 包同名发布（版本号带 -win32-x64 后缀）且缺 bin 字段，
+  # 导致 npm -g update 装到平台包时没有 atomcode 命令 shim。
+  # 现改为独立包名 @atomgit.com/atomcode-{os}-{arch}，并补 bin 字段兜底直装场景。
+  cat > "$dir/package.json" <<EOF
+{"name":"@atomgit.com/atomcode-${tag}","version":"${VERSION}","os":["${os}"],"cpu":["${arch}"],"files":["bin/"],"bin":{"atomcode":"./bin/${bin_name}"}}
+EOF
 
   echo "  ↓ downloading ${tag}..."
   local http_code
@@ -103,7 +106,7 @@ EOF
   # publish
   cd "$dir"
   npm publish --registry=https://registry.npmjs.org/ --access public $NPM_EXTRA
-  echo "  ✓ @atomgit.com/atomcode@${VERSION}-${tag}"
+  echo "  ✓ @atomgit.com/atomcode-${tag}@${VERSION}"
 }
 
 echo ""
@@ -123,17 +126,19 @@ cp "$NPM_DIR/package.json" "$CORE_DIR/"
 cp "$NPM_DIR/bin/atomcode.js" "$CORE_DIR/bin/"
 cd "$CORE_DIR"
 # Inject version + optionalDependencies dynamically (like Codex does in CI)
+# 修复 #1515：平台包已改为独立包名发布（@atomgit.com/atomcode-{os}-{arch}），
+# 这里直接引用独立包名版本，不再用 npm: alias 指向同名平台版本。
 node -e "
 var fs = require('fs');
 var pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
 pkg.version = '$VERSION';
 pkg.optionalDependencies = {
-  '@atomgit.com/atomcode-darwin-arm64': 'npm:@atomgit.com/atomcode@$VERSION-darwin-arm64',
-  '@atomgit.com/atomcode-darwin-x64': 'npm:@atomgit.com/atomcode@$VERSION-darwin-x64',
-  '@atomgit.com/atomcode-linux-arm64': 'npm:@atomgit.com/atomcode@$VERSION-linux-arm64',
-  '@atomgit.com/atomcode-linux-x64': 'npm:@atomgit.com/atomcode@$VERSION-linux-x64',
-  '@atomgit.com/atomcode-win32-x64': 'npm:@atomgit.com/atomcode@$VERSION-win32-x64',
-  '@atomgit.com/atomcode-ohos-arm64': 'npm:@atomgit.com/atomcode@$VERSION-ohos-arm64'
+  '@atomgit.com/atomcode-darwin-arm64': '$VERSION',
+  '@atomgit.com/atomcode-darwin-x64': '$VERSION',
+  '@atomgit.com/atomcode-linux-arm64': '$VERSION',
+  '@atomgit.com/atomcode-linux-x64': '$VERSION',
+  '@atomgit.com/atomcode-win32-x64': '$VERSION',
+  '@atomgit.com/atomcode-ohos-arm64': '$VERSION'
 };
 fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
 "
