@@ -517,6 +517,29 @@ fn auto_compact_trigger(
     (utilization >= threshold).then_some(CompactTrigger::Auto { utilization })
 }
 
+/// Conservative floor applied when the LIVE provider window is unknown (`0`) but a
+/// RECORDED window exists (from the last assistant's `meta.ctx_window`). Mirrors the
+/// serde default `context_window` (`default_context_window` = 128k), so a model
+/// switch that fails to report its new window still gets judged against a sane
+/// budget instead of the OLD (possibly much larger) recorded window — which would
+/// compute a misleadingly-low utilization and skip the compaction, sending an
+/// over-window request that the provider rejects with a 400.
+const UNKNOWN_WINDOW_SAFE_FLOOR: u32 = 128_000;
+
+/// Effective context window for pressure decisions: prefer the LIVE provider window;
+/// when it is unknown (`0`) but a recorded window exists, use the recorded window
+/// clamped to [`UNKNOWN_WINDOW_SAFE_FLOOR`]; when BOTH are unknown, `0` (callers
+/// treat that as "can't gauge, so don't act" — the original unknown-window default).
+fn effective_compact_window(live: u32, recorded: u32) -> u32 {
+    if live > 0 {
+        live
+    } else if recorded > 0 {
+        recorded.min(UNKNOWN_WINDOW_SAFE_FLOOR)
+    } else {
+        0
+    }
+}
+
 /// Classification of a single tool call for the three-phase tool loop.
 ///
 /// Phase ① CLASSIFY maps every `pending_call` (in order) to a `CallPlan`;
@@ -1122,8 +1145,11 @@ impl RunningAgent {
         // Prefer the live window; fall back to the recorded one only when the live
         // window is unknown (0) — mirrors `run_compaction`, and reproduces the old
         // stored-ratio behavior for the unknown-window case (no regression there).
+        // When BOTH are unknown the recorded fallback is clamped to a conservative
+        // floor so a model switch that fails to report its window still triggers
+        // once history outgrows a sane budget (issue #1499: over-window 400).
         let live = self.provider.context_window();
-        let window = if live > 0 { live } else { recorded_window };
+        let window = effective_compact_window(live, recorded_window);
         auto_compact_trigger(used, window, thresh)
     }
 
@@ -1153,11 +1179,10 @@ impl RunningAgent {
             .map(|meta| (meta.ctx_window, meta.used_tokens))
             .unwrap_or((0, 0));
         let live_window = self.provider.context_window();
-        let ctx_window = if live_window > 0 {
-            live_window
-        } else {
-            recorded_window
-        };
+        // Keep the SAME conservative window resolution as `should_compact` /
+        // `run_compaction` so the `will_summarize` stage prediction below always
+        // matches the plan `run_compaction` actually executes (issue #1499).
+        let ctx_window = effective_compact_window(live_window, recorded_window);
         let utilization = if ctx_window > 0 {
             used_tokens as f32 / ctx_window as f32
         } else {
@@ -1204,12 +1229,9 @@ impl RunningAgent {
         // one only when the live window is unknown), and recompute pressure against it.
         // A compaction running after a model switch must use the NEW window — otherwise
         // the keep-budget / drain math would be sized to the previous model's window.
+        // Unknown-window fallback is clamped to a conservative floor (issue #1499).
         let live_window = self.provider.context_window();
-        let ctx_window = if live_window > 0 {
-            live_window
-        } else {
-            recorded_window
-        };
+        let ctx_window = effective_compact_window(live_window, recorded_window);
         let utilization = if ctx_window > 0 {
             used_tokens as f32 / ctx_window as f32
         } else {
@@ -2068,7 +2090,15 @@ impl RunningAgent {
             // stops early when a pass drains nothing (single oversized input at the sacred
             // floor — unrecoverable, so fall through to the advisory).
             {
-                let window = self.provider.context_window();
+                // Same conservative window resolution as `should_compact` / `run_compaction`:
+                // prefer the live provider window; when it is unknown (0) but the conversation
+                // recorded a window, clamp the recorded fallback to a safe floor so a model
+                // switch that fails to report its window still gets emergency-compacted
+                // before the over-window request is sent (issue #1499). Both unknown → 0 →
+                // the loop below stays inert (the original "can't gauge, don't act").
+                let live = self.provider.context_window();
+                let (recorded_window, _, _) = convo.last_pressure();
+                let window = effective_compact_window(live, recorded_window);
                 let limit = effective_input_limit(window, self.chat_options.max_tokens);
                 let est = |msgs: &[Message]| -> u64 {
                     msgs.iter().map(|m| m.estimate_tokens() as u64).sum()
@@ -4559,7 +4589,7 @@ mod cap_tool_result_tests {
 
 #[cfg(test)]
 mod auto_compact_trigger_tests {
-    use super::{auto_compact_trigger, CompactTrigger};
+    use super::{auto_compact_trigger, effective_compact_window, CompactTrigger};
 
     fn fires(used: u32, window: u32, thresh: f32) -> bool {
         matches!(
@@ -4609,6 +4639,45 @@ mod auto_compact_trigger_tests {
             }
             other => panic!("expected Auto, got {other:?}"),
         }
+    }
+
+    // ── effective_compact_window: unknown-window fallback (issue #1499) ─────────
+
+    #[test]
+    fn live_window_wins_when_known() {
+        assert_eq!(effective_compact_window(256_000, 1_000_000), 256_000);
+        assert_eq!(effective_compact_window(128_000, 64_000), 128_000);
+    }
+
+    #[test]
+    fn unknown_live_window_clamps_recorded_to_safe_floor() {
+        // #1499: model switch 1M → 256k, but the new provider reports window 0
+        // (unknown). The recorded 1M fallback would compute util 0.3 and skip
+        // compaction; the clamped floor keeps a sane budget so 300k triggers.
+        assert_eq!(effective_compact_window(0, 1_000_000), 128_000);
+        assert_eq!(effective_compact_window(0, 256_000), 128_000);
+        // A small recorded window below the floor passes through unchanged.
+        assert_eq!(effective_compact_window(0, 64_000), 64_000);
+    }
+
+    #[test]
+    fn both_windows_unknown_stays_inert() {
+        assert_eq!(effective_compact_window(0, 0), 0);
+    }
+
+    #[test]
+    fn unknown_live_window_still_triggers_over_window_history() {
+        // 300k against the clamped 128k floor → util 2.34 ≥ 0.7 → fires.
+        let window = effective_compact_window(0, 1_000_000);
+        assert!(
+            fires(300_000, window, 0.7),
+            "model switch with unknown window must still compact over-window history"
+        );
+        // Small history under the floor stays below threshold — no over-compaction.
+        assert!(
+            !fires(50_000, window, 0.7),
+            "small history must not trigger under the clamped floor"
+        );
     }
 }
 
