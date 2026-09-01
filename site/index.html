@@ -129,6 +129,10 @@
   .install-cmd-section:hover .cp-btn{opacity:1}
   .install-cmd-section .cp-btn:hover{background:var(--accent);color:#000;border-color:var(--accent)}
   .install-cmd-section .cp-btn.copied{opacity:1;background:var(--green);color:#000;border-color:var(--green)}
+  .install-cmd-section.detected{border-color:rgba(232,160,80,.35);background:rgba(232,160,80,.05)}
+  .install-cmd-section.detected .cp-bar{background:rgba(232,160,80,.08);border-bottom-color:rgba(232,160,80,.18)}
+  .install-cmd-section.detected .cp-bar .label{color:rgba(255,255,255,.7)}
+  .det-badge{display:inline-block;margin-right:8px;padding:1px 7px;border-radius:20px;background:var(--green);color:#000;font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:.5px;vertical-align:middle}
   .install-actions{margin-top:14px;display:flex;align-items:center;justify-content:space-between;font-size:11px;letter-spacing:.5px;color:rgba(255,255,255,.45)}
   .install-actions .left{display:flex;align-items:center;gap:10px}
   .cp-btn{padding:7px 14px;background:rgba(232,160,80,.18);border:1px solid rgba(232,160,80,.4);color:var(--accent);font-family:var(--mono);font-size:11px;letter-spacing:1.5px;transition:all .2s}
@@ -699,13 +703,7 @@
           <div class="install-tab" data-method="brew"><span>brew</span></div>
         </div>
         <div class="install-body">
-          <pre class="install-cmd" id="osCmd"></pre>
-          <div class="install-actions">
-            <div class="left">
-              <span id="osHint">自动检测 · 已选 macOS</span>
-            </div>
-            <button class="cp-btn" id="copyInstall" data-magnetic data-i18n="install.copy">📋 复制命令</button>
-          </div>
+          <div class="install-cmd-list" id="osCmd"></div>
         </div>
       </div>
 
@@ -1187,6 +1185,7 @@ const T={
               en:"<b>Open-source alternative</b> to Claude Code / Cursor Agent, living in your terminal. Connect any OpenAI-compatible LLM, autonomously read, edit, test, self-verify — built with Rust. <b>100% AI-generated codebase.</b>"},
   'install.copy':{zh:'📋 复制命令',en:'📋 Copy command'},
   'install.copy.short':{zh:'📋 复制',en:'📋 Copy'},
+  'install.detected':{zh:'✓ 已检测',en:'✓ Detected'},
   'flow.bug':{zh:'修复登录 bug',en:'Fix login bug'},
   'flow.refactor':{zh:'模块重构',en:'Module refactor'},
   'flow.devserver':{zh:'启动 Dev Server',en:'Start dev server'},
@@ -1383,16 +1382,27 @@ function winInstallCmd(){
 }
 function npmInstallCmd(){return 'npm install -g @atomgit.com/atomcode';}
 function brewInstallCmd(){return 'brew install --cask atomcode';}
-// Hero box renders ONE detected line per method. `install.sh` auto-detects OS +
-// CPU arch itself, so the same curl line serves macOS / Linux / HarmonyOS /
-// Git-Bash; only NATIVE Windows (no Unix shell) needs the PowerShell `install.ps1`
-// path — so `os==='win'` is the sole branch that diverges.
-function heroMethodCmd(method,os){
-  if(method==='npm') return npmInstallCmd();
-  if(method==='brew') return brewInstallCmd();
-  return os==='win' ? winInstallCmd() : unixInstallCmd();
+// Split a METHOD_CMDS string into per-`# header + commands` sections on blank
+// lines; trim edge newlines and drop empties. Shared by the hero box and the
+// reference section so both render identical `install-cmd-section` blocks.
+function splitInstallSections(raw){
+  return raw.split(/\n[ \t]*\n/).map(s=>s.replace(/^\n+|\n+$/g,'')).filter(s=>s.length>0);
 }
-function osHint(os){return t('os.'+os);}
+// Hoist leading whole-line `#` comments into the section label (joined with
+// ` · `); the remaining lines are the executable body that renders + copies.
+function extractInstallLabel(text){
+  const lines=text.split('\n');
+  const labelParts=[];
+  let i=0;
+  while(i<lines.length){
+    if(/^\s*$/.test(lines[i])){i++;continue;}
+    if(/^\s*#/.test(lines[i])){labelParts.push(lines[i].replace(/^\s*#\s*/,'').trim());i++;continue;}
+    break;
+  }
+  const label=labelParts.filter(s=>s.length>0).join(' · ');
+  const body=lines.slice(i).join('\n').replace(/^\n+|\n+$/g,'');
+  return [label,body];
+}
 const METHOD_CMDS={
   // Reference section (bottom) shows ALL platforms at once, so curl carries both
   // the universal Unix line and the Windows PowerShell line — no OS detection
@@ -1525,7 +1535,6 @@ let HERO_METHOD='curl',HERO_OS='mac';
 (function(){
   const tabs=document.getElementById('osTabs');
   const cmd=document.getElementById('osCmd');
-  const hint=document.getElementById('osHint');
   const toast=document.getElementById('toast');
   function detect(){
     const ua=navigator.userAgent||'';
@@ -1544,25 +1553,43 @@ let HERO_METHOD='curl',HERO_OS='mac';
     text=text.replace(/\b(curl|irm|iex|bash|wget|git|cd|cargo|npm|brew|export)\b/g,'<span class="accent">$1</span>');
     return text.replace(/\x00(\d+)\x00/g,(_,i)=>`<span class="${stash[i][0]}">${stash[i][1]}</span>`);
   }
-  function heroHint(){
-    if(HERO_METHOD==='npm') return t('hint.npm');
-    if(HERO_METHOD==='brew') return t('hint.brew');
-    // curl: show the detected OS (only Windows changes the actual command).
-    return t('os.auto')+osHint(HERO_OS);
-  }
+  // Render ALL platform commands (curl for macOS/Linux/HarmonyOS/Git-Bash AND
+  // the Windows PowerShell `irm`), each as its own `install-cmd-section` — same
+  // layout as the reference section below. The block matching the visitor's
+  // detected OS is hoisted to the top and tagged with a "detected" badge, so we
+  // prioritise the detected platform without hiding the others.
   window.applyHeroInstall=function(){
     tabs.querySelectorAll('.install-tab').forEach(t=>t.classList.toggle('active',t.dataset.method===HERO_METHOD));
-    cmd.innerHTML=highlight(heroMethodCmd(HERO_METHOD,HERO_OS));
-    hint.textContent=heroHint();
+    const parsed=splitInstallSections(tx(METHOD_CMDS[HERO_METHOD])).map(extractInstallLabel);
+    // curl carries two blocks (Unix + PowerShell); lead with the one that
+    // matches the detected OS — native Windows → PowerShell first.
+    if(HERO_METHOD==='curl' && parsed.length>1){
+      const isPs=([lbl])=>/PowerShell/i.test(lbl);
+      const detIdx=HERO_OS==='win' ? parsed.findIndex(isPs) : parsed.findIndex(p=>!isPs(p));
+      if(detIdx>0){const [d]=parsed.splice(detIdx,1);parsed.unshift(d);}
+    }
+    const copyLabel=t('install.copy.short');
+    const badge=HERO_METHOD==='curl'?`<span class="det-badge">${t('install.detected')}</span>`:'';
+    cmd.innerHTML=parsed.map(([lbl,body],i)=>
+      `<div class="install-cmd-section${i===0&&badge?' detected':''}">`
+      +`<div class="cp-bar"><span class="label">${i===0?badge:''}${lbl}</span>`
+      +`<button class="cp-btn cp-section" type="button">${copyLabel}</button></div>`
+      +`<pre class="install-cmd">${highlight(body)}</pre>`
+      +`</div>`).join('');
+    cmd.querySelectorAll('.cp-section').forEach((btn,i)=>{btn.__copy=parsed[i][1]});
   };
   HERO_OS=detect();applyHeroInstall();
   tabs.addEventListener('click',e=>{const tb=e.target.closest('.install-tab');if(!tb)return;HERO_METHOD=tb.dataset.method;applyHeroInstall();});
-  document.getElementById('copyInstall').addEventListener('click',()=>{
-    copyText(heroMethodCmd(HERO_METHOD,HERO_OS));
-    const btn=document.getElementById('copyInstall');btn.classList.add('copied');btn.textContent=LANG==='zh'?'✓ 已复制':'✓ Copied';
+  // Delegated copy — the section button is re-rendered on every tab
+  // switch and language toggle, so bind on the stable container.
+  cmd.addEventListener('click',e=>{
+    const btn=e.target.closest('.cp-section');
+    if(!btn)return;
+    copyText(btn.__copy||'');
+    btn.classList.add('copied');btn.textContent=LANG==='zh'?'✓ 已复制':'✓ Copied';
     toast.textContent=t('toast.install.copied');toast.classList.add('show');
     setTimeout(()=>{toast.classList.remove('show')},1800);
-    setTimeout(()=>{btn.classList.remove('copied');btn.textContent=t('install.copy')},1800);
+    setTimeout(()=>{btn.classList.remove('copied');btn.textContent=t('install.copy.short')},1800);
   });
 })();
 
@@ -1746,34 +1773,18 @@ window.applyWizardNav=null;
   // Multiple consecutive leading `#` lines are joined with ` · ` so a
   // future METHOD_CMDS entry that splits its header across lines
   // still produces one readable label.
-  function extractLabel(text){
-    const lines=text.split('\n');
-    const labelParts=[];
-    let i=0;
-    while(i<lines.length){
-      if(/^\s*$/.test(lines[i])){i++;continue;}
-      if(/^\s*#/.test(lines[i])){labelParts.push(lines[i].replace(/^\s*#\s*/,'').trim());i++;continue;}
-      break;
-    }
-    const label=labelParts.filter(s=>s.length>0).join(' · ');
-    const body=lines.slice(i).join('\n').replace(/^\n+|\n+$/g,'');
-    return [label,body];
-  }
   function show(m){
     CUR_METHOD=m;
     tabs.querySelectorAll('.install-tab').forEach(tb=>tb.classList.toggle('active',tb.dataset.method===m));
     const raw=tx(METHOD_CMDS[m]);
     // Split on blank lines so each `# header + commands` group gets
-    // its own copy button. Trim per-section to drop stray edge
-    // newlines that would render as visible empty lines inside the
-    // <pre>. Empty sections are dropped (defensive — current strings
-    // don't produce any, but a future edit might).
-    const sections=raw.split(/\n[ \t]*\n/).map(s=>s.replace(/^\n+|\n+$/g,'')).filter(s=>s.length>0);
+    // its own copy button (shared helper; see splitInstallSections).
+    const sections=splitInstallSections(raw);
     const label=t('install.copy.short');
     // Parse each section once into [label, body]; the label rides in
     // the action bar (left of the copy button) and the body is what
     // both the <pre> renders and the button copies.
-    const parsed=sections.map(extractLabel);
+    const parsed=sections.map(extractInstallLabel);
     cmd.innerHTML=parsed.map(([lbl,body])=>
       `<div class="install-cmd-section">`
       +`<div class="cp-bar"><span class="label">${lbl}</span>`
