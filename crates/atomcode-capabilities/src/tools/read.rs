@@ -1215,11 +1215,11 @@ mod tests {
     #[cfg(feature = "codeintel")]
     #[tokio::test]
     async fn large_symbolless_code_file_falls_back_to_a_bounded_page() {
-        // A >300-line .rs with NO symbols (only comments) has no skeleton, so it
-        // falls back to the same bounded page as other text files.
+        // A .rs past the 1500-line default page with NO symbols (only comments) has no
+        // skeleton, so it falls back to the same bounded page as other text files.
         let d = tempfile::tempdir().unwrap();
         let mut src = String::new();
-        for i in 0..400 {
+        for i in 0..1600 {
             src.push_str(&format!("// comment {i}\n"));
         }
         std::fs::write(d.path().join("c.rs"), &src).unwrap();
@@ -1228,7 +1228,7 @@ mod tests {
             .await;
         assert!(!r.content.contains("File skeleton"), "{}", r.content);
         assert!(r.content.contains("comment 0"), "{}", r.content);
-        assert!(!r.content.contains("comment 300"), "{}", r.content);
+        assert!(!r.content.contains("comment 1500"), "{}", r.content);
         assert!(
             r.content.contains("Continue with read_file("),
             "{}",
@@ -1240,9 +1240,10 @@ mod tests {
     #[tokio::test]
     async fn large_non_code_file_uses_a_bounded_page() {
         // .txt has no tree-sitter language, so it uses normal bounded pagination.
+        // Short lines, so the 1500-line cap binds before the 50 KiB byte budget.
         let d = tempfile::tempdir().unwrap();
         let mut src = String::new();
-        for i in 0..400 {
+        for i in 0..1600 {
             src.push_str(&format!("line {i}\n"));
         }
         std::fs::write(d.path().join("big.txt"), &src).unwrap();
@@ -1251,7 +1252,7 @@ mod tests {
             .await;
         assert!(!r.content.contains("File skeleton"), "{}", r.content);
         assert!(r.content.contains("line 0"), "{}", r.content);
-        assert!(!r.content.contains("line 300"), "{}", r.content);
+        assert!(!r.content.contains("line 1500"), "{}", r.content);
         assert!(
             r.content.contains("Continue with read_file("),
             "{}",

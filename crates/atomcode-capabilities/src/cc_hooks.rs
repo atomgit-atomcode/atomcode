@@ -1164,8 +1164,12 @@ mod tests {
             event: HookEvent::Stop,
             matcher: None,
             command: format!(
-                "cd '{cwd}' && grep -q '\"transcript_path\":\"{transcript_s}\"' \
-                 && grep -q '\"stop_hook_active\":false' && touch '{m1_s}'"
+                // Land the payload before grepping it: two chained `grep -q` share one
+                // stdin, and the first drains the pipe when it exits on its match, so
+                // the second always sees EOF and the `touch` never runs.
+                "cd '{cwd}' && cat > payload.json \
+                 && grep -q '\"transcript_path\":\"{transcript_s}\"' payload.json \
+                 && grep -q '\"stop_hook_active\":false' payload.json && touch '{m1_s}'"
             ),
             timeout_ms: 5_000,
             plugin_root: None,
