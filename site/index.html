@@ -821,11 +821,13 @@
     <article class="feat">
       <div class="icon">⎇</div>
       <h3 data-i18n="feat.atomgit.t">AtomGit 原生集成</h3>
-      <p data-i18n="feat.atomgit.d">AtomGit OAuth 一键登录、内置工具管理 Issue / PR / 仓库、企业微信扫码登录 —— 与开源生态无缝对接。</p>
+      <p data-i18n="feat.atomgit.d">内置工具直接创建仓库、提交 PR、创建 Issue,OAuth 一键登录 · 微信扫码领 CodingPlan 免费额度 —— 与开源生态无缝对接。</p>
       <div class="demo">
         <div class="gitcmd">
-          <div class="l1">› 为 auth callback 404 创建一个 AtomGit Issue</div>
-          <div class="l2">✓ atomgit.com/.../atomcode/issues/124</div>
+          <div class="l1" data-i18n="feat.atomgit.demo.q1">› 为 auth callback 404 创建 AtomGit Issue</div>
+          <div class="l2" data-i18n="feat.atomgit.demo.a1">✓ atomgit.com/.../issues/124</div>
+          <div class="l1" data-i18n="feat.atomgit.demo.q2">› 提交修复 PR 到 main</div>
+          <div class="l2" data-i18n="feat.atomgit.demo.a2">✓ atomgit.com/.../pulls/57</div>
         </div>
       </div>
     </article>
@@ -1231,8 +1233,12 @@ const T={
                    en:'Ctrl+V paste, Finder drag, iTerm2 path auto-detect — when the main model lacks vision, falls back to VL preprocessor (OCR + describe).'},
   'feat.images.demo':{zh:'📎 <b>Ctrl + V</b> 粘贴截图  ·  或拖入图片',en:'📎 <b>Ctrl + V</b> paste screenshot · or drop an image'},
   'feat.atomgit.t':{zh:'AtomGit 原生集成',en:'AtomGit Native Integration'},
-  'feat.atomgit.d':{zh:'AtomGit OAuth 一键登录、内置工具管理 Issue / PR / 仓库、企业微信扫码登录 —— 与开源生态无缝对接。',
-                    en:'AtomGit OAuth login, built-in Issue / PR / repository tools, and WeCom QR login — seamless with the open-source ecosystem.'},
+  'feat.atomgit.d':{zh:'内置工具直接创建仓库、提交 PR、创建 Issue,OAuth 一键登录 · 微信扫码领 CodingPlan 免费额度 —— 与开源生态无缝对接。',
+                    en:'Built-in tools create repos, open PRs and file Issues directly — plus OAuth login and WeChat QR sign-in for free CodingPlan credits, seamless with the open-source ecosystem.'},
+  'feat.atomgit.demo.q1':{zh:'› 为 auth callback 404 创建 AtomGit Issue',en:'› Create an AtomGit Issue for the auth callback 404'},
+  'feat.atomgit.demo.a1':{zh:'✓ atomgit.com/.../issues/124',en:'✓ atomgit.com/.../issues/124'},
+  'feat.atomgit.demo.q2':{zh:'› 提交修复 PR 到 main',en:'› Open a fix PR to main'},
+  'feat.atomgit.demo.a2':{zh:'✓ atomgit.com/.../pulls/57',en:'✓ atomgit.com/.../pulls/57'},
   'feat.eco.t':{zh:'Skills + Plugin 生态',en:'Skills + Plugin Ecosystem'},
   'feat.eco.d':{zh:'Skills 写你自己的斜杠命令；/plugin install <git-repo> 一键拿别人的命令、hook、skill —— 与 Claude Code 生态兼容。',
                 en:'Write your own slash commands as Skills; /plugin install <git-repo> grabs packs of commands, hooks, skills — Claude Code ecosystem compatible.'},
