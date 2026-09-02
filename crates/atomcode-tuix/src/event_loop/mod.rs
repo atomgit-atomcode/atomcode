@@ -18141,10 +18141,22 @@ pub(crate) fn save_proxy_and_reload(
         };
     let desired = desired_config_from_snapshot(ctx, commit.snapshot.config.clone(), false);
 
-    // First-run `/proxy` commonly runs before any provider exists. There is no
-    // HTTP client to rebuild yet; `/login` creates its client after this method
-    // applies the process proxy environment.
-    if desired.providers.is_empty() {
+    // Skip the live-client rebuild ONLY when there is genuinely no running
+    // provider client yet — first-run `/proxy` before `/login`, where `/login`
+    // builds the client afterwards against the env we publish here.
+    //
+    // The previous guard keyed on `desired.providers.is_empty()`, but that
+    // LEGACY table is always empty under the new-schema / CodingPlan setup
+    // (providers live in `config.models` / accounts). So for a logged-in
+    // CodingPlan user it wrongly took this short path: it published the new
+    // proxy env but never rebuilt the live reqwest client, which had baked the
+    // old proxy in at build time — leaving every request tunnelling through a
+    // now-dead proxy until a full restart. Key on the actual runtime instead: a
+    // `Ready` runtime has a client to rebuild; a Deferred/Starting/Failed one
+    // (true first-run) does not, so it correctly falls through to the env-only
+    // path. Schema-agnostic, and matches how `stage_committed_config_reload`
+    // already reads the runtime generation.
+    if ctx.runtime.current_generation().is_none() {
         atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
         ctx.config = desired;
         ctx.observed_config_revision = Some(commit.snapshot.revision);
