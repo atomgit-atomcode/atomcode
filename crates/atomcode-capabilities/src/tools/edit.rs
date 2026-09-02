@@ -325,6 +325,66 @@ async fn write_encoded_if_unchanged(
     write_encoded(path, text, encoding).await
 }
 
+/// How far the closest-line scan looks into the file. The verbatim window below may sit
+/// at the very end of that range, so the line cache holds a little more.
+const MAX_SCAN_LINES: usize = 20_000;
+
+/// Hard caps on the verbatim excerpt handed back on a failed match.
+///
+/// The window SHRINKS to fit `MAX_EXCERPT_CHARS`; it never truncates a line, because a
+/// truncated line is worthless here — the excerpt exists precisely so it can be copied
+/// EXACTLY. A file whose closest line alone busts the budget (minified bundles, one-line
+/// JSON) therefore yields no excerpt and falls back to the short "re-read" hint.
+const MAX_EXCERPT_CHARS: usize = 2000;
+const MAX_EXCERPT_LINES: usize = 40;
+
+const REREAD_HINT: &str = "Re-read the file and copy the exact current text (including whitespace).";
+
+/// A verbatim window of the file's CURRENT text around `center` (0-based line index),
+/// sized to cover roughly what `old_string` spanned. Returns `(first, last, text)` with
+/// 1-based INCLUSIVE line numbers.
+///
+/// Built from `content.lines()`, i.e. LF-normalized — exactly the shape `read_file` shows
+/// the model, and the shape `edit_file`'s EOL coercion accepts back on a CRLF file.
+fn current_text_window(
+    lines: &[&str],
+    center: usize,
+    wanted_lines: usize,
+) -> Option<(usize, usize, String)> {
+    let cost = |line: &str| line.chars().count() + 1;
+    if cost(lines.get(center)?) > MAX_EXCERPT_CHARS {
+        return None;
+    }
+    let span = (wanted_lines + 4).clamp(8, MAX_EXCERPT_LINES);
+    let mut start = center.saturating_sub(2);
+    let mut end = (start + span).min(lines.len()); // exclusive
+    let mut used: usize = lines[start..end].iter().copied().map(cost).sum();
+    // Shrink from the edges, tail first, never dropping the centre line.
+    while used > MAX_EXCERPT_CHARS && end > center + 1 {
+        end -= 1;
+        used -= cost(lines[end]);
+    }
+    while used > MAX_EXCERPT_CHARS && start < center {
+        used -= cost(lines[start]);
+        start += 1;
+    }
+    if used > MAX_EXCERPT_CHARS {
+        return None;
+    }
+    Some((start + 1, end, lines[start..end].join("\n")))
+}
+
+/// What to tell the model when `old_string` did not match.
+///
+/// Beyond naming the closest line, this hands back the file's CURRENT text for the
+/// surrounding block VERBATIM. The failure this addresses is not a near-miss on the text
+/// the model just read — it is an edit written from MEMORY of a region that scrolled out
+/// of context (long session, large single file, post-compaction). Telling such a model to
+/// "re-read the surrounding block" costs a whole extra round-trip before it can even try
+/// again, and it has to guess which range to read; the block is already in hand here, so
+/// hand it over. Only the text we actually hold is asserted — when no window fits the
+/// budget the wording falls back to asking for a re-read, because then we genuinely have
+/// nothing to give.
 fn closest_match_hint(content: &str, old_string: &str) -> String {
     let wanted = old_string
         .lines()
@@ -332,34 +392,37 @@ fn closest_match_hint(content: &str, old_string: &str) -> String {
         .map(str::trim)
         .unwrap_or("");
     if wanted.chars().count() < 4 {
-        return "Re-read the file and copy the exact current text (including whitespace)."
-            .to_string();
+        return REREAD_HINT.to_string();
     }
 
+    let lines: Vec<&str> = content.lines().take(MAX_SCAN_LINES + MAX_EXCERPT_LINES).collect();
     let wanted_lower = wanted.to_lowercase();
-    let mut best: Option<(usize, &str, usize)> = None;
-    for (index, line) in content.lines().take(20_000).enumerate() {
+    let mut best: Option<(usize, usize)> = None;
+    for (index, line) in lines.iter().take(MAX_SCAN_LINES).enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         let score = common_prefix_chars(&wanted_lower, &trimmed.to_lowercase());
-        if best
-            .as_ref()
-            .map_or(true, |(_, _, current)| score > *current)
-        {
-            best = Some((index + 1, line, score));
+        if best.as_ref().map_or(true, |(_, current)| score > *current) {
+            best = Some((index, score));
         }
     }
-    match best.filter(|(_, _, score)| *score >= 4) {
-        Some((line_no, line, _)) => format!(
-            "The closest current line starts at line {line_no}: {:?}. Re-read the surrounding \
-             block and retry with its exact current text.",
-            line.trim().chars().take(160).collect::<String>()
+    let Some((index, _)) = best.filter(|(_, score)| *score >= 4) else {
+        return REREAD_HINT.to_string();
+    };
+    let head = format!(
+        "The closest current line starts at line {}: {:?}.",
+        index + 1,
+        lines[index].trim().chars().take(160).collect::<String>()
+    );
+    match current_text_window(&lines, index, old_string.lines().count()) {
+        Some((first, last, text)) => format!(
+            "{head} The file's CURRENT text for lines {first}-{last} follows verbatim — build \
+             old_string from it rather than from memory:\n\
+             --- current lines {first}-{last} ---\n{text}\n--- end current lines ---"
         ),
-        None => {
-            "Re-read the file and copy the exact current text (including whitespace).".to_string()
-        }
+        None => format!("{head} Re-read the surrounding block and retry with its exact current text."),
     }
 }
 
@@ -719,6 +782,94 @@ mod tests {
             .content
             .contains("closest current line starts at line 1"));
         assert!(result.content.contains("def test_rate_limit()"));
+    }
+
+    /// The whole point of the excerpt: the model can build the next `old_string` from the
+    /// error alone. It must therefore carry the surrounding lines EXACTLY — indentation
+    /// included — and the failed edit must still have changed nothing.
+    #[tokio::test]
+    async fn missing_old_string_hands_back_the_current_block_verbatim() {
+        let d = tempfile::tempdir().unwrap();
+        let mut file = String::new();
+        for i in 1..=60 {
+            file.push_str(&format!("line {i} filler\n"));
+        }
+        // A distinctive, INDENTED block the model will misremember.
+        file.push_str("  Promise.all([\n    api('/a'),\n    api('/b')\n  ]).then(go);\n");
+        for i in 61..=120 {
+            file.push_str(&format!("line {i} filler\n"));
+        }
+        std::fs::write(d.path().join("app.js"), &file).unwrap();
+
+        let result = EditFileTool
+            .execute(
+                r#"{"file_path":"app.js","old_string":"  Promise.all([\n    api('/a'),\n    api('/b'),\n    api('/c')\n  ]).then(go);","new_string":"x"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+
+        assert!(result.is_error, "{}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("app.js")).unwrap(),
+            file,
+            "a failed match must leave the file untouched"
+        );
+        assert!(
+            result.content.contains("--- current lines "),
+            "the error must carry the current block: {}",
+            result.content
+        );
+        // Verbatim, indentation and all — a trimmed copy would not match on the retry.
+        assert!(
+            result.content.contains("  Promise.all([\n    api('/a'),\n    api('/b')\n  ]).then(go);"),
+            "the block must be exact: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("Re-read the surrounding block"),
+            "do not ask for a re-read while handing back the block: {}",
+            result.content
+        );
+    }
+
+    /// A file whose closest line alone busts the excerpt budget (minified bundle, one-line
+    /// JSON) gets no excerpt — a truncated line cannot be copied exactly, so the short
+    /// hint is the honest answer.
+    #[tokio::test]
+    async fn oversized_line_falls_back_to_the_short_hint() {
+        let d = tempfile::tempdir().unwrap();
+        let huge = format!("function bundle(){}", "x".repeat(MAX_EXCERPT_CHARS * 2));
+        std::fs::write(d.path().join("bundle.js"), format!("{huge}\n")).unwrap();
+
+        let result = EditFileTool
+            .execute(
+                r#"{"file_path":"bundle.js","old_string":"function bundleXYZ(){nope}","new_string":"x"}"#,
+                &ctx(d.path()),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert!(
+            !result.content.contains("--- current lines "),
+            "an unquotable line must not be excerpted: {}",
+            result.content
+        );
+        assert!(result.content.contains("Re-read"), "{}", result.content);
+    }
+
+    /// The excerpt is bounded: a long block near the match cannot flood the model's
+    /// context, and the window shrinks by whole lines rather than cutting one in half.
+    #[test]
+    fn excerpt_window_shrinks_by_whole_lines_within_budget() {
+        let long: String = "y".repeat(300);
+        let lines: Vec<&str> = (0..80).map(|_| long.as_str()).collect();
+        let (first, last, text) = current_text_window(&lines, 40, 30).unwrap();
+        assert!(text.chars().count() + 1 <= MAX_EXCERPT_CHARS, "{}", text.len());
+        assert!(first <= 41 && last >= 41, "the centre line must survive: {first}-{last}");
+        assert!(
+            text.lines().all(|l| l.chars().count() == 300),
+            "no line may be truncated"
+        );
     }
 
     #[tokio::test]
