@@ -21,6 +21,7 @@ pub(crate) mod loop_ctrl;
 pub(crate) mod loop_parse;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
+pub(crate) mod openrouter_connect;
 pub(crate) mod pointer_select;
 pub(crate) mod ui_event;
 pub(crate) mod usage_monitor;
@@ -3985,6 +3986,19 @@ pub struct LoopCtx {
     pub oauth_event_rx: mpsc::UnboundedReceiver<oauth_poll::OauthEvent>,
     /// Sender cloned into each spawned poll task.
     pub oauth_event_tx: mpsc::UnboundedSender<oauth_poll::OauthEvent>,
+    /// Receiver for `OpenRouterConnectEvent`s emitted by the background
+    /// OpenRouter connect thread (see `event_loop::openrouter_connect`).
+    /// One event per `/openrouter` invocation (Ready or Failed). The
+    /// `tokio::select!` arm that reads this channel assembles the provider
+    /// config, persists it, and reloads the runtime.
+    pub openrouter_event_rx: mpsc::UnboundedReceiver<openrouter_connect::OpenRouterConnectEvent>,
+    /// Sender cloned into each spawned connect task.
+    pub openrouter_event_tx: mpsc::UnboundedSender<openrouter_connect::OpenRouterConnectEvent>,
+    /// Cancellation flag for the active OpenRouter connect task. Set to
+    /// `true` on ESC to abort the OAuth wait. A new `Arc` is created on
+    /// each `/openrouter` invocation so prior-task cancellation does not
+    /// leak.
+    pub openrouter_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Control handle for the crossterm reader thread — `Some` in raw-mode
     /// TTY sessions, `None` in pipe mode. Used by child-process handoffs
     /// (OAuth login, future `/shell`) to pause+resume event consumption
@@ -4017,6 +4031,11 @@ pub struct LoopCtx {
     /// Modal-to-Modal transition that needs mutable `active_modal`
     /// access only the event loop has.
     pub pending_open_provider_wizard: bool,
+    /// Set to `true` just before an `OnboardingWizard` is installed as
+    /// `active_modal`.  Drained (via `std::mem::take`) in the
+    /// `ModalAction::Close` handler so the /openrouter nudge fires only
+    /// when the wizard — not an arbitrary modal — closes.
+    pub pending_onboarding_nudge: bool,
     /// Telemetry handle — used to emit `UseCommand` at each slash dispatch.
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     /// Original working dir before `/worktree create`, for `/worktree done`.
@@ -9392,6 +9411,55 @@ pub(crate) fn handle_loop_decision(
     }
 }
 
+/// 处理一次后台 OpenRouter 连接事件。抽出来供 Unix/Windows 两个 `select!` 块
+/// 共用,避免 Ready/Failed/AwaitingBrowser 逻辑复制两份、改一处漏另一处。
+fn handle_openrouter_connect_event(
+    ctx: &mut LoopCtx,
+    ev: openrouter_connect::OpenRouterConnectEvent,
+    renderer: &mut dyn Renderer,
+) {
+    use openrouter_connect::OpenRouterConnectEvent;
+    match ev {
+        OpenRouterConnectEvent::AwaitingBrowser { auth_url } => {
+            renderer.render(UiLine::Muted(format!(
+                "浏览器未自动打开?手动访问完成授权:{auth_url}"
+            )));
+            renderer.flush();
+        }
+        OpenRouterConnectEvent::Ready { api_key, models } => {
+            let mut added_count = 0usize;
+            match ctx.config_store.update(|latest| {
+                let out = openrouter_connect::provision_openrouter(latest, &api_key, &models);
+                added_count = out.added.len();
+                Ok(())
+            }) {
+                Ok(commit) => {
+                    apply_persisted_config(
+                        ctx,
+                        commit.snapshot.config,
+                        commit.snapshot.revision,
+                        renderer,
+                    );
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "已接入 OpenRouter,新增 {added_count} 个免费模型。/model 可切换。"
+                    )));
+                    renderer.flush();
+                }
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("OpenRouter 配置保存失败: {e}")));
+                    renderer.flush();
+                }
+            }
+        }
+        OpenRouterConnectEvent::Failed(reason) => {
+            renderer.render(UiLine::Error(format!(
+                "OpenRouter 接入失败: {reason}。可重试 /openrouter,或 /openrouter <你的key> 直接接入。"
+            )));
+            renderer.flush();
+        }
+    }
+}
+
 pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<ExitReason> {
     let mut app = App::new(&ctx.caps);
     // The active runtime/model owns the context-window denominator. Seed it
@@ -9636,6 +9704,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         }
         wizard.draw(&app.buf, &app.state, &ctx, renderer);
         app.active_modal = Some(Box::new(wizard));
+        // Mark that the onboarding wizard is open so the ModalAction::Close
+        // handler knows to evaluate the /openrouter nudge when it closes.
+        ctx.pending_onboarding_nudge = true;
     } else {
         // One-shot legacy-conhost scroll hint. The classic Windows console
         // host snaps the viewport back to the bottom on every write, so the
@@ -9907,6 +9978,21 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // Preserve an active `/` command menu — don't blindly call
             // `redraw_idle_plain(menu: None)` which would erase it.
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
+                // 额度用尽一次性提示:usage_slot 刚被 spawn_check 写入时触发。
+                if !app.state.openrouter_quota_nudge_shown {
+                    if let Some((usage_info, _)) =
+                        ctx.usage_slot.lock().ok().as_deref().and_then(|g| g.clone())
+                    {
+                        if crate::event_loop::openrouter_connect::quota_exhausted(&usage_info) {
+                            app.state.openrouter_quota_nudge_shown = true;
+                            render_or_defer_background_notice(
+                                &mut app.state,
+                                renderer,
+                                "CodingPlan 额度已用尽 —— 输入 /openrouter 一键接入 OpenRouter 免费模型".to_string(),
+                            );
+                        }
+                    }
+                }
                 if let Some(modal) = app.active_modal.as_mut() {
                     if modal.poll_background() {
                         modal.draw(&app.buf, &app.state, &ctx, renderer);
@@ -9939,6 +10025,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // extension (as_any_mut + downcast) we don't yet have.
             Some(ev) = ctx.oauth_event_rx.recv() => {
                 use oauth_poll::OauthEvent;
+                // QR 登录经此臂关闭 onboarding 向导(绕过 ModalAction::Close),
+                // 清掉 nudge 标记,否则它会泄漏到下一个无关 modal 的关闭时误弹。
+                ctx.pending_onboarding_nudge = false;
                 let was_modal_open = app.active_modal.is_some();
                 if was_modal_open {
                     app.active_modal = None;
@@ -9988,6 +10077,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         renderer.flush();
                     }
                 }
+            }
+
+            // ── OpenRouter 后台连接结果 ──
+            Some(ev) = ctx.openrouter_event_rx.recv() => {
+                handle_openrouter_connect_event(&mut ctx, ev, renderer);
             }
 
             // ── /upgrade progress ──
@@ -10332,6 +10426,21 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // `redraw_idle_plain` — otherwise the menu gets erased when
             // this fires a second or two after the user types `/`.
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
+                // 额度用尽一次性提示:usage_slot 刚被 spawn_check 写入时触发。
+                if !app.state.openrouter_quota_nudge_shown {
+                    if let Some((usage_info, _)) =
+                        ctx.usage_slot.lock().ok().as_deref().and_then(|g| g.clone())
+                    {
+                        if crate::event_loop::openrouter_connect::quota_exhausted(&usage_info) {
+                            app.state.openrouter_quota_nudge_shown = true;
+                            render_or_defer_background_notice(
+                                &mut app.state,
+                                renderer,
+                                "CodingPlan 额度已用尽 —— 输入 /openrouter 一键接入 OpenRouter 免费模型".to_string(),
+                            );
+                        }
+                    }
+                }
                 if let Some(modal) = app.active_modal.as_mut() {
                     if modal.poll_background() {
                         modal.draw(&app.buf, &app.state, &ctx, renderer);
@@ -10364,6 +10473,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // extension (as_any_mut + downcast) we don't yet have.
             Some(ev) = ctx.oauth_event_rx.recv() => {
                 use oauth_poll::OauthEvent;
+                // QR 登录经此臂关闭 onboarding 向导(绕过 ModalAction::Close),
+                // 清掉 nudge 标记,否则它会泄漏到下一个无关 modal 的关闭时误弹。
+                ctx.pending_onboarding_nudge = false;
                 let was_modal_open = app.active_modal.is_some();
                 if was_modal_open {
                     app.active_modal = None;
@@ -10413,6 +10525,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         renderer.flush();
                     }
                 }
+            }
+
+            // ── OpenRouter 后台连接结果 ──
+            Some(ev) = ctx.openrouter_event_rx.recv() => {
+                handle_openrouter_connect_event(&mut ctx, ev, renderer);
             }
 
             // ── /upgrade progress ──
@@ -13837,6 +13954,15 @@ fn handle_input(
                     )?;
                     if matches!(action, ModalAction::Close) {
                         app.active_modal = None;
+                        // Consume the onboarding-nudge marker FIRST: the
+                        // provider-wizard follow-up below returns early, and
+                        // deferring the take until after it would strand the
+                        // flag onto an unrelated modal's later close (e.g. the
+                        // ProviderPanel), firing the nudge at the wrong time.
+                        // Only a clean onboarding dismissal (no login-setup /
+                        // provider-wizard follow-up) should evaluate the nudge.
+                        let onboarding_closed =
+                            std::mem::take(&mut ctx.pending_onboarding_nudge);
                         // OnboardingWizard signals its follow-up via two bool
                         // flags. Drain one, execute it here — the
                         // CodingPlan flow (which internally handles
@@ -13858,6 +13984,23 @@ fn handle_input(
                             // The panel owns the next frame now; skip the idle
                             // redraw below so we don't clobber it.
                             return Ok(());
+                        }
+                        // 新用户未领 CodingPlan 时一次性引导接入 OpenRouter。
+                        // 仅在 onboarding 向导关闭时触发——其它 modal(/model、
+                        // /resume、/config 等)关闭不得触发。onboarding_closed 已在
+                        // 本臂顶部消费(见上),这里只是求值,provider-wizard 早 return
+                        // 不会再泄漏该标记。
+                        if onboarding_closed
+                            && !app.state.openrouter_noplan_nudge_shown
+                            && !crate::event_loop::openrouter_connect::has_codingplan(&ctx.config)
+                        {
+                            app.state.openrouter_noplan_nudge_shown = true;
+                            render_or_defer_background_notice(
+                                &mut app.state,
+                                renderer,
+                                "还没有可用模型?输入 /openrouter 一键接入 OpenRouter 免费模型"
+                                    .to_string(),
+                            );
                         }
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     }
@@ -15848,6 +15991,12 @@ fn handle_idle_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    // ESC 取消后台 OpenRouter 连接任务(幂等:未在跑时置位无副作用,
+    // 每次 /openrouter 分派前已复位为 false)。
+    if code == KeyCode::Esc {
+        ctx.openrouter_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let cancel_resume = code == KeyCode::Esc && modifiers.is_empty()
         || code == KeyCode::Char('c')
             && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
@@ -17115,10 +17264,50 @@ fn shell_mode_hint(buf: &str) -> Option<(crate::i18n::Msg<'static>, crate::rende
     Some((msg, crate::render::HintSeverity::Shell))
 }
 
+/// A faint composer hint advertising a command's accepted arguments, shown while
+/// the buffer is JUST the command with no argument typed yet. `/worklog`'s example
+/// date is resolved from `today` (injected for testing) so it never looks stale
+/// and makes clear a bare `/worklog` means today. `None` otherwise.
+fn command_arg_hint_with(buf: &str, today: chrono::NaiveDate) -> Option<String> {
+    let rest = buf.trim_start().strip_prefix('/')?;
+    let (name, arg) = match rest.split_once(char::is_whitespace) {
+        Some((n, a)) => (n, a.trim()),
+        None => (rest, ""),
+    };
+    if name.eq_ignore_ascii_case("worklog") && arg.is_empty() {
+        return Some(format!(
+            "today | yesterday | {}",
+            today.format("%-m/%-d")
+        ));
+    }
+    None
+}
+
+fn command_arg_hint(buf: &str) -> Option<String> {
+    command_arg_hint_with(buf, chrono::Local::now().date_naive())
+}
+
 #[cfg(test)]
 mod bash_input_hint_tests {
-    use super::{bash_input_hint, shell_mode_hint};
+    use super::{bash_input_hint, command_arg_hint_with, shell_mode_hint};
     use crate::render::HintSeverity;
+
+    #[test]
+    fn worklog_arg_hint_shows_forms_with_todays_date_only_before_an_arg() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
+        // Bare command (and with the trailing space after menu selection) → hint
+        // advertising the accepted forms, with TODAY as the example date.
+        for buf in ["/worklog", "/worklog ", "/WorkLog"] {
+            let h = command_arg_hint_with(buf, today).expect("hint before arg");
+            assert!(h.contains("today") && h.contains("yesterday") && h.contains("8/28"), "{h}");
+        }
+        // Once an argument is present, the affordance disappears.
+        assert_eq!(command_arg_hint_with("/worklog 8/27", today), None);
+        assert_eq!(command_arg_hint_with("/worklog yesterday", today), None);
+        // Other commands / plain text get no worklog hint.
+        assert_eq!(command_arg_hint_with("/model", today), None);
+        assert_eq!(command_arg_hint_with("hello", today), None);
+    }
 
     // Resolve to (text, severity) — `Msg` has no PartialEq/Debug, so compare the
     // observable output instead (locale-agnostic: we assert bare ≠ runnable, not
@@ -17281,6 +17470,12 @@ fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mu
         let slot_is_free = status.hint.is_none();
         if slot_is_free {
             status.hint = Some((crate::i18n::t(msg).into_owned(), severity));
+        }
+    } else if status.hint.is_none() {
+        // Faint arg affordance for a bare arg-accepting command (e.g. `/worklog`),
+        // yielding to any higher-priority hint already in the slot.
+        if let Some(hint) = command_arg_hint(&buf.text) {
+            status.hint = Some((hint, crate::render::HintSeverity::Info));
         }
     }
     renderer.render(UiLine::InputPrompt {
@@ -17946,10 +18141,22 @@ pub(crate) fn save_proxy_and_reload(
         };
     let desired = desired_config_from_snapshot(ctx, commit.snapshot.config.clone(), false);
 
-    // First-run `/proxy` commonly runs before any provider exists. There is no
-    // HTTP client to rebuild yet; `/login` creates its client after this method
-    // applies the process proxy environment.
-    if desired.providers.is_empty() {
+    // Skip the live-client rebuild ONLY when there is genuinely no running
+    // provider client yet — first-run `/proxy` before `/login`, where `/login`
+    // builds the client afterwards against the env we publish here.
+    //
+    // The previous guard keyed on `desired.providers.is_empty()`, but that
+    // LEGACY table is always empty under the new-schema / CodingPlan setup
+    // (providers live in `config.models` / accounts). So for a logged-in
+    // CodingPlan user it wrongly took this short path: it published the new
+    // proxy env but never rebuilt the live reqwest client, which had baked the
+    // old proxy in at build time — leaving every request tunnelling through a
+    // now-dead proxy until a full restart. Key on the actual runtime instead: a
+    // `Ready` runtime has a client to rebuild; a Deferred/Starting/Failed one
+    // (true first-run) does not, so it correctly falls through to the env-only
+    // path. Schema-agnostic, and matches how `stage_committed_config_reload`
+    // already reads the runtime generation.
+    if ctx.runtime.current_generation().is_none() {
         atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
         ctx.config = desired;
         ctx.observed_config_revision = Some(commit.snapshot.revision);
@@ -18506,6 +18713,10 @@ fn handle_streaming_key(
     // Placed before menu navigation because stopping the stream is the higher
     // value action mid-turn (Ctrl+U remains available for clearing input).
     if code == KeyCode::Esc {
+        // 若在回合进行中还有后台 OpenRouter 连接在等授权(用户开了 /openrouter 后又
+        // 发了 prompt),这里的 ESC 也一并取消它——幂等,无在跑任务时是 no-op。
+        ctx.openrouter_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let had_active_turn = ctx.runtime.has_active_turn();
         let send_ok = if app.state.goal_condition.is_some()
             && app.state.goal_phase == atomcode_coding::GoalPhase::Pursuing
@@ -22010,6 +22221,8 @@ fn subtask_progress_from_args(
                 model: String::new(),
                 activity: String::new(),
                 started_at: None,
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: crate::render::SubtaskStatus::Pending,
             }
@@ -22108,6 +22321,15 @@ fn update_subtask_progress(
     if started && item.started_at.is_none() {
         item.started_at = Some(std::time::Instant::now());
     }
+    // Freeze elapsed at the terminal transition. Without this, a done member's
+    // row keeps ticking with `now` because the group re-renders live while its
+    // sibling members are still running.
+    if matches!(
+        status,
+        SubtaskStatus::Completed | SubtaskStatus::Stopped | SubtaskStatus::Failed
+    ) {
+        item.finished_at.get_or_insert_with(std::time::Instant::now);
+    }
     if let Some(model) = model.filter(|model| !model.is_empty()) {
         item.model = model.to_string();
     }
@@ -22120,6 +22342,14 @@ fn update_subtask_progress(
         .and_then(|tokens| tokens.parse::<u64>().ok())
     {
         item.output_tokens = item.output_tokens.max(tokens);
+    }
+    if let Some(tools) = parts
+        .iter()
+        .find_map(|part| part.strip_prefix("tools="))
+        .and_then(|tools| tools.parse::<u64>().ok())
+    {
+        // Monotonic: a reordered/late chunk can't lower the count.
+        item.tool_uses = item.tool_uses.max(tools);
     }
     let terminal_line = if matches!(
         status,
@@ -22381,6 +22611,8 @@ mod subtask_progress_projection_tests {
                     model: "model".into(),
                     activity: "done".into(),
                     started_at: None,
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 10,
                     status: SubtaskStatus::Completed,
                 }],
@@ -23805,15 +24037,15 @@ fn handle_runtime_event(
                 CodingRuntimeEvent::ContextStatsRefreshed(result) => {
                     match result {
                         Ok(stats) => {
-                            state.on_context_stats(
-                                0,
+                            // Gauge-only: update live occupancy + window, but PRESERVE
+                            // the fine-grained breakdown (system/tool/cold/message
+                            // counts) from the last rich emission — the runtime refresh
+                            // does not carry them, and feeding 0s here used to zero out
+                            // "Messages in window" the moment the user ran /context.
+                            state.on_context_gauge_refresh(
                                 stats.used_tokens as usize,
-                                0,
-                                0,
-                                0,
                                 stats.context_window as usize,
                                 "coding-runtime",
-                                "",
                             );
                             if let Some(show_prompt) = state.pending_context_render.take() {
                                 renderer.render(UiLine::CommandOutput(
@@ -26082,6 +26314,8 @@ fn handle_agent_event(
                                 } else {
                                     crate::render::SubtaskStatus::Failed
                                 };
+                                item.finished_at
+                                    .get_or_insert_with(std::time::Instant::now);
                                 item.activity = if success { "done" } else { "failed" }.into();
                             }
                         }
@@ -26481,13 +26715,17 @@ fn handle_agent_event(
                     *rendered = true;
                 }
             } else {
-                // No entry from ToolCallStarted, render and insert (pre-result).
-                renderer.render(UiLine::ToolCall {
-                    name: display.clone(),
-                    detail: detail.clone(),
-                    outcome: None,
-                });
-                pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
+                // Approval precedes ToolStarted in v2, so there is no transcript
+                // row yet. DON'T commit a neutral `● Tool(detail)` row here:
+                // nothing recolours a pre-result committed bullet — the
+                // result-time `ToolCallCommit` finds no inflight to freeze, and
+                // `commit_inflight_tool` is a no-op — so a committed row would
+                // strand white even on success (bash-approval green-dot bug).
+                // Defer the row exactly like task/team (`rendered = false`): the
+                // approval panel already restates `Allow Tool(detail)?`, and once
+                // approved ToolCallStarted renders the live inflight whose result
+                // greens the bullet through the normal path.
+                pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), false));
             }
 
             // Warn when the command about to be approved would trip the credential
@@ -26764,6 +27002,7 @@ fn handle_agent_event(
                                 | crate::render::SubtaskStatus::Running
                         ) {
                             item.status = crate::render::SubtaskStatus::Stopped;
+                            item.finished_at.get_or_insert_with(std::time::Instant::now);
                             item.activity = "cancelled".into();
                         }
                     }

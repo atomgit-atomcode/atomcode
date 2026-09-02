@@ -1131,6 +1131,10 @@ pub struct UiState {
     /// authoritative turn terminal so unrelated maintenance output never lands
     /// between tool rows.
     pub(crate) deferred_background_notices: Vec<String>,
+    /// 本会话是否已弹过"额度用尽 → 接入 OpenRouter"提示(一次性去重)。
+    pub(crate) openrouter_quota_nudge_shown: bool,
+    /// 本会话是否已弹过"未领 CodingPlan → 接入 OpenRouter"提示(一次性去重)。
+    pub(crate) openrouter_noplan_nudge_shown: bool,
     /// Per-turn token tallies (reset at turn end). Feed the footer's billable
     /// token count + cache-hit annotation via [`turn_token_summary`]; kept
     /// separate from the session-cumulative `*_tokens` above.
@@ -1534,6 +1538,8 @@ impl UiState {
             footer_persistence_warning: None,
             footer_usage: None,
             deferred_background_notices: Vec::new(),
+            openrouter_quota_nudge_shown: false,
+            openrouter_noplan_nudge_shown: false,
             turn_prompt_tokens: 0,
             turn_completion_tokens: 0,
             turn_cached_tokens: 0,
@@ -1669,6 +1675,38 @@ impl UiState {
         // narrow path passes "" and we keep whatever was cached last.
         if !system_prompt.is_empty() {
             snap.system_prompt = system_prompt.to_string();
+        }
+    }
+
+    /// Gauge-only refresh for `/context`'s `RefreshContextStats` round-trip.
+    ///
+    /// The runtime's `RuntimeContextStats` carries ONLY live occupancy + window;
+    /// it has no fine-grained breakdown (system/tool/cold/message counts). The
+    /// old path fed those as hardcoded `0` through the rich `on_context_stats`
+    /// arm, which unconditionally overwrote them — so running `/context` zeroed
+    /// out "Messages in window" (and the system/tool/cold buckets) whenever the
+    /// last emission was a failed (over-length) turn that never produced a rich
+    /// `AgentEvent::ContextStats`. Here we update the gauge (and window/ctx-name)
+    /// and PRESERVE the breakdown from the last real rich emission.
+    pub fn on_context_gauge_refresh(
+        &mut self,
+        sent_tokens: usize,
+        ctx_window: usize,
+        ctx_name: &str,
+    ) {
+        let snap = self
+            .last_context
+            .get_or_insert_with(ContextSnapshot::default);
+        // Same guard as the rich arm: a genuine turn always sends `sent > 0`, and
+        // a post-compaction gauge must not be re-inflated by a stale round-trip.
+        if sent_tokens > 0 && self.post_compaction_used_tokens.is_none() {
+            snap.sent_tokens = sent_tokens;
+        }
+        if ctx_window > 0 {
+            snap.ctx_window = ctx_window;
+        }
+        if !ctx_name.is_empty() {
+            snap.ctx_name = ctx_name.to_string();
         }
     }
 
@@ -1905,6 +1943,12 @@ impl UiState {
         // leave a stale `explore#4 · …` pinned onto the next turn's spinner.
         self.subagent_activity = None;
         self.active_subtasks = None;
+        // The Team strip is a live in-turn artifact that only self-hides on a
+        // `RunFinished` for every run. A hung member (never emits RunFinished) or
+        // a turn that ends first would otherwise pin the strip onto every idle
+        // round via the footer's `active_subtasks.or_else(|| team.panel())`
+        // fallback. Hide (not clear) so `/team show` can still resurrect it.
+        self.team.hide();
         self.pending_todo_preview = None;
         // Safety clear: if a turn ends without resolving an approval (e.g. error
         // path or session switch), ensure the panel is not left stale.
@@ -1935,6 +1979,11 @@ impl UiState {
         self.turn_saw_reasoning = false;
         self.subagent_activity = None;
         self.active_subtasks = None;
+        // A cancelled turn tears down any still-"running" Team members; the
+        // strip only auto-hides on `RunFinished`, which a hung/interrupted run
+        // never sends. Hide it here so Esc actually dismisses it (hide, not
+        // clear, keeps the run available to `/team show`).
+        self.team.hide();
         self.pending_todo_preview = None;
         self.approval_panel = None;
         self.user_input_panel = None;
@@ -2455,11 +2504,29 @@ mod tests {
         // "unknown" 0 must not wipe the value restored from the persisted session.
         let mut s = UiState::new();
         s.restore_context(42_000, 200_000);
-        // Simulate the RefreshContextStats reply (rich: window > 0, sent = 0).
-        s.on_context_stats(0, 0, 0, 0, 0, 200_000, "engine-v2", "");
+        // Simulate the RefreshContextStats reply (window > 0, sent = 0).
+        s.on_context_gauge_refresh(0, 200_000, "engine-v2");
         let snap = s.last_context.as_ref().unwrap();
         assert_eq!(snap.sent_tokens, 42_000, "restored occupancy preserved");
         assert_eq!(snap.ctx_window, 200_000);
+    }
+
+    #[test]
+    fn gauge_refresh_preserves_message_breakdown() {
+        // Regression: `/context` after a run of FAILED (over-length) turns used to
+        // show "Messages in window: 0" because RefreshContextStats fed 0 through
+        // the rich arm, clobbering the count the last successful turn had set. The
+        // gauge-only refresh must PRESERVE the breakdown while updating occupancy.
+        let mut s = UiState::new();
+        // A real (successful) turn: 33 messages, full breakdown.
+        s.on_context_stats(5_000, 400_000, 2_000, 1_000, 33, 512_000, "coding-runtime", "sys");
+        // A later /context refresh reports a higher (over-limit) occupancy only.
+        s.on_context_gauge_refresh(697_300, 512_000, "coding-runtime");
+        let snap = s.last_context.as_ref().unwrap();
+        assert_eq!(snap.sent_tokens, 697_300, "gauge updated to latest occupancy");
+        assert_eq!(snap.total_messages, 33, "message count preserved, not zeroed");
+        assert_eq!(snap.system_tokens, 5_000, "system bucket preserved");
+        assert_eq!(snap.cold_zone_tokens, 1_000, "cold bucket preserved");
     }
 
     #[test]
@@ -2468,7 +2535,7 @@ mod tests {
         s.on_context_stats(0, 40_000, 0, 0, 10, 128_000, "engine-v2", "");
         s.on_compaction_committed(12_000);
 
-        s.on_context_stats(0, 40_000, 0, 0, 6, 128_000, "engine-v2", "");
+        s.on_context_gauge_refresh(40_000, 128_000, "engine-v2");
 
         assert_eq!(s.last_context.as_ref().unwrap().sent_tokens, 12_000);
         assert_eq!(s.post_compaction_used_tokens, Some(12_000));
@@ -3673,6 +3740,61 @@ mod tests {
         assert!(
             s.user_input_batch.is_none(),
             "user_input_batch must not be touched"
+        );
+    }
+
+    // A live Team run whose members never emit `RunFinished` (subagent hung, or
+    // the turn was cancelled/errored first) leaves `TeamProjection::visible`
+    // true. The footer renders `active_subtasks.or_else(|| team.panel())`, so
+    // once `active_subtasks` clears at turn-end the stale Team strip pins itself
+    // onto every subsequent idle round with no way to dismiss it. Turn terminals
+    // must hide it, mirroring how they drop `active_subtasks`.
+    fn run_started_event(run: &str) -> atomcode_capabilities::team::TeamEvent {
+        atomcode_capabilities::team::TeamEvent::new(
+            atomcode_capabilities::team::TeamRunId::new(run),
+            1,
+            atomcode_capabilities::team::TeamEventPayload::RunStarted { total: 1 },
+        )
+    }
+
+    #[test]
+    fn on_turn_cancelled_hides_unfinished_team_panel() {
+        let mut s = UiState::new();
+        s.team.apply(1, run_started_event("hung"));
+        assert!(
+            s.team.panel().is_some(),
+            "an in-flight run without RunFinished shows the live strip"
+        );
+        s.on_turn_cancelled();
+        assert!(
+            s.team.panel().is_none(),
+            "Esc-cancelling the turn must dismiss the stuck Team strip"
+        );
+    }
+
+    #[test]
+    fn on_turn_complete_hides_unfinished_team_panel() {
+        let mut s = UiState::new();
+        s.team.apply(1, run_started_event("lost-finish"));
+        assert!(s.team.panel().is_some());
+        s.on_turn_complete();
+        assert!(
+            s.team.panel().is_none(),
+            "a turn that ends without a RunFinished must not pin the Team strip"
+        );
+    }
+
+    #[test]
+    fn turn_terminal_preserves_team_history_for_team_show() {
+        // `hide()`, not `clear()`: `/team show` must still resurrect the run.
+        let mut s = UiState::new();
+        s.team.apply(1, run_started_event("history"));
+        s.on_turn_cancelled();
+        assert!(s.team.panel().is_none());
+        s.team.show();
+        assert!(
+            s.team.panel().is_some(),
+            "run data survives turn-end so /team show can re-open it"
         );
     }
 }

@@ -27,6 +27,65 @@ const STORE_VERSION: &str = "atomcode-rewind-v1";
 pub(crate) const LEDGER_VERSION: u32 = 2;
 pub(crate) const TRANSACTION_VERSION: u32 = 1;
 
+/// Returns true if `ATOMCODE_CODE_REWIND` environment variable is set to one of
+/// the recognized opt-in values: "1", "true", "on", or "yes" (case-sensitive).
+/// Returns false if unset or set to any other value.
+pub fn code_rewind_opt_in() -> bool {
+    matches!(
+        std::env::var("ATOMCODE_CODE_REWIND").ok().as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
+/// Minimum free disk space (bytes) required before attempting a rewind capture
+/// (or a rewind restore, which also writes a recovery tree). 2 GiB — a 2 MB
+/// floor would only trip once the disk is already full, re-enabling the exact
+/// disk-exhaustion incident this circuit breaker exists to prevent.
+const DISK_FLOOR_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// Maximum size (bytes) of an individual file that will be included in a rewind snapshot.
+const MAX_SNAPSHOT_FILE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Maximum total size (bytes) of the rewind shadow Git store before eager gc is triggered.
+const STORE_BUDGET_BYTES: u64 = 500 * 1024 * 1024;
+
+fn available_disk_bytes(path: &Path) -> Option<u64> {
+    fs2::available_space(path).ok()
+}
+
+fn disk_floor_ok(available: Option<u64>, floor: u64) -> bool {
+    matches!(available, Some(a) if a >= floor)
+}
+
+fn dir_size_bytes(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if let Ok(md) = entry.metadata() {
+                total = total.saturating_add(md.len());
+            }
+        }
+    }
+    total
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    #[test]
+    fn disk_floor_unknown_is_treated_as_below_floor() {
+        assert!(!disk_floor_ok(None, 2_000));          // unknown → skip (fail-safe)
+        assert!(!disk_floor_ok(Some(1_999), 2_000));   // below floor → skip
+        assert!(disk_floor_ok(Some(2_000), 2_000));    // exactly floor → ok
+        assert!(disk_floor_ok(Some(9_999), 2_000));
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RewindLedger {
     pub version: u32,
@@ -91,6 +150,10 @@ pub struct RewindPoint {
 #[derive(Debug)]
 pub enum WorkspaceCheckpointError {
     Unsupported(String),
+    /// Free disk is below the safety floor, so a rewind restore — which must
+    /// write a recovery tree before touching the worktree — is refused rather
+    /// than risking a half-restored worktree from a mid-restore disk-full.
+    InsufficientDisk(String),
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -112,6 +175,7 @@ impl fmt::Display for WorkspaceCheckpointError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unsupported(reason) => write!(f, "{reason}"),
+            Self::InsufficientDisk(reason) => write!(f, "{reason}"),
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
             Self::Git { operation, stderr } => write!(f, "{operation} failed: {stderr}"),
             Self::InvalidPath(path) => write!(f, "unsafe workspace checkpoint path: {path}"),
@@ -225,8 +289,8 @@ impl WorkspaceCheckpoint {
     }
 
     /// Open an already-existing v1 store only for crash recovery. This never
-    /// initializes a Git directory or publishes new checkpoint objects, so the
-    /// v5.0.5 safety stop remains in force for ordinary turns.
+    /// initializes a Git directory or publishes new checkpoint objects; the
+    /// opt-in flag gate for ordinary turns is unaffected.
     pub(crate) fn for_session_recovery(
         worktree: &Path,
         session_id: &str,
@@ -357,9 +421,128 @@ impl WorkspaceCheckpoint {
         &self.worktree
     }
 
-    pub fn capture(&self) -> Result<String, WorkspaceCheckpointError> {
+    /// Refuse a rewind restore when free disk is below the safety floor.
+    ///
+    /// Every restore path (`restore`, `prepare_restore`, `apply_prepared_restore`)
+    /// writes a recovery tree via `capture_locked` before mutating the worktree.
+    /// On a critically-low disk that write can exhaust the disk mid-restore and
+    /// leave a half-restored worktree. Guarding all three entries with this check
+    /// turns an unsafe restore into a clean `Err` instead.
+    fn ensure_restore_disk_floor(&self) -> Result<(), WorkspaceCheckpointError> {
+        self.ensure_restore_disk_floor_bounded(DISK_FLOOR_BYTES)
+    }
+
+    /// Floor-parameterized core of [`ensure_restore_disk_floor`](Self::ensure_restore_disk_floor);
+    /// lets tests force the guard with an unsatisfiable floor without a real
+    /// low-disk simulation.
+    fn ensure_restore_disk_floor_bounded(
+        &self,
+        floor: u64,
+    ) -> Result<(), WorkspaceCheckpointError> {
+        if disk_floor_ok(available_disk_bytes(&self.git_dir), floor) {
+            Ok(())
+        } else {
+            Err(WorkspaceCheckpointError::InsufficientDisk(
+                "insufficient free disk for a safe rewind (need ≥2 GiB)".into(),
+            ))
+        }
+    }
+
+    pub fn capture(&self) -> Result<Option<String>, WorkspaceCheckpointError> {
+        self.capture_bounded(DISK_FLOOR_BYTES, STORE_BUDGET_BYTES)
+    }
+
+    /// Capture the working tree into the shadow store, bounded by two guards.
+    ///
+    /// Invariant A (disk floor): if free space is below `floor` (or unknown),
+    /// the capture is skipped (`Ok(None)`) — never write when the disk is
+    /// critically low.
+    ///
+    /// Invariant B (size budget): when the store exceeds `budget`,
+    /// `gc --prune=now` reclaims unreferenced objects; if the store is still
+    /// over budget after that, the capture is skipped (`Ok(None)`). The store is
+    /// therefore bounded at ~budget, but old rewind points are NOT auto-evicted:
+    /// LRU eviction of retained points is a follow-up feature (it requires
+    /// coordinating with the caller-owned ledger so an evicted point's tree is
+    /// not left referenced by a stale ledger entry).
+    pub(crate) fn capture_bounded(
+        &self,
+        floor: u64,
+        budget: u64,
+    ) -> Result<Option<String>, WorkspaceCheckpointError> {
+        // Invariant A: physical disk floor. Unknown free space → skip.
+        // This check is read-only and safe to perform outside the lock.
+        if !disk_floor_ok(available_disk_bytes(&self.git_dir), floor) {
+            return Ok(None);
+        }
+        // Invariant B: store must not exceed budget. The size check AND any gc
+        // that evicts loose objects MUST run inside the process lock, at parity
+        // with retain_points — an unlocked gc could prune loose objects written
+        // by a concurrent capture_locked that has not yet pinned them with a ref.
         let _guard = self.guard();
-        self.with_process_lock(|| self.capture_locked())
+        let tree = self.with_process_lock(|| {
+            let store_bytes = dir_size_bytes(&self.git_dir);
+            if store_bytes > budget {
+                let _ = self.gc_prune_now();
+                if dir_size_bytes(&self.git_dir) > budget {
+                    tracing::warn!(
+                        git_dir = %self.git_dir.display(),
+                        "code rewind capture skipped: store still over budget after gc"
+                    );
+                    return Ok(None);
+                }
+            }
+            let tree = self.capture_locked()?;
+            Ok(Some(tree))
+        })?;
+        Ok(tree)
+    }
+
+    /// Returns the total number of bytes consumed by the shadow Git store on disk.
+    ///
+    /// This is a best-effort recursive directory walk; it does not hold the
+    /// process lock, so the value is a snapshot that may be slightly stale when
+    /// gc is running concurrently.
+    pub fn store_size_bytes(&self) -> u64 {
+        dir_size_bytes(&self.git_dir)
+    }
+
+    /// Delete every `refs/atomcode/*` rewind-point ref and run `gc --prune=now`,
+    /// leaving the shadow store empty of retained points.
+    ///
+    /// This is a user-initiated "clear all" operation. Like [`retain_points`], it
+    /// EXCLUDES `refs/atomcode/recovery/*`: a concurrent restore transaction pins
+    /// its recovery tree there, and pruning it mid-restore would break crash
+    /// recovery (worst case: a half-restored worktree with no way back). Recovery
+    /// refs self-clean via the transaction end paths (commit/compensate/recover).
+    pub fn purge(&self) -> Result<(), WorkspaceCheckpointError> {
+        let _guard = self.guard();
+        self.with_process_lock(|| {
+            let existing =
+                self.run(["for-each-ref", "--format=%(refname)", "refs/atomcode/"])?;
+            let mut transaction = String::new();
+            for reference in String::from_utf8_lossy(&existing.stdout).lines() {
+                if reference.is_empty() {
+                    continue;
+                }
+                // Never delete an in-flight recovery ref (see retain_points).
+                if reference.starts_with("refs/atomcode/recovery/") {
+                    continue;
+                }
+                transaction.push_str(&format!("delete {reference}\n"));
+            }
+            if !transaction.is_empty() {
+                self.run_with_input(["update-ref", "--stdin"], transaction.as_bytes())?;
+            }
+            let _ = self.gc_prune_now();
+            Ok(())
+        })
+    }
+
+    fn gc_prune_now(&self) -> Result<(), WorkspaceCheckpointError> {
+        // Best-effort: reclaim unreferenced objects immediately (not on a timer).
+        let _ = self.run(["gc", "--prune=now", "--quiet"]);
+        Ok(())
     }
 
     pub fn diff(
@@ -380,6 +563,7 @@ impl WorkspaceCheckpoint {
         before: &str,
         after: &str,
     ) -> Result<WorkspaceRestoreReceipt, WorkspaceCheckpointError> {
+        self.ensure_restore_disk_floor()?;
         let _guard = self.guard();
         self.with_process_lock(|| {
             let recovery_tree = self.capture_locked()?;
@@ -406,14 +590,28 @@ impl WorkspaceCheckpoint {
 
     /// Capture and validate a restore without changing the worktree. The caller
     /// can durably persist the returned recovery tree before applying it.
+    ///
+    /// The recovery tree is immediately pinned at `refs/atomcode/recovery/current`
+    /// so that a `git gc --prune=now` running concurrently (e.g. from `retain_points`
+    /// evicting later-turn refs) cannot reclaim it before the transaction commits or
+    /// compensates. Call [`unpin_recovery_ref`](Self::unpin_recovery_ref) when the
+    /// transaction is finalised.
     pub(crate) fn prepare_restore(
         &self,
         before: &str,
         after: &str,
     ) -> Result<WorkspaceRestorePlan, WorkspaceCheckpointError> {
+        self.ensure_restore_disk_floor()?;
         let _guard = self.guard();
         self.with_process_lock(|| {
             let recovery_tree = self.capture_locked()?;
+            // Pin the loose recovery tree with a ref so that any gc that runs between
+            // now and the transaction's commit/compensate cannot prune the object.
+            // retain_points excludes refs/atomcode/recovery/* from its deletion sweep.
+            self.run_with_input(
+                ["update-ref", "--stdin"],
+                format!("update refs/atomcode/recovery/current {recovery_tree}\n").as_bytes(),
+            )?;
             let files = self.changed_files_locked(before, after)?;
             let conflicts = self.conflicts_locked(after, &recovery_tree, &files)?;
             if !conflicts.is_empty() {
@@ -427,12 +625,45 @@ impl WorkspaceCheckpoint {
         })
     }
 
+    /// Path to the shadow Git store managed by this checkpoint.
+    ///
+    /// Exposed for tests that need to inspect git refs without going through
+    /// the `WorkspaceCheckpoint` API.
+    #[cfg(test)]
+    pub(crate) fn git_dir_path(&self) -> &Path {
+        &self.git_dir
+    }
+
+    /// Drop the temporary recovery ref created by [`prepare_restore`](Self::prepare_restore).
+    ///
+    /// Call this when the durable transaction is committed or compensated so
+    /// subsequent gc runs can reclaim the (now unnecessary) recovery object.
+    pub(crate) fn unpin_recovery_ref(&self) -> Result<(), WorkspaceCheckpointError> {
+        let _guard = self.guard();
+        self.with_process_lock(|| {
+            // Enumerate all recovery refs and delete them; best-effort.
+            let existing =
+                self.run(["for-each-ref", "--format=%(refname)", "refs/atomcode/recovery/"])?;
+            let mut transaction = String::new();
+            for reference in String::from_utf8_lossy(&existing.stdout).lines() {
+                if !reference.is_empty() {
+                    transaction.push_str(&format!("delete {reference}\n"));
+                }
+            }
+            if !transaction.is_empty() {
+                self.run_with_input(["update-ref", "--stdin"], transaction.as_bytes())?;
+            }
+            Ok(())
+        })
+    }
+
     /// Apply a prepared restore only if affected files still match the recovery
     /// tree captured by [`prepare_restore`](Self::prepare_restore).
     pub(crate) fn apply_prepared_restore(
         &self,
         plan: &WorkspaceRestorePlan,
     ) -> Result<WorkspaceRestoreReceipt, WorkspaceCheckpointError> {
+        self.ensure_restore_disk_floor()?;
         let _guard = self.guard();
         self.with_process_lock(|| {
             let current = self.capture_locked()?;
@@ -488,16 +719,32 @@ impl WorkspaceCheckpoint {
                 wanted.insert(after_ref);
             }
             let existing = self.run(["for-each-ref", "--format=%(refname)", "refs/atomcode/"])?;
+            let mut had_deletions = false;
             for reference in String::from_utf8_lossy(&existing.stdout).lines() {
-                if !reference.is_empty() && !wanted.contains(reference) {
-                    updates.push(format!("delete {reference}\n"));
+                if reference.is_empty() || wanted.contains(reference) {
+                    continue;
                 }
+                // Never delete the in-flight recovery ref: it pins the loose recovery
+                // tree written by prepare_restore between journal-save and commit/compensate.
+                // Pruning it would break crash recovery on the dangerous path where
+                // had_deletions is true (restoring an older turn drops later-turn refs).
+                if reference.starts_with("refs/atomcode/recovery/") {
+                    continue;
+                }
+                updates.push(format!("delete {reference}\n"));
+                had_deletions = true;
             }
             let mut transaction = String::new();
             for update in updates {
                 transaction.push_str(&update);
             }
             self.run_with_input(["update-ref", "--stdin"], transaction.as_bytes())?;
+            // Only run gc when we actually deleted refs; a gc that runs while a
+            // caller holds a loose recovery-tree object (not yet pinned by any ref)
+            // would prune it before crash-recovery can use it.
+            if had_deletions {
+                let _ = self.gc_prune_now();
+            }
             Ok(())
         })
     }
@@ -550,6 +797,7 @@ impl WorkspaceCheckpoint {
             self.run(["config", "core.filemode", "true"])?;
             self.run(["config", "core.symlinks", "true"])?;
         }
+        self.write_alternates()?;
         let marker = self.git_dir.join("atomcode-rewind-version");
         if !marker.exists() {
             fs::write(&marker, STORE_VERSION).map_err(|source| WorkspaceCheckpointError::Io {
@@ -560,14 +808,61 @@ impl WorkspaceCheckpoint {
         Ok(())
     }
 
+    fn write_alternates(&self) -> Result<(), WorkspaceCheckpointError> {
+        // Point the shadow store at the real repo's object database so capture
+        // stores only NEW blobs instead of duplicating the entire working tree.
+        // Skip silently for non-git worktrees (no baseline to share).
+        let real_git = self.worktree.join(".git");
+        let objects = if real_git.is_dir() {
+            real_git.join("objects")
+        } else {
+            return Ok(()); // worktree file (submodule/worktree) or non-repo: no alternates
+        };
+        let objects = match fs::canonicalize(&objects) {
+            Ok(p) => p,
+            Err(_) => return Ok(()), // real objects missing → do NOT full-copy silently; just no share
+        };
+        let info = self.git_dir.join("objects").join("info");
+        fs::create_dir_all(&info).map_err(|source| WorkspaceCheckpointError::Io {
+            path: info.clone(),
+            source,
+        })?;
+        let alternates = info.join("alternates");
+        let line = format!("{}\n", git_alternate_path(&objects));
+        fs::write(&alternates, line).map_err(|source| WorkspaceCheckpointError::Io {
+            path: alternates,
+            source,
+        })?;
+        Ok(())
+    }
+
     fn capture_locked(&self) -> Result<String, WorkspaceCheckpointError> {
         let tracked = self.list_user_files(["ls-files", "--cached", "-z"])?;
         let untracked =
             self.list_user_files(["ls-files", "--others", "--exclude-standard", "-z"])?;
         let mut paths = Vec::new();
-        for path in tracked.into_iter().chain(untracked) {
+        // Tracked files: keep ALL of them (minus sensitive paths). Their blobs
+        // are shared with the real repo via alternates, so retaining them costs
+        // ~no disk; excluding a committed dist/ or build/ file would silently
+        // lose restore fidelity for it. The dir/size filter is for UNTRACKED
+        // files only, where a large build artifact would actually bloat the store.
+        for path in tracked {
             validate_relative_path(&path)?;
             if !is_sensitive_path(&path) {
+                paths.push(path);
+            }
+        }
+        for path in untracked {
+            validate_relative_path(&path)?;
+            if !is_sensitive_path(&path) {
+                if is_excluded_dir(&path) {
+                    continue;
+                }
+                let abs = self.worktree.join(&path);
+                if std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0) > MAX_SNAPSHOT_FILE_BYTES
+                {
+                    continue;
+                }
                 paths.push(path);
             }
         }
@@ -861,6 +1156,40 @@ fn git_worktree_root(path: &Path) -> Result<PathBuf, WorkspaceCheckpointError> {
     })
 }
 
+/// Render a canonicalized objects path for `objects/info/alternates`.
+///
+/// On Windows `fs::canonicalize` yields a `\\?\C:\...` verbatim path (and
+/// `\\?\UNC\server\share\...` for UNC paths) that git rejects when reading an
+/// alternates file. Strip that verbatim prefix and normalize backslashes to
+/// forward slashes so git can resolve the alternate. On non-Windows the input
+/// has neither a `\\?\` prefix nor backslashes, so this is a no-op.
+fn git_alternate_path(p: &Path) -> String {
+    let raw = p.to_string_lossy();
+    let stripped = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        // \\?\UNC\server\share\… → \\server\share\…
+        format!(r"\\{unc}")
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        raw.into_owned()
+    };
+    stripped.replace('\\', "/")
+}
+
+fn is_excluded_dir(rel: &str) -> bool {
+    const EXCLUDED: &[&str] = &[
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        ".venv",
+        "__pycache__",
+        ".next",
+        ".cache",
+    ];
+    rel.split('/').any(|c| EXCLUDED.contains(&c))
+}
+
 fn is_sensitive_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
@@ -1035,10 +1364,10 @@ mod tests {
     #[test]
     fn captures_diff_and_restores_tracked_and_untracked_files() {
         let (worktree, _store, checkpoint) = fixture();
-        let before = checkpoint.capture().unwrap();
+        let before = checkpoint.capture().unwrap().unwrap();
         fs::write(worktree.path().join("tracked.txt"), "one\ntwo\n").unwrap();
         fs::write(worktree.path().join("new.txt"), "new\n").unwrap();
-        let after = checkpoint.capture().unwrap();
+        let after = checkpoint.capture().unwrap().unwrap();
 
         let diff = checkpoint.diff(&before, &after).unwrap();
         assert_eq!(diff.len(), 2);
@@ -1069,28 +1398,77 @@ mod tests {
     fn ignored_files_are_not_tracked() {
         let (worktree, _store, checkpoint) = fixture();
         fs::write(worktree.path().join(".gitignore"), "secret.txt\n").unwrap();
-        let before = checkpoint.capture().unwrap();
+        let before = checkpoint.capture().unwrap().unwrap();
         fs::write(worktree.path().join("secret.txt"), "secret\n").unwrap();
-        let after = checkpoint.capture().unwrap();
+        let after = checkpoint.capture().unwrap().unwrap();
         assert!(checkpoint.diff(&before, &after).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tracked_files_in_excluded_dirs_are_retained() {
+        // A repo that COMMITS a file under an excluded dir (e.g. dist/) must not
+        // lose restore fidelity for it: the dir filter applies to UNTRACKED files
+        // only. Untracked files under the same dir are still excluded.
+        let (worktree, _store, checkpoint) = fixture();
+        fs::create_dir_all(worktree.path().join("dist")).unwrap();
+        fs::write(worktree.path().join("dist/committed.js"), "v1\n").unwrap();
+        git(worktree.path(), &["add", "dist/committed.js"]);
+        git(
+            worktree.path(),
+            &[
+                "-c",
+                "user.name=AtomCode",
+                "-c",
+                "user.email=atomcode@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "commit dist",
+            ],
+        );
+        let before = checkpoint.capture().unwrap().unwrap();
+        // Edit the tracked dist file and drop an UNTRACKED artifact next to it.
+        fs::write(worktree.path().join("dist/committed.js"), "v2\n").unwrap();
+        fs::write(worktree.path().join("dist/artifact.js"), "junk\n").unwrap();
+        let after = checkpoint.capture().unwrap().unwrap();
+
+        let diff = checkpoint.diff(&before, &after).unwrap();
+        // The tracked file's change is captured; the untracked artifact is not.
+        assert!(
+            diff.iter().any(|f| f.path == "dist/committed.js"),
+            "tracked dist file must be captured: {diff:?}"
+        );
+        assert!(
+            !diff.iter().any(|f| f.path == "dist/artifact.js"),
+            "untracked dist artifact must stay excluded: {diff:?}"
+        );
+
+        // Restoring the before→after range reverts the tracked file to its
+        // `before` content (v1), proving the excluded-dir tracked file was
+        // actually captured and is restorable — not silently dropped.
+        checkpoint.restore(&before, &after).unwrap();
+        assert_eq!(
+            fs::read_to_string(worktree.path().join("dist/committed.js")).unwrap(),
+            "v1\n"
+        );
     }
 
     #[test]
     fn sensitive_files_are_not_persisted_even_when_unignored() {
         let (worktree, _store, checkpoint) = fixture();
-        let before = checkpoint.capture().unwrap();
+        let before = checkpoint.capture().unwrap().unwrap();
         fs::write(worktree.path().join(".env"), "TOKEN=secret\n").unwrap();
         fs::write(worktree.path().join("id_rsa"), "private\n").unwrap();
-        let after = checkpoint.capture().unwrap();
+        let after = checkpoint.capture().unwrap().unwrap();
         assert_eq!(before, after);
     }
 
     #[test]
     fn later_user_edit_fails_closed() {
         let (worktree, _store, checkpoint) = fixture();
-        let before = checkpoint.capture().unwrap();
+        let before = checkpoint.capture().unwrap().unwrap();
         fs::write(worktree.path().join("tracked.txt"), "agent\n").unwrap();
-        let after = checkpoint.capture().unwrap();
+        let after = checkpoint.capture().unwrap().unwrap();
         fs::write(worktree.path().join("tracked.txt"), "user\n").unwrap();
 
         let error = checkpoint.restore(&before, &after).unwrap_err();
@@ -1108,11 +1486,11 @@ mod tests {
     #[test]
     fn restores_the_cumulative_range_to_an_older_turn() {
         let (worktree, _store, checkpoint) = fixture();
-        let before_first = checkpoint.capture().unwrap();
+        let before_first = checkpoint.capture().unwrap().unwrap();
         fs::write(worktree.path().join("tracked.txt"), "first turn\n").unwrap();
-        let _after_first = checkpoint.capture().unwrap();
+        let _after_first = checkpoint.capture().unwrap().unwrap();
         fs::write(worktree.path().join("second.txt"), "second turn\n").unwrap();
-        let after_latest = checkpoint.capture().unwrap();
+        let after_latest = checkpoint.capture().unwrap().unwrap();
 
         checkpoint.restore(&before_first, &after_latest).unwrap();
         assert_eq!(
@@ -1125,9 +1503,9 @@ mod tests {
     #[test]
     fn retained_points_survive_git_gc() {
         let (worktree, _store, checkpoint) = fixture();
-        let before = checkpoint.capture().unwrap();
+        let before = checkpoint.capture().unwrap().unwrap();
         fs::write(worktree.path().join("tracked.txt"), "after\n").unwrap();
-        let after = checkpoint.capture().unwrap();
+        let after = checkpoint.capture().unwrap().unwrap();
         let point = RewindPoint {
             turn_id: 1,
             prompt_number: 1,
@@ -1156,5 +1534,298 @@ mod tests {
             result,
             Err(WorkspaceCheckpointError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn code_rewind_is_off_by_default_and_on_when_opted_in() {
+        let prev = std::env::var("ATOMCODE_CODE_REWIND").ok();
+        std::env::remove_var("ATOMCODE_CODE_REWIND");
+        assert!(!crate::session::rewind::code_rewind_opt_in());
+        std::env::set_var("ATOMCODE_CODE_REWIND", "1");
+        assert!(crate::session::rewind::code_rewind_opt_in());
+        match prev {
+            Some(v) => std::env::set_var("ATOMCODE_CODE_REWIND", v),
+            None => std::env::remove_var("ATOMCODE_CODE_REWIND"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod alternates_tests {
+    use super::*;
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let output = git_command()
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn initialize_writes_alternates_to_real_objects_dir() {
+        let work_tmp = tempfile::tempdir().unwrap();
+        let work = work_tmp.path();
+        run_git(work, &["init", "--quiet"]);
+        fs::write(work.join("a.txt"), b"hi").unwrap();
+        run_git(work, &["add", "."]);
+        let store_tmp = tempfile::tempdir().unwrap();
+        let store = store_tmp.path().join("git");
+        let cp = WorkspaceCheckpoint::with_store(work, &store).unwrap();
+        let alt = store.join("objects/info/alternates");
+        let contents = fs::read_to_string(&alt).unwrap();
+        let real_objects = fs::canonicalize(work.join(".git/objects")).unwrap();
+        assert!(
+            contents.trim().ends_with(&*real_objects.to_string_lossy()),
+            "alternates points at real objects: {contents}",
+        );
+        drop(cp);
+    }
+
+    #[test]
+    fn git_alternate_path_strips_windows_verbatim_prefix() {
+        // A \\?\ verbatim prefix (Windows canonicalize output) must be stripped
+        // and backslashes normalized so git can read the alternates file.
+        assert_eq!(
+            git_alternate_path(Path::new(r"\\?\C:\repo\.git\objects")),
+            "C:/repo/.git/objects"
+        );
+        // \\?\UNC\server\share\… → \\server\share\… (forward-slashed).
+        assert_eq!(
+            git_alternate_path(Path::new(r"\\?\UNC\server\share\repo\objects")),
+            "//server/share/repo/objects"
+        );
+        // A plain POSIX path is unchanged (no prefix, no backslashes).
+        assert_eq!(
+            git_alternate_path(Path::new("/home/user/repo/.git/objects")),
+            "/home/user/repo/.git/objects"
+        );
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    #[test]
+    fn excludes_common_build_and_dep_dirs() {
+        assert!(is_excluded_dir("node_modules/react/index.js"));
+        assert!(is_excluded_dir("crate/target/debug/foo"));
+        assert!(is_excluded_dir(".venv/lib/x"));
+        assert!(!is_excluded_dir("src/main.rs"));
+        assert!(!is_excluded_dir("targeted/thing.rs")); // must match a full component, not substring
+    }
+}
+
+#[cfg(test)]
+mod bounded_capture_tests {
+    use super::*;
+
+    /// Build a minimal git worktree + separate store directory; return both as
+    /// `PathBuf`s kept alive by the returned `TempDir`.
+    fn temp_git_workspace() -> (PathBuf, PathBuf, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("worktree");
+        let store = tmp.path().join("store").join("git");
+        fs::create_dir_all(&work).unwrap();
+        let git = |args: &[&str]| {
+            let out = git_command().arg("-C").arg(&work).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        fs::write(work.join("hello.txt"), "hello\n").unwrap();
+        git(&["add", "hello.txt"]);
+        git(&[
+            "-c", "user.name=AtomCode",
+            "-c", "user.email=atomcode@example.invalid",
+            "commit", "--quiet", "-m", "initial",
+        ]);
+        (work, store, tmp)
+    }
+
+    #[test]
+    fn capture_skips_when_disk_below_floor() {
+        let (work, store, _tmp) = temp_git_workspace();
+        let cp = WorkspaceCheckpoint::with_store(&work, &store).unwrap();
+        // An absurd floor forces the disk check to fail → Ok(None).
+        assert!(
+            cp.capture_bounded(u64::MAX, 0).unwrap().is_none(),
+            "floor=u64::MAX forces skip"
+        );
+    }
+
+    #[test]
+    fn capture_writes_a_tree_when_within_limits() {
+        let (work, store, _tmp) = temp_git_workspace();
+        let cp = WorkspaceCheckpoint::with_store(&work, &store).unwrap();
+        // floor=0 (always passes), budget=u64::MAX (never over) → Ok(Some(_)).
+        let tree = cp.capture_bounded(0, u64::MAX).unwrap();
+        assert!(tree.is_some(), "expected a tree id, got None");
+    }
+
+    /// Regression test for Finding 1: eager gc in retain_points must NOT prune
+    /// the loose recovery tree written by prepare_restore.
+    ///
+    /// The dangerous path:
+    ///   prepare_restore → capture_locked (loose recovery tree, no ref yet)
+    ///   → retain_points(&retained) deletes later-turn refs → had_deletions=true
+    ///   → gc --prune=now → recovery tree pruned (BUG: crash recovery broken)
+    ///
+    /// The fix: prepare_restore pins refs/atomcode/recovery/current; retain_points
+    /// excludes refs/atomcode/recovery/* from its deletion sweep.
+    #[test]
+    fn recovery_tree_survives_retain_points_gc() {
+        let (work, store, _tmp) = temp_git_workspace();
+        let cp = WorkspaceCheckpoint::with_store(&work, &store).unwrap();
+
+        // Capture state before any agent edits.
+        let before = cp.capture_bounded(0, u64::MAX).unwrap().expect("before");
+
+        // Simulate an agent edit.
+        fs::write(work.join("hello.txt"), "after\n").unwrap();
+        let after = cp.capture_bounded(0, u64::MAX).unwrap().expect("after");
+
+        // Create two rewind points in the shadow store so retain_points has refs to delete.
+        let point1 = RewindPoint {
+            turn_id: 1,
+            prompt_number: 1,
+            prompt_preview: "turn 1".into(),
+            before_tree: Some(before.clone()),
+            after_tree: Some(after.clone()),
+            files: vec![],
+        };
+        let point2 = RewindPoint {
+            turn_id: 2,
+            prompt_number: 2,
+            prompt_preview: "turn 2".into(),
+            before_tree: Some(after.clone()),
+            after_tree: Some(before.clone()),
+            files: vec![],
+        };
+        // Pin both points with refs so the objects are referenced.
+        cp.retain_points(&[point1.clone(), point2.clone()]).unwrap();
+
+        // prepare_restore captures a recovery tree and pins it at
+        // refs/atomcode/recovery/current (the fix under test).
+        let plan = cp.prepare_restore(&before, &after).unwrap();
+        let recovery_tree = plan.recovery_tree.clone();
+
+        // Now simulate begin_rewind calling retain_points(&retained) for the
+        // earlier subset only — this DELETES point2's refs (had_deletions=true)
+        // and triggers gc --prune=now.  Under the old bug the recovery tree
+        // (loose, no ref) would be pruned here.
+        cp.retain_points(&[point1.clone()]).unwrap();
+
+        // Assert: the recovery tree is still reachable in the shadow store.
+        let cat_file = git_command()
+            .arg("--git-dir")
+            .arg(&cp.git_dir)
+            .args(["cat-file", "-e", &recovery_tree])
+            .output()
+            .expect("git cat-file");
+        assert!(
+            cat_file.status.success(),
+            "recovery tree {recovery_tree} was pruned by retain_points gc — Finding 1 regression"
+        );
+
+        // Assert: compensate can still restore from the recovery tree.
+        // The recovery_tree was captured while hello.txt = "after\n" (the
+        // current state at the time prepare_restore ran), so compensating
+        // from it must produce "after\n" (not "hello\n").
+        let files = vec!["hello.txt".to_string()];
+        cp.compensate(&recovery_tree, &files)
+            .expect("compensate must succeed when recovery tree survives gc");
+        assert_eq!(
+            fs::read_to_string(work.join("hello.txt")).unwrap(),
+            "after\n",
+            "compensate restored wrong content"
+        );
+
+        // Cleanup: drop the recovery pin (mirrors commit/compensate_rewind).
+        cp.unpin_recovery_ref().unwrap();
+    }
+
+    #[test]
+    fn restore_disk_floor_guard_refuses_when_below_floor_and_passes_otherwise() {
+        let (work, store, _tmp) = temp_git_workspace();
+        let cp = WorkspaceCheckpoint::with_store(&work, &store).unwrap();
+        // Below floor → InsufficientDisk, and the message is the safe-rewind text.
+        let err = cp
+            .ensure_restore_disk_floor_bounded(u64::MAX)
+            .expect_err("an unsatisfiable floor must refuse the restore");
+        assert!(matches!(err, WorkspaceCheckpointError::InsufficientDisk(_)));
+        assert!(err.to_string().contains("insufficient free disk"));
+        // A zero floor always passes (disk has ≥0 free).
+        cp.ensure_restore_disk_floor_bounded(0)
+            .expect("a zero floor must pass");
+    }
+
+    #[test]
+    fn restore_refuses_when_disk_below_real_floor() {
+        // End-to-end: with the real (2 GiB) guard active but a store on a disk
+        // that reports less than the floor free, restore must abort with
+        // InsufficientDisk before writing any recovery tree. We can't force the
+        // real available_space, so this asserts the guard is wired: on a normal
+        // CI disk (≥2 GiB free) restore does NOT spuriously refuse.
+        let (work, store, _tmp) = temp_git_workspace();
+        let cp = WorkspaceCheckpoint::with_store(&work, &store).unwrap();
+        let before = cp.capture_bounded(0, u64::MAX).unwrap().expect("before");
+        fs::write(work.join("hello.txt"), "after\n").unwrap();
+        let after = cp.capture_bounded(0, u64::MAX).unwrap().expect("after");
+        // Guard passes on a real disk → restore proceeds (no InsufficientDisk).
+        let result = cp.restore(&before, &after);
+        assert!(
+            !matches!(result, Err(WorkspaceCheckpointError::InsufficientDisk(_))),
+            "restore must not refuse on a disk with ample free space"
+        );
+    }
+
+    #[test]
+    fn purge_empties_the_store_refs() {
+        let (work, store, _tmp) = temp_git_workspace();
+        let cp = WorkspaceCheckpoint::with_store(&work, &store).unwrap();
+        let tree = cp.capture_bounded(0, u64::MAX).unwrap().unwrap();
+        let point = RewindPoint {
+            turn_id: 1,
+            prompt_number: 1,
+            prompt_preview: "initial".into(),
+            before_tree: Some(tree.clone()),
+            after_tree: Some(tree.clone()),
+            files: vec![],
+        };
+        cp.retain_points(&[point]).unwrap();
+
+        // Verify at least one ref exists before purge.
+        let before = git_command()
+            .arg("--git-dir")
+            .arg(cp.git_dir_path())
+            .args(["for-each-ref", "--format=%(refname)", "refs/atomcode/"])
+            .output()
+            .expect("git for-each-ref before purge");
+        assert!(
+            !before.stdout.is_empty(),
+            "expected refs to exist before purge"
+        );
+
+        cp.purge().unwrap();
+
+        // After purge, no refs/atomcode/ refs must remain.
+        let after = git_command()
+            .arg("--git-dir")
+            .arg(cp.git_dir_path())
+            .args(["for-each-ref", "--format=%(refname)", "refs/atomcode/"])
+            .output()
+            .expect("git for-each-ref after purge");
+        assert!(after.stdout.is_empty(), "all rewind refs deleted after purge");
     }
 }

@@ -700,8 +700,6 @@ fn render_wrapped_table(
     let ncols = col_widths.len();
     let data_rows: Vec<&Vec<String>> = parsed.iter().filter(|r| !is_separator_row(r)).collect();
     let mut out = String::new();
-    out.push_str(&render_table_boundary(col_widths, caps));
-    out.push('\n');
     for (i, row) in data_rows.iter().enumerate() {
         // Wrap every cell to its column width; row height = tallest cell.
         let wrapped: Vec<Vec<String>> = (0..ncols)
@@ -742,34 +740,50 @@ fn render_wrapped_table(
             out.push('\n');
         }
     }
-    out.push_str(&render_table_boundary(col_widths, caps));
     if out.ends_with('\n') {
         out.pop();
     }
     out
 }
 
-fn render_table_boundary(col_widths: &[usize], caps: TerminalCaps) -> String {
-    render_table_rule(col_widths, '━', caps)
+/// Low-contrast color wrapper for table separator lines — borderless aligned-column
+/// table, segmented low-contrast rules. Returns `(open_seq, close_seq)`.
+///
+/// Modern 256-color terminals get a 256-color soft-gray that retreats to the
+/// background: `AnsiValue(240)` on dark themes, `AnsiValue(250)` on light themes.
+/// Legacy 16-color terminals get SGR 2 (faint), which most terminals render as a
+/// dimmed version of the default foreground.
+/// Low-contrast wrap for table rules: FAINT (SGR 2) over the theme-muted grey
+/// (`md_border_open`: SGR 37 on dark / SGR 90 on light). The markdown→cells
+/// parser (`parse_markdown_to_cells`) supports SGR 2 and SGR 37/90 but SILENTLY
+/// DROPS 256-colour (`38;5;N`) — a 256-colour grey would render at the DEFAULT
+/// foreground (brighter, not dimmer) in the TUI. Faint over the muted grey is
+/// the recessed look that actually survives that parser, on 16-colour and
+/// modern terminals alike. Close: SGR 22 (clear faint) + SGR 39 (reset fg).
+fn md_table_rule_wrap() -> (String, &'static str) {
+    (
+        format!("\x1b[2m{}", crate::highlight::theme::md_border_open()),
+        "\x1b[22m\x1b[39m",
+    )
 }
 
-/// One CONTINUOUS horizontal rule spanning the FULL table width — the sum of the
-/// column widths, both cell paddings per column, AND the inter-column gaps. Used
-/// for the top/bottom boundaries AND the header/inter-row separators alike, so
-/// every horizontal line shares the exact same solid style. Filling the
-/// inter-column gaps (rather than leaving them blank, per-column segments) keeps
-/// the rule from reading as a broken/dashed line — which looked inconsistent with
-/// the solid boundary, glaring under the Windows ASCII (`=`/`-`) fallback and
-/// unpolished under ligature-capable fonts. There are still no vertical borders,
-/// corners, or junction glyphs. `preferred` selects the weight (`━` heavy for
-/// boundaries / the header rule, `─` light for inter-row separators).
+/// Segmented horizontal rule for table separators — one segment per column
+/// (`col_width + CELL_PADDING*2` characters wide), columns joined by
+/// `COLUMN_GAP` spaces. This produces a visually segmented rule that mirrors
+/// the column layout: `━━━━  ━━━━` rather than a solid full-width bar.
+/// `preferred` selects the weight (`━` heavy for the header rule, `─` light
+/// for inter-row separators). No vertical borders, corners, or junction glyphs.
 fn render_table_rule(col_widths: &[usize], preferred: char, caps: TerminalCaps) -> String {
-    let width = col_widths.iter().sum::<usize>()
-        + TABLE_CELL_PADDING * 2 * col_widths.len()
-        + TABLE_COLUMN_GAP * col_widths.len().saturating_sub(1);
-    let rule = stable_table_rule_char(preferred, caps).to_string().repeat(width);
+    let ch = stable_table_rule_char(preferred, caps);
+    let gap = " ".repeat(TABLE_COLUMN_GAP);
+    let segments: Vec<String> = col_widths
+        .iter()
+        .map(|&w| ch.to_string().repeat(w + TABLE_CELL_PADDING * 2))
+        .collect();
+    let rule = segments.join(&gap);
     if caps.colors {
-        format!("{}{}{}", theme::md_border_open(), rule, theme::MD_MUTED_CLOSE)
+        let (open, close) = md_table_rule_wrap();
+        format!("{}{}{}", open, rule, close)
     } else {
         rule
     }
@@ -899,8 +913,6 @@ pub fn flush_aligned_table_with_width(
     let data_rows: Vec<&Vec<String>> = parsed.iter().filter(|r| !is_sep(r)).collect();
 
     let mut out = String::new();
-    out.push_str(&render_table_boundary(&col_widths, caps));
-    out.push('\n');
     for (i, row) in data_rows.iter().enumerate() {
         for (j, w) in col_widths.iter().enumerate() {
             let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
@@ -935,7 +947,6 @@ pub fn flush_aligned_table_with_width(
             out.push('\n');
         }
     }
-    out.push_str(&render_table_boundary(&col_widths, caps));
     if out.ends_with('\n') {
         out.pop();
     }
@@ -1479,6 +1490,30 @@ mod tests {
         })
     }
 
+    #[test]
+    fn table_rule_colours_with_faint_not_dropped_256() {
+        // `parse_markdown_to_cells` honours SGR 2 (faint) + SGR 37/90 but SILENTLY
+        // DROPS 256-colour (`38;5;N`) — a 256-colour rule would render at full
+        // brightness in the TUI. Guard: the coloured rule uses faint, never 256.
+        let caps = TerminalCaps::from_env(EnvView {
+            is_stdout_tty: true,
+            no_color: false,
+            term: Some("xterm-256color".to_string()),
+            lang: Some("en_US.UTF-8".to_string()),
+            ..Default::default()
+        });
+        assert!(caps.colors, "test needs colours on");
+        let rule = render_table_rule(&[3, 4], '─', caps);
+        assert!(
+            rule.contains("\x1b[2m"),
+            "coloured rule must use faint (SGR 2): {rule:?}"
+        );
+        assert!(
+            !rule.contains("38;5"),
+            "must not use 256-colour (parser drops it): {rule:?}"
+        );
+    }
+
     /// The synthetic separator the circled-list spacing inserts between a
     /// circled number and its label, under THIS host's width model. Circled
     /// digits ①–⑳ are widened to 2 cells on emoji-capable terminals (macOS
@@ -1703,12 +1738,11 @@ mod tests {
     }
 
     #[test]
-    fn table_rules_are_continuous_across_column_gaps() {
-        // The header underline and inter-row separators must be ONE solid rule
-        // spanning the full table width — NOT per-column segments joined by blank
-        // inter-column gaps (which read as a broken/dashed line and, under
-        // ligature-capable fonts, look inconsistent with the solid top/bottom
-        // boundary). Every rule line must therefore contain NO interior space.
+    fn table_rules_are_segmented_per_column() {
+        // Separator lines are per-column segments (col_width + padding*2 rule chars
+        // each), joined by COLUMN_GAP spaces — not a solid full-width bar.
+        // No top/bottom boundary rows are emitted; the table starts with the
+        // header row and ends with the last data row.
         let rows = vec![
             "| 命令 | 行为 | 前台会话 |".to_string(),
             "| --- | --- | --- |".to_string(),
@@ -1716,27 +1750,46 @@ mod tests {
             "| /bg | 挪到后台 | 全新空会话 |".to_string(),
         ];
         let out = flush_aligned_table_with_width(&rows, plain_caps(), 80);
-        let rule_lines: Vec<&str> = out
-            .lines()
-            .map(str::trim_end)
-            .filter(|l| {
-                let t = l.trim();
-                !t.is_empty() && t.chars().all(|c| matches!(c, '━' | '─' | '=' | '-'))
-            })
-            .collect();
-        // top boundary + header separator + 1 inter-row separator + bottom boundary
+
+        let is_rule = |t: &str| {
+            !t.is_empty()
+                && t.chars().all(|c| matches!(c, '━' | '─' | '=' | '-' | ' '))
+                && t.chars().any(|c| matches!(c, '━' | '─' | '=' | '-'))
+        };
+        let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+        // No top/bottom boundary: the table starts with the header ROW and ends
+        // with the last DATA ROW — neither the first nor last line is a rule.
+        assert!(!is_rule(lines.first().unwrap().trim()), "no top boundary row");
+        assert!(!is_rule(lines.last().unwrap().trim()), "no bottom boundary row");
+        // Every rule line is SEGMENTED (3 columns → inter-segment gaps), not a
+        // solid full-width bar (a regression to the old solid rule has NO spaces).
+        for l in &lines {
+            let t = l.trim();
+            if is_rule(t) {
+                assert!(t.contains(' '), "rule must be segmented (gaps present): {t:?}");
+            }
+        }
+        let rule_lines: Vec<&str> = lines.iter().copied().filter(|l| is_rule(l.trim())).collect();
+
+        // Borderless design: header separator + 1 inter-row separator only (no top/bottom).
         assert!(
-            rule_lines.len() >= 4,
-            "expected top/header/row/bottom rules, got {}:\n{out}",
+            rule_lines.len() >= 2,
+            "expected at least header + inter-row separators, got {}:\n{out}",
             rule_lines.len()
         );
+
+        // Each separator must be segmented: it must contain an interior space
+        // (the COLUMN_GAP between adjacent column segments) — not a solid bar.
         for line in &rule_lines {
             assert!(
-                !line.trim().contains(' '),
-                "rule line must be continuous (no interior gap): {:?}\n{out}",
+                line.contains(' '),
+                "rule line must be segmented (interior gap between column segments): {:?}\n{out}",
                 line
             );
         }
+
+        // No vertical border chars.
+        assert!(!out.contains('│') && !out.contains('┼'));
     }
 
     #[test]
@@ -2399,8 +2452,8 @@ mod tests {
         );
     }
 
-    /// Wide-enough terminal: render as a Codex-style borderless table at the
-    /// table's natural column widths. No truncation, no ellipsis.
+    /// Wide-enough terminal: render as a borderless aligned-column table at the
+    /// table's natural column widths. No top/bottom boundary, no truncation, no ellipsis.
     #[test]
     fn wide_table_renders_borderless_at_natural_widths() {
         let rows = vec![
@@ -2418,39 +2471,43 @@ mod tests {
         assert!(out.contains("signup"));
         // No ellipsis introduced.
         assert!(!out.contains('…'));
+        // New design: header row + header-separator + data row + inter-row-separator + data row = 5 lines.
+        // (No top/bottom boundary rows.)
         assert_eq!(
             out.lines().count(),
-            7,
-            "outer boundaries, header, continuous rules, and two data rows:\n{out}"
+            5,
+            "header, header-separator, two data rows and one inter-row separator:\n{out}"
         );
         let header_rule = stable_table_rule_char('━', plain_caps());
         let body_rule = stable_table_rule_char('─', plain_caps());
-        // Three heavy continuous rules now: top boundary, header separator, and
-        // bottom boundary — the header separator shares the solid boundary style.
+        // Exactly one heavy header separator line (no top/bottom boundaries).
         assert_eq!(
             out.lines()
                 .filter(|line| {
                     let t = line.trim();
-                    !t.is_empty() && t.chars().all(|ch| ch == header_rule)
+                    !t.is_empty()
+                        && t.chars().all(|ch| ch == header_rule || ch == ' ')
+                        && t.chars().any(|ch| ch == header_rule)
                 })
                 .count(),
-            3,
-            "top boundary, header separator, and bottom boundary missing:\n{out}"
+            1,
+            "exactly one header separator expected (no top/bottom boundaries):\n{out}"
         );
-        // Every rule is continuous — no per-column segment leaves an interior gap.
+        // Inter-row (light) separator must be present.
         assert!(
             has_table_rule(&out, body_rule),
-            "body rule missing:\n{out}"
+            "inter-row body rule missing:\n{out}"
         );
+        // Separators are segmented — they contain interior spaces (column gaps).
         assert!(
-            !out.lines().any(|line| {
+            out.lines().any(|line| {
                 let t = line.trim();
                 !t.is_empty()
                     && t.contains(' ')
                     && t.chars()
                         .all(|ch| ch == header_rule || ch == body_rule || ch == ' ')
             }),
-            "rules must be continuous (no interior gap):\n{out}"
+            "separator lines must be segmented (interior gap between column segments):\n{out}"
         );
         let styled = flush_aligned_table_with_width(&rows, caps(), 80);
         assert!(

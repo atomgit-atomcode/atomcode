@@ -620,6 +620,24 @@ mod tests {
     }
 
     #[test]
+    fn mcp_help_lists_the_core_subcommands() {
+        let s = crate::i18n::t(crate::i18n::Msg::McpHelp);
+        for sub in ["tools", "reload", "trust", "help"] {
+            assert!(s.contains(sub), "help must mention `{sub}`: {s}");
+        }
+    }
+
+    #[test]
+    fn mcp_unknown_server_names_key_and_lists_available_without_not_configured() {
+        let s = crate::i18n::t(crate::i18n::Msg::McpUnknownServer {
+            name: "rvs new-file",
+            available: "filesystem, rvs",
+        });
+        assert!(s.contains("rvs new-file") && s.contains("filesystem"), "{s}");
+        assert!(!s.contains("not configured") && !s.contains("未配置"), "{s}");
+    }
+
+    #[test]
     fn format_compaction_interrupted_is_not_a_noop_message() {
         let s = format_compaction_interrupted();
 

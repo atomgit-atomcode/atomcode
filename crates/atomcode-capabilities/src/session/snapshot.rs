@@ -123,7 +123,8 @@ struct PendingRewindPoint {
 }
 
 const CODE_REWIND_DISABLED_REASON: &str =
-    "Code Rewind is temporarily disabled in v5.0.5 to protect disk space; conversation Rewind remains available.";
+    "Code Rewind (workspace file restore) is off by default to protect disk space; \
+     set ATOMCODE_CODE_REWIND=1 to opt in. Conversation Rewind remains available.";
 
 #[derive(Clone, Debug)]
 pub struct RewindTransactionReceipt {
@@ -161,12 +162,23 @@ impl SnapshotHook {
     ) -> Self {
         let session_id = session_id.into();
         let working_dir = working_dir.into();
-        // v5.0.5 safety stop: the per-session shadow Git store could grow without
-        // a quota or object collection and exhaust the system disk. Keep the
-        // conversation checkpoint ledger active, but do not initialize or write
-        // a workspace object database until the bounded shared-store design lands.
-        let checkpoint = None;
-        let unavailable = Some(CODE_REWIND_DISABLED_REASON.to_string());
+        // Code Rewind is off by default.  When the user opts in via
+        // ATOMCODE_CODE_REWIND=1 we construct the bounded workspace checkpoint
+        // whose store lives under $ATOMCODE_HOME/rewind/<bucket>/<session_id> —
+        // NOT inside the worktree or on a hard-coded C: path.
+        let (checkpoint, unavailable) = if crate::session::rewind::code_rewind_opt_in() {
+            match WorkspaceCheckpoint::for_session(
+                std::path::Path::new(&working_dir),
+                &session_id,
+            ) {
+                Ok(cp) => (Some(Arc::new(cp)), None),
+                Err(e) => (None, Some(format!(
+                    "Code Rewind unavailable (ATOMCODE_CODE_REWIND=1 is set but setup failed): {e}"
+                ))),
+            }
+        } else {
+            (None, Some(CODE_REWIND_DISABLED_REASON.to_string()))
+        };
         let points = mgr
             .load_rewind_ledger(&session_id)
             .map(|ledger| ledger.points)
@@ -378,6 +390,11 @@ impl SnapshotHook {
                         compensation: format!("could not clear recovery journal: {clear}"),
                     });
                 }
+                // prepare_restore pinned refs/atomcode/recovery/current; unpin it
+                // best-effort so the ref does not strand a dead object on disk.
+                if let Some(cp) = rewind.checkpoint.as_ref() {
+                    let _ = cp.unpin_recovery_ref();
+                }
                 return Err(error);
             }
         };
@@ -397,16 +414,28 @@ impl SnapshotHook {
                 })
                 .transpose();
             if let Err(compensation) = compensation {
+                // Unpin best-effort before returning the double-failure error.
+                if let Some(cp) = rewind.checkpoint.as_ref() {
+                    let _ = cp.unpin_recovery_ref();
+                }
                 return Err(WorkspaceCheckpointError::Compensation {
                     operation: error.to_string(),
                     compensation: compensation.to_string(),
                 });
             }
             if let Err(clear) = self.clear_rewind_transaction() {
+                // Unpin best-effort before returning the clear-failure error.
+                if let Some(cp) = rewind.checkpoint.as_ref() {
+                    let _ = cp.unpin_recovery_ref();
+                }
                 return Err(WorkspaceCheckpointError::Compensation {
                     operation: error.to_string(),
                     compensation: format!("could not clear recovery journal: {clear}"),
                 });
+            }
+            // Unpin best-effort: transaction is being unwound cleanly.
+            if let Some(cp) = rewind.checkpoint.as_ref() {
+                let _ = cp.unpin_recovery_ref();
             }
             return Err(error);
         }
@@ -441,6 +470,14 @@ impl SnapshotHook {
             committed: true,
         };
         self.save_rewind_transaction(&journal)?;
+        // Drop the temporary recovery ref that prepare_restore pinned: the
+        // transaction is committed so gc can reclaim the object if needed.
+        {
+            let rewind = self.rewind.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(checkpoint) = rewind.checkpoint.as_ref() {
+                let _ = checkpoint.unpin_recovery_ref();
+            }
+        }
         self.clear_rewind_transaction()
     }
 
@@ -461,6 +498,9 @@ impl SnapshotHook {
                 )
             })?;
             checkpoint.compensate(&workspace.recovery_tree, &workspace.restored_files)?;
+            // Drop the temporary recovery ref: workspace is restored so the object
+            // is no longer needed for crash recovery.
+            let _ = checkpoint.unpin_recovery_ref();
         }
         self.clear_rewind_transaction()
     }
@@ -595,21 +635,28 @@ impl SnapshotHook {
             });
             if journal.committed || conversation_committed {
                 self.replace_rewind_points_locked(&mut rewind, journal.retained_points)?;
+                // Transaction was committed — drop the recovery pin so gc can
+                // reclaim the object.
+                if let Some(checkpoint) = rewind.checkpoint.as_ref() {
+                    let _ = checkpoint.unpin_recovery_ref();
+                }
             } else {
                 self.replace_rewind_points_locked(&mut rewind, journal.previous_points)?;
                 if let Some(tree) = journal.recovery_tree.as_deref() {
-                    // v5.0.5 disables the live workspace backend, but an
-                    // interrupted v5.0.3 transaction may have already changed
-                    // files. Open its existing store only long enough to
-                    // compensate; never retain it for future turn capture.
+                    // Code Rewind is opt-in (default off), but an interrupted
+                    // prior transaction may have already changed files. Open its
+                    // existing store only long enough to compensate; never retain
+                    // it for future turn capture.
                     if let Some(checkpoint) = rewind.checkpoint.as_ref() {
                         checkpoint.compensate(tree, &journal.restored_files)?;
+                        let _ = checkpoint.unpin_recovery_ref();
                     } else {
                         let checkpoint = WorkspaceCheckpoint::for_session_recovery(
                             std::path::Path::new(&self.working_dir),
                             &self.session_id,
                         )?;
                         checkpoint.compensate(tree, &journal.restored_files)?;
+                        let _ = checkpoint.unpin_recovery_ref();
                     }
                 }
             }
@@ -761,7 +808,8 @@ impl LifecycleHooks for SnapshotHook {
             Some(checkpoint) => tokio::task::spawn_blocking(move || checkpoint.capture())
                 .await
                 .ok()
-                .and_then(Result::ok),
+                .and_then(Result::ok)
+                .flatten(),
             None => None,
         };
         {
@@ -841,7 +889,7 @@ impl LifecycleHooks for SnapshotHook {
                 let workspace = match (pending.before_tree, checkpoint) {
                     (Some(before_tree), Some(checkpoint)) => {
                         tokio::task::spawn_blocking(move || {
-                            let after_tree = checkpoint.capture().ok()?;
+                            let after_tree = checkpoint.capture().ok()??;
                             let files = checkpoint.diff(&before_tree, &after_tree).ok()?;
                             Some((before_tree, after_tree, files))
                         })
@@ -1124,7 +1172,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(atomcode_code_rewind_env)]
     fn pending_code_rewind_restores_workspace_after_interrupted_transaction() {
+        // Ensure Code Rewind is off so the recovered hook reports unavailable.
+        let prev = std::env::var("ATOMCODE_CODE_REWIND").ok();
+        std::env::remove_var("ATOMCODE_CODE_REWIND");
         let worktree = tempfile::tempdir().unwrap();
         git(worktree.path(), &["init", "--quiet"]);
         std::fs::write(worktree.path().join("tracked.txt"), "before\n").unwrap();
@@ -1145,9 +1197,9 @@ mod tests {
         let checkpoint = Arc::new(
             WorkspaceCheckpoint::for_session(worktree.path(), "rewind-code-crash").unwrap(),
         );
-        let before = checkpoint.capture().unwrap();
+        let before = checkpoint.capture().unwrap().unwrap();
         std::fs::write(worktree.path().join("tracked.txt"), "after\n").unwrap();
-        let after = checkpoint.capture().unwrap();
+        let after = checkpoint.capture().unwrap().unwrap();
         let point = RewindPoint {
             before_tree: Some(before),
             after_tree: Some(after),
@@ -1204,13 +1256,169 @@ mod tests {
         assert_eq!(recovered.rewind_points(), vec![point]);
         assert!(recovered
             .code_rewind_unavailable()
-            .is_some_and(|reason| reason.contains("temporarily disabled")));
+            // "off by default" is UNIQUE to CODE_REWIND_DISABLED_REASON; the
+            // opted-in-setup-failed message also contains "ATOMCODE_CODE_REWIND",
+            // so that substring cannot distinguish the disabled state.
+            .is_some_and(|reason| reason.contains("off by default")));
         assert!(recovered
             .rewind
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .checkpoint
             .is_none());
+        match prev {
+            Some(v) => std::env::set_var("ATOMCODE_CODE_REWIND", v),
+            None => std::env::remove_var("ATOMCODE_CODE_REWIND"),
+        }
+    }
+
+    /// Assert that the recovery ref (`refs/atomcode/recovery/current`) is pinned
+    /// by `prepare_restore` and released on every normal transaction-end path
+    /// (`commit_rewind`, `compensate_rewind`).
+    ///
+    /// Failure-arm unpin (the new fix): the two arms of `begin_rewind` that
+    /// return an error AFTER `prepare_restore` has already pinned the ref
+    /// (`apply_workspace_plan` failure and `replace_rewind_points_locked` failure)
+    /// are not exercised here because there is no injection point between
+    /// `prepare_restore` (which runs inside `begin_rewind`) and the two failure
+    /// arms — the only observable failure conditions require corrupting the store
+    /// mid-call, which is not safe in a unit test.  The fix is guarded by code
+    /// inspection and by the fact that the same `unpin_recovery_ref` call-site
+    /// pattern is used everywhere.  The common-path assertions below provide a
+    /// smoke-test that the ref lifecycle is correct end-to-end.
+    #[test]
+    fn recovery_ref_is_released_after_commit_and_compensate_rewind() {
+        // ── helpers ──────────────────────────────────────────────────────────
+        fn setup_worktree(name: &str) -> (tempfile::TempDir, Arc<WorkspaceCheckpoint>) {
+            let worktree = tempfile::tempdir().unwrap();
+            git(worktree.path(), &["init", "--quiet"]);
+            std::fs::write(worktree.path().join("f.txt"), "before\n").unwrap();
+            git(worktree.path(), &["add", "f.txt"]);
+            git(
+                worktree.path(),
+                &[
+                    "-c", "user.name=AtomCode",
+                    "-c", "user.email=atomcode@example.invalid",
+                    "commit", "--quiet", "-m", "initial",
+                ],
+            );
+            let cp = Arc::new(WorkspaceCheckpoint::for_session(worktree.path(), name).unwrap());
+            (worktree, cp)
+        }
+
+        fn ref_exists(git_dir: &std::path::Path, refname: &str) -> bool {
+            std::process::Command::new("git")
+                .arg("--git-dir").arg(git_dir)
+                .args(["for-each-ref", "--format=%(refname)", refname])
+                .output()
+                .map(|o| !o.stdout.is_empty())
+                .unwrap_or(false)
+        }
+
+        fn make_hook(
+            name: &str,
+            manager: &Arc<SessionManager>,
+            worktree: &std::path::Path,
+            cp: Arc<WorkspaceCheckpoint>,
+            points: &[RewindPoint],
+        ) -> SnapshotHook {
+            manager
+                .save_rewind_ledger(
+                    name,
+                    &RewindLedger {
+                        version: LEDGER_VERSION,
+                        points: points.to_vec(),
+                    },
+                )
+                .unwrap();
+            let lease = manager.acquire_lease(name).unwrap();
+            let hook =
+                SnapshotHook::new(manager.clone(), name, worktree.to_string_lossy().as_ref());
+            hook.rewind
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .checkpoint = Some(cp);
+            hook.with_lease(lease)
+        }
+
+        // ── Part 1: commit_rewind releases the recovery ref ──────────────────
+        {
+            let (worktree, cp) = setup_worktree("ref-lifecycle-commit");
+            let git_dir = cp.git_dir_path().to_path_buf();
+            let before = cp.capture().unwrap().unwrap();
+            std::fs::write(worktree.path().join("f.txt"), "after\n").unwrap();
+            let after = cp.capture().unwrap().unwrap();
+            let file_change = super::super::FileChangeSummary {
+                path: "f.txt".into(),
+                additions: 1,
+                deletions: 1,
+                binary: false,
+            };
+            let point = RewindPoint {
+                before_tree: Some(before),
+                after_tree: Some(after),
+                files: vec![file_change],
+                ..rewind_point(1, 1)
+            };
+            let session_store = tempfile::tempdir().unwrap();
+            let manager = Arc::new(SessionManager::with_root(session_store.path()));
+            let hook =
+                make_hook("ref-lifecycle-commit", &manager, worktree.path(), cp, &[point.clone()]);
+
+            let receipt = hook.begin_rewind(&point, true, None).unwrap();
+            // After begin_rewind the ref must be pinned.
+            assert!(
+                ref_exists(&git_dir, "refs/atomcode/recovery/current"),
+                "recovery ref must be present after prepare_restore"
+            );
+            hook.commit_rewind(receipt).unwrap();
+            // After commit_rewind the ref must be gone.
+            assert!(
+                !ref_exists(&git_dir, "refs/atomcode/recovery/current"),
+                "recovery ref must be absent after commit_rewind"
+            );
+        }
+
+        // ── Part 2: compensate_rewind releases the recovery ref ───────────────
+        {
+            let (worktree, cp) = setup_worktree("ref-lifecycle-compensate");
+            let git_dir = cp.git_dir_path().to_path_buf();
+            let before = cp.capture().unwrap().unwrap();
+            std::fs::write(worktree.path().join("f.txt"), "after\n").unwrap();
+            let after = cp.capture().unwrap().unwrap();
+            let file_change = super::super::FileChangeSummary {
+                path: "f.txt".into(),
+                additions: 1,
+                deletions: 1,
+                binary: false,
+            };
+            let point = RewindPoint {
+                before_tree: Some(before),
+                after_tree: Some(after),
+                files: vec![file_change],
+                ..rewind_point(1, 1)
+            };
+            let session_store = tempfile::tempdir().unwrap();
+            let manager = Arc::new(SessionManager::with_root(session_store.path()));
+            let hook = make_hook(
+                "ref-lifecycle-compensate",
+                &manager,
+                worktree.path(),
+                cp,
+                &[point.clone()],
+            );
+
+            let receipt = hook.begin_rewind(&point, true, None).unwrap();
+            assert!(
+                ref_exists(&git_dir, "refs/atomcode/recovery/current"),
+                "recovery ref must be present after prepare_restore"
+            );
+            hook.compensate_rewind(receipt).unwrap();
+            assert!(
+                !ref_exists(&git_dir, "refs/atomcode/recovery/current"),
+                "recovery ref must be absent after compensate_rewind"
+            );
+        }
     }
 
     #[test]
@@ -1900,7 +2108,9 @@ mod tests {
         assert!(points[0].files.is_empty());
         assert!(hook
             .code_rewind_unavailable()
-            .is_some_and(|reason| reason.contains("temporarily disabled")));
+            // "off by default" is UNIQUE to the disabled reason (the
+            // opted-in-setup-failed error also mentions ATOMCODE_CODE_REWIND).
+            .is_some_and(|reason| reason.contains("off by default")));
         assert_eq!(
             manager
                 .load_rewind_ledger("conversation-rewind")
@@ -1923,6 +2133,66 @@ mod tests {
         assert!(
             manager.has_inflight_snapshot("inflight-save-failure"),
             "the recovery checkpoint must survive a failed canonical save"
+        );
+    }
+
+    /// Build a SnapshotHook over a real git worktree so the Code Rewind
+    /// opt-in path (which calls `WorkspaceCheckpoint::for_session`) succeeds.
+    fn make_test_hook_with_worktree(
+        id: &str,
+    ) -> (SnapshotHook, Arc<SessionManager>, tempfile::TempDir, tempfile::TempDir) {
+        let worktree = tempfile::tempdir().unwrap();
+        git(worktree.path(), &["init", "--quiet"]);
+        // A bare init has no commits; for_session only needs a valid git dir.
+        let store_dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(SessionManager::with_root(store_dir.path()));
+        let hook = SnapshotHook::new(
+            mgr.clone(),
+            id,
+            worktree.path().to_string_lossy(),
+        );
+        (hook, mgr, worktree, store_dir)
+    }
+
+    #[test]
+    #[serial_test::serial(atomcode_code_rewind_env)]
+    fn snapshot_hook_keeps_code_rewind_off_by_default() {
+        let prev = std::env::var("ATOMCODE_CODE_REWIND").ok();
+        std::env::remove_var("ATOMCODE_CODE_REWIND");
+        let (hook, _mgr, _worktree, _store) =
+            make_test_hook_with_worktree("hook-default-off");
+        assert!(
+            hook.code_rewind_unavailable().is_some(),
+            "Code Rewind must be unavailable when ATOMCODE_CODE_REWIND is unset"
+        );
+        match prev {
+            Some(v) => std::env::set_var("ATOMCODE_CODE_REWIND", v),
+            None => std::env::remove_var("ATOMCODE_CODE_REWIND"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(atomcode_code_rewind_env)]
+    fn snapshot_hook_enables_code_rewind_when_opted_in_and_bounded_store_builds() {
+        let prev = std::env::var("ATOMCODE_CODE_REWIND").ok();
+        std::env::set_var("ATOMCODE_CODE_REWIND", "1");
+        let (hook, _mgr, _worktree, _store) =
+            make_test_hook_with_worktree("hook-opted-in");
+        assert!(
+            hook.code_rewind_unavailable().is_none(),
+            "Code Rewind must be available when ATOMCODE_CODE_REWIND=1 and worktree is valid"
+        );
+        match prev {
+            Some(v) => std::env::set_var("ATOMCODE_CODE_REWIND", v),
+            None => std::env::remove_var("ATOMCODE_CODE_REWIND"),
+        }
+    }
+
+    #[test]
+    fn disabled_reason_does_not_pin_a_stale_version() {
+        assert!(
+            !CODE_REWIND_DISABLED_REASON.contains("v5.0.5"),
+            "CODE_REWIND_DISABLED_REASON must not contain a stale version string"
         );
     }
 }

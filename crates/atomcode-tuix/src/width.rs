@@ -747,14 +747,27 @@ pub fn truncate_with_ellipsis(s: &str, max_cols: usize) -> String {
 /// must be on a UTF-8 boundary; callers that edit by grapheme naturally satisfy
 /// that invariant.
 pub fn editable_value_projection(value: &str, cursor_byte: usize, max_cols: usize) -> String {
+    editable_value_projection_with_caret(value, cursor_byte, max_cols).0
+}
+
+/// Like [`editable_value_projection`], but also returns the 0-indexed DISPLAY
+/// COLUMN of the `│` caret within the returned string. Callers park the real
+/// terminal cursor there so an OS IME anchors its preedit at the exact glyph
+/// the user sees — the raw byte offset can't give this once the value is
+/// windowed/ellipsized, so the column must come from the same projection.
+pub fn editable_value_projection_with_caret(
+    value: &str,
+    cursor_byte: usize,
+    max_cols: usize,
+) -> (String, usize) {
     const CARET: &str = "│";
     const ELLIPSIS: &str = "…";
 
     if max_cols == 0 {
-        return String::new();
+        return (String::new(), 0);
     }
     if max_cols == 1 {
-        return CARET.to_string();
+        return (CARET.to_string(), 0);
     }
 
     // The caller's byte offset may not land on a char boundary of `value` — e.g.
@@ -770,7 +783,8 @@ pub fn editable_value_projection(value: &str, cursor_byte: usize, max_cols: usiz
     let after_width = display_width(after);
     let text_budget = max_cols - 1;
     if before_width + after_width <= text_budget {
-        return format!("{before}{CARET}{after}");
+        // Caret sits right after `before`, at column `before_width`.
+        return (format!("{before}{CARET}{after}"), before_width);
     }
 
     let mut left_budget = text_budget / 2;
@@ -805,14 +819,18 @@ pub fn editable_value_projection(value: &str, cursor_byte: usize, max_cols: usiz
     }
     let left = left_parts.into_iter().rev().collect::<String>();
     let right = truncate_to_width(after, right_budget);
-    format!(
+    // Caret column = leading ellipsis (1 col when the left is clipped) + the
+    // visible-left width. `left_width` is the exact display width of `left`.
+    let caret_col = if left_hidden { 1 } else { 0 } + left_width;
+    let projected = format!(
         "{}{}{}{}{}",
         if left_hidden { ELLIPSIS } else { "" },
         left,
         CARET,
         right,
         if right_hidden { ELLIPSIS } else { "" }
-    )
+    );
+    (projected, caret_col)
 }
 
 /// Truncate a file-system path to `max_cols` display columns, using a
@@ -867,6 +885,31 @@ pub fn truncate_path(path: &str, max_cols: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editable_value_projection_caret_col_matches_glyph_position() {
+        // The returned caret column MUST equal the display column of the `│`
+        // caret in the projected string — that's what lets the footer park the
+        // real terminal cursor on the exact glyph the user sees (IME anchor),
+        // for fits, windowed, and ellipsized cases alike.
+        let cases = [
+            ("hello", 5, 20),                // fits, cursor at end
+            ("hello", 2, 20),                // fits, cursor mid
+            ("", 0, 20),                     // empty
+            ("aaaaaaaaaaaaaaaaaaaa", 20, 8),  // overflow, cursor at end (left clipped)
+            ("aaaaaaaaaaaaaaaaaaaa", 10, 8),  // overflow, cursor mid (both clipped)
+            ("你好世界你好世界", 6, 7),      // CJK overflow
+        ];
+        for (val, cur, max) in cases {
+            let (proj, col) = editable_value_projection_with_caret(val, cur, max);
+            let caret_byte = proj.find('│').expect("caret present in projection");
+            assert_eq!(
+                col,
+                display_width(&proj[..caret_byte]),
+                "caret col must match `│` position — val={val:?} cur={cur} max={max} proj={proj:?}"
+            );
+        }
+    }
 
     #[test]
     fn ascii_width_equals_len() {

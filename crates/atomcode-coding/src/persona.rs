@@ -357,10 +357,12 @@ or reformats file bytes → read_file / grep / glob.";
 
 #[cfg(feature = "atomgit")]
 const ATOMGIT_TOOL_USAGE: &str = "\n\n## ATOMGIT TOOLS:\n\
-For AtomGit repository, pull-request, and issue operations, use the dedicated \
-`atomgit_repo`, `atomgit_pr`, and `atomgit_issue` tools. Do not read AtomGit auth files, \
-print access tokens, or construct raw AtomGit API requests with `bash`/`curl`. The dedicated \
-tools obtain the current OAuth credential internally and preserve the approval boundary.";
+For AtomGit repository, pull-request, and issue operations, prefer the dedicated \
+`atomgit_repo`, `atomgit_pr`, and `atomgit_issue` tools (and `atomgit_api` for any other \
+AtomGit REST endpoint): they obtain the current OAuth credential internally and preserve the \
+approval boundary. Never read AtomGit auth files or print access tokens, and never pass a \
+credential through `bash`/`curl`. Read-only, unauthenticated public API queries via bash are \
+fine when you just need to look something up.";
 
 /// Blunt, point-of-decision restatement of the EXECUTION guardrails, appended only for the
 /// models flagged by [`model_needs_firm_execution`] (DeepSeek + Qwen — GLM excluded). The soft rules in
@@ -1530,8 +1532,8 @@ mod tests {
         for tool in ["`atomgit_repo`", "`atomgit_pr`", "`atomgit_issue`"] {
             assert!(p.contains(tool), "persona must direct the model to {tool}");
         }
-        assert!(p.contains("Do not read AtomGit auth files"));
-        assert!(p.contains("raw AtomGit API requests with `bash`/`curl`"));
+        assert!(p.contains("Never read AtomGit auth files"));
+        assert!(p.contains("never pass a credential through `bash`/`curl`"));
         assert!(p.contains("obtain the current OAuth credential internally"));
     }
 

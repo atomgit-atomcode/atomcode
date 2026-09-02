@@ -67,8 +67,16 @@ fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
 /// modal (or a "no rewind points" notice) via `install_pending_rewind_modal`.
 /// Idle-only: rewinding mutates conversation history, so it must not race a
 /// running turn (mirrors the double-Esc gate and `dispatch_undo`). Workspace/code
-/// Rewind is disabled in v5.0.5.
-pub(super) fn dispatch_rewind(state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+/// Rewind is opt-in via `ATOMCODE_CODE_REWIND=1` (off by default).
+///
+/// Subcommand: `/rewind purge` — deletes all `refs/atomcode/*` refs and runs
+/// `gc --prune=now`, clearing the shadow store. Reports store size before and
+/// after. Works regardless of phase (no conversation mutation, read + delete only).
+pub(super) fn dispatch_rewind(arg: &str, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    if arg.trim() == "purge" {
+        dispatch_rewind_purge(ctx, renderer);
+        return;
+    }
     if state.phase != crate::state::UiPhase::Idle {
         renderer.render(UiLine::CommandOutput(t(Msg::CmdRewindBusy).into_owned()));
         renderer.flush();
@@ -83,6 +91,65 @@ pub(super) fn dispatch_rewind(state: &UiState, ctx: &LoopCtx, renderer: &mut dyn
             t(Msg::CmdRewindUnavailable)
         )));
         renderer.flush();
+    }
+}
+
+/// `/rewind purge`: clear all shadow-store refs and report freed bytes.
+///
+/// Constructs a `WorkspaceCheckpoint` for the current session directly — this
+/// is a pure file-system operation (no conversation mutation) so it does not
+/// need to go through the async coding runtime.
+fn dispatch_rewind_purge(ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+    use atomcode_capabilities::session::WorkspaceCheckpoint;
+    if !atomcode_capabilities::session::rewind::code_rewind_opt_in() {
+        renderer.render(UiLine::CommandOutput(
+            "Code Rewind is off (set ATOMCODE_CODE_REWIND=1 to enable); nothing to purge."
+                .to_string(),
+        ));
+        renderer.flush();
+        return;
+    }
+    let session_id = ctx.current_session.id.as_str();
+    let cp = match WorkspaceCheckpoint::for_session(&ctx.working_dir, session_id) {
+        Ok(cp) => cp,
+        Err(e) => {
+            renderer.render(UiLine::Error(format!("Code Rewind store unavailable: {e}")));
+            renderer.flush();
+            return;
+        }
+    };
+    let before_bytes = cp.store_size_bytes();
+    match cp.purge() {
+        Ok(()) => {
+            let after_bytes = cp.store_size_bytes();
+            renderer.render(UiLine::CommandOutput(format!(
+                "Code Rewind store purged: {} → {}",
+                format_store_bytes(before_bytes),
+                format_store_bytes(after_bytes),
+            )));
+        }
+        Err(e) => {
+            renderer.render(UiLine::Error(format!("Code Rewind purge failed: {e}")));
+        }
+    }
+    renderer.flush();
+}
+
+/// Format a byte count as a human-readable string (B / KB / MB / GB).
+fn format_store_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if bytes == 0 {
+        "0 B".to_string()
+    } else if bytes < KB {
+        format!("{bytes} B")
+    } else if bytes < MB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else if bytes < GB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
     }
 }
 
@@ -1962,6 +2029,28 @@ fn execute_slash_command_impl(
         "provider" => {
             *active_modal = Some(Box::new(crate::modals::ProviderPanel::open()));
         }
+        "openrouter" => {
+            let mode = crate::event_loop::openrouter_connect::parse_connect_mode(arg);
+            // 取消任何仍在跑的上一次连接,再给本次分派一个全新的 cancel flag。
+            // 复用同一 Arc + store(false) 会让"ESC 取消旧任务后立刻再 /openrouter"
+            // 的 store(false) 把旧任务反取消,两个后台线程都发 Ready → 重复装配。
+            // 每次新建 Arc 兑现字段契约:ESC 只作用于当前任务,旧任务持有已被置真
+            // 的旧 Arc,自然退出。
+            ctx.openrouter_cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            ctx.openrouter_cancel = cancel.clone();
+            crate::event_loop::openrouter_connect::spawn_openrouter_connect(
+                mode,
+                ctx.openrouter_event_tx.clone(),
+                ctx.wake_tx.clone(),
+                cancel,
+            );
+            renderer.render(UiLine::CommandOutput(
+                "正在连接 OpenRouter…(浏览器授权,或稍候)".to_string(),
+            ));
+            renderer.flush();
+        }
         "proxy" => {
             *active_modal = Some(Box::new(ProxyPicker::open(&ctx.config)));
         }
@@ -2007,7 +2096,7 @@ fn execute_slash_command_impl(
             dispatch_undo(arg, state, ctx, renderer);
         }
         "rewind" => {
-            dispatch_rewind(state, ctx, renderer);
+            dispatch_rewind(arg, state, ctx, renderer);
         }
         "usage" => {
             // Mid-turn (Streaming): keep a text snapshot in the footer directly
@@ -2977,14 +3066,16 @@ fn execute_slash_command_impl(
             let sub = arg.trim();
             match parse_mcp_subcommand(sub) {
                 Some(McpSub::Login) => {
-                    let server = sub.strip_prefix("login").map(str::trim).unwrap_or("");
-                    if server.is_empty() {
+                    // Exactly one token is the server key; missing or a stray extra
+                    // arg (`/mcp login rvs new-file`) → usage, not a bogus key.
+                    let args = sub.strip_prefix("login").map(str::trim).unwrap_or("");
+                    let Some(server) = mcp_single_server_arg(args) else {
                         renderer.render(UiLine::CommandOutput(
                             t(Msg::McpOAuthLoginUsage).into_owned(),
                         ));
                         renderer.flush();
                         return Ok(());
-                    }
+                    };
                     let configs =
                         match atomcode_capabilities::mcp::load_mcp_config(&ctx.working_dir) {
                             Ok(configs) => configs,
@@ -2999,11 +3090,17 @@ fn execute_slash_command_impl(
                                 return Ok(());
                             }
                         };
+                    let mut available: Vec<String> =
+                        configs.iter().map(|config| config.name.clone()).collect();
+                    available.sort();
                     let Some(config) = configs.into_iter().find(|config| config.name == server)
                     else {
-                        renderer.render(UiLine::Error(
-                            t(Msg::McpOAuthServerNotFound { server }).into_owned(),
-                        ));
+                        // Unknown key: name it + list the real servers (shared with
+                        // `/mcp tools`), instead of a bare "not found".
+                        renderer.render(UiLine::CommandOutput(format_unknown_server(
+                            server,
+                            &available,
+                        )));
                         renderer.flush();
                         return Ok(());
                     };
@@ -3064,14 +3161,16 @@ fn execute_slash_command_impl(
                 }
 
                 Some(McpSub::Logout) => {
-                    let server = sub.strip_prefix("logout").map(str::trim).unwrap_or("");
-                    if server.is_empty() {
+                    // Exactly one token is the server key; missing or a stray extra
+                    // arg (`/mcp logout rvs new-file`) → usage, not a bogus key.
+                    let args = sub.strip_prefix("logout").map(str::trim).unwrap_or("");
+                    let Some(server) = mcp_single_server_arg(args) else {
                         renderer.render(UiLine::CommandOutput(
                             t(Msg::McpOAuthLogoutUsage).into_owned(),
                         ));
                         renderer.flush();
                         return Ok(());
-                    }
+                    };
                     let token_store = atomcode_capabilities::mcp::McpTokenStore::default();
                     match token_store.load_token(server) {
                         Ok(None) => {
@@ -3258,36 +3357,36 @@ fn execute_slash_command_impl(
                     return Ok(());
                 }
 
+                Some(McpSub::Help) => {
+                    renderer.render(UiLine::CommandOutput(t(Msg::McpHelp).into_owned()));
+                    renderer.flush();
+                    return Ok(());
+                }
+
                 Some(McpSub::Tools) => {
                     // `/mcp tools <server>`: list remote tool names for a connected server.
                     // This is intentionally separate from a global `/tools` so we keep the surface minimal.
-                    let server = sub.strip_prefix("tools").map(str::trim).unwrap_or("");
-                    if server.is_empty() {
+                    let args = sub.strip_prefix("tools").map(str::trim).unwrap_or("");
+                    let Some(server) = mcp_single_server_arg(args) else {
+                        // Zero, or a stray extra arg (e.g. `/mcp tools rvs new-file`) →
+                        // arg-count error; reuse the usage hint.
                         renderer.render(UiLine::CommandOutput(t(Msg::McpToolsUsage).into_owned()));
                         renderer.flush();
                         return Ok(());
-                    }
+                    };
                     let result = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current()
                             .block_on(ctx.runtime.mcp_tools(server.to_string()))
                     });
                     match result {
-                        Ok(snapshot) => {
-                            let mut message = String::from("tools:\n");
-                            if snapshot.tools.is_empty() {
-                                match snapshot.status {
-                                    Some(status) => {
-                                        message.push_str(&format!("  (none — {status})\n"));
-                                    }
-                                    None => message.push_str("  (none — server not configured)\n"),
-                                }
-                            } else {
-                                for tool in snapshot.tools {
-                                    message.push_str(&format!("  - {tool}\n"));
-                                }
-                            }
-                            renderer.render(UiLine::CommandOutput(message.trim_end().to_string()));
-                        }
+                        Ok(snapshot) => renderer.render(UiLine::CommandOutput(
+                            format_mcp_tools_snapshot(
+                                server,
+                                &snapshot.tools,
+                                snapshot.status.as_ref(),
+                                &snapshot.available,
+                            ),
+                        )),
                         Err(error) => renderer.render(UiLine::Error(error.to_string())),
                     }
                     renderer.flush();
@@ -3339,6 +3438,9 @@ fn execute_slash_command_impl(
                 crate::modals::OnboardingWizard::new_with_confirm()
                     .with_initial_language(ctx.config.language),
             ));
+            // Arm the nudge so that when this wizard closes the event
+            // loop evaluates whether to show the /openrouter hint.
+            ctx.pending_onboarding_nudge = true;
         }
         "worktree" => {
             handle_worktree(arg, ctx, renderer)?;
@@ -3954,6 +4056,57 @@ fn execute_slash_command_impl(
                 renderer.flush();
             }
         }
+        "worklog" => {
+            // `/worklog [date]`: deterministically gather the day's completed turns
+            // across ALL projects (with computed agent-active durations), then hand
+            // the model a structured recap to fill the 工作内容/时长/问题与评价 table.
+            use chrono::{Local, TimeZone};
+            let english =
+                matches!(atomcode_config::i18n::current_locale(), atomcode_config::i18n::Locale::En);
+            let Some(date) = atomcode_capabilities::session::resolve_worklog_date(
+                arg,
+                Local::now().date_naive(),
+            ) else {
+                renderer.render(UiLine::CommandOutput(
+                    if english {
+                        "Usage: /worklog [date]  (today / yesterday / 8/27 / 2026-08-27)".to_string()
+                    } else {
+                        "用法：/worklog [日期]（默认今天；支持 today / yesterday / 8/27 / 2026-08-27）"
+                            .to_string()
+                    },
+                ));
+                renderer.flush();
+                return Ok(());
+            };
+            // Local-day [midnight, next-midnight) → epoch ms. `.earliest()` resolves a
+            // DST-gap midnight; the UTC fallback is only for that rare ambiguity.
+            let to_ms = |ndt: chrono::NaiveDateTime| -> i64 {
+                Local
+                    .from_local_datetime(&ndt)
+                    .earliest()
+                    .map(|dt| dt.timestamp_millis())
+                    .unwrap_or_else(|| ndt.and_utc().timestamp_millis())
+            };
+            let after_ms = to_ms(date.and_hms_opt(0, 0, 0).unwrap());
+            let before_ms = to_ms(
+                date.succ_opt()
+                    .unwrap_or(date)
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+            );
+            let sessions_root = atomcode_capabilities::session::SessionManager::sessions_root();
+            let turns = atomcode_capabilities::session::collect_day_turns(
+                &sessions_root,
+                after_ms,
+                before_ms,
+            );
+            let label = date.format("%-m/%-d").to_string();
+            let prompt =
+                atomcode_capabilities::session::build_worklog_prompt(&label, &turns, english);
+            submit_agent_turn(ctx, state, prompt);
+            return Ok(());
+        }
+
         other => {
             // Before reporting "unknown", check user-defined custom commands,
             // then user-invocable skills (loaded from .claude/skills,
@@ -6440,6 +6593,7 @@ pub(crate) enum McpSub {
     Logout,
     Trust,
     Untrust,
+    Help,
 }
 
 /// Count servers withheld because the project is untrusted. Drives the
@@ -6460,6 +6614,61 @@ pub(crate) fn count_blocked_untrusted(
 
 /// Parse the argument string following `/mcp` into a known subcommand.
 /// Returns `None` for unrecognised inputs (which fall through to status display).
+/// Parse the single-server argument shared by `/mcp tools|login|logout <server>`:
+/// EXACTLY one whitespace token is a server key. Zero (missing) or more than one
+/// (a stray extra arg like `/mcp tools rvs new-file`) returns `None` so the
+/// caller shows that subcommand's usage hint.
+pub(crate) fn mcp_single_server_arg(args: &str) -> Option<&str> {
+    let mut it = args.split_whitespace();
+    match (it.next(), it.next()) {
+        (Some(server), None) => Some(server),
+        _ => None,
+    }
+}
+
+/// Shared "you named a server that isn't configured" guidance for
+/// `/mcp tools|login|logout`: name the bad key and list the real ones (shell-style
+/// "not found → here's what exists"), or report nothing configured. NEVER says
+/// "not configured" for a key when servers DO exist (the reported bug).
+pub(crate) fn format_unknown_server(server: &str, available: &[String]) -> String {
+    if available.is_empty() {
+        t(Msg::McpNoServersConfigured).trim_end().to_string()
+    } else {
+        t(Msg::McpUnknownServer {
+            name: server,
+            available: &available.join(", "),
+        })
+        .trim_end()
+        .to_string()
+    }
+}
+
+/// Render the `/mcp tools <server>` body from the runtime snapshot fields.
+/// - non-empty tools → the tool list;
+/// - empty + a known `status` → the server's connection status (configured, but
+///   currently exposing nothing: connecting / disconnected / failed / blocked);
+/// - empty + `status == None` → the key is NOT among the configured servers (a
+///   typo / wrong key), so name it and list the real keys — NOT "not configured"
+///   (which wrongly points the user at config/trust when the server IS connected).
+pub(crate) fn format_mcp_tools_snapshot(
+    server: &str,
+    tools: &[String],
+    status: Option<&atomcode_capabilities::mcp::ServerStatus>,
+    available: &[String],
+) -> String {
+    if !tools.is_empty() {
+        let mut message = String::from("tools:\n");
+        for tool in tools {
+            message.push_str(&format!("  - {tool}\n"));
+        }
+        return message.trim_end().to_string();
+    }
+    match status {
+        Some(status) => format!("tools:\n  (none — {status})"),
+        None => format_unknown_server(server, available),
+    }
+}
+
 pub(crate) fn parse_mcp_subcommand(sub: &str) -> Option<McpSub> {
     let s = sub.trim();
     if s.eq_ignore_ascii_case("reload") {
@@ -6468,6 +6677,11 @@ pub(crate) fn parse_mcp_subcommand(sub: &str) -> Option<McpSub> {
         Some(McpSub::Trust)
     } else if s.eq_ignore_ascii_case("untrust") {
         Some(McpSub::Untrust)
+    } else if s.eq_ignore_ascii_case("help")
+        || s.eq_ignore_ascii_case("--help")
+        || s.eq_ignore_ascii_case("-h")
+    {
+        Some(McpSub::Help)
     } else if s.starts_with("tools") {
         Some(McpSub::Tools)
     } else if s.starts_with("login") {
@@ -9253,6 +9467,91 @@ mod mcp_subcommand_tests {
         assert!(parse_mcp_subcommand("").is_none());
         assert!(parse_mcp_subcommand("status").is_none());
         assert!(parse_mcp_subcommand("foobar").is_none());
+    }
+
+    #[test]
+    fn mcp_help_subcommand_recognized() {
+        // `/mcp help`, `--help`, `-h` all reach the help arm instead of falling
+        // through to the default status list.
+        for arg in ["help", "HELP", "--help", "-h"] {
+            assert!(
+                matches!(parse_mcp_subcommand(arg), Some(McpSub::Help)),
+                "{arg:?} should parse as Help"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_single_server_arg_requires_exactly_one_token() {
+        use super::mcp_single_server_arg;
+        assert_eq!(mcp_single_server_arg("rvs"), Some("rvs"));
+        assert_eq!(mcp_single_server_arg("  rvs  "), Some("rvs"));
+        // Missing → usage.
+        assert_eq!(mcp_single_server_arg(""), None);
+        // Stray extra arg (the reported `/mcp tools rvs new-file`, and the same
+        // class for `/mcp login|logout`) → usage, NOT a bogus "rvs new-file" key.
+        assert_eq!(mcp_single_server_arg("rvs new-file"), None);
+    }
+
+    #[test]
+    fn format_unknown_server_lists_available_or_reports_none() {
+        use super::format_unknown_server;
+        let listed = format_unknown_server("rvs new-file", &["a".into(), "b".into()]);
+        assert!(listed.contains("rvs new-file") && listed.contains("a") && listed.contains("b"));
+        assert!(!listed.contains("not configured") && !listed.contains("未配置"));
+        let none = format_unknown_server("x", &[]);
+        assert!(none.contains("未配置") || none.contains("no MCP") || none.contains("No MCP"));
+    }
+
+    #[test]
+    fn mcp_tools_unknown_key_names_it_and_lists_available_not_not_configured() {
+        use super::format_mcp_tools_snapshot;
+        // Empty tools + status None = the key isn't among configured servers.
+        let out = format_mcp_tools_snapshot(
+            "rvs new-file",
+            &[],
+            None,
+            &["filesystem".to_string(), "rvs".to_string()],
+        );
+        assert!(out.contains("rvs new-file"), "names the bad key: {out:?}");
+        assert!(out.contains("filesystem") && out.contains("rvs"), "lists available: {out:?}");
+        assert!(
+            !out.contains("not configured") && !out.contains("未配置"),
+            "must NOT claim not-configured when servers exist: {out:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_tools_no_servers_configured_when_available_empty() {
+        use super::format_mcp_tools_snapshot;
+        let out = format_mcp_tools_snapshot("rvs", &[], None, &[]);
+        assert!(
+            out.contains("未配置") || out.contains("No MCP servers") || out.contains("no MCP"),
+            "empty available → not-configured message: {out:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_tools_known_server_with_no_tools_shows_status_not_unknown() {
+        use super::format_mcp_tools_snapshot;
+        use atomcode_capabilities::mcp::ServerStatus;
+        // Configured + connected but exposing zero tools: show the status, and do
+        // NOT misreport it as an unknown key.
+        let out = format_mcp_tools_snapshot("rvs", &[], Some(&ServerStatus::Connected), &["rvs".into()]);
+        assert!(out.contains("none"), "shows the (none — status) form: {out:?}");
+        assert!(!out.contains("未找到") && !out.contains("named"), "not an unknown-key message: {out:?}");
+    }
+
+    #[test]
+    fn mcp_tools_lists_tools_when_present() {
+        use super::format_mcp_tools_snapshot;
+        let out = format_mcp_tools_snapshot(
+            "rvs",
+            &["new-file".to_string(), "read".to_string()],
+            None,
+            &["rvs".into()],
+        );
+        assert!(out.contains("- new-file") && out.contains("- read"), "lists tools: {out:?}");
     }
 }
 

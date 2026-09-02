@@ -305,7 +305,11 @@ impl ToolMiddleware for PanicBeforeMiddleware {
 struct PanicAfterMiddleware;
 #[async_trait]
 impl ToolMiddleware for PanicAfterMiddleware {
-    async fn after(&self, _result: &mut ToolResult) -> AfterOutcome {
+    async fn after(
+        &self,
+        _result: &mut ToolResult,
+        _tool: Option<&Arc<dyn Tool>>,
+    ) -> AfterOutcome {
         panic!("after blew up");
     }
 }
@@ -313,7 +317,11 @@ impl ToolMiddleware for PanicAfterMiddleware {
 struct ParkAfterMiddleware;
 #[async_trait]
 impl ToolMiddleware for ParkAfterMiddleware {
-    async fn after(&self, _result: &mut ToolResult) -> AfterOutcome {
+    async fn after(
+        &self,
+        _result: &mut ToolResult,
+        _tool: Option<&Arc<dyn Tool>>,
+    ) -> AfterOutcome {
         futures::future::pending::<AfterOutcome>().await
     }
 }

@@ -1,0 +1,93 @@
+name: check
+
+# `build.yml` only fires on `v*` tags and only runs `cargo build` (which skips
+# every test target) plus one `cargo test -p atomcode-updater --lib`. That is
+# how the `ToolMiddleware::after` signature drift in
+# `crates/atomcode-kernel/tests/conformance.rs` stayed invisible for a week and
+# shipped in v5.0.9. This workflow is the pre-merge gate that closes that hole.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "release/**"
+  workflow_dispatch:
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  gate:
+    name: compile + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # ~94 test sites spawn `git`; a bare runner has no committer identity.
+      - name: Configure git identity for tests
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.com"
+          git config --global init.defaultBranch main
+
+      # BLOCKING. The cheap gate, and the one that matters: `--all-targets`
+      # reaches the `tests/` integration targets that `cargo build` never
+      # compiles, and `--workspace` reaches the 10 crates outside
+      # `default-members` that a bare `cargo test` never selects. This step
+      # alone would have caught the v5.0.9 break, on the day it landed.
+      - name: cargo check (all crates, all targets)
+        run: cargo check --workspace --all-targets
+
+      # Report-only for now. The suite is green locally on macOS
+      # (5711 passed / 0 failed at ecc9781a), but it has not yet run on a
+      # Linux runner and it touches the host in ways CI often refuses:
+      # ~94 external-command spawns, ~27 `$HOME` lookups, ~24 port binds.
+      # PROMOTE THIS: once a run is green here, delete the
+      # `continue-on-error` line below — a test gate that cannot fail a PR is
+      # not a gate.
+      - name: cargo test (all crates)
+        continue-on-error: true
+        run: cargo test --workspace
+
+  lint:
+    name: fmt + clippy (report only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Deliberately NOT blocking. Measured on release/v5.1.0 @ ecc9781a:
+      # 379 files fail `rustfmt --check` and clippy reports 598 warnings
+      # (atomcode-tuix alone accounts for 291). A gate that is red on its first
+      # run gets switched off, so these report the debt instead. Drop the
+      # `continue-on-error` line from a step once its backlog reaches zero —
+      # per step, independently.
+      - name: cargo fmt --check
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets

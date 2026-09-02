@@ -241,6 +241,28 @@ impl LlmProvider for AnthropicProvider {
                             return;
                         }
                         Ok(Some(Err(e))) => {
+                            // Message already logically complete (a `stop_reason`
+                            // arrived) AND the error is a benign transport drop — a
+                            // gateway closing the keep-alive after the final delta but
+                            // before `message_stop`, which rustls surfaces as a missing
+                            // TLS close_notify / UnexpectedEof. Treat it as a CLEAN end
+                            // (flush + Done), not a spurious mid-turn interruption.
+                            if dec.seen_stop() && retry::is_stale_connection_error(&e) {
+                                for ev in dec.finish() {
+                                    if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
+                                        pending_metadata.push(ev);
+                                        continue;
+                                    }
+                                    if retry::is_replay_sensitive_event(&ev)
+                                        || matches!(ev, StreamEvent::Done { .. } | StreamEvent::Error(_))
+                                    {
+                                        for metadata in pending_metadata.drain(..) { yield metadata; }
+                                    }
+                                    emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
+                                    yield ev;
+                                }
+                                return;
+                            }
                             if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
                                 reconnect_attempts += 1;
                                 // Brief, esc-interruptible backoff before reopening so an
@@ -762,6 +784,10 @@ struct AnthropicSseDecoder {
     output_tokens: u32,
     truncated: bool,
     done: bool,
+    /// True once a `message_delta` carried a `stop_reason` — the model's own
+    /// "message complete" signal, which arrives before the terminal
+    /// `message_stop`. After this a trailing transport EOF is benign.
+    seen_stop: bool,
     response_id_seen: bool,
 }
 
@@ -776,6 +802,7 @@ impl AnthropicSseDecoder {
             output_tokens: 0,
             truncated: false,
             done: false,
+            seen_stop: false,
             response_id_seen: false,
         }
     }
@@ -795,6 +822,12 @@ impl AnthropicSseDecoder {
             }
         }
         out
+    }
+
+    /// True once a `stop_reason` has arrived (see `seen_stop`). After this a
+    /// trailing transport EOF before `message_stop` is benign, not a truncation.
+    fn seen_stop(&self) -> bool {
+        self.seen_stop
     }
 
     /// Stream ended WITHOUT a `message_stop`: flush a final usage (if any) + `Done`.
@@ -987,6 +1020,9 @@ impl AnthropicSseDecoder {
                     .and_then(|d| d.get("stop_reason"))
                     .and_then(|s| s.as_str())
                 {
+                    // Any stop_reason marks the message logically complete (Anthropic
+                    // sends it once, on the final delta — no empty-string quirk).
+                    self.seen_stop = true;
                     if sr == "max_tokens" {
                         self.truncated = true;
                     }
@@ -1118,6 +1154,31 @@ mod tests {
 
     fn line(event: &str, v: Value) -> String {
         format!("event: {event}\ndata: {v}\n\n")
+    }
+
+    #[test]
+    fn seen_stop_gates_benign_trailing_eof_swallow() {
+        // The "gateway dropped keep-alive before message_stop" swallow is gated on
+        // seen_stop(). A `stop_reason` means the message is complete → a trailing
+        // close_notify / UnexpectedEof is benign. No stop_reason yet → NOT armed,
+        // so a genuine mid-content truncation still surfaces.
+        let mut d = AnthropicSseDecoder::new();
+        let _ = d.feed(
+            line(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}),
+            )
+            .as_bytes(),
+        );
+        assert!(!d.seen_stop(), "no stop_reason yet → not armed");
+        let _ = d.feed(
+            line(
+                "message_delta",
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}),
+            )
+            .as_bytes(),
+        );
+        assert!(d.seen_stop(), "stop_reason arms seen_stop");
     }
 
     // ---- request building ----

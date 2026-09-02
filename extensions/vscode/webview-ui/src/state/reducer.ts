@@ -12,6 +12,8 @@ import type {
   AuthStatus,
   ProviderInfo,
   SessionTerminalState,
+  TodoItemData,
+  TodoStatus,
 } from './types';
 import { blocksFromLegacyMessage } from './blocks';
 import { applyTodoCall, reduceTodosFromMessages } from './todo';
@@ -1133,10 +1135,22 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
         messages.push({ ...message, blocks: role === 'assistant' ? blocksFromLegacyMessage(message) : undefined });
       }
       const mergedMessages = mergeTerminalIntoHistory(messages, action.terminal);
+      // Derive todos from the transcript FIRST (authoritative while the todowrite
+      // calls are still present); fall back to the persisted sidecar list only
+      // when the transcript yields none (a compaction drained the plan calls —
+      // issue #1503). Sidecar statuses are the canonical strings, so they map
+      // directly onto TodoStatus.
+      const derivedTodos = reduceTodosFromMessages(mergedMessages);
+      const todos: TodoItemData[] = derivedTodos.length > 0
+        ? derivedTodos
+        : (action.todos ?? []).map((item) => ({
+            content: item.content,
+            status: item.status as TodoStatus,
+          }));
       return {
         ...state,
         messages: mergedMessages,
-        activeTodos: reduceTodosFromMessages(mergedMessages),
+        activeTodos: todos,
         isGenerating: false,
         persistenceWarning: undefined,
       };

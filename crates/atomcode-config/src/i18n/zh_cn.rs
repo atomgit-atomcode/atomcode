@@ -204,7 +204,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
     Right                            接受下一步建议（不会自动发送）
 
   ── 模式与模型 ──
-    Shift+Tab                        无补全菜单时切换到下一个执行模式
+    Shift+Tab                        无补全菜单时切换到下一个执行模式（终端不支持 Shift+Tab 时，用 /plan /build /auto）
     F2 / Shift+F2                    下一个 / 上一个模型（Mac：Fn+F2 / Fn+Shift+F2）
     Ctrl+T                           切换 reasoning_effort
 
@@ -367,6 +367,20 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelAccountFormHint => "Tab 切换  ↵ 保存  Esc 返回".into(),
         Msg::ProviderPanelModelFormHint =>
             "Tab 下一项  ←→ 切选项  空格切换  ↵ 保存  Esc 返回".into(),
+        Msg::ProviderPanelEffortLevelsHint =>
+            "空格 启用/禁用此档位（[✓] 启用 · [ ] 未启用）  Tab 下一项  Esc 返回".into(),
+        Msg::SubagentToolUses { count } => format!("{count} 次工具").into(),
+        Msg::SubtaskPanelCounts { finished, total, running, pending } =>
+            format!("{finished}/{total} 已完成 · {running} 运行中 · {pending} 排队").into(),
+        Msg::SubagentStatusRunning => "运行中".into(),
+        Msg::SubagentStatusDone => "完成".into(),
+        Msg::SubagentStatusStopped => "已停止".into(),
+        Msg::SubagentStatusFailed => "失败".into(),
+        Msg::SubagentStatusWaiting => "排队中".into(),
+        Msg::SubagentGroupFinished { kind, done, total, failed } =>
+            format!("{kind} · {done}/{total} 已完成 · {failed} 失败").into(),
+        Msg::SubagentGroupRunning { kind, running, total } =>
+            format!("运行中 {running}/{total} {kind}…").into(),
         // ── Model 选择器 ──
         Msg::ModelSwitched { provider, model } =>
             format!("  当前会话已切换到 {provider} · {model}\n").into(),
@@ -722,6 +736,18 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  用法：/mcp tools <服务器名>\n  示例：/mcp tools filesystem\n".into(),
         Msg::McpServersHeader =>
             "  MCP 服务器：\n".into(),
+        Msg::McpUnknownServer { name, available } =>
+            format!("  未找到名为 '{name}' 的 MCP 服务器 —— 可用：{available}\n").into(),
+        Msg::McpHelp =>
+            "  /mcp 用法：\n    \
+             /mcp                    列出已配置的 MCP 服务器及状态\n    \
+             /mcp tools <服务器名>    列出某个服务器的工具\n    \
+             /mcp reload             重新加载 MCP 配置\n    \
+             /mcp trust              信任本项目的 MCP 服务器\n    \
+             /mcp untrust            取消信任本项目的 MCP 服务器\n    \
+             /mcp login <服务器名>    对远程服务器进行 OAuth 登录\n    \
+             /mcp logout <服务器名>   注销 OAuth 登录\n    \
+             /mcp help               显示本帮助\n".into(),
         Msg::McpBlockedTrustHint { count } =>
             format!(
                 "  有 {count} 个服务器因本项目未被信任而被拦截。\n  运行 /mcp trust 可加载本项目的 MCP 服务器。\n"
@@ -735,8 +761,6 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
             "  用法：/mcp logout <服务名>\n  示例：/mcp logout github\n".into(),
         Msg::McpOAuthLoadConfigFailed { error } =>
             format!("  MCP OAuth 登录失败：无法加载配置：{error}\n").into(),
-        Msg::McpOAuthServerNotFound { server } =>
-            format!("  MCP OAuth 登录失败：配置中未找到服务 '{server}'。\n").into(),
         Msg::McpOAuthStarting { server } =>
             format!("  正在浏览器中启动 '{server}' 的 MCP OAuth 流程...\n").into(),
         Msg::McpOAuthSaved { provider, server } =>
@@ -981,6 +1005,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescCost => "显示本会话 Token 用量".into(),
         Msg::CmdDescUsage => "显示 CodingPlan 用量（标签：当前窗口 / 总览 / 模型）".into(),
         Msg::CmdDescContext => "显示上下文预算明细".into(),
+        Msg::CmdDescWorklog => "跨所有项目的每日工作复盘（/worklog [today|yesterday|月/日]）".into(),
         Msg::CmdDescCompact => "压缩对话历史".into(),
         Msg::CmdDescRemember => "保存记忆（/remember --global 为全局）".into(),
         Msg::CmdDescForget => "删除匹配的记忆".into(),
@@ -1005,7 +1030,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescCopy => "复制上一条回复里的代码块，或用 /copy msg 复制整条回复（/copy、/copy N、/copy all、/copy msg）".into(),
         Msg::CopyOk { lines, chars } => format!("已复制代码块到剪贴板（{lines} 行，{chars} 字符）").into(),
         Msg::CopyOkMsg { lines, chars } => format!("已复制回复到剪贴板（{lines} 行，{chars} 字符）").into(),
-        Msg::CopyNoCodeBlock => "上一条回复里没有可复制的代码块".into(),
+        Msg::CopyNoCodeBlock => "上一条回复里没有代码块——用 /copy msg 复制整条回复".into(),
         Msg::CopyMsgEmpty => "上一条回复为空，没有可复制的内容".into(),
         Msg::CopyBadIndex { count } => format!("没有这个代码块——上一条回复共 {count} 个（用 /copy N，范围 1..={count}）").into(),
         Msg::CopyFailed => "剪贴板不可用——复制失败".into(),
@@ -1028,6 +1053,8 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescSchedule => "查看定时任务列表和下次运行时间".into(),
         Msg::CmdDescDesktop =>
             "打开 {brand} 桌面端（已安装则启动，否则显示下载地址）".into(),
+        Msg::CmdDescOpenrouter =>
+            "接入 OpenRouter 免费模型（/openrouter 走 OAuth，/openrouter <key> 直传已有密钥）".into(),
         Msg::DesktopOpening { name, path } =>
             format!("正在打开 {}…\n  {}\n", name, path).into(),
         Msg::DesktopNotInstalled { url } =>

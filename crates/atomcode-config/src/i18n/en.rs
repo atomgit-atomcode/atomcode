@@ -219,7 +219,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Right                            Accept next-prompt suggestion (does not send)
 
   ── Mode and model ──
-    Shift+Tab                        Without a menu, cycle to the next mode
+    Shift+Tab                        Without a menu, cycle to the next mode (if your terminal can't send Shift+Tab, use /plan /build /auto)
     F2 / Shift+F2                    Next / previous model (Mac: Fn+F2 / Fn+Shift+F2)
     Ctrl+T                           Cycle reasoning_effort
 
@@ -385,6 +385,22 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ProviderPanelAccountFormHint => "Tab Switch  ↵ Save  Esc Back".into(),
         Msg::ProviderPanelModelFormHint =>
             "Tab Next  ←→ Switch option  Space Toggle  ↵ Save  Esc Back".into(),
+        Msg::ProviderPanelEffortLevelsHint =>
+            "Space Enable/disable level ([✓] on · [ ] off)  Tab Next  Esc Back".into(),
+        Msg::SubagentToolUses { count } => {
+            format!("{count} tool use{}", if count == 1 { "" } else { "s" }).into()
+        }
+        Msg::SubtaskPanelCounts { finished, total, running, pending } =>
+            format!("{finished}/{total} finished · {running} running · {pending} pending").into(),
+        Msg::SubagentStatusRunning => "running".into(),
+        Msg::SubagentStatusDone => "Done".into(),
+        Msg::SubagentStatusStopped => "Stopped".into(),
+        Msg::SubagentStatusFailed => "Failed".into(),
+        Msg::SubagentStatusWaiting => "waiting".into(),
+        Msg::SubagentGroupFinished { kind, done, total, failed } =>
+            format!("{kind} · {done}/{total} finished · {failed} failed").into(),
+        Msg::SubagentGroupRunning { kind, running, total } =>
+            format!("Running {running}/{total} {kind}…").into(),
         // ── Model picker ──
         Msg::ModelSwitched { provider, model } =>
             format!("  Switched to {provider} · {model} for this session\n").into(),
@@ -747,6 +763,18 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Usage: /mcp tools <server>\n  Example: /mcp tools filesystem\n".into(),
         Msg::McpServersHeader =>
             "  MCP Servers:\n".into(),
+        Msg::McpUnknownServer { name, available } =>
+            format!("  no MCP server named '{name}' — available: {available}\n").into(),
+        Msg::McpHelp =>
+            "  /mcp usage:\n    \
+             /mcp                 list configured MCP servers and status\n    \
+             /mcp tools <server>  list a server's tools\n    \
+             /mcp reload          reload MCP configuration\n    \
+             /mcp trust           trust this project's MCP servers\n    \
+             /mcp untrust         untrust this project's MCP servers\n    \
+             /mcp login <server>  OAuth-login to a remote server\n    \
+             /mcp logout <server> log out of OAuth\n    \
+             /mcp help            show this help\n".into(),
         Msg::McpBlockedTrustHint { count } =>
             format!(
                 "  {count} server(s) blocked because this project is untrusted.\n  Run /mcp trust to load this project's MCP servers.\n"
@@ -760,8 +788,6 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
             "  Usage: /mcp logout <server>\n  Example: /mcp logout github\n".into(),
         Msg::McpOAuthLoadConfigFailed { error } =>
             format!("  MCP OAuth login failed to load config: {error}\n").into(),
-        Msg::McpOAuthServerNotFound { server } =>
-            format!("  MCP OAuth login failed: server '{server}' not found in config.\n").into(),
         Msg::McpOAuthStarting { server } =>
             format!("  Starting MCP OAuth for '{server}' in your browser...\n").into(),
         Msg::McpOAuthSaved { provider, server } =>
@@ -1009,6 +1035,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescCost => "Show session token usage".into(),
         Msg::CmdDescUsage => "Show CodingPlan usage (tabs: current / overview / models)".into(),
         Msg::CmdDescContext => "Show context budget breakdown".into(),
+        Msg::CmdDescWorklog => "Daily work recap across all projects (/worklog [today|yesterday|M/D])".into(),
         Msg::CmdDescCompact => "Compact conversation history".into(),
         Msg::CmdDescRemember => "Save a fact to memory (/remember --global for global)".into(),
         Msg::CmdDescForget => "Remove matching memories".into(),
@@ -1033,7 +1060,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescCopy => "Copy a code block, or the full reply with /copy msg (/copy, /copy N, /copy all, /copy msg)".into(),
         Msg::CopyOk { lines, chars } => format!("Copied code block to clipboard ({lines} lines, {chars} chars)").into(),
         Msg::CopyOkMsg { lines, chars } => format!("Copied reply to clipboard ({lines} lines, {chars} chars)").into(),
-        Msg::CopyNoCodeBlock => "No code block in the last reply to copy".into(),
+        Msg::CopyNoCodeBlock => "No code block in the last reply — use /copy msg to copy the whole reply".into(),
         Msg::CopyMsgEmpty => "The last reply is empty — nothing to copy".into(),
         Msg::CopyBadIndex { count } => format!("No such code block — the last reply has {count} (use /copy N, 1..={count})").into(),
         Msg::CopyFailed => "Clipboard unavailable — could not copy".into(),
@@ -1056,6 +1083,8 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescSchedule => "List scheduled tasks and next run times".into(),
         Msg::CmdDescDesktop =>
             "Open the {brand} desktop app (launch it if installed, else show the download link)".into(),
+        Msg::CmdDescOpenrouter =>
+            "Connect to OpenRouter free models (/openrouter for OAuth, /openrouter <key> with existing key)".into(),
         Msg::DesktopOpening { name, path } =>
             format!("Opening {}…\n  {}\n", name, path).into(),
         Msg::DesktopNotInstalled { url } =>

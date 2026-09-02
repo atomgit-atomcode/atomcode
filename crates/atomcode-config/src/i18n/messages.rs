@@ -405,6 +405,39 @@ pub enum Msg<'a> {
     ProviderPanelProviderFormHint,
     ProviderPanelAccountFormHint,
     ProviderPanelModelFormHint,
+    ProviderPanelEffortLevelsHint,
+    // ── Subagent / task fan-out progress ──
+    /// Cumulative tool-call count on a member's primary row ("N tool uses").
+    SubagentToolUses {
+        count: u64,
+    },
+    /// Live footer panel header counts (`N/M finished · R running · P pending`).
+    SubtaskPanelCounts {
+        finished: usize,
+        total: usize,
+        running: usize,
+        pending: usize,
+    },
+    /// Detail-row status words shown under a subagent/task member row.
+    SubagentStatusRunning,
+    SubagentStatusDone,
+    SubagentStatusStopped,
+    SubagentStatusFailed,
+    SubagentStatusWaiting,
+    /// Agent-group header once every member has reached a terminal state.
+    /// `kind` is the product label (`SubAgents`/`Team agents`), left verbatim.
+    SubagentGroupFinished {
+        kind: &'a str,
+        done: usize,
+        total: usize,
+        failed: usize,
+    },
+    /// Agent-group header while members are still running.
+    SubagentGroupRunning {
+        kind: &'a str,
+        running: usize,
+        total: usize,
+    },
     // ── Model picker ──
     ModelSwitched {
         provider: &'a str,
@@ -844,6 +877,15 @@ pub enum Msg<'a> {
     McpClearedNoServers,
     McpToolsUsage,
     McpServersHeader,
+    /// `/mcp tools <name>` referenced a server key that is not configured.
+    /// `available` is the comma-joined list of real server keys (never empty —
+    /// the caller uses `McpNoServersConfigured` when nothing is configured).
+    McpUnknownServer {
+        name: &'a str,
+        available: &'a str,
+    },
+    /// `/mcp help` — the full list of `/mcp` subcommands.
+    McpHelp,
     /// Discoverability hint appended to `/mcp` status when one or more
     /// project-source servers are withheld because the project is untrusted.
     McpBlockedTrustHint {
@@ -857,9 +899,6 @@ pub enum Msg<'a> {
     McpOAuthLogoutUsage,
     McpOAuthLoadConfigFailed {
         error: &'a str,
-    },
-    McpOAuthServerNotFound {
-        server: &'a str,
     },
     McpOAuthStarting {
         server: &'a str,
@@ -1190,6 +1229,7 @@ pub enum Msg<'a> {
     /// Description for the `/usage` slash command — opens the CodingPlan usage modal.
     CmdDescUsage,
     CmdDescContext,
+    CmdDescWorklog,
     CmdDescCompact,
     CmdDescRemember,
     CmdDescForget,
@@ -1291,6 +1331,8 @@ pub enum Msg<'a> {
     CmdDescSchedule,
     /// Description for the `/desktop` slash command.
     CmdDescDesktop,
+    /// Description for the `/openrouter` slash command — connect via OpenRouter.
+    CmdDescOpenrouter,
     /// `/desktop` — launching the found app (`name` = app, `path` = its location).
     DesktopOpening {
         name: &'a str,

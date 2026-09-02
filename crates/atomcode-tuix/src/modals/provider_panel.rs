@@ -680,17 +680,20 @@ impl ModelForm {
     }
 
     /// Render the level toggles with the sub-cursor marked, e.g.
-    /// ` ● low  ‹○ medium›  ● high  ● max ` (focused level in guillemets).
+    /// ` [✓] low  ‹[ ] medium›  [✓] high  [✓] max ` (focused level in guillemets).
     ///
-    /// Use text glyphs rather than emoji so each marker stays monochrome and
-    /// occupies one terminal cell on the terminals supported by the TUI.
+    /// Checkbox glyphs (`[✓]`/`[ ]`) rather than radio-style `●`/`○`: this row is a
+    /// MULTI-select of which effort levels the model exposes, and the checkbox reads
+    /// unambiguously as on/off — matching the `设为默认 [✓]` toggle in the same form.
+    /// It also downgrades legibly on non-unicode terminals (`✓`→`v` ⇒ `[v]`/`[ ]`),
+    /// whereas `●`/`○` collapse to the ambiguous `*`/`o`.
     fn effort_levels_label(&self, focused: bool) -> String {
         atomcode_config::config::REASONING_EFFORT_LEVELS
             .iter()
             .enumerate()
             .map(|(i, level)| {
-                let mark = if self.effort_levels[i] { '●' } else { '○' };
-                let cell = format!("{mark} {level}");
+                let mark = if self.effort_levels[i] { '✓' } else { ' ' };
+                let cell = format!("[{mark}] {level}");
                 if focused && i == self.effort_level_cursor {
                     format!("‹{cell}›")
                 } else {
@@ -1917,7 +1920,7 @@ impl Modal for ProviderPanel {
         items.push((String::new(), String::new()));
 
         let mut selected = items.len(); // nothing highlighted by default
-        let hint: String; // assigned once per match arm below
+        let mut hint: String; // assigned per match arm below (Model arm may refine it)
                           // Forms use the box-less `PluginInfo` layout; the list uses the `Plugin`
                           // layout whose reserved index-2 slot is rendered as the search box.
         let mut kind = MenuKind::PluginInfo;
@@ -2274,6 +2277,12 @@ impl Modal for ProviderPanel {
                     form.focus == ModelField::MakeDefault,
                 ));
                 hint = crate::i18n::t(crate::i18n::Msg::ProviderPanelModelFormHint).into_owned();
+                // On the multi-select tier row, surface what Space does and what the
+                // checkbox marks mean — the generic form hint doesn't explain either.
+                if form.focus == ModelField::EffortLevels {
+                    hint = crate::i18n::t(crate::i18n::Msg::ProviderPanelEffortLevelsHint)
+                        .into_owned();
+                }
             }
         }
 
@@ -2848,12 +2857,18 @@ mod tests {
         assert_eq!(add.effort_levels, [true, false, true, true, true]);
         assert_eq!(
             add.effort_levels_label(true),
-            " ● low ‹○ medium› ● high  ● xhigh  ● max "
+            " [✓] low ‹[ ] medium› [✓] high  [✓] xhigh  [✓] max "
         );
         assert_eq!(
             add.effort_levels_label(false),
-            " ● low  ○ medium  ● high  ● xhigh  ● max "
+            " [✓] low  [ ] medium  [✓] high  [✓] xhigh  [✓] max "
         );
+        // Non-unicode terminals downgrade `✓`→`v`, so the checkbox stays
+        // legible as `[v]`/`[ ]` (unlike `●`/`○` → ambiguous `*`/`o`).
+        let unicode_label = add.effort_levels_label(false);
+        let ascii = crate::glyph::downgrade_glyphs(&unicode_label, false);
+        assert!(ascii.contains("[v] low"), "ascii checkbox on: {ascii}");
+        assert!(ascii.contains("[ ] medium"), "ascii checkbox off: {ascii}");
         // The DEFAULT cycle now skips medium: None → auto → low → high.
         add.reasoning_effort = None;
         add.cycle_effort(true);

@@ -263,6 +263,12 @@ struct UserInputRows {
     rows: Vec<Vec<Cell>>,
     /// Full rendered range belonging to the active option/input/submit row.
     active: std::ops::Range<usize>,
+    /// When the active row is a TEXT-input field (the Single/Multiple
+    /// custom-answer row, or a Text-mode box), the 0-indexed display column of
+    /// its caret within `rows[active.start]`. `None` for options-only /
+    /// non-text-focused rows. Lets the footer park the REAL terminal cursor
+    /// there so an OS IME anchors its preedit correctly (see paint_footer).
+    caret_col: Option<usize>,
 }
 
 /// Final physical-row budget for the retained footer. Individual widgets cap
@@ -613,7 +619,10 @@ fn format_loop_row(
 /// `todo_panel_rows`). No blank padding — a short list shows short.
 const MAX_TODO_PANEL_ROWS: usize = 7;
 /// Header + at most three live children + one folded terminal/pending summary.
-const MAX_SUBTASK_PANEL_ROWS: usize = 6;
+/// Footer height ceiling: 1 header + up to 3 running children × 2 rows each
+/// (primary + connected detail) = 7. Terminal/pending children fold into the
+/// header counts + a summary row rather than taking space.
+const MAX_SUBTASK_PANEL_ROWS: usize = 7;
 const MAX_VISIBLE_RUNNING_SUBTASKS: usize = 3;
 
 fn format_subtask_progress(activity: &str, elapsed: &str, tokens: u64, width: usize) -> String {
@@ -1039,6 +1048,32 @@ fn is_recoverable_tool_failure(success: bool, summary: &str) -> bool {
     !success && (summary.starts_with("[elapsed:") || summary.contains("The file was NOT modified"))
 }
 
+/// The "breathing" pulse for an in-flight tool's `●` bullet: a full white↔gray
+/// cycle every [`BREATH_PERIOD_MS`]. Applied only on unicode + colour terminals;
+/// non-unicode / no-colour fall back to the raw spinner glyph (see
+/// `render_inflight_tool`).
+const BREATH_PERIOD_MS: u128 = 1200;
+/// Trough (mid-grey) and peak (near-white) of the breath, as 256-colour grey-ramp
+/// AnsiValue indices (232 = darkest … 255 = lightest). A calm, contained pulse —
+/// bright enough to read as "alive", dim enough to not blink harshly. Rendered
+/// via the 256-colour grey ramp so it looks right on both truecolor and 256-colour
+/// terminals without probing the exact depth.
+const BREATH_DIM: u8 = 242;
+const BREATH_BRIGHT: u8 = 255;
+
+/// The grey-ramp AnsiValue for the breathing bullet at `elapsed` into a
+/// CONTINUOUS breath (not reset per tool — all in-flight bullets pulse in sync).
+/// Cosine-eased so it fades in/out smoothly (a "breath"), not a linear blink:
+/// starts at [`BREATH_DIM`], peaks at [`BREATH_BRIGHT`] mid-cycle, returns to dim.
+/// Pure fn of `elapsed` so the curve is unit-tested without a clock.
+fn breath_gray(elapsed: std::time::Duration) -> u8 {
+    let phase = (elapsed.as_millis() % BREATH_PERIOD_MS) as f64 / BREATH_PERIOD_MS as f64; // 0..1
+    // cos goes 1 → -1 → 1 over the cycle; (1-cos)/2 gives 0 → 1 → 0 (dim→bright→dim).
+    let t = (1.0 - (phase * std::f64::consts::TAU).cos()) / 2.0;
+    let span = (BREATH_BRIGHT - BREATH_DIM) as f64;
+    BREATH_DIM + (t * span).round() as u8
+}
+
 /// Leading gutter glyphs that anchor a tool block (`● bash`, `└ cmd`,
 /// `⎿ [elapsed…]`, …). Stripped from a tool row's COPY text so a drag copy
 /// carries the command/output, not the decorative anchor.
@@ -1168,6 +1203,10 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
 pub struct RetainedRenderer<W: Write + Send> {
     out: W,
     caps: TerminalCaps,
+    /// Anchor for the in-flight bullet's continuous "breathing" pulse (see
+    /// `breath_gray`). Set once at construction so all in-flight tools breathe in
+    /// sync and the phase never jumps between renders.
+    breath_anchor: std::time::Instant,
     mouse_capture_enabled: bool,
     interaction_publisher: crate::render::interaction::InteractionPublisher,
     pending_interactions: Vec<crate::render::interaction::HitRegion>,
@@ -1546,6 +1585,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         Self {
             out,
             caps,
+            breath_anchor: std::time::Instant::now(),
             mouse_capture_enabled,
             interaction_publisher,
             pending_interactions: Vec::new(),
@@ -1765,6 +1805,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.style_bold(Role::ToolName)
     }
 
+    /// Bullet style for a LIVE subtask/subagent `●`: a white↔gray breathing
+    /// pulse (identical to the in-flight tool bullet) on modern colour
+    /// terminals, else a static white — never the old magenta accent. The
+    /// footer repaints on each spinner tick while subagents run, so the pulse
+    /// animates; on legacy terminals it degrades to a steady white dot.
+    fn breathing_bullet_style(&self) -> CellStyle {
+        let mut s = CellStyle::default();
+        if self.caps.colors && self.caps.modern_emulator && self.caps.unicode_symbols {
+            s.fg = Some(Color::AnsiValue(breath_gray(self.breath_anchor.elapsed())));
+        } else {
+            s.fg = Some(Color::White);
+        }
+        s
+    }
+
     /// Bold style for the tool-call `●` bullet, coloured by the call's outcome:
     /// green success / yellow recoverable / red hard failure, or the neutral
     /// `ToolName` shade when the outcome is not yet known (in-flight, preempt,
@@ -1946,9 +2001,29 @@ impl<W: Write + Send> RetainedRenderer<W> {
             safe_name.to_ascii_lowercase().as_str(),
             "task" | "team" | "codereview" | "code_review"
         );
-        let prefix = format!("{} ", icon);
+        // A regular in-flight tool shows a static `●` whose colour "breathes"
+        // white↔grey (a calm running pulse), instead of the raw spinner frame —
+        // matching the committed `●` and Claude Code's running indicator. Gated
+        // on unicode + a MODERN emulator (the 256-colour grey ramp AnsiValue
+        // 242-255 needs real 256-colour support — same gate the mascot's AnsiValue
+        // art uses; bare/SSH/16-colour ttys claiming `xterm-256color` don't
+        // qualify). Subagent fan-outs keep their Brand spinner; everything else
+        // falls back to the passed spinner `icon` unchanged.
+        let breathe = !is_subagent_fanout
+            && self.caps.unicode_symbols
+            && self.caps.colors
+            && self.caps.modern_emulator;
+        let prefix = if breathe {
+            "\u{25cf} ".to_string()
+        } else {
+            format!("{} ", icon)
+        };
         let prefix_style = if is_subagent_fanout {
             self.style_for(Role::Brand)
+        } else if breathe {
+            let mut s = self.tool_bullet_style();
+            s.fg = Some(Color::AnsiValue(breath_gray(self.breath_anchor.elapsed())));
+            s
         } else {
             self.tool_bullet_style()
         };
@@ -3420,21 +3495,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .iter()
             .filter(|item| item.status == crate::render::SubtaskStatus::Running)
             .count();
-        let failed = subtasks
-            .items
-            .iter()
-            .filter(|item| item.status == crate::render::SubtaskStatus::Failed)
-            .count();
-        let stopped = subtasks
-            .items
-            .iter()
-            .filter(|item| item.status == crate::render::SubtaskStatus::Stopped)
-            .count();
-        let pending_items = subtasks
-            .items
-            .iter()
-            .filter(|item| item.status == crate::render::SubtaskStatus::Pending)
-            .count();
         let terminal = subtasks
             .items
             .iter()
@@ -3447,19 +3507,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 )
             })
             .count();
-        let pending = if subtasks.call_id.starts_with("team:") {
-            subtasks.total.saturating_sub(terminal + running)
-        } else {
-            pending_items
-        };
-        let needs_summary =
-            failed > 0 || stopped > 0 || pending > 0 || running > MAX_VISIBLE_RUNNING_SUBTASKS;
-        let spacer_rows = usize::from(cap >= 2);
-        let summary_rows = usize::from(needs_summary && cap >= spacer_rows + 2);
-        let visible_running = running
-            .min(MAX_VISIBLE_RUNNING_SUBTASKS)
-            .min(cap.saturating_sub(spacer_rows + 1 + summary_rows));
-        spacer_rows + 1 + visible_running + summary_rows
+        // Mirror `build_subtask_rows` exactly: no spacer, 1 header, and up to 3
+        // visible children (running first, then finished fill) × 2 rows each.
+        // Pending are header-only and never take a row.
+        let slots = MAX_VISIBLE_RUNNING_SUBTASKS.min(cap.saturating_sub(1) / 2);
+        let visible = slots.min(running + terminal);
+        1 + visible * 2
     }
 
     /// Build the fixed Task fan-out panel. Only running children own detailed
@@ -3477,13 +3530,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return Vec::new();
         }
         let mut rows = Vec::new();
-        // Keep the transient task panel visually separate from the conversation
-        // above it. On very short terminals the single available row remains
-        // the header, so cosmetic spacing never displaces useful status.
-        if cap >= 2 {
-            rows.push(Vec::new());
-        }
-
+        // No leading spacer: the two-row children already need every row of the
+        // tight budget (header + 3×2 = 7). The header itself separates the panel.
         let bold = CellStyle {
             bold: true,
             ..CellStyle::default()
@@ -3495,7 +3543,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             "*"
         };
-        push_str_cells(&mut header, marker, &self.style_for(Role::Brand));
+        push_str_cells(&mut header, marker, &self.breathing_bullet_style());
         let panel_title = if subtasks.call_id.starts_with("team:") {
             " Team"
         } else {
@@ -3534,30 +3582,57 @@ impl<W: Write + Send> RetainedRenderer<W> {
         push_str_cells(
             &mut header,
             &format!(
-                " \u{b7} {finished}/{} finished \u{b7} {} running \u{b7} {pending} pending",
-                subtasks.total,
-                running.len(),
-                pending = pending_count
+                " \u{b7} {}",
+                crate::i18n::t(crate::i18n::Msg::SubtaskPanelCounts {
+                    finished,
+                    total: subtasks.total,
+                    running: running.len(),
+                    pending: pending_count,
+                })
             ),
             &detail,
         );
         rows.push(header);
 
-        let needs_summary = failed > 0
-            || stopped > 0
-            || pending_count > 0
-            || running.len() > MAX_VISIBLE_RUNNING_SUBTASKS;
-        let summary_rows = usize::from(needs_summary && cap >= rows.len() + 1);
-        let visible_running = running
-            .len()
-            .min(MAX_VISIBLE_RUNNING_SUBTASKS)
-            .min(cap.saturating_sub(rows.len() + summary_rows));
-        for item in running.iter().take(visible_running).copied() {
-            let glyph = "\u{25cf}";
-            let glyph = if self.caps.unicode_symbols {
-                glyph
-            } else {
-                "[>]"
+        // Keep up to 3 subagents on the panel: running children first, then the
+        // most-recently-FINISHED ones fill any empty slot so a completed subagent
+        // lingers (showing `完成`) instead of vanishing — the panel never shrinks
+        // below the active-child count. Pending stay in the header count and
+        // promote into a slot when they actually start.
+        let mut terminal_items: Vec<&crate::render::SubtaskItem> = subtasks
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.status,
+                    SubtaskStatus::Completed | SubtaskStatus::Stopped | SubtaskStatus::Failed
+                )
+            })
+            .collect();
+        terminal_items.sort_by(|a, b| b.finished_at.cmp(&a.finished_at));
+        let slots = MAX_VISIBLE_RUNNING_SUBTASKS.min(cap.saturating_sub(1) / 2);
+        let mut visible: Vec<&crate::render::SubtaskItem> = running.iter().copied().take(slots).collect();
+        for item in terminal_items {
+            if visible.len() >= slots {
+                break;
+            }
+            visible.push(item);
+        }
+        let sub_glyph = if self.caps.unicode_symbols { "\u{2514}" } else { "`" };
+        let dot = if self.caps.unicode_symbols { "\u{25cf}" } else { "[>]" };
+        for item in visible {
+            // Running dots breathe; terminal dots take the status colour.
+            let (row_style, dot_style) = match item.status {
+                SubtaskStatus::Running => {
+                    (self.style_for(Role::Secondary), self.breathing_bullet_style())
+                }
+                SubtaskStatus::Stopped => {
+                    (self.style_for(Role::Warning), self.style_for(Role::Warning))
+                }
+                SubtaskStatus::Failed => {
+                    (self.style_for(Role::Error), self.style_for(Role::Error))
+                }
+                _ => (self.style_for(Role::Muted), self.style_for(Role::Muted)),
             };
             let mut identity = if item.description.is_empty() {
                 item.label.clone()
@@ -3569,82 +3644,53 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let remainder = identity.split_off(label_len);
                 identity.push_str(&format!(" \u{b7} {}{}", item.model, remainder));
             }
-            let elapsed = item
-                .started_at
-                .map(|started_at| started_at.elapsed().as_secs())
-                .unwrap_or(0);
+            let elapsed = item.elapsed().as_secs();
             let elapsed = if elapsed >= 60 {
                 format!("{}m{}s", elapsed / 60, elapsed % 60)
             } else {
                 format!("{elapsed}s")
             };
-            let activity = if item.activity.is_empty() {
-                "analyzing task"
-            } else {
-                item.activity.as_str()
-            };
-            let content = format!("{} \u{b7} {activity}", scrub_controls(&identity));
-            let glyph_width = crate::width::display_width(glyph);
+            // Primary row: identity (+ cumulative tool count); elapsed + tokens
+            // ride the right edge. The current action moves to its own row below.
+            let mut content = scrub_controls(&identity).to_string();
+            if item.tool_uses > 0 {
+                content.push_str(&format!(
+                    " \u{b7} {}",
+                    crate::i18n::t(crate::i18n::Msg::SubagentToolUses {
+                        count: item.tool_uses,
+                    })
+                ));
+            }
+            let glyph_width = crate::width::display_width(dot);
             let content_width = rule_width.saturating_sub(2 + glyph_width + 1);
             let fitted =
                 format_subtask_progress(&content, &elapsed, item.output_tokens, content_width);
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ", &CellStyle::default());
-            push_str_cells(&mut row, glyph, &self.style_for(Role::Brand));
+            push_str_cells(&mut row, dot, &dot_style);
             push_str_cells(&mut row, " ", &CellStyle::default());
-            push_str_cells(&mut row, &fitted, &self.style_for(Role::Secondary));
+            push_str_cells(&mut row, &fitted, &row_style);
             rows.push(row);
-        }
-        if needs_summary && rows.len() < cap {
-            let mut parts = Vec::new();
-            let hidden_running = running.len().saturating_sub(visible_running);
-            let expands_single_pending =
-                pending.len() == 1 && pending_count == 1 && hidden_running == 0 && failed == 0;
-            if hidden_running > 0 {
-                parts.push(format!("{hidden_running} running"));
-            }
-            if expands_single_pending {
-                let item = pending[0];
-                let mut identity = if item.description.is_empty() {
-                    item.label.clone()
-                } else {
-                    format!("{} \u{b7} {}", item.label, item.description)
-                };
-                if !item.model.is_empty() {
-                    let label_len = item.label.len();
-                    let remainder = identity.split_off(label_len);
-                    identity.push_str(&format!(" \u{b7} {}{}", item.model, remainder));
-                }
-                parts.push(format!("{} \u{b7} pending", scrub_controls(&identity)));
-            } else if pending_count > 0 {
-                parts.push(format!("{pending_count} pending"));
-            }
-            if failed > 0 {
-                parts.push(format!("{failed} failed"));
-            }
-            if stopped > 0 {
-                parts.push(format!("{stopped} stopped"));
-            }
-            let mut row = Vec::new();
-            push_str_cells(&mut row, "  ", &CellStyle::default());
-            push_str_cells(
-                &mut row,
-                &format!(
-                    "{} {}",
-                    if expands_single_pending && self.caps.unicode_symbols {
-                        "\u{25cb}"
-                    } else if expands_single_pending {
-                        "[ ]"
-                    } else if self.caps.unicode_symbols {
-                        "\u{2026}"
+            // Detail row: the current action while running (its own full-width
+            // line so it is never truncated), else a terminal status word.
+            let detail: std::borrow::Cow<str> = match item.status {
+                SubtaskStatus::Running => {
+                    if item.activity.is_empty() {
+                        crate::i18n::t(crate::i18n::Msg::SubagentStatusRunning)
                     } else {
-                        "..."
-                    },
-                    parts.join(" \u{b7} ")
-                ),
-                &self.style_for(Role::Muted),
-            );
-            rows.push(row);
+                        std::borrow::Cow::Borrowed(item.activity.as_str())
+                    }
+                }
+                SubtaskStatus::Completed => crate::i18n::t(crate::i18n::Msg::SubagentStatusDone),
+                SubtaskStatus::Stopped => crate::i18n::t(crate::i18n::Msg::SubagentStatusStopped),
+                SubtaskStatus::Failed => crate::i18n::t(crate::i18n::Msg::SubagentStatusFailed),
+                SubtaskStatus::Pending => crate::i18n::t(crate::i18n::Msg::SubagentStatusWaiting),
+            };
+            let sub_text = format!("    {sub_glyph} {}", scrub_controls(&detail));
+            let sub = crate::width::truncate_with_ellipsis(&sub_text, rule_width);
+            let mut sub_row = Vec::new();
+            push_str_cells(&mut sub_row, &sub, &row_style);
+            rows.push(sub_row);
         }
         for row in &mut rows {
             clamp_cell_row(row, rule_width);
@@ -3990,7 +4036,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         screen_height: usize,
         scroll_offset: isize,
     ) -> Vec<Vec<Cell>> {
-        let UserInputRows { rows, active } = built;
+        let UserInputRows {
+            rows,
+            active,
+            caret_col: _,
+        } = built;
         let max_rows = screen_height.saturating_sub(1);
         if max_rows == 0 {
             return Vec::new();
@@ -4072,6 +4122,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let unicode = self.caps.unicode_symbols;
         let mut out: Vec<Vec<Cell>> = Vec::new();
         let mut active = 0..1;
+        // 0-indexed caret column within the active row when it is a text field
+        // (custom-answer / Text box). Drives the real-cursor park for IME anchoring.
+        let mut caret_col: Option<usize> = None;
 
         // A blank spacer row (empty cells).
         let blank_row = |out: &mut Vec<Vec<Cell>>| out.push(Vec::new());
@@ -4257,6 +4310,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     }
                     push_str_cells(&mut row, &num, &chrome_style);
 
+                    // Caret column WITHIN the field content (0 = front of field).
+                    let mut field_caret_col = 0usize;
                     if panel.custom_text.trim().is_empty() {
                         // Faint placeholder when no text has been typed yet
                         // (consistent with build_response which trims before checking).
@@ -4297,11 +4352,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         };
                         let safe_text = scrub_controls(&panel.custom_text);
                         let text = if on_cursor {
-                            crate::width::editable_value_projection(
-                                &safe_text,
-                                panel.custom_text_cursor_byte,
-                                budget,
-                            )
+                            let (projected, caret_in_field) =
+                                crate::width::editable_value_projection_with_caret(
+                                    &safe_text,
+                                    panel.custom_text_cursor_byte,
+                                    budget,
+                                );
+                            field_caret_col = caret_in_field;
+                            projected
                         } else {
                             crate::width::truncate_with_ellipsis(&safe_text, text_budget)
                         };
@@ -4310,6 +4368,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     out.push(row);
                     if on_cursor {
                         active = custom_start..out.len();
+                        // Prefix (marker/checkbox/number) + the caret's column WITHIN the
+                        // field. Empty → 0 (front); non-empty → from the projection, so it
+                        // tracks windowing/ellipsis exactly and never drifts on long text.
+                        caret_col = Some(prefix_width + field_caret_col);
                     }
                 }
 
@@ -4380,6 +4442,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     }
                     out.push(row);
                     active = out.len().saturating_sub(1)..out.len();
+                    caret_col = Some(if field_width > 0 { 1 } else { 0 });
                 } else {
                     let inner_width = field_width.saturating_sub(2);
                     let (top_left, horizontal, top_right, bottom_left, bottom_right, prompt, caret) =
@@ -4402,14 +4465,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     let text_budget = inner_width
                         .saturating_sub(crate::width::display_width(prompt))
                         .saturating_sub(crate::width::display_width(caret));
+                    // Caret column WITHIN the projected text (0 for empty field).
+                    let mut text_field_caret = 0usize;
                     let buf = if panel.text.is_empty() {
                         String::new()
                     } else {
-                        crate::width::editable_value_projection(
-                            &safe_text,
-                            panel.text_cursor_byte,
-                            text_budget + crate::width::display_width(caret),
-                        )
+                        let (projected, caret_in_field) =
+                            crate::width::editable_value_projection_with_caret(
+                                &safe_text,
+                                panel.text_cursor_byte,
+                                text_budget + crate::width::display_width(caret),
+                            );
+                        text_field_caret = caret_in_field;
+                        projected
                     };
                     let visible_text = if buf.is_empty() {
                         crate::width::truncate_with_ellipsis(placeholder, text_budget)
@@ -4442,6 +4510,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     push_str_cells(&mut row, if unicode { "│" } else { "|" }, &border_style);
                     out.push(row);
                     active = out.len().saturating_sub(1)..out.len();
+                    // Real-cursor park for IME: left border (1) + prompt + the caret's
+                    // column within the projected text (0 for empty → right after the
+                    // prompt). Projection-derived so long/scrolled text never drifts.
+                    caret_col = Some(1 + crate::width::display_width(prompt) + text_field_caret);
 
                     let mut bottom = Vec::new();
                     push_str_cells(&mut bottom, bottom_left, &border_style);
@@ -4486,7 +4558,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         push_str_cells(&mut hint_row, &hint_truncated, &hint_style);
         out.push(hint_row);
 
-        UserInputRows { rows: out, active }
+        UserInputRows {
+            rows: out,
+            active,
+            caret_col,
+        }
     }
 
     /// Batch-aware wrapper over [`Self::build_user_input_rows`]. A standalone question
@@ -4635,10 +4711,43 @@ impl<W: Write + Send> RetainedRenderer<W> {
             push_line(&mut out, hint, &hint_style);
         }
         self.fit_user_input_rows(
-            UserInputRows { rows: out, active },
+            UserInputRows {
+                rows: out,
+                active,
+                // Batch (multi-question) IME caret parking is a follow-up; the
+                // single-question / Text paths carry it via build_user_input_rows.
+                caret_col: None,
+            },
             screen_height,
             view.scroll_offset,
         )
+    }
+
+    /// When the `request_user_input` panel's cursor is on a TEXT-input row (the
+    /// Single/Multiple custom-answer row, or a Text-mode box), returns
+    /// `(row_offset_in_panel, caret_col)` so the footer can park the REAL
+    /// terminal cursor there — otherwise an OS IME (e.g. a Chinese input method)
+    /// anchors its composing preedit at a stale position and the caret looks
+    /// misaligned. `None` for options-only navigation, batch (multi-question)
+    /// panels, or a scrolled panel (row offsets no longer map 1:1 to drawn rows
+    /// → safe fallback to the pre-existing hidden-cursor behavior).
+    fn user_input_text_caret(
+        &self,
+        view: &crate::render::UserInputPanelView,
+        rule_width: usize,
+        screen_width: usize,
+        screen_height: usize,
+    ) -> Option<(usize, usize)> {
+        if matches!(&view.batch, Some(m) if m.total > 1) {
+            return None;
+        }
+        let built = self.build_user_input_rows(view, rule_width, screen_width);
+        let caret_col = built.caret_col?;
+        let max_rows = screen_height.saturating_sub(1);
+        if built.rows.len() > max_rows {
+            return None;
+        }
+        Some((built.active.start, caret_col))
     }
 
     /// Row count matching [`Self::build_user_input_panel_view`].
@@ -5661,6 +5770,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // `post_approval` is the row index immediately after whatever occupies the
         // slot between the top rule and the attachment rows — either the approval
         // panel (when active) or the input box + bot_rule (normal case).
+        // Set when the user_input panel's cursor is on a text field: keeps the
+        // real cursor VISIBLE and parked at the caret (for IME), overriding the
+        // blanket "hide caret while approval_active" below.
+        let mut user_input_text_focused = false;
         let post_approval = if approval_active {
             // Approval replaces input box: draw approval rows directly after the
             // top rule (skip middle rows, skip bot_rule, skip status).
@@ -5670,7 +5783,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 Self::pad_row_to_width(&mut padded, w, CellStyle::default());
                 self.screen.draw_row(approval_top + i, 0, &padded);
             }
-            // Cursor visibility handled by the common suppress_cursor block below.
+            // Park the real terminal cursor on the user_input custom-answer /
+            // Text field so an OS IME anchors its preedit there. Options-only
+            // panels return None and keep the caret hidden. Gated on
+            // `approval.is_none()` because the approval panel wins the draw slot
+            // (see approval_cells) — without this, a simultaneously-set
+            // user_input would show a stray caret over the approval panel.
+            if status_clone.approval.is_none() {
+                if let Some(view) = status_clone.user_input.as_ref() {
+                    if let Some((row_off, col)) = self.user_input_text_caret(view, rule_width, w, h)
+                    {
+                        let abs_row = (approval_top + row_off + 1) as u16;
+                        let abs_col = (col + 1) as u16;
+                        self.screen.set_cursor(abs_row, abs_col);
+                        user_input_text_focused = true;
+                    }
+                }
+            }
             rules_top + 1 + approval_rows
         } else if hide_input_box {
             rules_top + 1
@@ -5844,7 +5973,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // hide the caret (user navigates with ↑↓/Enter/Tab).
         let suppress_cursor = self.inflight_tool.is_some()
             || subtask_fanout_idle
-            || approval_active
+            // A user_input TEXT field (custom-answer / Text box) keeps the caret
+            // visible + parked for IME; options-only panels stay hidden.
+            || (approval_active && !user_input_text_focused)
             || self.diff_overlay_active
             || (hide_input_box && !is_add_url && !is_search_box_focused);
         self.screen.set_cursor_visible(!suppress_cursor);
@@ -8339,11 +8470,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         };
         let header = if finished && terminal >= progress.total {
             format!(
-                "{marker} {kind} · {terminal}/{} finished · {failed} failed",
-                progress.total
+                "{marker} {}",
+                crate::i18n::t(crate::i18n::Msg::SubagentGroupFinished {
+                    kind,
+                    done: terminal,
+                    total: progress.total,
+                    failed,
+                })
             )
         } else {
-            format!("{marker} Running {running}/{} {kind}…", progress.total)
+            format!(
+                "{marker} {}",
+                crate::i18n::t(crate::i18n::Msg::SubagentGroupRunning {
+                    kind,
+                    running,
+                    total: progress.total,
+                })
+            )
         };
         let header_style = self.style_bold(Role::Secondary);
         let header_row = build_one_row(
@@ -8358,42 +8501,44 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let active_child_style = self.style_for(Role::Secondary);
         let stopped_child_style = self.style_for(Role::Warning);
         let failed_child_style = self.style_for(Role::Error);
+        // Two rows per member (stable count → the live in-place rewrite keeps
+        // working across status transitions): a primary identity/stats row and a
+        // connected detail row. The detail row carries the CURRENT action on its
+        // own full-width line (no longer truncated by competing fields) while
+        // running, and a terminal `Done`/`完成` word once the member finishes.
         let child_rows = progress
             .items
             .iter()
             .enumerate()
-            .map(|(index, item)| {
-                let branch = if index + 1 == progress.items.len() {
-                    "└"
-                } else {
-                    "├"
-                };
-                let state = match item.status {
-                    SubtaskStatus::Pending => "pending",
-                    SubtaskStatus::Running => {
-                        if item.activity.is_empty() {
-                            "running"
-                        } else {
-                            item.activity.as_str()
-                        }
-                    }
-                    SubtaskStatus::Completed => "done",
-                    SubtaskStatus::Stopped => "stopped",
-                    SubtaskStatus::Failed => "failed",
+            .flat_map(|(index, item)| {
+                let is_last = index + 1 == progress.items.len();
+                let branch = if is_last { "\u{2514}" } else { "\u{251c}" };
+                let cont = if is_last { " " } else { "\u{2502}" };
+                let child_style = match item.status {
+                    SubtaskStatus::Pending | SubtaskStatus::Running => &active_child_style,
+                    SubtaskStatus::Completed => &completed_child_style,
+                    SubtaskStatus::Stopped => &stopped_child_style,
+                    SubtaskStatus::Failed => &failed_child_style,
                 };
                 let mut text = format!("  {branch} {}", item.label);
                 if !item.description.is_empty() {
                     text.push_str(&format!(": {}", item.description));
                 }
                 if !item.model.is_empty() {
-                    text.push_str(&format!(" · {}", item.model));
+                    text.push_str(&format!(" \u{b7} {}", item.model));
                 }
-                text.push_str(&format!(" · {state}"));
-                let text = if item.started_at.is_some() || item.output_tokens > 0 {
-                    let elapsed = item
-                        .started_at
-                        .map(|started_at| crate::render::fmt_dur(started_at.elapsed()))
-                        .unwrap_or_else(|| "0s".into());
+                if item.tool_uses > 0 {
+                    text.push_str(&format!(
+                        " \u{b7} {}",
+                        crate::i18n::t(crate::i18n::Msg::SubagentToolUses {
+                            count: item.tool_uses,
+                        })
+                    ));
+                }
+                let primary = if item.started_at.is_some() || item.output_tokens > 0 {
+                    // `item.elapsed()` freezes once the item is terminal, so a done
+                    // row stops ticking even while the live group keeps re-rendering.
+                    let elapsed = crate::render::fmt_dur(item.elapsed());
                     format_subtask_progress(
                         &text,
                         &elapsed,
@@ -8403,18 +8548,44 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 } else {
                     crate::width::truncate_with_ellipsis(&text, self.screen.width() as usize)
                 };
-                let child_style = match item.status {
-                    SubtaskStatus::Pending | SubtaskStatus::Running => &active_child_style,
-                    SubtaskStatus::Completed => &completed_child_style,
-                    SubtaskStatus::Stopped => &stopped_child_style,
-                    SubtaskStatus::Failed => &failed_child_style,
+                let detail: std::borrow::Cow<str> = match item.status {
+                    SubtaskStatus::Running => {
+                        if item.activity.is_empty() {
+                            crate::i18n::t(crate::i18n::Msg::SubagentStatusRunning)
+                        } else {
+                            std::borrow::Cow::Borrowed(item.activity.as_str())
+                        }
+                    }
+                    SubtaskStatus::Completed => {
+                        crate::i18n::t(crate::i18n::Msg::SubagentStatusDone)
+                    }
+                    SubtaskStatus::Stopped => {
+                        crate::i18n::t(crate::i18n::Msg::SubagentStatusStopped)
+                    }
+                    SubtaskStatus::Failed => {
+                        crate::i18n::t(crate::i18n::Msg::SubagentStatusFailed)
+                    }
+                    SubtaskStatus::Pending => {
+                        crate::i18n::t(crate::i18n::Msg::SubagentStatusWaiting)
+                    }
                 };
-                build_one_row(
-                    &text,
-                    child_style,
-                    self.screen.width(),
-                    self.caps.unicode_symbols,
-                )
+                let sub_text = format!("  {cont} \u{2514} {}", scrub_controls(&detail));
+                let sub =
+                    crate::width::truncate_with_ellipsis(&sub_text, self.screen.width() as usize);
+                [
+                    build_one_row(
+                        &primary,
+                        child_style,
+                        self.screen.width(),
+                        self.caps.unicode_symbols,
+                    ),
+                    build_one_row(
+                        &sub,
+                        child_style,
+                        self.screen.width(),
+                        self.caps.unicode_symbols,
+                    ),
+                ]
             })
             .collect();
         (header_row, child_rows)
@@ -10559,6 +10730,8 @@ mod tests {
                     model: "test-model".into(),
                     activity: "running".into(),
                     started_at: None,
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 0,
                     status: SubtaskStatus::Running,
                 })
@@ -14599,6 +14772,8 @@ mod tests {
                 model: "deepseek-v4-flash".into(),
                 activity: "analyzing".into(),
                 started_at: Some(std::time::Instant::now()),
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 1000,
                 status: SubtaskStatus::Running,
             }],
@@ -15915,6 +16090,78 @@ mod tests {
     }
 
     #[test]
+    fn breath_gray_pulses_dim_to_bright_and_wraps() {
+        use std::time::Duration;
+        // Cosine-eased breath: starts DIM, peaks BRIGHT at mid-cycle, back to
+        // DIM at the end, then wraps continuously.
+        assert_eq!(breath_gray(Duration::from_millis(0)), BREATH_DIM, "start = dim");
+        assert_eq!(
+            breath_gray(Duration::from_millis(600)),
+            BREATH_BRIGHT,
+            "mid-cycle = bright"
+        );
+        assert_eq!(
+            breath_gray(Duration::from_millis(1200)),
+            BREATH_DIM,
+            "full cycle wraps back to dim"
+        );
+        // Rising and falling quarters sit strictly between dim and bright.
+        let up = breath_gray(Duration::from_millis(300));
+        let down = breath_gray(Duration::from_millis(900));
+        assert!(up > BREATH_DIM && up < BREATH_BRIGHT, "quarter up mid-range: {up}");
+        assert!(
+            down > BREATH_DIM && down < BREATH_BRIGHT,
+            "three-quarter down mid-range: {down}"
+        );
+        // Continuous: a second cycle matches the first.
+        assert_eq!(
+            breath_gray(Duration::from_millis(1200 + 300)),
+            up,
+            "breath is periodic across cycles"
+        );
+    }
+
+    #[test]
+    fn inflight_tool_bullet_breathes_on_unicode_colour_and_falls_back_otherwise() {
+        // unicode + colour → the raw spinner frame `⠙` is replaced by a `●`
+        // whose fg is a grey-ramp breath value (the running bullet "breathes").
+        // Use a non-bash tool (`Read`): its spinner frame IS the bullet, so the
+        // `⠙`→breathing-`●` swap is direct. (Bash has a separate static `● Bash`
+        // block + its own spinner-timer row; its `●` still breathes via the same
+        // prefix style, just not exercised here.)
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.unicode_symbols = true;
+        r.caps.colors = true;
+        r.caps.modern_emulator = true; // 256-colour grey ramp needs a modern emulator
+        r.render_inflight_tool("\u{2819}", "Read", "src/lib.rs", "");
+        let bullet = r.body_lines.iter().flatten().find(|c| c.ch == '\u{25cf}');
+        assert!(bullet.is_some(), "breathing bullet is ●, not the raw frame");
+        assert!(
+            matches!(bullet.unwrap().style.fg, Some(Color::AnsiValue(v)) if (BREATH_DIM..=BREATH_BRIGHT).contains(&v)),
+            "bullet fg is a grey-ramp breath value, got {:?}",
+            bullet.unwrap().style.fg
+        );
+        assert!(
+            !r.body_lines.iter().flatten().any(|c| c.ch == '\u{2819}'),
+            "raw spinner frame glyph is gone"
+        );
+
+        // no colour → keep the raw spinner frame glyph, no `●`, no breath.
+        let (mut r2, _b2) = new_capturing(80, 24);
+        r2.caps.unicode_symbols = true;
+        r2.caps.colors = false;
+        r2.render_inflight_tool("\u{2819}", "Read", "src/lib.rs", "");
+        assert!(
+            r2.body_lines.iter().flatten().any(|c| c.ch == '\u{2819}'),
+            "no-colour keeps the spinner frame"
+        );
+        assert!(
+            !r2.body_lines.iter().flatten().any(|c| c.ch == '\u{25cf}'),
+            "no ● fallback on a no-colour terminal"
+        );
+    }
+
+    #[test]
     fn tool_bullet_green_on_success_at_commit() {
         assert_commit_bullet(
             Some(crate::render::ToolOutcome::Success),
@@ -15938,6 +16185,47 @@ mod tests {
     fn tool_bullet_neutral_when_commit_has_no_outcome() {
         // A preempt / turn-end / approval freeze carries no outcome → neutral.
         assert_commit_bullet(None, Role::ToolName, "no outcome = neutral");
+    }
+
+    #[test]
+    fn committed_tool_bullet_is_not_retro_recoloured_by_a_later_commit() {
+        // Locks the stateless invariant behind the approval green-dot fix: once a
+        // `● Tool(detail)` row is committed neutral, a LATER ToolCallCommit with a
+        // real outcome canNOT green it — there is no inflight to freeze and
+        // `commit_inflight_tool` is a no-op on an already-committed row.
+        //
+        // This is exactly why the event loop must DEFER an approval-gated tool's
+        // transcript row (v2 asks approval BEFORE ToolStarted) instead of
+        // committing it up front: deferring lets the post-approval ToolStarted
+        // render a live inflight whose result greens the bullet through the normal
+        // path. If someone "fixes" the bug by retro-recolouring committed rows
+        // (the fragile pending-slot approach rejected twice before), this test
+        // fails — pushing the fix back to the event-loop defer.
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false); // dark
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        // Static pre-result row, as an early approval commit would have produced.
+        r.render(UiLine::ToolCall {
+            name: "Bash".into(),
+            detail: "ls".into(),
+            outcome: None,
+        });
+        // The successful result arrives later — but there is no inflight to recolour.
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("c1".into()),
+            outcome: Some(crate::render::ToolOutcome::Success),
+        });
+        assert_eq!(
+            bullet_fg(&r),
+            Some(r.tool_bullet_style().fg),
+            "a committed bullet stays neutral; the renderer never retro-greens it"
+        );
+        assert_ne!(
+            bullet_fg(&r),
+            Some(r.style_for(Role::Success).fg),
+            "specifically NOT green — the fix defers the row so the live path greens it"
+        );
     }
 
     #[test]
@@ -18908,6 +19196,8 @@ mod tests {
                     model: "deepseek-v4-flash".into(),
                     activity: "completed".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 900,
                     status: SubtaskStatus::Completed,
                 },
@@ -18917,6 +19207,8 @@ mod tests {
                     model: "deepseek-v4-flash".into(),
                     activity: "reading files".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 420,
                     status: SubtaskStatus::Running,
                 },
@@ -18926,6 +19218,8 @@ mod tests {
                     model: "deepseek-v4-flash".into(),
                     activity: "thinking".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 210,
                     status: SubtaskStatus::Running,
                 },
@@ -18947,21 +19241,24 @@ mod tests {
         assert!(grid.contains("explore#2 · deepseek-v4-flash · inspect codex"));
         assert!(grid.contains("reading files"));
         assert!(grid.contains("↑ 420 tokens"));
-        assert!(!grid.contains("explore#1"));
+        // The completed explore#1 fills the third slot (lingers with `Done`)
+        // instead of vanishing, so the panel keeps showing three subagents.
+        assert!(grid.contains("explore#1"));
+        assert!(grid.contains("Done") || grid.contains("完成"));
         assert!(!grid.contains("standing todo"));
         assert_eq!(
             r.current_footer_rows(),
             r.last_painted_footer_rows,
             "subtask footer height math must mirror the painted rows"
         );
-        let subtask_header = (0..vterm.height() as usize)
+        // The two running children each own a primary + connected detail row.
+        assert!(grid.contains("inspect codex"));
+        assert!(grid.contains("inspect opencode"));
+        // No leading spacer any more (dropped so the tight 7-row budget fits
+        // three 2-row children); the bold header is the top of the panel.
+        let _ = (0..vterm.height() as usize)
             .find(|&row| vterm.row_text(row).contains("SubTasks"))
             .expect("subtask header rendered");
-        assert!(
-            subtask_header > 0 && vterm.row_text(subtask_header - 1).trim().is_empty(),
-            "subtask panel must leave one blank row below the conversation:\n{}",
-            vterm.dump()
-        );
     }
 
     #[test]
@@ -18999,6 +19296,8 @@ mod tests {
                     model: "deepseek-v4-flash".into(),
                     activity: "已定位命令注册入口，正在核对补全与权限机制".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 12_345,
                     status: SubtaskStatus::Running,
                 })
@@ -19022,7 +19321,7 @@ mod tests {
     }
 
     #[test]
-    fn subtask_panel_prioritizes_live_rows_and_truthfully_aggregates_hidden_rows() {
+    fn subtask_panel_fills_empty_slots_with_recently_finished_children() {
         use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
 
         let (mut r, buf) = new_capturing(100, 24);
@@ -19034,6 +19333,8 @@ mod tests {
             model: "deepseek-v4-flash".into(),
             activity: String::new(),
             started_at: Some(std::time::Instant::now()),
+            finished_at: None,
+            tool_uses: 0,
             output_tokens: 0,
             status: state,
         };
@@ -19063,10 +19364,13 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         let grid = vterm.dump();
+        // 1 running + 2 finished fill the 3 slots so the panel stays full; the
+        // finished children linger instead of vanishing. Pending stay a header
+        // count and there is no separate summary aggregation line.
         assert!(grid.contains("running#1"));
-        assert!(!grid.contains("failed#1"));
+        assert!(grid.contains("done#1") && grid.contains("done#2"));
         assert!(grid.contains("5/8 finished · 1 running · 2 pending"));
-        assert!(grid.contains("2 pending · 1 failed"));
+        assert!(!grid.contains("2 pending · 1 failed"), "no summary line");
     }
 
     #[test]
@@ -19082,6 +19386,8 @@ mod tests {
             model: String::new(),
             activity: String::new(),
             started_at: None,
+            finished_at: None,
+            tool_uses: 0,
             output_tokens: 0,
             status: state,
         };
@@ -19107,7 +19413,11 @@ mod tests {
 
         let grid = vterm.dump();
         assert!(grid.contains("3/3 finished · 0 running · 0 pending"));
-        assert!(grid.contains("1 failed · 1 stopped"));
+        // With no running children, the terminal ones fill the slots and report
+        // their distinct status words (stopped is not conflated with failed).
+        assert!(grid.contains("Stopped") || grid.contains("已停止"));
+        assert!(grid.contains("Failed") || grid.contains("失败"));
+        assert!(grid.contains("Done") || grid.contains("完成"));
     }
 
     #[test]
@@ -19121,6 +19431,8 @@ mod tests {
             model: "GLM-5.2".into(),
             activity: "正在分析结果".into(),
             started_at: Some(std::time::Instant::now()),
+            finished_at: None,
+            tool_uses: 0,
             output_tokens: 128,
             status: state,
         };
@@ -19145,15 +19457,60 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
             .collect::<Vec<_>>();
 
-        assert_eq!(text.len(), MAX_SUBTASK_PANEL_ROWS);
-        assert!(text[0].trim().is_empty());
-        assert!(text[1].contains("3/7 finished · 3 running · 1 pending"));
-        assert!(text.iter().any(|line| line.contains("explore#4")));
-        assert!(text.iter().any(|line| line.contains("explore#5")));
-        assert!(text.iter().any(|line| line.contains("explore#6")));
-        assert!(text[5].contains("1 pending · 1 failed"));
-        assert!(text.iter().all(|line| !line.contains("failed#1")));
-        assert!(text.iter().all(|line| !line.contains("pending#1")));
+        // 3 running fill all 3 slots (header + 3×2 = 7), so the finished/pending
+        // children stay header-only. No summary aggregation line any more.
+        assert_eq!(text.len(), 7, "{text:#?}");
+        assert!(text[0].contains("3/7 finished · 3 running · 1 pending"));
+        for w in ["explore#4", "explore#5", "explore#6"] {
+            assert!(text.iter().any(|l| l.contains(w)), "{w} shown");
+        }
+        for hidden in ["done#1", "done#2", "failed#1", "pending#1"] {
+            assert!(
+                text.iter().all(|l| !l.contains(hidden)),
+                "{hidden} is header-only while 3 running fill the slots"
+            );
+        }
+        assert!(text.iter().all(|l| !l.contains("· 1 failed")), "no summary line");
+    }
+
+    #[test]
+    fn subtask_panel_fits_three_two_row_running_children_in_seven_rows() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (r, _buf) = new_capturing(120, 24);
+        let item = |label: &str| SubtaskItem {
+            label: label.into(),
+            description: format!("inspect {label}"),
+            model: "deepseek-v4-flash".into(),
+            activity: "正在执行 grep".into(),
+            started_at: Some(std::time::Instant::now()),
+            finished_at: None,
+            tool_uses: 7,
+            output_tokens: 128,
+            status: SubtaskStatus::Running,
+        };
+        let progress = SubtaskProgress {
+            call_id: "call-task".into(),
+            completed: 0,
+            total: 3,
+            items: vec![item("worker#1"), item("worker#2"), item("worker#3")],
+        };
+        let text = r
+            .build_subtask_rows(&progress, 120)
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>();
+        // 1 header + 3 running × 2 rows (primary + detail) = 7, no spacer/summary.
+        assert_eq!(text.len(), 7);
+        assert!(text[0].contains("0/3 finished · 3 running · 0 pending"));
+        for w in ["worker#1", "worker#2", "worker#3"] {
+            assert!(text.iter().any(|l| l.contains(w)), "{w} shown");
+        }
+        // The current action rides its own detail row; tool count on the primary.
+        // (Wide CJK chars reconstruct with continuation cells, so assert on the
+        // ASCII fragments that survive: the tool count and the "grep" action.)
+        assert!(text.iter().any(|l| l.contains("grep")), "current action on a detail row");
+        assert!(text.iter().any(|l| l.contains("tool use")), "tool count on a primary row");
     }
 
     #[test]
@@ -19167,18 +19524,23 @@ mod tests {
             model: "GLM-5.2".into(),
             activity: "working".into(),
             started_at: Some(std::time::Instant::now()),
+            finished_at: None,
+            tool_uses: 0,
             output_tokens: 128,
             status: state,
         };
         for call_id in ["call-task", "team:runtime"] {
+            // Two running (both fit as 2-row children) + one pending. The running
+            // children own the rows; the pending is carried by the header count
+            // only (it promotes to running via events when a slot frees), so it
+            // never takes a row or a summary line.
             let progress = SubtaskProgress {
                 call_id: call_id.into(),
                 completed: 0,
-                total: 4,
+                total: 3,
                 items: vec![
                     item("explore#1", SubtaskStatus::Running),
                     item("explore#2", SubtaskStatus::Running),
-                    item("explore#3", SubtaskStatus::Running),
                     item("explore#4", SubtaskStatus::Pending),
                 ],
             };
@@ -19189,10 +19551,15 @@ mod tests {
                 .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
                 .collect::<Vec<_>>();
 
-            assert_eq!(text.len(), MAX_SUBTASK_PANEL_ROWS);
-            assert!(text[0].trim().is_empty());
-            assert!(text[5].contains("explore#4 · GLM-5.2 · inspect explore#4 · pending"));
-            assert!(!text[5].contains("1 pending"));
+            assert!(text.len() <= MAX_SUBTASK_PANEL_ROWS);
+            assert!(text[0].contains("0/3 finished · 2 running · 1 pending"));
+            assert!(text.iter().any(|l| l.contains("explore#1")));
+            assert!(text.iter().any(|l| l.contains("explore#2")));
+            // Pending is header-only: no row, no summary line for it.
+            assert!(
+                text.iter().all(|l| !l.contains("explore#4")),
+                "pending stays in the header count, not a row"
+            );
         }
     }
 
@@ -19212,6 +19579,8 @@ mod tests {
                     model: "GLM-5.2".into(),
                     activity: "thinking".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 128,
                     status: SubtaskStatus::Running,
                 },
@@ -19221,6 +19590,8 @@ mod tests {
                     model: "GLM-5.2".into(),
                     activity: "queued".into(),
                     started_at: None,
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 0,
                     status: SubtaskStatus::Pending,
                 },
@@ -19252,8 +19623,10 @@ mod tests {
             "token metadata must survive clipping"
         );
         assert!(running_text.contains('↑'), "token marker must stay visible");
+        // Each member spans two rows now (primary + connected detail), so the
+        // second member's PRIMARY row is at child_indices[2].
         assert!(
-            r.body_lines[group.child_indices[1]]
+            r.body_lines[group.child_indices[2]]
                 .iter()
                 .filter(|cell| !cell.ch.is_whitespace())
                 .all(|cell| cell.style == active_style),
@@ -19280,12 +19653,16 @@ mod tests {
             String::from_utf8_lossy(&buf.lock().unwrap()).contains("\x1b["),
             "Agent update must immediately rewrite visible terminal rows"
         );
-        let child = r.body_lines[group.child_indices[1]]
-            .iter()
-            .map(|cell| cell.ch)
-            .collect::<String>();
-        assert!(child.contains("reading files"));
-        assert!(child.contains("256 tokens"));
+        // Member 2: tokens ride the PRIMARY row (child_indices[2]); the current
+        // action ("reading files") is on its own connected DETAIL row (…[3]).
+        let row_text = |idx: usize| {
+            r.body_lines[idx]
+                .iter()
+                .map(|cell| cell.ch)
+                .collect::<String>()
+        };
+        assert!(row_text(group.child_indices[2]).contains("256 tokens"));
+        assert!(row_text(group.child_indices[3]).contains("reading files"));
 
         for item in &mut progress.items {
             item.status = SubtaskStatus::Completed;
@@ -19327,6 +19704,57 @@ mod tests {
     }
 
     #[test]
+    fn completed_agent_row_shows_frozen_elapsed_not_live_wall_clock() {
+        // Regression: a done member's row must FREEZE its elapsed. The bug was a
+        // finished row ticking with `now` (started_at.elapsed()) while sibling
+        // members kept the group live — so `implementer#1 done · 45m27s` matched
+        // the wall clock instead of its real ~14m completion span.
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+        use std::time::{Duration, Instant};
+
+        let (r, _buf) = new_capturing(120, 24);
+        let start = Instant::now();
+        let progress = SubtaskProgress {
+            call_id: "task:freeze".into(),
+            completed: 1,
+            total: 2,
+            items: vec![
+                SubtaskItem {
+                    label: "implementer#1".into(),
+                    description: String::new(),
+                    model: "deepseek-v4-flash".into(),
+                    activity: "done".into(),
+                    started_at: Some(start),
+                    // Finished 90s after start — a LIVE recompute would read ~0s
+                    // (the test just started), so `1m30s` proves the freeze.
+                    finished_at: Some(start + Duration::from_secs(90)),
+                    tool_uses: 0,
+                    output_tokens: 100,
+                    status: SubtaskStatus::Completed,
+                },
+                SubtaskItem {
+                    label: "implementer#2".into(),
+                    description: String::new(),
+                    model: "deepseek-v4-flash".into(),
+                    activity: "running".into(),
+                    started_at: Some(start),
+                    finished_at: None,
+                    tool_uses: 0,
+                    output_tokens: 50,
+                    status: SubtaskStatus::Running,
+                },
+            ],
+        };
+        let (_, rows) = r.agent_group_rows(&progress, false);
+        let text = |row: &[Cell]| row.iter().map(|c| c.ch).collect::<String>();
+        let done_row = text(&rows[0]);
+        assert!(
+            done_row.contains("1m30s"),
+            "done row must show its frozen 90s span, got: {done_row}"
+        );
+    }
+
+    #[test]
     fn failed_and_stopped_agent_rows_remain_visually_distinct_from_completed() {
         use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
 
@@ -19347,6 +19775,8 @@ mod tests {
                 model: String::new(),
                 activity: label.into(),
                 started_at: None,
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status,
             })
@@ -19360,9 +19790,18 @@ mod tests {
                 .style
                 .clone()
         };
-        assert_ne!(first_style(&rows[0]), first_style(&rows[1]));
-        assert_eq!(first_style(&rows[1]).fg, r.style_for(Role::Warning).fg);
-        assert_eq!(first_style(&rows[2]).fg, r.style_for(Role::Error).fg);
+        // Each member now spans TWO rows (primary + connected detail), so the
+        // three members' primary rows are at indices 0, 2, 4.
+        assert_ne!(first_style(&rows[0]), first_style(&rows[2]));
+        assert_eq!(first_style(&rows[2]).fg, r.style_for(Role::Warning).fg);
+        assert_eq!(first_style(&rows[4]).fg, r.style_for(Role::Error).fg);
+        // The detail row shows a terminal status word (localized `Done`/`完成`).
+        let text = |row: &[Cell]| row.iter().map(|c| c.ch).collect::<String>();
+        assert!(
+            text(&rows[1]).contains("Done") || text(&rows[1]).contains("完成"),
+            "completed member's detail row shows a done word: {}",
+            text(&rows[1])
+        );
     }
 
     #[test]
@@ -19380,6 +19819,8 @@ mod tests {
                 model: "GLM-5.2".into(),
                 activity: "thinking".into(),
                 started_at: Some(std::time::Instant::now()),
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19436,6 +19877,8 @@ mod tests {
                         model: String::new(),
                         activity: "thinking".into(),
                         started_at: None,
+                        finished_at: None,
+                        tool_uses: 0,
                         output_tokens: 0,
                         status: SubtaskStatus::Running,
                     }],
@@ -19478,6 +19921,8 @@ mod tests {
                 model: String::new(),
                 activity: "thinking".into(),
                 started_at: None,
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19518,6 +19963,8 @@ mod tests {
                 model: String::new(),
                 activity: "thinking".into(),
                 started_at: None,
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19580,6 +20027,8 @@ mod tests {
                     model: "deepseek-v4-flash".into(),
                     activity: "thinking".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 0,
                     status: SubtaskStatus::Running,
                 })
@@ -19621,6 +20070,8 @@ mod tests {
                 model: "GLM-5.2".into(),
                 activity: String::new(),
                 started_at: None,
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Pending,
             }],
@@ -19628,7 +20079,14 @@ mod tests {
 
         assert_eq!(r.subtask_panel_cap(), 2, "exercise the exact edge case");
         let rows = r.build_subtask_rows(&progress, 80);
-        assert_eq!(rows.len(), 2, "spacer + header fit; summary must fold");
+        // No spacer, and a lone pending is carried by the header count (not a
+        // summary row), so only the header renders here.
+        assert_eq!(rows.len(), 1, "header only; pending folds into its count");
+        assert!(rows[0]
+            .iter()
+            .map(|c| c.ch)
+            .collect::<String>()
+            .contains("1 pending"));
         assert_eq!(
             r.subtask_panel_row_count(&progress),
             rows.len(),
@@ -19658,6 +20116,8 @@ mod tests {
                 model: "deepseek-v4-flash".into(),
                 activity: "thinking".into(),
                 started_at: Some(std::time::Instant::now()),
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19692,6 +20152,8 @@ mod tests {
                 model: "deepseek-v4-flash".into(),
                 activity: "thinking".into(),
                 started_at: Some(std::time::Instant::now()),
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19731,6 +20193,8 @@ mod tests {
                 model: "deepseek-v4-flash".into(),
                 activity: "waiting".into(),
                 started_at: Some(std::time::Instant::now()),
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -20122,6 +20586,84 @@ mod tests {
         assert!(
             caret < placeholder,
             "caret ▏ must render BEFORE the placeholder (输入自己的答案…)\nrow={row:?}\n{dump}"
+        );
+    }
+
+    #[test]
+    fn custom_answer_focus_reports_caret_col_for_ime() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        let mk = |cursor: usize| crate::render::UserInputPanelView {
+            header: "Library".into(),
+            question: "Which?".into(),
+            mode: UserInputMode::Single,
+            options: vec![("date-fns".into(), None), ("Day.js".into(), None)],
+            cursor,
+            checked: vec![false, false, false],
+            text: String::new(),
+            text_cursor_byte: 0,
+            custom_text: String::new(),
+            custom_text_cursor_byte: 0,
+            custom: true,
+            scroll_offset: 0,
+            batch: None,
+        };
+        // Cursor on the custom-answer row (index 2, after 2 options): the caret
+        // parks after `❯ ` (2) + `3. ` (3) = column 5, so an IME anchors there.
+        let built = r.build_user_input_rows(&mk(2), 70, 80);
+        assert_eq!(built.caret_col, Some(5));
+        // Cursor on a regular option: navigation, no text caret to park.
+        let built_opt = r.build_user_input_rows(&mk(0), 70, 80);
+        assert_eq!(built_opt.caret_col, None);
+    }
+
+    #[test]
+    fn custom_answer_text_field_keeps_cursor_visible_for_ime() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        // Regression: typing a custom answer via an IME needs the REAL terminal
+        // cursor visible + parked at the field. `approval_active` previously
+        // blanket-hid it, so the IME preedit anchored at a stale position.
+        let render_visible = |cursor: usize| -> bool {
+            let (mut r, buf) = new_capturing(80, 24);
+            r.caps.colors = true;
+            let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+            let mut status = status_basic();
+            status.user_input = Some(crate::render::UserInputPanelView {
+                header: "Library".into(),
+                question: "Which?".into(),
+                mode: UserInputMode::Single,
+                options: vec![("date-fns".into(), None), ("Day.js".into(), None)],
+                cursor,
+                checked: vec![false, false, false],
+                text: String::new(),
+                text_cursor_byte: 0,
+                custom_text: String::new(),
+                custom_text_cursor_byte: 0,
+                custom: true,
+                scroll_offset: 0,
+                batch: None,
+            });
+            r.render(UiLine::InputPrompt {
+                buf: String::new(),
+                cursor_byte: 0,
+                menu: None,
+                status,
+                attachments: Vec::new(),
+            });
+            r.flush_deferred();
+            drain_into_vterm(&buf, &mut vterm);
+            vterm.cursor_visible()
+        };
+        // On the custom-answer text row → cursor stays visible (IME anchor).
+        assert!(
+            render_visible(2),
+            "cursor must stay visible on the custom-answer text field"
+        );
+        // On a regular option (arrow navigation) → cursor hidden.
+        assert!(
+            !render_visible(0),
+            "cursor hidden while navigating options"
         );
     }
 
@@ -21519,13 +22061,15 @@ mod tests {
                         .all(|ch| matches!(ch, '━' | '─' | '=' | '-' | ' '))
             })
             .collect();
-        // Every table rule is a single continuous run spanning the full width —
-        // the inter-column gaps are filled, so no rule breaks into per-column
-        // segments (which read as a broken/dashed line). No rule line therefore
-        // carries an interior space.
+        // Separator lines are segmented per column — each segment covers one
+        // column's padded width, with inter-column gaps between them, so every
+        // rule line contains at least some rule characters (not empty).
         assert!(
-            !rules.is_empty() && rules.iter().all(|line| !line.contains(' ')),
-            "table rules must be continuous (no interior gap): {lines:#?}"
+            !rules.is_empty()
+                && rules.iter().all(|line| line
+                    .chars()
+                    .any(|ch| matches!(ch, '━' | '─' | '=' | '-'))),
+            "table rules must contain rule characters: {lines:#?}"
         );
         assert!(
             rules

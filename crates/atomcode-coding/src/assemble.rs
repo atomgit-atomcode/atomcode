@@ -127,10 +127,6 @@ fn build_coding_agent_from_tools(
         .middleware(Arc::new(
             atomcode_capabilities::tools::CredentialBashGate::new(cfg.credential_shell_policy),
         ));
-    #[cfg(feature = "atomgit")]
-    let builder = builder.middleware(Arc::new(
-        atomcode_capabilities::tools::AtomgitBashGate::new(),
-    ));
     let mut builder = builder
         // Auto-approve in-workspace open_file (it's Risky → would otherwise prompt on every
         // preview). This path pins an immutable working_dir, so the gate pins the same root.
@@ -192,7 +188,7 @@ fn build_coding_agent_from_tools(
     // CodingAgentConfig doesn't carry ui.todo, so we use the config default (true) here;
     // the env var ATOMCODE_TODO=0 / =false / =off can disable it without a config change.
     if todo_enabled {
-        builder = builder.hook(Arc::new(crate::todo::TodoHook));
+        builder = builder.hook(Arc::new(crate::todo::TodoHook::new(&cfg.working_dir)));
         builder = builder.hook(Arc::new(crate::todo::TodoEagerHook::new(
             &cfg.model,
             &cfg.provider_type,

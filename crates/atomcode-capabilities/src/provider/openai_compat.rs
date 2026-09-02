@@ -629,6 +629,32 @@ impl LlmProvider for OpenAiCompatProvider {
                             return;
                         }
                         Ok(Some(Err(e))) => {
+                            // Message already logically complete (a real, non-empty
+                            // finish_reason arrived) AND the error is a benign transport
+                            // drop — a gateway closing the keep-alive after the final
+                            // event but before the `[DONE]` sentinel, which rustls
+                            // surfaces as a missing TLS close_notify / UnexpectedEof.
+                            // Treat it as a CLEAN stream end (flush + Done), not a
+                            // spurious mid-turn "响应中断": deepseek-v4-flash relies on
+                            // `[DONE]` to terminate, so a keep-alive drop between the
+                            // finish_reason chunk and `[DONE]` otherwise killed a
+                            // fully-generated 20-minute turn.
+                            if dec.seen_finish() && retry::is_stale_connection_error(&e) {
+                                for ev in dec.finish() {
+                                    if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
+                                        pending_metadata.push(ev);
+                                        continue;
+                                    }
+                                    if retry::is_replay_sensitive_event(&ev)
+                                        || matches!(ev, StreamEvent::Done { .. } | StreamEvent::Error(_))
+                                    {
+                                        for metadata in pending_metadata.drain(..) { yield metadata; }
+                                    }
+                                    emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
+                                    yield ev;
+                                }
+                                return;
+                            }
                             // No replay-sensitive output reached the consumer yet → re-open
                             // the whole request transparently (bounded by MAX_STREAM_ATTEMPTS).
                             if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
@@ -1402,6 +1428,22 @@ fn provider_error_code(envelope: &serde_json::Value) -> Option<String> {
         .or_else(|| envelope.get("code").and_then(error_code_value))
 }
 
+/// Recover the HTTP status embedded in an in-band SSE error object. Gateways such
+/// as OpenRouter open the stream with HTTP 200, then relay an upstream failure
+/// (often a rate-limit) as `data: {"error":{"code":<status>,..}}`, where `code` is
+/// the upstream HTTP status. Only treat it as one when it is a plausible HTTP status
+/// (100–599), so vendor-specific numeric codes (e.g. billing `1113`) are not
+/// mislabeled. Returns `None` for string codes that are not pure HTTP status numbers.
+fn inband_error_http_status(err: &serde_json::Value) -> Option<u16> {
+    let n = match err.get("code")? {
+        serde_json::Value::Number(n) => n.as_u64()?,
+        serde_json::Value::String(s) => s.trim().parse::<u64>().ok()?,
+        _ => return None,
+    };
+    let n = u16::try_from(n).ok()?;
+    (100..=599).contains(&n).then_some(n)
+}
+
 // `friendly_http_error` (was here) moved to the shared `provider` module so
 // every protocol wraps auth/billing codes identically; see `super::friendly_http_error`.
 
@@ -1460,6 +1502,15 @@ impl SseDecoder {
             }
         }
         out
+    }
+
+    /// True once a NON-EMPTY `finish_reason` has been seen — the model's own
+    /// "message complete" signal. After this point a trailing transport EOF
+    /// (e.g. a gateway closing the keep-alive after the final event but before
+    /// the `[DONE]` sentinel, which rustls surfaces as a missing TLS
+    /// close_notify / `UnexpectedEof`) is benign, not a truncation.
+    fn seen_finish(&self) -> bool {
+        self.seen_finish
     }
 
     /// Stream ended WITHOUT a `[DONE]` sentinel: flush buffered tool calls + usage,
@@ -1533,13 +1584,20 @@ impl SseDecoder {
                 out.push(StreamEvent::ResponseModel(model.to_string()));
             }
         }
-        // A mid-stream provider error chunk: surface it (code + reason) and TERMINATE —
-        // mid-stream is non-recoverable. (Previously such chunks were silently dropped.)
+        // A mid-stream provider error chunk: surface it (code + reason). Gateways
+        // (e.g. OpenRouter) relay an upstream failure — often a rate-limit — as an
+        // in-band error object over an HTTP-200 SSE stream. Recover its HTTP status
+        // from the error `code` so the kernel's status-aware handling applies (in
+        // particular the mid-stream 429 retry, which is safe when no content has
+        // streamed yet) instead of treating every in-stream error as a status-less,
+        // non-retryable failure that terminates the turn.
+        // (Previously such chunks were silently dropped.)
         if let Some(err) = &chunk.error {
+            let http_status = inband_error_http_status(err);
             out.push(StreamEvent::Error(ProviderError {
-                retryable: false,
+                retryable: http_status.is_some_and(retry::is_retryable_status),
                 message: format!("provider error: {}", parse_error_obj(err)),
-                http_status: None,
+                http_status,
                 code: error_code(err),
                 retry_after_secs: None, // mid-stream error: no response headers
             }));
@@ -2842,6 +2900,24 @@ mod tests {
     }
 
     #[test]
+    fn seen_finish_gates_benign_trailing_eof_swallow() {
+        // The mid-stream "gateway dropped keep-alive before `[DONE]`" swallow is
+        // gated on `seen_finish()`. A NON-EMPTY finish_reason means the message is
+        // complete → a trailing close_notify / UnexpectedEof is benign. An EMPTY
+        // finish_reason (deepseek-v4-flash sends `""` on every content chunk) must
+        // NOT arm it, or a genuine mid-content truncation would be silently
+        // accepted as a complete turn.
+        let mut d = SseDecoder::new();
+        let _ = d.feed(
+            line(json!({"choices":[{"delta":{"content":"hi"},"finish_reason":""}]})).as_bytes(),
+        );
+        assert!(!d.seen_finish(), "empty finish_reason must NOT arm seen_finish");
+        let _ =
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})).as_bytes());
+        assert!(d.seen_finish(), "non-empty finish_reason arms seen_finish");
+    }
+
+    #[test]
     fn sse_empty_string_finish_reason_does_not_drop_tool_calls() {
         // SenseNova's free `deepseek-v4-flash` sends `"finish_reason":""` (EMPTY
         // STRING, not null) on EVERY streaming chunk — reasoning AND tool_call
@@ -3211,12 +3287,73 @@ mod tests {
             "must carry reason: {}",
             err.message
         );
-        assert!(!err.retryable, "mid-stream errors are non-retryable");
+        assert!(
+            !err.retryable,
+            "a non-HTTP-status mid-stream error stays non-retryable"
+        );
+        assert_eq!(err.http_status, None, "a string code is not an HTTP status");
         assert_eq!(
             err.code.as_deref(),
             Some("overloaded"),
             "structured code on mid-stream error"
         );
+    }
+
+    #[test]
+    fn sse_mid_stream_429_error_chunk_recovers_http_status_for_retry() {
+        // OpenRouter (and similar gateways) open the stream with HTTP 200, then relay
+        // an upstream rate-limit as an in-band error object: `data: {"error":{"code":429,..}}`.
+        // The decoder must recover the 429 as `http_status` so the kernel's mid-stream
+        // 429 handler fires (safe to retry before any content), instead of surfacing a
+        // status-less, non-retryable provider error that terminates the turn.
+        let mut d = SseDecoder::new();
+        let ev = d.feed(
+            line(json!({"error":{"message":"Provider returned error","code":429}})).as_bytes(),
+        );
+        let err = ev
+            .iter()
+            .find_map(|e| {
+                if let StreamEvent::Error(e) = e {
+                    Some(e.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("a mid-stream error chunk must surface a StreamEvent::Error");
+        assert_eq!(
+            err.http_status,
+            Some(429),
+            "in-band 429 must recover its HTTP status for the kernel retry path"
+        );
+        assert!(
+            err.retryable,
+            "an in-band 429 is retryable (kernel decides retry vs pause by content/terminal)"
+        );
+        assert_eq!(err.code.as_deref(), Some("429"), "structured code preserved");
+    }
+
+    #[test]
+    fn sse_mid_stream_vendor_code_not_mislabeled_as_http_status() {
+        // A vendor-specific numeric code (e.g. billing `1113`) is NOT an HTTP status:
+        // it must not be mislabeled, so the turn takes the generic terminate path rather
+        // than the 429 retry path.
+        let mut d = SseDecoder::new();
+        let ev = d.feed(line(json!({"error":{"message":"余额不足","code":1113}})).as_bytes());
+        let err = ev
+            .iter()
+            .find_map(|e| {
+                if let StreamEvent::Error(e) = e {
+                    Some(e.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("a mid-stream error chunk must surface a StreamEvent::Error");
+        assert_eq!(
+            err.http_status, None,
+            "a vendor code outside 100-599 is not an HTTP status"
+        );
+        assert!(!err.retryable, "an unmapped vendor code stays non-retryable");
     }
 
     #[test]
