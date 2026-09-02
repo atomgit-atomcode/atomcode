@@ -480,6 +480,45 @@ fn git_rev_parse(repo: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Parse `git ls-remote <url> HEAD` stdout → the SHA that HEAD points to.
+///
+/// Output is one ref per line, `"<sha>\t<refname>"`. We want the `HEAD` line
+/// specifically. Returns `None` when there's no HEAD line (caller then falls
+/// back to a real `git pull` rather than guessing off some other ref).
+fn parse_ls_remote_head(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        let mut cols = line.split_whitespace();
+        let sha = match cols.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        if cols.next() == Some("HEAD") {
+            return Some(sha.to_string());
+        }
+    }
+    None
+}
+
+/// Cheap network probe: the SHA the remote's HEAD points at, WITHOUT fetching
+/// any objects. This is ONE `git ls-remote` process rather than the whole
+/// `git pull` tree (fetch → git-remote-https → credential helper) — so the
+/// once-a-day auto-refresh can skip pulling marketplaces that haven't moved.
+fn git_ls_remote_head(url: &str) -> Result<String> {
+    let git = find_git()?;
+    let out = git_command(&git)
+        .args(["ls-remote", url, "HEAD"])
+        .output()
+        .context("spawn git ls-remote")?;
+    if !out.status.success() {
+        bail!(
+            "git ls-remote failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    parse_ls_remote_head(&String::from_utf8_lossy(&out.stdout))
+        .ok_or_else(|| anyhow!("git ls-remote returned no HEAD sha"))
+}
+
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -525,7 +564,23 @@ pub fn update_marketplace(name: &str) -> Result<MarketplaceInfo> {
         git_clone(&entry.source, &target)
             .with_context(|| format!("re-clone marketplace `{}`", name))?;
     } else {
-        git_pull_ff(&target, &entry.source)?;
+        // Cheap remote check first: if the remote HEAD already matches the SHA
+        // we recorded last time, nothing upstream changed — return early and
+        // skip the heavy `git pull` process tree (fetch → git-remote-https →
+        // credential helper). That per-startup burst is what trips Windows AV
+        // heuristics. On any ls-remote error, or a moved HEAD, fall through to
+        // a real pull so we never miss a genuine update.
+        match git_ls_remote_head(&entry.source) {
+            Ok(remote_sha) if remote_sha == entry.git_commit => {
+                return Ok(MarketplaceInfo {
+                    name: name.to_string(),
+                    source: entry.source.clone(),
+                    git_commit: entry.git_commit.clone(),
+                    plugins: entry.plugins.clone(),
+                });
+            }
+            _ => git_pull_ff(&target, &entry.source)?,
+        }
     }
     let commit = git_rev_parse(&target)?;
     let manifest = load_marketplace_manifest(&target)?;
@@ -645,6 +700,30 @@ mod tests {
             .status()
             .unwrap();
         repo
+    }
+
+    #[test]
+    fn parse_ls_remote_head_extracts_sha() {
+        assert_eq!(
+            parse_ls_remote_head("abc123def\tHEAD\n").as_deref(),
+            Some("abc123def")
+        );
+    }
+
+    #[test]
+    fn parse_ls_remote_head_picks_head_among_refs() {
+        // `git ls-remote <url> HEAD` yields the HEAD line; be robust if extra
+        // ref lines ever appear — pick HEAD, not the first line blindly.
+        let out = "aaa111\tHEAD\nbbb222\trefs/heads/main\n";
+        assert_eq!(parse_ls_remote_head(out).as_deref(), Some("aaa111"));
+    }
+
+    #[test]
+    fn parse_ls_remote_head_none_when_no_head_line() {
+        // No HEAD → None → caller falls back to a real `git pull` (safe).
+        assert_eq!(parse_ls_remote_head(""), None);
+        assert_eq!(parse_ls_remote_head("bbb222\trefs/heads/main\n"), None);
+        assert_eq!(parse_ls_remote_head("garbage\n"), None);
     }
 
     #[test]
