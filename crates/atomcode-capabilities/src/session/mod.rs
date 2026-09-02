@@ -29,6 +29,7 @@ pub mod manager;
 pub mod presentation;
 pub mod recall;
 pub mod rewind;
+pub mod session_list;
 pub mod snapshot;
 pub mod status_reminder;
 pub mod transcript;
@@ -47,6 +48,7 @@ pub use presentation::{
     PresentationFile, PresentationRole,
 };
 pub use recall::{KeywordIndex, RecallIndex, RecallTool};
+pub use session_list::ListSessionsTool;
 pub use rewind::{
     FileChangeSummary, RewindPoint, WorkspaceCheckpoint, WorkspaceCheckpointError,
     WorkspaceRestoreReceipt,

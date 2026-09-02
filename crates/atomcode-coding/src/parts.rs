@@ -27,8 +27,8 @@ use atomcode_capabilities::mcp::{self, McpConnectEvent, McpRegistry, McpServerCo
 use atomcode_capabilities::memory::MemoryHook;
 use atomcode_capabilities::session::snapshot::SnapshotPersistenceStatus;
 use atomcode_capabilities::session::{
-    PresentationFile, RecallTool, SessionContextHook, SessionLease, SessionManager, SessionMeta,
-    SnapshotHook, StorageOwner, TranscriptHook,
+    ListSessionsTool, PresentationFile, RecallTool, SessionContextHook, SessionLease,
+    SessionManager, SessionMeta, SnapshotHook, StorageOwner, TranscriptHook,
 };
 use atomcode_capabilities::skills::{
     register_skill_tools, runtime_skill_dirs, SkillCatalogHook, SkillRegistry,
@@ -890,6 +890,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             RecallTool::new().with_sessions_dir(b.manager.root()),
         ));
         names.push("recall".into());
+        registry.register(Arc::new(
+            ListSessionsTool::new().with_sessions_dir(b.manager.root()),
+        ));
+        names.push("list_sessions".into());
     }
 
     // Hooks in the CANONICAL ORDER (registration order = HookChain execution order):
