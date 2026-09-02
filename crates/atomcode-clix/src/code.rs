@@ -643,6 +643,7 @@ fn handle_slash(cmd: &str, dir: &std::path::Path, handle: &CodingRuntimeHandle) 
             let merged = MemoryStore::merged_for_prompt(
                 &MemoryStore::global(),
                 &MemoryStore::project(dir),
+                &MemoryStore::local(dir),
                 &dir.file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "project".into()),

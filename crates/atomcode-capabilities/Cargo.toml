@@ -206,11 +206,11 @@ mcp = [
 # TranscriptHook / recall tool / current-date hook that drive it. Opt-in (NOT default).
 session = ["dep:dirs", "dep:chrono", "dep:fs2", "dep:atomcode-config"]
 # User-driven persistent memory: the production memory.md store (global
-# $ATOMCODE_HOME/memory.md + per-project <root>/.atomcode/memory.md, same files so
-# old/new coexist) + a MemoryHook that injects the merged entries at session_start.
-# v1 is USER-driven only (driver slash-commands write the store); no model-facing
-# remember/forget tools. Opt-in (NOT default).
-memory = ["dep:dirs"]
+# $ATOMCODE_HOME/memory.md + per-project <root>/.atomcode/memory.md + machine-local
+# <root>/.atomcode/local/memory.md, same files so old/new coexist) + a MemoryHook
+# that injects the merged entries at session_start. v1 is USER-driven only (driver
+# slash-commands write the store); no model-facing remember/forget tools. Opt-in (NOT default).
+memory = ["dep:dirs", "dep:ignore"]
 # Lazy offline auto-detection: web_search transport failures flip the process
 # offline verdict (for offline_mode="auto"). Pulls the config leaf (where the verdict
 # lives). Opt-in — a network embedder that doesn't use offline_mode skips it.

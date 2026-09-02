@@ -604,6 +604,7 @@ fn render_context_file_status_block(working_dir: &std::path::Path) -> String {
             Msg::StatusMemoryScopeProject,
             MemoryStore::project(working_dir),
         ),
+        (Msg::StatusMemoryScopeLocal, MemoryStore::local(working_dir)),
     ] {
         let scope = t(scope_msg);
         let path = store.path().display().to_string();
@@ -2148,6 +2149,11 @@ fn execute_slash_command_impl(
                     .remove_matching(keyword)
                     .unwrap_or_default();
                 removed.extend(
+                    MemoryStore::local(&ctx.working_dir)
+                        .remove_matching(keyword)
+                        .unwrap_or_default(),
+                );
+                removed.extend(
                     MemoryStore::global()
                         .remove_matching(keyword)
                         .unwrap_or_default(),
@@ -2168,12 +2174,13 @@ fn execute_slash_command_impl(
         "memory" => {
             let global = MemoryStore::global();
             let project = MemoryStore::project(&ctx.working_dir);
+            let local = MemoryStore::local(&ctx.working_dir);
             let name = ctx
                 .working_dir
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "project".into());
-            let merged = MemoryStore::merged_for_prompt(&global, &project, &name);
+            let merged = MemoryStore::merged_for_prompt(&global, &project, &local, &name);
             let out = if merged.trim().is_empty() {
                 "(memory is empty)".to_string()
             } else {

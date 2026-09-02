@@ -186,6 +186,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusMemoryFilesHeader => "  Memory files:\n".into(),
         Msg::StatusMemoryScopeGlobal => "User global".into(),
         Msg::StatusMemoryScopeProject => "Project memory".into(),
+        Msg::StatusMemoryScopeLocal => "Local memory".into(),
         Msg::StatusMemoryPresent { path, scope } =>
             format!("    ✓ {scope}: {path}\n").into(),
         Msg::StatusMemoryMissing { path, scope } =>
