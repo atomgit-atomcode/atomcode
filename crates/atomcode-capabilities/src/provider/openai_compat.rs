@@ -1470,13 +1470,24 @@ impl SseDecoder {
             return out;
         }
         for (id, name, args) in std::mem::take(&mut self.tool_calls) {
-            if !id.is_empty() || !name.is_empty() || !args.is_empty() {
-                out.push(StreamEvent::ToolCall(ToolCall {
-                    id,
-                    name,
-                    arguments: args,
-                }));
+            // A tool call with NO function name is UNDISPATCHABLE: executors resolve tools
+            // BY NAME, so emitting one buys a guaranteed failed round trip — a 0ms
+            // "unknown tool" result that burns a round and, on hosts that classify tools
+            // by name, is reported as an UNKNOWN (hence destructive, approval-gated) call.
+            // A slot reaches this state whenever a gateway sends an `id`, or argument
+            // fragments, at an index whose `function.name` never arrives — including the
+            // placeholder slots this loop pads out for sparse `index` values. Dropping it
+            // leaves the round tool-call-free, which the agent loop already handles
+            // (empty-response re-issue); that is strictly better than dispatching a name
+            // that cannot resolve.
+            if name.is_empty() {
+                continue;
             }
+            out.push(StreamEvent::ToolCall(ToolCall {
+                id,
+                name,
+                arguments: args,
+            }));
         }
         if let Some(u) = self.last_usage.take() {
             out.push(StreamEvent::Usage(u));
@@ -1620,13 +1631,16 @@ impl SseDecoder {
         if let Some(fr) = choice.finish_reason.filter(|s| !s.is_empty()) {
             self.seen_finish = true;
             for (id, name, args) in std::mem::take(&mut self.tool_calls) {
-                if !id.is_empty() || !name.is_empty() || !args.is_empty() {
-                    out.push(StreamEvent::ToolCall(ToolCall {
-                        id,
-                        name,
-                        arguments: args,
-                    }));
+                // Same rule as `finish()`: a nameless tool call cannot be dispatched, so
+                // dropping it beats emitting a call that is certain to fail.
+                if name.is_empty() {
+                    continue;
                 }
+                out.push(StreamEvent::ToolCall(ToolCall {
+                    id,
+                    name,
+                    arguments: args,
+                }));
             }
             if fr == "length" {
                 self.truncated = true;
@@ -2941,6 +2955,41 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "a");
         assert_eq!(calls[1].name, "b");
+    }
+
+    /// A gateway can leave a buffered slot WITHOUT a `function.name`: an `id` on its own,
+    /// or argument fragments landing on an index whose name never arrives. Such a call
+    /// cannot be dispatched (tools resolve by name), so it must not be emitted — doing so
+    /// produced a 0ms unknown-tool failure every single time, observed downstream as
+    /// recurring "empty tool name" errors accumulating through long sessions.
+    #[test]
+    fn sse_nameless_tool_call_is_dropped() {
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(
+            d.feed(
+                line(json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"c0","function":{"arguments":"{}"}},
+                    {"index":1,"id":"c1","function":{"name":"real","arguments":"{}"}}
+                ]}}]}))
+                .as_bytes(),
+            ),
+        );
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()),
+        );
+        let calls: Vec<_> = ev
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "only the named call may survive: {calls:?}");
+        assert_eq!(calls[0].name, "real");
     }
 
     #[test]
