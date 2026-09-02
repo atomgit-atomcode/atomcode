@@ -2933,12 +2933,19 @@ impl RunningAgent {
             } else {
                 0.0
             };
-            // Derive the response's "code" from observed stream facts: tool calls present
-            // ⇒ tool_calls; else truncated ⇒ length; else stop.
-            let finish_reason = if !pending_calls.is_empty() {
-                "tool_calls"
-            } else if truncated {
+            // Derive the response's "code" from observed stream facts. TRUNCATION WINS over
+            // "there were tool calls": `truncated` means the provider actually reported
+            // `finish_reason=length` for this response, and a round can carry BOTH — the
+            // OpenAI-compatible decoder flushes whatever tool calls it had accumulated at the
+            // cut, which is exactly the case the OUTPUT-TRUNCATION GUARD below exists for.
+            // Reporting `tool_calls` there erased the only record that the response had been
+            // cut off: nothing downstream of `MessageMeta` (a host's telemetry, a driver's
+            // rendering, a later read of the stored message) could tell that round apart from
+            // an ordinary tool round.
+            let finish_reason = if truncated {
                 "length"
+            } else if !pending_calls.is_empty() {
+                "tool_calls"
             } else {
                 "stop"
             }
