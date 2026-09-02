@@ -202,10 +202,19 @@ impl WebSearchTool {
             }
         };
         if !resp.status().is_success() {
-            return fail(format!(
-                "Exa web search: HTTP {} for '{query}'",
-                resp.status().as_u16()
-            ));
+            let status = resp.status().as_u16();
+            // Surface the server's error body. Exa's 429 body states the cause and the fix
+            // ("You've hit Exa's free MCP rate limit… create your own Exa API key"); dropping
+            // it makes quota exhaustion look like a network fault, and the model keeps
+            // retrying. Truncate by CHARS — the body is UTF-8 and byte slicing would panic on
+            // a multi-byte boundary. NEVER include the request URL: it carries `?exaApiKey=`.
+            let body = resp.text().await.unwrap_or_default();
+            let body: String = body.trim().chars().take(500).collect();
+            return fail(if body.is_empty() {
+                format!("Exa web search: HTTP {status} for '{query}'")
+            } else {
+                format!("Exa web search: HTTP {status} for '{query}': {body}")
+            });
         }
         let sse = match resp.text().await {
             Ok(t) => t,
