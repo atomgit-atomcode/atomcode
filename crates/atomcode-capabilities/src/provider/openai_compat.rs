@@ -3301,6 +3301,32 @@ mod tests {
             friendly_http_error(403, "USER HAS NO CODINGPLAN"),
             "CodingPlan 未领取或已失效（HTTP 403）。请运行 /login 重新登录并领取 CodingPlan。"
         );
+        // 401 KEEPS its detail (unlike 402): `invalid_api_key` and
+        // `invalid_client_signature` both arrive as 401 and need opposite fixes,
+        // and the headline is identical for both.
+        assert_eq!(
+            friendly_http_error(
+                401,
+                "[invalid_request_error/invalid_api_key] Incorrect API key provided."
+            ),
+            "API key 未授权或已失效（HTTP 401）：[invalid_request_error/invalid_api_key] Incorrect API key provided."
+        );
+        assert_eq!(
+            friendly_http_error(
+                401,
+                "[authentication_error/invalid_client_signature] bad signature"
+            ),
+            "API key 未授权或已失效（HTTP 401）：[authentication_error/invalid_client_signature] bad signature"
+        );
+        // Empty / whitespace-only body: bare headline, no dangling separator.
+        assert_eq!(
+            friendly_http_error(401, ""),
+            "API key 未授权或已失效（HTTP 401）"
+        );
+        assert_eq!(
+            friendly_http_error(401, "   "),
+            "API key 未授权或已失效（HTTP 401）"
+        );
         assert!(friendly_http_error(401, "").contains("API key"));
         // 429 is NOT wrapped (kernel rate-limit path owns it — must keep the
         // literal `HTTP 429: ` prefix so `rate_limit_server_message` can strip it).
