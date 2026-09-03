@@ -504,7 +504,7 @@ impl ToolMiddleware for CredentialBashGate {
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
     ) -> BeforeOutcome {
-        if tool.name() != "bash" {
+        if !super::is_command_shell_tool(tool.name()) {
             return BeforeOutcome::Proceed;
         }
         let Ok(args) = serde_json::from_str::<BashArgs>(&call.arguments) else {

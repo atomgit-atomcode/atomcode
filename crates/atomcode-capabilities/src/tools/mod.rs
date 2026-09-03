@@ -68,6 +68,18 @@ pub mod web_fetch;
 pub mod web_search;
 pub mod write;
 pub mod write_approval;
+
+/// Tool names that execute an ARBITRARY shell command and must therefore face the same
+/// name-keyed middlewares as the foreground `bash` tool: the workspace-boundary gate, the
+/// credential-exfil gate, and git-push labeling. `bash_start` backgrounds a command — it
+/// runs exactly what `bash` runs — so it belongs here; `bash_poll` / `bash_kill` only read
+/// or stop an existing job and carry no command. Single source of truth so a newly added
+/// command-running tool can't silently slip past these gates (this exists because a review
+/// caught `bash_start` bypassing all three when they hard-coded the literal `"bash"`).
+pub(crate) fn is_command_shell_tool(name: &str) -> bool {
+    matches!(name, "bash" | "bash_start")
+}
+
 #[cfg(feature = "memory")]
 pub use memory::MemoryTool;
 
@@ -191,6 +203,11 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
     reg.register(Arc::new(ListDirTool));
     reg.register(Arc::new(OpenFileTool));
     reg.register(Arc::new(BashTool));
+    // Background job path for long-running commands (start/poll/kill) — the reference-
+    // informed alternative to an ever-larger `timeout` (see tools::bash::background).
+    reg.register(Arc::new(bash::BashStartTool));
+    reg.register(Arc::new(bash::BashPollTool));
+    reg.register(Arc::new(bash::BashKillTool));
     reg.register(Arc::new(GrepTool));
     reg.register(Arc::new(GlobTool));
     reg.register(Arc::new(SearchReplaceTool));
@@ -520,6 +537,17 @@ where
 mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolRegistry;
+
+    #[test]
+    fn command_shell_tools_are_bash_and_bash_start_only() {
+        // The name-keyed gates (workspace / credential / push-label) route through this, so a
+        // command-running tool is gated and a read/stop tool (or anything else) is not.
+        assert!(is_command_shell_tool("bash"));
+        assert!(is_command_shell_tool("bash_start"));
+        assert!(!is_command_shell_tool("bash_poll"));
+        assert!(!is_command_shell_tool("bash_kill"));
+        assert!(!is_command_shell_tool("read_file"));
+    }
 
     #[tokio::test]
     async fn run_bounded_yields_default_when_blocking_exceeds_timeout() {
