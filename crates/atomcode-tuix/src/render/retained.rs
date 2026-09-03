@@ -5969,9 +5969,16 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // moment they start a type-ahead message the caret returns (preserving the
         // "editable during streaming" behavior the live spinner deliberately keeps).
         let subtask_fanout_idle = self.status.subtasks.is_some() && self.input_buf.is_empty();
+        // Same rule for an animating inflight tool: suppress the caret ONLY while
+        // the composer is empty (user watching). The moment they type a type-ahead
+        // message the caret returns — otherwise a long tool run leaves the input box
+        // cursorless mid-reply ("no cursor while replying"). Typing during the run
+        // may briefly show the same two-caret shimmer the Task fan-out already
+        // accepts; empty-box watching stays flicker-free.
+        let inflight_tool_idle = self.inflight_tool.is_some() && self.input_buf.is_empty();
         // When approval is active or a plugin modal without text input is open,
         // hide the caret (user navigates with ↑↓/Enter/Tab).
-        let suppress_cursor = self.inflight_tool.is_some()
+        let suppress_cursor = inflight_tool_idle
             || subtask_fanout_idle
             // A user_input TEXT field (custom-answer / Text box) keeps the caret
             // visible + parked for IME; options-only panels stay hidden.
@@ -14854,6 +14861,40 @@ mod tests {
         assert!(
             vterm.cursor_visible(),
             "caret must return after an error commits the orphaned inflight tool"
+        );
+    }
+
+    /// A non-empty composer means the user is typing a type-ahead message WHILE
+    /// a tool runs. The caret must stay VISIBLE so they can see where they type —
+    /// mirrors the Task fan-out rule (suppress only while the box is empty). The
+    /// "no cursor while replying" complaint: a long tool run left the input box
+    /// cursorless even as the user typed.
+    #[test]
+    fn retained_inflight_tool_keeps_cursor_when_composer_nonempty() {
+        let (mut r, buf) = new_capturing(80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: "type-ahead reply".into(),
+            cursor_byte: "type-ahead reply".len(),
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::ToolCallInFlight {
+            id: "call_1".into(),
+            name: "Bash".into(),
+            detail: "cargo test".into(),
+            hint: None,
+        });
+        r.render(UiLine::Spinner {
+            frame: "⠙".into(),
+            label: "Running Bash".into(),
+        });
+        r.flush_deferred();
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            vterm.cursor_visible(),
+            "caret must stay visible while typing during a tool run"
         );
     }
 
