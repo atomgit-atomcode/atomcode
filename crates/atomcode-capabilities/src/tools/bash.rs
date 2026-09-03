@@ -186,8 +186,10 @@ impl Tool for BashTool {
                 ))
             }
         };
-        let secs = a
-            .timeout
+        // Keep the RAW request: the timeout error below must not tell a caller that already
+        // asked for more than the ceiling to "pass a larger timeout".
+        let requested_timeout = a.timeout;
+        let secs = requested_timeout
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
         let dur = Duration::from_secs(secs);
@@ -319,13 +321,16 @@ impl Tool for BashTool {
                 Ok(Err(e)) => err(format!("bash: error running command: {e}")),
                 // Timed out: the timeout future drops `wait` → kill_on_drop SIGKILLs the child.
                 // Don't echo the command (see the cancel arm); point at the actionable
-                // knob — a larger `timeout` — the way the core bash tool does.
+                // knob — a larger `timeout` — the way the core bash tool does. BUT only while
+                // that knob still has room: `timeout` is clamped to MAX_TIMEOUT_SECS, so once
+                // the run was already at the ceiling, "pass a larger timeout" is advice that
+                // provably cannot work — and the model reads this as ground truth and retries
+                // it. (Field case: a model passed `timeout: 330`, silently ran at 300s, and was
+                // told to ask for longer.) At the ceiling, name the ceiling and point at the
+                // one thing that DOES work instead.
                 Err(_) => {
                     kill_tree();
-                    err(format!(
-                        "bash: timed out after {secs}s — pass a larger `timeout` if this command \
-                         legitimately needs longer."
-                    ))
+                    err(timeout_message(secs, requested_timeout))
                 }
             }
         }
@@ -773,6 +778,36 @@ fn detect_windows_bash() -> Option<std::path::PathBuf> {
         .clone()
 }
 
+/// The message for a command killed by the timeout.
+///
+/// Pure so both branches are unit-testable without actually waiting `MAX_TIMEOUT_SECS`.
+/// `requested` is the caller's RAW `timeout` (pre-clamp), `secs` the value actually used.
+///
+/// The knob only gets named while it still has room. `timeout` is clamped to
+/// `MAX_TIMEOUT_SECS`, so a run that already sat at the ceiling cannot be helped by
+/// "pass a larger `timeout`" — the caller may have asked for more and been silently
+/// clamped (observed: a model passed `timeout: 330`, ran at 300s, and was told to ask for
+/// longer). The model treats tool output as ground truth, so an instruction that provably
+/// cannot work is worse than none: name the ceiling and point at what does work.
+fn timeout_message(secs: u64, requested: Option<u64>) -> String {
+    if secs >= MAX_TIMEOUT_SECS {
+        let asked = match requested {
+            Some(r) if r > MAX_TIMEOUT_SECS => format!(" (requested {r}s)"),
+            _ => String::new(),
+        };
+        format!(
+            "bash: timed out after {secs}s{asked}, which is this tool's maximum. A longer \
+             single command is not available — start the work in the background (redirect its \
+             output to a file) and read that file back in a later, short command."
+        )
+    } else {
+        format!(
+            "bash: timed out after {secs}s — pass a larger `timeout` (up to \
+             {MAX_TIMEOUT_SECS}s) if this command legitimately needs longer."
+        )
+    }
+}
+
 /// Detect bash constructs that cmd.exe cannot interpret. When bash is absent and we must
 /// fall back to cmd.exe, returning a clear error here (instead of letting cmd.exe silently
 /// corrupt the script) lets the model rewrite instead of retrying blindly. Returns
@@ -799,10 +834,33 @@ fn unsupported_bash_construct(command: &str) -> Option<&'static str> {
         return Some("here-string `<<<` — cmd.exe does not support here-strings");
     }
     // Process substitution `< <(...)` / `>(...)` — cmd.exe has no /dev/fd.
-    if command.contains("< <(") || command.contains(">(") {
+    if command.contains("< <(") || has_operator_position_process_substitution(command) {
         return Some("process substitution `< <(...)` / `>(...)` — cmd.exe has no /dev/fd");
     }
     None
+}
+
+/// Whether the command contains a `>(` that is actually SHELL SYNTAX rather than two
+/// characters that happen to sit next to each other inside ordinary text.
+///
+/// A bare `contains(">(")` is not usable here: the two commonest JavaScript one-liners a
+/// model writes both carry it inside a quoted literal —
+/// `s.match(/<script>([\s\S]*?)<\/script>/)` (the `<script>(` in an HTML-scraping regex)
+/// and the arrow-function-returning-an-object idiom `()=>({ .. })`. On a Windows box with
+/// no Git Bash that misfire HARD-FAILS a perfectly valid `node -e` / `python -c` command
+/// (field case: 5 of 6 cmd.exe rejections in one user's session were exactly this, all
+/// from the same `node -e` HTML syntax check the user ran after every edit).
+///
+/// Real process substitution puts the `>` at an OPERATOR position — `tee >(cat)`,
+/// `2> >(logger)` — i.e. preceded by whitespace or standing at the very start. Requiring
+/// that STRICTLY REDUCES what this guard flags; the no-space form (`tee>(cat)`) falls
+/// through to cmd.exe mangled, which is the same treatment every other un-flagged
+/// construct already gets (see this module's guard doc above).
+fn has_operator_position_process_substitution(command: &str) -> bool {
+    command.match_indices(">(").any(|(at, _)| match command[..at].chars().next_back() {
+        None => true,
+        Some(prev) => prev.is_whitespace(),
+    })
 }
 
 /// Rewrite a bash redirect whose target is the bare Windows device name `nul`
@@ -3289,6 +3347,24 @@ mod tests {
         assert!(unsupported_bash_construct(r#"python -c "print(1<<4)""#).is_none()); // << bit-shift
         assert!(unsupported_bash_construct("dir && echo ok").is_none()); // && chain
     }
+
+    /// `>(` inside a quoted literal is not process substitution. Both shapes below were
+    /// observed hard-failing on a Windows machine without Git Bash, and both are ordinary
+    /// cmd.exe-runnable one-liners.
+    #[test]
+    fn unsupported_construct_no_false_positive_on_angle_paren_inside_literals() {
+        // HTML-scraping regex: `<script>(` carries `>(`.
+        assert!(unsupported_bash_construct(
+            r#"node -e "const m=s.match(/<script>([\s\S]*?)<\/script>/);""#
+        )
+        .is_none());
+        // Arrow function returning an object literal: `()=>({...})` carries `>(`.
+        assert!(unsupported_bash_construct(r#"node -e "const o={init:()=>({s:1})};""#).is_none());
+        // The operator-position form is still flagged, with and without a redirect prefix.
+        assert!(unsupported_bash_construct("tee >(cat)").is_some());
+        assert!(unsupported_bash_construct("cmd 2> >(logger)").is_some());
+        assert!(unsupported_bash_construct(">(cat)").is_some());
+    }
     use tokio_util::sync::CancellationToken;
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
@@ -4053,6 +4129,41 @@ mod tests {
             .await;
         assert!(r.is_error, "{}", r.content);
         assert!(r.content.contains("timed out after 1s"), "{}", r.content);
+    }
+
+    /// Below the ceiling the message still points at the `timeout` knob, and now names the
+    /// ceiling so the caller cannot ask for something that will be silently clamped.
+    #[tokio::test]
+    async fn timeout_message_below_ceiling_points_at_the_knob() {
+        let d = tempfile::tempdir().unwrap();
+        let r = BashTool
+            .execute(r#"{"command":"sleep 30","timeout":1}"#, &ctx(d.path()))
+            .await;
+        assert!(r.content.contains("pass a larger `timeout`"), "{}", r.content);
+        assert!(
+            r.content.contains(&format!("{MAX_TIMEOUT_SECS}s")),
+            "the message must name the ceiling: {}",
+            r.content
+        );
+    }
+
+    /// At the ceiling the knob is gone: `timeout` is clamped there, so telling the caller to
+    /// pass a larger one is an instruction that cannot be carried out. A caller that asked
+    /// for MORE than the ceiling is told what it actually got.
+    #[test]
+    fn timeout_message_at_ceiling_does_not_point_at_a_maxed_knob() {
+        let m = timeout_message(MAX_TIMEOUT_SECS, Some(330));
+        assert!(
+            !m.contains("pass a larger"),
+            "must not tell a clamped caller to ask for longer: {m}"
+        );
+        assert!(m.contains("requested 330s"), "must report the clamp: {m}");
+        assert!(m.contains("background"), "must offer the workable alternative: {m}");
+        // No explicit timeout, but the default happened to be the ceiling: same verdict,
+        // and nothing is claimed about a request that was never made.
+        let m = timeout_message(MAX_TIMEOUT_SECS, None);
+        assert!(!m.contains("pass a larger"), "{m}");
+        assert!(!m.contains("requested"), "{m}");
     }
 
     #[test]
