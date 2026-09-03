@@ -105,6 +105,13 @@ unsafe fn detach_child_from_controlling_tty() {
     }
 }
 
+/// Background job path (`bash_start` / `bash_poll` / `bash_kill`) for long-running
+/// commands that would exceed the foreground `timeout` ceiling. A submodule of `bash` so
+/// it can reuse the private spawn/reaper primitives (`build_command`, `PgroupChild`,
+/// `detach_child_from_controlling_tty`) without widening their visibility.
+pub(crate) mod background;
+pub(crate) use background::{BashKillTool, BashPollTool, BashStartTool};
+
 #[derive(Default)]
 pub struct BashTool;
 
@@ -2522,6 +2529,25 @@ impl PgroupChild {
         }
     }
 
+    /// The child's process-group id (== pid; `setsid` made it the leader). Copyable, so a
+    /// caller can kill the group (see [`sigkill_pgroup`]) WITHOUT borrowing the child —
+    /// letting a background reader kill from one `select!` arm while another arm holds a
+    /// `&mut` for [`PgroupChild::wait_and_disarm`].
+    pub(crate) fn pgid(&self) -> i32 {
+        self.pgid
+    }
+
+    /// Reap the child on its OWN exit and DISARM the `Drop` SIGKILL. A bare `wait()` would
+    /// leave `terminated == false`, so `Drop` would then fire `killpg` at a pgid whose
+    /// leader is already reaped — into the exact PID-reuse window this type guards. Setting
+    /// `terminated` after the reap closes it. Used by the background reader task, whose
+    /// natural-exit path detects termination via `wait` rather than via `terminate()`.
+    pub(crate) async fn wait_and_disarm(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await;
+        self.terminated = true;
+        status
+    }
+
     /// Graceful pgroup shutdown: SIGTERM → 200ms grace → SIGKILL → reap.
     /// Call from explicit cleanup paths (timeout/idle) where we can await.
     async fn terminate(&mut self) {
@@ -2583,6 +2609,16 @@ extern "C" {
 const SIGTERM: i32 = 15;
 #[cfg(not(target_os = "windows"))]
 const SIGKILL: i32 = 9;
+
+/// SIGKILL an entire process group (a [`PgroupChild`]'s whole tree) WITHOUT borrowing the
+/// child — so a background reader can kill from one `select!` arm while another arm holds a
+/// `&mut` for `wait_and_disarm`. ESRCH (already-empty group) is ignored by the kernel.
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn sigkill_pgroup(pgid: i32) {
+    unsafe {
+        killpg(pgid, SIGKILL);
+    }
+}
 
 /// Result of running a shell command, decoupled from tool-result framing.
 /// `bash_execute` (model-invoked Bash tool) and `handle_local_shell`
