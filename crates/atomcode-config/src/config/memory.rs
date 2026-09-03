@@ -7,6 +7,16 @@ const DEFAULT_CHAR_LIMIT: usize = 4000;
 
 pub struct MemoryStore {
     path: PathBuf,
+    /// Marks the machine-local store: `append` drops a wildcard-only `.gitignore`
+    /// sentinel into the store's directory on first write, so machine-specific entries
+    /// never reach version control — parity with the capabilities-side store. This copy
+    /// stays dependency-free (no `ignore`-crate gitignore-semantics check) to keep this
+    /// foundational config leaf light; it may therefore write a harmless redundant
+    /// sentinel in a repo whose root `.gitignore` already covers `.atomcode/local/`
+    /// (the capabilities store skips that). The daemon only reads/forgets local memory
+    /// today, so that divergence is not currently observable — the field exists so a
+    /// FUTURE write through this store can never create an unprotected file.
+    local: bool,
 }
 
 /// Resolve the project-scope memory file. `override_dir` = the value of
@@ -29,9 +39,24 @@ fn local_memory_path(project_root: &Path, override_dir: Option<&str>) -> PathBuf
     project_root.join(dir).join("memory.md")
 }
 
+/// Drop a wildcard-only `.gitignore` next to a machine-local store so its entries never
+/// reach version control — even in repos where `atomcode setup` never appended the
+/// repo-root marker. Never clobbers an existing `.gitignore`. Propagates a genuine write
+/// failure: for a local store, "couldn't protect" must surface rather than silently leave
+/// the memory committable.
+fn ensure_gitignore_sentinel(store_path: &Path) -> io::Result<()> {
+    if let Some(dir) = store_path.parent() {
+        let sentinel = dir.join(".gitignore");
+        if !sentinel.exists() {
+            fs::write(sentinel, "*\n")?;
+        }
+    }
+    Ok(())
+}
+
 impl MemoryStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, local: false }
     }
 
     pub fn global() -> Self {
@@ -52,7 +77,10 @@ impl MemoryStore {
     /// should not be committed (`.atomcode/local/` is gitignored).
     pub fn local(project_root: &Path) -> Self {
         let override_dir = std::env::var("ATOMCODE_LOCAL_MEMORY_DIR").ok();
-        Self::new(local_memory_path(project_root, override_dir.as_deref()))
+        Self {
+            path: local_memory_path(project_root, override_dir.as_deref()),
+            local: true,
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -94,6 +122,9 @@ impl MemoryStore {
     pub fn append(&self, content: &str) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
+        }
+        if self.local {
+            ensure_gitignore_sentinel(&self.path)?;
         }
 
         // Read existing content to check if we need a leading newline
@@ -304,6 +335,39 @@ mod tests {
         assert_eq!(
             super::local_memory_path(root, Some("/opt/brand/mem")),
             Path::new("/opt/brand/mem/memory.md")
+        );
+    }
+
+    #[test]
+    fn local_append_writes_gitignore_sentinel() {
+        // Parity with the capabilities store: a local write must protect itself with a
+        // wildcard `.gitignore` so machine-specific memory never reaches version control,
+        // even if the store is created through the daemon's copy.
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::local(dir.path());
+        store.append("machine only").unwrap();
+        let sentinel = store.path().parent().unwrap().join(".gitignore");
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "*\n");
+        // Idempotent: an existing (possibly user-customized) sentinel is never clobbered.
+        fs::write(&sentinel, "# custom\n").unwrap();
+        store.append("more").unwrap();
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "# custom\n");
+    }
+
+    #[test]
+    fn non_local_append_writes_no_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        MemoryStore::project(dir.path())
+            .append("committed fact")
+            .unwrap();
+        let sentinel = MemoryStore::project(dir.path())
+            .path()
+            .parent()
+            .unwrap()
+            .join(".gitignore");
+        assert!(
+            !sentinel.exists(),
+            "project/global stores must not grow a gitignore sentinel"
         );
     }
 

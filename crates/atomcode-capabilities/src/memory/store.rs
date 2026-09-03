@@ -71,17 +71,20 @@ fn path_is_gitignored(store_path: &Path) -> bool {
     covered
 }
 
-/// Best-effort: drop a wildcard-only `.gitignore` next to the store file so the
-/// machine-local memory never reaches version control — even in repos where
-/// `atomcode setup` never appended the repo-root marker. Never fails the memory
-/// write: an unwritable repo is not a memory error.
-fn ensure_gitignore_sentinel(store_path: &Path) {
+/// Drop a wildcard-only `.gitignore` next to the store file so the machine-local
+/// memory never reaches version control — even in repos where `atomcode setup` never
+/// appended the repo-root marker. Never clobbers an existing `.gitignore`. Propagates a
+/// genuine write failure: for a local store, "couldn't protect" MUST surface to the
+/// caller rather than silently proceeding to write committable memory (the whole point
+/// of this scope is not-leaking, so leak-prevention wins over write-at-all-costs).
+fn ensure_gitignore_sentinel(store_path: &Path) -> io::Result<()> {
     if let Some(dir) = store_path.parent() {
         let sentinel = dir.join(".gitignore");
         if !sentinel.exists() {
-            let _ = fs::write(sentinel, "*\n");
+            fs::write(sentinel, "*\n")?;
         }
     }
+    Ok(())
 }
 
 impl MemoryStore {
@@ -150,7 +153,7 @@ impl MemoryStore {
             fs::create_dir_all(parent)?;
         }
         if self.local && !path_is_gitignored(&self.path) {
-            ensure_gitignore_sentinel(&self.path);
+            ensure_gitignore_sentinel(&self.path)?;
         }
 
         // Read existing content to check if we need a leading newline
@@ -442,6 +445,22 @@ mod tests {
         assert!(
             !sentinel.exists(),
             "project/global stores must not grow a gitignore sentinel"
+        );
+    }
+
+    #[test]
+    fn ensure_gitignore_sentinel_propagates_write_failure() {
+        // A failed sentinel write must NOT be swallowed: for a machine-local store,
+        // "couldn't protect" must surface rather than silently leave memory writable.
+        // Make the store's parent a FILE so writing `<parent>/.gitignore` fails with
+        // ENOTDIR — deterministic across OS/user/permissions (root included).
+        let dir = tempfile::tempdir().unwrap();
+        let parent_as_file = dir.path().join("local");
+        fs::write(&parent_as_file, b"x").unwrap();
+        let store_path = parent_as_file.join("memory.md");
+        assert!(
+            super::ensure_gitignore_sentinel(&store_path).is_err(),
+            "a failed sentinel write must be propagated, not swallowed"
         );
     }
 
