@@ -34,10 +34,10 @@ struct Args {
 
 impl MemoryTool {
     fn store(scope: &str, cwd: &Path) -> MemoryStore {
-        if scope == "global" {
-            MemoryStore::global()
-        } else {
-            MemoryStore::project(cwd)
+        match scope {
+            "global" => MemoryStore::global(),
+            "local" => MemoryStore::local(cwd),
+            _ => MemoryStore::project(cwd),
         }
     }
 
@@ -69,7 +69,7 @@ impl Tool for MemoryTool {
                 "action": { "type": "string", "enum": ["remember", "forget", "list"], "description": "remember a fact, forget entries by keyword, or list current memory" },
                 "content": { "type": "string", "description": "The concise fact to remember (required for action=remember)" },
                 "keyword": { "type": "string", "description": "Substring of entries to remove (required for action=forget)" },
-                "scope": { "type": "string", "enum": ["project", "global"], "description": "project (default) = this repo only; global = all projects" }
+                "scope": { "type": "string", "enum": ["project", "local", "global"], "description": "project (default) = this repo only; local = this repo on this machine only (not committed); global = all projects" }
             },
             "required": ["action"]
         })
@@ -122,12 +122,18 @@ impl Tool for MemoryTool {
                     Some(k) => k,
                     None => return err("memory: action=forget requires a non-empty `keyword`."),
                 };
-                // Scan BOTH stores regardless of `scope` (parity with the `/forget`
-                // command): a forget-by-keyword should remove the entry wherever it
-                // lives, so a global entry can be dropped without an explicit scope.
+                // Scan ALL three stores regardless of `scope` (parity with the
+                // `/forget` command): a forget-by-keyword should remove the entry
+                // wherever it lives, so a global or local entry can be dropped
+                // without an explicit scope.
                 let mut removed = MemoryStore::project(&ctx.working_dir)
                     .remove_matching(keyword)
                     .unwrap_or_default();
+                removed.extend(
+                    MemoryStore::local(&ctx.working_dir)
+                        .remove_matching(keyword)
+                        .unwrap_or_default(),
+                );
                 removed.extend(
                     MemoryStore::global()
                         .remove_matching(keyword)
@@ -146,12 +152,13 @@ impl Tool for MemoryTool {
             "list" => {
                 let g = MemoryStore::global();
                 let p = MemoryStore::project(&ctx.working_dir);
+                let l = MemoryStore::local(&ctx.working_dir);
                 let name = ctx
                     .working_dir
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "project".into());
-                let merged = MemoryStore::merged_for_prompt(&g, &p, &name);
+                let merged = MemoryStore::merged_for_prompt(&g, &p, &l, &name);
                 if merged.trim().is_empty() {
                     ok("(memory is empty)".to_string())
                 } else {
@@ -178,6 +185,63 @@ mod tests {
             progress: atomcode_kernel::tool::ProgressSink::noop(),
             requester: None,
         }
+    }
+
+    #[tokio::test]
+    async fn remember_writes_local_scope_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = MemoryTool
+            .execute(
+                r#"{"action":"remember","content":"node at /opt/homebrew/bin/node","scope":"local"}"#,
+                &ctx(tmp.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(crate::memory::MemoryStore::local(tmp.path())
+            .load()
+            .iter()
+            .any(|e| e == "node at /opt/homebrew/bin/node"));
+        // local scope must NOT land in the project store.
+        assert!(crate::memory::MemoryStore::project(tmp.path())
+            .load()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn forget_scan_removes_local_entry_without_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        MemoryTool
+            .execute(
+                r#"{"action":"remember","content":"local-only fact lq1","scope":"local"}"#,
+                &ctx(tmp.path()),
+            )
+            .await;
+        let r = MemoryTool
+            .execute(r#"{"action":"forget","keyword":"lq1"}"#, &ctx(tmp.path()))
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            crate::memory::MemoryStore::local(tmp.path())
+                .find_matching("lq1")
+                .is_empty(),
+            "local entry must be forgotten via bare forget"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_includes_local_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        MemoryTool
+            .execute(
+                r#"{"action":"remember","content":"l1 local marker","scope":"local"}"#,
+                &ctx(tmp.path()),
+            )
+            .await;
+        let r = MemoryTool
+            .execute(r#"{"action":"list"}"#, &ctx(tmp.path()))
+            .await;
+        assert!(!r.is_error);
+        assert!(r.content.contains("[Local]\n- l1 local marker"));
     }
 
     #[tokio::test]

@@ -46,7 +46,12 @@ async fn memory_hook_passes_kernel_conformance_with_populated_stores() {
     let project = MemoryStore::new(dir.path().join("p.md"));
     project.append(&"项目偏好".repeat(2000)).unwrap();
 
-    let hook = MemoryHook::with_stores(global, project, "conformance");
+    let hook = MemoryHook::with_stores(
+        global,
+        project,
+        MemoryStore::new(dir.path().join("l.md")),
+        "conformance",
+    );
     atomcode_kernel::conformance::hooks::check(Arc::new(hook))
         .await
         .assert_conformant();
@@ -58,6 +63,7 @@ async fn memory_hook_passes_kernel_conformance_with_empty_stores() {
     let hook = MemoryHook::with_stores(
         MemoryStore::new(dir.path().join("g.md")),
         MemoryStore::new(dir.path().join("p.md")),
+        MemoryStore::new(dir.path().join("l.md")),
         "conformance",
     );
     atomcode_kernel::conformance::hooks::check(Arc::new(hook))
