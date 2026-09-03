@@ -18,6 +18,17 @@ fn project_memory_path(project_root: &Path, override_dir: Option<&str>) -> PathB
     project_root.join(dir).join("memory.md")
 }
 
+/// Resolve the machine-local, project-scoped memory file. `override_dir` = the value of
+/// `ATOMCODE_LOCAL_MEMORY_DIR` (None/empty → default ".atomcode/local"). A relative value
+/// nests under `project_root`; an absolute value is used as-is — the same path-join
+/// semantics as `project_memory_path`. `memory.md` is appended in either case.
+fn local_memory_path(project_root: &Path, override_dir: Option<&str>) -> PathBuf {
+    let dir = override_dir
+        .filter(|s| !s.is_empty())
+        .unwrap_or(".atomcode/local");
+    project_root.join(dir).join("memory.md")
+}
+
 impl MemoryStore {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
@@ -33,6 +44,15 @@ impl MemoryStore {
     pub fn project(project_root: &Path) -> Self {
         let override_dir = std::env::var("ATOMCODE_PROJECT_MEMORY_DIR").ok();
         Self::new(project_memory_path(project_root, override_dir.as_deref()))
+    }
+
+    /// Machine-local, project-scoped store. Honors `ATOMCODE_LOCAL_MEMORY_DIR` (host
+    /// rebrand parity with the project scope's `ATOMCODE_PROJECT_MEMORY_DIR`); default
+    /// `.atomcode/local` is unchanged. Best home for facts unique to this machine that
+    /// should not be committed (`.atomcode/local/` is gitignored).
+    pub fn local(project_root: &Path) -> Self {
+        let override_dir = std::env::var("ATOMCODE_LOCAL_MEMORY_DIR").ok();
+        Self::new(local_memory_path(project_root, override_dir.as_deref()))
     }
 
     pub fn path(&self) -> &Path {
@@ -128,12 +148,14 @@ impl MemoryStore {
     pub fn merged_for_prompt(
         global: &MemoryStore,
         project: &MemoryStore,
+        local: &MemoryStore,
         project_name: &str,
     ) -> String {
         let global_entries = global.load();
         let project_entries = project.load();
+        let local_entries = local.load();
 
-        if global_entries.is_empty() && project_entries.is_empty() {
+        if global_entries.is_empty() && project_entries.is_empty() && local_entries.is_empty() {
             return String::new();
         }
 
@@ -151,6 +173,13 @@ impl MemoryStore {
         if !project_entries.is_empty() {
             result.push_str(&format!("\n[Project: {}]\n", project_name));
             for entry in &project_entries {
+                result.push_str(&format!("- {}\n", entry));
+            }
+        }
+
+        if !local_entries.is_empty() {
+            result.push_str("\n[Local]\n");
+            for entry in &local_entries {
                 result.push_str(&format!("- {}\n", entry));
             }
         }
@@ -257,6 +286,28 @@ mod tests {
     }
 
     #[test]
+    fn local_memory_path_resolves_override() {
+        use std::path::Path;
+        let root = Path::new("/proj");
+        assert_eq!(
+            super::local_memory_path(root, None),
+            Path::new("/proj/.atomcode/local/memory.md")
+        );
+        assert_eq!(
+            super::local_memory_path(root, Some("")),
+            Path::new("/proj/.atomcode/local/memory.md")
+        );
+        assert_eq!(
+            super::local_memory_path(root, Some(".myapp/local")),
+            Path::new("/proj/.myapp/local/memory.md")
+        );
+        assert_eq!(
+            super::local_memory_path(root, Some("/opt/brand/mem")),
+            Path::new("/opt/brand/mem/memory.md")
+        );
+    }
+
+    #[test]
     fn test_merged_for_prompt_truncation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("memory.md");
@@ -264,8 +315,41 @@ mod tests {
         fs::write(&path, format!("- {}\n", long_entry)).unwrap();
         let store = MemoryStore::new(path);
         let empty = MemoryStore::new(PathBuf::from("/none"));
-        let result = MemoryStore::merged_for_prompt(&store, &empty, "p");
+        let result = MemoryStore::merged_for_prompt(&store, &empty, &empty, "p");
         assert!(result.contains("[...truncated"));
         assert!(result.chars().count() < 5000);
+    }
+
+    #[test]
+    fn test_merged_for_prompt_three_tiers_ordered_and_omitted_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let new_store = |name: &str, entry: Option<&str>| {
+            let s = MemoryStore::new(dir.path().join(name));
+            if let Some(e) = entry {
+                s.append(e).unwrap();
+            }
+            s
+        };
+        let g = new_store("g.md", Some("g1"));
+        let p = new_store("p.md", Some("p1"));
+        let l = new_store("l.md", Some("l1"));
+
+        // All three tiers present, in order.
+        let merged = MemoryStore::merged_for_prompt(&g, &p, &l, "myproj");
+        let g_pos = merged.find("[Global]\n- g1").unwrap();
+        let p_pos = merged.find("[Project: myproj]\n- p1").unwrap();
+        let l_pos = merged.find("[Local]\n- l1").unwrap();
+        assert!(g_pos < p_pos && p_pos < l_pos);
+
+        // Local empty → `[Local]` section omitted; global/project still present.
+        let empty = new_store("empty.md", None);
+        let merged2 = MemoryStore::merged_for_prompt(&g, &p, &empty, "myproj");
+        assert!(merged2.contains("[Global]") && merged2.contains("[Project: myproj]"));
+        assert!(!merged2.contains("[Local]"));
+
+        // All empty → empty string.
+        assert!(
+            MemoryStore::merged_for_prompt(&empty, &empty, &empty, "myproj").is_empty()
+        );
     }
 }

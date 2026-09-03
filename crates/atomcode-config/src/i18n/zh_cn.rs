@@ -171,6 +171,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::StatusMemoryFilesHeader => "  记忆文件：\n".into(),
         Msg::StatusMemoryScopeGlobal => "用户全局".into(),
         Msg::StatusMemoryScopeProject => "项目记忆".into(),
+        Msg::StatusMemoryScopeLocal => "本机记忆".into(),
         Msg::StatusMemoryPresent { path, scope } =>
             format!("    ✓ {scope}：{path}\n").into(),
         Msg::StatusMemoryMissing { path, scope } =>

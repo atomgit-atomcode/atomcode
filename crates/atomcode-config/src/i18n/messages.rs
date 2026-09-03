@@ -258,6 +258,7 @@ pub enum Msg<'a> {
     StatusMemoryFilesHeader,
     StatusMemoryScopeGlobal,
     StatusMemoryScopeProject,
+    StatusMemoryScopeLocal,
     StatusMemoryPresent {
         path: &'a str,
         scope: &'a str,

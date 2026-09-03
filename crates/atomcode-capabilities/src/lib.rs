@@ -191,8 +191,9 @@ pub mod mcp;
 pub mod session;
 
 /// User-driven persistent memory: the production `memory.md` store (global
-/// `$ATOMCODE_HOME/memory.md` + per-project `<root>/.atomcode/memory.md` — the SAME
-/// files production reads/writes, so the two stacks share one memory) + a
+/// `$ATOMCODE_HOME/memory.md` + per-project `<root>/.atomcode/memory.md` + the
+/// machine-local `<root>/.atomcode/local/memory.md` — the SAME files production
+/// reads/writes, so the two stacks share one memory) + a
 /// [`MemoryHook`](memory::MemoryHook) that injects the merged entries as a system
 /// message at `session_start` (fresh sessions only — a resumed snapshot already
 /// carries it). v1 has NO model-facing remember/forget tools: the store is written by
