@@ -193,13 +193,17 @@ impl Tool for BashTool {
                 ))
             }
         };
-        // Keep the RAW request: the timeout error below must not tell a caller that already
-        // asked for more than the ceiling to "pass a larger timeout".
+        // Keep the RAW request so we can (a) avoid telling a caller that already asked for
+        // more than the ceiling to "pass a larger timeout", and (b) surface the clamp up
+        // front — the model otherwise believes its larger request was honored and only
+        // discovers the silent cap when a later step depends on it (mirrors the clamp notice
+        // shells like oh-my-pi emit at run time rather than only at the timeout).
         let requested_timeout = a.timeout;
         let secs = requested_timeout
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
         let dur = Duration::from_secs(secs);
+        let clamp_notice = timeout_clamp_notice(secs, requested_timeout);
 
         // macOS sudo (and some Linux configs) needs explicit `-A` to use SUDO_ASKPASS —
         // rewrite `sudo` → `sudo -A` so a plain `sudo` pops our password modal. Only when
@@ -312,7 +316,7 @@ impl Tool for BashTool {
             }
         };
 
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             // Cooperative cancel: returning drops `wait` → kill_on_drop SIGKILLs the child.
             _ = ctx.cancel.cancelled() => {
@@ -327,19 +331,32 @@ impl Tool for BashTool {
                 Ok(Ok(output)) => format_output(&output),
                 Ok(Err(e)) => err(format!("bash: error running command: {e}")),
                 // Timed out: the timeout future drops `wait` → kill_on_drop SIGKILLs the child.
-                // Don't echo the command (see the cancel arm); point at the actionable
-                // knob — a larger `timeout` — the way the core bash tool does. BUT only while
-                // that knob still has room: `timeout` is clamped to MAX_TIMEOUT_SECS, so once
-                // the run was already at the ceiling, "pass a larger timeout" is advice that
-                // provably cannot work — and the model reads this as ground truth and retries
-                // it. (Field case: a model passed `timeout: 330`, silently ran at 300s, and was
-                // told to ask for longer.) At the ceiling, name the ceiling and point at the
-                // one thing that DOES work instead.
+                // Don't echo the command (see the cancel arm); point at the actionable knob —
+                // a larger `timeout` — BUT only while that knob still has room. Once the run
+                // was already at MAX_TIMEOUT_SECS, "pass a larger timeout" is advice that
+                // provably cannot work, and the model reads tool output as ground truth and
+                // retries it. At the ceiling `timeout_message` names the ceiling and points at
+                // the one escape that ACTUALLY works on THIS platform: background+file on Unix
+                // (a detached child survives our reap — we only killpg on cancel/timeout), but
+                // split-into-steps on Windows, where the KILL_ON_JOB_CLOSE job reaps anything
+                // left running the moment we return (this tool has no background path there —
+                // see the job-object comment above the spawn).
                 Err(_) => {
                     kill_tree();
-                    err(timeout_message(secs, requested_timeout))
+                    err(timeout_message(secs, cfg!(not(windows))))
                 }
             }
+        };
+        // Surface a silent `timeout` clamp on EVERY outcome (not just the timeout), so a
+        // caller that asked for more than the ceiling learns the real limit here instead of
+        // carrying a wrong mental model into its next step.
+        match clamp_notice {
+            Some(note) => {
+                let mut result = result;
+                result.content.push_str(&note);
+                result
+            }
+            None => result,
         }
     }
 }
@@ -785,27 +802,52 @@ fn detect_windows_bash() -> Option<std::path::PathBuf> {
         .clone()
 }
 
+/// One-line note appended to the tool output whenever the caller's `timeout` was clamped
+/// into range, so the model learns the real ceiling instead of silently believing its
+/// (larger) request was honored — mirrors oh-my-pi's run-time clamp notice. `None` when the
+/// effective value equals the request (default, or an in-range explicit value): don't add
+/// noise to the common case. Pure ⇒ unit-testable without a real run.
+fn timeout_clamp_notice(secs: u64, requested: Option<u64>) -> Option<String> {
+    match requested {
+        Some(r) if r != secs => Some(format!(
+            "\n\n(note: `timeout` clamped to {secs}s — this tool allows 1–{MAX_TIMEOUT_SECS}s; \
+             you requested {r}s.)"
+        )),
+        _ => None,
+    }
+}
+
 /// The message for a command killed by the timeout.
 ///
 /// Pure so both branches are unit-testable without actually waiting `MAX_TIMEOUT_SECS`.
-/// `requested` is the caller's RAW `timeout` (pre-clamp), `secs` the value actually used.
+/// `secs` is the value actually used; `background_survives` = whether a process the command
+/// backgrounds outlives THIS call: true on Unix (we only reap the tree on cancel/timeout, so
+/// a detached `nohup … &` child lives on), false on Windows (every child is in a
+/// `KILL_ON_JOB_CLOSE` job reaped on return — this tool has no background path there).
 ///
-/// The knob only gets named while it still has room. `timeout` is clamped to
+/// The `timeout` knob only gets named while it still has room. `timeout` is clamped to
 /// `MAX_TIMEOUT_SECS`, so a run that already sat at the ceiling cannot be helped by
-/// "pass a larger `timeout`" — the caller may have asked for more and been silently
-/// clamped (observed: a model passed `timeout: 330`, ran at 300s, and was told to ask for
-/// longer). The model treats tool output as ground truth, so an instruction that provably
-/// cannot work is worse than none: name the ceiling and point at what does work.
-fn timeout_message(secs: u64, requested: Option<u64>) -> String {
+/// "pass a larger `timeout`" — the model treats tool output as ground truth, so an
+/// instruction that provably cannot work is worse than none. At the ceiling, name the
+/// ceiling and point at the one escape that is actually executable on THIS platform. (The
+/// clamp itself — "you asked for 330, got 300" — is surfaced separately by
+/// [`timeout_clamp_notice`], appended to every outcome, so it isn't repeated here.)
+fn timeout_message(secs: u64, background_survives: bool) -> String {
     if secs >= MAX_TIMEOUT_SECS {
-        let asked = match requested {
-            Some(r) if r > MAX_TIMEOUT_SECS => format!(" (requested {r}s)"),
-            _ => String::new(),
+        // The escape hatch must be runnable on THIS platform. On Windows the job object
+        // reaps anything the command leaves running the instant this call returns, so
+        // "background it" would be another instruction that provably can't work — the very
+        // failure this branch exists to avoid. Point Windows at splitting instead.
+        let escape = if background_survives {
+            "start the work in the background (redirect its output to a file) and read that \
+             file back in a later, short command"
+        } else {
+            "split the work into smaller steps that each finish under the limit (or run the \
+             long-running task outside this tool)"
         };
         format!(
-            "bash: timed out after {secs}s{asked}, which is this tool's maximum. A longer \
-             single command is not available — start the work in the background (redirect its \
-             output to a file) and read that file back in a later, short command."
+            "bash: timed out after {secs}s, which is this tool's maximum. A longer single \
+             command is not available — {escape}."
         )
     } else {
         format!(
@@ -847,8 +889,8 @@ fn unsupported_bash_construct(command: &str) -> Option<&'static str> {
     None
 }
 
-/// Whether the command contains a `>(` that is actually SHELL SYNTAX rather than two
-/// characters that happen to sit next to each other inside ordinary text.
+/// Whether the command contains a `>(` that is actually SHELL SYNTAX (output process
+/// substitution) rather than two characters sitting next to each other inside ordinary text.
 ///
 /// A bare `contains(">(")` is not usable here: the two commonest JavaScript one-liners a
 /// model writes both carry it inside a quoted literal —
@@ -858,16 +900,74 @@ fn unsupported_bash_construct(command: &str) -> Option<&'static str> {
 /// (field case: 5 of 6 cmd.exe rejections in one user's session were exactly this, all
 /// from the same `node -e` HTML syntax check the user ran after every edit).
 ///
-/// Real process substitution puts the `>` at an OPERATOR position — `tee >(cat)`,
-/// `2> >(logger)` — i.e. preceded by whitespace or standing at the very start. Requiring
-/// that STRICTLY REDUCES what this guard flags; the no-space form (`tee>(cat)`) falls
-/// through to cmd.exe mangled, which is the same treatment every other un-flagged
-/// construct already gets (see this module's guard doc above).
+/// Real process substitution is a WORD-level operator: `>` sits at an operator position
+/// (preceded by whitespace or standing at the very start) AND is UNQUOTED. Both conditions
+/// are checked in one quote-aware pass, using the same single-quote-is-literal /
+/// backslash-escapes-in-double-quotes model as [`rewrite_nul_redirect`]:
+///   * quoted — `python -c "print('a >(b)')"`, the `node -e` cases above — never flagged
+///     (process substitution does not occur inside quotes);
+///   * unquoted no-space — `tee>(cat)` — not flagged, falls through to cmd.exe mangled, the
+///     same treatment every other un-flagged construct already gets (this is "只减不增":
+///     strictly fewer hard-fails than the old bare substring match).
+/// Pure / platform-independent (scans bytes; ASCII operators never collide with UTF-8
+/// continuation bytes) so it is unit-testable off Windows.
 fn has_operator_position_process_substitution(command: &str) -> bool {
-    command.match_indices(">(").any(|(at, _)| match command[..at].chars().next_back() {
-        None => true,
-        Some(prev) => prev.is_whitespace(),
-    })
+    let bytes = command.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    // Start-of-command counts as an operator boundary, same as the old `next_back() == None`.
+    let mut prev_is_boundary = true;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            // Single quotes are fully literal in bash — only a closing `'` ends them, and
+            // nothing inside is an operator or a boundary.
+            if b == b'\'' {
+                in_single = false;
+            }
+            prev_is_boundary = false;
+            i += 1;
+        } else if in_double {
+            // Inside double quotes a backslash escapes the next byte (so `\"` doesn't close);
+            // otherwise a `"` ends the span. Nothing inside is a process-substitution operator.
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+            } else {
+                if b == b'"' {
+                    in_double = false;
+                }
+                i += 1;
+            }
+            prev_is_boundary = false;
+        } else {
+            match b {
+                // An unquoted backslash escapes the next byte: neither is an operator/boundary.
+                b'\\' if i + 1 < bytes.len() => {
+                    prev_is_boundary = false;
+                    i += 2;
+                }
+                b'\'' => {
+                    in_single = true;
+                    prev_is_boundary = false;
+                    i += 1;
+                }
+                b'"' => {
+                    in_double = true;
+                    prev_is_boundary = false;
+                    i += 1;
+                }
+                b'>' if prev_is_boundary && bytes.get(i + 1) == Some(&b'(') => {
+                    return true;
+                }
+                _ => {
+                    prev_is_boundary = b.is_ascii_whitespace();
+                    i += 1;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Rewrite a bash redirect whose target is the bare Windows device name `nul`
@@ -3401,6 +3501,22 @@ mod tests {
         assert!(unsupported_bash_construct("cmd 2> >(logger)").is_some());
         assert!(unsupported_bash_construct(">(cat)").is_some());
     }
+
+    /// Quote-awareness: an OPERATOR-position `>(` that nonetheless sits inside a quoted
+    /// literal is still not process substitution (it's argument text handed to a child
+    /// program). This is the residual FP the plain operator-position check could not catch.
+    #[test]
+    fn unsupported_construct_quote_aware_operator_position() {
+        // `>(` preceded by a space but INSIDE double quotes → argument text, not an operator.
+        assert!(unsupported_bash_construct(r#"python -c "print('a >(b)')""#).is_none());
+        assert!(unsupported_bash_construct(r#"echo "x >(y) z""#).is_none());
+        // …and inside single quotes.
+        assert!(unsupported_bash_construct(r#"echo 'pipe into >(cat)'"#).is_none());
+        // An escaped inner quote must not prematurely end the double-quoted span.
+        assert!(unsupported_bash_construct(r#"node -e "const s=\"a >(b)\";""#).is_none());
+        // Real, unquoted operator-position substitution is still flagged after quoted text.
+        assert!(unsupported_bash_construct(r#"echo "safe" | tee >(cat)"#).is_some());
+    }
     use tokio_util::sync::CancellationToken;
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
@@ -4183,23 +4299,35 @@ mod tests {
         );
     }
 
-    /// At the ceiling the knob is gone: `timeout` is clamped there, so telling the caller to
-    /// pass a larger one is an instruction that cannot be carried out. A caller that asked
-    /// for MORE than the ceiling is told what it actually got.
+    /// At the ceiling the knob is gone (`timeout` is clamped there), and the escape hatch
+    /// must be runnable on the platform: Unix keeps a detached child alive, so "background"
+    /// is real; Windows reaps it via the job object on return, so we point at splitting.
     #[test]
-    fn timeout_message_at_ceiling_does_not_point_at_a_maxed_knob() {
-        let m = timeout_message(MAX_TIMEOUT_SECS, Some(330));
-        assert!(
-            !m.contains("pass a larger"),
-            "must not tell a clamped caller to ask for longer: {m}"
-        );
-        assert!(m.contains("requested 330s"), "must report the clamp: {m}");
-        assert!(m.contains("background"), "must offer the workable alternative: {m}");
-        // No explicit timeout, but the default happened to be the ceiling: same verdict,
-        // and nothing is claimed about a request that was never made.
-        let m = timeout_message(MAX_TIMEOUT_SECS, None);
+    fn timeout_message_at_ceiling_offers_a_platform_workable_escape() {
+        // Unix: backgrounding survives our reap (we only killpg on cancel/timeout).
+        let m = timeout_message(MAX_TIMEOUT_SECS, true);
+        assert!(!m.contains("pass a larger"), "must not point at a maxed knob: {m}");
+        assert!(m.contains("background"), "unix escape is backgrounding: {m}");
+        // Windows: KILL_ON_JOB_CLOSE reaps a backgrounded child on return — never suggest it.
+        let m = timeout_message(MAX_TIMEOUT_SECS, false);
         assert!(!m.contains("pass a larger"), "{m}");
-        assert!(!m.contains("requested"), "{m}");
+        assert!(
+            !m.contains("background"),
+            "must not suggest an unsupported path on windows: {m}"
+        );
+        assert!(m.contains("smaller steps"), "windows escape is splitting: {m}");
+    }
+
+    /// A silently-clamped `timeout` is surfaced (real limit + what was asked); an honored
+    /// value — default or in-range — stays silent so the common case isn't noisy.
+    #[test]
+    fn timeout_clamp_notice_only_fires_when_clamped() {
+        let n = timeout_clamp_notice(MAX_TIMEOUT_SECS, Some(330)).expect("over-ceiling clamps");
+        assert!(n.contains("requested 330s"), "{n}");
+        assert!(n.contains(&format!("{MAX_TIMEOUT_SECS}s")), "names the ceiling: {n}");
+        assert!(timeout_clamp_notice(1, Some(0)).unwrap().contains("requested 0s")); // low clamp
+        assert!(timeout_clamp_notice(60, Some(60)).is_none()); // honored → silent
+        assert!(timeout_clamp_notice(60, None).is_none()); // default → silent
     }
 
     #[test]
