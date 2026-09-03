@@ -747,8 +747,8 @@ impl ToolMiddleware for BashWorkspaceGate {
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
     ) -> BeforeOutcome {
-        if tool.name() != "bash" {
-            return BeforeOutcome::Proceed; // not ours
+        if !super::is_command_shell_tool(tool.name()) {
+            return BeforeOutcome::Proceed; // not a command-running shell tool (bash / bash_start)
         }
         let Some(command) = bash_command(&call.arguments) else {
             return BeforeOutcome::Proceed; // unparseable args — bash tool / risk flow handles it
@@ -1278,6 +1278,28 @@ mod tests {
         assert!(
             out.is_deny(),
             "out-of-workspace rm must prompt (fail closed when silent), got {out:?}"
+        );
+    }
+
+    /// Regression: `bash_start` runs arbitrary commands too, so it must face THIS gate exactly
+    /// like `bash` — an out-of-workspace delete backgrounded via `bash_start` prompts, it does
+    /// not slip through as "not ours" (the bug this gate's `is_command_shell_tool` check fixes).
+    #[tokio::test]
+    async fn out_of_workspace_rm_via_bash_start_prompts() {
+        let ws = tempfile::tempdir().unwrap();
+        let target = std::path::PathBuf::from("/atomcode-test-outside-rm/x.txt");
+        let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::bash::BashStartTool);
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "bash_start".into(),
+            arguments: serde_json::json!({ "command": format!("rm {}", target.to_str().unwrap()) })
+                .to_string(),
+        };
+        let out = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(
+            out.is_deny(),
+            "out-of-workspace rm via bash_start must prompt (fail closed when silent), got {out:?}"
         );
     }
 
