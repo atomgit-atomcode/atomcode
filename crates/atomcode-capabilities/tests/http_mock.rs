@@ -678,5 +678,8 @@ async fn open_gives_up_on_a_hung_gateway_within_the_open_timeout() {
         elapsed < Duration::from_secs(3),
         "took {elapsed:?} — not bounded by open_timeout"
     );
-    assert!(err.retryable, "a TTFB timeout is transient, so it must be retryable");
+    assert!(
+        err.retryable,
+        "a TTFB timeout is transient, so it must be retryable"
+    );
 }

@@ -345,11 +345,7 @@ async fn transient_server_error_restores_segment_then_retry_succeeds() {
         "expected transient server error, got {first:?}"
     );
     assert_eq!(
-        q.lock()
-            .await
-            .ready_segments_sorted()
-            .unwrap()
-            .len(),
+        q.lock().await.ready_segments_sorted().unwrap().len(),
         1,
         "segment must be restored to ready after a transient error"
     );

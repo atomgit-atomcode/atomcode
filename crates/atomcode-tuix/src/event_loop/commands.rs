@@ -72,7 +72,12 @@ fn foreground_state_from_ui(state: &UiState) -> bg_runtime::RuntimeState {
 /// Subcommand: `/rewind purge` — deletes all `refs/atomcode/*` refs and runs
 /// `gc --prune=now`, clearing the shadow store. Reports store size before and
 /// after. Works regardless of phase (no conversation mutation, read + delete only).
-pub(super) fn dispatch_rewind(arg: &str, state: &UiState, ctx: &LoopCtx, renderer: &mut dyn Renderer) {
+pub(super) fn dispatch_rewind(
+    arg: &str,
+    state: &UiState,
+    ctx: &LoopCtx,
+    renderer: &mut dyn Renderer,
+) {
     if arg.trim() == "purge" {
         dispatch_rewind_purge(ctx, renderer);
         return;
@@ -3098,8 +3103,7 @@ fn execute_slash_command_impl(
                         // Unknown key: name it + list the real servers (shared with
                         // `/mcp tools`), instead of a bare "not found".
                         renderer.render(UiLine::CommandOutput(format_unknown_server(
-                            server,
-                            &available,
+                            server, &available,
                         )));
                         renderer.flush();
                         return Ok(());
@@ -3379,14 +3383,14 @@ fn execute_slash_command_impl(
                             .block_on(ctx.runtime.mcp_tools(server.to_string()))
                     });
                     match result {
-                        Ok(snapshot) => renderer.render(UiLine::CommandOutput(
-                            format_mcp_tools_snapshot(
+                        Ok(snapshot) => {
+                            renderer.render(UiLine::CommandOutput(format_mcp_tools_snapshot(
                                 server,
                                 &snapshot.tools,
                                 snapshot.status.as_ref(),
                                 &snapshot.available,
-                            ),
-                        )),
+                            )))
+                        }
                         Err(error) => renderer.render(UiLine::Error(error.to_string())),
                     }
                     renderer.flush();
@@ -4061,20 +4065,20 @@ fn execute_slash_command_impl(
             // across ALL projects (with computed agent-active durations), then hand
             // the model a structured recap to fill the 工作内容/时长/问题与评价 table.
             use chrono::{Local, TimeZone};
-            let english =
-                matches!(atomcode_config::i18n::current_locale(), atomcode_config::i18n::Locale::En);
+            let english = matches!(
+                atomcode_config::i18n::current_locale(),
+                atomcode_config::i18n::Locale::En
+            );
             let Some(date) = atomcode_capabilities::session::resolve_worklog_date(
                 arg,
                 Local::now().date_naive(),
             ) else {
-                renderer.render(UiLine::CommandOutput(
-                    if english {
-                        "Usage: /worklog [date]  (today / yesterday / 8/27 / 2026-08-27)".to_string()
-                    } else {
-                        "用法：/worklog [日期]（默认今天；支持 today / yesterday / 8/27 / 2026-08-27）"
-                            .to_string()
-                    },
-                ));
+                renderer.render(UiLine::CommandOutput(if english {
+                    "Usage: /worklog [date]  (today / yesterday / 8/27 / 2026-08-27)".to_string()
+                } else {
+                    "用法：/worklog [日期]（默认今天；支持 today / yesterday / 8/27 / 2026-08-27）"
+                        .to_string()
+                }));
                 renderer.flush();
                 return Ok(());
             };
@@ -9514,7 +9518,10 @@ mod mcp_subcommand_tests {
             &["filesystem".to_string(), "rvs".to_string()],
         );
         assert!(out.contains("rvs new-file"), "names the bad key: {out:?}");
-        assert!(out.contains("filesystem") && out.contains("rvs"), "lists available: {out:?}");
+        assert!(
+            out.contains("filesystem") && out.contains("rvs"),
+            "lists available: {out:?}"
+        );
         assert!(
             !out.contains("not configured") && !out.contains("未配置"),
             "must NOT claim not-configured when servers exist: {out:?}"
@@ -9537,9 +9544,16 @@ mod mcp_subcommand_tests {
         use atomcode_capabilities::mcp::ServerStatus;
         // Configured + connected but exposing zero tools: show the status, and do
         // NOT misreport it as an unknown key.
-        let out = format_mcp_tools_snapshot("rvs", &[], Some(&ServerStatus::Connected), &["rvs".into()]);
-        assert!(out.contains("none"), "shows the (none — status) form: {out:?}");
-        assert!(!out.contains("未找到") && !out.contains("named"), "not an unknown-key message: {out:?}");
+        let out =
+            format_mcp_tools_snapshot("rvs", &[], Some(&ServerStatus::Connected), &["rvs".into()]);
+        assert!(
+            out.contains("none"),
+            "shows the (none — status) form: {out:?}"
+        );
+        assert!(
+            !out.contains("未找到") && !out.contains("named"),
+            "not an unknown-key message: {out:?}"
+        );
     }
 
     #[test]
@@ -9551,7 +9565,10 @@ mod mcp_subcommand_tests {
             None,
             &["rvs".into()],
         );
-        assert!(out.contains("- new-file") && out.contains("- read"), "lists tools: {out:?}");
+        assert!(
+            out.contains("- new-file") && out.contains("- read"),
+            "lists tools: {out:?}"
+        );
     }
 }
 

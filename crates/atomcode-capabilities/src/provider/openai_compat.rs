@@ -46,7 +46,10 @@ use std::time::Duration;
 /// [`is_openrouter_url`]) so other OpenAI-compatible endpoints — including
 /// AtomGit's own signing gateway — never receive them.
 pub const OPENROUTER_ATTRIBUTION_HEADERS: &[(&str, &str); 3] = &[
-    ("HTTP-Referer", "https://gitcode.com/atomgit_atomcode/atomcode"),
+    (
+        "HTTP-Referer",
+        "https://gitcode.com/atomgit_atomcode/atomcode",
+    ),
     ("X-OpenRouter-Title", "AtomCode"),
     ("X-OpenRouter-Categories", "cli-agent"),
 ];
@@ -61,15 +64,9 @@ pub const OPENROUTER_ATTRIBUTION_HEADERS: &[(&str, &str); 3] = &[
 /// [`atomcode_config::endpoints::host_matches_domain`] so it agrees with the rest
 /// of the codebase and can't drift.
 pub fn is_openrouter_url(url: &str) -> bool {
-    let authority = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(url);
+    let authority = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     // Host = the authority minus path/query/fragment...
-    let host_port = authority
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(authority);
+    let host_port = authority.split(['/', '?', '#']).next().unwrap_or(authority);
     // ...minus any `userinfo@` prefix. Without this, a crafted
     // `https://openrouter.ai:x@evil.com/…` would parse the userinfo `openrouter.ai`
     // as the host and leak the attribution headers to `evil.com`.
@@ -2911,9 +2908,11 @@ mod tests {
         let _ = d.feed(
             line(json!({"choices":[{"delta":{"content":"hi"},"finish_reason":""}]})).as_bytes(),
         );
-        assert!(!d.seen_finish(), "empty finish_reason must NOT arm seen_finish");
-        let _ =
-            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})).as_bytes());
+        assert!(
+            !d.seen_finish(),
+            "empty finish_reason must NOT arm seen_finish"
+        );
+        let _ = d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})).as_bytes());
         assert!(d.seen_finish(), "non-empty finish_reason arms seen_finish");
     }
 
@@ -3329,7 +3328,11 @@ mod tests {
             err.retryable,
             "an in-band 429 is retryable (kernel decides retry vs pause by content/terminal)"
         );
-        assert_eq!(err.code.as_deref(), Some("429"), "structured code preserved");
+        assert_eq!(
+            err.code.as_deref(),
+            Some("429"),
+            "structured code preserved"
+        );
     }
 
     #[test]
@@ -3353,7 +3356,10 @@ mod tests {
             err.http_status, None,
             "a vendor code outside 100-599 is not an HTTP status"
         );
-        assert!(!err.retryable, "an unmapped vendor code stays non-retryable");
+        assert!(
+            !err.retryable,
+            "an unmapped vendor code stays non-retryable"
+        );
     }
 
     #[test]
@@ -3922,8 +3928,12 @@ mod tests {
         // Real OpenRouter endpoints (any path, http or https, explicit port).
         assert!(is_openrouter_url("https://openrouter.ai/api/v1"));
         assert!(is_openrouter_url("https://openrouter.ai"));
-        assert!(is_openrouter_url("http://openrouter.ai:443/api/v1/chat/completions"));
-        assert!(is_openrouter_url("https://openrouter.ai/api/v1/chat/completions"));
+        assert!(is_openrouter_url(
+            "http://openrouter.ai:443/api/v1/chat/completions"
+        ));
+        assert!(is_openrouter_url(
+            "https://openrouter.ai/api/v1/chat/completions"
+        ));
         // Subdomains count as OpenRouter too.
         assert!(is_openrouter_url("https://api.openrouter.ai/v1"));
         // Legit userinfo on the real host still matches (host is after `@`).
@@ -3949,12 +3959,10 @@ mod tests {
         let req = client
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header(reqwest::header::CONTENT_TYPE, "application/json");
-        let built = apply_openrouter_attribution(
-            "https://openrouter.ai/api/v1/chat/completions",
-            req,
-        )
-        .build()
-        .expect("request must build");
+        let built =
+            apply_openrouter_attribution("https://openrouter.ai/api/v1/chat/completions", req)
+                .build()
+                .expect("request must build");
         for (name, value) in OPENROUTER_ATTRIBUTION_HEADERS {
             assert_eq!(
                 built.headers().get(*name).and_then(|v| v.to_str().ok()),
@@ -3967,12 +3975,10 @@ mod tests {
         let req = client
             .post("https://api.deepseek.com/v1/chat/completions")
             .header(reqwest::header::CONTENT_TYPE, "application/json");
-        let built = apply_openrouter_attribution(
-            "https://api.deepseek.com/v1/chat/completions",
-            req,
-        )
-        .build()
-        .expect("request must build");
+        let built =
+            apply_openrouter_attribution("https://api.deepseek.com/v1/chat/completions", req)
+                .build()
+                .expect("request must build");
         for (name, _) in OPENROUTER_ATTRIBUTION_HEADERS {
             assert!(
                 !built.headers().contains_key(*name),

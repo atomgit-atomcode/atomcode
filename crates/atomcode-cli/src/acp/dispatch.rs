@@ -697,22 +697,43 @@ mod tests {
     fn cwd_matches_accepts_equivalent_spellings_and_rejects_others() {
         use std::path::Path;
         // Exact match.
-        assert!(cwd_matches(Path::new("/home/u/proj"), Path::new("/home/u/proj")));
+        assert!(cwd_matches(
+            Path::new("/home/u/proj"),
+            Path::new("/home/u/proj")
+        ));
         // Trailing separator — same directory (component-wise equality).
-        assert!(cwd_matches(Path::new("/home/u/proj"), Path::new("/home/u/proj/")));
-        assert!(cwd_matches(Path::new("/home/u/proj/"), Path::new("/home/u/proj")));
+        assert!(cwd_matches(
+            Path::new("/home/u/proj"),
+            Path::new("/home/u/proj/")
+        ));
+        assert!(cwd_matches(
+            Path::new("/home/u/proj/"),
+            Path::new("/home/u/proj")
+        ));
         // Redundant `.` segment — same directory, lexically.
-        assert!(cwd_matches(Path::new("/home/u/proj"), Path::new("/home/u/./proj")));
+        assert!(cwd_matches(
+            Path::new("/home/u/proj"),
+            Path::new("/home/u/./proj")
+        ));
         // A genuinely different directory is still rejected.
-        assert!(!cwd_matches(Path::new("/home/u/proj"), Path::new("/home/u/other")));
+        assert!(!cwd_matches(
+            Path::new("/home/u/proj"),
+            Path::new("/home/u/other")
+        ));
         // A sibling that merely shares a prefix is rejected (no substring match).
-        assert!(!cwd_matches(Path::new("/home/u/proj"), Path::new("/home/u/proj2")));
+        assert!(!cwd_matches(
+            Path::new("/home/u/proj"),
+            Path::new("/home/u/proj2")
+        ));
         // No lexical case-folding: a case difference on nonexistent paths is NOT
         // a lexical match (a case-insensitive FS is handled by canonicalize only
         // when the dirs actually exist). This keeps the guard from admitting a
         // cwd the case-sensitive storage bucket key would treat as a different
         // project.
-        assert!(!cwd_matches(Path::new("/home/u/Proj"), Path::new("/home/u/proj")));
+        assert!(!cwd_matches(
+            Path::new("/home/u/Proj"),
+            Path::new("/home/u/proj")
+        ));
     }
 
     #[test]

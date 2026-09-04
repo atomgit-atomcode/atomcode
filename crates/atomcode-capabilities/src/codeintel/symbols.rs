@@ -210,9 +210,19 @@ mod tests {
     #[test]
     fn skeleton_none_for_symbolless_source() {
         // pure comments → no symbols → None (caller falls back to a normal read)
-        assert!(skeleton(std::path::Path::new("a.rs"), "// just\n// comments\n", "a.rs").is_none());
+        assert!(skeleton(
+            std::path::Path::new("a.rs"),
+            "// just\n// comments\n",
+            "a.rs"
+        )
+        .is_none());
         // unsupported language → None
-        assert!(skeleton(std::path::Path::new("a.unknownext"), "anything", "a.unknownext").is_none());
+        assert!(skeleton(
+            std::path::Path::new("a.unknownext"),
+            "anything",
+            "a.unknownext"
+        )
+        .is_none());
     }
 
     #[test]
@@ -224,7 +234,10 @@ mod tests {
         let sk = skeleton(std::path::Path::new("a.rs"), src, "src/a.rs").expect("skeleton");
         // Header names the file + the full-shape call once.
         assert!(sk.contains("src/a.rs"), "header must name the file: {sk}");
-        assert!(sk.contains("read_file"), "header must show the recovery call: {sk}");
+        assert!(
+            sk.contains("read_file"),
+            "header must show the recovery call: {sk}"
+        );
         // `bar` spans L5-7 → offset=5, limit=3 (7-5+1). Exact, not a guess.
         assert!(
             sk.contains("offset=5, limit=3"),

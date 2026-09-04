@@ -62,12 +62,8 @@ mod tests {
         );
 
         assert_eq!(messages.len(), 3);
-        assert!(messages[2]
-            .text
-            .starts_with("<mcp-server-instructions>\n"));
-        assert!(messages[2]
-            .text
-            .ends_with("\n</mcp-server-instructions>"));
+        assert!(messages[2].text.starts_with("<mcp-server-instructions>\n"));
+        assert!(messages[2].text.ends_with("\n</mcp-server-instructions>"));
         assert!(!messages[2].text.contains("<system-reminder>"));
         assert!(messages[2].text.contains("server-scoped guidance"));
     }

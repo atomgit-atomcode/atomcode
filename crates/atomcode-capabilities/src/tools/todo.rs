@@ -41,7 +41,9 @@ impl TodoStatus {
             "pending" | "todo" | "open" | "waiting" | "not started" | "not_started" | "待办"
             | "未开始" => Some(TodoStatus::Pending),
             "in_progress" | "in-progress" | "in progress" | "inprogress" | "doing" | "started"
-            | "active" | "working" | "running" | "进行中" | "开发中" => Some(TodoStatus::InProgress),
+            | "active" | "working" | "running" | "进行中" | "开发中" => {
+                Some(TodoStatus::InProgress)
+            }
             "completed" | "complete" | "done" | "finished" | "closed" | "resolved" | "已完成"
             | "完成" => Some(TodoStatus::Completed),
             _ => None,
@@ -487,7 +489,10 @@ mod tests {
     fn parse_lenient_accepts_synonyms_case_and_whitespace() {
         // Issue #1456: long-context updates routinely carry near-miss status
         // variants; the incremental `update` path must not reject them.
-        assert_eq!(TodoStatus::parse_lenient("done"), Some(TodoStatus::Completed));
+        assert_eq!(
+            TodoStatus::parse_lenient("done"),
+            Some(TodoStatus::Completed)
+        );
         assert_eq!(
             TodoStatus::parse_lenient("complete"),
             Some(TodoStatus::Completed)
@@ -512,7 +517,10 @@ mod tests {
             TodoStatus::parse_lenient("InProgress"),
             Some(TodoStatus::InProgress)
         );
-        assert_eq!(TodoStatus::parse_lenient("doing"), Some(TodoStatus::InProgress));
+        assert_eq!(
+            TodoStatus::parse_lenient("doing"),
+            Some(TodoStatus::InProgress)
+        );
         assert_eq!(TodoStatus::parse_lenient("todo"), Some(TodoStatus::Pending));
         assert_eq!(
             TodoStatus::parse_lenient("waiting"),

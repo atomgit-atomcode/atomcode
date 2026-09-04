@@ -315,7 +315,10 @@ mod tests {
         // provider is a distinct preset on `/api/coding/paas/v4`, sharing the
         // same OpenAI-compatible type and `ZHIPUAI_API_KEY`.
         let token = preset("zhipu").expect("zhipu preset");
-        assert_eq!(token.default_base_url, Some("https://open.bigmodel.cn/api/paas/v4"));
+        assert_eq!(
+            token.default_base_url,
+            Some("https://open.bigmodel.cn/api/paas/v4")
+        );
 
         let coding = preset("zhipu-coding").expect("zhipu-coding preset");
         assert_eq!(coding.display_name, "Zhipu Coding Plan");
@@ -324,7 +327,10 @@ mod tests {
             coding.default_base_url,
             Some("https://open.bigmodel.cn/api/coding/paas/v4")
         );
-        assert_eq!(coding.api_key_env, token.api_key_env, "same ZHIPUAI_API_KEY");
+        assert_eq!(
+            coding.api_key_env, token.api_key_env,
+            "same ZHIPUAI_API_KEY"
+        );
     }
 
     #[test]

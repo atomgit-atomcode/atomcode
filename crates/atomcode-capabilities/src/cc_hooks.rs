@@ -498,7 +498,10 @@ impl CCExternalHooks {
     /// Build from an explicit hook list (used by tests + a future plugin source).
     pub fn new(hooks: Vec<HookConfig>, cwd: impl Into<String>) -> Self {
         let has_post_tool_hooks = hooks.iter().any(|h| {
-            matches!(h.event, HookEvent::PostToolUse | HookEvent::PostToolUseFailure)
+            matches!(
+                h.event,
+                HookEvent::PostToolUse | HookEvent::PostToolUseFailure
+            )
         });
         Self {
             hooks,
@@ -901,9 +904,11 @@ impl ToolMiddleware for CCExternalHooks {
         // deterministically (the per-tool path typically has 0-1 hooks, so there is
         // little to gain from the session_*-style concurrency here).
         let mut outcome = AfterOutcome::Proceed;
-        for hook in self.hooks.iter().filter(|h| {
-            h.event == event && post_tool_matches(&h.matcher, tool_name.as_deref())
-        }) {
+        for hook in self
+            .hooks
+            .iter()
+            .filter(|h| h.event == event && post_tool_matches(&h.matcher, tool_name.as_deref()))
+        {
             let Some((_code, stdout, _stderr)) = run_command_hook(hook, &payload).await else {
                 continue;
             };
@@ -919,10 +924,7 @@ impl ToolMiddleware for CCExternalHooks {
                 }
                 if d.decision.as_deref() == Some("block") {
                     outcome = AfterOutcome::Block {
-                        reason: d
-                            .reason
-                            .clone()
-                            .unwrap_or_else(|| "blocked by hook".into()),
+                        reason: d.reason.clone().unwrap_or_else(|| "blocked by hook".into()),
                     };
                 }
             }
@@ -1717,7 +1719,10 @@ mod tests {
             images: vec![],
         };
         cc.after(&mut ok, None).await;
-        assert_eq!(ok.content, "OK-REWRITE", "success must fire PostToolUse, not PostToolUseFailure");
+        assert_eq!(
+            ok.content, "OK-REWRITE",
+            "success must fire PostToolUse, not PostToolUseFailure"
+        );
 
         // A FAILED call: only the PostToolUseFailure hook may rewrite.
         let mut call = ToolCall {

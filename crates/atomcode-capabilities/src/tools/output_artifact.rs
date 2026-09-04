@@ -17,7 +17,10 @@ pub fn artifact_id(bytes: &[u8]) -> String {
 }
 
 fn is_valid_id(id: &str) -> bool {
-    id.len() == 16 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    id.len() == 16
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Content-addressed store for full tool outputs, one directory per session.
@@ -170,7 +173,9 @@ mod tests {
         let b = super::artifact_id(b"hello world");
         assert_eq!(a, b);
         assert_eq!(a.len(), 16);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_ne!(a, super::artifact_id(b"hello worlD"));
     }
 
@@ -205,8 +210,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = super::ArtifactStore::new(dir.path());
         assert!(store.get("0123456789abcdef", 0, 10).unwrap().is_none()); // absent
-        assert!(store.get("../etc/passwd", 0, 10).unwrap().is_none());    // traversal → rejected
-        assert!(store.get("XYZ", 0, 10).unwrap().is_none());              // non-hex → rejected
+        assert!(store.get("../etc/passwd", 0, 10).unwrap().is_none()); // traversal → rejected
+        assert!(store.get("XYZ", 0, 10).unwrap().is_none()); // non-hex → rejected
     }
 
     #[tokio::test]
@@ -214,9 +219,19 @@ mod tests {
         use atomcode_kernel::middleware::{AfterOutcome, ToolMiddleware};
         use atomcode_kernel::tool::ToolResult;
         let dir = tempfile::tempdir().unwrap();
-        let mw = super::ArtifactMiddleware::new(std::sync::Arc::new(super::ArtifactStore::new(dir.path())));
-        let mut r = ToolResult { call_id: "c".into(), content: "small".into(), is_error: false, images: vec![] };
-        assert!(matches!(mw.after(&mut r, None).await, AfterOutcome::Proceed));
+        let mw = super::ArtifactMiddleware::new(std::sync::Arc::new(super::ArtifactStore::new(
+            dir.path(),
+        )));
+        let mut r = ToolResult {
+            call_id: "c".into(),
+            content: "small".into(),
+            is_error: false,
+            images: vec![],
+        };
+        assert!(matches!(
+            mw.after(&mut r, None).await,
+            AfterOutcome::Proceed
+        ));
         assert_eq!(r.content, "small");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0); // nothing stored
     }
@@ -229,7 +244,12 @@ mod tests {
         let store = std::sync::Arc::new(super::ArtifactStore::new(dir.path()));
         let mw = super::ArtifactMiddleware::new(store.clone());
         let big = "x".repeat(20 * 1024);
-        let mk = || ToolResult { call_id: "c".into(), content: big.clone(), is_error: false, images: vec![] };
+        let mk = || ToolResult {
+            call_id: "c".into(),
+            content: big.clone(),
+            is_error: false,
+            images: vec![],
+        };
 
         let mut r1 = mk();
         mw.after(&mut r1, None).await;
@@ -239,7 +259,10 @@ mod tests {
         let id = super::artifact_id(big.as_bytes());
         assert!(r1.content.contains(&id));
         // artifact holds the FULL original
-        assert_eq!(store.get(&id, 0, big.len()).unwrap().unwrap(), big.as_bytes());
+        assert_eq!(
+            store.get(&id, 0, big.len()).unwrap().unwrap(),
+            big.as_bytes()
+        );
 
         // determinism: same output → byte-identical rewritten content
         let mut r2 = mk();
@@ -268,7 +291,10 @@ mod tests {
             is_error: false,
             images: vec![],
         };
-        assert!(matches!(mw.after(&mut r, Some(&tool)).await, AfterOutcome::Proceed));
+        assert!(matches!(
+            mw.after(&mut r, Some(&tool)).await,
+            AfterOutcome::Proceed
+        ));
         assert_eq!(r.content, big, "self-bounding output must be untouched");
         assert!(!r.content.contains("fetch_output"));
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0); // nothing stored
@@ -290,9 +316,16 @@ mod tests {
         use atomcode_kernel::middleware::ToolMiddleware;
         use atomcode_kernel::tool::ToolResult;
         let dir = tempfile::tempdir().unwrap();
-        let mw = super::ArtifactMiddleware::new(std::sync::Arc::new(super::ArtifactStore::new(dir.path())));
+        let mw = super::ArtifactMiddleware::new(std::sync::Arc::new(super::ArtifactStore::new(
+            dir.path(),
+        )));
         let huge = "y".repeat(5 * 1024 * 1024);
-        let mut r = ToolResult { call_id: "c".into(), content: huge, is_error: false, images: vec![] };
+        let mut r = ToolResult {
+            call_id: "c".into(),
+            content: huge,
+            is_error: false,
+            images: vec![],
+        };
         mw.after(&mut r, None).await;
         assert!(r.content.contains("Full output unavailable"));
         assert!(!r.content.contains("fetch_output"));
@@ -441,10 +474,7 @@ mod fetch_output_tests {
         // limit hard-capped at 64 KiB even if bigger requested
         let r = tool
             .execute(
-                &format!(
-                    r#"{{"artifact_id":"{}","offset":0,"limit":999999}}"#,
-                    id
-                ),
+                &format!(r#"{{"artifact_id":"{}","offset":0,"limit":999999}}"#, id),
                 &test_ctx,
             )
             .await;
@@ -466,7 +496,11 @@ mod fetch_output_tests {
                 &test_ctx,
             )
             .await;
-        assert!(r.is_error, "missing artifact should be an error: {}", r.content);
+        assert!(
+            r.is_error,
+            "missing artifact should be an error: {}",
+            r.content
+        );
         assert!(
             r.content.to_lowercase().contains("re-run"),
             "error should tell user to re-run: {}",

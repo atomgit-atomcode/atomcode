@@ -1802,8 +1802,7 @@ mod tests {
 
     #[test]
     fn external_subagent_delegation_is_gated_on_the_mount_flag() {
-        let on =
-            coding_persona_with_capabilities("glm-5.2", None, true, false, false, false, true);
+        let on = coding_persona_with_capabilities("glm-5.2", None, true, false, false, false, true);
         assert!(on.contains("## EXTERNAL AGENT SUBAGENTS:"));
         assert!(on.contains("subagent_<name>"));
         let off =

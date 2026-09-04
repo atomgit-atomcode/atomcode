@@ -142,7 +142,9 @@ impl TeamProjection {
                 };
                 // Freeze elapsed at the terminal transition so a finished member's
                 // row stops ticking while sibling members keep the group live.
-                member.finished_at.get_or_insert_with(std::time::Instant::now);
+                member
+                    .finished_at
+                    .get_or_insert_with(std::time::Instant::now);
                 run.total = run.total.max(run.members.len());
             }
             TeamEventPayload::RunFinished { total, .. } => {
@@ -348,14 +350,26 @@ mod tests {
         );
         assert!(state.summary().contains("1 stopped"));
         assert_eq!(
-            state.panel().unwrap().items.iter()
-                .find(|item| item.label == "b#1").unwrap().status,
+            state
+                .panel()
+                .unwrap()
+                .items
+                .iter()
+                .find(|item| item.label == "b#1")
+                .unwrap()
+                .status,
             SubtaskStatus::Stopped
         );
         // Real per-member token estimate flows through to the panel (was hardcoded 0).
         assert_eq!(
-            state.panel().unwrap().items.iter()
-                .find(|item| item.label == "a#1").unwrap().output_tokens,
+            state
+                .panel()
+                .unwrap()
+                .items
+                .iter()
+                .find(|item| item.label == "a#1")
+                .unwrap()
+                .output_tokens,
             900
         );
         state.hide();
@@ -429,14 +443,20 @@ mod tests {
         assert!(state.panel().is_none(), "all Team runs are terminal");
 
         state.show();
-        assert!(state.panel().is_some(), "history remains available via /team show");
+        assert!(
+            state.panel().is_some(),
+            "history remains available via /team show"
+        );
     }
 
     #[test]
     fn per_run_progress_has_unique_projection_id_and_excludes_other_runs() {
         let mut state = TeamProjection::default();
         for (run_id, role) in [("a", TeamRoleId::Explorer), ("b", TeamRoleId::Reviewer)] {
-            state.apply(1, event(run_id, 1, TeamEventPayload::RunStarted { total: 1 }));
+            state.apply(
+                1,
+                event(run_id, 1, TeamEventPayload::RunStarted { total: 1 }),
+            );
             state.apply(
                 1,
                 event(
@@ -509,11 +529,7 @@ mod tests {
             ),
         );
         let panel = state.panel().unwrap();
-        let item = panel
-            .items
-            .iter()
-            .find(|item| item.label == "a#1")
-            .unwrap();
+        let item = panel.items.iter().find(|item| item.label == "a#1").unwrap();
         assert_eq!(item.status, SubtaskStatus::Running);
         assert_eq!(item.activity, "done");
         assert_eq!(item.output_tokens, 500, "token 计数必须单调取 max");
@@ -555,11 +571,7 @@ mod tests {
             ),
         );
         let panel = state.panel().unwrap();
-        let item = panel
-            .items
-            .iter()
-            .find(|item| item.label == "a#1")
-            .unwrap();
+        let item = panel.items.iter().find(|item| item.label == "a#1").unwrap();
         assert_eq!(item.status, SubtaskStatus::Completed);
         assert_eq!(item.activity, "ok");
         assert_eq!(item.output_tokens, 100);

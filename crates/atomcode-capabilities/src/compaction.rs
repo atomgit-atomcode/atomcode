@@ -298,8 +298,11 @@ impl OverflowCompaction {
                 // calls, which stubbing tool results alone can't reduce). Without the
                 // split, `active_turn_start` returns the turn start → noop on a one-turn
                 // overflow → the doomed request fires anyway.
-                let drain_to =
-                    recent_keep_boundary_splitting(msgs, recent_keep_budget(view.ctx_window), floor);
+                let drain_to = recent_keep_boundary_splitting(
+                    msgs,
+                    recent_keep_budget(view.ctx_window),
+                    floor,
+                );
                 if drain_to <= floor {
                     return CompactionPlan::noop(); // nothing older than the kept window
                 }
@@ -897,7 +900,10 @@ fn recent_keep_boundary_splitting(
     // message (an assistant/user) and its trailing results, so the model retains one real
     // recent exchange to continue from.
     if boundary >= msgs.len() {
-        if let Some(keep_from) = (floor..msgs.len()).rev().find(|&i| msgs[i].role != Role::Tool) {
+        if let Some(keep_from) = (floor..msgs.len())
+            .rev()
+            .find(|&i| msgs[i].role != Role::Tool)
+        {
             boundary = keep_from;
         }
     }
@@ -987,7 +993,10 @@ mod tests {
         let total: usize = msgs.iter().map(|m| m.estimate_tokens() as usize).sum();
         let budget = total / 4; // active turn alone far exceeds this → must split
         let b = recent_keep_boundary_splitting(&msgs, budget, floor);
-        assert!(b > floor, "must drain the older prefix of the giant turn (b={b})");
+        assert!(
+            b > floor,
+            "must drain the older prefix of the giant turn (b={b})"
+        );
         assert!(b < msgs.len(), "must keep some recent messages (b={b})");
         assert_ne!(
             msgs[b].role,
@@ -1010,8 +1019,15 @@ mod tests {
         let budget = 1; // absurdly small → would keep only the last (Tool) message
         let b = recent_keep_boundary_splitting(&msgs, budget, 0);
         assert!(b < msgs.len(), "must keep at least one message (b={b})");
-        assert_ne!(msgs[b].role, Role::Tool, "kept span starts at a real message");
-        assert_eq!(b, 1, "keeps the last assistant + its result, drains the User (b={b})");
+        assert_ne!(
+            msgs[b].role,
+            Role::Tool,
+            "kept span starts at a real message"
+        );
+        assert_eq!(
+            b, 1,
+            "keeps the last assistant + its result, drains the User (b={b})"
+        );
     }
 
     #[test]

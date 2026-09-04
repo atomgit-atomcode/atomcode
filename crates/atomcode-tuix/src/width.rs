@@ -387,7 +387,11 @@ pub(crate) fn cluster_width(g: &str) -> usize {
             max_w = w;
         }
     }
-    if has_emoji_marker { 2 } else { max_w }
+    if has_emoji_marker {
+        2
+    } else {
+        max_w
+    }
 }
 
 /// Terminal column width of a string, CJK- and emoji-cluster-aware.
@@ -896,8 +900,8 @@ mod tests {
             ("hello", 5, 20),                // fits, cursor at end
             ("hello", 2, 20),                // fits, cursor mid
             ("", 0, 20),                     // empty
-            ("aaaaaaaaaaaaaaaaaaaa", 20, 8),  // overflow, cursor at end (left clipped)
-            ("aaaaaaaaaaaaaaaaaaaa", 10, 8),  // overflow, cursor mid (both clipped)
+            ("aaaaaaaaaaaaaaaaaaaa", 20, 8), // overflow, cursor at end (left clipped)
+            ("aaaaaaaaaaaaaaaaaaaa", 10, 8), // overflow, cursor mid (both clipped)
             ("你好世界你好世界", 6, 7),      // CJK overflow
         ];
         for (val, cur, max) in cases {
@@ -939,7 +943,7 @@ mod tests {
         assert_eq!(cell_char_width('⑳'), Some(2));
         assert_eq!(display_width("③的"), 4); // 2 + 2
         assert_eq!(display_width("①②③"), 6); // each 2 cols
-        // Ⓜ stays wide (pre-existing), and a plain ASCII digit stays narrow.
+                                             // Ⓜ stays wide (pre-existing), and a plain ASCII digit stays narrow.
         assert_eq!(cell_char_width('Ⓜ'), Some(2));
         assert_eq!(cell_char_width('3'), Some(1));
     }
@@ -955,8 +959,8 @@ mod tests {
         assert!(is_wide_emoji_symbol('❄')); // U+2744 snowflake
         assert!(is_wide_emoji_symbol('⭐')); // U+2B50 star
         assert!(is_wide_emoji_symbol('⚡')); // U+26A1 high voltage
-        // NOT emoji — must stay narrow, or we'd regress ordinary ambiguous
-        // text symbols (the whole point of scoping to the Emoji set).
+                                             // NOT emoji — must stay narrow, or we'd regress ordinary ambiguous
+                                             // text symbols (the whole point of scoping to the Emoji set).
         assert!(!is_wide_emoji_symbol('✓')); // U+2713 check mark (Emoji=No)
         assert!(!is_wide_emoji_symbol('°')); // U+00B0 degree sign
         assert!(!is_wide_emoji_symbol('◆')); // U+25C6 black diamond
@@ -974,7 +978,7 @@ mod tests {
         let sun = if emoji_wide_enabled() { 2 } else { 1 };
         assert_eq!(display_width("☀"), sun);
         assert_eq!(display_width("☀ 晴"), sun + 1 + 2); // sun + space + CJK
-        // Ambiguous-but-not-emoji content is never widened by this path.
+                                                        // Ambiguous-but-not-emoji content is never widened by this path.
         assert_eq!(display_width("✓"), 1);
         assert_eq!(display_width("20°C"), 4);
     }
@@ -987,13 +991,13 @@ mod tests {
         assert!(is_narrow_emoji_1f000('\u{1F396}')); // 🎖 military medal
         assert!(is_narrow_emoji_1f000('\u{1F5FA}')); // 🗺 world map
         assert!(is_narrow_emoji_1f000('\u{1F700}')); // 🜀 alchemical symbol
-        // U+1F1E6..=U+1F1FF (Regional Indicator) are excluded.
+                                                     // U+1F1E6..=U+1F1FF (Regional Indicator) are excluded.
         assert!(!is_narrow_emoji_1f000('\u{1F1E6}')); // 🇦 Regional Indicator A
         assert!(!is_narrow_emoji_1f000('\u{1F1FF}')); // 🇿 Regional Indicator Z
-        // Wide emoji (EA=W) are NOT in this set — they're already width 2.
+                                                      // Wide emoji (EA=W) are NOT in this set — they're already width 2.
         assert!(!is_narrow_emoji_1f000('\u{1F4C5}')); // 📅 calendar (EA=W)
         assert!(!is_narrow_emoji_1f000('\u{1F4A7}')); // 💧 droplet (EA=W)
-        // Outside range.
+                                                      // Outside range.
         assert!(!is_narrow_emoji_1f000('a'));
         assert!(!is_narrow_emoji_1f000('你'));
     }

@@ -1068,7 +1068,7 @@ const BREATH_BRIGHT: u8 = 255;
 /// Pure fn of `elapsed` so the curve is unit-tested without a clock.
 fn breath_gray(elapsed: std::time::Duration) -> u8 {
     let phase = (elapsed.as_millis() % BREATH_PERIOD_MS) as f64 / BREATH_PERIOD_MS as f64; // 0..1
-    // cos goes 1 → -1 → 1 over the cycle; (1-cos)/2 gives 0 → 1 → 0 (dim→bright→dim).
+                                                                                           // cos goes 1 → -1 → 1 over the cycle; (1-cos)/2 gives 0 → 1 → 0 (dim→bright→dim).
     let t = (1.0 - (phase * std::f64::consts::TAU).cos()) / 2.0;
     let span = (BREATH_BRIGHT - BREATH_DIM) as f64;
     BREATH_DIM + (t * span).round() as u8
@@ -3611,27 +3611,35 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .collect();
         terminal_items.sort_by(|a, b| b.finished_at.cmp(&a.finished_at));
         let slots = MAX_VISIBLE_RUNNING_SUBTASKS.min(cap.saturating_sub(1) / 2);
-        let mut visible: Vec<&crate::render::SubtaskItem> = running.iter().copied().take(slots).collect();
+        let mut visible: Vec<&crate::render::SubtaskItem> =
+            running.iter().copied().take(slots).collect();
         for item in terminal_items {
             if visible.len() >= slots {
                 break;
             }
             visible.push(item);
         }
-        let sub_glyph = if self.caps.unicode_symbols { "\u{2514}" } else { "`" };
-        let dot = if self.caps.unicode_symbols { "\u{25cf}" } else { "[>]" };
+        let sub_glyph = if self.caps.unicode_symbols {
+            "\u{2514}"
+        } else {
+            "`"
+        };
+        let dot = if self.caps.unicode_symbols {
+            "\u{25cf}"
+        } else {
+            "[>]"
+        };
         for item in visible {
             // Running dots breathe; terminal dots take the status colour.
             let (row_style, dot_style) = match item.status {
-                SubtaskStatus::Running => {
-                    (self.style_for(Role::Secondary), self.breathing_bullet_style())
-                }
+                SubtaskStatus::Running => (
+                    self.style_for(Role::Secondary),
+                    self.breathing_bullet_style(),
+                ),
                 SubtaskStatus::Stopped => {
                     (self.style_for(Role::Warning), self.style_for(Role::Warning))
                 }
-                SubtaskStatus::Failed => {
-                    (self.style_for(Role::Error), self.style_for(Role::Error))
-                }
+                SubtaskStatus::Failed => (self.style_for(Role::Error), self.style_for(Role::Error)),
                 _ => (self.style_for(Role::Muted), self.style_for(Role::Muted)),
             };
             let mut identity = if item.description.is_empty() {
@@ -8569,9 +8577,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     SubtaskStatus::Stopped => {
                         crate::i18n::t(crate::i18n::Msg::SubagentStatusStopped)
                     }
-                    SubtaskStatus::Failed => {
-                        crate::i18n::t(crate::i18n::Msg::SubagentStatusFailed)
-                    }
+                    SubtaskStatus::Failed => crate::i18n::t(crate::i18n::Msg::SubagentStatusFailed),
                     SubtaskStatus::Pending => {
                         crate::i18n::t(crate::i18n::Msg::SubagentStatusWaiting)
                     }
@@ -11509,8 +11515,14 @@ mod tests {
             "Error: invalid JSON arguments for tool"
         ));
         // Success is never a failure, regardless of the text.
-        assert!(!is_recoverable_tool_failure(true, "[elapsed: 0.0s, exit: 0]"));
-        assert!(!is_recoverable_tool_failure(true, "x The file was NOT modified"));
+        assert!(!is_recoverable_tool_failure(
+            true,
+            "[elapsed: 0.0s, exit: 0]"
+        ));
+        assert!(!is_recoverable_tool_failure(
+            true,
+            "x The file was NOT modified"
+        ));
     }
 
     #[test]
@@ -11522,7 +11534,10 @@ mod tests {
         }
         // Gutter glyph + space at col 0 is stripped → the command text alone.
         assert_eq!(copy_text_from_tool_row(&row("● bash")).0, "bash");
-        assert_eq!(copy_text_from_tool_row(&row("└ cargo build")).0, "cargo build");
+        assert_eq!(
+            copy_text_from_tool_row(&row("└ cargo build")).0,
+            "cargo build"
+        );
         // Parallel child row is doubly-anchored (`└ • Tool …`): BOTH the `└`
         // connector and the `•` status dot must be stripped from the copy.
         assert_eq!(
@@ -11544,10 +11559,16 @@ mod tests {
         assert_eq!(copy_text_from_tool_row(&row("  stdout")).0, "stdout");
         assert_eq!(copy_text_from_tool_row(&row("    nested")).0, "  nested");
         // A gutter AFTER the pad (the result line `  └ [exit: 0]`) is stripped too.
-        assert_eq!(copy_text_from_tool_row(&row("  └ [exit: 0]")).0, "[exit: 0]");
+        assert_eq!(
+            copy_text_from_tool_row(&row("  └ [exit: 0]")).0,
+            "[exit: 0]"
+        );
         // But a box-drawing glyph NOT followed by a space (real tree output) is
         // preserved — the space requirement guards it.
-        assert_eq!(copy_text_from_tool_row(&row("  └── file.rs")).0, "└── file.rs");
+        assert_eq!(
+            copy_text_from_tool_row(&row("  └── file.rs")).0,
+            "└── file.rs"
+        );
         // Non-unicode terminal: the gutter downgrades to an ASCII stand-in
         // (`● `→`* `, `▸ `→`> `, `└ `→`` ` ``). At col 0 (a header row) it is
         // still stripped.
@@ -11840,10 +11861,7 @@ mod tests {
         let row = run.rect.row as usize;
         let col = run.rect.col as usize;
         let selection_bg = crate::render::theme::selection_bg_for_current_theme();
-        assert!(
-            cells[row][col].style.bg.is_none(),
-            "ASCII prefix unchanged"
-        );
+        assert!(cells[row][col].style.bg.is_none(), "ASCII prefix unchanged");
         assert_eq!(
             cells[row][col + 1].style.bg,
             Some(selection_bg),
@@ -16112,7 +16130,11 @@ mod tests {
     /// assert the committed `●` bullet's fg equals `expected`. Colour is applied
     /// AT COMMIT from the outcome the event loop passes — not at ToolResult — so
     /// a result that belongs to no header can never miscolour one.
-    fn assert_commit_bullet(outcome: Option<crate::render::ToolOutcome>, expected: Role, label: &str) {
+    fn assert_commit_bullet(
+        outcome: Option<crate::render::ToolOutcome>,
+        expected: Role,
+        label: &str,
+    ) {
         let _theme = crate::highlight::theme::test_lock();
         crate::highlight::theme::set_theme_mode(false); // dark
         let (mut r, _buf) = new_capturing(80, 24);
@@ -16135,7 +16157,11 @@ mod tests {
         use std::time::Duration;
         // Cosine-eased breath: starts DIM, peaks BRIGHT at mid-cycle, back to
         // DIM at the end, then wraps continuously.
-        assert_eq!(breath_gray(Duration::from_millis(0)), BREATH_DIM, "start = dim");
+        assert_eq!(
+            breath_gray(Duration::from_millis(0)),
+            BREATH_DIM,
+            "start = dim"
+        );
         assert_eq!(
             breath_gray(Duration::from_millis(600)),
             BREATH_BRIGHT,
@@ -16149,7 +16175,10 @@ mod tests {
         // Rising and falling quarters sit strictly between dim and bright.
         let up = breath_gray(Duration::from_millis(300));
         let down = breath_gray(Duration::from_millis(900));
-        assert!(up > BREATH_DIM && up < BREATH_BRIGHT, "quarter up mid-range: {up}");
+        assert!(
+            up > BREATH_DIM && up < BREATH_BRIGHT,
+            "quarter up mid-range: {up}"
+        );
         assert!(
             down > BREATH_DIM && down < BREATH_BRIGHT,
             "three-quarter down mid-range: {down}"
@@ -16335,8 +16364,16 @@ mod tests {
             .map(|c| c.style.fg)
             .collect();
         assert_eq!(dots.len(), 2, "two child status dots");
-        assert_eq!(dots[0], r.style_for(Role::Success).fg, "c1 dot green (success)");
-        assert_eq!(dots[1], r.style_for(Role::ToolName).fg, "c2 dot neutral (failure)");
+        assert_eq!(
+            dots[0],
+            r.style_for(Role::Success).fg,
+            "c1 dot green (success)"
+        );
+        assert_eq!(
+            dots[1],
+            r.style_for(Role::ToolName).fg,
+            "c2 dot neutral (failure)"
+        );
     }
 
     #[test]
@@ -16373,7 +16410,11 @@ mod tests {
             .collect();
         assert_eq!(dots.len(), 2, "two child dots at initial render");
         assert_eq!(dots[0], r.style_for(Role::Success).fg, "c1 green (success)");
-        assert_eq!(dots[1], r.style_for(Role::ToolName).fg, "c2 neutral (failure)");
+        assert_eq!(
+            dots[1],
+            r.style_for(Role::ToolName).fg,
+            "c2 neutral (failure)"
+        );
     }
 
     #[test]
@@ -16412,8 +16453,16 @@ mod tests {
             .map(|c| c.style.fg)
             .collect();
         assert_eq!(bullets.len(), 2, "two committed tool headers");
-        assert_eq!(bullets[0], r.style_for(Role::ToolName).fg, "first (fail) = neutral");
-        assert_eq!(bullets[1], r.style_for(Role::Success).fg, "second (ok) = green");
+        assert_eq!(
+            bullets[0],
+            r.style_for(Role::ToolName).fg,
+            "first (fail) = neutral"
+        );
+        assert_eq!(
+            bullets[1],
+            r.style_for(Role::Success).fg,
+            "second (ok) = green"
+        );
     }
 
     /// Dark-theme color hierarchy: the `└` result line (leaf glyph +
@@ -19511,7 +19560,10 @@ mod tests {
                 "{hidden} is header-only while 3 running fill the slots"
             );
         }
-        assert!(text.iter().all(|l| !l.contains("· 1 failed")), "no summary line");
+        assert!(
+            text.iter().all(|l| !l.contains("· 1 failed")),
+            "no summary line"
+        );
     }
 
     #[test]
@@ -19550,8 +19602,14 @@ mod tests {
         // The current action rides its own detail row; tool count on the primary.
         // (Wide CJK chars reconstruct with continuation cells, so assert on the
         // ASCII fragments that survive: the tool count and the "grep" action.)
-        assert!(text.iter().any(|l| l.contains("grep")), "current action on a detail row");
-        assert!(text.iter().any(|l| l.contains("tool use")), "tool count on a primary row");
+        assert!(
+            text.iter().any(|l| l.contains("grep")),
+            "current action on a detail row"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("tool use")),
+            "tool count on a primary row"
+        );
     }
 
     #[test]
@@ -20702,10 +20760,7 @@ mod tests {
             "cursor must stay visible on the custom-answer text field"
         );
         // On a regular option (arrow navigation) → cursor hidden.
-        assert!(
-            !render_visible(0),
-            "cursor hidden while navigating options"
-        );
+        assert!(!render_visible(0), "cursor hidden while navigating options");
     }
 
     #[test]
@@ -21466,9 +21521,15 @@ mod tests {
         // Circled digits are width-aware: width-1 hosts (legacy narrow fonts)
         // insert a synthetic space after the label, width-2 hosts (emoji-
         // capable terminals) already separate via the glyph's second cell.
-        let sep = if crate::width::cell_char_width('①') == Some(1) { " " } else { "" };
+        let sep = if crate::width::cell_char_width('①') == Some(1) {
+            " "
+        } else {
+            ""
+        };
         assert!(
-            visible.contains(&format!("如果是 ①{sep}Rust、②{sep}前端：属于模型没加空格，无需修 TUI。")),
+            visible.contains(&format!(
+                "如果是 ①{sep}Rust、②{sep}前端：属于模型没加空格，无需修 TUI。"
+            )),
             "committed user echo should use the width-aware circled-label spacing: {visible:?}"
         );
         // On width-1 hosts the synthetic space must appear; on width-2 hosts
@@ -22106,9 +22167,9 @@ mod tests {
         // rule line contains at least some rule characters (not empty).
         assert!(
             !rules.is_empty()
-                && rules.iter().all(|line| line
-                    .chars()
-                    .any(|ch| matches!(ch, '━' | '─' | '=' | '-'))),
+                && rules
+                    .iter()
+                    .all(|line| line.chars().any(|ch| matches!(ch, '━' | '─' | '=' | '-'))),
             "table rules must contain rule characters: {lines:#?}"
         );
         assert!(

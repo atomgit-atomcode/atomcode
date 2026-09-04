@@ -106,8 +106,8 @@ impl ReviewAgentConfig {
             progress_label: None,
             no_web: false,
             graph_max_indexed_files: usize::MAX, // no degrade by default (bare-CLI behavior)
-            skill_dirs: Vec::new(), // no skills by default (bare-CLI behavior)
-            review_paths: Vec::new(), // no file allowlist by default (root-only confine)
+            skill_dirs: Vec::new(),              // no skills by default (bare-CLI behavior)
+            review_paths: Vec::new(),            // no file allowlist by default (root-only confine)
         }
     }
 

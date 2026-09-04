@@ -70,7 +70,8 @@ pub fn binary_on_path(bin: &str) -> bool {
         &[""]
     };
     std::env::split_paths(&path).any(|dir| {
-        exts.iter().any(|ext| is_executable_file(&dir.join(format!("{bin}{ext}"))))
+        exts.iter()
+            .any(|ext| is_executable_file(&dir.join(format!("{bin}{ext}"))))
     })
 }
 
@@ -232,9 +233,10 @@ impl Tool for ExternalSubagentTool {
                         format!(" Partial output:\n{}", res.output)
                     }
                 )),
-                SubagentStopReason::PermissionDenied => {
-                    err(format!("{}: the agent could not proceed (permission denied).", self.tool_name))
-                }
+                SubagentStopReason::PermissionDenied => err(format!(
+                    "{}: the agent could not proceed (permission denied).",
+                    self.tool_name
+                )),
             },
             Err(SubagentError::DangerousModeRefused) => err(format!(
                 "{}: bypass permission mode is not allowed in this context.",
@@ -286,8 +288,8 @@ pub fn register_external_subagent_tools(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::SubagentResult;
+    use super::*;
     use tokio_util::sync::CancellationToken;
 
     struct StubBackend {
@@ -373,7 +375,10 @@ mod tests {
 
     #[test]
     fn parse_prompt_accepts_object_and_bare_string() {
-        assert_eq!(parse_prompt(r#"{"prompt":"do it"}"#).as_deref(), Some("do it"));
+        assert_eq!(
+            parse_prompt(r#"{"prompt":"do it"}"#).as_deref(),
+            Some("do it")
+        );
         assert_eq!(parse_prompt("bare prompt").as_deref(), Some("bare prompt"));
         assert_eq!(parse_prompt(r#"{"prompt":"  "}"#), None);
         assert_eq!(parse_prompt(""), None);

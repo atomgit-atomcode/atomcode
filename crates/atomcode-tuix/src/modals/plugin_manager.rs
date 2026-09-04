@@ -1882,7 +1882,10 @@ mod tests {
         // ellipsis, never exceeding the budget and never splitting a CJK char.
         let wide = "描".repeat(40); // 80 display columns
         let out = truncate_plugin_desc(&wide);
-        assert!(out.ends_with('…'), "over-budget description must be marked truncated");
+        assert!(
+            out.ends_with('…'),
+            "over-budget description must be marked truncated"
+        );
         assert!(crate::width::display_width(&out) <= PLUGIN_DESC_DISPLAY_COLS);
         assert!(
             out.chars().all(|c| c == '描' || c == '…'),

@@ -208,7 +208,13 @@ mod tests {
     fn limit_caps_the_number_of_rows() {
         let dir = tempfile::tempdir().unwrap();
         for i in 0..5 {
-            seed(dir.path(), &format!("s{i}"), &format!("session {i}"), i as i64, 1);
+            seed(
+                dir.path(),
+                &format!("s{i}"),
+                &format!("session {i}"),
+                i as i64,
+                1,
+            );
         }
         let out = ListSessionsTool::new().list_dir(dir.path(), None, 2);
         let rows = out.matches("  • ").count();

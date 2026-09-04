@@ -262,13 +262,7 @@ mod tests {
 
     #[test]
     fn allows_relative_inside_repo() {
-        assert!(check_arguments(
-            &root(),
-            None,
-            "read_file",
-            r#"{"file_path":"src/a.rs"}"#
-        )
-        .is_ok());
+        assert!(check_arguments(&root(), None, "read_file", r#"{"file_path":"src/a.rs"}"#).is_ok());
     }
 
     #[test]
@@ -295,13 +289,9 @@ mod tests {
 
     #[test]
     fn rejects_absolute_outside_repo() {
-        assert!(check_arguments(
-            &root(),
-            None,
-            "read_file",
-            r#"{"file_path":"/etc/passwd"}"#
-        )
-        .is_err());
+        assert!(
+            check_arguments(&root(), None, "read_file", r#"{"file_path":"/etc/passwd"}"#).is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -335,20 +325,8 @@ mod tests {
     #[test]
     fn array_paths_any_escape_blocks() {
         // ast_grep `paths`: one inside, one escaping → blocked; all inside → ok.
-        assert!(check_arguments(
-            &root(),
-            None,
-            "ast_grep",
-            r#"{"paths":["src","/etc"]}"#
-        )
-        .is_err());
-        assert!(check_arguments(
-            &root(),
-            None,
-            "ast_grep",
-            r#"{"paths":["src","lib"]}"#
-        )
-        .is_ok());
+        assert!(check_arguments(&root(), None, "ast_grep", r#"{"paths":["src","/etc"]}"#).is_err());
+        assert!(check_arguments(&root(), None, "ast_grep", r#"{"paths":["src","lib"]}"#).is_ok());
     }
 
     #[test]
@@ -385,13 +363,7 @@ mod tests {
     #[test]
     fn allowlist_allows_ancestor_dir() {
         let a = allow(&["pkg/conanfile.py"]);
-        assert!(check_arguments(
-            &root(),
-            Some(&a),
-            "list_directory",
-            r#"{"path":"pkg"}"#
-        )
-        .is_ok());
+        assert!(check_arguments(&root(), Some(&a), "list_directory", r#"{"path":"pkg"}"#).is_ok());
     }
 
     #[test]
@@ -402,7 +374,7 @@ mod tests {
             &root(),
             Some(&a),
             "read_file",
-            r#"{"file_path":"pkg/notes.md"}"#
+            r#"{"file_path":"pkg/notes.md"}"#,
         );
         assert!(err.is_err(), "notes.md must be denied");
         let msg = err.unwrap_err();
@@ -428,25 +400,24 @@ mod tests {
     fn allowlist_requires_path_on_scoped_tools() {
         let a = allow(&["pkg/a.go"]);
         assert!(check_arguments(&root(), Some(&a), "grep", r#"{"pattern":"foo"}"#).is_err());
-        assert!(check_arguments(
-            &root(),
-            Some(&a),
-            "list_directory",
-            r#"{}"#
-        )
-        .is_err());
+        assert!(check_arguments(&root(), Some(&a), "list_directory", r#"{}"#).is_err());
     }
 
     #[test]
     fn allowlist_rejects_repo_root_dot() {
         let a = allow(&["pkg/a.go"]);
-        assert!(check_arguments(&root(), Some(&a), "grep", r#"{"pattern":"x","path":"."}"#).is_err());
+        assert!(
+            check_arguments(&root(), Some(&a), "grep", r#"{"pattern":"x","path":"."}"#).is_err()
+        );
     }
 
     #[test]
     fn with_allowlist_builder() {
-        let mw = PathConfineMiddleware::new(root())
-            .with_allowlist(&["pkg/a.go".into(), "".into(), "  ".into()]);
+        let mw = PathConfineMiddleware::new(root()).with_allowlist(&[
+            "pkg/a.go".into(),
+            "".into(),
+            "  ".into(),
+        ]);
         assert!(mw.allow.as_ref().unwrap().contains(Path::new("pkg/a.go")));
         assert_eq!(mw.allow.as_ref().unwrap().len(), 1);
     }

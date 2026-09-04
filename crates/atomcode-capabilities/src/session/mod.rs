@@ -39,20 +39,20 @@ pub use context::SessionContextHook;
 pub use manager::{
     aggregate_session_cost, CatalogDiagnostic, CatalogDiagnosticKind, CatalogEntry,
     CatalogLocation, CatalogPresence, CatalogScan, DetachedUsageRecorder, ForkInfo, ImportInfo,
-    ImportKind, LoadedSession, ModelCostSummary, ModelUsageStat,
-    NativeSessionRepairOutcome, SessionCostReport, SessionLease, SessionManager, SessionMeta,
-    SessionResult, SessionStoreError, StorageOwner, TokenBreakdown, TurnStat,
+    ImportKind, LoadedSession, ModelCostSummary, ModelUsageStat, NativeSessionRepairOutcome,
+    SessionCostReport, SessionLease, SessionManager, SessionMeta, SessionResult, SessionStoreError,
+    StorageOwner, TokenBreakdown, TurnStat,
 };
 pub use presentation::{
     anchor_from_legacy_position, DisplayAnchor, LegacyTurnBoundary, PresentationEntry,
     PresentationFile, PresentationRole,
 };
 pub use recall::{KeywordIndex, RecallIndex, RecallTool};
-pub use session_list::ListSessionsTool;
 pub use rewind::{
     FileChangeSummary, RewindPoint, WorkspaceCheckpoint, WorkspaceCheckpointError,
     WorkspaceRestoreReceipt,
 };
+pub use session_list::ListSessionsTool;
 pub use snapshot::{RewindTransactionReceipt, SnapshotHook};
 pub use status_reminder::StatusReminderHook;
 pub use transcript::{ToolRecord, TranscriptHook, TurnRecord, TurnTimestamp, UsageRecord};

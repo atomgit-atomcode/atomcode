@@ -23,7 +23,7 @@ fn provider(model: &str) -> ProviderConfig {
         skip_tls_verify: false,
         ephemeral: false,
         capable_model: None,
-            retry_max_attempts: None,
+        retry_max_attempts: None,
     }
 }
 

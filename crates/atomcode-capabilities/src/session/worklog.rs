@@ -168,7 +168,11 @@ pub fn build_worklog_prompt(date_label: &str, turns: &[WorklogTurn], english: bo
         });
         return s;
     }
-    s.push_str(if english { INSTRUCTION_EN } else { INSTRUCTION_ZH });
+    s.push_str(if english {
+        INSTRUCTION_EN
+    } else {
+        INSTRUCTION_ZH
+    });
     s.push_str(if english {
         "\n---\nRaw activity:\n"
     } else {
@@ -374,9 +378,17 @@ mod tests {
         // (the near-midnight first-turn case).
         e.created_at_ms = 0;
         e.updated_at_ms = 1_000_000;
-        assert!(session_overlaps_day(&e, 1_000_000 + OVERLAP_SKEW_MS - 1, 2_000_000));
+        assert!(session_overlaps_day(
+            &e,
+            1_000_000 + OVERLAP_SKEW_MS - 1,
+            2_000_000
+        ));
         // Beyond the skew margin → excluded.
-        assert!(!session_overlaps_day(&e, 1_000_000 + OVERLAP_SKEW_MS + 1, 2_000_000));
+        assert!(!session_overlaps_day(
+            &e,
+            1_000_000 + OVERLAP_SKEW_MS + 1,
+            2_000_000
+        ));
     }
 
     #[test]
@@ -388,14 +400,29 @@ mod tests {
         ];
         let zh = build_worklog_prompt("8/27", &turns, false);
         assert!(zh.contains("工作内容") && zh.contains("时长") && zh.contains("问题与评价"));
-        assert!(zh.contains("项目 atomcode") && zh.contains("项目 other"), "grouped: {zh}");
-        assert!(zh.contains("≈2h0m") && zh.contains("含等待/挂起"), "long flagged: {zh}");
+        assert!(
+            zh.contains("项目 atomcode") && zh.contains("项目 other"),
+            "grouped: {zh}"
+        );
+        assert!(
+            zh.contains("≈2h0m") && zh.contains("含等待/挂起"),
+            "long flagged: {zh}"
+        );
         assert!(zh.contains("全天合计"), "grand total: {zh}");
 
         let en = build_worklog_prompt("8/27", &turns, true);
-        assert!(en.contains("Work item") && en.contains("Issues & notes"), "en template: {en}");
-        assert!(!en.contains("工作内容") && !en.contains("项目"), "no Chinese in en: {en}");
-        assert!(en.contains("incl. wait/hang") && en.contains("Day total"), "{en}");
+        assert!(
+            en.contains("Work item") && en.contains("Issues & notes"),
+            "en template: {en}"
+        );
+        assert!(
+            !en.contains("工作内容") && !en.contains("项目"),
+            "no Chinese in en: {en}"
+        );
+        assert!(
+            en.contains("incl. wait/hang") && en.contains("Day total"),
+            "{en}"
+        );
     }
 
     #[test]
@@ -406,7 +433,11 @@ mod tests {
             .collect();
         let out = build_worklog_prompt("8/27", &turns, false);
         let shown = out.matches("- [≈1m]").count();
-        assert_eq!(shown, super::MAX_TURNS_PER_PROJECT, "rendered turns capped: shown={shown}");
+        assert_eq!(
+            shown,
+            super::MAX_TURNS_PER_PROJECT,
+            "rendered turns capped: shown={shown}"
+        );
         assert!(out.contains("已省略"), "omitted count surfaced: {out}");
         // 40 min total still accounts for ALL turns, not just the rendered 25.
         assert!(out.contains("40m"), "totals cover omitted turns too: {out}");

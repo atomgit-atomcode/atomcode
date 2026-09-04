@@ -83,9 +83,7 @@ async fn drive(
     cfg: &CodingAgentConfig,
     commands: &[&str],
 ) -> Vec<String> {
-    let mut h = assemble(parts, cfg, scripted(commands))
-        .unwrap()
-        .spawn();
+    let mut h = assemble(parts, cfg, scripted(commands)).unwrap().spawn();
     h.commands
         .send(AgentCommand::SendMessage {
             text: "go".into(),

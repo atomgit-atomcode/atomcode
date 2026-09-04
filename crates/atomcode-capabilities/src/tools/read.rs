@@ -683,13 +683,22 @@ mod tests {
         let text = ten_lines();
         let total = text.lines().count();
         let ranges = vec![
-            RangeArg { offset: Some(2), limit: Some(2) },
-            RangeArg { offset: Some(7), limit: Some(1) },
+            RangeArg {
+                offset: Some(2),
+                limit: Some(2),
+            },
+            RangeArg {
+                offset: Some(7),
+                limit: Some(1),
+            },
         ];
         let out = render_multi_range("a.txt", &text, total, &ranges);
         assert!(out.contains("[Lines 2-3]"), "{out}");
         assert!(out.contains("2\tl2") && out.contains("3\tl3"), "{out}");
-        assert!(out.contains("[Lines 7-7]") && out.contains("7\tl7"), "{out}");
+        assert!(
+            out.contains("[Lines 7-7]") && out.contains("7\tl7"),
+            "{out}"
+        );
         // only the requested windows — unrequested lines are absent
         assert!(!out.contains("1\tl1") && !out.contains("5\tl5"), "{out}");
         // rendered in request order
@@ -703,7 +712,10 @@ mod tests {
             "a.txt",
             &text,
             10,
-            &[RangeArg { offset: Some(99), limit: Some(3) }],
+            &[RangeArg {
+                offset: Some(99),
+                limit: Some(3),
+            }],
         );
         assert!(out.contains("beyond end of file"), "{out}");
     }
@@ -717,10 +729,17 @@ mod tests {
             .join("\n");
         let total = text.lines().count();
         let ranges: Vec<RangeArg> = (1..=50)
-            .map(|k| RangeArg { offset: Some(k * 50), limit: Some(20) })
+            .map(|k| RangeArg {
+                offset: Some(k * 50),
+                limit: Some(20),
+            })
             .collect();
         let out = render_multi_range("big.txt", &text, total, &ranges);
-        assert!(out.len() <= MAX_READ_OUTPUT_BYTES, "exceeded budget: {}", out.len());
+        assert!(
+            out.len() <= MAX_READ_OUTPUT_BYTES,
+            "exceeded budget: {}",
+            out.len()
+        );
         assert!(out.contains("Output budget reached"), "{out}");
     }
 
@@ -742,7 +761,11 @@ mod tests {
         let r0 = ReadFileTool::default()
             .execute(r#"{"file_path":"a.txt","limit":0}"#, &ctx(d.path()))
             .await;
-        assert!(r0.is_error && r0.content.contains("at least 1"), "{}", r0.content);
+        assert!(
+            r0.is_error && r0.content.contains("at least 1"),
+            "{}",
+            r0.content
+        );
     }
 
     #[tokio::test]
@@ -764,7 +787,11 @@ mod tests {
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("10\tfn f10()"), "{}", r.content);
         assert!(r.content.contains("300\tfn f300()"), "{}", r.content);
-        assert!(!r.content.contains("File skeleton"), "ranges must bypass skeleton: {}", r.content);
+        assert!(
+            !r.content.contains("File skeleton"),
+            "ranges must bypass skeleton: {}",
+            r.content
+        );
         // an unrequested line must not appear
         assert!(!r.content.contains("200\tfn f200()"), "{}", r.content);
     }

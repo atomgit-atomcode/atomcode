@@ -3748,9 +3748,7 @@ impl RunningAgent {
                     _ => None,
                 };
                 for mw in &self.middlewares {
-                    if let AfterOutcome::Block { reason } =
-                        mw.after(&mut result, plan_tool).await
-                    {
+                    if let AfterOutcome::Block { reason } = mw.after(&mut result, plan_tool).await {
                         post_block.get_or_insert(reason);
                     }
                 }

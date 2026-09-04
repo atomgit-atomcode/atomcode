@@ -31,7 +31,8 @@ pub const REVIEW_DIMENSIONS: &[ReviewDimension] = &[
     ReviewDimension {
         id: "security",
         display: "Security",
-        lens: "\n\n## This review's lens: SECURITY\nConcentrate on injection, missing authz/authn, \
+        lens:
+            "\n\n## This review's lens: SECURITY\nConcentrate on injection, missing authz/authn, \
                secret handling, unsafe deserialization, path/SSRF issues, and supply-chain surface \
                (dependency, CI, and config changes). Still report anything clearly severe you \
                notice outside this lens.",
@@ -69,7 +70,10 @@ pub fn merge_findings(per_dim: Vec<(&'static str, Vec<Finding>)>) -> Vec<MergedF
     let mut merged: Vec<MergedFinding> = Vec::new();
     for (dim, findings) in per_dim {
         for finding in findings {
-            match merged.iter_mut().find(|m| is_duplicate(&m.finding, &finding)) {
+            match merged
+                .iter_mut()
+                .find(|m| is_duplicate(&m.finding, &finding))
+            {
                 Some(existing) => {
                     if !existing.dimensions.contains(&dim) {
                         existing.dimensions.push(dim);
@@ -186,9 +190,7 @@ pub fn merge_deep_findings(
 /// Completed vs failed dimension ids, in table order. A dimension absent from
 /// `outcomes` counts as neither — but never enters `completed`, so `is_error`
 /// stays correct.
-pub fn dimension_coverage(
-    outcomes: &[DimensionOutcome],
-) -> (Vec<&'static str>, Vec<&'static str>) {
+pub fn dimension_coverage(outcomes: &[DimensionOutcome]) -> (Vec<&'static str>, Vec<&'static str>) {
     let completed = REVIEW_DIMENSIONS
         .iter()
         .filter(|d| outcomes.iter().any(|o| o.dimension == d.id && o.completed))
@@ -285,7 +287,10 @@ fn render_deep(
             out.push_str(&format!("   {}\n", f.body.trim().replace('\n', "\n   ")));
         }
         if !f.suggestion.trim().is_empty() {
-            out.push_str(&format!("   ↳ fix: {}\n", f.suggestion.trim().replace('\n', "\n   ")));
+            out.push_str(&format!(
+                "   ↳ fix: {}\n",
+                f.suggestion.trim().replace('\n', "\n   ")
+            ));
         }
     }
     out
@@ -493,8 +498,14 @@ mod tests {
     #[test]
     fn merge_dedups_same_file_overlapping_range_and_similar_title() {
         let merged = merge_findings(vec![
-            ("correctness", vec![f("P1", 0.8, "a.rs", 10, 12, "unchecked unwrap on None")]),
-            ("security", vec![f("P2", 0.6, "a.rs", 11, 15, "unwrap on None value")]),
+            (
+                "correctness",
+                vec![f("P1", 0.8, "a.rs", 10, 12, "unchecked unwrap on None")],
+            ),
+            (
+                "security",
+                vec![f("P2", 0.6, "a.rs", 11, 15, "unwrap on None value")],
+            ),
         ]);
         assert_eq!(merged.len(), 1, "overlapping near-duplicate collapses");
         // Higher-priority (P1) content wins; both dimensions are credited.
@@ -505,18 +516,37 @@ mod tests {
     #[test]
     fn merge_keeps_distinct_findings() {
         let merged = merge_findings(vec![
-            ("correctness", vec![f("P1", 0.8, "a.rs", 10, 12, "unchecked unwrap")]),
-            ("performance", vec![f("P2", 0.7, "a.rs", 90, 92, "needless clone in loop")]),
-            ("security", vec![f("P1", 0.9, "b.rs", 10, 12, "unchecked unwrap")]),
+            (
+                "correctness",
+                vec![f("P1", 0.8, "a.rs", 10, 12, "unchecked unwrap")],
+            ),
+            (
+                "performance",
+                vec![f("P2", 0.7, "a.rs", 90, 92, "needless clone in loop")],
+            ),
+            (
+                "security",
+                vec![f("P1", 0.9, "b.rs", 10, 12, "unchecked unwrap")],
+            ),
         ]);
-        assert_eq!(merged.len(), 3, "different range or file are not duplicates");
+        assert_eq!(
+            merged.len(),
+            3,
+            "different range or file are not duplicates"
+        );
     }
 
     #[test]
     fn merge_prefers_higher_confidence_when_priority_ties() {
         let merged = merge_findings(vec![
-            ("correctness", vec![f("P2", 0.5, "a.rs", 1, 1, "same bug title")]),
-            ("security", vec![f("P2", 0.9, "a.rs", 1, 1, "same bug title")]),
+            (
+                "correctness",
+                vec![f("P2", 0.5, "a.rs", 1, 1, "same bug title")],
+            ),
+            (
+                "security",
+                vec![f("P2", 0.9, "a.rs", 1, 1, "same bug title")],
+            ),
         ]);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].finding.confidence, 0.9);
@@ -534,11 +564,19 @@ mod tests {
     #[test]
     fn finalize_merges_filters_to_changed_files_and_sorts() {
         let outcomes = vec![
-            outcome("correctness", true, vec![f("P2", 0.7, "a.rs", 5, 6, "clone in loop")]),
-            outcome("security", true, vec![
-                f("P0", 0.9, "a.rs", 1, 1, "hardcoded secret"),
-                f("P1", 0.8, "not_changed.rs", 1, 1, "ignored"),
-            ]),
+            outcome(
+                "correctness",
+                true,
+                vec![f("P2", 0.7, "a.rs", 5, 6, "clone in loop")],
+            ),
+            outcome(
+                "security",
+                true,
+                vec![
+                    f("P0", 0.9, "a.rs", 1, 1, "hardcoded secret"),
+                    f("P1", 0.8, "not_changed.rs", 1, 1, "ignored"),
+                ],
+            ),
         ];
         let (is_error, out) = finalize_deep_review(&outcomes, 1, &["a.rs".to_string()]);
         assert!(!is_error);
@@ -546,7 +584,10 @@ mod tests {
         let p0 = out.find("hardcoded secret").unwrap();
         let p2 = out.find("clone in loop").unwrap();
         assert!(p0 < p2, "P0 must render before P2:\n{out}");
-        assert!(!out.contains("ignored"), "off-scope finding filtered:\n{out}");
+        assert!(
+            !out.contains("ignored"),
+            "off-scope finding filtered:\n{out}"
+        );
         assert!(out.contains("2/4"), "dimension completion summary:\n{out}");
     }
 
@@ -569,33 +610,71 @@ mod tests {
             outcome("tests_contracts", false, vec![]),
         ];
         let (is_error, _) = finalize_deep_review(&one_ok, 1, &["a.rs".to_string()]);
-        assert!(!is_error, "one clean dimension → partial but not a hard error");
+        assert!(
+            !is_error,
+            "one clean dimension → partial but not a hard error"
+        );
     }
 
     #[test]
     fn finalize_tags_findings_with_contributing_dimensions() {
         let outcomes = vec![
-            outcome("correctness", true, vec![f("P1", 0.8, "a.rs", 3, 4, "bad unwrap")]),
-            outcome("security", true, vec![f("P1", 0.8, "a.rs", 3, 4, "bad unwrap")]),
+            outcome(
+                "correctness",
+                true,
+                vec![f("P1", 0.8, "a.rs", 3, 4, "bad unwrap")],
+            ),
+            outcome(
+                "security",
+                true,
+                vec![f("P1", 0.8, "a.rs", 3, 4, "bad unwrap")],
+            ),
         ];
         let (_, out) = finalize_deep_review(&outcomes, 1, &["a.rs".to_string()]);
-        assert!(out.contains("correctness") && out.contains("security"), "dims tagged:\n{out}");
+        assert!(
+            out.contains("correctness") && out.contains("security"),
+            "dims tagged:\n{out}"
+        );
     }
 
     #[test]
     fn finalize_output_is_unchanged_after_the_split() {
         // The no-verify path must be byte-identical to Phase 1's behavior.
         let outcomes = vec![
-            DimensionOutcome { dimension: "correctness", findings: vec![f("P1", 0.8, "a.rs", 3, 4, "bad unwrap")], completed: true, error: None },
-            DimensionOutcome { dimension: "security", findings: vec![], completed: true, error: None },
-            DimensionOutcome { dimension: "performance", findings: vec![], completed: false, error: Some("boom".into()) },
-            DimensionOutcome { dimension: "tests_contracts", findings: vec![], completed: true, error: None },
+            DimensionOutcome {
+                dimension: "correctness",
+                findings: vec![f("P1", 0.8, "a.rs", 3, 4, "bad unwrap")],
+                completed: true,
+                error: None,
+            },
+            DimensionOutcome {
+                dimension: "security",
+                findings: vec![],
+                completed: true,
+                error: None,
+            },
+            DimensionOutcome {
+                dimension: "performance",
+                findings: vec![],
+                completed: false,
+                error: Some("boom".into()),
+            },
+            DimensionOutcome {
+                dimension: "tests_contracts",
+                findings: vec![],
+                completed: true,
+                error: None,
+            },
         ];
         let (err_a, out_a) = finalize_deep_review(&outcomes, 1, &["a.rs".to_string()]);
         let (merged, deduped) = merge_deep_findings(&outcomes, &["a.rs".to_string()]);
         let (completed, failed) = dimension_coverage(&outcomes);
         let (err_b, out_b) = render_deep_result(&merged, 1, &completed, &failed, deduped, None);
-        assert_eq!((err_a, out_a), (err_b, out_b), "finalize must equal its decomposed form with verify_dropped=None");
+        assert_eq!(
+            (err_a, out_a),
+            (err_b, out_b),
+            "finalize must equal its decomposed form with verify_dropped=None"
+        );
     }
 
     #[test]
@@ -637,7 +716,12 @@ mod tests {
         })
         .await;
         let ids: Vec<_> = outcomes.iter().map(|o| o.dimension).collect();
-        assert_eq!(ids, ["correctness", "security", "performance", "tests_contracts"]);
-        assert!(outcomes.iter().all(|o| o.completed && o.findings.len() == 1));
+        assert_eq!(
+            ids,
+            ["correctness", "security", "performance", "tests_contracts"]
+        );
+        assert!(outcomes
+            .iter()
+            .all(|o| o.completed && o.findings.len() == 1));
     }
 }

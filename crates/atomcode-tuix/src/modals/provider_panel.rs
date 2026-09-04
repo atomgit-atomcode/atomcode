@@ -1921,8 +1921,8 @@ impl Modal for ProviderPanel {
 
         let mut selected = items.len(); // nothing highlighted by default
         let mut hint: String; // assigned per match arm below (Model arm may refine it)
-                          // Forms use the box-less `PluginInfo` layout; the list uses the `Plugin`
-                          // layout whose reserved index-2 slot is rendered as the search box.
+                              // Forms use the box-less `PluginInfo` layout; the list uses the `Plugin`
+                              // layout whose reserved index-2 slot is rendered as the search box.
         let mut kind = MenuKind::PluginInfo;
         let mut buf = String::new();
         // PluginInfo rows are flush-left inside a one-column rule margin.

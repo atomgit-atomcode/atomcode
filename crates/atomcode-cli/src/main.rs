@@ -208,14 +208,9 @@ fn resolve_in_catalog(
 #[derive(Debug)]
 enum ResumeElsewhere {
     /// Found in another project whose directory still exists → switch to it.
-    SwitchTo {
-        id: String,
-        dir: std::path::PathBuf,
-    },
+    SwitchTo { id: String, dir: std::path::PathBuf },
     /// Found in another project but its recorded directory is gone.
-    DirMissing {
-        dir: std::path::PathBuf,
-    },
+    DirMissing { dir: std::path::PathBuf },
     /// Not found in ANY project.
     NotFound,
 }
@@ -2175,8 +2170,7 @@ async fn run() -> Result<i32> {
     // The active session id (fresh or resumed) for the on-exit resume hint,
     // captured before the runtime is moved into the headless/TUI arms below.
     // `None` for an ephemeral run (no persisted session → nothing to resume).
-    let active_session_id: Option<String> =
-        native_runtime.session.as_ref().map(|s| s.id.clone());
+    let active_session_id: Option<String> = native_runtime.session.as_ref().map(|s| s.id.clone());
     tracing::info!(
         target: "atomcode::startup",
         stage = "runtime_start",
@@ -4449,9 +4443,9 @@ mod tests {
         format_thinking_chunk, format_verbose_tool_chunk, headless_completion_exit_code,
         headless_completion_notify_reason, headless_denial_exit_code,
         interactive_provider_bootstrap, is_completion_invocation, merge_startup_notices,
-        print_shell_completion, resolve_working_dir, runtime_config_from,
-        resolve_in_catalog, resume_hint_line, should_fork_busy_continue, truncate_log_line, Cli,
-        Commands, HeadlessOutputFormat, DEFAULT_LOG_DIRECTIVES,
+        print_shell_completion, resolve_in_catalog, resolve_working_dir, resume_hint_line,
+        runtime_config_from, should_fork_busy_continue, truncate_log_line, Cli, Commands,
+        HeadlessOutputFormat, DEFAULT_LOG_DIRECTIVES,
     };
     use clap::Parser;
     use clap_complete::Shell;
@@ -4486,9 +4480,15 @@ mod tests {
         // Exact id wins even when a name also matches something.
         assert_eq!(resolve_in_catalog(&catalog, "ccc").as_deref(), Some("ccc"));
         // Ambiguous name resolves to the most-recently-updated session.
-        assert_eq!(resolve_in_catalog(&catalog, "review").as_deref(), Some("bbb"));
+        assert_eq!(
+            resolve_in_catalog(&catalog, "review").as_deref(),
+            Some("bbb")
+        );
         // Unique name.
-        assert_eq!(resolve_in_catalog(&catalog, "deploy").as_deref(), Some("ccc"));
+        assert_eq!(
+            resolve_in_catalog(&catalog, "deploy").as_deref(),
+            Some("ccc")
+        );
         // No match.
         assert_eq!(resolve_in_catalog(&catalog, "nope"), None);
         assert_eq!(resolve_in_catalog(&[], "review"), None);
@@ -4580,7 +4580,10 @@ mod tests {
         ));
         // bare `resume` → most recent.
         let c = Cli::try_parse_from(["atomcode", "resume"]).unwrap();
-        assert!(matches!(c.command, Some(Commands::Resume { session: None })));
+        assert!(matches!(
+            c.command,
+            Some(Commands::Resume { session: None })
+        ));
         // `--resume` conflicts with `--continue`.
         assert!(Cli::try_parse_from(["atomcode", "-p", "hi", "-c", "--resume", "x"]).is_err());
     }

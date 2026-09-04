@@ -167,14 +167,15 @@ impl SnapshotHook {
         // whose store lives under $ATOMCODE_HOME/rewind/<bucket>/<session_id> —
         // NOT inside the worktree or on a hard-coded C: path.
         let (checkpoint, unavailable) = if crate::session::rewind::code_rewind_opt_in() {
-            match WorkspaceCheckpoint::for_session(
-                std::path::Path::new(&working_dir),
-                &session_id,
-            ) {
+            match WorkspaceCheckpoint::for_session(std::path::Path::new(&working_dir), &session_id)
+            {
                 Ok(cp) => (Some(Arc::new(cp)), None),
-                Err(e) => (None, Some(format!(
+                Err(e) => (
+                    None,
+                    Some(format!(
                     "Code Rewind unavailable (ATOMCODE_CODE_REWIND=1 is set but setup failed): {e}"
-                ))),
+                )),
+                ),
             }
         } else {
             (None, Some(CODE_REWIND_DISABLED_REASON.to_string()))
@@ -473,7 +474,10 @@ impl SnapshotHook {
         // Drop the temporary recovery ref that prepare_restore pinned: the
         // transaction is committed so gc can reclaim the object if needed.
         {
-            let rewind = self.rewind.lock().unwrap_or_else(|error| error.into_inner());
+            let rewind = self
+                .rewind
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             if let Some(checkpoint) = rewind.checkpoint.as_ref() {
                 let _ = checkpoint.unpin_recovery_ref();
             }
@@ -1297,9 +1301,14 @@ mod tests {
             git(
                 worktree.path(),
                 &[
-                    "-c", "user.name=AtomCode",
-                    "-c", "user.email=atomcode@example.invalid",
-                    "commit", "--quiet", "-m", "initial",
+                    "-c",
+                    "user.name=AtomCode",
+                    "-c",
+                    "user.email=atomcode@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "initial",
                 ],
             );
             let cp = Arc::new(WorkspaceCheckpoint::for_session(worktree.path(), name).unwrap());
@@ -1308,7 +1317,8 @@ mod tests {
 
         fn ref_exists(git_dir: &std::path::Path, refname: &str) -> bool {
             std::process::Command::new("git")
-                .arg("--git-dir").arg(git_dir)
+                .arg("--git-dir")
+                .arg(git_dir)
                 .args(["for-each-ref", "--format=%(refname)", refname])
                 .output()
                 .map(|o| !o.stdout.is_empty())
@@ -1362,8 +1372,13 @@ mod tests {
             };
             let session_store = tempfile::tempdir().unwrap();
             let manager = Arc::new(SessionManager::with_root(session_store.path()));
-            let hook =
-                make_hook("ref-lifecycle-commit", &manager, worktree.path(), cp, &[point.clone()]);
+            let hook = make_hook(
+                "ref-lifecycle-commit",
+                &manager,
+                worktree.path(),
+                cp,
+                &[point.clone()],
+            );
 
             let receipt = hook.begin_rewind(&point, true, None).unwrap();
             // After begin_rewind the ref must be pinned.
@@ -2140,17 +2155,18 @@ mod tests {
     /// opt-in path (which calls `WorkspaceCheckpoint::for_session`) succeeds.
     fn make_test_hook_with_worktree(
         id: &str,
-    ) -> (SnapshotHook, Arc<SessionManager>, tempfile::TempDir, tempfile::TempDir) {
+    ) -> (
+        SnapshotHook,
+        Arc<SessionManager>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
         let worktree = tempfile::tempdir().unwrap();
         git(worktree.path(), &["init", "--quiet"]);
         // A bare init has no commits; for_session only needs a valid git dir.
         let store_dir = tempfile::tempdir().unwrap();
         let mgr = Arc::new(SessionManager::with_root(store_dir.path()));
-        let hook = SnapshotHook::new(
-            mgr.clone(),
-            id,
-            worktree.path().to_string_lossy(),
-        );
+        let hook = SnapshotHook::new(mgr.clone(), id, worktree.path().to_string_lossy());
         (hook, mgr, worktree, store_dir)
     }
 
@@ -2159,8 +2175,7 @@ mod tests {
     fn snapshot_hook_keeps_code_rewind_off_by_default() {
         let prev = std::env::var("ATOMCODE_CODE_REWIND").ok();
         std::env::remove_var("ATOMCODE_CODE_REWIND");
-        let (hook, _mgr, _worktree, _store) =
-            make_test_hook_with_worktree("hook-default-off");
+        let (hook, _mgr, _worktree, _store) = make_test_hook_with_worktree("hook-default-off");
         assert!(
             hook.code_rewind_unavailable().is_some(),
             "Code Rewind must be unavailable when ATOMCODE_CODE_REWIND is unset"
@@ -2176,8 +2191,7 @@ mod tests {
     fn snapshot_hook_enables_code_rewind_when_opted_in_and_bounded_store_builds() {
         let prev = std::env::var("ATOMCODE_CODE_REWIND").ok();
         std::env::set_var("ATOMCODE_CODE_REWIND", "1");
-        let (hook, _mgr, _worktree, _store) =
-            make_test_hook_with_worktree("hook-opted-in");
+        let (hook, _mgr, _worktree, _store) = make_test_hook_with_worktree("hook-opted-in");
         assert!(
             hook.code_rewind_unavailable().is_none(),
             "Code Rewind must be available when ATOMCODE_CODE_REWIND=1 and worktree is valid"

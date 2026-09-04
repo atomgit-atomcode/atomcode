@@ -433,12 +433,24 @@ mod tests {
 
     #[test]
     fn default_output_cap_matches_bounds() {
-        assert_eq!(default_max_tokens(16_000), 8_000, "tiny window floors at 8K");
-        assert_eq!(default_max_tokens(64_000), 16_000, "mid window is a quarter");
+        assert_eq!(
+            default_max_tokens(16_000),
+            8_000,
+            "tiny window floors at 8K"
+        );
+        assert_eq!(
+            default_max_tokens(64_000),
+            16_000,
+            "mid window is a quarter"
+        );
         // Large windows ceiling at 32K (raised from 16K) so a single big response
         // has room to finish before finish_reason=length.
         assert_eq!(default_max_tokens(200_000), 32_768);
-        assert_eq!(default_max_tokens(128_000), 32_000, "128K/4 sits just under the ceiling");
+        assert_eq!(
+            default_max_tokens(128_000),
+            32_000,
+            "128K/4 sits just under the ceiling"
+        );
     }
 
     #[test]

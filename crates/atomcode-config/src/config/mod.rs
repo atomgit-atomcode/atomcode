@@ -2224,7 +2224,10 @@ kind = "claude-code"
         assert!(a.timeout_secs.is_none());
         let b = &cfg.subagent.external[1];
         assert_eq!(b.kind, "claude-code");
-        assert_eq!(b.permission, None, "absent permission stays None (→ read-only downstream)");
+        assert_eq!(
+            b.permission, None,
+            "absent permission stays None (→ read-only downstream)"
+        );
     }
 
     #[test]
@@ -2240,10 +2243,9 @@ kind = "claude-code"
         assert_eq!(cfg.subagent.codex, "off");
         assert_eq!(cfg.subagent.claude, "off");
         // Explicit levels round-trip.
-        let cfg: Config = toml::from_str(
-            "[subagent]\ncodex = \"read-only\"\nclaude = \"accept-edits\"\n",
-        )
-        .unwrap();
+        let cfg: Config =
+            toml::from_str("[subagent]\ncodex = \"read-only\"\nclaude = \"accept-edits\"\n")
+                .unwrap();
         assert_eq!(cfg.subagent.codex, "read-only");
         assert_eq!(cfg.subagent.claude, "accept-edits");
     }
@@ -2388,11 +2390,7 @@ kind = "claude-code"
 
     #[test]
     fn server_declared_effort_levels_win_over_the_client_builtin() {
-        let declared = [
-            "low".to_string(),
-            "medium".to_string(),
-            "xhigh".to_string(),
-        ];
+        let declared = ["low".to_string(), "medium".to_string(), "xhigh".to_string()];
         assert_eq!(
             effective_reasoning_effort_levels(true, "deepseek-v4-flash", Some(&declared)),
             Some(declared.to_vec()),

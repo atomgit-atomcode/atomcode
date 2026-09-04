@@ -144,7 +144,11 @@ fn answer_summary(resp: &UserInputResponse) -> String {
         },
     };
     if !resp.images.is_empty() {
-        let noun = if resp.images.len() == 1 { "image" } else { "images" };
+        let noun = if resp.images.len() == 1 {
+            "image"
+        } else {
+            "images"
+        };
         summary.push_str(&format!(", and User attached {} {noun}", resp.images.len()));
     }
     summary
@@ -182,7 +186,10 @@ pub fn format_batch_result(reqs: &[UserInputRequest], resps: &[UserInputResponse
         call_id: String::new(),
         content: lines.join("\n"),
         is_error: false,
-        images: resps.iter().flat_map(|r| r.images.iter().cloned()).collect(),
+        images: resps
+            .iter()
+            .flat_map(|r| r.images.iter().cloned())
+            .collect(),
     }
 }
 
@@ -620,10 +627,8 @@ mod tests {
 
     #[test]
     fn old_response_without_images_remains_compatible() {
-        let r: UserInputResponse = serde_json::from_str(
-            r#"{"declined":false,"selected":["A"],"text":null}"#,
-        )
-        .unwrap();
+        let r: UserInputResponse =
+            serde_json::from_str(r#"{"declined":false,"selected":["A"],"text":null}"#).unwrap();
         assert!(r.images.is_empty());
     }
 }

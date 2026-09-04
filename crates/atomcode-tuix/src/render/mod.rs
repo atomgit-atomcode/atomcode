@@ -1065,7 +1065,11 @@ pub fn fmt_dur(d: Duration) -> String {
 mod tests {
     use super::*;
 
-    fn subtask(started: Option<std::time::Instant>, finished: Option<std::time::Instant>, status: SubtaskStatus) -> SubtaskItem {
+    fn subtask(
+        started: Option<std::time::Instant>,
+        finished: Option<std::time::Instant>,
+        status: SubtaskStatus,
+    ) -> SubtaskItem {
         SubtaskItem {
             label: "worker".into(),
             description: String::new(),
@@ -1084,7 +1088,11 @@ mod tests {
         use std::time::{Duration, Instant};
         let start = Instant::now();
         // A terminal item with a stamped finish reads the FROZEN span, not `now`.
-        let done = subtask(Some(start), Some(start + Duration::from_secs(90)), SubtaskStatus::Completed);
+        let done = subtask(
+            Some(start),
+            Some(start + Duration::from_secs(90)),
+            SubtaskStatus::Completed,
+        );
         assert_eq!(done.elapsed(), Duration::from_secs(90));
         // Re-reading later must NOT grow (the whole point of the freeze).
         assert_eq!(done.elapsed(), Duration::from_secs(90));
@@ -1094,7 +1102,10 @@ mod tests {
         assert!(running.elapsed() >= Duration::ZERO);
 
         // No start yet → zero, never a panic.
-        assert_eq!(subtask(None, None, SubtaskStatus::Pending).elapsed(), Duration::ZERO);
+        assert_eq!(
+            subtask(None, None, SubtaskStatus::Pending).elapsed(),
+            Duration::ZERO
+        );
     }
 
     #[test]

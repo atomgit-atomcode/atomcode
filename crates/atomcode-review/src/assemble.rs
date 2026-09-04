@@ -212,18 +212,25 @@ pub fn shared_review_deadline(
 /// Register the read-only review toolset (+ the shared `report_finding` instance) and
 /// mount only the read-only subset — write/edit/bash are registered by
 /// `register_coding_tools` but NEVER mounted, so the model cannot mutate.
-fn mount_review_tools(report: &ReportFindingTool, no_web: bool, mount_graph: bool, skill_dirs: &[PathBuf]) -> MountedTools {
+fn mount_review_tools(
+    report: &ReportFindingTool,
+    no_web: bool,
+    mount_graph: bool,
+    skill_dirs: &[PathBuf],
+) -> MountedTools {
     let mut reg = ToolRegistry::new();
     register_coding_tools(&mut reg); // read_file/grep/glob/list_directory (+ write/edit/bash, unmounted)
     register_codeintel_tools(&mut reg); // registered always; mounted only when `mount_graph`
     reg.register(Arc::new(AstGrepTool));
     reg.register(Arc::new(WebSearchTool::new())); // registered always; mounted only when !no_web
     reg.register(Arc::new(report.clone())); // shares state with the returned handle
-    // Skills: opt-in via --skill-dir (empty ⇒ no skill tools, bare-CLI behavior).
-    // Each dir scanned for SKILL.md (directory skill) or <name>.md (single-file).
+                                            // Skills: opt-in via --skill-dir (empty ⇒ no skill tools, bare-CLI behavior).
+                                            // Each dir scanned for SKILL.md (directory skill) or <name>.md (single-file).
     let mut names: Vec<&str> = review_tool_names(no_web, mount_graph).to_vec();
     if !skill_dirs.is_empty() {
-        let skills = Arc::new(atomcode_capabilities::skills::SkillRegistry::load(skill_dirs));
+        let skills = Arc::new(atomcode_capabilities::skills::SkillRegistry::load(
+            skill_dirs,
+        ));
         atomcode_capabilities::skills::register_skill_tools(&mut reg, skills);
         names.extend_from_slice(atomcode_capabilities::skills::skill_tool_names());
     }

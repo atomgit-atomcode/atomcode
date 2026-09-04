@@ -988,7 +988,10 @@ pub(crate) async fn patch_provider(
                     anyhow::bail!("account for model {name:?} not found");
                 }
                 if final_name != name {
-                    let model = config.models.remove(&name).expect("contains_key checked above");
+                    let model = config
+                        .models
+                        .remove(&name)
+                        .expect("contains_key checked above");
                     config.models.insert(final_name.clone(), model);
                     rename_default_selection(config, &name, &final_name);
                 }
@@ -1411,7 +1414,10 @@ mod tests {
         // "account is the connection" semantics — documented, not accidental).
         assert_eq!(config.models["bai/glm"].account, "bai");
         assert_eq!(
-            config.provider_config_for_selection("bai/glm").and_then(|p| p.base_url).as_deref(),
+            config
+                .provider_config_for_selection("bai/glm")
+                .and_then(|p| p.base_url)
+                .as_deref(),
             Some("https://api.c.ai/v1")
         );
     }
@@ -1434,10 +1440,20 @@ mod tests {
         .unwrap();
 
         // Account "ghost" is absent → helper returns false (unresolved), nothing mutated.
-        assert!(!apply_patch_to_new_schema_model(&mut config, "orphan/model", req));
+        assert!(!apply_patch_to_new_schema_model(
+            &mut config,
+            "orphan/model",
+            req
+        ));
         let model = &config.models["orphan/model"];
-        assert_eq!(model.model, "m", "model must be untouched on unresolved account");
-        assert_eq!(model.context_window, 128000, "context_window must be untouched");
+        assert_eq!(
+            model.model, "m",
+            "model must be untouched on unresolved account"
+        );
+        assert_eq!(
+            model.context_window, 128000,
+            "context_window must be untouched"
+        );
     }
 
     #[test]

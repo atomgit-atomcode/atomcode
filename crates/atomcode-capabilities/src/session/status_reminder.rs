@@ -109,7 +109,10 @@ mod tests {
             "must not push a context-usage gauge: {s}"
         );
         assert!(!s.contains('%'), "must not push any usage percentage: {s}");
-        assert!(!s.contains("Turn round"), "must not push a round counter: {s}");
+        assert!(
+            !s.contains("Turn round"),
+            "must not push a round counter: {s}"
+        );
     }
 
     #[tokio::test]

@@ -3240,13 +3240,12 @@ fn scan_bucket_into(bucket: &str, bucket_path: &Path, out: &mut BucketPartial) {
             Some((id, false))
         } else if let Some(id) = name.strip_suffix(".json") {
             if let Some(presentation_id) = name.strip_suffix(".ui.json") {
-                let has_native_companion =
-                    ["meta", "snapshot", "jsonl"].iter().any(|extension| {
-                        bucket_path
-                            .join(format!("{presentation_id}.{extension}"))
-                            .symlink_metadata()
-                            .is_ok()
-                    });
+                let has_native_companion = ["meta", "snapshot", "jsonl"].iter().any(|extension| {
+                    bucket_path
+                        .join(format!("{presentation_id}.{extension}"))
+                        .symlink_metadata()
+                        .is_ok()
+                });
                 if has_native_companion {
                     None
                 } else {
@@ -3425,7 +3424,11 @@ fn scan_catalog_root(sessions_root: &Path) -> CatalogScan {
                 // would substitute an empty partial and silently drop every bucket that
                 // worker had already scanned, returning a truncated catalog that looks
                 // complete. Propagating matches the old serial scan (a panic aborts).
-                .map(|handle| handle.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|p| std::panic::resume_unwind(p))
+                })
                 .collect()
         })
     };
@@ -5792,7 +5795,11 @@ mod tests {
                     "created_at": 1, "updated_at": s + 1,
                     "messages": (0..40).map(|m| serde_json::json!({"role":"user","content":pad,"m":m})).collect::<Vec<_>>(),
                 });
-                std::fs::write(bpath.join(format!("{id}.json")), serde_json::to_vec(&session).unwrap()).unwrap();
+                std::fs::write(
+                    bpath.join(format!("{id}.json")),
+                    serde_json::to_vec(&session).unwrap(),
+                )
+                .unwrap();
                 files += 1;
             }
         }
@@ -5845,7 +5852,12 @@ mod tests {
                     meta.updated_at = (bi as i64 * 100 + s as i64 + 1) * 1_000;
                     mgr.write_meta(&meta).unwrap();
                 } else {
-                    write_legacy_catalog_session(&bpath, &id, &format!("/p/{bucket}"), s as u64 + 1);
+                    write_legacy_catalog_session(
+                        &bpath,
+                        &id,
+                        &format!("/p/{bucket}"),
+                        s as u64 + 1,
+                    );
                 }
                 expected += 1;
             }
@@ -5873,7 +5885,11 @@ mod tests {
                     .map(|e| (e.project_bucket.clone(), e.id.clone(), e.updated_at_ms))
                     .collect::<Vec<_>>()
             };
-            assert_eq!(key(&first), key(&again), "parallel scan order must be stable");
+            assert_eq!(
+                key(&first),
+                key(&again),
+                "parallel scan order must be stable"
+            );
             assert_eq!(first.diagnostics.len(), again.diagnostics.len());
         }
 
@@ -5903,7 +5919,11 @@ mod tests {
                 .then_with(|| a.project_bucket.cmp(&b.project_bucket))
         });
         assert_eq!(
-            first.entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            first
+                .entries
+                .iter()
+                .map(|e| e.id.clone())
+                .collect::<Vec<_>>(),
             sorted.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
             "entries must be in the deterministic global order"
         );

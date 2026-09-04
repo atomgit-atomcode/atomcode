@@ -123,10 +123,20 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn stores(dir: &Path, global: &str, project: &str, local: &str) -> (MemoryStore, MemoryStore, MemoryStore) {
+    fn stores(
+        dir: &Path,
+        global: &str,
+        project: &str,
+        local: &str,
+    ) -> (MemoryStore, MemoryStore, MemoryStore) {
         let g = MemoryStore::new(dir.join("memory.md"));
         let p = MemoryStore::new(dir.join("proj").join(".atomcode").join("memory.md"));
-        let l = MemoryStore::new(dir.join("localmd").join(".atomcode").join("local").join("memory.md"));
+        let l = MemoryStore::new(
+            dir.join("localmd")
+                .join(".atomcode")
+                .join("local")
+                .join("memory.md"),
+        );
         if !global.is_empty() {
             g.append(global).unwrap();
         }
@@ -149,7 +159,8 @@ mod tests {
     fn header_const_matches_store_output() {
         let dir = tempfile::tempdir().unwrap();
         let (g, p, _) = stores(dir.path(), "x", "", "");
-        let merged = MemoryStore::merged_for_prompt(&g, &p, &MemoryStore::new(PathBuf::from("/none")), "n");
+        let merged =
+            MemoryStore::merged_for_prompt(&g, &p, &MemoryStore::new(PathBuf::from("/none")), "n");
         assert!(merged.starts_with(MEMORY_HEADER));
     }
 
@@ -217,7 +228,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let h = hook(dir.path(), "same fact", "", "");
 
-        let frozen = MemoryStore::merged_for_prompt(&h.global, &h.project, &h.local, &h.project_name);
+        let frozen =
+            MemoryStore::merged_for_prompt(&h.global, &h.project, &h.local, &h.project_name);
         let mut convo = Conversation::new();
         convo.push(Message::system("persona"));
         convo.push(Message::system(frozen.clone()));
@@ -295,7 +307,11 @@ mod tests {
         h.local.append("new local fact").unwrap();
         h.session_start(&mut convo, true).await;
 
-        assert_eq!(convo.messages.len(), 3, "refresh replaces in place, no growth");
+        assert_eq!(
+            convo.messages.len(),
+            3,
+            "refresh replaces in place, no growth"
+        );
         let mem = &convo.messages[1];
         assert!(mem.text.contains("[Global]\n- g fact"));
         assert!(mem.text.contains("[Project: myproj]\n- p fact"));
@@ -322,7 +338,10 @@ mod tests {
 
         let mem = &convo.messages[1];
         assert!(mem.text.contains("[Global]") && mem.text.contains("[Project: myproj]"));
-        assert!(!mem.text.contains("[Local]"), "empty local store → no [Local] section");
+        assert!(
+            !mem.text.contains("[Local]"),
+            "empty local store → no [Local] section"
+        );
     }
 
     #[test]

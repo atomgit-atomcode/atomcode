@@ -262,8 +262,7 @@ impl GoalState {
         // explicit user pause interposed before resume) — both are still recovery
         // pauses. `recovery_pause` is the authoritative signal; the phase check only
         // guards against firing outside a paused state.
-        if !self.recovery_pause
-            || !matches!(self.phase, GoalPhase::PausedAtCap | GoalPhase::Paused)
+        if !self.recovery_pause || !matches!(self.phase, GoalPhase::PausedAtCap | GoalPhase::Paused)
         {
             return None;
         }
@@ -705,7 +704,10 @@ fn parse_followup_class(text: &str) -> FollowupClass {
     // trailing punctuation / an appended reason (`Class: new-goal.`). `not-a-goal` is
     // checked first (shares no prefix with the rest). Trailing prose that merely
     // mentions a class does not start with the keyword, so it stays Continuation.
-    let rest = line.strip_prefix("class:").map(str::trim).unwrap_or(line.as_str());
+    let rest = line
+        .strip_prefix("class:")
+        .map(str::trim)
+        .unwrap_or(line.as_str());
     if rest.starts_with("not-a-goal") || rest.starts_with("not a goal") {
         FollowupClass::NotAGoal
     } else if rest.starts_with("new-goal") || rest.starts_with("new goal") {
@@ -888,8 +890,14 @@ mod tests {
         let note = goal_cap_stop_note("round limit", Some(300));
         assert!(note.contains("300"), "should name the round budget: {note}");
         assert!(!note.contains("not met"), "must not claim failure: {note}");
-        assert!(!note.to_lowercase().contains("未达"), "must not claim failure: {note}");
-        assert!(note.contains("继续对话"), "should tell the user how to continue: {note}");
+        assert!(
+            !note.to_lowercase().contains("未达"),
+            "must not claim failure: {note}"
+        );
+        assert!(
+            note.contains("继续对话"),
+            "should tell the user how to continue: {note}"
+        );
     }
 
     #[test]
@@ -926,18 +934,30 @@ mod tests {
     #[test]
     fn followup_class_parser_is_lenient_and_defaults_to_continuation() {
         use FollowupClass::*;
-        assert!(matches!(parse_followup_class("noise\nClass: new-goal"), NewGoal));
-        assert!(matches!(parse_followup_class("Class: not-a-goal"), NotAGoal));
-        assert!(matches!(parse_followup_class("Class: continuation"), Continuation));
+        assert!(matches!(
+            parse_followup_class("noise\nClass: new-goal"),
+            NewGoal
+        ));
+        assert!(matches!(
+            parse_followup_class("Class: not-a-goal"),
+            NotAGoal
+        ));
+        assert!(matches!(
+            parse_followup_class("Class: continuation"),
+            Continuation
+        ));
         // Case-insensitive on the last non-empty line.
         assert!(matches!(parse_followup_class("CLASS: NEW-GOAL"), NewGoal));
         // Tolerant of trailing punctuation / an appended reason (models rarely emit
         // the bare token) — a near-miss must NOT silently fall back to continuation
         // and re-pursue the OLD goal on a genuinely new one.
         assert!(matches!(parse_followup_class("Class: new-goal."), NewGoal));
-        assert!(matches!(parse_followup_class("Class: not-a-goal (chit-chat)"), NotAGoal));
+        assert!(matches!(
+            parse_followup_class("Class: not-a-goal (chit-chat)"),
+            NotAGoal
+        ));
         assert!(matches!(parse_followup_class("Class: new goal"), NewGoal)); // space variant
-        // A bare leading keyword (no `Class:` prefix) still resolves.
+                                                                             // A bare leading keyword (no `Class:` prefix) still resolves.
         assert!(matches!(parse_followup_class("new-goal"), NewGoal));
         // Reasoning-style trailing prose that merely MENTIONS a class stays safe.
         assert!(matches!(
@@ -1183,7 +1203,10 @@ mod tests {
         );
         assert!(summary.contains("Prior compacted context"));
         assert!(summary.contains("Edited src/lib.rs and completed migration"));
-        assert!(summary.chars().count() <= 6_012, "goal recap must stay bounded");
+        assert!(
+            summary.chars().count() <= 6_012,
+            "goal recap must stay bounded"
+        );
     }
 
     #[test]

@@ -450,8 +450,14 @@ mod tests {
         // them first — but they 404 on chat/tool use. They must be excluded.
         let got = select_top_free_models(MODELS_FIXTURE, 5).unwrap();
         let ids: Vec<&str> = got.iter().map(|m| m.id.as_str()).collect();
-        assert!(!ids.contains(&"vendor/music:free"), "audio-gen model excluded");
-        assert!(!ids.contains(&"vendor/notools:free"), "non-tool model excluded");
+        assert!(
+            !ids.contains(&"vendor/music:free"),
+            "audio-gen model excluded"
+        );
+        assert!(
+            !ids.contains(&"vendor/notools:free"),
+            "non-tool model excluded"
+        );
     }
 
     #[test]

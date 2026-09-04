@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use atomcode_capabilities::team::{
     role_by_id, TeamDifficulty, TeamPermission, TeamRoleProfile, TeamTaskSpec,
 };
-use atomcode_capabilities::tools::team_child_middlewares_for_policy;
 #[cfg(test)]
 use atomcode_capabilities::tools::team_child_middlewares;
+use atomcode_capabilities::tools::team_child_middlewares_for_policy;
 use atomcode_kernel::agent::{Agent, AutoRespond, ToolLoopPolicy};
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
@@ -234,13 +234,17 @@ impl LifecycleHooks for TeamProgressHook {
             .as_ref()
             .map(|meta| meta.tokens.completion as u64)
             .unwrap_or(0);
-        self.total_tokens.fetch_add(reported.max(estimated), Relaxed);
+        self.total_tokens
+            .fetch_add(reported.max(estimated), Relaxed);
         // Only surface an activity when the model is about to use a tool. A
         // response WITHOUT a tool call ends the turn — emitting "thinking" here
         // would just overwrite the last real activity and double the event rate;
         // the final token total is carried out via the member outcome instead.
         if let Some(call) = response.tool_calls.first() {
-            (self.activity)(format!("using {}", call.name), self.total_tokens.load(Relaxed));
+            (self.activity)(
+                format!("using {}", call.name),
+                self.total_tokens.load(Relaxed),
+            );
         }
     }
 }
@@ -366,9 +370,13 @@ mod tests {
             apply(&middleware, "write_file", r#"{"file_path":"src/ok.rs"}"#).await,
             BeforeOutcome::Proceed
         );
-        assert!(apply(&middleware, "read_file", r#"{"file_path":"tests/outside.rs"}"#)
-            .await
-            .is_deny());
+        assert!(apply(
+            &middleware,
+            "read_file",
+            r#"{"file_path":"tests/outside.rs"}"#
+        )
+        .await
+        .is_deny());
         assert_eq!(
             apply(&middleware, "read_file", r#"{"file_path":"src/ok.rs"}"#).await,
             BeforeOutcome::Proceed

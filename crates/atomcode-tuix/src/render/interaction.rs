@@ -197,11 +197,7 @@ impl InteractionPublisher {
         read_recover(&self.inner).epoch
     }
 
-    pub fn set_composer_selection(
-        &self,
-        source: &str,
-        selection: Option<std::ops::Range<usize>>,
-    ) {
+    pub fn set_composer_selection(&self, source: &str, selection: Option<std::ops::Range<usize>>) {
         let valid = selection.filter(|range| {
             range.start < range.end
                 && range.end <= source.len()
@@ -305,15 +301,18 @@ mod tests {
         assert!(initial.regions.is_empty());
         assert!(publisher.snapshot_actionable().is_none());
 
-        publisher.publish(1, vec![HitRegion {
-            rect: CellRect {
-                row: 3,
-                col: 2,
-                height: 1,
-                width: 20,
-            },
-            target: HitTarget::MenuItem { index: 4 },
-        }]);
+        publisher.publish(
+            1,
+            vec![HitRegion {
+                rect: CellRect {
+                    row: 3,
+                    col: 2,
+                    height: 1,
+                    width: 20,
+                },
+                target: HitTarget::MenuItem { index: 4 },
+            }],
+        );
         let painted = publisher.snapshot();
         assert_eq!(painted.generation, 1);
         assert_eq!(painted.hit(3, 5), Some(HitTarget::MenuItem { index: 4 }));
@@ -435,15 +434,18 @@ mod tests {
         let poison = publisher.clone();
         let _ = std::thread::spawn(move || poison.poison_for_test()).join();
 
-        publisher.publish(1, vec![HitRegion {
-            rect: CellRect {
-                row: 1,
-                col: 1,
-                height: 2,
-                width: 2,
-            },
-            target: HitTarget::ModalCancel,
-        }]);
+        publisher.publish(
+            1,
+            vec![HitRegion {
+                rect: CellRect {
+                    row: 1,
+                    col: 1,
+                    height: 2,
+                    width: 2,
+                },
+                target: HitTarget::ModalCancel,
+            }],
+        );
 
         assert_eq!(publisher.snapshot().generation, 1);
     }

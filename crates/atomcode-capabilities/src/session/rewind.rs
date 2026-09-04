@@ -61,7 +61,9 @@ fn dir_size_bytes(path: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in rd.flatten() {
             let Ok(ft) = entry.file_type() else { continue };
             if ft.is_dir() {
@@ -79,9 +81,9 @@ mod guard_tests {
     use super::*;
     #[test]
     fn disk_floor_unknown_is_treated_as_below_floor() {
-        assert!(!disk_floor_ok(None, 2_000));          // unknown → skip (fail-safe)
-        assert!(!disk_floor_ok(Some(1_999), 2_000));   // below floor → skip
-        assert!(disk_floor_ok(Some(2_000), 2_000));    // exactly floor → ok
+        assert!(!disk_floor_ok(None, 2_000)); // unknown → skip (fail-safe)
+        assert!(!disk_floor_ok(Some(1_999), 2_000)); // below floor → skip
+        assert!(disk_floor_ok(Some(2_000), 2_000)); // exactly floor → ok
         assert!(disk_floor_ok(Some(9_999), 2_000));
     }
 }
@@ -518,8 +520,7 @@ impl WorkspaceCheckpoint {
     pub fn purge(&self) -> Result<(), WorkspaceCheckpointError> {
         let _guard = self.guard();
         self.with_process_lock(|| {
-            let existing =
-                self.run(["for-each-ref", "--format=%(refname)", "refs/atomcode/"])?;
+            let existing = self.run(["for-each-ref", "--format=%(refname)", "refs/atomcode/"])?;
             let mut transaction = String::new();
             for reference in String::from_utf8_lossy(&existing.stdout).lines() {
                 if reference.is_empty() {
@@ -642,8 +643,11 @@ impl WorkspaceCheckpoint {
         let _guard = self.guard();
         self.with_process_lock(|| {
             // Enumerate all recovery refs and delete them; best-effort.
-            let existing =
-                self.run(["for-each-ref", "--format=%(refname)", "refs/atomcode/recovery/"])?;
+            let existing = self.run([
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/atomcode/recovery/",
+            ])?;
             let mut transaction = String::new();
             for reference in String::from_utf8_lossy(&existing.stdout).lines() {
                 if !reference.is_empty() {
@@ -859,8 +863,7 @@ impl WorkspaceCheckpoint {
                     continue;
                 }
                 let abs = self.worktree.join(&path);
-                if std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0) > MAX_SNAPSHOT_FILE_BYTES
-                {
+                if std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0) > MAX_SNAPSHOT_FILE_BYTES {
                     continue;
                 }
                 paths.push(path);
@@ -1327,15 +1330,24 @@ mod tests {
             .expect("a v1 ledger must remain readable after the bump");
 
         // The current version validates; a future version is rejected.
-        RewindLedger { version: LEDGER_VERSION, points: vec![] }
-            .validate()
-            .unwrap();
-        assert!(RewindLedger { version: LEDGER_VERSION + 1, points: vec![] }
-            .validate()
-            .is_err());
-        assert!(RewindLedger { version: 0, points: vec![] }
-            .validate()
-            .is_err());
+        RewindLedger {
+            version: LEDGER_VERSION,
+            points: vec![],
+        }
+        .validate()
+        .unwrap();
+        assert!(RewindLedger {
+            version: LEDGER_VERSION + 1,
+            points: vec![]
+        }
+        .validate()
+        .is_err());
+        assert!(RewindLedger {
+            version: 0,
+            points: vec![]
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -1635,7 +1647,12 @@ mod bounded_capture_tests {
         let store = tmp.path().join("store").join("git");
         fs::create_dir_all(&work).unwrap();
         let git = |args: &[&str]| {
-            let out = git_command().arg("-C").arg(&work).args(args).output().unwrap();
+            let out = git_command()
+                .arg("-C")
+                .arg(&work)
+                .args(args)
+                .output()
+                .unwrap();
             assert!(
                 out.status.success(),
                 "git {args:?}: {}",
@@ -1646,9 +1663,14 @@ mod bounded_capture_tests {
         fs::write(work.join("hello.txt"), "hello\n").unwrap();
         git(&["add", "hello.txt"]);
         git(&[
-            "-c", "user.name=AtomCode",
-            "-c", "user.email=atomcode@example.invalid",
-            "commit", "--quiet", "-m", "initial",
+            "-c",
+            "user.name=AtomCode",
+            "-c",
+            "user.email=atomcode@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "initial",
         ]);
         (work, store, tmp)
     }
@@ -1826,6 +1848,9 @@ mod bounded_capture_tests {
             .args(["for-each-ref", "--format=%(refname)", "refs/atomcode/"])
             .output()
             .expect("git for-each-ref after purge");
-        assert!(after.stdout.is_empty(), "all rewind refs deleted after purge");
+        assert!(
+            after.stdout.is_empty(),
+            "all rewind refs deleted after purge"
+        );
     }
 }

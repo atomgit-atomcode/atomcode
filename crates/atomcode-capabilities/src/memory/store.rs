@@ -26,7 +26,9 @@ pub struct MemoryStore {
 /// nests under `project_root`; an absolute value is used as-is (std `Path::join`
 /// semantics). `memory.md` is appended in either case.
 fn project_memory_path(project_root: &Path, override_dir: Option<&str>) -> PathBuf {
-    let dir = override_dir.filter(|s| !s.is_empty()).unwrap_or(".atomcode");
+    let dir = override_dir
+        .filter(|s| !s.is_empty())
+        .unwrap_or(".atomcode");
     project_root.join(dir).join("memory.md")
 }
 
@@ -89,10 +91,7 @@ fn ensure_gitignore_sentinel(store_path: &Path) -> io::Result<()> {
 
 impl MemoryStore {
     pub fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            local: false,
-        }
+        Self { path, local: false }
     }
 
     pub fn global() -> Self {

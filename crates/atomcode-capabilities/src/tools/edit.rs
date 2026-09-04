@@ -338,7 +338,8 @@ const MAX_SCAN_LINES: usize = 20_000;
 const MAX_EXCERPT_CHARS: usize = 2000;
 const MAX_EXCERPT_LINES: usize = 40;
 
-const REREAD_HINT: &str = "Re-read the file and copy the exact current text (including whitespace).";
+const REREAD_HINT: &str =
+    "Re-read the file and copy the exact current text (including whitespace).";
 
 /// A verbatim window of the file's CURRENT text around `center` (0-based line index),
 /// sized to cover roughly what `old_string` spanned. Returns `(first, last, text)` with
@@ -395,7 +396,10 @@ fn closest_match_hint(content: &str, old_string: &str) -> String {
         return REREAD_HINT.to_string();
     }
 
-    let lines: Vec<&str> = content.lines().take(MAX_SCAN_LINES + MAX_EXCERPT_LINES).collect();
+    let lines: Vec<&str> = content
+        .lines()
+        .take(MAX_SCAN_LINES + MAX_EXCERPT_LINES)
+        .collect();
     let wanted_lower = wanted.to_lowercase();
     let mut best: Option<(usize, usize)> = None;
     for (index, line) in lines.iter().take(MAX_SCAN_LINES).enumerate() {
@@ -422,7 +426,9 @@ fn closest_match_hint(content: &str, old_string: &str) -> String {
              old_string from it rather than from memory:\n\
              --- current lines {first}-{last} ---\n{text}\n--- end current lines ---"
         ),
-        None => format!("{head} Re-read the surrounding block and retry with its exact current text."),
+        None => {
+            format!("{head} Re-read the surrounding block and retry with its exact current text.")
+        }
     }
 }
 
@@ -821,7 +827,9 @@ mod tests {
         );
         // Verbatim, indentation and all — a trimmed copy would not match on the retry.
         assert!(
-            result.content.contains("  Promise.all([\n    api('/a'),\n    api('/b')\n  ]).then(go);"),
+            result
+                .content
+                .contains("  Promise.all([\n    api('/a'),\n    api('/b')\n  ]).then(go);"),
             "the block must be exact: {}",
             result.content
         );
@@ -864,8 +872,15 @@ mod tests {
         let long: String = "y".repeat(300);
         let lines: Vec<&str> = (0..80).map(|_| long.as_str()).collect();
         let (first, last, text) = current_text_window(&lines, 40, 30).unwrap();
-        assert!(text.chars().count() + 1 <= MAX_EXCERPT_CHARS, "{}", text.len());
-        assert!(first <= 41 && last >= 41, "the centre line must survive: {first}-{last}");
+        assert!(
+            text.chars().count() + 1 <= MAX_EXCERPT_CHARS,
+            "{}",
+            text.len()
+        );
+        assert!(
+            first <= 41 && last >= 41,
+            "the centre line must survive: {first}-{last}"
+        );
         assert!(
             text.lines().all(|l| l.chars().count() == 300),
             "no line may be truncated"
@@ -1259,7 +1274,11 @@ mod tests {
                 &ctx(d.path()),
             )
             .await;
-        assert!(!r.is_error, "whitespace-insensitive edit must succeed: {}", r.content);
+        assert!(
+            !r.is_error,
+            "whitespace-insensitive edit must succeed: {}",
+            r.content
+        );
         let after = std::fs::read_to_string(d.path().join("Cargo.toml")).unwrap();
         assert!(
             after.contains("default-features = false"),
@@ -1287,11 +1306,21 @@ mod tests {
                 &ctx(d.path()),
             )
             .await;
-        assert!(!r.is_error, "multi-line whitespace-insensitive edit must succeed: {}", r.content);
+        assert!(
+            !r.is_error,
+            "multi-line whitespace-insensitive edit must succeed: {}",
+            r.content
+        );
         let after = std::fs::read_to_string(d.path().join("android.yml")).unwrap();
-        assert!(after.contains("      - name: Copy CI Cargo config"), "indent not re-anchored: {after}");
+        assert!(
+            after.contains("      - name: Copy CI Cargo config"),
+            "indent not re-anchored: {after}"
+        );
         assert!(after.contains("cp ci/config.toml"), "{after}");
-        assert!(after.contains("      - name: Build"), "neighbor preserved: {after}");
+        assert!(
+            after.contains("      - name: Build"),
+            "neighbor preserved: {after}"
+        );
     }
 
     // The whitespace-insensitive tier must NOT fire on a short fragment (< 10 non-ws chars),
@@ -1306,8 +1335,16 @@ mod tests {
                 &ctx(d.path()),
             )
             .await;
-        assert!(r.is_error, "short whitespace-insensitive fragment must not match: {}", r.content);
-        assert_eq!(std::fs::read_to_string(d.path().join("a.txt")).unwrap(), "a = [1, 2]\nb = 9\n", "unchanged");
+        assert!(
+            r.is_error,
+            "short whitespace-insensitive fragment must not match: {}",
+            r.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("a.txt")).unwrap(),
+            "a = [1, 2]\nb = 9\n",
+            "unchanged"
+        );
     }
 
     // The whitespace-insensitive tier must still REFUSE when the normalized fragment is
@@ -1326,9 +1363,17 @@ mod tests {
                 &ctx(d.path()),
             )
             .await;
-        assert!(r.is_error, "ambiguous whitespace-insensitive match must be refused: {}", r.content);
         assert!(
-            std::fs::read_to_string(d.path().join("a.toml")).unwrap().matches("alpha").count() == 2,
+            r.is_error,
+            "ambiguous whitespace-insensitive match must be refused: {}",
+            r.content
+        );
+        assert!(
+            std::fs::read_to_string(d.path().join("a.toml"))
+                .unwrap()
+                .matches("alpha")
+                .count()
+                == 2,
             "file must be untouched"
         );
     }

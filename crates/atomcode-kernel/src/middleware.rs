@@ -57,11 +57,7 @@ pub trait ToolMiddleware: Send + Sync {
     /// keyed on tool identity (e.g. respecting [`Tool::self_bounds_output`]) reads it
     /// here instead of coordinating state across `before`/`after` — so it is robust even
     /// when an earlier `before` short-circuits the chain with [`BeforeOutcome::Allow`].
-    async fn after(
-        &self,
-        _result: &mut ToolResult,
-        _tool: Option<&Arc<dyn Tool>>,
-    ) -> AfterOutcome {
+    async fn after(&self, _result: &mut ToolResult, _tool: Option<&Arc<dyn Tool>>) -> AfterOutcome {
         AfterOutcome::Proceed
     }
 }

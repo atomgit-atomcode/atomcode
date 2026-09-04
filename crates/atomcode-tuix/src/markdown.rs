@@ -1759,17 +1759,30 @@ mod tests {
         let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
         // No top/bottom boundary: the table starts with the header ROW and ends
         // with the last DATA ROW — neither the first nor last line is a rule.
-        assert!(!is_rule(lines.first().unwrap().trim()), "no top boundary row");
-        assert!(!is_rule(lines.last().unwrap().trim()), "no bottom boundary row");
+        assert!(
+            !is_rule(lines.first().unwrap().trim()),
+            "no top boundary row"
+        );
+        assert!(
+            !is_rule(lines.last().unwrap().trim()),
+            "no bottom boundary row"
+        );
         // Every rule line is SEGMENTED (3 columns → inter-segment gaps), not a
         // solid full-width bar (a regression to the old solid rule has NO spaces).
         for l in &lines {
             let t = l.trim();
             if is_rule(t) {
-                assert!(t.contains(' '), "rule must be segmented (gaps present): {t:?}");
+                assert!(
+                    t.contains(' '),
+                    "rule must be segmented (gaps present): {t:?}"
+                );
             }
         }
-        let rule_lines: Vec<&str> = lines.iter().copied().filter(|l| is_rule(l.trim())).collect();
+        let rule_lines: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| is_rule(l.trim()))
+            .collect();
 
         // Borderless design: header separator + 1 inter-row separator only (no top/bottom).
         assert!(
@@ -1970,8 +1983,14 @@ mod tests {
             render_inline_line("现在批量落地：①Rust 修复 ②前端修复", plain_caps()),
             format!("现在批量落地：①{sep}Rust 修复 ②{sep}前端修复")
         );
-        assert_eq!(render_inline_line("③Task", plain_caps()), format!("③{sep}Task"));
-        assert_eq!(render_inline_line("⑳版本", plain_caps()), format!("⑳{sep}版本"));
+        assert_eq!(
+            render_inline_line("③Task", plain_caps()),
+            format!("③{sep}Task")
+        );
+        assert_eq!(
+            render_inline_line("⑳版本", plain_caps()),
+            format!("⑳{sep}版本")
+        );
     }
 
     #[test]
@@ -2511,8 +2530,7 @@ mod tests {
         );
         let styled = flush_aligned_table_with_width(&rows, caps(), 80);
         assert!(
-            styled.contains(theme::md_heading_open())
-                && styled.contains(theme::MD_HEADING_CLOSE),
+            styled.contains(theme::md_heading_open()) && styled.contains(theme::MD_HEADING_CLOSE),
             "styled terminals should emphasize the table header:\n{styled}"
         );
     }
@@ -2607,7 +2625,10 @@ mod tests {
             plain_caps(),
             80,
         );
-        assert!(!table.contains("---|---"), "raw delimiter must not leak: {table}");
+        assert!(
+            !table.contains("---|---"),
+            "raw delimiter must not leak: {table}"
+        );
         assert!(!table.contains('│'), "table must be borderless: {table}");
         assert!(
             table.contains('A') && table.contains('d'),
@@ -2875,10 +2896,7 @@ mod tests {
         ];
         // Natural width ~ 1 + (5+3) + (10+3) + (1+3) = 26.
         let wide = flush_aligned_table_with_width(&rows, plain_caps(), 80);
-        assert!(
-            !wide.contains('：'),
-            "80 cols should render as a grid"
-        );
+        assert!(!wide.contains('：'), "80 cols should render as a grid");
 
         let narrow = flush_aligned_table_with_width(&rows, plain_caps(), 20);
         assert!(narrow.contains('：'), "20 cols should fall back to flat");
@@ -2946,7 +2964,10 @@ mod tests {
                 out.push('\n');
             }
         }
-        assert!(!out.contains('：'), "wide terminal should keep a grid:\n{out}");
+        assert!(
+            !out.contains('：'),
+            "wide terminal should keep a grid:\n{out}"
+        );
         assert!(!out.contains('┌') && !out.contains('└') && !out.contains('│'));
         assert!(out.contains("a") && out.contains("2"));
     }

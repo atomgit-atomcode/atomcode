@@ -255,7 +255,12 @@ mod tests {
 
     #[test]
     fn weak_models_get_firm_execution_block() {
-        for m in ["qwen3.8-27b", "Qwen/Qwen3-VL-8B-Instruct", "deepseek-v4-flash", "deepseek-chat"] {
+        for m in [
+            "qwen3.8-27b",
+            "Qwen/Qwen3-VL-8B-Instruct",
+            "deepseek-v4-flash",
+            "deepseek-chat",
+        ] {
             let p = review_persona(m);
             assert!(
                 p.contains("REVIEWER EXECUTION DISCIPLINE"),
@@ -263,8 +268,14 @@ mod tests {
             );
             // The mechanics that fix the deep-fanout "0/N" failure must be present.
             assert!(p.contains("STOP WHEN DONE"), "{m}: must restate clean-stop");
-            assert!(p.contains("NEVER REPEAT AN IDENTICAL CALL"), "{m}: must guard the loop fuse");
-            assert!(p.contains("EMPTY IS A VALID RESULT"), "{m}: empty must count as success");
+            assert!(
+                p.contains("NEVER REPEAT AN IDENTICAL CALL"),
+                "{m}: must guard the loop fuse"
+            );
+            assert!(
+                p.contains("EMPTY IS A VALID RESULT"),
+                "{m}: empty must count as success"
+            );
         }
     }
 

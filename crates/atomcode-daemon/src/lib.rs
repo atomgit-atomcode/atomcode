@@ -8862,8 +8862,7 @@ mod tests {
     // as `{path, is_dir}` relative to the search dir. Mirrors the CLI popup.
     #[test]
     fn search_at_mention_finds_cross_level_and_skips_gitignored() {
-        let tmp =
-            std::env::temp_dir().join(format!("atomcode_fs_search_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("atomcode_fs_search_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let deep = tmp.join("src/main/java/cn");
         std::fs::create_dir_all(&deep).unwrap();
@@ -8878,7 +8877,9 @@ mod tests {
             .map(|m| m["path"].as_str().unwrap_or_default().to_string())
             .collect();
         assert!(
-            paths.iter().any(|p| p.ends_with("ApplyStockController.java")),
+            paths
+                .iter()
+                .any(|p| p.ends_with("ApplyStockController.java")),
             "must find the deep controller across levels: {paths:?}"
         );
         assert!(

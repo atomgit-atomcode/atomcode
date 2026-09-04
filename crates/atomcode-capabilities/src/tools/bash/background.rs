@@ -281,7 +281,10 @@ pub(crate) fn kill(job_id: &str) -> Result<String, String> {
 /// disabled `select!` arm (guarded by `*_done`) never resolves spuriously. `Ok(0)` (EOF) and
 /// read errors both map to `None` (the stream is done). Cancellation-safe: `AsyncReadExt::read`
 /// consumes no bytes when its future is dropped for another `select!` arm.
-async fn read_some<R: tokio::io::AsyncRead + Unpin>(s: &mut Option<R>, buf: &mut [u8]) -> Option<usize> {
+async fn read_some<R: tokio::io::AsyncRead + Unpin>(
+    s: &mut Option<R>,
+    buf: &mut [u8],
+) -> Option<usize> {
     match s {
         Some(r) => match r.read(buf).await {
             Ok(0) | Err(_) => None,
@@ -476,7 +479,8 @@ impl Tool for BashStartTool {
             Ok(a) => a,
             Err(e) => {
                 return err(format!(
-                    "bash_start: invalid arguments: {e}. Expected {{\"command\":\"<shell command>\"}}."
+                    "bash_start: invalid arguments: {e}. \
+                     Expected {{\"command\":\"<shell command>\"}}."
                 ))
             }
         };
@@ -606,7 +610,10 @@ mod tests {
         // Ordinary command: session-wide on BOTH, so one "Always" stops the next re-prompt.
         let (fg, bg) = scope("rm -rf victim");
         assert_eq!(fg, bg);
-        assert_eq!(bg, "", "a backgrounded ordinary command grants session-wide");
+        assert_eq!(
+            bg, "",
+            "a backgrounded ordinary command grants session-wide"
+        );
         // Two different ordinary commands share the key.
         assert_eq!(scope("rm -rf a").1, scope("python3 x.py > out.json").1);
         // Sensitive target: command-scoped on BOTH (the hard floor holds in the background too).
@@ -701,7 +708,10 @@ mod tests {
             .await
             .unwrap();
         let (out, status) = drain(&id).await;
-        assert!(out.contains("after"), "text after invalid byte was lost: {out:?}");
+        assert!(
+            out.contains("after"),
+            "text after invalid byte was lost: {out:?}"
+        );
         assert_eq!(status, Status::Exited(0));
     }
 

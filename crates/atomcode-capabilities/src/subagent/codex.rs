@@ -155,7 +155,10 @@ impl Drop for TempOutput {
 }
 
 fn result(output: String, stop_reason: SubagentStopReason) -> SubagentResult {
-    SubagentResult { output, stop_reason }
+    SubagentResult {
+        output,
+        stop_reason,
+    }
 }
 
 /// Turn one `codex exec --json` JSONL event line into a human progress line, or
@@ -211,7 +214,9 @@ fn codex_final_message_from_json_line(line: &str) -> Option<String> {
     if item.get("type")?.as_str()? != "agent_message" {
         return None;
     }
-    item.get("text").and_then(|t| t.as_str()).map(str::to_string)
+    item.get("text")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
 }
 
 /// Truncate on a char boundary with an ellipsis.
@@ -325,7 +330,8 @@ mod tests {
         for perm in [PermissionMode::AcceptEdits, PermissionMode::Auto] {
             let argv = codex_argv(perm, None, Path::new("/p"), Path::new("/o"));
             assert!(
-                argv.windows(2).any(|w| w == ["--sandbox", "workspace-write"]),
+                argv.windows(2)
+                    .any(|w| w == ["--sandbox", "workspace-write"]),
                 "{perm:?} → workspace-write"
             );
         }
@@ -396,9 +402,11 @@ mod tests {
         );
         assert_eq!(codex_activity_from_json_line("not json"), None);
         assert_eq!(codex_activity_from_json_line("  "), None);
-        assert!(codex_activity_from_json_line(r#"{"type":"error","message":"boom"}"#)
-            .unwrap()
-            .contains("boom"));
+        assert!(
+            codex_activity_from_json_line(r#"{"type":"error","message":"boom"}"#)
+                .unwrap()
+                .contains("boom")
+        );
     }
 
     #[test]
@@ -540,8 +548,7 @@ exit 0
         std::fs::write(&stub, "#!/bin/sh\nsleep 30\n").unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let backend = CodexBackend::new("codex-slow", PermissionMode::ReadOnly)
-            .with_program(&stub);
+        let backend = CodexBackend::new("codex-slow", PermissionMode::ReadOnly).with_program(&stub);
         let cancel = CancellationToken::new();
         cancel.cancel();
         let mut run = SubagentRun::new("x", dir.path());

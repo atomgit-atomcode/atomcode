@@ -424,6 +424,9 @@ mod tests {
         assert_ne!(a.entries, b.entries);
         assert_eq!(a.legacy_entries, history_path());
         assert_eq!(a.legacy_image_cache, image_cache_dir());
-        assert_eq!(a.entries.file_name().and_then(|s| s.to_str()), Some("entries.jsonl"));
+        assert_eq!(
+            a.entries.file_name().and_then(|s| s.to_str()),
+            Some("entries.jsonl")
+        );
     }
 }

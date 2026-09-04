@@ -452,7 +452,11 @@ mod tests {
     fn refresh_not_due_within_interval() {
         let now = chrono::Utc::now();
         let last = now - chrono::Duration::hours(1);
-        assert!(!refresh_is_due(Some(last), now, chrono::Duration::hours(24)));
+        assert!(!refresh_is_due(
+            Some(last),
+            now,
+            chrono::Duration::hours(24)
+        ));
     }
 
     #[test]

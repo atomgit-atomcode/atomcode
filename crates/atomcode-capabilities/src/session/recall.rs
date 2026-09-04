@@ -815,7 +815,10 @@ mod tests {
     fn tokenize_query_expands_cjk_to_bigrams() {
         assert_eq!(tokenize_query("工作任务"), vec!["工作", "作任", "任务"]);
         assert_eq!(tokenize_query("工"), vec!["工"]);
-        assert_eq!(tokenize_query("工作任务 工作"), vec!["工作", "作任", "任务"]);
+        assert_eq!(
+            tokenize_query("工作任务 工作"),
+            vec!["工作", "作任", "任务"]
+        );
     }
 
     #[test]
@@ -842,7 +845,12 @@ mod tests {
         write_jsonl(
             dir.path(),
             "zh1.jsonl",
-            &[rec("zh1", 1000, "请帮我把工作上的任务安排整理成清单", "好的")],
+            &[rec(
+                "zh1",
+                1000,
+                "请帮我把工作上的任务安排整理成清单",
+                "好的",
+            )],
         );
         write_jsonl(
             dir.path(),
@@ -854,13 +862,20 @@ mod tests {
             .unwrap();
         assert!(out.contains("Recalled 1 matching"), "got: {out}");
         assert!(out.contains("zh1"), "got: {out}");
-        assert!(!out.contains("烘焙记录"), "unrelated turn must not match: {out}");
+        assert!(
+            !out.contains("烘焙记录"),
+            "unrelated turn must not match: {out}"
+        );
     }
 
     #[test]
     fn zh_punctuation_pollution_query_hits() {
         let dir = tempfile::tempdir().unwrap();
-        write_jsonl(dir.path(), "zh3.jsonl", &[rec("zh3", 1000, "工作任务", "收到")]);
+        write_jsonl(
+            dir.path(),
+            "zh3.jsonl",
+            &[rec("zh3", 1000, "工作任务", "收到")],
+        );
         let tool = RecallTool::new();
         let ascii = tool
             .search_dir(dir.path(), "工作,任务", None, None, 8)
@@ -869,7 +884,10 @@ mod tests {
         let fullwidth = tool
             .search_dir(dir.path(), "工作，任务", None, None, 8)
             .unwrap();
-        assert!(fullwidth.contains("Recalled 1 matching"), "got: {fullwidth}");
+        assert!(
+            fullwidth.contains("Recalled 1 matching"),
+            "got: {fullwidth}"
+        );
     }
 
     #[test]

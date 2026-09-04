@@ -3994,7 +3994,10 @@ mod tests {
         // Never collapses to the tool-wide key, which would make it match an ordinary grant.
         assert_ne!(key("cat ~/.ssh/id_rsa"), "");
         // Cosmetic re-emit of the SAME sensitive command still matches its existing grant.
-        assert_eq!(key("cat  ~/.ssh/id_rsa   # a"), key("cat ~/.ssh/id_rsa # b"));
+        assert_eq!(
+            key("cat  ~/.ssh/id_rsa   # a"),
+            key("cat ~/.ssh/id_rsa # b")
+        );
     }
 
     #[test]
@@ -4321,7 +4324,11 @@ mod tests {
         let r = BashTool
             .execute(r#"{"command":"sleep 30","timeout":1}"#, &ctx(d.path()))
             .await;
-        assert!(r.content.contains("pass a larger `timeout`"), "{}", r.content);
+        assert!(
+            r.content.contains("pass a larger `timeout`"),
+            "{}",
+            r.content
+        );
         assert!(
             r.content.contains(&format!("{MAX_TIMEOUT_SECS}s")),
             "the message must name the ceiling: {}",
@@ -4335,8 +4342,14 @@ mod tests {
     #[test]
     fn timeout_message_at_ceiling_points_at_bash_start() {
         let m = timeout_message(MAX_TIMEOUT_SECS);
-        assert!(!m.contains("pass a larger"), "must not point at a maxed knob: {m}");
-        assert!(m.contains("bash_start"), "must point at the background tool: {m}");
+        assert!(
+            !m.contains("pass a larger"),
+            "must not point at a maxed knob: {m}"
+        );
+        assert!(
+            m.contains("bash_start"),
+            "must point at the background tool: {m}"
+        );
     }
 
     /// A silently-clamped `timeout` is surfaced (real limit + what was asked); an honored
@@ -4345,8 +4358,13 @@ mod tests {
     fn timeout_clamp_notice_only_fires_when_clamped() {
         let n = timeout_clamp_notice(MAX_TIMEOUT_SECS, Some(330)).expect("over-ceiling clamps");
         assert!(n.contains("requested 330s"), "{n}");
-        assert!(n.contains(&format!("{MAX_TIMEOUT_SECS}s")), "names the ceiling: {n}");
-        assert!(timeout_clamp_notice(1, Some(0)).unwrap().contains("requested 0s")); // low clamp
+        assert!(
+            n.contains(&format!("{MAX_TIMEOUT_SECS}s")),
+            "names the ceiling: {n}"
+        );
+        assert!(timeout_clamp_notice(1, Some(0))
+            .unwrap()
+            .contains("requested 0s")); // low clamp
         assert!(timeout_clamp_notice(60, Some(60)).is_none()); // honored → silent
         assert!(timeout_clamp_notice(60, None).is_none()); // default → silent
     }

@@ -973,9 +973,7 @@ pub async fn run(
 
 #[cfg(test)]
 mod panic_restore_tests {
-    use super::{
-        kitty_keyboard_flags, panic_restore_sequence, resolve_history_replay_max_rows,
-    };
+    use super::{kitty_keyboard_flags, panic_restore_sequence, resolve_history_replay_max_rows};
     use crossterm::event::KeyboardEnhancementFlags;
 
     fn test_caps() -> crate::terminal::TerminalCaps {
@@ -999,8 +997,9 @@ mod panic_restore_tests {
 
     #[test]
     fn automatic_history_replay_cap_is_below_retained_memory_limit() {
-        let cap = resolve_history_replay_max_rows(&atomcode_config::Config::default(), &test_caps())
-            .expect("automatic replay must stay bounded");
+        let cap =
+            resolve_history_replay_max_rows(&atomcode_config::Config::default(), &test_caps())
+                .expect("automatic replay must stay bounded");
         assert!(cap < crate::render::retained::MAX_SCROLLBACK_ROWS);
     }
 

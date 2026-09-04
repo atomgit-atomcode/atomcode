@@ -24,7 +24,9 @@ pub struct MemoryStore {
 /// nests under `project_root`; an absolute value is used as-is (std `Path::join`
 /// semantics). `memory.md` is appended in either case.
 fn project_memory_path(project_root: &Path, override_dir: Option<&str>) -> PathBuf {
-    let dir = override_dir.filter(|s| !s.is_empty()).unwrap_or(".atomcode");
+    let dir = override_dir
+        .filter(|s| !s.is_empty())
+        .unwrap_or(".atomcode");
     project_root.join(dir).join("memory.md")
 }
 
@@ -412,8 +414,6 @@ mod tests {
         assert!(!merged2.contains("[Local]"));
 
         // All empty → empty string.
-        assert!(
-            MemoryStore::merged_for_prompt(&empty, &empty, &empty, "myproj").is_empty()
-        );
+        assert!(MemoryStore::merged_for_prompt(&empty, &empty, &empty, "myproj").is_empty());
     }
 }

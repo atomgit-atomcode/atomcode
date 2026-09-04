@@ -429,8 +429,7 @@ mod tests {
         // The shell backgrounds a long sleep (grandchild), prints its PID, then
         // sleeps itself. setsid + killpg must reap the grandchild that a
         // direct-child kill would orphan.
-        let mut child =
-            ManagedChild::spawn(sh("sleep 60 & echo $!; sleep 60")).unwrap();
+        let mut child = ManagedChild::spawn(sh("sleep 60 & echo $!; sleep 60")).unwrap();
         let stdout = child.take_stdout().unwrap();
         let mut lines = BufReader::new(stdout).lines();
         let gpid: i32 = lines
@@ -451,6 +450,9 @@ mod tests {
             fn kill(pid: i32, sig: i32) -> i32;
         }
         let alive = unsafe { kill(gpid, 0) } == 0;
-        assert!(!alive, "grandchild {gpid} should have been reaped by killpg");
+        assert!(
+            !alive,
+            "grandchild {gpid} should have been reaped by killpg"
+        );
     }
 }

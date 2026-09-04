@@ -1,11 +1,11 @@
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Schedule {
-    Daily { time: String },                        // "HH:MM"
-    Weekly { weekday: u8, time: String },          // weekday 1..=7 (1=Mon)
+    Daily { time: String },               // "HH:MM"
+    Weekly { weekday: u8, time: String }, // weekday 1..=7 (1=Mon)
     Hourly,
     Interval { every_minutes: u32 },
     Cron { expr: String },
@@ -19,9 +19,9 @@ pub struct ScheduleTask {
     pub cwd: String,
     pub schedule: Schedule,
     #[serde(default = "default_mode")]
-    pub permission_mode: String,   // "plan" | "accept_edits" | "auto"
+    pub permission_mode: String, // "plan" | "accept_edits" | "auto"
     #[serde(default = "default_notify")]
-    pub notify: String,            // "off" | "important" | "all"
+    pub notify: String, // "off" | "important" | "all"
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -32,9 +32,15 @@ pub struct ScheduleTask {
     pub last_status: Option<String>,
 }
 
-fn default_mode() -> String { "plan".into() }
-fn default_notify() -> String { "important".into() }
-fn default_true() -> bool { true }
+fn default_mode() -> String {
+    "plan".into()
+}
+fn default_notify() -> String {
+    "important".into()
+}
+fn default_true() -> bool {
+    true
+}
 
 pub fn schedules_root() -> PathBuf {
     crate::config::Config::config_dir().join("schedules")
@@ -82,13 +88,17 @@ fn load_in(root: &std::path::Path, id: &str) -> std::io::Result<ScheduleTask> {
 
 fn list_in(root: &std::path::Path) -> Vec<ScheduleTask> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(root) else { return out };
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return out;
+    };
     for entry in rd.flatten() {
         let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
         if let Ok(bytes) = std::fs::read(&p) {
             if let Ok(t) = serde_json::from_slice::<ScheduleTask>(&bytes) {
-                out.push(t);   // corrupt files are skipped
+                out.push(t); // corrupt files are skipped
             }
         }
     }
@@ -104,10 +114,18 @@ fn remove_in(root: &std::path::Path, id: &str) -> std::io::Result<()> {
     }
 }
 
-pub fn save(task: &ScheduleTask) -> std::io::Result<()> { save_in(&schedules_root(), task) }
-pub fn load(id: &str) -> std::io::Result<ScheduleTask> { load_in(&schedules_root(), id) }
-pub fn list() -> Vec<ScheduleTask> { list_in(&schedules_root()) }
-pub fn remove(id: &str) -> std::io::Result<()> { remove_in(&schedules_root(), id) }
+pub fn save(task: &ScheduleTask) -> std::io::Result<()> {
+    save_in(&schedules_root(), task)
+}
+pub fn load(id: &str) -> std::io::Result<ScheduleTask> {
+    load_in(&schedules_root(), id)
+}
+pub fn list() -> Vec<ScheduleTask> {
+    list_in(&schedules_root())
+}
+pub fn remove(id: &str) -> std::io::Result<()> {
+    remove_in(&schedules_root(), id)
+}
 
 /// Next fire time (epoch secs) for simple frequencies. `Cron` returns None in
 /// phase 1 (its real firing is the phase-2 OS scheduler). Uses naive local-less
@@ -119,8 +137,9 @@ pub fn next_run(schedule: &Schedule, now_epoch_secs: i64) -> Option<i64> {
         Some((h.parse().ok()?, m.parse().ok()?))
     }
     match schedule {
-        Schedule::Interval { every_minutes } =>
-            (*every_minutes > 0).then(|| now_epoch_secs + (*every_minutes as i64) * 60),
+        Schedule::Interval { every_minutes } => {
+            (*every_minutes > 0).then(|| now_epoch_secs + (*every_minutes as i64) * 60)
+        }
         Schedule::Hourly => {
             let secs_into_hour = now_epoch_secs.rem_euclid(3600);
             Some(now_epoch_secs + (3600 - secs_into_hour))
@@ -129,7 +148,11 @@ pub fn next_run(schedule: &Schedule, now_epoch_secs: i64) -> Option<i64> {
             let (h, m) = hhmm(time)?;
             let day = now_epoch_secs.div_euclid(86400) * 86400;
             let target = day + h * 3600 + m * 60;
-            Some(if target > now_epoch_secs { target } else { target + 86400 })
+            Some(if target > now_epoch_secs {
+                target
+            } else {
+                target + 86400
+            })
         }
         Schedule::Weekly { time, .. } => {
             // Phase 1 approximation: next day-boundary match of the time; exact
@@ -137,7 +160,11 @@ pub fn next_run(schedule: &Schedule, now_epoch_secs: i64) -> Option<i64> {
             let (h, m) = hhmm(time)?;
             let day = now_epoch_secs.div_euclid(86400) * 86400;
             let target = day + h * 3600 + m * 60;
-            Some(if target > now_epoch_secs { target } else { target + 86400 })
+            Some(if target > now_epoch_secs {
+                target
+            } else {
+                target + 86400
+            })
         }
         Schedule::Cron { .. } => None,
     }
@@ -149,10 +176,19 @@ mod tests {
 
     fn sample() -> ScheduleTask {
         ScheduleTask {
-            id: "t1".into(), title: "Daily brief".into(), prompt: "summarize".into(),
-            cwd: "/tmp/proj".into(), schedule: Schedule::Daily { time: "09:00".into() },
-            permission_mode: "plan".into(), notify: "important".into(), enabled: true,
-            created_at: 0, last_run_at: None, last_status: None,
+            id: "t1".into(),
+            title: "Daily brief".into(),
+            prompt: "summarize".into(),
+            cwd: "/tmp/proj".into(),
+            schedule: Schedule::Daily {
+                time: "09:00".into(),
+            },
+            permission_mode: "plan".into(),
+            notify: "important".into(),
+            enabled: true,
+            created_at: 0,
+            last_run_at: None,
+            last_status: None,
         }
     }
 
@@ -222,12 +258,26 @@ mod tests {
     fn next_run_daily_is_today_or_tomorrow_at_time() {
         // 2026-07-31 08:00:00 UTC = 1785657600 ; daily 09:00 → same day 09:00
         let now = 1785657600;
-        let nr = next_run(&Schedule::Daily { time: "09:00".into() }, now).unwrap();
+        let nr = next_run(
+            &Schedule::Daily {
+                time: "09:00".into(),
+            },
+            now,
+        )
+        .unwrap();
         assert!(nr > now && nr - now <= 24 * 3600);
     }
 
     #[test]
     fn next_run_cron_is_none_in_phase1() {
-        assert_eq!(next_run(&Schedule::Cron { expr: "0 9 * * *".into() }, 0), None);
+        assert_eq!(
+            next_run(
+                &Schedule::Cron {
+                    expr: "0 9 * * *".into()
+                },
+                0
+            ),
+            None
+        );
     }
 }

@@ -36,9 +36,9 @@ use serde_json::json;
 use crate::config::ReviewAgentConfig;
 use crate::diff::annotate_diff_line_numbers;
 use crate::fanout::{
-    dimension_coverage, merge_deep_findings, render_deep_result, render_verify_task, run_deep_review,
-    run_verify, verify_reconfirms, DimensionOutcome, REVIEW_DIMENSIONS, VERIFY_CONCURRENCY,
-    VERIFY_LENS,
+    dimension_coverage, merge_deep_findings, render_deep_result, render_verify_task,
+    run_deep_review, run_verify, verify_reconfirms, DimensionOutcome, REVIEW_DIMENSIONS,
+    VERIFY_CONCURRENCY, VERIFY_LENS,
 };
 use crate::impact_plan::render_review_impact_plan;
 use crate::rules::{changed_files_from_diff, render_rules_section};
@@ -83,7 +83,8 @@ impl ReviewProgressHook {
             self.findings.load(Ordering::Relaxed),
             tail,
         );
-        self.progress.emit(format!("{REVIEW_ACTIVITY_MARKER}{line}"));
+        self.progress
+            .emit(format!("{REVIEW_ACTIVITY_MARKER}{line}"));
     }
 }
 
@@ -551,7 +552,12 @@ impl Tool for ReviewTool {
             return if stop == StopReason::Stopped && run_error.is_none() {
                 ok(render_findings(&findings, files.len()))
             } else {
-                err(render_incomplete_review(&findings, files.len(), stop, run_error.as_deref()))
+                err(render_incomplete_review(
+                    &findings,
+                    files.len(),
+                    stop,
+                    run_error.as_deref(),
+                ))
             };
         }
 
@@ -627,9 +633,19 @@ impl Tool for ReviewTool {
             merged.retain(|_| mask.next().unwrap_or(true));
             verify_dropped = Some(before - merged.len());
         }
-        let (is_error, content) =
-            render_deep_result(&merged, files.len(), &completed, &failed, deduped, verify_dropped);
-        if is_error { err(content) } else { ok(content) }
+        let (is_error, content) = render_deep_result(
+            &merged,
+            files.len(),
+            &completed,
+            &failed,
+            deduped,
+            verify_dropped,
+        );
+        if is_error {
+            err(content)
+        } else {
+            ok(content)
+        }
     }
 }
 
@@ -918,7 +934,10 @@ mod tests {
     #[test]
     fn review_activity_line_composes_label_findings_and_tail() {
         // No label, no findings → bare marker text + tail (round is never shown).
-        assert_eq!(review_activity_line(None, 0, "thinking"), "review · thinking");
+        assert_eq!(
+            review_activity_line(None, 0, "thinking"),
+            "review · thinking"
+        );
         // Singular finding, no label.
         assert_eq!(
             review_activity_line(None, 1, "thinking"),
@@ -1000,7 +1019,8 @@ mod tests {
             _ => panic!("expected Commit{{rev:HEAD}}"),
         }
         // An explicit rev is still honored.
-        let e: Args = serde_json::from_str(r#"{"scope":{"kind":"commit","rev":"abc123"}}"#).unwrap();
+        let e: Args =
+            serde_json::from_str(r#"{"scope":{"kind":"commit","rev":"abc123"}}"#).unwrap();
         match e.review_scope().unwrap() {
             ReviewScope::Commit { rev } => assert_eq!(rev, "abc123"),
             _ => panic!("expected Commit{{rev:abc123}}"),
@@ -1551,7 +1571,10 @@ mod tests {
             "{depth_desc}"
         );
         // Cost caution keeps a weak model from over-escalating.
-        assert!(depth_desc.contains("escalate only when warranted"), "{depth_desc}");
+        assert!(
+            depth_desc.contains("escalate only when warranted"),
+            "{depth_desc}"
+        );
         // The tool description also points at depth selection.
         assert!(tool.description().contains("depth"));
         assert!(tool.description().contains("escalate"));
@@ -1578,7 +1601,10 @@ mod tests {
             Arc::new(RwLock::new(Some(Arc::new(ScriptedReviewProvider))));
         let tool = ReviewTool::new(
             provider,
-            ReviewToolConfig { model: "mock-model".into(), ..Default::default() },
+            ReviewToolConfig {
+                model: "mock-model".into(),
+                ..Default::default()
+            },
         );
         let ctx = ToolContext {
             working_dir: dir.path().to_path_buf(),
@@ -1592,9 +1618,21 @@ mod tests {
         // 4 dimensions report the same finding → merged to 1; each finding's
         // verify agent (ScriptedReviewProvider) re-reports it → kept, dropped 0.
         assert!(!res.is_error, "deep+verify should succeed: {}", res.content);
-        assert!(res.content.contains("Deep review"), "deep header: {}", res.content);
-        assert!(res.content.contains("verify dropped 0"), "verify note, nothing culled: {}", res.content);
-        assert!(res.content.contains("1 finding"), "the confirmed finding survives: {}", res.content);
+        assert!(
+            res.content.contains("Deep review"),
+            "deep header: {}",
+            res.content
+        );
+        assert!(
+            res.content.contains("verify dropped 0"),
+            "verify note, nothing culled: {}",
+            res.content
+        );
+        assert!(
+            res.content.contains("1 finding"),
+            "the confirmed finding survives: {}",
+            res.content
+        );
     }
 
     #[tokio::test]

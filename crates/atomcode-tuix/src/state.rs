@@ -449,7 +449,10 @@ impl UserInputPanel {
                     if custom.is_empty() && self.images.is_empty() {
                         return None; // cursor on "Other" with no text → no-op
                     }
-                    (!custom.is_empty()).then(|| custom.to_string()).into_iter().collect()
+                    (!custom.is_empty())
+                        .then(|| custom.to_string())
+                        .into_iter()
+                        .collect()
                 };
                 Some(UserInputResponse {
                     declined: false,
@@ -1609,7 +1612,11 @@ impl UiState {
     /// is available, three ASCII dots (`...`) otherwise. Used by the
     /// spinner label and any other "still working…" suffix.
     pub fn ellipsis(&self) -> &'static str {
-        if self.unicode_symbols { "…" } else { "..." }
+        if self.unicode_symbols {
+            "…"
+        } else {
+            "..."
+        }
     }
 
     /// Merge one `AgentEvent::ContextStats` emission into the cached
@@ -2176,10 +2183,7 @@ impl UiState {
     }
 
     fn refresh_sub_agent_label(&mut self) {
-        self.spinner_label = format!(
-            "SubAgents {}/{}",
-            self.sub_agent_done, self.sub_agent_total
-        );
+        self.spinner_label = format!("SubAgents {}/{}", self.sub_agent_done, self.sub_agent_total);
     }
 
     /// End the dispatch — clears descriptors so subsequent thinks/tools
@@ -2518,12 +2522,27 @@ mod tests {
         // gauge-only refresh must PRESERVE the breakdown while updating occupancy.
         let mut s = UiState::new();
         // A real (successful) turn: 33 messages, full breakdown.
-        s.on_context_stats(5_000, 400_000, 2_000, 1_000, 33, 512_000, "coding-runtime", "sys");
+        s.on_context_stats(
+            5_000,
+            400_000,
+            2_000,
+            1_000,
+            33,
+            512_000,
+            "coding-runtime",
+            "sys",
+        );
         // A later /context refresh reports a higher (over-limit) occupancy only.
         s.on_context_gauge_refresh(697_300, 512_000, "coding-runtime");
         let snap = s.last_context.as_ref().unwrap();
-        assert_eq!(snap.sent_tokens, 697_300, "gauge updated to latest occupancy");
-        assert_eq!(snap.total_messages, 33, "message count preserved, not zeroed");
+        assert_eq!(
+            snap.sent_tokens, 697_300,
+            "gauge updated to latest occupancy"
+        );
+        assert_eq!(
+            snap.total_messages, 33,
+            "message count preserved, not zeroed"
+        );
         assert_eq!(snap.system_tokens, 5_000, "system bucket preserved");
         assert_eq!(snap.cold_zone_tokens, 1_000, "cold bucket preserved");
     }
@@ -3565,7 +3584,9 @@ mod tests {
         }]);
         assert_eq!(confirmed[0].message.text, "folded-now");
         assert_eq!(
-            st.pending_steers.front().map(|pending| pending.message.text.as_str()),
+            st.pending_steers
+                .front()
+                .map(|pending| pending.message.text.as_str()),
             Some("queued-next-turn"),
             "a queued context message must not block a later real steer acknowledgement"
         );
@@ -3633,7 +3654,9 @@ mod tests {
         let mut state = UiState::new();
         assert_eq!(state.reasoning_effort, None, "stale field starts empty");
         assert_eq!(
-            state.cycle_reasoning_effort_within(Some("high"), &all).as_deref(),
+            state
+                .cycle_reasoning_effort_within(Some("high"), &all)
+                .as_deref(),
             Some("max")
         );
         // And the now-seeded state continues correctly (max → None).
@@ -3650,20 +3673,29 @@ mod tests {
         // The motivating case: an endpoint exposing low/high/max but NOT medium.
         let allowed = ["low", "high", "max"];
         let mut st = UiState::new();
-        assert_eq!(st.cycle_reasoning_effort_within(None, &allowed).as_deref(), Some("low"));
+        assert_eq!(
+            st.cycle_reasoning_effort_within(None, &allowed).as_deref(),
+            Some("low")
+        );
         // low → high: medium is skipped because it is not allowed.
         assert_eq!(
-            st.cycle_reasoning_effort_within(Some("low"), &allowed).as_deref(),
+            st.cycle_reasoning_effort_within(Some("low"), &allowed)
+                .as_deref(),
             Some("high")
         );
         assert_eq!(
-            st.cycle_reasoning_effort_within(Some("high"), &allowed).as_deref(),
+            st.cycle_reasoning_effort_within(Some("high"), &allowed)
+                .as_deref(),
             Some("max")
         );
-        assert_eq!(st.cycle_reasoning_effort_within(Some("max"), &allowed), None);
+        assert_eq!(
+            st.cycle_reasoning_effort_within(Some("max"), &allowed),
+            None
+        );
         // A value no longer in the allowed set restarts at the first allowed level.
         assert_eq!(
-            st.cycle_reasoning_effort_within(Some("medium"), &allowed).as_deref(),
+            st.cycle_reasoning_effort_within(Some("medium"), &allowed)
+                .as_deref(),
             Some("low")
         );
     }
@@ -3680,7 +3712,8 @@ mod tests {
 
         // A synced concrete value is kept verbatim.
         assert_eq!(
-            st.cycle_reasoning_effort_within(Some("high"), empty).as_deref(),
+            st.cycle_reasoning_effort_within(Some("high"), empty)
+                .as_deref(),
             Some("high")
         );
         assert_eq!(st.reasoning_effort.as_deref(), Some("high"));
@@ -3697,7 +3730,8 @@ mod tests {
         let all = ["low", "medium", "high", "max"];
         let mut st = UiState::new();
         assert_eq!(
-            st.cycle_reasoning_effort_within(Some("  high  "), &all).as_deref(),
+            st.cycle_reasoning_effort_within(Some("  high  "), &all)
+                .as_deref(),
             Some("max")
         );
     }

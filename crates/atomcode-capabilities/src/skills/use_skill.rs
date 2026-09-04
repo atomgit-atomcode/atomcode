@@ -81,7 +81,8 @@ impl Tool for UseSkillTool {
         // install-path `<system-reminder>` rides along — otherwise the model, invoking
         // a skill that bundles `scripts/`/`references/`, has to re-search the working
         // directory for those files. Matches the user `$skill` path.
-        match tokio::task::spawn_blocking(move || skill.expand_for_injection(&arguments, "")).await {
+        match tokio::task::spawn_blocking(move || skill.expand_for_injection(&arguments, "")).await
+        {
             Ok(content) => ok(content),
             Err(_) => err("use_skill: expansion task failed"),
         }
@@ -180,7 +181,11 @@ mod tests {
         let tool = UseSkillTool::new(Arc::new(reg));
         let r = tool.execute(r#"{"name":"bundle"}"#, &ctx()).await;
         assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("Run scripts/go.sh"), "body missing: {}", r.content);
+        assert!(
+            r.content.contains("Run scripts/go.sh"),
+            "body missing: {}",
+            r.content
+        );
         assert!(
             r.content.contains("This skill is installed at:"),
             "install-path reminder missing — model would re-search cwd for bundled files: {}",
