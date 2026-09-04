@@ -16,8 +16,9 @@ use std::path::Path;
 /// atomic even when the target exists.
 ///
 /// `mode` is the Unix file mode. Use `0o644` for normal config files and
-/// `0o600` for secrets (tokens, OAuth credentials). Ignored on Windows
-/// for now; ACL handling is a P8 follow-up.
+/// `0o600` for secrets (tokens, OAuth credentials). On Windows, `0o600`
+/// maps to an owner-only ACL via `icacls` (strip inherited ACEs, grant the
+/// current user full control); other modes keep the default inherited ACL.
 pub fn atomic_write(path: &Path, content: &[u8], mode: u32) -> Result<()> {
     let parent = path.parent().context("atomic_write: path has no parent")?;
     std::fs::create_dir_all(parent)
@@ -37,14 +38,15 @@ pub fn atomic_write(path: &Path, content: &[u8], mode: u32) -> Result<()> {
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode))
             .with_context(|| format!("atomic_write: chmod({:o})", mode))?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = mode;
-        // TODO(P8-v2): Windows ACL for mode 0o600 files (mcp.json with tokens).
-        // Use `windows-acl` crate or `icacls` command to restrict to owner-only.
-        // Currently Windows files inherit parent directory ACL, which is acceptable
-        // for most dev environments but not for shared/enterprise machines.
-        // Tracked in spec Section 5 / "Windows ACL" follow-up.
+        // Windows has no POSIX permission bits. For secret files (mode
+        // 0o600) we mirror the POSIX semantics with `icacls`: strip all
+        // inherited ACEs and grant full control to the current user only.
+        // Non-secret files (0o644) keep the default inherited ACL.
+        if mode == 0o600 {
+            restrict_windows_acl(tmp.path())?;
+        }
     }
 
     tmp.persist(path)
@@ -70,6 +72,41 @@ pub fn atomic_write(path: &Path, content: &[u8], mode: u32) -> Result<()> {
     dir.sync_all()
         .with_context(|| format!("atomic_write: fsync parent {}", parent.display()))?;
 
+    Ok(())
+}
+
+/// Restrict a file to the current user on Windows, mirroring POSIX `0o600`.
+///
+/// Uses `icacls` to strip all inherited ACEs (`/inheritance:r`) and grant
+/// the current user full control (`/grant:r`). Runs on the temp file before
+/// `persist` so the ACL travels with the atomic rename.
+#[cfg(windows)]
+fn restrict_windows_acl(path: &Path) -> Result<()> {
+    use std::process::Command;
+
+    let user = std::env::var("USERNAME")
+        .map_err(|_| anyhow::anyhow!("restrict_windows_acl: USERNAME not set"))?;
+    // Quote the account when it contains spaces so icacls parses the grant
+    // as a single `<account>:(perm)` argument.
+    let grant = if user.contains(' ') {
+        format!("\"{user}\":(F)")
+    } else {
+        format!("{user}:(F)")
+    };
+    let status = Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(grant)
+        .status()
+        .with_context(|| format!("restrict_windows_acl: spawn icacls for {}", path.display()))?;
+    if !status.success() {
+        anyhow::bail!(
+            "restrict_windows_acl: icacls exited with {:?} for {}",
+            status.code(),
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -104,6 +141,56 @@ mod tests {
         atomic_write(&path, b"{}", 0o600).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_write_0600_restricts_acl_on_windows() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.json");
+        atomic_write(&path, b"{}", 0o600).unwrap();
+
+        // icacls output: `file NT AUTHORITY\SYSTEM:(I)(F) ... Lenovo\Lenovo:(F)`
+        // After /inheritance:r + /grant:r, inherited ACEs (marked (I)) must be gone
+        // and only the current user retains full control.
+        let output = Command::new("icacls")
+            .arg(&path)
+            .output()
+            .expect("icacls query should run");
+        assert!(output.status.success(), "icacls query failed");
+        let text = String::from_utf8_lossy(&output.stdout);
+
+        // No inherited ACEs left (the "(I)" marker is appended to inherited entries).
+        assert!(
+            !text.contains("(I)"),
+            "0o600 file must not keep inherited ACEs, got:\n{text}"
+        );
+        // Owner full control must be granted.
+        assert!(
+            text.contains("(F)"),
+            "0o600 file must grant owner full control, got:\n{text}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_write_0644_keeps_inherited_acl_on_windows() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("normal.json");
+        atomic_write(&path, b"{}", 0o644).unwrap();
+
+        let output = Command::new("icacls")
+            .arg(&path)
+            .output()
+            .expect("icacls query should run");
+        let text = String::from_utf8_lossy(&output.stdout);
+        // 0o644 files keep the default (inherited) ACL — the query must still succeed.
+        assert!(output.status.success());
+        assert!(!text.is_empty());
     }
 
     #[test]
