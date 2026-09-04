@@ -20,7 +20,7 @@
 //! | destructive, all targets IN workspace | `Proceed` (unchanged: single-file rm stays Safe→runs; recursive rm still Risky→ApprovalMiddleware) |
 //! | destructive, target is SENSITIVE (any location) | prompt EVERY time, never remembered |
 //! | destructive, target OUT of workspace | prompt; "Always" grants PER canonical directory |
-//! | destructive but targets UNRESOLVABLE (`cd`-then-relative, `$()`, unexpanded `$var`, no clean target) | prompt EVERY time, never remembered (fail-closed) |
+//! | destructive but targets UNRESOLVABLE (`cd`-then-relative, `$()`, unexpanded `$var`, no clean target) | prompt (fail-closed: we cannot prove it stays in-workspace); "Always" IS remembered for the session |
 //!
 //! Mode independence: this gate is about WORKSPACE SCOPE, not edit-accept, so it fires
 //! regardless of the accept-edits flag. In full `Auto` (免审批) mode the driver auto-answers
@@ -48,7 +48,7 @@ use super::approval::{
     ApprovalRequest, InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
 };
 use super::resolve_path;
-use super::sensitive_path::path_is_sensitive;
+use super::sensitive_path::{path_is_sensitive, references_sensitive_path};
 use super::write_approval::{canonical_dir_key, path_in_temp_dir, path_in_workspace};
 
 /// A token that contains an unexpanded shell expansion (`$var`, `$(...)`, backtick) whose value —
@@ -718,8 +718,9 @@ impl BashWorkspaceGate {
         PermissionDecision::from_value(&rt.request(&self.kind, payload).await)
     }
 
-    /// Prompt and NEVER remember it — every call re-prompts (used for sensitive targets and for
-    /// unresolvable destructive commands). Both allow-once and allow-always proceed without storing.
+    /// Prompt and NEVER remember it — every call re-prompts. Reserved for SENSITIVE targets:
+    /// no answer to one prompt may pre-approve a later secret access. Both allow-once and
+    /// allow-always proceed without storing.
     async fn prompt_unremembered(
         &self,
         call: &ToolCall,
@@ -730,6 +731,53 @@ impl BashWorkspaceGate {
             PermissionDecision::AllowOnce | PermissionDecision::AllowAlways => {
                 BeforeOutcome::Allow {
                     reason: Some("destructive bash approved (not remembered)".into()),
+                }
+            }
+            PermissionDecision::Deny => BeforeOutcome::deny(
+                "a destructive bash command needs approval and was denied".to_string(),
+            ),
+        }
+    }
+
+    /// A destructive command whose TARGET cannot be resolved statically (`cd`-then-relative,
+    /// `$(...)`, an unexpanded `$var`, no clean operand). The call still needs approval — we
+    /// cannot prove it stays in the workspace — but the ANSWER is now remembered.
+    ///
+    /// It used to route through [`prompt_unremembered`](Self::prompt_unremembered), which made
+    /// the approval panel's "Always" a literal no-op for this whole class: a
+    /// `cd '/some/dir' && python3 x.py > out.json` re-prompted on every single call no matter
+    /// what the user picked. That is the reported "点了总是允许，bash 还是每次都问". Fail-closed
+    /// applies to whether we ASK, not to whether we honour the answer.
+    ///
+    /// The grant key is [`Tool::always_grant_scope`], the SAME scope the approval panel renders
+    /// its label from, so "Always" means one thing everywhere. Sensitive arguments are routed to
+    /// the unremembered prompt above before we get here — that floor is unchanged.
+    async fn prompt_unresolvable(
+        &self,
+        call: &ToolCall,
+        tool: &Arc<dyn Tool>,
+        rt: &RequestCtx,
+    ) -> BeforeOutcome {
+        if references_sensitive_path(&call.arguments) {
+            return self.prompt_unremembered(call, tool, rt).await;
+        }
+        let key = format!(
+            "bash-unresolvable::{}",
+            tool.always_grant_scope(&call.arguments)
+        );
+        if self.store.is_granted(&key) {
+            return BeforeOutcome::Allow {
+                reason: Some("destructive bash previously approved for this session".into()),
+            };
+        }
+        match self.prompt(call, tool, rt).await {
+            PermissionDecision::AllowOnce => BeforeOutcome::Allow {
+                reason: Some("destructive bash approved (this call)".into()),
+            },
+            PermissionDecision::AllowAlways => {
+                self.store.grant(&key);
+                BeforeOutcome::Allow {
+                    reason: Some("destructive bash approved for this session".into()),
                 }
             }
             PermissionDecision::Deny => BeforeOutcome::deny(
@@ -756,7 +804,7 @@ impl ToolMiddleware for BashWorkspaceGate {
 
         let targets = match scan_destructive_bash(&command) {
             BashScan::NotDestructive => return BeforeOutcome::Proceed,
-            BashScan::Unresolvable => return self.prompt_unremembered(call, tool, rt).await,
+            BashScan::Unresolvable => return self.prompt_unresolvable(call, tool, rt).await,
             BashScan::Targets(t) => t,
         };
 

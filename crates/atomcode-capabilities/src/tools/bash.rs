@@ -164,12 +164,29 @@ impl Tool for BashTool {
             Err(_) => RiskLevel::Risky,
         }
     }
-    /// "Always allow" scope: the NORMALIZED command (comments stripped, whitespace collapsed),
-    /// keeping the DEFAULT per-command scope. Every bash approval is for a destructive command
-    /// (see `risk`), so a command-family prefix (`rm *`) would over-approve — per-command is
-    /// deliberate. Normalizing means a cosmetic re-emit of the SAME command (changed trailing
-    /// `# comment`, added whitespace) keeps the grant instead of re-prompting every turn.
+    /// "Always allow" scope — TOOL-WIDE for an ordinary command, PINNED TO THIS COMMAND when
+    /// the arguments name a sensitive path.
+    ///
+    /// This used to be per-command unconditionally, which made the approval panel's "Always"
+    /// useless in practice: a bash call that differed by one argument re-prompted, so users
+    /// answered the same question all session ("bash 总是询问"). A session-wide grant is what
+    /// the option has always claimed to give, and what the user is actually deciding — they
+    /// are trusting this session's shell, not one exact byte string.
+    ///
+    /// The exception is the hard floor shared with [`PermissionRuleGate`] and
+    /// [`WriteApprovalGate`](super::write_approval::WriteApprovalGate): a command touching
+    /// `~/.ssh`, `.env`, a credential file, … keeps a COMMAND-scoped grant, so approving one
+    /// ordinary `rm` can never silently pre-approve a later secret access. Callers that render
+    /// the approval label MUST derive it from this function (see the TUI's
+    /// `build_approval_options`) rather than re-deciding the scope — the two drifting apart is
+    /// exactly how the label came to promise a session-wide grant the store never recorded.
+    ///
+    /// Normalizing (comments stripped, whitespace collapsed) means a cosmetic re-emit of the
+    /// SAME command still matches an existing command-scoped grant.
     fn always_grant_scope(&self, args: &str) -> String {
+        if !super::sensitive_path::references_sensitive_path(args) {
+            return String::new(); // tool-wide: one "Always" covers this session's bash
+        }
         match serde_json::from_str::<Args>(args) {
             Ok(a) => normalize_command_for_grant(&a.command),
             Err(_) => args.to_string(),
@@ -3943,17 +3960,28 @@ mod tests {
     }
 
     #[test]
-    fn always_grant_scope_is_stable_across_cosmetic_variation() {
+    fn always_grant_scope_is_tool_wide_for_ordinary_commands() {
         let key = |cmd: &str| BashTool.always_grant_scope(&json!({ "command": cmd }).to_string());
-        // Same command, different trailing comment + whitespace → SAME grant key (so "always" sticks).
-        assert_eq!(
-            key("taskkill //F //IM X.exe  # attempt 1"),
-            key("taskkill //F //IM X.exe # attempt 2")
-        );
-        assert_eq!(key("rm  foo.txt   # a"), key("rm foo.txt # b"));
-        assert_eq!(key("rm foo.txt # a"), "rm foo.txt");
-        // A genuinely different command → different key (stays per-command, no family blanket).
-        assert_ne!(key("rm foo.txt"), key("rm bar.txt"));
+        // "Always" is a decision about this session's shell, not one byte string: an ordinary
+        // command grants TOOL-WIDE, so the next (different) command does not re-prompt. This is
+        // the fix for "点了总是允许，bash 还是每次都问".
+        assert_eq!(key("rm foo.txt"), "");
+        assert_eq!(key("rm bar.txt"), "");
+        assert_eq!(key("taskkill //F //IM X.exe # attempt 1"), "");
+        assert_eq!(key("rm foo.txt"), key("rm bar.txt"));
+    }
+
+    /// The hard floor: a sensitive target keeps a COMMAND-scoped grant, so one blanket
+    /// "Always" can never pre-approve a later secret access.
+    #[test]
+    fn always_grant_scope_stays_command_scoped_for_sensitive_targets() {
+        let key = |cmd: &str| BashTool.always_grant_scope(&json!({ "command": cmd }).to_string());
+        assert_eq!(key("cat ~/.ssh/id_rsa"), "cat ~/.ssh/id_rsa");
+        assert_ne!(key("cat ~/.ssh/id_rsa"), key("cat ~/.ssh/id_ed25519"));
+        // Never collapses to the tool-wide key, which would make it match an ordinary grant.
+        assert_ne!(key("cat ~/.ssh/id_rsa"), "");
+        // Cosmetic re-emit of the SAME sensitive command still matches its existing grant.
+        assert_eq!(key("cat  ~/.ssh/id_rsa   # a"), key("cat ~/.ssh/id_rsa # b"));
     }
 
     #[test]

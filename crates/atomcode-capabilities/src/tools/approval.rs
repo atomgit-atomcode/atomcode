@@ -318,7 +318,7 @@ mod tests {
     /// blanket-approves another. The bug: the grant key included the full args, so
     /// each distinct edit re-prompted ("Always" degraded to "allow once").
     #[test]
-    fn always_grant_is_tool_wide_for_edits_but_per_command_for_bash() {
+    fn always_grant_is_tool_wide_for_edits_and_bash_but_per_command_for_secrets() {
         use crate::tools::bash::BashTool;
         use crate::tools::edit::EditFileTool;
 
@@ -340,7 +340,9 @@ mod tests {
             "edit_file 'Always' must grant the whole tool, not just one exact call"
         );
 
-        // bash: two DIFFERENT destructive commands keep DISTINCT grant keys.
+        // bash: two DIFFERENT ordinary commands SHARE a grant key. "Always" is a decision
+        // about this session's shell, and a per-command key made the option useless — the
+        // next command always re-prompted.
         let bash: Arc<dyn Tool> = Arc::new(BashTool);
         let c1 = ToolCall {
             id: "3".into(),
@@ -352,10 +354,23 @@ mod tests {
             name: "bash".into(),
             arguments: r#"{"command":"rm -rf bar"}"#.into(),
         };
-        assert_ne!(
+        assert_eq!(
             ApprovalMiddleware::grant_key(&c1, bash.as_ref()),
             ApprovalMiddleware::grant_key(&c2, bash.as_ref()),
-            "bash 'Always' must stay per-command so one approval never covers another"
+            "bash 'Always' must cover the session, not just the one exact command"
+        );
+
+        // …but a SENSITIVE target keeps its own per-command key, so a session-wide bash
+        // grant can never pre-approve a later secret access.
+        let secret = ToolCall {
+            id: "5".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"cat ~/.ssh/id_rsa"}"#.into(),
+        };
+        assert_ne!(
+            ApprovalMiddleware::grant_key(&c1, bash.as_ref()),
+            ApprovalMiddleware::grant_key(&secret, bash.as_ref()),
+            "a sensitive bash target must not share the tool-wide grant"
         );
     }
 

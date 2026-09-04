@@ -127,6 +127,19 @@ fn build_coding_agent_from_tools(
         .middleware(Arc::new(
             atomcode_capabilities::tools::CredentialBashGate::new(cfg.credential_shell_policy),
         ));
+    // User-declared `[permissions]` allow/deny — after the hard credential boundary above,
+    // before the convenience gates and the approval prompt below. This path pins an immutable
+    // working_dir, so relative path rules resolve against the same root.
+    let builder = if cfg.permission_rules.is_empty() {
+        builder
+    } else {
+        builder.middleware(Arc::new(
+            atomcode_capabilities::tools::PermissionRuleGate::new(
+                cfg.permission_rules.clone(),
+                Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
+            ),
+        ))
+    };
     let mut builder = builder
         // Auto-approve in-workspace open_file (it's Risky → would otherwise prompt on every
         // preview). This path pins an immutable working_dir, so the gate pins the same root.

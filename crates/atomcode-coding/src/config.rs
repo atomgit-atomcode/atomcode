@@ -140,6 +140,11 @@ pub struct CodingAgentConfig {
     /// (`keep_interrupted_context`). Sourced from `Config::keep_interrupted_context`.
     pub keep_interrupted_context: bool,
     pub credential_shell_policy: atomcode_capabilities::tools::CredentialShellPolicy,
+    /// User-declared `[permissions]` allow/deny rules. Empty (the default) leaves every
+    /// approval gate untouched; a non-empty set registers `PermissionRuleGate` ahead of the
+    /// convenience gates so a matched rule skips (or blocks) the prompt. Shared, so a
+    /// `/model` swap re-assembling the agent keeps the same parsed rules.
+    pub permission_rules: std::sync::Arc<atomcode_capabilities::tools::PermissionRules>,
     /// Per-provider User-Agent override (`ProviderConfig::user_agent`). `None` ⇒
     /// `build_provider` falls back to the product `atomcode/<version>` so the gateway
     /// can attribute/slice traffic by version. Restores parity with v1's
@@ -198,6 +203,8 @@ pub struct CodingRuntimeConfig {
     pub interactive: bool,
     pub keep_interrupted_context: bool,
     pub credential_shell_policy: atomcode_capabilities::tools::CredentialShellPolicy,
+    /// Parsed `[permissions]` allow/deny rules (see `CodingAgentConfig::permission_rules`).
+    pub permission_rules: std::sync::Arc<atomcode_capabilities::tools::PermissionRules>,
     pub user_agent: Option<String>,
     pub skip_tls_verify: bool,
     /// Max attempts (including the first request) for provider OPEN retries;
@@ -241,6 +248,23 @@ pub fn lsp_settings_from_config(
             })
             .collect(),
     }
+}
+
+/// Parse `[permissions] allow/deny` into the neutral capabilities rule set. Malformed rules
+/// are skipped and reported on stderr rather than silently widening or narrowing the policy —
+/// a typo in a permission rule is exactly the kind of mistake that must not pass unnoticed.
+pub fn permission_rules_from_config(
+    permissions: &atomcode_config::config::PermissionsConfig,
+) -> atomcode_capabilities::tools::PermissionRules {
+    let (rules, invalid) =
+        atomcode_capabilities::tools::PermissionRules::parse(&permissions.allow, &permissions.deny);
+    for raw in &invalid {
+        eprintln!(
+            "[permissions] ignoring malformed rule {raw:?} \
+             (expected `Tool` or `Tool(pattern)`, e.g. `Bash(git *)`)"
+        );
+    }
+    rules
 }
 
 pub fn credential_shell_policy_from_config(
@@ -319,6 +343,9 @@ impl CodingRuntimeConfig {
             credential_shell_policy: credential_shell_policy_from_config(
                 config.coding.shell_guard_policy,
             ),
+            permission_rules: std::sync::Arc::new(permission_rules_from_config(
+                &config.permissions,
+            )),
             user_agent: r.and_then(|r| r.user_agent.clone()),
             skip_tls_verify: r.map(|r| r.skip_tls_verify).unwrap_or(false),
             retry_max_attempts: r.and_then(|r| r.retry_max_attempts),
@@ -380,6 +407,7 @@ impl CodingRuntimeConfig {
         }
         config.keep_interrupted_context = self.keep_interrupted_context;
         config.credential_shell_policy = self.credential_shell_policy;
+        config.permission_rules = self.permission_rules.clone();
         config.round_cap_checkpoint = self.round_cap_checkpoint;
         config.next_prompt_suggestions = self.next_prompt_suggestions;
         config.lsp = self.lsp.clone();
@@ -810,6 +838,7 @@ impl CodingAgentConfig {
             lsp: Default::default(),
             keep_interrupted_context: false,
             credential_shell_policy: Default::default(),
+            permission_rules: Default::default(),
             user_agent: None,
             skip_tls_verify: false,
             retry_max_attempts: None,
@@ -824,6 +853,37 @@ impl CodingAgentConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of the `[permissions]` table is that it reaches the GATE. Assert the
+    /// full TOML → `CodingRuntimeConfig` → `CodingAgentConfig` path, because a config that
+    /// parses but is dropped somewhere in the middle looks exactly like a config that works.
+    #[test]
+    fn permission_rules_survive_the_toml_to_agent_config_path() {
+        let mut config = atomcode_config::config::Config::default();
+        config.permissions.allow = vec!["Bash(git *)".to_string()];
+        config.permissions.deny = vec!["Bash(rm -rf *)".to_string()];
+
+        let runtime = CodingRuntimeConfig::from_config(
+            &config,
+            std::path::Path::new("/work"),
+            None,
+            None,
+            false,
+            false,
+        );
+        let agent = runtime.agent_config();
+        let cwd = std::path::Path::new("/work");
+        let git = serde_json::json!({ "command": "git status" }).to_string();
+        let rm = serde_json::json!({ "command": "rm -rf /" }).to_string();
+        assert_eq!(
+            agent.permission_rules.decide("bash", &git, cwd),
+            atomcode_capabilities::tools::RuleDecision::Allow
+        );
+        assert_eq!(
+            agent.permission_rules.decide("bash", &rm, cwd),
+            atomcode_capabilities::tools::RuleDecision::Deny
+        );
+    }
 
     #[test]
     fn shell_guard_policy_maps_at_the_coding_boundary() {

@@ -265,6 +265,36 @@ enabled = true
 eager = "auto"
 
 # =============================================================================
+# 权限预授权（`[permissions]`）
+# =============================================================================
+# 给常用命令/路径开白名单，省掉每次都弹的审批框——不用再上 `--dangerously-skip-permissions`
+# 那种全局全开的核选项。规则语法与 Claude Code 的 `permissions.allow/deny` 兼容，
+# 从 CC 的 settings.json 里抄过来即可用。
+#
+#   Bash                     —— 整个 bash 工具
+#   Bash(git *)              —— 以 `git ` 开头的命令；`*` 会跨 `/`（命令不是路径）
+#   Bash(npm run test:*)     —— CC 的 `:*` 前缀写法，等价于 `npm run test*`
+#   Bash(cargo test)         —— 精确匹配（空格/注释归一化后比较）
+#   Read(~/.zshrc)           —— 路径规则，`~` 展开、相对路径按当前工作目录解析
+#   Edit(src/**)             —— src/ 下的编辑
+#   mcp__server__tool        —— 指定 MCP 工具
+#   *                        —— 所有工具（一般只在 deny 里用）
+#
+# 工具名大小写与下划线不敏感，且认 CC 的简称：Read/Write/Edit/LS/MultiEdit
+# 分别对应 read_file/write_file/edit_file/list_directory/parallel_edit_files。
+#
+# 两条铁律：
+#   1. deny 先判、且优先于 allow；
+#   2. allow 永远不对「敏感路径」生效（~/.ssh、.env、凭证文件等）——这类调用照旧走审批，
+#      免得一条宽泛的 `Bash(rm *)` 变成静默的密钥删除/外泄通道。
+# 凭证守卫、plan 模式、敏感路径读取守卫都排在本规则之前，用户规则只能省掉「提示」，
+# 不能解开任何安全闸门。写错的规则会被忽略并在 stderr 告警，不会静默放宽策略。
+#
+# [permissions]
+# allow = ["Bash(git *)", "Bash(cargo test*)", "Read(src/**)"]
+# deny  = ["Bash(rm -rf *)"]
+
+# =============================================================================
 # Subagent 设置（`task` 工具：主 agent 把子任务派发给隔离上下文的子 agent）
 # =============================================================================
 # 总开关是环境变量 ATOMCODE_SUBAGENT（默认开启）——用 `ATOMCODE_SUBAGENT=0` 关闭。

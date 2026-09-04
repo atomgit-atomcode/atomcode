@@ -329,6 +329,9 @@ pub(crate) fn chat_runtime_config(
         credential_shell_policy: atomcode_coding::config::credential_shell_policy_from_config(
             config.coding.shell_guard_policy,
         ),
+        permission_rules: std::sync::Arc::new(
+            atomcode_coding::config::permission_rules_from_config(&config.permissions),
+        ),
         user_agent: p.and_then(|p| p.user_agent.clone()),
         skip_tls_verify: p.map(|p| p.skip_tls_verify).unwrap_or(false),
         retry_max_attempts: p.and_then(|p| p.retry_max_attempts),

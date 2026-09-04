@@ -19412,36 +19412,48 @@ fn approval_choice_to_decision(
     }
 }
 
+/// The session grant key for one approval, in the SAME `<tool>::<scope>` shape the kernel's
+/// `ApprovalMiddleware` uses. `bash` delegates to [`BashTool::always_grant_scope`] rather than
+/// recomputing a scope here: this driver-side cache and the middleware's store must agree, and
+/// a second, independent implementation of "what does Always cover" is precisely how the panel
+/// came to offer a session-wide grant that nothing recorded.
 fn get_approval_cache_key(tool: &str, args: &str) -> String {
-    if tool == "bash" {
-        let command = if let Ok(val) = serde_json::from_str::<serde_json::Value>(args) {
-            val.get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        } else {
-            args.to_string()
-        };
-        let normalized = atomcode_capabilities::tools::normalize_command_for_grant(&command);
-        format!("bash::{normalized}")
-    } else {
-        format!("{tool}::")
+    use atomcode_kernel::tool::Tool;
+    if tool.eq_ignore_ascii_case("bash") {
+        return format!(
+            "bash::{}",
+            atomcode_capabilities::tools::BashTool.always_grant_scope(args)
+        );
     }
+    format!("{tool}::")
 }
 
-/// The three approval options for `tool`, in display order (Allow once is the
-/// default selection). The "Always allow" label carries the tool name because
-/// `AgentEvent::ApprovalNeeded` does not carry the grant scope — except for the
-/// single-file write tools (`WriteFile`/`EditFile`), whose grant `WriteApprovalGate`
-/// scopes to the target's DIRECTORY, so their label names the folder instead.
-pub(crate) fn build_approval_options(tool: &str) -> Vec<crate::state::ApprovalOption> {
+/// The three approval options for `tool`, in display order (Allow once is the default
+/// selection). The "Always allow" label must state the scope the store will ACTUALLY record:
+///
+/// * `WriteFile`/`EditFile` — `WriteApprovalGate` grants per target DIRECTORY → name the folder.
+/// * `bash` — [`BashTool::always_grant_scope`] decides, and this label is derived from it: an
+///   empty scope is session-wide ("Always allow Bash"), a non-empty one is pinned to this
+///   command (the sensitive-path floor) and says so. Deriving the label from the same function
+///   that computes the grant is the point: the previous code decided the wording separately and
+///   compared `tool == "bash"` against a PascalCase display name, so the branch never fired and
+///   every user was promised a session-wide grant while the store recorded one command.
+/// * everything else — tool-wide, so the tool name is accurate.
+///
+/// `args` is the call's raw arguments (`AgentEvent::ApprovalNeeded` carries them); it is what
+/// makes the scope decision available here at all.
+pub(crate) fn build_approval_options(tool: &str, args: &str) -> Vec<crate::state::ApprovalOption> {
     use crate::state::{ApprovalKind, ApprovalOption};
+    use atomcode_kernel::tool::Tool;
     // Display names (snake→Pascal) of the directory-scoped write tools.
     let always_label = if matches!(tool, "WriteFile" | "EditFile") {
         crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowFolder).into_owned()
-    } else if tool == "bash" {
-        // bash's grant is scoped to THIS COMMAND (not the whole tool), so don't imply
-        // "Always allow bash" — say "this command".
+    } else if tool.eq_ignore_ascii_case("bash")
+        && !atomcode_capabilities::tools::BashTool
+            .always_grant_scope(args)
+            .is_empty()
+    {
+        // Non-empty scope ⇒ this grant covers only THIS command (sensitive target).
         crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowCommand).into_owned()
     } else {
         crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool }).into_owned()
@@ -19542,25 +19554,77 @@ mod bypass_approval_tests {
         ));
     }
 
+    fn bash_args(command: &str) -> String {
+        serde_json::json!({ "command": command }).to_string()
+    }
+
     #[test]
     fn build_approval_options_shape() {
         use crate::state::ApprovalKind;
-        let opts = super::build_approval_options("bash");
-        assert_eq!(opts.len(), 3);
-        assert_eq!(
-            (opts[0].kind, opts[0].accel),
-            (ApprovalKind::AllowOnce, 'y')
-        );
-        assert_eq!(
-            (opts[1].kind, opts[1].accel),
-            (ApprovalKind::AlwaysAllow, 'a')
-        );
+        // Production calls this with the PascalCase DISPLAY name (`display_tool_name`),
+        // never the wire name — assert on both so the label can't silently regress again.
+        for name in ["Bash", "bash"] {
+            let opts = super::build_approval_options(name, &bash_args("rm -rf victim"));
+            assert_eq!(opts.len(), 3);
+            assert_eq!(
+                (opts[0].kind, opts[0].accel),
+                (ApprovalKind::AllowOnce, 'y')
+            );
+            assert_eq!(
+                (opts[1].kind, opts[1].accel),
+                (ApprovalKind::AlwaysAllow, 'a')
+            );
+            assert_eq!(
+                opts[1].label,
+                crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool: name }).into_owned(),
+                "an ordinary bash grant is session-wide, so the label names the tool ({name})"
+            );
+            assert_eq!((opts[2].kind, opts[2].accel), (ApprovalKind::Deny, 'n'));
+        }
+    }
+
+    /// The label must track the scope the store will actually record: a sensitive target keeps
+    /// a COMMAND-scoped grant, so it must not be offered as a session-wide "Always allow Bash".
+    #[test]
+    fn build_approval_options_sensitive_bash_says_this_command() {
+        let opts = super::build_approval_options("Bash", &bash_args("cat ~/.ssh/id_rsa"));
         assert_eq!(
             opts[1].label,
             crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowCommand).into_owned(),
-            "bash grants are command-scoped and must not imply tool-wide approval"
+            "a sensitive-target grant is command-scoped and must say so"
         );
-        assert_eq!((opts[2].kind, opts[2].accel), (ApprovalKind::Deny, 'n'));
+    }
+
+    /// The label and the grant key are two renderings of ONE decision — assert they agree,
+    /// since the original bug was exactly these two drifting apart.
+    #[test]
+    fn approval_label_and_cache_key_agree_on_scope() {
+        // Ordinary command: session-wide grant (empty scope) + tool-named label.
+        let ordinary = bash_args("rm -rf victim");
+        assert_eq!(super::get_approval_cache_key("bash", &ordinary), "bash::");
+        assert_eq!(
+            super::build_approval_options("Bash", &ordinary)[1].label,
+            crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool: "Bash" }).into_owned()
+        );
+        // A DIFFERENT ordinary command shares that key — this is the whole fix: one "Always"
+        // stops the next command from re-prompting.
+        assert_eq!(
+            super::get_approval_cache_key("bash", &ordinary),
+            super::get_approval_cache_key("bash", &bash_args("python3 x.py > out.json"))
+        );
+        // Sensitive command: command-scoped key + "this command" label.
+        let sensitive = bash_args("cat ~/.ssh/id_rsa");
+        let key = super::get_approval_cache_key("bash", &sensitive);
+        assert_ne!(key, "bash::", "sensitive grants must not use the tool-wide key");
+        assert_eq!(
+            super::build_approval_options("Bash", &sensitive)[1].label,
+            crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowCommand).into_owned()
+        );
+        // The display name must produce the same key as the wire name.
+        assert_eq!(
+            super::get_approval_cache_key("Bash", &ordinary),
+            super::get_approval_cache_key("bash", &ordinary)
+        );
     }
 
     #[test]
@@ -19568,7 +19632,7 @@ mod bypass_approval_tests {
         // WriteFile/EditFile grants are directory-scoped, so their "always" label
         // must name the folder — NOT the tool (which would mislead as tool-wide).
         for tool in ["WriteFile", "EditFile"] {
-            let opts = super::build_approval_options(tool);
+            let opts = super::build_approval_options(tool, "{}");
             let label = &opts[1].label;
             assert!(
                 !label.contains(tool),
@@ -19576,7 +19640,7 @@ mod bypass_approval_tests {
             );
         }
         // A tool-wide write tool (no single target) keeps the tool-named label.
-        let opts = super::build_approval_options("SearchReplace");
+        let opts = super::build_approval_options("SearchReplace", "{}");
         assert!(opts[1].label.contains("SearchReplace"), "{}", opts[1].label);
     }
 
@@ -26738,7 +26802,7 @@ fn handle_agent_event(
             state.approval_panel = Some(crate::state::ApprovalPanel {
                 tool: display.clone(),
                 detail: detail.clone(),
-                options: build_approval_options(&display),
+                options: build_approval_options(&display, &call.arguments),
                 selected: 0,
                 cache_key,
                 note,

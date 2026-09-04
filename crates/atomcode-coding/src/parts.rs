@@ -1761,6 +1761,20 @@ pub fn assemble(
     if let Some(cc) = &parts.cc_external_hooks {
         builder = builder.middleware(cc.clone());
     }
+    // User-declared `[permissions]` allow/deny rules. Registered only when the user wrote
+    // some (zero middleware overhead otherwise). Placement is the whole contract: AFTER every
+    // hard boundary (turn policy, plan mode, CredentialBashGate, SensitivePathGate, CC
+    // PreToolUse hooks) so a user rule can never unlock a security gate, and BEFORE the
+    // convenience gates + the generic approval prompt so a matched `allow` actually skips the
+    // prompt. Reads the SAME live cwd handle, so a /cd moves what a relative path rule means.
+    if !cfg.permission_rules.is_empty() {
+        builder = builder.middleware(Arc::new(
+            atomcode_capabilities::tools::PermissionRuleGate::new(
+                cfg.permission_rules.clone(),
+                parts.shared_cwd.clone(),
+            ),
+        ));
+    }
     let mut builder = builder
         // open_file is Risky (launches a GUI), so approval would prompt on EVERY preview.
         // Restore the legacy engine's behavior: auto-approve when the target is inside the

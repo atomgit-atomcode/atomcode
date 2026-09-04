@@ -53,6 +53,7 @@ mod memory;
 pub mod open_file;
 pub mod output_artifact;
 pub mod parallel_edit;
+pub mod permission_rules;
 pub mod read;
 pub mod repair;
 pub mod report_finding;
@@ -117,6 +118,7 @@ pub use output_artifact::{
     ARTIFACT_TRUNCATION_MARKER_PREFIX, THRESHOLD_BYTES,
 };
 pub use parallel_edit::ParallelEditTool;
+pub use permission_rules::{PermissionRule, PermissionRuleGate, PermissionRules, RuleDecision};
 pub use read::ReadFileTool;
 pub use repair::{repair_tool_args, RepairToolArgsMiddleware};
 pub use report_finding::{Finding, ReportFindingTool};

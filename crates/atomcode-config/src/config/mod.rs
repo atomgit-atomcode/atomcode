@@ -112,6 +112,32 @@ impl Default for TodoToolConfig {
 pub struct ToolsConfig {
     pub todo: TodoToolConfig,
 }
+
+/// `[permissions]` — user-declared pre-authorization for tool calls, so the common
+/// commands in a project stop prompting without reaching for the all-or-nothing
+/// `--dangerously-skip-permissions`.
+///
+/// Rules are Claude Code compatible (`Bash(git *)`, `Read(~/.zshrc)`, bare `Bash`,
+/// `mcp__server__tool`, `*`); `deny` wins over `allow`, and an `allow` never applies to a
+/// call whose arguments reference a sensitive path. See
+/// `atomcode_capabilities::tools::permission_rules` for the full matching contract.
+///
+/// ```toml
+/// [permissions]
+/// allow = ["Bash(git *)", "Bash(cargo test*)", "Read(src/**)"]
+/// deny  = ["Bash(rm -rf *)"]
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PermissionsConfig {
+    /// Calls matching any of these run WITHOUT an approval prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// Calls matching any of these are blocked outright. Checked before `allow`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+}
+
 impl Default for CodingConfig {
     fn default() -> Self {
         Self {
@@ -308,6 +334,10 @@ pub struct Config {
     /// model-aware automatic eagerness.
     #[serde(default)]
     pub tools: ToolsConfig,
+    /// `[permissions]` allow/deny pre-authorization. Empty in older configs, which
+    /// leaves every existing approval gate exactly as it was.
+    #[serde(default)]
+    pub permissions: PermissionsConfig,
     /// Provider key (matches a key in `Config.providers`) of a vision-language
     /// model used to preprocess images before forwarding to a non-vision main
     /// provider. When `None` or empty, image preprocessing is disabled — pasted
@@ -665,6 +695,7 @@ impl Default for Config {
             loop_config: Default::default(),
             coding: CodingConfig::default(),
             tools: ToolsConfig::default(),
+            permissions: PermissionsConfig::default(),
             vision_preprocessor_provider: None,
             language: None,
             init_prompt_file: None,
@@ -2337,6 +2368,24 @@ kind = "claude-code"
     // server list is authoritative: it must override the client-side builtin (which knew
     // only `deepseek-v4-flash -> [high, max]`). With NO server list the builtin remains
     // the fallback for older/production servers that don't send the field yet.
+    /// `[permissions]` must parse from TOML and default to empty when absent — an older
+    /// config file has to keep behaving exactly as it did.
+    #[test]
+    fn permissions_table_parses_and_defaults_to_empty() {
+        let cfg: Config = toml::from_str(
+            "[permissions]\n\
+             allow = [\"Bash(git *)\", \"Read(src/**)\"]\n\
+             deny = [\"Bash(rm -rf *)\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.permissions.allow, ["Bash(git *)", "Read(src/**)"]);
+        assert_eq!(cfg.permissions.deny, ["Bash(rm -rf *)"]);
+
+        let absent: Config = toml::from_str("[coding]\nmax_rounds = 0\n").unwrap();
+        assert!(absent.permissions.allow.is_empty());
+        assert!(absent.permissions.deny.is_empty());
+    }
+
     #[test]
     fn server_declared_effort_levels_win_over_the_client_builtin() {
         let declared = [
@@ -3166,6 +3215,7 @@ model = "missing-type"
             ui: Default::default(),
             plugin: Default::default(),
             web_search: Default::default(),
+            permissions: Default::default(),
             keep_interrupted_context: false,
             offline_mode: Default::default(),
             offline_note: None,
