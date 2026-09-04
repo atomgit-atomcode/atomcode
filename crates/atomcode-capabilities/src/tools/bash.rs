@@ -343,7 +343,7 @@ impl Tool for BashTool {
                 // see the job-object comment above the spawn).
                 Err(_) => {
                     kill_tree();
-                    err(timeout_message(secs, cfg!(not(windows))))
+                    err(timeout_message(secs))
                 }
             }
         };
@@ -820,39 +820,28 @@ fn timeout_clamp_notice(secs: u64, requested: Option<u64>) -> Option<String> {
 /// The message for a command killed by the timeout.
 ///
 /// Pure so both branches are unit-testable without actually waiting `MAX_TIMEOUT_SECS`.
-/// `secs` is the value actually used; `background_survives` = whether a process the command
-/// backgrounds outlives THIS call: true on Unix (we only reap the tree on cancel/timeout, so
-/// a detached `nohup … &` child lives on), false on Windows (every child is in a
-/// `KILL_ON_JOB_CLOSE` job reaped on return — this tool has no background path there).
 ///
 /// The `timeout` knob only gets named while it still has room. `timeout` is clamped to
 /// `MAX_TIMEOUT_SECS`, so a run that already sat at the ceiling cannot be helped by
 /// "pass a larger `timeout`" — the model treats tool output as ground truth, so an
-/// instruction that provably cannot work is worse than none. At the ceiling, name the
-/// ceiling and point at the one escape that is actually executable on THIS platform. (The
-/// clamp itself — "you asked for 330, got 300" — is surfaced separately by
-/// [`timeout_clamp_notice`], appended to every outcome, so it isn't repeated here.)
-fn timeout_message(secs: u64, background_survives: bool) -> String {
+/// instruction that provably cannot work is worse than none. At the ceiling, point at the
+/// escape that exists on EVERY platform: `bash_start` backgrounds the command and returns
+/// immediately (Unix keeps the detached tree via its pgroup, Windows via a per-job Job
+/// Object), so a >ceiling command finally has somewhere to go. (The clamp itself — "you
+/// asked for 330, got 300" — is surfaced separately by [`timeout_clamp_notice`], appended to
+/// every outcome, so it isn't repeated here.)
+fn timeout_message(secs: u64) -> String {
     if secs >= MAX_TIMEOUT_SECS {
-        // The escape hatch must be runnable on THIS platform. On Windows the job object
-        // reaps anything the command leaves running the instant this call returns, so
-        // "background it" would be another instruction that provably can't work — the very
-        // failure this branch exists to avoid. Point Windows at splitting instead.
-        let escape = if background_survives {
-            "start the work in the background (redirect its output to a file) and read that \
-             file back in a later, short command"
-        } else {
-            "split the work into smaller steps that each finish under the limit (or run the \
-             long-running task outside this tool)"
-        };
         format!(
             "bash: timed out after {secs}s, which is this tool's maximum. A longer single \
-             command is not available — {escape}."
+             command is not available — run it with `bash_start` (it backgrounds the command \
+             and returns immediately), then collect output with `bash_poll` and stop it with \
+             `bash_kill`."
         )
     } else {
         format!(
-            "bash: timed out after {secs}s — pass a larger `timeout` (up to \
-             {MAX_TIMEOUT_SECS}s) if this command legitimately needs longer."
+            "bash: timed out after {secs}s — pass a larger `timeout` (up to {MAX_TIMEOUT_SECS}s) \
+             if this command legitimately needs longer, or run it with `bash_start` to background it."
         )
     }
 }
@@ -4299,23 +4288,14 @@ mod tests {
         );
     }
 
-    /// At the ceiling the knob is gone (`timeout` is clamped there), and the escape hatch
-    /// must be runnable on the platform: Unix keeps a detached child alive, so "background"
-    /// is real; Windows reaps it via the job object on return, so we point at splitting.
+    /// At the ceiling the `timeout` knob is gone (it's clamped there), so the message must not
+    /// point back at it and must point at the cross-platform escape that actually exists now:
+    /// `bash_start`.
     #[test]
-    fn timeout_message_at_ceiling_offers_a_platform_workable_escape() {
-        // Unix: backgrounding survives our reap (we only killpg on cancel/timeout).
-        let m = timeout_message(MAX_TIMEOUT_SECS, true);
+    fn timeout_message_at_ceiling_points_at_bash_start() {
+        let m = timeout_message(MAX_TIMEOUT_SECS);
         assert!(!m.contains("pass a larger"), "must not point at a maxed knob: {m}");
-        assert!(m.contains("background"), "unix escape is backgrounding: {m}");
-        // Windows: KILL_ON_JOB_CLOSE reaps a backgrounded child on return — never suggest it.
-        let m = timeout_message(MAX_TIMEOUT_SECS, false);
-        assert!(!m.contains("pass a larger"), "{m}");
-        assert!(
-            !m.contains("background"),
-            "must not suggest an unsupported path on windows: {m}"
-        );
-        assert!(m.contains("smaller steps"), "windows escape is splitting: {m}");
+        assert!(m.contains("bash_start"), "must point at the background tool: {m}");
     }
 
     /// A silently-clamped `timeout` is surfaced (real limit + what was asked); an honored
