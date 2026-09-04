@@ -63,7 +63,7 @@ jobs:
         run: cargo test --workspace
 
   lint:
-    name: fmt + clippy (report only)
+    name: fmt (blocking) + clippy (report only)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -78,16 +78,23 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # Deliberately NOT blocking. Measured on release/v5.1.0 @ ecc9781a:
-      # 379 files fail `rustfmt --check` and clippy reports 598 warnings
-      # (atomcode-tuix alone accounts for 291). A gate that is red on its first
-      # run gets switched off, so these report the debt instead. Drop the
-      # `continue-on-error` line from a step once its backlog reaches zero —
-      # per step, independently.
+      # BLOCKING as of the tree-wide `cargo fmt --all` that cleared the backlog
+      # (93 files / 407 hunks). It stays blocking only while the backlog is zero:
+      # the whole reason this was report-only is that a gate which is red on its
+      # first run gets switched off. If this ever goes red on a PR, the fix is to
+      # run `cargo fmt --all` in that PR — never to re-add `continue-on-error`.
+      #
+      # One caveat if it ever fails on a file nobody touched: rustfmt does not
+      # converge on a `format!` whose long string literal sits in a match arm
+      # (`cargo fmt` leaves it, `--check` still reports it). Fix it the way
+      # `bash_start`'s argument error was fixed — block-form the arm and split
+      # the literal with a `\` continuation — rather than switching the gate off.
       - name: cargo fmt --check
-        continue-on-error: true
         run: cargo fmt --all -- --check
 
+      # Still report-only: 598 warnings outstanding (atomcode-tuix alone
+      # accounts for 291). Same contract as fmt above — drop this
+      # `continue-on-error` once that backlog reaches zero.
       - name: cargo clippy
         continue-on-error: true
         run: cargo clippy --workspace --all-targets
