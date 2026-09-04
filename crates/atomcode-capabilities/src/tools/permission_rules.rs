@@ -78,11 +78,6 @@ pub enum RuleDecision {
     NoMatch,
 }
 
-/// Arg keys whose value is a path-ish match target, in probe order. Covers every
-/// current path-taking tool (`file_path` for read/write/edit, `path` for list/glob,
-/// `pattern` for glob/grep, `url` for web_fetch).
-const TARGET_KEYS: &[&str] = &["file_path", "path", "pattern", "url", "query"];
-
 /// Canonicalize a tool name for comparison: lowercase, `_` removed, then CC's short names
 /// folded onto our wire names. So `Read` / `read_file` / `ReadFile` all compare equal.
 fn canonical_tool(name: &str) -> String {
@@ -259,7 +254,11 @@ fn match_targets(tool: &str, args: &str, cwd: &Path) -> Vec<String> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(args) else {
         return Vec::new();
     };
-    if canonical_tool(tool) == "bash" {
+    // The shell-executing tools match on their COMMAND. `bash_start` backgrounds a command
+    // that is exactly as dangerous as a foreground one, so a rule must reach it too —
+    // `command` is not a path key, so without this arm a `BashStart(rm *)` pattern silently
+    // matched NOTHING, and a deny rule that never fires is worse than no rule at all.
+    if matches!(canonical_tool(tool).as_str(), "bash" | "bashstart") {
         return value
             .get("command")
             .and_then(|v| v.as_str())
@@ -267,15 +266,12 @@ fn match_targets(tool: &str, args: &str, cwd: &Path) -> Vec<String> {
             .unwrap_or_default();
     }
     let mut targets = Vec::new();
-    for key in TARGET_KEYS {
-        if let Some(raw) = value.get(*key).and_then(|v| v.as_str()) {
-            targets.push(raw.to_string());
-            let resolved = resolve_path(raw, cwd);
-            let resolved = resolved.to_string_lossy().to_string();
-            if resolved != raw {
-                targets.push(resolved);
-            }
+    for raw in super::target_arg_values(args) {
+        let resolved = resolve_path(&raw, cwd).to_string_lossy().to_string();
+        if resolved != raw {
+            targets.push(resolved);
         }
+        targets.push(raw);
     }
     targets
 }
@@ -515,6 +511,28 @@ mod tests {
         );
         assert_eq!(
             r.decide("mcp__playwright__click", "{}", &cwd()),
+            RuleDecision::NoMatch
+        );
+    }
+
+    /// A rule written for the background shell tool must actually match it. Before this,
+    /// `command` was not a path key and only `bash` had a command arm, so every
+    /// `BashStart(...)` PATTERN matched nothing — including deny rules.
+    #[test]
+    fn background_shell_tool_matches_command_rules() {
+        let r = rules(&[], &["BashStart(rm *)"]);
+        assert_eq!(
+            r.decide("bash_start", &bash_args("rm -rf /"), &cwd()),
+            RuleDecision::Deny
+        );
+        assert_eq!(
+            r.decide("bash_start", &bash_args("git status"), &cwd()),
+            RuleDecision::NoMatch
+        );
+        // A rule naming one shell tool does not leak onto the other.
+        let only_fg = rules(&["Bash(git *)"], &[]);
+        assert_eq!(
+            only_fg.decide("bash_start", &bash_args("git status"), &cwd()),
             RuleDecision::NoMatch
         );
     }

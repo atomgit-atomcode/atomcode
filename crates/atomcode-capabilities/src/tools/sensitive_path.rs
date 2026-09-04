@@ -85,6 +85,19 @@ pub fn references_sensitive_path(args: &str) -> bool {
         .is_some_and(|value| decoded_json_references_sensitive_path(&value))
 }
 
+/// The part of a call this gate's grant is keyed on: the TARGET it names, not the raw
+/// argument bytes. Reading a second WINDOW of the same file (`offset`/`limit`) is the same
+/// decision the user already answered — keying on raw args made it re-prompt per window. It
+/// stays PER TARGET, so a grant for one secret never covers a different one. A call naming no
+/// target falls back to the raw arguments (fail-closed: nothing is widened).
+fn grant_scope(args: &str) -> String {
+    let targets = super::target_arg_values(args);
+    if targets.is_empty() {
+        return args.to_string();
+    }
+    targets.join("\u{1f}")
+}
+
 /// [`SENSITIVE_MARKERS`] plus the resolved config dir's credential paths.
 fn matches_a_marker(lowercased: &str) -> bool {
     SENSITIVE_MARKERS.iter().any(|m| lowercased.contains(m))
@@ -325,7 +338,12 @@ impl ToolMiddleware for SensitivePathGate {
         }
         // Distinct key namespace so a "sensitive-read always" grant never silently widens
         // an ordinary approval grant (and vice versa).
-        let key = format!("sensitive::{}::{}", call.name, call.arguments);
+        //
+        // Keyed on the TARGET the call names, not the raw argument bytes: reading a second
+        // WINDOW of the same file (`offset`/`limit`) is the same decision the user already
+        // answered, and keying on raw args made it re-prompt per window. It stays per-target,
+        // so a grant for one secret never covers a different one. No target ⇒ raw args.
+        let key = format!("sensitive::{}::{}", call.name, grant_scope(&call.arguments));
         if self.store.is_granted(&key) {
             return BeforeOutcome::Proceed;
         }
@@ -346,6 +364,37 @@ impl ToolMiddleware for SensitivePathGate {
                 tool.name()
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod grant_scope_tests {
+    use super::grant_scope;
+    use serde_json::json;
+
+    /// A second window over the SAME secret is the same decision — it must not re-prompt.
+    /// (Before this, the key was the raw argument bytes, so every `offset` change asked again;
+    /// a driver-side tool-wide cache used to hide that, and hid far too much else besides.)
+    #[test]
+    fn same_target_different_window_shares_a_grant() {
+        let a = json!({ "file_path": "~/.ssh/config", "offset": 1, "limit": 50 }).to_string();
+        let b = json!({ "file_path": "~/.ssh/config", "offset": 51, "limit": 50 }).to_string();
+        assert_eq!(grant_scope(&a), grant_scope(&b));
+    }
+
+    /// …but a DIFFERENT secret is a different decision and must ask again.
+    #[test]
+    fn a_different_target_does_not_share_a_grant() {
+        let a = json!({ "file_path": "~/.ssh/id_rsa" }).to_string();
+        let b = json!({ "file_path": "~/.aws/credentials" }).to_string();
+        assert_ne!(grant_scope(&a), grant_scope(&b));
+    }
+
+    /// No target field ⇒ fall back to the raw arguments; nothing is widened.
+    #[test]
+    fn no_target_falls_back_to_raw_arguments() {
+        let raw = json!({ "whatever": "x" }).to_string();
+        assert_eq!(grant_scope(&raw), raw);
     }
 }
 

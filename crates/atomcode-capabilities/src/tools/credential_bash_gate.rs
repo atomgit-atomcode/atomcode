@@ -417,6 +417,18 @@ fn credential_bash_decision(raw_args: &str, command: &str) -> Option<CredentialB
 /// guard (extraction, exfil, a literal credential, or a config-file secret read)?
 /// Drivers use it to annotate an approval prompt — e.g. "this may send secrets to the
 /// model provider" — without duplicating the detection heuristics.
+/// The part of a call this gate's grant is keyed on: the NORMALIZED command (comments
+/// stripped, whitespace collapsed), like every other bash grant in the tree. Raw argument
+/// bytes made a cosmetic re-emit of the SAME command — a model retrying with `# attempt 2`
+/// appended — read as a new decision and prompt again, which is the "总是询问" failure this
+/// tree has already fixed twice elsewhere. Unparseable args fall back to the raw bytes.
+fn grant_scope(args: &str) -> String {
+    match serde_json::from_str::<BashArgs>(args) {
+        Ok(a) => super::bash::normalize_command_for_grant(&a.command),
+        Err(_) => args.to_string(),
+    }
+}
+
 pub fn bash_command_may_expose_credentials(arguments: &str) -> bool {
     match serde_json::from_str::<BashArgs>(arguments) {
         Ok(args) => credential_bash_decision(arguments, &args.command).is_some(),
@@ -475,7 +487,11 @@ impl CredentialBashGate {
         rt: &RequestCtx,
         store: &Arc<dyn PermissionStore>,
     ) -> BeforeOutcome {
-        let key = format!("credential-shell::{}::{}", call.name, call.arguments);
+        let key = format!(
+            "credential-shell::{}::{}",
+            call.name,
+            grant_scope(&call.arguments)
+        );
         if store.is_granted(&key) {
             return BeforeOutcome::Proceed;
         }
@@ -535,6 +551,28 @@ impl ToolMiddleware for CredentialBashGate {
                 None => BeforeOutcome::deny(CREDENTIAL_BASH_DENIAL_REASON),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod grant_scope_tests {
+    use super::grant_scope;
+    use serde_json::json;
+
+    /// The retry pattern this tree keeps tripping over: same command, new trailing comment.
+    #[test]
+    fn cosmetic_reemit_shares_a_grant() {
+        let a = json!({ "command": "cat prod.toml # attempt 1" }).to_string();
+        let b = json!({ "command": "cat  prod.toml   # attempt 2" }).to_string();
+        assert_eq!(grant_scope(&a), grant_scope(&b));
+    }
+
+    /// A genuinely different command is a different decision.
+    #[test]
+    fn a_different_command_does_not_share_a_grant() {
+        let a = json!({ "command": "cat prod.toml" }).to_string();
+        let b = json!({ "command": "cat staging.toml" }).to_string();
+        assert_ne!(grant_scope(&a), grant_scope(&b));
     }
 }
 
@@ -723,11 +761,13 @@ mod tests {
     #[tokio::test]
     async fn prompt_interactive_proceeds_on_a_persisted_grant() {
         let store: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
-        let key = format!(
+        // Plant the grant through the SAME scope function the gate keys on, so the test
+        // cannot drift from the implementation the way the old hand-built raw-args key did.
+        let args = serde_json::json!({ "command": DETECTED }).to_string();
+        store.grant(&format!(
             "credential-shell::bash::{}",
-            serde_json::json!({ "command": DETECTED })
-        );
-        store.grant(&key);
+            super::grant_scope(&args)
+        ));
         let gate = CredentialBashGate::with_store(CredentialShellPolicy::Prompt, store);
         assert_eq!(run(&gate, DETECTED).await, BeforeOutcome::Proceed);
     }

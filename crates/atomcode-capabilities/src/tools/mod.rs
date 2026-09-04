@@ -284,6 +284,26 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
 /// local copy was deduped into that home, which also carries the `std` `_sync` variant).
 pub(crate) use crate::process_utils::suppress_console_window;
 
+/// Argument keys whose value names the THING a call acts on, in probe order. Covers every
+/// current target-taking tool (`file_path` for read/write/edit, `path` for list/glob,
+/// `pattern` for glob/grep, `url` for web_fetch).
+pub(crate) const TARGET_ARG_KEYS: &[&str] = &["file_path", "path", "pattern", "url", "query"];
+
+/// The target values a call names, as written. Used to build grant keys and to match
+/// permission rules — both need "what does this call act on?" to be stable against argument
+/// NOISE that does not change the answer (a different `offset`/`limit` window over the same
+/// file must not look like a different target). Empty when the call names no target, in which
+/// case callers fall back to the raw arguments.
+pub(crate) fn target_arg_values(args: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(args) else {
+        return Vec::new();
+    };
+    TARGET_ARG_KEYS
+        .iter()
+        .filter_map(|key| value.get(*key).and_then(|v| v.as_str()).map(String::from))
+        .collect()
+}
+
 /// Resolve a model-supplied path: leading `~`/`~/` → home dir; absolute → as-is;
 /// relative → joined to `working_dir`. NO escape enforcement (see the module
 /// trust-model note). `~` expansion (via the crate-shared [`crate::pathutil`], so
