@@ -117,6 +117,9 @@ wire DTO 展开：
 - 仅当变更跨 crate、公共协议、持久化格式、workspace 依赖或构建配置时，运行相关 workspace 检查。
 - `cargo test` 已完成相同编译验证时，不紧接着重复运行 `cargo check`；代码和环境未变化时不盲目重跑失败命令。
 - 纯文档、注释和格式修改可以不运行测试，但必须检查 diff 和文档内部一致性。
+- 交付前运行 `cargo fmt --all`；`cargo fmt --all -- --check` 必须退出 0。这是 `check.yml` 的 lint job 里唯一的**阻塞**门（clippy 仍是 report-only）。全仓已经 fmt-clean，所以现在跑它只会动你自己改过的文件——这正是它能当门的前提，别再让它积债。
+- 纯格式化改动单独成一个 commit，不要混进功能 commit：全仓 fmt 会碰上百个文件，混在一起的 diff 没法评审，也会让 rebase 冲突面无谓地扩大。
+- 若 `--check` 在你没动过的文件上报错，多半是 rustfmt 在 match arm 的长字符串字面量上不收敛（`cargo fmt` 不改、`--check` 照报）。按块形式重写该 arm、字面量用 `\` 续行；不要给这道门加回 `continue-on-error`。
 - runtime/协议迁移按实际影响覆盖 CLI、TUI、daemon、headless、background、session resume、approval、cancel、provider reload 和持久化兼容；不受影响的入口无需机械重复验证。
 - 退役任务的最终说明必须包含：验证基线、达到的四态、实际删除项、仍保留的 importer/legacy surface、测试结果和唯一下一步。
 - 普通功能或修复只需报告行为变化、风险、验证结果和已知未验证范围，不强制套用迁移报告模板。
