@@ -84,7 +84,6 @@ pub struct ApprovalPanel {
     pub detail: String,
     pub options: Vec<ApprovalOption>,
     pub selected: usize,
-    pub cache_key: String,
     /// Optional advisory line rendered under the header (e.g. a credential-exposure
     /// warning). `None` for ordinary approvals.
     pub note: Option<String>,
@@ -3344,7 +3343,6 @@ mod tests {
                 },
             ],
             selected: 0,
-            cache_key: String::new(),
             note: None,
         };
         p.move_up();

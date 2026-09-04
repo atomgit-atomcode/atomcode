@@ -21172,7 +21172,6 @@ mod tests {
                 },
             ],
             selected: 0,
-            cache_key: String::new(),
             note: None,
         };
         // Digit routing: index = (c as usize) - ('1' as usize).

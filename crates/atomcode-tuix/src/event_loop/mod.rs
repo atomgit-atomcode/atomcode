@@ -3878,8 +3878,6 @@ pub struct LoopCtx {
     pub(crate) pending_provider_deactivation: bool,
     pub runtime: RuntimeControl,
     pub pending_runtime_request_id: Option<atomcode_kernel::event::RequestId>,
-    /// Cache of "Always Allow" tool/command decisions for the active TUI session.
-    pub allowed_always: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub native_tools: std::collections::HashMap<String, (String, std::time::Instant)>,
     /// Force-exit watchdog deadline. Armed by [`arm_shutdown_watchdog`] when the
     /// user genuinely asks to leave (`/quit`, `/exit`, a confirmed Ctrl+C). The
@@ -19432,18 +19430,6 @@ fn shell_grant_scope(tool: &str, args: &str) -> Option<String> {
     ))
 }
 
-/// The session grant key for one approval, in the SAME `<tool>::<scope>` shape the kernel's
-/// `ApprovalMiddleware` builds. The scope comes from [`shell_grant_scope`], i.e. the very
-/// function the tools themselves use, rather than being recomputed here: this driver-side
-/// cache and the middleware's store must agree, and a second, independent implementation of
-/// "what does Always cover" is precisely how the panel came to offer a session-wide grant
-/// that nothing recorded.
-fn get_approval_cache_key(tool: &str, args: &str) -> String {
-    match shell_grant_scope(tool, args) {
-        Some(scope) => format!("{tool}::{scope}"),
-        None => format!("{tool}::"),
-    }
-}
 
 /// The three approval options for `tool`, in display order (Allow once is the default
 /// selection). The "Always allow" label must state the scope the store will ACTUALLY record:
@@ -19607,36 +19593,37 @@ mod bypass_approval_tests {
         );
     }
 
-    /// The label and the grant key are two renderings of ONE decision — assert they agree,
-    /// since the original bug was exactly these two drifting apart.
+    /// The label is the ONLY driver-side rendering of the grant scope now that the driver
+    /// keeps no grant cache of its own, so it must track [`shell_grant_scope`] exactly — the
+    /// original bug was precisely a label that decided the scope separately from the store.
     #[test]
-    fn approval_label_and_cache_key_agree_on_scope() {
-        // Ordinary command: session-wide grant (empty scope) + tool-named label.
+    fn approval_label_tracks_the_grant_scope() {
+        // Ordinary command: session-wide grant (empty scope) ⇒ tool-named label.
         let ordinary = bash_args("rm -rf victim");
-        assert_eq!(super::get_approval_cache_key("bash", &ordinary), "bash::");
+        assert_eq!(super::shell_grant_scope("bash", &ordinary).as_deref(), Some(""));
         assert_eq!(
             super::build_approval_options("Bash", &ordinary)[1].label,
             crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool: "Bash" }).into_owned()
         );
-        // A DIFFERENT ordinary command shares that key — this is the whole fix: one "Always"
-        // stops the next command from re-prompting.
+        // A DIFFERENT ordinary command lands on the same scope — this is the whole fix: one
+        // "Always" stops the next command from re-prompting.
         assert_eq!(
-            super::get_approval_cache_key("bash", &ordinary),
-            super::get_approval_cache_key("bash", &bash_args("python3 x.py > out.json"))
+            super::shell_grant_scope("bash", &ordinary),
+            super::shell_grant_scope("bash", &bash_args("python3 x.py > out.json"))
         );
-        // Sensitive command: command-scoped key + "this command" label.
+        // Sensitive command: command-scoped ⇒ "this command" label.
         let sensitive = bash_args("cat ~/.ssh/id_rsa");
-        let key = super::get_approval_cache_key("bash", &sensitive);
-        assert_ne!(key, "bash::", "sensitive grants must not use the tool-wide key");
+        assert_ne!(
+            super::shell_grant_scope("bash", &sensitive).as_deref(),
+            Some(""),
+            "a sensitive target must not take the session-wide scope"
+        );
         assert_eq!(
             super::build_approval_options("Bash", &sensitive)[1].label,
             crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowCommand).into_owned()
         );
-        // The key's PREFIX is whatever name the caller passes — production always passes the
-        // event's wire name for both the store and the lookup (one `get_approval_cache_key`
-        // call feeds the panel, and the keypress handler stores that same `cache_key`), so the
-        // two halves can never disagree. What must be spelling-independent is the SCOPE, since
-        // that is the half carrying the security decision.
+        // The scope must be spelling-independent: the approval event carries the WIRE name,
+        // the panel the PascalCase display name.
         assert_eq!(
             super::shell_grant_scope("Bash", &sensitive),
             super::shell_grant_scope("bash", &sensitive)
@@ -19648,24 +19635,19 @@ mod bypass_approval_tests {
     }
 
     /// `bash_start` backgrounds a command that is "exactly as dangerous as a foreground one"
-    /// (its own `risk`), so the driver must scope its grant the same way — otherwise a
-    /// sensitive backgrounded command would take the unconditional tool-wide key that every
-    /// non-shell tool gets, and a later secret access would be auto-approved.
+    /// (its own `risk`), so its label must state the same scope the foreground tool records.
     #[test]
     fn bash_start_shares_the_foreground_bash_scope() {
         let ordinary = bash_args("rm -rf victim");
         let sensitive = bash_args("cat ~/.ssh/id_rsa");
-        // Wire name: keyed like the middleware, `<tool>::<scope>`.
         assert_eq!(
-            super::get_approval_cache_key("bash_start", &ordinary),
-            "bash_start::"
+            super::shell_grant_scope("bash_start", &ordinary),
+            super::shell_grant_scope("bash", &ordinary)
         );
-        assert_ne!(
-            super::get_approval_cache_key("bash_start", &sensitive),
-            "bash_start::",
-            "a sensitive backgrounded command must not take the tool-wide key"
+        assert_eq!(
+            super::shell_grant_scope("bash_start", &sensitive),
+            super::shell_grant_scope("bash", &sensitive)
         );
-        // Display name: the panel label tracks the same decision.
         assert_eq!(
             super::build_approval_options("BashStart", &sensitive)[1].label,
             crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowCommand).into_owned()
@@ -19675,8 +19657,8 @@ mod bypass_approval_tests {
             crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool: "BashStart" })
                 .into_owned()
         );
-        // A non-shell tool keeps the plain tool-wide key.
-        assert_eq!(super::get_approval_cache_key("bash_poll", "{}"), "bash_poll::");
+        // A non-shell tool is not the shell rule's business at all.
+        assert_eq!(super::shell_grant_scope("bash_poll", "{}"), None);
     }
 
     #[test]
@@ -20274,14 +20256,11 @@ fn handle_approval_key(
         return Ok(());
     };
     let choice = approval_kind_to_choice(kind);
-    if choice == ApprovalChoice::AllowAlways {
-        if let Some(p) = &app.state.approval_panel {
-            if !p.cache_key.is_empty() {
-                let mut guard = ctx.allowed_always.lock().unwrap();
-                guard.insert(p.cache_key.clone());
-            }
-        }
-    }
+    // The decision is NOT cached here. Each gate records its own grant at the scope it
+    // actually enforces (per directory, per path, per command, or deliberately not at all),
+    // and those stores already survive re-assembly via `CodingParts::inherit_runtime_continuity`.
+    // A driver-side cache could only guess a scope from the tool name, and the guess was
+    // tool-wide for everything except bash — silently widening every narrower gate.
     deliver_approval(ctx, choice);
     app.state.on_approval_resolved(); // clears approval_panel + phase → Streaming
                                       // Repaint the footer NOW so the approval panel disappears immediately, the
@@ -26750,15 +26729,10 @@ fn handle_agent_event(
             snapshot,
             ..
         } => {
-            let cache_key = get_approval_cache_key(&tool_name, &call.arguments);
-            let already_allowed = {
-                let guard = ctx.allowed_always.lock().unwrap();
-                guard.contains(&cache_key)
-            };
-            if already_allowed {
-                deliver_approval(ctx, ApprovalChoice::AllowAlways);
-                return;
-            }
+            // No driver-side grant lookup: a gate that already granted this call never asks
+            // again (it checks its own store before round-tripping), so reaching here means
+            // some gate genuinely wants an answer. Short-circuiting on a name-derived key
+            // here used to answer on behalf of gates whose grants are far narrower.
             // BYPASS mode (`--dangerously-skip-permissions`): auto-approve and
             // skip the prompt. The response goes through the hub when shared, so
             // all views observe the same pending request lifecycle.
@@ -26856,7 +26830,6 @@ fn handle_agent_event(
                 detail: detail.clone(),
                 options: build_approval_options(&display, &call.arguments),
                 selected: 0,
-                cache_key,
                 note,
             });
             renderer.flush();

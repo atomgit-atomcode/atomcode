@@ -73,7 +73,17 @@ async fn prompts_when_always_allowing(project: &std::path::Path, commands: &[&st
     cfg.request_timeout = Some(Duration::from_secs(5));
 
     let mut parts = prepare(&cfg, prepare_options()).await.unwrap();
-    let mut h = assemble(&mut parts, &cfg, scripted(commands))
+    drive(&mut parts, &cfg, commands).await
+}
+
+/// One turn against a fresh assembly built from EXISTING parts, answering every approval with
+/// "always". Returns the command text of each call that prompted.
+async fn drive(
+    parts: &mut atomcode_coding::CodingParts,
+    cfg: &CodingAgentConfig,
+    commands: &[&str],
+) -> Vec<String> {
+    let mut h = assemble(parts, cfg, scripted(commands))
         .unwrap()
         .spawn();
     h.commands
@@ -113,6 +123,38 @@ async fn prompts_when_always_allowing(project: &std::path::Path, commands: &[&st
     h.commands.send(AgentCommand::Shutdown).unwrap();
     let _ = h.task.await;
     prompted
+}
+
+/// The case the TUI's own driver-side grant cache was added for (`d90d195a`, five days after
+/// the middleware stores were already made to survive respawns): does "Always" still hold
+/// after a model swap / provider reload, which re-runs `assemble` against the SAME parts?
+///
+/// It does, and entirely at the middleware layer — `CodingParts::inherit_runtime_continuity`
+/// carries `approval` and every gate store across the rebuild. No driver-side cache takes
+/// part in this test: the harness answers each prompt and counts them.
+#[tokio::test]
+async fn always_allow_survives_reassembly_without_a_driver_cache() {
+    let project = tempfile::tempdir().unwrap();
+    for name in ["v1", "v2"] {
+        std::fs::create_dir(project.path().join(name)).unwrap();
+    }
+
+    let mut cfg = CodingAgentConfig::new("k", "http://unused", "test-model", project.path());
+    cfg.stream_timeout = Duration::from_secs(5);
+    cfg.request_timeout = Some(Duration::from_secs(5));
+    let mut parts = prepare(&cfg, prepare_options()).await.unwrap();
+
+    // Turn 1 on the first assembly: prompt once, answer "always".
+    let first = drive(&mut parts, &cfg, &["rm -rf v1"]).await;
+    assert_eq!(first.len(), 1, "the first destructive bash must prompt");
+
+    // Re-assemble (what a `/model` swap does) and issue a DIFFERENT destructive command.
+    let second = drive(&mut parts, &cfg, &["rm -rf v2"]).await;
+    assert!(
+        second.is_empty(),
+        "the session grant must survive re-assembly on its own; got {second:?}"
+    );
+    assert!(!project.path().join("v2").exists(), "it must have run");
 }
 
 /// THE reported bug. `rm -rf <name>` is Risky, so the first one prompts; after "Always" a
