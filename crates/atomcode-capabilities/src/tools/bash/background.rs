@@ -18,7 +18,7 @@
 //! the foreground tool has the same limit; Windows self-reaps via the OS closing the job
 //! handle even then).
 
-use super::{build_command, check_destructive_command, normalize_command_for_grant};
+use super::{build_command, check_destructive_command, shell_always_grant_scope};
 #[cfg(not(target_os = "windows"))]
 use super::{sigkill_pgroup, PgroupChild};
 use crate::tools::{err, ok};
@@ -460,9 +460,14 @@ impl Tool for BashStartTool {
             Err(_) => RiskLevel::Risky,
         }
     }
+    /// Same verdict as the foreground `bash` tool, via the SAME function — a backgrounded
+    /// command is exactly as dangerous as a foreground one (see `risk` above), so its
+    /// "Always" must cover the same ground: session-wide for an ordinary command, pinned to
+    /// this command when the arguments name a sensitive path. Keeping a private copy here is
+    /// what let the two drift apart in the first place.
     fn always_grant_scope(&self, args: &str) -> String {
         match serde_json::from_str::<StartArgs>(args) {
-            Ok(a) => normalize_command_for_grant(&a.command),
+            Ok(a) => shell_always_grant_scope(args, &a.command),
             Err(_) => args.to_string(),
         }
     }
@@ -583,6 +588,32 @@ impl Tool for BashKillTool {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// `bash_start` must reach the SAME "Always allow" verdict as foreground `bash` — its
+    /// own `risk` says a backgrounded command is exactly as dangerous. This asserts the two
+    /// agree rather than each keeping a private copy of the scope rule, which is exactly how
+    /// the foreground bug ("点了总是允许，bash 还是每次都问") survived as long as it did.
+    #[test]
+    fn always_grant_scope_matches_the_foreground_bash_tool() {
+        use crate::tools::bash::BashTool;
+        let scope = |cmd: &str| {
+            let args = serde_json::json!({ "command": cmd }).to_string();
+            (
+                BashTool.always_grant_scope(&args),
+                BashStartTool.always_grant_scope(&args),
+            )
+        };
+        // Ordinary command: session-wide on BOTH, so one "Always" stops the next re-prompt.
+        let (fg, bg) = scope("rm -rf victim");
+        assert_eq!(fg, bg);
+        assert_eq!(bg, "", "a backgrounded ordinary command grants session-wide");
+        // Two different ordinary commands share the key.
+        assert_eq!(scope("rm -rf a").1, scope("python3 x.py > out.json").1);
+        // Sensitive target: command-scoped on BOTH (the hard floor holds in the background too).
+        let (fg, bg) = scope("cat ~/.ssh/id_rsa");
+        assert_eq!(fg, bg);
+        assert_ne!(bg, "", "a sensitive target must not take the tool-wide key");
+    }
 
     fn ctx(dir: &Path) -> ToolContext {
         ToolContext {

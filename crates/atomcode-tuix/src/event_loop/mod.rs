@@ -19412,27 +19412,44 @@ fn approval_choice_to_decision(
     }
 }
 
-/// The session grant key for one approval, in the SAME `<tool>::<scope>` shape the kernel's
-/// `ApprovalMiddleware` uses. `bash` delegates to [`BashTool::always_grant_scope`] rather than
-/// recomputing a scope here: this driver-side cache and the middleware's store must agree, and
-/// a second, independent implementation of "what does Always cover" is precisely how the panel
-/// came to offer a session-wide grant that nothing recorded.
-fn get_approval_cache_key(tool: &str, args: &str) -> String {
-    use atomcode_kernel::tool::Tool;
-    if tool.eq_ignore_ascii_case("bash") {
-        return format!(
-            "bash::{}",
-            atomcode_capabilities::tools::BashTool.always_grant_scope(args)
-        );
+/// The shell-executing tools (`bash`, `bash_start` — a backgrounded command is exactly as
+/// dangerous as a foreground one) all take `{"command": …}` and share ONE grant-scope rule.
+/// `None` for anything else, whose approval is tool-wide.
+///
+/// Accepts either spelling of the name: the approval event carries the WIRE name, the panel
+/// the PascalCase display name.
+fn shell_grant_scope(tool: &str, args: &str) -> Option<String> {
+    let normalized = tool.to_ascii_lowercase().replace('_', "");
+    if !matches!(normalized.as_str(), "bash" | "bashstart") {
+        return None;
     }
-    format!("{tool}::")
+    let command = serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(String::from))
+        .unwrap_or_default();
+    Some(atomcode_capabilities::tools::shell_always_grant_scope(
+        args, &command,
+    ))
+}
+
+/// The session grant key for one approval, in the SAME `<tool>::<scope>` shape the kernel's
+/// `ApprovalMiddleware` builds. The scope comes from [`shell_grant_scope`], i.e. the very
+/// function the tools themselves use, rather than being recomputed here: this driver-side
+/// cache and the middleware's store must agree, and a second, independent implementation of
+/// "what does Always cover" is precisely how the panel came to offer a session-wide grant
+/// that nothing recorded.
+fn get_approval_cache_key(tool: &str, args: &str) -> String {
+    match shell_grant_scope(tool, args) {
+        Some(scope) => format!("{tool}::{scope}"),
+        None => format!("{tool}::"),
+    }
 }
 
 /// The three approval options for `tool`, in display order (Allow once is the default
 /// selection). The "Always allow" label must state the scope the store will ACTUALLY record:
 ///
 /// * `WriteFile`/`EditFile` — `WriteApprovalGate` grants per target DIRECTORY → name the folder.
-/// * `bash` — [`BashTool::always_grant_scope`] decides, and this label is derived from it: an
+/// * `bash` / `bash_start` — [`shell_grant_scope`] decides, and this label is derived from it: an
 ///   empty scope is session-wide ("Always allow Bash"), a non-empty one is pinned to this
 ///   command (the sensitive-path floor) and says so. Deriving the label from the same function
 ///   that computes the grant is the point: the previous code decided the wording separately and
@@ -19444,15 +19461,10 @@ fn get_approval_cache_key(tool: &str, args: &str) -> String {
 /// makes the scope decision available here at all.
 pub(crate) fn build_approval_options(tool: &str, args: &str) -> Vec<crate::state::ApprovalOption> {
     use crate::state::{ApprovalKind, ApprovalOption};
-    use atomcode_kernel::tool::Tool;
     // Display names (snake→Pascal) of the directory-scoped write tools.
     let always_label = if matches!(tool, "WriteFile" | "EditFile") {
         crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowFolder).into_owned()
-    } else if tool.eq_ignore_ascii_case("bash")
-        && !atomcode_capabilities::tools::BashTool
-            .always_grant_scope(args)
-            .is_empty()
-    {
+    } else if shell_grant_scope(tool, args).is_some_and(|scope| !scope.is_empty()) {
         // Non-empty scope ⇒ this grant covers only THIS command (sensitive target).
         crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowCommand).into_owned()
     } else {
@@ -19620,11 +19632,51 @@ mod bypass_approval_tests {
             super::build_approval_options("Bash", &sensitive)[1].label,
             crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowCommand).into_owned()
         );
-        // The display name must produce the same key as the wire name.
+        // The key's PREFIX is whatever name the caller passes — production always passes the
+        // event's wire name for both the store and the lookup (one `get_approval_cache_key`
+        // call feeds the panel, and the keypress handler stores that same `cache_key`), so the
+        // two halves can never disagree. What must be spelling-independent is the SCOPE, since
+        // that is the half carrying the security decision.
         assert_eq!(
-            super::get_approval_cache_key("Bash", &ordinary),
-            super::get_approval_cache_key("bash", &ordinary)
+            super::shell_grant_scope("Bash", &sensitive),
+            super::shell_grant_scope("bash", &sensitive)
         );
+        assert_eq!(
+            super::shell_grant_scope("BashStart", &ordinary),
+            super::shell_grant_scope("bash_start", &ordinary)
+        );
+    }
+
+    /// `bash_start` backgrounds a command that is "exactly as dangerous as a foreground one"
+    /// (its own `risk`), so the driver must scope its grant the same way — otherwise a
+    /// sensitive backgrounded command would take the unconditional tool-wide key that every
+    /// non-shell tool gets, and a later secret access would be auto-approved.
+    #[test]
+    fn bash_start_shares_the_foreground_bash_scope() {
+        let ordinary = bash_args("rm -rf victim");
+        let sensitive = bash_args("cat ~/.ssh/id_rsa");
+        // Wire name: keyed like the middleware, `<tool>::<scope>`.
+        assert_eq!(
+            super::get_approval_cache_key("bash_start", &ordinary),
+            "bash_start::"
+        );
+        assert_ne!(
+            super::get_approval_cache_key("bash_start", &sensitive),
+            "bash_start::",
+            "a sensitive backgrounded command must not take the tool-wide key"
+        );
+        // Display name: the panel label tracks the same decision.
+        assert_eq!(
+            super::build_approval_options("BashStart", &sensitive)[1].label,
+            crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowCommand).into_owned()
+        );
+        assert_eq!(
+            super::build_approval_options("BashStart", &ordinary)[1].label,
+            crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool: "BashStart" })
+                .into_owned()
+        );
+        // A non-shell tool keeps the plain tool-wide key.
+        assert_eq!(super::get_approval_cache_key("bash_poll", "{}"), "bash_poll::");
     }
 
     #[test]

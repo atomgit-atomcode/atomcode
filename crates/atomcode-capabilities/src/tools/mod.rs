@@ -100,8 +100,8 @@ pub use atomgit::{
     atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, AtomgitPrTool, AtomgitRepoTool,
 };
 pub use bash::{
-    bash_invocations, normalize_command_for_grant, run_shell, BashInvocation, BashTool, ShellExit,
-    ShellOutcome,
+    bash_invocations, normalize_command_for_grant, run_shell, shell_always_grant_scope,
+    BashInvocation, BashTool, ShellExit, ShellOutcome,
 };
 pub use bash_workspace_gate::BashWorkspaceGate;
 pub use cd::ChangeDirTool;

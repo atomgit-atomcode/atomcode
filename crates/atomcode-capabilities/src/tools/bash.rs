@@ -184,11 +184,8 @@ impl Tool for BashTool {
     /// Normalizing (comments stripped, whitespace collapsed) means a cosmetic re-emit of the
     /// SAME command still matches an existing command-scoped grant.
     fn always_grant_scope(&self, args: &str) -> String {
-        if !super::sensitive_path::references_sensitive_path(args) {
-            return String::new(); // tool-wide: one "Always" covers this session's bash
-        }
         match serde_json::from_str::<Args>(args) {
-            Ok(a) => normalize_command_for_grant(&a.command),
+            Ok(a) => shell_always_grant_scope(args, &a.command),
             Err(_) => args.to_string(),
         }
     }
@@ -1811,6 +1808,22 @@ pub fn strip_bash_comments(cmd: &str) -> String {
 /// cosmetic re-emit of the SAME command (a changed trailing `# comment`, extra spaces) keeps the
 /// grant instead of re-prompting. Stays PER-COMMAND (not a `rm *` family prefix): every bash
 /// approval is for a destructive command, so a family prefix would over-approve.
+/// The "Always allow" grant scope shared by EVERY shell-executing tool (`bash`, `bash_start`):
+/// TOOL-WIDE (`""`) for an ordinary command, PINNED TO THIS COMMAND when the arguments name a
+/// sensitive path.
+///
+/// This lives here, as one function, on purpose. "Always" was previously decided in three
+/// places that drifted — the tool, the approval label, and the driver's session cache — which
+/// is how the panel came to offer a session-wide grant that nothing recorded. A backgrounded
+/// command is exactly as dangerous as a foreground one, so `bash_start` must reach the same
+/// verdict as `bash` by CALLING this, not by keeping its own copy.
+pub fn shell_always_grant_scope(args: &str, command: &str) -> String {
+    if !super::sensitive_path::references_sensitive_path(args) {
+        return String::new(); // tool-wide: one "Always" covers this session's shell
+    }
+    normalize_command_for_grant(command)
+}
+
 pub fn normalize_command_for_grant(command: &str) -> String {
     strip_bash_comments(command)
         .split_whitespace()
