@@ -138,6 +138,13 @@ pub struct PermissionsConfig {
     pub deny: Vec<String>,
 }
 
+impl PermissionsConfig {
+    /// No rules declared — the table carries nothing and is omitted on save.
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_empty() && self.deny.is_empty()
+    }
+}
+
 impl Default for CodingConfig {
     fn default() -> Self {
         Self {
@@ -335,8 +342,11 @@ pub struct Config {
     #[serde(default)]
     pub tools: ToolsConfig,
     /// `[permissions]` allow/deny pre-authorization. Empty in older configs, which
-    /// leaves every existing approval gate exactly as it was.
-    #[serde(default)]
+    /// leaves every existing approval gate exactly as it was. Skipped when empty so a
+    /// config save does not sprinkle a meaningless `[permissions]` header into every
+    /// user's file — the table is opt-in, and an empty one reads as if something is
+    /// configured when nothing is.
+    #[serde(default, skip_serializing_if = "PermissionsConfig::is_empty")]
     pub permissions: PermissionsConfig,
     /// Provider key (matches a key in `Config.providers`) of a vision-language
     /// model used to preprocess images before forwarding to a non-vision main
@@ -2370,6 +2380,22 @@ kind = "claude-code"
     // server list is authoritative: it must override the client-side builtin (which knew
     // only `deepseek-v4-flash -> [high, max]`). With NO server list the builtin remains
     // the fallback for older/production servers that don't send the field yet.
+    /// An empty `[permissions]` table must not be written back into every user's config:
+    /// a header with nothing under it reads as if something is configured.
+    #[test]
+    fn empty_permissions_table_is_not_serialized() {
+        let cfg = Config::default();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(
+            !text.contains("[permissions]"),
+            "an empty permissions table must be omitted on save:\n{text}"
+        );
+        let mut with_rules = Config::default();
+        with_rules.permissions.allow = vec!["Bash(git *)".to_string()];
+        let text = toml::to_string(&with_rules).unwrap();
+        assert!(text.contains("[permissions]"), "a non-empty table must persist");
+    }
+
     /// `[permissions]` must parse from TOML and default to empty when absent — an older
     /// config file has to keep behaving exactly as it did.
     #[test]
