@@ -140,22 +140,47 @@ pub(crate) async fn start(command: &str, ctx: &ToolContext) -> Result<String, St
         ));
     }
 
-    let mut cmd = build_command(command)?;
+    // Mirror the foreground tool's env setup so a backgrounded command behaves identically:
+    // `sudo`→`sudo -A` when the askpass helper is active (a plain `sudo` then pops our secure
+    // modal instead of blocking on a prompt it can never answer with a null stdin).
+    #[cfg(unix)]
+    let effective_command = if crate::askpass::current_env().is_some() {
+        super::rewrite_sudo_for_askpass(command)
+    } else {
+        command.to_string()
+    };
+    #[cfg(not(unix))]
+    let effective_command = command.to_string();
+
+    let mut cmd = build_command(&effective_command)?;
     cmd.current_dir(&ctx.working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     super::apply_non_interactive_env(&mut cmd);
+    // Windows GBK console: flip a python child's default encoding to UTF-8 so its subprocess
+    // text pipes don't UnicodeDecodeError on UTF-8 output (parity with `BashTool::execute`).
+    #[cfg(windows)]
+    {
+        cmd.env("PYTHONUTF8", "1");
+        cmd.env("PYTHONIOENCODING", "utf-8");
+    }
     #[cfg(unix)]
     crate::process_utils::apply_utf8_locale_env(&mut cmd);
     #[cfg(unix)]
-    // SAFETY: async-signal-safe libc only — see `detach_child_from_controlling_tty`.
-    unsafe {
-        cmd.pre_exec(|| {
-            super::detach_child_from_controlling_tty();
-            Ok(())
-        });
+    {
+        // Inject the askpass env so a password prompt uses our secure modal, then detach.
+        if let Some(env) = crate::askpass::current_env() {
+            super::apply_askpass_env(&mut cmd, env);
+        }
+        // SAFETY: async-signal-safe libc only — see `detach_child_from_controlling_tty`.
+        unsafe {
+            cmd.pre_exec(|| {
+                super::detach_child_from_controlling_tty();
+                Ok(())
+            });
+        }
     }
     #[cfg(target_os = "windows")]
     crate::process_utils::suppress_console_window(&mut cmd);
