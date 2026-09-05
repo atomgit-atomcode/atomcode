@@ -16,10 +16,11 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::events::{
-    AgentRequest, ModelRequest, ModelResponse, RequestError, ToolExec, ToolsExecute, TurnProgress,
-    TurnStopping,
+    AgentRequest, ModelRequest, ModelResponse, RequestError, ToolBatch, ToolExec, ToolsExecute,
+    ToolsExecuteBatch, TurnProgress, TurnStopping,
 };
 use crate::seams::{Compaction, CompactionDecision, CompactionSvc, SessionSvc, StopReason};
+use crate::session::InjectionOrigin;
 use crate::session::SessionEvent;
 
 fn parse<T: for<'de> Deserialize<'de> + Default>(config: &Value) -> Result<T, String> {
@@ -483,6 +484,163 @@ impl Listener<TurnStopping> for ToolLoopGuard {
             return Some(StopReason::ToolLoopDetected);
         }
         None
+    }
+}
+
+/// The coarse fuse: the same calls, round after round, whatever they returned.
+///
+/// The exact guard above needs the *results* to match too, which is the right
+/// bar for "this is definitely stuck". It misses the case that actually burns a
+/// budget: a call whose output varies slightly every time — a timestamp, a
+/// counter, a directory listing that keeps changing — issued identically for
+/// round after round. Nothing matches, so nothing trips, and the turn runs to
+/// its cap.
+///
+/// So this one keys on the call signature alone, with a higher threshold: nudge
+/// first, and only stop if the nudge does not change anything.
+struct RepeatFuse {
+    ctx: Context,
+    nudge_at: u32,
+    stop_at: u32,
+    state: Mutex<RepeatState>,
+}
+
+#[derive(Default)]
+struct RepeatState {
+    signature: String,
+    rounds: u32,
+    nudged: bool,
+}
+
+const REPEAT_NUDGE: &str = "\
+You have issued the SAME tool call with the SAME arguments several rounds in a row. Stop \
+repeating it and change your approach. If you are trying to ask the user something, do not \
+print it with a shell command — end your turn with a plain-text question. If the task is done, \
+reply with a short summary and no tool calls. If you are blocked, say what you need.";
+
+/// Order-independent signature of one round's calls.
+///
+/// Call ids are excluded on purpose: providers commonly mint a fresh id for an
+/// otherwise identical retry, and keying on them would make every repeat look
+/// like a new call.
+fn round_signature(calls: &[atomcode_kernel::tool::ToolCall]) -> String {
+    let mut parts: Vec<String> = calls
+        .iter()
+        .map(|call| format!("{}\u{0}{}", call.name, call.arguments))
+        .collect();
+    parts.sort();
+    parts.join("\u{1}")
+}
+
+#[async_trait]
+impl Waterfall<ToolsExecuteBatch> for RepeatFuse {
+    async fn handle(
+        &self,
+        batch: &mut ToolBatch,
+        next: Next<'_, ToolsExecuteBatch>,
+    ) -> Vec<ToolResult> {
+        // A round with no tool calls is not a repeat of anything — it is the
+        // model talking. Counting it made three plain answers in a row look
+        // like a loop.
+        if batch.calls.is_empty() {
+            return next.run(batch).await;
+        }
+        let signature = round_signature(&batch.calls);
+        let rounds = {
+            let mut state = self.state.lock().expect("repeat fuse poisoned");
+            if state.signature == signature {
+                state.rounds += 1;
+            } else {
+                state.signature = signature;
+                state.rounds = 1;
+                state.nudged = false;
+            }
+            state.rounds
+        };
+
+        let results = next.run(batch).await;
+
+        if rounds >= self.nudge_at {
+            let mut state = self.state.lock().expect("repeat fuse poisoned");
+            if !state.nudged {
+                state.nudged = true;
+                drop(state);
+                // Logged as a fact with provenance, like every other thing the
+                // harness tells the model on its own initiative.
+                if let Some(session) = self.ctx.service::<SessionSvc>() {
+                    session.append(SessionEvent::Injected {
+                        turn: session.current_turn(),
+                        text: REPEAT_NUDGE.to_string(),
+                        origin: InjectionOrigin::Continuation,
+                    });
+                }
+            }
+        }
+        results
+    }
+}
+
+#[async_trait]
+impl Listener<TurnStopping> for RepeatFuse {
+    async fn call(&self, _progress: &TurnProgress) -> Option<StopReason> {
+        let mut state = self.state.lock().expect("repeat fuse poisoned");
+        if state.rounds >= self.stop_at {
+            *state = RepeatState::default();
+            return Some(StopReason::ToolLoopDetected);
+        }
+        None
+    }
+}
+
+pub struct RepeatFusePlugin;
+
+#[async_trait]
+impl Plugin for RepeatFusePlugin {
+    fn name(&self) -> &'static str {
+        "repeat-fuse"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools"]
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["sessions"]
+    }
+    fn description(&self) -> &'static str {
+        "nudge, then stop, when the same calls repeat regardless of what they return"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        #[derive(Deserialize)]
+        struct Row {
+            #[serde(default = "default_nudge_at")]
+            nudge_at: u32,
+            #[serde(default = "default_stop_at")]
+            stop_at: u32,
+        }
+        fn default_nudge_at() -> u32 {
+            3
+        }
+        fn default_stop_at() -> u32 {
+            6
+        }
+        let (nudge_at, stop_at) = if config.is_null() {
+            (default_nudge_at(), default_stop_at())
+        } else {
+            let row: Row =
+                serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?;
+            (row.nudge_at, row.stop_at)
+        };
+        if nudge_at >= stop_at {
+            return Err("nudge_at must be lower than stop_at".into());
+        }
+        let fuse = Arc::new(RepeatFuse {
+            ctx: ctx.clone(),
+            nudge_at,
+            stop_at,
+            state: Mutex::new(RepeatState::default()),
+        });
+        let _ = ctx.on_waterfall::<ToolsExecuteBatch>(fuse.clone(), false);
+        let _ = ctx.on_serial::<TurnStopping>(fuse);
+        Ok(())
     }
 }
 

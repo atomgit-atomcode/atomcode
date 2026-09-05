@@ -348,3 +348,67 @@ impl Plugin for RequestTimeoutPlugin {
         Ok(())
     }
 }
+
+// ---- reasoning hygiene --------------------------------------------------
+
+/// Placeholders some adapters emit when a thinking model produced no usable
+/// reasoning. They are not content, and storing them means echoing them back
+/// next turn as though the model had said them.
+const FILLER: &[&str] = &[
+    "·",
+    "(no reasoning detected)",
+    "(no reasoning recorded)",
+    "no reasoning detected",
+    "no reasoning recorded",
+];
+
+/// Strips filler from the reasoning channel.
+///
+/// It matters more than it looks: reasoning is echoed back to a thinking model
+/// on the next request, so a placeholder that survives becomes part of the
+/// conversation the model reasons about — and it costs prefix-cacheable tokens
+/// to say nothing.
+struct ReasoningFilter;
+
+#[async_trait]
+impl Waterfall<AgentRequest> for ReasoningFilter {
+    async fn handle(
+        &self,
+        req: &mut ModelRequest,
+        next: Next<'_, AgentRequest>,
+    ) -> Result<ModelResponse, RequestError> {
+        let mut response = next.run(req).await?;
+        if response.reasoning.is_empty() {
+            return Ok(response);
+        }
+        let mut cleaned = response.reasoning.clone();
+        for marker in FILLER {
+            if cleaned.contains(marker) {
+                cleaned = cleaned.replace(marker, "");
+            }
+        }
+        let cleaned = cleaned.trim();
+        response.reasoning = if cleaned.is_empty() {
+            String::new()
+        } else {
+            cleaned.to_string()
+        };
+        Ok(response)
+    }
+}
+
+pub struct ReasoningFilterPlugin;
+
+#[async_trait]
+impl Plugin for ReasoningFilterPlugin {
+    fn name(&self) -> &'static str {
+        "reasoning-filter"
+    }
+    fn description(&self) -> &'static str {
+        "drop placeholder reasoning before it is stored and echoed back"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let _ = ctx.on_waterfall::<AgentRequest>(Arc::new(ReasoningFilter), false);
+        Ok(())
+    }
+}

@@ -32,6 +32,8 @@ async fn main() -> ExitCode {
     let mut mermaid = false;
     let mut audit = false;
     let mut list = false;
+    let mut resume_latest = false;
+    let mut list_sessions = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -106,6 +108,18 @@ async fn main() -> ExitCode {
             }
             "--audit" => audit = true,
             "--list-profiles" => list = true,
+            // Continue an existing conversation. The id is required for
+            // `--resume`: which conversation to continue is not something a
+            // harness should guess.
+            "--resume" => match args.next() {
+                Some(id) => overlays.push(bundle::resume_overlay(&id)),
+                None => {
+                    eprintln!("--resume needs a session id (see --list-sessions)");
+                    return ExitCode::from(2);
+                }
+            },
+            "--continue" | "-c" => resume_latest = true,
+            "--list-sessions" => list_sessions = true,
             "--patch" => {
                 let Some(path) = args.next() else {
                     eprintln!("--patch needs a file path");
@@ -128,6 +142,46 @@ async fn main() -> ExitCode {
     }
 
     let profiles = Profiles::builtin().with_home();
+
+    // Session ids are read off disk before anything mounts, because choosing
+    // which conversation to continue has to happen before the tree that would
+    // hold it exists.
+    if list_sessions || resume_latest {
+        let dir = atomcode_harness::home().join("sessions");
+        let mut ids: Vec<(std::time::SystemTime, String)> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.extension()? != "jsonl" {
+                    return None;
+                }
+                let modified = entry.metadata().ok()?.modified().ok()?;
+                Some((modified, path.file_stem()?.to_str()?.to_string()))
+            })
+            .collect();
+        ids.sort_by(|a, b| b.0.cmp(&a.0));
+
+        if list_sessions {
+            if ids.is_empty() {
+                println!("no sessions under {}", dir.display());
+            }
+            for (modified, id) in ids.iter().take(20) {
+                let age = modified.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+                println!("  {id:<24} {}", human_age(age));
+            }
+            return ExitCode::SUCCESS;
+        }
+
+        match ids.first() {
+            Some((_, id)) => overlays.push(bundle::resume_overlay(id)),
+            None => {
+                eprintln!("no session to continue under {}", dir.display());
+                return ExitCode::from(2);
+            }
+        }
+    }
 
     if list {
         println!("profiles:");
@@ -231,6 +285,16 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Rough, and deliberately so: the point is "is this the one I was just in".
+fn human_age(secs: u64) -> String {
+    match secs {
+        0..=90 => "just now".into(),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    }
+}
+
 const HELP: &str = "\
 harness — AtomCode's coding agent as a plugin tree
 
@@ -263,6 +327,11 @@ OVERLAYS (stacked last, after the profile and your home patch):
     --yolo           allow every tool call without asking (sandboxes, evals)
     --interactive    ask before risky calls instead of refusing them
     --patch <FILE>   your own layer (repeatable, last wins)
+
+SESSIONS:
+    -c, --continue         resume the most recent session
+        --resume <ID>      resume a named session
+        --list-sessions    what is on disk
 
 INSPECTION:
     --dump-config          how the profile assembles, and what is running

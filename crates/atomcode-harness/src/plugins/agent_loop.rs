@@ -260,9 +260,16 @@ async fn stream_once(
             StreamEvent::ToolCall(call) => out.tool_calls.push(call),
             StreamEvent::Usage(usage) => out.usage = Some(usage),
             StreamEvent::Error(err) => return Err(RequestError::from_provider(&err)),
+            StreamEvent::Done { truncated } => out.truncated = truncated,
             _ => {}
         }
     }
+    // A truncated response is not empty even when it looks it: the model was
+    // cut off, which is a different situation with a different recovery.
+    if out.truncated {
+        return Ok(out);
+    }
+
     // A response with neither text nor tool calls cannot advance the turn.
     // Reported as a typed failure so a retry policy can decide, rather than
     // silently producing an empty assistant message.
@@ -295,7 +302,8 @@ impl AgentLoop for PluginAgentLoop {
         }
 
         agent.set_status(AgentStatus::Working);
-        let turn = session.open_turn();
+        let turn = session.next_turn();
+        self.commit(&session, SessionEvent::TurnStart { turn });
         let mut outcome = TurnOutcome {
             turn,
             ..Default::default()
@@ -471,9 +479,14 @@ impl AgentLoop for PluginAgentLoop {
 
             let tool_count = response.tool_calls.len() as u32;
             outcome.tool_calls += tool_count;
-            let results = self
-                .execute_batch(&ctx, agent, response.tool_calls, turn, step)
-                .await;
+            // No calls, nothing to schedule: dispatching an empty batch would
+            // make every listener reason about a round that did not happen.
+            let results = if tool_count == 0 {
+                Vec::new()
+            } else {
+                self.execute_batch(&ctx, agent, response.tool_calls, turn, step)
+                    .await
+            };
             // Side effects were already applied concurrently; the log is written
             // in emission order so the transcript matches what the model asked
             // for, not what happened to finish first.

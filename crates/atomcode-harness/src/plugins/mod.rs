@@ -15,6 +15,7 @@ pub mod session;
 pub mod subagent;
 pub mod tool_exec;
 pub mod tools;
+pub mod truncation;
 pub mod ui;
 pub mod ui_jsonrpc;
 pub mod ui_tui;
@@ -74,8 +75,11 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(recovery::RateLimitPlugin))
         .register(Arc::new(recovery::OverflowPlugin))
         .register(Arc::new(recovery::RequestTimeoutPlugin))
+        .register(Arc::new(truncation::TruncationPlugin))
+        .register(Arc::new(recovery::ReasoningFilterPlugin))
         .register(Arc::new(loop_policy::CompactionPlugin))
         .register(Arc::new(loop_policy::ToolLoopGuardPlugin))
+        .register(Arc::new(loop_policy::RepeatFusePlugin))
         .register(Arc::new(policy_rows::TodoPlugin))
         .register(Arc::new(policy_rows::PermissionsPlugin))
         .register(Arc::new(policy_rows::PlanModePlugin))

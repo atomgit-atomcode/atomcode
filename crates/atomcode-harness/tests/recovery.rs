@@ -387,3 +387,205 @@ async fn the_timeout_bounds_the_retries_too() {
         started.elapsed()
     );
 }
+
+// ---- truncation ---------------------------------------------------------
+
+/// Answers with a response the provider cut at its output limit.
+struct Truncated {
+    text: String,
+    calls: Vec<atomcode_kernel::tool::ToolCall>,
+    seen: Arc<AtomicU32>,
+    /// After this many truncated answers, finish normally.
+    truncate_times: u32,
+}
+
+#[async_trait]
+impl Waterfall<AgentRequest> for Truncated {
+    async fn handle(
+        &self,
+        _req: &mut ModelRequest,
+        _next: Next<'_, AgentRequest>,
+    ) -> Result<ModelResponse, RequestError> {
+        let n = self.seen.fetch_add(1, Ordering::SeqCst);
+        if n < self.truncate_times {
+            return Ok(ModelResponse {
+                text: self.text.clone(),
+                tool_calls: self.calls.clone(),
+                truncated: true,
+                ..Default::default()
+            });
+        }
+        Ok(ModelResponse {
+            text: "finished properly".into(),
+            ..Default::default()
+        })
+    }
+}
+
+fn call(name: &str, arguments: &str) -> atomcode_kernel::tool::ToolCall {
+    atomcode_kernel::tool::ToolCall {
+        id: format!("c-{name}"),
+        name: name.into(),
+        arguments: arguments.into(),
+    }
+}
+
+#[tokio::test]
+async fn a_truncated_answer_gets_a_resume_nudge_as_a_logged_fact() {
+    let dir = scratch("truncated-text");
+    let app = start(tree(&dir, &[])).await;
+    let seen = Arc::new(AtomicU32::new(0));
+    let _guard = app.context().on_waterfall::<AgentRequest>(
+        Arc::new(Truncated {
+            text: "half an ans".into(),
+            calls: vec![],
+            seen,
+            truncate_times: 1,
+        }),
+        false,
+    );
+
+    run_turn(&app, "write something long").await.unwrap();
+
+    let injected: Vec<String> = app
+        .context()
+        .service::<SessionSvc>()
+        .unwrap()
+        .events()
+        .into_iter()
+        .filter_map(|e| match e.event {
+            SessionEvent::Injected { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        injected.iter().any(|t| t.contains("Output limit hit")),
+        "the nudge must be in the log, not whispered outside it: {injected:?}"
+    );
+    assert!(
+        injected.iter().any(|t| t.contains("INCREMENTALLY")),
+        "and it must steer toward incremental writes rather than a re-emit"
+    );
+}
+
+#[tokio::test]
+async fn a_call_cut_mid_arguments_is_refused_rather_than_run() {
+    let dir = scratch("truncated-call");
+    let target = dir.join("would-be-truncated.txt");
+    let app = start(tree(&dir, &[bundle::YOLO])).await;
+    let seen = Arc::new(AtomicU32::new(0));
+    // The JSON stops mid-value: this is what a `write_file` looks like when the
+    // response was cut while its `content` was still streaming. Running it
+    // would silently write a truncated file.
+    let cut = format!(
+        r#"{{"file_path": "{}", "content": "the beginning of som"#,
+        target.to_string_lossy()
+    );
+    let _guard = app.context().on_waterfall::<AgentRequest>(
+        Arc::new(Truncated {
+            text: String::new(),
+            calls: vec![call("write_file", &cut)],
+            seen,
+            truncate_times: 1,
+        }),
+        false,
+    );
+
+    run_turn(&app, "write it").await.unwrap();
+
+    assert!(
+        !target.exists(),
+        "a call whose arguments were cut must not run — a half-written file is worse \
+         than no file"
+    );
+    let transcript = app
+        .context()
+        .service::<SessionSvc>()
+        .unwrap()
+        .derive_messages()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        transcript.contains("truncated and unsafe to run"),
+        "and the model has to learn why, or it will retry the same payload: {transcript}"
+    );
+    assert!(transcript.contains("split the work"));
+}
+
+#[tokio::test]
+async fn a_complete_call_in_a_truncated_response_still_runs() {
+    let dir = scratch("truncated-mixed");
+    std::fs::write(dir.join("a.txt"), "readable").unwrap();
+    let app = start(tree(&dir, &[bundle::YOLO])).await;
+    let seen = Arc::new(AtomicU32::new(0));
+    let _guard = app.context().on_waterfall::<AgentRequest>(
+        Arc::new(Truncated {
+            text: String::new(),
+            calls: vec![
+                call("read_file", r#"{"file_path": "a.txt"}"#),
+                call(
+                    "write_file",
+                    r#"{"file_path": "b.txt", "content": "cut off"#,
+                ),
+            ],
+            seen,
+            truncate_times: 1,
+        }),
+        false,
+    );
+
+    run_turn(&app, "go").await.unwrap();
+    let transcript = app
+        .context()
+        .service::<SessionSvc>()
+        .unwrap()
+        .derive_messages()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // A round that also contained good calls should not lose them.
+    assert!(
+        transcript.contains("readable"),
+        "the complete call ran: {transcript}"
+    );
+    assert!(
+        transcript.contains("unsafe to run"),
+        "and the cut one did not"
+    );
+    assert!(!dir.join("b.txt").exists());
+}
+
+#[tokio::test]
+async fn the_nudging_itself_is_bounded() {
+    let dir = scratch("truncated-forever");
+    let row = "[[patch]]\nid = \"truncation-recovery\"\nconfig = { max_continuations = 2 }";
+    let app = start(tree(&dir, &[row])).await;
+    let seen = Arc::new(AtomicU32::new(0));
+    let _guard = app.context().on_waterfall::<AgentRequest>(
+        Arc::new(Truncated {
+            text: "always cut".into(),
+            calls: vec![],
+            seen,
+            truncate_times: 99,
+        }),
+        false,
+    );
+
+    run_turn(&app, "go").await.unwrap();
+    let nudges = app
+        .context()
+        .service::<SessionSvc>()
+        .unwrap()
+        .events()
+        .into_iter()
+        .filter(|e| matches!(&e.event, SessionEvent::Injected { text, .. } if text.contains("Output limit")))
+        .count();
+    assert!(
+        nudges <= 2,
+        "a nudge that never works must stop being sent, or it becomes the loop: {nudges}"
+    );
+}

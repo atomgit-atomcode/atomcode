@@ -264,7 +264,7 @@ fn restoring_a_log_preserves_sequence_and_turn_numbering() {
     log.restore(events);
     assert_eq!(log.current_turn(), 3);
     assert_eq!(
-        log.open_turn(),
+        log.next_turn(),
         4,
         "a resumed session continues its numbering"
     );
@@ -448,4 +448,171 @@ async fn the_loop_refuses_to_continue_on_an_unexplainable_prompt() {
         atomcode_harness::seams::StopReason::Stopped,
         "a single-round turn ends before a second assembly can observe the smuggling"
     );
+}
+
+// ---- resuming -----------------------------------------------------------
+
+/// A tree pointed at a private harness home, so a resume test cannot see (or
+/// be seen by) any other session on the machine.
+fn resumable(home: &std::path::Path, session_id: Option<&str>, resume: bool) -> ConfigTree {
+    let script = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [ { text = "answered" } ] }
+"#;
+    let quiet =
+        "[[patch]]\nid = \"trace\"\nconfig = { stream = false, tools = false, summary = false }";
+    let sandbox = home.join("work");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    let rows = format!(
+        "[[patch]]\nid = \"skills\"\nconfig = {{ project_root = {work:?}, home = {work:?} }}\n\n\
+         [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {work:?} }}\n\n\
+         [[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ root = {root:?}, resume = {resume} }}\n{id}",
+        work = sandbox.to_string_lossy(),
+        root = home.join("sessions").to_string_lossy(),
+        resume = resume,
+        id = session_id
+            .map(|id| format!("\n[[patch]]\nid = \"session\"\nconfig = {{ id = {id:?} }}\n"))
+            .unwrap_or_default()
+    );
+    let mut layers = vec![bundle::base().unwrap()];
+    for src in [script, quiet, rows.as_str()] {
+        layers.push(Layer::from_toml(src).unwrap());
+    }
+    ConfigTree::from_layers(layers).unwrap()
+}
+
+fn resume_home(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("plexus-resume-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Let the fire-and-forget persistence writer land before reading it back.
+async fn settle(app: &App, id: &str, want: usize) {
+    let store = app.context().service::<SessionPersistenceSvc>().unwrap();
+    for _ in 0..50 {
+        if store.load(id).await.map(|e| e.len()).unwrap_or(0) >= want {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_resumed_session_carries_its_history_to_the_model() {
+    let home = resume_home("history");
+    let id = "fixed-id";
+
+    let mut first = App::new(plugins::catalog(), resumable(&home, Some(id), false));
+    first.start().await.unwrap();
+    run_turn(&first, "remember the number 42").await.unwrap();
+    settle(&first, id, 5).await;
+    drop(first);
+
+    let mut second = App::new(plugins::catalog(), resumable(&home, Some(id), true));
+    second.start().await.unwrap();
+
+    // The whole point: the model's view is rebuilt from the log, so the second
+    // process sees what the first one said.
+    let projected = second
+        .context()
+        .service::<SessionSvc>()
+        .unwrap()
+        .derive_messages()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        projected.contains("remember the number 42"),
+        "a resumed session must carry its history: {projected}"
+    );
+    assert!(projected.contains("answered"));
+}
+
+#[tokio::test]
+async fn a_resumed_session_continues_its_turn_numbering() {
+    let home = resume_home("numbering");
+    let id = "numbered";
+
+    let mut first = App::new(plugins::catalog(), resumable(&home, Some(id), false));
+    first.start().await.unwrap();
+    run_turn(&first, "one").await.unwrap();
+    run_turn(&first, "two").await.unwrap();
+    settle(&first, id, 10).await;
+    drop(first);
+
+    let mut second = App::new(plugins::catalog(), resumable(&home, Some(id), true));
+    second.start().await.unwrap();
+    let outcome = run_turn(&second, "three").await.unwrap();
+
+    // Restarting at 1 would give a transcript keyed by (session, turn)
+    // duplicate keys on every resume.
+    assert_eq!(outcome.turn, 3, "numbering must continue, not restart");
+}
+
+#[tokio::test]
+async fn the_turn_boundary_survives_a_round_trip() {
+    let home = resume_home("boundary");
+    let id = "boundaries";
+
+    let mut first = App::new(plugins::catalog(), resumable(&home, Some(id), false));
+    first.start().await.unwrap();
+    run_turn(&first, "one").await.unwrap();
+    settle(&first, id, 5).await;
+    drop(first);
+
+    let mut second = App::new(plugins::catalog(), resumable(&home, Some(id), true));
+    second.start().await.unwrap();
+    let turns = second
+        .context()
+        .service::<SessionSvc>()
+        .unwrap()
+        .events()
+        .into_iter()
+        .filter(|e| matches!(e.event, SessionEvent::TurnStart { .. }))
+        .count();
+    // `TurnStart` used to be appended directly rather than committed, so it
+    // existed in memory and reached no listener — including the one that
+    // persists. A resumed log was missing every boundary.
+    assert_eq!(
+        turns, 1,
+        "the turn boundary must reach the store like any other fact"
+    );
+}
+
+#[tokio::test]
+async fn resume_is_off_unless_asked_for() {
+    let home = resume_home("off");
+    let id = "not-resumed";
+
+    let mut first = App::new(plugins::catalog(), resumable(&home, Some(id), false));
+    first.start().await.unwrap();
+    run_turn(&first, "the first thing").await.unwrap();
+    settle(&first, id, 5).await;
+    drop(first);
+
+    let mut second = App::new(plugins::catalog(), resumable(&home, Some(id), false));
+    second.start().await.unwrap();
+    assert!(
+        second.context().service::<SessionSvc>().unwrap().is_empty(),
+        "a new session must not silently inherit an old one"
+    );
+}
+
+#[tokio::test]
+async fn resuming_a_session_that_does_not_exist_starts_a_fresh_one() {
+    let home = resume_home("missing");
+    let mut app = App::new(
+        plugins::catalog(),
+        resumable(&home, Some("never-written"), true),
+    );
+    app.start()
+        .await
+        .expect("a missing session is an empty one, not a failure");
+    let outcome = run_turn(&app, "hello").await.unwrap();
+    assert_eq!(outcome.turn, 1);
 }

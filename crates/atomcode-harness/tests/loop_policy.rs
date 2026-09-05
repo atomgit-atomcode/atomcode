@@ -83,7 +83,8 @@ async fn the_round_budget_is_a_row_and_the_loop_only_has_a_fuse() {
     let script = always_calls("read_file", r#"{ file_path = "a.txt" }"#);
 
     // With the row: the budget stops it, and says so.
-    let capped = "[[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 3 }";
+    let capped = "[[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 3 }\n\n\
+                  [[remove]]\nid = \"repeat-fuse\"";
     let app = start(tree(&dir, &script, &[capped])).await;
     let outcome = run_turn(&app, "go").await.unwrap();
     assert_eq!(outcome.stop, StopReason::MaxRounds);
@@ -93,7 +94,7 @@ async fn the_round_budget_is_a_row_and_the_loop_only_has_a_fuse() {
     // Without it: the loop's own fuse is what stops it, named differently so a
     // missing policy is visible rather than looking like a normal ending. The
     // guard comes out too, so the fuse is the only thing left that can stop it.
-    let no_cap = "[[remove]]\nid = \"round-cap\"\n\n[[remove]]\nid = \"tool-loop-guard\"\n\n\
+    let no_cap = "[[remove]]\nid = \"round-cap\"\n\n[[remove]]\nid = \"tool-loop-guard\"\n\n[[remove]]\nid = \"repeat-fuse\"\n\n\
                   [[patch]]\nid = \"agent-loop\"\nconfig = { max_rounds = 5 }";
     let app = start(tree(&dir, &script, &[no_cap])).await;
     let outcome = run_turn(&app, "go").await.unwrap();
@@ -111,7 +112,7 @@ async fn a_wall_clock_deadline_is_the_same_row_with_different_config() {
     // independent, and neither is the loop's.
     let deadline =
         "[[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 1000, max_seconds = 0 }\n\n\
-                    [[remove]]\nid = \"tool-loop-guard\"\n\n\
+                    [[remove]]\nid = \"tool-loop-guard\"\n\n[[remove]]\nid = \"repeat-fuse\"\n\n\
                     [[patch]]\nid = \"agent-loop\"\nconfig = { max_rounds = 10 }";
     let app = start(tree(&dir, &script, &[deadline])).await;
     let outcome = run_turn(&app, "go").await.unwrap();
@@ -122,7 +123,7 @@ async fn a_wall_clock_deadline_is_the_same_row_with_different_config() {
     // on the very first check.
     let immediate =
         "[[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 1000, max_seconds = 1 }\n\n\
-                     [[remove]]\nid = \"tool-loop-guard\"";
+                     [[remove]]\nid = \"tool-loop-guard\"\n\n[[remove]]\nid = \"repeat-fuse\"";
     let app = start(tree(&dir, &script, &[immediate])).await;
     let outcome = run_turn(&app, "go").await.unwrap();
     assert!(
@@ -326,6 +327,7 @@ async fn the_guard_warns_then_ends_a_turn_that_is_not_progressing() {
     let script = always_calls("read_file", r#"{ file_path = "a.txt" }"#);
     // Round budget above the guard's threshold, so the guard is what stops it.
     let rows = "[[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 20 }\n\n\
+                [[remove]]\nid = \"repeat-fuse\"\n\n\
                 [[patch]]\nid = \"tool-loop-guard\"\nconfig = { warn_after = 2, stop_after = 3 }";
     let app = start(tree(&dir, &script, &[rows])).await;
     let outcome = run_turn(&app, "go").await.unwrap();
@@ -354,6 +356,7 @@ async fn the_guard_does_not_fire_when_results_differ() {
     // not a loop, and the guard must not confuse the two.
     let script = always_calls("bash", r#"{ command = "date +%s%N" }"#);
     let rows = "[[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 5 }\n\n\
+                [[remove]]\nid = \"repeat-fuse\"\n\n\
                 [[patch]]\nid = \"tool-loop-guard\"\nconfig = { warn_after = 2, stop_after = 3 }\n\n\
                 [[patch]]\nid = \"approval\"\nconfig = { mode = \"yolo\" }";
     let app = start(tree(&dir, &script, &[rows])).await;

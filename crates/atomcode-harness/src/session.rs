@@ -208,11 +208,15 @@ impl SessionLog {
         &self.id
     }
 
-    /// Open a new turn and return its number.
-    pub fn open_turn(&self) -> u64 {
-        let turn = self.turn.fetch_add(1, Ordering::SeqCst) + 1;
-        self.append(SessionEvent::TurnStart { turn });
-        turn
+    /// Claim the next turn number.
+    ///
+    /// Deliberately does *not* append `TurnStart`. Appending directly bypasses
+    /// whoever broadcasts committed events, so the boundary would exist in
+    /// memory and be missing from every consumer that learns by listening —
+    /// persistence, projections, a UI. The caller commits it through the same
+    /// path as every other fact.
+    pub fn next_turn(&self) -> u64 {
+        self.turn.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     pub fn current_turn(&self) -> u64 {

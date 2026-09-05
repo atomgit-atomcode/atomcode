@@ -133,7 +133,7 @@ fn tree(root: &std::path::Path, script: &str, extra: &[&str]) -> ConfigTree {
     ConfigTree::from_layers(layers).unwrap()
 }
 
-/// One model turn that fires `n` calls of `tool` at once.
+/// One model turn that fires `n` calls of `tool` at once, then stops.
 fn fires(tool: &str, n: usize) -> String {
     let calls = (0..n)
         .map(|i| format!(r#"{{ name = "{tool}", args = {{ n = "{i}" }} }}"#))
@@ -142,6 +142,15 @@ fn fires(tool: &str, n: usize) -> String {
     format!(
         "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [\n  \
          {{ text = \"working\", calls = [ {calls} ] }},\n  {{ text = \"done\" }},\n] }}\n"
+    )
+}
+
+/// The same call, round after round — what a fuse exists to trip on.
+fn repeats(tool: &str) -> String {
+    let step = format!(r#"{{ text = "again", calls = [ {{ name = "{tool}", args = {{}} }} ] }}"#);
+    let steps = vec![step; 30].join(",\n  ");
+    format!(
+        "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [\n  {steps}\n] }}\n"
     )
 }
 
@@ -360,5 +369,148 @@ async fn a_call_that_had_not_started_when_cancelled_never_runs() {
     assert!(
         ran < 4,
         "every queued call ran anyway ({ran}/4) — a cancel must stop the ones that had not started"
+    );
+}
+
+// ---- the coarse repeat fuse ---------------------------------------------
+
+/// Returns something different every time, from an identical call.
+///
+/// This is the shape the exact loop guard cannot see: it needs the *results* to
+/// match too, so a call whose output carries a timestamp, a counter, or a
+/// directory that keeps changing never trips it — and the turn runs to its cap.
+struct AlwaysDifferent {
+    calls: Arc<AtomicU32>,
+}
+
+#[async_trait]
+impl Tool for AlwaysDifferent {
+    fn name(&self) -> &str {
+        "varies"
+    }
+    fn description(&self) -> &str {
+        "returns something new each time"
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    fn read_only_hint(&self) -> bool {
+        true
+    }
+    async fn execute(&self, _args: &str, _ctx: &ToolContext) -> ToolResult {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        ToolResult {
+            call_id: String::new(),
+            content: format!("result number {n}"),
+            is_error: false,
+            images: vec![],
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_coarse_fuse_catches_what_the_exact_guard_misses() {
+    let dir = scratch("repeat");
+    let calls = Arc::new(AtomicU32::new(0));
+    // The exact guard is on and will never fire: no two results match.
+    let rows = "[[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 30 }\n\n\
+                [[patch]]\nid = \"repeat-fuse\"\nconfig = { nudge_at = 2, stop_at = 4 }";
+    let app = start_with(
+        tree(&dir, &repeats("varies"), &[rows]),
+        vec![Arc::new(AlwaysDifferent {
+            calls: calls.clone(),
+        })],
+    )
+    .await;
+
+    let agent = create_agent(&app).unwrap();
+    agent.send("go");
+    let outcome = drive(&app, &agent).await.unwrap();
+
+    assert_eq!(
+        outcome.stop,
+        StopReason::ToolLoopDetected,
+        "identical calls with varying results still make no progress"
+    );
+    assert!(
+        outcome.steps <= 6,
+        "it stopped near the threshold rather than running to the round cap: {} steps",
+        outcome.steps
+    );
+
+    let transcript = app
+        .context()
+        .service::<SessionSvc>()
+        .unwrap()
+        .derive_messages()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        transcript.contains("SAME tool call"),
+        "the model gets a chance to change course before the turn is taken away"
+    );
+}
+
+#[tokio::test]
+async fn changing_the_call_resets_the_fuse() {
+    let dir = scratch("repeat-reset");
+    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    // Alternating calls: never the same signature twice in a row, so the fuse
+    // must not fire — varying work is not a loop.
+    let script = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [
+  { text = "a", calls = [ { name = "varies", args = {} } ] },
+  { text = "b", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] },
+  { text = "c", calls = [ { name = "varies", args = {} } ] },
+  { text = "d", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] },
+  { text = "done" },
+] }
+"#;
+    let rows = "[[patch]]\nid = \"repeat-fuse\"\nconfig = { nudge_at = 2, stop_at = 3 }\n\n\
+                [[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 20 }";
+    let app = start_with(
+        tree(&dir, script, &[rows]),
+        vec![Arc::new(AlwaysDifferent {
+            calls: Arc::new(AtomicU32::new(0)),
+        })],
+    )
+    .await;
+
+    let agent = create_agent(&app).unwrap();
+    agent.send("go");
+    let outcome = drive(&app, &agent).await.unwrap();
+    assert_eq!(
+        outcome.stop,
+        StopReason::Stopped,
+        "alternating calls are progress, not a loop"
+    );
+}
+
+#[tokio::test]
+async fn removing_the_fuse_removes_the_stopping() {
+    let dir = scratch("no-fuse");
+    let rows = "[[remove]]\nid = \"repeat-fuse\"\n\n\
+                [[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 5 }";
+    let app = start_with(
+        tree(&dir, &repeats("varies"), &[rows]),
+        vec![Arc::new(AlwaysDifferent {
+            calls: Arc::new(AtomicU32::new(0)),
+        })],
+    )
+    .await;
+
+    let agent = create_agent(&app).unwrap();
+    agent.send("go");
+    let outcome = drive(&app, &agent).await.unwrap();
+    assert_eq!(
+        outcome.stop,
+        StopReason::MaxRounds,
+        "with no fuse the round budget is all that stops it — which is the point of \
+         having the fuse"
     );
 }

@@ -339,6 +339,7 @@ async fn a_token_budget_ends_a_turn_the_round_budget_would_have_allowed() {
     std::fs::write(dir.join("a.txt"), "x").unwrap();
     // The replay adapter reports 100 prompt tokens per round.
     let rows = "[[patch]]\nid = \"token-budget\"\nconfig = { max_prompt_tokens = 50 }\n\n\
+                [[remove]]\nid = \"repeat-fuse\"\n\n\
                 [[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 20 }";
     let script = format!(
         "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [\n  {}\n] }}\n",

@@ -156,6 +156,15 @@ struct PersistenceRow {
     /// Directory for `<session-id>.jsonl`. Defaults under the harness home.
     #[serde(default)]
     root: Option<String>,
+    /// Load the session's existing events at mount time.
+    ///
+    /// There is no separate snapshot format to restore from: the log *is* the
+    /// snapshot. Everything a resumed session needs — the model's view, the
+    /// turn numbering, the compaction boundaries — is derived from the same
+    /// events a live session appends, so a resume is a replay and not a second
+    /// representation that can drift from the first.
+    #[serde(default)]
+    resume: bool,
 }
 
 struct JsonlStore {
@@ -277,6 +286,24 @@ impl Plugin for SessionPersistenceJsonlPlugin {
         // what lets persistence be removed without the loop changing.
         let session = ctx.require::<SessionSvc>().map_err(|e| e.to_string())?;
         let id = session.id().to_string();
+
+        if row.resume {
+            let events = store.load(&id).await?;
+            if !events.is_empty() {
+                let turns = events
+                    .iter()
+                    .filter(|e| matches!(e.event, SessionEvent::TurnStart { .. }))
+                    .count();
+                // Sequence numbers and the turn counter come from the data, not
+                // re-minted: a transcript keyed by (session, turn) would collect
+                // duplicate keys after the first resume otherwise.
+                session.restore(events);
+                eprintln!(
+                    "\x1b[2mresumed `{id}` — {turns} turn(s), {} event(s)\x1b[0m",
+                    session.len()
+                );
+            }
+        }
         let _ = ctx.on_emit::<SessionEventCommitted>(move |logged: &LoggedEvent| {
             let store = store.clone();
             let id = id.clone();

@@ -124,6 +124,11 @@ pub struct ModelResponse {
     pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<TokenUsage>,
+    /// The provider cut the response at its output-token limit
+    /// (`finish_reason=length`). What was produced is real but unfinished, and
+    /// anything still streaming when it was cut — a tool call's arguments in
+    /// particular — is incomplete and unsafe to act on.
+    pub truncated: bool,
 }
 
 /// A round's tool calls, on their way to being scheduled.

@@ -27,6 +27,7 @@ name = "session-projection"
 
 [[insert]]
 name = "session-persistence-jsonl"
+config = { resume = false }
 
 # --- registries: the slots everything else fills or reads -------------------
 [[insert]]
@@ -146,12 +147,26 @@ name = "compaction-overflow"
 config = { max_attempts = 3 }
 
 [[insert]]
+name = "truncation-recovery"
+config = { max_continuations = 4 }
+
+[[insert]]
+name = "reasoning-filter"
+
+[[insert]]
 name = "compaction-tail"
 config = { threshold = 0.75, keep_turns = 2 }
 
 [[insert]]
 name = "tool-loop-guard"
 config = { warn_after = 3, stop_after = 4 }
+
+# The coarse companion: same calls round after round, whatever they returned.
+# The exact guard needs matching results too, so it misses a call whose output
+# varies slightly every time — which is the shape that actually burns a budget.
+[[insert]]
+name = "repeat-fuse"
+config = { nudge_at = 3, stop_at = 6 }
 
 # --- policy, in wrap order: repair -> rules -> approve -> cap --------------
 [[insert]]
@@ -311,6 +326,17 @@ disabled = false
 id = "user-questions-unattended"
 disabled = false
 "#;
+
+/// Continue an existing session instead of starting a new one.
+///
+/// Takes the id, because "which conversation" is not something a harness should
+/// guess. `--continue` resolves the most recent one and produces this.
+pub fn resume_overlay(id: &str) -> String {
+    format!(
+        "[[patch]]\nid = \"session\"\nconfig = {{ id = {id:?} }}\n\n\
+         [[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ resume = true }}\n"
+    )
+}
 
 /// Allow everything. For a sandbox, a container, or an eval where the whole
 /// point is to let the agent act without a human in the loop.
