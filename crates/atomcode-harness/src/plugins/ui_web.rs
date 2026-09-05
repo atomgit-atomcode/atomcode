@@ -26,7 +26,7 @@ use crate::seams::{
     AgentLoopSvc, AgentsSvc, ControlSvc, SessionSvc, UiSvc, UserInterface, UserQuestions,
     UserQuestionsSvc,
 };
-use crate::session::LoggedEvent;
+use crate::session::Committed;
 
 #[derive(Debug, Deserialize)]
 struct WebRow {
@@ -153,11 +153,15 @@ impl UserInterface for WebUi {
 
         let events = self.events.clone();
         let fanout = events.clone();
-        let _stream = ctx.on_emit::<SessionEventCommitted>(move |logged: &LoggedEvent| {
+        let _stream = ctx.on_emit::<SessionEventCommitted>(move |committed: &Committed| {
             let payload = json!({
                 "type": "session",
-                "seq": logged.seq,
-                "event": logged.event,
+                // Named, not filtered: a browser watching a delegating agent
+                // may well want the child's stream — it just must be able to
+                // tell which conversation each fact belongs to.
+                "session": committed.session,
+                "seq": committed.seq,
+                "event": committed.event,
             })
             .to_string();
             // An error means nobody is listening, which is normal.

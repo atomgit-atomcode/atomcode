@@ -26,7 +26,7 @@ use crate::seams::{
     AgentLoopSvc, AgentsSvc, SessionSvc, SessionTitleSvc, UiSvc, UserInterface, UserQuestions,
     UserQuestionsSvc,
 };
-use crate::session::{LoggedEvent, SessionEvent};
+use crate::session::{Committed, SessionEvent};
 
 /// One rendered line of the transcript.
 #[derive(Clone)]
@@ -103,8 +103,8 @@ fn render(log: &crate::session::SessionLog) -> Vec<Line> {
             }),
             SessionEvent::TurnEnd { stop, error, .. } => lines.push(Line {
                 text: match error {
-                    Some(e) => format!("— {stop}: {e}"),
-                    None => format!("— {stop}"),
+                    Some(e) => format!("— {stop:?}: {e}"),
+                    None => format!("— {stop:?}"),
                 },
                 style: Style::Meta,
             }),
@@ -180,7 +180,7 @@ impl UserInterface for Tui {
         // Every committed event asks for a repaint. The loop coalesces them by
         // draining the channel, so a burst of stream chunks is one redraw.
         let redraw = signals_tx.clone();
-        let _watch = ctx.on_emit::<SessionEventCommitted>(move |_: &LoggedEvent| {
+        let _watch = ctx.on_emit::<SessionEventCommitted>(move |_: &Committed| {
             let _ = redraw.send(Signal::Redraw);
         });
 

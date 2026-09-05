@@ -30,6 +30,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use atomcode_plexus::Context;
 use tokio_util::sync::CancellationToken;
 
+use atomcode_kernel::message::ImageContent;
+
 use crate::seams::SessionSvc;
 use crate::session::{InjectionOrigin, SessionLog};
 
@@ -45,11 +47,32 @@ pub enum AgentStatus {
     Stopping,
 }
 
+/// Who asked for a turn.
+///
+/// A continuation the harness scheduled for itself is still someone asking for
+/// work — it wakes an idle agent exactly like a typed message does. What it is
+/// not is something the user said, and a transcript that cannot tell the two
+/// apart shows the user saying things they never said.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MessageOrigin {
+    /// A person, or whatever is standing in for one.
+    #[default]
+    User,
+    /// The harness itself: a continuation, a scheduled goal, a resumed plan.
+    Harness,
+}
+
 /// One item waiting for an agent.
 #[derive(Clone, Debug, PartialEq)]
 pub enum InboxItem {
     /// Someone asking for work. Wakes an idle agent.
-    Message { text: String },
+    Message {
+        text: String,
+        origin: MessageOrigin,
+        /// Attachments that belong to this message. Model-visible, so they
+        /// travel with it rather than being handed to the request separately.
+        images: Vec<ImageContent>,
+    },
     /// Model-visible context that rides along with the next message. Never
     /// wakes anything on its own.
     Injection {
@@ -63,6 +86,10 @@ pub enum InboxItem {
 pub struct Claimed {
     /// The message this step is answering, if any.
     pub message: Option<String>,
+    /// Who asked. Meaningless when there is no message.
+    pub origin: MessageOrigin,
+    /// What the message carried.
+    pub images: Vec<ImageContent>,
     /// Context that came along with it.
     pub injections: Vec<(String, InjectionOrigin)>,
 }
@@ -86,10 +113,30 @@ impl Inbox {
 
     /// Queue a message. This is the thing that starts or extends a turn.
     pub fn send(&self, text: impl Into<String>) {
+        self.send_full(text, MessageOrigin::User, Vec::new());
+    }
+
+    /// Queue a message the harness authored. Wakes the agent like any other
+    /// message; logged for what it is.
+    pub fn send_from(&self, text: impl Into<String>, origin: MessageOrigin) {
+        self.send_full(text, origin, Vec::new());
+    }
+
+    /// Queue a message with everything it carries.
+    pub fn send_full(
+        &self,
+        text: impl Into<String>,
+        origin: MessageOrigin,
+        images: Vec<ImageContent>,
+    ) {
         self.queue
             .lock()
             .expect("inbox poisoned")
-            .push_back(InboxItem::Message { text: text.into() });
+            .push_back(InboxItem::Message {
+                text: text.into(),
+                origin,
+                images,
+            });
     }
 
     /// Queue context to ride along with the next message.
@@ -118,8 +165,14 @@ impl Inbox {
         while let Some(item) = queue.pop_front() {
             match item {
                 InboxItem::Injection { text, origin } => claimed.injections.push((text, origin)),
-                InboxItem::Message { text } => {
+                InboxItem::Message {
+                    text,
+                    origin,
+                    images,
+                } => {
                     claimed.message = Some(text);
+                    claimed.origin = origin;
+                    claimed.images = images;
                     break;
                 }
             }
@@ -174,7 +227,14 @@ pub struct Agent {
     ctx: Context,
     inbox: Inbox,
     status: RwLock<AgentStatus>,
-    cancel: CancellationToken,
+    /// The token the *current* turn runs under.
+    ///
+    /// Per turn, not per agent. A token that outlives the turn it stopped makes
+    /// cancellation terminal: the agent is asked to stop once and every turn
+    /// after it ends before its first request, which looks exactly like a
+    /// broken model. Opening a turn mints a fresh one; cancelling fires the one
+    /// in flight.
+    cancel: RwLock<CancellationToken>,
 }
 
 impl Agent {
@@ -196,6 +256,21 @@ impl Agent {
     /// as the next step rather than starting a second turn.
     pub fn send(&self, text: impl Into<String>) {
         self.inbox.send(text);
+    }
+
+    /// Queue work the harness asked itself for. See [`MessageOrigin`].
+    pub fn send_from(&self, text: impl Into<String>, origin: MessageOrigin) {
+        self.inbox.send_from(text, origin);
+    }
+
+    /// Queue a message with its attachments. See [`Inbox::send_full`].
+    pub fn send_full(
+        &self,
+        text: impl Into<String>,
+        origin: MessageOrigin,
+        images: Vec<ImageContent>,
+    ) {
+        self.inbox.send_full(text, origin, images);
     }
 
     /// Take every queued injection, leaving messages. See [`Inbox::claim_injections`].
@@ -221,17 +296,48 @@ impl Agent {
     }
 
     /// Ask the current turn to stop. Cooperative: the step in flight finishes.
+    ///
+    /// A no-op when nothing is running, which is what cancelling an idle agent
+    /// means. It does not queue: a cancel that arrives before a turn opens is
+    /// not held against that turn.
     pub fn cancel(&self) {
         self.set_status(AgentStatus::Stopping);
-        self.cancel.cancel();
+        self.cancel.read().expect("cancel token poisoned").cancel();
     }
 
     pub fn cancelled(&self) -> bool {
-        self.cancel.is_cancelled()
+        self.cancel
+            .read()
+            .expect("cancel token poisoned")
+            .is_cancelled()
     }
 
     pub fn cancel_token(&self) -> CancellationToken {
-        self.cancel.clone()
+        self.cancel.read().expect("cancel token poisoned").clone()
+    }
+
+    /// Open a turn: mint this turn's cancellation token and mark the agent
+    /// working. Returns the token, so a driver holds the same one `cancel`
+    /// fires.
+    ///
+    /// Every loop implementation calls this, because "which token is this turn
+    /// running under" is the agent's fact, not the driver's.
+    pub fn begin_turn(&self) -> CancellationToken {
+        let fresh = CancellationToken::new();
+        *self.cancel.write().expect("cancel token poisoned") = fresh.clone();
+        self.set_status(AgentStatus::Working);
+        fresh
+    }
+
+    /// Close a turn: back to idle, under a fresh token.
+    ///
+    /// The pair with [`begin_turn`](Self::begin_turn), and the reason an idle
+    /// agent is never cancelled. Leaving the fired token in place would make
+    /// `cancelled()` answer a question about a turn that has already ended, and
+    /// every observer between turns would read the agent as stopping.
+    pub fn end_turn(&self) {
+        *self.cancel.write().expect("cancel token poisoned") = CancellationToken::new();
+        self.set_status(AgentStatus::Idle);
     }
 
     /// The log this agent writes to — its own if its realm provides one, else
@@ -269,7 +375,7 @@ impl Agents {
             ctx: ctx.isolate(),
             inbox: Inbox::new(),
             status: RwLock::new(AgentStatus::Idle),
-            cancel: CancellationToken::new(),
+            cancel: RwLock::new(CancellationToken::new()),
         });
         self.agents
             .write()

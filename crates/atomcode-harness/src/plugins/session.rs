@@ -14,7 +14,9 @@ use serde_json::{json, Value};
 
 use crate::events::SessionEventCommitted;
 use crate::seams::{SessionPersistence, SessionPersistenceSvc, SessionProjectionsSvc, SessionSvc};
-use crate::session::{LoggedEvent, ProjectionUnit, SessionEvent, SessionLog, SessionProjections};
+use crate::session::{
+    Committed, LoggedEvent, ProjectionUnit, SessionEvent, SessionLog, SessionProjections,
+};
 
 #[derive(Debug, Deserialize, Default)]
 struct SessionRow {
@@ -304,10 +306,16 @@ impl Plugin for SessionPersistenceJsonlPlugin {
                 );
             }
         }
-        let _ = ctx.on_emit::<SessionEventCommitted>(move |logged: &LoggedEvent| {
+        let _ = ctx.on_emit::<SessionEventCommitted>(move |committed: &Committed| {
+            // A delegated child commits to its own log, and this listener is
+            // above both. Writing its facts here would interleave two
+            // conversations in one file and make the parent unresumable.
+            if committed.session != id {
+                return;
+            }
             let store = store.clone();
             let id = id.clone();
-            let logged = logged.clone();
+            let logged = committed.logged();
             // Fire-and-forget: a slow disk must not stall the turn, and a
             // failed write is reported, never fatal to the conversation.
             tokio::spawn(async move {

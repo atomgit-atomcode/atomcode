@@ -4,7 +4,9 @@
 
 use std::sync::Arc;
 
-use atomcode_harness::seams::{SessionPersistenceSvc, SessionProjectionsSvc, SessionSvc};
+use atomcode_harness::seams::{
+    SessionPersistenceSvc, SessionProjectionsSvc, SessionSvc, StopReason,
+};
 use atomcode_harness::session::{
     assert_model_visible_is_logged, derive_messages, HeaderReason, InjectionOrigin, LoggedEvent,
     SessionEvent, SessionLog,
@@ -72,6 +74,7 @@ fn the_projection_is_the_only_path_from_facts_to_a_prompt() {
             call_id: "c1".into(),
             content: "ok".into(),
             is_error: false,
+            images: Vec::new(),
         },
         SessionEvent::Usage {
             turn: 1,
@@ -80,7 +83,7 @@ fn the_projection_is_the_only_path_from_facts_to_a_prompt() {
         },
         SessionEvent::TurnEnd {
             turn: 1,
-            stop: "Stopped".into(),
+            stop: StopReason::Stopped,
             error: None,
         },
     ]);

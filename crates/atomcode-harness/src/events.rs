@@ -26,7 +26,7 @@ use atomcode_kernel::tool::{ToolCall, ToolDef, ToolResult};
 use atomcode_plexus::plexus_event;
 
 use crate::seams::{StopReason, TurnOutcome};
-use crate::session::LoggedEvent;
+use crate::session::Committed;
 
 /// Everything that goes on the wire for one model call. A listener may rewrite
 /// any of it before delegating.
@@ -190,6 +190,11 @@ pub struct StepDecision {
     pub step: u32,
     /// The message this step answers, if the inbox had one.
     pub message: Option<String>,
+    /// Who asked for it. A listener that rewrites the message keeps the
+    /// provenance unless it means to change who is speaking.
+    pub origin: crate::agent::MessageOrigin,
+    /// Attachments the message carried.
+    pub images: Vec<atomcode_kernel::message::ImageContent>,
     /// Context claimed alongside it.
     pub injections: Vec<(String, crate::session::InjectionOrigin)>,
     /// Set by a listener to refuse this input. The turn ends without a step.
@@ -240,10 +245,11 @@ pub struct Chunk {
 }
 
 plexus_event!(
-    /// Every fact appended to the session log, broadcast as it commits.
+    /// Every fact appended to a session log, broadcast as it commits.
     /// Persistence, telemetry, transcripts and UIs are all listeners here —
-    /// none of them is wired into the loop.
-    SessionEventCommitted, "session/event", Emit, LoggedEvent
+    /// none of them is wired into the loop. The payload names its session,
+    /// because a listener above two logs receives facts from both.
+    SessionEventCommitted, "session/event", Emit, Committed
 );
 plexus_event!(TurnStart, "turn/start", Emit, TurnStarted);
 plexus_event!(TurnEnd, "turn/end", Emit, TurnOutcome);

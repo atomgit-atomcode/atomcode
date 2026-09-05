@@ -25,7 +25,7 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::agent::{Agent, AgentStatus};
+use crate::agent::{Agent, MessageOrigin};
 use crate::events::{
     AgentRequest, AssistantChunk, AssistantMessage, Chunk, ModelRequest, ModelResponse, PreStep,
     RequestError, SessionEventCommitted, StepDecision, ToolBatch, ToolExec, ToolResultEvent,
@@ -35,7 +35,7 @@ use crate::seams::{
     AgentLoop, AgentLoopSvc, LlmSvc, SessionProjectionsSvc, SessionSvc, StopReason,
     SystemPromptSvc, ToolsSvc, TurnOutcome,
 };
-use crate::session::{HeaderReason, LoggedEvent, SeqNo, SessionEvent, SessionLog};
+use crate::session::{Committed, HeaderReason, InjectionOrigin, SeqNo, SessionEvent, SessionLog};
 
 #[derive(Debug, Deserialize)]
 struct LoopRow {
@@ -86,8 +86,11 @@ impl PluginAgentLoop {
     /// listens to `session/event`; it never has to be called by the loop.
     fn commit(&self, session: &SessionLog, event: SessionEvent) -> SeqNo {
         let seq = session.append(event.clone());
-        self.ctx
-            .emit::<SessionEventCommitted>(&LoggedEvent { seq, event });
+        self.ctx.emit::<SessionEventCommitted>(&Committed {
+            session: session.id().to_string(),
+            seq,
+            event,
+        });
         if let Some(projections) = self.ctx.service::<SessionProjectionsSvc>() {
             projections.advance(session);
         }
@@ -232,12 +235,20 @@ async fn stream_once(
     while let Some(event) = stream.next().await {
         match event {
             StreamEvent::TextDelta(text) => {
-                session.append(SessionEvent::AssistantChunk {
-                    turn,
-                    round,
-                    delta: text.clone(),
-                    reasoning: false,
-                });
+                // Through the one write path like every other fact. A chunk
+                // that is appended and not broadcast is in memory and nowhere
+                // else: persistence never stores it, so a resumed session has
+                // no stream to replay.
+                crate::session::commit(
+                    ctx,
+                    session,
+                    SessionEvent::AssistantChunk {
+                        turn,
+                        round,
+                        delta: text.clone(),
+                        reasoning: false,
+                    },
+                );
                 ctx.emit::<AssistantChunk>(&Chunk {
                     text: text.clone(),
                     reasoning: false,
@@ -245,12 +256,16 @@ async fn stream_once(
                 out.text.push_str(&text);
             }
             StreamEvent::Reasoning(text) => {
-                session.append(SessionEvent::AssistantChunk {
-                    turn,
-                    round,
-                    delta: text.clone(),
-                    reasoning: true,
-                });
+                crate::session::commit(
+                    ctx,
+                    session,
+                    SessionEvent::AssistantChunk {
+                        turn,
+                        round,
+                        delta: text.clone(),
+                        reasoning: true,
+                    },
+                );
                 ctx.emit::<AssistantChunk>(&Chunk {
                     text: text.clone(),
                     reasoning: true,
@@ -306,7 +321,9 @@ impl AgentLoop for PluginAgentLoop {
             };
         }
 
-        agent.set_status(AgentStatus::Working);
+        // Opening the turn is what mints its cancellation token. Asking an
+        // agent to stop must not outlive the turn it stopped.
+        agent.begin_turn();
         let turn = session.next_turn();
         self.commit(&session, SessionEvent::TurnStart { turn });
         let mut outcome = TurnOutcome {
@@ -326,6 +343,8 @@ impl AgentLoop for PluginAgentLoop {
                 turn,
                 step: step + 1,
                 message: claimed.message,
+                origin: claimed.origin,
+                images: claimed.images,
                 injections: claimed.injections,
                 rejected: None,
                 starts_request_series: step == 0,
@@ -384,14 +403,23 @@ impl AgentLoop for PluginAgentLoop {
                 );
             }
             if let Some(text) = &decision.message {
-                self.commit(
-                    &session,
-                    SessionEvent::UserMessage {
+                // The same wake, two provenances. A continuation the harness
+                // scheduled is model-visible like anything else and is logged
+                // as the harness's, so a replayed transcript never attributes
+                // it to the user.
+                let event = match decision.origin {
+                    MessageOrigin::User => SessionEvent::UserMessage {
                         turn,
                         text: text.clone(),
-                        images: Vec::new(),
+                        images: decision.images.clone(),
                     },
-                );
+                    MessageOrigin::Harness => SessionEvent::Injected {
+                        turn,
+                        text: text.clone(),
+                        origin: InjectionOrigin::Continuation,
+                    },
+                };
+                self.commit(&session, event);
             }
 
             step += 1;
@@ -504,6 +532,7 @@ impl AgentLoop for PluginAgentLoop {
                         call_id: result.call_id.clone(),
                         content: result.content.clone(),
                         is_error: result.is_error,
+                        images: result.images.clone(),
                     },
                 );
                 self.ctx.emit::<ToolResultEvent>(&result);
@@ -517,6 +546,15 @@ impl AgentLoop for PluginAgentLoop {
                 },
             );
 
+            // Give the runtime a turn of its own before deciding to continue.
+            // Cancellation is cooperative, which means someone has to be able
+            // to *deliver* it: a round that resolves entirely from memory — a
+            // cached response, a replayed fixture, a tool that hits nothing —
+            // never yields, so on a single-threaded runtime the task holding
+            // the stop button is never scheduled and the turn runs to the end
+            // regardless. One yield per round makes the guarantee the loop
+            // already claims independent of what the provider happens to do.
+            tokio::task::yield_now().await;
             if agent.cancelled() {
                 outcome.stop = StopReason::Cancelled;
                 break;
@@ -555,16 +593,15 @@ impl AgentLoop for PluginAgentLoop {
             &session,
             SessionEvent::TurnEnd {
                 turn,
-                stop: format!("{:?}", outcome.stop),
+                stop: outcome.stop,
                 error: outcome.error.clone(),
             },
         );
         self.ctx.emit::<TurnEnd>(&outcome);
-        agent.set_status(if agent.cancelled() {
-            AgentStatus::Stopping
-        } else {
-            AgentStatus::Idle
-        });
+        // Idle under a fresh token even after a cancel: the turn that was
+        // stopping has stopped, and an agent left cancelled between turns is
+        // one every later turn ends before its first request.
+        agent.end_turn();
         outcome
     }
 }

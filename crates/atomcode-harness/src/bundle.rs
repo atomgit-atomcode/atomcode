@@ -550,6 +550,36 @@ id = "approval-interactive"
 disabled = false
 "#;
 
+/// A driver on the other end of an `AgentHandle` — the protocol `atomcode-tuix`,
+/// the daemon and the WebUI already speak.
+///
+/// The row fills four slots at once, and that is the point: a program that can
+/// render a conversation can also render an approval prompt and a question, so
+/// the standalone asker and both static approval rows stand down rather than
+/// fighting it for the seam.
+pub const HANDLE_APP: &str = r#"
+[[insert]]
+id = "ui"
+name = "ui-handle"
+
+# The driver owns the screen; nothing else may write to it.
+[[patch]]
+id = "trace"
+config = { stream = false, tools = false, summary = false }
+
+[[patch]]
+id = "user-questions-unattended"
+disabled = true
+
+[[patch]]
+id = "approval"
+disabled = true
+
+[[patch]]
+id = "approval-interactive"
+disabled = true
+"#;
+
 /// No front end: the embedder drives.
 pub const EMBED_APP: &str = r#"
 [[insert]]
@@ -601,6 +631,7 @@ pub const BUNDLES: &[(&str, &str)] = &[
     ("tui-app", TUI_APP),
     ("web-app", WEB_APP),
     ("sdk-app", SDK_APP),
+    ("handle-app", HANDLE_APP),
     ("embed-app", EMBED_APP),
 ];
 
@@ -644,6 +675,12 @@ pub const PROFILES: &[(&str, &[&str], Option<&str>, &str)] = &[
         &["base", "embed-app"],
         None,
         "no front end; a library caller drives",
+    ),
+    (
+        "handle",
+        &["base", "handle-app"],
+        None,
+        "an AgentHandle for the shipped TUI, daemon and WebUI to drive",
     ),
     (
         "headless",
@@ -953,6 +990,18 @@ pub fn ui_overlay(name: &str) -> String {
         other => other,
     };
     let mut out = format!("[[patch]]\nid = \"ui\"\nname = \"ui-{plugin}\"\n");
+    if name == "handle" {
+        // The driver answers approvals as well as questions, so both static
+        // approval rows stand down: two providers for one slot is an error,
+        // not a preference.
+        out.push_str(
+            "\n[[patch]]\nid = \"user-questions-unattended\"\ndisabled = true\n\n\
+             [[patch]]\nid = \"approval\"\ndisabled = true\n\n\
+             [[patch]]\nid = \"approval-interactive\"\ndisabled = true\n\n\
+             [[patch]]\nid = \"trace\"\nconfig = { stream = false, tools = false, summary = false }\n",
+        );
+        return out;
+    }
     if name == "quiet" {
         // Nobody to ask and nothing to ask with: the asking policy must stand
         // down too, or it waits forever for a provider that will never mount.
@@ -977,4 +1026,4 @@ pub fn ui_overlay(name: &str) -> String {
 }
 
 /// Front ends `--ui` accepts.
-pub const UI_NAMES: &[&str] = &["oneshot", "repl", "tui", "web", "sdk", "quiet"];
+pub const UI_NAMES: &[&str] = &["oneshot", "repl", "tui", "web", "sdk", "handle", "quiet"];

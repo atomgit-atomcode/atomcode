@@ -4,6 +4,7 @@ pub mod agent_loop;
 pub mod agents;
 pub mod capabilities;
 pub mod findings;
+pub mod handle;
 pub mod llm;
 pub mod loop_policy;
 pub mod persona;
@@ -94,6 +95,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(ui::TerminalQuestionsPlugin))
         .register(Arc::new(ui::QuietUiPlugin))
         .register(Arc::new(ui_jsonrpc::JsonRpcUiPlugin))
+        .register(Arc::new(handle::AgentHandlePlugin))
         .register(Arc::new(ui_tui::TuiUiPlugin))
         .register(Arc::new(ui_tui::TuiQuestionsPlugin))
         .register(Arc::new(ui_web::WebUiPlugin))

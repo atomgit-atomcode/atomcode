@@ -406,7 +406,7 @@ config = { script = [
     let yolo = "[[patch]]\nid = \"approval\"\nconfig = { mode = \"yolo\" }";
     let app = start(tree(&dir, script, &[yolo])).await;
     let agent = create_agent(&app).unwrap();
-    let _guard = app.context().on_waterfall::<ToolsExecute>(
+    let guard = app.context().on_waterfall::<ToolsExecute>(
         Arc::new(CancelsMidTurn {
             agent: agent.clone(),
         }),
@@ -421,7 +421,25 @@ config = { script = [
         outcome.steps, 1,
         "the step in flight finished, then it stopped"
     );
-    assert_eq!(agent.status(), AgentStatus::Stopping);
+    // The turn that was stopping has stopped, so the agent is idle again — and
+    // ready. A cancel that outlived its turn would end the next one before its
+    // first request.
+    assert_eq!(agent.status(), AgentStatus::Idle);
+    assert!(
+        !agent.cancelled(),
+        "the next turn must not inherit this one's cancellation"
+    );
+
+    // Nothing cancels this one, and nothing should have to: the point is that
+    // the agent itself is not carrying the previous turn's stop.
+    guard.dispose();
+    agent.send("again");
+    let after = drive(&app, &agent).await.unwrap();
+    assert_eq!(
+        after.stop,
+        StopReason::Stopped,
+        "an agent asked to stop once must still be able to work"
+    );
 }
 
 #[tokio::test]

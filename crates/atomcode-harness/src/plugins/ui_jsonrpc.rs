@@ -25,7 +25,7 @@ use crate::seams::{
     AgentLoopSvc, AgentsSvc, ControlSvc, SessionSvc, UiSvc, UserInterface, UserQuestions,
     UserQuestionsSvc,
 };
-use crate::session::LoggedEvent;
+use crate::session::Committed;
 
 /// Asking, over the same socket.
 ///
@@ -142,11 +142,15 @@ impl UserInterface for JsonRpc {
             .take()
             .ok_or("this front end can only be run once")?;
         let notify_tx = out_tx.clone();
-        let stream = ctx.on_emit::<SessionEventCommitted>(move |logged: &LoggedEvent| {
+        let stream = ctx.on_emit::<SessionEventCommitted>(move |committed: &Committed| {
             let _ = notify_tx.send(json!({
                 "jsonrpc": "2.0",
                 "method": "session/event",
-                "params": { "seq": logged.seq, "event": logged.event },
+                "params": {
+                    "session": committed.session,
+                    "seq": committed.seq,
+                    "event": committed.event,
+                },
             }));
         });
 

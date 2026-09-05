@@ -94,15 +94,19 @@ impl Waterfall<AgentRequest> for OnTruncation {
             .unwrap_or(false);
 
         if let Some(session) = self.ctx.service::<SessionSvc>() {
-            session.append(SessionEvent::Injected {
-                turn: session.current_turn(),
-                text: if cut_a_call {
-                    TRUNCATED_CALL_COACH.to_string()
-                } else {
-                    RESUME_NUDGE.to_string()
+            crate::session::commit(
+                &self.ctx,
+                &session,
+                SessionEvent::Injected {
+                    turn: session.current_turn(),
+                    text: if cut_a_call {
+                        TRUNCATED_CALL_COACH.to_string()
+                    } else {
+                        RESUME_NUDGE.to_string()
+                    },
+                    origin: InjectionOrigin::Continuation,
                 },
-                origin: InjectionOrigin::Continuation,
-            });
+            );
         }
         Ok(response)
     }

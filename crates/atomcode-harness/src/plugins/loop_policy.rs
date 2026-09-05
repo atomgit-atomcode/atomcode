@@ -328,11 +328,15 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
         }
 
         if let Some(decision) = compaction.compact(&session).await {
-            session.append(SessionEvent::Compacted {
-                turn: session.current_turn(),
-                through: decision.through,
-                summary: decision.summary,
-            });
+            crate::session::commit(
+                &self.ctx,
+                &session,
+                SessionEvent::Compacted {
+                    turn: session.current_turn(),
+                    through: decision.through,
+                    summary: decision.summary,
+                },
+            );
             // Re-project: the request must carry the compacted history, and it
             // must still be exactly what the log says.
             let mut messages: Vec<Message> = req
@@ -568,11 +572,15 @@ impl Waterfall<ToolsExecuteBatch> for RepeatFuse {
                 // Logged as a fact with provenance, like every other thing the
                 // harness tells the model on its own initiative.
                 if let Some(session) = self.ctx.service::<SessionSvc>() {
-                    session.append(SessionEvent::Injected {
-                        turn: session.current_turn(),
-                        text: REPEAT_NUDGE.to_string(),
-                        origin: InjectionOrigin::Continuation,
-                    });
+                    crate::session::commit(
+                        &self.ctx,
+                        &session,
+                        SessionEvent::Injected {
+                            turn: session.current_turn(),
+                            text: REPEAT_NUDGE.to_string(),
+                            origin: InjectionOrigin::Continuation,
+                        },
+                    );
                 }
             }
         }

@@ -42,6 +42,7 @@ plexus_service!(FindingsSvc => dyn Findings, "findings", Seam, "Where structured
 plexus_service!(SubagentsSvc => dyn Subagents, "subagents", Seam, "Delegating work to a child agent");
 plexus_service!(AgentLoopSvc => dyn AgentLoop, "agent-loop", Seam, "The turn driver");
 plexus_service!(ApprovalSvc => dyn ApprovalPolicy, "approval", Seam, "Whether a tool call may run");
+plexus_service!(AgentHandleSvc => dyn AgentHandleSource, "agent-handle", Seam, "A driver-protocol handle on this harness");
 
 /// The live tool catalog.
 ///
@@ -241,6 +242,18 @@ pub trait Control: Send + Sync {
     async fn rows(&self) -> Vec<(String, String, bool)>;
 }
 
+/// Handing out a driver-protocol handle.
+///
+/// A seam rather than a return value, because whoever embeds this harness holds
+/// a [`Context`], not the plugin — the same way every other front end resolves
+/// what it needs from the tree. Its consumer is outside the tree by
+/// construction; that is what makes it a handle.
+pub trait AgentHandleSource: Send + Sync {
+    /// The handle, once. A second caller gets `None`: two owners of one command
+    /// channel is two drivers fighting over one conversation.
+    fn take(&self) -> Option<atomcode_kernel::agent::AgentHandle>;
+}
+
 /// The front end: whoever drives agents and talks to a person.
 ///
 /// A seam, so "run one prompt and exit", "a terminal session", "a web server"
@@ -379,7 +392,12 @@ pub struct TurnOutcome {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Why a turn ended.
+///
+/// Serialized by variant name, which is what `format!("{:?}")` produced when
+/// the log stored a rendering of this instead of the value — so a session
+/// written before it was typed still loads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum StopReason {
     /// The model answered with no further tool calls.
     #[default]

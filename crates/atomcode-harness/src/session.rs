@@ -116,6 +116,11 @@ pub enum SessionEvent {
         call_id: String,
         content: String,
         is_error: bool,
+        /// Images the tool produced for a vision model to see. Model-visible,
+        /// so logged: a picture the model was shown and the log cannot account
+        /// for is exactly what the invariant forbids.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageContent>,
     },
     /// Model-visible text the harness added on its own initiative.
     Injected {
@@ -138,7 +143,10 @@ pub enum SessionEvent {
     },
     TurnEnd {
         turn: u64,
-        stop: String,
+        /// Why it ended. The reason itself, not a rendering of it: a consumer
+        /// that has to match on `"Cancelled"` to tell a stop from a failure is
+        /// one typo away from calling a failed turn a clean one.
+        stop: crate::seams::StopReason,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -180,6 +188,31 @@ impl SessionEvent {
 pub struct LoggedEvent {
     pub seq: SeqNo,
     pub event: SessionEvent,
+}
+
+/// A committed fact, broadcast with the session it belongs to.
+///
+/// The id is not decoration. One process runs more than one log — a delegated
+/// child has its own — and every listener registered above them sees all of
+/// them, because that is what one-way realm visibility means. Without the id on
+/// the broadcast, a subagent's transcript arrives on the parent's screen and in
+/// the parent's file, and nothing downstream can tell it apart.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Committed {
+    /// Which log this fact was appended to.
+    pub session: String,
+    pub seq: SeqNo,
+    pub event: SessionEvent,
+}
+
+impl Committed {
+    /// The log record, without the routing information.
+    pub fn logged(&self) -> LoggedEvent {
+        LoggedEvent {
+            seq: self.seq,
+            event: self.event.clone(),
+        }
+    }
 }
 
 /// The append-only log.
@@ -345,8 +378,19 @@ pub fn derive_messages(events: &[LoggedEvent]) -> Vec<Message> {
                 call_id,
                 content,
                 is_error,
+                images,
                 ..
-            } => messages.push(Message::tool_result(call_id, content, *is_error)),
+            } => {
+                messages.push(Message::tool_result(call_id, content, *is_error));
+                // A provider serializes images on a user message and rejects
+                // them on a tool one, so the picture rides in immediately
+                // after the result it belongs to.
+                if !images.is_empty() {
+                    let mut carrier = Message::user_with_images("", images.clone());
+                    carrier.synthetic = true;
+                    messages.push(carrier);
+                }
+            }
             // Chunks, headers, usage and turn boundaries are facts about the
             // session, not content the model receives.
             _ => {}
@@ -407,7 +451,11 @@ fn truncate(text: &str, max: usize) -> String {
 /// compaction cuts and truncation nudges were each lost that way.
 pub fn commit(ctx: &atomcode_plexus::Context, log: &SessionLog, event: SessionEvent) -> SeqNo {
     let seq = log.append(event.clone());
-    ctx.emit::<crate::events::SessionEventCommitted>(&LoggedEvent { seq, event });
+    ctx.emit::<crate::events::SessionEventCommitted>(&Committed {
+        session: log.id().to_string(),
+        seq,
+        event,
+    });
     if let Some(projections) = ctx.service::<crate::seams::SessionProjectionsSvc>() {
         projections.advance(log);
     }

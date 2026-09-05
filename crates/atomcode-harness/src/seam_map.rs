@@ -57,8 +57,8 @@ macro_rules! seam_catalog {
 }
 
 use crate::seams::{
-    AgentLoopSvc, AgentsSvc, ApprovalSvc, CodeIndexSvc, CompactionSvc, ControlSvc, FindingsSvc,
-    FsSvc, LlmSvc, McpSvc, SessionPersistenceSvc, SessionProjectionsSvc, SessionSvc,
+    AgentHandleSvc, AgentLoopSvc, AgentsSvc, ApprovalSvc, CodeIndexSvc, CompactionSvc, ControlSvc,
+    FindingsSvc, FsSvc, LlmSvc, McpSvc, SessionPersistenceSvc, SessionProjectionsSvc, SessionSvc,
     SessionTitleSvc, ShellSvc, SkillsSvc, SubagentsSvc, SubprocessSvc, SystemPromptSvc, ToolsSvc,
     UiSvc, UserQuestionsSvc,
 };
@@ -86,6 +86,7 @@ seam_catalog!(
     ApprovalSvc,
     UiSvc,
     ControlSvc,
+    AgentHandleSvc,
 );
 
 /// Slots the host reads directly rather than through a plugin. `run_turn` calls
@@ -109,6 +110,9 @@ pub const HOST_CONSUMED: &[&str] = &[
     "agents",
     "sessions",
     "session-title",
+    // The handle exists for whoever embeds this harness. Its consumer is
+    // outside the tree by construction — that is what makes it a handle.
+    "agent-handle",
 ];
 
 /// Build the map by joining the seam definitions with what the registry's

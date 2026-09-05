@@ -216,11 +216,15 @@ impl Waterfall<AgentRequest> for OverflowLadder {
                             ..error
                         });
                     };
-                    session.append(SessionEvent::Compacted {
-                        turn: session.current_turn(),
-                        through: decision.through,
-                        summary: decision.summary,
-                    });
+                    crate::session::commit(
+                        &self.ctx,
+                        &session,
+                        SessionEvent::Compacted {
+                            turn: session.current_turn(),
+                            through: decision.through,
+                            summary: decision.summary,
+                        },
+                    );
                     // Re-project: the retry has to carry the compacted history,
                     // and it still has to be exactly what the log says.
                     let mut messages: Vec<Message> = req
