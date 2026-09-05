@@ -25,6 +25,10 @@ must_detect "越权改别人的块"        another_producer_cannot_touch_my_bloc
 must_detect "宽字符被拦腰截断"      a_wide_character_is_never_halved
 must_detect "窄到放不下一个字时挂死" a_character_wider_than_the_line_is_dropped_not_hung_on
 must_detect "未挂载的模块导致崩溃"   an_unmounted_module_collapses_instead_of_panicking
+must_detect "两行争一个键"          two_rows_claiming_one_key_is_caught_at_mount_not_at_press
+must_detect "两行争一个命令名"      two_rows_claiming_one_name_is_caught_at_mount
+must_detect "命令的缝缺失时崩溃"    a_command_whose_seam_is_missing_says_so_instead_of_panicking
+must_detect "markdown 遇到怪输入挂死" rendering_is_total_and_terminates_on_anything
 
 # The instrument itself must be calibrated: a name that does not exist must FAIL
 # this script's own check, or the script would pass with zero real coverage.

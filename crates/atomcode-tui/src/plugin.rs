@@ -4,7 +4,7 @@
 //! Nothing here is privileged — remove `tui-mascot` from the tree and the cat
 //! is gone, with no branch left behind anywhere.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use atomcode_harness::agent::Agent;
@@ -24,11 +24,14 @@ use crate::surface::{Headless, Input, Surface, Terminal};
 
 plexus_service!(SurfaceSvc => dyn Surface, "surface", Seam, "Where a frame is painted");
 plexus_service!(ModulesSvc => Modules, "tui-modules", Core, "Mounted stream producers and view modules");
+plexus_service!(CommandsSvc => crate::command::Commands, "tui-commands", Core, "Slash commands contributed by rows");
 
 /// What woke the loop up.
 enum Wake {
     Fact,
     Input(Input),
+    /// An action from somewhere other than a key — a command, for now.
+    Act(Action),
     Tick,
     Closed,
 }
@@ -52,6 +55,10 @@ pub struct Tui {
     host: Arc<Host>,
     keys: Keys,
     surface: Arc<dyn Surface>,
+    /// Set when the loop starts. A command runs against the tree, and the tree
+    /// is not known until then.
+    ctx: Mutex<Option<Context>>,
+    wake: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
 }
 
 #[async_trait]
@@ -67,6 +74,8 @@ impl UserInterface for Tui {
         ctx.emit::<AgentCreated>(&AgentInfo { id: agent.id() });
 
         let (wake_tx, mut wake) = mpsc::unbounded_channel::<Wake>();
+        *self.ctx.lock().expect("ctx poisoned") = Some(ctx.clone());
+        *self.wake.lock().expect("wake poisoned") = Some(wake_tx.clone());
 
         // A question can arrive mid-turn, when nothing else is waking the loop.
         let (ask_tx, mut ask_rx) = mpsc::unbounded_channel::<()>();
@@ -124,6 +133,7 @@ impl UserInterface for Tui {
             match woke {
                 Wake::Closed => quit = true,
                 Wake::Fact => self.sync_activity(&agent),
+                Wake::Act(action) => quit = self.act(action, &agent, &driver),
                 Wake::Tick => {
                     let mut m = self.host.moment.write().expect("moment poisoned");
                     m.tick = m.tick.wrapping_add(1);
@@ -223,12 +233,20 @@ impl Tui {
                 m.caret = 0;
                 m.scroll = crate::moment::ScrollPos::BOTTOM;
                 drop(m);
-                if !text.is_empty() {
-                    // Straight to the inbox: a line typed during a turn folds
-                    // into the turn already running rather than queueing.
-                    agent.send(text);
-                    self.spawn_turn(driver, agent);
+                self.refresh_menu();
+                if text.is_empty() {
+                    return false;
                 }
+                // A slash goes to the command surface, everything else to the
+                // model. The one place the two are told apart.
+                if text.starts_with('/') {
+                    self.run_command(&text);
+                    return false;
+                }
+                // Straight to the inbox: a line typed during a turn folds into
+                // the turn already running rather than queueing.
+                agent.send(text);
+                self.spawn_turn(driver, agent);
                 return false;
             }
             Action::Insert(c) => {
@@ -305,6 +323,9 @@ impl Tui {
                 return false;
             }
         }
+        drop(m);
+        // Every edit to the line can change what the menu should show.
+        self.refresh_menu();
         false
     }
 
@@ -354,6 +375,76 @@ impl Tui {
             p.answer(answer);
         }
         false
+    }
+
+    /// Keep the slash menu in step with what is typed.
+    fn refresh_menu(&self) {
+        let typed = self
+            .host
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .input
+            .clone();
+        let menu = match typed.strip_prefix('/') {
+            Some(rest) if !rest.contains(char::is_whitespace) => self
+                .host
+                .commands
+                .matching(rest)
+                .into_iter()
+                .map(|c| {
+                    let name = match c.takes {
+                        Some(t) => format!("{} {t}", c.name),
+                        None => c.name.to_string(),
+                    };
+                    (name, c.about.to_string())
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        if let Some(view) = self.host.modules.view(crate::modules::input::ID) {
+            view.set_menu(menu);
+        }
+    }
+
+    /// Run a slash command and put what it said on the screen.
+    ///
+    /// On its own task: a command may reconfigure the tree or call a model, and
+    /// the loop must keep painting and keep accepting keys while it does.
+    fn run_command(&self, line: &str) {
+        let (Some(ctx), Some(keys)) = (
+            self.ctx.lock().expect("ctx poisoned").clone(),
+            self.wake.lock().expect("wake poisoned").clone(),
+        ) else {
+            return;
+        };
+        let commands = self.host.commands.clone();
+        let host = self.host.clone();
+        let line = line.to_string();
+        tokio::spawn(async move {
+            let outcome = commands.dispatch(&line, &ctx).await;
+            let said = match outcome {
+                crate::command::Outcome::Said(text) => Some((text, false)),
+                crate::command::Outcome::Refused(why) => Some((why, true)),
+                crate::command::Outcome::Quiet => None,
+                crate::command::Outcome::Do(action) => {
+                    // A command and a key share one implementation, so this is
+                    // the same path a keystroke takes.
+                    let _ = keys.send(Wake::Act(action));
+                    None
+                }
+            };
+            if let Some((text, refused)) = said {
+                let mut stream = host.stream.write().expect("stream poisoned");
+                let mut w = stream.writer("commands");
+                w.emit(
+                    crate::block::Coord::default(),
+                    Arc::new(crate::content::CommandSaid { text, refused }),
+                );
+                drop(stream);
+                let _ = keys.send(Wake::Fact);
+            }
+        });
     }
 
     fn toggle_module(&self, id: &'static str) {
@@ -436,6 +527,8 @@ pub fn assemble(surface: Arc<dyn Surface>, mascot: bool) -> (Arc<Host>, Tui) {
             host,
             keys,
             surface,
+            ctx: Mutex::new(None),
+            wake: Mutex::new(None),
         },
     )
 }
@@ -452,7 +545,7 @@ impl Plugin for TuiUiPlugin {
     }
     fn provides(&self) -> &'static [&'static str] {
         // It owns the screen, so it is the one that can ask.
-        &["ui", "tui-modules", "user-questions"]
+        &["ui", "tui-modules", "tui-commands", "user-questions"]
     }
     fn description(&self) -> &'static str {
         "a full-screen terminal UI assembled from module rows"
@@ -471,6 +564,9 @@ impl Plugin for TuiUiPlugin {
         let (host, tui) = assemble(surface, row.mascot);
         let _ = ctx
             .provide::<ModulesSvc>(host.modules.clone())
+            .map_err(|e| e.to_string())?;
+        let _ = ctx
+            .provide::<CommandsSvc>(host.commands.clone())
             .map_err(|e| e.to_string())?;
         let _ = ctx
             .provide::<UserQuestionsSvc>(Arc::new(crate::ask::ScreenQuestions::new(

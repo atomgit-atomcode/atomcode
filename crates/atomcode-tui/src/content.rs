@@ -339,6 +339,45 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("")
 }
 
+/// What a slash command said back.
+///
+/// A block like any other, so a command's answer scrolls with the conversation
+/// instead of living in a transient bar that the next redraw eats.
+#[derive(Debug)]
+pub struct CommandSaid {
+    pub text: String,
+    /// It could not run. Shown differently, because "here is your answer" and
+    /// "I could not do that" must never look the same.
+    pub refused: bool,
+}
+
+impl Content for CommandSaid {
+    fn kind(&self) -> &'static str {
+        "command"
+    }
+    fn content_hash(&self) -> ContentHash {
+        hash_of(&[
+            "command",
+            &self.text,
+            if self.refused { "no" } else { "ok" },
+        ])
+    }
+    fn lines(&self, w: u16) -> Vec<Line> {
+        let style = if self.refused { bad() } else { dim() };
+        let mut out = Vec::new();
+        for line in self.text.split('\n') {
+            out.extend(wrapped(line, w, style, "  "));
+        }
+        out
+    }
+    fn summary(&self, w: u16) -> Line {
+        Line::styled(
+            width::take_width(first_line(&self.text), w as usize),
+            if self.refused { bad() } else { dim() },
+        )
+    }
+}
+
 /// How a turn ended.
 #[derive(Debug)]
 pub struct TurnEndBlock {

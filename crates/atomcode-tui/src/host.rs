@@ -48,6 +48,8 @@ impl Presentation {
 /// Everything the screen is composed from.
 pub struct Host {
     pub stream: RwLock<Stream>,
+    /// Slash commands, contributed by rows.
+    pub commands: Arc<crate::command::Commands>,
     /// Questions waiting for the person. Rendered as a live block at the foot
     /// of the stream, and given first refusal on every key while it is there.
     pub asks: Arc<crate::ask::Asks>,
@@ -64,6 +66,7 @@ impl Host {
     pub fn new(modules: Arc<Modules>, layout: Region) -> Self {
         Self {
             stream: RwLock::new(Stream::new()),
+            commands: crate::commands::builtin(),
             asks: crate::ask::Asks::new(),
             modules,
             layout: RwLock::new(layout),
@@ -173,7 +176,18 @@ impl Host {
         let modules = self.modules.clone();
         let pruned = layout.prune(&|id| modules.has_view(id));
 
-        for (region, rect) in pruned.layout(Rect::sized(w, h)) {
+        // Ask each module how much room it would like, then let the tree
+        // decide. Requests, not seizures.
+        let asked = |id: &str| -> u16 {
+            modules
+                .view(id)
+                .map(|v| match v.height() {
+                    Height::Fixed(n) | Height::Hug(n) => n,
+                    Height::Fill => 1,
+                })
+                .unwrap_or(1)
+        };
+        for (region, rect) in pruned.layout_with(Rect::sized(w, h), &asked) {
             if rect.is_empty() {
                 continue;
             }
@@ -317,16 +331,20 @@ mod tests {
     #[test]
     fn the_newest_line_is_at_the_bottom() {
         let h = fed();
-        let rows = h.compose((80, 24)).rows();
-        let last_content = rows
+        // Assert on the stream's own part rather than on the whole screen: how
+        // many rows the prompt happens to take is the input module's business.
+        let frame = h.compose((80, 24));
+        let stream = frame.part("stream").expect("the stream is placed");
+        let last = stream
+            .lines
             .iter()
             .rev()
-            .skip(2) // the prompt and its hint
-            .find(|r| !r.trim().is_empty())
-            .unwrap();
+            .find(|l| !l.plain().trim().is_empty())
+            .expect("something was said");
         assert!(
-            last_content.contains("Cancelled") || last_content.contains("now break it"),
-            "bottom-anchored, newest last: {last_content:?}"
+            last.plain().contains("Cancelled"),
+            "bottom-anchored, newest last: {:?}",
+            last.plain()
         );
     }
 

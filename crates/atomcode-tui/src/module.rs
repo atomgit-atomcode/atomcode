@@ -57,6 +57,9 @@ pub trait View: Send + Sync + 'static {
         Height::Fill
     }
 
+    /// Take something the host computed. Default: ignore it.
+    fn set_menu(_state: &mut Self::State, _menu: Vec<(String, String)>) {}
+
     /// Ask to be redrawn on a timer even when no fact arrives. `None` (the
     /// default) means this module only changes when the conversation does —
     /// which is what stops an idle screen from burning bandwidth.
@@ -72,6 +75,13 @@ pub trait ViewObject: Send + Sync {
     fn render(&self, viewport: &Viewport<'_>) -> Vec<Line>;
     fn height(&self) -> Height;
     fn tick(&self) -> Option<Duration>;
+    /// Hand a module something the host computed for it.
+    ///
+    /// The slash menu is the host's — it owns the command registry — but the
+    /// input module is what draws it. Deliberately narrow: this is not a
+    /// general back door into a module's state, and a module that ignores it
+    /// (the default) is unaffected.
+    fn set_menu(&self, _menu: Vec<(String, String)>) {}
 }
 
 /// A [`View`] plus the state it has folded so far.
@@ -108,6 +118,9 @@ impl<V: View> ViewObject for Mounted<V> {
     }
     fn tick(&self) -> Option<Duration> {
         V::tick()
+    }
+    fn set_menu(&self, menu: Vec<(String, String)>) {
+        V::set_menu(&mut self.state.write().expect("view state poisoned"), menu);
     }
 }
 

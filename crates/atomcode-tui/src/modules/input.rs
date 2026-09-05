@@ -17,6 +17,9 @@ pub struct State {
     /// Whether anything has been said yet, so the first prompt can be helpful
     /// and later ones can get out of the way.
     pub spoke: bool,
+    /// The slash menu, when a command is being typed. Set by the host, which
+    /// owns the command registry — the module only draws it.
+    pub menu: Vec<(String, String)>,
 }
 
 pub struct Input;
@@ -65,14 +68,38 @@ impl View for Input {
         if lines.is_empty() {
             lines.push(Line::from_spans(vec![Span::styled("› ", arrow)]).truncate(w));
         }
+        // The menu sits between the line and the hint and takes whatever room
+        // is left — a discovery surface that pushed the prompt off the screen
+        // would be worse than no discovery surface.
+        if !state.menu.is_empty() {
+            let room = (vp.rect.h as usize).saturating_sub(lines.len() + 1);
+            for (name, about) in state.menu.iter().take(room) {
+                lines.push(
+                    Line::from_spans(vec![
+                        Span::styled(format!("  /{name}"), Style::new().fg(Color::Ansi(39))),
+                        Span::styled(format!("  {about}"), Style::new().dim()),
+                    ])
+                    .truncate(w),
+                );
+            }
+        }
         if vp.rect.h as usize > lines.len() {
             lines.push(Line::styled(width::take_width(hint, w), Style::new().dim()));
         }
         lines
     }
 
-    fn height(_: &State) -> Height {
-        Height::Hug(3)
+    fn set_menu(state: &mut State, menu: Vec<(String, String)>) {
+        state.menu = menu;
+    }
+
+    fn height(state: &State) -> Height {
+        // Asks for more room while the menu is open, and gives it back after.
+        Height::Hug(if state.menu.is_empty() {
+            3
+        } else {
+            (state.menu.len() as u16 + 2).min(12)
+        })
     }
 }
 

@@ -154,6 +154,7 @@ async fn main() -> ExitCode {
         // outside the tree by construction, like `ui` and `agent-handle`.
         let mut consumed: Vec<&str> = seam_map::HOST_CONSUMED.to_vec();
         consumed.push("tui-modules");
+        consumed.push("tui-commands");
         let findings = app.audit_with(&consumed, seam_map::HOST_PROVIDED);
         let defects = findings.iter().filter(|f| f.is_defect()).count();
         for f in &findings {

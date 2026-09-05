@@ -171,22 +171,31 @@ impl Region {
         }
     }
 
-    /// Assign a rect to every leaf. Pure geometry: no modules, no state, no
-    /// terminal. Leaves are returned in tree order, `Stack` children last-on-top.
+    /// Assign a rect to every leaf, giving every module one row.
     pub fn layout(&self, area: Rect) -> Vec<(Region, Rect)> {
+        self.layout_with(area, &|_| 1)
+    }
+
+    /// Assign rects, asking `wants` how many rows each module would like.
+    ///
+    /// Arbitration lives here rather than in the modules: a module *requests* a
+    /// height and the tree decides, so one module can never seize the screen —
+    /// and `Fill` can leave exactly the right amount for what sits beside it,
+    /// which pure geometry alone cannot know.
+    pub fn layout_with(&self, area: Rect, wants: &dyn Fn(&str) -> u16) -> Vec<(Region, Rect)> {
         let mut out = Vec::new();
-        self.lay(area, &mut out);
+        self.lay(area, wants, &mut out);
         out
     }
 
-    fn lay(&self, area: Rect, out: &mut Vec<(Region, Rect)>) {
+    fn lay(&self, area: Rect, wants: &dyn Fn(&str) -> u16, out: &mut Vec<(Region, Rect)>) {
         if area.is_empty() {
             return;
         }
         match self {
             Region::Empty => {}
             Region::Stream | Region::View(_) => out.push((self.clone(), area)),
-            Region::Stack(children) => children.iter().for_each(|c| c.lay(area, out)),
+            Region::Stack(children) => children.iter().for_each(|c| c.lay(area, wants, out)),
             Region::Split { dir, at, a, b } => {
                 let total = match dir {
                     Dir::Vertical => area.h,
@@ -195,26 +204,33 @@ impl Region {
                 let first = match at {
                     Constraint::Cells(n) => (*n).min(total),
                     Constraint::Percent(p) => ((total as u32 * (*p).min(100) as u32) / 100) as u16,
-                    Constraint::Fill => total.saturating_sub(b.min_size(*dir)),
+                    // Leave the other side what it asked for, but never so much
+                    // that this side vanishes: a module asking for more than the
+                    // screen gets what there is, not everything.
+                    Constraint::Fill => {
+                        let other = b.wanted(*dir, wants).min(total.saturating_sub(1));
+                        total.saturating_sub(other)
+                    }
                 };
                 let (ra, rb) = match dir {
                     Dir::Vertical => area.split_v(first),
                     Dir::Horizontal => area.split_h(first),
                 };
-                a.lay(ra, out);
-                b.lay(rb, out);
+                a.lay(ra, wants, out);
+                b.lay(rb, wants, out);
             }
         }
     }
 
-    /// How much a subtree needs when the other side takes `Fill`.
-    fn min_size(&self, dir: Dir) -> u16 {
+    /// How much a subtree asks for when the other side takes `Fill`.
+    fn wanted(&self, dir: Dir, wants: &dyn Fn(&str) -> u16) -> u16 {
         match self {
             Region::Empty => 0,
-            Region::Stream | Region::View(_) => 1,
-            Region::Stack(c) => c.iter().map(|r| r.min_size(dir)).max().unwrap_or(0),
+            Region::Stream => 1,
+            Region::View(id) => wants(id).max(1),
+            Region::Stack(c) => c.iter().map(|r| r.wanted(dir, wants)).max().unwrap_or(0),
             Region::Split { dir: d, at, a, b } => {
-                let (sa, sb) = (a.min_size(dir), b.min_size(dir));
+                let (sa, sb) = (a.wanted(dir, wants), b.wanted(dir, wants));
                 if *d == dir {
                     match at {
                         Constraint::Cells(n) => n.saturating_add(sb),

@@ -454,3 +454,130 @@ async fn esc_declines_and_the_model_is_told_rather_than_the_turn_dying() {
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+// ---- the command surface --------------------------------------------------
+
+#[tokio::test]
+async fn typing_a_slash_shows_what_is_available_and_narrows_as_you_type() {
+    let dir = scratch("menu");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_text("/");
+    s.quiet().await;
+    let all = s.screen();
+    assert!(all.contains("/help"), "the menu opens:\n{all}");
+    assert!(all.contains("/compact"), "{all}");
+
+    s.term.type_text("comp");
+    s.quiet().await;
+    let narrowed = s.screen();
+    assert!(narrowed.contains("/compact"), "{narrowed}");
+    assert!(!narrowed.contains("/help"), "it narrows:\n{narrowed}");
+
+    // And it closes again when the slash goes away.
+    for _ in 0..5 {
+        s.term.press(KeyPress::plain(Key::Backspace));
+    }
+    s.quiet().await;
+    assert!(
+        !s.screen().contains("/compact"),
+        "menu closed:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn a_command_answers_on_screen_and_never_reaches_the_model() {
+    let dir = scratch("cmd");
+    let s = start(tree(&dir, &replay(r#"{ text = "the model spoke" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("/context");
+    s.quiet().await;
+    let screen = s.screen();
+    assert!(
+        screen.contains("条事实"),
+        "the answer is on screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("the model spoke"),
+        "a command must not start a turn:\n{screen}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn an_unknown_command_suggests_instead_of_vanishing() {
+    let dir = scratch("typo");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("/comp");
+    s.quiet().await;
+    let screen = s.screen();
+    assert!(screen.contains("/compact"), "it suggests:\n{screen}");
+
+    s.term.type_line("/wat");
+    s.quiet().await;
+    assert!(
+        s.screen().contains("/help"),
+        "and points at help:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn a_command_and_a_key_share_one_implementation() {
+    let dir = scratch("shared");
+    std::fs::write(dir.join("a.rs"), "x").unwrap();
+    let script = replay(
+        r#"{ text = "Reading.", calls = [ { name = "read_file", args = { file_path = "a.rs" } } ] },
+           { text = "done" }"#,
+    );
+    let s = start(tree(&dir, &script, &[])).await;
+    let task = s.open().await;
+    s.term.type_line("hi");
+    s.quiet().await;
+
+    // Fold with the key, then unfold and fold again with the command. If they
+    // were two implementations these two screens would differ.
+    s.term.press(KeyPress::ctrl('t'));
+    s.quiet().await;
+    let by_key = s.screen();
+
+    s.term.press(KeyPress::ctrl('t')); // back to open
+    s.quiet().await;
+    s.term.type_line("/tools");
+    s.quiet().await;
+    let by_command = s.screen();
+
+    let stream_of = |screen: &str| {
+        screen
+            .lines()
+            .filter(|l| l.contains("read_file"))
+            .map(str::trim_end)
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        stream_of(&by_key),
+        stream_of(&by_command),
+        "a key and a command must fold the same way"
+    );
+    assert!(
+        by_command.contains("/tools") || by_command.contains("read_file"),
+        "the command ran:\n{by_command}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
