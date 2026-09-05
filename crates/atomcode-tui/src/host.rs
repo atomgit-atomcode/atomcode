@@ -202,7 +202,7 @@ impl Host {
                 Region::Stream => {
                     frame.place("stream", rect, self.stream_lines(rect));
                 }
-                Region::View(id) => {
+                Region::Module(id) => {
                     let Some(view) = modules.view(&id) else {
                         continue;
                     };

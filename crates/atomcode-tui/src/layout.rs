@@ -280,7 +280,7 @@ fn describe(op: &LayoutOp) -> String {
 fn matches(region: &Region, target: &Target) -> bool {
     match (region, target) {
         (Region::Stream, Target::Stream) => true,
-        (Region::View(id), Target::Module(m)) => id == m,
+        (Region::Module(id), Target::Module(m)) => id == m,
         _ => false,
     }
 }

@@ -38,14 +38,63 @@
 //! needs column arbitration, which is what the *region tree* already does one
 //! level up. Two layout engines for one screen is one too many.
 
-use crate::frame::{Color, Line, Span, Style};
+use crate::frame::{Color, Line, Rect, Span, Style};
 use crate::width;
 
-/// A piece of screen, before it knows how wide it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dir {
+    /// `a` above `b`.
+    Vertical,
+    /// `a` left of `b`.
+    Horizontal,
+}
+
+/// How much of the parent the first child gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Constraint {
+    /// Exactly this many cells, clamped to what exists.
+    Cells(u16),
+    /// This percentage, rounded down.
+    Percent(u8),
+    /// Whatever is left after the other side takes its fixed size.
+    Fill,
+}
+
+/// A piece of screen.
+///
+/// Two kinds of node, and the distinction is the same one HTML makes:
+///
+/// * **块级** — [`El::Split`], [`El::Stack`], [`El::Module`], [`El::Stream`].
+///   These divide a *rect*. [`El::place`] walks them and hands each leaf an
+///   area. This is what used to be a separate `El` type with its own
+///   engine; there is now one node type and one engine.
+/// * **行内** — [`El::Text`], [`El::Row`], [`El::Col`], [`El::Spacer`],
+///   [`El::Fixed`], [`El::Indent`], [`El::Framed`]. These divide a *width*.
+///   [`El::lay`] turns them into lines.
+///
+/// A module returns an inline tree; the screen is a block tree whose leaves are
+/// modules. Because they are the same type, a module can return a tree that
+/// itself names modules — nesting, which two separate types could not express.
 #[derive(Clone, Debug, PartialEq)]
 pub enum El {
-    /// Nothing. Renders to no lines, takes no space in a `Row`.
+    /// Nothing. Renders to no lines, takes no space in a `Row`; what a split
+    /// collapses to when a module is not mounted.
     Empty,
+    /// 块级：a view module, by id. The host resolves the name against the
+    /// mounted rows *for a realm*, so the tree says where and the realm says
+    /// which.
+    Module(String),
+    /// 块级：the irreversible stream.
+    Stream,
+    /// 块级：two children dividing an area.
+    Split {
+        dir: Dir,
+        at: Constraint,
+        a: Box<El>,
+        b: Box<El>,
+    },
+    /// 块级：overlaid, later on top. Exactly one may hold focus.
+    Stack(Vec<El>),
     /// One line of styled text.
     Text(Line),
     /// Children side by side, left to right, on a single line.
@@ -79,6 +128,21 @@ impl El {
     pub fn styled(s: impl Into<String>, style: Style) -> El {
         El::Text(Line::styled(s, style))
     }
+    /// 块级：name a module. The registry resolves it at compose time.
+    pub fn view(id: impl Into<String>) -> El {
+        El::Module(id.into())
+    }
+
+    /// 块级：divide an area between two children.
+    pub fn split(dir: Dir, at: Constraint, a: El, b: El) -> El {
+        El::Split {
+            dir,
+            at,
+            a: Box::new(a),
+            b: Box::new(b),
+        }
+    }
+
     pub fn row(children: Vec<El>) -> El {
         El::Row(children)
     }
@@ -121,6 +185,210 @@ impl El {
         }
     }
 
+    /// Stream on top, `below` underneath, `below` taking `rows`.
+    pub fn stream_over(below: El, rows: u16) -> El {
+        El::Split {
+            dir: Dir::Vertical,
+            at: Constraint::Fill,
+            a: Box::new(El::Stream),
+            b: Box::new(below),
+        }
+        .with_second_size(rows)
+    }
+
+    fn with_second_size(self, rows: u16) -> El {
+        match self {
+            El::Split { dir, a, b, .. } => El::Split {
+                dir,
+                at: Constraint::Cells(rows),
+                // `Cells` sizes the *first* child, so swap and keep meaning.
+                a: b,
+                b: a,
+            }
+            .flipped(),
+            other => other,
+        }
+    }
+
+    fn flipped(self) -> El {
+        match self {
+            El::Split { dir, at, a, b } => El::Split {
+                dir,
+                at,
+                a: b,
+                b: a,
+            },
+            other => other,
+        }
+    }
+
+    /// Every module id this tree names, in tree order.
+    pub fn modules(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        self.walk(&mut |r| {
+            if let El::Module(id) = r {
+                out.push(id.clone());
+            }
+        });
+        out
+    }
+
+    pub fn has_stream(&self) -> bool {
+        let mut found = false;
+        self.walk(&mut |r| {
+            if matches!(r, El::Stream) {
+                found = true;
+            }
+        });
+        found
+    }
+
+    fn walk(&self, f: &mut impl FnMut(&El)) {
+        f(self);
+        match self {
+            El::Split { a, b, .. } => {
+                a.walk(f);
+                b.walk(f);
+            }
+            El::Stack(children) => children.iter().for_each(|c| c.walk(f)),
+            _ => {}
+        }
+    }
+
+    /// Drop leaves naming modules that are not mounted, collapsing the splits
+    /// they leave behind.
+    ///
+    /// A layout that mentions `findings` must still work where that row is not
+    /// mounted — a variant's layout has to survive being used by another
+    /// variant. Collapsing, not panicking, is what makes that true.
+    pub fn prune(&self, mounted: &dyn Fn(&str) -> bool) -> El {
+        match self {
+            El::Module(id) if !mounted(id) => El::Empty,
+            El::Split { dir, at, a, b } => {
+                let a = a.prune(mounted);
+                let b = b.prune(mounted);
+                match (&a, &b) {
+                    (El::Empty, El::Empty) => El::Empty,
+                    (El::Empty, _) => b,
+                    (_, El::Empty) => a,
+                    _ => El::Split {
+                        dir: *dir,
+                        at: *at,
+                        a: Box::new(a),
+                        b: Box::new(b),
+                    },
+                }
+            }
+            El::Stack(children) => {
+                let kept: Vec<_> = children
+                    .iter()
+                    .map(|c| c.prune(mounted))
+                    .filter(|c| !matches!(c, El::Empty))
+                    .collect();
+                match kept.len() {
+                    0 => El::Empty,
+                    1 => kept.into_iter().next().unwrap(),
+                    _ => El::Stack(kept),
+                }
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Assign a rect to every leaf, giving every module one row.
+    pub fn layout(&self, area: Rect) -> Vec<(El, Rect)> {
+        self.layout_with(area, &|_| 1)
+    }
+
+    /// Assign rects, asking `wants` how many rows each module would like.
+    ///
+    /// Arbitration lives here rather than in the modules: a module *requests* a
+    /// height and the tree decides, so one module can never seize the screen —
+    /// and `Fill` can leave exactly the right amount for what sits beside it,
+    /// which pure geometry alone cannot know.
+    pub fn layout_with(&self, area: Rect, wants: &dyn Fn(&str) -> u16) -> Vec<(El, Rect)> {
+        let mut out = Vec::new();
+        self.place_into(area, wants, &mut out);
+        out
+    }
+
+    fn place_into(&self, area: Rect, wants: &dyn Fn(&str) -> u16, out: &mut Vec<(El, Rect)>) {
+        if area.is_empty() {
+            return;
+        }
+        match self {
+            El::Empty => {}
+            // Leaves of the block pass. An inline subtree sitting directly in
+            // a split is a leaf too: it gets an area, and the host lays it at
+            // that area's width.
+            El::Stream
+            | El::Module(_)
+            | El::Text(_)
+            | El::Row(_)
+            | El::Col(_)
+            | El::Spacer
+            | El::Fixed(..)
+            | El::Indent(..)
+            | El::Framed { .. } => out.push((self.clone(), area)),
+            El::Stack(children) => children.iter().for_each(|c| c.place_into(area, wants, out)),
+            El::Split { dir, at, a, b } => {
+                let total = match dir {
+                    Dir::Vertical => area.h,
+                    Dir::Horizontal => area.w,
+                };
+                let first = match at {
+                    Constraint::Cells(n) => (*n).min(total),
+                    Constraint::Percent(p) => ((total as u32 * (*p).min(100) as u32) / 100) as u16,
+                    // Leave the other side what it asked for, but never so much
+                    // that this side vanishes: a module asking for more than the
+                    // screen gets what there is, not everything.
+                    Constraint::Fill => {
+                        let other = b.wanted(*dir, wants).min(total.saturating_sub(1));
+                        total.saturating_sub(other)
+                    }
+                };
+                let (ra, rb) = match dir {
+                    Dir::Vertical => area.split_v(first),
+                    Dir::Horizontal => area.split_h(first),
+                };
+                a.place_into(ra, wants, out);
+                b.place_into(rb, wants, out);
+            }
+        }
+    }
+
+    /// How much a subtree asks for when the other side takes `Fill`.
+    fn wanted(&self, dir: Dir, wants: &dyn Fn(&str) -> u16) -> u16 {
+        match self {
+            El::Empty => 0,
+            El::Stream => 1,
+            El::Module(id) => wants(id).max(1),
+            // An inline subtree asks for one row. It could be laid to count
+            // its lines, but not here: `wanted` has no width, and guessing one
+            // would make the arbitration depend on a number nobody chose. A
+            // caller that wants more gives the split an explicit constraint.
+            El::Text(_)
+            | El::Row(_)
+            | El::Col(_)
+            | El::Spacer
+            | El::Fixed(..)
+            | El::Indent(..)
+            | El::Framed { .. } => 1,
+            El::Stack(c) => c.iter().map(|r| r.wanted(dir, wants)).max().unwrap_or(0),
+            El::Split { dir: d, at, a, b } => {
+                let (sa, sb) = (a.wanted(dir, wants), b.wanted(dir, wants));
+                if *d == dir {
+                    match at {
+                        Constraint::Cells(n) => n.saturating_add(sb),
+                        _ => sa.saturating_add(sb),
+                    }
+                } else {
+                    sa.max(sb)
+                }
+            }
+        }
+    }
+
     /// Render at this width. Every line comes back at most `w` cells wide —
     /// the containment invariant is upheld here rather than by each caller
     /// remembering to truncate.
@@ -130,6 +398,11 @@ impl El {
         }
         match self {
             El::Empty => Vec::new(),
+            // A block-level node in an inline context. Unreachable in correct
+            // use — `place` takes them and hands their leaves to the host —
+            // and empty rather than a panic, because a layout is data a user
+            // can write and bad data must not take the screen down.
+            El::Module(_) | El::Stream | El::Split { .. } | El::Stack(_) => Vec::new(),
             El::Text(line) => vec![line.truncate(w as usize)],
             El::Col(children) => children.iter().flat_map(|c| c.lay(w)).collect(),
             El::Row(_) | El::Spacer | El::Fixed(..) => vec![self.lay_row(w)],
@@ -377,6 +650,97 @@ mod tests {
         for line in el.lay(20) {
             assert_eq!(line.width(), 20, "{:?}", line.plain());
         }
+    }
+
+    // ---- the block-level pass (moved here with `Region`) ----------------
+
+    fn ids(v: &[(El, Rect)]) -> Vec<String> {
+        v.iter()
+            .map(|(r, _)| match r {
+                El::Stream => "stream".to_string(),
+                El::Module(id) => id.clone(),
+                _ => "?".into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_fixed_split_gives_exactly_what_it_asks_for() {
+        let tree = El::split(
+            Dir::Vertical,
+            Constraint::Cells(3),
+            El::view("top"),
+            El::view("bottom"),
+        );
+        let out = tree.layout(Rect::sized(20, 10));
+        assert_eq!(ids(&out), vec!["top", "bottom"]);
+        assert_eq!(out[0].1, Rect::new(0, 0, 20, 3));
+        assert_eq!(out[1].1, Rect::new(0, 3, 20, 7));
+    }
+
+    #[test]
+    fn fill_leaves_room_for_what_is_below_it() {
+        // The shape the TUI actually uses: stream takes what is left.
+        let tree = El::split(
+            Dir::Vertical,
+            Constraint::Fill,
+            El::Stream,
+            El::split(
+                Dir::Vertical,
+                Constraint::Cells(1),
+                El::view("status"),
+                El::view("input"),
+            ),
+        );
+        let out = tree.layout(Rect::sized(40, 12));
+        assert_eq!(ids(&out), vec!["stream", "status", "input"]);
+        assert_eq!(out[0].1.h + out[1].1.h + out[2].1.h, 12, "no rows lost");
+        assert_eq!(out[1].1.h, 1);
+    }
+
+    #[test]
+    fn an_unmounted_module_collapses_instead_of_panicking() {
+        let tree = El::split(
+            Dir::Horizontal,
+            Constraint::Percent(70),
+            El::Stream,
+            El::view("findings"),
+        );
+        let pruned = tree.prune(&|id| id != "findings");
+        assert_eq!(pruned, El::Stream, "the split collapses to what is left");
+        let out = pruned.layout(Rect::sized(30, 5));
+        assert_eq!(out[0].1, Rect::sized(30, 5), "the survivor takes the space");
+    }
+
+    #[test]
+    fn layout_never_panics_at_any_size() {
+        let tree = El::split(
+            Dir::Vertical,
+            Constraint::Fill,
+            El::Stream,
+            El::split(
+                Dir::Horizontal,
+                Constraint::Percent(30),
+                El::view("a"),
+                El::Stack(vec![El::view("b"), El::view("c")]),
+            ),
+        );
+        for w in 0..40u16 {
+            for h in 0..20u16 {
+                let out = tree.layout(Rect::sized(w, h));
+                for (_, r) in out {
+                    assert!(r.right() <= w && r.bottom() <= h, "{r:?} outside {w}×{h}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_stack_puts_every_child_in_the_same_rect() {
+        let tree = El::Stack(vec![El::view("under"), El::view("over")]);
+        let out = tree.layout(Rect::sized(10, 4));
+        assert_eq!(ids(&out), vec!["under", "over"], "later is on top");
+        assert_eq!(out[0].1, out[1].1);
     }
 
     #[test]
