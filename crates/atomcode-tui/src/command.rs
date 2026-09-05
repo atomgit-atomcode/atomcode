@@ -40,7 +40,7 @@ impl Command {
 }
 
 /// What running one produced.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 pub enum Outcome {
     /// Say this on screen.
     Said(String),
@@ -50,6 +50,34 @@ pub enum Outcome {
     Quiet,
     /// It could not run, and this is why. Never a panic, never a silent no-op.
     Refused(String),
+    /// Put a modal on screen. What it picks is dispatched as a command in turn,
+    /// so a modal and a typed command reach the same implementation.
+    Open(Arc<dyn crate::overlay::Overlay>),
+}
+
+impl std::fmt::Debug for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Outcome::Said(t) => write!(f, "Said({t:?})"),
+            Outcome::Do(a) => write!(f, "Do({a:?})"),
+            Outcome::Quiet => write!(f, "Quiet"),
+            Outcome::Refused(t) => write!(f, "Refused({t:?})"),
+            Outcome::Open(o) => write!(f, "Open({})", o.id()),
+        }
+    }
+}
+
+impl PartialEq for Outcome {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Outcome::Said(a), Outcome::Said(b)) => a == b,
+            (Outcome::Do(a), Outcome::Do(b)) => a == b,
+            (Outcome::Quiet, Outcome::Quiet) => true,
+            (Outcome::Refused(a), Outcome::Refused(b)) => a == b,
+            (Outcome::Open(a), Outcome::Open(b)) => a.id() == b.id(),
+            _ => false,
+        }
+    }
 }
 
 /// A row's contribution to the command surface.
@@ -57,6 +85,12 @@ pub enum Outcome {
 pub trait CommandSet: Send + Sync {
     fn id(&self) -> &'static str;
     fn commands(&self) -> Vec<Command>;
+    /// Dispatchable but not listed. For the targets a modal's pick dispatches
+    /// to: they are not something anyone types, and putting them in the menu
+    /// would be noise.
+    fn hidden(&self) -> Vec<Command> {
+        Vec::new()
+    }
     /// Run one. `args` is everything after the name, untrimmed of meaning.
     async fn run(&self, name: &str, args: &str, ctx: &Context) -> Outcome;
 }
@@ -127,7 +161,12 @@ impl Commands {
             .read()
             .expect("commands poisoned")
             .iter()
-            .find(|s| s.commands().iter().any(|c| c.name == name))
+            .find(|s| {
+                s.commands()
+                    .iter()
+                    .chain(s.hidden().iter())
+                    .any(|c| c.name == name)
+            })
             .cloned()
     }
 

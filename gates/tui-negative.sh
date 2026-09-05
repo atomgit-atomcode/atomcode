@@ -29,6 +29,9 @@ must_detect "两行争一个键"          two_rows_claiming_one_key_is_caught_at
 must_detect "两行争一个命令名"      two_rows_claiming_one_name_is_caught_at_mount
 must_detect "命令的缝缺失时崩溃"    a_command_whose_seam_is_missing_says_so_instead_of_panicking
 must_detect "markdown 遇到怪输入挂死" rendering_is_total_and_terminates_on_anything
+must_detect "模态画出自己的框"      a_picker_never_draws_wider_than_its_rect
+must_detect "第二个模态叠在第一个上" opening_a_second_modal_cancels_the_first_rather_than_stacking
+must_detect "边框超出小矩形"        the_frame_fits_its_rect_at_any_size
 
 # The instrument itself must be calibrated: a name that does not exist must FAIL
 # this script's own check, or the script would pass with zero real coverage.

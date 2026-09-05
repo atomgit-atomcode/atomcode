@@ -50,6 +50,8 @@ pub struct Host {
     pub stream: RwLock<Stream>,
     /// Slash commands, contributed by rows.
     pub commands: Arc<crate::command::Commands>,
+    /// At most one modal. Focus is arbitration, not composition.
+    pub overlays: Arc<crate::overlay::Overlays>,
     /// Questions waiting for the person. Rendered as a live block at the foot
     /// of the stream, and given first refusal on every key while it is there.
     pub asks: Arc<crate::ask::Asks>,
@@ -67,6 +69,7 @@ impl Host {
         Self {
             stream: RwLock::new(Stream::new()),
             commands: crate::commands::builtin(),
+            overlays: Arc::new(crate::overlay::Overlays::new()),
             asks: crate::ask::Asks::new(),
             modules,
             layout: RwLock::new(layout),
@@ -216,6 +219,29 @@ impl Host {
                     frame.place(id, rect, lines);
                 }
                 _ => {}
+            }
+        }
+
+        // A modal is drawn last, over everything, in a box of its own.
+        if let Some(modal) = self.overlays.current() {
+            let rect = crate::overlay::frame_rect(Rect::sized(w, h), modal.size());
+            if !rect.is_empty() {
+                let vp = crate::moment::Viewport::new(
+                    Rect::new(
+                        rect.x + 1,
+                        rect.y + 1,
+                        rect.w.saturating_sub(2),
+                        rect.h.saturating_sub(2),
+                    ),
+                    &moment,
+                );
+                let body = modal.render(&vp);
+                frame.place(
+                    modal.id(),
+                    rect,
+                    crate::overlay::framed(&modal.title(), body, rect),
+                );
+                frame.cursor = None;
             }
         }
 

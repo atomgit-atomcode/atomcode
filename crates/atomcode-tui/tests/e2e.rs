@@ -77,7 +77,10 @@ fn replay(steps: &str) -> String {
 }
 
 struct Session {
-    app: App,
+    /// Held, not just borrowed from: dropping the `App` unloads the whole tree,
+    /// and every screen goes blank in a way that looks like a UI bug.
+    _app: Arc<tokio::sync::Mutex<App>>,
+    app: atomcode_plexus::Context,
     term: Arc<Headless>,
     ui: Arc<dyn UserInterface>,
 }
@@ -93,14 +96,20 @@ async fn start(tree: ConfigTree) -> Session {
         .as_any_headless()
         .expect("this tree mounts the headless surface");
     let ui = app.context().service::<UiSvc>().expect("`ui` is filled");
-    Session { app, term, ui }
+    let ctx = app.context();
+    Session {
+        _app: Arc::new(tokio::sync::Mutex::new(app)),
+        app: ctx,
+        term,
+        ui,
+    }
 }
 
 impl Session {
     /// Run the UI in the background and wait for the first frame.
     async fn open(&self) -> tokio::task::JoinHandle<()> {
         let ui = self.ui.clone();
-        let ctx = self.app.context().clone();
+        let ctx = self.app.clone();
         let handle = tokio::spawn(async move {
             let _ = ui.run(&ctx, None).await;
         });
@@ -302,11 +311,7 @@ async fn a_module_can_be_shown_and_hidden_while_the_session_runs() {
     s.quiet().await;
     // Mounting a module is not enough on its own — the layout has to name it —
     // so this asserts the registry half, which is the part rows control.
-    let mods = s
-        .app
-        .context()
-        .service::<atomcode_tui::plugin::ModulesSvc>()
-        .unwrap();
+    let mods = s.app.service::<atomcode_tui::plugin::ModulesSvc>().unwrap();
     assert!(mods.has_view("mascot"), "mounted mid-session");
 
     s.term.press(KeyPress::ctrl('n'));
@@ -577,6 +582,109 @@ async fn a_command_and_a_key_share_one_implementation() {
         by_command.contains("/tools") || by_command.contains("read_file"),
         "the command ran:\n{by_command}"
     );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+// ---- modals ---------------------------------------------------------------
+
+/// A tree with `control` mounted, so `/rows` has something to show.
+async fn with_control(tree: ConfigTree) -> (Session, Arc<tokio::sync::Mutex<App>>) {
+    let mut app = App::new(catalog(), tree);
+    app.start().await.expect("the tree must mount");
+    let surface = app.context().service::<SurfaceSvc>().unwrap();
+    let term = surface.as_any_headless().unwrap();
+    let ui = app.context().service::<UiSvc>().unwrap();
+    let ctx = app.context();
+    let app = Arc::new(tokio::sync::Mutex::new(app));
+    let _ = ctx.provide::<atomcode_harness::seams::ControlSvc>(Arc::new(
+        atomcode_harness::control::AppControl::new(app.clone()),
+    ));
+    (
+        Session {
+            _app: app.clone(),
+            app: ctx,
+            term,
+            ui,
+        },
+        app,
+    )
+}
+
+#[tokio::test]
+async fn a_modal_takes_the_keyboard_and_escape_gives_it_back() {
+    let dir = scratch("modal");
+    let (s, _keep) = with_control(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("/rows");
+    s.quiet().await;
+    let open = s.screen();
+    assert!(open.contains("enter 开关"), "the modal is framed:\n{open}");
+    assert!(
+        open.contains("agent-loop") || open.contains("llm"),
+        "{open}"
+    );
+
+    // Typing goes to the modal's filter, not to the prompt.
+    s.term.type_text("llm");
+    s.quiet().await;
+    let filtered = s.screen();
+    assert!(filtered.contains("llm"), "{filtered}");
+    assert!(
+        !filtered.contains("› llm"),
+        "the keys went to the modal, not the prompt:\n{filtered}"
+    );
+
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
+    let closed = s.screen();
+    assert!(!closed.contains("enter 开关"), "closed:\n{closed}");
+
+    // And the prompt has the keyboard back.
+    s.term.type_text("hello");
+    s.quiet().await;
+    assert!(s.screen().contains("› hello"), "{}", s.screen());
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn picking_a_row_reconfigures_the_running_tree() {
+    let dir = scratch("swap");
+    let (s, _keep) = with_control(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    // The tool catalog before.
+    s.term.type_line("/tools-list");
+    s.quiet().await;
+    assert!(s.screen().contains("read_file"), "{}", s.screen());
+
+    // Turn off the row that provides the filesystem tools, from the modal.
+    s.term.type_line("/rows");
+    s.quiet().await;
+    s.term.type_text("tool-fs-world");
+    s.quiet().await;
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+
+    s.term.type_line("/tools-list");
+    s.quiet().await;
+    let after = s.screen();
+    // The earlier listing is still scrolled above, so assert on the *last*
+    // answer rather than on the whole screen — a scrollback that still says
+    // `read_file` is the transcript doing its job.
+    let latest = after
+        .lines()
+        .rfind(|l| l.contains("bash") && l.contains("grep"))
+        .unwrap_or_else(|| panic!("no tool listing on screen:\n{after}"));
+    assert!(
+        !latest.contains("read_file"),
+        "the tree really changed under a running session:\n{after}"
+    );
+    assert!(latest.contains("bash"), "and only that row went:\n{after}");
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;

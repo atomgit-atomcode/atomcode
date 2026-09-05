@@ -36,6 +36,7 @@ pub mod markdown;
 pub mod module;
 pub mod modules;
 pub mod moment;
+pub mod overlay;
 pub mod plugin;
 pub mod region;
 pub mod surface;

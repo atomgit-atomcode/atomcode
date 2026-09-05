@@ -130,11 +130,15 @@ impl CommandSet for SessionCommands {
 pub struct TreeCommands;
 
 const TREE: &[Command] = &[
-    Command::new("rows", "列出正在跑的行"),
+    Command::new("rows", "挑一行开关它——运行时换插件"),
+    Command::new("rows-list", "把行列出来,不开模态"),
     Command::new("tools-list", "列出模型能用的工具"),
     Command::new("audit", "检查这棵树的组合是否自洽"),
     Command::taking("patch", "<TOML>", "在运行中改一行配置"),
 ];
+
+/// Hidden: only a pick dispatches to it.
+const TREE_HIDDEN: &[Command] = &[Command::taking("row-toggle", "<行> on|off", "")];
 
 #[async_trait]
 impl CommandSet for TreeCommands {
@@ -143,6 +147,9 @@ impl CommandSet for TreeCommands {
     }
     fn commands(&self) -> Vec<Command> {
         TREE.to_vec()
+    }
+    fn hidden(&self) -> Vec<Command> {
+        TREE_HIDDEN.to_vec()
     }
     async fn run(&self, name: &str, args: &str, ctx: &Context) -> Outcome {
         if name == "tools-list" {
@@ -170,7 +177,7 @@ impl CommandSet for TreeCommands {
             return Outcome::Refused("只有启动器能给出这个能力,这棵树里没有".into());
         };
         match name {
-            "rows" => {
+            "rows-list" => {
                 let rows = control.rows().await;
                 Outcome::Said(
                     rows.iter()
@@ -180,6 +187,40 @@ impl CommandSet for TreeCommands {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 )
+            }
+            // The modal that makes runtime reconfiguration a thing a person can
+            // do, not just a thing the architecture claims: pick a row, press
+            // enter, the tree changes under a running session.
+            "rows" => {
+                let rows = control.rows().await;
+                Outcome::Open(crate::overlay::Picker::new(
+                    "rows",
+                    "行 · enter 开关",
+                    rows.into_iter()
+                        .map(|(id, plugin, on)| {
+                            crate::overlay::Choice::new(
+                                format!("/row-toggle {id} {}", if on { "off" } else { "on" }),
+                                id,
+                            )
+                            .about(plugin)
+                            .marked(on)
+                        })
+                        .collect(),
+                ))
+            }
+            // Not in the menu: it exists so a pick has something to dispatch to,
+            // which is how a modal and a command share one implementation.
+            "row-toggle" => {
+                let mut parts = args.split_whitespace();
+                let (Some(id), Some(state)) = (parts.next(), parts.next()) else {
+                    return Outcome::Refused("用法:/row-toggle <行> on|off".into());
+                };
+                let disabled = state == "off";
+                let toml = format!("[[patch]]\nid = \"{id}\"\ndisabled = {disabled}\n");
+                match control.patch(&toml).await {
+                    Ok(what) => Outcome::Said(format!("{id} → {state}\n{what}")),
+                    Err(e) => Outcome::Refused(e),
+                }
             }
             "audit" => {
                 let findings = control.audit().await;

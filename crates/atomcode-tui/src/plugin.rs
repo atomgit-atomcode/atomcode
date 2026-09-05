@@ -32,6 +32,8 @@ enum Wake {
     Input(Input),
     /// An action from somewhere other than a key — a command, for now.
     Act(Action),
+    /// A modal closed with this.
+    Chose(Option<String>),
     Tick,
     Closed,
 }
@@ -134,6 +136,7 @@ impl UserInterface for Tui {
                 Wake::Closed => quit = true,
                 Wake::Fact => self.sync_activity(&agent),
                 Wake::Act(action) => quit = self.act(action, &agent, &driver),
+                Wake::Chose(chosen) => self.chose(chosen),
                 Wake::Tick => {
                     let mut m = self.host.moment.write().expect("moment poisoned");
                     m.tick = m.tick.wrapping_add(1);
@@ -141,6 +144,12 @@ impl UserInterface for Tui {
                 Wake::Input(Input::Resize(..)) => {}
                 Wake::Input(Input::Paste(text)) => {
                     quit = self.act(Action::Paste(text), &agent, &driver);
+                }
+                // A modal has the keyboard while it is open, then the
+                // question, then the ordinary bindings. Exactly one owner at a
+                // time, decided here — that is what focus is.
+                Wake::Input(Input::Key(press)) if self.host.overlays.is_open() => {
+                    self.host.overlays.key(press);
                 }
                 // A question on screen gets first refusal on every key. Focus is
                 // arbitration, not composition: exactly one thing can hold it,
@@ -161,6 +170,7 @@ impl UserInterface for Tui {
         // Release anything blocked on an answer that is never coming, or the
         // turn it belongs to would never end.
         self.host.asks.refuse_all();
+        self.host.overlays.close_all();
         stream.dispose();
         self.surface.restore();
         // Full screen swallows the conversation on exit; hand it back so a
@@ -427,6 +437,17 @@ impl Tui {
                 crate::command::Outcome::Said(text) => Some((text, false)),
                 crate::command::Outcome::Refused(why) => Some((why, true)),
                 crate::command::Outcome::Quiet => None,
+                crate::command::Outcome::Open(modal) => {
+                    let keys2 = keys.clone();
+                    host.overlays.open(
+                        modal,
+                        Box::new(move |chosen| {
+                            let _ = keys2.send(Wake::Chose(chosen));
+                        }),
+                    );
+                    let _ = keys.send(Wake::Fact);
+                    None
+                }
                 crate::command::Outcome::Do(action) => {
                     // A command and a key share one implementation, so this is
                     // the same path a keystroke takes.
@@ -443,6 +464,38 @@ impl Tui {
                 );
                 drop(stream);
                 let _ = keys.send(Wake::Fact);
+            }
+        });
+    }
+
+    /// A modal closed. Whatever it was picking, the picking is done here so a
+    /// modal never needs the tree, the agent or the loop.
+    fn chose(&self, chosen: Option<String>) {
+        let Some(value) = chosen else { return };
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            return;
+        };
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        let host = self.host.clone();
+        // A pick is expressed as a command, so a modal and a typed command
+        // reach the same implementation — the same rule keys already follow.
+        tokio::spawn(async move {
+            let outcome = host.commands.dispatch(&value, &ctx).await;
+            let said = match outcome {
+                crate::command::Outcome::Said(t) => Some((t, false)),
+                crate::command::Outcome::Refused(w) => Some((w, true)),
+                _ => None,
+            };
+            if let Some((text, refused)) = said {
+                let mut stream = host.stream.write().expect("stream poisoned");
+                let mut w = stream.writer("commands");
+                w.emit(
+                    crate::block::Coord::default(),
+                    Arc::new(crate::content::CommandSaid { text, refused }),
+                );
+            }
+            if let Some(k) = keys {
+                let _ = k.send(Wake::Fact);
             }
         });
     }
