@@ -22,13 +22,26 @@
 //! See `docs/tui-composability.md` for the argument and `docs/adr/0004`–`0008`
 //! for the decisions.
 
+pub mod ansi;
 pub mod block;
+pub mod conformance;
+pub mod content;
 pub mod frame;
+pub mod host;
+pub mod keymap;
+pub mod module;
+pub mod modules;
 pub mod moment;
+pub mod plugin;
 pub mod region;
+pub mod surface;
 pub mod width;
 
 pub use block::{Block, BlockId, Content, ContentHash, Coord, Slot, Stream, StreamWriter};
 pub use frame::{Color, Frame, Line, Placed, Rect, Span, Style};
+pub use host::{default_layout, Host, Presentation};
+pub use keymap::{Action, Keymap, Keys};
+pub use module::{Height, Modules, Mounted, Producer, View, ViewObject};
 pub use moment::{Moment, Timestamp, Viewport};
 pub use region::{Constraint, Dir, Region};
+pub use surface::{Headless, Input, Key, KeyPress, Mods, Surface, Terminal};

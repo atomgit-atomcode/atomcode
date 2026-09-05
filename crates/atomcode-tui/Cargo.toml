@@ -5,8 +5,9 @@ edition = "2021"
 description = "A full-screen terminal UI assembled from plugins on atomcode-harness — panels, streams, keymaps and layout are all rows"
 publish = false
 
-# The launcher arrives with the host row (step 5). Until then this crate is a
-# library of value types and seams, and every commit stays green.
+[[bin]]
+name = "atui"
+path = "src/bin/atui.rs"
 
 [dependencies]
 # The plugin runtime and the agent assembly this UI is a front end for.

@@ -39,6 +39,8 @@ step() {                       # step <name> <cmd...>
 step "值类型与几何（单元）"        cargo test -q -p atomcode-tui --lib
 [ "$FAST" = 1 ] || step "集成与端到端"  cargo test -q -p atomcode-tui --tests
 [ "$FAST" = 1 ] || step "宿主 harness 未被弄坏" cargo test -q -p atomcode-harness
+[ "$FAST" = 1 ] || step "启动器能构建"  cargo build -q -p atomcode-tui
+[ "$FAST" = 1 ] || step "启动器能审计（无 tty）" ./target/debug/atui --offline --audit
 step "阴性对照：坏东西必须判红"    gates/tui-negative.sh
 step "格式"                        cargo fmt -p atomcode-tui -- --check
 # `--no-deps` is load-bearing, not tidiness: without it `-D warnings` promotes
