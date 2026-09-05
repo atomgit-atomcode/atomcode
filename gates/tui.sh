@@ -21,10 +21,38 @@ for a in "$@"; do
 done
 
 fail=0
+
+# 每一步都包一层硬超时，超时按失败处理 —— 不是跳过，也不是「慢」。
+#
+# 起因（真实）：把 El::Row 改成支持多行子元素时，我让每个子元素先「量」一次
+# 再「画」一次 —— 每层工作量翻倍，200 层嵌套就是 2^200。测试没有失败，它挂住了，
+# 而现场表现是「构建怎么这么久」。挂死是最坏的失败模式，因为它报的是慢不是错，
+# 于是人会去优化构建、换机器，唯独不会怀疑那个测试。
+#
+# macOS 没有 GNU timeout，所以自己来：后台跑、轮询、到点杀掉。
+TIMEOUT=${TUI_GATE_TIMEOUT:-300}
+run_with_timeout() {           # run_with_timeout <secs> <cmd...>
+  local secs="$1"; shift
+  "$@" >/tmp/tui-gate.$$ 2>&1 &
+  local pid=$!
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$secs" ]; then
+      kill -9 "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      echo "（超时 ${secs}s —— 按失败处理，不是按慢处理）" >> /tmp/tui-gate.$$
+      return 124
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid"
+}
+
 step() {                       # step <name> <cmd...>
   local name="$1"; shift
   printf '\033[2m→ %s\033[0m\n' "$name"
-  if "$@" >/tmp/tui-gate.$$ 2>&1; then
+  if run_with_timeout "$TIMEOUT" "$@"; then
     printf '\033[32m  ok\033[0m   %s\n' "$name"
   else
     printf '\033[31m  FAIL\033[0m %s\n' "$name"

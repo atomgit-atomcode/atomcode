@@ -45,6 +45,7 @@ pub mod plugin;
 pub mod region;
 pub mod rows;
 pub mod surface;
+pub mod widget;
 pub mod width;
 
 pub use block::{Block, BlockId, Content, ContentHash, Coord, Slot, Stream, StreamWriter};

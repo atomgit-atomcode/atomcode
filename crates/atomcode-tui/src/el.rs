@@ -555,7 +555,16 @@ impl El {
             El::Module(_) | El::Stream | El::Flex { .. } | El::Stack(_) => Vec::new(),
             El::Text(line) => vec![line.truncate(w as usize)],
             El::Col(children) => children.iter().flat_map(|c| c.lay(w)).collect(),
-            El::Row(_) | El::Spacer | El::Fixed(..) => vec![self.lay_row(w)],
+            El::Row(children) => lay_row(children, w),
+            El::Spacer => vec![Line::from_spans(vec![Span::raw(" ".repeat(w as usize))])],
+            El::Fixed(cells, inner) => {
+                let cells = (*cells).min(w);
+                inner
+                    .lay(cells)
+                    .into_iter()
+                    .map(|l| pad_to(l, cells as usize))
+                    .collect()
+            }
             El::Indent(by, child) => {
                 let inner = w.saturating_sub(*by);
                 if inner == 0 {
@@ -590,83 +599,95 @@ impl El {
             } => frame(title.as_deref(), footer.as_deref(), child, w),
         }
     }
+}
 
-    /// One line, children laid left to right with `Spacer`s sharing the slack.
-    ///
-    /// Every arm either returns or descends into a *strictly smaller* node.
-    /// The first version wrapped a leaf as `vec![self]` and then recursed on
-    /// it — which never advances, and blew the stack. Termination here is
-    /// structural, not a depth counter: a counter is a bandage, a shrinking
-    /// argument is a cure.
-    fn lay_row(&self, w: u16) -> Line {
-        let children: Vec<&El> = match self {
-            El::Row(cs) => cs.iter().collect(),
-            El::Spacer => return Line::from_spans(vec![Span::raw(" ".repeat(w as usize))]),
-            El::Fixed(cells, inner) => {
-                let cells = (*cells).min(w);
-                return pad_to(inner.lay_row(cells), cells as usize);
-            }
-            // A leaf, or a block asked to behave like one: it contributes its
-            // first line. `Row` is a single line by construction — a band of
-            // multi-line children is the region tree's job, one level up.
-            other => return other.lay(w).into_iter().next().unwrap_or_default(),
-        };
-        // Two passes: measure what everything but the spacers wants, then hand
-        // the remainder out. A single pass cannot know the slack.
-        let mut pieces: Vec<Option<Line>> = Vec::with_capacity(children.len());
-        let mut used = 0usize;
-        let mut spacers = 0usize;
-        for child in &children {
-            match child {
-                El::Spacer => {
-                    spacers += 1;
-                    pieces.push(None);
-                }
-                El::Fixed(cells, inner) => {
-                    let line = inner.lay_row(*cells);
-                    let padded = pad_to(line, *cells as usize);
-                    used += padded.width();
-                    pieces.push(Some(padded));
-                }
-                other => {
-                    // Each child gets at most what is still free, so an early
-                    // child cannot push a later one off the line entirely.
-                    let room = (w as usize).saturating_sub(used);
-                    let line = other.lay_row(room.min(w as usize) as u16);
-                    used += line.width();
-                    pieces.push(Some(line));
-                }
-            }
-        }
-        let slack = (w as usize).saturating_sub(used);
-        let mut out = Line::empty();
-        let mut spent = 0usize;
-        let mut seen = 0usize;
-        for piece in pieces {
-            match piece {
-                Some(line) => {
-                    for span in line.spans {
-                        out.push(span.clone());
-                    }
-                }
-                None => {
-                    seen += 1;
-                    // The last spacer takes the rounding, so the total is
-                    // exactly `slack` and the right edge lands where it should.
-                    let share = if seen == spacers {
-                        slack.saturating_sub(spent)
-                    } else {
-                        slack / spacers.max(1)
-                    };
-                    spent += share;
-                    if share > 0 {
-                        out.push(Span::raw(" ".repeat(share)));
-                    }
-                }
-            }
-        }
-        out.truncate(w as usize)
+/// Children side by side, each as tall as it needs.
+///
+/// A row used to be one line, and the doc said a band of multi-line children
+/// was the region tree's job. That was true when there were two trees; it is
+/// not what a widget needs. A list beside a preview, or content beside a
+/// scrollbar, is one module's inside — the tree above it sees one module.
+///
+/// So a row lays each child at its own width and then zips the results: row `i`
+/// is every child's line `i`, padded to its column. Single-line children behave
+/// exactly as before, which is why this is a generalisation and not a change.
+///
+/// **Each child is laid exactly once.** The first version measured a child by
+/// laying it and then laid it again to draw — doubling the work at every level,
+/// so a tree 200 deep cost 2^200 and the test suite stopped returning. It did
+/// not fail; it hung, which is the failure mode that gets mistaken for slowness.
+fn lay_row(children: &[El], w: u16) -> Vec<Line> {
+    if w == 0 || children.is_empty() {
+        return Vec::new();
     }
+    // One pass: lay each non-elastic child once, and take its width from what
+    // it produced. `None` marks a spacer, whose width is not known yet.
+    let mut columns: Vec<Option<Vec<Line>>> = Vec::with_capacity(children.len());
+    let mut widths: Vec<u16> = Vec::with_capacity(children.len());
+    let mut used = 0u16;
+    let mut spacers = 0usize;
+    for child in children {
+        match child {
+            El::Spacer => {
+                spacers += 1;
+                columns.push(None);
+                widths.push(0);
+            }
+            other => {
+                let room = w.saturating_sub(used);
+                let lines = other.lay(room);
+                let cw = lines
+                    .iter()
+                    .map(|l| l.width() as u16)
+                    .max()
+                    .unwrap_or(0)
+                    .min(room);
+                used = used.saturating_add(cw);
+                columns.push(Some(lines));
+                widths.push(cw);
+            }
+        }
+    }
+
+    // Spacers share the slack; the last takes the rounding, so the row ends
+    // exactly at `w`.
+    let slack = w.saturating_sub(used);
+    let mut spent = 0u16;
+    let mut seen = 0usize;
+    for (i, col) in columns.iter().enumerate() {
+        if col.is_none() {
+            seen += 1;
+            let share = if seen == spacers {
+                slack.saturating_sub(spent)
+            } else {
+                slack / spacers.max(1) as u16
+            };
+            spent += share;
+            widths[i] = share;
+        }
+    }
+
+    let height = columns
+        .iter()
+        .map(|c| c.as_ref().map_or(0, Vec::len))
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    (0..height)
+        .map(|i| {
+            let mut row = Line::empty();
+            for (col, &cw) in columns.iter().zip(&widths) {
+                let piece = col
+                    .as_ref()
+                    .and_then(|lines| lines.get(i).cloned())
+                    .unwrap_or_default();
+                for span in pad_to(piece, cw as usize).spans {
+                    row.push(span);
+                }
+            }
+            row.truncate(w as usize)
+        })
+        .collect()
 }
 
 fn pad_to(line: Line, cells: usize) -> Line {

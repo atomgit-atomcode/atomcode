@@ -286,6 +286,10 @@ pub enum Glyph {
     /// and the two are checked against each other.
     Prompt,
     Separator,
+    /// The filled part of a scrollbar.
+    Thumb,
+    /// Its unfilled track.
+    Track,
 }
 
 impl Caps {
@@ -307,6 +311,8 @@ impl Caps {
                 Pointer => "▸",
                 Prompt => "❯",
                 Separator => "·",
+                Thumb => "█",
+                Track => "│",
             }
         } else {
             match glyph {
@@ -321,6 +327,8 @@ impl Caps {
                 Pointer => ">",
                 Prompt => ">",
                 Separator => ".",
+                Thumb => "#",
+                Track => "|",
             }
         }
     }
@@ -369,7 +377,10 @@ mod tests {
             Glyph::Interrupted,
             Glyph::Bullet,
             Glyph::Pointer,
+            Glyph::Prompt,
             Glyph::Separator,
+            Glyph::Thumb,
+            Glyph::Track,
         ] {
             let rich = Caps::default().g(glyph);
             let plain = Caps::plain().g(glyph);
@@ -440,6 +451,8 @@ mod tests {
             Glyph::Bullet,
             Glyph::Pointer,
             Glyph::Prompt,
+            Glyph::Thumb,
+            Glyph::Track,
         ] {
             let rich = Caps::default().g(glyph);
             assert_eq!(
