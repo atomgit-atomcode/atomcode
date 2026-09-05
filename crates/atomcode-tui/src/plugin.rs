@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use atomcode_harness::agent::Agent;
 use atomcode_harness::events::{AgentCreated, AgentInfo, SessionEventCommitted};
-use atomcode_harness::seams::{AgentLoopSvc, AgentsSvc, UiSvc, UserInterface};
+use atomcode_harness::seams::{AgentLoopSvc, AgentsSvc, UiSvc, UserInterface, UserQuestionsSvc};
 use atomcode_harness::session::Committed;
 use atomcode_plexus::{plexus_service, Context, Plugin};
 use serde::Deserialize;
@@ -68,6 +68,18 @@ impl UserInterface for Tui {
 
         let (wake_tx, mut wake) = mpsc::unbounded_channel::<Wake>();
 
+        // A question can arrive mid-turn, when nothing else is waking the loop.
+        let (ask_tx, mut ask_rx) = mpsc::unbounded_channel::<()>();
+        self.host.asks.notify_on(ask_tx);
+        let asked = wake_tx.clone();
+        let asks_pump = tokio::spawn(async move {
+            while ask_rx.recv().await.is_some() {
+                if asked.send(Wake::Fact).is_err() {
+                    break;
+                }
+            }
+        });
+
         // Every committed fact reaches the modules here and nowhere else: the
         // screen is a fold over the log, so a resumed session and a live one
         // produce the same picture.
@@ -120,6 +132,12 @@ impl UserInterface for Tui {
                 Wake::Input(Input::Paste(text)) => {
                     quit = self.act(Action::Paste(text), &agent, &driver);
                 }
+                // A question on screen gets first refusal on every key. Focus is
+                // arbitration, not composition: exactly one thing can hold it,
+                // and the host decides which.
+                Wake::Input(Input::Key(press)) if self.host.asks.is_waiting() => {
+                    quit = self.answer_question(press);
+                }
                 Wake::Input(Input::Key(press)) => {
                     if let Some(action) = self.keys.resolve(press) {
                         quit = self.act(action, &agent, &driver);
@@ -129,6 +147,10 @@ impl UserInterface for Tui {
         }
 
         reader.abort();
+        asks_pump.abort();
+        // Release anything blocked on an answer that is never coming, or the
+        // turn it belongs to would never end.
+        self.host.asks.refuse_all();
         stream.dispose();
         self.surface.restore();
         // Full screen swallows the conversation on exit; hand it back so a
@@ -286,6 +308,54 @@ impl Tui {
         false
     }
 
+    /// Route one key to the question on screen. Returns `true` to quit.
+    fn answer_question(&self, press: crate::surface::KeyPress) -> bool {
+        use crate::surface::{Key, Mods};
+        let Some(pending) = self.host.asks.peek() else {
+            return false;
+        };
+        let (_, question, options) = pending;
+        let chosen = match (press.key, press.mods) {
+            // Esc and ctrl-c decline. Declining is an answer; it is never
+            // consent, and it must always be one keystroke away.
+            (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => Some(None),
+            (Key::Char('d'), Mods::CTRL) => return true,
+            (Key::Char(c), _) if c.is_ascii_digit() => {
+                let n = c.to_digit(10).unwrap_or(0) as usize;
+                options.get(n.wrapping_sub(1)).cloned().map(Some)
+            }
+            (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) => options
+                .iter()
+                .find(|o| o.to_lowercase().starts_with(c.to_ascii_lowercase()))
+                .cloned()
+                .map(Some),
+            // Enter takes the first option only when there is exactly one, so a
+            // stray return can never approve a two-way choice.
+            (Key::Enter, _) if options.len() == 1 => Some(options.first().cloned()),
+            _ => None,
+        };
+        let Some(answer) = chosen else {
+            return false; // an unrecognised key changes nothing
+        };
+        if let Some(p) = self.host.asks.take() {
+            // Record what was asked and what was said, as a settled fact of the
+            // conversation — the screen must be able to explain itself later.
+            let mut stream = self.host.stream.write().expect("stream poisoned");
+            let mut w = stream.writer("questions");
+            w.emit(
+                crate::block::Coord::default(),
+                Arc::new(crate::content::ChoiceBlock {
+                    question,
+                    options,
+                    answer: Some(answer.clone().unwrap_or_else(|| "declined".into())),
+                }),
+            );
+            drop(stream);
+            p.answer(answer);
+        }
+        false
+    }
+
     fn toggle_module(&self, id: &'static str) {
         let mods = &self.host.modules;
         if mods.has_view(id) {
@@ -381,7 +451,8 @@ impl Plugin for TuiUiPlugin {
         &["agents", "agent-loop", "sessions", "surface"]
     }
     fn provides(&self) -> &'static [&'static str] {
-        &["ui", "tui-modules"]
+        // It owns the screen, so it is the one that can ask.
+        &["ui", "tui-modules", "user-questions"]
     }
     fn description(&self) -> &'static str {
         "a full-screen terminal UI assembled from module rows"
@@ -400,6 +471,11 @@ impl Plugin for TuiUiPlugin {
         let (host, tui) = assemble(surface, row.mascot);
         let _ = ctx
             .provide::<ModulesSvc>(host.modules.clone())
+            .map_err(|e| e.to_string())?;
+        let _ = ctx
+            .provide::<UserQuestionsSvc>(Arc::new(crate::ask::ScreenQuestions::new(
+                host.asks.clone(),
+            )))
             .map_err(|e| e.to_string())?;
         let _ = ctx
             .provide::<UiSvc>(Arc::new(tui))

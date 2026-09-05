@@ -48,6 +48,9 @@ impl Presentation {
 /// Everything the screen is composed from.
 pub struct Host {
     pub stream: RwLock<Stream>,
+    /// Questions waiting for the person. Rendered as a live block at the foot
+    /// of the stream, and given first refusal on every key while it is there.
+    pub asks: Arc<crate::ask::Asks>,
     pub modules: Arc<Modules>,
     pub layout: RwLock<Region>,
     pub moment: RwLock<Moment>,
@@ -61,6 +64,7 @@ impl Host {
     pub fn new(modules: Arc<Modules>, layout: Region) -> Self {
         Self {
             stream: RwLock::new(Stream::new()),
+            asks: crate::ask::Asks::new(),
             modules,
             layout: RwLock::new(layout),
             moment: RwLock::new(Moment::default()),
@@ -102,8 +106,28 @@ impl Host {
         let pres = self.presentation.read().expect("presentation poisoned");
         let mut out: Vec<Line> = Vec::new();
         let want = rect.h as usize;
+
+        // A question in flight sits at the foot of the stream. It is not in the
+        // stream itself: it has no answer yet, and a block whose content is
+        // still to be decided has not settled — putting it in would mean
+        // amending a settled block the moment it is answered.
+        if let Some((_, question, options)) = self.asks.peek() {
+            let pending = crate::content::ChoiceBlock {
+                question,
+                options,
+                answer: None,
+            };
+            let mut lines = crate::block::Content::lines(&pending, rect.w);
+            lines.reverse();
+            for line in lines {
+                if out.len() < want {
+                    out.push(line);
+                }
+            }
+        }
         let scroll = self.moment.read().expect("moment poisoned").scroll.0;
         let mut skipped = 0usize;
+        let _ = &skipped;
 
         for slot in stream.slots().iter().rev() {
             let block = slot.block();

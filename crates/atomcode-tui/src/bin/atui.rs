@@ -46,10 +46,21 @@ name = "ui-tui2"
 id = "trace"
 config = { stream = false, tools = false, summary = false }
 
-# This front end owns the terminal, so it is the one that can ask.
+# This front end owns the screen, so it is the one that asks — and the
+# standalone asker must stand down, because two rows filling one slot is an
+# error rather than a preference.
 [[patch]]
 id = "user-questions-unattended"
-name = "user-questions-unattended"
+disabled = true
+
+# Ask before a risky call rather than refusing it outright. That is the whole
+# point of having a person there.
+[[patch]]
+id = "approval"
+disabled = true
+
+[[patch]]
+id = "approval-interactive"
 disabled = false
 "#;
 

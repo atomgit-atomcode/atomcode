@@ -255,6 +255,80 @@ impl Content for InjectedBlock {
     }
 }
 
+/// A question put to the person, and — once they answer — what they said.
+///
+/// The only block that *consumes* input. It is produced by whoever fills the
+/// `user-questions` seam rather than by the transcript, so the stream itself
+/// stays a pure fold: swap that provider for a JSON-RPC client and this block
+/// simply stops appearing, with nothing else changing.
+#[derive(Debug)]
+pub struct ChoiceBlock {
+    pub question: String,
+    pub options: Vec<String>,
+    /// `None` while it is being asked; `Some` once answered, and then frozen.
+    pub answer: Option<String>,
+}
+
+impl Content for ChoiceBlock {
+    fn kind(&self) -> &'static str {
+        "choice"
+    }
+    fn content_hash(&self) -> ContentHash {
+        let opts = self.options.join("\u{1}");
+        hash_of(&[
+            "choice",
+            &self.question,
+            &opts,
+            self.answer.as_deref().unwrap_or(""),
+        ])
+    }
+    fn lines(&self, w: u16) -> Vec<Line> {
+        if w == 0 {
+            return Vec::new();
+        }
+        let ask = Style::new().fg(Color::Ansi(214));
+        match &self.answer {
+            Some(a) => {
+                let mut out = wrapped(&self.question, w, dim(), "? ");
+                out.push(
+                    Line::from_spans(vec![
+                        Span::styled("  → ", dim()),
+                        Span::styled(a.clone(), ok()),
+                    ])
+                    .truncate(w as usize),
+                );
+                out
+            }
+            None => {
+                let mut out = wrapped(&self.question, w, ask, "? ");
+                let choices = self
+                    .options
+                    .iter()
+                    .enumerate()
+                    .map(|(i, o)| format!("{}) {o}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join("   ");
+                out.push(Line::styled(
+                    width::take_width(&format!("  {choices}   esc) 拒绝"), w as usize),
+                    ask,
+                ));
+                out
+            }
+        }
+    }
+    fn summary(&self, w: u16) -> Line {
+        let head = match &self.answer {
+            Some(a) => format!("? {} → {a}", first_line(&self.question)),
+            None => format!("? {}", first_line(&self.question)),
+        };
+        Line::styled(width::take_width(&head, w as usize), dim())
+    }
+}
+
+fn first_line(s: &str) -> &str {
+    s.lines().next().unwrap_or("")
+}
+
 /// How a turn ended.
 #[derive(Debug)]
 pub struct TurnEndBlock {

@@ -50,13 +50,13 @@ fn tree(root: &std::path::Path, script: &str, extra: &[&str]) -> ConfigTree {
          [[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true\n\n\
          [[patch]]\nid = \"approval\"\ndisabled = false\nconfig = {{ mode = \"yolo\" }}\n\n\
          [[patch]]\nid = \"approval-interactive\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"user-questions-unattended\"\ndisabled = true\n\n\
          [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 8, working_dir = {root:?} }}\n\n\
          [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
          [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {root:?} }}\n\n\
          [[patch]]\nid = \"fs\"\nconfig = {{ root = {root:?} }}\n\n\
          [[insert]]\nid = \"surface\"\nname = \"surface-headless\"\nconfig = {{ width = 80, height = 24 }}\n\n\
-         [[patch]]\nid = \"ui\"\nname = \"ui-tui2\"\n\n\
-         [[patch]]\nid = \"user-questions-unattended\"\nname = \"user-questions-unattended\"\ndisabled = false\n",
+         [[patch]]\nid = \"ui\"\nname = \"ui-tui2\"\n",
         root = root.to_string_lossy(),
         home = empty.to_string_lossy()
     );
@@ -347,6 +347,108 @@ async fn esc_stops_the_turn_and_the_next_one_still_runs() {
     assert!(
         screen.contains("Done."),
         "and the next turn really runs:\n{screen}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+// ---- approval: the flow that makes it usable without --yolo ---------------
+
+/// The tree the TUI is meant to run in: it asks before a risky call, and it is
+/// the thing being asked.
+fn asking(root: &std::path::Path, script: &str) -> ConfigTree {
+    tree(
+        root,
+        script,
+        &[
+            "[[patch]]\nid = \"approval\"\ndisabled = true\n",
+            "[[patch]]\nid = \"approval-interactive\"\ndisabled = false\n",
+        ],
+    )
+}
+
+#[tokio::test]
+async fn a_risky_call_is_asked_about_on_screen_and_yes_lets_it_run() {
+    let dir = scratch("approve");
+    let script = replay(
+        r#"{ text = "Writing.", calls = [ { name = "write_file", args = { file_path = "out.txt", content = "written" } } ] },
+           { text = "Done." }"#,
+    );
+    let s = start(asking(&dir, &script)).await;
+    let task = s.open().await;
+
+    s.term.type_line("write it");
+    // Wait for the question rather than for quiet: the turn is deliberately
+    // blocked on the answer, so quiet will never come until we give one.
+    let asked = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if s.screen().contains("write_file") && s.screen().contains("esc)") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(asked.is_ok(), "no question appeared:\n{}", s.screen());
+    assert!(
+        !dir.join("out.txt").exists(),
+        "nothing may run before it is approved"
+    );
+
+    s.term.press(KeyPress::ch('y'));
+    s.quiet().await;
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+        "written",
+        "an approved call runs"
+    );
+    let screen = s.screen();
+    assert!(
+        screen.contains("→ yes"),
+        "the answer is on the record:\n{screen}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn esc_declines_and_the_model_is_told_rather_than_the_turn_dying() {
+    let dir = scratch("decline");
+    let script = replay(
+        r#"{ text = "Writing.", calls = [ { name = "write_file", args = { file_path = "out.txt", content = "no" } } ] },
+           { text = "Understood." }"#,
+    );
+    let s = start(asking(&dir, &script)).await;
+    let task = s.open().await;
+
+    s.term.type_line("write it");
+    let asked = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if s.screen().contains("esc)") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(asked.is_ok(), "no question appeared:\n{}", s.screen());
+
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
+
+    assert!(!dir.join("out.txt").exists(), "a refused call must not run");
+    let screen = s.screen();
+    // Refusing is *returning a result*: the model learns why and the turn
+    // finishes, instead of dying with a dangling call.
+    assert!(
+        screen.contains("declined"),
+        "the refusal is recorded:\n{screen}"
+    );
+    assert!(
+        screen.contains("Understood."),
+        "the turn carried on:\n{screen}"
     );
 
     s.term.press(KeyPress::ctrl('d'));
