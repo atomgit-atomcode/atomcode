@@ -2393,7 +2393,10 @@ kind = "claude-code"
         let mut with_rules = Config::default();
         with_rules.permissions.allow = vec!["Bash(git *)".to_string()];
         let text = toml::to_string(&with_rules).unwrap();
-        assert!(text.contains("[permissions]"), "a non-empty table must persist");
+        assert!(
+            text.contains("[permissions]"),
+            "a non-empty table must persist"
+        );
     }
 
     /// `[permissions]` must parse from TOML and default to empty when absent — an older
