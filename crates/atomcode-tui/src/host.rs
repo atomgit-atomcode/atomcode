@@ -29,7 +29,7 @@ impl Presentation {
     /// the working.
     pub fn default_folds() -> Self {
         Self {
-            folded_kinds: vec!["reasoning"],
+            folded_kinds: vec!["reasoning", "tool_call"],
         }
     }
     pub fn is_folded(&self, kind: &str) -> bool {
@@ -141,7 +141,7 @@ impl Host {
 
         for slot in stream.slots().iter().rev() {
             let block = slot.block();
-            let mut lines = if pres.is_folded(block.kind()) {
+            let mut lines = if pres.is_folded(block.kind()) && !block.content.always_open() {
                 vec![block.content.summary(rect.w)]
             } else {
                 block.content.lines(rect.w)

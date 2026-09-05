@@ -137,6 +137,15 @@ pub struct ToolCallBlock {
 }
 
 impl ToolCallBlock {
+    fn mark(&self) -> (&'static str, Style) {
+        match &self.outcome {
+            Outcome::Pending => ("⋯", tool()),
+            Outcome::Ok(_) => ("✓", ok()),
+            Outcome::Failed(_) => ("✗", bad()),
+            Outcome::Interrupted => ("—", dim()),
+        }
+    }
+
     pub fn pending(
         call_id: impl Into<String>,
         name: impl Into<String>,
@@ -174,6 +183,160 @@ impl ToolCallBlock {
     }
 }
 
+// ---- what kind of tool call this is -------------------------------------
+
+/// How a tool call reads in the transcript.
+///
+/// The TUI knowing a handful of tool names by heart is presentation-only
+/// knowledge: guessing wrong costs a duller line, never a wrong result. The
+/// generic fallback below is what actually carries most of the weight — a tool
+/// this table has never heard of still gets its subject picked out, which is
+/// what stops this from becoming a list that has to be maintained in lockstep
+/// with the catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Look {
+    /// What this call *is*, in one word, when the tool name alone is not it.
+    pub verb: Option<&'static str>,
+    /// Argument names that hold the thing acted on, best first.
+    pub subject: &'static [&'static str],
+    /// Never fold this one.
+    ///
+    /// Loading a skill is not output, it is a change in how the agent will
+    /// behave for the rest of the turn. Collapsing it to a summary hides the
+    /// most consequential thing that happened.
+    pub always_open: bool,
+}
+
+const GENERIC: Look = Look {
+    verb: None,
+    // Ordered by how specific the key is: a tool with both `pattern` and `path`
+    // is a search, and the pattern is what a person remembers it by.
+    subject: &[
+        "pattern",
+        "command",
+        "query",
+        "name",
+        "skill",
+        "file_path",
+        "path",
+        "url",
+        "id",
+    ],
+    always_open: false,
+};
+
+pub fn look(tool: &str) -> Look {
+    match tool {
+        "use_skill" => Look {
+            verb: Some("技能"),
+            subject: &["name", "skill"],
+            always_open: true,
+        },
+        "list_skills" => Look {
+            verb: Some("技能"),
+            subject: &[],
+            always_open: false,
+        },
+        "bash" => Look {
+            verb: Some("$"),
+            subject: &["command"],
+            always_open: false,
+        },
+        "read_file" | "write_file" | "edit_file" | "list_directory" => Look {
+            subject: &["file_path", "path"],
+            ..GENERIC
+        },
+        "grep" | "glob" | "ast_grep" => Look {
+            subject: &["pattern", "path"],
+            ..GENERIC
+        },
+        "recall" | "web_search" => Look {
+            subject: &["query"],
+            ..GENERIC
+        },
+        "describe_self" => Look {
+            verb: Some("自省"),
+            subject: &["aspect"],
+            ..GENERIC
+        },
+        "memory" => Look {
+            verb: Some("记忆"),
+            subject: &["action", "content"],
+            ..GENERIC
+        },
+        "todowrite" => Look {
+            verb: Some("计划"),
+            subject: &[],
+            ..GENERIC
+        },
+        _ => GENERIC,
+    }
+}
+
+/// The thing this call acted on, pulled out of its arguments.
+///
+/// Falls back to the raw argument text so an unknown tool still says something
+/// — an empty subject reads as "nothing happened", which is worse than noisy.
+pub fn subject_of(tool: &str, args: &str) -> String {
+    let look = look(tool);
+    let parsed: Option<serde_json::Value> = serde_json::from_str(args).ok();
+    if let Some(obj) = parsed.as_ref().and_then(|v| v.as_object()) {
+        for key in look.subject {
+            if let Some(value) = obj.get(*key) {
+                let text = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let text = text.trim();
+                if !text.is_empty() {
+                    // A path is recognisable by its tail; a command or a pattern
+                    // by its head. Trimming the wrong end of a long path leaves
+                    // the useless half.
+                    return if text.len() > 48 && text.contains('/') {
+                        format!("…{}", &text[text.len() - 44..])
+                    } else {
+                        text.to_string()
+                    };
+                }
+            }
+        }
+        if obj.is_empty() {
+            return String::new();
+        }
+    }
+    let flat = args.split_whitespace().collect::<Vec<_>>().join(" ");
+    flat.trim_matches(|c| c == '{' || c == '}').to_string()
+}
+
+/// What came back, in a few words.
+fn outcome_note(outcome: &Outcome) -> (String, Style) {
+    match outcome {
+        Outcome::Pending => ("运行中".into(), dim()),
+        Outcome::Interrupted => ("已中断".into(), dim()),
+        Outcome::Failed(s) => {
+            let first = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("失败");
+            (format!("失败 · {}", clip(first, 60)), bad())
+        }
+        Outcome::Ok(s) if s.trim().is_empty() => ("完成".into(), dim()),
+        Outcome::Ok(s) => {
+            let lines = s.lines().filter(|l| !l.trim().is_empty()).count();
+            if lines > 1 {
+                (format!("{lines} 行"), dim())
+            } else {
+                (clip(s.trim(), 60), dim())
+            }
+        }
+    }
+}
+
+fn clip(s: &str, cells: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if width::str_width(&flat) <= cells {
+        return flat;
+    }
+    format!("{}…", width::take_width(&flat, cells.saturating_sub(1)))
+}
+
 impl Content for ToolCallBlock {
     fn kind(&self) -> &'static str {
         "tool_call"
@@ -191,12 +354,7 @@ impl Content for ToolCallBlock {
         if w == 0 {
             return Vec::new();
         }
-        let (mark, style) = match &self.outcome {
-            Outcome::Pending => ("⋯", tool()),
-            Outcome::Ok(_) => ("✓", ok()),
-            Outcome::Failed(_) => ("✗", bad()),
-            Outcome::Interrupted => ("—", dim()),
-        };
+        let (mark, style) = self.mark();
         let head = Line::from_spans(vec![
             Span::styled(format!("{mark} "), style),
             Span::styled(self.name.clone(), tool()),
@@ -217,8 +375,39 @@ impl Content for ToolCallBlock {
         }
         out
     }
+    /// One line that is worth reading on its own.
+    ///
+    /// The old version took the first line of the expanded form, which meant a
+    /// folded call said what was *asked* and nothing about what came back —
+    /// exactly the half a reader already knows. This one names the tool, the
+    /// thing it acted on, and what it returned.
     fn summary(&self, w: u16) -> Line {
-        self.lines(w).into_iter().next().unwrap_or_default()
+        let (mark, style) = self.mark();
+        let look = look(&self.name);
+        let subject = subject_of(&self.name, &self.args);
+        let (note, note_style) = outcome_note(&self.outcome);
+
+        let mut spans = vec![Span::styled(format!("{mark} "), style)];
+        match look.verb {
+            // A verb replaces the tool name when the name is machinery rather
+            // than meaning: `$ cargo test` reads; `bash {"command":…}` does not.
+            Some(verb) => spans.push(Span::styled(format!("{verb} "), tool())),
+            None => spans.push(Span::styled(format!("{} ", self.name), tool())),
+        }
+        if !subject.is_empty() {
+            spans.push(Span::raw(subject));
+        }
+        if !note.is_empty() {
+            spans.push(Span::styled(format!(" · {note}"), note_style));
+        }
+        Line::from_spans(spans).truncate(w as usize)
+    }
+
+    /// Skills are never folded: loading one changes how the agent behaves for
+    /// the rest of the turn, and a summary would hide the most consequential
+    /// thing on the screen.
+    fn always_open(&self) -> bool {
+        look(&self.name).always_open
     }
 }
 

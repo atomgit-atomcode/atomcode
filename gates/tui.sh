@@ -41,6 +41,8 @@ step "值类型与几何（单元）"        cargo test -q -p atomcode-tui --lib
 [ "$FAST" = 1 ] || step "宿主 harness 未被弄坏" cargo test -q -p atomcode-harness
 [ "$FAST" = 1 ] || step "启动器能构建"  cargo build -q -p atomcode-tui
 [ "$FAST" = 1 ] || step "启动器能审计（无 tty）" ./target/debug/atui --offline --audit
+step "分层：OS 差异不得漏出屏蔽层" gates/tui-layers.sh
+step "分层闸门自身会判红"          gates/tui-layers.spec.sh
 step "阴性对照：坏东西必须判红"    gates/tui-negative.sh
 step "格式"                        cargo fmt -p atomcode-tui -- --check
 # `--no-deps` is load-bearing, not tidiness: without it `-D warnings` promotes

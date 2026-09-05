@@ -96,6 +96,15 @@ pub trait Content: Send + Sync + std::fmt::Debug {
     /// Render at a width. Called every frame; must be pure.
     fn lines(&self, width: u16) -> Vec<Line>;
 
+    /// Refuse to be folded.
+    ///
+    /// For the rare block whose whole point is that it happened — a skill being
+    /// loaded changes how the agent behaves, and a one-line summary of that is
+    /// a one-line summary of the most important thing on the screen.
+    fn always_open(&self) -> bool {
+        false
+    }
+
     /// One line standing in for the whole block when it is folded.
     fn summary(&self, width: u16) -> Line {
         self.lines(width).into_iter().next().unwrap_or_default()
