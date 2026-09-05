@@ -56,7 +56,7 @@ pub struct Host {
     /// of the stream, and given first refusal on every key while it is there.
     pub asks: Arc<crate::ask::Asks>,
     pub modules: Arc<Modules>,
-    pub layout: RwLock<Region>,
+    pub layout: Arc<crate::layout::Layout>,
     pub moment: RwLock<Moment>,
     pub presentation: RwLock<Presentation>,
     /// Frames composed so far. Only counted, not kept — the surface keeps them
@@ -66,13 +66,14 @@ pub struct Host {
 
 impl Host {
     pub fn new(modules: Arc<Modules>, layout: Region) -> Self {
+        let layout_svc = Arc::new(crate::layout::Layout::new(layout));
         Self {
             stream: RwLock::new(Stream::new()),
-            commands: crate::commands::builtin(),
+            commands: crate::commands::builtin(layout_svc.clone(), modules.clone()),
             overlays: Arc::new(crate::overlay::Overlays::new()),
             asks: crate::ask::Asks::new(),
-            modules,
-            layout: RwLock::new(layout),
+            modules: modules.clone(),
+            layout: layout_svc.clone(),
             moment: RwLock::new(Moment::default()),
             presentation: RwLock::new(Presentation::default_folds()),
             painted: Mutex::new(0),
@@ -175,7 +176,7 @@ impl Host {
         let mut frame = Frame::new(w, h);
         let moment = self.moment.read().expect("moment poisoned").clone();
 
-        let layout = self.layout.read().expect("layout poisoned").clone();
+        let layout = self.layout.tree();
         let modules = self.modules.clone();
         let pruned = layout.prune(&|id| modules.has_view(id));
 
@@ -416,12 +417,12 @@ mod tests {
         h.modules
             .add_view(Arc::new(Mounted::<status::Mascot>::new()))
             .unwrap();
-        *h.layout.write().unwrap() = Region::split(
+        h.layout.set(Region::split(
             crate::region::Dir::Vertical,
             crate::region::Constraint::Cells(1),
             Region::view("mascot"),
             default_layout(),
-        );
+        ));
         assert!(
             h.compose((80, 24)).part("mascot").is_some(),
             "the registry is read fresh, not snapshotted"

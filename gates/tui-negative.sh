@@ -32,6 +32,10 @@ must_detect "markdown 遇到怪输入挂死" rendering_is_total_and_terminates_o
 must_detect "模态画出自己的框"      a_picker_never_draws_wider_than_its_rect
 must_detect "第二个模态叠在第一个上" opening_a_second_modal_cancels_the_first_rather_than_stacking
 must_detect "边框超出小矩形"        the_frame_fits_its_rect_at_any_size
+must_detect "布局 op 让树变非法"    every_op_leaves_a_tree_that_still_lays_out
+must_detect "三条入口对不上"        a_key_and_the_model_agree_on_what_focus_means
+must_detect "布局改动碰了模块状态"  a_layout_change_never_touches_what_a_module_has_folded
+must_detect "模型发来的畸形 op"     a_malformed_op_is_a_parse_error_not_a_panic
 
 # The instrument itself must be calibrated: a name that does not exist must FAIL
 # this script's own check, or the script would pass with zero real coverage.

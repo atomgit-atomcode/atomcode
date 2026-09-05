@@ -332,6 +332,26 @@ impl Tui {
                 self.toggle_module(id);
                 return false;
             }
+            Action::Layout(op) => {
+                drop(m);
+                // The same `apply` a command and the model's tool call. Three
+                // ways in, one implementation.
+                let known = known_modules(&self.host.modules);
+                let said = match self.host.layout.apply(&op, &known) {
+                    Ok(what) => (what, false),
+                    Err(e) => (e.to_string(), true),
+                };
+                let mut stream = self.host.stream.write().expect("stream poisoned");
+                let mut w = stream.writer("commands");
+                w.emit(
+                    crate::block::Coord::default(),
+                    Arc::new(crate::content::CommandSaid {
+                        text: said.0,
+                        refused: said.1,
+                    }),
+                );
+                return false;
+            }
         }
         drop(m);
         // Every edit to the line can change what the menu should show.
@@ -543,6 +563,17 @@ async fn read_input(wake: mpsc::UnboundedSender<Wake>) {
 
 // ---- the rows -----------------------------------------------------------
 
+/// Every module a layout may name — mounted or not.
+fn known_modules(mods: &Modules) -> Vec<String> {
+    mods.view_ids()
+        .into_iter()
+        .map(str::to_string)
+        .chain(["mascot".to_string(), "findings".to_string()])
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// Build the module registry a tree starts with.
 pub fn base_modules(mascot: bool) -> Arc<Modules> {
     let mods = Arc::new(Modules::new());
@@ -626,6 +657,30 @@ impl Plugin for TuiUiPlugin {
                 host.asks.clone(),
             )))
             .map_err(|e| e.to_string())?;
+
+        // The third way into the layout: the model. Perception is a prompt
+        // fragment — read fresh on every request, so what the model believes
+        // and what is on screen cannot drift — and action is a tool. Both are
+        // provided by this one row and derived from the one layout, which is
+        // why the description can never disagree with the picture.
+        if let Some(prompts) = ctx.service::<atomcode_harness::seams::SystemPromptSvc>() {
+            let l = host.layout.clone();
+            let m = host.modules.clone();
+            prompts.contribute("tui-layout", 60, l.describe_for_model(&known_modules(&m)));
+            let id = "tui-layout";
+            let p = prompts.clone();
+            let _ = ctx.effect(move || p.remove(id));
+        }
+        if let Some(tools) = ctx.service::<atomcode_harness::seams::ToolsSvc>() {
+            let tool: Arc<dyn atomcode_kernel::tool::Tool> =
+                Arc::new(crate::layout_tool::AdjustLayout {
+                    layout: host.layout.clone(),
+                    modules: host.modules.clone(),
+                });
+            tools.register(tool).map_err(|e| e.to_string())?;
+            let t = tools.clone();
+            let _ = ctx.effect(move || t.unregister("adjust_layout"));
+        }
         let _ = ctx
             .provide::<UiSvc>(Arc::new(tui))
             .map_err(|e| e.to_string())?;

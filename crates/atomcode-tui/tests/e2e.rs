@@ -133,16 +133,28 @@ impl Session {
     async fn quiet(&self) {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while std::time::Instant::now() < deadline {
-            if self
+            // Ask the agent, not the screen. Reading "idle" off the status
+            // bar worked until a test hid the status bar — a predicate that
+            // depends on what is *drawn* is a predicate the UI can break.
+            // Settle *first*, then ask: checking busy before waiting lets a turn
+            // start during the wait and still be reported quiet.
+            let still = self
                 .term
                 .settle(Duration::from_millis(60), Duration::from_secs(5))
-                .await
-                && self
-                    .term
-                    .last()
-                    .map(|f| f.rows().first().is_some_and(|r| r.contains("idle")))
-                    .unwrap_or(false)
-            {
+                .await;
+            let busy = self
+                .app
+                .service::<atomcode_harness::seams::AgentsSvc>()
+                .map(|a| {
+                    a.list().iter().any(|x| {
+                        // Idle with something still in the inbox is a turn that
+                        // has not started yet, not a turn that has finished.
+                        x.status() != atomcode_harness::agent::AgentStatus::Idle
+                            || x.inbox().has_waking_input()
+                    })
+                })
+                .unwrap_or(false);
+            if still && !busy {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -685,6 +697,112 @@ async fn picking_a_row_reconfigures_the_running_tree() {
         "the tree really changed under a running session:\n{after}"
     );
     assert!(latest.contains("bash"), "and only that row went:\n{after}");
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+// ---- runtime layout -------------------------------------------------------
+
+#[tokio::test]
+async fn the_screen_can_be_rearranged_while_it_runs_and_put_back() {
+    let dir = scratch("layout");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+    s.term.type_line("hi");
+    s.quiet().await;
+    assert!(s.screen().contains("atomcode ·"), "the status bar is up");
+
+    // By command.
+    s.term.type_line("/hide status");
+    s.quiet().await;
+    assert!(
+        !s.screen().contains("atomcode ·"),
+        "hidden:\n{}",
+        s.screen()
+    );
+
+    // By key — the same `apply`.
+    s.term.press(KeyPress::ctrl('z'));
+    s.quiet().await;
+    assert!(
+        s.screen().contains("atomcode ·"),
+        "undone by ctrl-z:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn the_model_is_told_the_layout_and_can_change_it() {
+    let dir = scratch("model-layout");
+    // The model calls the tool it was told about in its prompt.
+    let script = replay(
+        r#"{ text = "收起来。", calls = [ { name = "adjust_layout", args = { op = "hide", module = "status" } } ] },
+           { text = "好了。" }"#,
+    );
+    let s = start(tree(
+        &dir,
+        &script,
+        &["[[patch]]\nid = \"approval\"\nconfig = { mode = \"yolo\" }\n"],
+    ))
+    .await;
+    let task = s.open().await;
+
+    // What the model is told comes from the same tree the screen draws.
+    let prompt = s
+        .app
+        .service::<atomcode_harness::seams::SystemPromptSvc>()
+        .expect("the prompt registry is mounted")
+        .render();
+    assert!(prompt.contains("屏幕布局"), "the model is told:\n{prompt}");
+    assert!(prompt.contains("adjust_layout"), "{prompt}");
+
+    s.term.type_line("把状态栏收起来");
+    s.quiet().await;
+    let after = s.screen();
+    assert!(
+        !after.contains("atomcode ·"),
+        "the model rearranged the screen:\n{after}"
+    );
+    assert!(after.contains("好了"), "and the turn finished:\n{after}");
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn a_layout_request_the_model_gets_wrong_comes_back_with_the_reason() {
+    let dir = scratch("model-layout-bad");
+    let script = replay(
+        r#"{ text = "试试。", calls = [ { name = "adjust_layout", args = { op = "hide", module = "nonesuch" } } ] },
+           { text = "明白了。" }"#,
+    );
+    let s = start(tree(
+        &dir,
+        &script,
+        &["[[patch]]\nid = \"approval\"\nconfig = { mode = \"yolo\" }\n"],
+    ))
+    .await;
+    let task = s.open().await;
+
+    s.term.type_line("收起 nonesuch");
+    s.quiet().await;
+    let after = s.screen();
+    assert!(
+        after.contains("adjust_layout"),
+        "the call is on screen:\n{after}"
+    );
+    assert!(
+        after.contains("nonesuch") || after.contains("不在屏幕上"),
+        "with a reason the model can act on:\n{after}"
+    );
+    assert!(
+        after.contains("明白了"),
+        "and the turn carried on:\n{after}"
+    );
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;

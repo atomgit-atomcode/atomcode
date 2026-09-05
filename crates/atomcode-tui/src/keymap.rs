@@ -32,6 +32,9 @@ pub enum Action {
     ToggleFold(&'static str),
     /// Show or hide a module.
     ToggleModule(&'static str),
+    /// Change the screen's shape. The third entry point into `Layout::apply`,
+    /// alongside a command and the model's tool.
+    Layout(crate::layout::LayoutOp),
     /// Paste arrived as one event rather than N keystrokes.
     Paste(String),
 }
@@ -131,6 +134,16 @@ impl Keymap for Default_ {
             (KeyPress::ctrl('r'), Action::ToggleFold("reasoning")),
             (KeyPress::ctrl('t'), Action::ToggleFold("tool_call")),
             (KeyPress::ctrl('n'), Action::ToggleModule("mascot")),
+            (
+                KeyPress::ctrl('l'),
+                Action::Layout(crate::layout::LayoutOp::Preset {
+                    name: "focus".into(),
+                }),
+            ),
+            (
+                KeyPress::ctrl('z'),
+                Action::Layout(crate::layout::LayoutOp::Undo),
+            ),
         ]
     }
 }

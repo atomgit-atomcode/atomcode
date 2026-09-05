@@ -239,6 +239,123 @@ impl CommandSet for TreeCommands {
     }
 }
 
+/// The screen's shape, changed while it runs.
+///
+/// One of the three ways in — the others are a key and the model's
+/// `adjust_layout` tool — and all three land on `Layout::apply`, so there is one
+/// implementation of each op rather than three.
+pub struct LayoutCommands {
+    pub layout: Arc<crate::layout::Layout>,
+    pub modules: Arc<crate::module::Modules>,
+}
+
+const LAYOUT: &[Command] = &[
+    Command::new("layout", "挑一个命名布局,或显示/隐藏一个面板"),
+    Command::taking(
+        "show",
+        "<模块> [top|bottom|left|right]",
+        "把一个面板放上屏幕",
+    ),
+    Command::taking("hide", "<模块>", "把一个面板收起来"),
+    Command::new("undo-layout", "撤销上一次布局改动"),
+];
+
+const LAYOUT_HIDDEN: &[Command] = &[Command::taking("layout-set", "<名字>", "")];
+
+impl LayoutCommands {
+    fn known(&self) -> Vec<String> {
+        self.modules
+            .view_ids()
+            .into_iter()
+            .map(str::to_string)
+            .chain(["mascot".to_string(), "findings".to_string()])
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+    fn run_op(&self, op: crate::layout::LayoutOp) -> Outcome {
+        match self.layout.apply(&op, &self.known()) {
+            Ok(what) => Outcome::Said(what),
+            Err(e) => Outcome::Refused(e.to_string()),
+        }
+    }
+}
+
+#[async_trait]
+impl CommandSet for LayoutCommands {
+    fn id(&self) -> &'static str {
+        "cmd-layout"
+    }
+    fn commands(&self) -> Vec<Command> {
+        LAYOUT.to_vec()
+    }
+    fn hidden(&self) -> Vec<Command> {
+        LAYOUT_HIDDEN.to_vec()
+    }
+    async fn run(&self, name: &str, args: &str, _ctx: &Context) -> Outcome {
+        use crate::layout::{LayoutOp, Side};
+        match name {
+            "layout" => {
+                let on = self.layout.tree().modules();
+                let mut choices: Vec<crate::overlay::Choice> = crate::layout::presets()
+                    .iter()
+                    .map(|(n, d)| {
+                        crate::overlay::Choice::new(format!("/layout-set {n}"), format!("布局 {n}"))
+                            .about(*d)
+                    })
+                    .collect();
+                for m in self.known() {
+                    let shown = on.contains(&m);
+                    choices.push(
+                        crate::overlay::Choice::new(
+                            format!("/{} {m}", if shown { "hide" } else { "show" }),
+                            m.clone(),
+                        )
+                        .about(if shown { "在屏幕上" } else { "未显示" })
+                        .marked(shown),
+                    );
+                }
+                Outcome::Open(crate::overlay::Picker::new(
+                    "layout",
+                    "布局 · enter 应用",
+                    choices,
+                ))
+            }
+            "layout-set" => self.run_op(LayoutOp::Preset {
+                name: args.trim().to_string(),
+            }),
+            "show" => {
+                let mut parts = args.split_whitespace();
+                let Some(module) = parts.next() else {
+                    return Outcome::Refused("用法:/show <模块> [top|bottom|left|right]".into());
+                };
+                let side = match parts.next() {
+                    Some("top") => Side::Top,
+                    Some("left") => Side::Left,
+                    Some("right") => Side::Right,
+                    _ => Side::Bottom,
+                };
+                self.run_op(LayoutOp::Show {
+                    module: module.to_string(),
+                    side,
+                    size: parts.next().and_then(|s| s.parse().ok()),
+                })
+            }
+            "hide" => {
+                let module = args.trim();
+                if module.is_empty() {
+                    return Outcome::Refused("用法:/hide <模块>".into());
+                }
+                self.run_op(LayoutOp::Hide {
+                    module: module.to_string(),
+                })
+            }
+            "undo-layout" => self.run_op(LayoutOp::Undo),
+            _ => Outcome::Quiet,
+        }
+    }
+}
+
 /// `/help`, which has to know about everything, so it holds the registry.
 pub struct HelpCommands {
     pub all: Arc<Commands>,
@@ -284,11 +401,15 @@ fn first_line(s: &str) -> &str {
 }
 
 /// The registry a shipped tree starts with.
-pub fn builtin() -> Arc<Commands> {
+pub fn builtin(
+    layout: Arc<crate::layout::Layout>,
+    modules: Arc<crate::module::Modules>,
+) -> Arc<Commands> {
     let c = Arc::new(Commands::new());
     let _ = c.add(Arc::new(ScreenCommands));
     let _ = c.add(Arc::new(SessionCommands));
     let _ = c.add(Arc::new(TreeCommands));
+    let _ = c.add(Arc::new(LayoutCommands { layout, modules }));
     let _ = c.add(Arc::new(HelpCommands { all: c.clone() }));
     c
 }
@@ -302,9 +423,16 @@ mod tests {
         App::new(PluginRegistry::new(), ConfigTree::default())
     }
 
+    fn builtin_for_test() -> Arc<Commands> {
+        builtin(
+            Arc::new(crate::layout::Layout::new(crate::host::default_layout())),
+            Arc::new(crate::module::Modules::new()),
+        )
+    }
+
     #[test]
     fn the_shipped_set_mounts_without_conflicting_with_itself() {
-        let c = builtin();
+        let c = builtin_for_test();
         let names: Vec<_> = c.all().iter().map(|x| x.name).collect();
         assert!(names.contains(&"help") && names.contains(&"compact") && names.contains(&"rows"));
         let mut sorted = names.clone();
@@ -315,7 +443,7 @@ mod tests {
 
     #[tokio::test]
     async fn help_lists_everything_including_itself() {
-        let c = builtin();
+        let c = builtin_for_test();
         let app = bare();
         match c.dispatch("/help", &app.context()).await {
             Outcome::Said(text) => {
@@ -332,7 +460,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_command_whose_seam_is_missing_says_so_instead_of_panicking() {
-        let c = builtin();
+        let c = builtin_for_test();
         let app = bare(); // no session, no control, no tools
         for line in ["/compact", "/context", "/rows", "/audit", "/tools-list"] {
             match c.dispatch(line, &app.context()).await {
@@ -344,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn patch_without_an_argument_shows_what_it_wants() {
-        let c = builtin();
+        let c = builtin_for_test();
         let app = bare();
         match c.dispatch("/patch", &app.context()).await {
             Outcome::Refused(m) => assert!(m.contains("TOML"), "{m}"),
@@ -356,7 +484,7 @@ mod tests {
 
     #[tokio::test]
     async fn screen_commands_become_actions_so_a_key_and_a_command_share_one_path() {
-        let c = builtin();
+        let c = builtin_for_test();
         let app = bare();
         assert_eq!(
             c.dispatch("/quit", &app.context()).await,
