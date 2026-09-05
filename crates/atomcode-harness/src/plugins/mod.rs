@@ -77,6 +77,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(recovery::RequestTimeoutPlugin))
         .register(Arc::new(truncation::TruncationPlugin))
         .register(Arc::new(recovery::ReasoningFilterPlugin))
+        .register(Arc::new(recovery::StreamRecoveryPlugin))
         .register(Arc::new(loop_policy::CompactionPlugin))
         .register(Arc::new(loop_policy::ToolLoopGuardPlugin))
         .register(Arc::new(loop_policy::RepeatFusePlugin))

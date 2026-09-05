@@ -616,3 +616,53 @@ async fn resuming_a_session_that_does_not_exist_starts_a_fresh_one() {
     let outcome = run_turn(&app, "hello").await.unwrap();
     assert_eq!(outcome.turn, 1);
 }
+
+#[tokio::test]
+async fn facts_a_plugin_writes_survive_a_resume() {
+    let home = resume_home("plugin-facts");
+    let id = "plugin-written";
+    std::fs::create_dir_all(home.join("work/.atomcode")).unwrap();
+    std::fs::write(
+        home.join("work/.atomcode/memory.md"),
+        "- the user prefers short answers\n",
+    )
+    .unwrap();
+
+    let mut first = App::new(plugins::catalog(), resumable(&home, Some(id), false));
+    first.start().await.unwrap();
+    run_turn(&first, "hello").await.unwrap();
+    settle(&first, id, 6).await;
+
+    let injected_live = first
+        .context()
+        .service::<SessionSvc>()
+        .unwrap()
+        .events()
+        .into_iter()
+        .filter(|e| matches!(e.event, SessionEvent::Injected { .. }))
+        .count();
+    assert_eq!(injected_live, 1, "the memory row injected once");
+    drop(first);
+
+    let mut second = App::new(plugins::catalog(), resumable(&home, Some(id), true));
+    second.start().await.unwrap();
+    let restored = second.context().service::<SessionSvc>().unwrap();
+    let injected_after = restored
+        .events()
+        .into_iter()
+        .filter(|e| matches!(e.event, SessionEvent::Injected { .. }))
+        .count();
+
+    // Every plugin that tells the model something used to `append` directly,
+    // which reaches nothing that learns by listening — so memory injections,
+    // compaction cuts and truncation nudges were all silently missing from a
+    // resumed session while the model still believed it had been told them.
+    assert_eq!(
+        injected_after, 1,
+        "a fact a plugin wrote must reach the store like any other"
+    );
+    assert!(restored
+        .derive_messages()
+        .iter()
+        .any(|m| m.text.contains("short answers")));
+}

@@ -65,6 +65,13 @@ pub struct RequestError {
     /// The provider answered with no content and no tool calls. Distinct from
     /// an error: nothing failed, the turn simply cannot proceed on it.
     pub empty_response: bool,
+    /// What the stream had already produced when it broke.
+    ///
+    /// A stream that fails after emitting real work is not the same failure as
+    /// one that never opened: the tokens were paid for, the tool calls may
+    /// already describe work worth keeping, and discarding them means the retry
+    /// starts from nothing. Carried here so a recovery policy can preserve it.
+    pub partial: Option<Box<ModelResponse>>,
 }
 
 impl RequestError {
@@ -77,6 +84,7 @@ impl RequestError {
             retry_after: None,
             context_overflow: false,
             empty_response: false,
+            partial: None,
         }
     }
 
@@ -90,7 +98,19 @@ impl RequestError {
             retry_after: error.retry_after_secs.map(std::time::Duration::from_secs),
             context_overflow: error.is_context_overflow(),
             empty_response: false,
+            partial: None,
         }
+    }
+
+    /// Attach what the stream had produced before it broke.
+    pub fn with_partial(mut self, partial: ModelResponse) -> Self {
+        if !partial.text.is_empty()
+            || !partial.tool_calls.is_empty()
+            || !partial.reasoning.is_empty()
+        {
+            self.partial = Some(Box::new(partial));
+        }
+        self
     }
 
     pub fn empty() -> Self {

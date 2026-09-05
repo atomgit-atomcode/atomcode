@@ -298,11 +298,15 @@ impl Plugin for MemoryPlugin {
                 let Some(session) = ctx.service::<SessionSvc>() else {
                     return;
                 };
-                session.append(SessionEvent::Injected {
-                    turn: started.turn,
-                    text: merged.clone(),
-                    origin: InjectionOrigin::Memory,
-                });
+                crate::session::commit(
+                    &ctx,
+                    &session,
+                    SessionEvent::Injected {
+                        turn: started.turn,
+                        text: merged.clone(),
+                        origin: InjectionOrigin::Memory,
+                    },
+                );
             });
         Ok(())
     }

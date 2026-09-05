@@ -589,3 +589,128 @@ async fn the_nudging_itself_is_bounded() {
         "a nudge that never works must stop being sent, or it becomes the loop: {nudges}"
     );
 }
+
+// ---- partial streams ----------------------------------------------------
+
+/// Breaks mid-stream after producing real output, then succeeds.
+struct BreaksMidStream {
+    seen: Arc<AtomicU32>,
+    break_times: u32,
+}
+
+#[async_trait]
+impl Waterfall<AgentRequest> for BreaksMidStream {
+    async fn handle(
+        &self,
+        _req: &mut ModelRequest,
+        _next: Next<'_, AgentRequest>,
+    ) -> Result<ModelResponse, RequestError> {
+        let n = self.seen.fetch_add(1, Ordering::SeqCst);
+        if n < self.break_times {
+            return Err(RequestError {
+                retryable: true,
+                ..RequestError::message("connection reset mid-stream")
+            }
+            .with_partial(ModelResponse {
+                text: "I had already written this much".into(),
+                ..Default::default()
+            }));
+        }
+        Ok(ModelResponse {
+            text: "and then finished".into(),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_broken_stream_keeps_what_it_produced() {
+    let dir = scratch("partial");
+    let app = start(tree(&dir, &[])).await;
+    let seen = Arc::new(AtomicU32::new(0));
+    let _guard = app.context().on_waterfall::<AgentRequest>(
+        Arc::new(BreaksMidStream {
+            seen: seen.clone(),
+            break_times: 1,
+        }),
+        false,
+    );
+
+    let outcome = run_turn(&app, "write something").await.unwrap();
+    assert_eq!(outcome.stop, StopReason::Stopped);
+
+    let transcript = app
+        .context()
+        .service::<SessionSvc>()
+        .unwrap()
+        .derive_messages()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        transcript.contains("I had already written this much"),
+        "the tokens were paid for; discarding them makes the retry redo the work: {transcript}"
+    );
+    assert!(
+        transcript.contains("cut off mid-stream"),
+        "and the model has to know why its own message is unfinished"
+    );
+    assert!(transcript.contains("and then finished"));
+}
+
+#[tokio::test]
+async fn stream_recovery_is_bounded() {
+    let dir = scratch("partial-forever");
+    let row = "[[patch]]\nid = \"llm-stream-recovery\"\nconfig = { max_recoveries = 1 }";
+    let app = start(tree(&dir, &[row])).await;
+    let seen = Arc::new(AtomicU32::new(0));
+    let _guard = app.context().on_waterfall::<AgentRequest>(
+        Arc::new(BreaksMidStream {
+            seen: seen.clone(),
+            break_times: 99,
+        }),
+        false,
+    );
+
+    let outcome = run_turn(&app, "go").await.unwrap();
+    assert_eq!(outcome.stop, StopReason::ProviderError);
+    // A connection that keeps breaking is a signal, not something to absorb
+    // indefinitely — the retry row's budget bounds it from there.
+    assert!(
+        seen.load(Ordering::SeqCst) <= 6,
+        "it kept absorbing breaks: {} attempts",
+        seen.load(Ordering::SeqCst)
+    );
+}
+
+#[tokio::test]
+async fn an_open_failure_has_nothing_to_preserve() {
+    let dir = scratch("no-partial");
+    let app = start(tree(&dir, &[])).await;
+    // A failure with no partial output: the stream never produced anything, so
+    // there is nothing to keep and nothing to explain.
+    let run = run_with(
+        &app,
+        1,
+        RequestError {
+            retryable: true,
+            ..RequestError::message("connection refused")
+        },
+    )
+    .await;
+
+    assert_eq!(run.stop, StopReason::Stopped, "the plain retry handles it");
+    let injected = app
+        .context()
+        .service::<SessionSvc>()
+        .unwrap()
+        .events()
+        .into_iter()
+        .filter(|e| matches!(&e.event, SessionEvent::Injected { text, .. } if text.contains("cut off mid-stream")))
+        .count();
+    assert_eq!(
+        injected, 0,
+        "no resume nudge for a stream that never started"
+    );
+}

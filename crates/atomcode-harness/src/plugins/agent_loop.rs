@@ -259,7 +259,12 @@ async fn stream_once(
             }
             StreamEvent::ToolCall(call) => out.tool_calls.push(call),
             StreamEvent::Usage(usage) => out.usage = Some(usage),
-            StreamEvent::Error(err) => return Err(RequestError::from_provider(&err)),
+            // Hand back what was already produced: the tokens were paid for,
+            // and a retry that starts from nothing repeats work the model has
+            // already done.
+            StreamEvent::Error(err) => {
+                return Err(RequestError::from_provider(&err).with_partial(out))
+            }
             StreamEvent::Done { truncated } => out.truncated = truncated,
             _ => {}
         }

@@ -412,3 +412,147 @@ impl Plugin for ReasoningFilterPlugin {
         Ok(())
     }
 }
+
+// ---- partial streams ----------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct StreamRow {
+    /// How many times a turn may preserve a broken stream's output and carry
+    /// on. Low on purpose: a stream that keeps breaking mid-flight is a signal
+    /// about the connection, not something to paper over indefinitely.
+    #[serde(default = "default_recoveries")]
+    max_recoveries: u32,
+}
+
+impl Default for StreamRow {
+    fn default() -> Self {
+        Self {
+            max_recoveries: default_recoveries(),
+        }
+    }
+}
+
+fn default_recoveries() -> u32 {
+    1
+}
+
+const RESUME_NUDGE: &str = "\
+The previous response was cut off mid-stream. The preserved assistant message and any \
+interrupted tool results above are authoritative — continue from that saved progress. Do not \
+repeat tool calls that already completed, and do not restart the task.";
+
+/// Keeps what a broken stream produced, instead of discarding it.
+///
+/// The failure this addresses is quiet: a stream drops after the model has
+/// written half an answer and issued two tool calls. Treating that as a plain
+/// error throws all of it away, and the retry pays for the same tokens again —
+/// or worse, re-runs side-effecting calls that already happened.
+///
+/// So the partial output is committed as a real assistant message, a nudge
+/// explains the situation, and the turn continues from there. Bounded, because
+/// a connection that keeps breaking is not something to keep absorbing.
+struct StreamRecovery {
+    ctx: Context,
+    max_recoveries: u32,
+    used: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait]
+impl Waterfall<AgentRequest> for StreamRecovery {
+    async fn handle(
+        &self,
+        req: &mut ModelRequest,
+        next: Next<'_, AgentRequest>,
+    ) -> Result<ModelResponse, RequestError> {
+        match next.run(req).await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                let Some(partial) = error.partial.clone() else {
+                    return Err(error);
+                };
+                let used = self.used.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if used > self.max_recoveries {
+                    return Err(error);
+                }
+                let Some(session) = self.ctx.service::<SessionSvc>() else {
+                    return Err(error);
+                };
+
+                let turn = session.current_turn();
+                // Committed, not appended: a preserved message that never
+                // reaches the store would be missing from a resumed session
+                // while the model still believed it had said it.
+                crate::session::commit(
+                    &self.ctx,
+                    &session,
+                    SessionEvent::AssistantMessage {
+                        turn,
+                        round: req.round,
+                        text: partial.text.clone(),
+                        reasoning: partial.reasoning.clone(),
+                        // Tool calls are deliberately dropped: a call that was
+                        // still streaming has partial arguments, and one that
+                        // finished has no result recorded — either way the
+                        // model must re-issue it rather than have the harness
+                        // guess. The nudge says so.
+                        tool_calls: Vec::new(),
+                    },
+                );
+                crate::session::commit(
+                    &self.ctx,
+                    &session,
+                    SessionEvent::Injected {
+                        turn,
+                        text: RESUME_NUDGE.to_string(),
+                        origin: crate::session::InjectionOrigin::Continuation,
+                    },
+                );
+                eprintln!(
+                    "\x1b[2mstream broke after partial output; preserved it and continuing \
+                     ({used}/{})\x1b[0m",
+                    self.max_recoveries
+                );
+
+                // Re-project so the retry carries the preserved message.
+                let mut messages: Vec<Message> = req
+                    .messages
+                    .iter()
+                    .take_while(|m| {
+                        m.role == atomcode_kernel::message::Role::System && !m.synthetic
+                    })
+                    .cloned()
+                    .collect();
+                messages.extend(session.derive_messages());
+                req.messages = messages;
+                next.run(req).await
+            }
+        }
+    }
+}
+
+pub struct StreamRecoveryPlugin;
+
+#[async_trait]
+impl Plugin for StreamRecoveryPlugin {
+    fn name(&self) -> &'static str {
+        "llm-stream-recovery"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["sessions"]
+    }
+    fn description(&self) -> &'static str {
+        "keep what a broken stream produced and continue from it"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: StreamRow = parse(config)?;
+        let _ = ctx.on_waterfall::<AgentRequest>(
+            Arc::new(StreamRecovery {
+                ctx: ctx.clone(),
+                max_recoveries: row.max_recoveries,
+                used: std::sync::atomic::AtomicU32::new(0),
+            }),
+            false,
+        );
+        Ok(())
+    }
+}

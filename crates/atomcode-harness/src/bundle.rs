@@ -151,6 +151,10 @@ name = "truncation-recovery"
 config = { max_continuations = 4 }
 
 [[insert]]
+name = "llm-stream-recovery"
+config = { max_recoveries = 1 }
+
+[[insert]]
 name = "reasoning-filter"
 
 [[insert]]

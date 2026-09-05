@@ -223,6 +223,13 @@ impl SessionLog {
         self.turn.load(Ordering::SeqCst)
     }
 
+    /// Append without telling anyone.
+    ///
+    /// Almost always the wrong call. A fact that is appended and not broadcast
+    /// exists in memory and reaches nothing that learns by listening —
+    /// persistence, projections, a UI — so it is silently missing from a
+    /// resumed session. Use [`commit`](crate::session::commit) unless you are
+    /// restoring a log that was already broadcast once.
     pub fn append(&self, event: SessionEvent) -> SeqNo {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         self.events
@@ -389,6 +396,22 @@ fn truncate(text: &str, max: usize) -> String {
         return text.to_string();
     }
     text.chars().take(max).collect::<String>() + "…"
+}
+
+/// Commit one fact: append it, broadcast it, advance the projections.
+///
+/// The single write path, and the reason it is a free function rather than a
+/// method on the log: the log cannot broadcast (it has no context), and every
+/// caller that reached for `append` instead ended up with a fact that survived
+/// in memory and vanished on resume. Turn boundaries, memory injections,
+/// compaction cuts and truncation nudges were each lost that way.
+pub fn commit(ctx: &atomcode_plexus::Context, log: &SessionLog, event: SessionEvent) -> SeqNo {
+    let seq = log.append(event.clone());
+    ctx.emit::<crate::events::SessionEventCommitted>(&LoggedEvent { seq, event });
+    if let Some(projections) = ctx.service::<crate::seams::SessionProjectionsSvc>() {
+        projections.advance(log);
+    }
+    seq
 }
 
 // ---- projections --------------------------------------------------------
