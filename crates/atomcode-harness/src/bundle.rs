@@ -18,6 +18,15 @@ pub const BASE: &str = r#"
 [[insert]]
 name = "agents"
 
+# Where rows describe their own knobs. Never sent unprompted — `describe_self`
+# reads it when asked, so a row can be as detailed as its knob deserves without
+# that detail costing tokens on every request.
+#
+# First, because a contribution to a slot that is not filled yet is silently
+# dropped, and this slot is filled by rows all through the tree.
+[[insert]]
+name = "operations"
+
 # --- the session domain: the log, its projections, its durable store --------
 [[insert]]
 name = "session"
@@ -117,6 +126,13 @@ disabled = true
 
 [[insert]]
 name = "memory"
+
+# Searching the log the harness already writes. Separate from `memory`: memory
+# is what the user chose to state, recall is everything that was said — and a
+# system that only remembers what someone thought to write down remembers very
+# little.
+[[insert]]
+name = "recall"
 
 [[insert]]
 name = "tool-todo"

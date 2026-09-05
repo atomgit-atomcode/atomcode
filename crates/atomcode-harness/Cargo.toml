@@ -25,6 +25,9 @@ atomcode-capabilities = { path = "../atomcode-capabilities", default-features = 
     # feature: the harness has its own session log, and mounting a second
     # session subsystem beside it would be two systems of record.
     "instructions",
+    # The keyword ranking only — so the harness's recall answers a query the
+    # same way L1's does, without adopting L1's record type.
+    "search",
     "memory",
     "web",
     "mcp",

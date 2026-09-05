@@ -10,6 +10,7 @@ pub mod loop_policy;
 pub mod persona;
 pub mod policy;
 pub mod policy_rows;
+pub mod recall;
 pub mod recovery;
 pub mod registries;
 pub mod self_knowledge;
@@ -39,6 +40,7 @@ pub fn catalog() -> PluginRegistry {
     registry
         .register(Arc::new(registries::ToolsPlugin))
         .register(Arc::new(registries::SystemPromptPlugin))
+        .register(Arc::new(registries::OperationsPlugin))
         .register(Arc::new(agents::AgentsPlugin))
         .register(Arc::new(session::SessionPlugin))
         .register(Arc::new(session::SessionProjectionsPlugin))
@@ -64,6 +66,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(capabilities::McpPlugin))
         .register(Arc::new(findings::FindingsPlugin))
         .register(Arc::new(subagent::SubagentPlugin))
+        .register(Arc::new(recall::RecallPlugin))
         .register(Arc::new(self_knowledge::SelfKnowledgePlugin))
         .register(Arc::new(self_knowledge::ProjectInstructionsPlugin))
         .register(Arc::new(persona::CodingPersonaPlugin))

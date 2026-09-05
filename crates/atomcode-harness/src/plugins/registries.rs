@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use atomcode_plexus::{Context, Plugin};
 use serde_json::Value;
 
-use crate::seams::{PromptRegistry, SystemPromptSvc, ToolBox, ToolsSvc};
+use crate::seams::{OperationsSvc, PromptRegistry, SystemPromptSvc, ToolBox, ToolsSvc};
 
 pub struct ToolsPlugin;
 
@@ -47,6 +47,27 @@ impl Plugin for SystemPromptPlugin {
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let _ = ctx
             .provide::<SystemPromptSvc>(Arc::new(PromptRegistry::new()))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+pub struct OperationsPlugin;
+
+#[async_trait]
+impl Plugin for OperationsPlugin {
+    fn name(&self) -> &'static str {
+        "operations"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["operations"]
+    }
+    fn description(&self) -> &'static str {
+        "where each row describes its own knobs, for `describe_self` to answer with"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<OperationsSvc>(Arc::new(PromptRegistry::new()))
             .map_err(|e| e.to_string())?;
         Ok(())
     }

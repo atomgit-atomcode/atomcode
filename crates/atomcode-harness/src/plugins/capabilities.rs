@@ -66,7 +66,7 @@ impl Plugin for SkillsPlugin {
     }
     fn uses(&self) -> &'static [&'static str] {
         // `use_skill` / `list_skills` hold the registry this row provides.
-        &["skills"]
+        &["skills", "operations"]
     }
     fn provides(&self) -> &'static [&'static str] {
         &["skills"]
@@ -114,6 +114,18 @@ impl Plugin for SkillsPlugin {
                 ),
             );
         }
+        crate::plugins::self_knowledge::describes(
+            ctx,
+            "skills",
+            13,
+            format!(
+                "SKILLS — {count} loaded. Markdown files, read from the standard \
+                 per-project and per-user skill directories plus anything the \
+                 row's `dirs` config adds. To add one, drop a markdown file in \
+                 a skill directory and restart; nothing needs recompiling. \
+                 `list_skills` shows what is loaded now."
+            ),
+        );
         Ok(())
     }
 }
@@ -262,8 +274,13 @@ impl Plugin for MemoryPlugin {
     fn inject(&self) -> &'static [&'static str] {
         &["sessions"]
     }
+    fn uses(&self) -> &'static [&'static str] {
+        // The tool half is optional: a tree with no catalog still gets the
+        // injection, which is the half that works with no model cooperation.
+        &["tools", "operations"]
+    }
     fn description(&self) -> &'static str {
-        "inject the user's memory.md as a logged fact on the first turn"
+        "inject memory.md on the first turn, and let the agent write it back"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
         let row: MemoryRow = parse(config)?;
@@ -282,6 +299,35 @@ impl Plugin for MemoryPlugin {
             &MemoryStore::local(&project),
             &project_name,
         );
+        // The write half. Until this the agent could read the user's memory but
+        // never add to it, which made "remember that I prefer X" a request only
+        // a human could carry out — in a system whose whole point is that the
+        // agent carries things out.
+        if let Some(toolbox) = ctx.service::<crate::seams::ToolsSvc>() {
+            toolbox.register(Arc::new(atomcode_capabilities::tools::MemoryTool))?;
+            let toolbox = toolbox.clone();
+            let _ = ctx.effect(move || toolbox.unregister("memory"));
+        }
+
+        crate::plugins::self_knowledge::describes(
+            ctx,
+            "memory",
+            11,
+            format!(
+                "MEMORY — three tiers, merged on the first turn of every session:\n\
+                 \u{20}\u{20}global   {}   (every project)\n\
+                 \u{20}\u{20}project  {}   (this repo, committed)\n\
+                 \u{20}\u{20}local    {}   (this repo on this machine only)\n\
+                 Write with the `memory` tool: \
+                 `{{action: remember|forget|list, content, scope: project|local|global}}`. \
+                 Memory is what someone chose to state; for everything that was \
+                 merely *said*, use `recall` instead.",
+                MemoryStore::global().path().display(),
+                MemoryStore::project(&project).path().display(),
+                MemoryStore::local(&project).path().display(),
+            ),
+        );
+
         if merged.is_empty() {
             return Ok(());
         }
@@ -348,7 +394,7 @@ impl Plugin for McpPlugin {
     }
     fn uses(&self) -> &'static [&'static str] {
         // Every mounted adapter calls back into the registry this row provides.
-        &["mcp"]
+        &["mcp", "operations"]
     }
     fn provides(&self) -> &'static [&'static str] {
         &["mcp"]
@@ -392,6 +438,19 @@ impl Plugin for McpPlugin {
         mount(ctx, adapters)?;
         if let Some(instructions) = registry.instructions_for_mounted_tools(&mounted) {
             contribute_prompt(ctx, "mcp", 62, &instructions);
+        }
+        {
+            crate::plugins::self_knowledge::describes(
+                ctx,
+                "mcp",
+                14,
+                "MCP — how third-party tools get in without recompiling. Each \
+                 server is an entry on the `mcp` row's config (`command`/`args` \
+                 for stdio, `url` for HTTP); its tools join the catalog under \
+                 their own names and go through the same approval as everything \
+                 else. This is the closest thing to installing a plugin at \
+                 runtime; compiled rows require a build.",
+            );
         }
         Ok(())
     }

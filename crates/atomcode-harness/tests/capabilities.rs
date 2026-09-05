@@ -300,6 +300,8 @@ id = "persona-coding"
 [[remove]]
 id = "self-knowledge"
 [[remove]]
+id = "recall"
+[[remove]]
 id = "session-persistence-jsonl"
 [[remove]]
 id = "session-projection"

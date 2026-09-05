@@ -310,6 +310,98 @@ config = { script = [
     );
 }
 
+// ---- how to work it, not just what it is --------------------------------
+
+#[tokio::test]
+async fn every_mounted_row_can_describe_its_own_knobs() {
+    let dir = scratch("operations");
+    let app = start(tree(&dir, &[])).await;
+    let ops = ask(&app, "operations").await;
+
+    // Each of these is written by a different row, which is the point: no
+    // central document could stay right about all of them.
+    for expected in [
+        "MEMORY",
+        "RECALL",
+        "SESSIONS",
+        "MODEL",
+        "HOW THIS SYSTEM IS PUT TOGETHER",
+    ] {
+        assert!(ops.contains(expected), "missing {expected}:\n{ops}");
+    }
+    // Real paths, not prose about paths.
+    assert!(ops.contains("memory.md"), "{ops}");
+    assert!(
+        ops.contains(&dir.to_string_lossy().to_string()),
+        "the memory paths must be this tree's, not a template:\n{ops}"
+    );
+}
+
+#[tokio::test]
+async fn a_row_that_is_not_mounted_describes_nothing() {
+    // The reason descriptions live on rows instead of in a document: a document
+    // would confidently explain a capability this tree does not have.
+    let dir = scratch("ops-absent");
+    let app = start(tree(
+        &dir,
+        &[
+            "[[patch]]\nid = \"memory\"\ndisabled = true",
+            "[[patch]]\nid = \"recall\"\ndisabled = true",
+        ],
+    ))
+    .await;
+    let ops = ask(&app, "operations").await;
+    assert!(!ops.contains("MEMORY"), "{ops}");
+    assert!(!ops.contains("RECALL"), "{ops}");
+    // …while the rows that ARE mounted still describe themselves, so this is
+    // about removal and not about the registry having failed to fill.
+    assert!(ops.contains("SESSIONS"), "{ops}");
+}
+
+#[tokio::test]
+async fn the_settings_answer_is_the_settings_catalog_itself() {
+    let dir = scratch("settings");
+    let app = start(tree(&dir, &[])).await;
+    let said = ask(&app, "settings").await;
+
+    // The judge is the catalog, not a list this test also maintains: add a
+    // setting anywhere in the workspace and this stays true with no edit here.
+    assert!(
+        said.contains(&format!(
+            "{} of them are safely editable",
+            atomcode_config::settings::SETTINGS.len()
+        )),
+        "{said}"
+    );
+    for spec in atomcode_config::settings::SETTINGS {
+        assert!(said.contains(spec.id), "setting {} is missing", spec.id);
+    }
+    // The two questions a person actually asks.
+    assert!(said.contains("language"), "{said}");
+    assert!(
+        said.contains("中文"),
+        "aliases carry, so a Chinese ask still lands"
+    );
+    assert!(
+        said.contains("config.toml"),
+        "and it says which file to edit"
+    );
+}
+
+#[tokio::test]
+async fn settings_says_what_it_deliberately_does_not_cover() {
+    // The catalog excludes model/provider/credentials by design. An answer that
+    // silently omitted them would read as "you cannot change your model".
+    let dir = scratch("settings-gap");
+    let app = start(tree(&dir, &[])).await;
+    let said = ask(&app, "settings").await;
+    assert!(said.contains("deliberately absent"), "{said}");
+    assert!(
+        ask(&app, "operations").await.contains("MODEL"),
+        "and the aspect it points at must actually answer it"
+    );
+}
+
 // ---- the other half: what the repository says ---------------------------
 
 #[tokio::test]

@@ -195,6 +195,12 @@ pub mod mcp;
 #[cfg(feature = "instructions")]
 pub mod instructions;
 
+/// Keyword ranking (CJK-bigram aware) shared by anything searchable. Pure and
+/// dependency-free, so a store with its own record shape can rank the same way
+/// `recall` does without adopting `recall`'s records.
+#[cfg(feature = "search")]
+pub mod search;
+
 #[cfg(feature = "session")]
 pub mod session;
 

@@ -23,6 +23,13 @@ use crate::world::{FileSystem, Shell, Subprocess};
 plexus_service!(LlmSvc => dyn LlmProvider, "llm", Seam, "Model adapter");
 plexus_service!(ToolsSvc => ToolBox, "tools", Core, "The live tool catalog");
 plexus_service!(SystemPromptSvc => PromptRegistry, "system-prompt", Core, "Ordered prompt fragments");
+// Reuses `PromptRegistry` because the shape is identical — ranked fragments
+// keyed by id, removed with their row — and a second implementation of "ordered
+// contributions" would be a second thing to keep correct. The *slot* is what
+// differs: this one is never sent to the model unprompted. It is answered when
+// asked, so a row can describe a knob in as much detail as the knob deserves
+// without that detail costing tokens on every single request.
+plexus_service!(OperationsSvc => PromptRegistry, "operations", Core, "How to work the running system, described by the rows that own each knob");
 plexus_service!(SessionSvc => SessionLog, "sessions", Core, "The append-only session log");
 plexus_service!(SessionProjectionsSvc => SessionProjections, "session-projections", Core, "Incremental folds over the log");
 plexus_service!(SessionPersistenceSvc => dyn SessionPersistence, "session-persistence", Seam, "Durable session storage");

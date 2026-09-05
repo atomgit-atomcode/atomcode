@@ -18,6 +18,7 @@ use serde::Deserialize;
 
 use super::manager::{for_each_jsonl_line, regular_file_len, MAX_JSONL_BYTES, MAX_JSONL_LINES};
 use super::{SessionManager, SessionResult, SessionStoreError, TurnRecord};
+use crate::search::{best_first, tokenize, Score};
 
 /// A parsed recall query: lowercased keyword terms + a result cap.
 pub struct RecallQuery {
@@ -37,48 +38,29 @@ pub trait RecallIndex: Send + Sync {
 /// query terms it matches (`matched_terms`), then by total term occurrences across
 /// the turn's user + assistant + tool (name/args/result) text, then by hit density,
 /// then by recency (`ts` desc). Query terms are CJK-bigram-expanded by
-/// [`tokenize_query`] so space-less Chinese phrases still hit.
+/// [`tokenize`](crate::search::tokenize) so space-less Chinese phrases still hit.
 pub struct KeywordIndex;
-
-/// Per-record score: how many distinct query terms matched, their total occurrences,
-/// and the hay length (density tiebreak). Private; `RecallIndex`/`RecallQuery` unchanged.
-#[derive(Default, Clone, Copy)]
-struct Scored {
-    matched_terms: usize,
-    occurrences: usize,
-    hay_len: usize,
-}
-
-fn density(s: Scored) -> f64 {
-    s.occurrences as f64 / s.hay_len.max(1) as f64
-}
 
 impl RecallIndex for KeywordIndex {
     fn search<'a>(&self, records: &'a [TurnRecord], q: &RecallQuery) -> Vec<&'a TurnRecord> {
-        let mut scored: Vec<(Scored, &'a TurnRecord)> = records
+        let mut scored: Vec<(Score, &'a TurnRecord)> = records
             .iter()
             .filter_map(|r| {
                 let s = score_record(r, &q.terms);
-                (s.matched_terms > 0).then_some((s, r))
+                s.hit().then_some((s, r))
             })
             .collect();
         // coverage desc → occurrences desc → density desc → ts desc (recency).
-        scored.sort_by(|a, b| {
-            b.0.matched_terms
-                .cmp(&a.0.matched_terms)
-                .then(b.0.occurrences.cmp(&a.0.occurrences))
-                .then(
-                    density(b.0)
-                        .partial_cmp(&density(a.0))
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
-                .then(b.1.ts.cmp(&a.1.ts))
-        });
+        // The shared ranking, then recency — the one tiebreak only this record
+        // shape can supply.
+        scored.sort_by(|a, b| best_first(&a.0, &b.0).then(b.1.ts.cmp(&a.1.ts)));
         scored.into_iter().take(q.limit).map(|(_, r)| r).collect()
     }
 }
 
-fn score_record(r: &TurnRecord, terms: &[String]) -> Scored {
+/// A turn's searchable text. Which fields a record puts in the haystack is the
+/// record's own business; how the haystack ranks is not.
+fn score_record(r: &TurnRecord, terms: &[String]) -> Score {
     let mut hay = format!("{} {} {}", r.user, r.assistant, r.reasoning).to_lowercase();
     for t in &r.tools {
         hay.push(' ');
@@ -88,151 +70,7 @@ fn score_record(r: &TurnRecord, terms: &[String]) -> Scored {
         hay.push(' ');
         hay.push_str(&t.result.to_lowercase());
     }
-    let hay_len = hay.chars().count();
-    let mut matched_terms = 0;
-    let mut occurrences = 0;
-    for term in terms {
-        let n = hay.matches(term.as_str()).count();
-        if n > 0 {
-            matched_terms += 1;
-        }
-        occurrences += n;
-    }
-    Scored {
-        matched_terms,
-        occurrences,
-        hay_len,
-    }
-}
-
-/// CJK-run expansion: 1 char → the char itself; n≥2 → all consecutive char bigrams.
-fn expand_cjk_run(run: &str) -> Vec<String> {
-    let chars: Vec<char> = run.chars().collect();
-    match chars.len() {
-        0 => Vec::new(),
-        1 => vec![chars[0].to_string()],
-        n => (0..n - 1)
-            .map(|i| format!("{}{}", chars[i], chars[i + 1]))
-            .collect(),
-    }
-}
-
-fn is_cjk(c: char) -> bool {
-    let cp = c as u32;
-    (0x3400..=0x4DBF).contains(&cp)
-        || (0x4E00..=0x9FFF).contains(&cp)
-        || (0x20000..=0x2EBEF).contains(&cp)
-        || (0x2F800..=0x2FA1F).contains(&cp)
-        || (0x3040..=0x30FF).contains(&cp)
-        || (0x31F0..=0x31FF).contains(&cp)
-        || (0x1100..=0x11FF).contains(&cp)
-        || (0xAC00..=0xD7AF).contains(&cp)
-}
-
-/// Minimal connector 字 (char, not word) — stripable only at run edges.
-fn is_connector_char(c: char) -> bool {
-    matches!(c, '的' | '了' | '与' | '和' | '及' | '或')
-}
-
-/// 2-char connector words, stripped only at run edges.
-const CJK_CONNECTOR_WORDS: &[&str] = &["关于", "以及"];
-
-/// Edge-only connector strip + guard. Returns the core (or the original run when
-/// stripping would leave <2 chars); `None` when the whole run is connectors.
-fn strip_edge_connectors(run: &str) -> Option<String> {
-    let original: Vec<char> = run.chars().collect();
-    if original.len() == 1 {
-        return if is_connector_char(original[0]) {
-            None
-        } else {
-            Some(original[0].to_string())
-        };
-    }
-    let mut cur = run.to_string();
-    loop {
-        let before = cur.clone();
-        for &w in CJK_CONNECTOR_WORDS {
-            if let Some(rest) = cur.strip_prefix(w) {
-                cur = rest.to_string();
-                break;
-            }
-        }
-        for &w in CJK_CONNECTOR_WORDS {
-            if let Some(rest) = cur.strip_suffix(w) {
-                cur = rest.to_string();
-                break;
-            }
-        }
-        if let Some(first) = cur.chars().next() {
-            if is_connector_char(first) {
-                if let Some(rest) = cur.strip_prefix(first) {
-                    cur = rest.to_string();
-                }
-            }
-        }
-        if let Some(last) = cur.chars().next_back() {
-            if is_connector_char(last) {
-                if let Some(rest) = cur.strip_suffix(last) {
-                    cur = rest.to_string();
-                }
-            }
-        }
-        if cur == before {
-            break;
-        }
-    }
-    match cur.chars().count() {
-        0 => None,
-        1 => Some(original.iter().collect()), // guard: don't shave a ≥2 run to 1 char
-        _ => Some(cur),
-    }
-}
-
-/// One whitespace-token containing non-ASCII chars: drop punctuation → split into
-/// CJK/literal runs → edge-strip connectors on CJK runs → bigram-expand CJK runs,
-/// keep literal runs whole. Pure-ASCII tokens never enter here.
-fn tokenize_cjk_token(token: &str) -> Vec<String> {
-    let cleaned: String = token.chars().filter(|c| c.is_alphanumeric()).collect();
-    let chars: Vec<char> = cleaned.chars().collect();
-    let mut terms = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let cjk_run = is_cjk(chars[i]);
-        let mut j = i;
-        while j < chars.len() && is_cjk(chars[j]) == cjk_run {
-            j += 1;
-        }
-        let run: String = chars[i..j].iter().collect();
-        if cjk_run {
-            if let Some(core) = strip_edge_connectors(&run) {
-                terms.extend(expand_cjk_run(&core));
-            }
-        } else {
-            terms.push(run); // literal run kept whole (already lowercased)
-        }
-        i = j;
-    }
-    terms
-}
-
-/// Lowercase → split_whitespace → pure-ASCII tokens verbatim / CJK tokens via
-/// [`tokenize_cjk_token`] → dedup, first-occurrence order.
-fn tokenize_query(query: &str) -> Vec<String> {
-    let lower = query.to_lowercase();
-    let mut terms: Vec<String> = Vec::new();
-    for raw in lower.split_whitespace() {
-        let candidates: Vec<String> = if raw.is_ascii() {
-            vec![raw.to_string()]
-        } else {
-            tokenize_cjk_token(raw)
-        };
-        for t in candidates {
-            if !t.is_empty() && !terms.contains(&t) {
-                terms.push(t);
-            }
-        }
-    }
-    terms
+    crate::search::score(&hay, terms)
 }
 
 #[derive(Debug, Deserialize)]
@@ -310,7 +148,7 @@ impl RecallTool {
             .collect();
 
         let q = RecallQuery {
-            terms: tokenize_query(query),
+            terms: tokenize(query),
             limit,
         };
         let hits = self.index.search(&records, &q);
@@ -798,45 +636,6 @@ mod tests {
             RecallTool::new().search_dir(dir.path(), "hello", None, None, 8),
             Err(SessionStoreError::UnsafeFile { .. })
         ));
-    }
-
-    #[test]
-    fn tokenize_query_preserves_ascii_behavior() {
-        assert_eq!(
-            tokenize_query("OAuth Refresh  TOKEN"),
-            vec!["oauth", "refresh", "token"]
-        );
-        assert_eq!(tokenize_query("oauth.refresh"), vec!["oauth.refresh"]);
-        assert!(tokenize_query("").is_empty());
-        assert!(tokenize_query("   ").is_empty());
-    }
-
-    #[test]
-    fn tokenize_query_expands_cjk_to_bigrams() {
-        assert_eq!(tokenize_query("工作任务"), vec!["工作", "作任", "任务"]);
-        assert_eq!(tokenize_query("工"), vec!["工"]);
-        assert_eq!(
-            tokenize_query("工作任务 工作"),
-            vec!["工作", "作任", "任务"]
-        );
-    }
-
-    #[test]
-    fn tokenize_query_cleans_punctuation_and_connectors() {
-        assert_eq!(tokenize_query("工作,任务"), vec!["工作", "作任", "任务"]);
-        assert_eq!(tokenize_query("工作，任务"), vec!["工作", "作任", "任务"]);
-        assert_eq!(tokenize_query("关于工作 任务"), vec!["工作", "任务"]);
-        assert_eq!(tokenize_query("工作的"), vec!["工作"]);
-        assert_eq!(tokenize_query("目的"), vec!["目的"]);
-        assert!(tokenize_query("的 了 和").is_empty());
-    }
-
-    #[test]
-    fn tokenize_query_handles_mixed_ascii_cjk() {
-        assert_eq!(tokenize_query("OAuth的token"), vec!["oauth", "token"]);
-        let kana = tokenize_query("日本語のセッションid");
-        assert!(!kana.is_empty());
-        assert!(kana.iter().any(|t| t == "id"));
     }
 
     #[test]

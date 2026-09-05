@@ -42,6 +42,10 @@ impl Plugin for OpenAiCompatPlugin {
     fn name(&self) -> &'static str {
         "llm-openai-compat"
     }
+    fn uses(&self) -> &'static [&'static str] {
+        // This row tells `describe_self` how to switch the model.
+        &["operations"]
+    }
     fn provides(&self) -> &'static [&'static str] {
         &["llm"]
     }
@@ -98,6 +102,21 @@ impl Plugin for OpenAiCompatPlugin {
         let _ = ctx
             .provide::<LlmSvc>(Arc::new(provider))
             .map_err(|e| e.to_string())?;
+        crate::plugins::self_knowledge::describes(
+            ctx,
+            "model",
+            5,
+            format!(
+                "MODEL. This tree talks to `{model}` at `{base_url}`, through the \
+                 `llm-openai-compat` row reading ATOMCODE_BASE_URL / \
+                 ATOMCODE_MODEL / {key_env}.\n\
+                 To switch model: change ATOMCODE_MODEL and restart. To use the \
+                 account already configured in AtomCode instead, drop \
+                 `--env-model` so the `llm` row is `llm-atomcode-config`.\n\
+                 The model is NOT in the user-settings catalog on purpose — it \
+                 is a row in the running tree, not a preference."
+            ),
+        );
         Ok(())
     }
 }
@@ -197,6 +216,10 @@ impl Plugin for ReplayPlugin {
     fn name(&self) -> &'static str {
         "llm-replay"
     }
+    fn uses(&self) -> &'static [&'static str] {
+        // This row tells `describe_self` how to switch the model.
+        &["operations"]
+    }
     fn provides(&self) -> &'static [&'static str] {
         &["llm"]
     }
@@ -211,7 +234,24 @@ impl Plugin for ReplayPlugin {
         };
         let _ = ctx
             .provide::<LlmSvc>(Arc::new(ReplayProvider {
-                script: row.script,
+                script: {
+                    crate::plugins::self_knowledge::describes(
+                        ctx,
+                        "model",
+                        5,
+                        format!(
+                            "MODEL. There is no model. The `llm` row is \
+                             `llm-replay`, a scripted stand-in with {} canned \
+                             answer(s) and no network — used by `--offline` and \
+                             by every test. Nothing you say reaches a provider. \
+                             To talk to a real one, restart without `--offline`, \
+                             or with `--env-model` plus ATOMCODE_BASE_URL / \
+                             ATOMCODE_MODEL / ATOMCODE_API_KEY.",
+                            row.script.len()
+                        ),
+                    );
+                    row.script
+                },
                 cursor: std::sync::atomic::AtomicUsize::new(0),
             }))
             .map_err(|e| e.to_string())?;
@@ -246,6 +286,10 @@ pub struct AtomcodeConfigPlugin;
 impl Plugin for AtomcodeConfigPlugin {
     fn name(&self) -> &'static str {
         "llm-atomcode-config"
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        // This row tells `describe_self` how to switch the model.
+        &["operations"]
     }
     fn provides(&self) -> &'static [&'static str] {
         &["llm"]
@@ -307,6 +351,26 @@ impl Plugin for AtomcodeConfigPlugin {
             resolved.selection_id,
             resolved.model,
             path.display()
+        );
+        crate::plugins::self_knowledge::describes(
+            ctx,
+            "model",
+            5,
+            format!(
+                "MODEL. This tree uses selection `{}` (model `{}`) from `{}`, via \
+                 the `llm-atomcode-config` row.\n\
+                 To switch model: change the selection in that file (the \
+                 `/model` picker writes it), or put `config = {{ model = \"…\" }}` \
+                 on the `llm` row.\n\
+                 To use an arbitrary OpenAI-compatible endpoint instead, launch \
+                 with `--env-model` and set ATOMCODE_BASE_URL / ATOMCODE_MODEL / \
+                 ATOMCODE_API_KEY — that swaps this row for `llm-openai-compat`.\n\
+                 The model is NOT in the user-settings catalog on purpose — it \
+                 is a row in the running tree, not a preference.",
+                resolved.selection_id,
+                resolved.model,
+                path.display()
+            ),
         );
         let _ = ctx
             .provide::<LlmSvc>(Arc::new(provider))

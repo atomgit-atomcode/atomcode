@@ -155,9 +155,17 @@ impl Plugin for SessionProjectionsPlugin {
 
 #[derive(Debug, Deserialize, Default)]
 struct PersistenceRow {
-    /// Directory for `<session-id>.jsonl`. Defaults under the harness home.
+    /// Directory holding the per-project session buckets. Defaults under the
+    /// harness home.
     #[serde(default)]
     root: Option<String>,
+    /// Which project this session belongs to. Sessions bucket by it, so
+    /// "what did we do on *this* repo" is answerable at all — a flat directory
+    /// has no such dimension and no index can invent one.
+    ///
+    /// Defaults to the process cwd.
+    #[serde(default)]
+    project_root: Option<String>,
     /// Load the session's existing events at mount time.
     ///
     /// There is no separate snapshot format to restore from: the log *is* the
@@ -169,15 +177,17 @@ struct PersistenceRow {
     resume: bool,
 }
 
-struct JsonlStore {
+pub(crate) struct JsonlStore {
     root: PathBuf,
+    /// The project bucket new sessions are written into.
+    bucket: String,
 }
 
 impl JsonlStore {
-    fn path(&self, session_id: &str) -> PathBuf {
-        // Session ids are minted here, but a resumed one arrives from outside:
-        // keep it to one path segment so a crafted id cannot escape the root.
-        let safe: String = session_id
+    /// One path segment, whatever the id claims to be. Ids are minted here but a
+    /// resumed one arrives from outside, and a crafted id must not escape.
+    fn safe(session_id: &str) -> String {
+        session_id
             .chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -186,43 +196,28 @@ impl JsonlStore {
                     '_'
                 }
             })
-            .collect();
-        self.root.join(format!("{safe}.jsonl"))
-    }
-}
-
-#[async_trait]
-impl SessionPersistence for JsonlStore {
-    fn location(&self, session_id: &str) -> Option<String> {
-        Some(self.path(session_id).display().to_string())
+            .collect()
     }
 
-    async fn append(&self, session_id: &str, events: &[LoggedEvent]) -> Result<(), String> {
-        if events.is_empty() {
-            return Ok(());
-        }
-        std::fs::create_dir_all(&self.root).map_err(|e| e.to_string())?;
-        let mut buffer = String::new();
-        for logged in events {
-            let line = serde_json::json!({ "seq": logged.seq, "event": logged.event });
-            buffer.push_str(&serde_json::to_string(&line).map_err(|e| e.to_string())?);
-            buffer.push('\n');
-        }
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.path(session_id))
-            .map_err(|e| e.to_string())?;
-        file.write_all(buffer.as_bytes()).map_err(|e| e.to_string())
+    /// The project's bucket directory.
+    pub(crate) fn dir(&self) -> PathBuf {
+        self.root.join(&self.bucket)
     }
 
-    async fn load(&self, session_id: &str) -> Result<Vec<LoggedEvent>, String> {
-        let path = self.path(session_id);
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    fn path(&self, session_id: &str) -> PathBuf {
+        self.dir().join(format!("{}.jsonl", Self::safe(session_id)))
+    }
+
+    /// Where sessions written before bucketing existed still live.
+    ///
+    /// Read-only and deliberately not migrated: a resume must keep working for
+    /// a log the user already has, and rewriting a hundred files on disk to
+    /// tidy a layout is a much worse trade than reading two paths.
+    fn legacy_path(&self, session_id: &str) -> PathBuf {
+        self.root.join(format!("{}.jsonl", Self::safe(session_id)))
+    }
+
+    fn parse(path: &std::path::Path, text: &str) -> Result<Vec<LoggedEvent>, String> {
         let mut events = Vec::new();
         for (index, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
@@ -239,8 +234,57 @@ impl SessionPersistence for JsonlStore {
         Ok(events)
     }
 
+    /// Read one session's events from a path, for a reader that already knows
+    /// which file it wants (the recall row walking the bucket).
+    pub(crate) fn read_at(path: &std::path::Path) -> Result<Vec<LoggedEvent>, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        Self::parse(path, &text)
+    }
+}
+
+#[async_trait]
+impl SessionPersistence for JsonlStore {
+    fn location(&self, session_id: &str) -> Option<String> {
+        Some(self.path(session_id).display().to_string())
+    }
+
+    async fn append(&self, session_id: &str, events: &[LoggedEvent]) -> Result<(), String> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(self.dir()).map_err(|e| e.to_string())?;
+        let mut buffer = String::new();
+        for logged in events {
+            let line = serde_json::json!({ "seq": logged.seq, "event": logged.event });
+            buffer.push_str(&serde_json::to_string(&line).map_err(|e| e.to_string())?);
+            buffer.push('\n');
+        }
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.path(session_id))
+            .map_err(|e| e.to_string())?;
+        file.write_all(buffer.as_bytes()).map_err(|e| e.to_string())
+    }
+
+    async fn load(&self, session_id: &str) -> Result<Vec<LoggedEvent>, String> {
+        // The bucket first, then where sessions lived before buckets existed.
+        let path = match self.path(session_id) {
+            p if p.exists() => p,
+            _ => self.legacy_path(session_id),
+        };
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        Self::read_at(&path)
+    }
+
     async fn list(&self) -> Result<Vec<String>, String> {
-        let Ok(entries) = std::fs::read_dir(&self.root) else {
+        // This project's sessions, not every session on the machine. A list
+        // that crossed projects would make "what did we do here" unanswerable
+        // by the same amount the flat layout did.
+        let Ok(entries) = std::fs::read_dir(self.dir()) else {
             return Ok(Vec::new());
         };
         let mut ids: Vec<String> = entries
@@ -269,7 +313,7 @@ impl Plugin for SessionPersistenceJsonlPlugin {
         &["sessions"]
     }
     fn uses(&self) -> &'static [&'static str] {
-        &["session-persistence"]
+        &["session-persistence", "operations"]
     }
     fn provides(&self) -> &'static [&'static str] {
         &["session-persistence"]
@@ -283,7 +327,31 @@ impl Plugin for SessionPersistenceJsonlPlugin {
             .root
             .map(PathBuf::from)
             .unwrap_or_else(|| crate::home().join("sessions"));
-        let store = Arc::new(JsonlStore { root });
+        let project = row
+            .project_root
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        // The same bucket id the rest of the stack uses, so the two session
+        // stores under this root stop sharing one level and start agreeing on
+        // what a project is.
+        let bucket = atomcode_config::util::stable_project_hash(&project);
+        let store = Arc::new(JsonlStore { root, bucket });
+        crate::plugins::self_knowledge::describes(
+            ctx,
+            "sessions",
+            10,
+            format!(
+                "SESSIONS. Every committed fact of this session is appended to \n\
+                 `{}`. Sessions are bucketed per project, so the `recall` tool \n\
+                 searches this project's history and not the whole machine's.\n\
+                 To resume one: set `resume = true` on the \
+                 `session-persistence-jsonl` row and `id = \"<session-id>\"` on \
+                 the `session` row. There is no snapshot format — the log IS the \
+                 snapshot, so a resume is a replay.",
+                store.dir().display()
+            ),
+        );
         let _ = ctx
             .provide::<SessionPersistenceSvc>(store.clone())
             .map_err(|e| e.to_string())?;
