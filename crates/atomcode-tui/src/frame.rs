@@ -1,0 +1,385 @@
+//! What gets painted: geometry, a styled line, and a composed frame.
+//!
+//! A frame is a **value**. Nothing here writes to a terminal — that is the
+//! `surface` seam's job. Keeping the frame a value is what lets a test assert
+//! on what would be shown without a tty, and what lets the same frame be
+//! checked against a real terminal emulator's cell grid (the external oracle).
+
+use std::fmt;
+
+/// A rectangle in cells. Origin is top-left, `(0, 0)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rect {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+impl Rect {
+    pub const fn new(x: u16, y: u16, w: u16, h: u16) -> Self {
+        Self { x, y, w, h }
+    }
+
+    /// A rect at the origin — the shape a module usually cares about, since a
+    /// module must render the same regardless of where it sits.
+    pub const fn sized(w: u16, h: u16) -> Self {
+        Self::new(0, 0, w, h)
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.w == 0 || self.h == 0
+    }
+
+    pub const fn right(&self) -> u16 {
+        self.x + self.w
+    }
+
+    pub const fn bottom(&self) -> u16 {
+        self.y + self.h
+    }
+
+    pub fn contains(&self, x: u16, y: u16) -> bool {
+        x >= self.x && x < self.right() && y >= self.y && y < self.bottom()
+    }
+
+    /// Split vertically: `top` rows above, the rest below. Saturates rather
+    /// than panicking — a layout op must never be able to crash the host.
+    pub fn split_v(&self, top: u16) -> (Rect, Rect) {
+        let top = top.min(self.h);
+        (
+            Rect::new(self.x, self.y, self.w, top),
+            Rect::new(self.x, self.y + top, self.w, self.h - top),
+        )
+    }
+
+    /// Split horizontally: `left` columns, then the rest.
+    pub fn split_h(&self, left: u16) -> (Rect, Rect) {
+        let left = left.min(self.w);
+        (
+            Rect::new(self.x, self.y, left, self.h),
+            Rect::new(self.x + left, self.y, self.w - left, self.h),
+        )
+    }
+}
+
+/// How a run of text is drawn. Deliberately small: a theme maps meaning to
+/// colour, so modules speak in roles rather than in ANSI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Style {
+    pub fg: Option<Color>,
+    pub bg: Option<Color>,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub reverse: bool,
+}
+
+impl Style {
+    pub const fn new() -> Self {
+        Self {
+            fg: None,
+            bg: None,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            reverse: false,
+        }
+    }
+    pub const fn fg(mut self, c: Color) -> Self {
+        self.fg = Some(c);
+        self
+    }
+    pub const fn bg(mut self, c: Color) -> Self {
+        self.bg = Some(c);
+        self
+    }
+    pub const fn bold(mut self) -> Self {
+        self.bold = true;
+        self
+    }
+    pub const fn dim(mut self) -> Self {
+        self.dim = true;
+        self
+    }
+    pub const fn reverse(mut self) -> Self {
+        self.reverse = true;
+        self
+    }
+}
+
+/// A colour, in the terminal's own vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Color {
+    /// One of the 256 indexed colours.
+    Ansi(u8),
+    Rgb(u8, u8, u8),
+}
+
+/// A run of text sharing one style. Lines are made of these so a renderer can
+/// emit one escape sequence per run rather than one per character.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub text: String,
+    pub style: Style,
+}
+
+impl Span {
+    pub fn raw(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: Style::new(),
+        }
+    }
+    pub fn styled(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
+        }
+    }
+    /// Display width in cells, which is not the byte length and not the char
+    /// count — CJK and emoji occupy two.
+    pub fn width(&self) -> usize {
+        crate::width::str_width(&self.text)
+    }
+}
+
+/// One rendered row.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Line {
+    pub spans: Vec<Span>,
+}
+
+impl Line {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn raw(text: impl Into<String>) -> Self {
+        Self {
+            spans: vec![Span::raw(text)],
+        }
+    }
+
+    pub fn styled(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            spans: vec![Span::styled(text, style)],
+        }
+    }
+
+    pub fn from_spans(spans: Vec<Span>) -> Self {
+        Self { spans }
+    }
+
+    pub fn push(&mut self, span: Span) {
+        self.spans.push(span);
+    }
+
+    pub fn width(&self) -> usize {
+        self.spans.iter().map(Span::width).sum()
+    }
+
+    /// The text with styling dropped. For assertions and for the exit dump.
+    pub fn plain(&self) -> String {
+        self.spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    /// Cut to `w` cells, never mid-grapheme and never mid-wide-character.
+    pub fn truncate(&self, w: usize) -> Line {
+        if self.width() <= w {
+            return self.clone();
+        }
+        let mut out = Vec::new();
+        let mut used = 0usize;
+        for span in &self.spans {
+            if used >= w {
+                break;
+            }
+            let room = w - used;
+            let cut = crate::width::take_width(&span.text, room);
+            used += crate::width::str_width(&cut);
+            if !cut.is_empty() {
+                out.push(Span::styled(cut, span.style));
+            }
+        }
+        Line { spans: out }
+    }
+}
+
+impl fmt::Display for Line {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.plain())
+    }
+}
+
+/// Lines placed at a rect, tagged with who produced them.
+///
+/// The tag is not decoration: the containment check ("every cell a module drew
+/// is inside the rect it was given") is what makes spatial composability
+/// verifiable per module, and it needs to know whose cell each one is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Placed {
+    pub owner: String,
+    pub rect: Rect,
+    pub lines: Vec<Line>,
+}
+
+/// A whole screen, composed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Frame {
+    pub size: Rect,
+    pub parts: Vec<Placed>,
+    /// Where the terminal cursor should end up, if anywhere.
+    pub cursor: Option<(u16, u16)>,
+}
+
+impl Frame {
+    pub fn new(w: u16, h: u16) -> Self {
+        Self {
+            size: Rect::sized(w, h),
+            parts: Vec::new(),
+            cursor: None,
+        }
+    }
+
+    pub fn place(&mut self, owner: impl Into<String>, rect: Rect, lines: Vec<Line>) {
+        self.parts.push(Placed {
+            owner: owner.into(),
+            rect,
+            lines,
+        });
+    }
+
+    /// What one module drew.
+    pub fn part(&self, owner: &str) -> Option<&Placed> {
+        self.parts.iter().find(|p| p.owner == owner)
+    }
+
+    /// Flatten to plain rows, for assertions and the exit dump. Later parts
+    /// overwrite earlier ones, which is what `Region::Stack` means.
+    pub fn rows(&self) -> Vec<String> {
+        let mut grid: Vec<Vec<char>> = vec![vec![' '; self.size.w as usize]; self.size.h as usize];
+        for part in &self.parts {
+            for (dy, line) in part.lines.iter().enumerate() {
+                let y = part.rect.y as usize + dy;
+                if y >= grid.len() || dy >= part.rect.h as usize {
+                    break;
+                }
+                let mut x = part.rect.x as usize;
+                for ch in line.truncate(part.rect.w as usize).plain().chars() {
+                    let cw = crate::width::char_width(ch);
+                    if x >= grid[y].len() {
+                        break;
+                    }
+                    grid[y][x] = ch;
+                    for k in 1..cw {
+                        if x + k < grid[y].len() {
+                            grid[y][x + k] = '\0';
+                        }
+                    }
+                    x += cw.max(1);
+                }
+            }
+        }
+        grid.into_iter()
+            .map(|row| row.into_iter().filter(|c| *c != '\0').collect())
+            .collect()
+    }
+
+    /// Every cell a module drew is inside the rect it was given.
+    ///
+    /// The machine-checkable form of "a module occupies its part of the window
+    /// and no more" — the pixel-level verdict on spatial composability.
+    pub fn containment_violations(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for part in &self.parts {
+            if part.lines.len() > part.rect.h as usize {
+                out.push(format!(
+                    "`{}` drew {} lines into a rect {} tall",
+                    part.owner,
+                    part.lines.len(),
+                    part.rect.h
+                ));
+            }
+            for (i, line) in part.lines.iter().enumerate() {
+                if line.width() > part.rect.w as usize {
+                    out.push(format!(
+                        "`{}` line {i} is {} cells wide in a rect {} wide",
+                        part.owner,
+                        line.width(),
+                        part.rect.w
+                    ));
+                }
+            }
+            if part.rect.right() > self.size.w || part.rect.bottom() > self.size.h {
+                out.push(format!(
+                    "`{}` was given {:?}, which is outside the {}×{} screen",
+                    part.owner, part.rect, self.size.w, self.size.h
+                ));
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_split_saturates_instead_of_panicking() {
+        let r = Rect::sized(10, 4);
+        let (a, b) = r.split_v(99);
+        assert_eq!(a.h, 4);
+        assert_eq!(b.h, 0);
+        let (a, b) = r.split_h(99);
+        assert_eq!(a.w, 10);
+        assert_eq!(b.w, 0);
+    }
+
+    #[test]
+    fn width_counts_cells_not_bytes_or_chars() {
+        assert_eq!(Span::raw("abc").width(), 3);
+        assert_eq!(Span::raw("中文").width(), 4, "CJK is two cells each");
+        assert_eq!(Span::raw("").width(), 0);
+    }
+
+    #[test]
+    fn truncating_never_splits_a_wide_character() {
+        let line = Line::raw("中文abc");
+        assert_eq!(
+            line.truncate(3).plain(),
+            "中",
+            "3 cells cannot hold two CJK"
+        );
+        assert_eq!(line.truncate(4).plain(), "中文");
+        assert_eq!(line.truncate(99).plain(), "中文abc");
+    }
+
+    #[test]
+    fn containment_catches_a_module_drawing_outside_its_box() {
+        let mut f = Frame::new(10, 3);
+        f.place("good", Rect::new(0, 0, 10, 1), vec![Line::raw("hi")]);
+        assert!(f.containment_violations().is_empty());
+
+        f.place(
+            "greedy",
+            Rect::new(0, 1, 4, 1),
+            vec![Line::raw("far too wide"), Line::raw("and too tall")],
+        );
+        let v = f.containment_violations();
+        // One for the line count, one for each over-wide line.
+        assert_eq!(v.len(), 3, "{v:?}");
+        assert!(v.iter().all(|m| m.contains("greedy")));
+    }
+
+    #[test]
+    fn rows_flatten_to_a_grid_the_size_of_the_screen() {
+        let mut f = Frame::new(6, 2);
+        f.place("a", Rect::new(0, 0, 6, 1), vec![Line::raw("abc")]);
+        f.place("b", Rect::new(2, 1, 4, 1), vec![Line::raw("xy")]);
+        assert_eq!(f.rows(), vec!["abc   ".to_string(), "  xy  ".to_string()]);
+    }
+}

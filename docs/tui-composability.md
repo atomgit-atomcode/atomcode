@@ -633,31 +633,26 @@ Frame(我的模型)  ──surface──> ANSI 字节 ──vte 解析──> �
 
 **声明它们,是为了让「跑绿了」这三个字不被读成「做对了」。**
 
-## 十、装置台账
+## 十、装置台账(只登记已经装上的)
 
-**每个装置都要能追溯到一次真实发生过的麻烦。** 凭空想象的规则拦不住真实错误,
-还会挤占本就有限的注意力。
+**每个装置都要能追溯到一次真实发生过的麻烦**,而且**必须现在就能跑**。
+计划中的装置不进这张表,进 §十三 的落地顺序——那是任务表,这是台账。
+`scripts/verify-ledger.sh` 把这条变成闸门:逐行验证引用真的能解析。
 
-| # | 装置 | 起因(真实失败) |
+| # | 装置(可解析引用) | 起因(真实失败) |
 |---|---|---|
-| 1 | `SessionEvent::Notice` + 禁 `eprintln!` 的 lint | `recovery.rs:112/241/514` 往 alternate screen 打 stderr:画面会花,而且面板画不出这些状态,**卸载再挂载恢复不了——时间可组合性在这里破了** |
-| 2 | `render` 类型上不给 async | `ui_tui.rs` 的 `draw()` 在绘制路径里 `await` |
-| 3 | 禁 `static .*Mutex` 的 lint | `ui_tui.rs` 的 `CURRENT_INPUT` 全局输入缓冲 |
-| 4 | per-round `yield_now()` + `settle()` 超时对照 | 全内存 turn 一次 poll 跑完,按键插不进,交错测试会全部假绿 |
-| 5 | 产品行/测试行分开统计 | 用 117k 总行估了两次迁移成本,实际产品代码 25,275 行——差三倍 |
-| 6 | 区域树而非固定槽 | 上一版判断「可配置布局是在解决还没人提出的问题」,判断错了 |
-| 7 | `tui_conformance!` 宏而非手写性质测试 | 逐模块手写必然衰减:先写的有好测试,后写的凑合 |
-| 8 | vte 断言层 | 用自己的渲染器判自己的渲染器,一致是必然的,没有信息量 |
-| 9 | `./gates/tui.sh --bless` | 需要人肉看一眼的黄金帧,会让严格遵守流程的 Agent 正确地卡住 |
-| 10 | `Vec<Slot>` 而非单个 `live` | 并行工具调用同时有 N 个未决,单 live 表达不了 |
-| 11 | 三条入口的 op 相等断言 | 键位/命令/自然语言三条路,天然会长成三份布局编辑实现 |
-| 12 | 同一 kind 连续块数上界断言 | 把 todo 清单整个塞进流会刷屏,而「只增不减」仍然绿 |
-| 13 | 退出回吐测试 | 全屏会吞掉退出后的可见输出,而这是开发者工具的硬需求 |
-| 14 | panic 注入 + `Drop` 恢复终端 | 留一个 raw mode 的 shell 给用户,比没有 UI 更糟 |
-| 15 | 禁 `Instant::now` 的 lint | 一次墙钟读取静默毁掉闭环:测试还绿,但同一输入不再给同一输出 |
-| 16 | `frame(Idle, 0) == frame(Idle, 5)` 断言 | 闲着也重画的动画会白烧 SSH 带宽,而「真的在动」那条测试仍然绿 |
-
----
+| 1 | `crates/atomcode-harness/src/session.rs` 的 `SessionEvent::Notice` + `tests/recovery.rs::a_recovery_a_person_should_know_about_is_logged_not_printed` | `recovery.rs:112/241/514` 往 stderr 打状态:全屏 UI 里会把画面打花,面板画不出它,卸载再挂载恢复不了 |
+| 2 | `crates/atomcode-harness/src/plugins/handle.rs` 的 `Projector::project` 无 `_` 兜底 | 新增一条事实可以静默地对每个驱动方不可见;去掉通配后加变体当场编译失败 |
+| 3 | `crates/atomcode-harness/src/plugins/agent_loop.rs` 的 per-round `tokio::task::yield_now` | 全内存 turn 一次 poll 跑完,握停止按钮的任务永远排不上队,取消送不达 |
+| 4 | `crates/atomcode-tui/src/frame.rs` 的 `Frame::containment_violations` + `containment_catches_a_module_drawing_outside_its_box` | 模块画出自己的框,是空间可组合性最直接的违例,而肉眼很难发现 |
+| 5 | `crates/atomcode-tui/src/block.rs` 的 `StreamWriter`(无 settled 可变访问)+ `a_settled_block_cannot_be_amended` | 终态被改写是「流不可逆」的根本违例,靠约定挡不住 |
+| 6 | `crates/atomcode-tui/src/block.rs` 的 `hash_of`(FNV)+ `the_hash_is_stable_across_runs_not_just_within_one` | `DefaultHasher` 跨进程不稳定,会让冻结性断言在本地绿、CI 红 |
+| 7 | `crates/atomcode-tui/src/width.rs` 用 `unicode-width` 作权威 + `the_authority_is_unicode_width_not_our_own_table` | 自建宽度表就是用自己的实现判自己的实现 |
+| 8 | `crates/atomcode-tui/src/width.rs` 的 `wrap` 消费迭代器 + `a_character_wider_than_the_line_is_dropped_not_hung_on` | 两格宽字符遇到一格行宽时 `take_width` 永远返回空,`while` 不推进——测试挂死 60 秒被 SIGKILL,现场表现是「构建慢」 |
+| 9 | `crates/atomcode-tui/src/region.rs` 的 `Region::prune` + `an_unmounted_module_collapses_instead_of_panicking` | `code-review` 的布局在 `longcode` 下引用了未挂载的模块 |
+| 10 | `crates/atomcode-tui/src/region.rs` 的 `layout_never_panics_at_any_size` | 布局在宽度 0/1 或极小终端下越界或 panic |
+| 11 | `gates/tui.sh` + `gates/tui-negative.sh` | 没有一条命令能回答「现在是好的吗」,验收只能靠人 |
+| 12 | `gates/tui.sh` 里 clippy 的 `--no-deps` | `-D warnings` 把整个依赖树的存量警告升级成错误,闸门首跑即红——而首跑即红的闸门会被关掉 |
 
 ## 十一、被推翻的设计(放弃了什么)
 
@@ -732,6 +727,7 @@ Frame(我的模型)  ──surface──> ANSI 字节 ──vte 解析──> �
 
 ## 十三、落地顺序
 
+**这一节就是接手点任务表**——§十 的台账只登记已经装上的,计划中的装置在这里。
 每步单独绿、单独 commit、单独回滚:
 
 ```

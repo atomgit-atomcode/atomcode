@@ -653,6 +653,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomcode-tui"
+version = "5.0.9"
+dependencies = [
+ "async-trait",
+ "atomcode-harness",
+ "atomcode-kernel",
+ "atomcode-plexus",
+ "crossterm",
+ "ctor",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
 name = "atomcode-tuix"
 version = "5.0.9"
 dependencies = [
