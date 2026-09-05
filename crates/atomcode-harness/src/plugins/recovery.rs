@@ -25,7 +25,7 @@ use serde_json::Value;
 
 use crate::events::{AgentRequest, ModelRequest, ModelResponse, RequestError};
 use crate::seams::{CompactionSvc, SessionSvc};
-use crate::session::SessionEvent;
+use crate::session::{NoticeKind, SessionEvent};
 
 fn parse<T: for<'de> Deserialize<'de> + Default>(config: &Value) -> Result<T, String> {
     if config.is_null() {
@@ -74,7 +74,27 @@ fn default_fallback() -> u64 {
     5
 }
 
+/// Tell a person, through the log.
+///
+/// Not `eprintln!`: in a full-screen UI stderr corrupts the display it was
+/// meant to inform, and a state that only exists on stderr cannot be rendered
+/// by a panel, replayed on resume, or constructed in a test.
+fn notice(ctx: &Context, notice: crate::session::NoticeKind, detail: String) {
+    if let Some(session) = ctx.service::<SessionSvc>() {
+        crate::session::commit(
+            ctx,
+            &session,
+            crate::session::SessionEvent::Notice {
+                turn: session.current_turn(),
+                notice,
+                detail,
+            },
+        );
+    }
+}
+
 struct RateLimit {
+    ctx: Context,
     max_waits: u32,
     max_wait: Duration,
     fallback: Duration,
@@ -109,10 +129,14 @@ impl Waterfall<AgentRequest> for RateLimit {
                         });
                     }
                     waits += 1;
-                    eprintln!(
-                        "\x1b[2mrate limited; waiting {}s ({waits}/{})\x1b[0m",
-                        wait.as_secs(),
-                        self.max_waits
+                    notice(
+                        &self.ctx,
+                        NoticeKind::RateLimited,
+                        format!(
+                            "rate limited; waiting {}s ({waits}/{})",
+                            wait.as_secs(),
+                            self.max_waits
+                        ),
                     );
                     tokio::time::sleep(wait).await;
                 }
@@ -138,6 +162,7 @@ impl Plugin for RateLimitPlugin {
         // they each burn an attempt against a limit that has not lifted.
         let _ = ctx.on_waterfall::<AgentRequest>(
             Arc::new(RateLimit {
+                ctx: ctx.clone(),
                 max_waits: row.max_waits,
                 max_wait: Duration::from_secs(row.max_wait_secs),
                 fallback: Duration::from_secs(row.fallback_secs),
@@ -238,9 +263,13 @@ impl Waterfall<AgentRequest> for OverflowLadder {
                     messages.extend(session.derive_messages());
                     req.messages = messages;
                     attempt += 1;
-                    eprintln!(
-                        "\x1b[2mcontext overflow; compacted and retrying ({attempt}/{})\x1b[0m",
-                        self.max_attempts
+                    notice(
+                        &self.ctx,
+                        NoticeKind::OverflowCompacted,
+                        format!(
+                            "context overflow; compacted and retrying ({attempt}/{})",
+                            self.max_attempts
+                        ),
                     );
                 }
                 Err(error) => return Err(error),
@@ -511,10 +540,14 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                         origin: crate::session::InjectionOrigin::Continuation,
                     },
                 );
-                eprintln!(
-                    "\x1b[2mstream broke after partial output; preserved it and continuing \
-                     ({used}/{})\x1b[0m",
-                    self.max_recoveries
+                notice(
+                    &self.ctx,
+                    NoticeKind::StreamRecovered,
+                    format!(
+                        "stream broke after partial output; preserved it and continuing \
+                         ({used}/{})",
+                        self.max_recoveries
+                    ),
                 );
 
                 // Re-project so the retry carries the preserved message.

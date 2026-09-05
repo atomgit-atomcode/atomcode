@@ -158,6 +158,44 @@ async fn a_rate_limit_is_waited_out_and_the_turn_recovers() {
     assert_eq!(run.attempts, 3, "two limits waited out, then success");
 }
 
+/// A state the screen must show has to be a fact the log holds.
+///
+/// The failure this pins: these three recoveries used to `eprintln!` to stderr.
+/// In a full-screen UI that corrupts the display it was meant to inform, a panel
+/// cannot render a state that exists only on stderr, a resumed session cannot
+/// reproduce it, and a test cannot construct it.
+#[tokio::test]
+async fn a_recovery_a_person_should_know_about_is_logged_not_printed() {
+    let dir = scratch("notice");
+    let fast = "[[patch]]\nid = \"llm-rate-limit\"\nconfig = { max_waits = 5, max_wait_secs = 120, fallback_secs = 0 }";
+    let app = start(tree(&dir, &[fast])).await;
+    run_with(&app, 2, rate_limited(Some(0))).await;
+
+    let log = app.context().service::<SessionSvc>().unwrap();
+    let notices: Vec<_> = log
+        .events()
+        .into_iter()
+        .filter_map(|e| match e.event {
+            SessionEvent::Notice { notice, detail, .. } => Some((notice, detail)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(notices.len(), 2, "one per wait: {notices:?}");
+    assert!(notices
+        .iter()
+        .all(|(k, _)| *k == atomcode_harness::session::NoticeKind::RateLimited));
+    assert!(notices[0].1.contains("rate limited"), "{notices:?}");
+
+    // Given to a person, kept from the model: the conversation is unchanged.
+    assert!(
+        !log.derive_messages()
+            .iter()
+            .any(|m| m.text.contains("rate limited")),
+        "a notice must not reach the model"
+    );
+}
+
 #[tokio::test]
 async fn a_real_retry_after_is_honoured_over_any_guess() {
     let dir = scratch("retry-after");

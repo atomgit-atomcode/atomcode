@@ -57,6 +57,23 @@ pub enum InjectionOrigin {
     CompactionSummary,
 }
 
+/// Why the harness is telling a person something.
+///
+/// Distinct from [`InjectionOrigin`]: that one names model-visible context, this
+/// one names a fact the *screen* needs and the model must not see.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeKind {
+    /// A rate limit is being waited out.
+    RateLimited,
+    /// The history overflowed; it was compacted and the request retried.
+    OverflowCompacted,
+    /// A stream broke after producing real output, which was preserved.
+    StreamRecovered,
+    /// A retryable provider failure is backing off.
+    ProviderRetry,
+}
+
 /// One durable fact about a session.
 ///
 /// `#[non_exhaustive]` because adding a fact must not break a consumer that
@@ -141,6 +158,21 @@ pub enum SessionEvent {
         round: u32,
         usage: TokenUsage,
     },
+    /// Something the harness did that a person should know about and the model
+    /// should not.
+    ///
+    /// Screen-visible is logged, for the same reason model-visible is: a state
+    /// the screen shows but the log cannot explain is a state a panel cannot be
+    /// remounted into and a resumed session cannot reproduce. Printing it to
+    /// stderr instead is worse than useless in a full-screen UI — it corrupts
+    /// the display it was meant to inform.
+    Notice {
+        turn: u64,
+        /// Named `notice` rather than `kind` because the enum is tagged with
+        /// `kind` already — a field by that name would shadow the tag.
+        notice: NoticeKind,
+        detail: String,
+    },
     TurnEnd {
         turn: u64,
         /// Why it ended. The reason itself, not a rendering of it: a consumer
@@ -166,6 +198,7 @@ impl SessionEvent {
             | Self::Injected { turn, .. }
             | Self::Compacted { turn, .. }
             | Self::Usage { turn, .. }
+            | Self::Notice { turn, .. }
             | Self::TurnEnd { turn, .. } => *turn,
         }
     }

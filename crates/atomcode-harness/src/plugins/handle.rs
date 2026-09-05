@@ -211,6 +211,12 @@ impl Projector {
                 snapshot: None,
             }],
 
+            // Advisory: the turn continues. A driver renders it as a note, not
+            // as a failure — a rate-limit wait is not an error.
+            SessionEvent::Notice { detail, .. } => {
+                vec![AgentEvent::Warning(detail.clone())]
+            }
+
             SessionEvent::TurnEnd { stop, error, .. } => {
                 let mut out = Vec::new();
                 if let Some(message) = error {
