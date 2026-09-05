@@ -360,3 +360,43 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod demo {
+    //! Not an assertion — a way to look at a real frame. `cargo test -p
+    //! atomcode-tui --lib demo -- --nocapture` prints what a person would see.
+    use super::*;
+    use crate::conformance;
+    use crate::module::Mounted;
+    use crate::modules::{input, status, transcript};
+
+    #[test]
+    fn print_a_frame() {
+        let mods = Arc::new(Modules::new());
+        mods.add_producer(transcript::Transcript::new()).unwrap();
+        mods.add_view(Arc::new(Mounted::<status::Status>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<input::Input>::new()))
+            .unwrap();
+        let h = Host::new(mods, default_layout());
+        for f in conformance::facts() {
+            h.absorb(&f);
+        }
+        h.moment.write().unwrap().input = "接下来呢".into();
+        let frame = h.compose((78, 20));
+        println!("\n┌{}┐", "─".repeat(78));
+        for row in frame.rows() {
+            // Every row is exactly the screen's width in *cells*. Asserting it
+            // here as well as printing it: a demo that quietly drifted from the
+            // real geometry would be worse than no demo.
+            assert_eq!(
+                crate::width::str_width(&row),
+                78,
+                "row is {} cells, not 78: {row:?}",
+                crate::width::str_width(&row)
+            );
+            println!("│{row}│");
+        }
+        println!("└{}┘\n", "─".repeat(78));
+    }
+}
