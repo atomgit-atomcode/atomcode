@@ -62,8 +62,35 @@ impl Content for UserSaid {
     fn content_hash(&self) -> ContentHash {
         hash_of(&["user", &self.0])
     }
+    /// A full-width bar, the way `atomcode-tuix` echoes what you typed.
+    ///
+    /// The background is the point: in a screen of assistant prose and tool
+    /// output, the bar is where you scan to find "what did I ask". A chevron
+    /// alone gets lost among the `●` and `⎿` markers around it.
     fn lines(&self, w: u16) -> Vec<Line> {
-        wrapped(&self.0, w, user(), "❯ ")
+        let bar = crate::theme::bg(crate::theme::Role::PanelBg, crate::theme::Theme::Dark).under(
+            crate::theme::fg(crate::theme::Role::PanelFg, crate::theme::Theme::Dark),
+        );
+        wrapped(
+            &self.0,
+            w,
+            user(),
+            &format!("{} ", Caps::default().g(Glyph::Prompt)),
+        )
+        .into_iter()
+        .map(|line| {
+            let pad = (w as usize).saturating_sub(line.width());
+            let mut spans: Vec<Span> = line
+                .spans
+                .into_iter()
+                .map(|sp| Span::styled(sp.text, sp.style.under(bar)))
+                .collect();
+            if pad > 0 {
+                spans.push(Span::styled(" ".repeat(pad), bar));
+            }
+            Line::from_spans(spans)
+        })
+        .collect()
     }
 }
 
@@ -610,13 +637,20 @@ impl Content for TurnEndBlock {
     fn content_hash(&self) -> ContentHash {
         hash_of(&["turn_end", &self.stop, self.error.as_deref().unwrap_or("")])
     }
+    /// A divider with the turn's outcome set into it, the way tuix closes a
+    /// turn: `───── ✓ 完成 ─────`. A bare line of text at the left margin reads
+    /// as something that was said; a captioned rule reads as a boundary.
     fn lines(&self, w: u16) -> Vec<Line> {
-        let text = match &self.error {
-            Some(e) => format!("— {} · {e}", self.stop),
-            None => format!("— {}", self.stop),
+        let caps = Caps::default();
+        let (mark, style) = match &self.error {
+            Some(_) => (caps.g(Glyph::Fail), bad()),
+            None => (caps.g(Glyph::Ok), dim()),
         };
-        let style = if self.error.is_some() { bad() } else { dim() };
-        vec![Line::styled(width::take_width(&text, w as usize), style)]
+        let text = match &self.error {
+            Some(e) => format!("{mark} {} · {e}", self.stop),
+            None => format!("{mark} {}", self.stop),
+        };
+        vec![crate::el::captioned_rule(&text, w as usize, dim(), style)]
     }
 }
 

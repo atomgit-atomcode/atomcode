@@ -710,6 +710,35 @@ pub fn edge() -> Style {
 }
 
 /// A horizontal rule with an optional caption set into it.
+/// A full-width rule, no corners.
+///
+/// What separates the transcript from the composer, and what a turn's summary
+/// is set into. `atomcode-tuix` draws both as plain runs of `─` rather than as
+/// a box: a box around the composer looks tidy on its own and wrong beside the
+/// product people already use.
+pub fn plain_rule(w: usize, style: Style) -> Line {
+    Line::styled("─".repeat(w), style)
+}
+
+/// A rule with text set into the middle of it.
+///
+/// The turn separator: `───── ✓ 完成 · 2 轮 ─────`. Centred, because it reads as
+/// a divider with a label rather than as a line someone wrote.
+pub fn captioned_rule(caption: &str, w: usize, rule_style: Style, text_style: Style) -> Line {
+    let text = format!(" {} ", caption.trim());
+    let tw = width::str_width(&text);
+    if tw + 4 > w {
+        return plain_rule(w, rule_style);
+    }
+    let left = (w - tw) / 2;
+    let right = w - tw - left;
+    Line::from_spans(vec![
+        Span::styled("─".repeat(left), rule_style),
+        Span::styled(text, text_style),
+        Span::styled("─".repeat(right), rule_style),
+    ])
+}
+
 pub fn rule(left: char, right: char, caption: Option<&str>, w: usize) -> Line {
     if w < 2 {
         return Line::styled("─".repeat(w), edge());

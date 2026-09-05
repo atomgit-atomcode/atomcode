@@ -202,7 +202,10 @@ async fn a_person_types_a_question_and_reads_the_answer() {
         screen.contains("It is an empty main"),
         "the answer:\n{screen}"
     );
-    assert!(screen.contains("atomcode"), "the status bar is there");
+    assert!(
+        s.term.last().unwrap().part("status").is_some(),
+        "the status line is on screen"
+    );
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
@@ -256,7 +259,7 @@ async fn typing_during_a_turn_is_folded_into_it_rather_than_queued() {
     let screen = s.screen();
     assert!(screen.contains("first"), "{screen}");
     assert!(screen.contains("and also this"), "{screen}");
-    let turn_ends = screen.matches("— Stopped").count();
+    let turn_ends = screen.matches("Stopped").count();
     assert_eq!(turn_ends, 1, "one turn, not two:\n{screen}");
 
     s.term.press(KeyPress::ctrl('d'));
@@ -779,13 +782,16 @@ async fn the_screen_can_be_rearranged_while_it_runs_and_put_back() {
     let task = s.open().await;
     s.term.type_line("hi");
     s.quiet().await;
-    assert!(s.screen().contains("atomcode ·"), "the status bar is up");
+    assert!(
+        s.term.last().unwrap().part("status").is_some(),
+        "the status line is up"
+    );
 
     // By command.
     s.term.type_line("/hide status");
     s.quiet().await;
     assert!(
-        !s.screen().contains("atomcode ·"),
+        s.term.last().unwrap().part("status").is_none(),
         "hidden:\n{}",
         s.screen()
     );
@@ -794,7 +800,7 @@ async fn the_screen_can_be_rearranged_while_it_runs_and_put_back() {
     s.term.press(KeyPress::ctrl('z'));
     s.quiet().await;
     assert!(
-        s.screen().contains("atomcode ·"),
+        s.term.last().unwrap().part("status").is_some(),
         "undone by ctrl-z:\n{}",
         s.screen()
     );

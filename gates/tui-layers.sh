@@ -65,7 +65,11 @@ else
 fi
 
 # 上层：屏蔽层之外不得出现字面装饰字符或操作系统探测。
-UPPER=$(find "$SRC" -name '*.rs' ! -name caps.rs ! -name surface.rs)
+# el.rs 与 caps.rs 同类：它就是画装饰的那一层，而降级发生在上屏时
+# （ansi::encode_with），所以这里写 ┌ 是对的。豁免它，是为了让这条规则说的是
+# 「上层不得绕过原语」，而不是「谁都不许画框」——后者会逼原语层也去问 Caps，
+# 而在 lay(w) 里它拿不到。
+UPPER=$(find "$SRC" -name '*.rs' ! -name caps.rs ! -name surface.rs ! -name el.rs)
 
 echo "→ 屏蔽层之外不得出现字面装饰字符（应走 Caps::g(Glyph::…)）"
 n=$(grep -oE '[┌┐└┘─│├┤┬┴┼✓✗⋯▸•]' $UPPER 2>/dev/null | wc -l | tr -d ' ')

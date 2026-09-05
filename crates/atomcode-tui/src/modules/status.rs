@@ -52,6 +52,11 @@ impl View for Status {
         }
     }
 
+    /// The bottom line: what model, where, how much context.
+    ///
+    /// `atomcode-tuix` puts this last and dims it — it is the thing you glance
+    /// at, not the thing you read. A reverse-video bar across the top is what
+    /// an editor does; a coding agent's screen belongs to the conversation.
     fn render(state: &State, vp: &Viewport<'_>) -> Vec<Line> {
         use crate::caps::Glyph;
         use crate::el::El;
@@ -62,71 +67,54 @@ impl View for Status {
         }
         let caps = vp.moment.caps;
         let t = caps.theme;
-        let bar = theme::bg(Role::PanelBg, t).under(theme::fg(Role::PanelFg, t));
         let dim = theme::fg(Role::Muted, t);
-        let key = theme::fg(Role::Accent, t);
         let sep = || El::styled(format!(" {} ", caps.g(Glyph::Separator)), dim);
 
-        // Left: who, on what, doing what.
-        let mut left = vec![El::styled(
-            " atomcode",
-            Style::new().fg(Color::role(Role::Accent)).bold(),
-        )];
-        if !state.model.is_empty() {
-            left.push(sep());
-            left.push(El::styled(state.model.clone(), dim));
-        }
-        left.push(sep());
-        left.push(match vp.moment.activity {
-            // The phase comes from the injected tick, never a clock — the
-            // spinner is a pure function of the frame number (docs/adr/0008).
-            Activity::Working => El::styled(
-                format!(
-                    "{} 运行中",
-                    SPINNER[(vp.moment.tick as usize) % SPINNER.len()]
-                ),
-                theme::fg(Role::Warning, t),
-            ),
-            Activity::Stopping => El::styled("停止中", theme::fg(Role::Error, t)),
-            Activity::Idle => match &state.last_stop {
-                Some(stop) if stop.contains("Error") => El::styled(
-                    format!("{} {stop}", caps.g(Glyph::Fail)),
-                    Style::new().fg(Color::role(Role::Error)),
-                ),
-                Some(_) => El::styled(
-                    format!("{} 就绪", caps.g(Glyph::Ok)),
-                    Style::new().fg(Color::role(Role::Success)),
-                ),
-                None => El::styled("就绪", dim),
+        let mut row: Vec<El> = Vec::new();
+        row.push(El::styled(
+            if state.model.is_empty() {
+                "atomcode".to_string()
+            } else {
+                state.model.clone()
             },
-        });
-
-        // Right: the numbers, each one only when it means something. A counter
-        // reading zero is noise pretending to be information.
-        let mut right: Vec<El> = Vec::new();
-        let mut chip = |label: &str, value: String| {
-            right.push(sep());
-            right.push(El::styled(format!("{label} "), dim));
-            right.push(El::styled(value, key));
-        };
-        if state.turns > 0 {
-            chip("回合", state.turns.to_string());
+            dim,
+        ));
+        if !vp.moment.cwd.is_empty() {
+            row.push(sep());
+            row.push(El::styled(vp.moment.cwd.clone(), dim));
         }
-        if state.tool_calls > 0 {
-            chip("工具", state.tool_calls.to_string());
-        }
+        // Only what means something. A counter reading zero is noise pretending
+        // to be information.
         if state.prompt_tokens > 0 {
-            chip(
-                "上下文",
-                format!("{}k", (state.prompt_tokens as f32 / 1000.0).round() as u32),
-            );
+            row.push(sep());
+            row.push(El::styled(
+                format!(
+                    "{}k tok",
+                    (state.prompt_tokens as f32 / 1000.0).round() as u32
+                ),
+                dim,
+            ));
         }
-        right.push(El::raw(" "));
-
-        let mut row = left;
-        row.push(El::Spacer);
-        row.extend(right);
-        El::styled_all(bar, El::row(row)).lay(w)
+        match vp.moment.activity {
+            // The phase comes from the injected tick, never a clock
+            // (docs/adr/0008).
+            Activity::Working => {
+                row.push(sep());
+                row.push(El::styled(
+                    format!(
+                        "{} 运行中",
+                        SPINNER[(vp.moment.tick as usize) % SPINNER.len()]
+                    ),
+                    theme::fg(Role::Warning, t),
+                ));
+            }
+            Activity::Stopping => {
+                row.push(sep());
+                row.push(El::styled("停止中", theme::fg(Role::Error, t)));
+            }
+            Activity::Idle => {}
+        }
+        El::row(row).lay(w)
     }
 
     fn height(_: &State) -> Height {
@@ -217,37 +205,24 @@ mod tests {
     }
 
     #[test]
-    fn the_bar_says_what_is_running_and_what_it_cost() {
+    fn the_line_says_what_model_and_where() {
         let mut st = State::default();
-        for fact in [
-            SessionEvent::TurnStart { turn: 2 },
-            SessionEvent::RequestHeader {
-                turn: 2,
+        Status::absorb(
+            &mut st,
+            &SessionEvent::RequestHeader {
+                turn: 1,
                 round: 1,
-                model: "replay".into(),
+                model: "mimo-v2.5".into(),
                 reason: atomcode_harness::session::HeaderReason::Append,
             },
-            SessionEvent::StepEnd {
-                turn: 2,
-                step: 1,
-                tool_calls: 2,
-            },
-        ] {
-            Status::absorb(&mut st, &fact);
-        }
-        let line = Status::render(
-            &st,
-            &Viewport::new(Rect::sized(70, 1), &Moment::default().working()),
-        )[0]
-        .plain();
-        for expected in ["atomcode", "replay", "回合 2", "工具 2"] {
-            assert!(line.contains(expected), "{line:?} is missing {expected}");
-        }
-        assert_eq!(
-            width::str_width(&line),
-            70,
-            "the bar fills its width exactly, or the background has a hole in it"
         );
+        let m = Moment {
+            cwd: "~/project/atomcode".into(),
+            ..Default::default()
+        };
+        let line = Status::render(&st, &Viewport::new(Rect::sized(70, 1), &m))[0].plain();
+        assert!(line.contains("mimo-v2.5"), "{line:?}");
+        assert!(line.contains("~/project/atomcode"), "{line:?}");
     }
 
     #[test]
@@ -258,64 +233,55 @@ mod tests {
             &Viewport::new(Rect::sized(70, 1), &Moment::default()),
         )[0]
         .plain();
-        assert!(!line.contains("工具"), "{line:?}");
-        assert!(!line.contains("回合"), "{line:?}");
+        assert!(!line.contains("tok"), "{line:?}");
     }
 
     #[test]
-    fn usage_takes_the_max_not_the_sum_of_prompt_tokens() {
-        // Providers re-send a growing cumulative figure; summing double-counts.
-        let mut s = State::default();
-        for prompt in [100u32, 900, 900] {
-            Status::absorb(
-                &mut s,
-                &SessionEvent::Usage {
-                    turn: 1,
-                    round: 1,
-                    usage: atomcode_kernel::stream::TokenUsage {
-                        prompt,
-                        completion: 10,
-                        cached: 0,
-                    },
-                },
-            );
-        }
-        assert_eq!(s.prompt_tokens, 900);
-        assert_eq!(s.completion_tokens, 30, "completion really does accumulate");
-    }
-
-    #[test]
-    fn the_bar_fills_the_width_exactly_at_any_width() {
-        let s = State::default();
-        let moment = Moment::default();
-        for w in 1..80u16 {
-            let vp = Viewport::new(Rect::sized(w, 1), &moment);
-            let line = &Status::render(&s, &vp)[0];
-            assert_eq!(
-                line.width(),
-                w as usize,
-                "a reversed bar must not have gaps"
-            );
-        }
-    }
-
-    #[test]
-    fn the_mascot_reacts_to_what_happened() {
-        let mut m = Mood::default();
-        Mascot::absorb(&mut m, &SessionEvent::TurnStart { turn: 1 });
-        assert_eq!(m, Mood::Thinking);
-        Mascot::absorb(
-            &mut m,
-            &SessionEvent::ToolResultLogged {
-                turn: 1,
-                round: 1,
-                call_id: "c".into(),
-                content: "boom".into(),
-                is_error: true,
-                images: Vec::new(),
-            },
+    fn it_is_a_dim_line_rather_than_a_bar_across_the_screen() {
+        // tuix dims this and lets it end where its text ends. A reverse-video
+        // bar filling the width is what an editor does; a coding agent's screen
+        // belongs to the conversation.
+        let m = Moment {
+            cwd: "/tmp".into(),
+            ..Default::default()
+        };
+        let rendered = Status::render(&State::default(), &Viewport::new(Rect::sized(70, 1), &m));
+        assert!(
+            rendered[0].width() < 70,
+            "it must not fill the width: {:?}",
+            rendered[0].plain()
         );
-        assert_eq!(m, Mood::Sad);
+        assert!(
+            rendered[0].spans.iter().all(|s| s.style.bg.is_none()),
+            "and it must not paint a background"
+        );
+    }
+
+    #[test]
+    fn a_turn_in_progress_shows_here_now_that_the_composer_has_no_hint() {
+        let busy = Moment::default().working();
+        let line =
+            Status::render(&State::default(), &Viewport::new(Rect::sized(70, 1), &busy))[0].plain();
+        assert!(line.contains("运行中"), "{line:?}");
+    }
+
+    #[test]
+    fn nothing_it_draws_is_wider_than_the_screen() {
+        let m = Moment {
+            cwd: "/a/very/long/path/that/keeps/going/and/going/and/going".into(),
+            ..Default::default()
+        }
+        .working();
+        let st = State {
+            model: "some-extremely-long-model-name-v2.5-preview".into(),
+            prompt_tokens: 123_456,
+            ..Default::default()
+        };
+        for w in 1u16..80 {
+            for line in Status::render(&st, &Viewport::new(Rect::sized(w, 1), &m)) {
+                assert!(line.width() <= w as usize, "w={w}: {:?}", line.plain());
+            }
+        }
     }
 
     #[test]

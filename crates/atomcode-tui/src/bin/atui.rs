@@ -217,6 +217,9 @@ async fn main() -> ExitCode {
             moment.input = "再帮我看看 crates/ 的结构".into();
             moment.caret = moment.input.len();
             moment.caps = atomcode_tui::caps::Caps::detect();
+            moment.cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
         }
         let (w, h) = surface.size();
         let frame = host.compose((w, h));

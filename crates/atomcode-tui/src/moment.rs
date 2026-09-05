@@ -60,6 +60,9 @@ pub struct Moment {
     /// Injected wall time, for anything that needs a real interval (a
     /// countdown). Still injected: tests set it, `render` never reads a clock.
     pub now: Timestamp,
+    /// Where the agent is working. Not derivable from the log, which is
+    /// exactly what this struct is for.
+    pub cwd: String,
     /// What the terminal can draw. Injected for the same reason as the clock:
     /// a module that read `TERM` would be right on the developer's machine and
     /// silently wrong on the user's. The surface detects once; everything above

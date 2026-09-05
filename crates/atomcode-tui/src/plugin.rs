@@ -80,6 +80,16 @@ impl UserInterface for Tui {
         ctx.emit::<AgentCreated>(&AgentInfo { id: agent.id() });
 
         let (wake_tx, mut wake) = mpsc::unbounded_channel::<Wake>();
+        {
+            // Where we are is environment, not a fact from the log — which is
+            // what `Moment` is for. Read once here rather than per frame: a
+            // `render` that called `current_dir()` would be doing I/O in a
+            // function whose whole contract is purity.
+            let mut m = self.host.moment.write().expect("moment poisoned");
+            m.cwd = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+        }
         *self.ctx.lock().expect("ctx poisoned") = Some(ctx.clone());
         *self.wake.lock().expect("wake poisoned") = Some(wake_tx.clone());
 

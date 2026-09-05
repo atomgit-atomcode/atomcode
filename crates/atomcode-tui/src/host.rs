@@ -288,17 +288,22 @@ impl Host {
 }
 
 /// The shipped layout: the conversation, a status bar, a prompt.
+/// Stream, composer, status line — in that order, top to bottom.
+///
+/// The status line is *last*. `atomcode-tuix` puts it there and dims it: it is
+/// the thing you glance at, and the top of the screen belongs to the
+/// conversation. A reverse-video bar across the top is what an editor does.
 pub fn default_layout() -> Region {
     use crate::region::{Constraint, Dir};
     Region::split(
         Dir::Vertical,
-        Constraint::Cells(1),
-        Region::view(crate::modules::status::ID),
+        Constraint::Fill,
+        Region::Stream,
         Region::split(
             Dir::Vertical,
             Constraint::Fill,
-            Region::Stream,
             Region::view(crate::modules::input::ID),
+            Region::view(crate::modules::status::ID),
         ),
     )
 }
