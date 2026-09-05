@@ -1,6 +1,13 @@
 # TUI 的时间与空间可组合性
 
-**状态:设计,未实现。** 这份文档论证一件事——把 TUI 拆成插件之后,
+> **读之前先知道范围(2026-09-06 更新)**:这份文档论证的架构已经实现在
+> `atomcode-tui` 里,而那个 crate 的定位是 **harness 的无头前端**,不是产品 UI
+> ——产品 UI 是 `atomcode-tuix`,不动它。见 [`adr/0011`](./adr/0011-atomcode-tui-is-the-headless-front-end.md)。
+>
+> 下面的论证仍然成立,而且正是它让「不用 tty 跑完整 UI 端到端」成为可能。
+> 但**不要**把它读成「照着做就能替代 tuix」的路线图:那条路量过,9.4 倍。
+
+**状态:已实现(定位见 adr/0011)。** 这份文档论证一件事——把 TUI 拆成插件之后,
 [`plexus-plugin-architecture.md`](./plexus-plugin-architecture.md) 里那两条可组合性
 在**只有一块屏幕**的地方还成不成立。
 

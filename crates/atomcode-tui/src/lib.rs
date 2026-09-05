@@ -1,4 +1,19 @@
-//! A full-screen terminal UI, assembled from plugins.
+//! The harness's **headless** front end: a full-screen terminal UI assembled
+//! from plugins, whose reason for existing is that it can be driven with no
+//! terminal at all.
+//!
+//! # What this is not
+//!
+//! It is **not** the product UI and is not becoming one. `atomcode-tuix` is,
+//! and it is 9× the size of this crate — 16 modals, 60 commands, a retained
+//! renderer. Matching it was tried and abandoned; see `docs/adr/0011` for the
+//! numbers and for why bridging tuix onto the harness is not the cheap option
+//! it looks like.
+//!
+//! What this crate does that tuix cannot: 20 end-to-end tests drive the whole
+//! UI with no tty, no model and no human; `--audit` checks an assembly on a
+//! machine with no terminal; `--demo` prints one composed frame. Two front ends
+//! behind one `ui` seam is what the seam is for.
 //!
 //! Nothing here is a monolith with extension points bolted on. The host owns
 //! four things nobody else can — the surface, the event loop, layout
