@@ -16,7 +16,7 @@
 //! legacy session carries none. `/cd` is a NEW SESSION (the driver re-prepares in the new dir),
 //! so `session_start` runs fresh there.
 
-use super::instructions::render_instructions;
+use crate::instructions::render_instructions;
 use async_trait::async_trait;
 use atomcode_kernel::hook::LifecycleHooks;
 use atomcode_kernel::message::{Conversation, Message, Role};

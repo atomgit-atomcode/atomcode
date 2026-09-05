@@ -187,6 +187,14 @@ pub mod mcp;
 /// / [`TranscriptHook`](session::TranscriptHook) on the `turn_complete` terminal hook, a
 /// `recall` tool, a current-date injection hook). Wall-clock lives only here (the kernel
 /// is clock-free). Opt-in `session` feature. See [`session`].
+/// The three-tier project-instructions loader (`AGENTS.md` / `CLAUDE.md` /
+/// `.atomcode.md`, global + project + user). Pure — paths in, string out, no
+/// dependencies beyond `std::path` — so it is its own feature: a consumer that
+/// wants a repository's standing instructions should not have to take a whole
+/// session-persistence subsystem to get them.
+#[cfg(feature = "instructions")]
+pub mod instructions;
+
 #[cfg(feature = "session")]
 pub mod session;
 

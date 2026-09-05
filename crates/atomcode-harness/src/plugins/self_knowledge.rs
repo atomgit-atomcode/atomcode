@@ -232,3 +232,68 @@ that is running.";
         Ok(())
     }
 }
+
+// ---- the other half: what the *repository* says --------------------------
+
+/// The project's own standing instructions, as a prompt fragment.
+///
+/// `describe_self` answers "what am I made of" from the live tree. It cannot
+/// answer "what does this repository expect of me" — that is not a runtime fact,
+/// it is a file the repository maintains, and an agent that never reads it will
+/// happily re-derive house rules from scratch every session.
+///
+/// The loader already existed in L1 (`AGENTS.md`, `CLAUDE.md`, `.atomcode.md`,
+/// in that precedence). Nothing here mounted it, which is why an agent running
+/// inside a repository that documents its own gates was still guessing at them.
+///
+/// Unlike the identity fragment this one is deliberately *not* invariant — it is
+/// stable per project, which is the granularity a prompt cache keys on anyway.
+pub struct ProjectInstructionsPlugin;
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct InstructionsRow {
+    /// Workspace root the project tier resolves against.
+    #[serde(default)]
+    project_root: Option<String>,
+    /// Config root the global tier resolves against (`~/.atomcode`).
+    #[serde(default)]
+    home: Option<String>,
+}
+
+#[async_trait]
+impl Plugin for ProjectInstructionsPlugin {
+    fn name(&self) -> &'static str {
+        "project-instructions"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["system-prompt"]
+    }
+    fn description(&self) -> &'static str {
+        "read AGENTS.md / CLAUDE.md / .atomcode.md into the prompt"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: InstructionsRow = if config.is_null() {
+            InstructionsRow::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        let project = row
+            .project_root
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let home = row
+            .home
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(crate::home);
+
+        let text = atomcode_capabilities::instructions::render_instructions(&home, &project);
+        // A repository with no instructions file contributes nothing rather than
+        // an empty header: a fragment that says nothing still costs a blank line
+        // in every request, and `ids()` would report a contribution that is not
+        // one.
+        if !text.trim().is_empty() {
+            super::tools::contribute_prompt(ctx, "project-instructions", 1, &text);
+        }
+        Ok(())
+    }
+}

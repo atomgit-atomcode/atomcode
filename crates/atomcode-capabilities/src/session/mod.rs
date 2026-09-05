@@ -24,7 +24,9 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod context;
-pub mod instructions;
+// Moved to the crate root so a consumer can take the loader without the whole
+// session subsystem. Re-exported here so `session::instructions::…` still resolves.
+pub use crate::instructions;
 pub mod manager;
 pub mod presentation;
 pub mod recall;

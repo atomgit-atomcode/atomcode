@@ -21,6 +21,10 @@ atomcode-capabilities = { path = "../atomcode-capabilities", default-features = 
     "provider",
     "skills",
     "codeintel",
+    # The AGENTS.md / CLAUDE.md loader only — deliberately NOT the `session`
+    # feature: the harness has its own session log, and mounting a second
+    # session subsystem beside it would be two systems of record.
+    "instructions",
     "memory",
     "web",
     "mcp",

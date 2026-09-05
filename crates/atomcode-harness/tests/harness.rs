@@ -51,7 +51,8 @@ config = { stream = false, tools = false, summary = false }
     let _ = std::fs::create_dir_all(&empty_home);
     let scoped = format!(
         "[[patch]]\nid = \"skills\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
-         [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {root:?} }}\n",
+         [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {root:?} }}\n\n\
+         [[patch]]\nid = \"project-instructions\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n",
         root = working_dir.to_string_lossy(),
         home = empty_home.to_string_lossy()
     );

@@ -42,6 +42,12 @@ name = "system-prompt"
 [[insert]]
 name = "self-knowledge"
 
+# The repository's own standing instructions. A separate row from the one above:
+# that one reports the running tree, this one reads a file the project maintains,
+# and the two go stale in completely different ways.
+[[insert]]
+name = "project-instructions"
+
 # --- the model. Row id `llm` is the address; the plugin behind it is a value.
 # The default reads the provider the user already configured for AtomCode.
 # `--env-model` swaps in the environment-driven row for CI and containers.

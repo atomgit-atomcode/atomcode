@@ -65,6 +65,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(findings::FindingsPlugin))
         .register(Arc::new(subagent::SubagentPlugin))
         .register(Arc::new(self_knowledge::SelfKnowledgePlugin))
+        .register(Arc::new(self_knowledge::ProjectInstructionsPlugin))
         .register(Arc::new(persona::CodingPersonaPlugin))
         .register(Arc::new(persona::ReviewPersonaPlugin))
         .register(Arc::new(persona::SecurityPersonaPlugin))

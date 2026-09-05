@@ -45,6 +45,7 @@ fn tree(root: &std::path::Path, extra: &[&str]) -> ConfigTree {
          [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 20, working_dir = {root:?} }}\n\n\
          [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
          [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {root:?} }}\n\n\
+         [[patch]]\nid = \"project-instructions\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
          [[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ root = {store:?} }}\n\n\
          [[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [{{ text = \"ok\" }}] }}\n",
         root = root.to_string_lossy(),
@@ -276,9 +277,16 @@ config = { script = [
 ] }
 "#;
     let app = start(tree(&dir, &[call])).await;
-    let id = app.context().service::<SessionSvc>().unwrap().id().to_string();
+    let id = app
+        .context()
+        .service::<SessionSvc>()
+        .unwrap()
+        .id()
+        .to_string();
 
-    let outcome = run_turn(&app, "what session is this?").await.expect("a turn");
+    let outcome = run_turn(&app, "what session is this?")
+        .await
+        .expect("a turn");
     assert_eq!(outcome.tool_calls, 1);
 
     let logged = app
@@ -299,6 +307,79 @@ config = { script = [
         logged[0].contains(&id),
         "the answer that reached the model must carry the real session id:\n{}",
         logged[0]
+    );
+}
+
+// ---- the other half: what the repository says ---------------------------
+
+#[tokio::test]
+async fn a_repository_that_documents_itself_is_actually_read() {
+    let dir = scratch("agents-md");
+    std::fs::write(
+        dir.join("AGENTS.md"),
+        "# House rules\nRun ./gates/tui.sh before you claim done.",
+    )
+    .unwrap();
+    let app = start(tree(&dir, &[])).await;
+    let said = prompt(&app);
+    assert!(
+        said.contains("./gates/tui.sh"),
+        "the agent must be told what the repository expects of it:\n{said}"
+    );
+    assert!(
+        said.contains("AGENTS.md"),
+        "and where the rule came from, so it can go read the rest"
+    );
+}
+
+#[tokio::test]
+async fn the_ecosystem_names_are_honoured_in_precedence_order() {
+    let dir = scratch("precedence");
+    std::fs::write(dir.join("CLAUDE.md"), "claude-only rule").unwrap();
+    let only_claude = start(tree(&dir, &[])).await;
+    assert!(prompt(&only_claude).contains("claude-only rule"));
+
+    // AGENTS.md wins when both exist — the same order the rest of the stack uses.
+    std::fs::write(dir.join("AGENTS.md"), "agents rule").unwrap();
+    let both = start(tree(&dir, &[])).await;
+    let said = prompt(&both);
+    assert!(said.contains("agents rule"), "{said}");
+    assert!(
+        !said.contains("claude-only rule"),
+        "first match wins:\n{said}"
+    );
+}
+
+#[tokio::test]
+async fn a_repository_with_no_instructions_contributes_no_fragment() {
+    // Not an empty fragment: an empty contribution costs a blank line in every
+    // request and shows up in `ids()` as a contribution that is not one.
+    let dir = scratch("silent-repo");
+    let app = start(tree(&dir, &[])).await;
+    assert!(
+        !app.context()
+            .service::<SystemPromptSvc>()
+            .unwrap()
+            .ids()
+            .contains(&"project-instructions".to_string()),
+        "nothing to say means saying nothing"
+    );
+}
+
+#[tokio::test]
+async fn without_the_row_the_file_is_there_and_unread() {
+    // The negative control that matters: the file exists, so a green result
+    // above could otherwise mean "some other row happened to read it".
+    let dir = scratch("unread");
+    std::fs::write(dir.join("AGENTS.md"), "a rule nobody delivers").unwrap();
+    let app = start(tree(
+        &dir,
+        &["[[patch]]\nid = \"project-instructions\"\ndisabled = true"],
+    ))
+    .await;
+    assert!(
+        !prompt(&app).contains("a rule nobody delivers"),
+        "no other row reads the repository's instructions — that is the gap"
     );
 }
 
