@@ -139,6 +139,21 @@ pub enum Color {
     /// One of the 256 indexed colours.
     Ansi(u8),
     Rgb(u8, u8, u8),
+    /// What this text *is*, resolved to an actual colour at paint time.
+    ///
+    /// The same trick as the glyph fallback, for the same reason: a module has
+    /// no idea whether the terminal is light or dark, and threading that answer
+    /// through every `render` and every `Content::lines` would mean every one
+    /// of them could get it wrong. Instead they state the role and
+    /// [`crate::ansi::encode_with`] — which does know — resolves it.
+    Role(crate::theme::Role),
+}
+
+impl Color {
+    /// Shorthand, because this is how nearly every colour should be written.
+    pub const fn role(r: crate::theme::Role) -> Color {
+        Color::Role(r)
+    }
 }
 
 /// A run of text sharing one style. Lines are made of these so a renderer can

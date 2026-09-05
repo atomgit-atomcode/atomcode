@@ -6,23 +6,25 @@
 //! does not.
 
 use crate::block::{hash_of, Content, ContentHash};
+use crate::caps::{Caps, Glyph};
 use crate::frame::{Color, Line, Span, Style};
+use crate::theme::Role;
 use crate::width;
 
 fn dim() -> Style {
     Style::new().dim()
 }
 fn user() -> Style {
-    Style::new().fg(Color::Ansi(39))
+    Style::new().fg(Color::role(Role::Accent))
 }
 fn tool() -> Style {
-    Style::new().fg(Color::Ansi(37))
+    Style::new().fg(Color::role(Role::ToolName))
 }
 fn bad() -> Style {
-    Style::new().fg(Color::Ansi(203))
+    Style::new().fg(Color::role(Role::Error))
 }
 fn ok() -> Style {
-    Style::new().fg(Color::Ansi(78))
+    Style::new().fg(Color::role(Role::Success))
 }
 
 fn wrapped(text: &str, w: u16, style: Style, prefix: &str) -> Vec<Line> {
@@ -110,7 +112,10 @@ impl Content for ModelThought {
     fn summary(&self, w: u16) -> Line {
         let n = self.0.lines().count().max(1);
         Line::styled(
-            width::take_width(&format!("· thought for {n} line(s)"), w as usize),
+            width::take_width(
+                &format!("{} 思考 {n} 行", Caps::default().g(Glyph::Gutter)),
+                w as usize,
+            ),
             dim(),
         )
     }
@@ -165,21 +170,6 @@ impl ToolCallBlock {
             args: self.args.clone(),
             outcome,
         }
-    }
-    /// Arguments in the compact form a person scans, not raw JSON.
-    fn brief(&self) -> String {
-        let trimmed = self.args.trim();
-        let inner = trimmed
-            .strip_prefix('{')
-            .and_then(|s| s.strip_suffix('}'))
-            .unwrap_or(trimmed);
-        inner
-            .replace('"', "")
-            .replace(':', "=")
-            .replace(',', " ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
     }
 }
 
@@ -350,31 +340,65 @@ impl Content for ToolCallBlock {
         };
         hash_of(&["tool_call", &self.call_id, &self.name, &self.args, &tag])
     }
+    /// The shape `atomcode-tuix` ships, because two front ends with two looks
+    /// are two products:
+    ///
+    /// ```text
+    /// ● read_file(README.md)
+    ///   ⎿ 20 行
+    ///      1  <div align="center">
+    /// ```
+    ///
+    /// The marker opens the call, the gutter hangs the result off it, and the
+    /// first result line is metadata in muted grey — subordinate to both the
+    /// assistant text above and the call header, which is what makes a screenful
+    /// of tool calls skimmable.
     fn lines(&self, w: u16) -> Vec<Line> {
         if w == 0 {
             return Vec::new();
         }
-        let (mark, style) = self.mark();
+        let caps = Caps::default();
+        let look = look(&self.name);
+        let subject = subject_of(&self.name, &self.args);
+        let name = match look.verb {
+            Some(verb) => verb.to_string(),
+            None => self.name.clone(),
+        };
         let head = Line::from_spans(vec![
-            Span::styled(format!("{mark} "), style),
-            Span::styled(self.name.clone(), tool()),
-            Span::styled(format!(" {}", self.brief()), dim()),
+            Span::styled(format!("{} ", caps.g(Glyph::ToolMark)), self.mark().1),
+            Span::styled(name, tool()),
+            Span::raw(if subject.is_empty() {
+                String::new()
+            } else {
+                format!("({subject})")
+            }),
         ]);
         let mut out = vec![head.truncate(w as usize)];
+
+        let (note, note_style) = outcome_note(&self.outcome);
+        out.push(
+            Line::from_spans(vec![
+                Span::styled(format!("  {} ", caps.g(Glyph::Gutter)), dim()),
+                Span::styled(note, note_style),
+            ])
+            .truncate(w as usize),
+        );
+
         let body = match &self.outcome {
             Outcome::Ok(s) | Outcome::Failed(s) => s.as_str(),
             _ => "",
         };
-        if !body.is_empty() {
+        if !body.is_empty() && body.lines().filter(|l| !l.trim().is_empty()).count() > 1 {
             let detail = if matches!(self.outcome, Outcome::Failed(_)) {
                 bad()
             } else {
-                dim()
+                Style::new()
             };
-            out.extend(wrapped(body, w, detail, "  "));
+            out.extend(wrapped(body, w, detail, "     "));
         }
         out
     }
+
     /// One line that is worth reading on its own.
     ///
     /// The old version took the first line of the expanded form, which meant a
@@ -382,20 +406,25 @@ impl Content for ToolCallBlock {
     /// exactly the half a reader already knows. This one names the tool, the
     /// thing it acted on, and what it returned.
     fn summary(&self, w: u16) -> Line {
-        let (mark, style) = self.mark();
+        let (_mark, style) = self.mark();
         let look = look(&self.name);
         let subject = subject_of(&self.name, &self.args);
         let (note, note_style) = outcome_note(&self.outcome);
 
-        let mut spans = vec![Span::styled(format!("{mark} "), style)];
+        let mut spans = vec![Span::styled(
+            format!("{} ", Caps::default().g(Glyph::ToolMark)),
+            style,
+        )];
+        // `name(subject)` — the same shape as the expanded form, so folding
+        // changes how much you see and not what you are looking at.
         match look.verb {
             // A verb replaces the tool name when the name is machinery rather
             // than meaning: `$ cargo test` reads; `bash {"command":…}` does not.
-            Some(verb) => spans.push(Span::styled(format!("{verb} "), tool())),
-            None => spans.push(Span::styled(format!("{} ", self.name), tool())),
+            Some(verb) => spans.push(Span::styled(verb.to_string(), tool())),
+            None => spans.push(Span::styled(self.name.clone(), tool())),
         }
         if !subject.is_empty() {
-            spans.push(Span::raw(subject));
+            spans.push(Span::raw(format!("({subject})")));
         }
         if !note.is_empty() {
             spans.push(Span::styled(format!(" · {note}"), note_style));
@@ -485,7 +514,7 @@ impl Content for ChoiceBlock {
         if w == 0 {
             return Vec::new();
         }
-        let ask = Style::new().fg(Color::Ansi(214));
+        let ask = Style::new().fg(Color::role(Role::Warning));
         match &self.answer {
             Some(a) => {
                 let mut out = wrapped(&self.question, w, dim(), "? ");
@@ -655,12 +684,24 @@ mod tests {
     #[test]
     fn a_folded_thought_says_how_much_it_is_hiding() {
         let t = ModelThought("one\ntwo\nthree".into());
-        assert!(t.summary(40).plain().contains("3 line"));
+        assert!(t.summary(40).plain().contains("思考 3 行"));
     }
 
     #[test]
     fn arguments_are_shown_in_the_form_a_person_scans() {
+        // `brief` used to render `file_path=a.rs`, which reads like a debug
+        // dump. `subject_of` picks the argument that names the thing acted on,
+        // so the line reads `read_file(a.rs)` — and it has a fallback, so a
+        // tool nobody wrote a rule for still says something.
         let c = ToolCallBlock::pending("c", "read_file", r#"{"file_path":"a.rs"}"#);
-        assert_eq!(c.brief(), "file_path=a.rs");
+        assert_eq!(subject_of(&c.name, &c.args), "a.rs");
+        assert!(c.summary(40).plain().contains("read_file(a.rs)"));
+
+        let unknown = ToolCallBlock::pending("d", "some_new_tool", r#"{"thing":"x.rs"}"#);
+        assert!(
+            !subject_of(&unknown.name, &unknown.args).is_empty(),
+            "an unknown tool still gets a subject, or the table would have to \
+             track the catalog"
+        );
     }
 }

@@ -17,7 +17,7 @@ run() {                                   # run <fixture-dir> → 退出码
 fixture() {                               # fixture → 一个合规的最小 src 树
   local d; d=$(mktemp -d)
   mkdir -p "$d/src"
-  for f in el frame width ansi caps surface; do
+  for f in el frame width ansi caps surface theme; do
     printf '// clean\npub fn nothing() {}\n' > "$d/src/$f.rs"
   done
   printf '// upper layer\npub fn draw() {}\n' > "$d/src/modules.rs"
@@ -57,6 +57,10 @@ d=$(fixture); run "$d" >/dev/null
 printf 'fn f() { let _ = std::env::var("TERM"); }\n' >> "$d/src/modules.rs"
 check "上层读 TERM（超基线）" fail "$d"
 
+d=$(fixture); run "${d}" >/dev/null
+printf 'const C: u8 = 0; fn f() { let _ = Color::Ansi(75); }\n' >> "${d}/src/modules.rs"
+check "上层写裸颜色（超基线）" fail "${d}"
+
 echo "=== 校准：棘轮允许存量债带着基线上线 ==="
 d=$(fixture)
 printf 'const B: &str = "\xe2\x94\x8c";\n' >> "$d/src/modules.rs"
@@ -67,6 +71,10 @@ echo "=== 校准：屏蔽层自己不受这两条约束 ==="
 d=$(fixture)
 printf 'const B: &str = "\xe2\x94\x8c";\nfn f() { let _ = std::env::var("TERM"); }\n' >> "$d/src/caps.rs"
 check "caps.rs 可以有装饰符和环境读取" pass "$d"
+
+d=$(fixture)
+printf 'fn f() { let _ = Color::Ansi(75); }\n' >> "$d/src/theme.rs"
+check "theme.rs 就是调色板，可以写裸颜色" pass "$d"
 
 if [ $fail = 0 ]; then echo -e "\n分层闸门的阴性对照：通过"; else echo -e "\n分层闸门的阴性对照：未通过"; fi
 exit $fail

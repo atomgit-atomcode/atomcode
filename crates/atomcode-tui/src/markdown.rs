@@ -12,22 +12,23 @@
 //! half-supported.
 
 use crate::frame::{Color, Line, Span, Style};
+use crate::theme::Role;
 use crate::width;
 
 fn code() -> Style {
-    Style::new().fg(Color::Ansi(180))
+    Style::new().fg(Color::role(Role::Warning))
 }
 fn heading() -> Style {
-    Style::new().fg(Color::Ansi(75)).bold()
+    Style::new().fg(Color::role(Role::Accent)).bold()
 }
 fn quote() -> Style {
-    Style::new().fg(Color::Ansi(108))
+    Style::new().fg(Color::role(Role::Accent))
 }
 fn bullet() -> Style {
-    Style::new().fg(Color::Ansi(244))
+    Style::new().fg(Color::role(Role::Border))
 }
 fn link() -> Style {
-    Style::new().fg(Color::Ansi(39)).underline()
+    Style::new().fg(Color::role(Role::Accent)).underline()
 }
 fn fence() -> Style {
     Style::new().dim()
@@ -374,10 +375,10 @@ const KEYWORDS: &[&str] = &[
 /// is a cosmetic problem, a wrong parse is a hang or a panic, and this runs on
 /// every frame.
 fn highlight(line: &str, _lang: &str) -> Vec<Span> {
-    let kw = Style::new().fg(Color::Ansi(176));
-    let string = Style::new().fg(Color::Ansi(150));
-    let comment = Style::new().fg(Color::Ansi(244)).italic();
-    let number = Style::new().fg(Color::Ansi(215));
+    let kw = Style::new().fg(Color::role(Role::Brand));
+    let string = Style::new().fg(Color::role(Role::Success));
+    let comment = Style::new().fg(Color::role(Role::Border)).italic();
+    let number = Style::new().fg(Color::role(Role::Warning));
     let plain = code();
 
     let t = line.trim_start();
@@ -526,7 +527,7 @@ mod tests {
         assert!(code
             .spans
             .iter()
-            .any(|s| s.style.fg == Some(Color::Ansi(176))));
+            .any(|s| s.style.fg == Some(Color::role(Role::Brand))));
     }
 
     #[test]

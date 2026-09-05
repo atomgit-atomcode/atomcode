@@ -84,6 +84,10 @@ pub struct Caps {
     /// Decorative Unicode (box drawing, `✓`, `▸`) renders rather than tofu.
     pub unicode: bool,
     pub colors: Colors,
+    /// Which palette the background calls for. Configured (`ui.theme`), not
+    /// detected — and injected like everything else here, so no `render` ever
+    /// asks the environment what colour the terminal is.
+    pub theme: crate::theme::Theme,
     /// Pictures, if any. Nothing draws one yet — the field is here because it
     /// belongs to the shield, and the shield is the thing being built. A
     /// component that wants a picture will ask this rather than the
@@ -98,6 +102,7 @@ impl Default for Caps {
         Self {
             unicode: true,
             colors: Colors::Ansi256,
+            theme: crate::theme::Theme::Dark,
             graphics: Graphics::None,
         }
     }
@@ -109,6 +114,7 @@ impl Caps {
         Self {
             unicode: false,
             colors: Colors::None,
+            theme: crate::theme::Theme::Dark,
             graphics: Graphics::None,
         }
     }
@@ -166,6 +172,11 @@ impl Caps {
         Self {
             unicode,
             colors,
+            // Dark unless told otherwise: `ui.theme` decides, and the surface
+            // row passes it in. Guessing from `COLORFGBG` is worse than a
+            // default — it is wrong on the terminals that do not set it, and
+            // silently so.
+            theme: crate::theme::Theme::Dark,
             graphics,
         }
     }
@@ -290,6 +301,10 @@ pub enum Glyph {
     Thumb,
     /// Its unfilled track.
     Track,
+    /// The marker a tool call opens with.
+    ToolMark,
+    /// The gutter its result hangs from.
+    Gutter,
 }
 
 impl Caps {
@@ -313,6 +328,8 @@ impl Caps {
                 Separator => "·",
                 Thumb => "█",
                 Track => "│",
+                ToolMark => "●",
+                Gutter => "⎿",
             }
         } else {
             match glyph {
@@ -329,6 +346,8 @@ impl Caps {
                 Separator => ".",
                 Thumb => "#",
                 Track => "|",
+                ToolMark => "*",
+                Gutter => "`",
             }
         }
     }
@@ -381,6 +400,8 @@ mod tests {
             Glyph::Separator,
             Glyph::Thumb,
             Glyph::Track,
+            Glyph::ToolMark,
+            Glyph::Gutter,
         ] {
             let rich = Caps::default().g(glyph);
             let plain = Caps::plain().g(glyph);

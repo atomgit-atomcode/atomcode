@@ -39,6 +39,7 @@
 //! level up. Two layout engines for one screen is one too many.
 
 use crate::frame::{Color, Line, Rect, Span, Style};
+use crate::theme::Role;
 use crate::width;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -705,7 +706,7 @@ fn pad_to(line: Line, cells: usize) -> Line {
 /// `overlay::framed` used to own the only box-drawing in the crate; a second
 /// copy here would mean modals and panels drift into different corners.
 pub fn edge() -> Style {
-    Style::new().fg(Color::Ansi(244))
+    Style::new().fg(Color::role(Role::Border))
 }
 
 /// A horizontal rule with an optional caption set into it.

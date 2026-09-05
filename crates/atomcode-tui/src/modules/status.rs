@@ -5,6 +5,7 @@ use atomcode_harness::session::SessionEvent;
 use crate::frame::{Color, Line, Style};
 use crate::module::{Height, View};
 use crate::moment::{Activity, Viewport};
+use crate::theme::{self, Role};
 use crate::width;
 
 pub const ID: &str = "status";
@@ -60,15 +61,16 @@ impl View for Status {
             return Vec::new();
         }
         let caps = vp.moment.caps;
-        let bar = Style::new().bg(Color::Ansi(236));
-        let dim = Style::new().fg(Color::Ansi(245));
-        let key = Style::new().fg(Color::Ansi(110));
+        let t = caps.theme;
+        let bar = theme::bg(Role::PanelBg, t).under(theme::fg(Role::PanelFg, t));
+        let dim = theme::fg(Role::Muted, t);
+        let key = theme::fg(Role::Accent, t);
         let sep = || El::styled(format!(" {} ", caps.g(Glyph::Separator)), dim);
 
         // Left: who, on what, doing what.
         let mut left = vec![El::styled(
             " atomcode",
-            Style::new().fg(Color::Ansi(75)).bold(),
+            Style::new().fg(Color::role(Role::Accent)).bold(),
         )];
         if !state.model.is_empty() {
             left.push(sep());
@@ -83,17 +85,17 @@ impl View for Status {
                     "{} 运行中",
                     SPINNER[(vp.moment.tick as usize) % SPINNER.len()]
                 ),
-                Style::new().fg(Color::Ansi(214)),
+                theme::fg(Role::Warning, t),
             ),
-            Activity::Stopping => El::styled("停止中", Style::new().fg(Color::Ansi(203))),
+            Activity::Stopping => El::styled("停止中", theme::fg(Role::Error, t)),
             Activity::Idle => match &state.last_stop {
                 Some(stop) if stop.contains("Error") => El::styled(
                     format!("{} {stop}", caps.g(Glyph::Fail)),
-                    Style::new().fg(Color::Ansi(203)),
+                    Style::new().fg(Color::role(Role::Error)),
                 ),
                 Some(_) => El::styled(
                     format!("{} 就绪", caps.g(Glyph::Ok)),
-                    Style::new().fg(Color::Ansi(114)),
+                    Style::new().fg(Color::role(Role::Success)),
                 ),
                 None => El::styled("就绪", dim),
             },
@@ -184,7 +186,7 @@ impl View for Mascot {
         let f = frames[(vp.moment.tick as usize) % frames.len()];
         vec![Line::styled(
             width::take_width(f, vp.rect.w as usize),
-            Style::new().fg(Color::Ansi(202)),
+            Style::new().fg(Color::role(Role::Error)),
         )]
     }
 

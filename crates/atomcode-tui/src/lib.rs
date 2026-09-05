@@ -45,6 +45,7 @@ pub mod plugin;
 pub mod region;
 pub mod rows;
 pub mod surface;
+pub mod theme;
 pub mod widget;
 pub mod width;
 

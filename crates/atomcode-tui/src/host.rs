@@ -382,7 +382,7 @@ mod tests {
     fn reasoning_is_folded_by_default_and_expands_without_changing_content() {
         let h = fed();
         let folded = h.compose((80, 40)).rows().join("\n");
-        assert!(folded.contains("thought for"), "folded to a summary");
+        assert!(folded.contains("思考"), "folded to a summary");
         assert!(!folded.contains("hmm"), "the words are hidden, not gone");
 
         let hashes_before: Vec<_> = h

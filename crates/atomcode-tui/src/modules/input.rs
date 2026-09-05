@@ -5,9 +5,10 @@
 
 use atomcode_harness::session::SessionEvent;
 
-use crate::frame::{Color, Line, Style};
+use crate::frame::{Line, Style};
 use crate::module::{Height, View};
 use crate::moment::{Activity, Viewport};
+use crate::theme::{self, Role};
 use crate::width;
 
 pub const ID: &str = "input";
@@ -55,13 +56,16 @@ impl View for Input {
             Activity::Idle if !state.spoke => "回车发送 · / 看命令 · ctrl-d 退出",
             Activity::Idle => "回车发送 · ctrl-d 退出",
         };
-        let arrow = Style::new()
-            .fg(Color::Ansi(if vp.moment.activity == Activity::Working {
-                214
+        let t = vp.moment.caps.theme;
+        let arrow = theme::fg(
+            if vp.moment.activity == Activity::Working {
+                Role::Warning
             } else {
-                75
-            }))
-            .bold();
+                Role::Accent
+            },
+            t,
+        )
+        .bold();
 
         // The typed line wraps rather than scrolling sideways: a person editing
         // a long prompt needs to see all of it. `body` is the width inside the
@@ -87,7 +91,7 @@ impl View for Input {
             let room = (vp.rect.h as usize).saturating_sub(rows.len() + BORDER);
             for (name, about) in state.menu.iter().take(room) {
                 rows.push(El::row(vec![
-                    El::styled(format!("  /{name}"), Style::new().fg(Color::Ansi(75))),
+                    El::styled(format!("  /{name}"), theme::fg(Role::Accent, t)),
                     El::styled(format!("  {about}"), Style::new().dim()),
                 ]));
             }

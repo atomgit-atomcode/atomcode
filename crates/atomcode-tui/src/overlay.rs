@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::frame::{Color, Line, Rect, Span, Style};
 use crate::moment::Viewport;
 use crate::surface::{Key, KeyPress, Mods};
+use crate::theme::Role;
 use crate::width;
 
 /// What a key did to a modal.
@@ -163,7 +164,7 @@ impl Overlay for Picker {
                     if filter.is_empty() {
                         Style::new().dim()
                     } else {
-                        Style::new().fg(Color::Ansi(214))
+                        Style::new().fg(Color::role(Role::Warning))
                     },
                 ),
             ])
@@ -344,7 +345,7 @@ pub fn framed(title: &str, body: Vec<Line>, rect: Rect) -> Vec<Line> {
             .map(|l| l.truncate(w))
             .collect();
     }
-    let edge = Style::new().fg(Color::Ansi(244));
+    let edge = Style::new().fg(Color::role(Role::Border));
     let head = format!("┌─ {title} ");
     let head_w = width::str_width(&head);
     let mut out = vec![Line::from_spans(vec![

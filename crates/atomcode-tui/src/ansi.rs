@@ -18,7 +18,7 @@ pub const ENTER: &str = "\x1b[?1049h\x1b[?25l";
 /// The exact inverse of [`ENTER`].
 pub const LEAVE: &str = "\x1b[?25h\x1b[?1049l";
 
-fn sgr(style: &Style) -> String {
+fn sgr(style: &Style, theme: crate::theme::Theme) -> String {
     let mut parts: Vec<String> = Vec::new();
     if style.bold {
         parts.push("1".into());
@@ -38,10 +38,22 @@ fn sgr(style: &Style) -> String {
     match style.fg {
         Some(Color::Ansi(n)) => parts.push(format!("38;5;{n}")),
         Some(Color::Rgb(r, g, b)) => parts.push(format!("38;2;{r};{g};{b}")),
+        // A role with no colour means "the terminal's own foreground" — the
+        // absence of an SGR, not a colour that happens to look like it.
+        Some(Color::Role(r)) => {
+            if let Some(Color::Ansi(n)) = crate::theme::colour(r, theme) {
+                parts.push(format!("38;5;{n}"));
+            }
+        }
         None => {}
     }
     match style.bg {
         Some(Color::Ansi(n)) => parts.push(format!("48;5;{n}")),
+        Some(Color::Role(r)) => {
+            if let Some(Color::Ansi(n)) = crate::theme::colour(r, theme) {
+                parts.push(format!("48;5;{n}"));
+            }
+        }
         Some(Color::Rgb(r, g, b)) => parts.push(format!("48;2;{r};{g};{b}")),
         None => {}
     }
@@ -61,7 +73,7 @@ fn write_line(out: &mut String, line: &Line, width: u16, caps: crate::caps::Caps
         let codes = if caps.colors == crate::caps::Colors::None {
             String::new()
         } else {
-            sgr(&span.style)
+            sgr(&span.style, caps.theme)
         };
         if codes.is_empty() {
             out.push_str(&text);

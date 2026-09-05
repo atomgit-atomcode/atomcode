@@ -71,6 +71,14 @@ echo "→ 屏蔽层之外不得出现字面装饰字符（应走 Caps::g(Glyph::
 n=$(grep -oE '[┌┐└┘─│├┤┬┴┼✓✗⋯▸•]' $UPPER 2>/dev/null | wc -l | tr -d ' ')
 ratchet literal_glyphs "$n" "字面制表符/状态符，ASCII 终端上会 tofu 且宽度可能错" || fail=1
 
+echo "→ 调色板之外不得写裸颜色（应走 Color::role(Role::…)）"
+# 起因：新 TUI 一开始到处写 Color::Ansi(75)、Ansi(236) —— 那既假设了深色终端，
+# 也和 tuix 的调色板对不上，而两个前端对「muted 是什么颜色」有两种答案就是两个
+# 产品。角色在上屏时才解析成颜色，那里才知道明暗。
+PALETTE=$(find "${SRC}" -name '*.rs' ! -name theme.rs ! -name frame.rs ! -name ansi.rs)
+n=$(grep -nE 'Color::(Ansi|Rgb)\(' ${PALETTE} 2>/dev/null | wc -l | tr -d ' ')
+ratchet raw_colours "${n}" "裸颜色索引，绕过了角色调色板，也绕过了明暗主题" || fail=1
+
 echo "→ 屏蔽层之外不得探测操作系统或终端"
 n=$(grep -nE 'cfg!\(target_os|"TERM"|"LANG"|"LC_ALL"|ATOMCODE_ASCII|"NO_COLOR"|"WT_SESSION"' $UPPER 2>/dev/null | wc -l | tr -d ' ')
 ratchet os_probes "$n" "直接探测终端/操作系统，绕过了 Caps" || fail=1

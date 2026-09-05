@@ -25,14 +25,15 @@
 
 use crate::caps::{Caps, Glyph};
 use crate::el::El;
-use crate::frame::{Color, Line, Span, Style};
+use crate::frame::{Line, Span, Style};
+use crate::theme::{self, Role};
 use crate::width;
 
-fn dim() -> Style {
-    Style::new().fg(Color::Ansi(245))
+fn dim(caps: Caps) -> Style {
+    theme::fg(Role::Muted, caps.theme)
 }
-fn accent() -> Style {
-    Style::new().fg(Color::Ansi(75))
+fn accent(caps: Caps) -> Style {
+    theme::fg(Role::Accent, caps.theme)
 }
 
 /// One row of a [`list`].
@@ -84,7 +85,7 @@ pub fn window(len: usize, selected: usize, height: usize) -> (usize, usize) {
 /// hides most of itself is worse than one that scrolls.
 pub fn list(items: &[Choice], selected: usize, height: u16, caps: Caps) -> El {
     if items.is_empty() {
-        return El::styled("（空）", dim());
+        return El::styled("（空）", dim(caps));
     }
     let h = height as usize;
     let (start, end) = window(items.len(), selected.min(items.len() - 1), h.max(1));
@@ -96,24 +97,24 @@ pub fn list(items: &[Choice], selected: usize, height: u16, caps: Caps) -> El {
     for (i, item) in items.iter().enumerate().take(end).skip(start) {
         let picked = i == selected;
         let marker = if picked {
-            Span::styled(format!("{} ", caps.g(Glyph::Pointer)), accent())
+            Span::styled(format!("{} ", caps.g(Glyph::Pointer)), accent(caps))
         } else {
             Span::raw("  ")
         };
         let label = if picked {
-            Span::styled(item.label.clone(), accent().bold())
+            Span::styled(item.label.clone(), accent(caps).bold())
         } else {
             Span::raw(item.label.clone())
         };
         let mut spans = vec![marker, label];
         if !item.detail.is_empty() {
-            spans.push(Span::styled(format!("  {}", item.detail), dim()));
+            spans.push(Span::styled(format!("  {}", item.detail), dim(caps)));
         }
         rows.push(El::text(Line::from_spans(spans)));
     }
     let off = items.len() - (end - start);
     if off > 0 {
-        rows.push(El::styled(format!("  …还有 {off} 项"), dim()));
+        rows.push(El::styled(format!("  …还有 {off} 项"), dim(caps)));
     }
     El::col(rows)
 }
@@ -150,7 +151,7 @@ pub fn scroll(body: &[Line], offset: usize, height: u16, caps: Caps) -> El {
             let inside = i >= top && i < top + thumb;
             El::styled(
                 caps.g(if inside { Glyph::Thumb } else { Glyph::Track }),
-                if inside { accent() } else { dim() },
+                if inside { accent(caps) } else { dim(caps) },
             )
         })
         .collect();
@@ -204,20 +205,27 @@ pub fn form(fields: &[Field], focused: usize, caps: Caps) -> El {
             .map(|(i, f)| {
                 let here = i == focused;
                 let marker = if here {
-                    Span::styled(format!("{} ", caps.g(Glyph::Pointer)), accent())
+                    Span::styled(format!("{} ", caps.g(Glyph::Pointer)), accent(caps))
                 } else {
                     Span::raw("  ")
                 };
                 let mut spans = vec![Span::styled(
                     f.value.clone(),
-                    if here { accent().bold() } else { Style::new() },
+                    if here {
+                        accent(caps).bold()
+                    } else {
+                        Style::new()
+                    },
                 )];
                 if !f.hint.is_empty() {
-                    spans.push(Span::styled(format!("  {}", f.hint), dim()));
+                    spans.push(Span::styled(format!("  {}", f.hint), dim(caps)));
                 }
                 El::row(vec![
                     El::text(Line::from_spans(vec![marker])),
-                    El::Fixed(label_w + 2, Box::new(El::styled(f.label.clone(), dim()))),
+                    El::Fixed(
+                        label_w + 2,
+                        Box::new(El::styled(f.label.clone(), dim(caps))),
+                    ),
                     El::text(Line::from_spans(spans)),
                 ])
             })

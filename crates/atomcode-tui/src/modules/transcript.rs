@@ -250,12 +250,27 @@ mod tests {
             .collect();
         assert_eq!(calls.len(), 2, "two calls, two blocks — not four");
         assert!(calls.iter().all(|c| c.is_settled()));
-        let rendered: Vec<String> = calls
+        // The outcome is in the words on the result line, not in the header
+        // glyph — the header is `●` for every call, the way tuix draws it. That
+        // is also a better thing to assert: it does not depend on colour, and a
+        // person reading a colourless terminal is reading the same words.
+        let rendered: Vec<Vec<String>> = calls
             .iter()
-            .map(|c| c.block().content.lines(60)[0].plain())
+            .map(|c| {
+                c.block()
+                    .content
+                    .lines(60)
+                    .iter()
+                    .map(|l| l.plain())
+                    .collect()
+            })
             .collect();
-        assert!(rendered[0].starts_with('✓'), "{rendered:?}");
-        assert!(rendered[1].starts_with('✗'), "the failing one is marked");
+        assert!(rendered[0][0].contains("a.rs"), "{rendered:?}");
+        assert!(!rendered[0][1].contains("失败"), "{rendered:?}");
+        assert!(
+            rendered[1][1].contains("失败"),
+            "the failing one says so: {rendered:?}"
+        );
     }
 
     #[test]
@@ -288,9 +303,12 @@ mod tests {
             .unwrap()
             .block()
             .content
-            .lines(60)[0]
+            .lines(60)[1]
             .plain();
-        assert!(line.starts_with('—'), "interrupted, not ✗: {line}");
+        assert!(
+            line.contains("已中断") && !line.contains("失败"),
+            "a cut turn interrupts its calls, it does not fail them: {line}"
+        );
         assert!(
             s.slots().iter().all(|x| x.is_settled()),
             "a turn that ended leaves nothing open"
