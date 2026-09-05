@@ -21,6 +21,7 @@ use atomcode_harness::seams::{ControlSvc, UiSvc};
 use atomcode_harness::{bundle, plugins, seam_map};
 use atomcode_plexus::{App, PluginRegistry};
 use atomcode_tui::plugin::{HeadlessSurfacePlugin, TerminalSurfacePlugin, TuiUiPlugin};
+use atomcode_tui::rows;
 
 /// The shipped catalog plus this crate's rows.
 fn catalog() -> PluginRegistry {
@@ -28,6 +29,9 @@ fn catalog() -> PluginRegistry {
     c.register(Arc::new(TuiUiPlugin))
         .register(Arc::new(TerminalSurfacePlugin))
         .register(Arc::new(HeadlessSurfacePlugin));
+    for row in rows::catalog() {
+        c.register(row);
+    }
     c
 }
 
@@ -40,6 +44,11 @@ name = "surface-terminal"
 [[patch]]
 id = "ui"
 name = "ui-tui2"
+# Explicit and empty. A patch that names a new plugin keeps the old one's
+# config, so without this the `repl` profile's `banner`/`prompt` — knobs that
+# belong to the line-based REPL — arrive at a row that has no knobs at all.
+config = {}
+
 
 # The screen is the output; nothing else may write to it.
 [[patch]]
@@ -75,13 +84,13 @@ name = "surface-headless"
 
 const MASCOT: &str = r#"
 [[patch]]
-id = "ui"
-config = { mascot = true }
+id = "tui-panel-mascot"
+disabled = false
 "#;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let mut overlays: Vec<String> = vec![TUI2.to_string()];
+    let mut overlays: Vec<String> = vec![TUI2.to_string(), rows::SCREEN.to_string()];
     let mut prompt: Option<String> = None;
     let mut profile = "repl".to_string();
     let mut dump = false;

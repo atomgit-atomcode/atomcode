@@ -69,7 +69,10 @@ impl Host {
         let layout_svc = Arc::new(crate::layout::Layout::new(layout));
         Self {
             stream: RwLock::new(Stream::new()),
-            commands: crate::commands::builtin(layout_svc.clone(), modules.clone()),
+            // Empty, like the module registry beside it. Command sets arrive as
+            // rows (`crate::rows`); a Host that pre-filled this would make
+            // `[[remove]] id = "tui-commands-tree"` a lie.
+            commands: Arc::new(crate::command::Commands::new()),
             overlays: Arc::new(crate::overlay::Overlays::new()),
             asks: crate::ask::Asks::new(),
             modules: modules.clone(),

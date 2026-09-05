@@ -400,19 +400,10 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("")
 }
 
-/// The registry a shipped tree starts with.
-pub fn builtin(
-    layout: Arc<crate::layout::Layout>,
-    modules: Arc<crate::module::Modules>,
-) -> Arc<Commands> {
-    let c = Arc::new(Commands::new());
-    let _ = c.add(Arc::new(ScreenCommands));
-    let _ = c.add(Arc::new(SessionCommands));
-    let _ = c.add(Arc::new(TreeCommands));
-    let _ = c.add(Arc::new(LayoutCommands { layout, modules }));
-    let _ = c.add(Arc::new(HelpCommands { all: c.clone() }));
-    c
-}
+// `builtin()` used to live here and mount all five sets at once. It is gone on
+// purpose: with each set a row, a function that mounted "the usual five" would
+// be a second answer to "what commands does a screen have", and the second
+// answer is the one that goes stale. See `crate::rows::SCREEN`.
 
 #[cfg(test)]
 mod tests {
@@ -423,11 +414,24 @@ mod tests {
         App::new(PluginRegistry::new(), ConfigTree::default())
     }
 
+    /// The five shipped sets, assembled directly.
+    ///
+    /// Whether these are the sets a real screen gets is not this test's job any
+    /// more — `crate::rows::SCREEN` decides that, and `rows`' own tests check
+    /// that every row it names exists. What is tested here is the property that
+    /// survives either way: the shipped sets do not collide, and `/help`
+    /// renders them.
     fn builtin_for_test() -> Arc<Commands> {
-        builtin(
-            Arc::new(crate::layout::Layout::new(crate::host::default_layout())),
-            Arc::new(crate::module::Modules::new()),
-        )
+        let c = Arc::new(Commands::new());
+        let _ = c.add(Arc::new(ScreenCommands));
+        let _ = c.add(Arc::new(SessionCommands));
+        let _ = c.add(Arc::new(TreeCommands));
+        let _ = c.add(Arc::new(LayoutCommands {
+            layout: Arc::new(crate::layout::Layout::new(crate::host::default_layout())),
+            modules: Arc::new(crate::module::Modules::new()),
+        }));
+        let _ = c.add(Arc::new(HelpCommands { all: c.clone() }));
+        c
     }
 
     #[test]

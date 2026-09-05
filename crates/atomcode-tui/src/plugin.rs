@@ -18,12 +18,16 @@ use tokio::sync::mpsc;
 
 use crate::host::{default_layout, Host};
 use crate::keymap::{Action, Keys};
-use crate::module::{Modules, Mounted};
-use crate::modules::{input, status, transcript};
+use crate::module::Modules;
 use crate::surface::{Headless, Input, Surface, Terminal};
 
 plexus_service!(SurfaceSvc => dyn Surface, "surface", Seam, "Where a frame is painted");
 plexus_service!(ModulesSvc => Modules, "tui-modules", Core, "Mounted stream producers and view modules");
+// The region tree, as a service, because more than one row needs it: the layout
+// command set, the model's `adjust_layout` tool, and any panel that puts itself
+// on screen when it mounts. Before it was a field on `Host` reachable only from
+// inside this file, which is precisely why the mascot had to be a special case.
+plexus_service!(LayoutSvc => crate::layout::Layout, "tui-layout", Core, "The region tree on screen");
 plexus_service!(CommandsSvc => crate::command::Commands, "tui-commands", Core, "Slash commands contributed by rows");
 
 /// What woke the loop up.
@@ -38,12 +42,12 @@ enum Wake {
     Closed,
 }
 
+/// This row has no config left. The one knob it had — `mascot = true` — is now
+/// `[[insert]] name = "tui-panel-mascot"`, which is the point: a panel is a row,
+/// not a boolean on somebody else's row.
 #[derive(Debug, Default, Deserialize)]
-struct Row {
-    /// Start with the mascot visible.
-    #[serde(default)]
-    mascot: bool,
-}
+#[serde(deny_unknown_fields)]
+struct Row {}
 
 /// The assembled UI. Public so a test can drive exactly what ships.
 pub struct Tui {
@@ -520,13 +524,35 @@ impl Tui {
         });
     }
 
+    /// Toggle a panel's *visibility*, not its existence.
+    ///
+    /// The old version removed the view from the registry and could only put
+    /// one back — the mascot — because constructing a panel is the row's job
+    /// and this function had one type hard-coded. That is the wrong axis
+    /// entirely: which panels exist is the tree's business, where they sit is
+    /// the layout's, and a keystroke belongs to the second. So this is the
+    /// same `Show`/`Hide` a slash command and the model produce.
     fn toggle_module(&self, id: &'static str) {
-        let mods = &self.host.modules;
-        if mods.has_view(id) {
-            mods.remove_view(id);
-        } else if id == "mascot" {
-            let _ = mods.add_view(Arc::new(Mounted::<status::Mascot>::new()));
-        }
+        let known: Vec<String> = self
+            .host
+            .modules
+            .view_ids()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let showing = self.host.layout.tree().modules().iter().any(|n| n == id);
+        let op = if showing {
+            crate::layout::LayoutOp::Hide {
+                module: id.to_string(),
+            }
+        } else {
+            crate::layout::LayoutOp::Show {
+                module: id.to_string(),
+                side: crate::layout::Side::Top,
+                size: None,
+            }
+        };
+        let _ = self.host.layout.apply(&op, &known);
     }
 
     /// Print the conversation to the normal buffer on the way out.
@@ -574,34 +600,15 @@ fn known_modules(mods: &Modules) -> Vec<String> {
         .collect()
 }
 
-/// Build the module registry a tree starts with.
-pub fn base_modules(mascot: bool) -> Arc<Modules> {
+/// Assemble an EMPTY screen over a surface: the registries, the layout, the
+/// keymap, the event loop — and no panels.
+///
+/// The panels come from rows (`crate::rows`). That is the difference between a
+/// UI that *has* a plugin registry and a UI that *is* assembled from plugins:
+/// this function no longer knows that a status bar exists.
+pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
     let mods = Arc::new(Modules::new());
-    let _ = mods.add_producer(transcript::Transcript::new());
-    let _ = mods.add_view(Arc::new(Mounted::<status::Status>::new()));
-    let _ = mods.add_view(Arc::new(Mounted::<input::Input>::new()));
-    if mascot {
-        let _ = mods.add_view(Arc::new(Mounted::<status::Mascot>::new()));
-    }
-    mods
-}
-
-/// Assemble the whole UI over a surface. Shared by the row and by tests, so a
-/// test drives exactly what ships.
-pub fn assemble(surface: Arc<dyn Surface>, mascot: bool) -> (Arc<Host>, Tui) {
-    let mods = base_modules(mascot);
-    let layout = if mascot {
-        use crate::region::{Constraint, Dir, Region};
-        Region::split(
-            Dir::Vertical,
-            Constraint::Cells(1),
-            Region::view("mascot"),
-            default_layout(),
-        )
-    } else {
-        default_layout()
-    };
-    let host = Arc::new(Host::new(mods, layout));
+    let host = Arc::new(Host::new(mods, default_layout()));
     let mut keys = Keys::new();
     keys.add(&crate::keymap::Default_).expect("default keys");
     (
@@ -628,14 +635,25 @@ impl Plugin for TuiUiPlugin {
         &["agents", "agent-loop", "sessions", "surface"]
     }
     fn provides(&self) -> &'static [&'static str] {
-        // It owns the screen, so it is the one that can ask.
-        &["ui", "tui-modules", "tui-commands", "user-questions"]
+        // It owns the screen, so it is the one that can ask. The registries it
+        // provides are filled by other rows — this row supplies the slots, not
+        // the contents.
+        &[
+            "ui",
+            "tui-modules",
+            "tui-commands",
+            "tui-layout",
+            "user-questions",
+        ]
     }
     fn description(&self) -> &'static str {
         "a full-screen terminal UI assembled from module rows"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
-        let row: Row = if config.is_null() {
+        // Parsed only to reject a stale `config = { mascot = true }` loudly:
+        // silently ignoring it would leave someone staring at a screen with no
+        // cat and no explanation.
+        let _row: Row = if config.is_null() {
             Row::default()
         } else {
             serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
@@ -645,12 +663,15 @@ impl Plugin for TuiUiPlugin {
         // baked in here, which is what made a headless tree quietly grab the
         // tty and fail on a machine with no terminal at all.
         let surface = ctx.require::<SurfaceSvc>().map_err(|e| e.to_string())?;
-        let (host, tui) = assemble(surface, row.mascot);
+        let (host, tui) = assemble(surface);
         let _ = ctx
             .provide::<ModulesSvc>(host.modules.clone())
             .map_err(|e| e.to_string())?;
         let _ = ctx
             .provide::<CommandsSvc>(host.commands.clone())
+            .map_err(|e| e.to_string())?;
+        let _ = ctx
+            .provide::<LayoutSvc>(host.layout.clone())
             .map_err(|e| e.to_string())?;
         let _ = ctx
             .provide::<UserQuestionsSvc>(Arc::new(crate::ask::ScreenQuestions::new(

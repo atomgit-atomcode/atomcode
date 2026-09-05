@@ -35,6 +35,9 @@ fn catalog() -> PluginRegistry {
     c.register(Arc::new(TuiUiPlugin))
         .register(Arc::new(HeadlessSurfacePlugin))
         .register(Arc::new(atomcode_tui::plugin::TerminalSurfacePlugin));
+    for row in atomcode_tui::rows::catalog() {
+        c.register(row);
+    }
     c
 }
 
@@ -64,6 +67,9 @@ fn tree(root: &std::path::Path, script: &str, extra: &[&str]) -> ConfigTree {
         atomcode_harness::bundle::base().unwrap(),
         Layer::from_toml(atomcode_harness::bundle::ONESHOT_APP).unwrap(),
         Layer::from_toml(&base).unwrap(),
+        // The same screen the launcher mounts — taken from the library rather
+        // than restated, so a panel that stops shipping stops being tested.
+        Layer::from_toml(atomcode_tui::rows::SCREEN).unwrap(),
         Layer::from_toml(script).unwrap(),
     ];
     for e in extra {
@@ -311,8 +317,34 @@ async fn folding_changes_what_is_shown_and_not_what_was_said() {
 }
 
 #[tokio::test]
-async fn a_module_can_be_shown_and_hidden_while_the_session_runs() {
-    let dir = scratch("mascot");
+async fn a_panel_is_on_screen_because_a_row_mounted_it() {
+    // The whole point of panels being rows. Nothing in the launcher, the key
+    // map or `assemble` knows the mascot exists — one line of config does.
+    let dir = scratch("mascot-row");
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "ok" }"#),
+        &["[[patch]]\nid = \"tui-panel-mascot\"\ndisabled = false"],
+    ))
+    .await;
+    let task = s.open().await;
+    s.term.type_line("hi");
+    s.quiet().await;
+    assert!(
+        s.term.last().unwrap().part("mascot").is_some(),
+        "the row put itself on screen, through the same LayoutOp everything else uses"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn without_that_row_no_key_can_conjure_the_panel() {
+    // The negative control, and also the bug this refactor fixed: the toggle
+    // key used to CONSTRUCT a mascot, because it had one type hard-coded. A
+    // key belongs to the layout — it can show what is mounted and nothing else.
+    let dir = scratch("mascot-absent");
     let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
     let task = s.open().await;
     s.term.type_line("hi");
@@ -321,14 +353,45 @@ async fn a_module_can_be_shown_and_hidden_while_the_session_runs() {
 
     s.term.press(KeyPress::ctrl('n'));
     s.quiet().await;
-    // Mounting a module is not enough on its own — the layout has to name it —
-    // so this asserts the registry half, which is the part rows control.
+    assert!(
+        s.term.last().unwrap().part("mascot").is_none(),
+        "a keystroke must not be able to mount a panel the tree did not"
+    );
     let mods = s.app.service::<atomcode_tui::plugin::ModulesSvc>().unwrap();
-    assert!(mods.has_view("mascot"), "mounted mid-session");
+    assert!(!mods.has_view("mascot"), "and the registry is untouched");
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn a_panel_can_be_hidden_and_brought_back_while_the_session_runs() {
+    // Visibility, the other axis: the panel stays mounted throughout, so this
+    // is the layout changing and not the tree.
+    let dir = scratch("mascot-toggle");
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "ok" }"#),
+        &["[[patch]]\nid = \"tui-panel-mascot\"\ndisabled = false"],
+    ))
+    .await;
+    let task = s.open().await;
+    s.term.type_line("hi");
+    s.quiet().await;
+    let mods = s.app.service::<atomcode_tui::plugin::ModulesSvc>().unwrap();
+    assert!(s.term.last().unwrap().part("mascot").is_some());
 
     s.term.press(KeyPress::ctrl('n'));
     s.quiet().await;
-    assert!(!mods.has_view("mascot"), "and unmounted again");
+    assert!(s.term.last().unwrap().part("mascot").is_none(), "hidden");
+    assert!(
+        mods.has_view("mascot"),
+        "but still mounted — hiding is not unmounting"
+    );
+
+    s.term.press(KeyPress::ctrl('n'));
+    s.quiet().await;
+    assert!(s.term.last().unwrap().part("mascot").is_some(), "and back");
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
