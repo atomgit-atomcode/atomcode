@@ -60,11 +60,49 @@ pub enum Constraint {
     Fill,
 }
 
+/// One child of a [`El::Flex`], with its share of the main axis.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Item {
+    /// Starting size along the main axis, before any leftover is handed out.
+    /// `Fill` means "whatever the content asks for".
+    pub basis: Constraint,
+    /// Share of the leftover, as a weight. `0` never grows.
+    pub grow: u16,
+    pub el: El,
+}
+
+impl Item {
+    /// Exactly this size, and it does not grow.
+    pub fn fixed(cells: u16, el: El) -> Item {
+        Item {
+            basis: Constraint::Cells(cells),
+            grow: 0,
+            el,
+        }
+    }
+    /// Content-sized, and it takes the leftover.
+    pub fn grow(el: El) -> Item {
+        Item {
+            basis: Constraint::Fill,
+            grow: 1,
+            el,
+        }
+    }
+    /// Content-sized, and it does not grow.
+    pub fn hug(el: El) -> Item {
+        Item {
+            basis: Constraint::Fill,
+            grow: 0,
+            el,
+        }
+    }
+}
+
 /// A piece of screen.
 ///
 /// Two kinds of node, and the distinction is the same one HTML makes:
 ///
-/// * **块级** — [`El::Split`], [`El::Stack`], [`El::Module`], [`El::Stream`].
+/// * **块级** — [`El::Flex`], [`El::Stack`], [`El::Module`], [`El::Stream`].
 ///   These divide a *rect*. [`El::place`] walks them and hands each leaf an
 ///   area. This is what used to be a separate `El` type with its own
 ///   engine; there is now one node type and one engine.
@@ -86,12 +124,29 @@ pub enum El {
     Module(String),
     /// 块级：the irreversible stream.
     Stream,
-    /// 块级：two children dividing an area.
-    Split {
+    /// 块级：any number of children dividing an area — flexbox.
+    ///
+    /// The web's model, minus the parts a terminal should not have. `basis`
+    /// is `flex-basis`, `grow` is `flex-grow`, `gap` is `gap`, and `dir` is
+    /// `flex-direction`. `justify-content` needs no field: [`El::Spacer`]
+    /// already expresses space-between and centring, and it composes.
+    ///
+    /// Deliberately absent: `flex-wrap` (a terminal row that wraps is a layout
+    /// nobody can read, and it would end the "every row is exactly `w` cells"
+    /// invariant that catches real bugs) and `order` (the tree order is what a
+    /// person edits and what `describe_for_model` reports; a second ordering
+    /// would make those two disagree).
+    ///
+    /// `align-items` is absent too, but only for now and for a concrete
+    /// reason: cross-axis alignment needs each child's *cross-axis* wanted
+    /// size, and modules only express a height. Adding the knob before
+    /// anything can answer that question would be a knob that silently does
+    /// nothing.
+    Flex {
         dir: Dir,
-        at: Constraint,
-        a: Box<El>,
-        b: Box<El>,
+        items: Vec<Item>,
+        /// Cells between adjacent children.
+        gap: u16,
     },
     /// 块级：overlaid, later on top. Exactly one may hold focus.
     Stack(Vec<El>),
@@ -133,13 +188,50 @@ impl El {
         El::Module(id.into())
     }
 
-    /// 块级：divide an area between two children.
+    /// 块级：divide an area between two children — the two-child special case
+    /// of [`El::Flex`], kept because most layouts are exactly this and because
+    /// every existing call site and layout op speaks it.
+    ///
+    /// `at` sizes the *first* child; whichever child is not sized takes the
+    /// leftover. That is the same meaning it had when this was `Region::Split`.
     pub fn split(dir: Dir, at: Constraint, a: El, b: El) -> El {
-        El::Split {
+        let (ga, gb) = if matches!(at, Constraint::Fill) {
+            (1, 0)
+        } else {
+            (0, 1)
+        };
+        El::Flex {
             dir,
-            at,
-            a: Box::new(a),
-            b: Box::new(b),
+            gap: 0,
+            items: vec![
+                Item {
+                    basis: at,
+                    grow: ga,
+                    el: a,
+                },
+                Item {
+                    basis: Constraint::Fill,
+                    grow: gb,
+                    el: b,
+                },
+            ],
+        }
+    }
+
+    /// 块级：any number of children.
+    pub fn flex(dir: Dir, items: Vec<Item>) -> El {
+        El::Flex { dir, items, gap: 0 }
+    }
+
+    /// Space between children, in cells.
+    pub fn gap(self, cells: u16) -> El {
+        match self {
+            El::Flex { dir, items, .. } => El::Flex {
+                dir,
+                items,
+                gap: cells,
+            },
+            other => other,
         }
     }
 
@@ -187,39 +279,10 @@ impl El {
 
     /// Stream on top, `below` underneath, `below` taking `rows`.
     pub fn stream_over(below: El, rows: u16) -> El {
-        El::Split {
-            dir: Dir::Vertical,
-            at: Constraint::Fill,
-            a: Box::new(El::Stream),
-            b: Box::new(below),
-        }
-        .with_second_size(rows)
-    }
-
-    fn with_second_size(self, rows: u16) -> El {
-        match self {
-            El::Split { dir, a, b, .. } => El::Split {
-                dir,
-                at: Constraint::Cells(rows),
-                // `Cells` sizes the *first* child, so swap and keep meaning.
-                a: b,
-                b: a,
-            }
-            .flipped(),
-            other => other,
-        }
-    }
-
-    fn flipped(self) -> El {
-        match self {
-            El::Split { dir, at, a, b } => El::Split {
-                dir,
-                at,
-                a: b,
-                b: a,
-            },
-            other => other,
-        }
+        El::flex(
+            Dir::Vertical,
+            vec![Item::grow(El::Stream), Item::fixed(rows, below)],
+        )
     }
 
     /// Every module id this tree names, in tree order.
@@ -246,10 +309,7 @@ impl El {
     fn walk(&self, f: &mut impl FnMut(&El)) {
         f(self);
         match self {
-            El::Split { a, b, .. } => {
-                a.walk(f);
-                b.walk(f);
-            }
+            El::Flex { items, .. } => items.iter().for_each(|it| it.el.walk(f)),
             El::Stack(children) => children.iter().for_each(|c| c.walk(f)),
             _ => {}
         }
@@ -264,18 +324,25 @@ impl El {
     pub fn prune(&self, mounted: &dyn Fn(&str) -> bool) -> El {
         match self {
             El::Module(id) if !mounted(id) => El::Empty,
-            El::Split { dir, at, a, b } => {
-                let a = a.prune(mounted);
-                let b = b.prune(mounted);
-                match (&a, &b) {
-                    (El::Empty, El::Empty) => El::Empty,
-                    (El::Empty, _) => b,
-                    (_, El::Empty) => a,
-                    _ => El::Split {
+            El::Flex { dir, items, gap } => {
+                let kept: Vec<Item> = items
+                    .iter()
+                    .map(|it| Item {
+                        basis: it.basis,
+                        grow: it.grow,
+                        el: it.el.prune(mounted),
+                    })
+                    .filter(|it| !matches!(it.el, El::Empty))
+                    .collect();
+                match kept.len() {
+                    0 => El::Empty,
+                    // One survivor takes the whole area: a flex box around a
+                    // single child is the child.
+                    1 => kept.into_iter().next().expect("checked").el,
+                    _ => El::Flex {
                         dir: *dir,
-                        at: *at,
-                        a: Box::new(a),
-                        b: Box::new(b),
+                        items: kept,
+                        gap: *gap,
                     },
                 }
             }
@@ -331,28 +398,91 @@ impl El {
             | El::Indent(..)
             | El::Framed { .. } => out.push((self.clone(), area)),
             El::Stack(children) => children.iter().for_each(|c| c.place_into(area, wants, out)),
-            El::Split { dir, at, a, b } => {
+            El::Flex { dir, items, gap } => {
+                if items.is_empty() {
+                    return;
+                }
                 let total = match dir {
                     Dir::Vertical => area.h,
                     Dir::Horizontal => area.w,
                 };
-                let first = match at {
-                    Constraint::Cells(n) => (*n).min(total),
-                    Constraint::Percent(p) => ((total as u32 * (*p).min(100) as u32) / 100) as u16,
-                    // Leave the other side what it asked for, but never so much
-                    // that this side vanishes: a module asking for more than the
-                    // screen gets what there is, not everything.
-                    Constraint::Fill => {
-                        let other = b.wanted(*dir, wants).min(total.saturating_sub(1));
-                        total.saturating_sub(other)
+                let gaps = gap
+                    .saturating_mul(items.len().saturating_sub(1) as u16)
+                    .min(total);
+                let avail = total.saturating_sub(gaps);
+
+                // 1. flex-basis. `Fill` means "ask the content", which is how a
+                //    child that is not explicitly sized still reserves what it
+                //    needs before anyone grows into the rest.
+                let mut sizes: Vec<u16> = items
+                    .iter()
+                    .map(|it| match it.basis {
+                        Constraint::Cells(n) => n.min(avail),
+                        Constraint::Percent(p) => ((avail as u32 * p.min(100) as u32) / 100) as u16,
+                        Constraint::Fill => it.el.wanted(*dir, wants).min(avail),
+                    })
+                    .collect();
+
+                let used: u32 = sizes.iter().map(|&s| s as u32).sum();
+                let weight: u32 = items.iter().map(|it| it.grow as u32).sum();
+
+                if used < avail as u32 && weight > 0 {
+                    // 2. flex-grow. The last growing child takes the rounding,
+                    //    so the children add up to exactly the area and the far
+                    //    edge lands where it should.
+                    let slack = avail as u32 - used;
+                    let last = items.iter().rposition(|it| it.grow > 0);
+                    let mut spent = 0u32;
+                    for (i, it) in items.iter().enumerate() {
+                        if it.grow == 0 {
+                            continue;
+                        }
+                        let share = if Some(i) == last {
+                            slack - spent
+                        } else {
+                            slack * it.grow as u32 / weight
+                        };
+                        spent += share;
+                        sizes[i] = sizes[i].saturating_add(share as u16);
                     }
-                };
-                let (ra, rb) = match dir {
-                    Dir::Vertical => area.split_v(first),
-                    Dir::Horizontal => area.split_h(first),
-                };
-                a.place_into(ra, wants, out);
-                b.place_into(rb, wants, out);
+                } else if used > avail as u32 {
+                    // 3. Overflow. Growing children give room back first —
+                    //    they asked to be elastic — and only then the fixed
+                    //    ones. Nobody gets a negative size and nothing panics:
+                    //    a layout is data a user can write.
+                    let mut over = used - avail as u32;
+                    // Elastic children give room back first, in order — they
+                    // asked to be elastic. Then the fixed ones, from the *end*
+                    // backwards: what is declared first is usually what frames
+                    // the screen (a status bar, a title), and a rule has to
+                    // pick someone. Nobody goes negative and nothing panics —
+                    // a layout is data a user can write.
+                    let order: Vec<usize> = (0..items.len())
+                        .filter(|&i| items[i].grow > 0)
+                        .chain((0..items.len()).rev().filter(|&i| items[i].grow == 0))
+                        .collect();
+                    for i in order {
+                        if over == 0 {
+                            break;
+                        }
+                        let take = (sizes[i] as u32).min(over);
+                        sizes[i] -= take as u16;
+                        over -= take;
+                    }
+                }
+
+                let mut off = 0u16;
+                for (i, it) in items.iter().enumerate() {
+                    let s = sizes[i];
+                    let sub = match dir {
+                        Dir::Vertical => Rect::new(area.x, area.y + off, area.w, s),
+                        Dir::Horizontal => Rect::new(area.x + off, area.y, s, area.h),
+                    };
+                    it.el.place_into(sub, wants, out);
+                    off = off
+                        .saturating_add(s)
+                        .saturating_add(if i + 1 < items.len() { *gap } else { 0 });
+                }
             }
         }
     }
@@ -375,15 +505,24 @@ impl El {
             | El::Indent(..)
             | El::Framed { .. } => 1,
             El::Stack(c) => c.iter().map(|r| r.wanted(dir, wants)).max().unwrap_or(0),
-            El::Split { dir: d, at, a, b } => {
-                let (sa, sb) = (a.wanted(dir, wants), b.wanted(dir, wants));
+            El::Flex { dir: d, items, gap } => {
                 if *d == dir {
-                    match at {
-                        Constraint::Cells(n) => n.saturating_add(sb),
-                        _ => sa.saturating_add(sb),
-                    }
+                    // Along the axis: everyone's basis, plus the gaps.
+                    let content = items.iter().fold(0u16, |acc, it| {
+                        let want = match it.basis {
+                            Constraint::Cells(n) => n,
+                            _ => it.el.wanted(dir, wants),
+                        };
+                        acc.saturating_add(want)
+                    });
+                    content.saturating_add(gap.saturating_mul(items.len().saturating_sub(1) as u16))
                 } else {
-                    sa.max(sb)
+                    // Across it: the widest child.
+                    items
+                        .iter()
+                        .map(|it| it.el.wanted(dir, wants))
+                        .max()
+                        .unwrap_or(0)
                 }
             }
         }
@@ -402,7 +541,7 @@ impl El {
             // use — `place` takes them and hands their leaves to the host —
             // and empty rather than a panic, because a layout is data a user
             // can write and bad data must not take the screen down.
-            El::Module(_) | El::Stream | El::Split { .. } | El::Stack(_) => Vec::new(),
+            El::Module(_) | El::Stream | El::Flex { .. } | El::Stack(_) => Vec::new(),
             El::Text(line) => vec![line.truncate(w as usize)],
             El::Col(children) => children.iter().flat_map(|c| c.lay(w)).collect(),
             El::Row(_) | El::Spacer | El::Fixed(..) => vec![self.lay_row(w)],
@@ -741,6 +880,142 @@ mod tests {
         let out = tree.layout(Rect::sized(10, 4));
         assert_eq!(ids(&out), vec!["under", "over"], "later is on top");
         assert_eq!(out[0].1, out[1].1);
+    }
+
+    // ---- flex ------------------------------------------------------------
+
+    fn wants_one(_: &str) -> u16 {
+        1
+    }
+
+    fn placed(el: &El, w: u16, h: u16) -> Vec<(String, Rect)> {
+        el.layout_with(Rect::sized(w, h), &wants_one)
+            .into_iter()
+            .filter_map(|(e, r)| match e {
+                El::Module(id) => Some((id, r)),
+                El::Stream => Some(("stream".to_string(), r)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grow_weights_divide_the_leftover() {
+        // Three panes, the middle one twice as wide. Two-child splits could
+        // only express this by nesting and hand-computed percentages.
+        let el = El::flex(
+            Dir::Horizontal,
+            vec![
+                Item {
+                    basis: Constraint::Fill,
+                    grow: 1,
+                    el: El::view("a"),
+                },
+                Item {
+                    basis: Constraint::Fill,
+                    grow: 2,
+                    el: El::view("b"),
+                },
+                Item {
+                    basis: Constraint::Fill,
+                    grow: 1,
+                    el: El::view("c"),
+                },
+            ],
+        );
+        let out = placed(&el, 43, 10);
+        let w: Vec<u16> = out.iter().map(|(_, r)| r.w).collect();
+        assert_eq!(
+            w.iter().sum::<u16>(),
+            43,
+            "the row is filled exactly: {w:?}"
+        );
+        assert!(
+            w[1] >= w[0] * 2 - 1 && w[1] <= w[0] * 2 + 2,
+            "2:1:1 → {w:?}"
+        );
+    }
+
+    #[test]
+    fn a_fixed_child_keeps_its_size_while_the_rest_grow() {
+        let el = El::flex(
+            Dir::Vertical,
+            vec![
+                Item::fixed(1, El::view("status")),
+                Item::grow(El::Stream),
+                Item::fixed(3, El::view("input")),
+            ],
+        );
+        let out = placed(&el, 80, 24);
+        assert_eq!(out[0].1.h, 1);
+        assert_eq!(out[1].1.h, 20);
+        assert_eq!(out[2].1.h, 3);
+        assert_eq!(out[2].1.y, 21, "and they abut with no gap");
+    }
+
+    #[test]
+    fn gap_puts_space_between_children_and_nowhere_else() {
+        let el = El::flex(
+            Dir::Vertical,
+            vec![
+                Item::fixed(2, El::view("a")),
+                Item::fixed(2, El::view("b")),
+                Item::fixed(2, El::view("c")),
+            ],
+        )
+        .gap(1);
+        let out = placed(&el, 10, 10);
+        assert_eq!(out[0].1.y, 0);
+        assert_eq!(out[1].1.y, 3, "2 rows then a gap");
+        assert_eq!(out[2].1.y, 6);
+    }
+
+    #[test]
+    fn overflow_takes_room_from_the_elastic_children_first() {
+        // Asking for more than exists must not panic and must not silently
+        // shrink the child that was explicitly sized — it asked not to be.
+        let el = El::flex(
+            Dir::Vertical,
+            vec![
+                Item::fixed(4, El::view("pinned")),
+                Item::grow(El::view("elastic")),
+                Item::fixed(4, El::view("also_pinned")),
+            ],
+        );
+        let out = placed(&el, 10, 6);
+        let by = |name: &str| out.iter().find(|(id, _)| id == name).map(|(_, r)| r.h);
+        // Squeezed to nothing means not placed at all — there is no rect to
+        // draw into, and a zero-height part would only be something for the
+        // containment check to complain about later.
+        assert_eq!(by("elastic"), None, "the elastic one gives up first");
+        assert_eq!(by("pinned"), Some(4), "what was declared first survives");
+        assert_eq!(by("also_pinned"), Some(2), "the later fixed child yields");
+        assert!(
+            out.iter().map(|(_, r)| r.h).sum::<u16>() <= 6,
+            "and nothing overflows the area"
+        );
+    }
+
+    #[test]
+    fn flex_never_panics_at_any_size() {
+        let el = El::flex(
+            Dir::Horizontal,
+            vec![
+                Item::fixed(3, El::view("a")),
+                Item::grow(El::Stream),
+                Item {
+                    basis: Constraint::Percent(30),
+                    grow: 0,
+                    el: El::view("b"),
+                },
+            ],
+        )
+        .gap(2);
+        for w in 0u16..40 {
+            for h in [0u16, 1, 5, 24] {
+                let _ = el.layout_with(Rect::sized(w, h), &wants_one);
+            }
+        }
     }
 
     #[test]

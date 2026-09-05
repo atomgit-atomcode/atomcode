@@ -14,6 +14,7 @@ use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
+use crate::el::Item;
 use crate::region::{Constraint, Dir, Region};
 
 /// Which part of the screen an op is about.
@@ -295,49 +296,65 @@ fn swap(region: &Region, a: &Target, b: &Target) -> Region {
             Target::Stream => Region::Stream,
             Target::Module(m) => Region::view(m.clone()),
         },
-        Region::Split {
-            dir,
-            at,
-            a: x,
-            b: y,
-        } => Region::Split {
+        Region::Flex { dir, items, gap } => Region::Flex {
             dir: *dir,
-            at: *at,
-            a: Box::new(swap(x, a, b)),
-            b: Box::new(swap(y, a, b)),
+            gap: *gap,
+            items: items
+                .iter()
+                .map(|it| Item {
+                    basis: it.basis,
+                    grow: it.grow,
+                    el: swap(&it.el, a, b),
+                })
+                .collect(),
         },
         Region::Stack(c) => Region::Stack(c.iter().map(|r| swap(r, a, b)).collect()),
         other => other.clone(),
     }
 }
 
+/// Give `target` an explicit size wherever it sits.
+///
+/// The two-child version could only do this to the *first* child: hitting the
+/// second set the constraint to `Fill`, which sizes the first and leaves the
+/// second at whatever it asked for — so `/resize input 5` on a second child
+/// silently did nothing. With children in a list, the one that was named is the
+/// one that changes, whichever position it holds.
 fn resize(region: &Region, target: &Target, size: u16) -> Region {
     match region {
-        Region::Split { dir, at, a, b } => {
-            // The split that *holds* the target is the one to change.
-            let hit_a = matches(a, target);
-            let hit_b = matches(b, target);
-            if hit_a {
-                Region::Split {
-                    dir: *dir,
-                    at: Constraint::Cells(size.max(1)),
-                    a: a.clone(),
-                    b: b.clone(),
+        Region::Flex { dir, items, gap } => {
+            let hit = items.iter().position(|it| matches(&it.el, target));
+            match hit {
+                Some(i) => {
+                    let mut items: Vec<Item> = items.clone();
+                    items[i].basis = Constraint::Cells(size.max(1));
+                    items[i].grow = 0;
+                    // Something has to absorb what the resize gave up, or the
+                    // box stops filling its area. If the sized child was the
+                    // only elastic one, hand that job to a neighbour.
+                    if items.iter().all(|it| it.grow == 0) {
+                        if let Some(other) = (0..items.len()).find(|&k| k != i) {
+                            items[other].grow = 1;
+                        }
+                    }
+                    Region::Flex {
+                        dir: *dir,
+                        gap: *gap,
+                        items,
+                    }
                 }
-            } else if hit_b {
-                Region::Split {
+                None => Region::Flex {
                     dir: *dir,
-                    at: Constraint::Fill,
-                    a: a.clone(),
-                    b: b.clone(),
-                }
-            } else {
-                Region::Split {
-                    dir: *dir,
-                    at: *at,
-                    a: Box::new(resize(a, target, size)),
-                    b: Box::new(resize(b, target, size)),
-                }
+                    gap: *gap,
+                    items: items
+                        .iter()
+                        .map(|it| Item {
+                            basis: it.basis,
+                            grow: it.grow,
+                            el: resize(&it.el, target, size),
+                        })
+                        .collect(),
+                },
             }
         }
         Region::Stack(c) => Region::Stack(c.iter().map(|r| resize(r, target, size)).collect()),
@@ -347,6 +364,47 @@ fn resize(region: &Region, target: &Target, size: u16) -> Region {
 
 #[cfg(test)]
 mod tests {
+
+    /// The bug the two-child form hid.
+    ///
+    /// `resize` used to change the constraint that sizes the *first* child, so
+    /// naming the second one set `Fill` — which sizes the first and leaves the
+    /// second at whatever it asked for. The command reported success and the
+    /// screen did not move.
+    #[test]
+    fn resize_works_on_a_child_that_is_not_the_first() {
+        let layout = Layout::new(crate::host::default_layout());
+        let known = known();
+        let before = layout
+            .tree()
+            .layout_with(crate::frame::Rect::sized(80, 24), &|_| 3);
+        let input_h = |placed: &[(Region, crate::frame::Rect)]| {
+            placed
+                .iter()
+                .find(|(e, _)| matches!(e, Region::Module(id) if id == crate::modules::input::ID))
+                .map(|(_, r)| r.h)
+                .expect("input is on screen")
+        };
+        assert_ne!(input_h(&before), 7);
+
+        layout
+            .apply(
+                &LayoutOp::Resize {
+                    target: Target::Module(crate::modules::input::ID.to_string()),
+                    size: 7,
+                },
+                &known,
+            )
+            .expect("resize");
+        let after = layout
+            .tree()
+            .layout_with(crate::frame::Rect::sized(80, 24), &|_| 3);
+        assert_eq!(
+            input_h(&after),
+            7,
+            "the named child is the one that changed"
+        );
+    }
     use super::*;
 
     fn known() -> Vec<String> {
