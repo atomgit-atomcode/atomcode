@@ -74,10 +74,20 @@ impl Content for ModelSaid {
         "assistant"
     }
     fn content_hash(&self) -> ContentHash {
+        // Over the source, not the rendering: the same answer at a different
+        // width, or with code folded, is the same thing said.
         hash_of(&["assistant", &self.0])
     }
     fn lines(&self, w: u16) -> Vec<Line> {
-        wrapped(&self.0, w, Style::new(), "")
+        crate::markdown::render(&self.0, w, Style::new())
+    }
+    fn summary(&self, w: u16) -> Line {
+        let first = self
+            .0
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or_default();
+        Line::styled(width::take_width(first, w as usize), dim())
     }
 }
 

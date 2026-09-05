@@ -108,6 +108,14 @@ impl Style {
         self.reverse = true;
         self
     }
+    pub const fn italic(mut self) -> Self {
+        self.italic = true;
+        self
+    }
+    pub const fn underline(mut self) -> Self {
+        self.underline = true;
+        self
+    }
 }
 
 /// A colour, in the terminal's own vocabulary.

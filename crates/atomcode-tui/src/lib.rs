@@ -30,6 +30,7 @@ pub mod content;
 pub mod frame;
 pub mod host;
 pub mod keymap;
+pub mod markdown;
 pub mod module;
 pub mod modules;
 pub mod moment;

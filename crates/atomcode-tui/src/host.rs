@@ -406,6 +406,30 @@ mod demo {
         for f in conformance::facts() {
             h.absorb(&f);
         }
+        // A realistic answer: prose, a list, and code. Built from a slice so
+        // the source indentation of this file cannot leak into the fixture.
+        let answer = [
+            "找到了 **两处**问题:",
+            "",
+            "1. `parse` 没有检查空输入",
+            "2. 重试没有上界",
+            "",
+            "```rust",
+            "fn parse(s: &str) -> Result<Cfg> {",
+            "    if s.is_empty() { return Err(Empty); }",
+            "}",
+            "```",
+            "",
+            "要我改吗?",
+        ]
+        .join("\n");
+        h.absorb(&atomcode_harness::session::SessionEvent::AssistantMessage {
+            turn: 2,
+            round: 1,
+            text: answer,
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+        });
         h.moment.write().unwrap().input = "接下来呢".into();
         let frame = h.compose((78, 20));
         println!("\n┌{}┐", "─".repeat(78));

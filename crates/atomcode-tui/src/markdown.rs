@@ -1,0 +1,556 @@
+//! Markdown, rendered into styled lines.
+//!
+//! Not a port of the existing renderer: that one produces ANSI strings a line
+//! at a time, and this architecture needs structured spans. The difference is
+//! not cosmetic — spans are what let the host check that nothing drew outside
+//! its rect, and a pre-baked escape sequence cannot be measured or re-wrapped.
+//!
+//! Deliberately partial. It covers what a coding conversation actually
+//! contains — fenced code, inline code, emphasis, headings, lists, quotes,
+//! links — and stops there. Tables, footnotes and HTML are not rendered
+//! specially; they come out as text, which is honest and readable, rather than
+//! half-supported.
+
+use crate::frame::{Color, Line, Span, Style};
+use crate::width;
+
+fn code() -> Style {
+    Style::new().fg(Color::Ansi(180))
+}
+fn heading() -> Style {
+    Style::new().fg(Color::Ansi(75)).bold()
+}
+fn quote() -> Style {
+    Style::new().fg(Color::Ansi(108))
+}
+fn bullet() -> Style {
+    Style::new().fg(Color::Ansi(244))
+}
+fn link() -> Style {
+    Style::new().fg(Color::Ansi(39)).underline()
+}
+fn fence() -> Style {
+    Style::new().dim()
+}
+
+/// Render a markdown document at `w` cells.
+pub fn render(text: &str, w: u16, base: Style) -> Vec<Line> {
+    if w == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut in_code: Option<String> = None;
+    let mut code_lines: Vec<String> = Vec::new();
+
+    for raw in text.split('\n') {
+        let trimmed = raw.trim_end();
+        // Fences first: inside a block, nothing else is markdown.
+        if let Some(rest) = trimmed.trim_start().strip_prefix("```") {
+            match in_code.take() {
+                Some(lang) => {
+                    out.extend(code_block(&code_lines, &lang, w));
+                    code_lines.clear();
+                }
+                None => in_code = Some(rest.trim().to_string()),
+            }
+            continue;
+        }
+        if in_code.is_some() {
+            code_lines.push(trimmed.to_string());
+            continue;
+        }
+
+        let t = trimmed.trim_start();
+        let indent = trimmed.len() - t.len();
+
+        if t.is_empty() {
+            out.push(Line::empty());
+        } else if let Some((level, title)) = heading_of(t) {
+            let hashes = "#".repeat(level as usize);
+            out.extend(wrap_spans(
+                &inline(title, heading()),
+                w,
+                &format!("{hashes} "),
+                heading(),
+            ));
+        } else if is_rule(t) {
+            out.push(Line::styled("─".repeat(w as usize), fence()));
+        } else if let Some(body) = t.strip_prefix("> ").or_else(|| t.strip_prefix(">")) {
+            out.extend(wrap_spans(&inline(body, quote()), w, "▏ ", quote()));
+        } else if let Some((marker, body)) = list_item(t) {
+            let lead = format!("{}{marker} ", " ".repeat(indent));
+            out.extend(wrap_spans(&inline(body, base), w, &lead, bullet()));
+        } else {
+            out.extend(wrap_spans(&inline(t, base), w, &" ".repeat(indent), base));
+        }
+    }
+    // An unterminated fence is common in a stream that is still arriving; show
+    // what there is rather than swallowing it.
+    if in_code.is_some() && !code_lines.is_empty() {
+        out.extend(code_block(&code_lines, "", w));
+    }
+    out
+}
+
+fn heading_of(t: &str) -> Option<(u8, &str)> {
+    let hashes = t.chars().take_while(|c| *c == '#').count();
+    if (1..=6).contains(&hashes) {
+        let rest = &t[hashes..];
+        rest.strip_prefix(' ').map(|body| (hashes as u8, body))
+    } else {
+        None
+    }
+}
+
+fn is_rule(t: &str) -> bool {
+    let c = t.chars().next().unwrap_or(' ');
+    matches!(c, '-' | '*' | '_') && t.len() >= 3 && t.chars().all(|x| x == c)
+}
+
+fn list_item(t: &str) -> Option<(String, &str)> {
+    for m in ["- ", "* ", "+ "] {
+        if let Some(body) = t.strip_prefix(m) {
+            return Some(("•".to_string(), body));
+        }
+    }
+    // `1. ` and friends.
+    let digits: String = t.chars().take_while(char::is_ascii_digit).collect();
+    if !digits.is_empty() && digits.len() <= 3 {
+        if let Some(body) = t[digits.len()..].strip_prefix(". ") {
+            return Some((format!("{digits}."), body));
+        }
+    }
+    None
+}
+
+/// Split one line into styled runs: `code`, **bold**, *italic*, [text](url).
+fn inline(text: &str, base: Style) -> Vec<Span> {
+    let mut out: Vec<Span> = Vec::new();
+    let mut buf = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+
+    let flush = |buf: &mut String, out: &mut Vec<Span>| {
+        if !buf.is_empty() {
+            out.push(Span::styled(std::mem::take(buf), base));
+        }
+    };
+
+    while i < chars.len() {
+        match chars[i] {
+            '`' => {
+                if let Some(end) = find(&chars, i + 1, '`') {
+                    flush(&mut buf, &mut out);
+                    out.push(Span::styled(
+                        chars[i + 1..end].iter().collect::<String>(),
+                        code(),
+                    ));
+                    i = end + 1;
+                    continue;
+                }
+            }
+            '*' | '_' if i + 1 < chars.len() && chars[i + 1] == chars[i] => {
+                let marker = chars[i];
+                if let Some(end) = find_pair(&chars, i + 2, marker) {
+                    flush(&mut buf, &mut out);
+                    let inner: String = chars[i + 2..end].iter().collect();
+                    out.push(Span::styled(inner, style_with_bold(base)));
+                    i = end + 2;
+                    continue;
+                }
+            }
+            '*' | '_' => {
+                let marker = chars[i];
+                if let Some(end) = find(&chars, i + 1, marker) {
+                    if end > i + 1 {
+                        flush(&mut buf, &mut out);
+                        let inner: String = chars[i + 1..end].iter().collect();
+                        out.push(Span::styled(inner, style_with_italic(base)));
+                        i = end + 1;
+                        continue;
+                    }
+                }
+            }
+            '[' => {
+                if let Some(close) = find(&chars, i + 1, ']') {
+                    if chars.get(close + 1) == Some(&'(') {
+                        if let Some(paren) = find(&chars, close + 2, ')') {
+                            flush(&mut buf, &mut out);
+                            let label: String = chars[i + 1..close].iter().collect();
+                            out.push(Span::styled(label, link()));
+                            i = paren + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        buf.push(chars[i]);
+        i += 1;
+    }
+    flush(&mut buf, &mut out);
+    if out.is_empty() {
+        out.push(Span::styled(String::new(), base));
+    }
+    out
+}
+
+fn find(chars: &[char], from: usize, what: char) -> Option<usize> {
+    chars
+        .iter()
+        .skip(from)
+        .position(|c| *c == what)
+        .map(|p| p + from)
+}
+
+fn find_pair(chars: &[char], from: usize, marker: char) -> Option<usize> {
+    let mut i = from;
+    while i + 1 < chars.len() {
+        if chars[i] == marker && chars[i + 1] == marker {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn style_with_bold(mut s: Style) -> Style {
+    s.bold = true;
+    s
+}
+fn style_with_italic(mut s: Style) -> Style {
+    s.italic = true;
+    s
+}
+
+/// Wrap styled runs to `w`, keeping a prefix on the first line and an
+/// equivalent indent on the rest.
+fn wrap_spans(spans: &[Span], w: u16, prefix: &str, prefix_style: Style) -> Vec<Line> {
+    let indent = width::str_width(prefix);
+    let body = (w as usize).saturating_sub(indent).max(1);
+    let mut out: Vec<Line> = Vec::new();
+    let mut current = Line::from_spans(vec![Span::styled(prefix.to_string(), prefix_style)]);
+    let mut used = 0usize;
+
+    for span in spans {
+        for word in span.text.split_inclusive(' ') {
+            let ww = width::str_width(word);
+            if used > 0 && used + ww > body {
+                out.push(std::mem::replace(
+                    &mut current,
+                    Line::from_spans(vec![Span::styled(" ".repeat(indent), prefix_style)]),
+                ));
+                used = 0;
+            }
+            if ww > body {
+                // A token longer than the line: hard-break it, never loop.
+                let mut rest = word;
+                while !rest.is_empty() {
+                    let room = body - used;
+                    let piece = width::take_width(rest, room);
+                    if piece.is_empty() {
+                        out.push(std::mem::replace(
+                            &mut current,
+                            Line::from_spans(vec![Span::styled(" ".repeat(indent), prefix_style)]),
+                        ));
+                        used = 0;
+                        if room == body {
+                            break; // cannot fit even on a fresh line
+                        }
+                        continue;
+                    }
+                    rest = &rest[piece.len()..];
+                    used += width::str_width(&piece);
+                    current.push(Span::styled(piece, span.style));
+                }
+            } else {
+                current.push(Span::styled(word.to_string(), span.style));
+                used += ww;
+            }
+        }
+    }
+    out.push(current);
+    out.into_iter().map(|l| l.truncate(w as usize)).collect()
+}
+
+/// A fenced block: dimmed rule, the source with keywords lit, another rule.
+fn code_block(lines: &[String], lang: &str, w: u16) -> Vec<Line> {
+    let mut out = Vec::new();
+    let label = if lang.is_empty() {
+        "─".repeat(w as usize)
+    } else {
+        let head = format!("─ {lang} ");
+        format!(
+            "{head}{}",
+            "─".repeat((w as usize).saturating_sub(width::str_width(&head)))
+        )
+    };
+    out.push(Line::styled(width::take_width(&label, w as usize), fence()));
+    for line in lines {
+        out.push(Line::from_spans(highlight(line, lang)).truncate(w as usize));
+    }
+    out.push(Line::styled("─".repeat(w as usize), fence()));
+    out
+}
+
+const KEYWORDS: &[&str] = &[
+    "fn",
+    "let",
+    "mut",
+    "pub",
+    "use",
+    "impl",
+    "struct",
+    "enum",
+    "trait",
+    "match",
+    "if",
+    "else",
+    "for",
+    "while",
+    "loop",
+    "return",
+    "async",
+    "await",
+    "const",
+    "static",
+    "type",
+    "where",
+    "self",
+    "Self",
+    "mod",
+    "crate",
+    "super",
+    "as",
+    "in",
+    "ref",
+    "move",
+    "dyn",
+    "unsafe",
+    "def",
+    "class",
+    "import",
+    "from",
+    "lambda",
+    "None",
+    "True",
+    "False",
+    "elif",
+    "try",
+    "except",
+    "with",
+    "yield",
+    "pass",
+    "raise",
+    "function",
+    "var",
+    "new",
+    "this",
+    "null",
+    "undefined",
+    "export",
+    "default",
+    "interface",
+    "extends",
+    "package",
+    "func",
+    "go",
+    "defer",
+    "nil",
+    "range",
+    "select",
+    "case",
+    "switch",
+    "break",
+    "continue",
+    "do",
+    "then",
+    "fi",
+    "esac",
+];
+
+/// Keyword-and-literal highlighting. Deliberately not a parser: a wrong colour
+/// is a cosmetic problem, a wrong parse is a hang or a panic, and this runs on
+/// every frame.
+fn highlight(line: &str, _lang: &str) -> Vec<Span> {
+    let kw = Style::new().fg(Color::Ansi(176));
+    let string = Style::new().fg(Color::Ansi(150));
+    let comment = Style::new().fg(Color::Ansi(244)).italic();
+    let number = Style::new().fg(Color::Ansi(215));
+    let plain = code();
+
+    let t = line.trim_start();
+    if t.starts_with("//") || t.starts_with('#') || t.starts_with("--") {
+        return vec![Span::styled(line.to_string(), comment)];
+    }
+
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '"' || c == '\'' {
+            if !buf.is_empty() {
+                out.extend(word_spans(&std::mem::take(&mut buf), kw, number, plain));
+            }
+            let mut lit = String::from(c);
+            for n in chars.by_ref() {
+                lit.push(n);
+                if n == c {
+                    break;
+                }
+            }
+            out.push(Span::styled(lit, string));
+            continue;
+        }
+        buf.push(c);
+    }
+    if !buf.is_empty() {
+        out.extend(word_spans(&buf, kw, number, plain));
+    }
+    if out.is_empty() {
+        out.push(Span::styled(line.to_string(), plain));
+    }
+    out
+}
+
+fn word_spans(text: &str, kw: Style, number: Style, plain: Style) -> Vec<Span> {
+    let mut out = Vec::new();
+    for token in text.split_inclusive(|c: char| !c.is_alphanumeric() && c != '_') {
+        let word: String = token
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        let tail = &token[word.len()..];
+        if !word.is_empty() {
+            let style = if KEYWORDS.contains(&word.as_str()) {
+                kw
+            } else if word.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                number
+            } else {
+                plain
+            };
+            out.push(Span::styled(word, style));
+        }
+        if !tail.is_empty() {
+            out.push(Span::styled(tail.to_string(), plain));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain(text: &str, w: u16) -> Vec<String> {
+        render(text, w, Style::new())
+            .iter()
+            .map(|l| l.plain())
+            .collect()
+    }
+
+    #[test]
+    fn nothing_ever_exceeds_the_width_at_any_width() {
+        let doc = "# A heading that is quite long indeed\n\n\
+                   Some **bold** and *italic* and `inline code` in a paragraph that wraps.\n\n\
+                   - a bullet\n- another with a very long body that certainly needs wrapping\n\
+                   1. numbered\n\n\
+                   > a quotation that also happens to be long enough to wrap somewhere\n\n\
+                   ```rust\nfn main() { let x = \"hi\"; }\n```\n\n\
+                   中文段落也要能正确换行不能把宽字符劈成两半\n\
+                   https://example.com/a/very/long/url/that/cannot/be/broken/at/spaces";
+        for w in 1..=100u16 {
+            for line in render(doc, w, Style::new()) {
+                assert!(
+                    line.width() <= w as usize,
+                    "width {w}: {:?} is {} cells",
+                    line.plain(),
+                    line.width()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn markers_are_consumed_rather_than_shown() {
+        let out = plain("**bold** and *it* and `code`", 80);
+        assert_eq!(out[0], "bold and it and code");
+    }
+
+    #[test]
+    fn a_link_shows_its_text_not_its_url() {
+        let out = plain("see [the docs](https://example.com/very/long)", 80);
+        assert_eq!(out[0], "see the docs");
+    }
+
+    #[test]
+    fn a_fenced_block_is_framed_and_labelled() {
+        let out = plain("```rust\nfn main() {}\n```", 30);
+        assert!(out[0].starts_with("─ rust "), "{out:?}");
+        assert_eq!(out[1], "fn main() {}");
+        assert!(out[2].chars().all(|c| c == '─'));
+    }
+
+    #[test]
+    fn an_unterminated_fence_still_shows_what_arrived() {
+        // Exactly what a half-streamed answer looks like.
+        let out = plain("```rust\nfn main() {", 30);
+        assert!(out.iter().any(|l| l.contains("fn main")), "{out:?}");
+    }
+
+    #[test]
+    fn nothing_inside_a_fence_is_treated_as_markdown() {
+        let out = plain("```\n# not a heading\n- not a bullet\n```", 40);
+        assert!(out.iter().any(|l| l.contains("# not a heading")), "{out:?}");
+        assert!(out.iter().any(|l| l.contains("- not a bullet")), "{out:?}");
+    }
+
+    #[test]
+    fn headings_and_lists_get_their_own_markers() {
+        let out = plain("## Title\n- one\n2. two", 40);
+        assert_eq!(out[0], "## Title");
+        assert_eq!(out[1], "• one");
+        assert_eq!(out[2], "2. two");
+    }
+
+    #[test]
+    fn keywords_and_strings_are_lit_but_the_text_is_untouched() {
+        let lines = render("```rust\nlet s = \"hi\";\n```", 40, Style::new());
+        let code = &lines[1];
+        assert_eq!(code.plain(), "let s = \"hi\";");
+        assert!(
+            code.spans.len() > 1,
+            "it should be several styled runs, not one"
+        );
+        assert!(code
+            .spans
+            .iter()
+            .any(|s| s.style.fg == Some(Color::Ansi(176))));
+    }
+
+    #[test]
+    fn an_unclosed_marker_is_text_not_a_swallowed_rest_of_line() {
+        assert_eq!(plain("a * b", 40)[0], "a * b");
+        assert_eq!(plain("unclosed `code", 40)[0], "unclosed `code");
+    }
+
+    #[test]
+    fn rendering_is_total_and_terminates_on_anything() {
+        for doc in [
+            "",
+            "`",
+            "```",
+            "***",
+            "[](",
+            "####### too many",
+            "\u{0}\u{1}",
+            &"*".repeat(200),
+            &"中".repeat(200),
+        ] {
+            for w in [0u16, 1, 2, 3, 80] {
+                let _ = render(doc, w, Style::new());
+            }
+        }
+    }
+}
