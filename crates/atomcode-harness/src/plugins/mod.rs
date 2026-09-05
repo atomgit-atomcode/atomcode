@@ -12,6 +12,7 @@ pub mod policy;
 pub mod policy_rows;
 pub mod recovery;
 pub mod registries;
+pub mod self_knowledge;
 pub mod session;
 pub mod subagent;
 pub mod tool_exec;
@@ -63,6 +64,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(capabilities::McpPlugin))
         .register(Arc::new(findings::FindingsPlugin))
         .register(Arc::new(subagent::SubagentPlugin))
+        .register(Arc::new(self_knowledge::SelfKnowledgePlugin))
         .register(Arc::new(persona::CodingPersonaPlugin))
         .register(Arc::new(persona::ReviewPersonaPlugin))
         .register(Arc::new(persona::SecurityPersonaPlugin))

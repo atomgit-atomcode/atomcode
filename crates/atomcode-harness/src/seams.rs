@@ -196,6 +196,16 @@ pub trait SessionPersistence: Send + Sync {
     async fn list(&self) -> Result<Vec<String>, String> {
         Ok(Vec::new())
     }
+
+    /// Where this session's events actually land, in whatever terms the backend
+    /// uses — a path, a URL, a table name.
+    ///
+    /// The store answers because the store is the only thing that knows. A
+    /// caller that recomputed the path from the same config would be a second
+    /// copy of the rule, and the copy is what drifts.
+    fn location(&self, _session_id: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Where to cut the history, and what to leave in its place.

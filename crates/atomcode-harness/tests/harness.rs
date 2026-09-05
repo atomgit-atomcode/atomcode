@@ -276,6 +276,7 @@ async fn the_persona_is_a_fragment_not_a_privileged_message() {
         prompts.ids(),
         vec![
             "persona-coding".to_string(),
+            "self-knowledge".to_string(),
             "tool-fs-world".to_string(),
             "tool-bash-world".to_string(),
             "tool-search".to_string(),

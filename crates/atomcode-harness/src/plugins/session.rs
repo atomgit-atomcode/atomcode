@@ -193,6 +193,10 @@ impl JsonlStore {
 
 #[async_trait]
 impl SessionPersistence for JsonlStore {
+    fn location(&self, session_id: &str) -> Option<String> {
+        Some(self.path(session_id).display().to_string())
+    }
+
     async fn append(&self, session_id: &str, events: &[LoggedEvent]) -> Result<(), String> {
         if events.is_empty() {
             return Ok(());

@@ -98,6 +98,11 @@ async fn main() -> ExitCode {
                 }
             },
             "--offline" => overlays.push(bundle::OFFLINE.to_string()),
+            // Without this the env vars are simply not read — the config row
+            // is a different row, and it will happily send whatever key your
+            // config has, which is how "I exported three variables and got a
+            // 401" happens.
+            "--env-model" | "--env" => overlays.push(bundle::ENV_MODEL.to_string()),
             "--mascot" => overlays.push(MASCOT.to_string()),
             "--yolo" => overlays.push(bundle::YOLO.to_string()),
             "--read-only" => overlays.push(bundle::READ_ONLY.to_string()),
@@ -207,6 +212,7 @@ FLAGS
     -p, --profile <name>   which composition to mount (default: repl)
     -m, --model <id>       a model selection from your atomcode config
         --offline          a scripted model; no network
+        --env-model        use ATOMCODE_BASE_URL / _MODEL / _API_KEY
         --mascot           show the cat
         --yolo             approve every tool call
         --read-only        no writes, no shell

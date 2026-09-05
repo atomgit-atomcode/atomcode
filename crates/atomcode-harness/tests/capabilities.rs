@@ -298,6 +298,8 @@ id = "tool-bash-world"
 [[remove]]
 id = "persona-coding"
 [[remove]]
+id = "self-knowledge"
+[[remove]]
 id = "session-persistence-jsonl"
 [[remove]]
 id = "session-projection"

@@ -36,6 +36,12 @@ name = "tools"
 [[insert]]
 name = "system-prompt"
 
+# What the agent knows about itself. Without this row it will answer "where is
+# my session log" by grepping the repository and guessing, because nothing else
+# in the tree ever tells it.
+[[insert]]
+name = "self-knowledge"
+
 # --- the model. Row id `llm` is the address; the plugin behind it is a value.
 # The default reads the provider the user already configured for AtomCode.
 # `--env-model` swaps in the environment-driven row for CI and containers.
