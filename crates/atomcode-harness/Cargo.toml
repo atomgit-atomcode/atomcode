@@ -1,0 +1,57 @@
+[package]
+name = "atomcode-harness"
+version.workspace = true
+edition = "2021"
+description = "Spike: AtomCode's coding agent reassembled as a plugin tree on atomcode-plexus — no privileged core, every part a config row"
+publish = false
+
+[[bin]]
+name = "harness"
+path = "src/bin/harness.rs"
+
+[dependencies]
+atomcode-plexus = { path = "../atomcode-plexus" }
+# Value types only (Message/ToolCall/ToolDef/LlmProvider/Tool). The kernel's own
+# agent loop is deliberately NOT used: the loop is a plugin here, which is the
+# whole point of the experiment.
+atomcode-kernel = { path = "../atomcode-kernel" }
+# Real provider adapter + real tools, mounted as plugins.
+atomcode-capabilities = { path = "../atomcode-capabilities", default-features = false, features = [
+    "tools",
+    "provider",
+    "skills",
+    "codeintel",
+    "memory",
+    "web",
+    "mcp",
+] }
+# `io-std` + `io-util`: the terminal front end reads stdin on its own task, so
+# a line typed during a turn reaches the agent's inbox instead of waiting for it.
+# The leaf config crate, so the harness can use the provider a user already
+# configured for AtomCode instead of asking them to restate it as env vars.
+# It is a leaf by design — every stack layer reads config without pulling core.
+atomcode-config = { path = "../atomcode-config" }
+# The review specialization's persona and rules. Reused rather than restated:
+# the reviewer prompt is hard-won, and two copies of it drift.
+atomcode-review = { path = "../atomcode-review" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "signal", "io-std", "io-util", "process"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# The web front end. Already in the workspace's lock via atomcode-daemon, so
+# this adds a row to a build, not a tree to the dependency graph.
+axum = { version = "0.7", features = ["macros"] }
+# The full-screen terminal front end, likewise already in-tree via atomcode-tuix.
+crossterm = { version = "0.29", features = ["event-stream"] }
+# SSE bodies for the web front end; already in-tree via axum's own deps.
+async-stream = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+# Redirect ATOMCODE_HOME to a temp dir once per test binary (via a #[ctor]) so the
+# session-persistence row cannot write into the developer's real ~/.atomcode.
+atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
+ctor = "0.2"

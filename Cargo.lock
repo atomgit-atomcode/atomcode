@@ -566,6 +566,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomcode-harness"
+version = "5.0.9"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "atomcode-capabilities",
+ "atomcode-config",
+ "atomcode-kernel",
+ "atomcode-plexus",
+ "atomcode-review",
+ "axum",
+ "crossterm",
+ "ctor",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "toml 0.8.23",
+]
+
+
+[[package]]
 name = "atomcode-kernel"
 version = "5.0.9"
 dependencies = [
@@ -576,6 +599,19 @@ dependencies = [
  "tokio",
  "tokio-util",
 ]
+
+[[package]]
+name = "atomcode-plexus"
+version = "5.0.9"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.23",
+]
+
 
 [[package]]
 name = "atomcode-review"
