@@ -2,7 +2,7 @@
 
 use atomcode_harness::session::SessionEvent;
 
-use crate::frame::{Color, Line, Span, Style};
+use crate::frame::{Color, Line, Style};
 use crate::module::{Height, View};
 use crate::moment::{Activity, Viewport};
 use crate::width;
@@ -18,6 +18,10 @@ pub struct State {
     pub tool_calls: u32,
     pub last_stop: Option<String>,
 }
+
+/// One frame per tick. Braille dots because they are one column everywhere and
+/// degrade to a dot rather than to tofu.
+const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 pub struct Status;
 
@@ -48,41 +52,90 @@ impl View for Status {
     }
 
     fn render(state: &State, vp: &Viewport<'_>) -> Vec<Line> {
-        if vp.rect.w == 0 || vp.rect.h == 0 {
+        use crate::caps::Glyph;
+        use crate::el::El;
+
+        let w = vp.rect.w;
+        if w == 0 || vp.rect.h == 0 {
             return Vec::new();
         }
-        let activity = match vp.moment.activity {
-            Activity::Idle => "idle",
-            Activity::Working => "working",
-            Activity::Stopping => "stopping",
-        };
-        let mut right = format!("turn {} · {} tools", state.turns, state.tool_calls);
-        if state.prompt_tokens > 0 {
-            right = format!("{right} · {}k ctx", state.prompt_tokens / 1000);
-        }
-        let left = if state.model.is_empty() {
-            format!(" atomcode · {activity}")
-        } else {
-            format!(" atomcode · {} · {activity}", state.model)
-        };
+        let caps = vp.moment.caps;
+        let bar = Style::new().bg(Color::Ansi(236));
+        let dim = Style::new().fg(Color::Ansi(245));
+        let key = Style::new().fg(Color::Ansi(110));
+        let sep = || El::styled(format!(" {} ", caps.g(Glyph::Separator)), dim);
 
-        let w = vp.rect.w as usize;
-        let lw = width::str_width(&left);
-        let rw = width::str_width(&right);
-        let gap = w.saturating_sub(lw + rw + 1);
-        let bar = Style::new().reverse();
-        let mut spans = vec![Span::styled(width::take_width(&left, w), bar)];
-        if gap > 0 && lw + rw < w {
-            spans.push(Span::styled(" ".repeat(gap), bar));
-            spans.push(Span::styled(format!("{right} "), bar));
-        } else {
-            spans.push(Span::styled(" ".repeat(w.saturating_sub(lw)), bar));
+        // Left: who, on what, doing what.
+        let mut left = vec![El::styled(
+            " atomcode",
+            Style::new().fg(Color::Ansi(75)).bold(),
+        )];
+        if !state.model.is_empty() {
+            left.push(sep());
+            left.push(El::styled(state.model.clone(), dim));
         }
-        vec![Line::from_spans(spans).truncate(w)]
+        left.push(sep());
+        left.push(match vp.moment.activity {
+            // The phase comes from the injected tick, never a clock — the
+            // spinner is a pure function of the frame number (docs/adr/0008).
+            Activity::Working => El::styled(
+                format!(
+                    "{} 运行中",
+                    SPINNER[(vp.moment.tick as usize) % SPINNER.len()]
+                ),
+                Style::new().fg(Color::Ansi(214)),
+            ),
+            Activity::Stopping => El::styled("停止中", Style::new().fg(Color::Ansi(203))),
+            Activity::Idle => match &state.last_stop {
+                Some(stop) if stop.contains("Error") => El::styled(
+                    format!("{} {stop}", caps.g(Glyph::Fail)),
+                    Style::new().fg(Color::Ansi(203)),
+                ),
+                Some(_) => El::styled(
+                    format!("{} 就绪", caps.g(Glyph::Ok)),
+                    Style::new().fg(Color::Ansi(114)),
+                ),
+                None => El::styled("就绪", dim),
+            },
+        });
+
+        // Right: the numbers, each one only when it means something. A counter
+        // reading zero is noise pretending to be information.
+        let mut right: Vec<El> = Vec::new();
+        let mut chip = |label: &str, value: String| {
+            right.push(sep());
+            right.push(El::styled(format!("{label} "), dim));
+            right.push(El::styled(value, key));
+        };
+        if state.turns > 0 {
+            chip("回合", state.turns.to_string());
+        }
+        if state.tool_calls > 0 {
+            chip("工具", state.tool_calls.to_string());
+        }
+        if state.prompt_tokens > 0 {
+            chip(
+                "上下文",
+                format!("{}k", (state.prompt_tokens as f32 / 1000.0).round() as u32),
+            );
+        }
+        right.push(El::raw(" "));
+
+        let mut row = left;
+        row.push(El::Spacer);
+        row.extend(right);
+        El::styled_all(bar, El::row(row)).lay(w)
     }
 
     fn height(_: &State) -> Height {
         Height::Fixed(1)
+    }
+
+    /// The spinner needs frames; nothing else here does. Asking always is fine
+    /// because an idle screen renders identically each time — the host repaints
+    /// what changed, and nothing changed.
+    fn tick() -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_millis(110))
     }
 }
 
@@ -163,15 +216,48 @@ mod tests {
 
     #[test]
     fn the_bar_says_what_is_running_and_what_it_cost() {
-        let mut s = State::default();
-        for f in crate::conformance::facts() {
-            Status::absorb(&mut s, &f);
+        let mut st = State::default();
+        for fact in [
+            SessionEvent::TurnStart { turn: 2 },
+            SessionEvent::RequestHeader {
+                turn: 2,
+                round: 1,
+                model: "replay".into(),
+                reason: atomcode_harness::session::HeaderReason::Append,
+            },
+            SessionEvent::StepEnd {
+                turn: 2,
+                step: 1,
+                tool_calls: 2,
+            },
+        ] {
+            Status::absorb(&mut st, &fact);
         }
-        let text = draw::<Status>(&s, 60, &Moment::default().working());
-        assert!(text.contains("replay"), "{text}");
-        assert!(text.contains("working"), "{text}");
-        assert!(text.contains("turn 2"), "{text}");
-        assert!(text.contains("2 tools"), "{text}");
+        let line = Status::render(
+            &st,
+            &Viewport::new(Rect::sized(70, 1), &Moment::default().working()),
+        )[0]
+        .plain();
+        for expected in ["atomcode", "replay", "回合 2", "工具 2"] {
+            assert!(line.contains(expected), "{line:?} is missing {expected}");
+        }
+        assert_eq!(
+            width::str_width(&line),
+            70,
+            "the bar fills its width exactly, or the background has a hole in it"
+        );
+    }
+
+    #[test]
+    fn a_counter_reading_zero_is_left_out() {
+        // A zero is noise pretending to be information.
+        let line = Status::render(
+            &State::default(),
+            &Viewport::new(Rect::sized(70, 1), &Moment::default()),
+        )[0]
+        .plain();
+        assert!(!line.contains("工具"), "{line:?}");
+        assert!(!line.contains("回合"), "{line:?}");
     }
 
     #[test]

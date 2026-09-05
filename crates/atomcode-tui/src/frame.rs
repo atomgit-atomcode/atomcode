@@ -88,6 +88,21 @@ impl Style {
             reverse: false,
         }
     }
+    /// Fill unset fields from `base`. What this style states wins; what it
+    /// leaves open is inherited — the same rule CSS uses, and what lets a
+    /// container give every child a background without every child knowing.
+    pub fn under(self, base: Style) -> Style {
+        Style {
+            fg: self.fg.or(base.fg),
+            bg: self.bg.or(base.bg),
+            bold: self.bold || base.bold,
+            dim: self.dim || base.dim,
+            italic: self.italic || base.italic,
+            underline: self.underline || base.underline,
+            reverse: self.reverse || base.reverse,
+        }
+    }
+
     pub const fn fg(mut self, c: Color) -> Self {
         self.fg = Some(c);
         self

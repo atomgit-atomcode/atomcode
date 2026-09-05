@@ -52,15 +52,22 @@ fn sgr(style: &Style) -> String {
     }
 }
 
-fn write_line(out: &mut String, line: &Line, width: u16) {
+fn write_line(out: &mut String, line: &Line, width: u16, caps: crate::caps::Caps) {
     let clipped = line.truncate(width as usize);
     for span in &clipped.spans {
-        let codes = sgr(&span.style);
+        // Swap first, then measure nothing: every substitution is the same
+        // number of columns, so clipping above stays correct.
+        let text = caps.text(&span.text);
+        let codes = if caps.colors == crate::caps::Colors::None {
+            String::new()
+        } else {
+            sgr(&span.style)
+        };
         if codes.is_empty() {
-            out.push_str(&span.text);
+            out.push_str(&text);
         } else {
             out.push_str(&codes);
-            out.push_str(&span.text);
+            out.push_str(&text);
             out.push_str("\x1b[0m");
         }
     }
@@ -72,7 +79,14 @@ fn write_line(out: &mut String, line: &Line, width: u16) {
 /// Positioning is absolute *by construction*, which is the encoder's half of
 /// the containment guarantee: even a module that returns too many lines cannot
 /// push its neighbour down the screen — it is clipped at its own rect.
-pub fn encode(frame: &Frame) -> String {
+/// Paint a frame for a terminal with these capabilities.
+///
+/// This is where the OS shield actually bites: glyphs the terminal cannot show
+/// are swapped for ASCII of the same width, and colours it does not have are
+/// dropped. Doing it here rather than at every call site is what makes the
+/// layering enforceable — a module has no opportunity to forget, because it was
+/// never asked.
+pub fn encode_with(frame: &Frame, caps: crate::caps::Caps) -> String {
     let mut out = String::with_capacity(1024);
     out.push_str(CLEAR);
     for part in &frame.parts {
@@ -83,7 +97,7 @@ pub fn encode(frame: &Frame) -> String {
             let row = part.rect.y as usize + dy + 1; // ANSI is 1-based
             let col = part.rect.x as usize + 1;
             let _ = write!(out, "\x1b[{row};{col}H");
-            write_line(&mut out, line, part.rect.w);
+            write_line(&mut out, line, part.rect.w, caps);
         }
     }
     match frame.cursor {
@@ -93,6 +107,11 @@ pub fn encode(frame: &Frame) -> String {
         None => out.push_str("\x1b[?25l"),
     }
     out
+}
+
+/// Paint for a fully capable terminal. Tests and callers that do not care.
+pub fn encode(frame: &Frame) -> String {
+    encode_with(frame, crate::caps::Caps::default())
 }
 
 #[cfg(test)]

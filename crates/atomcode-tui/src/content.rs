@@ -61,7 +61,7 @@ impl Content for UserSaid {
         hash_of(&["user", &self.0])
     }
     fn lines(&self, w: u16) -> Vec<Line> {
-        wrapped(&self.0, w, user(), "› ")
+        wrapped(&self.0, w, user(), "❯ ")
     }
 }
 

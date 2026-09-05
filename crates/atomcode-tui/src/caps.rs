@@ -224,11 +224,14 @@ fn ascii_for(ch: char) -> Option<&'static str> {
         '\u{2500}' | '\u{2550}' | '\u{2501}' => "-",
         '\u{2502}' | '\u{2551}' | '\u{2503}' | '\u{258E}' => "|",
         '\u{23BD}' | '\u{23BC}' => "_",
-        '\u{23BF}' | '\u{2514}' | '\u{2570}' => "`",
-        '\u{250C}' | '\u{2510}' | '\u{2518}' | '\u{251C}' | '\u{2524}' | '\u{252C}'
-        | '\u{2534}' | '\u{253C}' | '\u{256D}' | '\u{256E}' | '\u{256F}' | '\u{2554}'
-        | '\u{2557}' | '\u{255A}' | '\u{255D}' | '\u{2560}' | '\u{2563}' | '\u{2566}'
-        | '\u{2569}' | '\u{256C}' => "+",
+        // `⎿` is a tree-line tail, not a corner; box corners all become `+`
+        // so a frame does not get one corner from each source. The glyph set
+        // and this table are checked against each other.
+        '\u{23BF}' => "`",
+        '\u{2514}' | '\u{2570}' | '\u{250C}' | '\u{2510}' | '\u{2518}' | '\u{251C}'
+        | '\u{2524}' | '\u{252C}' | '\u{2534}' | '\u{253C}' | '\u{256D}' | '\u{256E}'
+        | '\u{256F}' | '\u{2554}' | '\u{2557}' | '\u{255A}' | '\u{255D}' | '\u{2560}'
+        | '\u{2563}' | '\u{2566}' | '\u{2569}' | '\u{256C}' => "+",
         // blocks / shades
         '\u{2588}' | '\u{2580}' | '\u{2584}' | '\u{2592}' | '\u{2593}' => "#",
         '\u{2591}' => ".",
@@ -274,6 +277,14 @@ pub enum Glyph {
     Interrupted,
     Bullet,
     Pointer,
+    /// The prompt marker.
+    ///
+    /// `❯` and not `›` on purpose: `›` is also ordinary punctuation, and the
+    /// downgrade table must leave punctuation alone (rewriting `‹model›` in
+    /// something the model said would be a far worse bug than a `□`). A glyph
+    /// that is only ever chrome can live in both the glyph set and the table,
+    /// and the two are checked against each other.
+    Prompt,
     Separator,
 }
 
@@ -294,6 +305,7 @@ impl Caps {
                 Interrupted => "—",
                 Bullet => "•",
                 Pointer => "▸",
+                Prompt => "❯",
                 Separator => "·",
             }
         } else {
@@ -307,6 +319,7 @@ impl Caps {
                 Interrupted => "-",
                 Bullet => "*",
                 Pointer => ">",
+                Prompt => ">",
                 Separator => ".",
             }
         }
@@ -405,6 +418,36 @@ mod tests {
     fn the_table_is_not_empty_so_the_check_above_means_something() {
         // A range walk that found nothing would make every assertion vacuous.
         assert!(mapped().len() > 40, "only {} entries", mapped().len());
+    }
+
+    #[test]
+    fn the_two_paths_to_ascii_agree() {
+        // There are two ways a `┌` becomes ASCII: a module asks for
+        // `Glyph::TopLeft` and gets `+`, or a literal `┌` goes through the
+        // downgrade table on its way to the terminal. If they disagree, a box
+        // gets one corner from each and looks broken — which is exactly what
+        // happened: the table mapped `└` to a backtick (good for tree lines,
+        // wrong for a box) while the glyph set said `+`.
+        for glyph in [
+            Glyph::TopLeft,
+            Glyph::TopRight,
+            Glyph::BottomLeft,
+            Glyph::BottomRight,
+            Glyph::Horizontal,
+            Glyph::Vertical,
+            Glyph::Ok,
+            Glyph::Fail,
+            Glyph::Bullet,
+            Glyph::Pointer,
+            Glyph::Prompt,
+        ] {
+            let rich = Caps::default().g(glyph);
+            assert_eq!(
+                downgrade(rich, false),
+                Caps::plain().g(glyph),
+                "{glyph:?}: the table and the glyph set disagree about {rich:?}"
+            );
+        }
     }
 
     #[test]

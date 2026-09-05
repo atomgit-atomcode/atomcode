@@ -171,6 +171,10 @@ pub enum El {
     },
     /// Indent every line of the child.
     Indent(u16, Box<El>),
+    /// Give every span underneath a style it does not already state — a
+    /// background for a whole bar, a dim for a whole block. Inheritance, so a
+    /// child never has to know what it is sitting on.
+    Styled(Style, Box<El>),
 }
 
 impl El {
@@ -241,6 +245,11 @@ impl El {
     pub fn col(children: Vec<El>) -> El {
         El::Col(children)
     }
+    /// Everything underneath inherits this style where it states none.
+    pub fn styled_all(style: Style, child: El) -> El {
+        El::Styled(style, Box::new(child))
+    }
+
     pub fn framed(child: El) -> El {
         El::Framed {
             title: None,
@@ -396,6 +405,7 @@ impl El {
             | El::Spacer
             | El::Fixed(..)
             | El::Indent(..)
+            | El::Styled(..)
             | El::Framed { .. } => out.push((self.clone(), area)),
             El::Stack(children) => children.iter().for_each(|c| c.place_into(area, wants, out)),
             El::Flex { dir, items, gap } => {
@@ -503,6 +513,7 @@ impl El {
             | El::Spacer
             | El::Fixed(..)
             | El::Indent(..)
+            | El::Styled(..)
             | El::Framed { .. } => 1,
             El::Stack(c) => c.iter().map(|r| r.wanted(dir, wants)).max().unwrap_or(0),
             El::Flex { dir: d, items, gap } => {
@@ -560,6 +571,18 @@ impl El {
                     })
                     .collect()
             }
+            El::Styled(style, child) => child
+                .lay(w)
+                .into_iter()
+                .map(|l| {
+                    Line::from_spans(
+                        l.spans
+                            .into_iter()
+                            .map(|sp| Span::styled(sp.text, sp.style.under(*style)))
+                            .collect(),
+                    )
+                })
+                .collect(),
             El::Framed {
                 title,
                 footer,

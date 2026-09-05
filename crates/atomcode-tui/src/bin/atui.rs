@@ -95,6 +95,7 @@ async fn main() -> ExitCode {
     let mut profile = "repl".to_string();
     let mut dump = false;
     let mut audit = false;
+    let mut demo = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -129,6 +130,10 @@ async fn main() -> ExitCode {
             "--headless" => overlays.push(HEADLESS.to_string()),
             "--audit" => {
                 audit = true;
+                overlays.push(HEADLESS.to_string());
+            }
+            "--demo" => {
+                demo = true;
                 overlays.push(HEADLESS.to_string());
             }
             "-h" | "--help" => {
@@ -189,6 +194,47 @@ async fn main() -> ExitCode {
         };
     }
 
+    if demo {
+        // One composed frame, printed and gone: what the screen looks like,
+        // with no tty, no model and no keyboard. It goes through the real
+        // host, the real modules and the real encoder — a mock-up that did not
+        // would be a picture of something that does not exist.
+        let ctx = app.context();
+        let Some(surface) = ctx.service::<atomcode_tui::plugin::SurfaceSvc>() else {
+            eprintln!("--demo needs a surface row");
+            return ExitCode::FAILURE;
+        };
+        let Some(modules) = ctx.service::<atomcode_tui::plugin::ModulesSvc>() else {
+            eprintln!("--demo needs the module rows");
+            return ExitCode::FAILURE;
+        };
+        let host = atomcode_tui::host::Host::new(modules, atomcode_tui::host::default_layout());
+        for fact in atomcode_tui::conformance::facts() {
+            host.absorb(&fact);
+        }
+        {
+            let mut moment = host.moment.write().expect("moment poisoned");
+            moment.input = "再帮我看看 crates/ 的结构".into();
+            moment.caret = moment.input.len();
+            moment.caps = atomcode_tui::caps::Caps::detect();
+        }
+        let (w, h) = surface.size();
+        let frame = host.compose((w, h));
+        let violations = frame.containment_violations();
+        print!(
+            "{}",
+            atomcode_tui::ansi::encode_with(&frame, atomcode_tui::caps::Caps::detect())
+        );
+        println!("\x1b[{};1H", h + 1);
+        if !violations.is_empty() {
+            for v in &violations {
+                eprintln!("containment: {v}");
+            }
+            return ExitCode::FAILURE;
+        }
+        return ExitCode::SUCCESS;
+    }
+
     let ctx = app.context();
     let ui = match ctx.require::<UiSvc>() {
         Ok(ui) => ui,
@@ -229,6 +275,7 @@ FLAGS
         --dump-config      print the tree that would run
         --headless         paint into memory; no terminal needed
         --audit            check the composition and exit
+        --demo             print one composed frame and exit（不需要终端）
     -h, --help             this
 
 KEYS

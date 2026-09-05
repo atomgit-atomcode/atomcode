@@ -708,7 +708,7 @@ async fn a_modal_takes_the_keyboard_and_escape_gives_it_back() {
     let filtered = s.screen();
     assert!(filtered.contains("llm"), "{filtered}");
     assert!(
-        !filtered.contains("› llm"),
+        !filtered.contains("❯ llm"),
         "the keys went to the modal, not the prompt:\n{filtered}"
     );
 
@@ -720,7 +720,12 @@ async fn a_modal_takes_the_keyboard_and_escape_gives_it_back() {
     // And the prompt has the keyboard back.
     s.term.type_text("hello");
     s.quiet().await;
-    assert!(s.screen().contains("› hello"), "{}", s.screen());
+    let prompt = atomcode_tui::caps::Caps::default().g(atomcode_tui::caps::Glyph::Prompt);
+    assert!(
+        s.screen().contains(&format!("{prompt} hello")),
+        "{}",
+        s.screen()
+    );
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
