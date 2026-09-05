@@ -29,6 +29,7 @@ pub mod agent;
 pub mod bundle;
 pub mod control;
 pub mod events;
+pub mod exec;
 pub mod plugins;
 pub mod profile;
 pub mod seam_map;

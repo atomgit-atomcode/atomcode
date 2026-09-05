@@ -18,19 +18,18 @@ use async_trait::async_trait;
 use atomcode_kernel::message::Message;
 use atomcode_kernel::provider::{ChatOptions, LlmProvider};
 use atomcode_kernel::stream::StreamEvent;
-use atomcode_kernel::tool::{ProgressSink, ToolContext, ToolDef, ToolResult};
+use atomcode_kernel::tool::{ToolCall, ToolDef, ToolResult};
 use atomcode_plexus::{Context, Plugin};
 use futures::future::BoxFuture;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentStatus};
 use crate::events::{
     AgentRequest, AssistantChunk, AssistantMessage, Chunk, ModelRequest, ModelResponse, PreStep,
-    SessionEventCommitted, StepDecision, ToolExec, ToolResultEvent, ToolsExecute, TurnEnd,
-    TurnProgress, TurnStart, TurnStarted, TurnStopping,
+    RequestError, SessionEventCommitted, StepDecision, ToolBatch, ToolExec, ToolResultEvent,
+    ToolsExecuteBatch, TurnEnd, TurnProgress, TurnStart, TurnStarted, TurnStopping,
 };
 use crate::seams::{
     AgentLoop, AgentLoopSvc, LlmSvc, SessionProjectionsSvc, SessionSvc, StopReason,
@@ -124,7 +123,7 @@ impl PluginAgentLoop {
         turn: u64,
         round: u32,
         mut req: ModelRequest,
-    ) -> Result<ModelResponse, String> {
+    ) -> Result<ModelResponse, RequestError> {
         let ctx = agent_ctx.clone();
         agent_ctx
             .waterfall::<AgentRequest, _>(&mut req, move |req| {
@@ -139,58 +138,74 @@ impl PluginAgentLoop {
                         &*provider, &ctx, &session, turn, round, messages, tools, options,
                     )
                     .await
-                }) as BoxFuture<'_, Result<ModelResponse, String>>
+                }) as BoxFuture<'_, Result<ModelResponse, RequestError>>
             })
             .await
     }
 
-    /// One tool call, wrapped in the `tools/execute` waterfall. A denial is a
-    /// *result*, not an error: the model has to see why its call did not run,
-    /// and the history has to stay pairable.
-    async fn execute(&self, agent_ctx: &Context, mut exec: ToolExec) -> ToolResult {
+    /// One round's tool calls, wrapped in the `tools/execute-batch` waterfall.
+    ///
+    /// The terminal runs them one at a time. Overlapping them is a listener's
+    /// job (`tool-exec-parallel`), so a tree with no scheduler mounted still
+    /// works — just serially. That is the difference between a default and a
+    /// hole.
+    async fn execute_batch(
+        &self,
+        agent_ctx: &Context,
+        agent: &Agent,
+        calls: Vec<ToolCall>,
+        turn: u64,
+        step: u32,
+    ) -> Vec<ToolResult> {
+        let mut batch = ToolBatch {
+            calls,
+            turn,
+            step,
+            working_dir: self.working_dir.clone(),
+            cancel: agent.cancel_token(),
+        };
         let ctx = agent_ctx.clone();
-        let working_dir = self.working_dir.clone();
         agent_ctx
-            .waterfall::<ToolsExecute, _>(&mut exec, move |exec| {
+            .waterfall::<ToolsExecuteBatch, _>(&mut batch, move |batch| {
                 let ctx = ctx.clone();
-                let working_dir = working_dir.clone();
-                let call = exec.call.clone();
+                let cancel = batch.cancel.clone();
+                let working_dir = batch.working_dir.clone();
+                let turn = batch.turn;
+                let step = batch.step;
+                let calls = batch.calls.clone();
                 Box::pin(async move {
-                    let Some(toolbox) = ctx.service::<ToolsSvc>() else {
-                        return error_result(&call.id, "no tool catalog is mounted");
-                    };
-                    let Some(tool) = toolbox.get(&call.name) else {
-                        return error_result(
-                            &call.id,
-                            &format!(
-                                "unknown tool `{}`; mounted: {}",
-                                call.name,
-                                toolbox.names().join(", ")
-                            ),
+                    let mut out = Vec::with_capacity(calls.len());
+                    for call in calls {
+                        // The same guarantee the parallel scheduler makes: a
+                        // call that had not started when the turn was cancelled
+                        // never starts. Without it, `/stop` during a four-call
+                        // round still runs all four.
+                        if cancel.is_cancelled() {
+                            out.push(crate::exec::error_result(
+                                &call.id,
+                                "(cancelled before it started)",
+                            ));
+                            continue;
+                        }
+                        out.push(
+                            crate::exec::execute_one(
+                                &ctx,
+                                cancel.clone(),
+                                working_dir.clone(),
+                                ToolExec {
+                                    call,
+                                    turn,
+                                    round: step,
+                                    pre_approved: false,
+                                },
+                            )
+                            .await,
                         );
-                    };
-                    let tool_ctx = ToolContext {
-                        working_dir,
-                        cancel: CancellationToken::new(),
-                        progress: ProgressSink::noop(),
-                        requester: None,
-                    };
-                    let mut result = tool.execute(&call.arguments, &tool_ctx).await;
-                    // Tools mint their own id-less results; the loop owns pairing.
-                    result.call_id = call.id.clone();
-                    result
-                }) as BoxFuture<'_, ToolResult>
+                    }
+                    out
+                }) as BoxFuture<'_, Vec<ToolResult>>
             })
             .await
-    }
-}
-
-fn error_result(call_id: &str, message: &str) -> ToolResult {
-    ToolResult {
-        call_id: call_id.to_string(),
-        content: message.to_string(),
-        is_error: true,
-        images: vec![],
     }
 }
 
@@ -208,11 +223,11 @@ async fn stream_once(
     messages: Vec<Message>,
     tools: Vec<ToolDef>,
     options: ChatOptions,
-) -> Result<ModelResponse, String> {
+) -> Result<ModelResponse, RequestError> {
     let mut stream = provider
         .chat_stream(&messages, &tools, &options)
         .await
-        .map_err(|e| e.message)?;
+        .map_err(|e| RequestError::from_provider(&e))?;
     let mut out = ModelResponse::default();
     while let Some(event) = stream.next().await {
         match event {
@@ -244,9 +259,15 @@ async fn stream_once(
             }
             StreamEvent::ToolCall(call) => out.tool_calls.push(call),
             StreamEvent::Usage(usage) => out.usage = Some(usage),
-            StreamEvent::Error(err) => return Err(err.message),
+            StreamEvent::Error(err) => return Err(RequestError::from_provider(&err)),
             _ => {}
         }
+    }
+    // A response with neither text nor tool calls cannot advance the turn.
+    // Reported as a typed failure so a retry policy can decide, rather than
+    // silently producing an empty assistant message.
+    if out.text.trim().is_empty() && out.tool_calls.is_empty() {
+        return Err(RequestError::empty());
     }
     Ok(out)
 }
@@ -412,9 +433,9 @@ impl AgentLoop for PluginAgentLoop {
                 .await
             {
                 Ok(response) => response,
-                Err(message) => {
+                Err(error) => {
                     outcome.stop = StopReason::ProviderError;
-                    outcome.error = Some(message);
+                    outcome.error = Some(error.to_string());
                     break;
                 }
             };
@@ -449,19 +470,14 @@ impl AgentLoop for PluginAgentLoop {
             }
 
             let tool_count = response.tool_calls.len() as u32;
-            for call in response.tool_calls {
-                outcome.tool_calls += 1;
-                let result = self
-                    .execute(
-                        &ctx,
-                        ToolExec {
-                            call,
-                            turn,
-                            round: step,
-                            pre_approved: false,
-                        },
-                    )
-                    .await;
+            outcome.tool_calls += tool_count;
+            let results = self
+                .execute_batch(&ctx, agent, response.tool_calls, turn, step)
+                .await;
+            // Side effects were already applied concurrently; the log is written
+            // in emission order so the transcript matches what the model asked
+            // for, not what happened to finish first.
+            for result in results {
                 self.commit(
                     &session,
                     SessionEvent::ToolResultLogged {

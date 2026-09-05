@@ -155,7 +155,17 @@ impl LlmProvider for ReplayProvider {
         let index = self
             .cursor
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let step = self.script.get(index).cloned().unwrap_or_default();
+        // Past the end of the script, say so rather than answering with
+        // nothing: an empty response is now a typed failure, and a fixture
+        // running out is not a provider failure.
+        let step = self
+            .script
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| ReplayStep {
+                text: "(replay script exhausted)".into(),
+                calls: Vec::new(),
+            });
         let mut events = Vec::new();
         if !step.text.is_empty() {
             // Chunked, so anything downstream that renders a live stream is

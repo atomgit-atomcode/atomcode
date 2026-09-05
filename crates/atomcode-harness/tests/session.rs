@@ -426,7 +426,8 @@ async fn the_loop_refuses_to_continue_on_an_unexplainable_prompt() {
             &self,
             req: &mut atomcode_harness::events::ModelRequest,
             next: atomcode_plexus::Next<'_, atomcode_harness::events::AgentRequest>,
-        ) -> Result<atomcode_harness::events::ModelResponse, String> {
+        ) -> Result<atomcode_harness::events::ModelResponse, atomcode_harness::events::RequestError>
+        {
             req.messages.push(Message::user("smuggled context"));
             next.run(req).await
         }

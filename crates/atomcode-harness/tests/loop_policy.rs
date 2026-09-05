@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use atomcode_harness::events::{AgentRequest, ModelRequest, ModelResponse};
+use atomcode_harness::events::{AgentRequest, ModelRequest, ModelResponse, RequestError};
 use atomcode_harness::seams::{CompactionSvc, SessionSvc, StopReason};
 use atomcode_harness::session::SessionEvent;
 use atomcode_harness::{bundle, plugins, run_turn};
@@ -49,17 +49,19 @@ fn tree(root: &std::path::Path, script: &str, extra: &[&str]) -> ConfigTree {
     ConfigTree::from_layers(layers).unwrap()
 }
 
-/// A model that never stops asking for tools — the shape a round budget exists
-/// to bound.
+/// A model that answers once and stops.
+///
+/// Not an empty script: a response with neither text nor tool calls is now a
+/// typed failure (`RequestError::empty`), because it cannot advance a turn and
+/// silently accepting it produced empty assistant messages.
 const NEVER_STOPS: &str = r#"
 [[patch]]
 id = "llm"
 name = "llm-replay"
-config = { script = [] }
+config = { script = [ { text = "ok" } ] }
 "#;
 
-/// The empty replay script yields an empty response with no tool calls, which
-/// stops immediately. This one keeps calling a tool instead.
+/// Keeps calling a tool, so a round budget has something to bound.
 fn always_calls(tool: &str, args: &str) -> String {
     let step = format!(r#"{{ text = "again", calls = [ {{ name = "{tool}", args = {args} }} ] }}"#);
     let steps = vec![step; 40].join(",\n  ");
@@ -140,7 +142,7 @@ async fn a_wall_clock_deadline_is_the_same_row_with_different_config() {
 struct FlakyProvider {
     seen: Arc<std::sync::atomic::AtomicU32>,
     fail_times: u32,
-    error: String,
+    error: RequestError,
 }
 
 #[async_trait]
@@ -149,7 +151,7 @@ impl Waterfall<AgentRequest> for FlakyProvider {
         &self,
         _req: &mut ModelRequest,
         _next: Next<'_, AgentRequest>,
-    ) -> Result<ModelResponse, String> {
+    ) -> Result<ModelResponse, RequestError> {
         let n = self.seen.fetch_add(1, Ordering::SeqCst);
         if n < self.fail_times {
             return Err(self.error.clone());
@@ -161,7 +163,29 @@ impl Waterfall<AgentRequest> for FlakyProvider {
     }
 }
 
-async fn retry_case(fail_times: u32, error: &str, attempts: u32) -> (StopReason, String, u32) {
+/// A transient failure the provider marked retryable.
+fn transient(message: &str) -> RequestError {
+    RequestError {
+        retryable: true,
+        http_status: Some(503),
+        ..RequestError::message(message)
+    }
+}
+
+/// An auth failure: retrying it burns time and money for nothing.
+fn fatal(message: &str) -> RequestError {
+    RequestError {
+        retryable: false,
+        http_status: Some(401),
+        ..RequestError::message(message)
+    }
+}
+
+async fn retry_case(
+    fail_times: u32,
+    error: RequestError,
+    attempts: u32,
+) -> (StopReason, String, u32) {
     let dir = scratch("retry");
     let row = format!(
         "[[patch]]\nid = \"llm-retry\"\nconfig = {{ attempts = {attempts}, backoff_ms = 1 }}\n"
@@ -172,7 +196,7 @@ async fn retry_case(fail_times: u32, error: &str, attempts: u32) -> (StopReason,
         Arc::new(FlakyProvider {
             seen: seen.clone(),
             fail_times,
-            error: error.to_string(),
+            error,
         }),
         false,
     );
@@ -186,7 +210,7 @@ async fn retry_case(fail_times: u32, error: &str, attempts: u32) -> (StopReason,
 
 #[tokio::test]
 async fn retry_re_runs_the_request_rather_than_replaying_the_failure() {
-    let (stop, text, attempts) = retry_case(2, "503 service unavailable", 3).await;
+    let (stop, text, attempts) = retry_case(2, transient("503 service unavailable"), 3).await;
     assert_eq!(stop, StopReason::Stopped);
     assert_eq!(text, "recovered");
     assert_eq!(attempts, 3, "two failures then a success — a real re-issue");
@@ -194,15 +218,15 @@ async fn retry_re_runs_the_request_rather_than_replaying_the_failure() {
 
 #[tokio::test]
 async fn retry_gives_up_after_its_budget() {
-    let (stop, error, attempts) = retry_case(99, "429 too many requests", 3).await;
+    let (stop, error, attempts) = retry_case(99, transient("503 upstream down"), 3).await;
     assert_eq!(stop, StopReason::ProviderError);
-    assert!(error.contains("429"), "{error}");
+    assert!(error.contains("503"), "{error}");
     assert_eq!(attempts, 3);
 }
 
 #[tokio::test]
 async fn a_fatal_error_is_not_retried() {
-    let (stop, error, attempts) = retry_case(99, "401 invalid api key", 3).await;
+    let (stop, error, attempts) = retry_case(99, fatal("401 invalid api key"), 3).await;
     assert_eq!(stop, StopReason::ProviderError);
     assert!(error.contains("401"), "{error}");
     assert_eq!(
@@ -220,7 +244,7 @@ async fn removing_the_retry_row_removes_the_retrying() {
         Arc::new(FlakyProvider {
             seen: seen.clone(),
             fail_times: 1,
-            error: "503".into(),
+            error: transient("503"),
         }),
         false,
     );

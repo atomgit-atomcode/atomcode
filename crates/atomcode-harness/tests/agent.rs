@@ -8,7 +8,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use atomcode_harness::agent::{Agent, AgentStatus};
 use atomcode_harness::events::{
-    AgentRequest, ModelRequest, ModelResponse, PreStep, StepDecision, ToolExec, ToolsExecute,
+    AgentRequest, ModelRequest, ModelResponse, PreStep, RequestError, StepDecision, ToolExec,
+    ToolsExecute,
 };
 use atomcode_harness::seams::{AgentsSvc, SessionSvc, StopReason, ToolsSvc};
 use atomcode_harness::session::{InjectionOrigin, SessionEvent};
@@ -257,7 +258,7 @@ impl Waterfall<AgentRequest> for SendsMidTurn {
         &self,
         req: &mut ModelRequest,
         next: Next<'_, AgentRequest>,
-    ) -> Result<ModelResponse, String> {
+    ) -> Result<ModelResponse, RequestError> {
         if !self.fired.swap(true, Ordering::SeqCst) {
             self.agent.send("actually, also do this");
         }

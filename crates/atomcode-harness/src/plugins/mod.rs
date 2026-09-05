@@ -9,9 +9,11 @@ pub mod loop_policy;
 pub mod persona;
 pub mod policy;
 pub mod policy_rows;
+pub mod recovery;
 pub mod registries;
 pub mod session;
 pub mod subagent;
+pub mod tool_exec;
 pub mod tools;
 pub mod ui;
 pub mod ui_jsonrpc;
@@ -66,8 +68,12 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(policy::RepairArgsPlugin))
         .register(Arc::new(policy::ApprovalPlugin))
         .register(Arc::new(policy::ResultCapPlugin))
+        .register(Arc::new(tool_exec::ParallelToolsPlugin))
         .register(Arc::new(loop_policy::RoundCapPlugin))
         .register(Arc::new(loop_policy::RetryPlugin))
+        .register(Arc::new(recovery::RateLimitPlugin))
+        .register(Arc::new(recovery::OverflowPlugin))
+        .register(Arc::new(recovery::RequestTimeoutPlugin))
         .register(Arc::new(loop_policy::CompactionPlugin))
         .register(Arc::new(loop_policy::ToolLoopGuardPlugin))
         .register(Arc::new(policy_rows::TodoPlugin))

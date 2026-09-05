@@ -131,6 +131,20 @@ config = { max_rounds = 24, max_seconds = 0 }
 name = "llm-retry"
 config = { attempts = 3, backoff_ms = 1000 }
 
+# Recovery, outermost first: a bound that each retry resets is not a bound,
+# and waiting out a limit has to happen outside everything that would burn it.
+[[insert]]
+name = "llm-request-timeout"
+config = { request_secs = 600 }
+
+[[insert]]
+name = "llm-rate-limit"
+config = { max_waits = 5, max_wait_secs = 120, fallback_secs = 5 }
+
+[[insert]]
+name = "compaction-overflow"
+config = { max_attempts = 3 }
+
 [[insert]]
 name = "compaction-tail"
 config = { threshold = 0.75, keep_turns = 2 }
@@ -166,6 +180,12 @@ disabled = true
 [[insert]]
 name = "tool-result-cap"
 config = { max_bytes = 65536 }
+
+# Scheduling is a policy, not loop code: remove this row and a round's calls
+# run one at a time, which is always correct and sometimes slow.
+[[insert]]
+name = "tool-exec-parallel"
+config = { max_parallel = 4 }
 
 # --- the driver --------------------------------------------------------------
 # `max_rounds` here is the runaway fuse, not the budget: the budget is the

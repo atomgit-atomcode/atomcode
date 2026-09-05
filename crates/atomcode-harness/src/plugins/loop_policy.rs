@@ -16,7 +16,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::events::{
-    AgentRequest, ModelRequest, ModelResponse, ToolExec, ToolsExecute, TurnProgress, TurnStopping,
+    AgentRequest, ModelRequest, ModelResponse, RequestError, ToolExec, ToolsExecute, TurnProgress,
+    TurnStopping,
 };
 use crate::seams::{Compaction, CompactionDecision, CompactionSvc, SessionSvc, StopReason};
 use crate::session::SessionEvent;
@@ -122,54 +123,32 @@ struct Retry {
     backoff_ms: u64,
 }
 
-/// Whether an error is worth trying again. Auth failures and bad requests are
-/// not: retrying them burns time and, on a paid endpoint, money.
-fn is_transient(message: &str) -> bool {
-    let lowered = message.to_lowercase();
-    const FATAL: &[&str] = &[
-        "401",
-        "403",
-        "invalid api key",
-        "unauthorized",
-        "insufficient balance",
-        "400",
-        "model not found",
-    ];
-    if FATAL.iter().any(|marker| lowered.contains(marker)) {
-        return false;
-    }
-    const TRANSIENT: &[&str] = &[
-        "429",
-        "500",
-        "502",
-        "503",
-        "504",
-        "timeout",
-        "timed out",
-        "connection",
-        "reset",
-        "eof",
-        "stream",
-    ];
-    TRANSIENT.iter().any(|marker| lowered.contains(marker))
-}
-
 #[async_trait]
 impl Waterfall<AgentRequest> for Retry {
     async fn handle(
         &self,
         req: &mut ModelRequest,
         next: Next<'_, AgentRequest>,
-    ) -> Result<ModelResponse, String> {
+    ) -> Result<ModelResponse, RequestError> {
         let mut attempt = 1;
         loop {
             // `Next` is `Copy`, so delegating again genuinely re-runs the
             // request rather than replaying a stale answer.
             match next.run(req).await {
                 Ok(response) => return Ok(response),
-                Err(message) => {
-                    if attempt >= self.attempts || !is_transient(&message) {
-                        return Err(message);
+                Err(error) => {
+                    // The provider already classified this. Deciding again from
+                    // the message text is how a handler ends up retrying an
+                    // auth failure or giving up on a transient one.
+                    let worth_retrying = !error.is_fatal()
+                        && (error.retryable || error.empty_response)
+                        // A rate limit and an overflow each have a dedicated
+                        // handler that knows how to make the next attempt
+                        // different; a blind retry here would just burn budget.
+                        && !error.is_rate_limited()
+                        && !error.context_overflow;
+                    if attempt >= self.attempts || !worth_retrying {
+                        return Err(error);
                     }
                     let wait = self.backoff_ms * 2u64.pow(attempt - 1);
                     tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
@@ -326,7 +305,7 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
         &self,
         req: &mut ModelRequest,
         next: Next<'_, AgentRequest>,
-    ) -> Result<ModelResponse, String> {
+    ) -> Result<ModelResponse, RequestError> {
         let (Some(session), Some(compaction)) = (
             self.ctx.service::<SessionSvc>(),
             self.ctx.service::<CompactionSvc>(),
