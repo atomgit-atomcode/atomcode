@@ -408,6 +408,12 @@ pub enum LayoutError {
     (现有 `Screen` 的 `Drop` 模式 + 一条 panic 注入测试)
     留一个 raw mode 的 shell 给用户,比没有 UI 更糟。
 
+11. **`render` 永不读系统时钟。**
+    (`tui` crate 内禁 `Instant::now` / `SystemTime::now` 的 lint;
+    时间从 `Moment.tick` / `Moment.now` 注入)
+    一次墙钟读取就**静默**毁掉整个闭环——测试还绿,只是同一份输入不再给
+    同一份输出。见 [ADR 0008](./adr/0008-animation-time-is-injected-not-read.md)。
+
 ---
 
 ## 五、判据
@@ -648,6 +654,8 @@ Frame(我的模型)  ──surface──> ANSI 字节 ──vte 解析──> �
 | 12 | 同一 kind 连续块数上界断言 | 把 todo 清单整个塞进流会刷屏,而「只增不减」仍然绿 |
 | 13 | 退出回吐测试 | 全屏会吞掉退出后的可见输出,而这是开发者工具的硬需求 |
 | 14 | panic 注入 + `Drop` 恢复终端 | 留一个 raw mode 的 shell 给用户,比没有 UI 更糟 |
+| 15 | 禁 `Instant::now` 的 lint | 一次墙钟读取静默毁掉闭环:测试还绿,但同一输入不再给同一输出 |
+| 16 | `frame(Idle, 0) == frame(Idle, 5)` 断言 | 闲着也重画的动画会白烧 SSH 带宽,而「真的在动」那条测试仍然绿 |
 
 ---
 
@@ -663,6 +671,7 @@ Frame(我的模型)  ──surface──> ANSI 字节 ──vte 解析──> �
 | turn / step 是坐标,不是块 | [ADR 0005](./adr/0005-turn-and-step-are-coordinates.md) |
 | 全屏,流式由 `ui-repl` 那一行承担 | [ADR 0006](./adr/0006-tui-is-full-screen-not-inline.md) |
 | 布局是入日志的状态,三条入口一个 op 词汇表 | [ADR 0007](./adr/0007-tui-layout-is-logged-state-with-one-op-vocabulary.md) |
+| 时间由宿主注入,`render` 永不读系统时钟 | [ADR 0008](./adr/0008-animation-time-is-injected-not-read.md) |
 
 下表是本文档自身的演化,粒度比 ADR 细:
 
@@ -753,7 +762,81 @@ Frame(我的模型)  ──surface──> ANSI 字节 ──vte 解析──> �
 
 ---
 
-## 十四、结论
+## 十四、走一遍:加一个会动的吉祥物
+
+拿一个具体模块把前面每条规则都碰一遍。这个例子挑得刻意——它同时压到
+两类模块的分水岭、`Moment` 作为不可推导输入、以及动画如何保持可穷举测试。
+
+### 位置由规则决定,不由喜好决定
+
+- 流块 settle 之后**内容冻结** → 流里的吉祥物永远动不了
+- 视图模块**每帧重画** → 它能动
+
+所以会动的吉祥物**必须**是视图模块,占区域树的一块 rect。顺带回答一个隐含问题:
+现在 tuix 的吉祥物在欢迎横幅里;横幅若做成流块(挂在对话顶端),它就动不了。
+这个限制是规则推出来的,不是谁拍的。
+
+### 状态分两半
+
+**情绪来自事实,相位来自 tick。**
+
+```rust
+impl ViewModule for Mascot {
+    type State = Mood;                       // Idle / Thinking / Working / Happy / Sad
+
+    fn absorb(mood: &mut Mood, fact: &SessionEvent) {
+        *mood = match fact {
+            SessionEvent::TurnStart { .. }                        => Mood::Thinking,
+            SessionEvent::ToolResultLogged { is_error: true, .. }  => Mood::Sad,
+            SessionEvent::TurnEnd { stop: StopReason::Stopped, .. } => Mood::Happy,
+            _ => *mood,
+        };
+    }
+
+    fn render(mood: &Mood, vp: &Viewport) -> Vec<Line> {
+        let f = frames(*mood);
+        f[vp.moment.tick as usize % f.len()].draw(vp.rect)
+    }
+
+    /// 宿主需要一个「没有事实到达也要重画」的理由。
+    /// Idle 返回 None —— 静止时不请求节拍，不白烧带宽。
+    fn tick(&self) -> Option<Duration> { Some(Duration::from_millis(120)) }
+}
+```
+
+`render` **仍然是纯函数**:`(mood, tick, rect) → 行`。§六 的一致性套件一条都不用改,
+因为 tick 是**输入**,不是隐藏状态。时间必须注入而不能就地读,见
+[ADR 0008](./adr/0008-animation-time-is-injected-not-read.md)。
+
+### 动画反而能穷举
+
+这是设计的意外红利。5 种情绪 × 12 相位 = **60 帧,全部可断言**:
+
+```rust
+test  每一帧：高度 == 4、不越界、宽度 ≤ 9         // 60 个组合全跑
+test  frame(Thinking, 0) != frame(Thinking, 6)    // 真的在动
+test  frame(Idle, 0) == frame(Idle, 5)            // 静止时不重画  ← 阴性对照
+e2e   start_paused + advance(600ms) → tick 精确 +5，断言第 5 帧
+```
+
+第三条是阴性对照:一个「闲着也每 120ms 重画」的吉祥物会白烧带宽,这条把它判红。
+比大多数 UI 能做到的都强——因为帧是值,而时间是注入的。
+
+### 加它要动几处
+
+| 动作 | 量 |
+|---|---|
+| 写模块(`absorb` + `render` + 帧数据) | 一个文件 |
+| 注册为行 | 一个 `Plugin` impl |
+| 拿到全套性质测试 | `tui_conformance!(Mascot, View)` **一行** |
+| 出现在屏幕上 | 变体的初始布局加一个 `Leaf`,或运行时 `Show{module:"mascot"}` |
+| 让模型能调它 | **零**——`adjust_layout` 自动认识它,prompt 片段自动列出它 |
+
+最后一行是这套设计真正的回报:**新模块不需要为「能被自然语言调整」做任何事。**
+
+---
+
+## 十五、结论
 
 > **时间 = 块序列(不可逆)× 呈现(可变)**
 > **空间 = 区域树(在哪)× realm(哪些)**
