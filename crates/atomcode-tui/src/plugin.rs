@@ -191,7 +191,7 @@ impl UserInterface for Tui {
                         Click::Release => {
                             let from = self.pressed_at.lock().expect("press poisoned").take();
                             match from {
-                                Some(p) if p == (x, y) => Some(Action::FoldAt(x, y)),
+                                Some(p) if p == (x, y) => Some(Action::ClickAt(x, y)),
                                 Some(_) => Some(Action::CopySelection),
                                 None => None,
                             }
@@ -322,9 +322,9 @@ impl Tui {
                 | Action::CopySelection
                 | Action::ClearSelection
         ) {
-            // Escape does the innermost thing: drop the selection if there is
-            // one, and only otherwise stop the turn.
-            if m.selection.take().is_some() && matches!(action, Action::Cancel) {
+            // Escape does the innermost thing, and the selection is the
+            // innermost of them.
+            if m.selection.take().is_some() && matches!(action, Action::Escape) {
                 return false;
             }
         }
@@ -449,12 +449,21 @@ impl Tui {
             // A click on a block, resolved against the frame that was actually
             // painted. Anywhere else — the prompt, the status line, a gap — is
             // not an error, it is simply not a fold.
-            Action::FoldAt(x, y) => {
+            Action::ClickAt(x, y) => {
                 // The badge sits on top of a row of the stream, and the thing
                 // on top is the thing that was clicked.
                 if self.host.jump_at(x, y) {
                     m.scroll = crate::moment::ScrollPos::BOTTOM;
                     return false;
+                }
+                // Inside the composer a click is a caret, not a fold. Checked
+                // before the stream because the two never overlap and this is
+                // the cheaper answer.
+                if let Some(rect) = self.host.field_rect() {
+                    if let Some(at) = crate::modules::input::offset_at_cell(&m, rect, x, y) {
+                        m.caret = at;
+                        return false;
+                    }
                 }
                 drop(m);
                 let Some((id, kind)) = self.host.block_at(x, y) else {
@@ -524,6 +533,29 @@ impl Tui {
                 if !text.is_empty() {
                     self.surface.copy(&text);
                 }
+                return false;
+            }
+            // One layer at a time: the selection (above), then what is typed,
+            // then the turn. Clearing a draft you were still writing is
+            // annoying; losing it because you wanted to stop the model is
+            // worse, which is why ctrl-c stays `Cancel` and only stops.
+            Action::Escape => {
+                if !m.input.is_empty() {
+                    m.draft.clear();
+                    m.history_at = None;
+                    m.input.clear();
+                    m.caret = 0;
+                    return false;
+                }
+                drop(m);
+                agent.cancel();
+                return false;
+            }
+            Action::Newline => {
+                let at = m.caret.min(m.input.len());
+                m.input.insert(at, '\n');
+                m.caret = at + 1;
+                m.history_at = None;
                 return false;
             }
             Action::Redraw => {

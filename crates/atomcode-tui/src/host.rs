@@ -96,6 +96,8 @@ pub struct Hits {
     rows: Vec<Option<(crate::block::BlockId, &'static str)>>,
     /// Where the "back to the bottom" badge was, when it was up.
     jump: Option<Rect>,
+    /// Where the composer was drawn, so a click in it can find a caret.
+    field: Option<Rect>,
 }
 
 impl Hits {
@@ -320,6 +322,7 @@ impl Host {
                         rect,
                         rows: owners,
                         jump: None,
+                        field: None,
                     };
                     *self.last_width.lock().expect("width poisoned") = rect.w;
                     stream_rect = Some(rect);
@@ -342,6 +345,7 @@ impl Host {
                     lines.truncate(cap);
                     if id == crate::modules::input::ID {
                         frame.cursor = Some(crate::modules::input::caret(&moment, rect));
+                        self.hits.lock().expect("hits poisoned").field = Some(rect);
                     }
                     frame.place(id, rect, lines);
                 }
@@ -470,6 +474,11 @@ impl Host {
     /// Whether a point is on the "back to the bottom" badge.
     pub fn jump_at(&self, x: u16, y: u16) -> bool {
         self.hits.lock().expect("hits poisoned").on_jump(x, y)
+    }
+
+    /// Where the composer was drawn on the last frame, if it was.
+    pub fn field_rect(&self) -> Option<Rect> {
+        self.hits.lock().expect("hits poisoned").field
     }
 
     pub fn live_blocks(&self) -> usize {

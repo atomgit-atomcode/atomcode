@@ -34,14 +34,23 @@ pub enum Action {
     Quit,
     Scroll(i32),
     ScrollToBottom,
-    /// Fold or unfold the one block under this cell. The pointing gesture, next
-    /// to `ToggleFold`, which does every block of a kind at once.
-    FoldAt(u16, u16),
+    /// A click landed on this cell. What it means is decided by what is drawn
+    /// there — a caret in the composer, a fold on a tool call, the way back
+    /// down on the badge — because the alternative is three actions that all
+    /// have to agree about the layout.
+    ClickAt(u16, u16),
     /// Take the pointer, or hand it back to the terminal so click-drag selects
     /// text again.
     ToggleMouse,
     /// Forget what is believed to be on screen and paint all of it again.
     Redraw,
+    /// A line break inside what is being typed, rather than sending it.
+    Newline,
+    /// Back out of the innermost thing: the selection, then what is typed, then
+    /// the turn. Distinct from [`Action::Cancel`], which always stops the turn —
+    /// pressing ctrl-c to stop a model that is running must not turn into
+    /// "cleared your draft" just because there was one.
+    Escape,
     /// Start a selection at this cell.
     SelectFrom(u16, u16),
     /// Drag it out to here.
@@ -140,8 +149,17 @@ impl Keymap for Default_ {
         vec![
             (KeyPress::plain(Key::Enter), Action::Submit),
             (KeyPress::plain(Key::Backspace), Action::Backspace),
-            (KeyPress::plain(Key::Esc), Action::Cancel),
+            (KeyPress::plain(Key::Esc), Action::Escape),
             (KeyPress::ctrl('c'), Action::Cancel),
+            // Three keys for one action, because only one of them can be
+            // relied on. Shift-enter is what people reach for and needs the
+            // keyboard protocol to arrive at all; alt-enter is what several
+            // terminals send instead; ctrl-j is a literal line feed and works
+            // everywhere, including through the terminals that pass none of
+            // the modifiers on.
+            (KeyPress::new(Key::Enter, Mods::SHIFT), Action::Newline),
+            (KeyPress::new(Key::Enter, Mods::ALT), Action::Newline),
+            (KeyPress::ctrl('j'), Action::Newline),
             (KeyPress::ctrl('d'), Action::Quit),
             (KeyPress::ctrl('u'), Action::Clear),
             (KeyPress::ctrl('w'), Action::DeleteWord),

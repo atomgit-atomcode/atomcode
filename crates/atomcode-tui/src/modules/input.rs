@@ -142,6 +142,34 @@ pub fn offset_at(input: &str, row: usize, col: usize, width: u16) -> usize {
     (start + prefix.len()).min(input.len())
 }
 
+/// The byte offset a click at a screen cell lands on.
+///
+/// The same window `render` drew: the field scrolls, so the row under the
+/// pointer is not the row of the text. Forgiving at the edges on purpose — a
+/// click past the end of a line means the end of that line, and a click on the
+/// rules means the nearest row. Refusing those would make the field feel like
+/// it has invisible dead zones.
+pub fn offset_at_cell(
+    moment: &crate::moment::Moment,
+    rect: crate::frame::Rect,
+    x: u16,
+    y: u16,
+) -> Option<usize> {
+    if !rect.contains(x, y) {
+        return None;
+    }
+    let body = body_width(rect.w);
+    let (rows, (caret_row, _), _) = lay(&moment.input, moment.caret, body);
+    let room = typed_room(rect.h);
+    let first = caret_row.saturating_sub(room.saturating_sub(1));
+    let shown = room.min(rows.len().saturating_sub(first)).max(1);
+
+    let within = (y.saturating_sub(rect.y) as usize).saturating_sub(RULE);
+    let row = first + within.min(shown - 1);
+    let col = (x.saturating_sub(rect.x) as usize).saturating_sub(PROMPT);
+    Some(offset_at(&moment.input, row, col, rect.w))
+}
+
 /// The cells inside the prompt. One definition, because `render`, `caret` and
 /// every caller that moves by rows must measure the same field.
 pub fn body_width(width: u16) -> usize {
@@ -457,6 +485,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_click_puts_the_caret_where_it_landed() {
+        let rect = Rect::new(0, 5, 30, 5); // two rules, three typed rows
+        let m = Moment::default().typing("hello\nsecond line\nthird");
+        let at = |x, y| offset_at_cell(&m, rect, x, y).expect("inside the field");
+
+        // Row 0 of the text is one below the top rule; the prompt eats two
+        // cells, so its first character is at x = 2.
+        assert_eq!(at(2, 6), 0, "the very start");
+        assert_eq!(&m.input[..at(5, 6)], "hel");
+        assert_eq!(&m.input[..at(2, 7)], "hello\n", "the second row");
+        // x=6 is column 4 inside the field (the prompt eats two), so four
+        // characters of the second row.
+        assert_eq!(&m.input[..at(6, 7)], "hello\nseco");
+
+        // Forgiving at the edges: past the end of a line is the end of it, and
+        // the rules are the nearest row. Dead zones inside a text field are
+        // worse than a caret that lands one cell off.
+        assert_eq!(at(29, 6), 5, "past the end of `hello`");
+        assert_eq!(at(2, 5), 0, "the top rule");
+        assert_eq!(at(2, 9), m.input.len() - "third".len(), "the bottom rule");
+        assert_eq!(offset_at_cell(&m, rect, 2, 20), None, "outside is outside");
+    }
+
+    #[test]
+    fn a_click_follows_the_window_when_the_field_has_scrolled() {
+        // The row under the pointer is not the row of the text once the field
+        // scrolls — clicking the top visible line has to mean *that* line.
+        let rect = Rect::new(0, 0, 30, RULES as u16 + 2);
+        let text: String = (1..=9).map(|n| format!("line {n}\n")).collect();
+        let mut m = Moment::default().typing(text.clone());
+        m.caret = text.len(); // at the end, so the tail is what is shown
+        let hit = offset_at_cell(&m, rect, 2, 1).expect("inside");
+        assert!(
+            text[hit..].starts_with("line 9"),
+            "clicked the top visible row and got {:?}",
+            &text[hit..hit + 8.min(text.len() - hit)]
+        );
     }
 
     #[test]

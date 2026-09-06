@@ -308,7 +308,9 @@ FLAGS
     -h, --help             this
 
 KEYS
-    enter        send            esc / ctrl-c   stop the turn
+    enter        send            shift-enter    a line break (or ctrl-j)
+    esc          back out one layer: the selection, then what you typed,
+                 then the turn.  ctrl-c always stops the turn.
     ctrl-d       quit            ctrl-u         clear the line
     ctrl-w       delete a word   ctrl-r         fold or unfold reasoning
     ctrl-t       fold tool calls ctrl-n         show or hide the mascot
@@ -320,7 +322,8 @@ KEYS
     pgup/pgdn    scroll the conversation (so does the wheel, a line a notch)
 
 MOUSE
-    drag to select; the selection is copied to the clipboard on release
+    click in the composer to put the caret there. Drag to select; the
+    selection is copied to the clipboard on release
     (OSC 52, so it works over ssh and tmux) and esc clears it. Click a tool
     call to fold or unfold that one — ctrl-t still does every one at once.
     The wheel scrolls the conversation.

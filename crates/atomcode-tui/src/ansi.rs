@@ -51,9 +51,19 @@ pub const ERASE_LINE: &str = "\x1b[K";
 /// stack trace submits itself on its first line and types the rest into the
 /// next prompt. With it the terminal wraps the text in markers and it arrives
 /// as one event, which is what `Input::Paste` was always written for.
-pub const ENTER: &str = "\x1b[?1049h\x1b[?7l\x1b[?1007h\x1b[?2004h\x1b[?25l";
-/// The exact inverse of [`ENTER`].
-pub const LEAVE: &str = "\x1b[?25h\x1b[?2004l\x1b[?1007l\x1b[?7h\x1b[?1049l";
+///
+/// The last part asks the terminal to *disambiguate* keys (the keyboard
+/// protocol's flag 1). Without it a terminal sends the same byte — a carriage
+/// return — for enter, shift-enter and ctrl-enter, so "shift-enter inserts a
+/// newline" is not something an application can implement: the modifier never
+/// arrives. With it the key comes as `CSI 13;2u` and the difference is real.
+/// Terminals that do not know the sequence ignore it, and `ctrl-j` is bound to
+/// the same action for them.
+pub const ENTER: &str = "\x1b[?1049h\x1b[?7l\x1b[?1007h\x1b[?2004h\x1b[>1u\x1b[?25l";
+/// The exact inverse of [`ENTER`]. Popping the keyboard flags matters as much
+/// as leaving the alternate screen: a shell that inherits them sees every key
+/// in a form it does not expect.
+pub const LEAVE: &str = "\x1b[?25h\x1b[<u\x1b[?2004l\x1b[?1007l\x1b[?7h\x1b[?1049l";
 /// Ask the terminal to report the pointer: button presses (1000) with SGR
 /// coordinates (1006), so columns past 223 are reportable at all.
 ///
@@ -418,6 +428,9 @@ mod tests {
         // Bracketed paste, likewise — and leaving it on would make every
         // subsequent shell paste arrive wrapped in markers it does not expect.
         assert!(ENTER.contains("?2004h") && LEAVE.contains("?2004l"));
+        // The keyboard protocol is pushed and popped, not just pushed: a shell
+        // that inherits it sees every key in a form it does not expect.
+        assert!(ENTER.contains("[>1u") && LEAVE.contains("[<u"));
         // Mouse reporting is separate because it is optional, but it has the
         // same obligation: a shell left reporting the pointer prints garbage
         // on every click.
