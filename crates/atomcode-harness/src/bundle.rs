@@ -650,10 +650,6 @@ disabled = true
 /// Every bundle by name, for profiles to reference.
 pub const BUNDLES: &[(&str, &str)] = &[
     ("base", BASE),
-    ("longcode-spec", LONGCODE_SPEC),
-    ("longcode-air-spec", LONGCODE_AIR_SPEC),
-    ("code-security-spec", CODE_SECURITY_SPEC),
-    ("code-review-spec", CODE_REVIEW_SPEC),
     ("oneshot-app", ONESHOT_APP),
     ("repl-app", REPL_APP),
     ("tui-app", TUI_APP),
@@ -667,6 +663,13 @@ pub const BUNDLES: &[(&str, &str)] = &[
 ///
 /// A profile is data. Adding one here and dropping a file in
 /// `$ATOMCODE_HOME/profiles/` are the same act, and the file wins.
+///
+/// Every profile here names an *engine* assembly — which front end, which
+/// execution world, which policy. Product specializations (a persona, a tuned
+/// rule set, a brand) are deliberately not among them: they are rows a separate
+/// assembly contributes, mounted from the same catalog by whoever ships the
+/// product. Keeping them out is what stops this crate from being the place four
+/// products quietly fork.
 pub const PROFILES: &[(&str, &[&str], Option<&str>, &str)] = &[
     (
         "oneshot",
@@ -728,276 +731,9 @@ pub const PROFILES: &[(&str, &[&str], Option<&str>, &str)] = &[
         Some(FULL),
         "everything on: code graph, web access, delegation",
     ),
-    // ---- the four product variants -------------------------------------
-    (
-        "longcode",
-        &["base", "repl-app", "longcode-spec"],
-        None,
-        "LongCode — the full coding agent, everything mounted",
-    ),
-    (
-        "longcode-air",
-        &["base", "repl-app", "longcode-air-spec"],
-        None,
-        "LongCode Air — the same agent with its costs cut",
-    ),
-    (
-        "code-security",
-        &["base", "oneshot-app", "code-security-spec"],
-        None,
-        "Code Security — read-only audit that reports findings",
-    ),
-    (
-        "code-review",
-        &["base", "oneshot-app", "code-review-spec"],
-        None,
-        "Code Review — read-only reviewer that reports findings",
-    ),
 ];
 
-// ---- specializations: four products, one base ---------------------------
-//
-// A specialization decides three things: what the model is told (persona), what
-// it can reach (tools and the execution world), and what it is allowed to do
-// (policy). None of them decides how a person talks to it — that is the app
-// bundle's job, and keeping the two orthogonal is what lets `code-review` run
-// behind a terminal, a browser or a JSON-RPC socket without a second assembly.
-
-/// **LongCode** — the full coding agent.
-///
-/// Everything mounted, delegation available, asks before risky calls. This is
-/// the variant that changes code, so it is also the one with a human in the
-/// loop by default.
-pub const LONGCODE_SPEC: &str = r#"
-[[patch]]
-id = "code-graph"
-disabled = false
-
-[[patch]]
-id = "tool-web"
-disabled = false
-
-[[patch]]
-id = "subagent-in-process"
-disabled = false
-
-[[patch]]
-id = "mcp"
-disabled = false
-
-[[patch]]
-id = "round-cap"
-config = { max_rounds = 40, max_seconds = 0 }
-
-[[patch]]
-id = "compaction-tail"
-config = { threshold = 0.75, keep_turns = 3 }
-"#;
-
-/// **LongCode Air** — the same agent with its costs cut.
-///
-/// Fewer tools, a tighter round budget, earlier compaction, smaller tool
-/// results. The differences are all quantities and mounted rows; the loop, the
-/// policy engine and the session model are the same ones, which is the point of
-/// having a base at all.
-pub const LONGCODE_AIR_SPEC: &str = r#"
-# No graph index, no network, no delegation: each is a cost multiplier, and Air
-# exists for the work that does not need them.
-[[patch]]
-id = "code-graph"
-disabled = true
-
-[[patch]]
-id = "tool-web"
-disabled = true
-
-[[patch]]
-id = "subagent-in-process"
-disabled = true
-
-[[patch]]
-id = "mcp"
-disabled = true
-
-[[patch]]
-id = "skills"
-disabled = true
-
-[[patch]]
-id = "round-cap"
-config = { max_rounds = 12, max_seconds = 0 }
-
-# Compact earlier and keep less: a short context is the single biggest lever on
-# cost per turn.
-[[patch]]
-id = "compaction-tail"
-config = { threshold = 0.5, keep_turns = 1 }
-
-[[patch]]
-id = "tool-result-cap"
-config = { max_bytes = 16384 }
-
-[[patch]]
-id = "agent-loop"
-config = { max_rounds = 40 }
-"#;
-
-/// **Code Security** — a read-only security review that reports findings.
-///
-/// The read-only guarantee is a *world*, not a policy: `fs-readonly` refuses
-/// mutations at the boundary, so it holds even if the approval row is
-/// misconfigured or removed. The graph layer is mounted because reachability is
-/// the whole job — a sink with no path to it is not a finding.
-pub const CODE_SECURITY_SPEC: &str = r#"
-[[patch]]
-id = "fs"
-name = "fs-readonly"
-
-[[patch]]
-id = "persona-coding"
-disabled = true
-
-[[insert]]
-id = "persona"
-name = "persona-security"
-
-[[insert]]
-name = "tool-report-finding"
-
-# Reporting is not a mutation of anything outside the process, but a read-only
-# policy has no way to know that — the tool declares no read-only hint. Allow it
-# explicitly, or the auditor can find things and never file them.
-[[patch]]
-id = "permissions"
-config = { allow = ["report_finding"], deny = [] }
-
-[[patch]]
-id = "tool-ast-grep"
-disabled = false
-
-[[patch]]
-id = "code-graph"
-disabled = false
-
-[[patch]]
-id = "tool-web"
-disabled = false
-
-# No shell and no delegation: an audit that can run commands is not an audit.
-# The process world comes out too, not just the tool that used it — leaving
-# `shell` and `subprocess` mounted would leave the capability one patch away
-# instead of absent, and `--audit` reports them as dead weight either way.
-[[patch]]
-id = "tool-bash-world"
-disabled = true
-
-[[patch]]
-id = "shell"
-disabled = true
-
-[[patch]]
-id = "subprocess"
-disabled = true
-
-[[patch]]
-id = "subagent-in-process"
-disabled = true
-
-[[patch]]
-id = "approval"
-disabled = false
-config = { mode = "read-only" }
-
-[[patch]]
-id = "approval-interactive"
-disabled = true
-
-# Read-only means there is nothing to approve, so nothing to ask about. Leaving
-# the asker mounted would be a provider nobody consumes.
-[[patch]]
-id = "user-questions-unattended"
-name = "user-questions-unattended"
-disabled = true
-
-[[patch]]
-id = "round-cap"
-config = { max_rounds = 30, max_seconds = 0 }
-"#;
-
-/// **Code Review** — a read-only reviewer that reports findings.
-///
-/// The same read-only world as the security variant, a different prompt, and
-/// the graph layer left off by default: a review reads a diff and its
-/// surroundings, and a whole-repo index is usually more than that needs.
-pub const CODE_REVIEW_SPEC: &str = r#"
-[[patch]]
-id = "fs"
-name = "fs-readonly"
-
-[[patch]]
-id = "persona-coding"
-disabled = true
-
-[[insert]]
-id = "persona"
-name = "persona-review"
-
-[[insert]]
-name = "tool-report-finding"
-
-# Reporting is not a mutation of anything outside the process, but a read-only
-# policy has no way to know that — the tool declares no read-only hint. Allow it
-# explicitly, or the auditor can find things and never file them.
-[[patch]]
-id = "permissions"
-config = { allow = ["report_finding"], deny = [] }
-
-[[patch]]
-id = "tool-ast-grep"
-disabled = false
-
-[[patch]]
-id = "tool-web"
-disabled = false
-
-[[patch]]
-id = "tool-bash-world"
-disabled = true
-
-[[patch]]
-id = "shell"
-disabled = true
-
-[[patch]]
-id = "subprocess"
-disabled = true
-
-[[patch]]
-id = "subagent-in-process"
-disabled = true
-
-[[patch]]
-id = "approval"
-disabled = false
-config = { mode = "read-only" }
-
-[[patch]]
-id = "approval-interactive"
-disabled = true
-
-# Read-only means there is nothing to approve, so nothing to ask about. Leaving
-# the asker mounted would be a provider nobody consumes.
-[[patch]]
-id = "user-questions-unattended"
-name = "user-questions-unattended"
-disabled = true
-
-[[patch]]
-id = "round-cap"
-config = { max_rounds = 24, max_seconds = 0 }
-"#;
-
-/// Swap the front end without touching the specialization. `--ui <name>`.
+/// Swap the front end without touching anything else in the tree. `--ui <name>`.
 ///
 /// It moves the asker with the screen: a question drawn on a plain terminal and
 /// one drawn inside an alternate screen are different providers, and a front end

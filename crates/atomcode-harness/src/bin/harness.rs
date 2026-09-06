@@ -47,8 +47,8 @@ async fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             },
-            // The front end is orthogonal to the specialization: `code-review`
-            // behind a browser is a --ui away, not a second profile.
+            // The front end is orthogonal to everything else in the tree: the
+            // same agent behind a browser is a --ui away, not a second profile.
             "--ui" => match args.next() {
                 Some(name) if bundle::UI_NAMES.contains(&name.as_str()) => {
                     overlays.push(bundle::ui_overlay(&name))
