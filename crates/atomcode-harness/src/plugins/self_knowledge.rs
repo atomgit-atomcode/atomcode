@@ -12,10 +12,17 @@
 //!   the running objects on every call, so it cannot be out of date.
 //!
 //! This row does the second. The prompt fragment it contributes carries only
-//! what is invariant *for the whole session* — the identity, the session id, the
-//! log path — plus the one behavioural instruction that matters: when you don't
-//! know what you are made of, call the tool instead of searching the repository
-//! and guessing. Guessing is what an agent does when nobody gave it a door.
+//! what is invariant across every session — that the tree is assembled at
+//! runtime and therefore unknowable from training — plus the one behavioural
+//! instruction that matters: when you don't know what you are made of, call the
+//! tool instead of searching the repository and guessing. Guessing is what an
+//! agent does when nobody gave it a door.
+//!
+//! What it deliberately does **not** carry: an identity. "You are X" is the
+//! persona row's sentence, and only one row may own it — see
+//! [`super::persona`]. Nor the session id or log path, which are per-session and
+//! would make the prompt uncacheable across sessions; those are a tool call
+//! away.
 
 use std::sync::Arc;
 
@@ -284,11 +291,17 @@ impl Plugin for SelfKnowledgePlugin {
         //
         // `tests/self_knowledge.rs::the_prompt_stays_identical_across_sessions`
         // is what keeps this honest.
+        //
+        // Deliberately free of an identity, too — it states a fact about the
+        // agent, never "you are X". Identity belongs to the persona row, which
+        // is the row an assembly swaps: two fragments that both open with "you
+        // are" put two answers to one question in front of the model, and in a
+        // read-only tree the losing one is the whole point of the tree.
         const INVARIANT: &str = "\
-You are AtomCode, an agent assembled at runtime from plugin rows on the plexus \
-kernel — the coding opinion, if you have one, is itself just another row. There is no fixed feature set — only the rows the running tree \
-happens to have mounted, which is why you cannot know what you are from \
-anything you were trained on.
+This agent is assembled at runtime from plugin rows on the plexus kernel. There \
+is no fixed feature set — only the rows the running tree happens to have \
+mounted, which is why you cannot know what you are made of from anything you \
+were trained on.
 
 When you are asked what you are made of, what you can do, how to change \
 something about yourself — the model, memory, plugins, the layout, the \

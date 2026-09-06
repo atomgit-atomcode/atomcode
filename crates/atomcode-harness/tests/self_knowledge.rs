@@ -129,6 +129,53 @@ async fn the_agent_is_told_to_ask_rather_than_guess() {
 }
 
 #[tokio::test]
+async fn only_the_persona_row_says_who_the_agent_is() {
+    // Both fragments reach the model in one request, so two rows opening with
+    // "you are" is two answers to one question and the loser is whichever the
+    // model reads second. Identity is the persona row's sentence; this row
+    // states what the agent is assembled from and never who it is.
+    //
+    // The judge is the rendered prompt rather than either constant, because the
+    // rendered prompt is the only thing the model actually sees. An identity
+    // claim is a paragraph that *opens* with it — "read the code you are about
+    // to change" is prose, not a second answer to "who are you".
+    fn identity_claims(prompt: &str) -> Vec<&str> {
+        prompt
+            .split("\n\n")
+            .filter(|p| p.trim_start().to_lowercase().starts_with("you are"))
+            .collect()
+    }
+
+    let dir = scratch("identity");
+
+    let with_persona = prompt(&start(tree(&dir, &[])).await);
+    assert_eq!(
+        identity_claims(&with_persona).len(),
+        1,
+        "exactly one row may claim an identity, got {:?}",
+        identity_claims(&with_persona)
+    );
+
+    let without_persona = prompt(
+        &start(tree(
+            &dir,
+            &["[[patch]]\nid = \"persona-coding\"\ndisabled = true"],
+        ))
+        .await,
+    );
+    assert!(
+        identity_claims(&without_persona).is_empty(),
+        "with the persona row gone nothing may still be telling the agent who it is — \
+         an assembly that swaps in its own persona would then get two: {:?}",
+        identity_claims(&without_persona)
+    );
+    assert!(
+        without_persona.contains("describe_self"),
+        "and the self-knowledge fragment is still there, so this is not passing by absence"
+    );
+}
+
+#[tokio::test]
 async fn the_reported_log_path_is_the_file_persistence_actually_writes() {
     let dir = scratch("real-path");
     let app = start(tree(&dir, &[])).await;

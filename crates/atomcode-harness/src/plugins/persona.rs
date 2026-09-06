@@ -1,13 +1,21 @@
-//! The coding persona — one prompt fragment among several, not a privileged
-//! system message. Removing this row leaves a working agent with no coding
-//! opinion, which is what makes the runtime a harness rather than a product.
+//! The personas — one prompt fragment among several, not a privileged system
+//! message. Removing the row leaves a working agent with no opinion, which is
+//! what makes the runtime a harness rather than a product.
+//!
+//! # A persona row owns the identity sentence, and nothing else may
+//!
+//! "You are X" is this module's to say. [`super::self_knowledge`] states what
+//! the agent is *assembled from* and never who it is, because both fragments
+//! reach the model in the same request: two rows opening with "you are" is two
+//! answers to one question, and the one that loses is whichever the model reads
+//! second. Keeping the sentence in exactly one row is also what lets an
+//! assembly change the answer — a product with its own name swaps this row, and
+//! nothing else in the tree has to know.
 
 use async_trait::async_trait;
 use atomcode_plexus::{Context, Plugin};
 use serde::Deserialize;
 use serde_json::Value;
-
-use crate::seams::SystemPromptSvc;
 
 const CODING_PERSONA: &str = "\
 You are a coding agent working in a real repository. Investigate before you act: \
@@ -43,18 +51,13 @@ impl Plugin for CodingPersonaPlugin {
         } else {
             serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
         };
-        let prompts = ctx
-            .require::<SystemPromptSvc>()
-            .map_err(|e| e.to_string())?;
         let mut text = CODING_PERSONA.to_string();
         if let Some(extra) = row.extra.filter(|e| !e.trim().is_empty()) {
             text.push_str("\n\n");
             text.push_str(extra.trim());
         }
         // Rank 0: the persona leads, tool guidance follows.
-        prompts.contribute("persona-coding", 0, text);
-        let prompts = prompts.clone();
-        let _ = ctx.effect(move || prompts.remove("persona-coding"));
+        super::tools::contribute_prompt(ctx, "persona-coding", 0, &text);
         Ok(())
     }
 }
@@ -95,12 +98,12 @@ impl Plugin for ReviewPersonaPlugin {
             .model
             .or_else(|| std::env::var("ATOMCODE_MODEL").ok())
             .unwrap_or_default();
-        let prompts = ctx
-            .require::<SystemPromptSvc>()
-            .map_err(|e| e.to_string())?;
-        prompts.contribute("persona-review", 0, atomcode_review::review_persona(&model));
-        let prompts = prompts.clone();
-        let _ = ctx.effect(move || prompts.remove("persona-review"));
+        super::tools::contribute_prompt(
+            ctx,
+            "persona-review",
+            0,
+            &atomcode_review::review_persona(&model),
+        );
         Ok(())
     }
 }
@@ -142,12 +145,7 @@ impl Plugin for SecurityPersonaPlugin {
         "a read-only security reviewer that must establish reachability"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
-        let prompts = ctx
-            .require::<SystemPromptSvc>()
-            .map_err(|e| e.to_string())?;
-        prompts.contribute("persona-security", 0, SECURITY_PERSONA);
-        let prompts = prompts.clone();
-        let _ = ctx.effect(move || prompts.remove("persona-security"));
+        super::tools::contribute_prompt(ctx, "persona-security", 0, SECURITY_PERSONA);
         Ok(())
     }
 }
