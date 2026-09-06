@@ -6,7 +6,7 @@
 //! fills `subprocess`, so replacing the process provider relocates bash without
 //! bash knowing.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -15,182 +15,15 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::seams::{FsSvc, ShellSvc, SubprocessSvc};
-use crate::world::{
-    DirEntry, FileInfo, FileSystem, FsError, FsErrorKind, Output, Shell, SpawnOptions, Subprocess,
-};
+use atomcode_capabilities::world::LocalFs;
+
+use crate::seams::FileSystem;
+use crate::world::{Output, Shell, SpawnOptions, Subprocess};
 
 // ---- fs-local -----------------------------------------------------------
-
-/// The local disk, fenced to a root.
-///
-/// Containment lives in the provider, not in each tool: a consumer cannot forget
-/// to call it, and a different world enforces its own boundary its own way.
-struct LocalFs {
-    root: PathBuf,
-    read_only: bool,
-}
-
-impl LocalFs {
-    /// Resolve a model-supplied path inside the root, refusing anything that
-    /// escapes it. Symlinks are resolved where the path exists, so a link out
-    /// of the tree is caught rather than followed.
-    fn resolve(&self, path: &Path) -> Result<PathBuf, FsError> {
-        let joined = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.root.join(path)
-        };
-        // Canonicalize the deepest existing ancestor, then re-attach the rest:
-        // a write to a not-yet-existing file still gets a real-path check.
-        let mut existing = joined.as_path();
-        let mut trailing = PathBuf::new();
-        loop {
-            if existing.exists() {
-                break;
-            }
-            let Some(parent) = existing.parent() else {
-                return Err(FsError::denied("path has no resolvable ancestor"));
-            };
-            let name = existing
-                .file_name()
-                .ok_or_else(|| FsError::denied("path has no file name"))?;
-            trailing = if trailing.as_os_str().is_empty() {
-                PathBuf::from(name)
-            } else {
-                PathBuf::from(name).join(&trailing)
-            };
-            existing = parent;
-        }
-        let real = existing.canonicalize().map_err(FsError::io)?;
-        let root = self
-            .root
-            .canonicalize()
-            .unwrap_or_else(|_| self.root.clone());
-        let full = if trailing.as_os_str().is_empty() {
-            real
-        } else {
-            real.join(&trailing)
-        };
-        if !full.starts_with(&root) {
-            return Err(FsError::denied(format!(
-                "{} is outside the world's root {}",
-                full.display(),
-                root.display()
-            )));
-        }
-        Ok(full)
-    }
-
-    fn deny_write(&self) -> Result<(), FsError> {
-        if self.read_only {
-            return Err(FsError::denied("this filesystem world is read-only"));
-        }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl FileSystem for LocalFs {
-    fn describe(&self) -> String {
-        if self.read_only {
-            format!("local (read-only) at {}", self.root.display())
-        } else {
-            format!("local at {}", self.root.display())
-        }
-    }
-
-    fn root(&self) -> PathBuf {
-        self.root.clone()
-    }
-
-    async fn read_text(&self, path: &Path) -> Result<String, FsError> {
-        let path = self.resolve(path)?;
-        if !path.exists() {
-            return Err(FsError::not_found(&path));
-        }
-        if path.is_dir() {
-            return Err(FsError {
-                kind: FsErrorKind::NotAFile,
-                message: format!("{} is a directory", path.display()),
-            });
-        }
-        let bytes = std::fs::read(&path).map_err(FsError::io)?;
-        String::from_utf8(bytes).map_err(|_| FsError {
-            kind: FsErrorKind::NotText,
-            message: format!("{} is not UTF-8 text", path.display()),
-        })
-    }
-
-    async fn write_text(&self, path: &Path, content: &str) -> Result<(), FsError> {
-        self.deny_write()?;
-        let path = self.resolve(path)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(FsError::io)?;
-        }
-        std::fs::write(&path, content).map_err(FsError::io)
-    }
-
-    async fn list(&self, path: &Path, depth: usize) -> Result<Vec<DirEntry>, FsError> {
-        let root = self.resolve(path)?;
-        if !root.exists() {
-            return Err(FsError::not_found(&root));
-        }
-        if !root.is_dir() {
-            return Err(FsError {
-                kind: FsErrorKind::NotADirectory,
-                message: format!("{} is not a directory", root.display()),
-            });
-        }
-        let mut out = Vec::new();
-        let mut stack = vec![(root.clone(), 0usize)];
-        while let Some((dir, level)) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            let mut children: Vec<_> = entries.flatten().collect();
-            children.sort_by_key(|e| e.file_name());
-            for entry in children {
-                let path = entry.path();
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                // Skip the directories that make a listing useless.
-                if matches!(
-                    name.as_ref(),
-                    ".git" | "node_modules" | "target" | ".venv" | "__pycache__"
-                ) {
-                    continue;
-                }
-                let is_dir = path.is_dir();
-                out.push(DirEntry {
-                    path: path.clone(),
-                    is_dir,
-                    depth: level,
-                });
-                if is_dir && level + 1 < depth {
-                    stack.push((path, level + 1));
-                }
-            }
-        }
-        out.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(out)
-    }
-
-    async fn info(&self, path: &Path) -> Result<FileInfo, FsError> {
-        let path = self.resolve(path)?;
-        Ok(match std::fs::metadata(&path) {
-            Ok(meta) => FileInfo {
-                exists: true,
-                is_dir: meta.is_dir(),
-                len: meta.len(),
-            },
-            Err(_) => FileInfo {
-                exists: false,
-                is_dir: false,
-                len: 0,
-            },
-        })
-    }
-}
+//
+// The implementation lives in `atomcode_capabilities::world`, next to the tools
+// that go through it. These two rows only choose which one to mount.
 
 #[derive(Debug, Deserialize, Default)]
 struct FsRow {
@@ -221,10 +54,11 @@ impl Plugin for FsLocalPlugin {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         let _ = ctx
-            .provide::<FsSvc>(Arc::new(LocalFs {
-                root,
-                read_only: row.read_only,
-            }))
+            .provide::<FsSvc>(if row.read_only {
+                Arc::new(LocalFs::read_only(root)) as Arc<dyn FileSystem>
+            } else {
+                Arc::new(LocalFs::new(root))
+            })
             .map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -253,10 +87,7 @@ impl Plugin for FsReadOnlyPlugin {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         let _ = ctx
-            .provide::<FsSvc>(Arc::new(LocalFs {
-                root,
-                read_only: true,
-            }))
+            .provide::<FsSvc>(Arc::new(LocalFs::read_only(root)))
             .map_err(|e| e.to_string())?;
         Ok(())
     }

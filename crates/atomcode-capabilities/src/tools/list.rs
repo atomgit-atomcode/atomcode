@@ -87,6 +87,8 @@ impl Tool for ListDirTool {
                     crate::pathnorm::to_display(&root)
                 ))
             }
+            // Denied is not missing — see the same note in `read`.
+            Err(e) if e.is_denied() => return err(format!("list_directory: {e}")),
             _ => {
                 return err(format!(
                     "Directory not found: {}{}",

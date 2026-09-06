@@ -363,6 +363,11 @@ impl Tool for ReadFileTool {
 
         let meta = match self.world.info(&path).await {
             Ok(m) if m.exists => m,
+            // A refusal is not an absence. Telling the model "no such file"
+            // when the world actually denied it sends it looking for a path
+            // that is right there — and hides the one fact it needs, which is
+            // that this world will not serve it.
+            Err(e) if e.is_denied() => return err(format!("read_file: {e}")),
             _ => {
                 return err(format!(
                     "Error: no such file: {} (resolved to {}){}",

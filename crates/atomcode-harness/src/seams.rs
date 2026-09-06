@@ -18,7 +18,8 @@ use atomcode_plexus::{plexus_service, Context};
 
 use crate::agent::{Agent, Agents};
 use crate::session::{LoggedEvent, SessionLog, SessionProjections};
-use crate::world::{FileSystem, Shell, Subprocess};
+use crate::world::{Shell, Subprocess};
+pub use atomcode_capabilities::world::FileSystem;
 
 plexus_service!(LlmSvc => dyn LlmProvider, "llm", Seam, "Model adapter");
 plexus_service!(ToolsSvc => ToolBox, "tools", Core, "The live tool catalog");
