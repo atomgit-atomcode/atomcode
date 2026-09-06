@@ -620,7 +620,7 @@ mod gate_tests {
         let cwd = std::fs::canonicalize(d.path()).unwrap();
         std::fs::write(cwd.join("a.txt"), "x").unwrap();
         let gate = OpenFileWorkspaceGate::new(cwd_handle(&cwd));
-        let tool: Arc<dyn Tool> = Arc::new(crate::tools::write::WriteFileTool);
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::write::WriteFileTool::default());
         let mut call = ToolCall {
             id: "1".into(),
             name: "write_file".into(),

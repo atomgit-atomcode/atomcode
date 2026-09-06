@@ -108,6 +108,12 @@ pub(crate) mod pathutil;
 #[cfg(any(feature = "plugin", feature = "mcp"))]
 pub mod fs;
 
+/// The execution world: the seam every world-touching tool goes through, so
+/// "read-only" or "in a sandbox" is a property of the world rather than a rule
+/// each tool is asked to respect. See [`world`] for what deliberately does not
+/// route through it.
+pub mod world;
+
 /// Plugin subsystem: loader / installer / marketplace / manifest / trust store.
 /// Faithful port of `core::plugin` as a v2 migration target for the front-ends.
 /// Synchronous (shells out to `git` via `std::process` — no async runtime).

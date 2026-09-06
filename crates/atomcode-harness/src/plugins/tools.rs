@@ -81,9 +81,9 @@ impl Plugin for FsToolsPlugin {
             ctx,
             vec![
                 Arc::new(ReadFileTool::new(row.vision)),
-                Arc::new(WriteFileTool),
+                Arc::new(WriteFileTool::default()),
                 Arc::new(EditFileTool),
-                Arc::new(ListDirTool),
+                Arc::new(ListDirTool::default()),
             ],
         )?;
         contribute_prompt(

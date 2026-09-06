@@ -200,9 +200,9 @@ pub fn register_coding_tools(reg: &mut ToolRegistry) {
 /// provider image encoder.
 pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
     reg.register(Arc::new(ReadFileTool::new(vision)));
-    reg.register(Arc::new(WriteFileTool));
+    reg.register(Arc::new(WriteFileTool::default()));
     reg.register(Arc::new(EditFileTool));
-    reg.register(Arc::new(ListDirTool));
+    reg.register(Arc::new(ListDirTool::default()));
     reg.register(Arc::new(OpenFileTool));
     reg.register(Arc::new(BashTool));
     // Background job path for long-running commands (start/poll/kill) — the reference-

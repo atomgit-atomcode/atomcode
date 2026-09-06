@@ -393,7 +393,7 @@ mod tests {
         Arc::new(crate::tools::edit::EditFileTool)
     }
     fn write_tool() -> Arc<dyn Tool> {
-        Arc::new(crate::tools::write::WriteFileTool)
+        Arc::new(crate::tools::write::WriteFileTool::default())
     }
 
     /// A driver that never answers → the bounded round-trip times out → Null → Deny. So any

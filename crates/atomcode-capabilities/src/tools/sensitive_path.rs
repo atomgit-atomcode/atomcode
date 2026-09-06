@@ -491,7 +491,7 @@ mod tests {
         // A Risky tool is ApprovalMiddleware's job; this gate must skip it (no double-prompt)
         // even if its args look sensitive.
         let gate = SensitivePathGate::new();
-        let tool: Arc<dyn Tool> = Arc::new(crate::tools::write::WriteFileTool);
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::write::WriteFileTool::default());
         let mut call = ToolCall {
             id: "1".into(),
             name: "write_file".into(),

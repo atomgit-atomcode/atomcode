@@ -420,7 +420,7 @@ mod tests {
         let rt = RequestCtx::new(tx, Some(Duration::from_millis(50)));
         let store = Arc::new(InMemoryPermissionStore::new());
         let call = risky_call();
-        let tool: Arc<dyn Tool> = Arc::new(WriteFileTool);
+        let tool: Arc<dyn Tool> = Arc::new(WriteFileTool::default());
         store.grant(&ApprovalMiddleware::grant_key(&call, tool.as_ref()));
         let mw = ApprovalMiddleware::new(store);
         let mut c = call;
@@ -435,7 +435,7 @@ mod tests {
         let (tx, _rx) = unbounded_channel::<AgentEvent>();
         let rt = RequestCtx::new(tx, Some(Duration::from_millis(20)));
         let mw = ApprovalMiddleware::in_memory();
-        let tool: Arc<dyn Tool> = Arc::new(WriteFileTool);
+        let tool: Arc<dyn Tool> = Arc::new(WriteFileTool::default());
         let mut call = risky_call();
         let res = mw.before(&mut call, &tool, &rt).await;
         assert!(res.is_deny(), "silent driver must fail closed");

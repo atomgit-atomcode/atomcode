@@ -2,16 +2,35 @@
 //! skipped). Non-destructive ⇒ always `Safe`.
 
 use super::{err, is_skip_dir, not_found_hint, ok, resolve_path};
+use crate::world::{FileSystem, LocalFs};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
+use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::Path;
+use std::sync::Arc;
 
 const MAX_ENTRIES: usize = 200;
 const MAX_DEPTH_CAP: usize = 5;
 
-pub struct ListDirTool;
+pub struct ListDirTool {
+    world: Arc<dyn FileSystem>,
+}
+
+impl Default for ListDirTool {
+    fn default() -> Self {
+        Self {
+            world: Arc::new(LocalFs::unfenced()),
+        }
+    }
+}
+
+impl ListDirTool {
+    pub fn with_world(world: Arc<dyn FileSystem>) -> Self {
+        Self { world }
+    }
+}
 
 #[derive(Deserialize)]
 struct Args {
@@ -60,15 +79,15 @@ impl Tool for ListDirTool {
         let root = resolve_path(&raw, &ctx.working_dir);
         let depth = a.depth.unwrap_or(2).min(MAX_DEPTH_CAP);
 
-        match tokio::fs::metadata(&root).await {
-            Ok(m) if m.is_dir() => {}
-            Ok(_) => {
+        match self.world.info(&root).await {
+            Ok(m) if m.is_dir => {}
+            Ok(m) if m.exists => {
                 return err(format!(
                     "Not a directory: {}",
                     crate::pathnorm::to_display(&root)
                 ))
             }
-            Err(_) => {
+            _ => {
                 return err(format!(
                     "Directory not found: {}{}",
                     crate::pathnorm::to_display(&root),
@@ -77,17 +96,8 @@ impl Tool for ListDirTool {
             }
         }
 
-        let root2 = root.clone();
-        let lines = match tokio::task::spawn_blocking(move || {
-            let mut out = Vec::new();
-            walk(&root2, 0, depth, &mut out);
-            out
-        })
-        .await
-        {
-            Ok(v) => v,
-            Err(_) => return err("list_directory: scan task failed".to_string()),
-        };
+        let mut lines = Vec::new();
+        walk(self.world.as_ref(), &root, 0, depth, &mut lines).await;
 
         let truncated = lines.len() > MAX_ENTRIES;
         let mut shown = lines;
@@ -102,33 +112,52 @@ impl Tool for ListDirTool {
     }
 }
 
-fn walk(dir: &Path, depth: usize, max: usize, out: &mut Vec<String>) {
-    if depth > max || out.len() > MAX_ENTRIES {
-        return;
-    }
-    let mut entries: Vec<_> = match std::fs::read_dir(dir) {
-        Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
-        Err(_) => return, // unreadable subtree → silently skip (e.g. permission denied)
-    };
-    entries.sort_by_key(|e| e.file_name());
-    let indent = "  ".repeat(depth);
-    for e in entries {
-        if out.len() > MAX_ENTRIES {
+/// Boxed because it recurses across an `await`: the traversal is depth-first
+/// pre-order (print a directory, descend, then continue with its siblings), and
+/// flattening it to an explicit stack would reorder the output.
+///
+/// The skip-list stays here rather than in the world: `list_directory` prints
+/// `target/ (skipped)`, which it could not do if the world had already dropped
+/// the entry.
+fn walk<'a>(
+    world: &'a dyn FileSystem,
+    dir: &'a Path,
+    depth: usize,
+    max: usize,
+    out: &'a mut Vec<String>,
+) -> BoxFuture<'a, ()> {
+    Box::pin(async move {
+        if depth > max || out.len() > MAX_ENTRIES {
             return;
         }
-        let name = e.file_name().to_string_lossy().to_string();
-        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        if is_dir {
-            if is_skip_dir(&name) {
-                out.push(format!("{indent}{name}/ (skipped)"));
-                continue;
+        // unreadable subtree → silently skip (e.g. permission denied)
+        let Ok(entries) = world.list(dir).await else {
+            return;
+        };
+        let indent = "  ".repeat(depth);
+        for e in entries {
+            if out.len() > MAX_ENTRIES {
+                return;
             }
-            out.push(format!("{indent}{name}/"));
-            walk(&e.path(), depth + 1, max, out);
-        } else {
-            out.push(format!("{indent}{name}"));
+            let name = e
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let is_dir = e.is_dir;
+            if is_dir {
+                if is_skip_dir(&name) {
+                    out.push(format!("{indent}{name}/ (skipped)"));
+                    continue;
+                }
+                out.push(format!("{indent}{name}/"));
+                let child = e.path.clone();
+                walk(world, &child, depth + 1, max, out).await;
+            } else {
+                out.push(format!("{indent}{name}"));
+            }
         }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -152,7 +181,7 @@ mod tests {
         std::fs::create_dir(d.path().join("src")).unwrap();
         std::fs::write(d.path().join("src/main.rs"), "fn main(){}").unwrap();
         std::fs::write(d.path().join("README.md"), "# hi").unwrap();
-        let r = ListDirTool.execute(r#"{"path":"."}"#, &ctx(d.path())).await;
+        let r = ListDirTool::default().execute(r#"{"path":"."}"#, &ctx(d.path())).await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("src/"), "{}", r.content);
         assert!(r.content.contains("  main.rs"), "{}", r.content);
@@ -164,7 +193,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir(d.path().join("target")).unwrap();
         std::fs::write(d.path().join("target/junk"), "x").unwrap();
-        let r = ListDirTool.execute(r#"{"path":"."}"#, &ctx(d.path())).await;
+        let r = ListDirTool::default().execute(r#"{"path":"."}"#, &ctx(d.path())).await;
         assert!(r.content.contains("target/ (skipped)"), "{}", r.content);
         assert!(!r.content.contains("junk"), "{}", r.content);
     }
@@ -172,7 +201,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_json_args_error() {
         let d = tempfile::tempdir().unwrap();
-        let r = ListDirTool.execute("{not valid json", &ctx(d.path())).await;
+        let r = ListDirTool::default().execute("{not valid json", &ctx(d.path())).await;
         assert!(
             r.is_error,
             "malformed args must surface an error, not silently default"
@@ -183,7 +212,7 @@ mod tests {
     #[tokio::test]
     async fn missing_dir_errors() {
         let d = tempfile::tempdir().unwrap();
-        let r = ListDirTool
+        let r = ListDirTool::default()
             .execute(r#"{"path":"nope"}"#, &ctx(d.path()))
             .await;
         assert!(r.is_error);
@@ -196,7 +225,7 @@ mod tests {
     async fn missing_dir_error_carries_the_nearest_existing_ancestor() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("settings.gradle"), "").unwrap();
-        let r = ListDirTool
+        let r = ListDirTool::default()
             .execute(r#"{"path":"app/src/main"}"#, &ctx(d.path()))
             .await;
         assert!(r.is_error);
