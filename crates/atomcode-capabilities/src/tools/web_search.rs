@@ -121,6 +121,26 @@ fn fail(msg: impl Into<String>) -> ToolResult {
     err(format!("{}{SKILL_FALLBACK_HINT}", msg.into()))
 }
 
+/// Max chars of a server error body to fold into a failed-search message. Bounded so a
+/// verbose HTML block page can't flood the model's context.
+const ERROR_BODY_MAX_CHARS: usize = 500;
+
+/// Append a failed HTTP search's server error body to `headline`, so the model sees the
+/// CAUSE (e.g. Exa's 429 "free MCP rate limit … create your own key") instead of a bare
+/// status it can't tell from a network fault. Truncated by CHARS — the body is UTF-8 and a
+/// byte slice would panic on a multi-byte boundary. An empty / whitespace-only body yields
+/// the headline verbatim (no dangling separator — the empty-body case the headline exists
+/// for). Pure so the char-safety is unit-testable without a live server. NEVER pass the
+/// request URL here: it carries `?exaApiKey=<key>`.
+fn append_error_body(headline: String, body: &str) -> String {
+    let body: String = body.trim().chars().take(ERROR_BODY_MAX_CHARS).collect();
+    if body.is_empty() {
+        headline
+    } else {
+        format!("{headline}: {body}")
+    }
+}
+
 #[async_trait]
 impl Tool for WebSearchTool {
     fn name(&self) -> &str {
@@ -206,15 +226,13 @@ impl WebSearchTool {
             // Surface the server's error body. Exa's 429 body states the cause and the fix
             // ("You've hit Exa's free MCP rate limit… create your own Exa API key"); dropping
             // it makes quota exhaustion look like a network fault, and the model keeps
-            // retrying. Truncate by CHARS — the body is UTF-8 and byte slicing would panic on
-            // a multi-byte boundary. NEVER include the request URL: it carries `?exaApiKey=`.
+            // retrying. `append_error_body` char-truncates (UTF-8-safe) and omits an empty
+            // body; NEVER pass the request URL — it carries `?exaApiKey=`.
             let body = resp.text().await.unwrap_or_default();
-            let body: String = body.trim().chars().take(500).collect();
-            return fail(if body.is_empty() {
-                format!("Exa web search: HTTP {status} for '{query}'")
-            } else {
-                format!("Exa web search: HTTP {status} for '{query}': {body}")
-            });
+            return fail(append_error_body(
+                format!("Exa web search: HTTP {status} for '{query}'"),
+                &body,
+            ));
         }
         let sse = match resp.text().await {
             Ok(t) => t,
@@ -251,9 +269,12 @@ impl WebSearchTool {
             }
         };
         if !resp.status().is_success() {
-            return fail(format!(
-                "web_search: HTTP {} from DuckDuckGo",
-                resp.status().as_u16()
+            // Same treatment as the Exa path: a block/limit page's body carries the reason.
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return fail(append_error_body(
+                format!("web_search: HTTP {status} from DuckDuckGo"),
+                &body,
             ));
         }
         let html = match resp.text().await {
@@ -502,6 +523,40 @@ mod tests {
             SearchProvider::from_str("anything"),
             SearchProvider::Exa,
             "unknown → Exa default"
+        );
+    }
+
+    #[test]
+    fn append_error_body_char_truncates_multibyte_without_panic() {
+        // 600 three-byte chars: a byte slice at 500 would split a char and panic; char
+        // truncation keeps exactly ERROR_BODY_MAX_CHARS chars.
+        let body = "限".repeat(600);
+        let out = append_error_body("Exa web search: HTTP 429".to_string(), &body);
+        let appended = out
+            .strip_prefix("Exa web search: HTTP 429: ")
+            .expect("headline + separator preserved");
+        assert_eq!(appended.chars().count(), ERROR_BODY_MAX_CHARS);
+    }
+
+    #[test]
+    fn append_error_body_empty_or_whitespace_keeps_headline_verbatim() {
+        assert_eq!(
+            append_error_body("HTTP 429".to_string(), ""),
+            "HTTP 429",
+            "empty body → no dangling separator"
+        );
+        assert_eq!(
+            append_error_body("HTTP 429".to_string(), "  \n\t "),
+            "HTTP 429",
+            "whitespace-only body → headline verbatim"
+        );
+    }
+
+    #[test]
+    fn append_error_body_appends_trimmed_body() {
+        assert_eq!(
+            append_error_body("HTTP 429".to_string(), "  rate limit hit  "),
+            "HTTP 429: rate limit hit"
         );
     }
 
