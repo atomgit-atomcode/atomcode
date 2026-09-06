@@ -80,6 +80,9 @@ struct Projector {
     ctx_window: u32,
     batch: Option<OpenBatch>,
     last_prompt_tokens: u32,
+    /// How many user messages this turn has taken. The second and later ones
+    /// are steering.
+    said_this_turn: u32,
 }
 
 impl Projector {
@@ -109,7 +112,10 @@ impl Projector {
 
     fn project(&mut self, event: &SessionEvent) -> Vec<AgentEvent> {
         match event {
-            SessionEvent::TurnStart { .. } => vec![AgentEvent::TurnStarted],
+            SessionEvent::TurnStart { .. } => {
+                self.said_this_turn = 0;
+                vec![AgentEvent::TurnStarted]
+            }
 
             SessionEvent::AssistantChunk {
                 delta, reasoning, ..
@@ -266,8 +272,28 @@ impl Projector {
             // be able to become invisible to every driver by default. Adding
             // one stops compiling here until someone decides what it looks
             // like on a screen.
-            SessionEvent::UserMessage { .. }
-            | SessionEvent::Injected { .. }
+            // A second user message inside one turn is steering: the person
+            // typed while the model was answering and the loop folded it in.
+            // The behaviour was already right — one turn, not two — but the
+            // driver was never told, so a UI could not say "your message was
+            // folded into this turn". The reference engine announces it; a
+            // differential run showed this as the only difference on that path.
+            SessionEvent::UserMessage { text, images, .. } => {
+                if self.said_this_turn == 0 {
+                    self.said_this_turn = 1;
+                    Vec::new()
+                } else {
+                    self.said_this_turn += 1;
+                    vec![AgentEvent::Steered {
+                        count: 1,
+                        inputs: vec![atomcode_kernel::event::SteeredInput {
+                            text: text.clone(),
+                            images: images.clone(),
+                        }],
+                    }]
+                }
+            }
+            SessionEvent::Injected { .. }
             | SessionEvent::StepStart { .. }
             | SessionEvent::RequestHeader { .. } => Vec::new(),
         }
@@ -553,6 +579,7 @@ async fn pump(
     // turn, and a differential run caught this: it replied instantly with
     // `messages=0` where the reference replied with `messages=4`.
     let mut snapshots_waiting = 0usize;
+    let mut compactions_waiting: Vec<Option<String>> = Vec::new();
 
     loop {
         let woke = tokio::select! {
@@ -563,6 +590,9 @@ async fn pump(
         let command = match woke {
             Woke::TurnDone => {
                 turn = None;
+                for focus in std::mem::take(&mut compactions_waiting) {
+                    compact(&ctx, &events, focus).await;
+                }
                 for _ in 0..std::mem::take(&mut snapshots_waiting) {
                     send_snapshot(&ctx, &events);
                 }
@@ -602,6 +632,17 @@ async fn pump(
             }
             AgentCommand::Cancel => {
                 agent.cancel();
+                // And release anything parked on an answer. Cancelling is
+                // cooperative: a tool blocked on an approval nobody will now
+                // give never reaches a point where it can observe the token,
+                // so the turn hangs until the driver gives up. The shutdown
+                // path already did both in this order and said why; the cancel
+                // path only did the first half, and a liveness scenario in the
+                // differential rig sat on it for the full twenty seconds.
+                //
+                // A pending approval becomes a refusal, which is the right
+                // reading: the person asked to stop, not to proceed.
+                asker.refuse_all();
                 continue;
             }
             AgentCommand::Snapshot => {
@@ -616,7 +657,14 @@ async fn pump(
                 continue;
             }
             AgentCommand::Compact { focus } => {
-                compact(&ctx, &events, focus).await;
+                // Behind the turn, like a snapshot and for the same reason:
+                // rewriting the conversation while a round is mid-flight
+                // compacts a history the turn is still appending to.
+                if turn.is_some() {
+                    compactions_waiting.push(focus);
+                } else {
+                    compact(&ctx, &events, focus).await;
+                }
                 continue;
             }
             AgentCommand::Shutdown => break,
@@ -834,6 +882,7 @@ impl Plugin for AgentHandlePlugin {
                 .unwrap_or(0),
             batch: None,
             last_prompt_tokens: 0,
+            said_this_turn: 0,
         }));
 
         let out = event_tx.clone();
@@ -895,6 +944,7 @@ pub fn replay(events: &[SessionEvent], ctx_window: u32) -> Vec<AgentEvent> {
         ctx_window,
         batch: None,
         last_prompt_tokens: 0,
+        said_this_turn: 0,
     };
     events
         .iter()

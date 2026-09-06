@@ -238,26 +238,56 @@ async fn drive_until(handle: AgentHandle, commands: Vec<AgentCommand>, also: &[&
 /// Cancellation only means anything mid-turn. Sending it in the same breath as
 /// the message measures which engine drains its command queue faster, which is
 /// not a difference anybody cares about.
+/// The wire shape a driver answers an approval with.
+///
+/// `{"decision":"allow"}` — not `"yes"`. Anything unrecognised parses as deny,
+/// on purpose (a crashed driver must not become consent), which is why the
+/// first version of these scenarios saw every call refused.
+fn allow() -> serde_json::Value {
+    serde_json::json!({ "decision": "allow" })
+}
+
+fn deny() -> serde_json::Value {
+    serde_json::json!({ "decision": "deny" })
+}
+
 async fn drive_with(
+    handle: AgentHandle,
+    commands: Vec<AgentCommand>,
+    also: &[&str],
+    late: Option<AgentCommand>,
+) -> Vec<Step> {
+    drive_answering(handle, commands, also, late, allow()).await
+}
+
+async fn drive_answering(
     mut handle: AgentHandle,
     commands: Vec<AgentCommand>,
     also: &[&str],
     late: Option<AgentCommand>,
+    answer: serde_json::Value,
 ) -> Vec<Step> {
     for c in commands {
         if handle.commands.send(c).is_err() {
             break;
         }
     }
+    /// How long to keep listening after the turn ends.
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(250);
     let mut out = Vec::new();
     let mut done = false;
+    let mut grace: Option<tokio::time::Instant> = None;
     // A bound, not a hope: an engine that never terminates must fail the test
     // rather than hang it. A hang reports as slowness and gets blamed on the
     // machine.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let until = grace.map_or(deadline, |g| g.min(deadline));
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
+            if grace.is_some() {
+                break; // the trailing window closed; not a failure
+            }
             out.push(Step {
                 kind: "TIMEOUT",
                 detail: "the engine never finished the turn".into(),
@@ -271,6 +301,19 @@ async fn drive_with(
                     AgentEvent::TurnComplete { .. } | AgentEvent::Error { .. }
                 ) {
                     done = true;
+                }
+                // Answer any request the engine raises. A driver that did not
+                // would park the turn, and every approval scenario would
+                // measure the rig's silence rather than the engines.
+                // `Null` means "this driver does not answer" — for the
+                // deadlock scenario, where the way out has to be the cancel.
+                if let AgentEvent::Request { id, .. } = &event {
+                    if !answer.is_null() {
+                        let _ = handle.commands.send(AgentCommand::Respond {
+                            id: *id,
+                            value: answer.clone(),
+                        });
+                    }
                 }
                 if matches!(event, AgentEvent::TurnStarted) {
                     if let Some(cmd) = late.clone() {
@@ -286,15 +329,30 @@ async fn drive_with(
                 // that arrives after the turn ended would otherwise never be
                 // noticed, and the rig would sit out its whole timeout.
                 if done && also.iter().all(|k| out.iter().any(|s| s.kind == *k)) {
-                    break;
+                    // A short window for anything that legitimately trails the
+                    // turn — a queued compaction, a snapshot answered on the
+                    // way out. Breaking at the terminal event made the rig
+                    // report "neither engine emits this" when the truth was
+                    // "the rig stopped listening". Both sides get the same
+                    // window, so what is compared is still the engines.
+                    if grace.is_none() {
+                        grace = Some(tokio::time::Instant::now() + GRACE);
+                    }
+                }
+                if let Some(until) = grace {
+                    if tokio::time::Instant::now() >= until {
+                        break;
+                    }
                 }
             }
             Ok(None) => break,
             Err(_) => {
-                out.push(Step {
-                    kind: "TIMEOUT",
-                    detail: "the engine never finished the turn".into(),
-                });
+                if grace.is_none() {
+                    out.push(Step {
+                        kind: "TIMEOUT",
+                        detail: "the engine never finished the turn".into(),
+                    });
+                }
                 break;
             }
         }
@@ -333,6 +391,21 @@ async fn reference_cancelling(
     drive_with(agent.spawn(), commands, &[], Some(AgentCommand::Cancel)).await
 }
 
+fn coding_agent(script: Arc<Script>, dir: &std::path::Path) -> atomcode_kernel::agent::Agent {
+    let cfg = atomcode_coding::CodingAgentConfig::new("k", "http://unused.test/v1", "script", dir);
+    atomcode_coding::build_coding_agent_with(&cfg, script)
+}
+
+/// A second message, sent once the turn is genuinely under way.
+async fn reference_late(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+    late: AgentCommand,
+) -> Vec<Step> {
+    drive_with(coding_agent(script, dir).spawn(), commands, &[], Some(late)).await
+}
+
 async fn reference_until(
     script: Arc<Script>,
     dir: &std::path::Path,
@@ -361,6 +434,40 @@ async fn candidate_cancelling(
     candidate_inner(script, dir, commands, &[], Some(AgentCommand::Cancel)).await
 }
 
+async fn candidate_late(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+    late: AgentCommand,
+) -> Vec<Step> {
+    candidate_answering(
+        script,
+        dir,
+        commands,
+        &[],
+        Some(late),
+        serde_json::json!("yes"),
+    )
+    .await
+}
+
+/// Raise the approval, never answer it, cancel instead.
+async fn candidate_never_answering(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+) -> Vec<Step> {
+    candidate_answering(
+        script,
+        dir,
+        commands,
+        &[],
+        Some(AgentCommand::Cancel),
+        serde_json::Value::Null,
+    )
+    .await
+}
+
 async fn candidate_until(
     script: Arc<Script>,
     dir: &std::path::Path,
@@ -376,6 +483,17 @@ async fn candidate_inner(
     commands: Vec<AgentCommand>,
     also: &[&str],
     late: Option<AgentCommand>,
+) -> Vec<Step> {
+    candidate_answering(script, dir, commands, also, late, allow()).await
+}
+
+async fn candidate_answering(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+    also: &[&str],
+    late: Option<AgentCommand>,
+    answer: serde_json::Value,
 ) -> Vec<Step> {
     use atomcode_plexus::{App, ConfigTree, Layer};
 
@@ -413,7 +531,7 @@ async fn candidate_inner(
         .expect("agent-handle row must provide a handle")
         .take()
         .expect("the handle, once");
-    let steps = drive_with(handle, commands, also, late).await;
+    let steps = drive_answering(handle, commands, also, late, answer).await;
     app.stop();
     steps
 }
@@ -812,6 +930,239 @@ async fn a_cancel_lands() {
                 .count(),
             1,
             "{who}: 恰好一个终结{report}"
+        );
+    }
+}
+
+/// Approval is a property of the candidate, not a comparison.
+///
+/// At the `AgentHandle` seam the two sides gate differently *by configuration*:
+/// `build_coding_agent_with` registers no approval gate unless permission rules
+/// are supplied, so a differential run here measured the config and not the
+/// engine — the reference wrote the file without asking at all. Comparing that
+/// to a harness that does ask says nothing about whether the harness could sit
+/// underneath it.
+///
+/// So these two judge the candidate on its own, and they judge it against the
+/// **disk**: whether a file exists is not something an event stream can be
+/// mistaken about.
+#[tokio::test]
+async fn an_approval_is_asked_once_and_a_yes_lets_the_call_through() {
+    let dir = scratch("approval");
+    let script = Script::new(&[
+        Reply::call(
+            "c1",
+            "write_file",
+            r#"{"file_path":"new.rs","content":"fn x(){}"}"#,
+        ),
+        Reply::Text("written"),
+    ]);
+    let cmds = vec![AgentCommand::SendMessage {
+        text: "write it".into(),
+        images: Vec::new(),
+    }];
+    let steps = candidate_answering(script, &dir, cmds, &[], None, allow()).await;
+    let report = render(&steps, &steps);
+
+    assert_eq!(
+        steps.iter().filter(|s| s.kind == "Request").count(),
+        1,
+        "一次调用问一次，不是零次也不是两次{report}"
+    );
+    assert_eq!(
+        steps.iter().filter(|s| s.kind == "TurnComplete").count(),
+        1,
+        "审批不会多开一个回合{report}"
+    );
+    assert!(
+        !steps.iter().any(|s| s.kind == "TIMEOUT"),
+        "被应答之后回合必须继续{report}"
+    );
+    assert!(
+        dir.join("new.rs").exists(),
+        "同意了就必须真的写进去 —— 这条判据看的是磁盘，不是事件{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_no_blocks_the_call_and_the_turn_carries_on() {
+    // Saying no is an answer, not a failure: the model is told, and the turn
+    // continues so it can try something else.
+    let dir = scratch("refused");
+    let script = Script::new(&[
+        Reply::call(
+            "c1",
+            "write_file",
+            r#"{"file_path":"nope.rs","content":"x"}"#,
+        ),
+        Reply::Text("understood"),
+    ]);
+    let cmds = vec![AgentCommand::SendMessage {
+        text: "write it".into(),
+        images: Vec::new(),
+    }];
+    let steps = candidate_answering(script, &dir, cmds, &[], None, deny()).await;
+    let report = render(&steps, &steps);
+
+    assert!(
+        !dir.join("nope.rs").exists(),
+        "拒绝之后文件不该存在{report}"
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|s| s.kind == "ToolResult" && s.detail.contains("error=true")),
+        "模型必须被告知它被拒了，否则它不知道要换个做法{report}"
+    );
+    assert_eq!(
+        steps.iter().filter(|s| s.kind == "TurnComplete").count(),
+        1,
+        "拒绝也要让回合正常走完{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_while_a_tool_waits_for_approval() {
+    // The deadlock this protocol can produce: a tool parked on an unanswered
+    // approval, and the only way out is a cancel that the parked task must
+    // actually observe. Nobody answers here on purpose.
+    //
+    // A candidate property rather than a comparison, for the same reason as the
+    // other approval scenarios: the reference mounts no gate at this seam.
+    let dir = scratch("approval-cancel");
+    let script = Script::new(&[
+        Reply::call("c1", "write_file", r#"{"file_path":"x.rs","content":"x"}"#),
+        Reply::Text("done"),
+    ]);
+    let cmds = vec![AgentCommand::SendMessage {
+        text: "write it".into(),
+        images: Vec::new(),
+    }];
+    let started = std::time::Instant::now();
+    let steps = candidate_never_answering(script, &dir, cmds).await;
+    let took = started.elapsed();
+    let report = render(&steps, &steps);
+
+    assert!(
+        !steps.iter().any(|s| s.kind == "TIMEOUT"),
+        "等审批的工具被取消后回合必须结束，否则就是死锁{report}"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "取消要及时到达那个被 park 住的任务，实际用了 {took:?}{report}"
+    );
+    assert!(
+        !dir.join("x.rs").exists(),
+        "没人同意过，文件不该存在{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_manual_compaction() {
+    let dir = scratch("compact");
+    let cmds = || {
+        vec![
+            AgentCommand::SendMessage {
+                text: "hi".into(),
+                images: Vec::new(),
+            },
+            AgentCommand::Compact { focus: None },
+        ]
+    };
+    let a = reference_until(Script::text(&["ok"]), &dir, cmds(), &[]).await;
+    let b = candidate_until(Script::text(&["ok"]), &dir, cmds(), &[]).await;
+    let report = render(&a, &b);
+    // Known and benign: the candidate emits `CompactionStarted` where the
+    // reference goes straight to `Compacted`. The event exists precisely so a
+    // driver can show "compacting…" before a possibly multi-second summary, and
+    // an engine cannot know in advance that a compaction will be quick — so
+    // announcing it is the documented behaviour, not a defect. Frozen at 1 so
+    // it cannot quietly become 2.
+    ratchet("compact", divergences(&a, &b), &report);
+
+    for (who, steps) in [("参考", &a), ("候选", &b)] {
+        assert!(
+            !steps.iter().any(|s| s.kind == "TIMEOUT"),
+            "{who}: 压缩请求不能挂住{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_second_message_steers_the_running_turn() {
+    // Typing while the model is answering folds into the turn already running.
+    // The invariant a driver depends on: still one turn, not two.
+    let dir = scratch("steer");
+    let script = || Script::new(&[Reply::Slow(300, "first"), Reply::Text("second")]);
+    let cmds = || {
+        vec![AgentCommand::SendMessage {
+            text: "start".into(),
+            images: Vec::new(),
+        }]
+    };
+    let later = || AgentCommand::SendMessage {
+        text: "and also this".into(),
+        images: Vec::new(),
+    };
+    let a = reference_late(script(), &dir, cmds(), later()).await;
+    let b = candidate_late(script(), &dir, cmds(), later()).await;
+    let report = render(&a, &b);
+    ratchet("steering", divergences(&a, &b), &report);
+
+    for (who, steps) in [("参考", &a), ("候选", &b)] {
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "TurnStarted").count(),
+            1,
+            "{who}: 插话折进正在跑的回合，不另开一个{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_message_carrying_context() {
+    // Context is model-visible but is not something the user said. Both engines
+    // must run exactly one turn for the pair.
+    let dir = scratch("context");
+    let cmds = || {
+        vec![AgentCommand::SendMessageWithContext {
+            text: "given that, what next?".into(),
+            images: Vec::new(),
+            context: "the build is broken".into(),
+        }]
+    };
+    let a = reference(Script::text(&["fix it"]), &dir, cmds()).await;
+    let b = candidate(Script::text(&["fix it"]), &dir, cmds()).await;
+    let report = render(&a, &b);
+    ratchet("with_context", divergences(&a, &b), &report);
+
+    for (who, steps) in [("参考", &a), ("候选", &b)] {
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "TurnStarted").count(),
+            1,
+            "{who}: 一条命令一个回合{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_synthetic_message() {
+    // The harness speaking on its own initiative — a continuation nudge. Same
+    // shape as a user message from the engine's point of view.
+    let dir = scratch("synthetic");
+    let cmds = || {
+        vec![AgentCommand::SendSyntheticMessage {
+            text: "keep going".into(),
+        }]
+    };
+    let a = reference(Script::text(&["carrying on"]), &dir, cmds()).await;
+    let b = candidate(Script::text(&["carrying on"]), &dir, cmds()).await;
+    let report = render(&a, &b);
+    ratchet("synthetic", divergences(&a, &b), &report);
+
+    for (who, steps) in [("参考", &a), ("候选", &b)] {
+        assert!(
+            !steps.iter().any(|s| s.kind == "TIMEOUT"),
+            "{who}: 合成消息也要跑完一个回合{report}"
         );
     }
 }

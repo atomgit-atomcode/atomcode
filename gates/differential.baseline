@@ -1,8 +1,12 @@
+cancel=0
+with_context=0
 plain_turn=0
+steering=0
+snapshot=0
+synthetic=0
+unknown_tool=0
 one_tool_call=0
 several_rounds=0
 provider_error=0
 two_tool_calls=0
-snapshot=0
-unknown_tool=0
-cancel=0
+compact=1
