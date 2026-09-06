@@ -57,6 +57,12 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 async-stream = "0.3"
 
 [dev-dependencies]
+# The reference engine, for the differential rig only.
+#
+# A DEV dependency on purpose: the harness must not depend on `atomcode-coding`
+# in production — the whole question being measured is whether coding could sit
+# ON the harness, and a dependency pointing the other way would prejudge it.
+atomcode-coding = { path = "../atomcode-coding" }
 tokio = { version = "1", features = ["test-util"] }
 # Redirect ATOMCODE_HOME to a temp dir once per test binary (via a #[ctor]) so the
 # session-persistence row cannot write into the developer's real ~/.atomcode.
