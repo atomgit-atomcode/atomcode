@@ -240,8 +240,45 @@ impl Projector {
 
             // Advisory: the turn continues. A driver renders it as a note, not
             // as a failure — a rate-limit wait is not an error.
-            SessionEvent::Notice { detail, .. } => {
-                vec![AgentEvent::Warning(detail.clone())]
+            // Typed, not flattened. The protocol has a dedicated event for each
+            // of these and a driver renders them differently — a rate limit
+            // wants a countdown, a retry wants an attempt counter. Sending them
+            // all as `Warning(String)` hands the driver prose to parse, and
+            // parsing prose is how a UI ends up wrong in a language nobody
+            // tested.
+            SessionEvent::Notice { notice, detail, .. } => {
+                vec![match notice {
+                    crate::session::NoticeKind::RateLimited => AgentEvent::RateLimited {
+                        reset_at_display: detail.clone(),
+                        reset_label: detail.clone(),
+                        secs_until_reset: None,
+                        auto_resuming: true,
+                        server_message: Some(detail.clone()),
+                    },
+                    crate::session::NoticeKind::ProviderRetry => AgentEvent::ProviderRetry {
+                        attempt: 0,
+                        max_attempts: 0,
+                        backoff_secs: 0,
+                        reason: detail.clone(),
+                    },
+                    crate::session::NoticeKind::StreamRecovered => AgentEvent::StreamRecovery {
+                        attempt: 0,
+                        max_attempts: 0,
+                        recovered: true,
+                    },
+                    crate::session::NoticeKind::OutputTruncated => {
+                        AgentEvent::OutputTruncationRecovery {
+                            attempt: 0,
+                            max_attempts: 0,
+                        }
+                    }
+                    // Compaction is not a recovery the protocol names; it stays
+                    // a warning rather than being forced into a shape that means
+                    // something else.
+                    crate::session::NoticeKind::OverflowCompacted => {
+                        AgentEvent::Warning(detail.clone())
+                    }
+                }]
             }
 
             SessionEvent::TurnEnd { stop, error, .. } => {

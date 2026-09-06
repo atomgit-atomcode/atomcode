@@ -72,6 +72,8 @@ pub enum NoticeKind {
     StreamRecovered,
     /// A retryable provider failure is backing off.
     ProviderRetry,
+    /// The answer hit the output-token limit; the model was asked to resume.
+    OutputTruncated,
 }
 
 /// One durable fact about a session.

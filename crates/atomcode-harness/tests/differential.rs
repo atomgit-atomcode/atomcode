@@ -51,6 +51,8 @@ enum Reply {
     ),
     /// A mid-stream provider failure.
     Fail(&'static str),
+    /// Cut off by `finish_reason=length`.
+    Truncated(&'static str),
     /// A round that takes time to answer.
     ///
     /// Needed to measure cancellation at all: with an instant provider, whether
@@ -117,6 +119,16 @@ impl LlmProvider for Script {
             Reply::Slow(ms, t) => {
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 events.push(StreamEvent::TextDelta(t.into()));
+            }
+            Reply::Truncated(t) => {
+                events.push(StreamEvent::TextDelta(t.into()));
+                events.push(StreamEvent::Usage(atomcode_kernel::stream::TokenUsage {
+                    prompt: 100,
+                    completion: 20,
+                    cached: 0,
+                }));
+                events.push(StreamEvent::Done { truncated: true });
+                return Ok(Box::pin(stream::iter(events)));
             }
             Reply::Text(t) => events.push(StreamEvent::TextDelta(t.into())),
             Reply::Calls(t, calls) => {
@@ -208,7 +220,10 @@ fn normalise(event: &AgentEvent) -> Option<Step> {
         AgentEvent::Warning(_) => None,
         AgentEvent::StreamRecovery { .. } => None,
         AgentEvent::ProviderRetry { .. } => None,
-        AgentEvent::OutputTruncationRecovery { .. } => None,
+        // Reported, not ignored: a divergence whose only trace is an extra
+        // `Usage` is a mystery, and the rig exists to produce findings rather
+        // than puzzles.
+        AgentEvent::OutputTruncationRecovery { .. } => step("TruncationRecovery", String::new()),
         AgentEvent::RateLimited { .. } => None,
         AgentEvent::Steered { .. } => step("Steered", String::new()),
         AgentEvent::CompactionStarted { .. } => step("CompactionStarted", String::new()),
@@ -238,6 +253,95 @@ async fn drive_until(handle: AgentHandle, commands: Vec<AgentCommand>, also: &[&
 /// Cancellation only means anything mid-turn. Sending it in the same breath as
 /// the message measures which engine drains its command queue faster, which is
 /// not a difference anybody cares about.
+/// Send one message, wait for its turn to end, then the next.
+///
+/// A second turn is not a second message on the same turn — the distinction the
+/// steering scenario is about — so the rig has to wait, or it would be
+/// measuring steering again under a different name.
+async fn drive_turns(mut handle: AgentHandle, messages: &[&str]) -> Vec<Step> {
+    let mut out = Vec::new();
+    for text in messages {
+        if handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: (*text).into(),
+                images: Vec::new(),
+            })
+            .is_err()
+        {
+            break;
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                out.push(Step {
+                    kind: "TIMEOUT",
+                    detail: "a turn never ended".into(),
+                });
+                return out;
+            }
+            match tokio::time::timeout(left, handle.events.recv()).await {
+                Ok(Some(event)) => {
+                    let terminal = matches!(
+                        event,
+                        AgentEvent::TurnComplete { .. } | AgentEvent::Error { .. }
+                    );
+                    if let Some(step) = normalise(&event) {
+                        out.push(step);
+                    }
+                    if terminal {
+                        break;
+                    }
+                }
+                _ => return out,
+            }
+        }
+    }
+    let _ = handle.commands.send(AgentCommand::Shutdown);
+    out
+}
+
+/// Everything the model was shown, as text, taken from a snapshot.
+///
+/// For the questions an event stream cannot answer — "did the context actually
+/// reach the model" is about message contents, and every event in the world
+/// could look right while the answer is no.
+async fn transcript(mut handle: AgentHandle, commands: Vec<AgentCommand>) -> String {
+    for c in commands {
+        if handle.commands.send(c).is_err() {
+            break;
+        }
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut asked = false;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return String::new();
+        }
+        match tokio::time::timeout(left, handle.events.recv()).await {
+            Ok(Some(AgentEvent::TurnComplete { .. })) | Ok(Some(AgentEvent::Error { .. }))
+                if !asked =>
+            {
+                asked = true;
+                let _ = handle.commands.send(AgentCommand::Snapshot);
+            }
+            Ok(Some(AgentEvent::Snapshot { snapshot })) => {
+                let _ = handle.commands.send(AgentCommand::Shutdown);
+                return snapshot
+                    .messages
+                    .iter()
+                    .map(|m| format!("{:?}: {}", m.role, m.text))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            Ok(Some(_)) => {}
+            _ => return String::new(),
+        }
+    }
+}
+
 /// The wire shape a driver answers an approval with.
 ///
 /// `{"decision":"allow"}` — not `"yes"`. Anything unrecognised parses as deny,
@@ -487,14 +591,27 @@ async fn candidate_inner(
     candidate_answering(script, dir, commands, also, late, allow()).await
 }
 
-async fn candidate_answering(
+/// A mounted candidate tree and its handle.
+///
+/// Both, because the tree must outlive the handle: dropping the `App` unloads
+/// every row, and the next command goes to a conversation whose services have
+/// all been torn down.
+async fn candidate_handle(
     script: Arc<Script>,
     dir: &std::path::Path,
-    commands: Vec<AgentCommand>,
-    also: &[&str],
-    late: Option<AgentCommand>,
-    answer: serde_json::Value,
-) -> Vec<Step> {
+) -> (AgentHandle, atomcode_plexus::App) {
+    let app = candidate_app(script, dir).await;
+    let handle = app
+        .context()
+        .service::<atomcode_harness::seams::AgentHandleSvc>()
+        .expect("agent-handle row must provide a handle")
+        .take()
+        .expect("the handle, once");
+    (handle, app)
+}
+
+/// Mount a candidate tree with this script as its model.
+async fn candidate_app(script: Arc<Script>, dir: &std::path::Path) -> atomcode_plexus::App {
     use atomcode_plexus::{App, ConfigTree, Layer};
 
     let empty = dir.join("__no_skills__");
@@ -524,7 +641,18 @@ async fn candidate_answering(
     registry.register(Arc::new(InjectScript(script)));
     let mut app = App::new(registry, tree);
     app.start().await.expect("the candidate tree must mount");
+    app
+}
 
+async fn candidate_answering(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+    also: &[&str],
+    late: Option<AgentCommand>,
+    answer: serde_json::Value,
+) -> Vec<Step> {
+    let mut app = candidate_app(script, dir).await;
     let handle = app
         .context()
         .service::<atomcode_harness::seams::AgentHandleSvc>()
@@ -1055,6 +1183,186 @@ async fn a_cancel_while_a_tool_waits_for_approval() {
         !dir.join("x.rs").exists(),
         "没人同意过，文件不该存在{report}"
     );
+}
+
+#[tokio::test]
+async fn the_provider_fails_while_a_tool_call_is_outstanding() {
+    // The dangling-call case. A model asks for a tool, the tool runs, and the
+    // next round dies. Every `tool_call` in the history must have a paired
+    // result or the next request is malformed and the conversation is stuck —
+    // providers reject an assistant message whose calls have no answers.
+    let dir = scratch("dangling");
+    seed(&dir);
+    let script = || {
+        Script::new(&[
+            Reply::call("c1", "read_file", r#"{"file_path":"a.rs"}"#),
+            Reply::Fail("died holding the bag"),
+        ])
+    };
+    let cmds = || {
+        vec![AgentCommand::SendMessage {
+            text: "read it".into(),
+            images: Vec::new(),
+        }]
+    };
+    let a = reference(script(), &dir, cmds()).await;
+    let b = candidate(script(), &dir, cmds()).await;
+    let report = render(&a, &b);
+    ratchet("dangling_call", divergences(&a, &b), &report);
+
+    for (who, steps) in [("参考", &a), ("候选", &b)] {
+        let started = steps.iter().filter(|s| s.kind == "ToolStarted").count();
+        let results = steps.iter().filter(|s| s.kind == "ToolResult").count();
+        assert_eq!(
+            started, results,
+            "{who}: provider 死掉也不能留下没有结果的调用{report}"
+        );
+        assert!(
+            !steps.iter().any(|s| s.kind == "TIMEOUT"),
+            "{who}: 必须终结{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn one_of_two_parallel_tools_fails() {
+    // A batch is only closed correctly if it closes on partial failure too.
+    let dir = scratch("mixed-batch");
+    seed(&dir);
+    let script = || {
+        Script::new(&[
+            Reply::Calls(
+                "both",
+                vec![
+                    ("c1", "read_file", r#"{"file_path":"a.rs"}"#),
+                    ("c2", "read_file", r#"{"file_path":"missing.rs"}"#),
+                ],
+            ),
+            Reply::Text("one worked"),
+        ])
+    };
+    let cmds = || {
+        vec![AgentCommand::SendMessage {
+            text: "read both".into(),
+            images: Vec::new(),
+        }]
+    };
+    let a = reference(script(), &dir, cmds()).await;
+    let b = candidate(script(), &dir, cmds()).await;
+    let report = render(&a, &b);
+    ratchet("mixed_batch", divergences(&a, &b), &report);
+
+    for (who, steps) in [("参考", &a), ("候选", &b)] {
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "ToolResult").count(),
+            2,
+            "{who}: 两个调用两个结果，成败无关{report}"
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|s| s.kind == "ToolBatchCompleted")
+                .count(),
+            1,
+            "{who}: 部分失败也要合上批次，否则 UI 上那一组永远转圈{report}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.kind == "ToolResult" && s.detail.contains("error=true")),
+            "{who}: 失败的那个要被报成失败{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_second_turn_sees_the_first() {
+    // Continuity. Two turns, and the second must be answering with the first
+    // still in the history — otherwise every turn is a fresh conversation and
+    // nothing the person said earlier counts.
+    let dir = scratch("two-turns");
+    let script = || Script::text(&["first answer", "second answer"]);
+    let a = drive_turns(
+        coding_agent(script(), &dir).spawn(),
+        &["remember the number 41", "what number?"],
+    )
+    .await;
+    let (handle, _app) = candidate_handle(script(), &dir).await;
+    let b = drive_turns(handle, &["remember the number 41", "what number?"]).await;
+    let report = render(&a, &b);
+    ratchet("two_turns", divergences(&a, &b), &report);
+
+    for (who, steps) in [("参考", &a), ("候选", &b)] {
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "TurnStarted").count(),
+            2,
+            "{who}: 两条消息两个回合{report}"
+        );
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "TurnComplete").count(),
+            2,
+            "{who}: 各自终结{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_context_a_message_carries_actually_reaches_the_model() {
+    // An event-stream comparison cannot answer this: every event could be
+    // identical while the context was silently dropped. The judge is the
+    // snapshot — what the model was actually shown.
+    let dir = scratch("context-visible");
+    let cmds = || {
+        vec![AgentCommand::SendMessageWithContext {
+            text: "what is broken?".into(),
+            images: Vec::new(),
+            context: "the build fails on line 41".into(),
+        }]
+    };
+    let seen_reference =
+        transcript(coding_agent(Script::text(&["ok"]), &dir).spawn(), cmds()).await;
+    let (handle, _app) = candidate_handle(Script::text(&["ok"]), &dir).await;
+    let seen_candidate = transcript(handle, cmds()).await;
+
+    for (who, seen) in [("参考", &seen_reference), ("候选", &seen_candidate)] {
+        assert!(
+            seen.contains("the build fails on line 41"),
+            "{who}: 上下文没到模型面前：\n{seen}"
+        );
+        assert!(
+            seen.contains("what is broken?"),
+            "{who}: 提问也得在：\n{seen}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_truncated_response() {
+    // `finish_reason=length`. Whatever each engine does about it, neither may
+    // leave the turn open.
+    let dir = scratch("truncated");
+    let script = || Script::new(&[Reply::Truncated("this got cut off mid-")]);
+    let cmds = || {
+        vec![AgentCommand::SendMessage {
+            text: "write a long thing".into(),
+            images: Vec::new(),
+        }]
+    };
+    let a = reference(script(), &dir, cmds()).await;
+    let b = candidate(script(), &dir, cmds()).await;
+    let report = render(&a, &b);
+    // Known and benign: both engines run the recovery round and both report the
+    // same two usages; they differ only in whether the first usage is reported
+    // before or after the recovery notice. A driver accumulating usage cannot
+    // tell. Frozen so it cannot quietly become something else.
+    ratchet("truncated", divergences(&a, &b), &report);
+
+    for (who, steps) in [("参考", &a), ("候选", &b)] {
+        assert!(
+            !steps.iter().any(|s| s.kind == "TIMEOUT"),
+            "{who}: 截断不能让回合悬着{report}"
+        );
+    }
 }
 
 #[tokio::test]

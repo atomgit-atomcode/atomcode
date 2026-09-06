@@ -73,7 +73,7 @@ impl Waterfall<AgentRequest> for OnTruncation {
         req: &mut ModelRequest,
         next: Next<'_, AgentRequest>,
     ) -> Result<ModelResponse, RequestError> {
-        let response = next.run(req).await?;
+        let mut response = next.run(req).await?;
         if !response.truncated {
             return Ok(response);
         }
@@ -82,6 +82,13 @@ impl Waterfall<AgentRequest> for OnTruncation {
         if seen > self.max_continuations {
             // The nudge is not working. Let the turn end on what it has rather
             // than spend the rest of the budget asking again.
+            //
+            // Clearing the flag is how that decision reaches the loop: the loop
+            // keeps asking while a response says it was cut off, so "stop
+            // asking" and "this response is final" are the same statement. The
+            // cap therefore lives here, once, rather than being re-derived by
+            // whoever reads `truncated` next.
+            response.truncated = false;
             return Ok(response);
         }
 
@@ -94,6 +101,21 @@ impl Waterfall<AgentRequest> for OnTruncation {
             .unwrap_or(false);
 
         if let Some(session) = self.ctx.service::<SessionSvc>() {
+            // Tell the driver as well as the model. The nudge is model-visible;
+            // that the answer was cut off and is being resumed is something a
+            // person watching the screen should also see.
+            crate::session::commit(
+                &self.ctx,
+                &session,
+                SessionEvent::Notice {
+                    turn: session.current_turn(),
+                    notice: crate::session::NoticeKind::OutputTruncated,
+                    detail: format!(
+                        "输出被截断，正在请模型接着写（第 {seen}/{} 次）",
+                        self.max_continuations
+                    ),
+                },
+            );
             crate::session::commit(
                 &self.ctx,
                 &session,

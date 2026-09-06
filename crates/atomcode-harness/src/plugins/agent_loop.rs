@@ -590,8 +590,17 @@ impl AgentLoop for PluginAgentLoop {
             }
 
             // The turn continues while anything is owed: tools produced results
-            // the model has not seen, or someone put more work in the inbox.
-            let owes_a_request = tool_count > 0;
+            // the model has not seen, someone put more work in the inbox, or
+            // the answer was cut off at the output limit and the recovery row
+            // has asked the model to resume.
+            //
+            // Truncation used to end the turn here, which made the
+            // `truncation-recovery` row half a feature: it injected the coaching
+            // text and nothing ever asked for the rest. The person got half a
+            // sentence. That row still owns the *policy* — when it stops
+            // nudging it clears the flag, and this condition goes false — so the
+            // continuation cap stays in one place.
+            let owes_a_request = tool_count > 0 || response.truncated;
             if !owes_a_request && !agent.inbox().has_waking_input() {
                 outcome.stop = StopReason::Stopped;
                 break;
