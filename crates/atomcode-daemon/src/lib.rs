@@ -6168,6 +6168,28 @@ pub struct ServerOpts {
 /// Note: early bootstrap that is process-global (panic hook, Windows console
 /// attach, legacy session migration) is handled by the binary's `main()` before
 /// calling this; see `src/main.rs`.
+/// Actionable message for a daemon bind failure. `atomcode daemon --port X` binds
+/// the exact port (it does NOT scan), so `AddrInUse` means the daemon simply did
+/// not start — most often because a JetBrains/VSCode plugin's daemon already holds
+/// the conventional 13456. Point at the likely cause + the fix (`--port`), and flag
+/// the `&`-backgrounding gotcha that hides this line (the user thinks it started
+/// while it exited). Non-collision errors keep the plain form.
+fn daemon_bind_failure_message(addr: &str, port: u16, err: &std::io::Error) -> String {
+    if err.kind() == std::io::ErrorKind::AddrInUse {
+        format!(
+            "Fatal: 端口 {addr} 已被占用,daemon 未能启动。\n\
+             很可能是 JetBrains/VSCode 插件的 daemon 已占用该端口(常驻 13456)。\n\
+             处理:改用其它端口 `--port <PORT>`(并让客户端 / 飞书 daemonBaseUrl 指向同一端口),\n\
+             或退出占用 {port} 的程序后重试。\n\
+             提示:若用 `&` 后台启动,这行报错会被吞掉——请确认 `~/.atomcode/daemon-{port}.json` \
+             是否真的生成,以判断 daemon 是否启动成功。\n\
+             (底层错误:{err})"
+        )
+    } else {
+        format!("Fatal: failed to bind to {addr}: {err}")
+    }
+}
+
 pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     use axum::routing::patch;
 
@@ -6533,7 +6555,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         None => match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("Fatal: failed to bind to {}: {}", addr, e);
+                eprintln!("{}", daemon_bind_failure_message(&addr, port, &e));
                 // Step 12: On bind failure, still emit OpenAtomcode (R4.4) then exit
                 CurrentContext::scope(
                     CurrentContext {
@@ -8890,6 +8912,28 @@ mod tests {
         assert!(matches.iter().all(|m| m["is_dir"].is_boolean()));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn daemon_bind_failure_message_is_actionable_on_addr_in_use() {
+        // Port collision (the JetBrains/VSCode-on-13456 case): name the likely cause,
+        // the fix (`--port`), and how to tell whether the daemon actually started.
+        let busy = std::io::Error::new(std::io::ErrorKind::AddrInUse, "address already in use");
+        let m = daemon_bind_failure_message("127.0.0.1:13456", 13456, &busy);
+        assert!(m.contains("被占用"), "must say the port is occupied: {m}");
+        assert!(m.contains("--port"), "must suggest --port: {m}");
+        assert!(m.contains("13456"), "must name the conflicting port: {m}");
+        assert!(
+            m.contains("daemon-13456.json"),
+            "must point at the token file to verify startup: {m}"
+        );
+
+        // A non-collision error (perms, bad address) can't be fixed by changing the
+        // port, so it keeps the plain form — no misleading --port advice.
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let plain = daemon_bind_failure_message("0.0.0.0:80", 80, &denied);
+        assert!(plain.starts_with("Fatal: failed to bind"), "plain form: {plain}");
+        assert!(!plain.contains("--port"), "no port advice for non-collision: {plain}");
     }
 
     #[tokio::test]
