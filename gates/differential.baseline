@@ -1,2 +1,8 @@
-plain_turn=2
-snapshot=3
+cancel=1
+plain_turn=0
+snapshot=2
+unknown_tool=1
+one_tool_call=0
+several_rounds=0
+provider_error=0
+two_tool_calls=0

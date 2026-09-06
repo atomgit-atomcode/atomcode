@@ -37,22 +37,59 @@ fn _isolate_atomcode_home() {
 
 // ---- one model, so a divergence can only be the engine ------------------
 
+/// One scripted round.
+///
+/// Rich enough to reach the paths that actually carry ordering guarantees: a
+/// tool call, several at once, a usage report, a mid-stream failure.
+#[derive(Clone)]
+enum Reply {
+    Text(&'static str),
+    /// Text plus tool calls in the same round — what a real model does.
+    Calls(
+        &'static str,
+        Vec<(&'static str, &'static str, &'static str)>,
+    ),
+    /// A mid-stream provider failure.
+    Fail(&'static str),
+    /// A round that takes time to answer.
+    ///
+    /// Needed to measure cancellation at all: with an instant provider, whether
+    /// a `Cancel` lands before the round finishes is a race, and a race reports
+    /// as an engine difference on one run and not the next. Blocking makes the
+    /// cancel deterministically mid-turn, so what is compared is the engines'
+    /// behaviour rather than their scheduling luck.
+    Slow(u64, &'static str),
+}
+
+impl Reply {
+    fn call(id: &'static str, name: &'static str, args: &'static str) -> Reply {
+        Reply::Calls("", vec![(id, name, args)])
+    }
+}
+
 /// A provider that replays a fixed script.
 ///
 /// Shared by both engines *by value*, not re-implemented on each side: two
 /// scripted providers that drifted would show up as an engine difference, and
 /// the whole point is that they cannot.
+///
+/// Every round reports the same token usage, so "who forwards usage" is a real
+/// question about the engines rather than an artefact of one of them inventing
+/// numbers.
 struct Script {
-    replies: Vec<String>,
+    replies: Vec<Reply>,
     cursor: AtomicUsize,
 }
 
 impl Script {
-    fn new(replies: &[&str]) -> Arc<Script> {
+    fn new(replies: &[Reply]) -> Arc<Script> {
         Arc::new(Script {
-            replies: replies.iter().map(|s| s.to_string()).collect(),
+            replies: replies.to_vec(),
             cursor: AtomicUsize::new(0),
         })
+    }
+    fn text(replies: &[&'static str]) -> Arc<Script> {
+        Script::new(&replies.iter().map(|t| Reply::Text(t)).collect::<Vec<_>>())
     }
 }
 
@@ -71,15 +108,47 @@ impl LlmProvider for Script {
         _options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
         let i = self.cursor.fetch_add(1, Ordering::SeqCst);
-        let text = self
-            .replies
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| "done".to_string());
-        Ok(Box::pin(stream::iter(vec![
-            StreamEvent::TextDelta(text),
-            StreamEvent::Done { truncated: false },
-        ])))
+        // Past the end of the script, stop cleanly rather than failing: a
+        // fixture running out is not a provider outage, and one engine taking
+        // an extra round must not read as a provider difference.
+        let reply = self.replies.get(i).cloned().unwrap_or(Reply::Text("done"));
+        let mut events: Vec<StreamEvent> = Vec::new();
+        match reply {
+            Reply::Slow(ms, t) => {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                events.push(StreamEvent::TextDelta(t.into()));
+            }
+            Reply::Text(t) => events.push(StreamEvent::TextDelta(t.into())),
+            Reply::Calls(t, calls) => {
+                if !t.is_empty() {
+                    events.push(StreamEvent::TextDelta(t.into()));
+                }
+                for (id, name, args) in calls {
+                    events.push(StreamEvent::ToolCall(atomcode_kernel::tool::ToolCall {
+                        id: id.into(),
+                        name: name.into(),
+                        arguments: args.into(),
+                    }));
+                }
+            }
+            Reply::Fail(message) => {
+                events.push(StreamEvent::Error(ProviderError {
+                    retryable: false,
+                    message: message.into(),
+                    http_status: Some(500),
+                    code: None,
+                    retry_after_secs: None,
+                }));
+                return Ok(Box::pin(stream::iter(events)));
+            }
+        }
+        events.push(StreamEvent::Usage(atomcode_kernel::stream::TokenUsage {
+            prompt: 100,
+            completion: 20,
+            cached: 0,
+        }));
+        events.push(StreamEvent::Done { truncated: false });
+        Ok(Box::pin(stream::iter(events)))
     }
 }
 
@@ -145,10 +214,20 @@ fn normalise(event: &AgentEvent) -> Option<Step> {
 /// that legitimately arrives after it — a `Snapshot` answer — was cut off by the
 /// rig rather than missing from the engine. A measurement that reports its own
 /// harness's behaviour is worse than no measurement.
-async fn drive_until(
+async fn drive_until(handle: AgentHandle, commands: Vec<AgentCommand>, also: &[&str]) -> Vec<Step> {
+    drive_with(handle, commands, also, None).await
+}
+
+/// As above, but send `late` once the turn has actually started.
+///
+/// Cancellation only means anything mid-turn. Sending it in the same breath as
+/// the message measures which engine drains its command queue faster, which is
+/// not a difference anybody cares about.
+async fn drive_with(
     mut handle: AgentHandle,
     commands: Vec<AgentCommand>,
     also: &[&str],
+    late: Option<AgentCommand>,
 ) -> Vec<Step> {
     for c in commands {
         if handle.commands.send(c).is_err() {
@@ -177,6 +256,13 @@ async fn drive_until(
                     AgentEvent::TurnComplete { .. } | AgentEvent::Error { .. }
                 ) {
                     done = true;
+                }
+                if matches!(event, AgentEvent::TurnStarted) {
+                    if let Some(cmd) = late.clone() {
+                        // Give the round a moment to be genuinely in flight.
+                        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                        let _ = handle.commands.send(cmd);
+                    }
                 }
                 if let Some(step) = normalise(&event) {
                     out.push(step);
@@ -222,6 +308,16 @@ async fn reference(
     reference_until(script, dir, commands, &[]).await
 }
 
+async fn reference_cancelling(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+) -> Vec<Step> {
+    let cfg = atomcode_coding::CodingAgentConfig::new("k", "http://unused.test/v1", "script", dir);
+    let agent = atomcode_coding::build_coding_agent_with(&cfg, script);
+    drive_with(agent.spawn(), commands, &[], Some(AgentCommand::Cancel)).await
+}
+
 async fn reference_until(
     script: Arc<Script>,
     dir: &std::path::Path,
@@ -242,11 +338,29 @@ async fn candidate(
     candidate_until(script, dir, commands, &[]).await
 }
 
+async fn candidate_cancelling(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+) -> Vec<Step> {
+    candidate_inner(script, dir, commands, &[], Some(AgentCommand::Cancel)).await
+}
+
 async fn candidate_until(
     script: Arc<Script>,
     dir: &std::path::Path,
     commands: Vec<AgentCommand>,
     also: &[&str],
+) -> Vec<Step> {
+    candidate_inner(script, dir, commands, also, None).await
+}
+
+async fn candidate_inner(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+    also: &[&str],
+    late: Option<AgentCommand>,
 ) -> Vec<Step> {
     use atomcode_plexus::{App, ConfigTree, Layer};
 
@@ -284,7 +398,7 @@ async fn candidate_until(
         .expect("agent-handle row must provide a handle")
         .take()
         .expect("the handle, once");
-    let steps = drive_until(handle, commands, also).await;
+    let steps = drive_with(handle, commands, also, late).await;
     app.stop();
     steps
 }
@@ -317,25 +431,68 @@ impl atomcode_plexus::Plugin for InjectScript {
 
 // ---- the diff ------------------------------------------------------------
 
+/// Line up the two streams, allowing insertions on either side.
+///
+/// Position-by-position comparison was wrong in a way that mattered: one extra
+/// event near the start shifted everything after it, so a single defect
+/// reported as four. The ratchet reads this number, so an inflated one both
+/// exaggerates the problem and hides the next real regression underneath it.
+///
+/// Plain LCS — the streams are tens of events, not thousands.
+fn align(a: &[Step], b: &[Step]) -> Vec<(Option<Step>, Option<Step>)> {
+    let (n, m) = (a.len(), b.len());
+    let mut lcs = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j, mut out) = (0, 0, Vec::new());
+    while i < n && j < m {
+        if a[i] == b[j] {
+            out.push((Some(a[i].clone()), Some(b[j].clone())));
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            out.push((Some(a[i].clone()), None));
+            i += 1;
+        } else {
+            out.push((None, Some(b[j].clone())));
+            j += 1;
+        }
+    }
+    out.extend(a[i..].iter().map(|s| (Some(s.clone()), None)));
+    out.extend(b[j..].iter().map(|s| (None, Some(s.clone()))));
+    out
+}
+
 fn render(a: &[Step], b: &[Step]) -> String {
     let mut out = String::from("\n  参考（coding）              候选（harness）\n");
-    for i in 0..a.len().max(b.len()) {
-        let left = a.get(i).map(|s| format!("{} {}", s.kind, s.detail));
-        let right = b.get(i).map(|s| format!("{} {}", s.kind, s.detail));
-        let same = left == right;
+    for (left, right) in align(a, b) {
+        let same = left.is_some() && right.is_some();
+        let show = |s: Option<Step>| {
+            s.map(|s| format!("{} {}", s.kind, s.detail))
+                .unwrap_or_else(|| "—".into())
+        };
         out.push_str(&format!(
             "  {} {:<28} {}\n",
             if same { ' ' } else { '!' },
-            left.unwrap_or_else(|| "—".into()),
-            right.unwrap_or_else(|| "—".into())
+            show(left),
+            show(right)
         ));
     }
     out
 }
 
+/// How many events are unmatched — one insertion counts once.
 fn divergences(a: &[Step], b: &[Step]) -> usize {
-    (0..a.len().max(b.len()))
-        .filter(|&i| a.get(i) != b.get(i))
+    align(a, b)
+        .into_iter()
+        .filter(|(l, r)| l.is_none() || r.is_none())
         .count()
 }
 
@@ -391,8 +548,8 @@ async fn a_plain_turn() {
             images: Vec::new(),
         }]
     };
-    let a = reference(Script::new(&["hello"]), &dir, cmds()).await;
-    let b = candidate(Script::new(&["hello"]), &dir, cmds()).await;
+    let a = reference(Script::text(&["hello"]), &dir, cmds()).await;
+    let b = candidate(Script::text(&["hello"]), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("plain_turn", divergences(&a, &b), &report);
 
@@ -407,6 +564,222 @@ async fn a_plain_turn() {
         assert!(
             !steps.iter().any(|s| s.kind == "TIMEOUT"),
             "{who} 没有结束{report}"
+        );
+    }
+}
+
+/// Write a file the scripted tools can act on, so both engines see the same
+/// world as well as the same model.
+fn seed(dir: &std::path::Path) {
+    std::fs::write(dir.join("a.rs"), "fn main() {}\n").expect("seed");
+    std::fs::write(dir.join("b.rs"), "fn other() {}\n").expect("seed");
+}
+
+#[tokio::test]
+async fn one_tool_call() {
+    // The first place ordering matters: ToolStarted must precede its
+    // ToolResult, and the turn must not end between them.
+    let dir = scratch("one-tool");
+    seed(&dir);
+    let script = || {
+        Script::new(&[
+            Reply::call("c1", "read_file", r#"{"file_path":"a.rs"}"#),
+            Reply::Text("that is an empty main"),
+        ])
+    };
+    let cmds = || {
+        vec![AgentCommand::SendMessage {
+            text: "read a.rs".into(),
+            images: Vec::new(),
+        }]
+    };
+    let a = reference(script(), &dir, cmds()).await;
+    let b = candidate(script(), &dir, cmds()).await;
+    let report = render(&a, &b);
+    ratchet("one_tool_call", divergences(&a, &b), &report);
+
+    for (who, steps) in [("参考", &a), ("候选", &b)] {
+        let started = steps.iter().position(|s| s.kind == "ToolStarted");
+        let result = steps.iter().position(|s| s.kind == "ToolResult");
+        assert!(
+            matches!((started, result), (Some(x), Some(y)) if x < y),
+            "{who}: 工具必须先开始后有结果{report}"
+        );
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "TurnComplete").count(),
+            1,
+            "{who}: 工具轮之后仍然只有一个终结{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn two_tool_calls_at_once() {
+    // Parallel calls are where a batch protocol earns its keep: whatever else
+    // differs, every call that started must have a result, or a driver waits
+    // forever on one that never lands.
+    let dir = scratch("two-tools");
+    seed(&dir);
+    let script = || {
+        Script::new(&[
+            Reply::Calls(
+                "reading both",
+                vec![
+                    ("c1", "read_file", r#"{"file_path":"a.rs"}"#),
+                    ("c2", "read_file", r#"{"file_path":"b.rs"}"#),
+                ],
+            ),
+            Reply::Text("both read"),
+        ])
+    };
+    let cmds = || {
+        vec![AgentCommand::SendMessage {
+            text: "read both".into(),
+            images: Vec::new(),
+        }]
+    };
+    let a = reference(script(), &dir, cmds()).await;
+    let b = candidate(script(), &dir, cmds()).await;
+    let report = render(&a, &b);
+    ratchet("two_tool_calls", divergences(&a, &b), &report);
+
+    for (who, steps) in [("参考", &a), ("候选", &b)] {
+        let started = steps.iter().filter(|s| s.kind == "ToolStarted").count();
+        let results = steps.iter().filter(|s| s.kind == "ToolResult").count();
+        assert_eq!(
+            started, results,
+            "{who}: 每个开始的调用都必须有结果，否则驱动方会永远等那一个{report}"
+        );
+        assert_eq!(started, 2, "{who}: 两个调用{report}");
+    }
+}
+
+#[tokio::test]
+async fn a_tool_that_does_not_exist() {
+    // A model asking for a tool nobody mounted is normal, and it must come back
+    // as a failed result rather than as a dead turn.
+    let dir = scratch("no-such-tool");
+    let script = || {
+        Script::new(&[
+            Reply::call("c1", "no_such_tool", "{}"),
+            Reply::Text("ah, my mistake"),
+        ])
+    };
+    let cmds = || {
+        vec![AgentCommand::SendMessage {
+            text: "use it".into(),
+            images: Vec::new(),
+        }]
+    };
+    let a = reference(script(), &dir, cmds()).await;
+    let b = candidate(script(), &dir, cmds()).await;
+    let report = render(&a, &b);
+    ratchet("unknown_tool", divergences(&a, &b), &report);
+
+    for (who, steps) in [("参考", &a), ("候选", &b)] {
+        assert!(
+            !steps.iter().any(|s| s.kind == "TIMEOUT"),
+            "{who}: 未知工具不能挂死回合{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_provider_fails_mid_stream() {
+    let dir = scratch("provider-fails");
+    let script = || Script::new(&[Reply::Fail("upstream exploded")]);
+    let cmds = || {
+        vec![AgentCommand::SendMessage {
+            text: "go".into(),
+            images: Vec::new(),
+        }]
+    };
+    let a = reference(script(), &dir, cmds()).await;
+    let b = candidate(script(), &dir, cmds()).await;
+    let report = render(&a, &b);
+    ratchet("provider_error", divergences(&a, &b), &report);
+
+    for (who, steps) in [("参考", &a), ("候选", &b)] {
+        let terminals = steps
+            .iter()
+            .filter(|s| matches!(s.kind, "TurnComplete" | "Error"))
+            .count();
+        assert!(terminals >= 1, "{who}: 失败也要终结回合{report}");
+        assert!(
+            !steps.iter().any(|s| s.kind == "TIMEOUT"),
+            "{who}: 失败不能表现成挂死{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn several_rounds() {
+    // Continuation: tool, tool, then an answer. Each round must open and close
+    // once — an engine that emits TurnStarted per round rather than per turn
+    // makes a driver draw three turns.
+    let dir = scratch("rounds");
+    seed(&dir);
+    let script = || {
+        Script::new(&[
+            Reply::call("c1", "read_file", r#"{"file_path":"a.rs"}"#),
+            Reply::call("c2", "read_file", r#"{"file_path":"b.rs"}"#),
+            Reply::Text("read them both"),
+        ])
+    };
+    let cmds = || {
+        vec![AgentCommand::SendMessage {
+            text: "read both, one at a time".into(),
+            images: Vec::new(),
+        }]
+    };
+    let a = reference(script(), &dir, cmds()).await;
+    let b = candidate(script(), &dir, cmds()).await;
+    let report = render(&a, &b);
+    ratchet("several_rounds", divergences(&a, &b), &report);
+
+    for (who, steps) in [("参考", &a), ("候选", &b)] {
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "TurnStarted").count(),
+            1,
+            "{who}: 一个回合开一次，不是每轮开一次{report}"
+        );
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "TurnComplete").count(),
+            1,
+            "{who}: 也只终结一次{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_lands() {
+    // Cancellation is the one command whose whole value is timing. What must
+    // hold either way: the turn ends, once, and does not hang.
+    let dir = scratch("cancel");
+    let cmds = || {
+        vec![AgentCommand::SendMessage {
+            text: "go".into(),
+            images: Vec::new(),
+        }]
+    };
+    let script = || Script::new(&[Reply::Slow(400, "working")]);
+    let a = reference_cancelling(script(), &dir, cmds()).await;
+    let b = candidate_cancelling(script(), &dir, cmds()).await;
+    let report = render(&a, &b);
+    ratchet("cancel", divergences(&a, &b), &report);
+
+    for (who, steps) in [("参考", &a), ("候选", &b)] {
+        assert!(
+            !steps.iter().any(|s| s.kind == "TIMEOUT"),
+            "{who}: 取消之后回合必须结束{report}"
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|s| matches!(s.kind, "TurnComplete" | "Error"))
+                .count(),
+            1,
+            "{who}: 恰好一个终结{report}"
         );
     }
 }
@@ -426,8 +799,8 @@ async fn a_snapshot_round_trip() {
             AgentCommand::Snapshot,
         ]
     };
-    let a = reference_until(Script::new(&["ok"]), &dir, cmds(), &["Snapshot"]).await;
-    let b = candidate_until(Script::new(&["ok"]), &dir, cmds(), &["Snapshot"]).await;
+    let a = reference_until(Script::text(&["ok"]), &dir, cmds(), &["Snapshot"]).await;
+    let b = candidate_until(Script::text(&["ok"]), &dir, cmds(), &["Snapshot"]).await;
     let report = render(&a, &b);
     ratchet("snapshot", divergences(&a, &b), &report);
 }
