@@ -89,16 +89,7 @@ impl CommandSet for SessionCommands {
                 };
                 match c.compact(&log).await {
                     Some(d) => {
-                        let turn = log.current_turn();
-                        atomcode_harness::session::commit(
-                            ctx,
-                            &log,
-                            atomcode_harness::session::SessionEvent::Compacted {
-                                turn,
-                                through: d.through,
-                                summary: d.summary,
-                            },
-                        );
+                        atomcode_harness::session::apply_compaction(ctx, &log, d);
                         Outcome::Said("已压缩".into())
                     }
                     // Refused, not failed: nothing was worth compacting and the

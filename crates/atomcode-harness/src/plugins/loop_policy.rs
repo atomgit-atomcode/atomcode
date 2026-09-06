@@ -328,15 +328,7 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
         }
 
         if let Some(decision) = compaction.compact(&session).await {
-            crate::session::commit(
-                &self.ctx,
-                &session,
-                SessionEvent::Compacted {
-                    turn: session.current_turn(),
-                    through: decision.through,
-                    summary: decision.summary,
-                },
-            );
+            crate::session::apply_compaction(&self.ctx, &session, decision);
             // Re-project: the request must carry the compacted history, and it
             // must still be exactly what the log says.
             let mut messages: Vec<Message> = req

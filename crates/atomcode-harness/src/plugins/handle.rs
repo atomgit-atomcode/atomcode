@@ -755,16 +755,7 @@ async fn compact(ctx: &Context, events: &mpsc::UnboundedSender<AgentEvent>, focu
     let decision = compaction.compact(&log).await;
     let committed = match decision {
         Some(decision) => {
-            let turn = log.current_turn();
-            crate::session::commit(
-                ctx,
-                &log,
-                SessionEvent::Compacted {
-                    turn,
-                    through: decision.through,
-                    summary: decision.summary,
-                },
-            );
+            crate::session::apply_compaction(ctx, &log, decision);
             true
         }
         None => false,
