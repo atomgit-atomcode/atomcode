@@ -65,6 +65,8 @@ pub struct Tui {
     /// is not known until then.
     ctx: Mutex<Option<Context>>,
     wake: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
+    /// Where the button went down, so a release can tell a click from a drag.
+    pressed_at: Mutex<Option<(u16, u16)>>,
 }
 
 #[async_trait]
@@ -89,6 +91,11 @@ impl UserInterface for Tui {
             m.cwd = std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default();
+            // What the terminal can show, from the one row allowed to ask.
+            // Without this every module renders against `Caps::default()` — a
+            // dark, fully capable terminal — whatever the real one is, which is
+            // how a light terminal ended up painted in a dark palette.
+            m.caps = self.surface.caps();
         }
         *self.ctx.lock().expect("ctx poisoned") = Some(ctx.clone());
         *self.wake.lock().expect("wake poisoned") = Some(wake_tx.clone());
@@ -156,6 +163,36 @@ impl UserInterface for Tui {
                     m.tick = m.tick.wrapping_add(1);
                 }
                 Wake::Input(Input::Resize(..)) => {}
+                // The wheel scrolls the conversation, not the terminal's own
+                // history — in the alternate screen that history is the shell's,
+                // so a wheel the terminal keeps would scroll the wrong thing.
+                Wake::Input(Input::Mouse(click, x, y)) => {
+                    use crate::surface::Click;
+                    // A press is not yet a click and not yet a selection —
+                    // which it becomes is decided at the release, by whether
+                    // the pointer moved. Deciding at the press would mean
+                    // folding a block every time someone selects text on it.
+                    let action = match click {
+                        Click::WheelUp => Some(Action::Scroll(-3)),
+                        Click::WheelDown => Some(Action::Scroll(3)),
+                        Click::Press => {
+                            *self.pressed_at.lock().expect("press poisoned") = Some((x, y));
+                            Some(Action::SelectFrom(x, y))
+                        }
+                        Click::Drag => Some(Action::SelectTo(x, y)),
+                        Click::Release => {
+                            let from = self.pressed_at.lock().expect("press poisoned").take();
+                            match from {
+                                Some(p) if p == (x, y) => Some(Action::FoldAt(x, y)),
+                                Some(_) => Some(Action::CopySelection),
+                                None => None,
+                            }
+                        }
+                    };
+                    if let Some(action) = action {
+                        quit = self.act(action, &agent, &driver);
+                    }
+                }
                 Wake::Input(Input::Paste(text)) => {
                     quit = self.act(Action::Paste(text), &agent, &driver);
                 }
@@ -198,6 +235,23 @@ impl Tui {
     fn paint(&self) {
         let frame = self.host.compose(self.surface.size());
         self.surface.present(&frame);
+    }
+
+    /// Put a line of the UI's own into the conversation.
+    ///
+    /// A block like any other, so it scrolls, folds and is dumped on exit with
+    /// everything else — the alternative is a status line that has to be read
+    /// before something overwrites it.
+    fn say(&self, text: &str) {
+        let mut stream = self.host.stream.write().expect("stream poisoned");
+        let mut w = stream.writer("commands");
+        w.emit(
+            crate::block::Coord::default(),
+            Arc::new(crate::content::CommandSaid {
+                text: text.to_string(),
+                refused: false,
+            }),
+        );
     }
 
     fn sync_activity(&self, agent: &Arc<Agent>) {
@@ -249,6 +303,23 @@ impl Tui {
         driver: &Arc<dyn atomcode_harness::seams::AgentLoop>,
     ) -> bool {
         let mut m = self.host.moment.write().expect("moment poisoned");
+        // A highlight is a rectangle of screen cells. Anything that repaints
+        // those cells with different text leaves it pointing at the wrong
+        // words, so it is dropped by everything except the gestures that are
+        // *about* it.
+        if !matches!(
+            action,
+            Action::SelectFrom(..)
+                | Action::SelectTo(..)
+                | Action::CopySelection
+                | Action::ClearSelection
+        ) {
+            // Escape does the innermost thing: drop the selection if there is
+            // one, and only otherwise stop the turn.
+            if m.selection.take().is_some() && matches!(action, Action::Cancel) {
+                return false;
+            }
+        }
         match action {
             Action::Quit => return true,
             Action::Submit => {
@@ -316,6 +387,7 @@ impl Tui {
             Action::CaretHome => m.caret = 0,
             Action::CaretEnd => m.caret = m.input.len(),
             Action::Paste(text) => {
+                let text = sanitize_paste(&text);
                 let at = m.caret.min(m.input.len());
                 m.input.insert_str(at, &text);
                 m.caret = at + text.len();
@@ -326,12 +398,80 @@ impl Tui {
                 return false;
             }
             Action::Scroll(by) => {
-                let width = self.surface.size().0;
-                let max = self.host.stream_height(width);
+                // Bounded by what is left to read, not by how much there is:
+                // scrolling past the oldest line would empty the region rather
+                // than show more of it.
+                let max = self.host.scroll_limit(self.surface.size(), &m);
                 let next = m.scroll.0 as i64 - by as i64;
                 m.scroll = crate::moment::ScrollPos(next.clamp(0, max as i64) as usize);
             }
             Action::ScrollToBottom => m.scroll = crate::moment::ScrollPos::BOTTOM,
+            // A click on a block, resolved against the frame that was actually
+            // painted. Anywhere else — the prompt, the status line, a gap — is
+            // not an error, it is simply not a fold.
+            Action::FoldAt(x, y) => {
+                // The badge sits on top of a row of the stream, and the thing
+                // on top is the thing that was clicked.
+                if self.host.jump_at(x, y) {
+                    m.scroll = crate::moment::ScrollPos::BOTTOM;
+                    return false;
+                }
+                drop(m);
+                if let Some((id, kind)) = self.host.block_at(x, y) {
+                    self.host
+                        .presentation
+                        .write()
+                        .expect("presentation poisoned")
+                        .toggle_block(id, kind);
+                }
+                return false;
+            }
+            // Handing the mouse back is the answer to "I cannot select text
+            // any more", so the answer has to say so where it will be read —
+            // and say how to get selection without giving the pointer up at
+            // all, which most people would rather do.
+            Action::ToggleMouse => {
+                drop(m);
+                let on = !self.surface.mouse();
+                self.surface.set_mouse(on);
+                let text = if on {
+                    "鼠标已收回:点击工具调用可折叠展开,滚轮滚动。                     想框选复制:按住 option(macOS)或 shift(其它终端)拖动,或再按 ctrl-o"
+                        .to_string()
+                } else {
+                    "鼠标已交还终端:框选复制恢复正常。折叠改用 ctrl-t/ctrl-r,                     滚动用 pgup/pgdn。按 ctrl-o 收回鼠标"
+                        .to_string()
+                };
+                self.say(&text);
+                return false;
+            }
+
+            Action::SelectFrom(x, y) => {
+                m.selection = Some(crate::moment::Selection::at(x, y));
+                return false;
+            }
+            Action::SelectTo(x, y) => {
+                if let Some(sel) = m.selection.as_mut() {
+                    sel.head = (x, y);
+                }
+                return false;
+            }
+            Action::ClearSelection => {
+                m.selection = None;
+                return false;
+            }
+            // Copy on release, the way a terminal does it. The highlight stays
+            // up afterwards so a person can see what they took.
+            Action::CopySelection => {
+                let Some(sel) = m.selection else {
+                    return false;
+                };
+                drop(m);
+                let text = self.host.compose(self.surface.size()).selected_text(&sel);
+                if !text.is_empty() {
+                    self.surface.copy(&text);
+                }
+                return false;
+            }
             Action::ToggleFold(kind) => {
                 drop(m);
                 self.host
@@ -585,6 +725,63 @@ impl Tui {
     }
 }
 
+/// What a paste is allowed to put in the buffer.
+///
+/// Pasted text is arbitrary bytes from somewhere else: a log full of colour
+/// escapes, a Windows file with CRLF, a table indented with tabs. Every span
+/// this UI draws reaches the terminal verbatim, and the width arithmetic counts
+/// a control character as zero cells — so an escape sequence in a paste is a
+/// paste that can move the cursor, repaint the screen, or leave the alternate
+/// screen entirely. It is stripped here, on the way in, rather than guarded
+/// against at each of the places that later draw it.
+///
+/// Newlines survive, because they are content and the composer breaks on them.
+/// Tabs become spaces: they are the other character whose drawn width is not
+/// the width we counted.
+fn sanitize_paste(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // A whole escape sequence, not just the ESC: dropping the ESC alone
+            // would leave `[32m` sitting in the prompt as text.
+            '\x1b' => match chars.next() {
+                // CSI: parameters, then one final byte in @..~.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: runs to BEL or to ST (`ESC \`).
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' || (c == '\x1b' && chars.peek() == Some(&'\\')) {
+                            if c == '\x1b' {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            '\n' => out.push('\n'),
+            '\t' => out.push_str("    "),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 async fn read_input(wake: mpsc::UnboundedSender<Wake>) {
     use futures::StreamExt;
     let mut events = crossterm::event::EventStream::new();
@@ -630,6 +827,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             surface,
             ctx: Mutex::new(None),
             wake: Mutex::new(None),
+            pressed_at: Mutex::new(None),
         },
     )
 }
@@ -722,6 +920,54 @@ impl Plugin for TuiUiPlugin {
 /// The real terminal, as a row.
 pub struct TerminalSurfacePlugin;
 
+/// `theme = "auto" | "dark" | "light"`.
+///
+/// `auto` asks the terminal for its background colour and follows the answer.
+/// The other two are the escape hatch for a terminal that does not answer, or
+/// answers wrongly through tmux or ssh.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SurfaceRow {
+    #[serde(default)]
+    theme: Option<String>,
+    /// Report the pointer, so a tool call folds when clicked. Costs the
+    /// terminal's own click-drag selection, which every terminal gives back
+    /// under a modifier (Option on macOS, Shift elsewhere).
+    #[serde(default = "yes")]
+    mouse: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// The configured palette (`None` means "ask the terminal"), and whether to
+/// report the pointer.
+fn surface_row(config: &Value) -> Result<(Option<crate::theme::Theme>, bool), String> {
+    let row: SurfaceRow = if config.is_null() {
+        SurfaceRow {
+            theme: None,
+            mouse: true,
+        }
+    } else {
+        serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+    };
+    let mouse = row.mouse && !std::env::var("ATOMCODE_NO_MOUSE").is_ok_and(|v| v != "0");
+    // The env var wins: it is how a person overrides one session without
+    // editing the tree they share with everyone else.
+    let named = std::env::var("ATOMCODE_THEME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or(row.theme);
+    let theme = match named.as_deref() {
+        None | Some("auto") => None,
+        Some("dark") => Some(crate::theme::Theme::Dark),
+        Some("light") => Some(crate::theme::Theme::Light),
+        Some(other) => return Err(format!("theme `{other}` is not auto, dark or light")),
+    };
+    Ok((theme, mouse))
+}
+
 #[async_trait]
 impl Plugin for TerminalSurfacePlugin {
     fn name(&self) -> &'static str {
@@ -733,8 +979,10 @@ impl Plugin for TerminalSurfacePlugin {
     fn description(&self) -> &'static str {
         "the terminal, full screen, restored on the way out"
     }
-    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
-        let term = Terminal::enter().map_err(|e| format!("cannot take the terminal: {e}"))?;
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let (theme, mouse) = surface_row(config)?;
+        let term =
+            Terminal::enter(theme, mouse).map_err(|e| format!("cannot take the terminal: {e}"))?;
         let _ = ctx
             .provide::<SurfaceSvc>(Arc::new(term))
             .map_err(|e| e.to_string())?;
@@ -784,5 +1032,47 @@ impl Plugin for HeadlessSurfacePlugin {
             .provide::<SurfaceSvc>(Headless::new(row.width, row.height))
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::sanitize_paste;
+
+    #[test]
+    fn an_escape_sequence_in_a_paste_never_reaches_the_terminal() {
+        // The hazard: spans are written verbatim and a control character is
+        // counted as zero cells, so a pasted log could move the cursor, repaint
+        // the screen, or leave the alternate screen.
+        assert_eq!(sanitize_paste("\x1b[32mgreen\x1b[0m"), "green");
+        assert_eq!(sanitize_paste("before\x1b[2Jafter"), "beforeafter");
+        assert_eq!(sanitize_paste("\x1b]0;a title\x07x"), "x");
+        assert_eq!(sanitize_paste("\x1b]11;rgb:00/00/00\x1b\\x"), "x");
+        assert!(!sanitize_paste("\x1b[?1049lgone").contains('\x1b'));
+    }
+
+    #[test]
+    fn newlines_survive_because_they_are_content() {
+        // The composer breaks on them, and a paste that lost them would be a
+        // paste that silently changed what the user is sending.
+        assert_eq!(sanitize_paste("one\ntwo"), "one\ntwo");
+        assert_eq!(
+            sanitize_paste("crlf\r\nfile"),
+            "crlf\nfile",
+            "CRLF is one break"
+        );
+        assert_eq!(sanitize_paste("old\rmac"), "old\nmac");
+    }
+
+    #[test]
+    fn a_tab_becomes_spaces_because_its_drawn_width_is_not_the_counted_one() {
+        assert_eq!(sanitize_paste("a\tb"), "a    b");
+    }
+
+    #[test]
+    fn ordinary_text_is_untouched_including_chinese_and_emoji() {
+        for s in ["hello", "写一个网页", "🙂 ok", "path/to/file.rs:12"] {
+            assert_eq!(sanitize_paste(s), s);
+        }
     }
 }

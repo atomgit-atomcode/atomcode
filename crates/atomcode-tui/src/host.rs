@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use atomcode_harness::session::SessionEvent;
 
-use crate::block::{Slot, Stream};
+use crate::block::{BlockId, Slot, Stream};
 use crate::frame::{Frame, Line, Rect};
 use crate::module::{Height, Modules};
 use crate::moment::Moment;
@@ -21,6 +21,14 @@ use crate::region::Region;
 #[derive(Default)]
 pub struct Presentation {
     folded_kinds: Vec<&'static str>,
+    /// Blocks folded or unfolded by hand, overriding the default for their
+    /// kind.
+    ///
+    /// Per block, because a click is about *this* tool call. Folding every tool
+    /// call in the transcript because one was clicked is a different gesture,
+    /// and it already has a key (ctrl-t) — a click that did it would be a click
+    /// that changed six other things the person was looking at.
+    by_block: std::collections::HashMap<crate::block::BlockId, bool>,
 }
 
 impl Presentation {
@@ -30,11 +38,26 @@ impl Presentation {
     pub fn default_folds() -> Self {
         Self {
             folded_kinds: vec!["reasoning", "tool_call"],
+            by_block: std::collections::HashMap::new(),
         }
     }
     pub fn is_folded(&self, kind: &str) -> bool {
         self.folded_kinds.contains(&kind)
     }
+
+    /// Whether one block is folded: what the person said about it, or failing
+    /// that what its kind says.
+    pub fn is_block_folded(&self, id: crate::block::BlockId, kind: &str) -> bool {
+        match self.by_block.get(&id) {
+            Some(folded) => *folded,
+            None => self.is_folded(kind),
+        }
+    }
+
+    /// Fold or unfold every block of a kind. The keyboard gesture.
+    ///
+    /// Per-block choices are dropped, because otherwise "unfold everything"
+    /// would visibly not unfold everything.
     pub fn toggle(&mut self, kind: &'static str) {
         match self.folded_kinds.iter().position(|k| *k == kind) {
             Some(i) => {
@@ -42,6 +65,52 @@ impl Presentation {
             }
             None => self.folded_kinds.push(kind),
         }
+        self.by_block.clear();
+    }
+
+    /// Fold or unfold one block. The pointing gesture.
+    pub fn toggle_block(&mut self, id: crate::block::BlockId, kind: &str) {
+        let folded = self.is_block_folded(id, kind);
+        self.by_block.insert(id, !folded);
+    }
+}
+
+/// What a click can fold.
+///
+/// Deliberately narrow. Everything the model *says* is what the transcript is
+/// for, so making prose and reasoning click targets means most of the screen
+/// silently swallows a click and folds something the person was reading. A tool
+/// call is the one block that is genuinely a lid over a detail.
+const CLICKABLE: [&str; 1] = ["tool_call"];
+
+/// Which block each row of the stream came from, and where the stream was.
+///
+/// Composing is where this is known and clicking is where it is needed, so the
+/// frame leaves it behind. A click is answered from the picture that was
+/// actually on screen rather than from a second, re-derived one — the two would
+/// drift the moment anything scrolled between the paint and the press.
+#[derive(Default)]
+pub struct Hits {
+    rect: Rect,
+    /// One entry per row of `rect`, top to bottom.
+    rows: Vec<Option<(crate::block::BlockId, &'static str)>>,
+    /// Where the "back to the bottom" badge was, when it was up.
+    jump: Option<Rect>,
+}
+
+impl Hits {
+    /// The block under a point, if the point is on one.
+    pub fn at(&self, x: u16, y: u16) -> Option<(crate::block::BlockId, &'static str)> {
+        if !self.rect.contains(x, y) {
+            return None;
+        }
+        *self.rows.get((y - self.rect.y) as usize)?
+    }
+
+    /// Whether the point is on the badge. Checked first: it sits on top of a
+    /// row of the stream, and the thing on top is the thing that was clicked.
+    pub fn on_jump(&self, x: u16, y: u16) -> bool {
+        self.jump.is_some_and(|r| r.contains(x, y))
     }
 }
 
@@ -62,6 +131,11 @@ pub struct Host {
     /// Frames composed so far. Only counted, not kept — the surface keeps them
     /// when it is the headless one.
     painted: Mutex<u64>,
+    /// What was on screen last, so a click can be answered from it.
+    hits: Mutex<Hits>,
+    /// The width the stream was last laid out at. New content arrives between
+    /// frames and has to be measured in the same terms the frame used.
+    last_width: Mutex<u16>,
 }
 
 impl Host {
@@ -80,6 +154,8 @@ impl Host {
             moment: RwLock::new(Moment::default()),
             presentation: RwLock::new(Presentation::default_folds()),
             painted: Mutex::new(0),
+            hits: Mutex::new(Hits::default()),
+            last_width: Mutex::new(0),
         }
     }
 
@@ -88,6 +164,19 @@ impl Host {
     /// Producers first, then views: a view that reacts to the same fact should
     /// see a screen whose stream already contains it.
     pub fn absorb(&self, fact: &SessionEvent) {
+        // Pinned reading. The scroll offset is measured from the bottom of the
+        // conversation, and the model puts new output *at* that bottom — so a
+        // reader who has scrolled up to study something would watch it slide
+        // away by exactly as much as arrived, which is the screen refusing to
+        // hold still. Growing the offset by what grew keeps the same lines
+        // under the same eyes.
+        //
+        // Only while held back: at the bottom the whole point is to follow, and
+        // measuring is O(the conversation), so it is not paid for nothing.
+        let width = *self.last_width.lock().expect("width poisoned");
+        let held = width > 0 && self.moment.read().expect("moment poisoned").scroll.0 > 0;
+        let before = if held { self.stream_height(width) } else { 0 };
+
         {
             let mut stream = self.stream.write().expect("stream poisoned");
             for p in self.modules.producers() {
@@ -98,6 +187,14 @@ impl Host {
         for id in self.modules.view_ids() {
             if let Some(v) = self.modules.view(id) {
                 v.absorb(fact);
+            }
+        }
+
+        if held {
+            let grew = self.stream_height(width).saturating_sub(before);
+            if grew > 0 {
+                let mut m = self.moment.write().expect("moment poisoned");
+                m.scroll = crate::moment::ScrollPos(m.scroll.0 + grew);
             }
         }
     }
@@ -111,10 +208,13 @@ impl Host {
     /// Bottom-anchored: what a person is reading is the newest thing. Blocks
     /// are rendered newest-first until the rect is full, then reversed — so the
     /// cost is O(what fits), not O(the conversation).
-    fn stream_lines(&self, rect: Rect) -> Vec<Line> {
+    fn stream_lines(&self, rect: Rect) -> (Vec<Line>, Vec<Option<(BlockId, &'static str)>>) {
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         let mut out: Vec<Line> = Vec::new();
+        // Grown in lockstep with `out`, so a row and its owner cannot get out
+        // of step — the alternative is two loops that agree until one changes.
+        let mut owner: Vec<Option<(BlockId, &'static str)>> = Vec::new();
         let want = rect.h as usize;
 
         // A question in flight sits at the foot of the stream. It is not in the
@@ -132,6 +232,7 @@ impl Host {
             for line in lines {
                 if out.len() < want {
                     out.push(line);
+                    owner.push(None); // a question is not a block yet
                 }
             }
         }
@@ -141,7 +242,12 @@ impl Host {
 
         for slot in stream.slots().iter().rev() {
             let block = slot.block();
-            let mut lines = if pres.is_folded(block.kind()) && !block.content.always_open() {
+            // Two different questions. Reasoning folds — that is what ctrl-r
+            // is — but it is not a click target, because it is something the
+            // model said and most of the screen is things the model said.
+            let foldable = !block.content.always_open();
+            let clickable = foldable && CLICKABLE.contains(&block.kind());
+            let mut lines = if foldable && pres.is_block_folded(block.id, block.kind()) {
                 vec![block.content.summary(rect.w)]
             } else {
                 block.content.lines(rect.w)
@@ -159,18 +265,22 @@ impl Host {
                     break;
                 }
                 out.push(line);
+                owner.push(clickable.then_some((block.id, block.kind())));
             }
             if out.len() >= want {
                 break;
             }
         }
         out.reverse();
+        owner.reverse();
         // Push the content to the bottom of the rect when there is not enough
         // of it, so the newest line is always where the eye expects it.
         let pad = want.saturating_sub(out.len());
         let mut padded = vec![Line::empty(); pad];
         padded.extend(out);
-        padded
+        let mut owners = vec![None; pad];
+        owners.extend(owner);
+        (padded, owners)
     }
 
     /// Compose one frame.
@@ -185,22 +295,23 @@ impl Host {
 
         // Ask each module how much room it would like, then let the tree
         // decide. Requests, not seizures.
-        let asked = |id: &str| -> u16 {
-            modules
-                .view(id)
-                .map(|v| match v.height() {
-                    Height::Fixed(n) | Height::Hug(n) => n,
-                    Height::Fill => 1,
-                })
-                .unwrap_or(1)
-        };
+        let asked = |id: &str| -> u16 { asked_height(&modules, id, &moment, w) };
+        let mut stream_rect: Option<Rect> = None;
         for (region, rect) in pruned.layout_with(Rect::sized(w, h), &asked) {
             if rect.is_empty() {
                 continue;
             }
             match region {
                 Region::Stream => {
-                    frame.place("stream", rect, self.stream_lines(rect));
+                    let (lines, owners) = self.stream_lines(rect);
+                    *self.hits.lock().expect("hits poisoned") = Hits {
+                        rect,
+                        rows: owners,
+                        jump: None,
+                    };
+                    *self.last_width.lock().expect("width poisoned") = rect.w;
+                    stream_rect = Some(rect);
+                    frame.place("stream", rect, lines);
                 }
                 Region::Module(id) => {
                     let Some(view) = modules.view(&id) else {
@@ -211,7 +322,7 @@ impl Host {
                     // Arbitration is the host's, so a module can request but
                     // never seize: too many lines are clipped, never allowed to
                     // push a neighbour off the screen.
-                    let cap = match view.height() {
+                    let cap = match view.height(&moment, rect.w) {
                         Height::Fixed(n) => n.min(rect.h),
                         Height::Hug(n) => n.min(rect.h),
                         Height::Fill => rect.h,
@@ -223,6 +334,35 @@ impl Host {
                     frame.place(id, rect, lines);
                 }
                 _ => {}
+            }
+        }
+
+        // Held back, so the conversation has moved on below the fold. Say how
+        // far, and make saying so the way back — a person who has scrolled up
+        // should not have to know that ctrl-e or End exists.
+        //
+        // Drawn *over* the stream's last row rather than inside it, so the
+        // badge costs no line of content: later parts win the cells they cover,
+        // and only those.
+        if let (Some(rect), true) = (stream_rect, moment.scroll.0 > 0) {
+            let caps = moment.caps;
+            let label = format!(
+                " {} 还有 {} 行 · 点击回到底部 ",
+                caps.g(crate::caps::Glyph::Down),
+                moment.scroll.0
+            );
+            let want = crate::width::str_width(&label);
+            if rect.h > 0 && want <= rect.w as usize {
+                let badge = Rect::new(
+                    rect.x + rect.w - want as u16,
+                    rect.bottom() - 1,
+                    want as u16,
+                    1,
+                );
+                let style = crate::theme::bg(crate::theme::Role::PanelBg)
+                    .under(crate::theme::fg(crate::theme::Role::PanelFg));
+                frame.place("jump-to-bottom", badge, vec![Line::styled(label, style)]);
+                self.hits.lock().expect("hits poisoned").jump = Some(badge);
             }
         }
 
@@ -249,6 +389,12 @@ impl Host {
             }
         }
 
+        // Last, over everything, including a modal: the selection is a
+        // rectangle on the screen, and the screen is what was pointed at.
+        if let Some(sel) = moment.selection {
+            frame.highlight(&sel);
+        }
+
         debug_assert!(
             frame.containment_violations().is_empty(),
             "a module drew outside its rect: {:?}",
@@ -256,6 +402,33 @@ impl Host {
         );
         *self.painted.lock().expect("counter poisoned") += 1;
         frame
+    }
+
+    /// How many rows the conversation gets on a screen this size.
+    ///
+    /// The other half of a scroll bound. Scrolling back is limited by how much
+    /// there is to read *minus what is already on screen*: without the second
+    /// term the stream scrolls off its own top and the region goes blank, which
+    /// reads as the conversation having been lost.
+    pub fn stream_rows(&self, size: (u16, u16), moment: &Moment) -> u16 {
+        let (w, h) = size;
+        let modules = self.modules.clone();
+        let pruned = self.layout.tree().prune(&|id| modules.has_view(id));
+        let asked = |id: &str| -> u16 { asked_height(&modules, id, moment, w) };
+        pruned
+            .layout_with(Rect::sized(w, h), &asked)
+            .into_iter()
+            .find_map(|(region, rect)| matches!(region, Region::Stream).then_some(rect.h))
+            .unwrap_or(h)
+    }
+
+    /// How far back the stream can be scrolled, in rendered lines. Zero when
+    /// everything there is to read is already on screen.
+    /// The moment is an argument, not a field read: the caller is holding the
+    /// write lock on it when it asks, and a `RwLock` does not forgive that.
+    pub fn scroll_limit(&self, size: (u16, u16), moment: &Moment) -> usize {
+        self.stream_height(size.0)
+            .saturating_sub(self.stream_rows(size, moment) as usize)
     }
 
     /// How many rendered lines the stream currently holds, for scroll bounds.
@@ -267,13 +440,24 @@ impl Host {
             .iter()
             .map(|s| {
                 let b = s.block();
-                if pres.is_folded(b.kind()) {
+                if !b.content.always_open() && pres.is_block_folded(b.id, b.kind()) {
                     1
                 } else {
                     b.content.lines(width).len()
                 }
             })
             .sum()
+    }
+
+    /// The block under a point on the last painted frame, if it is one that
+    /// can be folded.
+    pub fn block_at(&self, x: u16, y: u16) -> Option<(BlockId, &'static str)> {
+        self.hits.lock().expect("hits poisoned").at(x, y)
+    }
+
+    /// Whether a point is on the "back to the bottom" badge.
+    pub fn jump_at(&self, x: u16, y: u16) -> bool {
+        self.hits.lock().expect("hits poisoned").on_jump(x, y)
     }
 
     pub fn live_blocks(&self) -> usize {
@@ -285,6 +469,19 @@ impl Host {
             .filter(|s| matches!(s, Slot::Live(_)))
             .count()
     }
+}
+
+/// What one module asks for, vertically. Shared by `compose` and
+/// [`Host::stream_rows`] so the rows a scroll is measured against are the same
+/// rows that get painted.
+fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16 {
+    modules
+        .view(id)
+        .map(|v| match v.height(moment, width) {
+            Height::Fixed(n) | Height::Hug(n) => n,
+            Height::Fill => 1,
+        })
+        .unwrap_or(1)
 }
 
 /// The shipped layout: the conversation, a status bar, a prompt.
@@ -345,6 +542,222 @@ mod tests {
         assert!(text.contains("fix the build"), "the user's words:\n{text}");
         assert!(text.contains("Fixed it"), "the model's answer");
         assert!(text.contains("read_file"), "the tools it used");
+    }
+
+    #[test]
+    fn a_click_lands_on_the_block_that_was_painted_there() {
+        // The click is answered from the frame that was actually on screen, not
+        // from a re-derived one: the two would drift the moment anything
+        // scrolled between the paint and the press.
+        let h = fed();
+        let size = (80, 24);
+        let frame = h.compose(size);
+        let stream = frame.part("stream").expect("a conversation");
+
+        // Every row that shows a foldable block answers, and answers with that
+        // block; the chrome around it answers with nothing.
+        let hit_rows: Vec<u16> = (stream.rect.y..stream.rect.bottom())
+            .filter(|&y| h.block_at(2, y).is_some())
+            .collect();
+        assert!(!hit_rows.is_empty(), "no foldable block on screen");
+        assert_eq!(h.block_at(2, stream.rect.bottom() + 1), None, "the prompt");
+
+        // Clicking one folds exactly it, and clicking again gives it back.
+        // A tool call, specifically: a one-line reasoning block looks the same
+        // folded as open, so it would prove nothing either way.
+        let (id, kind) = hit_rows
+            .iter()
+            .filter_map(|&y| h.block_at(2, y))
+            .find(|(_, kind)| *kind == "tool_call")
+            .expect("a tool call on screen");
+        let before = h.compose(size).rows().join("\n");
+        h.presentation.write().unwrap().toggle_block(id, kind);
+        let folded = h.compose(size).rows().join("\n");
+        assert_ne!(before, folded, "clicking a block changed nothing");
+        h.presentation.write().unwrap().toggle_block(id, kind);
+        assert_eq!(h.compose(size).rows().join("\n"), before, "not an inverse");
+    }
+
+    #[test]
+    fn only_a_tool_call_answers_a_click() {
+        // Everything the model says is what the transcript is *for*. Making
+        // prose and reasoning click targets meant most of the screen silently
+        // swallowed a click and folded away what the person was reading.
+        let h = fed();
+        let size = (80, 40);
+        let frame = h.compose(size);
+        let rect = frame.part("stream").unwrap().rect;
+        let kinds: Vec<&str> = (rect.y..rect.bottom())
+            .filter_map(|y| h.block_at(2, y))
+            .map(|(_, kind)| kind)
+            .collect();
+        assert!(!kinds.is_empty(), "nothing is clickable at all");
+        assert!(
+            kinds.iter().all(|k| *k == "tool_call"),
+            "these answer a click too: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_still_folds_by_key_even_though_it_is_not_a_click_target() {
+        // The two questions are different, and collapsing them into one broke
+        // ctrl-r: a block that cannot be clicked must still be foldable.
+        let h = fed();
+        let open = |folded: bool| {
+            let mut p = h.presentation.write().unwrap();
+            if p.is_folded("reasoning") != folded {
+                p.toggle("reasoning");
+            }
+        };
+        open(true);
+        let short = h.compose((80, 40)).rows().join("\n");
+        open(false);
+        let long = h.compose((80, 40)).rows().join("\n");
+        assert_ne!(short, long, "reasoning stopped folding");
+    }
+
+    #[test]
+    fn new_output_does_not_slide_the_view_out_from_under_a_reader() {
+        // The complaint this answers: while the model is producing, the reader
+        // scrolls up to study something and it walks off the top, because the
+        // offset is measured from a bottom that keeps moving.
+        let h = fed();
+        let size = (80, 16);
+        let _ = h.compose(size); // the width has to be known to measure growth
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(4);
+        // The stream's own lines, not the flattened screen: the badge sits on
+        // top of them and its count is *supposed* to move as output arrives.
+        let read = |f: &crate::frame::Frame| {
+            f.part("stream")
+                .unwrap()
+                .lines
+                .iter()
+                .map(|l| l.plain())
+                .collect::<Vec<_>>()
+        };
+        let held = read(&h.compose(size));
+
+        for n in 0..3 {
+            h.absorb(&SessionEvent::AssistantChunk {
+                delta: format!("more output, line {n}\n"),
+                reasoning: false,
+                turn: 9,
+                round: 0,
+            });
+        }
+        assert_eq!(
+            read(&h.compose(size)),
+            held,
+            "the screen moved while it was being read"
+        );
+
+        // And following resumes the moment the reader asks for it.
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos::BOTTOM;
+        let following = read(&h.compose(size));
+        assert_ne!(following, held);
+        assert!(
+            following.iter().any(|l| l.contains("line 2")),
+            "the newest output is on screen: {following:?}"
+        );
+    }
+
+    #[test]
+    fn being_held_back_says_so_and_the_badge_is_the_way_out() {
+        let h = fed();
+        let size = (80, 16);
+        let _ = h.compose(size);
+        assert!(
+            h.compose(size).part("jump-to-bottom").is_none(),
+            "nothing to say while following"
+        );
+
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(7);
+        let frame = h.compose(size);
+        let badge = frame.part("jump-to-bottom").expect("no badge");
+        let text = badge.lines[0].plain();
+        assert!(text.contains('7'), "it says how far behind: {text:?}");
+
+        // It sits on the stream's last row, and it is what a click there hits.
+        let stream = frame.part("stream").unwrap();
+        assert_eq!(badge.rect.bottom(), stream.rect.bottom());
+        assert!(h.jump_at(badge.rect.x, badge.rect.y));
+        assert!(!h.jump_at(badge.rect.x.saturating_sub(1), badge.rect.y));
+        assert!(frame.containment_violations().is_empty());
+    }
+
+    #[test]
+    fn folding_one_block_leaves_its_siblings_alone() {
+        // The difference between the pointing gesture and the keyboard one. A
+        // click that folded every tool call would change six other things the
+        // person was looking at.
+        let h = fed();
+        let size = (80, 40);
+        let _ = h.compose(size);
+        let ids: Vec<_> = {
+            let stream = h.stream.read().unwrap();
+            stream
+                .slots()
+                .iter()
+                .map(|s| (s.block().id, s.block().kind()))
+                .filter(|(_, k)| *k == "tool_call")
+                .collect()
+        };
+        assert!(ids.len() >= 2, "need two tool calls to tell them apart");
+        let pres = || {
+            h.presentation
+                .read()
+                .unwrap()
+                .is_block_folded(ids[1].0, ids[1].1)
+        };
+        let other = pres();
+        h.presentation
+            .write()
+            .unwrap()
+            .toggle_block(ids[0].0, ids[0].1);
+        assert_eq!(pres(), other, "the sibling moved too");
+    }
+
+    #[test]
+    fn the_stream_gets_the_rows_the_chrome_does_not() {
+        let h = fed();
+        let m = Moment::default();
+        let rows = h.stream_rows((80, 24), &m);
+        assert!(
+            rows > 0 && rows < 24,
+            "status and prompt take their share: {rows}"
+        );
+        assert_eq!(
+            h.compose((80, 24)).part("stream").unwrap().rect.h,
+            rows,
+            "the rows a scroll is measured against are the rows that get painted"
+        );
+    }
+
+    #[test]
+    fn scrolling_stops_at_the_oldest_line_not_past_it() {
+        let h = fed();
+        // A screen tall enough to hold the whole conversation has nowhere to go.
+        let m = Moment::default();
+        assert_eq!(h.scroll_limit((80, 200), &m), 0, "nothing above the fold");
+
+        // A short one can go back exactly as far as there is more to read.
+        let size = (80, 12);
+        let limit = h.scroll_limit(size, &m);
+        assert!(limit > 0, "the conversation does not fit in 12 rows");
+        assert_eq!(
+            limit,
+            h.stream_height(80) - h.stream_rows(size, &m) as usize,
+            "what there is to read, minus what is already on screen"
+        );
+
+        // At the limit the oldest line is on screen. One line further used to
+        // be reachable, and it emptied the region.
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(limit);
+        let text = h.compose(size).rows().join("\n");
+        assert!(
+            !text.trim().is_empty(),
+            "scrolled to the top, not into nothing"
+        );
     }
 
     #[test]

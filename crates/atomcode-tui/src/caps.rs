@@ -84,10 +84,17 @@ pub struct Caps {
     /// Decorative Unicode (box drawing, `✓`, `▸`) renders rather than tofu.
     pub unicode: bool,
     pub colors: Colors,
-    /// Which palette the background calls for. Configured (`ui.theme`), not
-    /// detected — and injected like everything else here, so no `render` ever
-    /// asks the environment what colour the terminal is.
-    pub theme: crate::theme::Theme,
+    /// The colours the terminal actually renders: its background, and its
+    /// sixteen slots, as measured by the surface row.
+    ///
+    /// Not a light/dark flag. One bit cannot answer "will this be legible" —
+    /// two terminals can both be dark and disagree by half the luminance range,
+    /// and every signal that produces the bit (OSC 11, `COLORFGBG`, a config
+    /// line) can be missing, stale or inverted. Both palettes that shipped
+    /// before this were unreadable, in opposite directions, for exactly that
+    /// reason. What is stored is a measurement; `theme.rs` does arithmetic on
+    /// it.
+    pub palette: crate::theme::Palette,
     /// Pictures, if any. Nothing draws one yet — the field is here because it
     /// belongs to the shield, and the shield is the thing being built. A
     /// component that wants a picture will ask this rather than the
@@ -102,7 +109,7 @@ impl Default for Caps {
         Self {
             unicode: true,
             colors: Colors::Ansi256,
-            theme: crate::theme::Theme::Dark,
+            palette: crate::theme::Palette::assumed(crate::theme::Theme::Dark),
             graphics: Graphics::None,
         }
     }
@@ -114,7 +121,7 @@ impl Caps {
         Self {
             unicode: false,
             colors: Colors::None,
-            theme: crate::theme::Theme::Dark,
+            palette: crate::theme::Palette::assumed(crate::theme::Theme::Dark),
             graphics: Graphics::None,
         }
     }
@@ -172,11 +179,10 @@ impl Caps {
         Self {
             unicode,
             colors,
-            // Dark unless told otherwise: `ui.theme` decides, and the surface
-            // row passes it in. Guessing from `COLORFGBG` is worse than a
-            // default — it is wrong on the terminals that do not set it, and
-            // silently so.
-            theme: crate::theme::Theme::Dark,
+            // Assumed until the surface row measures it. Everything detected
+            // here comes from the environment; asking the terminal what colour
+            // it is is I/O, and belongs to the row that owns the tty.
+            palette: crate::theme::Palette::assumed(crate::theme::Theme::Dark),
             graphics,
         }
     }
@@ -305,6 +311,8 @@ pub enum Glyph {
     ToolMark,
     /// The gutter its result hangs from.
     Gutter,
+    /// Points at what is below the fold.
+    Down,
 }
 
 impl Caps {
@@ -330,6 +338,7 @@ impl Caps {
                 Track => "│",
                 ToolMark => "●",
                 Gutter => "⎿",
+                Down => "↓",
             }
         } else {
             match glyph {
@@ -348,6 +357,7 @@ impl Caps {
                 Track => "|",
                 ToolMark => "*",
                 Gutter => "`",
+                Down => "v",
             }
         }
     }
@@ -402,6 +412,7 @@ mod tests {
             Glyph::Track,
             Glyph::ToolMark,
             Glyph::Gutter,
+            Glyph::Down,
         ] {
             let rich = Caps::default().g(glyph);
             let plain = Caps::plain().g(glyph);
@@ -474,6 +485,7 @@ mod tests {
             Glyph::Prompt,
             Glyph::Thumb,
             Glyph::Track,
+            Glyph::Down,
         ] {
             let rich = Caps::default().g(glyph);
             assert_eq!(

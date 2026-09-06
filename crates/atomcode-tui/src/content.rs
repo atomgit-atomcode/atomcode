@@ -68,9 +68,11 @@ impl Content for UserSaid {
     /// output, the bar is where you scan to find "what did I ask". A chevron
     /// alone gets lost among the `●` and `⎿` markers around it.
     fn lines(&self, w: u16) -> Vec<Line> {
-        let bar = crate::theme::bg(crate::theme::Role::PanelBg, crate::theme::Theme::Dark).under(
-            crate::theme::fg(crate::theme::Role::PanelFg, crate::theme::Theme::Dark),
-        );
+        // Roles, not colours. This used to name `Theme::Dark` outright, which
+        // is how the whole transcript stayed dark on a light screen: a module
+        // that can resolve is a module that can resolve wrongly.
+        let bar = crate::theme::bg(crate::theme::Role::PanelBg)
+            .under(crate::theme::fg(crate::theme::Role::PanelFg));
         wrapped(
             &self.0,
             w,

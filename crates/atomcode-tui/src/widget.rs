@@ -29,11 +29,11 @@ use crate::frame::{Line, Span, Style};
 use crate::theme::{self, Role};
 use crate::width;
 
-fn dim(caps: Caps) -> Style {
-    theme::fg(Role::Muted, caps.theme)
+fn dim(_caps: Caps) -> Style {
+    theme::fg(Role::Muted)
 }
-fn accent(caps: Caps) -> Style {
-    theme::fg(Role::Accent, caps.theme)
+fn accent(_caps: Caps) -> Style {
+    theme::fg(Role::Accent)
 }
 
 /// One row of a [`list`].

@@ -24,6 +24,7 @@ const SCREEN: &[Command] = &[
     Command::new("reasoning", "展开或折叠模型的思考"),
     Command::new("tools", "展开或折叠工具调用的结果"),
     Command::new("mascot", "显示或隐藏吉祥物"),
+    Command::new("mouse", "把鼠标交还终端,或收回来"),
     Command::new("keys", "列出快捷键"),
 ];
 
@@ -42,9 +43,12 @@ impl CommandSet for ScreenCommands {
             "reasoning" => Outcome::Do(Action::ToggleFold("reasoning")),
             "tools" => Outcome::Do(Action::ToggleFold("tool_call")),
             "mascot" => Outcome::Do(Action::ToggleModule("mascot")),
+            "mouse" => Outcome::Do(Action::ToggleMouse),
             "keys" => Outcome::Said(
                 "enter 发送 · esc/ctrl-c 停止 · ctrl-d 退出 · ctrl-u 清空 · ctrl-w 删词\n\
-                 ctrl-r 折叠思考 · ctrl-t 折叠工具 · ctrl-n 吉祥物 · pgup/pgdn 滚动"
+                 ctrl-r 折叠思考 · ctrl-t 折叠工具 · ctrl-n 吉祥物 · pgup/pgdn 滚动\n\
+                 拖动选中并复制 · esc 取消选中 · 点击工具调用折叠展开\n\
+                 ctrl-o 把鼠标交还终端(改用终端自己的框选)"
                     .into(),
             ),
             _ => Outcome::Quiet,

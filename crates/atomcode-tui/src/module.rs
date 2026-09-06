@@ -23,7 +23,7 @@ use atomcode_harness::session::SessionEvent;
 
 use crate::block::StreamWriter;
 use crate::frame::Line;
-use crate::moment::Viewport;
+use crate::moment::{Moment, Viewport};
 
 /// How much vertical space a module asks for. The host arbitrates; a module
 /// requests, so one module can never blow up the layout.
@@ -53,7 +53,14 @@ pub trait View: Send + Sync + 'static {
     /// through `viewport.moment`.
     fn render(state: &Self::State, viewport: &Viewport<'_>) -> Vec<Line>;
 
-    fn height(_state: &Self::State) -> Height {
+    /// How much room to ask for, given what it would be drawing.
+    ///
+    /// The moment and the width are arguments rather than state because the
+    /// composer's height depends on text it does not own: the typed line lives
+    /// in `Moment`, and a module keeping its own copy would be a second home
+    /// for it. Asking from `state` alone is what pinned the composer at one row
+    /// no matter how much was pasted into it.
+    fn height(_state: &Self::State, _moment: &Moment, _width: u16) -> Height {
         Height::Fill
     }
 
@@ -73,7 +80,7 @@ pub trait ViewObject: Send + Sync {
     fn id(&self) -> &'static str;
     fn absorb(&self, fact: &SessionEvent);
     fn render(&self, viewport: &Viewport<'_>) -> Vec<Line>;
-    fn height(&self) -> Height;
+    fn height(&self, moment: &Moment, width: u16) -> Height;
     fn tick(&self) -> Option<Duration>;
     /// Hand a module something the host computed for it.
     ///
@@ -113,8 +120,12 @@ impl<V: View> ViewObject for Mounted<V> {
     fn render(&self, viewport: &Viewport<'_>) -> Vec<Line> {
         V::render(&self.state.read().expect("view state poisoned"), viewport)
     }
-    fn height(&self) -> Height {
-        V::height(&self.state.read().expect("view state poisoned"))
+    fn height(&self, moment: &Moment, width: u16) -> Height {
+        V::height(
+            &self.state.read().expect("view state poisoned"),
+            moment,
+            width,
+        )
     }
     fn tick(&self) -> Option<Duration> {
         V::tick()
@@ -249,7 +260,7 @@ mod tests {
         fn render(state: &Count, _vp: &Viewport<'_>) -> Vec<Line> {
             vec![Line::raw(format!("turns: {}", state.0))]
         }
-        fn height(_: &Count) -> Height {
+        fn height(_: &Count, _: &Moment, _: u16) -> Height {
             Height::Fixed(1)
         }
     }
@@ -263,7 +274,7 @@ mod tests {
         m.absorb(&SessionEvent::TurnStart { turn: 1 });
         m.absorb(&SessionEvent::TurnStart { turn: 2 });
         assert_eq!(m.render(&vp)[0].plain(), "turns: 2");
-        assert_eq!(m.height(), Height::Fixed(1));
+        assert_eq!(m.height(&moment, 20), Height::Fixed(1));
     }
 
     #[test]

@@ -162,7 +162,7 @@ pub mod probes {
         fn render(_: &(), vp: &Viewport<'_>) -> Vec<Line> {
             vec![Line::raw("x".repeat(vp.rect.w as usize + 5))]
         }
-        fn height(_: &()) -> Height {
+        fn height(_: &(), _: &crate::moment::Moment, _: u16) -> Height {
             Height::Fixed(1)
         }
     }

@@ -4,7 +4,7 @@ use atomcode_harness::session::SessionEvent;
 
 use crate::frame::{Color, Line, Style};
 use crate::module::{Height, View};
-use crate::moment::{Activity, Viewport};
+use crate::moment::{Activity, Moment, Viewport};
 use crate::theme::{self, Role};
 use crate::width;
 
@@ -66,8 +66,7 @@ impl View for Status {
             return Vec::new();
         }
         let caps = vp.moment.caps;
-        let t = caps.theme;
-        let dim = theme::fg(Role::Muted, t);
+        let dim = theme::fg(Role::Muted);
         let sep = || El::styled(format!(" {} ", caps.g(Glyph::Separator)), dim);
 
         let mut row: Vec<El> = Vec::new();
@@ -105,19 +104,19 @@ impl View for Status {
                         "{} 运行中",
                         SPINNER[(vp.moment.tick as usize) % SPINNER.len()]
                     ),
-                    theme::fg(Role::Warning, t),
+                    theme::fg(Role::Warning),
                 ));
             }
             Activity::Stopping => {
                 row.push(sep());
-                row.push(El::styled("停止中", theme::fg(Role::Error, t)));
+                row.push(El::styled("停止中", theme::fg(Role::Error)));
             }
             Activity::Idle => {}
         }
         El::row(row).lay(w)
     }
 
-    fn height(_: &State) -> Height {
+    fn height(_: &State, _: &Moment, _: u16) -> Height {
         Height::Fixed(1)
     }
 
@@ -178,7 +177,7 @@ impl View for Mascot {
         )]
     }
 
-    fn height(_: &Mood) -> Height {
+    fn height(_: &Mood, _: &Moment, _: u16) -> Height {
         Height::Fixed(1)
     }
 

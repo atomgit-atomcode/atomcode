@@ -11,14 +11,112 @@ use std::fmt::Write as _;
 
 use crate::frame::{Color, Frame, Line, Style};
 
-/// Move the cursor home and clear.
+/// Move the cursor home and clear the whole display.
+///
+/// **Not used per frame.** A full-display erase is the wrong tool for a
+/// repaint: it costs a terminal-wide invalidation, and on emulators that keep
+/// scrollback for the alternate screen — iTerm2 does, by default — repeating it
+/// nine times a second churns that scrollback, which is what a person sees as
+/// the screen drifting upward and the scrollbar never sitting still. Rows are
+/// erased one at a time instead, with [`ERASE_LINE`], which cannot scroll and
+/// cannot reach the scrollback. Kept public for a caller that really does want
+/// the screen gone.
 pub const CLEAR: &str = "\x1b[H\x1b[2J";
-/// Enter the alternate screen and hide the cursor.
-pub const ENTER: &str = "\x1b[?1049h\x1b[?25l";
+/// Erase from the cursor to the right edge of its row.
+pub const ERASE_LINE: &str = "\x1b[K";
+/// Enter the alternate screen, turn auto-wrap **off**, and hide the cursor.
+///
+/// Auto-wrap off is the load-bearing part. With it on, a single cell of
+/// over-draw on the bottom row wraps, and a wrap on the bottom row scrolls the
+/// whole screen — permanently, since the next frame is painted one row higher
+/// than the last. Our width arithmetic can be one column out for reasons no
+/// amount of care here removes (a terminal set to render East Asian *ambiguous*
+/// characters double-width, a font substituting a wider glyph, a control
+/// character arriving inside tool output), so the failure mode is closed off
+/// rather than argued about: with wrap off, an over-wide row is truncated by
+/// the terminal and the screen stays put.
+///
+/// Alternate scroll (DECSET 1007) is the other half of owning the screen. In
+/// the alternate screen the terminal's own scrollback is the *shell's* history,
+/// not the conversation, so a wheel the terminal keeps for itself scrolls the
+/// wrong thing entirely — and the conversation above the fold becomes
+/// unreachable with the mouse. With 1007 the terminal translates the wheel into
+/// arrow keys, which this UI already binds to scrolling the stream. It is worth
+/// preferring over mouse reporting (DECSET 1000/1006) precisely because it does
+/// *not* take the mouse: click-drag still selects and copies text the way it
+/// does in any other program.
+///
+/// Bracketed paste (DECSET 2004) is the third. Without it a paste arrives as
+/// keystrokes, which means the newlines in it arrive as *Enter* — a pasted
+/// stack trace submits itself on its first line and types the rest into the
+/// next prompt. With it the terminal wraps the text in markers and it arrives
+/// as one event, which is what `Input::Paste` was always written for.
+pub const ENTER: &str = "\x1b[?1049h\x1b[?7l\x1b[?1007h\x1b[?2004h\x1b[?25l";
 /// The exact inverse of [`ENTER`].
-pub const LEAVE: &str = "\x1b[?25h\x1b[?1049l";
+pub const LEAVE: &str = "\x1b[?25h\x1b[?2004l\x1b[?1007l\x1b[?7h\x1b[?1049l";
+/// Ask the terminal to report the pointer: button presses (1000) with SGR
+/// coordinates (1006), so columns past 223 are reportable at all.
+///
+/// **This takes the mouse away from the terminal**, which is a real cost, not a
+/// detail: click-drag stops selecting text and starts arriving here. Every
+/// terminal has a modifier that opts out of the grab for one gesture — Option
+/// on iTerm2 and Terminal.app, Shift on xterm, kitty and WezTerm — and the row
+/// can be turned off entirely (`config = { mouse = false }`). It is on by
+/// default because a tool call that folds when clicked is worth more than a
+/// selection gesture that needs a modifier.
+///
+/// Motion is deliberately not requested (no 1002, no 1003): nothing here
+/// follows a pointer, and asking would mean a packet per cell crossed.
+pub const MOUSE_ON: &str = "\x1b[?1002h\x1b[?1006h";
+/// The exact inverse of [`MOUSE_ON`].
+pub const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l";
 
-fn sgr(style: &Style, theme: crate::theme::Theme) -> String {
+/// Put text on the system clipboard, through the terminal (OSC 52).
+///
+/// The terminal is the right one to ask: it is the process that has a
+/// clipboard. Shelling out to `pbcopy` would work on this machine and nowhere
+/// else, and would copy to the *server's* clipboard over ssh, which is the
+/// wrong one. OSC 52 crosses ssh and tmux because it is just bytes on the wire.
+///
+/// iTerm2 gates this behind "Applications in terminal may access clipboard";
+/// if a copy silently does nothing, that is the switch.
+pub fn set_clipboard(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", base64(text.as_bytes()))
+}
+
+/// Just enough base64 for OSC 52 — a dependency for sixty characters of table
+/// lookup would be a dependency to audit, update and explain.
+fn base64(bytes: &[u8]) -> String {
+    const SET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(SET[(n >> (18 - 6 * i)) as usize & 0x3f] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+/// Begin a synchronized update (DECSET 2026): the terminal buffers everything
+/// until the matching [`SYNC_END`] and shows the result in one go.
+///
+/// A frame is erased and redrawn in one write; without this the terminal is
+/// free to present the half-drawn middle of it, which reads as flicker.
+/// Terminals that do not know the mode ignore it, so it costs eight bytes.
+pub const SYNC_BEGIN: &str = "\x1b[?2026h";
+/// End a synchronized update. See [`SYNC_BEGIN`].
+pub const SYNC_END: &str = "\x1b[?2026l";
+
+fn sgr(style: &Style, caps: crate::caps::Caps) -> String {
     let mut parts: Vec<String> = Vec::new();
     if style.bold {
         parts.push("1".into());
@@ -38,22 +136,23 @@ fn sgr(style: &Style, theme: crate::theme::Theme) -> String {
     match style.fg {
         Some(Color::Ansi(n)) => parts.push(format!("38;5;{n}")),
         Some(Color::Rgb(r, g, b)) => parts.push(format!("38;2;{r};{g};{b}")),
-        // A role with no colour means "the terminal's own foreground" — the
-        // absence of an SGR, not a colour that happens to look like it.
-        Some(Color::Role(r)) => {
-            if let Some(Color::Ansi(n)) = crate::theme::colour(r, theme) {
-                parts.push(format!("38;5;{n}"));
-            }
-        }
+        // The one place a role becomes a colour, against the palette that was
+        // actually measured. A role with no colour means "the terminal's own
+        // foreground" — the absence of an SGR, not a colour that looks like it.
+        Some(Color::Role(r)) => match crate::theme::resolve(r, caps) {
+            Some(Color::Ansi(n)) => parts.push(format!("38;5;{n}")),
+            Some(Color::Rgb(r, g, b)) => parts.push(format!("38;2;{r};{g};{b}")),
+            _ => {}
+        },
         None => {}
     }
     match style.bg {
         Some(Color::Ansi(n)) => parts.push(format!("48;5;{n}")),
-        Some(Color::Role(r)) => {
-            if let Some(Color::Ansi(n)) = crate::theme::colour(r, theme) {
-                parts.push(format!("48;5;{n}"));
-            }
-        }
+        Some(Color::Role(r)) => match crate::theme::resolve(r, caps) {
+            Some(Color::Ansi(n)) => parts.push(format!("48;5;{n}")),
+            Some(Color::Rgb(r, g, b)) => parts.push(format!("48;2;{r};{g};{b}")),
+            _ => {}
+        },
         Some(Color::Rgb(r, g, b)) => parts.push(format!("48;2;{r};{g};{b}")),
         None => {}
     }
@@ -73,7 +172,7 @@ fn write_line(out: &mut String, line: &Line, width: u16, caps: crate::caps::Caps
         let codes = if caps.colors == crate::caps::Colors::None {
             String::new()
         } else {
-            sgr(&span.style, caps.theme)
+            sgr(&span.style, caps)
         };
         if codes.is_empty() {
             out.push_str(&text);
@@ -99,26 +198,103 @@ fn write_line(out: &mut String, line: &Line, width: u16, caps: crate::caps::Caps
 /// layering enforceable — a module has no opportunity to forget, because it was
 /// never asked.
 pub fn encode_with(frame: &Frame, caps: crate::caps::Caps) -> String {
-    let mut out = String::with_capacity(1024);
-    out.push_str(CLEAR);
+    encode_rows(frame, caps).full()
+}
+
+/// A frame encoded as one payload per screen row.
+///
+/// The unit a repaint can be skipped at. Two frames that differ only in a
+/// spinner differ in exactly one row, and the other twenty-nine have nothing to
+/// say — so the terminal is told about one row rather than the screen. This is
+/// how every renderer that stays still under an animation works; OpenTUI (what
+/// opencode paints through) diffs at the cell.
+///
+/// `rows[i]` is what follows `CUP(i + 1, 1)`: an erase of that row, then the
+/// absolutely-positioned runs the parts put on it. Row payloads carry their own
+/// row number, so comparing two frames' payloads row by row is meaningful.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rows {
+    size: (u16, u16),
+    rows: Vec<String>,
+    /// The trailing cursor sequence — a move and a show, or just a hide.
+    cursor: String,
+}
+
+impl Rows {
+    /// Every row, as one write. What a first paint, or a resize, needs.
+    pub fn full(&self) -> String {
+        let mut out = String::with_capacity(self.rows.iter().map(String::len).sum::<usize>() + 64);
+        out.push_str(SYNC_BEGIN);
+        for (i, payload) in self.rows.iter().enumerate() {
+            let _ = write!(out, "\x1b[{};1H", i + 1);
+            out.push_str(payload);
+        }
+        out.push_str(&self.cursor);
+        out.push_str(SYNC_END);
+        out
+    }
+
+    /// Only what changed since `prev`. Empty when nothing did — and an empty
+    /// write is the correct output for a screen that did not move.
+    ///
+    /// A different size is not a diff: the terminal reflowed the whole screen
+    /// under us, so every row is repainted.
+    pub fn patch_from(&self, prev: Option<&Rows>) -> String {
+        let Some(prev) = prev.filter(|p| p.size == self.size) else {
+            return self.full();
+        };
+        let changed: Vec<usize> = (0..self.rows.len())
+            .filter(|&i| prev.rows.get(i) != Some(&self.rows[i]))
+            .collect();
+        if changed.is_empty() && prev.cursor == self.cursor {
+            return String::new();
+        }
+        let mut out = String::with_capacity(128);
+        out.push_str(SYNC_BEGIN);
+        for i in changed {
+            let _ = write!(out, "\x1b[{};1H", i + 1);
+            out.push_str(&self.rows[i]);
+        }
+        // Always last: painting a row leaves the cursor wherever that row ended.
+        out.push_str(&self.cursor);
+        out.push_str(SYNC_END);
+        out
+    }
+}
+
+/// Encode a frame row by row. See [`Rows`].
+pub fn encode_rows(frame: &Frame, caps: crate::caps::Caps) -> Rows {
+    let h = frame.size.h as usize;
+    // Erase first, draw second, one row at a time. Erasing a row cannot scroll
+    // the screen and cannot reach the scrollback; erasing the display does
+    // both, which is what made this screen drift. See [`CLEAR`].
+    let mut rows = vec![String::from(ERASE_LINE); h];
     for part in &frame.parts {
         for (dy, line) in part.lines.iter().enumerate() {
             if dy >= part.rect.h as usize {
                 break;
             }
-            let row = part.rect.y as usize + dy + 1; // ANSI is 1-based
+            let row = part.rect.y as usize + dy;
+            // Off the bottom is dropped rather than clamped. A terminal given a
+            // row past the last one draws on the last one instead, so a module
+            // that overruns would land on top of the prompt.
+            let Some(buf) = rows.get_mut(row) else {
+                continue;
+            };
             let col = part.rect.x as usize + 1;
-            let _ = write!(out, "\x1b[{row};{col}H");
-            write_line(&mut out, line, part.rect.w, caps);
+            let _ = write!(buf, "\x1b[{};{col}H", row + 1); // ANSI is 1-based
+            write_line(buf, line, part.rect.w, caps);
         }
     }
-    match frame.cursor {
-        Some((x, y)) => {
-            let _ = write!(out, "\x1b[{};{}H\x1b[?25h", y + 1, x + 1);
-        }
-        None => out.push_str("\x1b[?25l"),
+    let cursor = match frame.cursor {
+        Some((x, y)) => format!("\x1b[{};{}H\x1b[?25h", y + 1, x + 1),
+        None => "\x1b[?25l".to_string(),
+    };
+    Rows {
+        size: (frame.size.w, frame.size.h),
+        rows,
+        cursor,
     }
-    out
 }
 
 /// Paint for a fully capable terminal. Tests and callers that do not care.
@@ -137,9 +313,38 @@ mod tests {
         f.place("a", Rect::new(0, 0, 20, 1), vec![Line::raw("top")]);
         f.place("b", Rect::new(2, 2, 18, 1), vec![Line::raw("bottom")]);
         let s = encode(&f);
-        assert!(s.starts_with(CLEAR));
+        assert!(s.starts_with(SYNC_BEGIN));
         assert!(s.contains("\x1b[1;1Htop"));
         assert!(s.contains("\x1b[3;3Hbottom"), "row 3, column 3");
+    }
+
+    #[test]
+    fn a_frame_erases_row_by_row_and_never_the_whole_display() {
+        // A full-display erase per frame is what made the screen drift on a
+        // terminal that keeps scrollback for the alternate screen: nine erases
+        // a second, nine chances to churn the scrollback. Row erases cannot.
+        let mut f = Frame::new(20, 3);
+        f.place("a", Rect::new(0, 0, 20, 1), vec![Line::raw("top")]);
+        let s = encode(&f);
+        assert!(!s.contains("\x1b[2J"), "no full-display erase: {s:?}");
+        for row in 1..=3 {
+            assert!(
+                s.contains(&format!("\x1b[{row};1H{ERASE_LINE}")),
+                "row {row} is not erased: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_is_one_synchronized_update() {
+        // Erase and redraw are one presentation or they are flicker.
+        let mut f = Frame::new(8, 2);
+        f.place("a", Rect::new(0, 0, 8, 1), vec![Line::raw("hi")]);
+        let s = encode(&f);
+        assert!(s.starts_with(SYNC_BEGIN), "{s:?}");
+        assert!(s.ends_with(SYNC_END), "{s:?}");
+        assert_eq!(s.matches(SYNC_BEGIN).count(), 1);
+        assert_eq!(s.matches(SYNC_END).count(), 1);
     }
 
     #[test]
@@ -155,6 +360,27 @@ mod tests {
         assert!(s.contains("one"));
         assert!(!s.contains("two"), "clipped at its own rect");
         assert!(s.contains("\x1b[2;1Hsafe"), "the neighbour keeps its row");
+    }
+
+    #[test]
+    fn the_clipboard_escape_is_base64_the_terminal_will_accept() {
+        // Checked against the RFC 4648 vectors rather than against itself: an
+        // encoder that agrees only with its own test is an encoder that ships
+        // a padding bug to every terminal at once.
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64("中".as_bytes()), "5Lit");
+
+        let seq = set_clipboard("hi");
+        assert!(
+            seq.starts_with("\x1b]52;c;") && seq.ends_with('\x07'),
+            "{seq:?}"
+        );
     }
 
     #[test]
@@ -182,5 +408,24 @@ mod tests {
         // A UI that leaves a shell in the alternate screen is worse than no UI.
         assert!(ENTER.contains("1049h") && LEAVE.contains("1049l"));
         assert!(ENTER.contains("25l") && LEAVE.contains("25h"));
+        // Auto-wrap: off while we own the screen, back on when we hand it
+        // back. Leaving a shell with wrap off is as rude as leaving it in raw
+        // mode — every long command line would overwrite its own last column.
+        assert!(ENTER.contains("?7l") && LEAVE.contains("?7h"));
+        // Alternate scroll, likewise: the wheel is ours while we hold the
+        // screen and the terminal's again the moment we let go.
+        assert!(ENTER.contains("?1007h") && LEAVE.contains("?1007l"));
+        // Bracketed paste, likewise — and leaving it on would make every
+        // subsequent shell paste arrive wrapped in markers it does not expect.
+        assert!(ENTER.contains("?2004h") && LEAVE.contains("?2004l"));
+        // Mouse reporting is separate because it is optional, but it has the
+        // same obligation: a shell left reporting the pointer prints garbage
+        // on every click.
+        // 1002, not 1000: motion *while a button is held* is what a drag is,
+        // and without it a selection cannot be followed. Not 1003, which
+        // reports every cell the pointer crosses whether or not anyone asked.
+        assert!(MOUSE_ON.contains("?1002h") && MOUSE_OFF.contains("?1002l"));
+        assert!(!MOUSE_ON.contains("?1003"), "free motion is never needed");
+        assert!(MOUSE_ON.contains("?1006h") && MOUSE_OFF.contains("?1006l"));
     }
 }

@@ -43,6 +43,55 @@ impl ScrollPos {
     }
 }
 
+/// A selection on screen, in cells.
+///
+/// Anchored where the button went down, headed where the pointer is now.
+/// Line-wise rather than rectangular, because that is what every terminal does
+/// and what reading a wrapped paragraph needs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: (u16, u16),
+    pub head: (u16, u16),
+}
+
+impl Selection {
+    pub fn at(x: u16, y: u16) -> Self {
+        Self {
+            anchor: (x, y),
+            head: (x, y),
+        }
+    }
+
+    /// Nothing covered yet — a press that has not become a drag.
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+
+    /// The two ends in reading order. Dragging upward selects the same text as
+    /// dragging downward over it.
+    fn ends(&self) -> ((u16, u16), (u16, u16)) {
+        let (a, h) = (self.anchor, self.head);
+        if (a.1, a.0) <= (h.1, h.0) {
+            (a, h)
+        } else {
+            (h, a)
+        }
+    }
+
+    /// The half-open cell range this row contributes, if it is in the
+    /// selection at all. The head's own cell is included: a person who dragged
+    /// over a character selected it.
+    pub fn on_row(&self, y: u16, width: u16) -> Option<(u16, u16)> {
+        let ((sx, sy), (ex, ey)) = self.ends();
+        if y < sy || y > ey {
+            return None;
+        }
+        let start = if y == sy { sx } else { 0 };
+        let end = if y == ey { (ex + 1).min(width) } else { width };
+        (start < end).then_some((start, end))
+    }
+}
+
 /// The non-derivable half of what a module renders from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Moment {
@@ -53,6 +102,9 @@ pub struct Moment {
     pub caret: usize,
     pub focus: Option<String>,
     pub scroll: ScrollPos,
+    /// What the pointer has selected, if anything. Screen state, not a fact —
+    /// which is exactly what this struct is for.
+    pub selection: Option<Selection>,
     /// Logical frame counter. Animation phase comes from here, never from a
     /// clock read inside `render` — that would make the whole test loop
     /// non-deterministic while leaving it green.

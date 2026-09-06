@@ -28,6 +28,20 @@ pub enum Action {
     Quit,
     Scroll(i32),
     ScrollToBottom,
+    /// Fold or unfold the one block under this cell. The pointing gesture, next
+    /// to `ToggleFold`, which does every block of a kind at once.
+    FoldAt(u16, u16),
+    /// Take the pointer, or hand it back to the terminal so click-drag selects
+    /// text again.
+    ToggleMouse,
+    /// Start a selection at this cell.
+    SelectFrom(u16, u16),
+    /// Drag it out to here.
+    SelectTo(u16, u16),
+    /// Finish it: copy what it covers, and leave it up so it can be seen.
+    CopySelection,
+    /// Drop it.
+    ClearSelection,
     /// Fold or unfold every block of a kind.
     ToggleFold(&'static str),
     /// Show or hide a module.
@@ -134,6 +148,9 @@ impl Keymap for Default_ {
             (KeyPress::ctrl('r'), Action::ToggleFold("reasoning")),
             (KeyPress::ctrl('t'), Action::ToggleFold("tool_call")),
             (KeyPress::ctrl('n'), Action::ToggleModule("mascot")),
+            // Hand the mouse back, and take it again. `o` for "off", and one of
+            // the few control keys a terminal does not already claim.
+            (KeyPress::ctrl('o'), Action::ToggleMouse),
             (
                 KeyPress::ctrl('l'),
                 Action::Layout(crate::layout::LayoutOp::Preset {

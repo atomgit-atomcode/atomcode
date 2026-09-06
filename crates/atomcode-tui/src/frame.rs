@@ -154,6 +154,12 @@ impl Color {
     pub const fn role(r: crate::theme::Role) -> Color {
         Color::Role(r)
     }
+
+    /// An exact colour, from a measured triple. Only the palette resolver
+    /// produces these, and only when no slot in the user's scheme reads.
+    pub fn rgb((r, g, b): crate::theme::Rgb) -> Color {
+        Color::Rgb(r, g, b)
+    }
 }
 
 /// A run of text sharing one style. Lines are made of these so a renderer can
@@ -246,6 +252,47 @@ impl Line {
     }
 }
 
+impl Line {
+    /// A copy with the cells in `[from, to)` restyled.
+    ///
+    /// Spans are split at the boundaries and never mid-grapheme, so a selection
+    /// that lands in the middle of a word — or in the middle of a CJK character
+    /// — still highlights whole cells. Cells, not bytes and not chars: the
+    /// selection is a rectangle on screen, and that is what the person drew.
+    pub fn restyle(&self, from: usize, to: usize, f: impl Fn(Style) -> Style) -> Line {
+        if from >= to {
+            return self.clone();
+        }
+        let mut out: Vec<Span> = Vec::with_capacity(self.spans.len());
+        let mut at = 0usize;
+        for span in &self.spans {
+            let w = span.width();
+            let (lo, hi) = (at, at + w);
+            at = hi;
+            if hi <= from || lo >= to {
+                out.push(span.clone());
+                continue;
+            }
+            // Up to three pieces: before the range, inside it, after it.
+            let head = crate::width::take_width(&span.text, from.saturating_sub(lo));
+            let rest = &span.text[head.len()..];
+            let inside =
+                crate::width::take_width(rest, to.min(hi) - (lo + crate::width::str_width(&head)));
+            let tail = &rest[inside.len()..];
+            for (text, style) in [
+                (head.as_str(), span.style),
+                (inside.as_str(), f(span.style)),
+                (tail, span.style),
+            ] {
+                if !text.is_empty() {
+                    out.push(Span::styled(text, style));
+                }
+            }
+        }
+        Line { spans: out }
+    }
+}
+
 impl fmt::Display for Line {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.plain())
@@ -324,6 +371,64 @@ impl Frame {
         grid.into_iter()
             .map(|row| row.into_iter().filter(|c| *c != '\0').collect())
             .collect()
+    }
+
+    /// Mark the cells a selection covers, wherever they were drawn.
+    ///
+    /// Applied to the composed frame rather than by each module, because a
+    /// selection is a rectangle on the *screen*: it crosses parts, and a module
+    /// asked to highlight its own share would have to know where it sits and
+    /// what its neighbours did.
+    pub fn highlight(&mut self, sel: &crate::moment::Selection) {
+        if sel.is_empty() {
+            return;
+        }
+        let width = self.size.w;
+        for part in &mut self.parts {
+            for (dy, line) in part.lines.iter_mut().enumerate() {
+                let row = part.rect.y as usize + dy;
+                let Ok(row) = u16::try_from(row) else {
+                    continue;
+                };
+                let Some((a, b)) = sel.on_row(row, width) else {
+                    continue;
+                };
+                // Screen cells to this part's own, clipped to its rect.
+                let a = a.max(part.rect.x) - part.rect.x;
+                let b = b.min(part.rect.right()).saturating_sub(part.rect.x);
+                if a < b {
+                    *line = line.restyle(a as usize, b as usize, |st| Style {
+                        reverse: !st.reverse,
+                        ..st
+                    });
+                }
+            }
+        }
+    }
+
+    /// The text a selection covers, as a person would expect to paste it.
+    ///
+    /// Read back from the flattened frame rather than from the blocks behind
+    /// it: what was selected is what was *on screen*, wrapped the way it was
+    /// wrapped. Trailing blanks go, because a terminal's own selection drops
+    /// them and pasting a rectangle of spaces is never what was meant.
+    pub fn selected_text(&self, sel: &crate::moment::Selection) -> String {
+        if sel.is_empty() {
+            return String::new();
+        }
+        let rows = self.rows();
+        let mut out: Vec<String> = Vec::new();
+        for (y, row) in rows.iter().enumerate() {
+            let Ok(y) = u16::try_from(y) else { continue };
+            let Some((a, b)) = sel.on_row(y, self.size.w) else {
+                continue;
+            };
+            let head = crate::width::take_width(row, a as usize);
+            let rest = &row[head.len()..];
+            let piece = crate::width::take_width(rest, (b - a) as usize);
+            out.push(piece.trim_end().to_string());
+        }
+        out.join("\n")
     }
 
     /// Every cell a module drew is inside the rect it was given.
@@ -411,6 +516,111 @@ mod tests {
         // One for the line count, one for each over-wide line.
         assert_eq!(v.len(), 3, "{v:?}");
         assert!(v.iter().all(|m| m.contains("greedy")));
+    }
+
+    #[test]
+    fn a_selection_marks_the_cells_it_covers_and_no_others() {
+        use crate::moment::Selection;
+        let mut f = Frame::new(10, 2);
+        f.place("a", Rect::new(0, 0, 10, 1), vec![Line::raw("abcdefghij")]);
+        f.place("b", Rect::new(0, 1, 10, 1), vec![Line::raw("klmnopqrst")]);
+        f.highlight(&Selection {
+            anchor: (2, 0),
+            head: (4, 0),
+        });
+        let marked: String = f.parts[0].lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.reverse)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(marked, "cde", "the head's own cell is selected too");
+        assert!(
+            f.parts[1].lines[0].spans.iter().all(|s| !s.style.reverse),
+            "a one-row selection reached the row below"
+        );
+    }
+
+    #[test]
+    fn dragging_upward_selects_the_same_text_as_dragging_down_over_it() {
+        use crate::moment::Selection;
+        let text = |sel: &Selection| {
+            let mut f = Frame::new(6, 3);
+            for (y, s) in ["one---", "two---", "three-"].iter().enumerate() {
+                f.place(
+                    format!("r{y}"),
+                    Rect::new(0, y as u16, 6, 1),
+                    vec![Line::raw(*s)],
+                );
+            }
+            f.selected_text(sel)
+        };
+        let down = Selection {
+            anchor: (1, 0),
+            head: (2, 2),
+        };
+        let up = Selection {
+            anchor: (2, 2),
+            head: (1, 0),
+        };
+        assert_eq!(text(&down), text(&up));
+        assert_eq!(
+            text(&down),
+            "ne---
+two---
+thr"
+        );
+    }
+
+    #[test]
+    fn what_is_copied_is_what_was_on_screen() {
+        use crate::moment::Selection;
+        let mut f = Frame::new(20, 2);
+        // Two parts side by side: a selection crosses them, because it is a
+        // rectangle on the screen and knows nothing about who drew what.
+        f.place("left", Rect::new(0, 0, 10, 1), vec![Line::raw("hello")]);
+        f.place("right", Rect::new(10, 0, 10, 1), vec![Line::raw("world")]);
+        let all = Selection {
+            anchor: (0, 0),
+            head: (19, 0),
+        };
+        assert_eq!(f.selected_text(&all), "hello     world");
+
+        // Trailing blanks go: a terminal drops them and a rectangle of spaces
+        // is never what was meant.
+        let tail = Selection {
+            anchor: (5, 0),
+            head: (19, 0),
+        };
+        assert_eq!(f.selected_text(&tail), "     world");
+        assert_eq!(
+            f.selected_text(&Selection::at(3, 0)),
+            "",
+            "a press is not a selection"
+        );
+    }
+
+    #[test]
+    fn a_selection_never_splits_a_wide_character() {
+        use crate::moment::Selection;
+        let mut f = Frame::new(8, 1);
+        f.place("a", Rect::new(0, 0, 8, 1), vec![Line::raw("中文abc")]);
+        // Cells 0..=2 cover 中 (two cells) and half of 文 — the half cannot be
+        // taken, so it is not.
+        let sel = Selection {
+            anchor: (0, 0),
+            head: (2, 0),
+        };
+        assert_eq!(f.selected_text(&sel), "中");
+        let mut marked = f.clone();
+        marked.highlight(&sel);
+        let hot: String = marked.parts[0].lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.reverse)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(hot, "中");
     }
 
     #[test]

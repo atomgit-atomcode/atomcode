@@ -114,6 +114,22 @@ async fn main() -> ExitCode {
             // 401" happens.
             "--env-model" | "--env" => overlays.push(bundle::ENV_MODEL.to_string()),
             "--mascot" => overlays.push(MASCOT.to_string()),
+            // The palette follows the terminal's own background unless told
+            // otherwise; this is the "otherwise", for a terminal that will not
+            // answer (some tmux and ssh setups) or answers wrongly.
+            "--theme" => match args.next() {
+                Some(name) => overlays.push(format!(
+                    "[[patch]]\nid = \"surface\"\nconfig = {{ theme = {name:?} }}\n"
+                )),
+                None => {
+                    eprintln!("--theme needs auto, dark or light");
+                    return ExitCode::from(2);
+                }
+            },
+            // Give the mouse back to the terminal: click-drag selects text
+            // again, and folding goes back to being a keyboard gesture.
+            "--no-mouse" => overlays
+                .push("[[patch]]\nid = \"surface\"\nconfig = { mouse = false }\n".to_string()),
             "--yolo" => overlays.push(bundle::YOLO.to_string()),
             "--read-only" => overlays.push(bundle::READ_ONLY.to_string()),
             "--full" => overlays.push(bundle::FULL.to_string()),
@@ -126,6 +142,13 @@ async fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             },
+            // What the terminal answered, and what each role resolved to. The
+            // first thing to run when something still looks wrong: it says
+            // whether the terminal answered at all.
+            "--probe-terminal" => {
+                print!("{}", atomcode_tui::surface::probe_report());
+                return ExitCode::SUCCESS;
+            }
             "--dump-config" => dump = true,
             "--headless" => overlays.push(HEADLESS.to_string()),
             "--audit" => {
@@ -272,9 +295,12 @@ FLAGS
         --offline          a scripted model; no network
         --env-model        use ATOMCODE_BASE_URL / _MODEL / _API_KEY
         --mascot           show the cat
+        --theme <t>        auto (ask the terminal), dark or light
+        --no-mouse         leave the pointer to the terminal
         --yolo             approve every tool call
         --read-only        no writes, no shell
         --full             code graph, web access, delegation
+        --probe-terminal   what this terminal answered, and how it resolves
         --dump-config      print the tree that would run
         --headless         paint into memory; no terminal needed
         --audit            check the composition and exit
@@ -287,4 +313,14 @@ KEYS
     ctrl-w       delete a word   ctrl-r         fold or unfold reasoning
     ctrl-t       fold tool calls ctrl-n         show or hide the mascot
     pgup/pgdn    scroll          up/down        scroll by a line
+
+MOUSE
+    drag to select; the selection is copied to the clipboard on release
+    (OSC 52, so it works over ssh and tmux) and esc clears it. Click a tool
+    call to fold or unfold that one — ctrl-t still does every one at once.
+    The wheel scrolls the conversation.
+
+    ctrl-o (or /mouse) hands the pointer back to the terminal, for when you
+    want its own selection instead — across scrollback, say. --no-mouse
+    starts that way.
 ";
