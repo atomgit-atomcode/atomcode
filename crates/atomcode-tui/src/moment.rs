@@ -105,6 +105,18 @@ pub struct Moment {
     /// What the pointer has selected, if anything. Screen state, not a fact —
     /// which is exactly what this struct is for.
     pub selection: Option<Selection>,
+    /// Everything the person has said this session, oldest first.
+    ///
+    /// Folded from the log rather than appended at submit, so a resumed session
+    /// can arrow back through what was said before it was resumed — the log is
+    /// the only thing that survives, and a second copy would drift from it.
+    pub history: Vec<String>,
+    /// Which entry is being shown, when arrowing through them. `None` means
+    /// what is in the field is the person's own draft.
+    pub history_at: Option<usize>,
+    /// The draft that was set aside to go browsing, so leaving the history
+    /// gives it back rather than losing it.
+    pub draft: String,
     /// Logical frame counter. Animation phase comes from here, never from a
     /// clock read inside `render` — that would make the whole test loop
     /// non-deterministic while leaving it green.

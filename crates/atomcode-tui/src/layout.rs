@@ -658,7 +658,7 @@ mod three_ways {
     #[test]
     fn a_key_and_the_model_agree_on_what_focus_means() {
         assert_eq!(
-            by_key(KeyPress::ctrl('l')).expect("ctrl-l is bound"),
+            by_key(KeyPress::ctrl('f')).expect("ctrl-f is bound"),
             by_model(r#"{"op":"preset","name":"focus"}"#)
         );
     }

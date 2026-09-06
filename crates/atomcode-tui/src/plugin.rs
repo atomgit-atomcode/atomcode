@@ -30,6 +30,14 @@ plexus_service!(ModulesSvc => Modules, "tui-modules", Core, "Mounted stream prod
 plexus_service!(LayoutSvc => crate::layout::Layout, "tui-layout", Core, "The region tree on screen");
 plexus_service!(CommandsSvc => crate::command::Commands, "tui-commands", Core, "Slash commands contributed by rows");
 
+/// Lines the conversation moves per wheel notch.
+///
+/// One, not three. The terminal already sends one event per notch, so three
+/// lines an event is three times the distance the hand asked for — and the
+/// reason to reach for the wheel here is to study something that went past,
+/// which is exactly when precision beats speed.
+const WHEEL_LINES: i32 = 1;
+
 /// What woke the loop up.
 enum Wake {
     Fact,
@@ -173,8 +181,8 @@ impl UserInterface for Tui {
                     // the pointer moved. Deciding at the press would mean
                     // folding a block every time someone selects text on it.
                     let action = match click {
-                        Click::WheelUp => Some(Action::Scroll(-3)),
-                        Click::WheelDown => Some(Action::Scroll(3)),
+                        Click::WheelUp => Some(Action::Scroll(-WHEEL_LINES)),
+                        Click::WheelDown => Some(Action::Scroll(WHEEL_LINES)),
                         Click::Press => {
                             *self.pressed_at.lock().expect("press poisoned") = Some((x, y));
                             Some(Action::SelectFrom(x, y))
@@ -320,12 +328,22 @@ impl Tui {
                 return false;
             }
         }
+        // Typing means this is yours now, not the entry you arrowed back to.
+        // The stashed draft goes: there is only one thing being composed.
+        if matches!(
+            action,
+            Action::Insert(_) | Action::Backspace | Action::DeleteWord | Action::Paste(_)
+        ) {
+            m.history_at = None;
+        }
         match action {
             Action::Quit => return true,
             Action::Submit => {
                 let text = m.input.trim().to_string();
                 m.input.clear();
                 m.caret = 0;
+                m.history_at = None;
+                m.draft.clear();
                 m.scroll = crate::moment::ScrollPos::BOTTOM;
                 drop(m);
                 self.refresh_menu();
@@ -386,6 +404,28 @@ impl Tui {
             }
             Action::CaretHome => m.caret = 0,
             Action::CaretEnd => m.caret = m.input.len(),
+
+            // Inside the text they move the caret; at its edge they hand over
+            // to the history. That is what an arrow key does in a shell, and
+            // the composer is now tall enough for the first half to matter.
+            Action::CaretUp | Action::CaretDown => {
+                use crate::modules::input;
+                let up = matches!(action, Action::CaretUp);
+                let w = self.surface.size().0;
+                let (row, col, rows) = input::caret_row(&m.input, m.caret, w);
+                let inside = if up { row > 0 } else { row + 1 < rows };
+                if inside {
+                    // The column is kept, the way a text editor keeps it:
+                    // moving down and back up lands where it started.
+                    let to = if up { row - 1 } else { row + 1 };
+                    m.caret = input::offset_at(&m.input, to, col, w);
+                } else if up {
+                    recall_back(&mut m);
+                } else {
+                    recall_forward(&mut m);
+                }
+                return false;
+            }
             Action::Paste(text) => {
                 let text = sanitize_paste(&text);
                 let at = m.caret.min(m.input.len());
@@ -417,13 +457,27 @@ impl Tui {
                     return false;
                 }
                 drop(m);
-                if let Some((id, kind)) = self.host.block_at(x, y) {
-                    self.host
-                        .presentation
-                        .write()
-                        .expect("presentation poisoned")
-                        .toggle_block(id, kind);
-                }
+                let Some((id, kind)) = self.host.block_at(x, y) else {
+                    return false;
+                };
+                // Anchor the block that was clicked, not the bottom of the
+                // conversation. The stream is bottom-anchored, so a block that
+                // grows pushes its own header off the top — click a tool call
+                // and the line you clicked is the first thing to leave. Moving
+                // the view back by exactly what it gained keeps that line where
+                // it was, and what appears, appears *below* it.
+                let size = self.surface.size();
+                let before = self.host.stream_height(size.0);
+                self.host
+                    .presentation
+                    .write()
+                    .expect("presentation poisoned")
+                    .toggle_block(id, kind);
+                let grew = self.host.stream_height(size.0) as i64 - before as i64;
+                let mut m = self.host.moment.write().expect("moment poisoned");
+                let max = self.host.scroll_limit(size, &m) as i64;
+                m.scroll =
+                    crate::moment::ScrollPos((m.scroll.0 as i64 + grew).clamp(0, max) as usize);
                 return false;
             }
             // Handing the mouse back is the answer to "I cannot select text
@@ -435,10 +489,10 @@ impl Tui {
                 let on = !self.surface.mouse();
                 self.surface.set_mouse(on);
                 let text = if on {
-                    "鼠标已收回:点击工具调用可折叠展开,滚轮滚动。                     想框选复制:按住 option(macOS)或 shift(其它终端)拖动,或再按 ctrl-o"
+                    "鼠标已收回:拖动选中并复制,点击工具调用折叠展开,滚轮滚动,esc 取消选中"
                         .to_string()
                 } else {
-                    "鼠标已交还终端:框选复制恢复正常。折叠改用 ctrl-t/ctrl-r,                     滚动用 pgup/pgdn。按 ctrl-o 收回鼠标"
+                    "鼠标已交还终端:改用终端自己的框选(可跨 scrollback)。折叠用 ctrl-t/ctrl-r,滚动用 pgup/pgdn,ctrl-o 收回鼠标"
                         .to_string()
                 };
                 self.say(&text);
@@ -470,6 +524,11 @@ impl Tui {
                 if !text.is_empty() {
                     self.surface.copy(&text);
                 }
+                return false;
+            }
+            Action::Redraw => {
+                drop(m);
+                self.surface.forget();
                 return false;
             }
             Action::ToggleFold(kind) => {
@@ -723,6 +782,39 @@ impl Tui {
             let _ = stdout.flush();
         }
     }
+}
+
+/// Back one entry in the history, stashing the draft on the way in.
+fn recall_back(m: &mut crate::moment::Moment) {
+    if m.history.is_empty() {
+        return;
+    }
+    let at = match m.history_at {
+        None => {
+            m.draft = m.input.clone();
+            m.history.len() - 1
+        }
+        Some(0) => return, // already at the oldest; going further is nowhere
+        Some(i) => i - 1,
+    };
+    m.history_at = Some(at);
+    m.input = m.history[at].clone();
+    m.caret = m.input.len();
+}
+
+/// Forward one entry, and out the far side to the draft that was set aside.
+fn recall_forward(m: &mut crate::moment::Moment) {
+    let Some(at) = m.history_at else {
+        return; // already composing; there is nothing newer than now
+    };
+    if at + 1 < m.history.len() {
+        m.history_at = Some(at + 1);
+        m.input = m.history[at + 1].clone();
+    } else {
+        m.history_at = None;
+        m.input = std::mem::take(&mut m.draft);
+    }
+    m.caret = m.input.len();
 }
 
 /// What a paste is allowed to put in the buffer.
@@ -1032,6 +1124,61 @@ impl Plugin for HeadlessSurfacePlugin {
             .provide::<SurfaceSvc>(Headless::new(row.width, row.height))
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::{recall_back, recall_forward};
+    use crate::moment::Moment;
+
+    fn said(entries: &[&str], typing: &str) -> Moment {
+        let mut m = Moment::default();
+        m.history = entries.iter().map(|s| s.to_string()).collect();
+        m.input = typing.to_string();
+        m.caret = m.input.len();
+        m
+    }
+
+    #[test]
+    fn arrowing_back_walks_what_was_said_newest_first() {
+        let mut m = said(&["first", "second", "third"], "");
+        recall_back(&mut m);
+        assert_eq!(m.input, "third");
+        recall_back(&mut m);
+        assert_eq!(m.input, "second");
+        recall_back(&mut m);
+        assert_eq!(m.input, "first");
+        recall_back(&mut m);
+        assert_eq!(m.input, "first", "the oldest is the end of the road");
+        assert_eq!(m.caret, m.input.len(), "the caret follows to the end");
+    }
+
+    #[test]
+    fn the_draft_is_set_aside_and_given_back() {
+        // The thing a history that loses your half-written message gets wrong.
+        let mut m = said(&["old"], "half a thought");
+        recall_back(&mut m);
+        assert_eq!(m.input, "old");
+        recall_forward(&mut m);
+        assert_eq!(m.input, "half a thought", "the draft came back");
+        assert_eq!(m.history_at, None, "and we are composing again");
+    }
+
+    #[test]
+    fn forward_from_a_draft_does_nothing_because_there_is_nothing_newer() {
+        let mut m = said(&["old"], "mine");
+        recall_forward(&mut m);
+        assert_eq!(m.input, "mine");
+        assert_eq!(m.history_at, None);
+    }
+
+    #[test]
+    fn an_empty_history_is_not_a_special_case_anyone_has_to_handle() {
+        let mut m = said(&[], "mine");
+        recall_back(&mut m);
+        recall_forward(&mut m);
+        assert_eq!(m.input, "mine");
     }
 }
 

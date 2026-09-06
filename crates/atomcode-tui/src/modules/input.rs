@@ -54,7 +54,7 @@ fn typed_room(h: u16) -> usize {
 /// on the character it is next to, and a word that jumps to the next row moves
 /// every column after it. Word wrapping is right for prose in the transcript
 /// and wrong for a field being edited.
-fn lay(input: &str, caret: usize, body: usize) -> (Vec<String>, (usize, usize)) {
+fn lay(input: &str, caret: usize, body: usize) -> (Vec<String>, (usize, usize), Vec<usize>) {
     use unicode_segmentation::UnicodeSegmentation;
 
     let body = body.max(1);
@@ -64,12 +64,17 @@ fn lay(input: &str, caret: usize, body: usize) -> (Vec<String>, (usize, usize)) 
     let mut used = 0usize;
     let mut at = (0usize, 0usize);
     let mut offset = 0usize;
+    // Where each drawn row begins in the buffer. Moving the caret up a row is
+    // the inverse of this walk, and doing it in a second walk is how `render`
+    // and `caret` came to disagree in the first place.
+    let mut starts = vec![0usize];
 
     for (n, logical) in input.split('\n').enumerate() {
         if n > 0 {
             rows.push(std::mem::take(&mut row));
             used = 0;
             offset += 1; // the newline itself
+            starts.push(offset);
             if offset <= caret {
                 at = (rows.len(), 0);
             }
@@ -88,6 +93,7 @@ fn lay(input: &str, caret: usize, body: usize) -> (Vec<String>, (usize, usize)) 
             if used + gw > body {
                 rows.push(std::mem::take(&mut row));
                 used = 0;
+                starts.push(offset);
             }
             row.push_str(g);
             used += gw;
@@ -106,9 +112,40 @@ fn lay(input: &str, caret: usize, body: usize) -> (Vec<String>, (usize, usize)) 
         at = (at.0 + 1, 0);
         if at.0 >= rows.len() {
             rows.push(String::new());
+            starts.push(input.len());
         }
     }
-    (rows, at)
+    (rows, at, starts)
+}
+
+/// Where the caret sits in the drawn text: its row, its column, and how many
+/// rows there are.
+///
+/// What the host needs to decide whether an up-arrow is "one row up" or "the
+/// previous thing I said": inside the text it moves, at the edge it hands over.
+pub fn caret_row(input: &str, caret: usize, width: u16) -> (usize, usize, usize) {
+    let (rows, (row, col), _) = lay(input, caret, body_width(width));
+    (row, col, rows.len())
+}
+
+/// The byte offset the caret lands on when it moves to `(row, col)`.
+///
+/// The inverse of the same walk that drew the rows, so moving up and then down
+/// again returns to where it started — as long as nothing was typed in between,
+/// which is exactly the guarantee a person expects from an arrow key.
+pub fn offset_at(input: &str, row: usize, col: usize, width: u16) -> usize {
+    let body = body_width(width);
+    let (rows, _, starts) = lay(input, 0, body);
+    let row = row.min(rows.len().saturating_sub(1));
+    let start = starts.get(row).copied().unwrap_or(0).min(input.len());
+    let prefix = width::take_width(&rows[row], col);
+    (start + prefix.len()).min(input.len())
+}
+
+/// The cells inside the prompt. One definition, because `render`, `caret` and
+/// every caller that moves by rows must measure the same field.
+pub fn body_width(width: u16) -> usize {
+    (width as usize).saturating_sub(PROMPT).max(1)
 }
 
 pub struct Input;
@@ -159,18 +196,16 @@ impl View for Input {
         // caret in view — `caret` below windows it the same way, from the same
         // walk, so the cursor cannot land off the text.
         let prompt = format!("{} ", vp.moment.caps.g(crate::caps::Glyph::Prompt));
-        let body = (w as usize).saturating_sub(PROMPT).max(1);
-        let (typed, (caret_row, _)) = lay(&vp.moment.input, vp.moment.caret, body);
+        let body = body_width(w);
+        let (typed, (caret_row, _), _) = lay(&vp.moment.input, vp.moment.caret, body);
         let room = typed_room(vp.rect.h);
         let first = caret_row.saturating_sub(room.saturating_sub(1));
         for (i, piece) in typed.iter().skip(first).take(room).enumerate() {
-            // The prompt marks the first row of the field, not the first row of
-            // the text: a composer scrolled down still has to look like one.
-            let lead = if first + i == 0 {
-                prompt.clone()
-            } else {
-                "  ".into()
-            };
+            // The prompt marks the first row *on screen*, not the first row of
+            // the text. Marking the text's first row meant a field scrolled
+            // past it had no prompt anywhere — ten rows of bare text between
+            // two rules, which does not read as somewhere you can type.
+            let lead = if i == 0 { prompt.clone() } else { "  ".into() };
             rows.push(El::row(vec![
                 El::styled(lead, arrow),
                 El::raw(piece.clone()),
@@ -205,7 +240,7 @@ impl View for Input {
     /// what pinned the composer at one row: a pasted stack trace went into the
     /// buffer whole and was sent whole, but only its first line was ever drawn.
     fn height(state: &State, moment: &crate::moment::Moment, width: u16) -> Height {
-        let body = (width as usize).saturating_sub(PROMPT).max(1);
+        let body = body_width(width);
         let typed = lay(&moment.input, moment.caret, body).0.len().min(MAX_ROWS);
         let rows = RULES + typed.max(1);
         Height::Hug(if state.menu.is_empty() {
@@ -219,8 +254,8 @@ impl View for Input {
 /// Where the caret should sit — from the same walk and the same window
 /// `render` used, so it cannot drift off the character it belongs to.
 pub fn caret(moment: &crate::moment::Moment, rect: crate::frame::Rect) -> (u16, u16) {
-    let body = (rect.w as usize).saturating_sub(PROMPT).max(1);
-    let (_, (row, col)) = lay(&moment.input, moment.caret, body);
+    let body = body_width(rect.w);
+    let (_, (row, col), _) = lay(&moment.input, moment.caret, body);
     let room = typed_room(rect.h);
     let first = row.saturating_sub(room.saturating_sub(1));
     // The prompt eats two cells; the rule above eats one row.
@@ -386,7 +421,7 @@ mod tests {
         // `caret` disagreeing is a cursor sitting on the wrong character —
         // which is what `cells / body` did the moment a newline could appear.
         let rect = Rect::new(0, 5, 24, 8);
-        let body = 24 - PROMPT;
+        let body = body_width(24);
         for text in [
             "short",
             "a much longer line that has to wrap more than once at this width",
@@ -401,7 +436,7 @@ mod tests {
                 }
                 let mut m = Moment::default().typing(text);
                 m.caret = caret;
-                let (rows, (row, col)) = lay(text, caret, body);
+                let (rows, (row, col), _) = lay(text, caret, body);
                 let (x, y) = super::caret(&m, rect);
                 assert!(
                     col < body,
@@ -425,15 +460,54 @@ mod tests {
     }
 
     #[test]
+    fn moving_by_rows_is_the_exact_inverse_of_drawing_them() {
+        // Down then up has to land where it started, or an arrow key is a
+        // guess. Both directions go through the same walk that drew the rows,
+        // which is the only reason this holds for wrapped and CJK text too.
+        for text in [
+            "one\ntwo\nthree",
+            "a much longer line that wraps more than once at this width",
+            "宽字符 中文 mixed\nsecond line here",
+        ] {
+            for caret in (0..=text.len()).filter(|c| text.is_char_boundary(*c)) {
+                let (row, col, rows) = caret_row(text, caret, 24);
+                if row + 1 >= rows {
+                    continue;
+                }
+                let down = offset_at(text, row + 1, col, 24);
+                let (r2, _, _) = caret_row(text, down, 24);
+                assert_eq!(r2, row + 1, "{text:?}@{caret} did not move down a row");
+                let back = offset_at(text, row, col, 24);
+                assert_eq!(back, caret, "{text:?}@{caret}: down then up moved it");
+            }
+        }
+    }
+
+    #[test]
+    fn the_edges_of_the_text_are_where_the_arrows_hand_over() {
+        // The whole rule in one place: inside the text the arrows move, at its
+        // edge they belong to the history instead.
+        let one = "single line";
+        let (row, _, rows) = caret_row(one, 3, 40);
+        assert_eq!((row, rows), (0, 1), "one row is both edges at once");
+
+        let three = "one\ntwo\nthree";
+        assert_eq!(caret_row(three, 0, 40).0, 0, "top");
+        assert_eq!(caret_row(three, 5, 40).0, 1, "middle: neither edge");
+        let (row, _, rows) = caret_row(three, three.len(), 40);
+        assert_eq!(row + 1, rows, "bottom");
+    }
+
+    #[test]
     fn wrapping_is_hard_so_a_column_means_the_same_thing_in_both_answers() {
         // Word wrapping is right for prose and wrong for a field being edited:
         // a word jumping to the next row moves every column after it, and the
         // caret would follow the arithmetic rather than the character.
-        let (rows, _) = lay("aaa bbb ccc", 0, 4);
+        let (rows, _, _) = lay("aaa bbb ccc", 0, 4);
         assert_eq!(rows, vec!["aaa ", "bbb ", "ccc"], "broken at the edge");
         // Two cells each, so a three-cell field holds one per row — a wide
         // character is never halved to fill the gap.
-        let (rows, at) = lay("中文中文", 0, 3);
+        let (rows, at, _) = lay("中文中文", 0, 3);
         assert_eq!(rows, vec!["中", "文", "中", "文"], "never mid-character");
         assert_eq!(at, (0, 0));
     }

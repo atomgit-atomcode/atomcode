@@ -190,6 +190,18 @@ impl Host {
             }
         }
 
+        // What the person said is what an up-arrow goes back through. Folded
+        // here because this is where facts land, and consecutive repeats are
+        // dropped the way every shell drops them.
+        if let SessionEvent::UserMessage { text, .. } = fact {
+            let mut m = self.moment.write().expect("moment poisoned");
+            if !text.trim().is_empty()
+                && m.history.last().map(String::as_str) != Some(text.as_str())
+            {
+                m.history.push(text.clone());
+            }
+        }
+
         if held {
             let grew = self.stream_height(width).saturating_sub(before);
             if grew > 0 {
@@ -576,6 +588,29 @@ mod tests {
         assert_ne!(before, folded, "clicking a block changed nothing");
         h.presentation.write().unwrap().toggle_block(id, kind);
         assert_eq!(h.compose(size).rows().join("\n"), before, "not an inverse");
+    }
+
+    #[test]
+    fn what_was_said_is_folded_from_the_log_not_kept_beside_it() {
+        // Folded here rather than appended at submit, so a resumed session can
+        // arrow back through what was said before the resume — the log is the
+        // only thing that survives, and a second copy would drift from it.
+        let h = fed();
+        let history = h.moment.read().unwrap().history.clone();
+        assert_eq!(history, vec!["fix the build", "now break it"]);
+
+        // Consecutive repeats collapse, the way every shell collapses them.
+        h.absorb(&SessionEvent::UserMessage {
+            text: "now break it".into(),
+            turn: 9,
+            images: Vec::new(),
+        });
+        h.absorb(&SessionEvent::UserMessage {
+            text: "   ".into(),
+            turn: 10,
+            images: Vec::new(),
+        });
+        assert_eq!(h.moment.read().unwrap().history, history, "{history:?}");
     }
 
     #[test]

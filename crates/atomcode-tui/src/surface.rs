@@ -155,6 +155,16 @@ pub trait Surface: Send + Sync {
         false
     }
 
+    /// Forget what is believed to be on screen, so the next frame is painted
+    /// in full.
+    ///
+    /// The renderer only sends rows that changed, which is what stops an idle
+    /// screen from churning — and which means anything *else* that writes to
+    /// this terminal leaves marks that are never painted over, because from
+    /// here nothing changed. Before the diff, a full erase every 110ms hid that
+    /// class of damage by brute force. This is the way back from it.
+    fn forget(&self) {}
+
     /// Put text on the system clipboard.
     ///
     /// The surface's job because it is the only layer that may talk to the
@@ -326,7 +336,20 @@ pub struct Terminal {
     mouse: std::sync::atomic::AtomicBool,
     caps: crate::caps::Caps,
     painted: LastPainted,
+    /// Where stderr was sent while we hold the screen, and the descriptor it
+    /// came from. See [`Terminal::take_stderr`].
+    stderr: Option<StderrHeld>,
 }
+
+/// The real stderr, set aside, and the file it was pointed at instead.
+#[cfg(unix)]
+struct StderrHeld {
+    original: std::os::fd::RawFd,
+    path: std::path::PathBuf,
+}
+
+#[cfg(not(unix))]
+struct StderrHeld;
 
 impl Terminal {
     /// The bytes this frame would send, given what is already on the screen —
@@ -368,9 +391,80 @@ impl Terminal {
             mouse: std::sync::atomic::AtomicBool::new(mouse),
             caps,
             painted: LastPainted::default(),
+            stderr: take_stderr(),
         })
     }
 }
+
+/// Point stderr at a file for as long as this UI owns the screen.
+///
+/// **The terminal is a physical singleton and this row holds it.** Anything
+/// else that writes here — a library's `eprintln!`, a dependency's warning, a
+/// panic message from a background task — lands as characters at whatever cell
+/// the cursor happens to be on. That was survivable when every frame began with
+/// a full-screen erase: the damage lasted 110ms. It is not survivable against a
+/// renderer that only repaints rows it believes changed, because from here
+/// nothing changed, and the marks stay until something else happens to touch
+/// that row. A stray character in the middle of a session is exactly that.
+///
+/// Nothing is silenced: the output goes to a file, and [`Terminal::restore`]
+/// says where when there is anything in it. Losing a diagnostic would be a
+/// worse trade than the corruption it prevents.
+#[cfg(unix)]
+fn take_stderr() -> Option<StderrHeld> {
+    use std::os::fd::IntoRawFd;
+
+    let path = std::env::temp_dir().join(format!("atomcode-tui-{}.stderr.log", std::process::id()));
+    let file = std::fs::File::create(&path).ok()?;
+    // SAFETY: both are open descriptors for the length of these calls; `dup`
+    // and `dup2` are the documented way to swap one, and failure is reported
+    // rather than assumed away.
+    let original = unsafe { libc::dup(libc::STDERR_FILENO) };
+    if original < 0 {
+        return None;
+    }
+    let fd = file.into_raw_fd();
+    if unsafe { libc::dup2(fd, libc::STDERR_FILENO) } < 0 {
+        unsafe { libc::close(fd) };
+        unsafe { libc::close(original) };
+        return None;
+    }
+    unsafe { libc::close(fd) };
+    Some(StderrHeld { original, path })
+}
+
+#[cfg(not(unix))]
+fn take_stderr() -> Option<StderrHeld> {
+    None
+}
+
+/// Put stderr back, and say where anything that was written to it went.
+#[cfg(unix)]
+fn give_back_stderr(held: &StderrHeld) {
+    use std::io::Write;
+    // SAFETY: `original` is the descriptor `take_stderr` duplicated and has not
+    // been closed; this is the matching half of that swap.
+    unsafe {
+        libc::dup2(held.original, libc::STDERR_FILENO);
+        libc::close(held.original);
+    }
+    match std::fs::metadata(&held.path).map(|m| m.len()) {
+        Ok(0) | Err(_) => {
+            let _ = std::fs::remove_file(&held.path);
+        }
+        Ok(n) => {
+            let mut err = std::io::stderr();
+            let _ = writeln!(
+                err,
+                "{n} bytes went to stderr; kept at {}",
+                held.path.display()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn give_back_stderr(_held: &StderrHeld) {}
 
 /// Hand the text to whatever this machine uses for a clipboard.
 ///
@@ -768,6 +862,9 @@ impl Surface for Terminal {
     fn mouse(&self) -> bool {
         self.mouse.load(std::sync::atomic::Ordering::SeqCst)
     }
+    fn forget(&self) {
+        self.painted.forget();
+    }
     fn copy(&self, text: &str) {
         if text.is_empty() {
             return;
@@ -793,6 +890,11 @@ impl Surface for Terminal {
         let _ = out.write_all(ansi::LEAVE.as_bytes());
         let _ = out.flush();
         let _ = crossterm::terminal::disable_raw_mode();
+        // Last, so anything it has to report is printed to a terminal that is
+        // back in its normal mode.
+        if let Some(held) = &self.stderr {
+            give_back_stderr(held);
+        }
     }
 }
 

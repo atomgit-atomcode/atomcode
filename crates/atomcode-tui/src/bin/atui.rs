@@ -312,7 +312,12 @@ KEYS
     ctrl-d       quit            ctrl-u         clear the line
     ctrl-w       delete a word   ctrl-r         fold or unfold reasoning
     ctrl-t       fold tool calls ctrl-n         show or hide the mascot
-    pgup/pgdn    scroll          up/down        scroll by a line
+    ctrl-o       hand the mouse back to the terminal
+    ctrl-l       repaint everything (for when something else wrote here)
+    ctrl-f       focus layout      ctrl-z         undo the last layout change
+    up/down      move the caret in what you are typing; at its top or bottom
+                 edge, step back and forward through what you have said
+    pgup/pgdn    scroll the conversation (so does the wheel, a line a notch)
 
 MOUSE
     drag to select; the selection is copied to the clipboard on release

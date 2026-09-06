@@ -23,6 +23,12 @@ pub enum Action {
     CaretRight,
     CaretHome,
     CaretEnd,
+    /// Up a row inside what is being typed — or, at the top of it, back to the
+    /// previous thing that was said.
+    CaretUp,
+    /// The mirror: down a row, or forward through the history and out the far
+    /// side to the draft that was set aside.
+    CaretDown,
     /// Stop the running turn. Cooperative.
     Cancel,
     Quit,
@@ -34,6 +40,8 @@ pub enum Action {
     /// Take the pointer, or hand it back to the terminal so click-drag selects
     /// text again.
     ToggleMouse,
+    /// Forget what is believed to be on screen and paint all of it again.
+    Redraw,
     /// Start a selection at this cell.
     SelectFrom(u16, u16),
     /// Drag it out to here.
@@ -143,16 +151,26 @@ impl Keymap for Default_ {
             (KeyPress::plain(Key::End), Action::CaretEnd),
             (KeyPress::plain(Key::PageUp), Action::Scroll(-10)),
             (KeyPress::plain(Key::PageDown), Action::Scroll(10)),
-            (KeyPress::plain(Key::Up), Action::Scroll(-1)),
-            (KeyPress::plain(Key::Down), Action::Scroll(1)),
+            // The arrows belong to the field, the way they do in every other
+            // text input. Scrolling the conversation is pgup/pgdn and the
+            // wheel — which now moves a line a notch, so nothing was lost.
+            (KeyPress::plain(Key::Up), Action::CaretUp),
+            (KeyPress::plain(Key::Down), Action::CaretDown),
             (KeyPress::ctrl('r'), Action::ToggleFold("reasoning")),
             (KeyPress::ctrl('t'), Action::ToggleFold("tool_call")),
             (KeyPress::ctrl('n'), Action::ToggleModule("mascot")),
             // Hand the mouse back, and take it again. `o` for "off", and one of
             // the few control keys a terminal does not already claim.
             (KeyPress::ctrl('o'), Action::ToggleMouse),
+            // ctrl-l is "redraw" in every terminal there has ever been, and
+            // that is the reflex to serve: it is the key a person reaches for
+            // when the screen is wrong.
+            (KeyPress::ctrl('l'), Action::Redraw),
+            // The `focus` preset moved off ctrl-l rather than being dropped —
+            // it is one of the three routes to a layout op, and the layout
+            // tests exist to check that all three still agree.
             (
-                KeyPress::ctrl('l'),
+                KeyPress::ctrl('f'),
                 Action::Layout(crate::layout::LayoutOp::Preset {
                     name: "focus".into(),
                 }),
