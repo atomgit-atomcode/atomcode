@@ -83,6 +83,19 @@ struct Projector {
 }
 
 impl Projector {
+    /// Whether this tool is one the catalog will actually dispatch.
+    ///
+    /// Announces when it cannot tell. Suppressing on "no catalog visible" would
+    /// drop *every* `ToolStarted` in a tree with no `tools` row — silently, and
+    /// only for the drivers that need those events most. The rule is: stay
+    /// quiet only when we know for certain the tool is absent.
+    fn mounted(&self, name: &str) -> bool {
+        match self.tools.as_ref() {
+            Some(tools) => tools.get(name).is_some(),
+            None => true,
+        }
+    }
+
     fn parallel_safe(&self, name: &str, arguments: &str) -> bool {
         self.tools
             .as_ref()
@@ -140,7 +153,15 @@ impl Projector {
                     });
                 }
                 for call in tool_calls {
-                    out.push(AgentEvent::ToolStarted { call: call.clone() });
+                    // Only for a tool that will actually run. A model naming a
+                    // tool nobody mounted is ordinary, and announcing that it
+                    // *started* is a lie the driver then has to unpick — the
+                    // reference engine goes straight to the failed result, and
+                    // a differential run showed this as the only difference on
+                    // that path.
+                    if self.mounted(&call.name) {
+                        out.push(AgentEvent::ToolStarted { call: call.clone() });
+                    }
                 }
                 out
             }
@@ -448,6 +469,35 @@ impl UserQuestions for Asker {
 // ---- the pump -----------------------------------------------------------
 
 /// Wait on the turn in flight, or forever when there is none.
+/// The conversation as the model has it, for a driver to persist.
+///
+/// The system prompt is prepended, even though it lives in the prompt registry
+/// rather than in the log. A snapshot is "what the model saw", and a driver that
+/// persists one and resumes from it would otherwise come back with the system
+/// message gone. A differential run against `atomcode-coding` caught exactly
+/// that: it produced `user, assistant` where the reference produced
+/// `system, …, user, assistant`.
+///
+/// One coalesced system message rather than the reference's several: the stack
+/// already coalesces consecutive system messages on the wire, because some
+/// providers only honour the first.
+fn send_snapshot(ctx: &Context, events: &mpsc::UnboundedSender<AgentEvent>) {
+    let Some(log) = ctx.service::<SessionSvc>() else {
+        return;
+    };
+    let mut messages = Vec::new();
+    if let Some(prompts) = ctx.service::<crate::seams::SystemPromptSvc>() {
+        let system = prompts.render();
+        if !system.is_empty() {
+            messages.push(atomcode_kernel::message::Message::system(system));
+        }
+    }
+    messages.extend(log.derive_messages());
+    let _ = events.send(AgentEvent::Snapshot {
+        snapshot: SessionSnapshot::new(messages),
+    });
+}
+
 async fn finished(turn: &mut Option<tokio::task::JoinHandle<()>>) {
     match turn {
         Some(handle) => {
@@ -495,6 +545,14 @@ async fn pump(
         return;
     };
     let mut turn: Option<tokio::task::JoinHandle<()>> = None;
+    // Snapshot requests that arrived while a turn was running.
+    //
+    // A driver asks for a snapshot to persist the conversation; answering it
+    // from a log the running turn has not finished appending to hands back a
+    // conversation that never existed. The reference engine answers after the
+    // turn, and a differential run caught this: it replied instantly with
+    // `messages=0` where the reference replied with `messages=4`.
+    let mut snapshots_waiting = 0usize;
 
     loop {
         let woke = tokio::select! {
@@ -505,6 +563,9 @@ async fn pump(
         let command = match woke {
             Woke::TurnDone => {
                 turn = None;
+                for _ in 0..std::mem::take(&mut snapshots_waiting) {
+                    send_snapshot(&ctx, &events);
+                }
                 // A message that arrived after the loop decided it was done
                 // starts the next turn rather than waiting for one.
                 if agent.inbox().has_waking_input() {
@@ -544,10 +605,13 @@ async fn pump(
                 continue;
             }
             AgentCommand::Snapshot => {
-                if let Some(log) = ctx.service::<SessionSvc>() {
-                    let _ = events.send(AgentEvent::Snapshot {
-                        snapshot: SessionSnapshot::new(log.derive_messages()),
-                    });
+                // Queued while a turn is in flight; answered the moment it
+                // ends. Answering now would describe a conversation that is
+                // still being written.
+                if turn.is_some() {
+                    snapshots_waiting += 1;
+                } else {
+                    send_snapshot(&ctx, &events);
                 }
                 continue;
             }

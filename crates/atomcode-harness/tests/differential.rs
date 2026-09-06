@@ -185,7 +185,22 @@ fn normalise(event: &AgentEvent) -> Option<Step> {
         AgentEvent::Request { kind, .. } => step("Request", kind.clone()),
         AgentEvent::Usage(_) => step("Usage", String::new()),
         AgentEvent::Snapshot { snapshot } => {
-            step("Snapshot", format!("messages={}", snapshot.messages.len()))
+            // Roles, not just a count: "4 vs 2" says there is a difference,
+            // "system,user,assistant,… vs user,assistant" says what it is.
+            // Consecutive system messages collapse to one. Not a fudge: the
+            // stack already coalesces them on the wire because some providers
+            // honour only the first, so "one system message" and "three in a
+            // row" are the same conversation. What must not differ is whether
+            // there is a system message at all.
+            let mut roles: Vec<String> = Vec::new();
+            for m in &snapshot.messages {
+                let role = format!("{:?}", m.role).to_lowercase();
+                if role == "system" && roles.last().map(String::as_str) == Some("system") {
+                    continue;
+                }
+                roles.push(role);
+            }
+            step("Snapshot", roles.join(","))
         }
         AgentEvent::TurnComplete { reason } => step("TurnComplete", format!("{reason:?}")),
         AgentEvent::Error { message, .. } => step("Error", message.clone()),
@@ -762,11 +777,28 @@ async fn a_cancel_lands() {
             images: Vec::new(),
         }]
     };
+    // 400ms round, cancelled 60ms in. An engine that honours the cancel
+    // promptly finishes well before the round would have; one that waits for
+    // the in-flight request finishes after it. That is a difference a person
+    // feels, and it does not show up in the event stream at all — the same
+    // events arrive, just late.
     let script = || Script::new(&[Reply::Slow(400, "working")]);
+    let started = std::time::Instant::now();
     let a = reference_cancelling(script(), &dir, cmds()).await;
+    let took_reference = started.elapsed();
+    let started = std::time::Instant::now();
     let b = candidate_cancelling(script(), &dir, cmds()).await;
+    let took_candidate = started.elapsed();
     let report = render(&a, &b);
     ratchet("cancel", divergences(&a, &b), &report);
+
+    for (who, took) in [("参考", took_reference), ("候选", took_candidate)] {
+        assert!(
+            took < std::time::Duration::from_millis(380),
+            "{who}: 取消用了 {took:?} —— 那一轮本来就要 400ms，说明它在等回合跑完\
+             而不是中断它{report}"
+        );
+    }
 
     for (who, steps) in [("参考", &a), ("候选", &b)] {
         assert!(

@@ -456,23 +456,37 @@ impl AgentLoop for PluginAgentLoop {
                 },
             );
 
-            let response = match self
-                .request(
-                    provider.clone(),
-                    session.clone(),
-                    &ctx,
+            // Race the request against the stop button.
+            //
+            // Checking `cancelled()` between rounds is not enough: a model
+            // answer takes seconds, and a cancel that only lands after it does
+            // means a person who pressed stop waits for the whole reply. The
+            // events are identical either way — they just arrive late — so this
+            // is invisible to an event-stream comparison and was caught by
+            // timing a cancel against `atomcode-coding`, which aborts promptly.
+            let asked = self.request(
+                provider.clone(),
+                session.clone(),
+                &ctx,
+                turn,
+                step,
+                ModelRequest {
+                    messages,
+                    tools,
+                    options: ChatOptions::default(),
                     turn,
-                    step,
-                    ModelRequest {
-                        messages,
-                        tools,
-                        options: ChatOptions::default(),
-                        turn,
-                        round: step,
-                    },
-                )
-                .await
-            {
+                    round: step,
+                },
+            );
+            let cancel = agent.cancel_token();
+            let response = match tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    outcome.stop = StopReason::Cancelled;
+                    break;
+                }
+                answered = asked => answered,
+            } {
                 Ok(response) => response,
                 Err(error) => {
                     outcome.stop = StopReason::ProviderError;
