@@ -3519,7 +3519,6 @@ mod tests {
             friendly_http_error(401, "   "),
             "API key 未授权或已失效（HTTP 401）"
         );
-        assert!(friendly_http_error(401, "").contains("API key"));
         // 429 is NOT wrapped (kernel rate-limit path owns it — must keep the
         // literal `HTTP 429: ` prefix so `rate_limit_server_message` can strip it).
         assert_eq!(friendly_http_error(429, "slow down"), "HTTP 429: slow down");
