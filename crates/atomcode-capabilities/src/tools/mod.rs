@@ -201,7 +201,7 @@ pub fn register_coding_tools(reg: &mut ToolRegistry) {
 pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
     reg.register(Arc::new(ReadFileTool::new(vision)));
     reg.register(Arc::new(WriteFileTool::default()));
-    reg.register(Arc::new(EditFileTool));
+    reg.register(Arc::new(EditFileTool::default()));
     reg.register(Arc::new(ListDirTool::default()));
     reg.register(Arc::new(OpenFileTool));
     reg.register(Arc::new(BashTool));

@@ -323,7 +323,7 @@ mod tests {
         use crate::tools::edit::EditFileTool;
 
         // edit_file: two DIFFERENT edits collapse to the SAME grant key.
-        let edit: Arc<dyn Tool> = Arc::new(EditFileTool);
+        let edit: Arc<dyn Tool> = Arc::new(EditFileTool::default());
         let a = ToolCall {
             id: "1".into(),
             name: "edit_file".into(),

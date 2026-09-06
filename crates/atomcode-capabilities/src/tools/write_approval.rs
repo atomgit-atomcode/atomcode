@@ -113,6 +113,31 @@ static TEMP_ROOTS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
         .collect()
 });
 
+// ---- why this gate does not go through [`crate::world`] --------------------
+//
+// The world seam exists so containment is a boundary rather than a rule tools
+// cooperate with, and a gate that canonicalises on the host while the tool it
+// guards writes through a remote world would be checking one machine and
+// permitting another. That argument does not reach these four call sites,
+// because none of them is asking the world a question it owns:
+//
+// * `TEMP_ROOTS` resolves `$TMPDIR` / `/tmp` — the *host's* scratch space, and
+//   the reason a write there needs no prompt. A remote world's temp dir is a
+//   different fact that this exemption is not about.
+// * `canonical_dir_key` computes a session-grant KEY. Like `edit`'s path lock,
+//   it is an identity, not a claim about what is on disk.
+// * `path_in_workspace` / `path_under_any` ask "is this inside the workspace" —
+//   which a fenced world already answers, and answers more strongly: it refuses
+//   at `write_bytes` whatever this gate decided upstream. The two can disagree
+//   (a gate keyed on `cwd`, a world keyed on its configured root), but only in
+//   the safe direction — the gate is upstream, so a write it waves through can
+//   still be denied by the world, never the reverse.
+//
+// So what is left here is approval *UX* policy — when to prompt, what a grant
+// covers — and that is host-local by nature. Containment lives in the world.
+// Threading a world through these would duplicate the world's own check in a
+// second place, which is how two containment rules start disagreeing.
+
 /// True if `raw` (resolved against `cwd`) lands inside ANY of `roots`. Walks the target's
 /// ancestors, canonicalizing the deepest one that EXISTS (so a not-yet-created leaf is
 /// classified by its parent) — canonicalization resolves `..` traversal and symlinks, so a
@@ -390,7 +415,7 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     fn edit_tool() -> Arc<dyn Tool> {
-        Arc::new(crate::tools::edit::EditFileTool)
+        Arc::new(crate::tools::edit::EditFileTool::default())
     }
     fn write_tool() -> Arc<dyn Tool> {
         Arc::new(crate::tools::write::WriteFileTool::default())

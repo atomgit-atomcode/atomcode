@@ -14,7 +14,24 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::sync::Mutex as AsyncMutex;
 
-pub struct EditFileTool;
+pub struct EditFileTool {
+    world: Arc<dyn crate::world::FileSystem>,
+}
+
+impl Default for EditFileTool {
+    fn default() -> Self {
+        Self {
+            world: Arc::new(crate::world::LocalFs::unfenced()),
+        }
+    }
+}
+
+impl EditFileTool {
+    /// Route this tool's reads and writes through `world`.
+    pub fn with_world(world: Arc<dyn crate::world::FileSystem>) -> Self {
+        Self { world }
+    }
+}
 
 type PathLock = AsyncMutex<()>;
 
@@ -23,6 +40,14 @@ fn edit_path_locks() -> &'static Mutex<HashMap<PathBuf, Weak<PathLock>>> {
     LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Deliberately NOT routed through the world.
+///
+/// This canonicalisation produces a *lock key*, not a fact about the file: it
+/// serialises this process's own concurrent edits to one path. A world that
+/// cannot canonicalise (a remote one, say) falls through to the raw path, which
+/// is still a perfectly good key — and going through the async seam would turn a
+/// synchronous helper async to buy nothing. The rule "branch only on facts from
+/// your own world" is about what the tool *decides*; this decides nothing.
 fn edit_path_lock(path: &Path) -> Arc<PathLock> {
     let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut locks = edit_path_locks().lock().unwrap_or_else(|p| p.into_inner());
@@ -103,7 +128,7 @@ impl Tool for EditFileTool {
         // pre-commit check also catches external changes that happen before the check.
         let path_lock = edit_path_lock(&path);
         let _path_guard = path_lock.lock().await;
-        let raw = match tokio::fs::read(&path).await {
+        let raw = match self.world.read_bytes(&path).await {
             Ok(b) => b,
             Err(e) => {
                 return err(format!(
@@ -169,7 +194,7 @@ impl Tool for EditFileTool {
                     );
                 }
                 if let Err(msg) =
-                    write_encoded_if_unchanged(&path, &raw, &fuzzy_result, file_encoding).await
+                    write_encoded_if_unchanged(self.world.as_ref(), &path, &raw, &fuzzy_result, file_encoding).await
                 {
                     return err(msg);
                 }
@@ -200,7 +225,7 @@ impl Tool for EditFileTool {
                     );
                 }
                 if let Err(msg) =
-                    write_encoded_if_unchanged(&path, &raw, &ws_result, file_encoding).await
+                    write_encoded_if_unchanged(self.world.as_ref(), &path, &raw, &ws_result, file_encoding).await
                 {
                     return err(msg);
                 }
@@ -220,7 +245,7 @@ impl Tool for EditFileTool {
             {
                 if anchor_result != content {
                     if let Err(msg) =
-                        write_encoded_if_unchanged(&path, &raw, &anchor_result, file_encoding).await
+                        write_encoded_if_unchanged(self.world.as_ref(), &path, &raw, &anchor_result, file_encoding).await
                     {
                         return err(msg);
                     }
@@ -261,7 +286,7 @@ impl Tool for EditFileTool {
         } else {
             content.replacen(&old_match, &new_match, 1)
         };
-        if let Err(msg) = write_encoded_if_unchanged(&path, &raw, &updated, file_encoding).await {
+        if let Err(msg) = write_encoded_if_unchanged(self.world.as_ref(), &path, &raw, &updated, file_encoding).await {
             return err(msg);
         }
         let replaced = if a.replace_all { count } else { 1 };
@@ -279,6 +304,7 @@ impl Tool for EditFileTool {
 /// with a user-facing message) rather than write replacement bytes if the text cannot
 /// be represented — so a failed re-encode leaves the file untouched, never corrupted.
 async fn write_encoded(
+    world: &dyn crate::world::FileSystem,
     path: &std::path::Path,
     text: &str,
     encoding: crate::tools::encoding::FileEncoding,
@@ -290,7 +316,7 @@ async fn write_encoded(
             crate::pathnorm::to_display(path)
         )
     })?;
-    tokio::fs::write(path, bytes).await.map_err(|e| {
+    world.write_bytes(path, &bytes).await.map_err(|e| {
         format!(
             "edit_file: failed to write {}: {e}",
             crate::pathnorm::to_display(path)
@@ -304,12 +330,13 @@ async fn write_encoded(
 /// best-effort guard for external writers; because ordinary filesystems do not provide a
 /// portable compare-and-swap write, an unrelated process can still race after the check.
 async fn write_encoded_if_unchanged(
+    world: &dyn crate::world::FileSystem,
     path: &Path,
     expected: &[u8],
     text: &str,
     encoding: crate::tools::encoding::FileEncoding,
 ) -> Result<(), String> {
-    let current = tokio::fs::read(path).await.map_err(|e| {
+    let current = world.read_bytes(path).await.map_err(|e| {
         format!(
             "edit_file: cannot re-read {} before commit: {e}. The file was NOT modified.",
             crate::pathnorm::to_display(path)
@@ -322,7 +349,7 @@ async fn write_encoded_if_unchanged(
             crate::pathnorm::to_display(path)
         ));
     }
-    write_encoded(path, text, encoding).await
+    write_encoded(world, path, text, encoding).await
 }
 
 /// How far the closest-line scan looks into the file. The verbatim window below may sit
@@ -751,7 +778,9 @@ mod tests {
         let expected = std::fs::read(&path).unwrap();
         std::fs::write(&path, "changed elsewhere\n").unwrap();
 
+        let world = crate::world::LocalFs::unfenced();
         let error = write_encoded_if_unchanged(
+            &world,
             &path,
             &expected,
             "our replacement\n",
@@ -776,7 +805,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = EditFileTool
+        let result = EditFileTool::default()
             .execute(
                 r#"{"file_path":"sample.py","old_string":"def test_rate_limit_old():\n    assert response.status == 429","new_string":"replacement"}"#,
                 &ctx(d.path()),
@@ -807,7 +836,7 @@ mod tests {
         }
         std::fs::write(d.path().join("app.js"), &file).unwrap();
 
-        let result = EditFileTool
+        let result = EditFileTool::default()
             .execute(
                 r#"{"file_path":"app.js","old_string":"  Promise.all([\n    api('/a'),\n    api('/b'),\n    api('/c')\n  ]).then(go);","new_string":"x"}"#,
                 &ctx(d.path()),
@@ -849,7 +878,7 @@ mod tests {
         let huge = format!("function bundle(){}", "x".repeat(MAX_EXCERPT_CHARS * 2));
         std::fs::write(d.path().join("bundle.js"), format!("{huge}\n")).unwrap();
 
-        let result = EditFileTool
+        let result = EditFileTool::default()
             .execute(
                 r#"{"file_path":"bundle.js","old_string":"function bundleXYZ(){nope}","new_string":"x"}"#,
                 &ctx(d.path()),
@@ -897,7 +926,7 @@ mod tests {
         assert!(!had_err);
         std::fs::write(d.path().join("notes.txt"), &gbk[..]).unwrap();
 
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"notes.txt","old_string":"第二行","new_string":"改过的第二行"}"#,
                 &ctx(d.path()),
@@ -926,7 +955,7 @@ mod tests {
         bytes.extend_from_slice(b"\n");
         std::fs::write(d.path().join("weird.txt"), &bytes).unwrap();
 
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"weird.txt","old_string":"plain","new_string":"changed"}"#,
                 &ctx(d.path()),
@@ -945,7 +974,7 @@ mod tests {
     async fn unique_replace_succeeds() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn main() {\n    let x = 1;\n}\n").unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#,
                 &ctx(d.path()),
@@ -1004,7 +1033,7 @@ mod tests {
     async fn ambiguous_match_refuses() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "dup\ndup\n").unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"a.txt","old_string":"dup","new_string":"x"}"#,
                 &ctx(d.path()),
@@ -1023,7 +1052,7 @@ mod tests {
     async fn replace_all_handles_duplicates() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "dup\ndup\ndup\n").unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"a.txt","old_string":"dup","new_string":"x","replace_all":true}"#,
                 &ctx(d.path()),
@@ -1041,7 +1070,7 @@ mod tests {
     async fn missing_string_errors_and_keeps_file() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "hello\n").unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"a.txt","old_string":"absent","new_string":"x"}"#,
                 &ctx(d.path()),
@@ -1057,7 +1086,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_is_risky() {
-        assert_eq!(EditFileTool.risk("{}"), RiskLevel::Risky);
+        assert_eq!(EditFileTool::default().risk("{}"), RiskLevel::Risky);
     }
 
     // A CRLF (Windows) file edited with a multi-line `old_string` whose line break is
@@ -1072,7 +1101,7 @@ mod tests {
             "  path: '/help',\r\n  next: 1,\r\n",
         )
         .unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"router.js","old_string":"  path: '/help',\n  next: 1,","new_string":"  path: '/proxyCase',\n  next: 1,"}"#,
                 &ctx(d.path()),
@@ -1097,7 +1126,7 @@ mod tests {
     async fn literal_match_writes_new_verbatim_no_crlf_injection() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("m.txt"), "head\r\nalpha\nbeta\n").unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"m.txt","old_string":"alpha\nbeta","new_string":"alpha\nBETA"}"#,
                 &ctx(d.path()),
@@ -1118,7 +1147,7 @@ mod tests {
     async fn eol_only_difference_is_rejected_as_noop() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("c.txt"), "a\r\nb\r\n").unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"c.txt","old_string":"a\nb","new_string":"a\r\nb"}"#,
                 &ctx(d.path()),
@@ -1136,7 +1165,7 @@ mod tests {
     async fn empty_old_string_is_rejected() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "abc").unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"a.txt","old_string":"","new_string":"X","replace_all":true}"#,
                 &ctx(d.path()),
@@ -1158,7 +1187,7 @@ mod tests {
     async fn lf_file_is_unaffected_by_eol_tolerance() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "let x = 1;\nlet y = 2;\n").unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"a.rs","old_string":"let x = 1;\nlet y = 2;","new_string":"let x = 9;\nlet y = 2;"}"#,
                 &ctx(d.path()),
@@ -1184,7 +1213,7 @@ mod tests {
             "fn f() {\n\tlet x = 1;\n\tlet y = 2;\n}\n",
         )
         .unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"f.rs","old_string":"    let x = 1;\n    let y = 2;","new_string":"    let x = 9;\n    let y = 2;"}"#,
                 &ctx(d.path()),
@@ -1219,7 +1248,7 @@ mod tests {
         )
         .unwrap();
         // Model copied LF text (read_file strips \r) with SPACE indentation.
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"f.rs","old_string":"    let x = 1;\n    let y = 2;","new_string":"    let x = 9;\n    let y = 2;"}"#,
                 &ctx(d.path()),
@@ -1238,7 +1267,7 @@ mod tests {
     async fn fuzzy_does_not_fire_for_short_fragments() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "\tx\n").unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"a.txt","old_string":"  x","new_string":"  y"}"#,
                 &ctx(d.path()),
@@ -1268,7 +1297,7 @@ mod tests {
             "[dependencies]\nreqwest = { version = \"0.12\", features = [\"json\", \"stream\", \"gzip\"] }\nmysql = { version = \"25\" }\n",
         )
         .unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"Cargo.toml","old_string":"reqwest = { version = \"0.12\", features = [\"json\",\"stream\",\"gzip\"] }","new_string":"reqwest = { version = \"0.12\", default-features = false, features = [\"json\", \"stream\", \"gzip\"] }"}"#,
                 &ctx(d.path()),
@@ -1300,7 +1329,7 @@ mod tests {
             "steps:\n      - name: Remove local Cargo config for CI\n        run: rm -f .cargo/config.toml\n        shell: bash\n      - name: Build\n",
         )
         .unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"android.yml","old_string":"- name: Remove local Cargo config for CI\n  run:  rm -f .cargo/config.toml\n  shell:  bash","new_string":"- name: Copy CI Cargo config\n  run: cp ci/config.toml .cargo/config.toml\n  shell: bash"}"#,
                 &ctx(d.path()),
@@ -1329,7 +1358,7 @@ mod tests {
     async fn whitespace_insensitive_skips_short_fragment() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.txt"), "a = [1, 2]\nb = 9\n").unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"a.txt","old_string":"a=[1,2]","new_string":"a=[3]"}"#,
                 &ctx(d.path()),
@@ -1357,7 +1386,7 @@ mod tests {
             "alpha = [\"one\", \"two\", \"three\"]\nbeta = 1\nalpha = [\"one\", \"two\", \"three\"]\n",
         )
         .unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"a.toml","old_string":"alpha = [\"one\",\"two\",\"three\"]","new_string":"alpha = [\"one\"]"}"#,
                 &ctx(d.path()),
@@ -1396,7 +1425,7 @@ mod tests {
             "fn f() {\n\tlet a = 1;\n\tlet b = 2;\n\tlet c = 3;\n}\n",
         )
         .unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"f.rs","old_string":"    let a = 1;\n    let b = 20;\n    let c = 3;","new_string":"    let a = 1;\n    let b = 99;\n    let c = 3;"}"#,
                 &ctx(d.path()),
@@ -1422,7 +1451,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let original = "start marker\nreal one\nreal two\nreal three\nend marker\n";
         std::fs::write(d.path().join("a.txt"), original).unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 // first/last match, but all 3 interior lines are wrong → 2/5 < half → reject.
                 r#"{"file_path":"a.txt","old_string":"start marker\nWRONG a\nWRONG b\nWRONG c\nend marker","new_string":"start marker\nX\nend marker"}"#,
@@ -1449,7 +1478,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let original = "region top\n\treal one\n\treal two\nregion bottom\n";
         std::fs::write(d.path().join("a.txt"), original).unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 // first/last match; BOTH interior lines wrong → matched 2/4 → reject.
                 r#"{"file_path":"a.txt","old_string":"region top\nWRONG one\nWRONG two\nregion bottom","new_string":"region top\nX\nregion bottom"}"#,
@@ -1479,7 +1508,7 @@ mod tests {
             "fn f() {\n\tlet a = 1;\n\tlet b = 2;\n}\n",
         )
         .unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 // Model copied with spaces; new_string's 2nd line is OUTDENTED to column 0.
                 r#"{"file_path":"f.rs","old_string":"    let a = 1;\n    let b = 2;","new_string":"    let a = 1;\ndone();"}"#,
@@ -1505,7 +1534,7 @@ mod tests {
         let original =
             "open block\n  middle here\nclose block\n\nopen block\n  other mid\nclose block\n";
         std::fs::write(d.path().join("a.txt"), original).unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"a.txt","old_string":"open block\n  drifted\nclose block","new_string":"open block\n  changed\nclose block"}"#,
                 &ctx(d.path()),
@@ -1528,7 +1557,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let original = "if x {\n\tfoo();\n}\n";
         std::fs::write(d.path().join("a.rs"), original).unwrap();
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"a.rs","old_string":"{\n    bar();\n}","new_string":"{\n    baz();\n}"}"#,
                 &ctx(d.path()),
@@ -1555,7 +1584,7 @@ mod tests {
         .unwrap();
         // Model reproduced the body with plain-space indentation → exact match fails,
         // fuzzy path fires.
-        let r = EditFileTool
+        let r = EditFileTool::default()
             .execute(
                 r#"{"file_path":"f.py","old_string":"    x = 1\n    y = 2","new_string":"    x = 99\n    y = 2"}"#,
                 &ctx(d.path()),
