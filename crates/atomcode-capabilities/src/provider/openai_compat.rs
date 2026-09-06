@@ -3067,6 +3067,42 @@ mod tests {
         assert_eq!(calls[0].name, "real");
     }
 
+    /// Companion to `sse_nameless_tool_call_is_dropped` covering the OTHER flush site:
+    /// `finish()` (stream terminates at `[DONE]` with only a non-terminal
+    /// `finish_reason:""`, so buffered calls flush there, not in the finish_reason
+    /// branch). A nameless slot must be dropped here too; the named call survives.
+    #[test]
+    fn sse_nameless_tool_call_dropped_on_finish_flush() {
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(
+            d.feed(
+                line(json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"c0","function":{"arguments":"{}"}},
+                    {"index":1,"id":"c1","function":{"name":"real","arguments":"{}"}}
+                ]},"finish_reason":""}]}))
+                .as_bytes(),
+            ),
+        );
+        ev.extend(d.feed(b"data: [DONE]\n"));
+        let calls: Vec<_> = ev
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the finish() flush must drop the nameless slot too: {calls:?}"
+        );
+        assert_eq!(calls[0].name, "real");
+    }
+
     #[test]
     fn sse_byte_split_robust_and_utf8_safe() {
         let payload = format!(
