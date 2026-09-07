@@ -63,20 +63,47 @@ pub const OPENROUTER_ATTRIBUTION_HEADERS: &[(&str, &str); 3] = &[
 /// `provider` alone). The label-aware suffix match reuses
 /// [`atomcode_config::endpoints::host_matches_domain`] so it agrees with the rest
 /// of the codebase and can't drift.
-pub fn is_openrouter_url(url: &str) -> bool {
+/// The host of a URL, extracted safely for host-gated header helpers. Shared so the
+/// gates (openrouter attribution, opencode session) can't drift in how they parse — and
+/// can't be fooled by a crafted `https://good.example:x@evil.com/…` into reading the
+/// `userinfo` as the host. Authority minus path/query/fragment, minus `userinfo@`, minus
+/// `:port`.
+fn url_host(url: &str) -> &str {
     let authority = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    // Host = the authority minus path/query/fragment...
     let host_port = authority.split(['/', '?', '#']).next().unwrap_or(authority);
-    // ...minus any `userinfo@` prefix. Without this, a crafted
-    // `https://openrouter.ai:x@evil.com/…` would parse the userinfo `openrouter.ai`
-    // as the host and leak the attribution headers to `evil.com`.
     let host_port = host_port
         .rsplit_once('@')
         .map(|(_userinfo, host)| host)
         .unwrap_or(host_port);
-    // ...minus an explicit `:port`.
-    let host = host_port.split(':').next().unwrap_or(host_port);
-    atomcode_config::endpoints::host_matches_domain(host, "openrouter.ai")
+    host_port.split(':').next().unwrap_or(host_port)
+}
+
+pub fn is_openrouter_url(url: &str) -> bool {
+    atomcode_config::endpoints::host_matches_domain(url_host(url), "openrouter.ai")
+}
+
+/// True when `url` targets OpenCode Zen (`opencode.ai`, the OpenAI-compatible `/zen/v1`
+/// endpoint atomcode ships a preset for). Gates the `x-opencode-session` header so it is
+/// sent ONLY there — meaningless (and an unwanted product-identity leak) on any other
+/// OpenAI-compatible endpoint, same rationale as the openrouter-attribution gate.
+fn is_opencode_zen_url(url: &str) -> bool {
+    atomcode_config::endpoints::host_matches_domain(url_host(url), "opencode.ai")
+}
+
+/// Attach OpenCode Zen's required `x-opencode-session` header — one stable ID per
+/// conversation — when `url` targets opencode.ai. We already carry exactly that stable id
+/// (sent as `x-atomcode-session-id`), so surface it under their header name too rather than
+/// mint a second one. Gated to their host; an empty session (session-less sub-agent /
+/// summary) is omitted, matching the `x-atomcode-session-id` behavior.
+fn apply_opencode_session(
+    url: &str,
+    req: reqwest::RequestBuilder,
+    session_id: &str,
+) -> reqwest::RequestBuilder {
+    if session_id.is_empty() || !is_opencode_zen_url(url) {
+        return req;
+    }
+    req.header("x-opencode-session", session_id)
 }
 
 /// Attach the OpenRouter app-attribution headers to `req` when `url` targets
@@ -799,6 +826,8 @@ async fn open_stream(
         if !session_id.is_empty() {
             req = req.header("x-atomcode-session-id", session_id);
         }
+        // OpenCode Zen requires its own `x-opencode-session` (same stable id); host-gated.
+        req = apply_opencode_session(url, req, session_id);
         req = apply_openrouter_attribution(url, req);
         let was_capped = tls12_probe || atomcode_config::tls::should_cap_url(url);
         // TTFB watchdog for THIS attempt. `send()` resolves as soon as the response
@@ -4059,6 +4088,49 @@ mod tests {
         assert!(!is_openrouter_url("https://openrouter.ai:x@evil.com/v1"));
         assert!(!is_openrouter_url("https://openrouter.ai@evil.com/v1"));
         assert!(!is_openrouter_url("not a url"));
+    }
+
+    #[test]
+    fn is_opencode_zen_url_matches_only_opencode_hosts() {
+        assert!(is_opencode_zen_url("https://opencode.ai/zen/v1"));
+        assert!(is_opencode_zen_url(
+            "https://opencode.ai/zen/v1/chat/completions"
+        ));
+        assert!(is_opencode_zen_url("https://api.opencode.ai/zen/v1")); // subdomain
+        assert!(!is_opencode_zen_url("https://openrouter.ai/api/v1"));
+        // Suffix trick: opencode.ai must be the domain, not a prefix of the real host.
+        assert!(!is_opencode_zen_url("https://opencode.ai.evil.com/v1"));
+        // Userinfo trick: the host is after `@`, so this targets evil.com, not opencode.
+        assert!(!is_opencode_zen_url("https://opencode.ai:x@evil.com/v1"));
+    }
+
+    #[test]
+    fn apply_opencode_session_gated_to_opencode_and_nonempty() {
+        let client = reqwest::Client::new();
+        let header_of = |url: &str, sess: &str| {
+            apply_opencode_session(url, client.post(url), sess)
+                .build()
+                .expect("request must build")
+                .headers()
+                .get("x-opencode-session")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        // opencode.ai + non-empty session → header carries the stable id.
+        assert_eq!(
+            header_of("https://opencode.ai/zen/v1/chat/completions", "sess-abc-123"),
+            Some("sess-abc-123".to_string())
+        );
+        // Non-opencode host → never sent (no product-identity leak to other gateways).
+        assert_eq!(
+            header_of("https://api.deepseek.com/v1/chat/completions", "sess-abc-123"),
+            None
+        );
+        // Empty session (sub-agent / summary) → omitted even on opencode.
+        assert_eq!(
+            header_of("https://opencode.ai/zen/v1/chat/completions", ""),
+            None
+        );
     }
 
     #[test]
