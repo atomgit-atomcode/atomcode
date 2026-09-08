@@ -314,8 +314,11 @@ struct IssueArgs {
     body: Option<String>,
     #[serde(default)]
     comment_id: Option<u64>,
-    #[serde(default = "default_state")]
-    state: String,
+    // Optional so `update` can tell "state omitted" from a value — a bare default
+    // would wrongly reopen/close on an edit that only touches title/body. `list`
+    // falls back to "open" at the call site.
+    #[serde(default)]
+    state: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
 }
@@ -342,7 +345,8 @@ impl Tool for AtomgitIssueTool {
     fn description(&self) -> &str {
         "Operate on AtomGit issues. action: \"list\" (owner+repo; optional \
          state=open|closed|all, limit), \"view\" (owner+repo+number), \"create\" \
-         (owner+repo+title; optional body), \"comment_create\"/\"comment_view\" \
+         (owner+repo+title; optional body), \"update\" (owner+repo+number+title; \
+         optional body, state=reopen|close), \"comment_create\"/\"comment_view\" \
          (owner+repo+number; body for create), \"comment_edit\"/\"comment_delete\" \
          (owner+repo+comment_id; body for edit)."
     }
@@ -351,7 +355,7 @@ impl Tool for AtomgitIssueTool {
             "type": "object",
             "properties": {
                 "action": { "type": "string", "enum": [
-                    "list","view","create",
+                    "list","view","create","update",
                     "comment_create","comment_view","comment_edit","comment_delete"
                 ]},
                 "owner": { "type": "string" },
@@ -380,7 +384,10 @@ impl Tool for AtomgitIssueTool {
         let c = &self.client;
         match a.action.as_str() {
             "list" => match (a.owner, a.repo) {
-                (Some(o), Some(r)) => match c.issue_list(&o, &r, &a.state, a.limit).await {
+                (Some(o), Some(r)) => match c
+                    .issue_list(&o, &r, a.state.as_deref().unwrap_or("open"), a.limit)
+                    .await
+                {
                     Ok(is) if is.is_empty() => ok("No issues.".to_string()),
                     Ok(is) => ok(is.iter().map(render_issue).collect::<Vec<_>>().join("\n\n")),
                     Err(e) => err(e),
@@ -404,6 +411,18 @@ impl Tool for AtomgitIssueTool {
                     Err(e) => err(e),
                 },
                 _ => err("atomgit_issue create: owner, repo and title are required".to_string()),
+            },
+            "update" => match (a.owner, a.repo, a.number, a.title) {
+                (Some(o), Some(r), Some(n), Some(t)) => match c
+                    .issue_update(&o, &r, n, &t, a.body.as_deref(), a.state.as_deref())
+                    .await
+                {
+                    Ok(i) => ok(format!("Updated {}", render_issue(&i))),
+                    Err(e) => err(e),
+                },
+                _ => err(
+                    "atomgit_issue update: owner, repo, number and title are required".to_string(),
+                ),
             },
             "comment_create" => match need_owner_repo_number(
                 a.owner,
@@ -830,7 +849,7 @@ mod tests {
     use crate::atomgit::testutil::StaticToken;
     use crate::atomgit::AtomgitConfig;
     use tokio_util::sync::CancellationToken;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn ctx() -> ToolContext {
@@ -1106,6 +1125,46 @@ mod tests {
             .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("#4"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn issue_update_renders() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v5/repos/o/issues/5")) // owner+number in path, repo in body
+            // Exercises BOTH optional inserts (body + state) alongside required repo/title.
+            .and(body_json(
+                json!({ "repo": "r", "title": "T", "body": "B", "state": "close" }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"number":5,"title":"T","state":"closed"})),
+            )
+            .mount(&server)
+            .await;
+        let r = issue_tool(&server)
+            .execute(
+                r#"{"action":"update","owner":"o","repo":"r","number":5,"title":"T","body":"B","state":"close"}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("#5"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn issue_update_requires_owner_repo_number_title() {
+        let server = MockServer::start().await;
+        // No number/title → clear error, no HTTP call made.
+        let r = issue_tool(&server)
+            .execute(r#"{"action":"update","owner":"o","repo":"r"}"#, &ctx())
+            .await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(
+            r.content.contains("owner, repo, number and title are required"),
+            "{}",
+            r.content
+        );
     }
 
     #[test]
