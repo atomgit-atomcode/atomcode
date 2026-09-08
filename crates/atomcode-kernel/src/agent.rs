@@ -175,6 +175,16 @@ const EMPTY_RESPONSE_MAX_RETRIES: u32 = 5;
 /// bound still caps a genuinely stuck (re-dumping) model at a few wasted rounds.
 const MAX_TRUNCATION_CONTINUATIONS: u32 = 4;
 
+/// Default per-response OUTPUT-token cap sent to OpenAI-compatible providers when the
+/// model/provider config leaves `max_tokens` unset. This equals the output budget
+/// [`effective_input_limit`] already RESERVES, so what we reserve for output matches
+/// what we actually CAP the model at. Without it, a gateway's much larger default lets
+/// a model run a multi-minute runaway response that both overruns the reserve and feeds
+/// the truncation auto-continue loop (observed: qwen generating ~30K tokens / 12 min per
+/// round). A single response rarely needs more; genuinely large output is written
+/// incrementally (see `TRUNCATION_RESUME_NUDGE`).
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
+
 /// Always-on, coarse cross-round repetition fuse. The opt-in exact guard below
 /// compares the executed call, effective cwd, result and success state; this fuse
 /// covers the broader failure mode where the model keeps choosing the same action
@@ -198,6 +208,26 @@ fn round_tool_signature(calls: &[ToolCall]) -> String {
         .collect();
     parts.sort();
     parts.join("\u{1}")
+}
+
+/// Two consecutive OUTPUT-truncated responses that share a long identical LEADING prefix
+/// are the model RE-DUMPING the same content (restarting from the top) instead of
+/// resuming incrementally as [`TRUNCATION_RESUME_NUDGE`] asks. Detecting it lets a turn
+/// stop the blind auto-continue early — deferring to `offer_continuation` / the
+/// interactive checkpoint / turn-end — rather than burning the whole
+/// `MAX_TRUNCATION_CONTINUATIONS` budget on a weak model that ignores the nudge.
+/// Compared by chars (UTF-8 safe); trivially short rounds never match.
+fn truncation_is_redump(prev: &str, curr: &str) -> bool {
+    const MIN_LEN: usize = 64;
+    const PREFIX_CHARS: usize = 400;
+    let p = prev.trim_start();
+    let c = curr.trim_start();
+    if p.chars().take(MIN_LEN).count() < MIN_LEN || c.chars().take(MIN_LEN).count() < MIN_LEN {
+        return false;
+    }
+    p.chars()
+        .take(PREFIX_CHARS)
+        .eq(c.chars().take(PREFIX_CHARS))
 }
 
 /// Maximum number of `parallel_safe` (read-only) tools that run CONCURRENTLY in
@@ -467,7 +497,7 @@ fn empty_exhaustion_message(
 /// full window while the guard keeps the real request (messages + completion) under
 /// the model's usable limit.
 fn effective_input_limit(window: u32, max_tokens: Option<u32>) -> u32 {
-    let output_reserve = max_tokens.unwrap_or(16_384);
+    let output_reserve = max_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
     let margin = (window / 8).clamp(16_000, 128_000);
     let reserve = output_reserve.saturating_add(margin);
     // If the reserve can't fit inside the window (unrealistically small windows,
@@ -1900,6 +1930,9 @@ impl RunningAgent {
         // output-limit truncation (`finish_reason=length`). Bounded by
         // `MAX_TRUNCATION_CONTINUATIONS` so endless truncation cannot livelock.
         let mut truncation_continuations: u32 = 0;
+        // Text of the PREVIOUS auto-continued truncated round, to catch a model that
+        // re-dumps the same content instead of resuming (see `truncation_is_redump`).
+        let mut last_truncated_text: Option<String> = None;
         // Internal continuations do not pass through `handle_prompt`, which owns the
         // normal task-boundary auto-compaction check. Bound the equivalent in-turn
         // opportunity to one attempt per policy stage. A moderate-pressure stub
@@ -3092,8 +3125,17 @@ impl RunningAgent {
                 // instead of silently ending the turn. BOUNDED so endless truncation can't
                 // livelock. Runs BEFORE `offer_continuation` so a discipline hook's nudge
                 // does not pre-empt finishing the truncated content.
-                if truncated && truncation_continuations < MAX_TRUNCATION_CONTINUATIONS {
+                // Skip the blind auto-continue when the model RE-DUMPED the same content
+                // last round instead of resuming — re-nudging just spins. Falling through
+                // hands off to `offer_continuation` / the interactive checkpoint / turn-end
+                // (defer to the user), the way codex/opencode treat truncation.
+                let redump = last_truncated_text
+                    .as_deref()
+                    .is_some_and(|prev| truncation_is_redump(prev, &assistant_text));
+                if truncated && !redump && truncation_continuations < MAX_TRUNCATION_CONTINUATIONS
+                {
                     truncation_continuations += 1;
+                    last_truncated_text = Some(assistant_text.clone());
                     self.rt.emit(AgentEvent::OutputTruncationRecovery {
                         attempt: truncation_continuations,
                         max_attempts: MAX_TRUNCATION_CONTINUATIONS,
@@ -5799,6 +5841,43 @@ mod effective_input_limit_tests {
         // falls back to the raw window (old `est >= window` behavior). Never panics.
         assert_eq!(effective_input_limit(1_000, Some(16_384)), 1_000);
         assert_eq!(effective_input_limit(100, Some(16_384)), 100);
+    }
+
+    #[test]
+    fn default_output_cap_matches_the_reserve() {
+        // The cap sent on an unset request must equal the reserve so we never let a
+        // model produce more output than we budgeted room for.
+        assert_eq!(
+            effective_input_limit(1_000_000, None),
+            effective_input_limit(1_000_000, Some(super::DEFAULT_MAX_OUTPUT_TOKENS))
+        );
+    }
+}
+
+#[cfg(test)]
+mod truncation_redump_tests {
+    use super::truncation_is_redump;
+
+    #[test]
+    fn identical_leading_prefix_is_a_redump() {
+        // Real truncated responses are large; both share an identical 400-char lead.
+        let a = "第 1 节:游戏概述。".repeat(80); // ~640 chars > PREFIX_CHARS
+        let b = format!("{a} 但这次又多说了一点点。");
+        assert!(truncation_is_redump(&a, &b), "same long prefix = re-dump");
+        assert!(truncation_is_redump(&a, &a));
+    }
+
+    #[test]
+    fn genuine_continuation_is_not_a_redump() {
+        let prev = "第 1 节:玩家可选性别,只画脸,滚动条调肤色……".repeat(20);
+        let curr = "第 2 节:多点触控时其余脸随机肤色,来回判定加分……".repeat(20);
+        assert!(!truncation_is_redump(&prev, &curr), "different content = resume");
+    }
+
+    #[test]
+    fn trivially_short_rounds_never_match() {
+        assert!(!truncation_is_redump("ok", "ok"));
+        assert!(!truncation_is_redump("", ""));
     }
 }
 
