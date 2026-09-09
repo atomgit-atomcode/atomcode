@@ -7,7 +7,98 @@ use serde_json::json;
 use super::client::AtomgitClient;
 use super::models::{Comment, CreatedComment, PullRequest};
 
+/// Optional filters for [`AtomgitClient::user_pulls`] (`GET /user/pulls`). Every
+/// field maps to a same-named query parameter and is only sent when `Some`; an
+/// all-`None` query lets the server apply its defaults (all states, created_by_me).
+#[derive(Default)]
+pub struct UserPullsQuery {
+    pub state: Option<String>,
+    pub sort: Option<String>,
+    pub direction: Option<String>,
+    pub labels: Option<String>,
+    pub scope: Option<String>,
+    pub source_branch: Option<String>,
+    pub target_branch: Option<String>,
+    pub created_after: Option<String>,
+    pub created_before: Option<String>,
+    pub updated_after: Option<String>,
+    pub updated_before: Option<String>,
+    pub per_page: Option<u32>,
+    pub page: Option<u32>,
+}
+
+/// Optional fields for [`AtomgitClient::pr_update`] (`PATCH .../pulls/{n}`). Only
+/// `Some` fields are written into the JSON body, so a caller can touch one field
+/// without clobbering the rest. [`PrUpdate::is_empty`] guards the no-op case.
+#[derive(Default)]
+pub struct PrUpdate {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub state: Option<String>,
+    pub milestone_number: Option<u64>,
+    pub labels: Option<String>,
+    pub draft: Option<bool>,
+    pub close_related_issue: Option<bool>,
+    pub prune_branch: Option<bool>,
+    pub squash_merge: Option<bool>,
+}
+
+impl PrUpdate {
+    /// True when no field is set — a PATCH would send an empty body.
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.body.is_none()
+            && self.state.is_none()
+            && self.milestone_number.is_none()
+            && self.labels.is_none()
+            && self.draft.is_none()
+            && self.close_related_issue.is_none()
+            && self.prune_branch.is_none()
+            && self.squash_merge.is_none()
+    }
+}
+
 impl AtomgitClient {
+    /// `GET /user/pulls` — the authenticated user's pull requests across repos,
+    /// filtered by [`UserPullsQuery`]. `limit` is a client-side context-safety cap;
+    /// an explicit `per_page` raises it (a caller that asked the server for a page of
+    /// N must not have it silently truncated below N), so the effective cap is
+    /// `max(limit, per_page)`.
+    pub async fn user_pulls(
+        &self,
+        q: &UserPullsQuery,
+        limit: usize,
+    ) -> Result<Vec<PullRequest>, String> {
+        let mut query: Vec<(&str, String)> = Vec::new();
+        for (k, v) in [
+            ("state", &q.state),
+            ("sort", &q.sort),
+            ("direction", &q.direction),
+            ("labels", &q.labels),
+            ("scope", &q.scope),
+            ("source_branch", &q.source_branch),
+            ("target_branch", &q.target_branch),
+            ("created_after", &q.created_after),
+            ("created_before", &q.created_before),
+            ("updated_after", &q.updated_after),
+            ("updated_before", &q.updated_before),
+        ] {
+            if let Some(val) = v {
+                query.push((k, val.clone()));
+            }
+        }
+        if let Some(p) = q.per_page {
+            query.push(("per_page", p.to_string()));
+        }
+        if let Some(p) = q.page {
+            query.push(("page", p.to_string()));
+        }
+        let mut prs: Vec<PullRequest> = self.get_json("/user/pulls", &query).await?;
+        let cap = limit.max(q.per_page.map(|p| p as usize).unwrap_or(0));
+        prs.truncate(cap);
+        Ok(prs)
+    }
+
     /// `GET /repos/{o}/{r}/pulls?state={state}` (state default "open" is the caller's).
     pub async fn pr_list(
         &self,
@@ -64,6 +155,48 @@ impl AtomgitClient {
             &json!({ "state": "closed" }),
         )
         .await
+    }
+
+    /// `PATCH /repos/{o}/{r}/pulls/{number}` — update PR fields. Only the `Some`
+    /// fields of [`PrUpdate`] are sent (see its doc); the caller is expected to
+    /// reject an empty update via [`PrUpdate::is_empty`] before calling.
+    pub async fn pr_update(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        u: &PrUpdate,
+    ) -> Result<PullRequest, String> {
+        let mut payload = json!({});
+        if let Some(v) = &u.title {
+            payload["title"] = json!(v);
+        }
+        if let Some(v) = &u.body {
+            payload["body"] = json!(v);
+        }
+        if let Some(v) = &u.state {
+            payload["state"] = json!(v);
+        }
+        if let Some(v) = u.milestone_number {
+            payload["milestone_number"] = json!(v);
+        }
+        if let Some(v) = &u.labels {
+            payload["labels"] = json!(v);
+        }
+        if let Some(v) = u.draft {
+            payload["draft"] = json!(v);
+        }
+        if let Some(v) = u.close_related_issue {
+            payload["close_related_issue"] = json!(v);
+        }
+        if let Some(v) = u.prune_branch {
+            payload["prune_branch"] = json!(v);
+        }
+        if let Some(v) = u.squash_merge {
+            payload["squash_merge"] = json!(v);
+        }
+        self.patch_json(&format!("/repos/{owner}/{repo}/pulls/{number}"), &payload)
+            .await
     }
 
     /// `POST /repos/{o}/{r}/pulls/{number}/comments`.
@@ -242,6 +375,86 @@ mod tests {
             .await;
         let pr = client(&server).pr_close("o", "r", 5).await.unwrap();
         assert_eq!(pr.state, "closed");
+    }
+
+    #[tokio::test]
+    async fn user_pulls_sends_only_set_filters_and_truncates_to_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v5/user/pulls"))
+            .and(query_param("scope", "created_by_me"))
+            .and(query_param("state", "open"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"number":1,"title":"a","state":"open"},
+                {"number":2,"title":"b","state":"open"},
+                {"number":3,"title":"c","state":"open"}
+            ])))
+            .mount(&server)
+            .await;
+        let q = UserPullsQuery {
+            state: Some("open".into()),
+            scope: Some("created_by_me".into()),
+            ..Default::default()
+        };
+        // No per_page → limit is the cap.
+        let prs = client(&server).user_pulls(&q, 2).await.unwrap();
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0].number, 1);
+    }
+
+    #[tokio::test]
+    async fn user_pulls_explicit_per_page_raises_the_cap_above_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v5/user/pulls"))
+            .and(query_param("per_page", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"number":1,"title":"a","state":"open"},
+                {"number":2,"title":"b","state":"open"},
+                {"number":3,"title":"c","state":"open"}
+            ])))
+            .mount(&server)
+            .await;
+        let q = UserPullsQuery {
+            per_page: Some(50),
+            ..Default::default()
+        };
+        // per_page=50 > limit=2 → the server page is kept, not truncated to 2.
+        let prs = client(&server).user_pulls(&q, 2).await.unwrap();
+        assert_eq!(prs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn update_patches_only_set_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v5/repos/o/r/pulls/7"))
+            .and(body_json(json!({"title":"NT","draft":false,"squash_merge":true})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"number":7,"title":"NT","state":"open"})),
+            )
+            .mount(&server)
+            .await;
+        let u = PrUpdate {
+            title: Some("NT".into()),
+            draft: Some(false),
+            squash_merge: Some(true),
+            ..Default::default()
+        };
+        let pr = client(&server).pr_update("o", "r", 7, &u).await.unwrap();
+        assert_eq!(pr.number, 7);
+        assert_eq!(pr.title, "NT");
+    }
+
+    #[test]
+    fn pr_update_is_empty_detects_no_op() {
+        assert!(PrUpdate::default().is_empty());
+        assert!(!PrUpdate {
+            state: Some("closed".into()),
+            ..Default::default()
+        }
+        .is_empty());
     }
 
     #[tokio::test]

@@ -14,6 +14,7 @@ use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolRegistry, ToolResu
 
 use super::{err, ok};
 use crate::atomgit::models::{Comment, CreatedComment, Issue, PullRequest, Repo, Tag};
+use crate::atomgit::pr::{PrUpdate, UserPullsQuery};
 use crate::atomgit::AtomgitClient;
 
 /// Pull `action` out of the raw args without failing the whole parse — used by
@@ -648,13 +649,46 @@ struct PrArgs {
     parent_id: Option<u64>,
     #[serde(default)]
     issues: Vec<u64>,
-    #[serde(default = "default_state")]
-    state: String,
+    #[serde(default)]
+    state: Option<String>,
+    // list_mine (GET /user/pulls) filters.
+    #[serde(default)]
+    sort: Option<String>,
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(default)]
+    labels: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    source_branch: Option<String>,
+    #[serde(default)]
+    target_branch: Option<String>,
+    #[serde(default)]
+    created_after: Option<String>,
+    #[serde(default)]
+    created_before: Option<String>,
+    #[serde(default)]
+    updated_after: Option<String>,
+    #[serde(default)]
+    updated_before: Option<String>,
+    #[serde(default)]
+    page: Option<u32>,
+    #[serde(default)]
+    per_page: Option<u32>,
+    // update (PATCH .../pulls/{n}) fields.
+    #[serde(default)]
+    milestone_number: Option<u64>,
+    #[serde(default)]
+    draft: Option<bool>,
+    #[serde(default)]
+    close_related_issue: Option<bool>,
+    #[serde(default)]
+    prune_branch: Option<bool>,
+    #[serde(default)]
+    squash_merge: Option<bool>,
     #[serde(default = "default_limit")]
     limit: usize,
-}
-fn default_state() -> String {
-    "open".to_string()
 }
 
 /// `atomgit_pr` tool.
@@ -672,6 +706,15 @@ fn render_pr(p: &PullRequest) -> String {
         "#{} [{}] {}\n  {} ← {}\n  {}",
         p.number, p.state, p.title, p.base.ref_, p.head.ref_, p.html_url
     )
+}
+/// Shared result rendering for the `list` / `list_mine` actions: empty → a notice,
+/// otherwise one `render_pr` block per PR, blank-line separated.
+fn render_pr_list(prs: Result<Vec<PullRequest>, String>) -> ToolResult {
+    match prs {
+        Ok(prs) if prs.is_empty() => ok("No pull requests.".to_string()),
+        Ok(prs) => ok(prs.iter().map(render_pr).collect::<Vec<_>>().join("\n\n")),
+        Err(e) => err(e),
+    }
 }
 fn render_comments(cs: &[Comment]) -> String {
     if cs.is_empty() {
@@ -707,19 +750,25 @@ impl Tool for AtomgitPrTool {
     }
     fn description(&self) -> &str {
         "Operate on AtomGit pull requests. action: \"list\" (owner+repo; optional \
-         state=open|closed|all, limit), \"view\" (owner+repo+number), \"create\" \
-         (owner+repo+title+head+base; optional body), \"close\" (owner+repo+number), \
-         \"comment_create\"/\"comment_view\" (owner+repo+number; body for create), \
-         \"comment_edit\"/\"comment_delete\" (owner+repo+comment_id; body for edit), \
-         \"comment_reply\" (owner+repo+number+parent_id+body), \"link_issues\"/\
-         \"unlink_issues\" (owner+repo+number+issues=[numbers])."
+         state=open|closed|all, limit), \"list_mine\" (the authenticated user's PRs \
+         across all repos; optional scope=created_by_me|assigned_to_me|need_my_review|\
+         need_my_approve, state, sort, direction, labels, source_branch, target_branch, \
+         created_after/before, updated_after/before (ISO 8601), page, per_page, limit), \
+         \"view\" (owner+repo+number), \"create\" (owner+repo+title+head+base; optional \
+         body), \"update\" (owner+repo+number + any of title, body, state, \
+         milestone_number, labels, draft, close_related_issue, prune_branch, \
+         squash_merge), \"close\" (owner+repo+number), \"comment_create\"/\
+         \"comment_view\" (owner+repo+number; body for create), \"comment_edit\"/\
+         \"comment_delete\" (owner+repo+comment_id; body for edit), \"comment_reply\" \
+         (owner+repo+number+parent_id+body), \"link_issues\"/\"unlink_issues\" \
+         (owner+repo+number+issues=[numbers])."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
                 "action": { "type": "string", "enum": [
-                    "list","view","create","close",
+                    "list","list_mine","view","create","update","close",
                     "comment_create","comment_view","comment_edit","comment_delete","comment_reply",
                     "link_issues","unlink_issues"
                 ]},
@@ -733,15 +782,34 @@ impl Tool for AtomgitPrTool {
                 "comment_id": { "type": "integer", "description": "Comment id for comment_edit/comment_delete." },
                 "parent_id": { "type": "integer", "description": "Parent comment id for comment_reply." },
                 "issues": { "type": "array", "items": { "type": "integer" }, "description": "Issue numbers for link/unlink." },
-                "state": { "type": "string", "description": "list filter (default open)." },
-                "limit": { "type": "integer", "description": "Max for list (default 30)." }
+                "state": { "type": "string", "description": "list filter (default open); or the new state for update." },
+                "scope": { "type": "string", "description": "list_mine: created_by_me|assigned_to_me|need_my_review|need_my_approve." },
+                "sort": { "type": "string", "description": "list_mine sort field: created|updated|merged_at." },
+                "direction": { "type": "string", "description": "list_mine sort direction: asc|desc." },
+                "labels": { "type": "string", "description": "Comma-separated label names (list_mine filter / update)." },
+                "source_branch": { "type": "string", "description": "list_mine: filter by source branch." },
+                "target_branch": { "type": "string", "description": "list_mine: filter by target branch." },
+                "created_after": { "type": "string", "description": "list_mine: ISO 8601 lower bound on creation time." },
+                "created_before": { "type": "string", "description": "list_mine: ISO 8601 upper bound on creation time." },
+                "updated_after": { "type": "string", "description": "list_mine: ISO 8601 lower bound on update time." },
+                "updated_before": { "type": "string", "description": "list_mine: ISO 8601 upper bound on update time." },
+                "page": { "type": "integer", "description": "list_mine page number." },
+                "per_page": { "type": "integer", "description": "list_mine page size (max 100)." },
+                "milestone_number": { "type": "integer", "description": "update: milestone id." },
+                "draft": { "type": "boolean", "description": "update: mark PR as draft." },
+                "close_related_issue": { "type": "boolean", "description": "update: close linked issue on merge." },
+                "prune_branch": { "type": "boolean", "description": "update: delete source branch on merge." },
+                "squash_merge": { "type": "boolean", "description": "update: squash on merge." },
+                "limit": { "type": "integer", "description": "Max rows for list/list_mine (default 30); an explicit larger per_page raises this cap." }
             },
             "required": ["action"]
         })
     }
     fn risk(&self, args: &str) -> RiskLevel {
         match action_of(args).as_deref() {
-            Some("list") | Some("view") | Some("comment_view") => RiskLevel::Safe,
+            Some("list") | Some("list_mine") | Some("view") | Some("comment_view") => {
+                RiskLevel::Safe
+            }
             _ => RiskLevel::Risky,
         }
     }
@@ -753,13 +821,30 @@ impl Tool for AtomgitPrTool {
         let c = &self.client;
         match a.action.as_str() {
             "list" => match (a.owner, a.repo) {
-                (Some(o), Some(r)) => match c.pr_list(&o, &r, &a.state, a.limit).await {
-                    Ok(prs) if prs.is_empty() => ok("No pull requests.".to_string()),
-                    Ok(prs) => ok(prs.iter().map(render_pr).collect::<Vec<_>>().join("\n\n")),
-                    Err(e) => err(e),
-                },
+                (Some(o), Some(r)) => {
+                    let state = a.state.as_deref().unwrap_or("open");
+                    render_pr_list(c.pr_list(&o, &r, state, a.limit).await)
+                }
                 _ => err("atomgit_pr list: owner and repo are required".to_string()),
             },
+            "list_mine" => {
+                let q = UserPullsQuery {
+                    state: a.state,
+                    sort: a.sort,
+                    direction: a.direction,
+                    labels: a.labels,
+                    scope: a.scope,
+                    source_branch: a.source_branch,
+                    target_branch: a.target_branch,
+                    created_after: a.created_after,
+                    created_before: a.created_before,
+                    updated_after: a.updated_after,
+                    updated_before: a.updated_before,
+                    per_page: a.per_page,
+                    page: a.page,
+                };
+                render_pr_list(c.user_pulls(&q, a.limit).await)
+            }
             "view" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_pr view") {
                 Ok((o, r, n)) => match c.pr_view(&o, &r, n).await {
                     Ok(pr) => ok(render_pr(&pr)),
@@ -776,6 +861,29 @@ impl Tool for AtomgitPrTool {
                     }
                 }
                 _ => err("atomgit_pr create: owner, repo, title and head are required".to_string()),
+            },
+            "update" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_pr update") {
+                Ok((o, r, n)) => {
+                    let u = PrUpdate {
+                        title: a.title,
+                        body: a.body,
+                        state: a.state,
+                        milestone_number: a.milestone_number,
+                        labels: a.labels,
+                        draft: a.draft,
+                        close_related_issue: a.close_related_issue,
+                        prune_branch: a.prune_branch,
+                        squash_merge: a.squash_merge,
+                    };
+                    if u.is_empty() {
+                        return err("atomgit_pr update: provide at least one field to change (title, body, state, milestone_number, labels, draft, close_related_issue, prune_branch, squash_merge)".to_string());
+                    }
+                    match c.pr_update(&o, &r, n, &u).await {
+                        Ok(pr) => ok(format!("Updated {}", render_pr(&pr))),
+                        Err(e) => err(e),
+                    }
+                }
+                Err(e) => e,
             },
             "close" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_pr close") {
                 Ok((o, r, n)) => match c.pr_close(&o, &r, n).await {
@@ -920,6 +1028,59 @@ mod tests {
         assert!(r.content.contains("tag_name are required"), "{}", r.content);
     }
 
+    #[tokio::test]
+    async fn execute_list_mine_hits_user_pulls() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v5/user/pulls"))
+            .and(wiremock::matchers::query_param("scope", "created_by_me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"number":1,"title":"mine","state":"open"}
+            ])))
+            .mount(&server)
+            .await;
+        let r = pr_tool(&server)
+            .execute(r#"{"action":"list_mine","scope":"created_by_me"}"#, &ctx())
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("#1"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn execute_update_patches_pr() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v5/repos/o/r/pulls/4"))
+            .and(body_json(json!({"title":"new","squash_merge":true})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"number":4,"title":"new","state":"open"})),
+            )
+            .mount(&server)
+            .await;
+        let r = pr_tool(&server)
+            .execute(
+                r#"{"action":"update","owner":"o","repo":"r","number":4,"title":"new","squash_merge":true}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("Updated"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn execute_update_rejects_empty() {
+        let server = MockServer::start().await;
+        let r = pr_tool(&server)
+            .execute(
+                r#"{"action":"update","owner":"o","repo":"r","number":4}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(r.is_error);
+        assert!(r.content.contains("at least one field"), "{}", r.content);
+    }
+
     fn api_tool(server: &MockServer) -> AtomgitApiTool {
         let client = AtomgitClient::new(AtomgitConfig {
             base_url: format!("{}/api/v5", server.uri()),
@@ -1051,8 +1212,10 @@ mod tests {
             .unwrap(),
         ));
         assert_eq!(t.risk(r#"{"action":"list"}"#), RiskLevel::Safe);
+        assert_eq!(t.risk(r#"{"action":"list_mine"}"#), RiskLevel::Safe);
         assert_eq!(t.risk(r#"{"action":"comment_view"}"#), RiskLevel::Safe);
         assert_eq!(t.risk(r#"{"action":"create"}"#), RiskLevel::Risky);
+        assert_eq!(t.risk(r#"{"action":"update"}"#), RiskLevel::Risky);
         assert_eq!(t.risk(r#"{"action":"comment_delete"}"#), RiskLevel::Risky);
         assert_eq!(t.risk(r#"{"action":"link_issues"}"#), RiskLevel::Risky);
     }
