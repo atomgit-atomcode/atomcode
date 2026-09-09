@@ -20,6 +20,7 @@ mod atomgit_sign;
 mod ollama;
 mod openai_compat;
 mod reasoning;
+mod responses;
 mod retry;
 mod sign;
 
@@ -30,6 +31,7 @@ pub use openai_compat::{
     model_suggests_vision, reason_effort_applicable, OpenAiCompatConfig, OpenAiCompatProvider,
 };
 pub use reasoning::{ReasoningPolicy, REASONING_PLACEHOLDER};
+pub use responses::ResponsesProvider;
 pub use retry::RetryPolicy;
 pub use sign::{RequestSigner, RequestSigningError, SignedAuth};
 

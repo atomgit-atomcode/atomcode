@@ -19,6 +19,10 @@ pub enum ProviderType {
     OpenAi,
     Anthropic,
     Ollama,
+    /// OpenAI **Responses API** (`/responses`). A distinct wire from
+    /// [`ProviderType::OpenAi`] (chat/completions): different endpoint, tool
+    /// shape, and SSE event family.
+    Responses,
 }
 
 impl ProviderType {
@@ -28,6 +32,7 @@ impl ProviderType {
             Self::OpenAi => "openai",
             Self::Anthropic => "anthropic",
             Self::Ollama => "ollama",
+            Self::Responses => "responses",
         }
     }
 }
@@ -82,6 +87,20 @@ pub const ANTHROPIC_COMPATIBLE: ProviderPreset = ProviderPreset {
     default_base_url: None,
     auth_kind: AuthKind::ApiKey,
     api_key_env: None,
+    model_source: ModelSource::Manual,
+};
+
+/// Generic OpenAI **Responses API** custom endpoint. Same auth family as
+/// [`OPENAI_COMPATIBLE`] but a distinct wire (`/responses`); the base URL is
+/// the OpenAI default and is meant to be overridden per account for
+/// Responses-speaking gateways.
+pub const RESPONSES_COMPATIBLE: ProviderPreset = ProviderPreset {
+    id: "openai-responses",
+    display_name: "OpenAI Responses endpoint",
+    provider_type: ProviderType::Responses,
+    default_base_url: Some("https://api.openai.com/v1"),
+    auth_kind: AuthKind::ApiKey,
+    api_key_env: Some("OPENAI_API_KEY"),
     model_source: ModelSource::Manual,
 };
 
@@ -249,6 +268,7 @@ pub const PRESETS: &[ProviderPreset] = &[
     },
     OPENAI_COMPATIBLE,
     ANTHROPIC_COMPATIBLE,
+    RESPONSES_COMPATIBLE,
 ];
 
 /// Exact lookup of a preset by its `id`.

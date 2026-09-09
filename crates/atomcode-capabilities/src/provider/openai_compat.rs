@@ -278,8 +278,9 @@ impl OpenAiCompatProvider {
 
 /// Build a fresh streaming HTTP client from the process's current proxy env.
 /// Extracted so [`SwappableClient`] can rebuild an identical client with an EMPTY
-/// connection pool when a pooled connection goes stale.
-fn build_http_client(
+/// connection pool when a pooled connection goes stale. `pub(crate)`: the
+/// Responses-API adapter reuses the identical client policy.
+pub(crate) fn build_http_client(
     connect_timeout: std::time::Duration,
     skip_tls_verify: bool,
     user_agent: Option<String>,
@@ -448,7 +449,7 @@ pub(crate) struct SwappableClient {
 }
 
 impl SwappableClient {
-    fn new(
+    pub(crate) fn new(
         force_tls12: bool,
         build: impl Fn(bool) -> Result<reqwest::Client, ProviderError> + Send + Sync + 'static,
     ) -> Result<Self, ProviderError> {
@@ -729,8 +730,10 @@ fn authentication_expired_error(code: u16) -> ProviderError {
 /// transport) per `policy`. Builds the request fresh each attempt so a signer
 /// (if any) re-auths with a new nonce/timestamp. Returns the live `Response` on
 /// a 2xx, or a terminal `ProviderError`. Shared by the initial open and the
-/// mid-stream re-open so both paths behave identically.
-async fn open_stream(
+/// mid-stream re-open so both paths behave identically. `pub(crate)`: the
+/// Responses-API adapter reuses the identical open/retry/idle semantics — only
+/// the URL and body bytes differ.
+pub(crate) async fn open_stream(
     client: &SwappableClient,
     url: &str,
     body_bytes: &[u8],
@@ -1163,6 +1166,10 @@ fn normalize_openai_tool_schema(schema: &Value) -> Value {
     normalized
 }
 
+pub(crate) fn shared_normalize_tool_schema(schema: &Value) -> Value {
+    normalize_openai_tool_schema(schema)
+}
+
 fn normalize_openai_tool_schema_in_place(schema: &mut Value) {
     let Value::Object(map) = schema else {
         return;
@@ -1321,7 +1328,7 @@ fn truncate_msg(s: &str) -> String {
 /// `atomcode_core::provider::extract_error_message`'s shape list (kept LOCAL — L1 must
 /// not depend on core). Previously only the `error` object was handled, so GLM-style
 /// top-level `message` bodies dumped raw JSON into the user-facing error.
-fn extract_error_detail(text: &str) -> String {
+pub(crate) fn extract_error_detail(text: &str) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
         if let Some(detail) = v.get("detail") {
             if detail.is_object() {

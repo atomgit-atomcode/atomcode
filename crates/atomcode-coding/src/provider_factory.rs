@@ -3,7 +3,7 @@ use std::sync::Arc;
 use atomcode_capabilities::provider::{
     atomgit_request_signer, is_atomgit_gateway, signer_available, AnthropicConfig,
     AnthropicProvider, OllamaConfig, OllamaProvider, OpenAiCompatConfig, OpenAiCompatProvider,
-    ReasoningPolicy, RequestSigner, RetryPolicy,
+    ReasoningPolicy, RequestSigner, ResponsesProvider, RetryPolicy,
 };
 use atomcode_kernel::provider::LlmProvider;
 
@@ -138,6 +138,29 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 oc.retry = retry_policy_for(cfg.retry_max_attempts)?;
                 Arc::new(
                     OllamaProvider::new(oc).map_err(|e| ProviderBuildError::Adapter(e.message))?,
+                )
+            }
+            "responses" => {
+                // OpenAI Responses API wire (`/responses`). Shares the
+                // OpenAiCompatConfig shape (same auth/timeouts/signer fields);
+                // only the URL path + codecs differ.
+                let mut pc = OpenAiCompatConfig::new(&cfg.api_key, &cfg.base_url, &cfg.model);
+                pc.context_window = cfg.context_window;
+                pc.idle_timeout = cfg.stream_timeout;
+                pc.supports_vision = cfg.supports_vision;
+                pc.max_tokens = Some(default_max_tokens(cfg.context_window));
+                pc.supports_reasoning_effort = supports_reasoning_effort(cfg);
+                pc.reasoning_policy =
+                    ReasoningPolicy::from_config(cfg.reasoning_history.as_deref())
+                        .map_err(ProviderBuildError::Adapter)?;
+                pc.user_agent = Some(ua);
+                pc.skip_tls_verify = cfg.skip_tls_verify;
+                pc.retry = retry_policy_for(cfg.retry_max_attempts)?;
+                if let Some(authenticator) = &self.authenticator {
+                    pc.request_signer = authenticator.request_signer(&cfg.base_url)?;
+                }
+                Arc::new(
+                    ResponsesProvider::new(pc).map_err(|e| ProviderBuildError::Adapter(e.message))?,
                 )
             }
             _ => {
