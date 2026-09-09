@@ -26,6 +26,9 @@ cargo run -p atomcode-daemon -- --host 0.0.0.0
 
 # 同时指定 host 和 port
 cargo run -p atomcode-daemon -- --host 0.0.0.0 --port 8080
+
+# 关闭 API token 认证（所有接口均可匿名访问）
+cargo run -p atomcode-daemon -- --no-auth
 ```
 
 ### 启动参数
@@ -34,10 +37,13 @@ cargo run -p atomcode-daemon -- --host 0.0.0.0 --port 8080
 |------|------|--------|------|
 | `--host` | `--host <ip>` | `127.0.0.1` | 绑定 IP 地址 |
 | `--port` | `--port <port>` | `13456` | 监听端口号 |
+| `--no-auth` | `--no-auth` | 关闭 | 关闭所有 API token 认证 |
 
 也支持 `--host=<ip>` 和 `--port=<port>` 的等号格式。
 
 > **安全提示**：当绑定非 loopback 地址（非 `127.0.0.1`、`localhost`、`::1`）时，服务会打印安全警告。daemon 暴露了聊天、文件编辑、工具执行等敏感端点，请确保网络可信或在前方部署反向代理并配置认证。
+
+> **无认证模式警告**：`--no-auth` 会让所有 API 接口无需 token 即可访问，并且不会生成 `daemon-<port>.json`。该参数可与任意绑定地址组合；使用者必须自行保证网络隔离。
 
 ### 环境变量
 
