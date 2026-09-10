@@ -1,7 +1,7 @@
 //! `file_dependencies` — which files a file USES (its symbols' callees) and which files
 //! USE it (callers). `Safe`.
 
-use super::index::CodeIndex;
+use super::index::{CodeIndex, IndexLimits};
 use super::{canonical, display_path, err, ok, resolve_path};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
@@ -64,7 +64,10 @@ impl Tool for FileDependenciesTool {
 }
 
 fn render(index: &CodeIndex, root: &Path, file: &Path, display: &str) -> ToolResult {
-    let g = index.get(root);
+    let g = match index.get_limited(root, &IndexLimits::default()) {
+        Ok(g) => g,
+        Err(e) => return err(format!("file_dependencies: {}", e)),
+    };
     let croot = canonical(root);
     let root: &Path = &croot;
     let cfile = canonical(file);
