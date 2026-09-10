@@ -655,6 +655,13 @@ pub struct StatusLine {
     /// from `mode_indicator` (left-aligned PLAN badge) so it does not
     /// displace the mode indicator.
     pub bypass_indicator: Option<String>,
+    /// Right-aligned cache-hit indicator for the current turn, rendered in
+    /// the left info group after the ctx-usage segment (e.g. `cache 70%`).
+    /// Derived from the per-turn prompt/cached token tallies; `None` while
+    /// no cached usage has been reported this turn (cold start, providers
+    /// that don't report cached tokens), so the status row stays quiet.
+    /// Language-neutral format — no i18n entry needed.
+    pub cache_indicator: Option<String>,
     /// Current session display name, shown as a right-aligned cyan
     /// pill overlaid on the input box's top rule. `Some` only after
     /// the user has explicitly run `/rename` (Session::user_renamed) —
