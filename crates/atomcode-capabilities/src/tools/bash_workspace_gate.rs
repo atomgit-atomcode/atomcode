@@ -1337,7 +1337,7 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let target = std::path::PathBuf::from("/atomcode-test-outside-rm/x.txt");
         let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
-        let tool: Arc<dyn Tool> = Arc::new(crate::tools::bash::BashStartTool);
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::bash::BashStartTool::default());
         let mut call = ToolCall {
             id: "1".into(),
             name: "bash_start".into(),

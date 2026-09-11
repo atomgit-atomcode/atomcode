@@ -111,7 +111,7 @@ unsafe fn detach_child_from_controlling_tty() {
 /// it can reuse the private spawn/reaper primitives (`build_command`, `PgroupChild`,
 /// `detach_child_from_controlling_tty`) without widening their visibility.
 pub(crate) mod background;
-pub(crate) use background::{BashKillTool, BashPollTool, BashStartTool};
+pub use background::{BashKillTool, BashPollTool, BashStartTool};
 
 /// `bash`, run in whichever execution world it was handed.
 ///
@@ -2944,8 +2944,16 @@ impl crate::world::Process for LocalProcess {
         #[cfg(target_os = "windows")]
         let status = child.wait().await;
         let status = status.map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        let signal = {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal()
+        };
+        #[cfg(not(unix))]
+        let signal = None;
         let exit = crate::world::Exit {
             code: status.code(),
+            signal,
         };
         state.exit = Some(exit);
         Ok(exit)

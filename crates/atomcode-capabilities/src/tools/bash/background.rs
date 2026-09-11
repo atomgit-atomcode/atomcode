@@ -8,30 +8,35 @@
 //! see [`crate::tools::is_command_shell_tool`], which the workspace / credential / push-label
 //! middlewares all key on, so a backgrounded command can't slip past them.
 //!
+//! ## Where the process actually runs
+//! Through the same `shell` seam as the foreground tool ([`crate::world::Shell`]), so a
+//! job started from a tree whose world is a container or a read-only sandbox runs *there*.
+//! This is the reason the seam is a handle and not a `run()`: a job outlives the tool call
+//! that started it, is drained incrementally by later calls, and is killed by a third — the
+//! three things a collected result cannot do. Nothing in this file names a shell binary, a
+//! pipe, a process group or a job object any more.
+//!
 //! ## Orphan-safety
-//! Honors the same invariant as the foreground tool's Job Object: the reader task OWNS the
-//! platform reaper — Unix [`super::PgroupChild`] (`killpg` on `Drop`) / Windows
-//! [`crate::process_utils::JobHandle`] (`KILL_ON_JOB_CLOSE` on `Drop`, or when the OS closes
-//! the handle). The task lives in the global [`STORE`], so the tree survives across tool
-//! calls; a graceful process exit drops the runtime → the task → the reaper → the tree.
-//! Only an abrupt SIGKILL of atomcode itself can orphan on Unix (pre-existing and inherent —
-//! the foreground tool has the same limit; Windows self-reaps via the OS closing the job
-//! handle even then).
+//! Honors the same invariant as the foreground tool: the reader task OWNS the
+//! [`crate::world::Process`] handle, and the local world's handle owns the platform reaper —
+//! Unix `PgroupChild` (`killpg` on `Drop`) / Windows `JobHandle` (`KILL_ON_JOB_CLOSE` on
+//! `Drop`, or when the OS closes the handle). The task lives in the global [`STORE`], so the
+//! tree survives across tool calls; a graceful process exit drops the runtime → the task →
+//! the handle → the reaper → the tree. Only an abrupt SIGKILL of atomcode itself can orphan
+//! on Unix (pre-existing and inherent — the foreground tool has the same limit; Windows
+//! self-reaps via the OS closing the job handle even then).
 
-use super::{build_command, check_destructive_command, shell_always_grant_scope};
-#[cfg(not(target_os = "windows"))]
-use super::{sigkill_pgroup, PgroupChild};
+use super::{check_destructive_command, shell_always_grant_scope, LocalShell};
 use crate::tools::{err, ok};
+use crate::world::{Exit, Process, Shell, SpawnOptions};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// Per-job output is bounded so a chatty long-runner can't grow the process heap without
@@ -107,6 +112,9 @@ struct Job {
     /// Absolute byte offset already returned by a previous `poll`.
     delivered: usize,
     kill: tokio::sync::mpsc::UnboundedSender<()>,
+    /// The world the job was started in — `poll` decodes with *its* code page,
+    /// not this machine's.
+    world: Arc<dyn Shell>,
 }
 
 static STORE: OnceLock<Mutex<HashMap<String, Job>>> = OnceLock::new();
@@ -127,10 +135,15 @@ pub(crate) struct PollResult {
     pub(crate) status: Status,
 }
 
-/// Spawn `command` detached, register it, and return its job id. Reuses the foreground
-/// tool's shell selection, non-interactive env, UTF-8 locale, and tty-detach so a
-/// backgrounded command behaves identically to a foreground one — it just isn't awaited.
-pub(crate) async fn start(command: &str, ctx: &ToolContext) -> Result<String, String> {
+/// Spawn `command` in `world`, register it, and return its job id. The world is what
+/// makes a backgrounded command behave identically to a foreground one — same shell
+/// selection, non-interactive env, UTF-8 locale and tty-detach — because it is the same
+/// `spawn`; this function just doesn't await it.
+pub(crate) async fn start(
+    world: &Arc<dyn Shell>,
+    command: &str,
+    ctx: &ToolContext,
+) -> Result<String, String> {
     // Bound the store BEFORE spawning so a runaway starter can't grow it (or leak processes)
     // without limit; count under the lock, drop it before the await-y spawn below.
     if store().lock().unwrap().len() >= MAX_BACKGROUND_JOBS {
@@ -140,56 +153,14 @@ pub(crate) async fn start(command: &str, ctx: &ToolContext) -> Result<String, St
         ));
     }
 
-    // Mirror the foreground tool's env setup so a backgrounded command behaves identically:
-    // `sudo`→`sudo -A` when the askpass helper is active (a plain `sudo` then pops our secure
-    // modal instead of blocking on a prompt it can never answer with a null stdin).
-    #[cfg(unix)]
-    let effective_command = if crate::askpass::current_env().is_some() {
-        super::rewrite_sudo_for_askpass(command)
-    } else {
-        command.to_string()
+    let options = SpawnOptions {
+        cwd: Some(ctx.working_dir.clone()),
+        env: Vec::new(),
     };
-    #[cfg(not(unix))]
-    let effective_command = command.to_string();
-
-    let mut cmd = build_command(&effective_command)?;
-    cmd.current_dir(&ctx.working_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    super::apply_non_interactive_env(&mut cmd);
-    // Windows GBK console: flip a python child's default encoding to UTF-8 so its subprocess
-    // text pipes don't UnicodeDecodeError on UTF-8 output (parity with `BashTool::execute`).
-    #[cfg(windows)]
-    {
-        cmd.env("PYTHONUTF8", "1");
-        cmd.env("PYTHONIOENCODING", "utf-8");
-    }
-    #[cfg(unix)]
-    crate::process_utils::apply_utf8_locale_env(&mut cmd);
-    #[cfg(unix)]
-    {
-        // Inject the askpass env so a password prompt uses our secure modal, then detach.
-        if let Some(env) = crate::askpass::current_env() {
-            super::apply_askpass_env(&mut cmd, env);
-        }
-        // SAFETY: async-signal-safe libc only — see `detach_child_from_controlling_tty`.
-        unsafe {
-            cmd.pre_exec(|| {
-                super::detach_child_from_controlling_tty();
-                Ok(())
-            });
-        }
-    }
-    #[cfg(target_os = "windows")]
-    crate::process_utils::suppress_console_window(&mut cmd);
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("bash_start: failed to spawn shell: {e}"))?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let process = world.spawn(command, &options).await.map_err(|e| match e {
+        crate::world::SpawnError::Unsupported(reason) => reason,
+        crate::world::SpawnError::Failed(reason) => format!("bash_start: {reason}"),
+    })?;
 
     let shared = Arc::new(Shared {
         output: Mutex::new(Buf {
@@ -199,30 +170,7 @@ pub(crate) async fn start(command: &str, ctx: &ToolContext) -> Result<String, St
         status: Mutex::new(Status::Running),
     });
     let (kill_tx, kill_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let reaper = PgroupChild::new(child);
-        tokio::spawn(reader_task_unix(
-            reaper,
-            stdout,
-            stderr,
-            Arc::clone(&shared),
-            kill_rx,
-        ));
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let job = crate::process_utils::assign_child_to_kill_on_close_job(&child);
-        tokio::spawn(reader_task_windows(
-            child,
-            job,
-            stdout,
-            stderr,
-            Arc::clone(&shared),
-            kill_rx,
-        ));
-    }
+    tokio::spawn(reader_task(process, Arc::clone(&shared), kill_rx));
 
     let id = next_id();
     store().lock().unwrap().insert(
@@ -232,6 +180,7 @@ pub(crate) async fn start(command: &str, ctx: &ToolContext) -> Result<String, St
             shared,
             delivered: 0,
             kill: kill_tx,
+            world: Arc::clone(world),
         },
     );
     Ok(id)
@@ -249,14 +198,15 @@ pub(crate) fn poll(job_id: &str) -> Result<PollResult, String> {
     let (raw, new_delivered, truncated) = job.shared.output.lock().unwrap().since(job.delivered);
     job.delivered = new_delivered;
     let status = job.shared.status.lock().unwrap().clone();
+    let world = Arc::clone(&job.world);
     if !matches!(status, Status::Running) {
         // Terminal status is only set AFTER the reader finalizes, so everything is delivered
         // by the `since` above — safe to drop the entry now.
         guard.remove(job_id);
     }
-    // Reuse the foreground decode (non-UTF8/GBK/UTF-16) + ANSI/CSI strip so a color- or
-    // cursor-emitting long-runner doesn't flood the model with escape bytes.
-    let text = super::sanitize_terminal_output(&super::decode_output(&raw));
+    // The world decodes (non-UTF8/GBK/UTF-16 is *its* code page); the ANSI/CSI strip is
+    // ours, so a color- or cursor-emitting long-runner doesn't flood the model with escapes.
+    let text = super::sanitize_terminal_output(&world.decode(&raw));
     Ok(PollResult {
         text,
         truncated,
@@ -277,70 +227,19 @@ pub(crate) fn kill(job_id: &str) -> Result<String, String> {
     }
 }
 
-/// Read one chunk from an optional stream; parks forever when the stream is absent so a
-/// disabled `select!` arm (guarded by `*_done`) never resolves spuriously. `Ok(0)` (EOF) and
-/// read errors both map to `None` (the stream is done). Cancellation-safe: `AsyncReadExt::read`
-/// consumes no bytes when its future is dropped for another `select!` arm.
-async fn read_some<R: tokio::io::AsyncRead + Unpin>(
-    s: &mut Option<R>,
-    buf: &mut [u8],
-) -> Option<usize> {
-    match s {
-        Some(r) => match r.read(buf).await {
-            Ok(0) | Err(_) => None,
-            Ok(n) => Some(n),
-        },
-        None => std::future::pending().await,
+/// Drain the process's output into `shared` until its pipes close. Arrival order across
+/// both pipes is whatever the world hands back — the same interleaving the old two-pipe
+/// `select!` produced.
+async fn pump(process: Arc<dyn Process>, shared: Arc<Shared>) {
+    while let Some(chunk) = process.next_chunk().await {
+        shared.output.lock().unwrap().append(chunk.bytes());
     }
 }
 
-/// Pump both child streams into `shared` until EOF on both. Platform-agnostic; the reaper is
-/// managed separately by the per-platform reader so this loop stays shared.
-async fn pump_streams(
-    stdout: Option<tokio::process::ChildStdout>,
-    stderr: Option<tokio::process::ChildStderr>,
-    shared: Arc<Shared>,
-) {
-    let mut out = stdout;
-    let mut errs = stderr;
-    let mut out_done = out.is_none();
-    let mut err_done = errs.is_none();
-    let mut obuf = [0u8; 8192];
-    let mut ebuf = [0u8; 8192];
-    while !(out_done && err_done) {
-        tokio::select! {
-            r = read_some(&mut out, &mut obuf), if !out_done => match r {
-                None => out_done = true,
-                Some(n) => shared.output.lock().unwrap().append(&obuf[..n]),
-            },
-            r = read_some(&mut errs, &mut ebuf), if !err_done => match r {
-                None => err_done = true,
-                Some(n) => shared.output.lock().unwrap().append(&ebuf[..n]),
-            },
-        }
-    }
-}
-
-/// Map a child's exit result to an exit code, using the `128 + signal` shell convention when
+/// Map how a process ended to an exit code, using the `128 + signal` shell convention when
 /// it was terminated by a signal (so an OOM-kill reads as `137`, not a misleading `-1`).
-fn exit_code_of(status: std::io::Result<std::process::ExitStatus>) -> i32 {
-    match status {
-        Ok(s) => match s.code() {
-            Some(code) => code,
-            None => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::ExitStatusExt;
-                    return s.signal().map(|sig| 128 + sig).unwrap_or(-1);
-                }
-                #[cfg(not(unix))]
-                {
-                    -1
-                }
-            }
-        },
-        Err(_) => -1,
-    }
+fn exit_code_of(exit: Result<Exit, String>) -> i32 {
+    exit.map(|e| e.code_or_signal()).unwrap_or(-1)
 }
 
 /// Give the pump a bounded grace to drain buffered output, then finalize the status. The
@@ -361,55 +260,31 @@ async fn finalize(
     };
 }
 
-#[cfg(not(target_os = "windows"))]
-async fn reader_task_unix(
-    mut reaper: PgroupChild,
-    stdout: Option<tokio::process::ChildStdout>,
-    stderr: Option<tokio::process::ChildStderr>,
+/// Owns the process for its whole life: pumps output, answers a kill, reaps on exit.
+///
+/// `kill` and `wait` are both `&self` on the handle, which is what lets one `select!` arm
+/// kill while the other is waiting — the borrow the two old per-platform readers had to
+/// arrange by copying the pgid / job handle out beforehand.
+async fn reader_task(
+    process: Arc<dyn Process>,
     shared: Arc<Shared>,
     mut kill_rx: UnboundedReceiver<()>,
 ) {
-    let pgid = reaper.pgid();
-    let mut pump = tokio::spawn(pump_streams(stdout, stderr, Arc::clone(&shared)));
+    let mut pump = tokio::spawn(pump(Arc::clone(&process), Arc::clone(&shared)));
     let mut killed = false;
     let code = loop {
         tokio::select! {
             biased;
             _ = kill_rx.recv(), if !killed => {
                 killed = true;
-                sigkill_pgroup(pgid); // borrow-free: doesn't touch `reaper`
+                process.kill().await;
             }
-            status = reaper.wait_and_disarm() => break exit_code_of(status),
+            exit = process.wait() => break exit_code_of(exit),
         }
     };
     finalize(&shared, &mut pump, killed, code).await;
-}
-
-#[cfg(target_os = "windows")]
-async fn reader_task_windows(
-    mut child: tokio::process::Child,
-    job: Option<crate::process_utils::JobHandle>,
-    stdout: Option<tokio::process::ChildStdout>,
-    stderr: Option<tokio::process::ChildStderr>,
-    shared: Arc<Shared>,
-    mut kill_rx: UnboundedReceiver<()>,
-) {
-    let pid = child.id();
-    let mut pump = tokio::spawn(pump_streams(stdout, stderr, Arc::clone(&shared)));
-    let mut killed = false;
-    let code = loop {
-        tokio::select! {
-            biased;
-            _ = kill_rx.recv(), if !killed => {
-                killed = true;
-                crate::process_utils::kill_windows_tree(&job, pid);
-            }
-            status = child.wait() => break exit_code_of(status),
-        }
-    };
-    finalize(&shared, &mut pump, killed, code).await;
-    // `job` drops here → KILL_ON_JOB_CLOSE reaps anything still in the tree.
-    drop(job);
+    // `process` drops here → the local world's reaper (pgroup / KILL_ON_JOB_CLOSE job)
+    // takes anything still in the tree with it.
 }
 
 fn status_line(status: &Status) -> String {
@@ -431,8 +306,24 @@ struct JobArgs {
 }
 
 /// `bash_start` — spawn a command in the background and return its job id.
-#[derive(Default)]
-pub(crate) struct BashStartTool;
+pub struct BashStartTool {
+    world: Arc<dyn Shell>,
+}
+
+impl Default for BashStartTool {
+    fn default() -> Self {
+        Self {
+            world: Arc::new(LocalShell),
+        }
+    }
+}
+
+impl BashStartTool {
+    /// Start jobs in `world` instead of on this machine.
+    pub fn with_world(world: Arc<dyn Shell>) -> Self {
+        Self { world }
+    }
+}
 
 #[async_trait]
 impl Tool for BashStartTool {
@@ -484,7 +375,7 @@ impl Tool for BashStartTool {
                 ))
             }
         };
-        match start(&a.command, ctx).await {
+        match start(&self.world, &a.command, ctx).await {
             Ok(id) => ok(format!(
                 "Started background job {id}. Collect output with bash_poll {{\"job_id\":\"{id}\"}} \
                  (repeat until it reports it exited); stop it with bash_kill {{\"job_id\":\"{id}\"}}."
@@ -496,7 +387,7 @@ impl Tool for BashStartTool {
 
 /// `bash_poll` — read new output from a background job and its status.
 #[derive(Default)]
-pub(crate) struct BashPollTool;
+pub struct BashPollTool;
 
 #[async_trait]
 impl Tool for BashPollTool {
@@ -549,7 +440,7 @@ impl Tool for BashPollTool {
 
 /// `bash_kill` — stop a background job and reap its whole process tree.
 #[derive(Default)]
-pub(crate) struct BashKillTool;
+pub struct BashKillTool;
 
 #[async_trait]
 impl Tool for BashKillTool {
@@ -604,7 +495,7 @@ mod tests {
             let args = serde_json::json!({ "command": cmd }).to_string();
             (
                 BashTool::default().always_grant_scope(&args),
-                BashStartTool.always_grant_scope(&args),
+                BashStartTool::default().always_grant_scope(&args),
             )
         };
         // Ordinary command: session-wide on BOTH, so one "Always" stops the next re-prompt.
@@ -620,6 +511,10 @@ mod tests {
         let (fg, bg) = scope("cat ~/.ssh/id_rsa");
         assert_eq!(fg, bg);
         assert_ne!(bg, "", "a sensitive target must not take the tool-wide key");
+    }
+
+    fn local() -> Arc<dyn Shell> {
+        Arc::new(LocalShell)
     }
 
     fn ctx(dir: &Path) -> ToolContext {
@@ -651,10 +546,65 @@ mod tests {
         (collected, status)
     }
 
+    /// A world that never spawns anything and says so.
+    struct Elsewhere(Mutex<Vec<String>>);
+
+    struct Canned(Mutex<Option<crate::world::Chunk>>);
+
+    #[async_trait]
+    impl Process for Canned {
+        async fn next_chunk(&self) -> Option<crate::world::Chunk> {
+            self.0.lock().unwrap().take()
+        }
+        async fn wait(&self) -> Result<Exit, String> {
+            Ok(Exit {
+                code: Some(0),
+                signal: None,
+            })
+        }
+        async fn kill(&self) {}
+    }
+
+    #[async_trait]
+    impl Shell for Elsewhere {
+        fn describe(&self) -> String {
+            "elsewhere".into()
+        }
+        async fn spawn(
+            &self,
+            command: &str,
+            _options: &SpawnOptions,
+        ) -> Result<Arc<dyn Process>, crate::world::SpawnError> {
+            self.0.lock().unwrap().push(command.to_string());
+            Ok(Arc::new(Canned(Mutex::new(Some(
+                crate::world::Chunk::Stdout(b"ran elsewhere".to_vec()),
+            )))))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_job_runs_in_the_world_it_was_started_in() {
+        // The claim this file makes since it stopped spawning for itself: point
+        // `shell` elsewhere and a background job goes there, and its output comes
+        // back from there. `echo` never runs on this machine.
+        let d = tempfile::tempdir().unwrap();
+        let world = Arc::new(Elsewhere(Mutex::new(Vec::new())));
+        let as_shell: Arc<dyn Shell> = world.clone();
+        let id = start(&as_shell, "echo local", &ctx(d.path()))
+            .await
+            .unwrap();
+        let (out, status) = drain(&id).await;
+        assert_eq!(out, "ran elsewhere");
+        assert_eq!(status, Status::Exited(0));
+        assert_eq!(*world.0.lock().unwrap(), vec!["echo local".to_string()]);
+    }
+
     #[tokio::test]
     async fn start_survives_the_call_and_poll_collects_output_then_exit() {
         let d = tempfile::tempdir().unwrap();
-        let id = start("printf 'hello-bg\\n'", &ctx(d.path())).await.unwrap();
+        let id = start(&local(), "printf 'hello-bg\\n'", &ctx(d.path()))
+            .await
+            .unwrap();
         let (out, status) = drain(&id).await;
         assert!(out.contains("hello-bg"), "output was {out:?}");
         assert_eq!(status, Status::Exited(0));
@@ -663,7 +613,7 @@ mod tests {
     #[tokio::test]
     async fn nonzero_exit_code_is_reported() {
         let d = tempfile::tempdir().unwrap();
-        let id = start("exit 7", &ctx(d.path())).await.unwrap();
+        let id = start(&local(), "exit 7", &ctx(d.path())).await.unwrap();
         let (_out, status) = drain(&id).await;
         assert_eq!(status, Status::Exited(7));
     }
@@ -671,7 +621,7 @@ mod tests {
     #[tokio::test]
     async fn kill_stops_a_long_running_job() {
         let d = tempfile::tempdir().unwrap();
-        let id = start("sleep 30", &ctx(d.path())).await.unwrap();
+        let id = start(&local(), "sleep 30", &ctx(d.path())).await.unwrap();
         tokio::time::sleep(Duration::from_millis(80)).await; // let the shell come up
         kill(&id).unwrap();
         let (_out, status) = drain(&id).await;
@@ -689,7 +639,7 @@ mod tests {
     async fn grandchild_holding_pipe_does_not_hang_the_job() {
         let d = tempfile::tempdir().unwrap();
         // `sleep 5` inherits stdout and outlives the shell, which exits right after echo.
-        let id = start("sleep 5 & echo launched", &ctx(d.path()))
+        let id = start(&local(), "sleep 5 & echo launched", &ctx(d.path()))
             .await
             .unwrap();
         let (out, status) = drain(&id).await;
@@ -704,7 +654,7 @@ mod tests {
     async fn non_utf8_output_is_not_truncated() {
         let d = tempfile::tempdir().unwrap();
         // 0xFF is invalid UTF-8; "after" follows it.
-        let id = start(r"printf '\377bad\nafter\n'", &ctx(d.path()))
+        let id = start(&local(), r"printf '\377bad\nafter\n'", &ctx(d.path()))
             .await
             .unwrap();
         let (out, status) = drain(&id).await;
@@ -719,7 +669,7 @@ mod tests {
     #[tokio::test]
     async fn ansi_escapes_are_sanitized() {
         let d = tempfile::tempdir().unwrap();
-        let id = start(r"printf '\033[31mred\033[0m\n'", &ctx(d.path()))
+        let id = start(&local(), r"printf '\033[31mred\033[0m\n'", &ctx(d.path()))
             .await
             .unwrap();
         let (out, _status) = drain(&id).await;
@@ -732,7 +682,9 @@ mod tests {
     #[tokio::test]
     async fn external_signal_reports_128_plus_signal() {
         let d = tempfile::tempdir().unwrap();
-        let id = start("kill -KILL $$", &ctx(d.path())).await.unwrap();
+        let id = start(&local(), "kill -KILL $$", &ctx(d.path()))
+            .await
+            .unwrap();
         let (_out, status) = drain(&id).await;
         assert_eq!(status, Status::Exited(137));
     }

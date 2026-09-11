@@ -289,11 +289,24 @@ impl Chunk {
 pub struct Exit {
     /// `None` when the process was terminated by a signal rather than exiting.
     pub code: Option<i32>,
+    /// The signal that terminated it, where the world has one. Carried
+    /// separately rather than folded into `code` because callers disagree on
+    /// the fold: the foreground tool says "terminated by signal", a background
+    /// job reports the shell's `128 + signal` so an OOM-kill reads as `137`.
+    pub signal: Option<i32>,
 }
 
 impl Exit {
     pub fn success(&self) -> bool {
         self.code == Some(0)
+    }
+
+    /// The shell convention: the code, or `128 + signal`, or `-1` when neither
+    /// is known.
+    pub fn code_or_signal(&self) -> i32 {
+        self.code
+            .or_else(|| self.signal.map(|sig| 128 + sig))
+            .unwrap_or(-1)
     }
 }
 

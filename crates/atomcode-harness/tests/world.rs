@@ -45,7 +45,10 @@ impl Process for Canned {
         self.chunk.lock().unwrap().take()
     }
     async fn wait(&self) -> Result<Exit, String> {
-        Ok(Exit { code: Some(0) })
+        Ok(Exit {
+            code: Some(0),
+            signal: None,
+        })
     }
     async fn kill(&self) {}
 }
@@ -392,12 +395,13 @@ async fn unloading_the_world_takes_its_tools_with_it() {
 
 #[tokio::test]
 async fn a_routed_world_mounts_no_process_path_that_bypasses_it() {
-    // The production crate also ships `bash_start` / `bash_poll` / `bash_kill`,
-    // which still spawn on this machine directly. A tree whose `shell` points
-    // elsewhere must not offer them: a "read-only sandbox" with a side door to
-    // the host is worse than no sandbox, because the model is told it is
-    // contained. This pins the fact that no world-routed row mounts them until
-    // they route too.
+    // The production crate also ships `bash_start` / `bash_poll` / `bash_kill`.
+    // They route through the same seam now, but only when handed the world —
+    // `BashStartTool::default()` is this machine. A tree whose `shell` points
+    // elsewhere must not offer the default form: a "read-only sandbox" with a
+    // side door to the host is worse than no sandbox, because the model is told
+    // it is contained. No row mounts them today; if one does, it goes through
+    // `with_world` and this assertion moves to "mounted, and routed".
     let dir = scratch("no-side-door");
     let recorder = Arc::new(RecordingShell::default());
     let mut registry = plugins::catalog();

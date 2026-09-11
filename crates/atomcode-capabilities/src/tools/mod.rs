@@ -207,7 +207,7 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
     reg.register(Arc::new(BashTool::default()));
     // Background job path for long-running commands (start/poll/kill) — the reference-
     // informed alternative to an ever-larger `timeout` (see tools::bash::background).
-    reg.register(Arc::new(bash::BashStartTool));
+    reg.register(Arc::new(bash::BashStartTool::default()));
     reg.register(Arc::new(bash::BashPollTool));
     reg.register(Arc::new(bash::BashKillTool));
     reg.register(Arc::new(GrepTool));
