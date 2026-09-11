@@ -168,10 +168,8 @@ async fn main() {
 
     let (host, port, cli_override, idle_timeout_secs, startup_mode, no_auth) = parse_daemon_args();
 
-    let (webui_tokens, daemon_token_file) = atomcode_daemon::resolve_daemon_auth(
-        no_auth,
-        std::env::var("ATOMCODE_DAEMON_TOKEN").ok(),
-    );
+    let (webui_tokens, daemon_token_file) =
+        atomcode_daemon::resolve_daemon_auth(no_auth, std::env::var("ATOMCODE_DAEMON_TOKEN").ok());
     if no_auth {
         eprintln!(
             "WARNING: daemon authentication is disabled; all API endpoints are accessible without a token"

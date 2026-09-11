@@ -8969,8 +8969,14 @@ mod tests {
         // port, so it keeps the plain form — no misleading --port advice.
         let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
         let plain = daemon_bind_failure_message("0.0.0.0:80", 80, &denied);
-        assert!(plain.starts_with("Fatal: failed to bind"), "plain form: {plain}");
-        assert!(!plain.contains("--port"), "no port advice for non-collision: {plain}");
+        assert!(
+            plain.starts_with("Fatal: failed to bind"),
+            "plain form: {plain}"
+        );
+        assert!(
+            !plain.contains("--port"),
+            "no port advice for non-collision: {plain}"
+        );
     }
 
     #[tokio::test]

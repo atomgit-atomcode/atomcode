@@ -4118,12 +4118,18 @@ mod tests {
         };
         // opencode.ai + non-empty session → header carries the stable id.
         assert_eq!(
-            header_of("https://opencode.ai/zen/v1/chat/completions", "sess-abc-123"),
+            header_of(
+                "https://opencode.ai/zen/v1/chat/completions",
+                "sess-abc-123"
+            ),
             Some("sess-abc-123".to_string())
         );
         // Non-opencode host → never sent (no product-identity leak to other gateways).
         assert_eq!(
-            header_of("https://api.deepseek.com/v1/chat/completions", "sess-abc-123"),
+            header_of(
+                "https://api.deepseek.com/v1/chat/completions",
+                "sess-abc-123"
+            ),
             None
         );
         // Empty session (sub-agent / summary) → omitted even on opencode.

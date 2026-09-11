@@ -6490,7 +6490,11 @@ mod menu_tests {
         use crossterm::event::KeyModifiers;
 
         // Default (shift_tab) preference: plain Tab stays a completion key.
-        assert!(!is_mode_cycle_key(KeyCode::Tab, KeyModifiers::NONE, ShiftTab));
+        assert!(!is_mode_cycle_key(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+            ShiftTab
+        ));
         assert!(is_mode_cycle_key(
             KeyCode::BackTab,
             KeyModifiers::SHIFT,
@@ -6501,7 +6505,11 @@ mod menu_tests {
             KeyModifiers::NONE,
             ShiftTab
         ));
-        assert!(is_mode_cycle_key(KeyCode::Tab, KeyModifiers::SHIFT, ShiftTab));
+        assert!(is_mode_cycle_key(
+            KeyCode::Tab,
+            KeyModifiers::SHIFT,
+            ShiftTab
+        ));
         assert!(!is_mode_cycle_key(
             KeyCode::BackTab,
             KeyModifiers::SHIFT | KeyModifiers::CONTROL,
@@ -6522,13 +6530,13 @@ mod menu_tests {
         assert!(is_mode_cycle_key(KeyCode::BackTab, KeyModifiers::NONE, Tab));
         // Modified Tab never cycles regardless of preference (would collide
         // with terminal chords / newline aliases).
+        assert!(!is_mode_cycle_key(KeyCode::Tab, KeyModifiers::CONTROL, Tab));
+        // Sanity: the same plain Tab is NOT a cycle key under shift_tab.
         assert!(!is_mode_cycle_key(
             KeyCode::Tab,
-            KeyModifiers::CONTROL,
-            Tab
+            KeyModifiers::NONE,
+            ShiftTab
         ));
-        // Sanity: the same plain Tab is NOT a cycle key under shift_tab.
-        assert!(!is_mode_cycle_key(KeyCode::Tab, KeyModifiers::NONE, ShiftTab));
     }
 
     #[test]

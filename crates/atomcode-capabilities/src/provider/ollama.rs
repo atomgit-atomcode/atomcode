@@ -767,9 +767,7 @@ mod tests {
         let msgs = [Message::user("hi")];
         let body = build_request_body("m", &msgs, &[], &ChatOptions::default(), &cfg);
         assert!(
-            body.get("options")
-                .and_then(|o| o.get("num_ctx"))
-                .is_none(),
+            body.get("options").and_then(|o| o.get("num_ctx")).is_none(),
             "unpinned ⇒ no num_ctx"
         );
 
