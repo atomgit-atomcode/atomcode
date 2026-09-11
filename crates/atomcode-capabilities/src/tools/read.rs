@@ -266,23 +266,44 @@ where
     })
 }
 
+macro_rules! read_file_description {
+    ($image_guidance:literal) => {
+        concat!(
+            "Read a file — or any slice of one — from the filesystem. This is the way to read \
+             or slice files: prefer it over `bash cat`/`head`/`tail` or a `python`/`awk` script, \
+             which return partial content and bypass paging, caching, and history retention. \
+             Returns the contents prefixed with 1-based line numbers (`<n>\\t<content>`). By \
+             default returns up to 1500 lines; a ~50 KiB output budget may return fewer. When a result \
+             shows a continuation offset, continue from that offset instead of rereading line 1. \
+             Use `offset` (1-based start line) and `limit` (max lines) when a larger relevant \
+             window is needed; avoid many tiny overlapping reads. To grab several disjoint \
+             windows at once (e.g. multiple symbols listed in a skeleton), pass `ranges` instead \
+             of paginating or splitting the file yourself. If the path is a directory its entries \
+             are listed instead. Relative paths resolve against the working directory. \
+             ",
+            $image_guidance
+        )
+    };
+}
+
 #[async_trait]
 impl Tool for ReadFileTool {
     fn name(&self) -> &str {
         "read_file"
     }
     fn description(&self) -> &str {
-        "Read a file — or any slice of one — from the filesystem. This is the way to read \
-         or slice files: prefer it over `bash cat`/`head`/`tail` or a `python`/`awk` script, \
-         which return partial content and bypass paging, caching, and history retention. \
-         Returns the contents prefixed with 1-based line numbers (`<n>\\t<content>`). By \
-         default returns up to 1500 lines; a ~50 KiB output budget may return fewer. When a result \
-         shows a continuation offset, continue from that offset instead of rereading line 1. \
-         Use `offset` (1-based start line) and `limit` (max lines) when a larger relevant \
-         window is needed; avoid many tiny overlapping reads. To grab several disjoint \
-         windows at once (e.g. multiple symbols listed in a skeleton), pass `ranges` instead \
-         of paginating or splitting the file yourself. If the path is a directory its entries \
-         are listed instead. Relative paths resolve against the working directory."
+        if self.vision {
+            read_file_description!(
+                "You can see images: whenever a relevant JPG, JPEG, PNG, GIF, or WebP path is \
+                 present, proactively call this tool to inspect it. The image is returned as \
+                 visual content."
+            )
+        } else {
+            read_file_description!(
+                "This tool cannot display image contents in the current text-only mode; do not \
+                 treat JPG, JPEG, PNG, GIF, or WebP files as readable text."
+            )
+        }
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
