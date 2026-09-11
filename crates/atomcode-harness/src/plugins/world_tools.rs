@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use atomcode_capabilities::tools::{
-    BashTool, EditFileTool, ListDirTool, ReadFileTool, WriteFileTool,
+    BashTool, EditFileTool, GlobTool, GrepTool, ListDirTool, ReadFileTool, WriteFileTool,
 };
 use atomcode_kernel::tool::Tool;
 use atomcode_plexus::{Context, Plugin};
@@ -72,6 +72,45 @@ impl Plugin for FsWorldToolsPlugin {
                  editing it, and prefer `edit_file` over rewriting a whole file.",
                 fs.describe()
             ),
+        );
+        Ok(())
+    }
+}
+
+// ---- search -------------------------------------------------------------
+
+pub struct SearchWorldToolsPlugin;
+
+#[async_trait]
+impl Plugin for SearchWorldToolsPlugin {
+    fn name(&self) -> &'static str {
+        "tool-search-world"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools", "fs"]
+    }
+    fn description(&self) -> &'static str {
+        "grep and glob, routed through the `fs` seam"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let fs = ctx.require::<FsSvc>().map_err(|e| e.to_string())?;
+        // These were the two tools a fenced world could not contain: they walked
+        // the host disk with their own `ignore::WalkBuilder`. The walk and the
+        // search are the world's now (`FileSystem::walk` / `search`), so a
+        // fenced root refuses them before an entry is read.
+        super::tools::mount(
+            ctx,
+            vec![
+                Arc::new(GrepTool::with_world(fs.clone())),
+                Arc::new(GlobTool::with_world(fs.clone())),
+            ],
+        )?;
+        super::tools::contribute_prompt(
+            ctx,
+            "tool-search-world",
+            52,
+            "Prefer `grep`/`glob` over listing directories by hand when you are looking for \
+             something by name or content.",
         );
         Ok(())
     }

@@ -80,7 +80,7 @@ name = "bash-local"
 name = "tool-fs-world"
 
 [[insert]]
-name = "tool-search"
+name = "tool-search-world"
 
 # Structural search: cheap to mount, but only the audit variants ask the kind of
 # question it answers, so base leaves it off.
@@ -96,6 +96,10 @@ name = "tool-bash-world"
 # other — the catalog refuses a duplicate rather than silently picking.
 [[insert]]
 name = "tool-fs"
+disabled = true
+
+[[insert]]
+name = "tool-search"
 disabled = true
 
 [[insert]]
@@ -394,7 +398,7 @@ name = "llm-openai-compat"
 config = { api_key_env = "ATOMCODE_API_KEY" }
 "#;
 
-/// Swap the local tool implementations for the production ones. Same four tool
+/// Swap the local tool implementations for the production ones. Same tool
 /// names, same model-facing behaviour, no `fs` seam in the path.
 ///
 /// The execution world comes out with them. The production tools reach the disk
@@ -404,6 +408,10 @@ config = { api_key_env = "ATOMCODE_API_KEY" }
 pub const NATIVE_TOOLS: &str = r#"
 [[patch]]
 id = "tool-fs-world"
+disabled = true
+
+[[patch]]
+id = "tool-search-world"
 disabled = true
 
 [[patch]]
@@ -420,6 +428,10 @@ disabled = true
 
 [[patch]]
 id = "tool-fs"
+disabled = false
+
+[[patch]]
+id = "tool-search"
 disabled = false
 
 [[patch]]

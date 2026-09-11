@@ -239,20 +239,13 @@ async fn the_fence_holds_for_the_tools_that_go_through_the_world() {
     // `#[ignore]`d: an ignored test is one nobody runs, and a bare count does not
     // say *which* tool started leaking.
     //
-    // `grep` and `glob` traverse with `ignore::WalkBuilder`, which reads the real
-    // disk and never consults the `fs` row. Routing only their existence check
-    // would be worse than leaving them alone — the seam map would then report
-    // them as world-routed while the traversal still went around it.
-    //
-    // The fix is a decision, not a patch, and it belongs with whoever makes it:
-    //   (a) give the world a search primitive, so a remote world runs its own
-    //       ripgrep and returns matches — the shape a sandbox wants anyway; or
-    //   (b) do not mount grep/glob in a non-local world, the way `open_file`
-    //       already cannot be mounted in one.
-    //
-    // Until then this test's job is to make sure the list does not grow, and to
-    // fail loudly on the happy day it shrinks.
-    const KNOWN_TO_ESCAPE: &[&str] = &["grep", "glob"];
+    // `grep` and `glob` used to be on this list: they traversed with their own
+    // `ignore::WalkBuilder`, which read the real disk and never consulted the
+    // `fs` row. The decision this comment once deferred was taken — the world
+    // got `walk` and `search` primitives (a remote world runs its own ripgrep
+    // and returns the lines), and `tool-search-world` mounts the two tools
+    // handed the world. The list is empty; its job now is to stay that way.
+    const KNOWN_TO_ESCAPE: &[&str] = &[];
 
     let escaped = tools_that_escape_the_fence().await;
 

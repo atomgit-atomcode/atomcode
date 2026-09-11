@@ -140,11 +140,63 @@ pub struct DirEntry {
     pub is_dir: bool,
 }
 
+/// A caller's "do not descend into a directory with this name". Shared and
+/// `'static` because a walker hands it to a filter that outlives the call frame.
+pub type SkipDir = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// A caller's "do not search this file" — by path, so an extension rule or a
+/// size rule both fit.
+pub type SkipFile = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FileInfo {
     pub exists: bool,
     pub is_dir: bool,
     pub len: u64,
+}
+
+/// A content search, as the caller wants it run. Everything here is the
+/// caller's decision — the world only executes it.
+#[cfg(feature = "tools")]
+#[derive(Clone)]
+pub struct SearchQuery {
+    /// The regex, already final: smart-case and the literal fallback are the
+    /// caller's to decide, so a world never guesses at them.
+    pub pattern: String,
+    pub case_insensitive: bool,
+    /// Lines of context around each match.
+    pub context: usize,
+    /// Stop after this many matching lines.
+    pub max_matches: usize,
+    pub skip_dir: SkipDir,
+    pub skip_file: SkipFile,
+}
+
+/// One line of a search result, **undecoded** — the world's bytes, for the
+/// same reason [`Chunk`] carries bytes.
+#[cfg(feature = "tools")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchLine {
+    Match {
+        path: PathBuf,
+        line: u64,
+        text: Vec<u8>,
+    },
+    Context {
+        path: PathBuf,
+        line: u64,
+        text: Vec<u8>,
+    },
+    /// Between two non-contiguous groups of context.
+    Break,
+}
+
+#[cfg(feature = "tools")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchResult {
+    pub lines: Vec<SearchLine>,
+    pub matches: usize,
+    pub files_searched: usize,
 }
 
 // ---- the filesystem seam -------------------------------------------------
@@ -197,6 +249,86 @@ pub trait FileSystem: Send + Sync {
     async fn canonicalize(&self, path: &Path) -> Result<PathBuf, FsError>;
 
     // ---- derived, overridable -------------------------------------------
+
+    /// Every file under `root`, recursively, in the order the world walks them.
+    ///
+    /// `skip_dir` is the **caller's** policy — directory names it does not want
+    /// descended (`target`, `node_modules`, …) — for the same reason
+    /// [`list`](Self::list) takes no skip-list: which subtrees are noise is the
+    /// tool's opinion, and two tools hold different ones. What the world adds on
+    /// top is its own notion of what is *part of* its tree: hidden entries are
+    /// left out, and a world that has ignore files honours them. The default
+    /// here honours none — reading a tree's `.gitignore` chain and the host's
+    /// global excludes is the local world's business (see `LocalFs`), and a
+    /// remote world knows its own — so it is the plain tree minus dotfiles and
+    /// the caller's skips, built on [`list`](Self::list). A world with a git
+    /// tree should override.
+    ///
+    /// This is the primitive `glob` and `grep` walk with. Before it existed
+    /// they walked the host disk directly and were the two tools a fenced world
+    /// could not contain.
+    async fn walk(&self, root: &Path, skip_dir: &SkipDir) -> Result<Vec<PathBuf>, FsError> {
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let mut subdirs = Vec::new();
+            for entry in self.list(&dir).await? {
+                let name = entry
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if name.starts_with('.') {
+                    continue;
+                }
+                if entry.is_dir {
+                    if !skip_dir(&name) {
+                        subdirs.push(entry.path);
+                    }
+                } else {
+                    files.push(entry.path);
+                }
+            }
+            // Depth-first in listing order, so the result reads like a tree.
+            pending.extend(subdirs.into_iter().rev());
+        }
+        Ok(files)
+    }
+
+    /// Search file contents under `root`.
+    ///
+    /// Derived from [`walk`](Self::walk) + [`read_bytes`](Self::read_bytes):
+    /// correct in any world, at the cost of reading each file whole. The local
+    /// world overrides it with a streaming searcher whose memory is bounded per
+    /// line, not per file; a remote world would override it with its own
+    /// `ripgrep` and return the lines — which is the shape a sandbox wants
+    /// anyway. What a caller decides (the pattern, the caps, what to skip) and
+    /// what it renders stay with the caller.
+    #[cfg(feature = "tools")]
+    async fn search(&self, root: &Path, query: &SearchQuery) -> Result<SearchResult, FsError> {
+        let matcher = build_matcher(query)?;
+        let mut searcher = build_searcher(query.context);
+        let mut result = SearchResult::default();
+        for path in self.walk(root, &query.skip_dir).await? {
+            if result.matches >= query.max_matches {
+                break;
+            }
+            if (query.skip_file)(&path) {
+                continue;
+            }
+            let Ok(bytes) = self.read_bytes(&path).await else {
+                continue;
+            };
+            result.files_searched += 1;
+            let sink = CollectingSink {
+                path: &path,
+                result: &mut result,
+                max: query.max_matches,
+            };
+            let _ = searcher.search_slice(&matcher, &bytes, sink);
+        }
+        Ok(result)
+    }
 
     async fn read_text(&self, path: &Path) -> Result<String, FsError> {
         let bytes = self.read_bytes(path).await?;
@@ -653,6 +785,157 @@ impl FileSystem for LocalFs {
     async fn canonicalize(&self, path: &Path) -> Result<PathBuf, FsError> {
         self.resolve(path)
     }
+
+    /// The walker `glob` and `grep` always used, verbatim — gitignore-aware
+    /// (tree, global and `.git/info/exclude`), hidden entries skipped, the
+    /// caller's skip-list applied to directories — now behind the fence, so a
+    /// root outside it is refused before a single entry is read. Runs on the
+    /// blocking pool because the `ignore` crate is synchronous.
+    #[cfg(feature = "tools")]
+    async fn walk(&self, root: &Path, skip_dir: &SkipDir) -> Result<Vec<PathBuf>, FsError> {
+        let root = self.resolve(root)?;
+        let skip_dir = Arc::clone(skip_dir);
+        tokio::task::spawn_blocking(move || {
+            Ok(local_walker(&root, skip_dir)
+                .flatten()
+                .map(|entry| entry.into_path())
+                .filter(|path| path.is_file())
+                .collect())
+        })
+        .await
+        .map_err(FsError::io)?
+    }
+
+    /// The streaming search `grep` always ran, verbatim: the same walker, one
+    /// [`grep::searcher::Searcher`] per call with a per-file heap cap so a
+    /// multi-MB single line cannot grow the buffer without bound, matches
+    /// stopping the walk at the cap. Fenced like everything else here.
+    #[cfg(feature = "tools")]
+    async fn search(&self, root: &Path, query: &SearchQuery) -> Result<SearchResult, FsError> {
+        let root = self.resolve(root)?;
+        let matcher = build_matcher(query)?;
+        let query = query.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut result = SearchResult::default();
+            let mut searcher = build_searcher(query.context);
+            for entry in local_walker(&root, Arc::clone(&query.skip_dir)).flatten() {
+                if result.matches >= query.max_matches {
+                    break;
+                }
+                let path = entry.path();
+                if !path.is_file() || (query.skip_file)(path) {
+                    continue;
+                }
+                result.files_searched += 1;
+                let sink = CollectingSink {
+                    path,
+                    result: &mut result,
+                    max: query.max_matches,
+                };
+                // io / binary / decode errors ⇒ skip the file, as before.
+                let _ = searcher.search_path(&matcher, path, sink);
+            }
+            Ok(result)
+        })
+        .await
+        .map_err(FsError::io)?
+    }
+}
+
+/// The walker `glob` and `grep` always used: gitignore-aware (tree, global and
+/// `.git/info/exclude`), hidden entries skipped, the caller's skip-list applied
+/// to directories.
+#[cfg(feature = "tools")]
+fn local_walker(root: &Path, skip_dir: SkipDir) -> ignore::Walk {
+    ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(move |e| {
+            // Drop the caller's skip-dirs (gitignore already covers most).
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if let Some(name) = e.file_name().to_str() {
+                    return !skip_dir(name);
+                }
+            }
+            true
+        })
+        .build()
+}
+
+#[cfg(feature = "tools")]
+fn build_matcher(query: &SearchQuery) -> Result<grep::regex::RegexMatcher, FsError> {
+    grep::regex::RegexMatcherBuilder::new()
+        .case_insensitive(query.case_insensitive)
+        .build(&query.pattern)
+        .map_err(|e| FsError::io(format!("invalid pattern '{}': {e}", query.pattern)))
+}
+
+/// Per-file heap cap for the searcher's line buffer. Without it the searcher
+/// would grow the buffer to hold the LONGEST single line — a multi-MB minified
+/// bundle or a one-line giant log would still buffer whole and OOM a small
+/// machine. Past this, the file's search errors and is skipped.
+#[cfg(feature = "tools")]
+pub const MAX_LINE_BUF_BYTES: usize = 10 * 1024 * 1024;
+
+#[cfg(feature = "tools")]
+fn build_searcher(context: usize) -> grep::searcher::Searcher {
+    grep::searcher::SearcherBuilder::new()
+        .line_number(true)
+        .before_context(context)
+        .after_context(context)
+        // Treat NUL-containing files as binary and stop (ripgrep-standard).
+        // Non-UTF-8 text is searched lossily rather than skipped, so ASCII
+        // patterns still match in e.g. a GBK-encoded file.
+        .binary_detection(grep::searcher::BinaryDetection::quit(b'\x00'))
+        .heap_limit(Some(MAX_LINE_BUF_BYTES))
+        .build()
+}
+
+/// Collects raw lines; stops a file once the global cap is hit.
+#[cfg(feature = "tools")]
+struct CollectingSink<'a> {
+    path: &'a Path,
+    result: &'a mut SearchResult,
+    max: usize,
+}
+
+#[cfg(feature = "tools")]
+impl grep::searcher::Sink for CollectingSink<'_> {
+    type Error = std::io::Error;
+
+    fn matched(
+        &mut self,
+        _: &grep::searcher::Searcher,
+        mat: &grep::searcher::SinkMatch<'_>,
+    ) -> Result<bool, std::io::Error> {
+        self.result.lines.push(SearchLine::Match {
+            path: self.path.to_path_buf(),
+            line: mat.line_number().unwrap_or(0),
+            text: mat.bytes().to_vec(),
+        });
+        self.result.matches += 1;
+        Ok(self.result.matches < self.max) // stop this file at the cap
+    }
+
+    fn context(
+        &mut self,
+        _: &grep::searcher::Searcher,
+        ctx: &grep::searcher::SinkContext<'_>,
+    ) -> Result<bool, std::io::Error> {
+        self.result.lines.push(SearchLine::Context {
+            path: self.path.to_path_buf(),
+            line: ctx.line_number().unwrap_or(0),
+            text: ctx.bytes().to_vec(),
+        });
+        Ok(true)
+    }
+
+    fn context_break(&mut self, _: &grep::searcher::Searcher) -> Result<bool, std::io::Error> {
+        self.result.lines.push(SearchLine::Break);
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -810,6 +1093,124 @@ mod tests {
         );
         // One level only — recursion and depth are the caller's policy.
         assert_eq!(names.len(), 3, "{names:?}");
+    }
+
+    /// Five methods over a map: the smallest world there is. What it proves is
+    /// that a world implements the primitives and *inherits* `walk` — and that
+    /// the inherited walk is the plain tree minus dotfiles and the caller's
+    /// skips, nothing cleverer.
+    struct Memory(std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>); // None = dir
+
+    #[async_trait]
+    impl FileSystem for Memory {
+        fn describe(&self) -> String {
+            "in memory".into()
+        }
+        fn root(&self) -> PathBuf {
+            PathBuf::from("/")
+        }
+        async fn read_bytes(&self, path: &Path) -> Result<Vec<u8>, FsError> {
+            match self.0.get(path) {
+                Some(Some(bytes)) => Ok(bytes.clone()),
+                Some(None) => Err(FsError::not_a_file(path)),
+                None => Err(FsError::not_found(path)),
+            }
+        }
+        async fn write_bytes(&self, _: &Path, _: &[u8]) -> Result<(), FsError> {
+            Err(FsError::denied("frozen"))
+        }
+        async fn create_dir_all(&self, _: &Path) -> Result<(), FsError> {
+            Err(FsError::denied("frozen"))
+        }
+        async fn list(&self, path: &Path) -> Result<Vec<DirEntry>, FsError> {
+            if !matches!(self.0.get(path), Some(None)) {
+                return Err(FsError::not_found(path));
+            }
+            Ok(self
+                .0
+                .iter()
+                .filter(|(p, _)| p.parent() == Some(path))
+                .map(|(p, v)| DirEntry {
+                    path: p.clone(),
+                    is_dir: v.is_none(),
+                })
+                .collect())
+        }
+        async fn info(&self, path: &Path) -> Result<FileInfo, FsError> {
+            Ok(match self.0.get(path) {
+                Some(v) => FileInfo {
+                    exists: true,
+                    is_dir: v.is_none(),
+                    len: v.as_ref().map_or(0, |b| b.len() as u64),
+                },
+                None => FileInfo::default(),
+            })
+        }
+        async fn canonicalize(&self, path: &Path) -> Result<PathBuf, FsError> {
+            Ok(path.to_path_buf())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_world_that_implements_the_primitives_inherits_walk() {
+        let mut m = std::collections::BTreeMap::new();
+        for dir in ["/", "/src", "/src/deep", "/target", "/.git"] {
+            m.insert(PathBuf::from(dir), None);
+        }
+        for file in [
+            "/src/a.rs",
+            "/src/deep/b.rs",
+            "/src/.hidden.rs",
+            "/target/x.rs",
+            "/.git/HEAD",
+            "/top.rs",
+        ] {
+            m.insert(PathBuf::from(file), Some(Vec::new()));
+        }
+        let world = Memory(m);
+        let skip: SkipDir = Arc::new(|name: &str| name == "target");
+        let mut found = world.walk(Path::new("/"), &skip).await.unwrap();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                PathBuf::from("/src/a.rs"),
+                PathBuf::from("/src/deep/b.rs"),
+                PathBuf::from("/top.rs"),
+            ],
+            "dotfiles and the caller's skip-dir are out; everything else is in"
+        );
+    }
+
+    #[cfg(feature = "tools")]
+    #[tokio::test]
+    async fn the_local_walk_is_fenced_and_gitignore_aware() {
+        let dir = scratch("walk");
+        std::fs::create_dir_all(dir.join("inside/src")).unwrap();
+        std::fs::create_dir_all(dir.join("inside/target")).unwrap();
+        std::fs::write(dir.join("inside/src/a.rs"), "").unwrap();
+        std::fs::write(dir.join("inside/target/x.rs"), "").unwrap();
+        std::fs::write(dir.join("inside/gen.rs"), "").unwrap();
+        std::fs::write(dir.join("inside/.gitignore"), "gen.rs\n").unwrap();
+        // The walker honours `.gitignore` only inside a repository (ripgrep's
+        // `require_git`), which is how the tools always behaved; a bare `.git`
+        // is enough to make it one.
+        std::fs::create_dir_all(dir.join("inside/.git")).unwrap();
+        std::fs::write(dir.join("outside.rs"), "").unwrap();
+        let fs = LocalFs::new(dir.join("inside"));
+
+        let skip: SkipDir = Arc::new(|name: &str| name == "target");
+        let mut found = fs.walk(Path::new("."), &skip).await.unwrap();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![dir.join("inside/src/a.rs")],
+            "gitignored, skipped and hidden entries are out"
+        );
+        // The fence applies to a walk exactly as to a read: a root outside it is
+        // refused, not walked.
+        let err = fs.walk(Path::new(".."), &skip).await.unwrap_err();
+        assert!(err.is_denied(), "{err}");
     }
 
     #[tokio::test]

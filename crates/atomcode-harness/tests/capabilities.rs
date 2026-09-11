@@ -290,7 +290,7 @@ id = "codeintel"
 [[remove]]
 id = "memory"
 [[remove]]
-id = "tool-search"
+id = "tool-search-world"
 [[remove]]
 id = "tool-todo"
 [[remove]]

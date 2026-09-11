@@ -52,6 +52,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(world::FsReadOnlyPlugin))
         .register(Arc::new(world::BashLocalPlugin))
         .register(Arc::new(world_tools::FsWorldToolsPlugin))
+        .register(Arc::new(world_tools::SearchWorldToolsPlugin))
         .register(Arc::new(world_tools::BashWorldToolPlugin))
         .register(Arc::new(tools::FsToolsPlugin))
         .register(Arc::new(tools::SearchToolsPlugin))

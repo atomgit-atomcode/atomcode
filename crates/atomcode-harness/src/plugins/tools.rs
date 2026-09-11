@@ -164,7 +164,10 @@ impl Plugin for SearchToolsPlugin {
         "grep and glob over the working directory"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
-        mount(ctx, vec![Arc::new(GrepTool), Arc::new(GlobTool)])?;
+        mount(
+            ctx,
+            vec![Arc::new(GrepTool::default()), Arc::new(GlobTool::default())],
+        )?;
         contribute_prompt(
             ctx,
             "tool-search",

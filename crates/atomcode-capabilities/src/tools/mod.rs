@@ -210,8 +210,8 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
     reg.register(Arc::new(bash::BashStartTool::default()));
     reg.register(Arc::new(bash::BashPollTool));
     reg.register(Arc::new(bash::BashKillTool));
-    reg.register(Arc::new(GrepTool));
-    reg.register(Arc::new(GlobTool));
+    reg.register(Arc::new(GrepTool::default()));
+    reg.register(Arc::new(GlobTool::default()));
     reg.register(Arc::new(SearchReplaceTool));
     reg.register(Arc::new(AstGrepTool));
     // Gate on ATOMCODE_TODO env var (0/false/off → skip; anything else or absent → register).
