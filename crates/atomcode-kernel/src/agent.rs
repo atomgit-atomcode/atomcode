@@ -114,10 +114,13 @@ const MAX_OVERFLOW_ATTEMPTS: u8 = 3;
 /// How many times the agent loop re-opens a round after a TRANSIENT provider
 /// failure (`ProviderError::retryable`) before surfacing the error. This is the
 /// SECOND retry tier — the provider's transport layer already did its own fast
-/// backoff (~1.5s) underneath. Mirrors v1's agent-loop budget (3, with 3/6/9s
-/// waits) so the user perceives a retry is happening AND a fresh connection gets
-/// a real chance to recover (the stale keep-alive class). NON-retryable errors
-/// (auth / 400 / balance) never enter this path — they fail fast.
+/// backoff (~1.5s) underneath. The default budget is 3 re-opens (configurable via
+/// `[network] upstream_retry_max_attempts`); the visible waits are exponential
+/// (3/6/12/24/30s, capped) and honor a server `Retry-After` (see
+/// `provider_retry_backoff_secs`), so the user perceives a retry is happening AND
+/// a fresh connection gets a real chance to recover (the stale keep-alive class,
+/// and a flaky gateway's transient "no upstream available" 503). NON-retryable
+/// errors (auth / 400 / balance) never enter this path — they fail fast.
 const DEFAULT_MAX_PROVIDER_RETRIES: u32 = 3;
 /// Max mid-stream RECONNECTS after a stream idle-timeout before failing the turn
 /// (codex parity: 5). Each reconnect re-issues the SAME round from history
@@ -377,6 +380,58 @@ fn retry_reason(e: &crate::stream::ProviderError) -> &'static str {
                 "网络连接失败"
             }
         }
+    }
+}
+
+/// Backoff (seconds) for the visible provider-retry tier.
+///
+/// Honors a server `Retry-After` hint (the gateway telling us exactly when to
+/// come back), clamped to a sane ceiling so a hostile/misconfigured hint can't
+/// stall the turn for minutes. Absent a hint, uses exponential backoff (3s base,
+/// doubling) capped at 30s — far more patient than the old flat 3/6/9s for a
+/// sustained-but-transient gateway 5xx (e.g. a relay's momentary "no upstream
+/// available"), while every wait stays Esc-cancellable at the call site.
+///
+/// `attempt` is 1-based (first retry = 1): yields 3, 6, 12, 24, 30, 30, …
+fn provider_retry_backoff_secs(attempt: u32, retry_after_secs: Option<u64>) -> u64 {
+    const BASE: u64 = 3;
+    const CAP: u64 = 30;
+    const RETRY_AFTER_CAP: u64 = 60;
+    if let Some(ra) = retry_after_secs {
+        // A server hint of 0 would busy-spin; floor at 1s. Ceiling keeps a bad
+        // hint from parking the turn far longer than our own exponential would.
+        return ra.clamp(1, RETRY_AFTER_CAP);
+    }
+    // Shift is bounded so a large configured retry count can't overflow the 1<<n.
+    let shift = attempt.saturating_sub(1).min(20);
+    BASE.saturating_mul(1u64 << shift).min(CAP)
+}
+
+#[cfg(test)]
+mod provider_retry_backoff_tests {
+    use super::provider_retry_backoff_secs;
+
+    #[test]
+    fn exponential_backoff_grows_and_caps_at_30s() {
+        // 1-based attempt → 3, 6, 12, 24, then pinned at the 30s cap.
+        assert_eq!(provider_retry_backoff_secs(1, None), 3);
+        assert_eq!(provider_retry_backoff_secs(2, None), 6);
+        assert_eq!(provider_retry_backoff_secs(3, None), 12);
+        assert_eq!(provider_retry_backoff_secs(4, None), 24);
+        assert_eq!(provider_retry_backoff_secs(5, None), 30);
+        assert_eq!(provider_retry_backoff_secs(6, None), 30);
+        // A large configured count must not overflow `1 << shift` or exceed cap.
+        assert_eq!(provider_retry_backoff_secs(100, None), 30);
+    }
+
+    #[test]
+    fn retry_after_hint_overrides_exponential_and_is_clamped() {
+        // A server hint wins over the exponential schedule…
+        assert_eq!(provider_retry_backoff_secs(1, Some(20)), 20);
+        // …a 0-second hint is floored to 1s (never busy-spin)…
+        assert_eq!(provider_retry_backoff_secs(3, Some(0)), 1);
+        // …and a hostile/huge hint is capped so it can't park the turn for minutes.
+        assert_eq!(provider_retry_backoff_secs(1, Some(6000)), 60);
     }
 }
 
@@ -2267,12 +2322,12 @@ impl RunningAgent {
                     continue;
                 }
                 // 429 RATE LIMIT: defer to the host's usage-aware verdict instead of
-                // the blind 3/6/9s transient retry (useless for a 5-hour window).
+                // the generic exponential transient retry (useless for a 5-hour window).
                 // WaitAndRetry => cancellable sleep then re-issue this round.
                 // Pause       => clean RateLimited stop preserving already-produced
                 //                content (NOT a red Error).
                 // Placed BEFORE the generic retryable branch so a 429 never enters
-                // the blind 3/6/9s path.
+                // the generic transient-retry path.
                 Err(e) if e.http_status == Some(429) => {
                     let hint = crate::hook::RateLimitHint {
                         http_status: e.http_status,
@@ -2371,11 +2426,11 @@ impl RunningAgent {
                 // connection — and the Warning tells the user a retry is underway
                 // (silent fast-fail read as "no retry happened at all"). NON-retryable
                 // errors (auth / 400 / balance) skip this and hard-fail below, so we
-                // never spin ~18s on an error that cannot recover. 429 is handled
-                // above by the host hook before reaching this branch.
+                // never spin through the (now-patient) retry backoff on an error that
+                // cannot recover. 429 is handled above by the host hook before this branch.
                 Err(e) if e.retryable && provider_retry < self.max_provider_retries => {
                     provider_retry += 1;
-                    let wait = (provider_retry as u64 * 3).min(15); // 3 / 6 / 9s, matching v1
+                    let wait = provider_retry_backoff_secs(provider_retry, e.retry_after_secs);
                     self.rt.emit(AgentEvent::ProviderRetry {
                         attempt: provider_retry,
                         max_attempts: self.max_provider_retries,
@@ -2911,8 +2966,8 @@ impl RunningAgent {
                 if empty_retries < EMPTY_RESPONSE_MAX_RETRIES {
                     empty_retries += 1;
                     // Front-loaded short backoff: 1,1,2,2,3s (~9s for all 5) — matches
-                    // v1. The empty body returns instantly, so the generic 3/6/9s tier
-                    // would be pure wasted latency. A VISIBLE Warning tells the user a
+                    // v1. The empty body returns instantly, so the generic exponential
+                    // retry tier would be pure wasted latency. A VISIBLE Warning tells the user a
                     // retry is underway (a silent re-open reads as "nothing happened").
                     let wait = (((empty_retries + 1) / 2).min(3)) as u64;
                     // Distinguish a GARBLED response (adapter dropped unparseable chunks)

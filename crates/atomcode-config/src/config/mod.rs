@@ -1559,6 +1559,14 @@ pub struct NotificationConfig {
 pub struct NetworkConfig {
     #[serde(default)]
     pub proxy: ProxyConfig,
+    /// Max attempts for the VISIBLE kernel provider-retry tier (the `重试(N/M)`
+    /// re-opens that fire on a transient 5xx / dropped connection at OPEN, with
+    /// patient exponential backoff that honors a server `Retry-After`). `None`
+    /// keeps the built-in default (3). Raise it for a flaky gateway/relay whose
+    /// transient "no upstream available" 503 takes longer than the default
+    /// window to clear. `0` disables the tier. Read when the agent is assembled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_retry_max_attempts: Option<u32>,
 }
 
 /// Controls LSP (Language Server Protocol) integration.

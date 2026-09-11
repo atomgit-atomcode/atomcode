@@ -128,6 +128,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         apply: ApplyPolicy::NextTurn,
     },
     SettingSpec {
+        id: "network.upstream_retry_max_attempts",
+        path: &["network", "upstream_retry_max_attempts"],
+        label_en: "Provider retry attempts",
+        label_zh: "上游重试次数",
+        aliases: &["retry", "重试", "断流", "503", "gateway", "中转", "backoff"],
+        kind: SettingKind::Integer { min: 0, max: 20 },
+        apply: ApplyPolicy::AgentReassemble,
+    },
+    SettingSpec {
         id: "subagent.max_concurrent",
         path: &["subagent", "max_concurrent"],
         label_en: "Concurrent subagents",
@@ -314,6 +323,11 @@ impl SettingSpec {
                 format!("{:?}", config.coding.shell_guard_policy).to_lowercase()
             }
             "loop_config.max_rounds" => config.loop_config.max_rounds.to_string(),
+            "network.upstream_retry_max_attempts" => config
+                .network
+                .upstream_retry_max_attempts
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
             "subagent.max_concurrent" => config.subagent.max_concurrent.to_string(),
             "subagent.max_rounds" => config.subagent.max_rounds.to_string(),
             "subagent.codex" => config.subagent.codex.clone(),
@@ -384,6 +398,16 @@ impl SettingSpec {
                 _ => bail!("expected one of: auto, enabled, disabled"),
             },
             SettingKind::Integer { min, max } => {
+                // Empty input clears the key (→ struct default / `None`), mirroring
+                // `Text`. Without this an `Option<Integer>` setting that renders
+                // blank when unset can never be re-cleared from the `/config`
+                // editor — Enter on the empty field would `bail!` "expected an
+                // integer" (the editor always submits `Some(edit_value)`).
+                let input = input.trim();
+                if input.is_empty() {
+                    self.reset(document);
+                    return Ok(());
+                }
                 let parsed = input
                     .parse::<i64>()
                     .map_err(|_| anyhow::anyhow!("expected an integer"))?;
@@ -702,6 +726,35 @@ mod tests {
             .find(|setting| setting.id == "coding.shell_guard_policy")
             .unwrap();
         assert_eq!(setting.value(&configured), "prompt");
+    }
+
+    #[test]
+    fn upstream_retry_max_attempts_round_trips_and_defaults_none() {
+        let setting = SETTINGS
+            .iter()
+            .find(|s| s.id == "network.upstream_retry_max_attempts")
+            .expect("upstream_retry_max_attempts is in the catalog");
+        assert!(matches!(setting.kind, SettingKind::Integer { min: 0, max: 20 }));
+
+        // Absent from config → None → empty rendered value (not "0").
+        let empty: Config = toml::from_str("").unwrap();
+        assert_eq!(empty.network.upstream_retry_max_attempts, None);
+        assert_eq!(setting.value(&empty), "");
+
+        // patch writes it under [network]; value() renders it back.
+        let mut document = DocumentMut::new();
+        setting.patch(&mut document, "6").unwrap();
+        let configured: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(configured.network.upstream_retry_max_attempts, Some(6));
+        assert_eq!(setting.value(&configured), "6");
+
+        // Empty input clears it back to None (the /config editor submits the
+        // blank field as `Some("")`, so Integer must treat empty as a reset —
+        // otherwise this Option<Integer> could never be un-set from the UI).
+        setting.patch(&mut document, "").unwrap();
+        let cleared: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(cleared.network.upstream_retry_max_attempts, None);
+        assert!(!document.to_string().contains("upstream_retry_max_attempts"));
     }
 
     #[test]
