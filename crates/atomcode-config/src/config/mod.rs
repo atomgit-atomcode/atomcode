@@ -542,6 +542,13 @@ pub struct UiConfig {
     /// `"OA OAuth"`) via config or env `ATOMCODE_OAUTH_PROVIDER_NAME`.
     #[serde(default = "default_oauth_provider_name")]
     pub oauth_provider_name: String,
+    /// Which key cycles the execution mode (Plan/Build/Auto/AcceptEdits).
+    /// Defaults to `shift_tab` on most platforms and `tab` on HarmonyOS
+    /// (`target_env = "ohos"`), where terminals cannot deliver Shift+Tab.
+    /// See [`ModeSwitchKey`]. Read live on each keypress, so a `/config`
+    /// change takes effect immediately.
+    #[serde(default)]
+    pub mode_switch_key: ModeSwitchKey,
 }
 
 impl Default for UiConfig {
@@ -555,6 +562,35 @@ impl Default for UiConfig {
             truncate_resumed_history: true,
             brand_name: default_brand_name(),
             oauth_provider_name: default_oauth_provider_name(),
+            mode_switch_key: ModeSwitchKey::default(),
+        }
+    }
+}
+
+/// Which key cycles the execution mode (Plan → Build → Auto → AcceptEdits),
+/// the footer mode badge. This is NOT model selection (that is `/model`).
+///
+/// - `ShiftTab` (default on most platforms): Shift+Tab (or `BackTab`) cycles
+///   the mode; plain Tab stays reserved for slash/@/skill completion.
+/// - `Tab` (default on HarmonyOS / `target_env = "ohos"`, where the terminal
+///   cannot deliver Shift+Tab): plain Tab cycles the mode; completion is
+///   accepted with → (inline suggestion) or Enter (menu). `BackTab` and
+///   Shift+Tab keep cycling too, so no terminal loses the gesture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModeSwitchKey {
+    ShiftTab,
+    Tab,
+}
+
+impl Default for ModeSwitchKey {
+    fn default() -> Self {
+        // HarmonyOS terminals don't deliver Shift+Tab, so default that platform
+        // to plain Tab; every other platform keeps the Shift+Tab gesture.
+        if cfg!(target_env = "ohos") {
+            ModeSwitchKey::Tab
+        } else {
+            ModeSwitchKey::ShiftTab
         }
     }
 }

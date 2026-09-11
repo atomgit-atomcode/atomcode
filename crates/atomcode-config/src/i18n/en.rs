@@ -219,7 +219,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
     Right                            Accept next-prompt suggestion (does not send)
 
   ── Mode and model ──
-    Shift+Tab                        Without a menu, cycle to the next mode (if your terminal can't send Shift+Tab, use /plan /build /auto)
+    Shift+Tab                        Without a menu, cycle to the next mode (set ui.mode_switch_key=tab in /config to cycle with Tab and accept completion via →/↵; HarmonyOS defaults to tab)
     F2 / Shift+F2                    Next / previous model (Mac: Fn+F2 / Fn+Shift+F2)
     Ctrl+T                           Cycle reasoning_effort
 

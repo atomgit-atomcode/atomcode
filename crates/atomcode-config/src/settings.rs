@@ -46,6 +46,7 @@ const THEMES: &[&str] = &["auto", "dark", "light"];
 const LANGUAGES: &[&str] = &["auto", "en", "zh_CN"];
 const SHELL_GUARD_POLICIES: &[&str] = &["prompt", "strict", "off"];
 const SUBAGENT_LEVELS: &[&str] = &["off", "read-only", "accept-edits", "auto"];
+const MODE_SWITCH_KEYS: &[&str] = &["shift_tab", "tab"];
 
 pub static SETTINGS: &[SettingSpec] = &[
     bool_setting(
@@ -152,6 +153,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         aliases: &["dark", "light"],
         kind: SettingKind::Choice(THEMES),
         apply: ApplyPolicy::NextStartup,
+    },
+    SettingSpec {
+        id: "ui.mode_switch_key",
+        path: &["ui", "mode_switch_key"],
+        label_en: "Mode switch key",
+        label_zh: "模式切换键",
+        aliases: &["tab", "shift", "shift+tab", "键位", "补全", "harmony", "鸿蒙"],
+        kind: SettingKind::Choice(MODE_SWITCH_KEYS),
+        apply: ApplyPolicy::ImmediateUi,
     },
     bool_setting(
         "ui.auto_copy_code_blocks",
@@ -309,6 +319,11 @@ impl SettingSpec {
             "subagent.codex" => config.subagent.codex.clone(),
             "subagent.claude" => config.subagent.claude.clone(),
             "ui.theme" => format!("{:?}", config.ui.theme).to_lowercase(),
+            "ui.mode_switch_key" => match config.ui.mode_switch_key {
+                crate::config::ModeSwitchKey::ShiftTab => "shift_tab",
+                crate::config::ModeSwitchKey::Tab => "tab",
+            }
+            .to_string(),
             "ui.auto_copy_code_blocks" => config.ui.auto_copy_code_blocks.to_string(),
             "ui.ai_session_naming" => config.ui.ai_session_naming.to_string(),
             "ui.terminal_status_glyph" => config.ui.terminal_status_glyph.to_string(),
@@ -687,6 +702,56 @@ mod tests {
             .find(|setting| setting.id == "coding.shell_guard_policy")
             .unwrap();
         assert_eq!(setting.value(&configured), "prompt");
+    }
+
+    #[test]
+    fn mode_switch_key_round_trips_shift_tab_and_tab() {
+        let setting = SETTINGS
+            .iter()
+            .find(|setting| setting.id == "ui.mode_switch_key")
+            .expect("mode_switch_key is in the catalog");
+        assert!(matches!(setting.kind, SettingKind::Choice(_)));
+
+        let mut document = DocumentMut::new();
+        setting.patch(&mut document, "tab").unwrap();
+        let configured: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(
+            configured.ui.mode_switch_key,
+            crate::config::ModeSwitchKey::Tab
+        );
+        assert_eq!(setting.value(&configured), "tab");
+
+        setting.patch(&mut document, "shift_tab").unwrap();
+        let configured: Config = toml::from_str(&document.to_string()).unwrap();
+        assert_eq!(
+            configured.ui.mode_switch_key,
+            crate::config::ModeSwitchKey::ShiftTab
+        );
+        assert_eq!(setting.value(&configured), "shift_tab");
+    }
+
+    #[test]
+    fn mode_switch_key_defaults_and_value_reflects_platform_default() {
+        // A config with no `[ui]` section adopts the platform default, and the
+        // catalog's `value()` renders the same snake_case token round-trips use.
+        let configured: Config = toml::from_str("").unwrap();
+        let expected = if cfg!(target_env = "ohos") {
+            crate::config::ModeSwitchKey::Tab
+        } else {
+            crate::config::ModeSwitchKey::ShiftTab
+        };
+        assert_eq!(configured.ui.mode_switch_key, expected);
+
+        let setting = SETTINGS
+            .iter()
+            .find(|setting| setting.id == "ui.mode_switch_key")
+            .unwrap();
+        let expected_token = if cfg!(target_env = "ohos") {
+            "tab"
+        } else {
+            "shift_tab"
+        };
+        assert_eq!(setting.value(&configured), expected_token);
     }
 
     #[test]
