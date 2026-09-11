@@ -24492,13 +24492,22 @@ fn handle_runtime_event(
                 }
             }
         }
+        bg_runtime::RuntimeEventPayload::Driver(bg_runtime::DriverEvent::LocalShellLine {
+            line,
+        }) => {
+            // The `!` shell streams: the person ran it precisely to watch it.
+            renderer.render(UiLine::CommandOutput(line));
+            renderer.flush();
+        }
         bg_runtime::RuntimeEventPayload::Driver(bg_runtime::DriverEvent::LocalShellFinished {
             output,
             failed,
         }) => {
+            // The body already went by line by line; this is only the status
+            // tail, and a clean run with output has none.
             if failed {
                 renderer.render(UiLine::Error(output));
-            } else {
+            } else if !output.is_empty() {
                 renderer.render(UiLine::CommandOutput(output));
             }
             renderer.flush();
@@ -25275,47 +25284,218 @@ fn escape_runtime_context(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn run_local_shell_command(command: String, ctx: &LoopCtx) {
-    use atomcode_kernel::tool::Tool;
+/// Wall-clock ceiling for a user-typed `!cmd`. The bridge-era runner used 300s
+/// (a person watching a build tolerates more than the model's 60s default),
+/// and the idle kill in `run_shell` catches the truly stuck case sooner.
+const LOCAL_SHELL_TIMEOUT_SECS: u64 = 300;
 
+/// What a finished `!cmd` leaves behind, given that its body already streamed.
+///
+/// Returns `(tail, context, failed)`: `tail` is the status line the person has
+/// not seen yet (empty on a clean run that printed something); `context` is the
+/// full `<bash-output>` body the model receives on its next turn, framed the way
+/// the model's own `bash` tool frames a result so the two read alike.
+fn format_local_shell_outcome(
+    outcome: &atomcode_capabilities::tools::ShellOutcome,
+) -> (String, String, bool) {
+    use atomcode_capabilities::tools::ShellExit;
+    let stdout = outcome.stdout.trim_end();
+    let stderr = outcome.stderr.trim_end();
+    let mut body = String::new();
+    if !stdout.is_empty() {
+        body.push_str(stdout);
+    }
+    if !stderr.trim().is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("[stderr]\n");
+        body.push_str(stderr);
+    }
+    let (marker, failed) = match outcome.exit {
+        ShellExit::Exited { code: Some(0), .. } => (String::new(), false),
+        ShellExit::Exited {
+            code: Some(code), ..
+        } => (format!("[exit code {code}]"), true),
+        ShellExit::Exited { code: None, .. } => {
+            ("[process terminated by signal]".to_string(), true)
+        }
+        ShellExit::KilledIdle => (
+            format!(
+                "[command killed after {}s without output]",
+                atomcode_capabilities::tools::bash::SILENT_KILL_SECS
+            ),
+            true,
+        ),
+        ShellExit::KilledTimeout => (
+            format!("[command timed out ({LOCAL_SHELL_TIMEOUT_SECS}s)]"),
+            true,
+        ),
+    };
+    let tail = if marker.is_empty() && body.is_empty() {
+        "(no output)".to_string()
+    } else {
+        marker.clone()
+    };
+    let mut context = body;
+    if !marker.is_empty() {
+        if !context.is_empty() {
+            context.push('\n');
+        }
+        context.push_str(&marker);
+    }
+    if context.is_empty() {
+        context = "(no output)".to_string();
+    }
+    (tail, context, failed)
+}
+
+fn run_local_shell_command(command: String, ctx: &LoopCtx) {
     let working_dir = ctx.working_dir.clone();
     let runtime = ctx.runtime.clone();
     let runtime_id = ctx.foreground_runtime_id;
     let event_tx = ctx.runtime_event_tx.clone();
     tokio::spawn(async move {
-        let tool = atomcode_capabilities::tools::BashTool::default();
-        let args = serde_json::json!({ "command": command.clone() }).to_string();
-        let tool_ctx = atomcode_kernel::tool::ToolContext {
-            working_dir,
-            cancel: tokio_util::sync::CancellationToken::new(),
-            progress: atomcode_kernel::tool::ProgressSink::noop(),
-            requester: None,
+        // Stream the body as it happens, one complete line per event: a chunk
+        // boundary is a read size, not a line, and a row per half-line would
+        // tear the output.
+        let pending = std::sync::Mutex::new(String::new());
+        let send_line = |line: String| {
+            let _ = event_tx.send(bg_runtime::RuntimeEvent {
+                runtime_id,
+                event: bg_runtime::RuntimeEventPayload::Driver(
+                    bg_runtime::DriverEvent::LocalShellLine { line },
+                ),
+            });
         };
-        let result = tool.execute(&args, &tool_ctx).await;
-        let output = truncate_local_shell_output(result.content);
+        let outcome = atomcode_capabilities::tools::run_shell(
+            &atomcode_capabilities::world::LocalShell,
+            &command,
+            &working_dir,
+            LOCAL_SHELL_TIMEOUT_SECS,
+            |chunk| {
+                let mut buf = pending.lock().unwrap();
+                buf.push_str(chunk);
+                while let Some(nl) = buf.find('\n') {
+                    let line = buf[..nl].to_string();
+                    buf.drain(..=nl);
+                    send_line(line);
+                }
+            },
+        )
+        .await;
+        let rest = std::mem::take(&mut *pending.lock().unwrap());
+        if !rest.is_empty() {
+            send_line(rest);
+        }
+
+        let (tail, content, failed) = format_local_shell_outcome(&outcome);
+        let content = truncate_local_shell_output(content);
         let context = format!(
             "<bash-input>{}</bash-input>\n<bash-output>{}</bash-output>",
             escape_runtime_context(&command),
-            escape_runtime_context(&output)
+            escape_runtime_context(&content)
         );
         let queue_failed = runtime
             .dispatch(atomcode_coding::DriverCommand::QueueLocalContext(
                 atomcode_coding::LocalContextInput { content: context },
             ))
             .is_err();
-        let failed = result.is_error || queue_failed;
         let output = if queue_failed {
-            format!("{output}\n[failed to add shell output to runtime context]")
+            format!("{tail}\n[failed to add shell output to runtime context]")
         } else {
-            output
+            tail
         };
         let _ = event_tx.send(bg_runtime::RuntimeEvent {
             runtime_id,
             event: bg_runtime::RuntimeEventPayload::Driver(
-                bg_runtime::DriverEvent::LocalShellFinished { output, failed },
+                bg_runtime::DriverEvent::LocalShellFinished {
+                    output,
+                    failed: failed || queue_failed,
+                },
             ),
         });
     });
+}
+
+#[cfg(test)]
+mod local_shell_outcome_tests {
+    use super::format_local_shell_outcome;
+    use atomcode_capabilities::tools::{ShellExit, ShellOutcome};
+
+    fn outcome(stdout: &str, stderr: &str, exit: ShellExit) -> ShellOutcome {
+        ShellOutcome {
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            exit,
+            elapsed_secs: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_clean_run_with_output_leaves_no_tail_but_a_full_context() {
+        let (tail, context, failed) = outcome(
+            "file1\nfile2\n",
+            "",
+            ShellExit::Exited {
+                success: true,
+                code: Some(0),
+            },
+        )
+        .pipe(format_local_shell_outcome);
+        assert!(!failed);
+        assert_eq!(tail, "", "the body already streamed; nothing to add");
+        assert_eq!(context, "file1\nfile2");
+    }
+
+    #[test]
+    fn a_clean_run_with_no_output_says_so() {
+        let (tail, context, failed) = outcome(
+            "",
+            "",
+            ShellExit::Exited {
+                success: true,
+                code: Some(0),
+            },
+        )
+        .pipe(format_local_shell_outcome);
+        assert!(!failed);
+        assert_eq!(tail, "(no output)");
+        assert_eq!(context, "(no output)");
+    }
+
+    #[test]
+    fn a_failure_reports_the_code_and_frames_stderr_like_the_bash_tool() {
+        let (tail, context, failed) = outcome(
+            "partial\n",
+            "boom\n",
+            ShellExit::Exited {
+                success: false,
+                code: Some(2),
+            },
+        )
+        .pipe(format_local_shell_outcome);
+        assert!(failed);
+        assert_eq!(tail, "[exit code 2]");
+        assert_eq!(context, "partial\n[stderr]\nboom\n[exit code 2]");
+    }
+
+    #[test]
+    fn a_kill_is_named_for_its_reason() {
+        let (tail, _, failed) =
+            outcome("", "", ShellExit::KilledTimeout).pipe(format_local_shell_outcome);
+        assert!(failed);
+        assert!(tail.starts_with("[command timed out ("), "{tail}");
+        let (tail, _, _) = outcome("x", "", ShellExit::KilledIdle).pipe(format_local_shell_outcome);
+        assert!(tail.contains("without output"), "{tail}");
+    }
+
+    trait Pipe: Sized {
+        fn pipe<R>(self, f: impl FnOnce(&Self) -> R) -> R {
+            f(&self)
+        }
+    }
+    impl Pipe for ShellOutcome {}
 }
 
 fn handle_undo_success(

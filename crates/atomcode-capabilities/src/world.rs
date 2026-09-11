@@ -360,6 +360,15 @@ pub trait Process: Send + Sync {
     /// keeps holding the build lock.
     async fn kill(&self);
 
+    /// Ask the tree to stop, then make it. Where the world has a gentler
+    /// signal it goes first, with a short grace — long enough for a dev server
+    /// to release its port and flush its log, short enough that it still feels
+    /// like a Ctrl-C. Defaults to [`kill`](Self::kill), so a world without the
+    /// distinction is not obliged to invent one.
+    async fn terminate(&self) {
+        self.kill().await;
+    }
+
     /// Drain the output to EOF, then wait — the shape a caller that only wants
     /// the finished result would otherwise write for itself.
     ///
