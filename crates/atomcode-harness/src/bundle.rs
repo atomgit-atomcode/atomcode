@@ -65,15 +65,11 @@ id = "llm"
 name = "llm-atomcode-config"
 
 # --- the execution world: where files and processes actually live ----------
-# Point these three somewhere else (a container, a remote sandbox) and every
+# Point these two somewhere else (a container, a remote sandbox) and every
 # tool below follows, because no tool touches a path or spawns a process itself.
 [[insert]]
 id = "fs"
 name = "fs-local"
-
-[[insert]]
-id = "subprocess"
-name = "subprocess-local"
 
 [[insert]]
 id = "shell"
@@ -402,9 +398,9 @@ config = { api_key_env = "ATOMCODE_API_KEY" }
 /// names, same model-facing behaviour, no `fs` seam in the path.
 ///
 /// The execution world comes out with them. The production tools reach the disk
-/// and spawn processes directly, so leaving `fs` / `subprocess` / `shell`
-/// mounted would leave three providers running that nothing reads — which is
-/// exactly what `--audit` reports if you try.
+/// and spawn processes directly, so leaving `fs` / `shell` mounted would leave
+/// two providers running that nothing reads — which is exactly what `--audit`
+/// reports if you try.
 pub const NATIVE_TOOLS: &str = r#"
 [[patch]]
 id = "tool-fs-world"
@@ -416,10 +412,6 @@ disabled = true
 
 [[patch]]
 id = "fs"
-disabled = true
-
-[[patch]]
-id = "subprocess"
 disabled = true
 
 [[patch]]

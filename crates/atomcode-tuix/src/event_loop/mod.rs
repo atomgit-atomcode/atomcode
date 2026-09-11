@@ -25283,7 +25283,7 @@ fn run_local_shell_command(command: String, ctx: &LoopCtx) {
     let runtime_id = ctx.foreground_runtime_id;
     let event_tx = ctx.runtime_event_tx.clone();
     tokio::spawn(async move {
-        let tool = atomcode_capabilities::tools::BashTool;
+        let tool = atomcode_capabilities::tools::BashTool::default();
         let args = serde_json::json!({ "command": command.clone() }).to_string();
         let tool_ctx = atomcode_kernel::tool::ToolContext {
             working_dir,

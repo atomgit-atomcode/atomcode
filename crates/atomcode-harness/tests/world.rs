@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use atomcode_harness::seams::{FsSvc, ShellSvc, SubprocessSvc, ToolsSvc};
-use atomcode_harness::world::{Output, SpawnOptions, Subprocess};
+use atomcode_capabilities::world::{Chunk, Exit, Process, Shell, SpawnError, SpawnOptions};
+use atomcode_harness::seams::{FsSvc, ShellSvc, ToolsSvc};
 use atomcode_harness::{bundle, plugins, run_turn};
 use atomcode_plexus::{App, ConfigTree, Context, Layer, Plugin};
 use serde_json::Value;
@@ -26,43 +26,60 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-/// A process provider that records what it was asked to run and answers without
-/// spawning anything. Standing in for "a different execution world".
+/// A shell that records what it was asked to run and answers without spawning
+/// anything. Standing in for "a different execution world" — and proof that a
+/// world needs none of the local machine's platform probing to fill the seam.
 #[derive(Default)]
-struct RecordingSubprocess {
-    seen: Mutex<Vec<Vec<String>>>,
+struct RecordingShell {
+    seen: Mutex<Vec<String>>,
+}
+
+/// One canned run: a single stdout chunk, then a clean exit.
+struct Canned {
+    chunk: Mutex<Option<Chunk>>,
 }
 
 #[async_trait]
-impl Subprocess for RecordingSubprocess {
+impl Process for Canned {
+    async fn next_chunk(&self) -> Option<Chunk> {
+        self.chunk.lock().unwrap().take()
+    }
+    async fn wait(&self) -> Result<Exit, String> {
+        Ok(Exit { code: Some(0) })
+    }
+    async fn kill(&self) {}
+}
+
+#[async_trait]
+impl Shell for RecordingShell {
     fn describe(&self) -> String {
         "recording (no real processes)".into()
     }
-    async fn run(&self, argv: &[String], _options: &SpawnOptions) -> Result<Output, String> {
-        self.seen.lock().unwrap().push(argv.to_vec());
-        Ok(Output {
-            code: 0,
-            stdout: "ran somewhere else".into(),
-            stderr: String::new(),
-            timed_out: false,
-            truncated: false,
-        })
+    async fn spawn(
+        &self,
+        command: &str,
+        _options: &SpawnOptions,
+    ) -> Result<Arc<dyn Process>, SpawnError> {
+        self.seen.lock().unwrap().push(command.to_string());
+        Ok(Arc::new(Canned {
+            chunk: Mutex::new(Some(Chunk::Stdout(b"ran somewhere else".to_vec()))),
+        }))
     }
 }
 
-struct RecordingSubprocessPlugin(Arc<RecordingSubprocess>);
+struct RecordingShellPlugin(Arc<RecordingShell>);
 
 #[async_trait]
-impl Plugin for RecordingSubprocessPlugin {
+impl Plugin for RecordingShellPlugin {
     fn name(&self) -> &'static str {
-        "subprocess-recording"
+        "shell-recording"
     }
     fn provides(&self) -> &'static [&'static str] {
-        &["subprocess"]
+        &["shell"]
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let _ = ctx
-            .provide::<SubprocessSvc>(self.0.clone())
+            .provide::<ShellSvc>(self.0.clone())
             .map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -197,31 +214,34 @@ async fn a_read_only_world_refuses_writes_even_with_approval_wide_open() {
 }
 
 #[tokio::test]
-async fn replacing_the_process_provider_relocates_bash() {
+async fn replacing_the_shell_provider_relocates_bash() {
     let dir = scratch("relocate");
-    let recorder = Arc::new(RecordingSubprocess::default());
+    let recorder = Arc::new(RecordingShell::default());
     let mut registry = plugins::catalog();
-    registry.register(Arc::new(RecordingSubprocessPlugin(recorder.clone())));
+    registry.register(Arc::new(RecordingShellPlugin(recorder.clone())));
 
     let script = script_one("bash", r#"{ command = "echo hello" }"#);
-    let swap = "[[patch]]\nid = \"subprocess\"\nname = \"subprocess-recording\"";
+    let swap = "[[patch]]\nid = \"shell\"\nname = \"shell-recording\"";
     let mut app = App::new(registry, tree(&dir, &script, &[YOLO, swap]));
     app.start().await.unwrap();
 
-    // `bash-local` was never patched and does not know the world moved.
+    // `tool-bash-world` was never patched and does not know the world moved.
     let shell = app.context().service::<ShellSvc>().unwrap();
-    assert_eq!(shell.describe(), "bash via recording (no real processes)");
+    assert_eq!(shell.describe(), "recording (no real processes)");
 
     run_turn(&app, "run it").await.unwrap();
     let seen = recorder.seen.lock().unwrap().clone();
     assert_eq!(
         seen,
-        vec![vec![
-            "bash".to_string(),
-            "-c".to_string(),
-            "echo hello".to_string()
-        ]],
-        "the shell spawns through whatever fills `subprocess`, so swapping it moves bash too"
+        vec!["echo hello".to_string()],
+        "bash spawns through whatever fills `shell`, so swapping it moves bash too"
+    );
+    // And what the model saw came from that world, not from this machine.
+    let text = transcript(&app);
+    assert!(text.contains("ran somewhere else"), "{text}");
+    assert!(
+        !text.contains("hello\n"),
+        "the local shell must not have run: {text}"
     );
 }
 
@@ -368,4 +388,37 @@ async fn unloading_the_world_takes_its_tools_with_it() {
         app.context().service::<FsSvc>().is_some(),
         "the world itself is still mounted; only its consumer left"
     );
+}
+
+#[tokio::test]
+async fn a_routed_world_mounts_no_process_path_that_bypasses_it() {
+    // The production crate also ships `bash_start` / `bash_poll` / `bash_kill`,
+    // which still spawn on this machine directly. A tree whose `shell` points
+    // elsewhere must not offer them: a "read-only sandbox" with a side door to
+    // the host is worse than no sandbox, because the model is told it is
+    // contained. This pins the fact that no world-routed row mounts them until
+    // they route too.
+    let dir = scratch("no-side-door");
+    let recorder = Arc::new(RecordingShell::default());
+    let mut registry = plugins::catalog();
+    registry.register(Arc::new(RecordingShellPlugin(recorder)));
+    let swap = "[[patch]]\nid = \"shell\"\nname = \"shell-recording\"";
+    let mut app = App::new(
+        registry,
+        tree(
+            &dir,
+            &script_one("bash", r#"{ command = "true" }"#),
+            &[swap],
+        ),
+    );
+    app.start().await.unwrap();
+
+    let names = app.context().service::<ToolsSvc>().unwrap().names();
+    assert!(names.contains(&"bash".to_string()), "{names:?}");
+    for side_door in ["bash_start", "bash_poll", "bash_kill"] {
+        assert!(
+            !names.contains(&side_door.to_string()),
+            "`{side_door}` spawns on this machine, not in the mounted world: {names:?}"
+        );
+    }
 }

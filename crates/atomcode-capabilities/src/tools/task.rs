@@ -3154,7 +3154,7 @@ mod tests {
     #[tokio::test]
     async fn child_sensitive_path_denial_is_terminal() {
         let gate = DenySensitivePaths;
-        let tool: Arc<dyn Tool> = Arc::new(super::super::BashTool);
+        let tool: Arc<dyn Tool> = Arc::new(super::super::BashTool::default());
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
         let rt = RequestCtx::new(events, None);
         let mut call = ToolCall {

@@ -600,7 +600,7 @@ mod tests {
     }
 
     async fn run(gate: &CredentialBashGate, command: &str) -> BeforeOutcome {
-        let tool: Arc<dyn Tool> = Arc::new(BashTool);
+        let tool: Arc<dyn Tool> = Arc::new(BashTool::default());
         let mut call = ToolCall {
             id: "call-1".into(),
             name: "bash".into(),

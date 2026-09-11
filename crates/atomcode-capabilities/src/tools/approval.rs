@@ -343,7 +343,7 @@ mod tests {
         // bash: two DIFFERENT ordinary commands SHARE a grant key. "Always" is a decision
         // about this session's shell, and a per-command key made the option useless — the
         // next command always re-prompted.
-        let bash: Arc<dyn Tool> = Arc::new(BashTool);
+        let bash: Arc<dyn Tool> = Arc::new(BashTool::default());
         let c1 = ToolCall {
             id: "3".into(),
             name: "bash".into(),

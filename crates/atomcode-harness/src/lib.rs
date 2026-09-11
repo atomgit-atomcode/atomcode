@@ -35,7 +35,6 @@ pub mod profile;
 pub mod seam_map;
 pub mod seams;
 pub mod session;
-pub mod world;
 
 use std::path::PathBuf;
 

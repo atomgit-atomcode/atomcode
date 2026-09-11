@@ -111,7 +111,7 @@ impl Plugin for BashToolPlugin {
         "shell execution"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
-        mount(ctx, vec![Arc::new(BashTool)])?;
+        mount(ctx, vec![Arc::new(BashTool::default())])?;
         contribute_prompt(
             ctx,
             "tool-bash",

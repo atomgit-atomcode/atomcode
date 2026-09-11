@@ -18,8 +18,7 @@ use atomcode_plexus::{plexus_service, Context};
 
 use crate::agent::{Agent, Agents};
 use crate::session::{LoggedEvent, SessionLog, SessionProjections};
-use crate::world::{Shell, Subprocess};
-pub use atomcode_capabilities::world::FileSystem;
+pub use atomcode_capabilities::world::{FileSystem, Shell};
 
 plexus_service!(LlmSvc => dyn LlmProvider, "llm", Seam, "Model adapter");
 plexus_service!(ToolsSvc => ToolBox, "tools", Core, "The live tool catalog");
@@ -37,8 +36,7 @@ plexus_service!(SessionPersistenceSvc => dyn SessionPersistence, "session-persis
 plexus_service!(SkillsSvc => SkillRegistry, "skills", Core, "Markdown skill catalog");
 plexus_service!(CodeIndexSvc => CodeIndex, "code-index", Core, "Shared lazily-built code graph");
 plexus_service!(FsSvc => dyn FileSystem, "fs", Seam, "One execution world's view of files");
-plexus_service!(SubprocessSvc => dyn Subprocess, "subprocess", Seam, "Process execution for one world");
-plexus_service!(ShellSvc => dyn Shell, "shell", Seam, "Shell execution, built on the process seam");
+plexus_service!(ShellSvc => dyn Shell, "shell", Seam, "Shell execution for one world: spawn, stream, kill the tree");
 plexus_service!(CompactionSvc => dyn Compaction, "compaction", Seam, "History compaction strategy");
 plexus_service!(SessionTitleSvc => dyn SessionTitle, "session-title", Seam, "How a session gets named");
 plexus_service!(UserQuestionsSvc => dyn UserQuestions, "user-questions", Seam, "Asking a human");

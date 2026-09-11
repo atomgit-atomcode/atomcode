@@ -1,29 +1,30 @@
-//! Providers for the execution world, and the tools that reach the outside
-//! only through it.
+//! Providers for the execution world.
 //!
-//! `fs-local` and `subprocess-local` are the local world. `fs-readonly` is the
-//! same world with writes refused. `bash-local` builds the shell on whatever
-//! fills `subprocess`, so replacing the process provider relocates bash without
-//! bash knowing.
+//! `fs-local` and `bash-local` are the local machine; `fs-readonly` is the same
+//! disk with writes refused. The implementations live in
+//! `atomcode_capabilities::world`, next to the tools that go through them —
+//! these rows only choose which one to mount.
+//!
+//! There used to be a third seam here, `subprocess` (an argv runner), with the
+//! shell built on top of it so that swapping the process provider relocated
+//! bash. It went when the shell seam became a process handle: "which shell
+//! exists and how is its tree reaped" is one question, answered by one
+//! provider, and an argv seam underneath it had no second consumer — it was
+//! plumbing that existed to make a claim, not to carry anything. The claim
+//! survives, one level up: swap `shell` and bash relocates.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use atomcode_capabilities::world::{LocalFs, LocalShell};
 use atomcode_plexus::{Context, Plugin};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::seams::{FsSvc, ShellSvc, SubprocessSvc};
-use atomcode_capabilities::world::LocalFs;
-
-use crate::seams::FileSystem;
-use crate::world::{Output, Shell, SpawnOptions, Subprocess};
+use crate::seams::{FileSystem, FsSvc, ShellSvc};
 
 // ---- fs-local -----------------------------------------------------------
-//
-// The implementation lives in `atomcode_capabilities::world`, next to the tools
-// that go through it. These two rows only choose which one to mount.
 
 #[derive(Debug, Deserialize, Default)]
 struct FsRow {
@@ -93,133 +94,15 @@ impl Plugin for FsReadOnlyPlugin {
     }
 }
 
-// ---- subprocess-local ---------------------------------------------------
-
-struct LocalSubprocess;
-
-#[async_trait]
-impl Subprocess for LocalSubprocess {
-    fn describe(&self) -> String {
-        "local processes".into()
-    }
-
-    async fn run(&self, argv: &[String], options: &SpawnOptions) -> Result<Output, String> {
-        let Some((program, args)) = argv.split_first() else {
-            return Err("empty argv".into());
-        };
-        let mut command = tokio::process::Command::new(program);
-        command.args(args);
-        if let Some(cwd) = &options.cwd {
-            command.current_dir(cwd);
-        }
-        for (key, value) in &options.env {
-            command.env(key, value);
-        }
-        let child = command.output();
-        let output = match options.timeout {
-            Some(limit) => match tokio::time::timeout(limit, child).await {
-                Ok(result) => result.map_err(|e| e.to_string())?,
-                Err(_) => {
-                    return Ok(Output {
-                        code: -1,
-                        stdout: String::new(),
-                        stderr: format!("timed out after {:?}", limit),
-                        timed_out: true,
-                        truncated: false,
-                    })
-                }
-            },
-            None => child.await.map_err(|e| e.to_string())?,
-        };
-        let mut out = Output {
-            code: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            timed_out: false,
-            truncated: false,
-        };
-        if options.max_output_bytes > 0 {
-            for field in [&mut out.stdout, &mut out.stderr] {
-                if field.len() > options.max_output_bytes {
-                    let keep: String = field.chars().take(options.max_output_bytes).collect();
-                    *field = keep;
-                    out.truncated = true;
-                }
-            }
-        }
-        Ok(out)
-    }
-}
-
-pub struct SubprocessLocalPlugin;
-
-#[async_trait]
-impl Plugin for SubprocessLocalPlugin {
-    fn name(&self) -> &'static str {
-        "subprocess-local"
-    }
-    fn provides(&self) -> &'static [&'static str] {
-        &["subprocess"]
-    }
-    fn description(&self) -> &'static str {
-        "spawn processes on this machine"
-    }
-    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
-        let _ = ctx
-            .provide::<SubprocessSvc>(Arc::new(LocalSubprocess))
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-}
-
 // ---- bash-local ---------------------------------------------------------
 
-/// Bash, spawned through whatever fills `subprocess`.
+/// This machine's shell — the production spawn, with its tty detach, job
+/// object / process-group reaping and code-page decoding, behind the seam.
 ///
-/// It holds the context rather than the provider so it resolves per call: swap
-/// the process provider and the very next command runs in the new world.
-struct BashShell {
-    ctx: Context,
-    program: String,
-}
-
-#[async_trait]
-impl Shell for BashShell {
-    fn describe(&self) -> String {
-        match self.ctx.service::<SubprocessSvc>() {
-            Some(sub) => format!("{} via {}", self.program, sub.describe()),
-            None => format!("{} (no process provider)", self.program),
-        }
-    }
-
-    async fn run(&self, command: &str, options: &SpawnOptions) -> Result<Output, String> {
-        let sub = self
-            .ctx
-            .service::<SubprocessSvc>()
-            .ok_or("no `subprocess` provider is mounted")?;
-        let argv = vec![self.program.clone(), "-c".to_string(), command.to_string()];
-        sub.run(&argv, options).await
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct BashRow {
-    #[serde(default = "default_shell")]
-    program: String,
-}
-
-impl Default for BashRow {
-    fn default() -> Self {
-        Self {
-            program: default_shell(),
-        }
-    }
-}
-
-fn default_shell() -> String {
-    "bash".into()
-}
-
+/// No `program` knob: which shell binary a world uses is the world's own
+/// answer (Git Bash vs `cmd.exe` on Windows is *detected*, not configured), and
+/// a row that overrode it would be the assembly deciding a fact for a machine it
+/// may not be running on.
 pub struct BashLocalPlugin;
 
 #[async_trait]
@@ -227,22 +110,15 @@ impl Plugin for BashLocalPlugin {
     fn name(&self) -> &'static str {
         "bash-local"
     }
-    fn inject(&self) -> &'static [&'static str] {
-        &["subprocess"]
-    }
     fn provides(&self) -> &'static [&'static str] {
         &["shell"]
     }
     fn description(&self) -> &'static str {
-        "bash -c, spawned through the process seam"
+        "this machine's shell, with its process tree reaped on kill"
     }
-    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
-        let row: BashRow = parse(config)?;
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let _ = ctx
-            .provide::<ShellSvc>(Arc::new(BashShell {
-                ctx: ctx.clone(),
-                program: row.program,
-            }))
+            .provide::<ShellSvc>(Arc::new(LocalShell))
             .map_err(|e| e.to_string())?;
         Ok(())
     }

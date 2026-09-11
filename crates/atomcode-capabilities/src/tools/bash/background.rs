@@ -603,7 +603,7 @@ mod tests {
         let scope = |cmd: &str| {
             let args = serde_json::json!({ "command": cmd }).to_string();
             (
-                BashTool.always_grant_scope(&args),
+                BashTool::default().always_grant_scope(&args),
                 BashStartTool.always_grant_scope(&args),
             )
         };

@@ -1266,7 +1266,7 @@ mod tests {
     // ---- gate integration tests ------------------------------------------------------------
 
     fn bash_tool() -> Arc<dyn Tool> {
-        Arc::new(crate::tools::bash::BashTool)
+        Arc::new(crate::tools::bash::BashTool::default())
     }
 
     /// A driver that never answers → the bounded round-trip times out → Null → Deny. Any path

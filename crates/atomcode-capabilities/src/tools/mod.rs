@@ -204,7 +204,7 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
     reg.register(Arc::new(EditFileTool::default()));
     reg.register(Arc::new(ListDirTool::default()));
     reg.register(Arc::new(OpenFileTool));
-    reg.register(Arc::new(BashTool));
+    reg.register(Arc::new(BashTool::default()));
     // Background job path for long-running commands (start/poll/kill) — the reference-
     // informed alternative to an ever-larger `timeout` (see tools::bash::background).
     reg.register(Arc::new(bash::BashStartTool));

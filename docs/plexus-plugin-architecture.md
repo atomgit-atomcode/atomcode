@@ -71,19 +71,19 @@ harness --profile repl --patch mine.toml
 
 | | dsh | 这个 spike |
 |---|---|---|
-| 服务缝 | 68 | **20** |
+| 服务缝 | 68 | **19** |
 | 插件 | 250 包 | **48** |
 | 事件 | 三个事件域 | **11** |
 | bundle / profile | 9 bundle + 5 profile 模板 | **7 bundle + 9 profile** |
 
-20 个缝：
+19 个缝：
 
 ```
 agents  agent-loop  ui                                   agent 注册表 / 循环 / 前端
 llm  tools  system-prompt  approval                      模型 / 工具 / 提示词 / 审批
 sessions  session-projections  session-persistence       会话事件日志 + 投影 + 持久化
 session-title  compaction                                标题 / 压缩
-fs  subprocess  shell                                    执行世界
+fs  shell                                                执行世界
 skills  code-index  mcp  user-questions  subagents       能力 / 索引 / 外部服务器 / 人类问答 / 委派
 ```
 
@@ -350,7 +350,7 @@ repair-args  →  approval  →  result-cap  →  [ 工具执行 ]
 
 **会话事件模型**（`session.rs`，11 个）：投影是从事实到 prompt 的唯一路径；原始 chunk 留在日志里所以回放是保真的；**压缩改变投影但不擦除日志**；注入带 provenance；**不变量能抓到没进日志就到达模型的内容**；持久化是监听器且能往返重建。
 
-**执行世界**（`world.rs`，8 个）：世界围栏拒绝 root 之外的路径；**只读世界在 approval 全放行时仍然拒绝写**（策略可以被覆盖，世界不能被说服）；**换掉 subprocess 提供方，bash 自动搬家**（`bash-local` 从没被 patch 过）；两套工具实现互斥且模型可见行为一致。
+**执行世界**（`world.rs`，8 个）：世界围栏拒绝 root 之外的路径；**只读世界在 approval 全放行时仍然拒绝写**（策略可以被覆盖，世界不能被说服）；**换掉 shell 提供方，bash 自动搬家**（`tool-bash-world` 从没被 patch 过；`shell` 是进程句柄式的缝——spawn / 流式 chunk / 杀整棵树都 `&self`，取消臂才能在等待臂持有句柄时开火）；两套工具实现互斥且模型可见行为一致。
 
 **能力行**（`capabilities.rs`，8 个）：符号层真的解析代码；图层是 opt-in 且自带 `code-index` 服务；skills 只在真有技能时才进 prompt；**memory 作为带 provenance 的日志事实注入，且只注一次**；删掉任何一行 agent 照跑。
 
@@ -375,7 +375,7 @@ repair-args  →  approval  →  result-cap  →  [ 工具执行 ]
 | | 行数 |
 |---|---|
 | `atomcode-plexus`（内核 + 测试） | 2842 |
-| `atomcode-harness`（20 个缝 + 48 个插件 + 9 个 profile + launcher + 13 个测试文件） | 13100 |
+| `atomcode-harness`（19 个缝 + 48 个插件 + 9 个 profile + launcher + 13 个测试文件） | 13100 |
 | 合计 | **15942** |
 
 内核本身约 1900 行（不含测试），对照 vendor 的 cordis 是 2693 行 TS。

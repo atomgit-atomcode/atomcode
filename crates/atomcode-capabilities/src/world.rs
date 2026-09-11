@@ -55,9 +55,11 @@
 //!   it. No interface needed.
 //! * **Probed from the host** — `where bash`, `reg query`, `/proc/version`.
 //!   These are the split brain. They belong *inside* the local implementation of
-//!   a seam, as its private business, which is why [`Shell::run`] takes a command
-//!   string rather than an argv: which shell exists and where is a property of
-//!   the world, and a remote world knows its own answer without probing anything.
+//!   a seam, as its private business, which is why [`Shell::spawn`] takes a
+//!   command string rather than an argv, and why decoding its output is
+//!   [`Shell::decode`] rather than the caller's business: which shell exists,
+//!   where it lives and what code page it answers in are all properties of the
+//!   world, and a remote world knows its own answers without probing anything.
 //!
 //! The filesystem tools currently branch on nothing from the host, so
 //! [`FileSystem`] deliberately exposes no world *properties* (os, separator,
@@ -66,6 +68,7 @@
 //! guessing at the shape of a world nobody has built.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -235,24 +238,158 @@ pub trait FileSystem: Send + Sync {
 
 // ---- the process seam ----------------------------------------------------
 
+/// What a caller can say about a command *before* it starts.
+///
+/// Two things that look like they belong here are deliberately absent, for the
+/// same reason the skip-list is absent from [`FileSystem::list`]: they are the
+/// caller's policy, and the callers disagree.
+///
+/// * **A timeout.** The foreground tool wants a hard wall-clock ceiling it can
+///   report as advice ("pass a larger `timeout`"); a background job wants none
+///   at all; a streaming runner wants to kill on *silence* rather than on
+///   duration. A world that owned the timeout would be answering a question its
+///   own callers answer three different ways, and the one that disagreed would
+///   have to reach around it.
+/// * **An output cap.** Truncation is a presentation decision made against a
+///   model's context budget, and it needs the bytes in hand to decide which end
+///   to keep. A world that dropped them has destroyed what the caller was going
+///   to choose from.
+///
+/// Both are expressible on the handle: hold the timeout yourself and call
+/// [`Process::kill`] when it fires.
 #[derive(Clone, Debug, Default)]
 pub struct SpawnOptions {
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
-    pub timeout: Option<std::time::Duration>,
-    /// Bytes of combined output to keep. `0` means unbounded.
-    pub max_output_bytes: usize,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Output {
-    pub code: i32,
-    pub stdout: String,
-    pub stderr: String,
-    pub timed_out: bool,
-    /// True when output was cut to `max_output_bytes`.
-    pub truncated: bool,
+/// One piece of output, in arrival order, **undecoded**.
+///
+/// Bytes rather than `String` for the same reason [`FileSystem`] reads bytes: a
+/// chunk boundary can land in the middle of a multi-byte character, and a
+/// decoder applied per chunk would turn that into a replacement character that
+/// no later concatenation can undo. Worse, a lossy decode of a non-UTF-8 chunk
+/// can produce an empty string, which a reader loop mistakes for EOF.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Chunk {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
 }
+
+impl Chunk {
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Chunk::Stdout(b) | Chunk::Stderr(b) => b,
+        }
+    }
+}
+
+/// How a process ended, as far as the world can tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Exit {
+    /// `None` when the process was terminated by a signal rather than exiting.
+    pub code: Option<i32>,
+}
+
+impl Exit {
+    pub fn success(&self) -> bool {
+        self.code == Some(0)
+    }
+}
+
+/// Everything a command produced, once it is over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Collected {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit: Exit,
+}
+
+/// A command that is already running.
+///
+/// # Why a handle and not `run() -> Output`
+///
+/// The seam used to hand back a collected result with a `timed_out: bool` on it.
+/// That shape cannot carry what a real shell tool does, in two escalating ways:
+///
+/// 1. **The result type was lossy.** One flag has to stand in for "exited",
+///    "killed on a wall-clock ceiling", "killed because it went silent" and
+///    "terminated by a signal" — four outcomes the caller reports differently,
+///    because only some of them are the model's to fix.
+/// 2. **It had no way to say "stop".** A person pressing escape has to reach a
+///    process that is *mid-flight*. `run()` owns the child until it returns, so
+///    the only cancellation available is dropping the future — which kills the
+///    direct child and orphans the tree it spawned.
+///
+/// Hence a handle. And hence `&self` on every method rather than `&mut self`:
+/// the whole point is to await the exit in one `select!` arm while killing from
+/// another, and a `&mut self` handle makes that un-expressible — the cancel arm
+/// would need a borrow the waiting arm is already holding. An implementation
+/// keeps whatever it needs for the kill (a process-group id, a job object)
+/// *beside* the child rather than inside it.
+#[async_trait]
+pub trait Process: Send + Sync {
+    /// The next chunk of output, or `None` once the process's pipes are closed.
+    ///
+    /// Note that pipe EOF is not process exit: a grandchild that inherited
+    /// stdout (`some-daemon &`) holds the pipe open after the shell itself is
+    /// gone. A caller that must not wait for it needs its own bound.
+    async fn next_chunk(&self) -> Option<Chunk>;
+
+    /// Wait for the process to exit. Idempotent: later calls return the same
+    /// answer rather than blocking forever on an already-reaped child.
+    async fn wait(&self) -> Result<Exit, String>;
+
+    /// Kill the process **and everything it spawned**, now.
+    ///
+    /// Tree-wide rather than child-only because the child is a shell: killing
+    /// `bash` while leaving the `cargo` it launched is how a "cancelled" command
+    /// keeps holding the build lock.
+    async fn kill(&self);
+
+    /// Drain the output to EOF, then wait — the shape a caller that only wants
+    /// the finished result would otherwise write for itself.
+    ///
+    /// Provided rather than required so a world implements the three primitives
+    /// and inherits this, and so it cannot disagree with them.
+    async fn collect(&self) -> Result<Collected, String> {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        while let Some(chunk) = self.next_chunk().await {
+            match chunk {
+                Chunk::Stdout(bytes) => stdout.extend_from_slice(&bytes),
+                Chunk::Stderr(bytes) => stderr.extend_from_slice(&bytes),
+            }
+        }
+        let exit = self.wait().await?;
+        Ok(Collected {
+            stdout,
+            stderr,
+            exit,
+        })
+    }
+}
+
+/// Why a command could not be started — the same split as [`FsError::is_denied`],
+/// because a caller reports the two halves differently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpawnError {
+    /// The world cannot run this command *as written*, and says what to change.
+    /// This one is the model's to fix, so it goes back verbatim.
+    Unsupported(String),
+    /// The world tried and could not start the process.
+    Failed(String),
+}
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpawnError::Unsupported(m) | SpawnError::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for SpawnError {}
 
 /// Shell execution for one world.
 ///
@@ -263,10 +400,32 @@ pub struct Output {
 #[async_trait]
 pub trait Shell: Send + Sync {
     fn describe(&self) -> String;
-    async fn run(&self, command: &str, options: &SpawnOptions) -> Result<Output, String>;
-}
 
-// ---- the local world -----------------------------------------------------
+    /// Start `command`. Returns once the process exists, not once it is done.
+    async fn spawn(
+        &self,
+        command: &str,
+        options: &SpawnOptions,
+    ) -> Result<Arc<dyn Process>, SpawnError>;
+
+    /// Turn this world's output bytes into text.
+    ///
+    /// A world property, not a caller's utility: what encoding a command's
+    /// output is in depends on the machine it ran on — a Windows console code
+    /// page, a legacy locale — and a caller that answered that by probing *its
+    /// own* host would be decoding a remote world's bytes with the local
+    /// machine's answer. The default is the one every non-local world should
+    /// need: UTF-8.
+    fn decode(&self, bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+} // ---- the local world -----------------------------------------------------
+
+/// This machine's shell. Lives beside the bash tool because "which shell is on
+/// this machine and how is its tree reaped" is several hundred lines of platform
+/// probing with its own tests, and the seam above is the part a *different*
+/// world needs; re-exported here so the worlds are found in one place.
+pub use crate::tools::bash::LocalShell;
 
 /// The local disk, fenced to a root, optionally read-only.
 ///
@@ -361,9 +520,7 @@ impl LocalFs {
             existing = parent;
         }
         let real = existing.canonicalize().map_err(FsError::io)?;
-        let root = root_dir
-            .canonicalize()
-            .unwrap_or_else(|_| root_dir.clone());
+        let root = root_dir.canonicalize().unwrap_or_else(|_| root_dir.clone());
         let full = if trailing.as_os_str().is_empty() {
             real
         } else {
@@ -449,11 +606,7 @@ impl FileSystem for LocalFs {
         let mut reader = tokio::fs::read_dir(&root).await.map_err(FsError::io)?;
         let mut out = Vec::new();
         while let Ok(Some(entry)) = reader.next_entry().await {
-            let is_dir = entry
-                .file_type()
-                .await
-                .map(|t| t.is_dir())
-                .unwrap_or(false);
+            let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
             out.push(DirEntry {
                 path: entry.path(),
                 is_dir,
@@ -537,11 +690,17 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "before").unwrap();
         let fs = LocalFs::read_only(&dir);
 
-        let err = fs.write_text(Path::new("a.txt"), "after").await.unwrap_err();
+        let err = fs
+            .write_text(Path::new("a.txt"), "after")
+            .await
+            .unwrap_err();
         assert!(err.is_denied(), "{err}");
         // The refusal is the world's, so the file is untouched — not "the write
         // was logged and skipped", actually untouched.
-        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "before");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "before"
+        );
         // And reading still works: read-only, not inert.
         assert_eq!(fs.read_text(Path::new("a.txt")).await.unwrap(), "before");
     }
@@ -613,8 +772,20 @@ mod tests {
         assert!(names.contains(&"target".to_string()), "{names:?}");
         assert!(names.contains(&"src".to_string()));
         assert!(names.contains(&"a.rs".to_string()));
-        assert!(entries.iter().find(|e| e.path.ends_with("src")).unwrap().is_dir);
-        assert!(!entries.iter().find(|e| e.path.ends_with("a.rs")).unwrap().is_dir);
+        assert!(
+            entries
+                .iter()
+                .find(|e| e.path.ends_with("src"))
+                .unwrap()
+                .is_dir
+        );
+        assert!(
+            !entries
+                .iter()
+                .find(|e| e.path.ends_with("a.rs"))
+                .unwrap()
+                .is_dir
+        );
         // One level only — recursion and depth are the caller's policy.
         assert_eq!(names.len(), 3, "{names:?}");
     }

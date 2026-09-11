@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use atomcode_harness::profile::Profiles;
 use atomcode_harness::seams::{
-    FindingsSvc, SessionSvc, ShellSvc, SubprocessSvc, SystemPromptSvc, ToolsSvc, UiSvc,
+    FindingsSvc, SessionSvc, ShellSvc, SystemPromptSvc, ToolsSvc, UiSvc,
 };
 use atomcode_harness::{plugins, run_turn};
 use atomcode_plexus::{App, ConfigTree};
@@ -276,10 +276,6 @@ disabled = true
 [[patch]]
 id = \"shell\"
 disabled = true
-
-[[patch]]
-id = \"subprocess\"
-disabled = true
 ";
     let app = start(tree("repl", &dir, &says("ok"), &[no_processes])).await;
     let ctx = app.context();
@@ -288,10 +284,6 @@ disabled = true
     assert!(
         ctx.service::<ShellSvc>().is_none(),
         "a shell provider is still mounted"
-    );
-    assert!(
-        ctx.service::<SubprocessSvc>().is_none(),
-        "a process provider is still mounted"
     );
     assert!(!tools_of(&app).contains(&"bash".to_string()));
 }

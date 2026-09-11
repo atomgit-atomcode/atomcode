@@ -60,7 +60,7 @@ use crate::seams::{
     AgentHandleSvc, AgentLoopSvc, AgentsSvc, ApprovalSvc, CodeIndexSvc, CompactionSvc, ControlSvc,
     FindingsSvc, FsSvc, LlmSvc, McpSvc, OperationsSvc, SessionPersistenceSvc,
     SessionProjectionsSvc, SessionSvc, SessionTitleSvc, ShellSvc, SkillsSvc, SubagentsSvc,
-    SubprocessSvc, SystemPromptSvc, ToolsSvc, UiSvc, UserQuestionsSvc,
+    SystemPromptSvc, ToolsSvc, UiSvc, UserQuestionsSvc,
 };
 
 seam_catalog!(
@@ -77,7 +77,6 @@ seam_catalog!(
     CodeIndexSvc,
     McpSvc,
     FsSvc,
-    SubprocessSvc,
     ShellSvc,
     CompactionSvc,
     UserQuestionsSvc,
