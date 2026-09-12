@@ -139,6 +139,34 @@ binary 调 `plugins::catalog()` 再 `register` 自己的行,加一个 profiles �
 没接上,cli / daemon 仍在老栈,harness 的 web 行是单 agent 单会话无鉴权;
 auth / updater / telemetry 是 AtomGit 口味,私有化多半要换。
 
+## SDK 与协议
+
+SDK 不是第五层,是两种东西落在已有的层上:
+
+- **进程内 SDK 是 Agent 层的公开面。** 调用方的进程就是 Host。面 = `embed`
+  profile + `App` / `Context` + `AgentHandle`(8 个命令进、25 个事件出)+ `Plugin`
+  trait。建议加一个薄的 facade crate 只做 re-export 与语义化版本,让 SDK 用户
+  看不到 `bundle.rs` 的内部常量。
+- **进程外 SDK 拆三块。** 协议行归 UI 层;宿主进程归 Host 层(`harness --profile
+  sdk` 今天就是一个,daemon 挂同一个行就是网络版);目标语言的客户端库在四层
+  之外,是 Host 的另一端。
+
+**决定(2026-09-12):进程外协议用 ACP(Agent Client Protocol)。** 做一个 `ui-acp`
+行挂在 `ui` 缝上,把老栈 `crates/atomcode-cli/src/acp/`(14 个文件,跑在 coding
+栈上)移植过来。`ui-jsonrpc` 那 12 个自定义方法(`plugins/ui_jsonrpc.rs:230-342`)
+不再扩展。理由:ACP 已在 workspace 里,IDE 集成与第三方客户端省一层翻译,不养
+第二套协议。
+
+**SDK 面只定义一次。** ACP 行、进程内 facade、客户端库都是 `AgentHandle` 协议的
+投影,不各自长方法。因此上面缺口清单里 28 个无对应的句柄方法直接是 SDK 的能力
+上限:undo / rewind / snapshot 恢复不补,任何一种 SDK 都没有。
+
+**未决:配置树改写方法是否进公开 SDK。** `harness/patch` / `harness/rows` /
+`harness/audit` 让调用方在运行中换缝的提供方,很强,但把内部行名暴露成了 API。
+对外暴露是单向的,开了就是兼容面。当前做法:进程内 facade 开放,进程外协议
+默认不开;等出现一个用 profile 与 overlay 表达不了、非得运行中改行的外部调用方
+再按白名单开。
+
 ## 第一步
 
 不新建四个 crate。把 coding 的 18k 生产行按上表分流:owner loop 已被差分证明
