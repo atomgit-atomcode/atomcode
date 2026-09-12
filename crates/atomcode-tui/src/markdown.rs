@@ -96,6 +96,10 @@ pub fn render(text: &str, w: u16, base: Style) -> Vec<Line> {
 fn heading_of(t: &str) -> Option<(u8, &str)> {
     let hashes = t.chars().take_while(|c| *c == '#').count();
     if (1..=6).contains(&hashes) {
+        #[allow(
+            clippy::string_slice,
+            reason = "`#` is one byte, so the count of them is a byte boundary"
+        )]
         let rest = &t[hashes..];
         rest.strip_prefix(' ').map(|body| (hashes as u8, body))
     } else {
@@ -117,7 +121,12 @@ fn list_item(t: &str) -> Option<(String, &str)> {
     // `1. ` and friends.
     let digits: String = t.chars().take_while(char::is_ascii_digit).collect();
     if !digits.is_empty() && digits.len() <= 3 {
-        if let Some(body) = t[digits.len()..].strip_prefix(". ") {
+        #[allow(
+            clippy::string_slice,
+            reason = "ASCII digits taken from the front: their byte length is a boundary"
+        )]
+        let after_digits = &t[digits.len()..];
+        if let Some(body) = after_digits.strip_prefix(". ") {
             return Some((format!("{digits}."), body));
         }
     }
@@ -261,7 +270,13 @@ fn wrap_spans(spans: &[Span], w: u16, prefix: &str, prefix_style: Style) -> Vec<
                         }
                         continue;
                     }
-                    rest = &rest[piece.len()..];
+                    #[allow(
+                        clippy::string_slice,
+                        reason = "`piece` is a take_width prefix of `rest`, so its length is a boundary"
+                    )]
+                    {
+                        rest = &rest[piece.len()..];
+                    }
                     used += width::str_width(&piece);
                     current.push(Span::styled(piece, span.style));
                 }
@@ -422,6 +437,10 @@ fn word_spans(text: &str, kw: Style, number: Style, plain: Style) -> Vec<Span> {
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
+        #[allow(
+            clippy::string_slice,
+            reason = "`word` is taken from the front of `token`, so its byte length is a boundary"
+        )]
         let tail = &token[word.len()..];
         if !word.is_empty() {
             let style = if KEYWORDS.contains(&word.as_str()) {

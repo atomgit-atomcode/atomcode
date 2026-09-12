@@ -264,7 +264,23 @@ mod tests {
             .iter()
             .filter(|x| x.block().kind() == "tool_call")
             .collect();
-        assert_eq!(calls.len(), 2, "two calls, two blocks — not four");
+        // One block per call, not one per fact: the call and its result are
+        // two facts that have to land in the same block. The corpus has three
+        // calls, so six facts must fold into three blocks.
+        let in_corpus = conformance::facts()
+            .iter()
+            .filter_map(|f| match f {
+                atomcode_harness::session::SessionEvent::AssistantMessage {
+                    tool_calls, ..
+                } => Some(tool_calls.len()),
+                _ => None,
+            })
+            .sum::<usize>();
+        assert_eq!(
+            calls.len(),
+            in_corpus,
+            "one block per call, not one per fact"
+        );
         assert!(calls.iter().all(|c| c.is_settled()));
         // The outcome is in the words on the result line, not in the header
         // glyph — the header is `●` for every call, the way tuix draws it. That

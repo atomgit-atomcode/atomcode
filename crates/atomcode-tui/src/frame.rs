@@ -274,10 +274,21 @@ impl Line {
                 continue;
             }
             // Up to three pieces: before the range, inside it, after it.
+            // The two slices below cut at the *byte length of a grapheme
+            // prefix* `take_width` just returned, so the index is a boundary by
+            // construction — not by anyone's arithmetic.
             let head = crate::width::take_width(&span.text, from.saturating_sub(lo));
+            #[allow(
+                clippy::string_slice,
+                reason = "cut at the length of a take_width prefix, which is a grapheme boundary"
+            )]
             let rest = &span.text[head.len()..];
             let inside =
                 crate::width::take_width(rest, to.min(hi) - (lo + crate::width::str_width(&head)));
+            #[allow(
+                clippy::string_slice,
+                reason = "cut at the length of a take_width prefix, which is a grapheme boundary"
+            )]
             let tail = &rest[inside.len()..];
             for (text, style) in [
                 (head.as_str(), span.style),
@@ -424,6 +435,10 @@ impl Frame {
                 continue;
             };
             let head = crate::width::take_width(row, a as usize);
+            #[allow(
+                clippy::string_slice,
+                reason = "cut at the length of a take_width prefix, which is a grapheme boundary"
+            )]
             let rest = &row[head.len()..];
             let piece = crate::width::take_width(rest, (b - a) as usize);
             out.push(piece.trim_end().to_string());

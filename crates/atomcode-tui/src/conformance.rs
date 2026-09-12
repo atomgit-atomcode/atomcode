@@ -130,12 +130,87 @@ pub fn facts() -> Vec<SessionEvent> {
             text: "now break it".into(),
             images: Vec::new(),
         },
+        // A call whose arguments are long, Chinese, and full of slashes.
+        //
+        // Not decoration. Every module folds this corpus, and for two years the
+        // only tool calls in it were `{"file_path":"a.rs"}` — short, ASCII, no
+        // separator. So the abbreviation path in `subject_of` was never once
+        // handed a string it could cut in half, and it cut one in half in
+        // production instead, on a command a person typed in Chinese, and took
+        // the whole TUI down with it. The corpus had CJK in the *prose* and
+        // none in the *arguments*, which is precisely where it was needed.
+        SessionEvent::AssistantMessage {
+            turn: 2,
+            round: 1,
+            text: "看看那个目录".into(),
+            reasoning: String::new(),
+            // The tail is deliberately an unbroken run of three-byte
+            // characters: "keep the last N bytes" then lands mid-character for
+            // every N that is not a multiple of three, which is what makes this
+            // a guard rather than a coin flip. `a_hostile_argument_is_in_the_corpus`
+            // holds that property still true.
+            tool_calls: vec![call(
+                "c3",
+                "bash",
+                r#"{"command":"cd /Users/我的项目/前端/源码 && echo 这条命令足够长而且结尾整段都是中文没有任何半角字符"}"#,
+            )],
+        },
+        SessionEvent::ToolResultLogged {
+            turn: 2,
+            round: 1,
+            call_id: "c3".into(),
+            content: "这是一条足够长的中文结果/带斜杠/也要能画".into(),
+            is_error: false,
+            images: Vec::new(),
+        },
         SessionEvent::TurnEnd {
             turn: 2,
             stop: atomcode_harness::seams::StopReason::Cancelled,
             error: Some("cancelled by the user".into()),
         },
     ]
+}
+
+/// The corpus still carries an argument that byte arithmetic cuts in half.
+///
+/// A fixture guard, not a module test: what it protects is the *input*, and an
+/// input nobody notices going soft is how this class of bug survived. For two
+/// years every tool call in here was `{"file_path":"a.rs"}` — short, ASCII, no
+/// separator — so the one code path that abbreviates a long path was never
+/// handed anything it could split, and it split one in production instead and
+/// took the TUI down with it.
+#[cfg(test)]
+#[test]
+fn a_hostile_argument_is_in_the_corpus() {
+    use atomcode_harness::session::SessionEvent;
+
+    let arguments: Vec<String> = facts()
+        .iter()
+        .filter_map(|f| match f {
+            SessionEvent::AssistantMessage { tool_calls, .. } => Some(tool_calls.clone()),
+            _ => None,
+        })
+        .flatten()
+        .map(|c| c.arguments)
+        .collect();
+    let hostile = arguments.iter().any(|args| {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(args) else {
+            return false;
+        };
+        let Some(text) = value.get("command").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        // Long enough to be abbreviated, with a separator to abbreviate around,
+        // and a tail where most byte offsets are inside a character rather than
+        // between two.
+        text.len() > 48
+            && text.contains('/')
+            && (1..=48).filter(|k| !text.is_char_boundary(text.len() - k)).count() >= 32
+    });
+    assert!(
+        hostile,
+        "no tool call here can catch a byte-offset cut any more: {arguments:?}"
+    );
 }
 
 /// Widths worth trying: the degenerate ones, the ones that split a wide
@@ -191,8 +266,14 @@ pub mod probes {
         fn absorb(_: &mut (), _: &SessionEvent) {}
         fn render(_: &(), vp: &Viewport<'_>) -> Vec<Line> {
             let text = "hello";
-            // Slices without checking — the classic.
-            vec![Line::raw(&text[..(vp.rect.w as usize).min(99)])]
+            // Slices without checking — the classic. This one is *meant* to be
+            // wrong: it is the negative control that proves the width property
+            // can fail. The lint is allowed here for the same reason the panic
+            // is tolerated — a judge with nothing unsound to judge decides
+            // nothing.
+            #[allow(clippy::string_slice, reason = "a probe that exists to be unsound")]
+            let cut = &text[..(vp.rect.w as usize).min(99)];
+            vec![Line::raw(cut)]
         }
     }
 }

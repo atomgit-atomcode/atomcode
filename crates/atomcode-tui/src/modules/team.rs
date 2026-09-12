@@ -108,9 +108,12 @@ impl View for Team {
                             }
                         }
                         "stop" => {
-                            state
-                                .pending
-                                .insert(call.id.clone(), Pending::Stop { name: str_at("name") });
+                            state.pending.insert(
+                                call.id.clone(),
+                                Pending::Stop {
+                                    name: str_at("name"),
+                                },
+                            );
                         }
                         _ => {}
                     }
@@ -232,13 +235,13 @@ impl View for Team {
             };
             let mut line: Vec<El> = vec![
                 El::styled(format!("{mark} "), mark_style),
-                El::styled(
-                    pad(&row.member.name, name_w),
-                    theme::fg(Role::Secondary),
-                ),
+                El::styled(pad(&row.member.name, name_w), theme::fg(Role::Secondary)),
             ];
             if role_w > 0 {
-                line.push(El::styled(format!(" {}", pad(&row.member.role, role_w)), muted));
+                line.push(El::styled(
+                    format!(" {}", pad(&row.member.role, role_w)),
+                    muted,
+                ));
             }
             line.push(El::styled(format!(" {said}"), muted));
             if !row.member.last.is_empty() {
@@ -430,7 +433,11 @@ mod tests {
             activity: Activity::Working,
             turn: 2,
         }]);
-        assert!(drew(&state, &live).contains("第 2 轮"), "{}", drew(&state, &live));
+        assert!(
+            drew(&state, &live).contains("第 2 轮"),
+            "{}",
+            drew(&state, &live)
+        );
         assert!(
             drew(&state, &Moment::default()).contains("已结束"),
             "gone from the registry is gone"
@@ -449,6 +456,35 @@ mod tests {
         assert!(screen.contains("1 名成员"), "{screen}");
     }
 
+    /// Nothing the panel draws is wider than the strip it was given — with
+    /// members on it, which is the only interesting case and the one the
+    /// shared property suite cannot reach: conformance folds a corpus with no
+    /// team in it, so an empty panel is all it ever checks.
+    #[test]
+    fn nothing_it_draws_is_wider_than_its_rect_at_any_width() {
+        let state = fold(&[
+            delegate("c1", "巡查员-with-a-very-long-name", "explorer"),
+            result("c1", false),
+            delegate("c2", "lib", "docs_writer"),
+            result("c2", false),
+            SessionEvent::Injected {
+                turn: 1,
+                text: "[lib] 列了 12 个文档,还有一些很长很长很长的中文说明文字".into(),
+                origin: InjectionOrigin::Peer { from: "l/lib".into() },
+            },
+        ]);
+        let moment = Moment::default().with_members(vec![
+            MemberNow { name: "巡查员-with-a-very-long-name".into(), activity: Activity::Working, turn: 3 },
+            MemberNow { name: "lib".into(), activity: Activity::Idle, turn: 1 },
+        ]);
+        for w in 1u16..100 {
+            let vp = Viewport::new(Rect::sized(w, 10), &moment);
+            for (i, line) in Team::render(&state, &vp).iter().enumerate() {
+                assert!(line.width() <= w as usize, "team line {i} is {} cells at width {w}: {:?}", line.width(), line.plain());
+            }
+        }
+    }
+
     #[test]
     fn the_panel_asks_for_a_line_each_plus_its_header() {
         let state = fold(&[
@@ -457,10 +493,7 @@ mod tests {
             delegate("c2", "lib", "docs_writer"),
             result("c2", false),
         ]);
-        assert_eq!(
-            Team::height(&state, &Moment::default(), 60),
-            Height::Hug(3)
-        );
+        assert_eq!(Team::height(&state, &Moment::default(), 60), Height::Hug(3));
         assert_eq!(
             Team::height(&State::default(), &Moment::default(), 60),
             Height::Hug(1)

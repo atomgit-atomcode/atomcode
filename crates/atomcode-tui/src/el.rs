@@ -800,6 +800,12 @@ fn frame(title: Option<&str>, footer: Option<&str>, child: &El, w: u16) -> Vec<L
 
 #[cfg(test)]
 mod tests {
+    //! Slicing is allowed in here: every index is a byte offset a test computed
+    //! from its own ASCII fixture, and the point of the assertion is usually
+    //! that offset. Production code says why each slice is safe instead; this
+    //! is the one place where "the test wrote the string" is the whole reason.
+    #![allow(clippy::string_slice, reason = "byte offsets over the test's own fixtures")]
+
     use super::*;
 
     fn plain(el: &El, w: u16) -> Vec<String> {
