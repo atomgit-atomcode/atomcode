@@ -77,11 +77,21 @@ impl Presentation {
 
 /// What a click can fold.
 ///
-/// Deliberately narrow. Everything the model *says* is what the transcript is
-/// for, so making prose and reasoning click targets means most of the screen
-/// silently swallows a click and folds something the person was reading. A tool
-/// call is the one block that is genuinely a lid over a detail.
-const CLICKABLE: [&str; 1] = ["tool_call"];
+/// Narrow, for two different reasons — which is why this is a list and not a
+/// predicate over "is it foldable".
+///
+/// Prose is out. Everything the model *says* is what the transcript is for, and
+/// it is the largest surface on the screen, so a click that folded the answer
+/// someone was reading away is the one gesture that can lose work. A click on
+/// prose stays a no-op.
+///
+/// A thought and a tool call are in. Both are drawn as a one-line lid over a
+/// detail — `· 思考 3 行`, `● read_file(a.rs) · ok` — and a click on a lid has
+/// exactly one meaning. Folding a thought was reachable only by ctrl-r, which
+/// moves *every* thought in the transcript; the row itself answered nothing, so
+/// pointing at a lid opens that lid and costs no other gesture. A press that
+/// moves is still a selection, and ctrl-r still does them all at once.
+const CLICKABLE: [&str; 2] = ["tool_call", "reasoning"];
 
 /// Which block each row of the stream came from, and where the stream was.
 ///
@@ -392,8 +402,7 @@ impl Host {
 
         // A modal is drawn last, over everything, in a box of its own.
         if let Some(modal) = self.overlays.current() {
-            let rect =
-                crate::overlay::modal_rect(Rect::sized(w, h), modal.size(), modal.rows());
+            let rect = crate::overlay::modal_rect(Rect::sized(w, h), modal.size(), modal.rows());
             if !rect.is_empty() {
                 let vp = crate::moment::Viewport::new(
                     Rect::new(
@@ -632,10 +641,11 @@ mod tests {
     }
 
     #[test]
-    fn only_a_tool_call_answers_a_click() {
-        // Everything the model says is what the transcript is *for*. Making
-        // prose and reasoning click targets meant most of the screen silently
-        // swallowed a click and folded away what the person was reading.
+    fn a_thought_and_a_tool_call_answer_a_click_but_prose_does_not() {
+        // Two decisions, deliberately different. Prose is not a click target:
+        // it is the largest surface on the screen, and folding away the answer
+        // someone was reading is the one gesture that can lose work. A thought
+        // or a tool call is a one-line lid, and a click on a lid has one meaning.
         let h = fed();
         let size = (80, 40);
         let frame = h.compose(size);
@@ -646,27 +656,84 @@ mod tests {
             .collect();
         assert!(!kinds.is_empty(), "nothing is clickable at all");
         assert!(
-            kinds.iter().all(|k| *k == "tool_call"),
+            kinds.iter().all(|k| *k == "tool_call" || *k == "reasoning"),
             "these answer a click too: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"reasoning"),
+            "a thought is a lid: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"tool_call"),
+            "a tool call is a lid: {kinds:?}"
         );
     }
 
     #[test]
-    fn reasoning_still_folds_by_key_even_though_it_is_not_a_click_target() {
-        // The two questions are different, and collapsing them into one broke
-        // ctrl-r: a block that cannot be clicked must still be foldable.
+    fn clicking_a_thought_opens_that_thought() {
+        // The gesture that used to be missing: ctrl-r unfolds every thought in
+        // the transcript at once, and the folded row — the thing being pointed
+        // at — answered nothing. Clicking the lid opens the lid.
         let h = fed();
-        let open = |folded: bool| {
-            let mut p = h.presentation.write().unwrap();
-            if p.is_folded("reasoning") != folded {
-                p.toggle("reasoning");
-            }
-        };
-        open(true);
-        let short = h.compose((80, 40)).rows().join("\n");
-        open(false);
-        let long = h.compose((80, 40)).rows().join("\n");
-        assert_ne!(short, long, "reasoning stopped folding");
+        let size = (80, 40);
+        let folded = h.compose(size).rows().join("\n");
+        assert!(folded.contains("思考"), "folded to a summary:\n{folded}");
+        assert!(!folded.contains("hmm"), "the words are hidden, not gone");
+
+        let rect = h.compose(size).part("stream").unwrap().rect;
+        let (id, kind) = (rect.y..rect.bottom())
+            .filter_map(|y| h.block_at(2, y))
+            .find(|(_, kind)| *kind == "reasoning")
+            .expect("the folded thought answers a click");
+        h.presentation.write().unwrap().toggle_block(id, kind);
+        let open = h.compose(size).rows().join("\n");
+        assert!(
+            open.contains("hmm"),
+            "the click showed the working:\n{open}"
+        );
+
+        h.presentation.write().unwrap().toggle_block(id, kind);
+        assert_eq!(
+            h.compose(size).rows().join("\n"),
+            folded,
+            "clicking it again is the inverse"
+        );
+    }
+
+    #[test]
+    fn a_block_that_cannot_be_clicked_still_folds_by_key() {
+        // 「能折叠」and「能点击」are two questions, and writing them as one
+        // predicate once broke ctrl-r: making a kind unclickable silently made
+        // it unfoldable too. Prose is the standing example — never a click
+        // target, still foldable by key.
+        assert!(
+            !CLICKABLE.contains(&"assistant"),
+            "prose is not a click target"
+        );
+        let h = fed();
+        // A one-line answer would prove nothing: folded and open would render
+        // the same row. The block has to be long enough that folding it is a
+        // difference anyone could see.
+        let answer = (1..=8)
+            .map(|n| format!("第 {n} 行:一段足够长的回答,折叠起来和不折叠不是同一屏"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 12,
+            round: 0,
+            text: answer,
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+        });
+        let open = h.compose((80, 40)).rows().join("\n");
+        assert!(open.contains("第 8 行"), "the whole answer is up:\n{open}");
+        h.presentation.write().unwrap().toggle("assistant");
+        let folded = h.compose((80, 40)).rows().join("\n");
+        assert_ne!(open, folded, "prose stopped folding by key");
+        assert!(
+            !folded.contains("第 8 行"),
+            "folded means hidden:\n{folded}"
+        );
     }
 
     #[test]
@@ -843,7 +910,7 @@ mod tests {
             .find(|l| !l.plain().trim().is_empty())
             .expect("something was said");
         assert!(
-            last.plain().contains("Cancelled"),
+            last.plain().contains("已中断"),
             "bottom-anchored, newest last: {:?}",
             last.plain()
         );

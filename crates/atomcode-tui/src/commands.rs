@@ -50,7 +50,7 @@ impl CommandSet for ScreenCommands {
                  上/下 在输入里移动游标,到头则翻历史 · 点击输入框定位游标\n\
                  pgup/pgdn 与滚轮滚动对话\n\
                  ctrl-r 折叠思考 · ctrl-t 折叠工具 · ctrl-n 吉祥物 · ctrl-l 重画屏幕\n\
-                 拖动选中并复制 · esc 取消选中 · 点击工具调用折叠展开\n\
+                 拖动选中并复制 · esc 取消选中 · 点击思考或工具调用折叠展开那一个\n\
                  ctrl-o 把鼠标交还终端(改用终端自己的框选)"
                     .into(),
             ),

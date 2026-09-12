@@ -10,6 +10,7 @@ use crate::caps::{Caps, Glyph};
 use crate::frame::{Color, Line, Span, Style};
 use crate::theme::Role;
 use crate::width;
+use atomcode_harness::seams::StopReason;
 
 fn dim() -> Style {
     Style::new().dim()
@@ -629,10 +630,52 @@ impl Content for CommandSaid {
 }
 
 /// How a turn ended.
+///
+/// The reason is the *typed* one, not a rendering of it. A block that took a
+/// string could only hand it back, and the fold would have to decide the words
+/// — which is how this line came to say `✓ RunawayFuse`: `format!("{stop:?}")`
+/// is a Rust identifier, and `error.is_none()` is not the same question as "did
+/// this turn finish". Only [`StopReason::Stopped`] is a clean end; every other
+/// variant cut it short, and one of them (a round budget running out) is the
+/// outcome a person most needs named, because it looks like a crash and is not.
 #[derive(Debug)]
 pub struct TurnEndBlock {
-    pub stop: String,
+    pub stop: StopReason,
     pub error: Option<String>,
+}
+
+/// The mark and the words for one stop reason.
+///
+/// `完成` / `已中断` are `atomcode-tuix`'s two words for these two outcomes, and
+/// this crate's own tool-result note (`outcome_note`) already uses them, so the
+/// vocabulary is the product's rather than new. What is added is the cause,
+/// where a person can do something about it: a turn that ran out of rounds says
+/// so, in words, instead of showing them a variant name or nothing at all.
+fn turn_end_note(stop: StopReason) -> (Glyph, String, Style) {
+    use StopReason::*;
+    let warn = Style::new().fg(Color::role(Role::Warning));
+    match stop {
+        // The only clean end: the model answered and asked for nothing.
+        Stopped => (Glyph::Ok, "完成".to_string(), dim()),
+        // The person's own doing, so it is stated without alarm.
+        Cancelled => (Glyph::Interrupted, "已中断".to_string(), dim()),
+        // Both budgets are round budgets — the `round-cap` row and the loop's
+        // own fuse — and for a person they are one fact: this turn was long and
+        // was cut. Sending another message continues it.
+        MaxRounds | StoppedByPolicy | RunawayFuse => (
+            Glyph::Interrupted,
+            "已中断 · 达到了本轮的轮数上限".to_string(),
+            warn,
+        ),
+        ToolLoopDetected => (
+            Glyph::Interrupted,
+            "已中断 · 检测到重复循环".to_string(),
+            warn,
+        ),
+        InputRejected => (Glyph::Interrupted, "已中断 · 输入被拒绝".to_string(), warn),
+        // A failure, with the provider's own sentence folded in below.
+        ProviderError | InvariantViolated => (Glyph::Fail, "已中断".to_string(), bad()),
+    }
 }
 
 impl Content for TurnEndBlock {
@@ -640,18 +683,22 @@ impl Content for TurnEndBlock {
         "turn_end"
     }
     fn content_hash(&self) -> ContentHash {
-        hash_of(&["turn_end", &self.stop, self.error.as_deref().unwrap_or("")])
+        // The variant name is identity here, not presentation: it is never
+        // drawn, and two turns that stopped for different reasons must not hash
+        // alike even when neither has a cause attached.
+        hash_of(&[
+            "turn_end",
+            &format!("{:?}", self.stop),
+            self.error.as_deref().unwrap_or(""),
+        ])
     }
     /// A divider with the turn's outcome set into it, the way tuix closes a
     /// turn: `───── ✓ 完成 ─────`. A bare line of text at the left margin reads
     /// as something that was said; a captioned rule reads as a boundary.
     fn lines(&self, w: u16) -> Vec<Line> {
         let caps = Caps::default();
-        let (mark, style) = match &self.error {
-            Some(_) => (caps.g(Glyph::Fail), bad()),
-            None => (caps.g(Glyph::Ok), dim()),
-        };
-        let short = format!("{mark} {}", self.stop);
+        let (mark, said, style) = turn_end_note(self.stop);
+        let short = format!("{} {said}", caps.g(mark));
         let Some(error) = &self.error else {
             return vec![crate::el::captioned_rule(&short, w as usize, dim(), style)];
         };
@@ -683,7 +730,7 @@ mod tests {
                      (https://openrouter.ai/api/v1/chat/completions): client error (Connect): \
                      dns error: failed to lookup address information: nodename nor servname provided";
         let block = TurnEndBlock {
-            stop: "ProviderError".into(),
+            stop: StopReason::ProviderError,
             error: Some(error.into()),
         };
         let lines = block.lines(100);
@@ -692,7 +739,7 @@ mod tests {
             .map(|l| l.plain())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("ProviderError"), "{text}");
+        assert!(text.contains("已中断"), "{text}");
         assert!(
             text.contains("nodename nor servname"),
             "the cause must reach the screen:\n{text}"
@@ -707,12 +754,75 @@ mod tests {
 
         // A short cause still sits in the rule, on one line.
         let short = TurnEndBlock {
-            stop: "Cancelled".into(),
+            stop: StopReason::Cancelled,
             error: Some("by the user".into()),
         };
         let lines = short.lines(100);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].plain().contains("Cancelled · by the user"));
+        assert!(lines[0].plain().contains("已中断 · by the user"));
+    }
+
+    /// The reason a turn stopped is a value, and a person reads words. This is
+    /// the regression: a turn the loop's own fuse ended was drawn as
+    /// `✓ RunawayFuse` — a success mark on a turn that was cut short, and a Rust
+    /// identifier where the words belong.
+    #[test]
+    fn a_stop_reason_is_spoken_not_printed() {
+        let drawn = |stop: StopReason| {
+            TurnEndBlock { stop, error: None }
+                .lines(80)
+                .iter()
+                .map(|l| l.plain())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        for budget in [
+            StopReason::MaxRounds,
+            StopReason::StoppedByPolicy,
+            StopReason::RunawayFuse,
+        ] {
+            let text = drawn(budget);
+            assert!(
+                text.contains("已中断") && text.contains("轮数上限"),
+                "a budget that ran out must say so: {text}"
+            );
+            assert!(
+                !text.contains(&format!("{budget:?}")),
+                "no variant name on the screen: {text}"
+            );
+        }
+
+        let clean = drawn(StopReason::Stopped);
+        assert!(
+            clean.contains("完成") && !clean.contains("Stopped"),
+            "{clean}"
+        );
+
+        let cancelled = drawn(StopReason::Cancelled);
+        assert!(
+            cancelled.contains("已中断") && !cancelled.contains("Cancelled"),
+            "{cancelled}"
+        );
+
+        let failed = drawn(StopReason::ProviderError);
+        assert!(failed.contains("已中断"), "{failed}");
+
+        // Every reason is one of two outcomes, and the mark says which.
+        let mark = |stop| turn_end_note(stop).0;
+        assert_eq!(mark(StopReason::Stopped), Glyph::Ok);
+        for cut in [
+            StopReason::Cancelled,
+            StopReason::MaxRounds,
+            StopReason::StoppedByPolicy,
+            StopReason::RunawayFuse,
+            StopReason::ToolLoopDetected,
+            StopReason::InputRejected,
+            StopReason::ProviderError,
+            StopReason::InvariantViolated,
+        ] {
+            assert_ne!(mark(cut), Glyph::Ok, "{cut:?} was not a clean end");
+        }
     }
 
     #[test]
@@ -733,7 +843,11 @@ mod tests {
                 detail: "rate limited; waiting 30s".into(),
             }),
             Box::new(TurnEndBlock {
-                stop: "Cancelled".into(),
+                stop: StopReason::RunawayFuse,
+                error: None,
+            }),
+            Box::new(TurnEndBlock {
+                stop: StopReason::Cancelled,
                 error: Some("by the user".into()),
             }),
         ];

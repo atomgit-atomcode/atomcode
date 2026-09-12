@@ -208,7 +208,11 @@ impl Producer for Transcript {
                 out.emit(
                     at,
                     Arc::new(TurnEndBlock {
-                        stop: format!("{stop:?}"),
+                        // The typed reason, not a rendering of it: how the turn
+                        // ended is what the block draws, and a `{:?}` here would
+                        // put a Rust identifier on the screen (see
+                        // `content::turn_end_note`).
+                        stop: *stop,
                         error: error.clone(),
                     }),
                 );

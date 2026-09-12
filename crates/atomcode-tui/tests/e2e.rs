@@ -407,7 +407,10 @@ async fn typing_during_a_turn_is_folded_into_it_rather_than_queued() {
     let screen = s.screen();
     assert!(screen.contains("first"), "{screen}");
     assert!(screen.contains("and also this"), "{screen}");
-    let turn_ends = screen.matches("Stopped").count();
+    // The turn-end caption, which is what the person reads: `✓ 完成`. Counted by
+    // that caption rather than by a variant name, which the screen no longer
+    // shows at all.
+    let turn_ends = screen.matches("✓ 完成").count();
     assert_eq!(turn_ends, 1, "one turn, not two:\n{screen}");
 
     s.term.press(KeyPress::ctrl('d'));
@@ -450,7 +453,7 @@ async fn a_turn_the_model_never_answers_says_so_and_stops_spinning() {
     s.quiet().await;
 
     let screen = s.screen();
-    assert!(screen.contains("ProviderError"), "the outcome:\n{screen}");
+    assert!(screen.contains("已中断"), "the outcome:\n{screen}");
     assert!(
         screen.contains("nodename nor servname"),
         "the cause, wrapped rather than dropped:\n{screen}"
@@ -616,7 +619,7 @@ async fn esc_stops_the_turn_and_the_next_one_still_runs() {
     tokio::time::sleep(Duration::from_millis(120)).await;
     s.term.press(KeyPress::plain(Key::Esc));
     s.quiet().await;
-    assert!(s.screen().contains("Cancelled"), "{}", s.screen());
+    assert!(s.screen().contains("已中断"), "{}", s.screen());
 
     s.term.type_line("again");
     s.quiet().await;

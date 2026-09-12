@@ -255,7 +255,8 @@ MOUSE
     click in the composer to put the caret there. Drag to select; the
     selection is copied to the clipboard on release
     (OSC 52, so it works over ssh and tmux) and esc clears it. Click a tool
-    call to fold or unfold that one — ctrl-t still does every one at once.
+    call or a thought to fold or unfold that one — ctrl-t and ctrl-r still do
+    every one at once, and a click on prose does nothing.
     The wheel scrolls the conversation.
 
     ctrl-o (or /mouse) hands the pointer back to the terminal, for when you
