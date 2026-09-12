@@ -15,10 +15,9 @@ use crate::events::{
     ToolExec, ToolsExecute, TurnEnd, TurnProgress, TurnStart, TurnStarted, TurnStopping,
 };
 use crate::seams::{
-    Decision, SessionSvc, SessionTitle, SessionTitleSvc, StopReason, ToolsSvc, TurnOutcome,
+    Decision, SessionSvc, StopReason, ToolsSvc, TurnOutcome,
     UserQuestions, UserQuestionsSvc,
 };
-use crate::session::SessionEvent;
 
 use super::tools::{contribute_prompt, mount};
 
@@ -209,88 +208,6 @@ impl Plugin for PlanModePlugin {
 }
 
 // ---- session title ------------------------------------------------------
-
-/// Titles from the first prompt, without a model call.
-///
-/// A seam because a deployment that wants a model-written title fills the same
-/// slot; a headless run should not pay for one.
-struct FirstPromptTitle {
-    max_words: usize,
-    max_bytes: usize,
-}
-
-#[async_trait]
-impl SessionTitle for FirstPromptTitle {
-    fn describe(&self) -> String {
-        "first prompt, truncated".into()
-    }
-
-    async fn title(&self, log: &crate::session::SessionLog) -> Option<String> {
-        let first = log.events().into_iter().find_map(|e| match e.event {
-            SessionEvent::UserMessage { text, .. } => Some(text),
-            _ => None,
-        })?;
-        let mut title: String = first
-            .split_whitespace()
-            .take(self.max_words)
-            .collect::<Vec<_>>()
-            .join(" ");
-        if title.len() > self.max_bytes {
-            title = title.chars().take(self.max_bytes / 4).collect();
-        }
-        (!title.is_empty()).then_some(title)
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct TitleRow {
-    #[serde(default = "default_words")]
-    max_words: usize,
-    #[serde(default = "default_bytes")]
-    max_bytes: usize,
-}
-
-impl Default for TitleRow {
-    fn default() -> Self {
-        Self {
-            max_words: default_words(),
-            max_bytes: default_bytes(),
-        }
-    }
-}
-
-fn default_words() -> usize {
-    8
-}
-
-fn default_bytes() -> usize {
-    80
-}
-
-pub struct SessionTitlePlugin;
-
-#[async_trait]
-impl Plugin for SessionTitlePlugin {
-    fn name(&self) -> &'static str {
-        "session-title-first-prompt"
-    }
-    fn provides(&self) -> &'static [&'static str] {
-        &["session-title"]
-    }
-    fn description(&self) -> &'static str {
-        "name a session after its first prompt, with no model call"
-    }
-    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
-        let row: TitleRow = parse(config)?;
-        let _ = ctx
-            .provide::<SessionTitleSvc>(Arc::new(FirstPromptTitle {
-                max_words: row.max_words,
-                max_bytes: row.max_bytes,
-            }))
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-}
 
 // ---- user questions -----------------------------------------------------
 

@@ -78,8 +78,8 @@ cwd、parent、inherited),日志对象持有它,JSONL 文件第一行 `{"header"
 
 - fork 只有接口(`seed` + `parent`),没有从活日志切前缀并校验(无悬空工具调用)
   的便捷函数。
-- 没有人提交 `Titled`:`session-title` 缝仍是按需计算,接到前端或 ACP 的
-  SessionInfoUpdate 时再落成事件。
+- ~~没有人提交 `Titled`~~:[`0015`](./0015-utility-model-seam-and-session-titles.md)
+  的 `session-title-on-first-prompt` 行已落成事件。
 - cwd 覆盖用 `LocalFs::new(cwd)`,不继承树级 `fs-readonly`;ACP 的 `session/new`
   接进来时要决定只读世界如何按 agent 覆盖。
 - MCP 集合、模式仍是树级行,按 agent 覆盖走 `setup` 即可,尚无调用方。

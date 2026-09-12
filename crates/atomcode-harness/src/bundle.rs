@@ -249,6 +249,15 @@ config = { stream = true, tools = true, summary = true }
 [[insert]]
 name = "session-title-first-prompt"
 
+# Names the session as soon as the first prompt lands, in the background, and
+# logs the name. Which namer answers is the row above: the first prompt by
+# default. To have a cheaper model do it, patch that row to the model namer
+# and mount a utility model:
+#   [[patch]]  id = "session-title-first-prompt"  name = "session-title-model"
+#   [[insert]] id = "llm-utility"  name = "llm-utility-openai-compat"  config = { model = "…" }
+[[insert]]
+name = "session-title-on-first-prompt"
+
 # Dormant: nothing in the default tree asks a human, and a provider nobody
 # consumes is dead weight the audit rightly complains about. `--interactive`
 # turns it on together with the approval row that needs it.

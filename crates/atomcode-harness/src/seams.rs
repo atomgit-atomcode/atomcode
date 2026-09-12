@@ -22,6 +22,7 @@ pub use atomcode_capabilities::tools::Opener;
 pub use atomcode_capabilities::world::{FileSystem, Shell};
 
 plexus_service!(LlmSvc => dyn LlmProvider, "llm", Seam, "Model adapter");
+plexus_service!(LlmUtilitySvc => dyn LlmProvider, "llm-utility", Seam, "The model for side calls whose result a program consumes — titles, summaries, suggestions — not the conversation");
 plexus_service!(ToolsSvc => ToolBox, "tools", Core, "The live tool catalog");
 plexus_service!(SystemPromptSvc => PromptRegistry, "system-prompt", Core, "Ordered prompt fragments");
 // Reuses `PromptRegistry` because the shape is identical — ranked fragments

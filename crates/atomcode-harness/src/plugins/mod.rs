@@ -16,6 +16,7 @@ pub mod recovery;
 pub mod registries;
 pub mod self_knowledge;
 pub mod session;
+pub mod session_title;
 pub mod subagent;
 pub mod tool_exec;
 pub mod tools;
@@ -93,7 +94,11 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(policy_rows::TodoPlugin))
         .register(Arc::new(policy_rows::PermissionsPlugin))
         .register(Arc::new(policy_rows::PlanModePlugin))
-        .register(Arc::new(policy_rows::SessionTitlePlugin))
+        .register(Arc::new(session_title::SessionTitlePlugin))
+        .register(Arc::new(session_title::ModelTitlePlugin))
+        .register(Arc::new(session_title::TitleOnFirstPromptPlugin))
+        .register(Arc::new(llm::LlmUtilityOpenAiCompatPlugin))
+        .register(Arc::new(llm::LlmUtilityReplayPlugin))
         .register(Arc::new(policy_rows::UnattendedQuestionsPlugin))
         .register(Arc::new(policy_rows::InteractiveApprovalPlugin))
         .register(Arc::new(policy_rows::TelemetryPlugin))

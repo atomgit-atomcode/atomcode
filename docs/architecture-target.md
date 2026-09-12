@@ -109,6 +109,7 @@
 | 缝 | 类型 | 装什么 |
 |---|---|---|
 | llm | Seam | 模型适配器 |
+| llm-utility | Seam | 旁路模型:标题、摘要、建议,程序消费结果;不回退到 llm(0015) |
 | fs · shell · opener | Seam | 执行世界:文件、进程、呈现给人 |
 | compaction · session-title · session-persistence | Seam | 压缩策略、命名、持久化后端 |
 | approval · user-questions | Seam | 审批策略、问人 |
@@ -283,6 +284,7 @@ tui 线永远对着 replay 模型与 Headless surface 开发;新命令只由 har
 | 0012 | tui 替换 tuix |
 | 0013 | Agent / Product / Host / UI 四层、缺口清单、ACP |
 | 0014 | agent 拥有自己的会话与世界;`session` 行只给默认值 |
+| 0015 | `llm-utility` 旁路模型缝;会话标题并行起名、落成 `Titled` 事件 |
 
 相关文档:[`plexus-plugin-architecture.md`](./plexus-plugin-architecture.md)(底座与 spike 记录)、
 [`tui-composability.md`](./tui-composability.md)(TUI 的时间与空间可组合性)、

@@ -13,7 +13,7 @@ use futures::stream::BoxStream;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::seams::LlmSvc;
+use crate::seams::{LlmSvc, LlmUtilitySvc};
 
 /// An environment variable, treating empty as unset — an exported-but-blank
 /// variable is a mistake, not a value.
@@ -93,12 +93,7 @@ impl Plugin for OpenAiCompatPlugin {
             api_key.expect("checked"),
         );
 
-        let mut cfg = OpenAiCompatConfig::new(&api_key, &base_url, &model);
-        if let Some(window) = row.context_window {
-            cfg.context_window = window;
-        }
-        let provider = OpenAiCompatProvider::new(cfg)
-            .map_err(|e| format!("provider init failed: {}", e.message))?;
+        let provider = openai_compat(&api_key, &base_url, &model, row.context_window)?;
         let _ = ctx
             .provide::<LlmSvc>(Arc::new(provider))
             .map_err(|e| e.to_string())?;
@@ -127,6 +122,102 @@ impl Plugin for OpenAiCompatPlugin {
 /// that the slot is real. The loop, the tools, the approval policy and the
 /// tracing all run unchanged against it, because none of them can tell which
 /// plugin filled `llm`.
+fn openai_compat(
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+    context_window: Option<u32>,
+) -> Result<OpenAiCompatProvider, String> {
+    let mut cfg = OpenAiCompatConfig::new(api_key, base_url, model);
+    if let Some(window) = context_window {
+        cfg.context_window = window;
+    }
+    OpenAiCompatProvider::new(cfg).map_err(|e| format!("provider init failed: {}", e.message))
+}
+
+/// The utility model, as its own row.
+///
+/// Side calls — a title, a summary, a suggestion — are one-off prompts with
+/// no prefix to cache, so the model's unit price is their whole cost, and a
+/// cheap one loses nothing. They also must not contend with the conversation:
+/// a title request racing the first turn for one gateway's rate limit is a
+/// 429 on the answer the person is waiting for. A separate slot, a separate
+/// model, a separate budget.
+///
+/// `model` is required; `base_url` and the key fall back to the environment
+/// the main row reads, so "same gateway, smaller model" is one line of config.
+#[derive(Debug, Deserialize)]
+struct UtilityRow {
+    model: String,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    #[serde(default)]
+    context_window: Option<u32>,
+}
+
+pub struct LlmUtilityOpenAiCompatPlugin;
+
+#[async_trait]
+impl Plugin for LlmUtilityOpenAiCompatPlugin {
+    fn name(&self) -> &'static str {
+        "llm-utility-openai-compat"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["llm-utility"]
+    }
+    fn description(&self) -> &'static str {
+        "a cheaper OpenAI-compatible model for side calls: titles, summaries, suggestions"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: UtilityRow =
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?;
+        let key_env = row.api_key_env.unwrap_or_else(|| "ATOMCODE_API_KEY".into());
+        let base_url = row
+            .base_url
+            .or_else(|| env("ATOMCODE_BASE_URL"))
+            .ok_or("llm-utility-openai-compat needs `base_url` or ATOMCODE_BASE_URL")?;
+        let api_key = env(&key_env).ok_or_else(|| format!("llm-utility-openai-compat needs {key_env}"))?;
+        let provider = openai_compat(&api_key, &base_url, &row.model, row.context_window)?;
+        let _ = ctx
+            .provide::<LlmUtilitySvc>(Arc::new(provider))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// A scripted utility model, so a test can say what the side call answers
+/// without the conversation's script being consumed by it.
+pub struct LlmUtilityReplayPlugin;
+
+#[async_trait]
+impl Plugin for LlmUtilityReplayPlugin {
+    fn name(&self) -> &'static str {
+        "llm-utility-replay"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["llm-utility"]
+    }
+    fn description(&self) -> &'static str {
+        "scripted side-call model — the utility seam with no network"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: ReplayRow = if config.is_null() {
+            ReplayRow::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        let _ = ctx
+            .provide::<LlmUtilitySvc>(Arc::new(ReplayProvider {
+                script: row.script,
+                cursor: std::sync::atomic::AtomicUsize::new(0),
+            }))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct ReplayRow {
     /// Each step is one model turn: optional text, optional tool calls.

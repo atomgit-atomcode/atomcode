@@ -331,18 +331,33 @@ impl Repl {
                     eprintln!("\x1b[2m  {name}\x1b[0m");
                 }
             }
-            "/title" => {
-                let title = match (
-                    ctx.service::<SessionTitleSvc>(),
-                    Some(agent.session()),
-                ) {
-                    (Some(titler), Some(log)) => titler.title(&log).await,
-                    _ => None,
-                };
-                eprintln!(
-                    "\x1b[2m  {}\x1b[0m",
-                    title.unwrap_or_else(|| "(untitled)".into())
-                );
+            t if t == "/title" || t.starts_with("/title ") => {
+                let log = agent.session();
+                let name = t["/title".len()..].trim();
+                if !name.is_empty() {
+                    // A name the person gives is a fact, and the newest wins.
+                    crate::session::commit(
+                        ctx,
+                        &log,
+                        crate::session::SessionEvent::Titled {
+                            turn: log.current_turn(),
+                            title: name.to_string(),
+                        },
+                    );
+                    eprintln!("\x1b[2m  renamed: {name}\x1b[0m");
+                } else {
+                    let title = match log.title() {
+                        Some(t) => Some(t),
+                        None => match ctx.service::<SessionTitleSvc>() {
+                            Some(titler) => titler.title(&log).await,
+                            None => None,
+                        },
+                    };
+                    eprintln!(
+                        "\x1b[2m  {}\x1b[0m",
+                        title.unwrap_or_else(|| "(untitled)".into())
+                    );
+                }
             }
             // Reconfigure the running tree. This is the interactive face of
             // `App::patch`: the row changes, its fiber is remounted, and
