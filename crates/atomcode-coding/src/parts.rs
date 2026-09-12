@@ -1836,10 +1836,16 @@ pub fn assemble(
     if cfg.max_rounds != 0 {
         builder = builder.max_rounds(cfg.max_rounds);
     }
-    // An explicit retry_max_attempts value is the TOTAL adapter OPEN budget.
-    // Do not multiply it by the kernel's historical outer same-round retries;
-    // the neutral kernel default remains unchanged when the setting is absent.
-    if cfg.retry_max_attempts.is_some() {
+    // Provider-retry tiers. `upstream_retry_max_attempts` (global `[network]`) is
+    // the explicit knob for the VISIBLE kernel tier and WINS when set — it lets a
+    // flaky-gateway user keep the fast adapter budget small AND make the patient
+    // tier more persistent. Otherwise the legacy coupling holds: an explicit
+    // per-model `retry_max_attempts` is the TOTAL adapter OPEN budget, so the
+    // kernel's outer same-round retries are disabled to avoid multiplying it.
+    // With neither set, the neutral kernel default (patient) stands.
+    if let Some(n) = cfg.upstream_retry_max_attempts {
+        builder = builder.max_provider_retries(n);
+    } else if cfg.retry_max_attempts.is_some() {
         builder = builder.max_provider_retries(0);
     }
     builder = builder.round_cap_checkpoint(cfg.round_cap_checkpoint);

@@ -158,6 +158,13 @@ pub struct CodingAgentConfig {
     /// each layer's default.
     /// Sourced from `ProviderConfig::retry_max_attempts`.
     pub retry_max_attempts: Option<u32>,
+    /// Global cap on the VISIBLE kernel provider-retry tier (the `重试(N/M)`
+    /// re-opens, now with patient exponential backoff that honors `Retry-After`).
+    /// Sourced from `[network] upstream_retry_max_attempts`. `None` keeps the
+    /// kernel default. When set it takes precedence over the `retry_max_attempts`
+    /// → disable-kernel coupling, so a user on a flaky gateway can keep the fast
+    /// adapter budget small AND make the patient tier more persistent.
+    pub upstream_retry_max_attempts: Option<u32>,
     /// Full provider registry used to resolve task-tool fast/capable tiers.
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
     /// Swap-aware, lazily-built FAST-tier provider for the `task` tool. `None` ⇒ the fast
@@ -211,6 +218,10 @@ pub struct CodingRuntimeConfig {
     /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
     /// each layer's default.
     pub retry_max_attempts: Option<u32>,
+    /// Global cap on the visible kernel provider-retry tier (`[network]
+    /// upstream_retry_max_attempts`). `None` keeps the kernel default; takes
+    /// precedence over the `retry_max_attempts`→disable-kernel coupling.
+    pub upstream_retry_max_attempts: Option<u32>,
     pub loop_max_rounds: u32,
     pub turn_max_rounds: u32,
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
@@ -349,6 +360,7 @@ impl CodingRuntimeConfig {
             user_agent: r.and_then(|r| r.user_agent.clone()),
             skip_tls_verify: r.map(|r| r.skip_tls_verify).unwrap_or(false),
             retry_max_attempts: r.and_then(|r| r.retry_max_attempts),
+            upstream_retry_max_attempts: config.network.upstream_retry_max_attempts,
             loop_max_rounds: resolve_loop_max_rounds(
                 config.loop_config.max_rounds,
                 std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
@@ -398,6 +410,7 @@ impl CodingRuntimeConfig {
         config.user_agent = self.user_agent.clone();
         config.skip_tls_verify = self.skip_tls_verify;
         config.retry_max_attempts = self.retry_max_attempts;
+        config.upstream_retry_max_attempts = self.upstream_retry_max_attempts;
         config.loop_max_rounds = self.loop_max_rounds;
         config.max_rounds = self.turn_max_rounds;
         config.subagent_config = self.subagent_config.clone();
@@ -842,6 +855,7 @@ impl CodingAgentConfig {
             user_agent: None,
             skip_tls_verify: false,
             retry_max_attempts: None,
+            upstream_retry_max_attempts: None,
             subagent_config: None,
             subagent_fast_provider: None,
             subagent_capable_provider: None,

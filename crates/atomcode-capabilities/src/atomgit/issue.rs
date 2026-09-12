@@ -47,6 +47,30 @@ impl AtomgitClient {
         .await
     }
 
+    /// `PATCH /repos/{o}/issues/{number}` — update an issue. NOTE the AtomGit API is
+    /// owner-scoped here: the repo is NOT in the path — `repo` and `title` are REQUIRED
+    /// BODY fields (per the API doc), while `body` and `state` are optional. `state`
+    /// takes `reopen` / `close`. Only the provided optionals are sent.
+    pub async fn issue_update(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        title: &str,
+        body: Option<&str>,
+        state: Option<&str>,
+    ) -> Result<Issue, String> {
+        let mut payload = json!({ "repo": repo, "title": title });
+        if let Some(b) = body {
+            payload["body"] = json!(b);
+        }
+        if let Some(s) = state {
+            payload["state"] = json!(s);
+        }
+        self.patch_json(&format!("/repos/{owner}/issues/{number}"), &payload)
+            .await
+    }
+
     /// `POST /repos/{o}/{r}/issues/{number}/comments`.
     pub async fn issue_comment_create(
         &self,
@@ -155,6 +179,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(i.number, 4);
+    }
+
+    #[tokio::test]
+    async fn update_is_owner_scoped_with_repo_and_title_in_body() {
+        // Per the AtomGit API: PATCH /repos/{owner}/issues/{number} — owner+number in
+        // the PATH, repo+title REQUIRED in the BODY (no repo in the path). Optional
+        // `body` is omitted when None; `state` takes reopen/close.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v5/repos/o/issues/5"))
+            .and(body_json(json!({ "repo": "r", "title": "T", "state": "close" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"number":5,"title":"T"})))
+            .mount(&server)
+            .await;
+        let i = client(&server)
+            .issue_update("o", "r", 5, "T", None, Some("close"))
+            .await
+            .unwrap();
+        assert_eq!(i.number, 5);
     }
 
     #[tokio::test]

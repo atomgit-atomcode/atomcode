@@ -129,9 +129,16 @@ pub(crate) fn push_system_coalesced(out: &mut Vec<Value>, text: &str) {
 /// (openai-compat, Anthropic/Claude, ollama, …) so the wording stays consistent
 /// regardless of which wire format hit the error.
 ///
-/// 401/402 get a headline, and for those the provider's raw `detail` is
-/// deliberately DROPPED — the headline already says it and this short form folds
-/// cleanly into the interrupted-turn summary (`✗ 已中断：账户余额不足（HTTP 402）`).
+/// 402 gets a headline and its raw `detail` is deliberately DROPPED — the headline
+/// already says it and this short form folds cleanly into the interrupted-turn
+/// summary (`✗ 已中断：账户余额不足（HTTP 402）`). 401 gets a headline too but KEEPS
+/// its detail: that detail is the only thing separating a genuinely bad key
+/// (`invalid_api_key`) from a rejected request signature
+/// (`invalid_client_signature`). Those two arrive under the same status and need
+/// opposite fixes — re-authenticate, versus a client/gateway signing-path mismatch
+/// that no amount of re-login will clear. Dropping it also starves downstream
+/// classifiers: the headline is byte-identical for every 401, so anything reading
+/// the message can only lump them into a single bucket.
 /// One explicit CodingPlan entitlement rejection also gets an actionable `/login`
 /// hint. Other 403 responses stay raw because AtomGit reuses that status for
 /// session-concurrency conflicts and their structured reason must survive. 429
@@ -152,6 +159,12 @@ pub(crate) fn friendly_http_error(code: u16, detail: &str) -> String {
         402 => "账户余额不足",
         _ => return format!("HTTP {code}: {detail}"),
     };
+    // An empty body is exactly the case this headline was invented for, so append
+    // nothing rather than leave a dangling separator.
+    let detail = detail.trim();
+    if code == 401 && !detail.is_empty() {
+        return format!("{headline}（HTTP {code}）：{detail}");
+    }
     format!("{headline}（HTTP {code}）")
 }
 

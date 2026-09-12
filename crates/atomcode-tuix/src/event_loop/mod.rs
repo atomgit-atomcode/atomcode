@@ -6486,16 +6486,49 @@ mod menu_tests {
 
     #[test]
     fn main_composer_reserves_plain_tab_for_completion() {
+        use atomcode_config::config::ModeSwitchKey::ShiftTab;
         use crossterm::event::KeyModifiers;
 
-        assert!(!is_mode_cycle_key(KeyCode::Tab, KeyModifiers::NONE));
-        assert!(is_mode_cycle_key(KeyCode::BackTab, KeyModifiers::SHIFT));
-        assert!(is_mode_cycle_key(KeyCode::BackTab, KeyModifiers::NONE));
-        assert!(is_mode_cycle_key(KeyCode::Tab, KeyModifiers::SHIFT));
+        // Default (shift_tab) preference: plain Tab stays a completion key.
+        assert!(!is_mode_cycle_key(KeyCode::Tab, KeyModifiers::NONE, ShiftTab));
+        assert!(is_mode_cycle_key(
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT,
+            ShiftTab
+        ));
+        assert!(is_mode_cycle_key(
+            KeyCode::BackTab,
+            KeyModifiers::NONE,
+            ShiftTab
+        ));
+        assert!(is_mode_cycle_key(KeyCode::Tab, KeyModifiers::SHIFT, ShiftTab));
         assert!(!is_mode_cycle_key(
             KeyCode::BackTab,
-            KeyModifiers::SHIFT | KeyModifiers::CONTROL
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+            ShiftTab
         ));
+    }
+
+    #[test]
+    fn tab_preference_makes_plain_tab_cycle_mode() {
+        use atomcode_config::config::ModeSwitchKey::{ShiftTab, Tab};
+        use crossterm::event::KeyModifiers;
+
+        // `tab` preference (HarmonyOS default): plain Tab cycles the mode.
+        assert!(is_mode_cycle_key(KeyCode::Tab, KeyModifiers::NONE, Tab));
+        // Shift+Tab / BackTab keep cycling under either preference — no
+        // terminal loses the gesture.
+        assert!(is_mode_cycle_key(KeyCode::Tab, KeyModifiers::SHIFT, Tab));
+        assert!(is_mode_cycle_key(KeyCode::BackTab, KeyModifiers::NONE, Tab));
+        // Modified Tab never cycles regardless of preference (would collide
+        // with terminal chords / newline aliases).
+        assert!(!is_mode_cycle_key(
+            KeyCode::Tab,
+            KeyModifiers::CONTROL,
+            Tab
+        ));
+        // Sanity: the same plain Tab is NOT a cycle key under shift_tab.
+        assert!(!is_mode_cycle_key(KeyCode::Tab, KeyModifiers::NONE, ShiftTab));
     }
 
     #[test]
@@ -15832,11 +15865,30 @@ fn idle_menu_confirmation_allowed(commit_gate_pending: bool) -> bool {
 /// Main-composer execution-mode shortcut. Crossterm normally reports
 /// Shift+Tab as `BackTab`, while a few terminals preserve it as `Tab + SHIFT`.
 /// Plain Tab is deliberately excluded so it remains dedicated to completion.
-fn is_mode_cycle_key(code: KeyCode, modifiers: crossterm::event::KeyModifiers) -> bool {
+fn is_mode_cycle_key(
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+    key_pref: atomcode_config::config::ModeSwitchKey,
+) -> bool {
     let shift = crossterm::event::KeyModifiers::SHIFT;
-    let has_no_other_modifiers = modifiers.difference(shift).is_empty();
-    has_no_other_modifiers
-        && (code == KeyCode::BackTab || (code == KeyCode::Tab && modifiers.contains(shift)))
+    // Only bare or Shift-modified chords qualify — Ctrl/Alt+Tab never cycles.
+    if !modifiers.difference(shift).is_empty() {
+        return false;
+    }
+    // BackTab (how most terminals encode Shift+Tab) and the Tab+SHIFT variant
+    // always cycle, on every platform, so no terminal loses the gesture even
+    // when the user switches the preference to plain Tab.
+    if code == KeyCode::BackTab || (code == KeyCode::Tab && modifiers.contains(shift)) {
+        return true;
+    }
+    // With the `tab` preference (HarmonyOS default, where Shift+Tab is
+    // undeliverable), plain Tab cycles too. The callers guard this with
+    // `menu_items.is_none()`, so an open completion menu still accepts on Tab;
+    // plain Tab only reaches mode-cycling when no menu is up (→ / Enter remain
+    // the completion-accept keys in this mode).
+    matches!(key_pref, atomcode_config::config::ModeSwitchKey::Tab)
+        && code == KeyCode::Tab
+        && !modifiers.contains(shift)
 }
 
 fn streaming_top_level_slash_selection(
@@ -16428,8 +16480,9 @@ fn handle_idle_key(
     }
 
     // Shift+Tab cycles execution mode when no completion menu is up. Plain Tab
-    // is reserved for slash-command, skill, and @file completion.
-    if is_mode_cycle_key(code, modifiers) && menu_items.is_none() {
+    // is reserved for completion — unless `ui.mode_switch_key = "tab"` (the
+    // HarmonyOS default), where plain Tab cycles and → / Enter accept.
+    if is_mode_cycle_key(code, modifiers, ctx.config.ui.mode_switch_key) && menu_items.is_none() {
         let next = app.state.agent_mode.next();
         set_agent_mode(app, ctx, renderer, next);
         return Ok(());
@@ -18785,7 +18838,7 @@ fn handle_streaming_key(
     // this turn (matching Claude Code's mid-run Shift+Tab). Already-surfaced
     // approvals are not retroactively changed — only later tool calls see the new
     // mode. Repaint the spinner footer so the mode badge updates immediately.
-    if is_mode_cycle_key(code, modifiers) && menu_items.is_none() {
+    if is_mode_cycle_key(code, modifiers, ctx.config.ui.mode_switch_key) && menu_items.is_none() {
         let next = app.state.agent_mode.next();
         set_agent_mode(app, ctx, renderer, next);
         draw_spinner_now(

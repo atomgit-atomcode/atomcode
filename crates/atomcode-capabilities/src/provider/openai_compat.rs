@@ -63,20 +63,47 @@ pub const OPENROUTER_ATTRIBUTION_HEADERS: &[(&str, &str); 3] = &[
 /// `provider` alone). The label-aware suffix match reuses
 /// [`atomcode_config::endpoints::host_matches_domain`] so it agrees with the rest
 /// of the codebase and can't drift.
-pub fn is_openrouter_url(url: &str) -> bool {
+/// The host of a URL, extracted safely for host-gated header helpers. Shared so the
+/// gates (openrouter attribution, opencode session) can't drift in how they parse — and
+/// can't be fooled by a crafted `https://good.example:x@evil.com/…` into reading the
+/// `userinfo` as the host. Authority minus path/query/fragment, minus `userinfo@`, minus
+/// `:port`.
+fn url_host(url: &str) -> &str {
     let authority = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    // Host = the authority minus path/query/fragment...
     let host_port = authority.split(['/', '?', '#']).next().unwrap_or(authority);
-    // ...minus any `userinfo@` prefix. Without this, a crafted
-    // `https://openrouter.ai:x@evil.com/…` would parse the userinfo `openrouter.ai`
-    // as the host and leak the attribution headers to `evil.com`.
     let host_port = host_port
         .rsplit_once('@')
         .map(|(_userinfo, host)| host)
         .unwrap_or(host_port);
-    // ...minus an explicit `:port`.
-    let host = host_port.split(':').next().unwrap_or(host_port);
-    atomcode_config::endpoints::host_matches_domain(host, "openrouter.ai")
+    host_port.split(':').next().unwrap_or(host_port)
+}
+
+pub fn is_openrouter_url(url: &str) -> bool {
+    atomcode_config::endpoints::host_matches_domain(url_host(url), "openrouter.ai")
+}
+
+/// True when `url` targets OpenCode Zen (`opencode.ai`, the OpenAI-compatible `/zen/v1`
+/// endpoint atomcode ships a preset for). Gates the `x-opencode-session` header so it is
+/// sent ONLY there — meaningless (and an unwanted product-identity leak) on any other
+/// OpenAI-compatible endpoint, same rationale as the openrouter-attribution gate.
+fn is_opencode_zen_url(url: &str) -> bool {
+    atomcode_config::endpoints::host_matches_domain(url_host(url), "opencode.ai")
+}
+
+/// Attach OpenCode Zen's required `x-opencode-session` header — one stable ID per
+/// conversation — when `url` targets opencode.ai. We already carry exactly that stable id
+/// (sent as `x-atomcode-session-id`), so surface it under their header name too rather than
+/// mint a second one. Gated to their host; an empty session (session-less sub-agent /
+/// summary) is omitted, matching the `x-atomcode-session-id` behavior.
+fn apply_opencode_session(
+    url: &str,
+    req: reqwest::RequestBuilder,
+    session_id: &str,
+) -> reqwest::RequestBuilder {
+    if session_id.is_empty() || !is_opencode_zen_url(url) {
+        return req;
+    }
+    req.header("x-opencode-session", session_id)
 }
 
 /// Attach the OpenRouter app-attribution headers to `req` when `url` targets
@@ -799,6 +826,8 @@ async fn open_stream(
         if !session_id.is_empty() {
             req = req.header("x-atomcode-session-id", session_id);
         }
+        // OpenCode Zen requires its own `x-opencode-session` (same stable id); host-gated.
+        req = apply_opencode_session(url, req, session_id);
         req = apply_openrouter_attribution(url, req);
         let was_capped = tls12_probe || atomcode_config::tls::should_cap_url(url);
         // TTFB watchdog for THIS attempt. `send()` resolves as soon as the response
@@ -1518,13 +1547,24 @@ impl SseDecoder {
             return out;
         }
         for (id, name, args) in std::mem::take(&mut self.tool_calls) {
-            if !id.is_empty() || !name.is_empty() || !args.is_empty() {
-                out.push(StreamEvent::ToolCall(ToolCall {
-                    id,
-                    name,
-                    arguments: args,
-                }));
+            // A tool call with NO function name is UNDISPATCHABLE: executors resolve tools
+            // BY NAME, so emitting one buys a guaranteed failed round trip — a 0ms
+            // "unknown tool" result that burns a round and, on hosts that classify tools
+            // by name, is reported as an UNKNOWN (hence destructive, approval-gated) call.
+            // A slot reaches this state whenever a gateway sends an `id`, or argument
+            // fragments, at an index whose `function.name` never arrives — including the
+            // placeholder slots this loop pads out for sparse `index` values. Dropping it
+            // leaves the round tool-call-free, which the agent loop already handles
+            // (empty-response re-issue); that is strictly better than dispatching a name
+            // that cannot resolve.
+            if name.is_empty() {
+                continue;
             }
+            out.push(StreamEvent::ToolCall(ToolCall {
+                id,
+                name,
+                arguments: args,
+            }));
         }
         if let Some(u) = self.last_usage.take() {
             out.push(StreamEvent::Usage(u));
@@ -1675,13 +1715,16 @@ impl SseDecoder {
         if let Some(fr) = choice.finish_reason.filter(|s| !s.is_empty()) {
             self.seen_finish = true;
             for (id, name, args) in std::mem::take(&mut self.tool_calls) {
-                if !id.is_empty() || !name.is_empty() || !args.is_empty() {
-                    out.push(StreamEvent::ToolCall(ToolCall {
-                        id,
-                        name,
-                        arguments: args,
-                    }));
+                // Same rule as `finish()`: a nameless tool call cannot be dispatched, so
+                // dropping it beats emitting a call that is certain to fail.
+                if name.is_empty() {
+                    continue;
                 }
+                out.push(StreamEvent::ToolCall(ToolCall {
+                    id,
+                    name,
+                    arguments: args,
+                }));
             }
             if fr == "length" {
                 self.truncated = true;
@@ -3018,6 +3061,77 @@ mod tests {
         assert_eq!(calls[1].name, "b");
     }
 
+    /// A gateway can leave a buffered slot WITHOUT a `function.name`: an `id` on its own,
+    /// or argument fragments landing on an index whose name never arrives. Such a call
+    /// cannot be dispatched (tools resolve by name), so it must not be emitted — doing so
+    /// produced a 0ms unknown-tool failure every single time, observed downstream as
+    /// recurring "empty tool name" errors accumulating through long sessions.
+    #[test]
+    fn sse_nameless_tool_call_is_dropped() {
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(
+            d.feed(
+                line(json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"c0","function":{"arguments":"{}"}},
+                    {"index":1,"id":"c1","function":{"name":"real","arguments":"{}"}}
+                ]}}]}))
+                .as_bytes(),
+            ),
+        );
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()),
+        );
+        let calls: Vec<_> = ev
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "only the named call may survive: {calls:?}");
+        assert_eq!(calls[0].name, "real");
+    }
+
+    /// Companion to `sse_nameless_tool_call_is_dropped` covering the OTHER flush site:
+    /// `finish()` (stream terminates at `[DONE]` with only a non-terminal
+    /// `finish_reason:""`, so buffered calls flush there, not in the finish_reason
+    /// branch). A nameless slot must be dropped here too; the named call survives.
+    #[test]
+    fn sse_nameless_tool_call_dropped_on_finish_flush() {
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(
+            d.feed(
+                line(json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"c0","function":{"arguments":"{}"}},
+                    {"index":1,"id":"c1","function":{"name":"real","arguments":"{}"}}
+                ]},"finish_reason":""}]}))
+                .as_bytes(),
+            ),
+        );
+        ev.extend(d.feed(b"data: [DONE]\n"));
+        let calls: Vec<_> = ev
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the finish() flush must drop the nameless slot too: {calls:?}"
+        );
+        assert_eq!(calls[0].name, "real");
+    }
+
     #[test]
     fn sse_byte_split_robust_and_utf8_safe() {
         let payload = format!(
@@ -3444,7 +3558,32 @@ mod tests {
             friendly_http_error(403, "USER HAS NO CODINGPLAN"),
             "CodingPlan 未领取或已失效（HTTP 403）。请运行 /login 重新登录并领取 CodingPlan。"
         );
-        assert!(friendly_http_error(401, "").contains("API key"));
+        // 401 KEEPS its detail (unlike 402): `invalid_api_key` and
+        // `invalid_client_signature` both arrive as 401 and need opposite fixes,
+        // and the headline is identical for both.
+        assert_eq!(
+            friendly_http_error(
+                401,
+                "[invalid_request_error/invalid_api_key] Incorrect API key provided."
+            ),
+            "API key 未授权或已失效（HTTP 401）：[invalid_request_error/invalid_api_key] Incorrect API key provided."
+        );
+        assert_eq!(
+            friendly_http_error(
+                401,
+                "[authentication_error/invalid_client_signature] bad signature"
+            ),
+            "API key 未授权或已失效（HTTP 401）：[authentication_error/invalid_client_signature] bad signature"
+        );
+        // Empty / whitespace-only body: bare headline, no dangling separator.
+        assert_eq!(
+            friendly_http_error(401, ""),
+            "API key 未授权或已失效（HTTP 401）"
+        );
+        assert_eq!(
+            friendly_http_error(401, "   "),
+            "API key 未授权或已失效（HTTP 401）"
+        );
         // 429 is NOT wrapped (kernel rate-limit path owns it — must keep the
         // literal `HTTP 429: ` prefix so `rate_limit_server_message` can strip it).
         assert_eq!(friendly_http_error(429, "slow down"), "HTTP 429: slow down");
@@ -3949,6 +4088,49 @@ mod tests {
         assert!(!is_openrouter_url("https://openrouter.ai:x@evil.com/v1"));
         assert!(!is_openrouter_url("https://openrouter.ai@evil.com/v1"));
         assert!(!is_openrouter_url("not a url"));
+    }
+
+    #[test]
+    fn is_opencode_zen_url_matches_only_opencode_hosts() {
+        assert!(is_opencode_zen_url("https://opencode.ai/zen/v1"));
+        assert!(is_opencode_zen_url(
+            "https://opencode.ai/zen/v1/chat/completions"
+        ));
+        assert!(is_opencode_zen_url("https://api.opencode.ai/zen/v1")); // subdomain
+        assert!(!is_opencode_zen_url("https://openrouter.ai/api/v1"));
+        // Suffix trick: opencode.ai must be the domain, not a prefix of the real host.
+        assert!(!is_opencode_zen_url("https://opencode.ai.evil.com/v1"));
+        // Userinfo trick: the host is after `@`, so this targets evil.com, not opencode.
+        assert!(!is_opencode_zen_url("https://opencode.ai:x@evil.com/v1"));
+    }
+
+    #[test]
+    fn apply_opencode_session_gated_to_opencode_and_nonempty() {
+        let client = reqwest::Client::new();
+        let header_of = |url: &str, sess: &str| {
+            apply_opencode_session(url, client.post(url), sess)
+                .build()
+                .expect("request must build")
+                .headers()
+                .get("x-opencode-session")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        // opencode.ai + non-empty session → header carries the stable id.
+        assert_eq!(
+            header_of("https://opencode.ai/zen/v1/chat/completions", "sess-abc-123"),
+            Some("sess-abc-123".to_string())
+        );
+        // Non-opencode host → never sent (no product-identity leak to other gateways).
+        assert_eq!(
+            header_of("https://api.deepseek.com/v1/chat/completions", "sess-abc-123"),
+            None
+        );
+        // Empty session (sub-agent / summary) → omitted even on opencode.
+        assert_eq!(
+            header_of("https://opencode.ai/zen/v1/chat/completions", ""),
+            None
+        );
     }
 
     #[test]

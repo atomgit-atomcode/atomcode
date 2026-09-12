@@ -114,10 +114,13 @@ const MAX_OVERFLOW_ATTEMPTS: u8 = 3;
 /// How many times the agent loop re-opens a round after a TRANSIENT provider
 /// failure (`ProviderError::retryable`) before surfacing the error. This is the
 /// SECOND retry tier — the provider's transport layer already did its own fast
-/// backoff (~1.5s) underneath. Mirrors v1's agent-loop budget (3, with 3/6/9s
-/// waits) so the user perceives a retry is happening AND a fresh connection gets
-/// a real chance to recover (the stale keep-alive class). NON-retryable errors
-/// (auth / 400 / balance) never enter this path — they fail fast.
+/// backoff (~1.5s) underneath. The default budget is 3 re-opens (configurable via
+/// `[network] upstream_retry_max_attempts`); the visible waits are exponential
+/// (3/6/12/24/30s, capped) and honor a server `Retry-After` (see
+/// `provider_retry_backoff_secs`), so the user perceives a retry is happening AND
+/// a fresh connection gets a real chance to recover (the stale keep-alive class,
+/// and a flaky gateway's transient "no upstream available" 503). NON-retryable
+/// errors (auth / 400 / balance) never enter this path — they fail fast.
 const DEFAULT_MAX_PROVIDER_RETRIES: u32 = 3;
 /// Max mid-stream RECONNECTS after a stream idle-timeout before failing the turn
 /// (codex parity: 5). Each reconnect re-issues the SAME round from history
@@ -175,6 +178,16 @@ const EMPTY_RESPONSE_MAX_RETRIES: u32 = 5;
 /// bound still caps a genuinely stuck (re-dumping) model at a few wasted rounds.
 const MAX_TRUNCATION_CONTINUATIONS: u32 = 4;
 
+/// Default per-response OUTPUT-token cap sent to OpenAI-compatible providers when the
+/// model/provider config leaves `max_tokens` unset. This equals the output budget
+/// [`effective_input_limit`] already RESERVES, so what we reserve for output matches
+/// what we actually CAP the model at. Without it, a gateway's much larger default lets
+/// a model run a multi-minute runaway response that both overruns the reserve and feeds
+/// the truncation auto-continue loop (observed: qwen generating ~30K tokens / 12 min per
+/// round). A single response rarely needs more; genuinely large output is written
+/// incrementally (see `TRUNCATION_RESUME_NUDGE`).
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
+
 /// Always-on, coarse cross-round repetition fuse. The opt-in exact guard below
 /// compares the executed call, effective cwd, result and success state; this fuse
 /// covers the broader failure mode where the model keeps choosing the same action
@@ -198,6 +211,26 @@ fn round_tool_signature(calls: &[ToolCall]) -> String {
         .collect();
     parts.sort();
     parts.join("\u{1}")
+}
+
+/// Two consecutive OUTPUT-truncated responses that share a long identical LEADING prefix
+/// are the model RE-DUMPING the same content (restarting from the top) instead of
+/// resuming incrementally as [`TRUNCATION_RESUME_NUDGE`] asks. Detecting it lets a turn
+/// stop the blind auto-continue early — deferring to `offer_continuation` / the
+/// interactive checkpoint / turn-end — rather than burning the whole
+/// `MAX_TRUNCATION_CONTINUATIONS` budget on a weak model that ignores the nudge.
+/// Compared by chars (UTF-8 safe); trivially short rounds never match.
+fn truncation_is_redump(prev: &str, curr: &str) -> bool {
+    const MIN_LEN: usize = 64;
+    const PREFIX_CHARS: usize = 400;
+    let p = prev.trim_start();
+    let c = curr.trim_start();
+    if p.chars().take(MIN_LEN).count() < MIN_LEN || c.chars().take(MIN_LEN).count() < MIN_LEN {
+        return false;
+    }
+    p.chars()
+        .take(PREFIX_CHARS)
+        .eq(c.chars().take(PREFIX_CHARS))
 }
 
 /// Maximum number of `parallel_safe` (read-only) tools that run CONCURRENTLY in
@@ -350,6 +383,58 @@ fn retry_reason(e: &crate::stream::ProviderError) -> &'static str {
     }
 }
 
+/// Backoff (seconds) for the visible provider-retry tier.
+///
+/// Honors a server `Retry-After` hint (the gateway telling us exactly when to
+/// come back), clamped to a sane ceiling so a hostile/misconfigured hint can't
+/// stall the turn for minutes. Absent a hint, uses exponential backoff (3s base,
+/// doubling) capped at 30s — far more patient than the old flat 3/6/9s for a
+/// sustained-but-transient gateway 5xx (e.g. a relay's momentary "no upstream
+/// available"), while every wait stays Esc-cancellable at the call site.
+///
+/// `attempt` is 1-based (first retry = 1): yields 3, 6, 12, 24, 30, 30, …
+fn provider_retry_backoff_secs(attempt: u32, retry_after_secs: Option<u64>) -> u64 {
+    const BASE: u64 = 3;
+    const CAP: u64 = 30;
+    const RETRY_AFTER_CAP: u64 = 60;
+    if let Some(ra) = retry_after_secs {
+        // A server hint of 0 would busy-spin; floor at 1s. Ceiling keeps a bad
+        // hint from parking the turn far longer than our own exponential would.
+        return ra.clamp(1, RETRY_AFTER_CAP);
+    }
+    // Shift is bounded so a large configured retry count can't overflow the 1<<n.
+    let shift = attempt.saturating_sub(1).min(20);
+    BASE.saturating_mul(1u64 << shift).min(CAP)
+}
+
+#[cfg(test)]
+mod provider_retry_backoff_tests {
+    use super::provider_retry_backoff_secs;
+
+    #[test]
+    fn exponential_backoff_grows_and_caps_at_30s() {
+        // 1-based attempt → 3, 6, 12, 24, then pinned at the 30s cap.
+        assert_eq!(provider_retry_backoff_secs(1, None), 3);
+        assert_eq!(provider_retry_backoff_secs(2, None), 6);
+        assert_eq!(provider_retry_backoff_secs(3, None), 12);
+        assert_eq!(provider_retry_backoff_secs(4, None), 24);
+        assert_eq!(provider_retry_backoff_secs(5, None), 30);
+        assert_eq!(provider_retry_backoff_secs(6, None), 30);
+        // A large configured count must not overflow `1 << shift` or exceed cap.
+        assert_eq!(provider_retry_backoff_secs(100, None), 30);
+    }
+
+    #[test]
+    fn retry_after_hint_overrides_exponential_and_is_clamped() {
+        // A server hint wins over the exponential schedule…
+        assert_eq!(provider_retry_backoff_secs(1, Some(20)), 20);
+        // …a 0-second hint is floored to 1s (never busy-spin)…
+        assert_eq!(provider_retry_backoff_secs(3, Some(0)), 1);
+        // …and a hostile/huge hint is capped so it can't park the turn for minutes.
+        assert_eq!(provider_retry_backoff_secs(1, Some(6000)), 60);
+    }
+}
+
 /// Best-effort parse of a "try again in N seconds" hint from a provider error
 /// message (some OpenAI-compatible gateways embed it on a 429). Returns None
 /// when no such hint is found — the host hook is the authoritative reset source;
@@ -467,7 +552,7 @@ fn empty_exhaustion_message(
 /// full window while the guard keeps the real request (messages + completion) under
 /// the model's usable limit.
 fn effective_input_limit(window: u32, max_tokens: Option<u32>) -> u32 {
-    let output_reserve = max_tokens.unwrap_or(16_384);
+    let output_reserve = max_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
     let margin = (window / 8).clamp(16_000, 128_000);
     let reserve = output_reserve.saturating_add(margin);
     // If the reserve can't fit inside the window (unrealistically small windows,
@@ -1900,6 +1985,9 @@ impl RunningAgent {
         // output-limit truncation (`finish_reason=length`). Bounded by
         // `MAX_TRUNCATION_CONTINUATIONS` so endless truncation cannot livelock.
         let mut truncation_continuations: u32 = 0;
+        // Text of the PREVIOUS auto-continued truncated round, to catch a model that
+        // re-dumps the same content instead of resuming (see `truncation_is_redump`).
+        let mut last_truncated_text: Option<String> = None;
         // Internal continuations do not pass through `handle_prompt`, which owns the
         // normal task-boundary auto-compaction check. Bound the equivalent in-turn
         // opportunity to one attempt per policy stage. A moderate-pressure stub
@@ -2234,12 +2322,12 @@ impl RunningAgent {
                     continue;
                 }
                 // 429 RATE LIMIT: defer to the host's usage-aware verdict instead of
-                // the blind 3/6/9s transient retry (useless for a 5-hour window).
+                // the generic exponential transient retry (useless for a 5-hour window).
                 // WaitAndRetry => cancellable sleep then re-issue this round.
                 // Pause       => clean RateLimited stop preserving already-produced
                 //                content (NOT a red Error).
                 // Placed BEFORE the generic retryable branch so a 429 never enters
-                // the blind 3/6/9s path.
+                // the generic transient-retry path.
                 Err(e) if e.http_status == Some(429) => {
                     let hint = crate::hook::RateLimitHint {
                         http_status: e.http_status,
@@ -2338,11 +2426,11 @@ impl RunningAgent {
                 // connection — and the Warning tells the user a retry is underway
                 // (silent fast-fail read as "no retry happened at all"). NON-retryable
                 // errors (auth / 400 / balance) skip this and hard-fail below, so we
-                // never spin ~18s on an error that cannot recover. 429 is handled
-                // above by the host hook before reaching this branch.
+                // never spin through the (now-patient) retry backoff on an error that
+                // cannot recover. 429 is handled above by the host hook before this branch.
                 Err(e) if e.retryable && provider_retry < self.max_provider_retries => {
                     provider_retry += 1;
-                    let wait = (provider_retry as u64 * 3).min(15); // 3 / 6 / 9s, matching v1
+                    let wait = provider_retry_backoff_secs(provider_retry, e.retry_after_secs);
                     self.rt.emit(AgentEvent::ProviderRetry {
                         attempt: provider_retry,
                         max_attempts: self.max_provider_retries,
@@ -2878,8 +2966,8 @@ impl RunningAgent {
                 if empty_retries < EMPTY_RESPONSE_MAX_RETRIES {
                     empty_retries += 1;
                     // Front-loaded short backoff: 1,1,2,2,3s (~9s for all 5) — matches
-                    // v1. The empty body returns instantly, so the generic 3/6/9s tier
-                    // would be pure wasted latency. A VISIBLE Warning tells the user a
+                    // v1. The empty body returns instantly, so the generic exponential
+                    // retry tier would be pure wasted latency. A VISIBLE Warning tells the user a
                     // retry is underway (a silent re-open reads as "nothing happened").
                     let wait = (((empty_retries + 1) / 2).min(3)) as u64;
                     // Distinguish a GARBLED response (adapter dropped unparseable chunks)
@@ -3092,8 +3180,17 @@ impl RunningAgent {
                 // instead of silently ending the turn. BOUNDED so endless truncation can't
                 // livelock. Runs BEFORE `offer_continuation` so a discipline hook's nudge
                 // does not pre-empt finishing the truncated content.
-                if truncated && truncation_continuations < MAX_TRUNCATION_CONTINUATIONS {
+                // Skip the blind auto-continue when the model RE-DUMPED the same content
+                // last round instead of resuming — re-nudging just spins. Falling through
+                // hands off to `offer_continuation` / the interactive checkpoint / turn-end
+                // (defer to the user), the way codex/opencode treat truncation.
+                let redump = last_truncated_text
+                    .as_deref()
+                    .is_some_and(|prev| truncation_is_redump(prev, &assistant_text));
+                if truncated && !redump && truncation_continuations < MAX_TRUNCATION_CONTINUATIONS
+                {
                     truncation_continuations += 1;
+                    last_truncated_text = Some(assistant_text.clone());
                     self.rt.emit(AgentEvent::OutputTruncationRecovery {
                         attempt: truncation_continuations,
                         max_attempts: MAX_TRUNCATION_CONTINUATIONS,
@@ -5799,6 +5896,43 @@ mod effective_input_limit_tests {
         // falls back to the raw window (old `est >= window` behavior). Never panics.
         assert_eq!(effective_input_limit(1_000, Some(16_384)), 1_000);
         assert_eq!(effective_input_limit(100, Some(16_384)), 100);
+    }
+
+    #[test]
+    fn default_output_cap_matches_the_reserve() {
+        // The cap sent on an unset request must equal the reserve so we never let a
+        // model produce more output than we budgeted room for.
+        assert_eq!(
+            effective_input_limit(1_000_000, None),
+            effective_input_limit(1_000_000, Some(super::DEFAULT_MAX_OUTPUT_TOKENS))
+        );
+    }
+}
+
+#[cfg(test)]
+mod truncation_redump_tests {
+    use super::truncation_is_redump;
+
+    #[test]
+    fn identical_leading_prefix_is_a_redump() {
+        // Real truncated responses are large; both share an identical 400-char lead.
+        let a = "第 1 节:游戏概述。".repeat(80); // ~640 chars > PREFIX_CHARS
+        let b = format!("{a} 但这次又多说了一点点。");
+        assert!(truncation_is_redump(&a, &b), "same long prefix = re-dump");
+        assert!(truncation_is_redump(&a, &a));
+    }
+
+    #[test]
+    fn genuine_continuation_is_not_a_redump() {
+        let prev = "第 1 节:玩家可选性别,只画脸,滚动条调肤色……".repeat(20);
+        let curr = "第 2 节:多点触控时其余脸随机肤色,来回判定加分……".repeat(20);
+        assert!(!truncation_is_redump(&prev, &curr), "different content = resume");
+    }
+
+    #[test]
+    fn trivially_short_rounds_never_match() {
+        assert!(!truncation_is_redump("ok", "ok"));
+        assert!(!truncation_is_redump("", ""));
     }
 }
 

@@ -19,6 +19,14 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const MAX_UNPRODUCTIVE: u32 = 5;
+
+/// Stop the loop after this many CONSECUTIVE "not met" rounds that made no forward
+/// progress (zero tool calls). A round that only emits text without touching a tool
+/// did nothing but talk; when the evaluator also judges the goal unmet, re-injecting
+/// "keep working" just spins. This most often means the goal isn't a concrete,
+/// verifiable objective (e.g. an empty/vague goal like "需要"), which otherwise burned
+/// every round up to `max_rounds`. Any tool-call round resets the counter.
+pub(crate) const MAX_STALLED_ROUNDS: u32 = 3;
 const EVALUATOR_TIMEOUT: Duration = Duration::from_secs(30);
 
 const EVALUATOR_SYSTEM_PROMPT: &str = r#"You are a strict goal evaluator for an autonomous coding agent.
@@ -110,6 +118,11 @@ pub(crate) struct GoalState {
     pub max_rounds: Option<u32>,
     deadline: Option<Instant>,
     pub unproductive: u32,
+    /// Consecutive "not met" rounds that made no forward progress (zero tool calls).
+    /// Distinct from `unproductive` (which counts provider errors/timeouts and is reset
+    /// whenever the evaluator runs): this survives across evaluate rounds so an
+    /// unpursuable goal trips [`MAX_STALLED_ROUNDS`] instead of spinning to `max_rounds`.
+    pub no_progress: u32,
     pub cancel: CancellationToken,
     /// Stored so `resume()` can refresh the wall-clock deadline after a pause.
     max_duration_secs: u64,
@@ -139,6 +152,7 @@ impl GoalState {
             deadline: (max_duration_secs != 0)
                 .then(|| started_at + Duration::from_secs(max_duration_secs)),
             unproductive: 0,
+            no_progress: 0,
             cancel: CancellationToken::new(),
             max_duration_secs,
             progress_recap: None,
@@ -216,6 +230,9 @@ impl GoalState {
         // Reset no-progress counter so accumulated unproductive rounds before the
         // cap don't immediately trip MAX_UNPRODUCTIVE on the first resumed round.
         self.unproductive = 0;
+        // Fresh window for the stall guard too — a user granting more rounds wants
+        // another shot, not an instant re-stop from the prior window's tally.
+        self.no_progress = 0;
         // Refresh the wall-clock deadline so a time-capped goal gets a fresh
         // window rather than re-pausing instantly on every resume.
         self.deadline = (self.max_duration_secs != 0)
@@ -233,6 +250,20 @@ impl GoalState {
         // Recovery context is consumed once at re-engage (captured before this
         // call); clear the flag so it never leaks into the resumed Pursuing state.
         self.recovery_pause = false;
+        self.no_progress = 0;
+    }
+
+    /// Record a "not met" round and whether it made forward progress (any tool call
+    /// in the just-finished round). Returns `true` once the goal has STALLED —
+    /// [`MAX_STALLED_ROUNDS`] consecutive no-progress rounds — so the caller stops the
+    /// loop instead of re-injecting "keep working". Any progress round resets the tally.
+    pub fn note_not_met(&mut self, made_progress: bool) -> bool {
+        if made_progress {
+            self.no_progress = 0;
+        } else {
+            self.no_progress = self.no_progress.saturating_add(1);
+        }
+        self.no_progress >= MAX_STALLED_ROUNDS
     }
 
     /// Adjust only the round budget (0 = unlimited), leaving the round counter,
@@ -252,6 +283,7 @@ impl GoalState {
         self.condition = condition;
         self.progress_recap = None;
         self.recovery_pause = false;
+        self.no_progress = 0;
     }
 
     /// Build one bounded host-owned context message for the first real user turn
@@ -1099,6 +1131,41 @@ mod tests {
             state.unproductive, 0,
             "resume() must clear unproductive so the next window starts fresh"
         );
+    }
+
+    #[test]
+    fn note_not_met_trips_after_consecutive_no_progress_rounds() {
+        let mut g = GoalState::new(1, "需要".into(), 100, 0);
+        // Two no-progress "not met" rounds accumulate but don't stop yet.
+        assert!(!g.note_not_met(false));
+        assert!(!g.note_not_met(false));
+        assert_eq!(g.no_progress, 2);
+        // The third consecutive no-progress round trips the stall guard.
+        assert!(g.note_not_met(false));
+        assert_eq!(g.no_progress, MAX_STALLED_ROUNDS);
+    }
+
+    #[test]
+    fn note_not_met_progress_round_resets_the_stall_tally() {
+        let mut g = GoalState::new(1, "x".into(), 100, 0);
+        g.note_not_met(false);
+        g.note_not_met(false);
+        // A round that made a tool call resets the counter — genuine work is not a stall.
+        assert!(!g.note_not_met(true));
+        assert_eq!(g.no_progress, 0);
+        // ...and it now takes a fresh run of MAX_STALLED_ROUNDS to trip.
+        assert!(!g.note_not_met(false));
+        assert!(!g.note_not_met(false));
+        assert!(g.note_not_met(false));
+    }
+
+    #[test]
+    fn retask_clears_the_stall_tally() {
+        let mut g = GoalState::new(1, "old".into(), 100, 0);
+        g.note_not_met(false);
+        g.note_not_met(false);
+        g.retask("a specific, verifiable goal".into());
+        assert_eq!(g.no_progress, 0);
     }
 
     // Fix #2: resume() refreshes the wall-clock deadline; a time-capped goal

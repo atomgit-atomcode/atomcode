@@ -3130,8 +3130,17 @@ fn spawn_runtime_owner_with_optional_agent(
                             keep_goal_on_eval = true;
                         }
                         GoalResult::NotMet(verdict) => {
+                            // A round that made ZERO tool calls did nothing but talk. When the
+                            // evaluator ALSO judges the goal unmet, re-injecting "keep working"
+                            // just spins — usually because the goal isn't a concrete, verifiable
+                            // objective (e.g. an empty/vague goal like "需要"). Stop after
+                            // MAX_STALLED_ROUNDS such rounds instead of burning every round up to
+                            // max_rounds.
+                            let made_progress = held_turn
+                                .as_ref()
+                                .map(|(_, _, _, stats)| stats.tool_call_count > 0)
+                                .unwrap_or(false);
                             if let Some(state) = goal.as_mut() {
-                                state.round = state.round.saturating_add(1);
                                 state.last_reason = Some(verdict.clone());
                                 if let Some((_, _, snapshot, _)) = held_turn.as_ref() {
                                     state.update_progress_recap(summarize_for_goal(
@@ -3139,9 +3148,24 @@ fn spawn_runtime_owner_with_optional_agent(
                                         Some(&verdict),
                                     ));
                                 }
-                                continuation =
-                                    Some(goal_continuation_message(&verdict, &state.condition));
-                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                if state.note_not_met(made_progress) {
+                                    // Terminal stall — finish WITHOUT bumping `round` (mirrors the
+                                    // Inconclusive/Error arms; the stalled round isn't a new run).
+                                    let note = format!(
+                                        "stopped: no tool calls for {} consecutive rounds and the goal is still unmet — it likely isn't a concrete, verifiable objective. Give a specific goal and run /loop again.",
+                                        state.no_progress
+                                    );
+                                    state.finish(GoalTerminal::Stopped, note.clone());
+                                    finish_reason = Some(StopReason::Stopped);
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!("goal {note}")));
+                                } else {
+                                    // A new round begins — count it, then re-inject continuation.
+                                    state.round = state.round.saturating_add(1);
+                                    continuation =
+                                        Some(goal_continuation_message(&verdict, &state.condition));
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                }
                             }
                         }
                         GoalResult::Inconclusive(reason) => {

@@ -18,7 +18,7 @@ use atomcode_telemetry::{CliOverride, SessionMode};
 /// down when no client activity is observed.
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
 
-fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
+fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode, bool) {
     const DEFAULT_HOST: &str = "127.0.0.1";
     // Shared with `atomcode daemon --port`'s clap default, which used to carry
     // its own `13456` literal.
@@ -27,6 +27,7 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
     let mut host: Option<String> = None;
     let mut port: Option<u16> = None;
     let mut no_telemetry = false;
+    let mut no_auth = false;
     let mut idle_timeout: Option<u64> = None;
     let mut client_mode: Option<String> = None;
 
@@ -58,6 +59,11 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
 
         if arg == "--no-telemetry" {
             no_telemetry = true;
+            continue;
+        }
+
+        if arg == "--no-auth" {
+            no_auth = true;
             continue;
         }
 
@@ -123,6 +129,7 @@ fn parse_daemon_args() -> (String, u16, CliOverride, u64, SessionMode) {
         cli_override,
         timeout,
         mode,
+        no_auth,
     )
 }
 
@@ -159,13 +166,17 @@ async fn main() {
         tracing::warn!("[session] Failed to migrate legacy sessions: {error}");
     }
 
-    let (host, port, cli_override, idle_timeout_secs, startup_mode) = parse_daemon_args();
+    let (host, port, cli_override, idle_timeout_secs, startup_mode, no_auth) = parse_daemon_args();
 
-    let token_store = atomcode_daemon::auth_token::WebuiTokenStore::new();
-    let daemon_token = atomcode_daemon::resolve_daemon_token(
+    let (webui_tokens, daemon_token_file) = atomcode_daemon::resolve_daemon_auth(
+        no_auth,
         std::env::var("ATOMCODE_DAEMON_TOKEN").ok(),
-        &token_store,
     );
+    if no_auth {
+        eprintln!(
+            "WARNING: daemon authentication is disabled; all API endpoints are accessible without a token"
+        );
+    }
 
     if let Err(e) = run_server(ServerOpts {
         host,
@@ -173,7 +184,7 @@ async fn main() {
         cli_override,
         idle_timeout_secs,
         startup_mode,
-        webui_tokens: Some(token_store),
+        webui_tokens,
         // 独立二进制：保留完整启动横幅。
         quiet: false,
         // 独立二进制 / VSCode：沿用 config 的 default_workdir，不覆盖。
@@ -182,7 +193,7 @@ async fn main() {
         prebound_listener: None,
         // 独立 daemon 模式不需要 app user_id 校验。
         app_user_id: None,
-        daemon_token_file: Some(daemon_token),
+        daemon_token_file,
     })
     .await
     {

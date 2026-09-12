@@ -131,6 +131,10 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                 oc.context_window = cfg.context_window;
                 oc.idle_timeout = cfg.stream_timeout;
                 oc.max_tokens = Some(default_max_tokens(cfg.context_window));
+                // Explicit opt-in: pin the Ollama runtime window only when the user set
+                // ATOMCODE_OLLAMA_NUM_CTX. Unset ⇒ leave the daemon's own default alone.
+                oc.num_ctx =
+                    parse_ollama_num_ctx(std::env::var("ATOMCODE_OLLAMA_NUM_CTX").ok().as_deref());
                 oc.supports_vision = cfg.supports_vision;
                 oc.think = cfg.thinking_enabled.unwrap_or(false);
                 oc.user_agent = Some(ua.clone());
@@ -189,6 +193,20 @@ pub fn default_max_tokens(context_window: u32) -> u32 {
     // trips finish_reason=length. A higher ceiling means fewer unrecoverable
     // truncations to warn about.
     (context_window / 4).clamp(8_000, 32_768)
+}
+
+/// Parse the `ATOMCODE_OLLAMA_NUM_CTX` override → `OllamaConfig::num_ctx`. `None` (unset,
+/// blank, zero, or unparseable) ⇒ OMIT the knob and leave the Ollama daemon's own default
+/// (`OLLAMA_CONTEXT_LENGTH`) untouched — sending a value here FORCES the runtime window, so
+/// a bad/empty override must never shrink a server configured for a larger one. Explicit
+/// opt-in ONLY; deliberately NOT derived from `context_window` (whose fallback would shrink
+/// the daemon). Pinning matters because Ollama truncates an over-long prompt SILENTLY (no
+/// error), so the kernel's context-overflow ladder never fires — see `OllamaConfig::num_ctx`.
+fn parse_ollama_num_ctx(raw: Option<&str>) -> Option<u32> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| n > 0)
 }
 
 /// Build the adapter retry policy from the user's `retry_max_attempts` config
@@ -406,6 +424,22 @@ pub fn install_subagent_tiers(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn parse_ollama_num_ctx_only_accepts_a_positive_integer() {
+        // Unset / blank ⇒ leave the daemon's own default alone (None), so we never
+        // shrink a server configured for a larger window.
+        assert_eq!(parse_ollama_num_ctx(None), None);
+        assert_eq!(parse_ollama_num_ctx(Some("")), None);
+        assert_eq!(parse_ollama_num_ctx(Some("   ")), None);
+        // Zero and garbage are not a window ⇒ None (omit the knob).
+        assert_eq!(parse_ollama_num_ctx(Some("0")), None);
+        assert_eq!(parse_ollama_num_ctx(Some("abc")), None);
+        assert_eq!(parse_ollama_num_ctx(Some("-1")), None);
+        // A real value pins it (whitespace tolerated).
+        assert_eq!(parse_ollama_num_ctx(Some("32768")), Some(32_768));
+        assert_eq!(parse_ollama_num_ctx(Some("  8192 ")), Some(8_192));
+    }
 
     fn config(provider_type: &str) -> CodingAgentConfig {
         let mut cfg = CodingAgentConfig::new(
