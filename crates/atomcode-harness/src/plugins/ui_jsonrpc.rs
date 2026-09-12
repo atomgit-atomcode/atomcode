@@ -65,7 +65,7 @@ impl UserQuestions for RpcQuestions {
         "the connected JSON-RPC client".into()
     }
 
-    async fn ask(&self, question: &str, options: &[String]) -> Option<String> {
+    async fn ask(&self, question: &crate::seams::Question) -> Option<String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending
@@ -75,7 +75,19 @@ impl UserQuestions for RpcQuestions {
         let sent = self.outgoing.send(json!({
             "jsonrpc": "2.0",
             "method": "user/question",
-            "params": { "id": id, "question": question, "options": options },
+            "params": {
+                "id": id,
+                "question": question.prompt,
+                "options": question.values(),
+                // The structured half, for a client that draws its own prompt.
+                // A client that ignores it still has the sentence above.
+                "asker": question.asker,
+                "about": question.about.as_ref().map(|a| json!({
+                    "tool": a.tool,
+                    "arguments": a.arguments,
+                    "grant": a.grant,
+                })),
+            },
         }));
         // The socket is gone: nobody to ask, which is a refusal, not a wait.
         if sent.is_err() {

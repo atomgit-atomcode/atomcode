@@ -501,8 +501,21 @@ fn asking(root: &std::path::Path, script: &str) -> ConfigTree {
     )
 }
 
+/// Wait for something to appear on screen, or fail saying what was there
+/// instead. Used where `quiet` cannot be: a turn blocked on a question never
+/// goes quiet until it is answered.
+async fn until(s: &Session, text: &str) {
+    for _ in 0..400 {
+        if s.screen().contains(text) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("`{text}` never appeared:\n{}", s.screen());
+}
+
 #[tokio::test]
-async fn a_risky_call_is_asked_about_on_screen_and_yes_lets_it_run() {
+async fn a_risky_call_is_asked_about_on_screen_and_an_allow_lets_it_run() {
     let dir = scratch("approve");
     let script = replay(
         r#"{ text = "Writing.", calls = [ { name = "write_file", args = { file_path = "out.txt", content = "written" } } ] },
@@ -514,22 +527,16 @@ async fn a_risky_call_is_asked_about_on_screen_and_yes_lets_it_run() {
     s.term.type_line("write it");
     // Wait for the question rather than for quiet: the turn is deliberately
     // blocked on the answer, so quiet will never come until we give one.
-    let asked = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if s.screen().contains("write_file") && s.screen().contains("esc)") {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    assert!(asked.is_ok(), "no question appeared:\n{}", s.screen());
+    until(&s, "esc 拒绝").await;
+    let card = s.screen();
+    assert!(card.contains("write_file"), "which tool:\n{card}");
+    assert!(card.contains("out.txt"), "and what it would do:\n{card}");
     assert!(
         !dir.join("out.txt").exists(),
         "nothing may run before it is approved"
     );
 
-    s.term.press(KeyPress::ch('y'));
+    s.term.press(KeyPress::ch('1'));
     s.quiet().await;
     assert_eq!(
         std::fs::read_to_string(dir.join("out.txt")).unwrap(),
@@ -538,7 +545,7 @@ async fn a_risky_call_is_asked_about_on_screen_and_yes_lets_it_run() {
     );
     let screen = s.screen();
     assert!(
-        screen.contains("→ yes"),
+        screen.contains("→ 允许一次"),
         "the answer is on the record:\n{screen}"
     );
 
@@ -557,16 +564,7 @@ async fn esc_declines_and_the_model_is_told_rather_than_the_turn_dying() {
     let task = s.open().await;
 
     s.term.type_line("write it");
-    let asked = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if s.screen().contains("esc)") {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    assert!(asked.is_ok(), "no question appeared:\n{}", s.screen());
+    until(&s, "esc 拒绝").await;
 
     s.term.press(KeyPress::plain(Key::Esc));
     s.quiet().await;
@@ -576,7 +574,7 @@ async fn esc_declines_and_the_model_is_told_rather_than_the_turn_dying() {
     // Refusing is *returning a result*: the model learns why and the turn
     // finishes, instead of dying with a dangling call.
     assert!(
-        screen.contains("declined"),
+        screen.contains("→ 拒绝"),
         "the refusal is recorded:\n{screen}"
     );
     assert!(
@@ -1040,6 +1038,115 @@ async fn the_team_panel_says_who_is_on_the_team_and_what_each_last_said() {
     assert!(
         !panel.contains("MEMBER-THINKING-OUT-LOUD"),
         "and still nothing it said to itself:\n{panel}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+// ---- approval ------------------------------------------------------------
+
+/// An approval says who wants it.
+///
+/// A member's call is not the conversation's call: "allow `write_file`?" with
+/// no name on it is a question the person cannot answer honestly, because the
+/// thing they would be approving is not the thing they asked for.
+#[tokio::test]
+async fn an_approval_asked_for_by_a_member_says_which_member() {
+    let dir = scratch("ask-member");
+    let script = replay(
+        r#"{ text = "Delegating.", calls = [ { name = "team", args = { action = "delegate", name = "scribe", role = "docs_writer", task = "write notes.md" } } ] },
+           { text = "Delegated." },
+           { text = "Noted." }"#,
+    );
+    let asking = format!(
+        "[[insert]]\nname = \"team-in-process\"\nconfig = {{ project_root = {dir:?} }}\n\n\
+         [[patch]]\nid = \"approval\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"approval-interactive\"\ndisabled = false\n\n\
+         [[insert]]\nid = \"llm-utility\"\nname = \"llm-utility-replay\"\n\
+         config = {{ script = [ \
+           {{ text = \"writing\", calls = [ {{ name = \"write_file\", args = {{ file_path = \"notes.md\", content = \"hello\" }} }} ] }}, \
+           {{ text = \"done\", calls = [ {{ name = \"tell_parent\", args = {{ text = \"wrote notes.md\" }} }} ] }} ] }}\n",
+        dir = dir.to_string_lossy(),
+    );
+    let s = start(tree(&dir, &script, &[&asking])).await;
+    let task = s.open().await;
+
+    s.term.type_line("have someone write the notes");
+    // Delegating is itself a risky call, so the lead's own `team` card comes
+    // first. Allow it, and the member's card is the next one up.
+    until(&s, "team").await;
+    s.term.press(KeyPress::ch('1'));
+    // Not `quiet`: the turn is deliberately stuck on a question, which is the
+    // state under test. Settle on the card being up instead.
+    until(&s, "write_file").await;
+    let card = s.screen();
+    assert!(card.contains("scribe"), "who is asking:\n{card}");
+    assert!(card.contains("write_file"), "which tool:\n{card}");
+    assert!(card.contains("notes.md"), "what it would do:\n{card}");
+    assert!(
+        card.contains("允许一次") && card.contains("总是允许") && card.contains("拒绝"),
+        "and the three answers:\n{card}"
+    );
+    assert!(
+        !card.contains("\"file_path\""),
+        "the arguments are read, not dumped:\n{card}"
+    );
+
+    // Answer it: the member writes, and the file is there.
+    s.term.press(KeyPress::ch('1'));
+    s.quiet().await;
+    assert!(
+        dir.join("notes.md").exists(),
+        "an allowed call runs:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// Take the card away and the screen still asks.
+///
+/// The claim the seam makes: a row draws questions *better*, it is not what
+/// makes them answerable. Without it the question is plain lines at the foot
+/// of the stream and the keyboard answers them there — which is also the path
+/// every front end that never mounts a card takes.
+#[tokio::test]
+async fn with_no_card_row_the_question_is_still_asked_and_still_answered() {
+    let dir = scratch("no-card");
+    let script = replay(
+        r#"{ text = "Writing.", calls = [ { name = "write_file", args = { file_path = "out.txt", content = "plain" } } ] },
+           { text = "Done." }"#,
+    );
+    let s = start(tree(
+        &dir,
+        &script,
+        &[
+            "[[patch]]\nid = \"approval\"\ndisabled = true\n",
+            "[[patch]]\nid = \"approval-interactive\"\ndisabled = false\n",
+            "[[remove]]\nid = \"tui-ask-card\"\n",
+        ],
+    ))
+    .await;
+    let task = s.open().await;
+
+    s.term.type_line("write it");
+    until(&s, "write_file").await;
+    let screen = s.screen();
+    assert!(
+        !screen.contains("┌─ 审批"),
+        "no row, no card:\n{screen}"
+    );
+    assert!(screen.contains("允许一次"), "but the answers are there:\n{screen}");
+
+    s.term.press(KeyPress::ch('1'));
+    s.quiet().await;
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+        "plain",
+        "and the key answered it:\n{}",
+        s.screen()
     );
 
     s.term.press(KeyPress::ctrl('d'));

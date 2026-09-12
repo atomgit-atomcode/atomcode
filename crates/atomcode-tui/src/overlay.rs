@@ -42,6 +42,15 @@ pub trait Overlay: Send + Sync {
     fn size(&self) -> (u8, u8) {
         (70, 60)
     }
+    /// How many body rows it would fill, when it knows.
+    ///
+    /// A list does not know — it is as long as what is in it and scrolls. A
+    /// card does, and a card with five lines in it should not be drawn in a box
+    /// with eleven. Still a request: the host clamps it to the screen, like
+    /// every other module's height.
+    fn rows(&self) -> Option<u16> {
+        None
+    }
 }
 
 /// One row of a picker.
@@ -321,6 +330,19 @@ impl Overlays {
     pub fn close_all(&self) {
         self.close(None);
     }
+}
+
+/// Where a modal goes: centred, as wide as it asked, and as tall as its
+/// content when it knows — otherwise as tall as it asked.
+pub fn modal_rect(screen: Rect, size: (u8, u8), rows: Option<u16>) -> Rect {
+    let rect = frame_rect(screen, size);
+    let Some(rows) = rows else {
+        return rect;
+    };
+    // Two for the border. Never taller than the screen, and never so short
+    // that the frame has nothing between its edges.
+    let h = rows.saturating_add(2).clamp(3, screen.h.max(3)).min(screen.h);
+    Rect::new(rect.x, (screen.h.saturating_sub(h)) / 2, rect.w, h)
 }
 
 /// A framed box in the middle of the screen.

@@ -1,8 +1,9 @@
 //! Policy and product rows that were flags, strings or middleware entries in the
 //! builder-assembled agent.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use atomcode_capabilities::tools::{PermissionRules, RuleDecision, TodoTool};
@@ -15,7 +16,7 @@ use crate::events::{
     ToolExec, ToolsExecute, TurnEnd, TurnProgress, TurnStart, TurnStarted, TurnStopping,
 };
 use crate::seams::{
-    Decision, SessionSvc, StopReason, ToolsSvc, TurnOutcome,
+    AgentsSvc, Decision, SessionSvc, StopReason, ToolsSvc, TurnOutcome,
     UserQuestions, UserQuestionsSvc,
 };
 
@@ -222,7 +223,7 @@ impl UserQuestions for UnattendedQuestions {
     fn describe(&self) -> String {
         "unattended (every question is declined)".into()
     }
-    async fn ask(&self, _question: &str, _options: &[String]) -> Option<String> {
+    async fn ask(&self, _question: &crate::seams::Question) -> Option<String> {
         None
     }
 }
@@ -256,6 +257,32 @@ pub struct InteractiveApprovalPlugin;
 
 struct AskingPolicy {
     ctx: Context,
+    /// Scopes the person answered `allow_always` to, `{tool}::{scope}`.
+    ///
+    /// In memory and session-lived on purpose: a grant that outlived the
+    /// session would be a permission nobody remembers giving. The scope comes
+    /// from the tool rather than the raw arguments, so `write_file` can be
+    /// tool-wide while `bash` stays per-command — see
+    /// [`atomcode_kernel::tool::Tool::always_grant_scope`].
+    granted: Mutex<HashSet<String>>,
+}
+
+impl AskingPolicy {
+    /// The member asking, when it is not the agent the person is driving.
+    ///
+    /// Taken from the task-local "current agent" rather than passed down the
+    /// call: approval runs inside the tool call, which runs inside the agent's
+    /// own turn, so the answer is already here. An agent with a parent is a
+    /// delegated one; its name is the last segment of its session id, which is
+    /// the name the lead gave it.
+    fn asker(&self) -> Option<String> {
+        let current = crate::agent::current()?;
+        let log = current.service::<SessionSvc>()?;
+        let agent = self.ctx.service::<AgentsSvc>()?.by_session(log.id())?;
+        agent.parent()?;
+        let id = agent.session_id();
+        Some(id.rsplit('/').next().unwrap_or(id).to_string())
+    }
 }
 
 #[async_trait]
@@ -268,22 +295,49 @@ impl crate::seams::ApprovalPolicy for AskingPolicy {
         if matches!(tool.risk(&call.arguments), RiskLevel::Safe) {
             return Decision::Allow;
         }
+        // The tool's own name, not the call's: a gate that presents a safe
+        // tool as risky says why in the name, and the person should see it.
+        let scope = tool.always_grant_scope(&call.arguments);
+        // The remembered key is the tool and its scope; the scope alone is what
+        // the person is shown, because the tool is already on the card.
+        let grant = format!("{}::{scope}", tool.name());
+        if self
+            .granted
+            .lock()
+            .expect("grants poisoned")
+            .contains(&grant)
+        {
+            return Decision::Allow;
+        }
         let Some(questions) = self.ctx.service::<UserQuestionsSvc>() else {
             return Decision::Deny("no way to ask for approval".into());
         };
-        // The tool's own name, not the call's: a gate that presents a safe
-        // tool as risky says why in the name, and the person should see it.
-        let question = format!(
-            "Allow `{}` to run with these arguments?\n{}",
-            tool.name(),
-            call.arguments
-        );
-        match questions
-            .ask(&question, &["yes".to_string(), "no".to_string()])
-            .await
-            .as_deref()
-        {
-            Some("yes") => Decision::Allow,
+        let asker = self.asker();
+        let question = crate::seams::Question {
+            prompt: match &asker {
+                Some(who) => format!("Allow `{}` to run, asked for by `{who}`?", tool.name()),
+                None => format!("Allow `{}` to run?", tool.name()),
+            },
+            options: vec![
+                crate::seams::Answer::labelled(crate::seams::ANSWER_ALLOW, "allow once"),
+                crate::seams::Answer::labelled(crate::seams::ANSWER_ALWAYS, "always allow"),
+                crate::seams::Answer::labelled(crate::seams::ANSWER_DENY, "deny"),
+            ],
+            asker,
+            about: Some(crate::seams::AboutCall {
+                tool: tool.name().to_string(),
+                arguments: call.arguments.clone(),
+                grant: Some(scope),
+            }),
+        };
+        match questions.ask(&question).await.as_deref() {
+            Some(crate::seams::ANSWER_ALLOW) => Decision::Allow,
+            Some(crate::seams::ANSWER_ALWAYS) => {
+                self.granted.lock().expect("grants poisoned").insert(grant);
+                Decision::Allow
+            }
+            // Anything else is a refusal, including an answer nobody offered:
+            // consent is only ever the words that were offered for it.
             _ => Decision::Deny("the user declined".into()),
         }
     }
@@ -308,7 +362,10 @@ impl Plugin for InteractiveApprovalPlugin {
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let _ = ctx
-            .provide::<crate::seams::ApprovalSvc>(Arc::new(AskingPolicy { ctx: ctx.clone() }))
+            .provide::<crate::seams::ApprovalSvc>(Arc::new(AskingPolicy {
+                ctx: ctx.clone(),
+                granted: Mutex::new(HashSet::new()),
+            }))
             .map_err(|e| e.to_string())?;
         let _ = ctx.on_waterfall::<ToolsExecute>(
             Arc::new(super::policy::ApprovalGate { ctx: ctx.clone() }),

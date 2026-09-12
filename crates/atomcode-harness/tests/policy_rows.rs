@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use atomcode_harness::seams::{
-    SessionTitleSvc, StopReason, ToolsSvc, UserQuestions, UserQuestionsSvc,
+    Question, SessionTitleSvc, StopReason, ToolsSvc, UserQuestions, UserQuestionsSvc,
+    ANSWER_ALLOW, ANSWER_ALWAYS, ANSWER_DENY,
 };
 use atomcode_harness::{bundle, plugins, run_turn};
 use atomcode_plexus::{App, ConfigTree, Context, Layer, Plugin};
@@ -240,7 +241,7 @@ async fn a_session_is_named_from_its_first_prompt_without_a_model_call() {
 
 // ---- user questions -----------------------------------------------------
 
-/// A human who always says yes.
+/// A human who allows every call, once.
 struct AlwaysYes;
 
 #[async_trait]
@@ -248,8 +249,8 @@ impl UserQuestions for AlwaysYes {
     fn describe(&self) -> String {
         "scripted human (always yes)".into()
     }
-    async fn ask(&self, _question: &str, _options: &[String]) -> Option<String> {
-        Some("yes".into())
+    async fn ask(&self, _question: &Question) -> Option<String> {
+        Some(ANSWER_ALLOW.into())
     }
 }
 
@@ -419,7 +420,7 @@ async fn yolo_lets_a_sensitive_read_through() {
     assert!(transcript(&app).contains("hunter2"));
 }
 
-/// A human who counts what they were asked and always says yes.
+/// A human who counts what they were asked, and allows each one.
 struct CountingYes(Arc<Mutex<Vec<String>>>);
 
 #[async_trait]
@@ -427,9 +428,9 @@ impl UserQuestions for CountingYes {
     fn describe(&self) -> String {
         "scripted human (counting)".into()
     }
-    async fn ask(&self, question: &str, _options: &[String]) -> Option<String> {
-        self.0.lock().unwrap().push(question.to_string());
-        Some("yes".into())
+    async fn ask(&self, question: &Question) -> Option<String> {
+        self.0.lock().unwrap().push(question.prompt.clone());
+        Some(ANSWER_ALLOW.into())
     }
 }
 
@@ -469,4 +470,130 @@ async fn interactive_approval_is_asked_about_the_sensitive_read_and_only_that() 
     let questions = asked.lock().unwrap().clone();
     assert_eq!(questions.len(), 1, "asked once, by the gate, not again by approval: {questions:?}");
     assert!(questions[0].contains("sensitive path"), "and the question says why: {}", questions[0]);
+}
+
+/// A human who allows the first call for good, and would refuse afterwards.
+///
+/// The refusal is the point: if the grant is not remembered, the second write
+/// is asked about and denied, and the test says so in the transcript.
+struct AlwaysThenNo(Arc<Mutex<Vec<String>>>);
+
+#[async_trait]
+impl UserQuestions for AlwaysThenNo {
+    fn describe(&self) -> String {
+        "scripted human (always, then no)".into()
+    }
+    async fn ask(&self, question: &Question) -> Option<String> {
+        let mut asked = self.0.lock().unwrap();
+        asked.push(question.prompt.clone());
+        if asked.len() == 1 {
+            Some(ANSWER_ALWAYS.into())
+        } else {
+            Some(ANSWER_DENY.into())
+        }
+    }
+}
+
+struct AlwaysThenNoPlugin(Arc<Mutex<Vec<String>>>);
+
+#[async_trait]
+impl Plugin for AlwaysThenNoPlugin {
+    fn name(&self) -> &'static str {
+        "user-questions-always-then-no"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["user-questions"]
+    }
+    fn description(&self) -> &'static str {
+        "scripted human: allow_always once, then deny"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<UserQuestionsSvc>(Arc::new(AlwaysThenNo(self.0.clone())))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn always_allow_is_asked_once_and_remembered_for_the_scope() {
+    let dir = scratch("always");
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = plugins::catalog();
+    registry.register(Arc::new(AlwaysThenNoPlugin(asked.clone())));
+    let swap =
+        "[[patch]]\nid = \"user-questions-unattended\"\nname = \"user-questions-always-then-no\"";
+    // Two writes in one turn. `write_file` reports a tool-wide grant scope, so
+    // an "always" on the first covers the second.
+    let script = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [
+  { text = "one", calls = [ { name = "write_file", args = { file_path = "a.txt", content = "a" } } ] },
+  { text = "two", calls = [ { name = "write_file", args = { file_path = "b.txt", content = "b" } } ] },
+  { text = "done" },
+] }
+"#;
+    let mut app = App::new(registry, tree(&dir, script, &[bundle::INTERACTIVE, swap]));
+    app.start().await.unwrap();
+    run_turn(&app, "write both").await.unwrap();
+
+    let questions = asked.lock().unwrap().clone();
+    assert_eq!(
+        questions.len(),
+        1,
+        "asked once; the second write is covered by the grant: {questions:?}"
+    );
+    assert!(
+        dir.join("a.txt").exists() && dir.join("b.txt").exists(),
+        "both writes ran"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_nobody_offered_is_a_refusal() {
+    struct Yes;
+    #[async_trait]
+    impl UserQuestions for Yes {
+        fn describe(&self) -> String {
+            "a human answering a question that was never asked".into()
+        }
+        async fn ask(&self, _question: &Question) -> Option<String> {
+            // What the old prompt took as consent. It is not one of the
+            // answers any more, and consent is only ever the words offered
+            // for it.
+            Some("yes".into())
+        }
+    }
+    struct YesPlugin;
+    #[async_trait]
+    impl Plugin for YesPlugin {
+        fn name(&self) -> &'static str {
+            "user-questions-stale-yes"
+        }
+        fn provides(&self) -> &'static [&'static str] {
+            &["user-questions"]
+        }
+        fn description(&self) -> &'static str {
+            "scripted human answering with a word nobody offered"
+        }
+        async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+            let _ = ctx
+                .provide::<UserQuestionsSvc>(Arc::new(Yes))
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+    }
+
+    let dir = scratch("stale-yes");
+    let mut registry = plugins::catalog();
+    registry.register(Arc::new(YesPlugin));
+    let swap = "[[patch]]\nid = \"user-questions-unattended\"\nname = \"user-questions-stale-yes\"";
+    let script = script_one("write_file", r#"{ file_path = "a.txt", content = "a" }"#);
+    let mut app = App::new(registry, tree(&dir, &script, &[bundle::INTERACTIVE, swap]));
+    app.start().await.unwrap();
+    run_turn(&app, "write it").await.unwrap();
+    assert!(!dir.join("a.txt").exists(), "unrecognised is not consent");
+    assert!(transcript(&app).contains("the user declined"));
 }

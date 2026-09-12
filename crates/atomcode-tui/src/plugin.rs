@@ -33,6 +33,9 @@ plexus_service!(ModulesSvc => Modules, "tui-modules", Core, "Mounted stream prod
 plexus_service!(LayoutSvc => crate::layout::Layout, "tui-layout", Core, "The region tree on screen");
 plexus_service!(CommandsSvc => crate::command::Commands, "tui-commands", Core, "Slash commands contributed by rows");
 plexus_service!(AgentClientSvc => AgentClient, "tui-agent-client", Core, "The command channel to the agent this screen drives");
+// How a question is drawn. A seam rather than a branch: the foot-of-the-stream
+// lines are the fallback every screen has, and anything better is a row.
+plexus_service!(AskViewSvc => dyn crate::ask::AskView, "tui-ask-view", Seam, "How a question is put on screen");
 
 /// The screen's end of the handle protocol.
 ///
@@ -228,6 +231,9 @@ impl UserInterface for Tui {
         let mut quit = false;
         while !quit {
             self.refresh_members(ctx, &mine);
+            // A question that arrived while the loop was asleep gets its modal
+            // here, before the frame it appears in is composed.
+            self.open_question();
             self.paint();
             let timer = self.host.modules.tick();
             let woke = match timer {
@@ -320,6 +326,45 @@ impl UserInterface for Tui {
         self.dump();
         Ok(())
     }
+}
+
+/// What was asked and what was said, as a settled fact of the conversation —
+/// the screen must be able to explain itself later. A free function because
+/// both paths write it: the keyboard at the foot of the stream, and the modal's
+/// callback, which outlives the borrow it was created from.
+fn record_answer(
+    host: &Host,
+    question: &atomcode_harness::seams::Question,
+    answer: &Option<String>,
+) {
+    let said = match answer {
+        Some(value) => crate::ask::answer_label(
+            value,
+            &question
+                .options
+                .iter()
+                .find(|a| &a.value == value)
+                .map(|a| a.label.clone())
+                .unwrap_or_else(|| value.clone()),
+        ),
+        // No answer is a refusal, and the record says so in the same words the
+        // card offered for it.
+        None => crate::ask::answer_label(atomcode_harness::seams::ANSWER_DENY, "declined"),
+    };
+    let mut stream = host.stream.write().expect("stream poisoned");
+    let mut w = stream.writer("questions");
+    w.emit(
+        crate::block::Coord::default(),
+        Arc::new(crate::content::ChoiceBlock {
+            question: crate::ask::recorded(question),
+            options: question
+                .options
+                .iter()
+                .map(|a| crate::ask::answer_label(&a.value, &a.label))
+                .collect(),
+            answer: Some(said),
+        }),
+    );
 }
 
 impl Tui {
@@ -726,51 +771,98 @@ impl Tui {
     }
 
     /// Route one key to the question on screen. Returns `true` to quit.
+    ///
+    /// The fallback path: this is how a question is answered when no row draws
+    /// it. With `tui-ask-card` mounted the modal holds the keyboard and this is
+    /// never reached — the loop gives an open overlay the key first.
     fn answer_question(&self, press: crate::surface::KeyPress) -> bool {
         use crate::surface::{Key, Mods};
-        let Some(pending) = self.host.asks.peek() else {
+        let Some((_, question)) = self.host.asks.peek() else {
             return false;
         };
-        let (_, question, options) = pending;
+        let value_at = |n: usize| {
+            question
+                .options
+                .get(n.wrapping_sub(1))
+                .map(|a| a.value.clone())
+        };
         let chosen = match (press.key, press.mods) {
             // Esc and ctrl-c decline. Declining is an answer; it is never
             // consent, and it must always be one keystroke away.
             (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => Some(None),
             (Key::Char('d'), Mods::CTRL) => return true,
             (Key::Char(c), _) if c.is_ascii_digit() => {
-                let n = c.to_digit(10).unwrap_or(0) as usize;
-                options.get(n.wrapping_sub(1)).cloned().map(Some)
+                value_at(c.to_digit(10).unwrap_or(0) as usize).map(Some)
             }
-            (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) => options
+            (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) => question
+                .options
                 .iter()
-                .find(|o| o.to_lowercase().starts_with(c.to_ascii_lowercase()))
-                .cloned()
-                .map(Some),
+                .find(|a| a.value.to_lowercase().starts_with(c.to_ascii_lowercase()))
+                .map(|a| Some(a.value.clone())),
             // Enter takes the first option only when there is exactly one, so a
             // stray return can never approve a two-way choice.
-            (Key::Enter, _) if options.len() == 1 => Some(options.first().cloned()),
+            (Key::Enter, _) if question.options.len() == 1 => Some(value_at(1)),
             _ => None,
         };
         let Some(answer) = chosen else {
             return false; // an unrecognised key changes nothing
         };
         if let Some(p) = self.host.asks.take() {
-            // Record what was asked and what was said, as a settled fact of the
-            // conversation — the screen must be able to explain itself later.
-            let mut stream = self.host.stream.write().expect("stream poisoned");
-            let mut w = stream.writer("questions");
-            w.emit(
-                crate::block::Coord::default(),
-                Arc::new(crate::content::ChoiceBlock {
-                    question,
-                    options,
-                    answer: Some(answer.clone().unwrap_or_else(|| "declined".into())),
-                }),
-            );
-            drop(stream);
+            record_answer(&self.host, &question, &answer);
             p.answer(answer);
         }
         false
+    }
+
+    /// Hand the waiting question to whoever draws questions.
+    ///
+    /// Nothing happens when no row fills `tui-ask-view`: the question stays at
+    /// the foot of the stream and the keyboard answers it there. That is the
+    /// point of the seam — the fallback is a working screen, not a broken one.
+    fn open_question(&self) {
+        // A question refused out from under its card — a cancel, a shutdown —
+        // leaves a modal asking about something nobody is waiting for. Take it
+        // down rather than let a person answer a question that is already over.
+        if !self.host.asks.is_waiting() {
+            if self
+                .host
+                .overlays
+                .current()
+                .is_some_and(|o| o.id() == crate::ask::CARD)
+            {
+                self.host.overlays.close_all();
+            }
+            return;
+        }
+        if self.host.overlays.is_open() {
+            return;
+        }
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            return;
+        };
+        let Some(view) = ctx.service::<AskViewSvc>() else {
+            return;
+        };
+        let Some((_, question)) = self.host.asks.peek() else {
+            return;
+        };
+        let overlay = view.overlay(&question);
+        let host = self.host.clone();
+        let wake = self.wake.lock().expect("wake poisoned").clone();
+        self.host.overlays.open(
+            overlay,
+            Box::new(move |chosen| {
+                // A modal that closes with nothing closed with a refusal:
+                // `Pending::answer(None)` is a deny, never a default yes.
+                if let Some(p) = host.asks.take() {
+                    record_answer(&host, &question, &chosen);
+                    p.answer(chosen);
+                }
+                if let Some(k) = wake {
+                    let _ = k.send(Wake::Fact);
+                }
+            }),
+        );
     }
 
     /// Keep the slash menu in step with what is typed.
@@ -1089,9 +1181,17 @@ impl Plugin for TuiUiPlugin {
         &["agents", "agent-loop", "surface"]
     }
     fn uses(&self) -> &'static [&'static str] {
-        // What the pump's projection reads, resolved live; and where its own
-        // agent's session comes from.
-        &["tools", "llm", "compaction", "session-defaults"]
+        // What the pump's projection reads, resolved live; where its own
+        // agent's session comes from; and who draws a question, when anyone
+        // does — this row asks either way, so the seam is a `uses`, not a
+        // dependency it cannot start without.
+        &[
+            "tools",
+            "llm",
+            "compaction",
+            "session-defaults",
+            "tui-ask-view",
+        ]
     }
     fn provides(&self) -> &'static [&'static str] {
         // It owns the screen, so it is the one that can ask. The registries it

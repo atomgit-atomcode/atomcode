@@ -367,12 +367,101 @@ pub trait SessionTitle: Send + Sync {
     async fn title(&self, log: &SessionLog) -> Option<String>;
 }
 
+/// The three answers an approval can have. The spelling is
+/// `atomcode_capabilities::tools::approval`'s, so a decision means the same
+/// thing whichever gate asked and whatever carries it.
+pub const ANSWER_ALLOW: &str = "allow";
+pub const ANSWER_ALWAYS: &str = "allow_always";
+pub const ANSWER_DENY: &str = "deny";
+
+/// One answer: what comes back, and what a plain front end prints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Answer {
+    /// Returned by [`UserQuestions::ask`] when this one is picked.
+    pub value: String,
+    /// What a front end with nothing better to show prints. A front end that
+    /// knows the answer's meaning is free to word it its own way.
+    pub label: String,
+}
+
+impl Answer {
+    pub fn new(value: impl Into<String>) -> Self {
+        let value = value.into();
+        Self {
+            label: value.clone(),
+            value,
+        }
+    }
+    pub fn labelled(value: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            label: label.into(),
+        }
+    }
+}
+
+/// The call an approval is about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AboutCall {
+    pub tool: String,
+    /// The exact bytes that will run. A front end summarises them for the eye,
+    /// but this is what executes — approve what runs, not a paraphrase of it.
+    pub arguments: String,
+    /// What an `allow_always` would cover, or `None` when this call is not
+    /// something to remember. Empty means every call of this tool; otherwise
+    /// it is the tool's own scope — `bash` reports the command, so approving
+    /// one destructive command never blanket-approves another. Shown, because
+    /// a person saying "always" is owed the scope they are saying it to.
+    pub grant: Option<String>,
+}
+
+/// A question put to a person — data, not a sentence.
+///
+/// A string was enough while one agent asked and the answers were yes and no.
+/// It stopped being enough the moment a delegated member could ask: "allow
+/// `write_file`?" with no way to say *who* wants to write is a question a
+/// person cannot answer honestly. So everything a front end needs to lay a
+/// question out is here, and everything it gets to decide — wording, colour,
+/// which key means which answer — is not.
+#[derive(Clone, Debug, Default)]
+pub struct Question {
+    /// The ask, phrased, for a front end that renders nothing else.
+    pub prompt: String,
+    /// The answers, in the order they should be offered.
+    pub options: Vec<Answer>,
+    /// Which agent is asking, when it is not the one the person is driving —
+    /// a team member's name. `None` is this conversation itself.
+    pub asker: Option<String>,
+    /// The call under review, when this is an approval.
+    pub about: Option<AboutCall>,
+}
+
+impl Question {
+    /// A question with nothing behind it: a prompt and some answers.
+    pub fn plain(prompt: impl Into<String>, options: &[&str]) -> Self {
+        Self {
+            prompt: prompt.into(),
+            options: options.iter().map(|o| Answer::new(*o)).collect(),
+            ..Self::default()
+        }
+    }
+    /// Just the values, for an asker that only echoes them.
+    pub fn values(&self) -> Vec<String> {
+        self.options.iter().map(|o| o.value.clone()).collect()
+    }
+    /// The answer whose value is this, if it is one of them.
+    pub fn has(&self, value: &str) -> bool {
+        self.options.iter().any(|o| o.value == value)
+    }
+}
+
 /// Asking a human. `None` means "no answer" — every caller must treat that as a
 /// refusal, never as consent.
 #[async_trait]
 pub trait UserQuestions: Send + Sync {
     fn describe(&self) -> String;
-    async fn ask(&self, question: &str, options: &[String]) -> Option<String>;
+    /// Put the question and wait. The returned string is an [`Answer::value`].
+    async fn ask(&self, question: &Question) -> Option<String>;
 }
 
 /// What a delegated task produced.

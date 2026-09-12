@@ -62,11 +62,16 @@
 - `modules/team.rs` + `tui-panel-team` 行(默认关):成员面板。两个来源——委派/角色/报告
   折自 lead 自己的日志,「此刻在不在跑、第几轮」来自 `Moment.members`(宿主每帧从 agent
   注册表读)。成员自己的流不在屏幕上,这是 0016 的规矩。
+- 审批:`seams::Question`(prompt / options / asker / about)取代了一句话 + 两个选项;
+  `approval-interactive` 说出是哪个成员在问、记住 `allow_always` 的授权范围
+  (`{tool}::{scope}`,来自 `Tool::always_grant_scope`)。屏幕这边 `tui-ask-view` 是缝,
+  `tui-ask-card` 行是默认实现(弹框:谁在问、调用做什么、三个答案各覆盖什么);
+  拆掉这行,问题退回流脚下的几行纯文本,照样能问能答。
 
 ## 怎么验证
 
 ```sh
-cargo test -p atomcode-harness -p atomcode-tui --no-fail-fast   # 506 全绿
+cargo test -p atomcode-harness -p atomcode-tui --no-fail-fast   # 516 全绿
 cargo clippy --no-deps -p atomcode-harness -p atomcode-plexus --all-targets -- -D warnings
 bash gates/tui-layers.sh && bash gates/tui-negative.sh && bash gates/tui-test-count.sh
 git status --short gates/     # 差分基线 gates/differential.baseline 只准降,不准动
@@ -95,7 +100,7 @@ telemetry 各几条,都是 rust 1.94 新 lint 的既有问题,不在本次范围
    挂上(4.6k 行实现已在 capabilities)。
 5. **定时与 loop 行**:往 inbox 放 `Harness` 消息即可,机制已备;coding 的 `controllers.rs` 是策略参考。
 6. team 剩余:lead 取消级联、`report_finding` 进成员工具集、fork 切片器。
-   (成员面板已落地:`tui-panel-team`;成员的审批问题仍弹在 lead 屏上且不说是谁问的。)
+   (成员面板已落地:`tui-panel-team`;审批问题会说是哪个成员在问,见 `tui-ask-card`。)
 7. 会话剩余:`delete`、OS 租约、`Titled` 的 `/title` 之外的提交点。
 
 ## 踩过的坑

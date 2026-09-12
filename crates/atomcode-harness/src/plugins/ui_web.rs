@@ -96,7 +96,7 @@ impl UserQuestions for WebQuestions {
         "the connected browser".into()
     }
 
-    async fn ask(&self, question: &str, options: &[String]) -> Option<String> {
+    async fn ask(&self, question: &crate::seams::Question) -> Option<String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.pending
@@ -108,8 +108,15 @@ impl UserQuestions for WebQuestions {
             json!({
                 "type": "question",
                 "id": id,
-                "question": question,
-                "options": options,
+                "question": question.prompt,
+                "options": question.values(),
+                // The structured half, for a browser that draws its own prompt.
+                "asker": question.asker,
+                "about": question.about.as_ref().map(|a| json!({
+                    "tool": a.tool,
+                    "arguments": a.arguments,
+                    "grant": a.grant,
+                })),
             })
             .to_string(),
         );

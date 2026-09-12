@@ -496,20 +496,29 @@ impl UserQuestions for Asker {
         "the connected driver".into()
     }
 
-    async fn ask(&self, question: &str, options: &[String]) -> Option<String> {
+    async fn ask(&self, question: &crate::seams::Question) -> Option<String> {
         let request = UserInputRequest {
-            header: "Question".into(),
-            question: question.to_string(),
-            mode: if options.is_empty() {
+            // Who is asking belongs in the header, where a driver draws it
+            // without having to parse the sentence for a name.
+            header: match &question.asker {
+                Some(who) => format!("Question · {who}"),
+                None => "Question".into(),
+            },
+            question: question.prompt.clone(),
+            mode: if question.options.is_empty() {
                 UserInputMode::Text
             } else {
                 UserInputMode::Single
             },
-            options: options
+            // `label` carries the value, because that is what comes back and
+            // what the caller compares against; the wording rides along as the
+            // description, for a driver with nothing better to show.
+            options: question
+                .options
                 .iter()
-                .map(|label| UserInputOption {
-                    label: label.clone(),
-                    description: None,
+                .map(|answer| UserInputOption {
+                    label: answer.value.clone(),
+                    description: Some(answer.label.clone()),
                 })
                 .collect(),
             custom: true,

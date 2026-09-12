@@ -235,10 +235,18 @@ impl Host {
         // stream itself: it has no answer yet, and a block whose content is
         // still to be decided has not settled — putting it in would mean
         // amending a settled block the moment it is answered.
-        if let Some((_, question, options)) = self.asks.peek() {
+        //
+        // Unless a row is drawing it as a modal: then the modal is where it is
+        // being answered, and a second copy here would be the same question
+        // asked twice on one screen.
+        if let Some((_, question)) = self.asks.peek().filter(|_| !self.overlays.is_open()) {
             let pending = crate::content::ChoiceBlock {
-                question,
-                options,
+                question: crate::ask::recorded(&question),
+                options: question
+                    .options
+                    .iter()
+                    .map(|a| crate::ask::answer_label(&a.value, &a.label))
+                    .collect(),
                 answer: None,
             };
             let mut lines = crate::block::Content::lines(&pending, rect.w);
@@ -384,7 +392,8 @@ impl Host {
 
         // A modal is drawn last, over everything, in a box of its own.
         if let Some(modal) = self.overlays.current() {
-            let rect = crate::overlay::frame_rect(Rect::sized(w, h), modal.size());
+            let rect =
+                crate::overlay::modal_rect(Rect::sized(w, h), modal.size(), modal.rows());
             if !rect.is_empty() {
                 let vp = crate::moment::Viewport::new(
                     Rect::new(

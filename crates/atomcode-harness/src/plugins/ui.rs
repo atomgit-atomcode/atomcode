@@ -394,20 +394,43 @@ impl UserQuestions for TerminalQuestions {
         "the terminal".into()
     }
 
-    async fn ask(&self, question: &str, options: &[String]) -> Option<String> {
-        eprintln!("\n\x1b[33m{question}\x1b[0m");
-        eprint!("\x1b[33m[{}]\x1b[0m ", options.join("/"));
+    async fn ask(&self, question: &crate::seams::Question) -> Option<String> {
+        eprintln!("\n\x1b[33m{}\x1b[0m", question.prompt);
+        // The call, on its own line: a person approving `bash` is approving a
+        // command, and a prompt that does not show it is asking them to guess.
+        if let Some(about) = &question.about {
+            eprintln!("\x1b[2m  {} {}\x1b[0m", about.tool, about.arguments);
+        }
+        let shown: Vec<String> = question
+            .options
+            .iter()
+            .map(|a| {
+                if a.label == a.value {
+                    a.value.clone()
+                } else {
+                    format!("{} ({})", a.value, a.label)
+                }
+            })
+            .collect();
+        eprint!("\x1b[33m[{}]\x1b[0m ", shown.join("/"));
         let _ = std::io::stderr().flush();
         let mut line = String::new();
         let mut stdin = BufReader::new(tokio::io::stdin());
         if stdin.read_line(&mut line).await.ok()? == 0 {
             return None;
         }
-        let answer = line.trim().to_lowercase();
-        options
+        let typed = line.trim().to_lowercase();
+        if typed.is_empty() {
+            return None;
+        }
+        question
+            .options
             .iter()
-            .find(|o| o.to_lowercase() == answer || o.to_lowercase().starts_with(&answer))
-            .cloned()
+            .find(|a| {
+                let (v, l) = (a.value.to_lowercase(), a.label.to_lowercase());
+                v == typed || l == typed || v.starts_with(&typed) || l.starts_with(&typed)
+            })
+            .map(|a| a.value.clone())
     }
 }
 

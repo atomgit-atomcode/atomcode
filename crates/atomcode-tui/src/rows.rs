@@ -67,6 +67,12 @@ disabled = true
 name = "tui-panel-team"
 disabled = true
 
+# How a question is drawn. Remove this row and questions still arrive, still
+# answer and still record — as plain lines at the foot of the stream. That is
+# the fallback this row improves on, not a branch it replaces.
+[[insert]]
+name = "tui-ask-card"
+
 [[insert]]
 name = "tui-commands-screen"
 
@@ -94,6 +100,7 @@ pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
         Arc::new(InputPanel),
         Arc::new(MascotPanel),
         Arc::new(TeamPanel),
+        Arc::new(AskCardRow),
         Arc::new(ScreenCommandsRow),
         Arc::new(SessionCommandsRow),
         Arc::new(TreeCommandsRow),
@@ -282,6 +289,34 @@ impl Plugin for TeamPanel {
             );
             m.remove_view(id);
         });
+        Ok(())
+    }
+}
+
+/// The approval card: the modal a question is put in.
+///
+/// Not a panel — it takes no room until something asks — and not a branch in
+/// the host either. The host hands the question to whoever fills
+/// `tui-ask-view`; this row is who that is by default, and a product with a
+/// different idea of what an approval should look like replaces the row rather
+/// than patching the loop.
+pub struct AskCardRow;
+
+#[async_trait]
+impl Plugin for AskCardRow {
+    fn name(&self) -> &'static str {
+        "tui-ask-card"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["tui-ask-view"]
+    }
+    fn description(&self) -> &'static str {
+        "draw a question as a card: who is asking, what the call does, what each answer means"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<crate::plugin::AskViewSvc>(Arc::new(crate::ask::Card))
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 }
