@@ -24,6 +24,24 @@ fail=0
 PURE="$SRC/el.rs $SRC/frame.rs $SRC/width.rs $SRC/ansi.rs"
 SHIELD="$SRC/caps.rs $SRC/surface.rs"
 
+# 只读代码,不读散文。
+#
+# 起因（真实）：这条闸门数的是「上层出现了几个字面装饰符」,而它 grep 整个文件——
+# 于是一条引用界面文案的文档注释（`/// 一回合的结尾是 ───── ✓ 完成 ─────`）和一条
+# 断言画出来长什么样的测试（`assert!(line.starts_with("[•]"))`）都被算成违规。
+# 写文档把闸门弄红一次,这条棘轮的寿命就以天计——仓库自己写过：首跑即红的闸门会被
+# 关掉。规则说的是代码不许绕过屏蔽层,那它就该只看代码。
+#
+# 剥两样:整行注释,以及文件末尾的 `mod tests`。行尾注释不剥——`//` 出现在字符串
+# 字面量里是常事,剥了会把真代码剪断,而一个漏判远好过一个假阳性。
+code_only() {                    # code_only <files...> → 只剩代码的文本
+  local f
+  for f in "$@"; do
+    awk '/^mod [a-z_]*tests?[[:space:]]*\{/ { exit } { print }' "$f" \
+      | grep -vE '^[[:space:]]*(//|/\*|\*)'
+  done
+}
+
 ratchet() {                      # ratchet <name> <count> <what>
   local name="$1" count="$2" what="$3" base
   [ -f "$BASE" ] && base=$(grep "^$name=" "$BASE" 2>/dev/null | cut -d= -f2)
@@ -45,7 +63,7 @@ ratchet() {                      # ratchet <name> <count> <what>
 }
 
 echo "→ 第一层不得含领域词汇"
-n=$(grep -nE "SessionEvent|atomcode_harness|atomcode_kernel" $PURE 2>/dev/null | wc -l | tr -d ' ')
+n=$(code_only $PURE | grep -cE "SessionEvent|atomcode_harness|atomcode_kernel")
 if [ "$n" != "0" ]; then
   grep -nE "SessionEvent|atomcode_harness|atomcode_kernel" $PURE
   echo "  ✗ 绘制原语引用了领域类型：原语层必须能被另一个产品原样拿走"
@@ -55,7 +73,7 @@ else
 fi
 
 echo "→ 第一层（caps 除外）不得读环境"
-n=$(grep -nE "std::env|env::var" $PURE 2>/dev/null | wc -l | tr -d ' ')
+n=$(code_only $PURE | grep -cE "std::env|env::var")
 if [ "$n" != "0" ]; then
   grep -nE "std::env|env::var" $PURE
   echo "  ✗ 能力必须注入而非探测（同 docs/adr/0008：探测会让判据在错误的机器上永远绿）"
@@ -72,7 +90,7 @@ fi
 UPPER=$(find "$SRC" -name '*.rs' ! -name caps.rs ! -name surface.rs ! -name el.rs)
 
 echo "→ 屏蔽层之外不得出现字面装饰字符（应走 Caps::g(Glyph::…)）"
-n=$(grep -oE '[┌┐└┘─│├┤┬┴┼✓✗⋯▸•]' $UPPER 2>/dev/null | wc -l | tr -d ' ')
+n=$(code_only $UPPER | grep -oE '[┌┐└┘─│├┤┬┴┼✓✗⋯▸•]' | wc -l | tr -d ' ')
 ratchet literal_glyphs "$n" "字面制表符/状态符，ASCII 终端上会 tofu 且宽度可能错" || fail=1
 
 echo "→ 调色板之外不得写裸颜色（应走 Color::role(Role::…)）"
@@ -80,11 +98,11 @@ echo "→ 调色板之外不得写裸颜色（应走 Color::role(Role::…)）"
 # 也和 tuix 的调色板对不上，而两个前端对「muted 是什么颜色」有两种答案就是两个
 # 产品。角色在上屏时才解析成颜色，那里才知道明暗。
 PALETTE=$(find "${SRC}" -name '*.rs' ! -name theme.rs ! -name frame.rs ! -name ansi.rs)
-n=$(grep -nE 'Color::(Ansi|Rgb)\(' ${PALETTE} 2>/dev/null | wc -l | tr -d ' ')
+n=$(code_only ${PALETTE} | grep -cE 'Color::(Ansi|Rgb)\(')
 ratchet raw_colours "${n}" "裸颜色索引，绕过了角色调色板，也绕过了明暗主题" || fail=1
 
 echo "→ 屏蔽层之外不得探测操作系统或终端"
-n=$(grep -nE 'cfg!\(target_os|"TERM"|"LANG"|"LC_ALL"|ATOMCODE_ASCII|"NO_COLOR"|"WT_SESSION"' $UPPER 2>/dev/null | wc -l | tr -d ' ')
+n=$(code_only $UPPER | grep -cE 'cfg!\(target_os|"TERM"|"LANG"|"LC_ALL"|ATOMCODE_ASCII|"NO_COLOR"|"WT_SESSION"')
 ratchet os_probes "$n" "直接探测终端/操作系统，绕过了 Caps" || fail=1
 
 if [ $fail = 0 ]; then echo -e "\n分层闸门：通过"; else echo -e "\n分层闸门：未通过"; fi

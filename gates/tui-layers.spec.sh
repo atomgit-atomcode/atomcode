@@ -61,6 +61,22 @@ d=$(fixture); run "${d}" >/dev/null
 printf 'const C: u8 = 0; fn f() { let _ = Color::Ansi(75); }\n' >> "${d}/src/modules.rs"
 check "上层写裸颜色（超基线）" fail "${d}"
 
+echo "=== 校准：闸门读代码,不读散文 ==="
+# 起因（真实）：一条引用界面文案的文档注释和一条断言画出来长什么样的测试,把闸门
+# 判红了 5 次。规则说的是代码不许绕过屏蔽层——那注释里出现同一个字符就不是违规,
+# 而一条因为写文档而红的棘轮,寿命以天计。
+d=$(fixture); run "$d" >/dev/null
+printf '/// 一回合的结尾画成 \xe2\x94\x80\xe2\x94\x80 \xe2\x9c\x93 \xe2\x94\x80\xe2\x94\x80\n' >> "$d/src/modules.rs"
+check "文档注释里的装饰符不算违规" pass "$d"
+
+d=$(fixture); run "$d" >/dev/null
+printf 'mod tests {\n    fn t() { assert!(x.starts_with("[\xe2\x80\xa2]")); }\n}\n' >> "$d/src/modules.rs"
+check "测试断言里的装饰符不算违规" pass "$d"
+
+d=$(fixture); run "$d" >/dev/null
+printf '// \xe2\x94\x8c 注释里说一句\nconst B: &str = "\xe2\x94\x8c";\n' >> "$d/src/modules.rs"
+check "同一行注释挡不住下一行的真违规" fail "$d"
+
 echo "=== 校准：棘轮允许存量债带着基线上线 ==="
 d=$(fixture)
 printf 'const B: &str = "\xe2\x94\x8c";\n' >> "$d/src/modules.rs"
