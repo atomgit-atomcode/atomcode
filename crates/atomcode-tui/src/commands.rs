@@ -76,26 +76,27 @@ impl CommandSet for SessionCommands {
     fn commands(&self) -> Vec<Command> {
         SESSION.to_vec()
     }
-    async fn run(&self, name: &str, _args: &str, ctx: &Context) -> Outcome {
+    async fn run(&self, name: &str, args: &str, ctx: &Context) -> Outcome {
         let Some(log) = ctx.service::<SessionSvc>() else {
             return Outcome::Refused("这棵树没挂会话日志".into());
         };
         match name {
             "compact" => {
-                let Some(c) = ctx.service::<CompactionSvc>() else {
+                if ctx.service::<CompactionSvc>().is_none() {
                     return Outcome::Refused(
                         "这棵树没挂压缩策略;`compaction-tail` 那一行是关的".into(),
                     );
-                };
-                match c.compact(&log).await {
-                    Some(d) => {
-                        atomcode_harness::session::apply_compaction(ctx, &log, d);
-                        Outcome::Said("已压缩".into())
-                    }
-                    // Refused, not failed: nothing was worth compacting and the
-                    // history is byte-identical.
-                    None => Outcome::Said("暂时没有值得压缩的".into()),
                 }
+                let Some(client) = ctx.service::<crate::plugin::AgentClientSvc>() else {
+                    return Outcome::Refused("这块屏幕没接上 agent".into());
+                };
+                // Over the handle, so it waits behind a running turn like every
+                // other driver's `/compact`. The outcome comes back as an event
+                // and is said then; saying "done" here would be saying it
+                // before it is true.
+                let focus = args.trim();
+                client.compact((!focus.is_empty()).then(|| focus.to_string()));
+                Outcome::Quiet
             }
             "context" => {
                 let messages = log.derive_messages().len();

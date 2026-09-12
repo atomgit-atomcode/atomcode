@@ -529,6 +529,34 @@ impl UserQuestions for Asker {
     }
 }
 
+/// The half of a driver that holds the questions.
+///
+/// The pump needs exactly three things from it: to route an answer that came
+/// back over the wire, to refuse everything pending when the person cancels
+/// (a tool blocked on an approval nobody will now give never reaches a point
+/// where it can observe the cancel), and to close on shutdown. The handle's own
+/// [`Asker`] asks over the event channel; a screen asks by drawing. Both fit.
+pub trait Answers: Send + Sync {
+    /// Deliver an answer. `false` means nobody was waiting for it.
+    fn answer(&self, id: RequestId, value: Value) -> bool;
+    /// Every pending question, refused at once.
+    fn refuse_all(&self);
+    /// No more questions; whatever is still waiting is refused.
+    fn close(&self);
+}
+
+impl Answers for Asker {
+    fn answer(&self, id: RequestId, value: Value) -> bool {
+        Asker::answer(self, id, value)
+    }
+    fn refuse_all(&self) {
+        Asker::refuse_all(self)
+    }
+    fn close(&self) {
+        Asker::close(self)
+    }
+}
+
 // ---- the pump -----------------------------------------------------------
 
 /// Wait on the turn in flight, or forever when there is none.
@@ -594,7 +622,7 @@ enum Woke {
 async fn pump(
     ctx: Context,
     agent: Arc<Agent>,
-    asker: Arc<Asker>,
+    asker: Arc<dyn Answers>,
     events: mpsc::UnboundedSender<AgentEvent>,
     mut commands: mpsc::UnboundedReceiver<AgentCommand>,
 ) {
@@ -814,6 +842,117 @@ impl UserInterface for HandleFrontEnd {
     }
 }
 
+/// One driver's channel pair, made before anything that needs a sending end.
+///
+/// Whoever asks questions over the wire needs `events` before the pump exists,
+/// and the pump needs the receiving ends — so the pair is made first and handed
+/// over whole.
+pub struct Wire {
+    pub commands: mpsc::UnboundedSender<AgentCommand>,
+    pub events: mpsc::UnboundedSender<AgentEvent>,
+    command_rx: mpsc::UnboundedReceiver<AgentCommand>,
+    event_rx: mpsc::UnboundedReceiver<AgentEvent>,
+}
+
+pub fn wire() -> Wire {
+    let (commands, command_rx) = mpsc::unbounded_channel::<AgentCommand>();
+    let (events, event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+    Wire {
+        commands,
+        events,
+        command_rx,
+        event_rx,
+    }
+}
+
+/// A driver running: the handle to speak through, and the moment it hangs up.
+pub struct Driven {
+    pub handle: AgentHandle,
+    /// Resolves once the pump has stopped: the turn is over and the asker is
+    /// closed. What a front end waits on before it returns.
+    pub done: oneshot::Receiver<()>,
+}
+
+/// Create one agent and drive it through the handle protocol.
+///
+/// This is the whole of what a driver-protocol front end does, addressable on
+/// its own so that a front end living *in* the tree (the full-screen TUI) and
+/// one on the far end of a channel (a daemon, a test) run the same pump: the
+/// same steering, the same cancel that releases the asker, the same compaction
+/// and snapshot ordering behind the turn. A second driver written beside this
+/// one drifted on exactly those points, which is why there is no second one.
+///
+/// `answers` is whoever holds the questions — the handle's own [`Asker`], or a
+/// screen that draws them.
+pub fn spawn(ctx: &Context, wire: Wire, answers: Arc<dyn Answers>) -> Result<Driven, String> {
+    let Wire {
+        commands,
+        events,
+        command_rx,
+        event_rx,
+    } = wire;
+
+    // One agent, created here rather than on the first message, so the
+    // registry and any `agent/created` observer see it before the driver
+    // can send anything.
+    let agents = ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
+    let agent = agents.create(ctx);
+    ctx.emit::<AgentCreated>(&AgentInfo { id: agent.id() });
+
+    let session: Option<Arc<SessionLog>> = ctx.service::<SessionSvc>();
+    let session_id = session
+        .as_ref()
+        .map(|s| s.id().to_string())
+        .unwrap_or_default();
+    let projector = Arc::new(Mutex::new(Projector {
+        tools: ctx.service::<ToolsSvc>(),
+        ctx_window: ctx
+            .service::<LlmSvc>()
+            .map(|p| p.context_window())
+            .unwrap_or(0),
+        batch: None,
+        last_prompt_tokens: 0,
+        said_this_turn: 0,
+    }));
+
+    let out = events.clone();
+    let fold = projector.clone();
+    let stream = ctx.on_emit::<SessionEventCommitted>(move |committed: &Committed| {
+        // One handle, one conversation. A delegated child commits to its
+        // own log and this listener is above both.
+        if committed.session != session_id {
+            return;
+        }
+        let projected = fold
+            .lock()
+            .expect("projector poisoned")
+            .project(&committed.event);
+        for event in projected {
+            let _ = out.send(event);
+        }
+    });
+
+    let (done_tx, done_rx) = oneshot::channel();
+    let pump_ctx = ctx.clone();
+    let task = tokio::spawn(async move {
+        pump(pump_ctx, agent, answers, events, command_rx).await;
+        // The listener holds a clone of the sender; revoking it is what
+        // lets the event channel close, so a driver reading to the end sees
+        // the end. Dropping only the local handles would hang it forever.
+        stream.dispose();
+        let _ = done_tx.send(());
+    });
+
+    Ok(Driven {
+        handle: AgentHandle {
+            commands,
+            events: event_rx,
+            task,
+        },
+        done: done_rx,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct HandleRow {
     /// How long a question waits before it is treated as unanswered. A driver
@@ -866,11 +1005,9 @@ impl Plugin for AgentHandlePlugin {
             serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
         };
 
-        let (command_tx, command_rx) = mpsc::unbounded_channel::<AgentCommand>();
-        let (event_tx, event_rx) = mpsc::unbounded_channel::<AgentEvent>();
-
+        let wire = wire();
         let asker = Arc::new(Asker::new(
-            event_tx.clone(),
+            wire.events.clone(),
             Duration::from_secs(row.ask_timeout_secs),
         ));
         // Both asking seams, filled before anything mounts on top of them: a
@@ -890,68 +1027,13 @@ impl Plugin for AgentHandlePlugin {
             false,
         );
 
-        // One agent, created here rather than on the first message, so the
-        // registry and any `agent/created` observer see it before the driver
-        // can send anything.
-        let agents = ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
-        let agent = agents.create(ctx);
-        ctx.emit::<AgentCreated>(&AgentInfo { id: agent.id() });
-
-        let session: Option<Arc<SessionLog>> = ctx.service::<SessionSvc>();
-        let session_id = session
-            .as_ref()
-            .map(|s| s.id().to_string())
-            .unwrap_or_default();
-        let projector = Arc::new(Mutex::new(Projector {
-            tools: ctx.service::<ToolsSvc>(),
-            ctx_window: ctx
-                .service::<LlmSvc>()
-                .map(|p| p.context_window())
-                .unwrap_or(0),
-            batch: None,
-            last_prompt_tokens: 0,
-            said_this_turn: 0,
-        }));
-
-        let out = event_tx.clone();
-        let fold = projector.clone();
-        let stream = ctx.on_emit::<SessionEventCommitted>(move |committed: &Committed| {
-            // One handle, one conversation. A delegated child commits to its
-            // own log and this listener is above both.
-            if committed.session != session_id {
-                return;
-            }
-            let projected = fold
-                .lock()
-                .expect("projector poisoned")
-                .project(&committed.event);
-            for event in projected {
-                let _ = out.send(event);
-            }
-        });
-
-        let (done_tx, done_rx) = oneshot::channel();
-        let pump_ctx = ctx.clone();
-        let pump_agent = agent.clone();
-        let pump_asker = asker.clone();
-        let pump_events = event_tx.clone();
-        let task = tokio::spawn(async move {
-            pump(pump_ctx, pump_agent, pump_asker, pump_events, command_rx).await;
-            // The listener holds a clone of the sender; revoking it is what
-            // lets the event channel close, so a driver reading to the end sees
-            // the end. Dropping only the local handles would hang it forever.
-            stream.dispose();
-            let _ = done_tx.send(());
-        });
+        let initial = wire.commands.clone();
+        let Driven { handle, done } = spawn(ctx, wire, asker)?;
 
         let front = Arc::new(HandleFrontEnd {
-            handle: Mutex::new(Some(AgentHandle {
-                commands: command_tx.clone(),
-                events: event_rx,
-                task,
-            })),
-            done: Mutex::new(Some(done_rx)),
-            initial: Mutex::new(Some(command_tx)),
+            handle: Mutex::new(Some(handle)),
+            done: Mutex::new(Some(done)),
+            initial: Mutex::new(Some(initial)),
         });
         let _ = ctx
             .provide::<AgentHandleSvc>(front.clone())

@@ -7,10 +7,12 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use atomcode_harness::agent::Agent;
-use atomcode_harness::events::{AgentCreated, AgentInfo, SessionEventCommitted};
-use atomcode_harness::seams::{AgentLoopSvc, AgentsSvc, UiSvc, UserInterface, UserQuestionsSvc};
+use atomcode_harness::events::SessionEventCommitted;
+use atomcode_harness::plugins::handle::{spawn as spawn_driver, wire, Driven};
+use atomcode_harness::seams::{UiSvc, UserInterface, UserQuestionsSvc};
 use atomcode_harness::session::Committed;
+use atomcode_kernel::agent::AgentHandle;
+use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_plexus::{plexus_service, Context, Plugin};
 use serde::Deserialize;
 use serde_json::Value;
@@ -29,6 +31,36 @@ plexus_service!(ModulesSvc => Modules, "tui-modules", Core, "Mounted stream prod
 // inside this file, which is precisely why the mascot had to be a special case.
 plexus_service!(LayoutSvc => crate::layout::Layout, "tui-layout", Core, "The region tree on screen");
 plexus_service!(CommandsSvc => crate::command::Commands, "tui-commands", Core, "Slash commands contributed by rows");
+plexus_service!(AgentClientSvc => AgentClient, "tui-agent-client", Core, "The command channel to the agent this screen drives");
+
+/// The screen's end of the handle protocol.
+///
+/// Everything this UI tells the agent goes through here as an
+/// [`AgentCommand`] — the same eight the daemon, the SDK and the shipped TUI
+/// speak. The UI does not run turns, does not decide what steering means and
+/// does not order compaction behind the turn: the pump on the other end does,
+/// once, under the differential gate. This row only turns keys into commands.
+pub struct AgentClient {
+    commands: mpsc::UnboundedSender<AgentCommand>,
+}
+
+impl AgentClient {
+    pub fn send(&self, text: String) {
+        let _ = self.commands.send(AgentCommand::SendMessage {
+            text,
+            images: Vec::new(),
+        });
+    }
+    pub fn cancel(&self) {
+        let _ = self.commands.send(AgentCommand::Cancel);
+    }
+    pub fn compact(&self, focus: Option<String>) {
+        let _ = self.commands.send(AgentCommand::Compact { focus });
+    }
+    pub fn shutdown(&self) {
+        let _ = self.commands.send(AgentCommand::Shutdown);
+    }
+}
 
 /// Lines the conversation moves per wheel notch.
 ///
@@ -41,6 +73,8 @@ const WHEEL_LINES: i32 = 1;
 /// What woke the loop up.
 enum Wake {
     Fact,
+    /// The agent said something about itself — over the handle, not the log.
+    Event(AgentEvent),
     Input(Input),
     /// An action from somewhere other than a key — a command, for now.
     Act(Action),
@@ -59,13 +93,11 @@ struct Row {}
 
 /// The assembled UI. Public so a test can drive exactly what ships.
 pub struct Tui {
-    /// Whether a turn has been handed to the driver and not yet come back.
-    ///
-    /// `AgentStatus` cannot answer this: the driver sets `Working` inside the
-    /// spawned task, so two lines submitted in quick succession both see `Idle`
-    /// and both start a turn. The inbox is meant to fold the second into the
-    /// first — this flag is what lets it.
-    driving: Arc<std::sync::atomic::AtomicBool>,
+    /// The agent, driven through the handle protocol. Opened when the row
+    /// mounts so the registry sees the agent before anyone can type; taken
+    /// once, by `run`.
+    driven: Mutex<Option<Driven>>,
+    client: Mutex<Option<Arc<AgentClient>>>,
     host: Arc<Host>,
     keys: Keys,
     surface: Arc<dyn Surface>,
@@ -84,10 +116,22 @@ impl UserInterface for Tui {
     }
 
     async fn run(&self, ctx: &Context, initial: Option<String>) -> Result<(), String> {
-        let driver = ctx.require::<AgentLoopSvc>().map_err(|e| e.to_string())?;
-        let agents = ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
-        let agent = agents.create(ctx);
-        ctx.emit::<AgentCreated>(&AgentInfo { id: agent.id() });
+        let Driven { handle, done } = self
+            .driven
+            .lock()
+            .expect("driven poisoned")
+            .take()
+            .ok_or("this front end can only be run once")?;
+        let client = self
+            .client
+            .lock()
+            .expect("client poisoned")
+            .clone()
+            .ok_or("no agent client; the row was not mounted")?;
+        let AgentHandle {
+            events: mut agent_events,
+            ..
+        } = handle;
 
         let (wake_tx, mut wake) = mpsc::unbounded_channel::<Wake>();
         {
@@ -120,6 +164,19 @@ impl UserInterface for Tui {
             }
         });
 
+        // What the agent says about itself — turn boundaries, a compaction's
+        // outcome, an error — arrives over the handle. Content never does: the
+        // transcript is a fold over the log (below), and these events only
+        // move the status line and the command surface.
+        let said = wake_tx.clone();
+        let events_pump = tokio::spawn(async move {
+            while let Some(event) = agent_events.recv().await {
+                if said.send(Wake::Event(event)).is_err() {
+                    break;
+                }
+            }
+        });
+
         // Every committed fact reaches the modules here and nowhere else: the
         // screen is a fold over the log, so a resumed session and a live one
         // produce the same picture.
@@ -145,8 +202,7 @@ impl UserInterface for Tui {
         };
 
         if let Some(text) = initial {
-            agent.send(text);
-            self.spawn_turn(&driver, &agent);
+            client.send(text);
         }
 
         let mut quit = false;
@@ -163,8 +219,9 @@ impl UserInterface for Tui {
             };
             match woke {
                 Wake::Closed => quit = true,
-                Wake::Fact => self.sync_activity(&agent),
-                Wake::Act(action) => quit = self.act(action, &agent, &driver),
+                Wake::Fact => {}
+                Wake::Event(event) => self.on_event(event),
+                Wake::Act(action) => quit = self.act(action, &client),
                 Wake::Chose(chosen) => self.chose(chosen),
                 Wake::Tick => {
                     let mut m = self.host.moment.write().expect("moment poisoned");
@@ -198,11 +255,11 @@ impl UserInterface for Tui {
                         }
                     };
                     if let Some(action) = action {
-                        quit = self.act(action, &agent, &driver);
+                        quit = self.act(action, &client);
                     }
                 }
                 Wake::Input(Input::Paste(text)) => {
-                    quit = self.act(Action::Paste(text), &agent, &driver);
+                    quit = self.act(Action::Paste(text), &client);
                 }
                 // A modal has the keyboard while it is open, then the
                 // question, then the ordinary bindings. Exactly one owner at a
@@ -218,7 +275,7 @@ impl UserInterface for Tui {
                 }
                 Wake::Input(Input::Key(press)) => {
                     if let Some(action) = self.keys.resolve(press) {
-                        quit = self.act(action, &agent, &driver);
+                        quit = self.act(action, &client);
                     }
                 }
             }
@@ -226,8 +283,13 @@ impl UserInterface for Tui {
 
         reader.abort();
         asks_pump.abort();
-        // Release anything blocked on an answer that is never coming, or the
-        // turn it belongs to would never end.
+        // The pump stops the turn and closes the asker in the one order that
+        // does not deadlock, then says so. Wait for that rather than racing
+        // it — but not forever: a tool that ignores its cancel is not a reason
+        // to leave the terminal in the alternate screen.
+        client.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), done).await;
+        events_pump.abort();
         self.host.asks.refuse_all();
         self.host.overlays.close_all();
         stream.dispose();
@@ -262,64 +324,49 @@ impl Tui {
         );
     }
 
-    fn sync_activity(&self, agent: &Arc<Agent>) {
-        use atomcode_harness::agent::AgentStatus;
-        let activity = match agent.status() {
-            AgentStatus::Idle => crate::moment::Activity::Idle,
-            AgentStatus::Working => crate::moment::Activity::Working,
-            AgentStatus::Stopping => crate::moment::Activity::Stopping,
-        };
+    /// The agent's own events: they move the status line and answer the
+    /// commands that asked for something, and nothing else. Content is not
+    /// read from here — the transcript folds the log.
+    fn on_event(&self, event: AgentEvent) {
+        use crate::moment::Activity;
+        match event {
+            AgentEvent::TurnStarted => self.set_activity(Activity::Working),
+            AgentEvent::TurnComplete { .. } | AgentEvent::Cancelled => {
+                self.set_activity(Activity::Idle)
+            }
+            AgentEvent::Compacted { committed, .. } => {
+                if committed {
+                    self.say("已压缩");
+                } else {
+                    self.say("暂时没有值得压缩的");
+                }
+            }
+            AgentEvent::Error { message, .. } => {
+                self.set_activity(Activity::Idle);
+                self.say_refused(&message);
+            }
+            _ => {}
+        }
+    }
+
+    fn set_activity(&self, activity: crate::moment::Activity) {
         self.host.moment.write().expect("moment poisoned").activity = activity;
     }
 
-    /// Start a turn unless one is already running. A message that arrives while
-    /// one is in flight is claimed by that turn at its next step, which is what
-    /// steering means.
-    fn spawn_turn(&self, driver: &Arc<dyn atomcode_harness::seams::AgentLoop>, agent: &Arc<Agent>) {
-        use std::sync::atomic::Ordering;
-        if self
-            .driving
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-        let driver = driver.clone();
-        let agent = agent.clone();
-        let flag = self.driving.clone();
-        let wake = self.wake.lock().expect("wake poisoned").clone();
-        tokio::spawn(async move {
-            driver.drive(&agent).await;
-            flag.store(false, Ordering::SeqCst);
-            // Anything that arrived after the loop decided it was done starts
-            // the next turn rather than waiting for another keystroke.
-            if agent.inbox().has_waking_input()
-                && flag
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-            {
-                driver.drive(&agent).await;
-                flag.store(false, Ordering::SeqCst);
-            }
-            // The driver commits the turn's last fact and only then marks the
-            // agent idle. The loop syncs the status line on facts, so on that
-            // last one it can still read `Working` — and nothing else was
-            // going to wake it. A turn the model never answered then sat under
-            // a spinner until the next keystroke. Here the driver has returned,
-            // which is the one moment the status is known to be settled.
-            if let Some(wake) = wake {
-                let _ = wake.send(Wake::Fact);
-            }
-        });
+    fn say_refused(&self, text: &str) {
+        let mut stream = self.host.stream.write().expect("stream poisoned");
+        let mut w = stream.writer("commands");
+        w.emit(
+            crate::block::Coord::default(),
+            Arc::new(crate::content::CommandSaid {
+                text: text.to_string(),
+                refused: true,
+            }),
+        );
     }
 
     /// Apply one action. Returns `true` to quit.
-    fn act(
-        &self,
-        action: Action,
-        agent: &Arc<Agent>,
-        driver: &Arc<dyn atomcode_harness::seams::AgentLoop>,
-    ) -> bool {
+    fn act(&self, action: Action, client: &AgentClient) -> bool {
         let mut m = self.host.moment.write().expect("moment poisoned");
         // A highlight is a rectangle of screen cells. Anything that repaints
         // those cells with different text leaves it pointing at the wrong
@@ -366,10 +413,9 @@ impl Tui {
                     self.run_command(&text);
                     return false;
                 }
-                // Straight to the inbox: a line typed during a turn folds into
-                // the turn already running rather than queueing.
-                agent.send(text);
-                self.spawn_turn(driver, agent);
+                // One command. Whether it starts a turn or folds into the one
+                // running is the pump's call, not the screen's.
+                client.send(text);
                 return false;
             }
             Action::Insert(c) => {
@@ -443,8 +489,9 @@ impl Tui {
                 m.caret = at + text.len();
             }
             Action::Cancel => {
+                m.activity = crate::moment::Activity::Stopping;
                 drop(m);
-                agent.cancel();
+                client.cancel();
                 return false;
             }
             Action::Scroll(by) => {
@@ -557,8 +604,9 @@ impl Tui {
                     m.caret = 0;
                     return false;
                 }
+                m.activity = crate::moment::Activity::Stopping;
                 drop(m);
-                agent.cancel();
+                client.cancel();
                 return false;
             }
             Action::Newline => {
@@ -955,7 +1003,8 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
     (
         host.clone(),
         Tui {
-            driving: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            driven: Mutex::new(None),
+            client: Mutex::new(None),
             host,
             keys,
             surface,
@@ -976,12 +1025,17 @@ impl Plugin for TuiUiPlugin {
     fn inject(&self) -> &'static [&'static str] {
         &["agents", "agent-loop", "sessions", "surface"]
     }
+    fn uses(&self) -> &'static [&'static str] {
+        // What the pump's projection reads, resolved live.
+        &["tools", "llm", "compaction"]
+    }
     fn provides(&self) -> &'static [&'static str] {
         // It owns the screen, so it is the one that can ask. The registries it
         // provides are filled by other rows — this row supplies the slots, not
         // the contents.
         &[
             "ui",
+            "tui-agent-client",
             "tui-modules",
             "tui-commands",
             "tui-layout",
@@ -1019,6 +1073,19 @@ impl Plugin for TuiUiPlugin {
             .provide::<UserQuestionsSvc>(Arc::new(crate::ask::ScreenQuestions::new(
                 host.asks.clone(),
             )))
+            .map_err(|e| e.to_string())?;
+
+        // The agent, behind the same pump every other driver uses. The screen
+        // holds the questions, so it is what the pump releases on cancel.
+        let wire = wire();
+        let client = Arc::new(AgentClient {
+            commands: wire.commands.clone(),
+        });
+        let driven = spawn_driver(ctx, wire, host.asks.clone())?;
+        *tui.driven.lock().expect("driven poisoned") = Some(driven);
+        *tui.client.lock().expect("client poisoned") = Some(client.clone());
+        let _ = ctx
+            .provide::<AgentClientSvc>(client)
             .map_err(|e| e.to_string())?;
 
         // The third way into the layout: the model. Perception is a prompt

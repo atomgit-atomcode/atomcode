@@ -115,6 +115,21 @@ impl Asks {
     }
 }
 
+/// The pump's view of the screen's questions. Answers never arrive over the
+/// wire here — the person answers on screen — so `answer` has nothing to
+/// route; what the pump needs is the release on cancel and shutdown.
+impl atomcode_harness::plugins::handle::Answers for Asks {
+    fn answer(&self, _id: u64, _value: serde_json::Value) -> bool {
+        false
+    }
+    fn refuse_all(&self) {
+        Asks::refuse_all(self)
+    }
+    fn close(&self) {
+        Asks::refuse_all(self)
+    }
+}
+
 /// Fills `user-questions` by putting the question on the screen.
 pub struct ScreenQuestions {
     asks: Arc<Asks>,
