@@ -778,7 +778,7 @@ impl Tui {
                     "鼠标已收回:拖动选中并复制,点击思考或工具调用折叠展开那一个,滚轮滚动,esc 取消选中"
                         .to_string()
                 } else {
-                    "鼠标已交还终端:改用终端自己的框选(可跨 scrollback)。折叠用 ctrl-t/ctrl-r,滚动用 pgup/pgdn,ctrl-o 收回鼠标"
+                    "鼠标已交还终端:改用终端自己的框选(可跨 scrollback)。折叠用 ctrl-t,思考用 ctrl-r(默认不显示),滚动用 pgup/pgdn,ctrl-o 收回鼠标"
                         .to_string()
                 };
                 self.say(&text);

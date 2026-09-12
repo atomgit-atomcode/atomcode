@@ -21,7 +21,7 @@ const SCREEN: &[Command] = &[
     Command::new("quit", "退出"),
     Command::new("exit", "退出"),
     Command::new("clear", "清空输入行"),
-    Command::new("reasoning", "展开或折叠模型的思考"),
+    Command::new("reasoning", "思考:一行、全文、收起,循环"),
     Command::new("tools", "展开或折叠工具调用的结果"),
     Command::new("mascot", "显示或隐藏吉祥物"),
     Command::new("mouse", "把鼠标交还终端,或收回来"),
@@ -49,7 +49,7 @@ impl CommandSet for ScreenCommands {
                  esc 依次:取消选中 -> 清空输入 -> 停止当轮 · ctrl-c 直接停止当轮\n\
                  上/下 在输入里移动游标,到头则翻历史 · 点击输入框定位游标\n\
                  pgup/pgdn 与滚轮滚动对话\n\
-                 ctrl-r 折叠思考 · ctrl-t 折叠工具 · ctrl-n 吉祥物 · ctrl-l 重画屏幕\n\
+                 ctrl-r 思考(一行/全文/收起,循环) · ctrl-t 折叠工具 · ctrl-n 吉祥物 · ctrl-l 重画屏幕\n\
                  拖动选中并复制 · esc 取消选中 · 点击思考或工具调用折叠展开那一个\n\
                  ctrl-o 把鼠标交还终端(改用终端自己的框选)"
                     .into(),

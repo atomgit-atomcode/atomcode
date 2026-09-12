@@ -16,11 +16,46 @@ use crate::module::{Height, Modules};
 use crate::moment::Moment;
 use crate::region::Region;
 
-/// Which blocks are shown how. Kept here, keyed by id, rather than on the block
-/// — which is what makes "folding does not change content" structural.
+/// How a kind of block is shown.
+///
+/// Three states, not two. `Folded` is a lid: one row standing in for the whole
+/// block, which is the only "off" there used to be. `Hidden` draws nothing at
+/// all — the block is still in the stream, still in the content hashes, still
+/// saying exactly what it said; it is simply not on the screen.
+///
+/// The difference is a row. A reader who is not reading the working does not
+/// want a `◐ 思考 7 行` lid between every call telling them how much working
+/// there is that they are not reading.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Showing {
+    /// Drawn in full.
+    #[default]
+    Open,
+    /// One row standing in for the whole block.
+    Folded,
+    /// Not drawn at all.
+    Hidden,
+}
+
+/// The kinds a reader may take off the screen entirely.
+///
+/// Reasoning, and nothing else. It is the working rather than the answer — the
+/// one thing the model produces that a person may reasonably want gone once
+/// they have read it — and it opens hidden for that reason. Everything else on
+/// the stream is content: what was asked, what was answered, what a tool
+/// returned. Putting a lid over those is a different decision, and `ctrl-t`
+/// already makes it.
+///
+/// A list rather than a flag on the block, for the same reason [`CLICKABLE`] is
+/// one: it is about what the screen does, not about what the block is.
+const HIDEABLE: [&str; 1] = ["reasoning"];
+
+/// Which blocks are shown how. Kept here, keyed by kind, rather than on the
+/// block — which is what makes "folding does not change content" structural.
 #[derive(Default)]
 pub struct Presentation {
-    folded_kinds: Vec<&'static str>,
+    /// How each kind is shown right now. A kind nobody has touched is `Open`.
+    by_kind: Vec<(&'static str, Showing)>,
     /// Blocks folded or unfolded by hand, overriding the default for their
     /// kind.
     ///
@@ -28,48 +63,92 @@ pub struct Presentation {
     /// call in the transcript because one was clicked is a different gesture,
     /// and it already has a key (ctrl-t) — a click that did it would be a click
     /// that changed six other things the person was looking at.
-    by_block: std::collections::HashMap<crate::block::BlockId, bool>,
+    by_block: std::collections::HashMap<BlockId, bool>,
 }
 
 impl Presentation {
-    /// Kinds shown as one line unless expanded. Reasoning and tool calls are
-    /// folded by default because a transcript is read for the answer, not for
-    /// the working.
+    /// How the screen opens: reasoning away, tool calls behind a lid.
+    ///
+    /// Both are the working rather than the answer, and a transcript is read for
+    /// the answer. Tool calls keep a lid where reasoning does not, because
+    /// *what was run* is part of that answer: someone glancing at a transcript
+    /// wants to know that a file was read, not what the model was thinking
+    /// while it read it.
     pub fn default_folds() -> Self {
         Self {
-            folded_kinds: vec!["reasoning", "tool_call"],
+            by_kind: vec![
+                ("reasoning", Showing::Hidden),
+                ("tool_call", Showing::Folded),
+            ],
             by_block: std::collections::HashMap::new(),
         }
     }
+
+    /// How this kind is shown now.
+    pub fn showing(&self, kind: &str) -> Showing {
+        self.by_kind
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, s)| *s)
+            .unwrap_or_default()
+    }
+
+    fn set(&mut self, kind: &'static str, to: Showing) {
+        match self.by_kind.iter_mut().find(|(k, _)| *k == kind) {
+            Some(entry) => entry.1 = to,
+            None => self.by_kind.push((kind, to)),
+        }
+    }
+
     pub fn is_folded(&self, kind: &str) -> bool {
-        self.folded_kinds.contains(&kind)
+        self.showing(kind) == Showing::Folded
+    }
+
+    /// Whether this kind draws nothing at all.
+    pub fn is_hidden(&self, kind: &str) -> bool {
+        self.showing(kind) == Showing::Hidden
     }
 
     /// Whether one block is folded: what the person said about it, or failing
     /// that what its kind says.
-    pub fn is_block_folded(&self, id: crate::block::BlockId, kind: &str) -> bool {
+    ///
+    /// Hiding is not asked here. A block that draws nothing has no row to fold,
+    /// and both the painter and the height check [`is_hidden`] before they get
+    /// this far.
+    ///
+    /// [`is_hidden`]: Self::is_hidden
+    pub fn is_block_folded(&self, id: BlockId, kind: &str) -> bool {
         match self.by_block.get(&id) {
             Some(folded) => *folded,
             None => self.is_folded(kind),
         }
     }
 
-    /// Fold or unfold every block of a kind. The keyboard gesture.
+    /// Show more of every block of a kind, or put it away again. The keyboard
+    /// gesture and the slash command, one implementation called once.
+    ///
+    /// The cycle is `Hidden → Folded → Open → Hidden` for a kind that may be
+    /// hidden, and `Folded → Open → Folded` for one that may not: each press
+    /// reveals one step more and the last puts it back where it started. That
+    /// order is what makes a press on reasoning mean "show me" — the first
+    /// thing it hands over is the lid, which says how much there is before
+    /// anybody spends a screenful reading it.
     ///
     /// Per-block choices are dropped, because otherwise "unfold everything"
     /// would visibly not unfold everything.
     pub fn toggle(&mut self, kind: &'static str) {
-        match self.folded_kinds.iter().position(|k| *k == kind) {
-            Some(i) => {
-                self.folded_kinds.remove(i);
-            }
-            None => self.folded_kinds.push(kind),
-        }
+        let next = match self.showing(kind) {
+            Showing::Hidden => Showing::Folded,
+            Showing::Folded => Showing::Open,
+            Showing::Open if HIDEABLE.contains(&kind) => Showing::Hidden,
+            Showing::Open => Showing::Folded,
+        };
+        self.set(kind, next);
         self.by_block.clear();
     }
 
     /// Fold or unfold one block. The pointing gesture.
-    pub fn toggle_block(&mut self, id: crate::block::BlockId, kind: &str) {
+    pub fn toggle_block(&mut self, id: BlockId, kind: &str) {
         let folded = self.is_block_folded(id, kind);
         self.by_block.insert(id, !folded);
     }
@@ -317,9 +396,17 @@ impl Host {
         for slot in stream.slots().iter().rev() {
             let block = slot.block();
             let kind = block.kind();
-            // Two different questions. Reasoning folds — that is what ctrl-r
-            // is — but it is not a click target, because it is something the
-            // model said and most of the screen is things the model said.
+            // A kind the reader has taken off the screen draws nothing at all —
+            // not even the blank row, because it is not a neighbour of anything
+            // either. Asked before the `below` bookkeeping, so a hidden block
+            // leaves the seam between its visible neighbours the way it was.
+            if pres.is_hidden(kind) {
+                continue;
+            }
+            // Two different questions. Reasoning and tool calls both fold — that
+            // is what ctrl-r and ctrl-t are — but what a click may fold is
+            // narrower than what folds: prose is out, because it is what the
+            // transcript is for and most of the screen is things the model said.
             let foldable = !block.content.always_open();
             let clickable = foldable && CLICKABLE.contains(&kind);
             let mut lines = if foldable && pres.is_block_folded(block.id, kind) {
@@ -525,10 +612,14 @@ impl Host {
 
     /// How many rendered lines the stream currently holds, for scroll bounds.
     ///
-    /// The blanks between blocks are rows like any other: [`stream_lines`] puts
-    /// them on screen, so they are counted here. Skip one and the last few rows
+    /// Every row the painter draws is counted here, and no others: the blanks
+    /// between blocks, and — the same question asked the same way — a kind the
+    /// reader has hidden, which the painter skips and this therefore skips too.
+    /// Get one wrong in either direction and the scroll is measured against a
+    /// screen that never existed: count a row nobody drew and the last few rows
     /// of a long transcript can never be scrolled to, because the limit is this
-    /// number minus the height of the window.
+    /// number minus the height of the window; miss one that was drawn and the
+    /// top goes out of reach the same way.
     ///
     /// [`stream_lines`]: Self::stream_lines
     pub fn stream_height(&self, width: u16) -> usize {
@@ -538,6 +629,11 @@ impl Host {
         let mut below: Option<&'static str> = None;
         for slot in stream.slots() {
             let b = slot.block();
+            // What is not drawn is not a row of the transcript — and by the same
+            // token it is not a neighbour, so the blanks around it stay put.
+            if pres.is_hidden(b.kind()) {
+                continue;
+            }
             let n = if !b.content.always_open() && pres.is_block_folded(b.id, b.kind()) {
                 1
             } else {
@@ -1028,8 +1124,13 @@ mod tests {
         // it is the largest surface on the screen, and folding away the answer
         // someone was reading is the one gesture that can lose work. A thought
         // or a tool call is a one-line lid, and a click on a lid has one meaning.
+        //
+        // A lid, specifically — not a hidden block. Reasoning opens off the
+        // screen now, so this asks for its lid first: a click can only land on
+        // something that has a row to land on.
         let h = fed();
         let size = (80, 40);
+        h.presentation.write().unwrap().toggle("reasoning");
         let frame = h.compose(size);
         let rect = frame.part("stream").unwrap().rect;
         let kinds: Vec<&str> = (rect.y..rect.bottom())
@@ -1053,11 +1154,15 @@ mod tests {
 
     #[test]
     fn clicking_a_thought_opens_that_thought() {
-        // The gesture that used to be missing: ctrl-r unfolds every thought in
-        // the transcript at once, and the folded row — the thing being pointed
-        // at — answered nothing. Clicking the lid opens the lid.
+        // The gesture that used to be missing: ctrl-r moves every thought in the
+        // transcript at once, and the lid — the thing being pointed at —
+        // answered nothing. Clicking the lid opens the lid.
+        //
+        // Reasoning opens off the screen, so the lid is asked for first: one
+        // press of ctrl-r, which is the state that has a row to point at.
         let h = fed();
         let size = (80, 40);
+        h.presentation.write().unwrap().toggle("reasoning");
         let folded = h.compose(size).rows().join("\n");
         assert!(folded.contains("思考"), "folded to a summary:\n{folded}");
         assert!(!folded.contains("hmm"), "the words are hidden, not gone");
@@ -1299,11 +1404,16 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_is_folded_by_default_and_expands_without_changing_content() {
+    fn reasoning_is_off_the_screen_by_default_and_the_key_brings_it_back() {
+        // The reasoning channel is the working, not the answer. A lid between
+        // every call — `◐ 思考 7 行` — is a row spent telling someone who is not
+        // reading the working how much working there is that they are not
+        // reading. So it opens off the screen, and ctrl-r (or `/reasoning`)
+        // brings it back: a lid, then the whole thought, then away again.
         let h = fed();
-        let folded = h.compose((80, 40)).rows().join("\n");
-        assert!(folded.contains("思考"), "folded to a summary");
-        assert!(!folded.contains("hmm"), "the words are hidden, not gone");
+        let away = h.compose((80, 40)).rows().join("\n");
+        assert!(!away.contains("思考"), "a lid is on screen:\n{away}");
+        assert!(!away.contains("hmm"), "and the words with it");
 
         let hashes_before: Vec<_> = h
             .stream
@@ -1313,12 +1423,68 @@ mod tests {
             .into_iter()
             .collect();
         h.presentation.write().unwrap().toggle("reasoning");
+        let lid = h.compose((80, 40)).rows().join("\n");
+        assert!(
+            lid.contains("思考"),
+            "the key did not bring it back:\n{lid}"
+        );
+        assert!(!lid.contains("hmm"), "and did not spend the screen yet");
+
+        h.presentation.write().unwrap().toggle("reasoning");
         let open = h.compose((80, 40)).rows().join("\n");
         assert!(open.contains("hmm"), "expanding shows them");
         assert_eq!(
             h.stream.read().unwrap().settled_hashes(),
             hashes_before,
             "presentation changed; content did not"
+        );
+
+        // And round again. A key that can bring this back is only half a key if
+        // it cannot put it away: reasoning is the one kind a reader may take off
+        // the screen, and this is the only way back to that.
+        h.presentation.write().unwrap().toggle("reasoning");
+        assert_eq!(
+            h.compose((80, 40)).rows().join("\n"),
+            away,
+            "the cycle does not come back round"
+        );
+    }
+
+    #[test]
+    fn a_hidden_kind_is_a_row_the_scroll_does_not_count() {
+        // The blanks test with the sign flipped, and the same failure behind it:
+        // the painter skipping a block is only half of that decision. If the
+        // height goes on counting rows of a block nobody drew, the top of the
+        // transcript sits one row further away than the screen has rows, and
+        // scrolling to the limit walks the first thing said off the top.
+        let h = fed();
+        let size = (80, 12);
+        let at_limit = |h: &Host| -> Vec<String> {
+            let m = Moment::default();
+            h.moment.write().unwrap().scroll = crate::moment::ScrollPos(h.scroll_limit(size, &m));
+            h.compose(size)
+                .part("stream")
+                .expect("the conversation")
+                .lines
+                .iter()
+                .map(|l| l.plain())
+                .collect()
+        };
+
+        let away = at_limit(&h);
+        assert!(
+            away.iter().any(|r| r.contains("fix the build")),
+            "hidden: scrolled to the limit and the first thing said is gone: {away:?}"
+        );
+
+        // And the same with it back on screen. The count has to be the painter's
+        // in either state — one of the two is otherwise measured against a
+        // screen that is not the one in front of anybody.
+        h.presentation.write().unwrap().toggle("reasoning");
+        let lid = at_limit(&h);
+        assert!(
+            lid.iter().any(|r| r.contains("fix the build")),
+            "shown: scrolled to the limit and the first thing said is gone: {lid:?}"
         );
     }
 

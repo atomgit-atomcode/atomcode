@@ -242,7 +242,7 @@ KEYS
     esc          back out one layer: the selection, then what you typed,
                  then the turn.  ctrl-c always stops the turn.
     ctrl-d       quit            ctrl-u         clear the line
-    ctrl-w       delete a word   ctrl-r         fold or unfold reasoning
+    ctrl-w       delete a word   ctrl-r         reasoning: one line, full, off
     ctrl-t       fold tool calls ctrl-n         show or hide the mascot
     ctrl-o       hand the mouse back to the terminal
     ctrl-l       repaint everything (for when something else wrote here)
@@ -256,7 +256,8 @@ MOUSE
     selection is copied to the clipboard on release
     (OSC 52, so it works over ssh and tmux) and esc clears it. Click a tool
     call or a thought to fold or unfold that one — ctrl-t and ctrl-r still do
-    every one at once, and a click on prose does nothing.
+    every one at once, and a click on prose does nothing. Reasoning arrives
+    hidden, so ctrl-r is what puts a row there to click.
     The wheel scrolls the conversation.
 
     ctrl-o (or /mouse) hands the pointer back to the terminal, for when you

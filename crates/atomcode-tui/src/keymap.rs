@@ -59,7 +59,9 @@ pub enum Action {
     CopySelection,
     /// Drop it.
     ClearSelection,
-    /// Fold or unfold every block of a kind.
+    /// Show more of every block of a kind, or put it away again: a one-line
+    /// lid, then the whole thing, then — for a kind that may be hidden — off
+    /// the screen.
     ToggleFold(&'static str),
     /// Show or hide a module.
     ToggleModule(&'static str),
