@@ -1,12 +1,13 @@
 //! The live line: what this turn is doing, for how long, and for how much.
 //!
 //! One row above the composer, drawn only while a turn is in flight — with a
-//! blank row on either side, so it is welded neither to the words above nor to
-//! the field's rule. It answers a question the conversation cannot: a block
-//! that has not arrived yet is not on screen, and the status line says where the
-//! session is, not what it is doing this second — so a turn that is thinking,
-//! or waiting on a model that has gone quiet, looks like a turn that has
-//! finished.
+//! blank row above it, so it is welded neither to the words above nor to the
+//! field's rule: the reserved row the composer keeps under it (`modules::tip`)
+//! is blank and there either way, so it does not need a margin of its own. It
+//! answers a question the conversation cannot: a block that has not arrived yet
+//! is not on screen, and the status line says where the session is, not what it
+//! is doing this second — so a turn that is thinking, or waiting on a model that
+//! has gone quiet, looks like a turn that has finished.
 //!
 //! Two sources, and the split is the point:
 //!
@@ -186,10 +187,16 @@ impl View for Live {
         }
 
         // The margin, only when the rect can hold it: at a height that cannot
-        // seat the blank rows as well as the words, the words win and the line
+        // seat the blank row as well as the words, the words win and the line
         // closes back onto its neighbours. The host clips to `height`, so
         // emitting a blank row it would keep in place of the words is the one
         // way this could draw a live line that says nothing.
+        //
+        // Above the words only. Under them is the reserved row the composer
+        // keeps (`modules::tip`) — blank, and there whether or not this line is
+        // mounted — so a margin below would be a second row of nothing between
+        // the words and the field's rule, and the two rows would disagree the
+        // day a tip is written into one of them.
         let margin = if vp.rect.h >= ROWS {
             MARGIN as usize
         } else {
@@ -200,9 +207,6 @@ impl View for Live {
             out.push(Line::empty());
         }
         out.extend(El::row(row).lay(w));
-        for _ in 0..margin {
-            out.push(Line::empty());
-        }
         out
     }
 
@@ -228,19 +232,25 @@ impl View for Live {
     }
 }
 
-/// Blank rows above and below the line while a turn is in flight — the padding
-/// that keeps it off the prose above and off the field's rule.
+/// The blank row above the line while a turn is in flight — the padding that
+/// keeps it off the prose.
+///
+/// Above only: under the line is the composer's [reserved row](super::tip),
+/// which is blank and is there whether or not this line is mounted. A margin
+/// below would be a second row of nothing between the words and the field's
+/// rule, and the two would disagree the day a tip is written into the copy that
+/// is not this module's.
 ///
 /// The margin is the module's rather than the composer's, and the reason is the
 /// one the composer's own comment gives: a `gap` on that flex is counted between
 /// its children whether or not this one is mounted, so between turns the
 /// composer would be standing on a blank row — the chrome this module exists to
-/// not be. Asked for here, the blank rows arrive and leave with the line they
-/// belong to, in `height`, from the same predicate `render` draws from.
+/// not be. Asked for here, the blank row arrives and leaves with the line it
+/// belongs to, in `height`, from the same predicate `render` draws from.
 const MARGIN: u16 = 1;
 
-/// What the line asks for in total: the words with the margin either side.
-const ROWS: u16 = 1 + 2 * MARGIN;
+/// What the line asks for in total: the blank row above and the words.
+const ROWS: u16 = 1 + MARGIN;
 
 /// What the line says is happening, or `None` when nothing is.
 ///
@@ -483,31 +493,35 @@ mod tests {
     #[test]
     fn the_margin_arrives_with_the_line_and_leaves_with_it() {
         // `ROWS` is the module's answer, and this is what makes it the module's
-        // business: the blank rows are drawn exactly when the words are, so the
+        // business: the blank row is drawn exactly when the words are, so the
         // composer never stands on one between turns.
         let state = fold(&a_turn());
         let mut moment = Moment::default().working().at_tick(0);
         moment.now = Timestamp::millis(3_000);
         moment.turn_started = Some(Timestamp::millis(0));
 
-        let rows = draw(&state, &moment, 80, 3);
-        assert_eq!(rows.len(), 3, "{rows:?}");
+        let rows = draw(&state, &moment, 80, 2);
+        assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0], "", "a blank row above, not welded to the prose");
-        assert_eq!(rows[2], "", "and below, off the field's rule");
-        assert!(rows[1].contains("正在等待模型"), "{rows:?}");
+        assert!(
+            rows[1].contains("正在等待模型"),
+            "and the words last: what is under them is the composer's reserved \
+             row, not this module's margin, so there is no row of its own to \
+             give back below: {rows:?}"
+        );
 
         // A rect that cannot seat the margin keeps the words and drops the
-        // blank rows. The host clips to `height`, so asking for a blank row
+        // blank row. The host clips to `height`, so asking for a blank row
         // first would leave a live line that says nothing.
         let short = draw(&state, &moment, 80, 1);
         assert_eq!(short.len(), 1, "{short:?}");
         assert!(short[0].contains("正在等待模型"), "{short:?}");
 
-        // And the height it asks for is the rect it then fills: three while a
-        // turn is in flight, none otherwise.
+        // And the height it asks for is the rect it then fills: the row above
+        // and the words while a turn is in flight, none otherwise.
         assert_eq!(
             Live::height(&state, &moment, 80),
-            Height::Hug(3),
+            Height::Hug(2),
             "the margin is asked for, not seized"
         );
     }

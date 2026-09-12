@@ -34,7 +34,7 @@ use serde_json::Value;
 use crate::command::Commands;
 use crate::layout::{LayoutOp, Side};
 use crate::module::{Modules, Mounted, Producer};
-use crate::modules::{input, live, status, team, todo, transcript};
+use crate::modules::{input, live, status, team, tip, todo, transcript};
 use crate::plugin::{CommandsSvc, LayoutSvc, ModulesSvc};
 
 /// The screen, panel by panel — the one place that says what a full UI is made
@@ -58,6 +58,13 @@ name = "tui-panel-status"
 # the composer closes up around the field.
 [[insert]]
 name = "tui-panel-live"
+
+# The reserved row directly above the field, kept whether or not it has anything
+# to say. On by default and placed by `host::composer` with the live line above
+# it, for the same reason: it is part of the composer, and `Show` names neither
+# side of the input box. Removing it gives the row back to the conversation.
+[[insert]]
+name = "tui-panel-tip"
 
 [[insert]]
 name = "tui-panel-input"
@@ -112,6 +119,7 @@ pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
         Arc::new(TranscriptPanel),
         Arc::new(StatusPanel),
         Arc::new(LivePanel),
+        Arc::new(TipPanel),
         Arc::new(InputPanel),
         Arc::new(MascotPanel),
         Arc::new(TeamPanel),
@@ -179,6 +187,16 @@ panel!(
     "tui-panel-live",
     live::Live,
     "the live line above the composer: what this turn is doing, for how long, and for how much"
+);
+// The reserved row: the second panel whose row mounts it and says nothing about
+// where it goes. It belongs against the field, between the live line and the top
+// rule, which is `host::composer`'s to write for the same reason the live line's
+// is — `LayoutOp::Show` has two sides and neither is the side of the input box.
+panel!(
+    TipPanel,
+    "tui-panel-tip",
+    tip::Tip,
+    "the reserved row above the field: right-aligned tips, blank most of the time"
 );
 
 /// The transcript is a *stream producer*, not a view: it has history, and its

@@ -539,7 +539,7 @@ fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16
         .unwrap_or(1)
 }
 
-/// The composer: the live line above the field.
+/// The composer: the live line and the reserved tip row above the field.
 ///
 /// One definition, because every arrangement that has an input has this above
 /// it — the input box is where a person's eyes are, and the one thing that
@@ -551,12 +551,17 @@ fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16
 /// conversation and below the status bar, and both are the wrong side of the
 /// input box.
 ///
-/// Both children are `Hug`-ish: the live line asks for no rows between turns, so
-/// the composer closes up around the field instead of standing on a blank row.
+/// The live line is `Hug`-ish: it asks for no rows between turns, so the
+/// composer closes up around the field instead of standing on a blank row. The
+/// tip row beneath it is the deliberate exception — it asks for its row always,
+/// which is why a tip can never move the box out from under a hand reaching for
+/// it. See `modules::tip`.
 ///
-/// The blank row on either side of the live line is the line's own for that same
-/// reason: a `gap` on this flex is counted between the children whether or not
-/// the line is mounted, so the margin would outlive the thing it spaces out.
+/// The blank row above the live line is the line's own for that same reason: a
+/// `gap` on this flex is counted between the children whether or not the line is
+/// mounted, so the margin would outlive the thing it spaces out. It is above
+/// only — under the line sits the reserved row, which is not a margin and is
+/// drawn whether or not there is a line to space off.
 pub fn composer() -> Region {
     use crate::el::Item;
     use crate::region::Dir;
@@ -564,6 +569,7 @@ pub fn composer() -> Region {
         Dir::Vertical,
         vec![
             Item::hug(Region::view(crate::modules::live::ID)),
+            Item::hug(Region::view(crate::modules::tip::ID)),
             Item::grow(Region::view(crate::modules::input::ID)),
         ],
     )
@@ -667,13 +673,15 @@ mod tests {
         );
         // The composer is anchored to the bottom, so the rows it grows into come
         // off the conversation above it: the field does not move, and the stream
-        // hands over the live line and the blank row on either side of it —
-        // which is what keeps it off the words above and off the field's rule.
+        // hands over the live line and the blank row above it — which is what
+        // keeps it off the words above. Under the line there is nothing of this
+        // module's to give back: the composer's reserved row is what separates
+        // it from the field's rule, and it is there in either case.
         assert_eq!(field, field_at_rest, "the field does not move");
         assert_eq!(
             running.part("stream").expect("the conversation").rect.h,
-            at_rest.part("stream").expect("the conversation").rect.h - 3,
-            "and what it costs is the line and its margin"
+            at_rest.part("stream").expect("the conversation").rect.h - 2,
+            "and what it costs is the line and the row above it"
         );
         let said: String = line.lines.iter().map(|l| l.plain()).collect();
         assert!(said.contains("正在等待模型"), "{said}");
@@ -692,6 +700,74 @@ mod tests {
             removed.part("input").expect("the field").rect,
             field_at_rest,
             "a composer of one is the field"
+        );
+    }
+
+    #[test]
+    fn the_reserved_row_is_kept_and_a_tip_can_never_move_the_box() {
+        use crate::modules::{live, tip};
+        let mods = Arc::new(Modules::new());
+        mods.add_producer(transcript::Transcript::new()).unwrap();
+        mods.add_view(Arc::new(Mounted::<live::Live>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<tip::Tip>::new())).unwrap();
+        mods.add_view(Arc::new(Mounted::<input::Input>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<status::Status>::new()))
+            .unwrap();
+        let h = Host::new(mods, default_layout());
+
+        // The deliberate opposite of the live line: this row is there between
+        // turns as well. That is what the module exists for — a tip that pushed
+        // the box down as it appeared would move the field out from under a
+        // hand already on its way to it.
+        let idle = h.compose((60, 12));
+        let tip_row = idle.part("tip").expect("the reserved row");
+        let field = idle.part("input").expect("the field").rect;
+        assert_eq!(tip_row.rect.h, 1, "one row, asked for unconditionally");
+        assert_eq!(
+            tip_row.rect.y + tip_row.rect.h,
+            field.y,
+            "directly above the field, not adrift"
+        );
+        assert!(
+            tip_row.lines.iter().all(|l| l.plain().trim().is_empty()),
+            "blank until something writes one: {:?}",
+            tip_row.lines.iter().map(|l| l.plain()).collect::<Vec<_>>()
+        );
+
+        // A turn in flight takes its rows off the conversation above, not from
+        // here: the live line and this row do not compete for the same row, and
+        // the field sits still either way.
+        h.absorb(&SessionEvent::TurnStart { turn: 1 });
+        h.moment.write().unwrap().activity = crate::moment::Activity::Working;
+        let running = h.compose((60, 12));
+        assert!(running.part("live").is_some(), "the line is up this turn");
+        assert_eq!(
+            running.part("input").expect("the field").rect,
+            field,
+            "the box does not move when a tip's neighbours come and go"
+        );
+        assert_eq!(
+            running.part("tip").expect("the row").rect.y + 1,
+            field.y,
+            "and the row is still the one against the field"
+        );
+
+        // `[[remove]] id = "tui-panel-tip"`: the composer closes up, and the row
+        // goes back to the conversation rather than being left as a blank line.
+        h.modules.remove_view("tip");
+        let removed = h.compose((60, 12));
+        assert!(removed.part("tip").is_none());
+        assert_eq!(
+            removed.part("input").expect("the field").rect,
+            field,
+            "the field does not move"
+        );
+        assert_eq!(
+            removed.part("stream").expect("the conversation").rect.h,
+            running.part("stream").expect("the conversation").rect.h + 1,
+            "and the row is handed back to the words"
         );
     }
 
