@@ -93,6 +93,26 @@ impl Presentation {
 /// moves is still a selection, and ctrl-r still does them all at once.
 const CLICKABLE: [&str; 2] = ["tool_call", "reasoning"];
 
+/// Whether a blank row goes between two blocks stacked next to each other.
+///
+/// A tool call is its own paragraph. Without a row between them the model's
+/// prose runs straight into the `●` header and the two read as one wall — the
+/// sentence and the thing that was run at the same level. One blank row is the
+/// whole of the fix, and it goes on *both* sides of a call, because
+/// `⎿ ok · 12 行` followed by the next sentence has the same problem the other
+/// way round.
+///
+/// Nothing goes between two tool calls. A run of them is one thought, and a
+/// screen of six calls separated by five gaps is a screen that no longer shows
+/// what was done in one glance.
+///
+/// One definition, consulted by both the painter and the height the scroll is
+/// measured against — the two have to agree or the last rows of a long
+/// transcript become unreachable.
+fn blank_between(a: &str, b: &str) -> bool {
+    (a == "tool_call") != (b == "tool_call")
+}
+
 /// Which block each row of the stream came from, and where the stream was.
 ///
 /// Composing is where this is known and clicking is where it is needed, so the
@@ -288,20 +308,42 @@ impl Host {
         let mut skipped = 0usize;
         let _ = &skipped;
 
+        // The kind of the block whose rows went in last, which — iterating
+        // newest-first — is the one *below* the block being rendered now. Only
+        // blocks that drew something count: a block that renders no rows is not
+        // a neighbour, whatever its kind says.
+        let mut below: Option<&'static str> = None;
+
         for slot in stream.slots().iter().rev() {
             let block = slot.block();
+            let kind = block.kind();
             // Two different questions. Reasoning folds — that is what ctrl-r
             // is — but it is not a click target, because it is something the
             // model said and most of the screen is things the model said.
             let foldable = !block.content.always_open();
-            let clickable = foldable && CLICKABLE.contains(&block.kind());
-            let mut lines = if foldable && pres.is_block_folded(block.id, block.kind()) {
+            let clickable = foldable && CLICKABLE.contains(&kind);
+            let mut lines = if foldable && pres.is_block_folded(block.id, kind) {
                 vec![block.content.summary(rect.w)]
             } else {
                 block.content.lines(rect.w)
             };
             if lines.is_empty() {
                 continue;
+            }
+            let blank = below.is_some_and(|b| blank_between(b, kind));
+            below = Some(kind);
+            // The blank belongs to the seam between this block and the one
+            // below it, so it goes into the buffer first: rows go in
+            // bottom-to-top, and a row pushed before this block's own rows ends
+            // up between the two. It belongs to nobody — a click there folds
+            // nothing.
+            if blank && out.len() < want {
+                if skipped < scroll {
+                    skipped += 1;
+                } else {
+                    out.push(Line::empty());
+                    owner.push(None);
+                }
             }
             lines.reverse();
             for line in lines {
@@ -313,7 +355,7 @@ impl Host {
                     break;
                 }
                 out.push(line);
-                owner.push(clickable.then_some((block.id, block.kind())));
+                owner.push(clickable.then_some((block.id, kind)));
             }
             if out.len() >= want {
                 break;
@@ -482,21 +524,35 @@ impl Host {
     }
 
     /// How many rendered lines the stream currently holds, for scroll bounds.
+    ///
+    /// The blanks between blocks are rows like any other: [`stream_lines`] puts
+    /// them on screen, so they are counted here. Skip one and the last few rows
+    /// of a long transcript can never be scrolled to, because the limit is this
+    /// number minus the height of the window.
+    ///
+    /// [`stream_lines`]: Self::stream_lines
     pub fn stream_height(&self, width: u16) -> usize {
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
-        stream
-            .slots()
-            .iter()
-            .map(|s| {
-                let b = s.block();
-                if !b.content.always_open() && pres.is_block_folded(b.id, b.kind()) {
-                    1
-                } else {
-                    b.content.lines(width).len()
-                }
-            })
-            .sum()
+        let mut total = 0usize;
+        let mut below: Option<&'static str> = None;
+        for slot in stream.slots() {
+            let b = slot.block();
+            let n = if !b.content.always_open() && pres.is_block_folded(b.id, b.kind()) {
+                1
+            } else {
+                b.content.lines(width).len()
+            };
+            if n == 0 {
+                continue;
+            }
+            if below.is_some_and(|k| blank_between(k, b.kind())) {
+                total += 1;
+            }
+            below = Some(b.kind());
+            total += n;
+        }
+        total
     }
 
     /// The block under a point on the last painted frame, if it is one that
@@ -633,6 +689,97 @@ mod tests {
         assert!(text.contains("fix the build"), "the user's words:\n{text}");
         assert!(text.contains("Fixed it"), "the model's answer");
         assert!(text.contains("read_file"), "the tools it used");
+    }
+
+    #[test]
+    fn a_tool_call_gets_a_row_of_its_own_above_and_below() {
+        // 「太挤了」. Prose and the `●` header were adjacent rows, so the
+        // sentence read as the tool's own caption and a screenful of both was
+        // one wall of text. `看看那个目录` is the standing case: the model said
+        // it and the very next row was the call it was asking for.
+        let h = fed();
+        let rows: Vec<String> = h
+            .compose((80, 40))
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        let prose = rows
+            .iter()
+            .position(|r| r.contains("看看那个目录"))
+            .expect("the model's words are on screen");
+        let call = rows
+            .iter()
+            .position(|r| r.contains("$("))
+            .expect("the call it asked for");
+        assert_eq!(
+            call,
+            prose + 2,
+            "the prose and the call are not two paragraphs: {:?}",
+            &rows[prose..=call]
+        );
+        assert!(
+            rows[prose + 1].trim().is_empty(),
+            "the one row between them is not blank: {:?}",
+            &rows[prose..=call]
+        );
+    }
+
+    #[test]
+    fn two_calls_in_a_row_stay_one_stretch_of_work() {
+        // The other half of the same decision: a run of tools is one thought,
+        // and a gap between each of them would be a screen that no longer shows
+        // in one glance what was done.
+        let h = fed();
+        let rows: Vec<String> = h
+            .compose((80, 40))
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        let first = rows
+            .iter()
+            .position(|r| r.contains("read_file(a.rs)"))
+            .expect("the first call");
+        let second = rows
+            .iter()
+            .position(|r| r.contains("read_file(b.rs)"))
+            .expect("the second call");
+        assert_eq!(
+            second,
+            first + 1,
+            "a run of tools was broken up: {:?}",
+            &rows[first..=second]
+        );
+    }
+
+    #[test]
+    fn the_blanks_are_rows_the_scroll_can_reach() {
+        // A blank the painter drew and the height forgot is a row of the
+        // transcript that scrolling can never arrive at — the top of a long
+        // conversation would stop a few rows short.
+        let h = fed();
+        let size = (80, 12);
+        let m = Moment::default();
+        let limit = h.scroll_limit(size, &m);
+        assert!(limit > 0, "the conversation does not fit in 12 rows");
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(limit);
+        let rows: Vec<String> = h
+            .compose(size)
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("fix the build")),
+            "scrolled to the limit and the first thing said is not there: {rows:?}"
+        );
     }
 
     #[test]
