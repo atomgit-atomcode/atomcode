@@ -285,6 +285,7 @@ tui 线永远对着 replay 模型与 Headless surface 开发;新命令只由 har
 | 0013 | Agent / Product / Host / UI 四层、缺口清单、ACP |
 | 0014 | agent 拥有自己的会话与世界;`session` 行只给默认值 |
 | 0015 | `llm-utility` 旁路模型缝;会话标题并行起名、落成 `Titled` 事件 |
+| 0016 | agent team:inbox 有消息就叫醒空闲 agent(定时 / loop 的前置);同伴消息是带来源的日志事实,成员只认 lead |
 
 相关文档:[`plexus-plugin-architecture.md`](./plexus-plugin-architecture.md)(底座与 spike 记录)、
 [`tui-composability.md`](./tui-composability.md)(TUI 的时间与空间可组合性)、

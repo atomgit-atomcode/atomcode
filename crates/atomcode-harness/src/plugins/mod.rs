@@ -18,6 +18,7 @@ pub mod self_knowledge;
 pub mod session;
 pub mod session_title;
 pub mod subagent;
+pub mod team;
 pub mod tool_exec;
 pub mod tools;
 pub mod truncation;
@@ -69,6 +70,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(capabilities::McpPlugin))
         .register(Arc::new(findings::FindingsPlugin))
         .register(Arc::new(subagent::SubagentPlugin))
+        .register(Arc::new(team::TeamPlugin))
         .register(Arc::new(recall::RecallPlugin))
         .register(Arc::new(self_knowledge::SelfKnowledgePlugin))
         .register(Arc::new(self_knowledge::ProjectInstructionsPlugin))

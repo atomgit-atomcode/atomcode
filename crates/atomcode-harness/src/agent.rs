@@ -215,6 +215,8 @@ pub enum MessageOrigin {
     User,
     /// The harness itself: a continuation, a scheduled goal, a resumed plan.
     Harness,
+    /// Another agent, by registry id. Logged with the sender's session id.
+    Peer(AgentId),
 }
 
 /// One item waiting for an agent.
@@ -345,7 +347,7 @@ impl Inbox {
         let mut taken = Vec::new();
         queue.retain(|item| match item {
             InboxItem::Injection { text, origin } => {
-                taken.push((text.clone(), *origin));
+                taken.push((text.clone(), origin.clone()));
                 false
             }
             InboxItem::Message { .. } => true,

@@ -44,9 +44,13 @@ pub enum HeaderReason {
 
 /// Where an injected message came from. Injection is model-visible, so it is a
 /// logged fact like any other.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InjectionOrigin {
+    /// Said by another agent — a team member reporting to its lead, a lead
+    /// steering a member. `from` is the sender's session id, so a resumed log
+    /// still says who spoke, whether or not that agent is alive.
+    Peer { from: String },
     /// A persistent memory store.
     Memory,
     /// A `<system-reminder>` style runtime note.
@@ -478,6 +482,11 @@ pub fn derive_messages(events: &[LoggedEvent]) -> Vec<Message> {
                     // A continuation speaks as the user, because it is a
                     // prompt; the rest are context, which is a system note.
                     InjectionOrigin::Continuation => Message::user(text),
+                    // A peer's message is something to act on, not a note in
+                    // the margin: it speaks as the user, and says who it is.
+                    InjectionOrigin::Peer { from } => {
+                        Message::user(format!("[message from {from}]\n{text}"))
+                    }
                     _ => Message::system(text),
                 };
                 message.synthetic = true;

@@ -405,7 +405,7 @@ impl PluginAgentLoop {
                     SessionEvent::Injected {
                         turn,
                         text: text.clone(),
-                        origin: *origin,
+                        origin: origin.clone(),
                     },
                 );
             }
@@ -424,6 +424,20 @@ impl PluginAgentLoop {
                         turn,
                         text: text.clone(),
                         origin: InjectionOrigin::Continuation,
+                    },
+                    // Logged under the sender's session id, not its registry
+                    // id: the log outlives both agents.
+                    MessageOrigin::Peer(sender) => SessionEvent::Injected {
+                        turn,
+                        text: text.clone(),
+                        origin: InjectionOrigin::Peer {
+                            from: self
+                                .ctx
+                                .service::<crate::seams::AgentsSvc>()
+                                .and_then(|a| a.get(sender))
+                                .map(|a| a.session_id().to_string())
+                                .unwrap_or_else(|| format!("agent-{sender}")),
+                        },
                     },
                 };
                 self.commit(&session, event);

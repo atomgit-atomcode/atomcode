@@ -34,8 +34,8 @@ use crate::seams::{
 use super::tools::{contribute_prompt, mount};
 
 /// Ends a delegated turn after its own budget, independent of the parent's.
-struct ChildRoundCap {
-    max_steps: u32,
+pub(crate) struct ChildRoundCap {
+    pub(crate) max_steps: u32,
 }
 
 #[async_trait]
