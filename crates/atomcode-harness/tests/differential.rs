@@ -51,6 +51,9 @@ enum Reply {
     ),
     /// A mid-stream provider failure.
     Fail(&'static str),
+    /// A failure at OPEN the provider marks retryable — a relay's momentary
+    /// "no upstream available" 503 — with the server's `Retry-After`, if any.
+    OpenFail(&'static str, Option<u64>),
     /// Cut off by `finish_reason=length`.
     Truncated(&'static str),
     /// A round that takes time to answer.
@@ -116,6 +119,15 @@ impl LlmProvider for Script {
         let reply = self.replies.get(i).cloned().unwrap_or(Reply::Text("done"));
         let mut events: Vec<StreamEvent> = Vec::new();
         match reply {
+            Reply::OpenFail(message, retry_after_secs) => {
+                return Err(ProviderError {
+                    retryable: true,
+                    message: message.into(),
+                    http_status: Some(503),
+                    code: None,
+                    retry_after_secs,
+                });
+            }
             Reply::Slow(ms, t) => {
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 events.push(StreamEvent::TextDelta(t.into()));
@@ -1361,6 +1373,80 @@ async fn a_truncated_response() {
         assert!(
             !steps.iter().any(|s| s.kind == "TIMEOUT"),
             "{who}: 截断不能让回合悬着{report}"
+        );
+    }
+}
+
+/// Long enough that two identical truncated rounds read as a re-dump rather
+/// than a coincidence (the check ignores anything under 64 chars).
+const REDUMPED: &str =
+    "第 1 节:游戏概述。玩家可选性别,只画脸,滚动条调肤色;多点触控时其余脸随机肤色,\
+来回判定加分。第 2 节:关卡设计。每关三十秒,失败三次结束。第 3 节:美术风格。";
+
+#[tokio::test]
+async fn a_truncation_the_model_answers_by_redumping() {
+    // The first cut gets the resume nudge. The model answers it by sending the
+    // same text from the top and getting cut again. Nudging again would only
+    // spend the budget on the same answer; both engines must stop asking and
+    // end the turn on what they have.
+    let dir = scratch("truncated-redump");
+    let script = || Script::new(&[Reply::Truncated(REDUMPED), Reply::Truncated(REDUMPED)]);
+    let cmds = || {
+        vec![AgentCommand::SendMessage {
+            text: "write a long thing".into(),
+            images: Vec::new(),
+        }]
+    };
+    let a = reference(script(), &dir, cmds()).await;
+    let b = candidate(script(), &dir, cmds()).await;
+    let report = render(&a, &b);
+    ratchet("truncated_redump", divergences(&a, &b), &report);
+
+    for (who, steps) in [("参考", &a), ("候选", &b)] {
+        assert!(
+            !steps.iter().any(|s| s.kind == "TIMEOUT"),
+            "{who}: 重灌不能把回合挂死{report}"
+        );
+        let recoveries = steps
+            .iter()
+            .filter(|s| s.kind == "TruncationRecovery")
+            .count();
+        assert_eq!(recoveries, 1, "{who}: 检测到重灌后不能再盲续{report}");
+    }
+}
+
+#[tokio::test]
+async fn a_transient_open_failure_with_a_retry_after() {
+    // A relay that cannot reach its upstream for a moment says so with a 503
+    // and a `Retry-After`. Both engines must wait the server's word, re-issue
+    // the round, and finish the turn as if nothing happened — no error, no
+    // second turn.
+    let dir = scratch("retry-after");
+    let script = || {
+        Script::new(&[
+            Reply::OpenFail("no upstream available", Some(1)),
+            Reply::Text("recovered"),
+        ])
+    };
+    let cmds = || {
+        vec![AgentCommand::SendMessage {
+            text: "go".into(),
+            images: Vec::new(),
+        }]
+    };
+    let a = reference(script(), &dir, cmds()).await;
+    let b = candidate(script(), &dir, cmds()).await;
+    let report = render(&a, &b);
+    ratchet("retry_after", divergences(&a, &b), &report);
+
+    for (who, steps) in [("参考", &a), ("候选", &b)] {
+        assert!(
+            !steps.iter().any(|s| s.kind == "Error"),
+            "{who}: 认了 Retry-After 的瞬时 503 不该以错误收场{report}"
+        );
+        assert!(
+            steps.iter().any(|s| s.kind == "TurnComplete"),
+            "{who}: 重试后回合要正常结束{report}"
         );
     }
 }

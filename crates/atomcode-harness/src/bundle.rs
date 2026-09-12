@@ -161,7 +161,7 @@ config = { max_rounds = 24, max_seconds = 0 }
 
 [[insert]]
 name = "llm-retry"
-config = { attempts = 3, backoff_ms = 1000 }
+config = { attempts = 3, backoff_ms = 3000, cap_ms = 30000 }
 
 # Recovery, outermost first: a bound that each retry resets is not a bound,
 # and waiting out a limit has to happen outside everything that would burn it.

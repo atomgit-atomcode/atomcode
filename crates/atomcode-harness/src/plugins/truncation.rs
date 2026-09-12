@@ -8,7 +8,9 @@
 //!   and the model is told to split the work, not to re-emit the same payload.
 //! - **Truncated text.** Nothing unsafe happened; the answer is simply
 //!   unfinished. The turn continues with a nudge to resume incrementally rather
-//!   than restart.
+//!   than restart — unless the model answered the last nudge by re-dumping the
+//!   same content from the top, in which case nudging again only spends the
+//!   budget, and the response is treated as final instead.
 //!
 //! Both are listeners, so a deployment that would rather see the raw truncation
 //! removes the row.
@@ -23,6 +25,7 @@ use serde_json::Value;
 
 use crate::events::{
     AgentRequest, ModelRequest, ModelResponse, RequestError, ToolBatch, ToolsExecuteBatch,
+    TurnStart, TurnStarted,
 };
 use crate::seams::SessionSvc;
 use crate::session::{InjectionOrigin, SessionEvent};
@@ -59,11 +62,45 @@ fn default_max() -> u32 {
     4
 }
 
+/// Two consecutive truncated responses that share a long identical leading
+/// prefix are the model re-dumping the same content — restarting from the top
+/// instead of resuming as the nudge asked. A weak model that ignores the nudge
+/// would otherwise burn every continuation re-sending the same text.
+///
+/// Compared by chars, so a multi-byte prefix is never split. Trivially short
+/// rounds never match: two short answers that happen to agree are not evidence
+/// of anything.
+pub(crate) fn truncation_is_redump(prev: &str, curr: &str) -> bool {
+    const MIN_LEN: usize = 64;
+    const PREFIX_CHARS: usize = 400;
+    let p = prev.trim_start();
+    let c = curr.trim_start();
+    if p.chars().take(MIN_LEN).count() < MIN_LEN || c.chars().take(MIN_LEN).count() < MIN_LEN {
+        return false;
+    }
+    p.chars()
+        .take(PREFIX_CHARS)
+        .eq(c.chars().take(PREFIX_CHARS))
+}
+
 /// Notices a truncated response and queues the resume nudge as a logged fact.
 struct OnTruncation {
     ctx: Context,
     max_continuations: u32,
+    /// Continuations spent in the current turn.
     seen: std::sync::atomic::AtomicU32,
+    /// Text of the last truncated round this turn, to catch a re-dump.
+    last: std::sync::Mutex<Option<String>>,
+}
+
+impl OnTruncation {
+    /// A new turn starts with a fresh budget and no memory of the last one:
+    /// the cap is "per turn", and a re-dump is only meaningful against the
+    /// round the nudge answered.
+    fn reset(&self) {
+        self.seen.store(0, std::sync::atomic::Ordering::SeqCst);
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 #[async_trait]
@@ -75,6 +112,22 @@ impl Waterfall<AgentRequest> for OnTruncation {
     ) -> Result<ModelResponse, RequestError> {
         let mut response = next.run(req).await?;
         if !response.truncated {
+            return Ok(response);
+        }
+
+        // The model answered the last nudge by starting over. Asking again
+        // would get the same again; hand the turn on with what it has — the
+        // same way a truncation past the cap is handled below.
+        let redump = {
+            let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+            let redump = last
+                .as_deref()
+                .is_some_and(|prev| truncation_is_redump(prev, &response.text));
+            *last = Some(response.text.clone());
+            redump
+        };
+        if redump {
+            response.truncated = false;
             return Ok(response);
         }
 
@@ -232,7 +285,7 @@ impl Plugin for TruncationPlugin {
         "truncation-recovery"
     }
     fn description(&self) -> &'static str {
-        "resume after an output-limit cut, and refuse a call whose arguments were cut"
+        "resume after an output-limit cut (unless the model just re-dumped the same text), and refuse a call whose arguments were cut"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
         let row: Row = if config.is_null() {
@@ -240,17 +293,58 @@ impl Plugin for TruncationPlugin {
         } else {
             serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
         };
-        let _ = ctx.on_waterfall::<AgentRequest>(
-            Arc::new(OnTruncation {
-                ctx: ctx.clone(),
-                max_continuations: row.max_continuations,
-                seen: std::sync::atomic::AtomicU32::new(0),
-            }),
-            false,
-        );
+        let on_truncation = Arc::new(OnTruncation {
+            ctx: ctx.clone(),
+            max_continuations: row.max_continuations,
+            seen: std::sync::atomic::AtomicU32::new(0),
+            last: std::sync::Mutex::new(None),
+        });
+        let per_turn = on_truncation.clone();
+        let _ = ctx.on_emit::<TurnStart>(move |_: &TurnStarted| per_turn.reset());
+        let _ = ctx.on_waterfall::<AgentRequest>(on_truncation, false);
         // Prepended: a truncated call must be caught before any scheduler picks
         // it up, or it runs with partial arguments.
         let _ = ctx.on_waterfall::<ToolsExecuteBatch>(Arc::new(RefuseTruncatedCalls), true);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod redump_tests {
+    use super::{looks_complete, truncation_is_redump};
+
+    #[test]
+    fn an_identical_long_prefix_is_a_redump() {
+        // Real truncated responses are large; both share an identical 400-char lead.
+        let a = "第 1 节:游戏概述。".repeat(80);
+        let b = format!("{a} 但这次又多说了一点点。");
+        assert!(truncation_is_redump(&a, &b), "same long prefix = re-dump");
+        assert!(truncation_is_redump(&a, &a));
+    }
+
+    #[test]
+    fn a_genuine_continuation_is_not_a_redump() {
+        let prev = "第 1 节:玩家可选性别,只画脸,滚动条调肤色……".repeat(20);
+        let curr = "第 2 节:多点触控时其余脸随机肤色,来回判定加分……".repeat(20);
+        assert!(
+            !truncation_is_redump(&prev, &curr),
+            "different content = resume"
+        );
+    }
+
+    #[test]
+    fn trivially_short_rounds_never_match() {
+        assert!(!truncation_is_redump("ok", "ok"));
+        assert!(!truncation_is_redump("", ""));
+    }
+
+    #[test]
+    fn a_cut_argument_string_looks_incomplete() {
+        assert!(looks_complete(
+            r#"{"path": "a.rs", "content": "fn main() {}"}"#
+        ));
+        assert!(!looks_complete(
+            r#"{"path": "a.rs", "content": "fn main() {"#
+        ));
     }
 }

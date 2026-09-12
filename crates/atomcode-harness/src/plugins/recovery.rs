@@ -79,7 +79,7 @@ fn default_fallback() -> u64 {
 /// Not `eprintln!`: in a full-screen UI stderr corrupts the display it was
 /// meant to inform, and a state that only exists on stderr cannot be rendered
 /// by a panel, replayed on resume, or constructed in a test.
-fn notice(ctx: &Context, notice: crate::session::NoticeKind, detail: String) {
+pub(super) fn notice(ctx: &Context, notice: crate::session::NoticeKind, detail: String) {
     if let Some(session) = crate::agent::scoped(ctx).service::<SessionSvc>() {
         crate::session::commit(
             ctx,

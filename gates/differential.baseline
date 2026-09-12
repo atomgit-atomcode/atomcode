@@ -14,3 +14,5 @@ provider_error=0
 dangling_call=0
 two_tool_calls=0
 truncated=2
+retry_after=0
+truncated_redump=2

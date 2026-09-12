@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use atomcode_kernel::message::Message;
@@ -98,8 +99,13 @@ impl Plugin for RoundCapPlugin {
 struct RetryRow {
     #[serde(default = "default_attempts")]
     attempts: u32,
+    /// First wait; each retry doubles it.
     #[serde(default = "default_backoff")]
     backoff_ms: u64,
+    /// Ceiling on the doubling, so a generous `attempts` never turns into a
+    /// minutes-long wait.
+    #[serde(default = "default_cap")]
+    cap_ms: u64,
 }
 
 impl Default for RetryRow {
@@ -107,6 +113,7 @@ impl Default for RetryRow {
         Self {
             attempts: default_attempts(),
             backoff_ms: default_backoff(),
+            cap_ms: default_cap(),
         }
     }
 }
@@ -116,12 +123,45 @@ fn default_attempts() -> u32 {
 }
 
 fn default_backoff() -> u64 {
-    1000
+    3000
+}
+
+fn default_cap() -> u64 {
+    30_000
+}
+
+/// The longest a server `Retry-After` may hold a retry. A hostile or
+/// misconfigured hint must not park the turn for minutes; our own schedule
+/// would not have.
+const RETRY_AFTER_CAP: Duration = Duration::from_secs(60);
+
+/// How long to wait before retry number `attempt` (1-based).
+///
+/// A server `Retry-After` is authoritative — the gateway is saying exactly when
+/// to come back — clamped to `[1s, RETRY_AFTER_CAP]`: zero would busy-spin, and
+/// the ceiling keeps a bad hint from stalling the turn. Without a hint the wait
+/// doubles from `base` and stops at `cap`, so a sustained-but-transient gateway
+/// failure (a relay's momentary "no upstream available") gets a real window to
+/// clear instead of three quick pokes.
+pub(crate) fn retry_backoff(
+    attempt: u32,
+    base: Duration,
+    cap: Duration,
+    retry_after: Option<Duration>,
+) -> Duration {
+    if let Some(hint) = retry_after {
+        return hint.clamp(Duration::from_secs(1), RETRY_AFTER_CAP);
+    }
+    // Bounded shift: a large configured `attempts` must not overflow `1 << n`.
+    let shift = attempt.saturating_sub(1).min(20);
+    base.saturating_mul(1u32 << shift).min(cap)
 }
 
 struct Retry {
+    ctx: Context,
     attempts: u32,
-    backoff_ms: u64,
+    base: Duration,
+    cap: Duration,
 }
 
 #[async_trait]
@@ -151,8 +191,21 @@ impl Waterfall<AgentRequest> for Retry {
                     if attempt >= self.attempts || !worth_retrying {
                         return Err(error);
                     }
-                    let wait = self.backoff_ms * 2u64.pow(attempt - 1);
-                    tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                    let wait = retry_backoff(attempt, self.base, self.cap, error.retry_after);
+                    // A silent re-issue reads as "nothing happened" to a person
+                    // watching a stalled turn. Logged, so every front end can
+                    // show it and a replay can explain the gap.
+                    super::recovery::notice(
+                        &self.ctx,
+                        crate::session::NoticeKind::ProviderRetry,
+                        format!(
+                            "{}; retrying in {}s ({attempt}/{})",
+                            error.message,
+                            wait.as_secs(),
+                            self.attempts.saturating_sub(1)
+                        ),
+                    );
+                    tokio::time::sleep(wait).await;
                     attempt += 1;
                 }
             }
@@ -168,14 +221,16 @@ impl Plugin for RetryPlugin {
         "llm-retry"
     }
     fn description(&self) -> &'static str {
-        "retry a transient provider failure with backoff"
+        "retry a transient provider failure with doubling backoff, honouring a real Retry-After"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
         let row: RetryRow = parse(config)?;
         let _ = ctx.on_waterfall::<AgentRequest>(
             Arc::new(Retry {
+                ctx: ctx.clone(),
                 attempts: row.attempts,
-                backoff_ms: row.backoff_ms,
+                base: Duration::from_millis(row.backoff_ms),
+                cap: Duration::from_millis(row.cap_ms),
             }),
             true,
         );
@@ -666,5 +721,46 @@ impl Plugin for ToolLoopGuardPlugin {
         let _ = ctx.on_waterfall::<ToolsExecute>(guard.clone(), false);
         let _ = ctx.on_serial::<TurnStopping>(guard);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod retry_backoff_tests {
+    use super::retry_backoff;
+    use std::time::Duration;
+
+    const BASE: Duration = Duration::from_secs(3);
+    const CAP: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn doubling_backoff_grows_and_stops_at_the_cap() {
+        // 1-based attempt → 3, 6, 12, 24, then pinned at the cap.
+        assert_eq!(retry_backoff(1, BASE, CAP, None), Duration::from_secs(3));
+        assert_eq!(retry_backoff(2, BASE, CAP, None), Duration::from_secs(6));
+        assert_eq!(retry_backoff(3, BASE, CAP, None), Duration::from_secs(12));
+        assert_eq!(retry_backoff(4, BASE, CAP, None), Duration::from_secs(24));
+        assert_eq!(retry_backoff(5, BASE, CAP, None), CAP);
+        assert_eq!(retry_backoff(6, BASE, CAP, None), CAP);
+        // A large configured count must neither overflow the shift nor pass the cap.
+        assert_eq!(retry_backoff(100, BASE, CAP, None), CAP);
+    }
+
+    #[test]
+    fn a_retry_after_hint_wins_and_is_clamped() {
+        // The server's word beats the schedule…
+        assert_eq!(
+            retry_backoff(1, BASE, CAP, Some(Duration::from_secs(20))),
+            Duration::from_secs(20)
+        );
+        // …a zero hint is floored so the client never busy-spins…
+        assert_eq!(
+            retry_backoff(3, BASE, CAP, Some(Duration::ZERO)),
+            Duration::from_secs(1)
+        );
+        // …and a hostile hint cannot park the turn for minutes.
+        assert_eq!(
+            retry_backoff(1, BASE, CAP, Some(Duration::from_secs(6000))),
+            Duration::from_secs(60)
+        );
     }
 }
