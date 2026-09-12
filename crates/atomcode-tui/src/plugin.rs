@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use crate::block::Stream;
 use crate::host::{default_layout, Host};
 use crate::keymap::{Action, Keys};
 use crate::module::Modules;
@@ -1089,20 +1090,37 @@ impl Tui {
     fn dump(&self) {
         use std::io::Write;
         let (w, _) = self.surface.size();
-        let stream = self.host.stream.read().expect("stream poisoned");
-        let mut out = String::new();
-        for slot in stream.slots() {
-            for line in slot.block().content.lines(w.max(20)) {
-                out.push_str(&line.plain());
-                out.push('\n');
-            }
-        }
-        if !out.is_empty() {
+        let text = {
+            let stream = self.host.stream.read().expect("stream poisoned");
+            transcript_text(&stream, w)
+        };
+        if !text.is_empty() {
             let mut stdout = std::io::stdout();
-            let _ = stdout.write_all(out.as_bytes());
+            let _ = stdout.write_all(text.as_bytes());
             let _ = stdout.flush();
         }
     }
+}
+
+/// The conversation as it is handed back to the normal buffer on exit.
+///
+/// The same rule as a drawn row, for the same reason: this text came from a
+/// file, a tool or the model, and it is on its way to a terminal. See
+/// [`crate::text`]. The screen has already been restored when this is printed,
+/// so these bytes land in the person's own buffer, next to the shell prompt —
+/// and there is no repaint diff down here to bound the damage. A tool result
+/// carrying `ESC[2J` clears the scrollback this exists to hand back, a `\r`
+/// progress bar rewrites the line it lands on, and a tab-indented file returns
+/// as columns the terminal resolved with a stop we never counted.
+fn transcript_text(stream: &Stream, width: u16) -> String {
+    let mut out = String::new();
+    for slot in stream.slots() {
+        for line in slot.block().content.lines(width.max(20)) {
+            out.push_str(&crate::text::for_screen(&line.plain()));
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Back one entry in the history, stashing the draft on the way in.
@@ -1464,6 +1482,73 @@ impl Plugin for HeadlessSurfacePlugin {
             .provide::<SurfaceSvc>(Headless::new(row.width, row.height))
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dump_tests {
+    use super::transcript_text;
+    use crate::block::{hash_of, Content, ContentHash, Coord, Stream};
+    use crate::frame::Line;
+    use std::sync::Arc;
+
+    /// A tool result exactly as it came back: the bytes that were in the file,
+    /// not the bytes that are safe to print.
+    #[derive(Debug)]
+    struct ToolOutput(&'static str);
+
+    impl Content for ToolOutput {
+        fn kind(&self) -> &'static str {
+            "tool-output"
+        }
+        fn content_hash(&self) -> ContentHash {
+            hash_of(&[self.0])
+        }
+        fn lines(&self, _w: u16) -> Vec<Line> {
+            self.0.lines().map(Line::raw).collect()
+        }
+    }
+
+    fn conversation(body: &'static str) -> Stream {
+        let mut s = Stream::new();
+        let mut w = s.writer("test");
+        let id = w.open(Coord::new(1, 1), Arc::new(ToolOutput(body)));
+        w.settle(id);
+        s
+    }
+
+    #[test]
+    fn the_text_handed_back_on_exit_can_never_move_the_cursor() {
+        // On the way out the alternate screen is given back and this text is
+        // printed into the person's own buffer, shell prompt and all. There is
+        // no repaint diff down here to bound the damage, so a tool result
+        // carrying an escape does not corrupt one row — it reaches whatever the
+        // escape says: `ESC[2J` clears the scrollback this exists to hand back.
+        let body = "1 a\rb\tc\x1b[31md\n2 \x1b[2Jwipe\n";
+        assert!(
+            body.contains('\r') && body.contains('\t') && body.contains('\x1b'),
+            "the fixture must actually be hazardous, or this test proves nothing"
+        );
+
+        let text = transcript_text(&conversation(body), 80);
+        assert!(
+            !text.contains('\r'),
+            "a CR rewrites the line it lands on: {text:?}"
+        );
+        assert!(
+            !text.contains('\t'),
+            "a tab is the terminal's stop, not ours: {text:?}"
+        );
+        assert!(
+            !text.contains('\x1b'),
+            "an escape clears the buffer we just handed back: {text:?}"
+        );
+        assert!(text.contains("ab"), "the text itself survives: {text:?}");
+        assert!(text.contains("wipe"), "the text itself survives: {text:?}");
+        assert!(
+            text.ends_with('\n'),
+            "and it still ends in a break: {text:?}"
+        );
     }
 }
 
