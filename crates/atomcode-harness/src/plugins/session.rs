@@ -12,13 +12,13 @@ use atomcode_plexus::{Context, Plugin};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::events::SessionEventCommitted;
+use crate::events::{AgentCreated, AgentInfo, SessionEventCommitted};
 use crate::seams::{
     SessionDefaults, SessionDefaultsSvc, SessionPersistence, SessionPersistenceSvc,
     SessionProjectionsSvc,
 };
 use crate::session::{
-    Committed, LoggedEvent, ProjectionUnit, SessionEvent, SessionProjections,
+    Committed, LoggedEvent, ProjectionUnit, SessionEvent, SessionHeader, SessionProjections,
 };
 
 #[derive(Debug, Deserialize, Default)]
@@ -209,6 +209,46 @@ impl JsonlStore {
         self.root.join(format!("{}.jsonl", Self::safe(session_id)))
     }
 
+    /// The first line, when it is a header. A file from before headers begins
+    /// with an event instead, and reads the same as one whose header was lost:
+    /// a session with no recorded identity beyond its file name.
+    fn parse_header(path: &std::path::Path, text: &str) -> Result<Option<SessionHeader>, String> {
+        let Some(first) = text.lines().find(|l| !l.trim().is_empty()) else {
+            return Ok(None);
+        };
+        let value: Value =
+            serde_json::from_str(first).map_err(|e| format!("{}:1: {e}", path.display()))?;
+        let Some(header) = value.get("header") else {
+            return Ok(None);
+        };
+        let header: SessionHeader = serde_json::from_value(header.clone())
+            .map_err(|e| format!("{}:1: header: {e}", path.display()))?;
+        if header.version > crate::session::SESSION_FORMAT_VERSION {
+            return Err(format!(
+                "{}: session format {} is newer than this build reads ({})",
+                path.display(),
+                header.version,
+                crate::session::SESSION_FORMAT_VERSION
+            ));
+        }
+        Ok(Some(header))
+    }
+
+    /// Write the header line if the file does not exist yet. Synchronous and
+    /// small on purpose: it must be on disk before the first event lands, and
+    /// the first event is appended from a task this does not wait for.
+    fn begin_sync(&self, header: &SessionHeader) -> Result<(), String> {
+        let path = self.path(&header.id);
+        if path.exists() || self.legacy_path(&header.id).exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(self.dir()).map_err(|e| e.to_string())?;
+        let line = serde_json::json!({ "header": header });
+        let mut text = serde_json::to_string(&line).map_err(|e| e.to_string())?;
+        text.push('\n');
+        std::fs::write(&path, text).map_err(|e| e.to_string())
+    }
+
     fn parse(path: &std::path::Path, text: &str) -> Result<Vec<LoggedEvent>, String> {
         let mut events = Vec::new();
         for (index, line) in text.lines().enumerate() {
@@ -217,6 +257,10 @@ impl JsonlStore {
             }
             let value: Value = serde_json::from_str(line)
                 .map_err(|e| format!("{}:{}: {e}", path.display(), index + 1))?;
+            // The header line carries no event; it is read by `parse_header`.
+            if value.get("header").is_some() && value.get("event").is_none() {
+                continue;
+            }
             let seq = value.get("seq").and_then(Value::as_u64).unwrap_or(0);
             let event: SessionEvent =
                 serde_json::from_value(value.get("event").cloned().unwrap_or(Value::Null))
@@ -238,6 +282,20 @@ impl JsonlStore {
 impl SessionPersistence for JsonlStore {
     fn location(&self, session_id: &str) -> Option<String> {
         Some(self.path(session_id).display().to_string())
+    }
+    async fn begin(&self, header: &SessionHeader) -> Result<(), String> {
+        self.begin_sync(header)
+    }
+    async fn header(&self, session_id: &str) -> Result<Option<SessionHeader>, String> {
+        let path = match self.path(session_id) {
+            p if p.exists() => p,
+            _ => self.legacy_path(session_id),
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        Self::parse_header(&path, &text)
     }
 
     async fn append(&self, session_id: &str, events: &[LoggedEvent]) -> Result<(), String> {
@@ -352,6 +410,26 @@ impl Plugin for SessionPersistenceJsonlPlugin {
         // of its own. The agent is resolved live rather than captured: it may
         // be gone by the time its last fact is flushed, and persisting that
         // fact is still right.
+        // A session's header goes down the moment its agent exists — before
+        // any event, which is the only order in which "first line" is true.
+        // Inline rather than spawned for the same reason.
+        let header_ctx = ctx.clone();
+        let header_store = store.clone();
+        let _ = ctx.on_emit::<AgentCreated>(move |created: &AgentInfo| {
+            let Some(agent) = header_ctx
+                .service::<crate::seams::AgentsSvc>()
+                .and_then(|a| a.get(created.id))
+            else {
+                return;
+            };
+            if !agent.persist() {
+                return;
+            }
+            if let Err(e) = header_store.begin_sync(agent.session().header()) {
+                eprintln!("session-persistence: {e}");
+            }
+        });
+
         let agents_ctx = ctx.clone();
         let _ = ctx.on_emit::<SessionEventCommitted>(move |committed: &Committed| {
             let keep = agents_ctx

@@ -194,6 +194,51 @@ impl PromptRegistry {
 /// compaction after the fact.
 #[async_trait]
 pub trait SessionPersistence: Send + Sync {
+    /// Record a session's header, once, before any of its events. A session
+    /// the store already holds keeps the header it has: this is where a new
+    /// file gets its first line, not where an old one is rewritten.
+    async fn begin(&self, _header: &crate::session::SessionHeader) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// The header a stored session was created with — `None` for a store that
+    /// keeps none, or a file written before there was one.
+    async fn header(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<crate::session::SessionHeader>, String> {
+        Ok(None)
+    }
+
+    /// What `session/list` wants to say about one session without replaying
+    /// it into an agent: the header, the name, and how much happened.
+    async fn describe(&self, session_id: &str) -> Result<Option<SessionSummary>, String> {
+        let header = self.header(session_id).await?;
+        let events = self.load(session_id).await?;
+        if header.is_none() && events.is_empty() {
+            return Ok(None);
+        }
+        let inherited = header.as_ref().map(|h| h.inherited).unwrap_or(0);
+        let title = events
+            .iter()
+            .skip(inherited)
+            .rev()
+            .find_map(|e| match &e.event {
+                crate::session::SessionEvent::Titled { title, .. } => Some(title.clone()),
+                _ => None,
+            });
+        let turns = events
+            .iter()
+            .filter(|e| matches!(e.event, crate::session::SessionEvent::TurnStart { .. }))
+            .count();
+        Ok(Some(SessionSummary {
+            header,
+            title,
+            turns,
+            events: events.len(),
+        }))
+    }
+
     /// Append everything after `cursor`. Implementations must be idempotent for
     /// a re-sent range: a crash between write and cursor update is normal.
     async fn append(&self, session_id: &str, events: &[LoggedEvent]) -> Result<(), String>;
@@ -225,6 +270,16 @@ pub trait SessionPersistence: Send + Sync {
 pub struct SessionDefaults {
     pub id: Option<String>,
     pub resume: bool,
+}
+
+/// One stored session, as a list would show it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionSummary {
+    /// `None` for a file written before headers existed.
+    pub header: Option<crate::session::SessionHeader>,
+    pub title: Option<String>,
+    pub turns: usize,
+    pub events: usize,
 }
 
 /// Where to cut the history, and what to leave in its place.

@@ -59,9 +59,27 @@ deepseek-harness 的做法是 `CreateAgentOptions.sessionId`(agent 与日志共�
   的 provide 是 agent 的世界,不是行的表面。
 - 差分基线 16 场景不变;harness 225 + tui 238 全绿。
 
+## 补:header(同日)
+
+会话有一份**不可变的 header**(`session::SessionHeader`:version、id、created_at、
+cwd、parent、inherited),日志对象持有它,JSONL 文件第一行 `{"header": …}` 写它,不占
+序号。它不是事件,所以 fork 继承父的事件前缀时**不会**带上父的 header:子会话拿到
+自己的 header,`parent` 和 `inherited` 写在里面。header 在 `AgentCreated` 时同步写入
+(`begin_sync`),保证先于第一条事件;resume 时从文件读回,`created_at` 是会话的不是
+进程的;没有 header 的旧文件照常加载,不在磁盘上补造。
+
+可变的事实走事件:`SessionEvent::Titled`,`log.title()` 只看继承段之后的事件,fork
+出来的子会话在被命名前没有标题。持久化缝加 `begin` / `header` / `describe`,
+`describe` 给 `session/list` 用:header、标题、回合数、事件数,不用把会话装进 agent。
+
+`seed_len` 的第一个读者就是 header 的 `inherited`。
+
 ## 未做
 
-- fork 只有接口(`seed` + `parent`),没有从活日志切前缀的便捷函数。
+- fork 只有接口(`seed` + `parent`),没有从活日志切前缀并校验(无悬空工具调用)
+  的便捷函数。
+- 没有人提交 `Titled`:`session-title` 缝仍是按需计算,接到前端或 ACP 的
+  SessionInfoUpdate 时再落成事件。
 - cwd 覆盖用 `LocalFs::new(cwd)`,不继承树级 `fs-readonly`;ACP 的 `session/new`
   接进来时要决定只读世界如何按 agent 覆盖。
 - MCP 集合、模式仍是树级行,按 agent 覆盖走 `setup` 即可,尚无调用方。

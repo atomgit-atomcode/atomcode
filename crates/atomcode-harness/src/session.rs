@@ -175,6 +175,13 @@ pub enum SessionEvent {
         notice: NoticeKind,
         detail: String,
     },
+    /// The session was named. A fact rather than a header field because a name
+    /// changes: the first-prompt guess, then a model's summary, then whatever
+    /// the person typed. The log records each; the newest wins.
+    Titled {
+        turn: u64,
+        title: String,
+    },
     TurnEnd {
         turn: u64,
         /// Why it ended. The reason itself, not a rendering of it: a consumer
@@ -201,6 +208,7 @@ impl SessionEvent {
             | Self::Compacted { turn, .. }
             | Self::Usage { turn, .. }
             | Self::Notice { turn, .. }
+            | Self::Titled { turn, .. }
             | Self::TurnEnd { turn, .. } => *turn,
         }
     }
@@ -216,6 +224,60 @@ impl SessionEvent {
                 | Self::Injected { .. }
                 | Self::Compacted { .. }
         )
+    }
+}
+
+/// Bumped when the on-disk shape of a session changes in a way a reader must
+/// know about. A reader that meets a version it does not know refuses the
+/// file rather than guessing.
+pub const SESSION_FORMAT_VERSION: u32 = 1;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// What is true of a session before its first event, and stays true.
+///
+/// Not an event, on purpose. Events are the session's *work*, and a fork
+/// inherits a prefix of its parent's work — but not its parent's identity.
+/// Keeping the header outside the event stream is what lets a fork carry the
+/// parent's events under its own name, and what lets `session/list` answer
+/// "which sessions, from where, since when" by reading one line per file.
+///
+/// The mutable facts about a session — its title — are events, because they
+/// change and the log is where change is recorded.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionHeader {
+    pub version: u32,
+    pub id: String,
+    /// Unix milliseconds.
+    pub created_at: u64,
+    /// The world's root when the session was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The session this one was forked from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// How many of the log's leading events are the parent's work rather than
+    /// this session's. Zero for a session that started empty. Persisted so a
+    /// resume, a replay and a transcript can all tell the two apart.
+    #[serde(default)]
+    pub inherited: usize,
+}
+
+impl SessionHeader {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            version: SESSION_FORMAT_VERSION,
+            id: id.into(),
+            created_at: now_ms(),
+            cwd: None,
+            parent: None,
+            inherited: 0,
+        }
     }
 }
 
@@ -256,7 +318,7 @@ impl Committed {
 /// returns the assigned [`SeqNo`] so a caller can reference the exact fact it
 /// just recorded (a compaction boundary, a persistence cursor).
 pub struct SessionLog {
-    id: String,
+    header: SessionHeader,
     events: RwLock<Vec<LoggedEvent>>,
     next_seq: AtomicU64,
     turn: AtomicU64,
@@ -264,8 +326,12 @@ pub struct SessionLog {
 
 impl SessionLog {
     pub fn new(id: impl Into<String>) -> Self {
+        Self::with_header(SessionHeader::new(id))
+    }
+
+    pub fn with_header(header: SessionHeader) -> Self {
         Self {
-            id: id.into(),
+            header,
             events: RwLock::new(Vec::new()),
             next_seq: AtomicU64::new(1),
             turn: AtomicU64::new(0),
@@ -273,7 +339,27 @@ impl SessionLog {
     }
 
     pub fn id(&self) -> &str {
-        &self.id
+        &self.header.id
+    }
+
+    pub fn header(&self) -> &SessionHeader {
+        &self.header
+    }
+
+    /// The session's name: the last `Titled` fact among its *own* events. A
+    /// title inherited from a parent is the parent's, so a fork has none until
+    /// it is named.
+    pub fn title(&self) -> Option<String> {
+        self.events
+            .read()
+            .expect("session log poisoned")
+            .iter()
+            .skip(self.header.inherited)
+            .rev()
+            .find_map(|e| match &e.event {
+                SessionEvent::Titled { title, .. } => Some(title.clone()),
+                _ => None,
+            })
     }
 
     /// Claim the next turn number.

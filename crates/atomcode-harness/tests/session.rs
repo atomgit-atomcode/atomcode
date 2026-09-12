@@ -2,10 +2,11 @@
 //! persistence round-trip, and the invariant that keeps a side channel from
 //! growing into the prompt.
 
-use atomcode_harness::agent::OnlySession;
+use atomcode_harness::agent::{CreateAgent, OnlySession};
 use std::sync::Arc;
 
 use atomcode_harness::seams::{
+    AgentsSvc,
     SessionPersistenceSvc, SessionProjectionsSvc, StopReason,
 };
 use atomcode_harness::session::{
@@ -675,4 +676,152 @@ async fn facts_a_plugin_writes_survive_a_resume() {
         .derive_messages()
         .iter()
         .any(|m| m.text.contains("short answers")));
+}
+
+// ---- the header: what is true before the first event -------------------
+
+fn lines_of(path: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_file_begins_with_a_header_and_the_events_follow() {
+    let home = resume_home("header");
+    let id = "headed";
+    let mut app = App::new(plugins::catalog(), resumable(&home, Some(id), false));
+    app.start().await.unwrap();
+    run_turn(&app, "hello").await.unwrap();
+    settle(&app, id, 5).await;
+
+    let path = app
+        .context()
+        .service::<SessionPersistenceSvc>()
+        .unwrap()
+        .location(id)
+        .unwrap();
+    let lines = lines_of(std::path::Path::new(&path));
+    let header = &lines[0]["header"];
+    assert_eq!(header["id"], id, "first line names the session: {}", lines[0]);
+    assert_eq!(header["version"], atomcode_harness::session::SESSION_FORMAT_VERSION);
+    assert!(header["created_at"].as_u64().unwrap() > 0);
+    assert!(lines[0].get("seq").is_none(), "the header takes no sequence number");
+    assert!(lines[1].get("seq").is_some(), "and the events start right after");
+    assert_eq!(
+        lines.iter().filter(|l| l.get("header").is_some()).count(),
+        1,
+        "one header, however many turns"
+    );
+}
+
+#[tokio::test]
+async fn a_file_from_before_headers_still_loads() {
+    let home = resume_home("headless-file");
+    let id = "old-style";
+    let dir = home.join("sessions");
+    // Where files lived before bucketing — the store still reads that path.
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{id}.jsonl")),
+        "{\"seq\":1,\"event\":{\"kind\":\"turn_start\",\"turn\":1}}\n\
+         {\"seq\":2,\"event\":{\"kind\":\"user_message\",\"turn\":1,\"text\":\"from before\"}}\n",
+    )
+    .unwrap();
+
+    let mut app = App::new(plugins::catalog(), resumable(&home, Some(id), true));
+    app.start().await.unwrap();
+    let agent = atomcode_harness::create_agent(&app).await.unwrap();
+    assert_eq!(agent.session().len(), 2, "the events were replayed");
+    assert_eq!(agent.session().id(), id, "and the identity is the file's");
+    let store = app.context().service::<SessionPersistenceSvc>().unwrap();
+    assert!(
+        store.header(id).await.unwrap().is_none(),
+        "no header was invented on disk"
+    );
+}
+
+#[tokio::test]
+async fn a_resume_keeps_the_header_the_session_was_created_with() {
+    let home = resume_home("header-kept");
+    let id = "kept";
+    let mut first = App::new(plugins::catalog(), resumable(&home, Some(id), false));
+    first.start().await.unwrap();
+    let born = atomcode_harness::create_agent(&first).await.unwrap();
+    let original = born.session().header().clone();
+    run_turn(&first, "hello").await.unwrap();
+    settle(&first, id, 5).await;
+    drop(first);
+
+    let mut second = App::new(plugins::catalog(), resumable(&home, Some(id), true));
+    second.start().await.unwrap();
+    let back = atomcode_harness::create_agent(&second).await.unwrap();
+    assert_eq!(
+        back.session().header(),
+        &original,
+        "created_at and the rest are the session's, not the process's"
+    );
+}
+
+#[tokio::test]
+async fn a_fork_carries_the_parents_events_under_its_own_name() {
+    let home = resume_home("fork");
+    let mut app = App::new(plugins::catalog(), resumable(&home, Some("parent"), false));
+    app.start().await.unwrap();
+    let parent = atomcode_harness::create_agent(&app).await.unwrap();
+    run_turn(&app, "the parent speaks").await.unwrap();
+    let ctx = app.context();
+    atomcode_harness::session::commit(
+        &ctx,
+        &parent.session(),
+        SessionEvent::Titled {
+            turn: 1,
+            title: "the parent's name".into(),
+        },
+    );
+    assert_eq!(parent.session().title().as_deref(), Some("the parent's name"));
+
+    // Fork-shaped: the child's seed is the parent's whole log so far.
+    let prefix = parent.session().events();
+    let n = prefix.len();
+    let agents = ctx.service::<AgentsSvc>().unwrap();
+    let child = agents
+        .create(
+            &ctx,
+            CreateAgent::new()
+                .id("child")
+                .parent("parent")
+                .seed(prefix, n),
+        )
+        .await
+        .unwrap();
+
+    let child_session = child.session();
+    let header = child_session.header();
+    assert_eq!(header.id, "child");
+    assert_eq!(header.parent.as_deref(), Some("parent"));
+    assert_eq!(header.inherited, n);
+    assert!(header.created_at >= parent.session().header().created_at);
+    assert_eq!(child.session().len(), n, "the events came along");
+    assert!(
+        child.session().title().is_none(),
+        "but the parent's name did not: a title in the inherited prefix is the parent's"
+    );
+    // And the parent's header is untouched by having been forked.
+    assert!(parent.session().header().parent.is_none());
+    assert_eq!(parent.session().header().inherited, 0);
+
+    // The store describes both from their headers. The child's file holds its
+    // header and nothing else yet: inherited events are the parent's to store.
+    let store = ctx.service::<SessionPersistenceSvc>().unwrap();
+    let described = store.describe("child").await.unwrap().unwrap();
+    assert_eq!(described.header.unwrap().parent.as_deref(), Some("parent"));
+    assert!(described.title.is_none());
+    settle(&app, "parent", parent.session().len()).await;
+    let parent_described = store.describe("parent").await.unwrap().unwrap();
+    assert_eq!(parent_described.title.as_deref(), Some("the parent's name"));
+    assert_eq!(parent_described.turns, 1);
 }

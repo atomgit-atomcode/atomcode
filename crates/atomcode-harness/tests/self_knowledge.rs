@@ -191,10 +191,16 @@ async fn the_reported_log_path_is_the_file_persistence_actually_writes() {
         .find(|s| s.ends_with(".jsonl"))
         .expect("the tool must name a log file")
         .to_string();
-    assert!(
-        !std::path::Path::new(&path).exists(),
-        "nothing written yet: {path}"
+    // The agent exists, so its header is already on disk — one line, no
+    // events. That the file is there before anything was said is the point of
+    // a header: identity first, work after.
+    let before = std::fs::read_to_string(&path).unwrap_or_default();
+    assert_eq!(
+        before.lines().count(),
+        1,
+        "the header and nothing else yet:\n{before}"
     );
+    assert!(before.contains("\"header\""), "{before}");
 
     run_turn(&app, "hello").await.expect("a turn");
     // Persistence listens rather than being called, so give the listener a beat.

@@ -81,11 +81,27 @@ impl Introspect {
                  session is in memory only and ends when the process does"
                     .into()
             });
-        format!(
-            "session id: {id}\nturn: {}\nevents logged so far: {}\nevent log: {where_}",
-            log.current_turn(),
-            log.len(),
-        )
+        let header = log.header();
+        let mut lines = vec![
+            format!("session id: {id}"),
+            format!("created at: {} (unix ms)", header.created_at),
+        ];
+        if let Some(cwd) = &header.cwd {
+            lines.push(format!("working directory: {cwd}"));
+        }
+        if let Some(parent) = &header.parent {
+            lines.push(format!(
+                "forked from: {parent} (the first {} events are inherited)",
+                header.inherited
+            ));
+        }
+        if let Some(title) = log.title() {
+            lines.push(format!("title: {title}"));
+        }
+        lines.push(format!("turn: {}", log.current_turn()));
+        lines.push(format!("events logged so far: {}", log.len()));
+        lines.push(format!("event log: {where_}"));
+        lines.join("\n")
     }
 
     fn services(&self) -> String {

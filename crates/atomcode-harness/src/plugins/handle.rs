@@ -332,7 +332,8 @@ impl Projector {
             }
             SessionEvent::Injected { .. }
             | SessionEvent::StepStart { .. }
-            | SessionEvent::RequestHeader { .. } => Vec::new(),
+            | SessionEvent::RequestHeader { .. }
+            | SessionEvent::Titled { .. } => Vec::new(),
         }
     }
 }

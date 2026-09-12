@@ -35,7 +35,7 @@ use atomcode_kernel::message::ImageContent;
 
 use crate::events::{AgentCreated, AgentInfo};
 use crate::seams::{FsSvc, SessionDefaultsSvc, SessionPersistenceSvc, SessionSvc};
-use crate::session::{InjectionOrigin, LoggedEvent, SessionLog};
+use crate::session::{InjectionOrigin, LoggedEvent, SessionHeader, SessionLog};
 
 // ---- the agent whose turn this is -----------------------------------------
 
@@ -557,14 +557,27 @@ impl Agents {
 
         let mut seed = std::mem::take(&mut req.seed);
         let mut seed_len = req.seed_len;
+        // The identity the session is created with. A fork records its parent
+        // and how much of the seed is the parent's; a resume keeps the header
+        // the session was created with, which is the whole point of storing
+        // one; a session started empty gets a fresh one.
+        let mut header = SessionHeader::new(session_id.clone());
+        header.cwd = req.cwd.as_ref().map(|p| p.display().to_string());
+        header.parent = req.parent.clone();
+        if req.parent.is_some() {
+            header.inherited = seed_len;
+        }
         if req.resume && seed.is_empty() {
             let store = ctx
                 .service::<SessionPersistenceSvc>()
                 .ok_or("resume: no `session-persistence` is mounted")?;
+            if let Some(stored) = store.header(&session_id).await? {
+                header = stored;
+            }
             seed = store.load(&session_id).await?;
             seed_len = seed.len();
         }
-        let log = Arc::new(SessionLog::new(session_id));
+        let log = Arc::new(SessionLog::with_header(header));
         if !seed.is_empty() {
             log.restore(seed);
         }
