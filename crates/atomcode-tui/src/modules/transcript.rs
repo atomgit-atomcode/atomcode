@@ -358,7 +358,7 @@ mod tests {
             .map(|x| x.block().content.lines(60)[0].plain())
             .collect();
         assert_eq!(ends.len(), 2, "two turns end in the corpus: {ends:?}");
-        for want in ["1 步", "入 1200", "出 80", "缓存 33%"] {
+        for want in ["1 步", "入 1200", "出 80", "缓存 33.33%"] {
             assert!(ends[0].contains(want), "{want} missing from {:?}", ends[0]);
         }
         // Turn 2 reported nothing, so its line is the outcome alone — not a row

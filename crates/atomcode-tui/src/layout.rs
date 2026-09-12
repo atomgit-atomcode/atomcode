@@ -107,21 +107,26 @@ impl std::fmt::Display for LayoutError {
 /// The named arrangements this build ships.
 pub fn presets() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("default", "状态栏 · 对话 · 输入"),
-        ("focus", "只有对话和输入,状态栏收起"),
+        ("default", "状态栏 · 对话 · 实时行 · 输入"),
+        ("focus", "状态栏收起,只剩对话、实时行和输入"),
         ("wide", "对话在左,面板在右"),
     ]
 }
 
 fn preset(name: &str) -> Option<Region> {
     let base = crate::host::default_layout();
+    // Whatever arrangement is chosen, the input box keeps the live line above
+    // it: it belongs to the composer (`crate::host::composer`), not to a panel
+    // that happens to be on screen — a screen a person picked for its shape
+    // should not lose the one row that says whether the turn is still moving.
+    let composer = crate::host::composer();
     match name {
         "default" => Some(base),
         "focus" => Some(Region::split(
             Dir::Vertical,
             Constraint::Fill,
             Region::Stream,
-            Region::view(crate::modules::input::ID),
+            composer,
         )),
         "wide" => Some(Region::split(
             Dir::Vertical,
@@ -136,7 +141,7 @@ fn preset(name: &str) -> Option<Region> {
                     Region::Stream,
                     Region::view("findings"),
                 ),
-                Region::view(crate::modules::input::ID),
+                composer,
             ),
         )),
         _ => None,

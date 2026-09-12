@@ -2,6 +2,10 @@
 
 use atomcode_harness::session::SessionEvent;
 
+// One frame per tick, shared with the live line above the composer: two panels
+// cycling two different sets, or the same set out of phase, is two front ends
+// on one screen.
+use crate::caps::SPINNER;
 use crate::frame::{Color, Line, Style};
 use crate::module::{Height, View};
 use crate::moment::{Activity, Moment, Viewport};
@@ -19,10 +23,6 @@ pub struct State {
     pub tool_calls: u32,
     pub last_stop: Option<String>,
 }
-
-/// One frame per tick. Braille dots because they are one column everywhere and
-/// degrade to a dot rather than to tofu.
-const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 pub struct Status;
 

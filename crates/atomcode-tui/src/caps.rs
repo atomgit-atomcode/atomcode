@@ -315,6 +315,19 @@ pub enum Glyph {
     Down,
 }
 
+/// The frames a spinner cycles through, one per redraw.
+///
+/// Here rather than in a module because there is one answer to "what does
+/// work in progress look like": two panels cycling two different sets, or the
+/// same set out of phase, is two front ends on one screen. Both callers index
+/// it by `Moment::tick`, so they turn together.
+///
+/// Braille, and deliberately not a [`Glyph`]: the downgrade table trades one
+/// glyph for one ASCII cell, and there is no one-cell ASCII spinner that reads
+/// as motion. These are one column everywhere, which is the property that
+/// matters — a frame two cells wide would move the text beside it every tick.
+pub const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
 impl Caps {
     pub fn g(&self, glyph: Glyph) -> &'static str {
         use Glyph::*;
@@ -509,6 +522,22 @@ mod tests {
         let framed = "┌─ title ─┐ ✓ ▸ • ⋯";
         let out = downgrade(framed, false);
         assert!(out.is_ascii(), "{out}");
+    }
+
+    #[test]
+    fn every_spinner_frame_is_one_column() {
+        // The property the choice of braille was made for, checked rather than
+        // asserted in prose: a frame of two cells would shift everything beside
+        // the spinner on every tick, and a frame that renders as nothing would
+        // make the line look like a stuck label.
+        for frame in SPINNER {
+            assert_eq!(
+                crate::width::str_width(frame),
+                1,
+                "{frame:?} is not one cell"
+            );
+            assert_eq!(downgrade(frame, false), frame, "chrome is never rewritten");
+        }
     }
 
     #[test]

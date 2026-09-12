@@ -34,7 +34,7 @@ use serde_json::Value;
 use crate::command::Commands;
 use crate::layout::{LayoutOp, Side};
 use crate::module::{Modules, Mounted, Producer};
-use crate::modules::{input, status, team, todo, transcript};
+use crate::modules::{input, live, status, team, todo, transcript};
 use crate::plugin::{CommandsSvc, LayoutSvc, ModulesSvc};
 
 /// The screen, panel by panel — the one place that says what a full UI is made
@@ -51,6 +51,13 @@ name = "tui-panel-transcript"
 
 [[insert]]
 name = "tui-panel-status"
+
+# Between the conversation and the field, because it belongs to the composer:
+# its place is written in `host::composer`, not claimed with a `Show` op —
+# neither of `Show`'s sides is the side of the input box. Remove this row and
+# the composer closes up around the field.
+[[insert]]
+name = "tui-panel-live"
 
 [[insert]]
 name = "tui-panel-input"
@@ -104,6 +111,7 @@ pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
     vec![
         Arc::new(TranscriptPanel),
         Arc::new(StatusPanel),
+        Arc::new(LivePanel),
         Arc::new(InputPanel),
         Arc::new(MascotPanel),
         Arc::new(TeamPanel),
@@ -161,6 +169,16 @@ panel!(
     "tui-panel-input",
     input::Input,
     "the prompt line, its wrapping, and the slash menu"
+);
+// The live line: the one panel whose row mounts it and says nothing about where
+// it goes. Its place is written by the composer (`crate::host::composer`),
+// because the answer for a row that belongs against the input box is not a side
+// `LayoutOp::Show` can name.
+panel!(
+    LivePanel,
+    "tui-panel-live",
+    live::Live,
+    "the live line above the composer: what this turn is doing, for how long, and for how much"
 );
 
 /// The transcript is a *stream producer*, not a view: it has history, and its

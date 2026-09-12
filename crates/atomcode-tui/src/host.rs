@@ -176,6 +176,22 @@ impl Host {
     /// Producers first, then views: a view that reacts to the same fact should
     /// see a screen whose stream already contains it.
     pub fn absorb(&self, fact: &SessionEvent) {
+        // When a turn opened or closed, on the clock the host was handed. Here
+        // rather than in a module because this is the one place that sees both
+        // the fact and the reading — and a duration on screen is the difference
+        // of two readings the log does not carry (docs/adr/0008).
+        match fact {
+            SessionEvent::TurnStart { .. } => {
+                let mut m = self.moment.write().expect("moment poisoned");
+                let now = m.now;
+                m.turn_started = Some(now);
+            }
+            SessionEvent::TurnEnd { .. } => {
+                self.moment.write().expect("moment poisoned").turn_started = None;
+            }
+            _ => {}
+        }
+
         // Pinned reading. The scroll offset is measured from the bottom of the
         // conversation, and the model puts new output *at* that bottom — so a
         // reader who has scrolled up to study something would watch it slide
@@ -523,6 +539,36 @@ fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16
         .unwrap_or(1)
 }
 
+/// The composer: the live line above the field.
+///
+/// One definition, because every arrangement that has an input has this above
+/// it — the input box is where a person's eyes are, and the one thing that
+/// answers "is it stuck?" belongs against it rather than in a panel beside the
+/// conversation.
+///
+/// Written into the tree rather than claimed by the live line's own row the way
+/// the mascot claims its strip: `LayoutOp::Show` has two sides, above the
+/// conversation and below the status bar, and both are the wrong side of the
+/// input box.
+///
+/// Both children are `Hug`-ish: the live line asks for no rows between turns, so
+/// the composer closes up around the field instead of standing on a blank row.
+///
+/// The blank row on either side of the live line is the line's own for that same
+/// reason: a `gap` on this flex is counted between the children whether or not
+/// the line is mounted, so the margin would outlive the thing it spaces out.
+pub fn composer() -> Region {
+    use crate::el::Item;
+    use crate::region::Dir;
+    Region::flex(
+        Dir::Vertical,
+        vec![
+            Item::hug(Region::view(crate::modules::live::ID)),
+            Item::grow(Region::view(crate::modules::input::ID)),
+        ],
+    )
+}
+
 /// The shipped layout: the conversation, a status bar, a prompt.
 /// Stream, composer, status line — in that order, top to bottom.
 ///
@@ -538,7 +584,7 @@ pub fn default_layout() -> Region {
         Region::split(
             Dir::Vertical,
             Constraint::Fill,
-            Region::view(crate::modules::input::ID),
+            composer(),
             Region::view(crate::modules::status::ID),
         ),
     )
@@ -581,6 +627,72 @@ mod tests {
         assert!(text.contains("fix the build"), "the user's words:\n{text}");
         assert!(text.contains("Fixed it"), "the model's answer");
         assert!(text.contains("read_file"), "the tools it used");
+    }
+
+    #[test]
+    fn the_live_line_stands_against_the_field_and_only_while_a_turn_runs() {
+        use crate::modules::live;
+        let mods = Arc::new(Modules::new());
+        mods.add_producer(transcript::Transcript::new()).unwrap();
+        mods.add_view(Arc::new(Mounted::<live::Live>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<input::Input>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<status::Status>::new()))
+            .unwrap();
+        let h = Host::new(mods, default_layout());
+
+        // Between turns: no row at all, so the conversation keeps it. A line
+        // standing there saying "空闲" would be chrome where the words go.
+        let at_rest = h.compose((60, 12));
+        assert!(at_rest.part("live").is_none(), "nothing to say, no row");
+        let field_at_rest = at_rest.part("input").expect("the field").rect;
+
+        // A turn opens, and the clock is already running: the reading the host
+        // stamps the opening with is the one the line subtracts from.
+        h.moment.write().unwrap().now = crate::moment::Timestamp::millis(8_000);
+        h.absorb(&SessionEvent::TurnStart { turn: 1 });
+        {
+            let mut m = h.moment.write().unwrap();
+            m.activity = crate::moment::Activity::Working;
+            m.now = crate::moment::Timestamp::millis(21_000);
+        }
+        let running = h.compose((60, 12));
+        let line = running.part("live").expect("the live line");
+        let field = running.part("input").expect("the field").rect;
+        assert_eq!(
+            line.rect.y + line.rect.h,
+            field.y,
+            "against the field, not adrift in the screen"
+        );
+        // The composer is anchored to the bottom, so the rows it grows into come
+        // off the conversation above it: the field does not move, and the stream
+        // hands over the live line and the blank row on either side of it —
+        // which is what keeps it off the words above and off the field's rule.
+        assert_eq!(field, field_at_rest, "the field does not move");
+        assert_eq!(
+            running.part("stream").expect("the conversation").rect.h,
+            at_rest.part("stream").expect("the conversation").rect.h - 3,
+            "and what it costs is the line and its margin"
+        );
+        let said: String = line.lines.iter().map(|l| l.plain()).collect();
+        assert!(said.contains("正在等待模型"), "{said}");
+        assert!(
+            said.contains("13s"),
+            "stamped where facts land, drawn from what the host injected: {said}"
+        );
+
+        // `[[remove]] id = "tui-panel-live"`: the row is gone from the tree as
+        // well as from the registry, and the composer closes up rather than
+        // leaving the blank row it was reserving.
+        h.modules.remove_view("live");
+        let removed = h.compose((60, 12));
+        assert!(removed.part("live").is_none());
+        assert_eq!(
+            removed.part("input").expect("the field").rect,
+            field_at_rest,
+            "a composer of one is the field"
+        );
     }
 
     #[test]
@@ -978,13 +1090,15 @@ mod demo {
     use super::*;
     use crate::conformance;
     use crate::module::Mounted;
-    use crate::modules::{input, status, transcript};
+    use crate::modules::{input, live, status, transcript};
 
     #[test]
     fn print_a_frame() {
         let mods = Arc::new(Modules::new());
         mods.add_producer(transcript::Transcript::new()).unwrap();
         mods.add_view(Arc::new(Mounted::<status::Status>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<live::Live>::new()))
             .unwrap();
         mods.add_view(Arc::new(Mounted::<input::Input>::new()))
             .unwrap();
@@ -1016,7 +1130,39 @@ mod demo {
             reasoning: String::new(),
             tool_calls: Vec::new(),
         });
-        h.moment.write().unwrap().input = "接下来呢".into();
+        // A turn in flight, so the live line is in the picture: three seconds
+        // and one tool call into the next thing the model was asked to do.
+        h.moment.write().unwrap().now = crate::moment::Timestamp::millis(12_000);
+        h.absorb(&atomcode_harness::session::SessionEvent::TurnStart { turn: 3 });
+        h.absorb(&atomcode_harness::session::SessionEvent::AssistantMessage {
+            turn: 3,
+            round: 1,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: "c4".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"cargo test -p atomcode-tui"}"#.into(),
+            }],
+        });
+        // A real reading off the wire, so the figures in the frame are the shape
+        // they take on a long turn: a context of tens of thousands of tokens
+        // almost all served from cache, and the output of one round.
+        h.absorb(&atomcode_harness::session::SessionEvent::Usage {
+            turn: 3,
+            round: 1,
+            usage: atomcode_kernel::stream::TokenUsage {
+                prompt: 57_252,
+                completion: 1_107,
+                cached: 56_192,
+            },
+        });
+        {
+            let mut m = h.moment.write().unwrap();
+            m.input = "接下来呢".into();
+            m.activity = crate::moment::Activity::Working;
+            m.now = crate::moment::Timestamp::millis(15_000);
+        }
         let frame = h.compose((78, 20));
         println!("\n┌{}┐", "─".repeat(78));
         for row in frame.rows() {

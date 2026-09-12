@@ -23,6 +23,7 @@ use crate::block::Stream;
 use crate::host::{default_layout, Host};
 use crate::keymap::{Action, Keys};
 use crate::module::Modules;
+use crate::moment::Timestamp;
 use crate::surface::{Headless, Input, Surface, Terminal};
 
 plexus_service!(SurfaceSvc => dyn Surface, "surface", Seam, "Where a frame is painted");
@@ -37,6 +38,32 @@ plexus_service!(AgentClientSvc => AgentClient, "tui-agent-client", Core, "The co
 // How a question is drawn. A seam rather than a branch: the foot-of-the-stream
 // lines are the fallback every screen has, and anything better is a row.
 plexus_service!(AskViewSvc => dyn crate::ask::AskView, "tui-ask-view", Seam, "How a question is put on screen");
+
+/// The session's clock, and the only place this crate reads one.
+///
+/// A duration on screen is the difference of two readings the log does not
+/// carry, so the readings travel in `Moment` and every `render` stays a pure
+/// function of them (`docs/adr/0008`). Read here because the host loop is the
+/// only thing that knows when *now* is: it wakes for a fact, for a key and for a
+/// tick, and each of those is a moment the screen is painted from.
+struct Clock(std::time::Instant);
+
+impl Clock {
+    /// Start counting. Called before anything can commit a fact, so a turn that
+    /// opens during start-up is measured on the same clock as every later one.
+    fn start() -> Self {
+        Self(std::time::Instant::now())
+    }
+
+    /// How long this session has been on screen.
+    fn reading(&self) -> Timestamp {
+        // Milliseconds since the loop started, saturated rather than wrapped: a
+        // u64 of milliseconds is 584 million years, and a number that suddenly
+        // went backwards would read as a turn that started in the future.
+        let ms = u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Timestamp::millis(ms)
+    }
+}
 
 /// The screen's end of the handle protocol.
 ///
@@ -144,6 +171,9 @@ impl UserInterface for Tui {
         } = handle;
 
         let (wake_tx, mut wake) = mpsc::unbounded_channel::<Wake>();
+        // Started before anything can commit a fact, so the first turn's
+        // opening reading is measured on the same clock as every later one.
+        let clock = Clock::start();
         {
             // Where we are is environment, not a fact from the log — which is
             // what `Moment` is for. Read once here rather than per frame: a
@@ -158,6 +188,7 @@ impl UserInterface for Tui {
             // dark, fully capable terminal — whatever the real one is, which is
             // how a light terminal ended up painted in a dark palette.
             m.caps = self.surface.caps();
+            m.now = clock.reading();
         }
         *self.ctx.lock().expect("ctx poisoned") = Some(ctx.clone());
         *self.wake.lock().expect("wake poisoned") = Some(wake_tx.clone());
@@ -232,6 +263,10 @@ impl UserInterface for Tui {
 
         let mut quit = false;
         while !quit {
+            // The reading the frame about to be painted is drawn from. Facts
+            // absorb against whatever the last one was — a frame at most out of
+            // date, and the only reading available between commits.
+            self.host.moment.write().expect("moment poisoned").now = clock.reading();
             self.refresh_members(ctx, &mine);
             // A question that arrived while the loop was asleep gets its modal
             // here, before the frame it appears in is composed.

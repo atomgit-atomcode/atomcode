@@ -666,6 +666,56 @@ async fn until(s: &Session, text: &str) {
 }
 
 #[tokio::test]
+async fn the_live_line_says_what_the_turn_is_doing_while_it_runs() {
+    // The one thing a screen of blocks cannot say: a turn waiting on a tool and
+    // a turn that has finished look alike, because the block that would tell
+    // them apart has not arrived yet. The line is drawn from the facts *and*
+    // from the host's clock, so this asserts both — a line without the seconds
+    // is a line whose opening reading never got stamped.
+    let dir = scratch("live-line");
+    let script = replay(
+        r#"{ text = "Reading it.", calls = [ { name = "bash", args = { command = "sleep 0.6" } } ] },
+           { text = "Done." }"#,
+    );
+    let s = start(tree(&dir, &script, &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("go");
+    until(&s, "正在运行 1 个工具").await;
+    // The figures are a reading the provider reported, and they belong to the
+    // turn in flight: 100 tokens of context, 20 out of this round. Waiting for
+    // the reading rather than assuming it beats the tool call — the row is drawn
+    // from the log, and the log says which of the two came first.
+    until(&s, "入 100").await;
+    let live = s
+        .term
+        .last()
+        .and_then(|f| f.part("live").map(|p| p.lines.clone()))
+        .expect("the live line is on screen while the tool runs");
+    let said: String = live.iter().map(|l| l.plain()).collect();
+    assert!(said.contains("正在运行 1 个工具"), "{said}");
+    assert!(
+        said.contains("耗时 "),
+        "and says how long it has been running: {said}"
+    );
+    assert!(
+        said.contains("入 100") && said.contains("出 20"),
+        "and what it has cost so far: {said}"
+    );
+
+    s.quiet().await;
+    let done = s.screen();
+    assert!(
+        !done.contains("正在运行"),
+        "the row goes with the turn it was about:\n{done}"
+    );
+    assert!(done.contains("Done."), "{done}");
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
 async fn a_risky_call_is_asked_about_on_screen_and_an_allow_lets_it_run() {
     let dir = scratch("approve");
     let script = replay(

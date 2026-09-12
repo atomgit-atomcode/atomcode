@@ -144,6 +144,18 @@ pub struct Moment {
     /// Injected wall time, for anything that needs a real interval (a
     /// countdown). Still injected: tests set it, `render` never reads a clock.
     pub now: Timestamp,
+    /// When the turn in flight began, on the same clock as [`Moment::now`].
+    /// `None` between turns.
+    ///
+    /// Read off a fact rather than derived from one: the log records no clock,
+    /// so a turn's start time exists only here — stamped where facts land
+    /// (`Host::absorb`), which is the one place that sees both the fact and the
+    /// reading. A duration on screen is therefore the difference of two
+    /// injected readings, and `render` still never reads a clock
+    /// (docs/adr/0008). Folded rather than stored per module for the same
+    /// reason [`Moment::history`] is: it is not derivable, and two modules
+    /// folding it separately would eventually give two answers.
+    pub turn_started: Option<Timestamp>,
     /// Where the agent is working. Not derivable from the log, which is
     /// exactly what this struct is for.
     pub cwd: String,
