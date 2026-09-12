@@ -205,7 +205,10 @@ fn a_hostile_argument_is_in_the_corpus() {
         // between two.
         text.len() > 48
             && text.contains('/')
-            && (1..=48).filter(|k| !text.is_char_boundary(text.len() - k)).count() >= 32
+            && (1..=48)
+                .filter(|k| !text.is_char_boundary(text.len() - k))
+                .count()
+                >= 32
     });
     assert!(
         hostile,

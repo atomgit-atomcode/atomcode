@@ -252,7 +252,10 @@ mod tests {
     //! from its own ASCII fixture, and the point of the assertion is usually
     //! that offset. Production code says why each slice is safe instead; this
     //! is the one place where "the test wrote the string" is the whole reason.
-    #![allow(clippy::string_slice, reason = "byte offsets over the test's own fixtures")]
+    #![allow(
+        clippy::string_slice,
+        reason = "byte offsets over the test's own fixtures"
+    )]
 
     use super::*;
 

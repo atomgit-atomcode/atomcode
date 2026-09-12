@@ -470,17 +470,32 @@ mod tests {
             SessionEvent::Injected {
                 turn: 1,
                 text: "[lib] 列了 12 个文档,还有一些很长很长很长的中文说明文字".into(),
-                origin: InjectionOrigin::Peer { from: "l/lib".into() },
+                origin: InjectionOrigin::Peer {
+                    from: "l/lib".into(),
+                },
             },
         ]);
         let moment = Moment::default().with_members(vec![
-            MemberNow { name: "巡查员-with-a-very-long-name".into(), activity: Activity::Working, turn: 3 },
-            MemberNow { name: "lib".into(), activity: Activity::Idle, turn: 1 },
+            MemberNow {
+                name: "巡查员-with-a-very-long-name".into(),
+                activity: Activity::Working,
+                turn: 3,
+            },
+            MemberNow {
+                name: "lib".into(),
+                activity: Activity::Idle,
+                turn: 1,
+            },
         ]);
         for w in 1u16..100 {
             let vp = Viewport::new(Rect::sized(w, 10), &moment);
             for (i, line) in Team::render(&state, &vp).iter().enumerate() {
-                assert!(line.width() <= w as usize, "team line {i} is {} cells at width {w}: {:?}", line.width(), line.plain());
+                assert!(
+                    line.width() <= w as usize,
+                    "team line {i} is {} cells at width {w}: {:?}",
+                    line.width(),
+                    line.plain()
+                );
             }
         }
     }
