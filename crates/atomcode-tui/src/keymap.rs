@@ -68,6 +68,10 @@ pub enum Action {
     Layout(crate::layout::LayoutOp),
     /// Paste arrived as one event rather than N keystrokes.
     Paste(String),
+    /// Take whatever image the clipboard holds and attach it to what is being
+    /// typed. A no-op when there is none — the key is also how a person finds
+    /// out that there is none.
+    AttachImage,
 }
 
 /// A set of bindings contributed by one row.
@@ -176,6 +180,25 @@ impl Keymap for Default_ {
             (KeyPress::plain(Key::Down), Action::CaretDown),
             (KeyPress::ctrl('r'), Action::ToggleFold("reasoning")),
             (KeyPress::ctrl('t'), Action::ToggleFold("tool_call")),
+            // Ctrl+V, and the alternate Windows Terminal sends instead. A
+            // terminal with no bracketed-paste support delivers a screenshot
+            // paste as a literal `\x16` — which is exactly why the chord is
+            // bound rather than left to `Input::Paste`: the byte that arrives
+            // is a key, and a key that nothing binds is a keystroke that
+            // vanishes. Ctrl+Shift+V stays unbound, so a terminal's own
+            // "paste as plain text" still gets through.
+            (KeyPress::ctrl('v'), Action::AttachImage),
+            (
+                KeyPress::new(
+                    Key::Char('v'),
+                    Mods {
+                        ctrl: true,
+                        alt: true,
+                        shift: false,
+                    },
+                ),
+                Action::AttachImage,
+            ),
             (KeyPress::ctrl('n'), Action::ToggleModule("mascot")),
             // Hand the mouse back, and take it again. `o` for "off", and one of
             // the few control keys a terminal does not already claim.

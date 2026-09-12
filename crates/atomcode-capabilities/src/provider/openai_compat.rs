@@ -192,7 +192,17 @@ pub struct OpenAiCompatConfig {
 /// It gates provider image encoding and the `read_file` vision path; daemon live
 /// preprocessing also uses it. A drift would silently drop or wrongly forward images.
 pub fn model_suggests_vision(name: &str) -> bool {
-    let n = name.to_lowercase();
+    let lowered = name.to_lowercase();
+    // A gateway that fronts many vendors qualifies the model with its vendor:
+    // OpenRouter ids are `anthropic/claude-opus-4.1`, `openai/gpt-4o`,
+    // `google/gemini-2.5-pro`, and Vertex's are a whole resource path ending in
+    // the model name. Every `starts_with` rule below looks at the *front* of
+    // the string, so on a prefixed id not one of them fired — a vision model
+    // behind `anthropic/…` was classified blind, and the image someone pasted
+    // for it was degraded to a caption with nothing saying so. The rules are
+    // about the model, so they run against the model: the last path segment,
+    // which is the whole name when there is no prefix.
+    let n = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
     n.contains("vision")
         || n.contains("-vl")
         || n.contains("vl-")
@@ -511,6 +521,12 @@ impl LlmProvider for OpenAiCompatProvider {
 
     fn context_window(&self) -> u32 {
         self.cfg.context_window
+    }
+
+    /// The same flag `format_messages` degrades on, so what a front end is told
+    /// before attaching a picture is what the encoder will actually do with it.
+    fn supports_vision(&self) -> bool {
+        self.cfg.supports_vision
     }
 
     fn bind_session_id(&self, session_id: &str) {
@@ -2063,7 +2079,7 @@ mod tests {
     // Classification lock for every supported vision naming rule plus a
     // representative text-only negative.
     #[test]
-    fn model_suggests_vision_matches_core_classifications() {
+    fn model_suggests_vision_classification_lock() {
         for m in [
             "gpt-4-vision-preview",
             "glm-4v",
@@ -2090,6 +2106,40 @@ mod tests {
             "gpt-4-turbo",
             "claude-2.1",
             "o3-mini",
+        ] {
+            assert!(!model_suggests_vision(m), "should be text-only: {m}");
+        }
+    }
+
+    // A vendor prefix is a fact about the route, not about the model. Every
+    // `starts_with` rule looks at the front of the string, so before the
+    // last-segment normalization not one of them fired on a prefixed id:
+    // OpenRouter's `anthropic/claude-opus-4.1` was classified blind, and an
+    // image pasted for it was degraded to a caption in silence. This is the
+    // classification the paste gate and the degrade path both read.
+    #[test]
+    fn a_vendor_prefixed_id_is_classified_by_its_model_segment() {
+        for m in [
+            "anthropic/claude-opus-4.1",
+            "anthropic/claude-sonnet-4-6",
+            "openai/gpt-4o",
+            "google/gemini-2.5-pro",
+            "mistralai/pixtral-12b",
+            // Vertex hands over the whole resource path as the model id.
+            "projects/p/locations/us-central1/publishers/google/models/gemini-2.5-pro",
+            // A `:free`-style tag suffix leaves the family at the front.
+            "google/gemini-2.0-flash-exp:free",
+        ] {
+            assert!(model_suggests_vision(m), "should be vision: {m}");
+        }
+        // The vendor segment must not be able to call a model vision-capable on
+        // its own, and a prefixed text-only model must stay text-only: only the
+        // model segment decides, in both directions.
+        for m in [
+            "anthropic/claude-2.1",
+            "deepseek/deepseek-v4",
+            "openai/o3-mini",
+            "vision-plus/gpt-3.5",
         ] {
             assert!(!model_suggests_vision(m), "should be text-only: {m}");
         }

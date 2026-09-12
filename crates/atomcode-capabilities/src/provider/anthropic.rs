@@ -160,6 +160,11 @@ impl LlmProvider for AnthropicProvider {
         self.cfg.context_window
     }
 
+    /// The same flag `format_user_message` degrades on.
+    fn supports_vision(&self) -> bool {
+        self.cfg.supports_vision
+    }
+
     fn bind_session_id(&self, session_id: &str) {
         let _ = self.session_id.set(session_id.to_string());
     }

@@ -466,6 +466,31 @@ mod tests {
     }
 
     #[test]
+    fn accepts_images_sees_through_a_vendor_prefixed_model_id() {
+        // OpenRouter and Vertex qualify a model with its vendor, and the config
+        // is where those reach `accepts_images` — which the daemon projects as
+        // a live session's `supports_vision`. Reading the vendor as the family
+        // made every one of these look text-only.
+        let router: ProviderConfig = toml::from_str(
+            r#"
+                type = "openai"
+                model = "anthropic/claude-opus-4.1"
+            "#,
+        )
+        .expect("parse openrouter id");
+        assert!(router.accepts_images());
+
+        let text_only: ProviderConfig = toml::from_str(
+            r#"
+                type = "openai"
+                model = "deepseek/deepseek-v4"
+            "#,
+        )
+        .expect("parse prefixed text-only id");
+        assert!(!text_only.accepts_images());
+    }
+
+    #[test]
     fn thinking_fields_default_to_none() {
         let toml_str = r#"
             type = "claude"

@@ -72,12 +72,23 @@ fn get_user_home(_username: &str) -> Option<PathBuf> {
     None
 }
 
-/// Heuristic: does this model name look vision-capable? Verbatim copy of
-/// `atomcode_core::provider::model_name_suggests_vision` (and
-/// `atomcode_capabilities::provider::model_suggests_vision`). Used by
-/// `ProviderConfig::accepts_images`. MUST stay in sync with those copies.
+/// Heuristic: does this model name look vision-capable? Same rules as
+/// `atomcode_capabilities::provider::model_suggests_vision`, which is the copy
+/// the coding/provider side arms `supports_vision` from. This one backs
+/// `ProviderConfig::accepts_images` and the config's own active-model check.
+/// MUST stay in sync with that copy.
 pub fn model_name_suggests_vision(name: &str) -> bool {
-    let n = name.to_lowercase();
+    let lowered = name.to_lowercase();
+    // A gateway that fronts many vendors qualifies the model with its vendor:
+    // OpenRouter ids are `anthropic/claude-opus-4.1`, `openai/gpt-4o`,
+    // `google/gemini-2.5-pro`, and Vertex's are a whole resource path ending in
+    // the model name. Every `starts_with` rule below looks at the *front* of
+    // the string, so on a prefixed id not one of them fired — a vision model
+    // behind `anthropic/…` was classified blind, and the image someone pasted
+    // for it was degraded to a caption with nothing saying so. The rules are
+    // about the model, so they run against the model: the last path segment,
+    // which is the whole name when there is no prefix.
+    let n = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
     n.contains("vision")
         || n.contains("-vl")
         || n.contains("vl-")

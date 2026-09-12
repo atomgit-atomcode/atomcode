@@ -133,6 +133,10 @@ pub struct Moment {
     /// The draft that was set aside to go browsing, so leaving the history
     /// gives it back rather than losing it.
     pub draft: String,
+    /// Pictures the composer is holding, waiting for the message that carries
+    /// them. Not a fact until it is sent: a screenshot attached and then
+    /// deleted is a gesture, not a thing that happened.
+    pub attachments: crate::attach::Attachments,
     /// Logical frame counter. Animation phase comes from here, never from a
     /// clock read inside `render` — that would make the whole test loop
     /// non-deterministic while leaving it green.

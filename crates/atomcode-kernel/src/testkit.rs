@@ -1403,6 +1403,10 @@ impl LlmProvider for DeferredSteerProvider {
     fn context_window(&self) -> u32 {
         0
     }
+    /// Forwarded so the double stays faithful to what it wraps.
+    fn supports_vision(&self) -> bool {
+        self.inner.supports_vision()
+    }
     async fn chat_stream(
         &self,
         messages: &[Message],

@@ -82,6 +82,35 @@ fn replay(steps: &str) -> String {
     format!("[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [ {steps} ] }}\n")
 }
 
+/// The same scripted model, plus an answer to "can you see pictures?".
+fn replay_vision(steps: &str, vision: bool) -> String {
+    format!(
+        "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = \
+         {{ supports_vision = {vision}, script = [ {steps} ] }}\n"
+    )
+}
+
+/// Every image that reached the conversation, in order. The log is the only
+/// place that can say whether an attachment was actually *sent* — the marker on
+/// screen says what was typed, not what the model received.
+fn images_sent(s: &Session) -> Vec<usize> {
+    let agents = s
+        .app
+        .service::<atomcode_harness::seams::AgentsSvc>()
+        .expect("`agents` is mounted");
+    agents
+        .list()
+        .iter()
+        .flat_map(|a| a.session().events())
+        .filter_map(|logged| match logged.event {
+            atomcode_harness::session::SessionEvent::UserMessage { images, .. } => {
+                Some(images.len())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 struct Session {
     /// Held, not just borrowed from: dropping the `App` unloads the whole tree,
     /// and every screen goes blank in a way that looks like a UI bug.
@@ -205,6 +234,125 @@ async fn a_person_types_a_question_and_reads_the_answer() {
     assert!(
         s.term.last().unwrap().part("status").is_some(),
         "the status line is on screen"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+// ---- a picture the model cannot receive is never sent quietly -----------
+
+fn screenshot(tag: &str) -> atomcode_kernel::message::ImageContent {
+    atomcode_kernel::message::ImageContent {
+        media_type: "image/png".into(),
+        data: tag.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn a_picture_pasted_for_a_blind_model_is_refused_where_it_was_typed() {
+    // The failure this exists to prevent: the screen says `[Image #1]`, the log
+    // records it, the encoder drops the bytes, and the model answers as if
+    // nothing had been attached — with nobody having said so.
+    let dir = scratch("blind-paste");
+    let s = start(tree(&dir, &replay_vision(r#"{ text = "ok" }"#, false), &[])).await;
+    let task = s.open().await;
+    s.term.set_clipboard_image(screenshot("blind"));
+
+    s.term.press(KeyPress::ctrl('v'));
+    s.quiet().await;
+
+    let screen = s.screen();
+    assert!(
+        screen.contains("看不了图片"),
+        "the refusal names the model, on screen:\n{screen}"
+    );
+    assert!(
+        !screen.contains("[Image #1]"),
+        "nothing was attached, so no marker was written:\n{screen}"
+    );
+    // And it is refused before anything is typed: a composer holding nothing
+    // cannot later send a picture nobody can see.
+    s.term.type_line("看这个");
+    s.quiet().await;
+    assert_eq!(
+        images_sent(&s),
+        vec![0],
+        "the turn ran with the text alone, and the log says zero images"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn a_picture_pasted_for_a_model_that_can_see_it_is_attached_and_sent() {
+    // The other direction, which is what keeps the gate a gate rather than a
+    // wall: a vision model still gets the picture.
+    let dir = scratch("vision-paste");
+    let s = start(tree(&dir, &replay_vision(r#"{ text = "ok" }"#, true), &[])).await;
+    let task = s.open().await;
+    s.term.set_clipboard_image(screenshot("vision"));
+
+    s.term.press(KeyPress::ctrl('v'));
+    s.quiet().await;
+    assert!(
+        s.screen().contains("[Image #1]"),
+        "the marker is in what is being typed:\n{}",
+        s.screen()
+    );
+
+    s.term.type_line("看这个");
+    s.quiet().await;
+    assert_eq!(
+        images_sent(&s),
+        vec![1],
+        "the image was in the message the model received"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn clearing_the_composer_takes_the_picture_with_it() {
+    // Ctrl+U throws the text away, and `[Image #1]` was part of that text.
+    //
+    // This locks what a person can see: the marker goes with the text, and the
+    // turn that follows carries no image. It does NOT witness the composer
+    // releasing the bytes — that is deliberately unobservable from here,
+    // because a marker number is never reused (`add` only ever moves `next`
+    // forward), so an image left held after a clear can never be referred to
+    // again and `take_shown` filters it out of every later send. The release is
+    // therefore a state-coherence and memory bound, and its witness is the unit
+    // test in `attach.rs`, not this one.
+    let dir = scratch("clear-attachment");
+    let s = start(tree(&dir, &replay_vision(r#"{ text = "ok" }"#, true), &[])).await;
+    let task = s.open().await;
+    s.term.set_clipboard_image(screenshot("cleared"));
+
+    s.term.press(KeyPress::ctrl('v'));
+    s.quiet().await;
+    assert!(
+        s.screen().contains("[Image #1]"),
+        "the picture is attached to start with:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('u'));
+    s.quiet().await;
+    assert!(
+        !s.screen().contains("[Image #1]"),
+        "the marker is gone with the text:\n{}",
+        s.screen()
+    );
+
+    s.term.type_line("清空之后只发文字");
+    s.quiet().await;
+    assert_eq!(
+        images_sent(&s),
+        vec![0],
+        "the turn after a clear carries text, not the cleared picture"
     );
 
     s.term.press(KeyPress::ctrl('d'));

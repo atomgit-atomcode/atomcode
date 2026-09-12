@@ -661,14 +661,17 @@ dependencies = [
 name = "atomcode-tui"
 version = "5.0.9"
 dependencies = [
+ "arboard",
  "async-trait",
  "atomcode-harness",
  "atomcode-kernel",
  "atomcode-plexus",
+ "base64",
  "crossterm",
  "ctor",
  "futures",
  "libc",
+ "png 0.17.16",
  "serde",
  "serde_json",
  "tokio",

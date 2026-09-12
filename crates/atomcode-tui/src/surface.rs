@@ -172,6 +172,22 @@ pub trait Surface: Send + Sync {
     /// [`crate::ansi::set_clipboard`] for why not `pbcopy`.
     fn copy(&self, _text: &str) {}
 
+    /// Take an image off the system clipboard, as the value the model sees.
+    ///
+    /// The same seam as [`Surface::copy`], for the same reason and in the other
+    /// direction: a clipboard is the terminal's, so the one layer allowed to
+    /// touch the terminal is where `arboard` lives. Above this line an
+    /// attachment is a value — which is what makes it testable without a
+    /// clipboard, without a screenshot tool and without a human: the headless
+    /// surface answers with whatever a test put there.
+    ///
+    /// `None` is the ordinary answer (the clipboard holds text, or nothing),
+    /// not an error. Encoding happens here too — one place turns RGBA into the
+    /// bytes every provider adapter can carry, rather than three.
+    fn clipboard_image(&self) -> Option<atomcode_kernel::message::ImageContent> {
+        None
+    }
+
     /// The recorder behind this surface, when it is one. How a test reaches the
     /// frames without the tree having to know it is being tested.
     fn as_any_headless(&self) -> Option<Arc<Headless>> {
@@ -192,6 +208,11 @@ pub struct Headless {
     frames: Mutex<Vec<Frame>>,
     keys: tokio::sync::mpsc::UnboundedSender<Input>,
     incoming: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Input>>>,
+    /// What a scripted clipboard holds. A real one cannot be scripted, so
+    /// without this the paste path would only ever be tested by hand — which
+    /// means never, on the path where "no image in the clipboard" is the
+    /// ordinary case.
+    clipboard: Mutex<Option<atomcode_kernel::message::ImageContent>>,
     /// A weak handle back to the `Arc` this lives in, so a consumer holding
     /// `Arc<dyn Surface>` can get the recorder back without downcasting.
     me: Mutex<Option<std::sync::Weak<Headless>>>,
@@ -205,10 +226,21 @@ impl Headless {
             frames: Mutex::new(Vec::new()),
             keys,
             incoming: Mutex::new(Some(incoming)),
+            clipboard: Mutex::new(None),
             me: Mutex::new(None),
         });
         *me.me.lock().expect("headless poisoned") = Some(Arc::downgrade(&me));
         me
+    }
+
+    /// Put an image on the scripted clipboard — a screenshot, for a test.
+    pub fn set_clipboard_image(&self, image: atomcode_kernel::message::ImageContent) {
+        *self.clipboard.lock().expect("headless poisoned") = Some(image);
+    }
+
+    /// Empty it again, so the "nothing to paste" path is reachable too.
+    pub fn clear_clipboard(&self) {
+        *self.clipboard.lock().expect("headless poisoned") = None;
     }
 
     /// Press a key.
@@ -315,6 +347,9 @@ impl Surface for Headless {
     fn take_input(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<Input>> {
         self.incoming.lock().expect("headless poisoned").take()
     }
+    fn clipboard_image(&self) -> Option<atomcode_kernel::message::ImageContent> {
+        self.clipboard.lock().expect("headless poisoned").clone()
+    }
     fn as_any_headless(&self) -> Option<Arc<Headless>> {
         self.me
             .lock()
@@ -386,13 +421,86 @@ impl Terminal {
             Some(theme) => Palette::assumed(theme),
             None => measure_palette(),
         };
+        let stderr = take_stderr();
+        // Armed once the screen is actually taken, so a panic between here and
+        // `restore` gives it back before it prints.
+        #[cfg(unix)]
+        arm_panic_restore(stderr.as_ref().map(|held| held.original));
+        #[cfg(not(unix))]
+        arm_panic_restore(None);
         Ok(Self {
             raw: true,
             mouse: std::sync::atomic::AtomicBool::new(mouse),
             caps,
             painted: LastPainted::default(),
-            stderr: take_stderr(),
+            stderr,
         })
+    }
+}
+
+/// What a panic needs in order to give the screen back.
+///
+/// A panic hook has no `self`, and by the time unwinding reaches
+/// [`Terminal`]'s `Drop` the message has already been printed — into the file
+/// stderr was pointed at, which is the one place nobody looks. Four crashes
+/// were reported as "the window just blinked" for exactly that reason: the
+/// diagnosis existed, in `$TMPDIR/atomcode-tui-<pid>.stderr.log`, and the
+/// person saw a restored shell with nothing on it.
+///
+/// So the screen and stderr are given back *at panic time*, before the message
+/// is printed, by a hook that then chains to whatever hook was there. These two
+/// are the whole of what it needs, and an atomic swap makes sure the hook and
+/// `restore` cannot both do it.
+static SCREEN_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(unix)]
+static STDERR_ORIGINAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Arm the emergency restore, and install the hook the first time.
+fn arm_panic_restore(#[allow(unused_variables)] original: Option<std::os::fd::RawFd>) {
+    use std::sync::atomic::Ordering;
+    #[cfg(unix)]
+    STDERR_ORIGINAL.store(original.unwrap_or(-1), Ordering::SeqCst);
+    SCREEN_HELD.store(true, Ordering::SeqCst);
+
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            emergency_restore();
+            // Now the message goes to a terminal that can show it.
+            previous(info);
+        }));
+    });
+}
+
+/// Give the screen back, from anywhere, at most once.
+///
+/// Both the panic hook and [`Terminal::restore`] call it; whichever gets there
+/// first wins the swap and the other does nothing. `MOUSE_OFF` goes out
+/// unconditionally — disabling reporting that was never enabled costs a few
+/// bytes, and tracking the flag from a global would be one more thing to keep
+/// in step for no gain.
+fn emergency_restore() {
+    use std::sync::atomic::Ordering;
+    if !SCREEN_HELD.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let mut out = std::io::stdout();
+    let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
+    let _ = out.write_all(ansi::LEAVE.as_bytes());
+    let _ = out.flush();
+    let _ = crossterm::terminal::disable_raw_mode();
+    #[cfg(unix)]
+    {
+        let original = STDERR_ORIGINAL.swap(-1, Ordering::SeqCst);
+        if original >= 0 {
+            // SAFETY: `original` is the descriptor `take_stderr` duplicated and
+            // has not been closed — this swap took it, so nobody else will.
+            unsafe {
+                libc::dup2(original, libc::STDERR_FILENO);
+                libc::close(original);
+            }
+        }
     }
 }
 
@@ -438,16 +546,14 @@ fn take_stderr() -> Option<StderrHeld> {
     None
 }
 
-/// Put stderr back, and say where anything that was written to it went.
+/// Say where anything written to stderr went.
+///
+/// The descriptor itself is put back by [`emergency_restore`], which runs on
+/// the panic path too — this half only runs when there is a terminal left to
+/// print the note on.
 #[cfg(unix)]
 fn give_back_stderr(held: &StderrHeld) {
     use std::io::Write;
-    // SAFETY: `original` is the descriptor `take_stderr` duplicated and has not
-    // been closed; this is the matching half of that swap.
-    unsafe {
-        libc::dup2(held.original, libc::STDERR_FILENO);
-        libc::close(held.original);
-    }
     match std::fs::metadata(&held.path).map(|m| m.len()) {
         Ok(0) | Err(_) => {
             let _ = std::fs::remove_file(&held.path);
@@ -465,6 +571,52 @@ fn give_back_stderr(held: &StderrHeld) {
 
 #[cfg(not(unix))]
 fn give_back_stderr(_held: &StderrHeld) {}
+
+/// Read an image off the system clipboard, encoded the way providers want it.
+///
+/// `arboard::get_image` hands back raw RGBA and no format; every provider
+/// adapter expects an encoded image, and which format is a wire detail each of
+/// them owns. So this is where RGBA becomes a PNG — one place, at the boundary,
+/// rather than the same three lines in three adapters. Everything above sees
+/// `image/png` and base64, which is what the kernel's `ImageContent` promises.
+///
+/// Deliberately only the raw-bytes tier. A clipboard carrying a *path* to an
+/// image (Finder's ⌘C on a file) is a different fact, not a different image,
+/// and reading it here would mean a picture that the composer says it has and
+/// the filesystem disagreed with by the time it is sent.
+fn read_clipboard_image() -> Option<atomcode_kernel::message::ImageContent> {
+    use base64::Engine as _;
+
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let img = clipboard.get_image().ok()?;
+    let png = encode_rgba_png(img.width, img.height, &img.bytes)?;
+    Some(atomcode_kernel::message::ImageContent {
+        media_type: "image/png".into(),
+        data: base64::engine::general_purpose::STANDARD.encode(png),
+    })
+}
+
+/// RGBA bytes into a PNG stream, or `None` if the buffer does not describe the
+/// pixels it claims to.
+///
+/// The length check is the point: `arboard` has been known to hand back a
+/// buffer that is short for its declared size on some platforms, and a PNG
+/// written from that decodes to garbage — a picture the model is shown and
+/// nobody can explain, which is worse than a paste that refuses.
+fn encode_rgba_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> {
+    if width == 0 || height == 0 || rgba.len() != width.checked_mul(height)?.checked_mul(4)? {
+        return None;
+    }
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, width as u32, height as u32);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().ok()?;
+        writer.write_image_data(rgba).ok()?;
+    }
+    Some(out)
+}
 
 /// Hand the text to whatever this machine uses for a clipboard.
 ///
@@ -881,15 +1033,15 @@ impl Surface for Terminal {
         let _ = out.flush();
         local_clipboard(text);
     }
+    fn clipboard_image(&self) -> Option<atomcode_kernel::message::ImageContent> {
+        read_clipboard_image()
+    }
     fn restore(&self) {
         self.painted.forget();
-        let mut out = std::io::stdout();
-        if self.mouse() {
-            let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
-        }
-        let _ = out.write_all(ansi::LEAVE.as_bytes());
-        let _ = out.flush();
-        let _ = crossterm::terminal::disable_raw_mode();
+        // The same path a panic takes, so an ordinary exit and a crash cannot
+        // give the screen back two different ways — and so the second caller
+        // is a no-op rather than a double `dup2`.
+        emergency_restore();
         // Last, so anything it has to report is printed to a terminal that is
         // back in its normal mode.
         if let Some(held) = &self.stderr {
@@ -1140,5 +1292,30 @@ mod tests {
             from_crossterm(Event::Key(release)).is_none(),
             "a release must not read as a second press"
         );
+    }
+
+    /// The screen is given back exactly once, whoever gets there first.
+    ///
+    /// The panic hook and `restore` both call it, and on a crash they both
+    /// run: the hook at panic time, `restore` as `Drop` unwinds past it. Two
+    /// `dup2`s on a descriptor the first call already closed is how that kind
+    /// of safety net becomes its own crash.
+    #[test]
+    fn the_screen_is_given_back_once_and_only_once() {
+        use std::sync::atomic::Ordering;
+
+        // Arming without having entered anything is safe: nothing was taken,
+        // so the restore is a few bytes at a stdout the harness is capturing.
+        arm_panic_restore(None);
+        assert!(SCREEN_HELD.load(Ordering::SeqCst), "armed");
+        emergency_restore();
+        assert!(
+            !SCREEN_HELD.load(Ordering::SeqCst),
+            "the first caller wins the swap"
+        );
+        // The second is a no-op rather than a second attempt at the same
+        // descriptor.
+        emergency_restore();
+        assert!(!SCREEN_HELD.load(Ordering::SeqCst));
     }
 }

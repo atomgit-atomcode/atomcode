@@ -16,6 +16,15 @@ atomcode-harness = { path = "../atomcode-harness" }
 # Value types only: SessionEvent carries kernel messages and tool calls.
 atomcode-kernel = { path = "../atomcode-kernel" }
 crossterm = { version = "0.29", features = ["event-stream"] }
+# Reading the clipboard. The surface is the only row allowed to talk to the
+# terminal, and the clipboard is the terminal's — so the platform lives here,
+# behind `Surface::clipboard_image`, and everything above it sees an
+# `ImageContent` and nothing else.
+arboard = "3"
+# arboard hands back raw RGBA; every provider wants an encoded image, so the
+# encode happens once at this boundary rather than in each provider adapter.
+png = "0.17"
+base64 = "0.22"
 unicode-width = "0.2"
 unicode-segmentation = "1"
 async-trait = "0.1"

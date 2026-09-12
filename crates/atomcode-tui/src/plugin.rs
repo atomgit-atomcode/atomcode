@@ -7,10 +7,10 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use atomcode_harness::events::SessionEventCommitted;
 use atomcode_harness::agent::{Agent, CreateAgent};
+use atomcode_harness::events::SessionEventCommitted;
 use atomcode_harness::plugins::handle::{spawn as spawn_driver, wire, Driven};
-use atomcode_harness::seams::{UiSvc, UserInterface, UserQuestionsSvc};
+use atomcode_harness::seams::{LlmSvc, UiSvc, UserInterface, UserQuestionsSvc};
 use atomcode_harness::session::Committed;
 use atomcode_kernel::agent::AgentHandle;
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
@@ -55,11 +55,10 @@ impl AgentClient {
     pub fn session(&self) -> Arc<atomcode_harness::session::SessionLog> {
         self.agent.session()
     }
-    pub fn send(&self, text: String) {
-        let _ = self.commands.send(AgentCommand::SendMessage {
-            text,
-            images: Vec::new(),
-        });
+    pub fn send(&self, text: String, images: Vec<atomcode_kernel::message::ImageContent>) {
+        let _ = self
+            .commands
+            .send(AgentCommand::SendMessage { text, images });
     }
     pub fn cancel(&self) {
         let _ = self.commands.send(AgentCommand::Cancel);
@@ -225,7 +224,9 @@ impl UserInterface for Tui {
         };
 
         if let Some(text) = initial {
-            client.send(text);
+            // A start-up prompt is text by construction — there is no composer
+            // yet, so there is nothing it could have been attached to.
+            client.send(text, Vec::new());
         }
 
         let mut quit = false;
@@ -382,9 +383,9 @@ impl Tui {
     /// read, and status and turn are one atomic load each, so this costs less
     /// than the repaint it precedes.
     fn refresh_members(&self, ctx: &Context, mine: &str) {
+        use crate::moment::{Activity, MemberNow};
         use atomcode_harness::agent::AgentStatus;
         use atomcode_harness::seams::AgentsSvc;
-        use crate::moment::{Activity, MemberNow};
 
         let Some(agents) = ctx.service::<AgentsSvc>() else {
             return;
@@ -497,7 +498,11 @@ impl Tui {
         // The stashed draft goes: there is only one thing being composed.
         if matches!(
             action,
-            Action::Insert(_) | Action::Backspace | Action::DeleteWord | Action::Paste(_)
+            Action::Insert(_)
+                | Action::Backspace
+                | Action::DeleteWord
+                | Action::Paste(_)
+                | Action::AttachImage
         ) {
             m.history_at = None;
         }
@@ -505,6 +510,11 @@ impl Tui {
             Action::Quit => return true,
             Action::Submit => {
                 let text = m.input.trim().to_string();
+                // Take the pictures the text still shows before the text is
+                // cleared: what was written and what was attached have to be
+                // decided together, or an attachment can outlive the marker
+                // that was the only reason it was going.
+                let images = m.attachments.take_shown(&text);
                 m.input.clear();
                 m.caret = 0;
                 m.history_at = None;
@@ -523,7 +533,7 @@ impl Tui {
                 }
                 // One command. Whether it starts a turn or folds into the one
                 // running is the pump's call, not the screen's.
-                client.send(text);
+                client.send(text, images);
                 return false;
             }
             Action::Insert(c) => {
@@ -543,6 +553,17 @@ impl Tui {
             }
             Action::DeleteWord => {
                 let caret = m.caret;
+                // Safe on the caret's invariant, not on luck: every writer of
+                // `m.caret` above lands it on a character boundary — insert
+                // adds `len_utf8`, the arrows and backspace walk to
+                // `is_char_boundary`, a click goes through
+                // `input::offset_at`, which adds the byte length of a
+                // `take_width` prefix. Add a sixth writer and it must do the
+                // same, or this is where it panics.
+                #[allow(
+                    clippy::string_slice,
+                    reason = "the caret is kept on a character boundary by every writer of it"
+                )]
                 let head = m.input[..caret].trim_end();
                 let cut = head.rfind(' ').map(|i| i + 1).unwrap_or(0);
                 m.input.replace_range(cut..caret, "");
@@ -550,6 +571,10 @@ impl Tui {
             }
             Action::Clear => {
                 m.input.clear();
+                // The markers went with the text, so the images they stood for
+                // go too. Leaving them held would make the composer's state
+                // disagree with the only place a person can see it.
+                m.attachments.clear();
                 m.caret = 0;
             }
             Action::CaretLeft => {
@@ -595,6 +620,45 @@ impl Tui {
                 let at = m.caret.min(m.input.len());
                 m.input.insert_str(at, &text);
                 m.caret = at + text.len();
+            }
+            Action::AttachImage => {
+                // The destination is decided before the clipboard is even read.
+                // A model that would drop the bytes has to say so now, while the
+                // person is still holding the screenshot, rather than after they
+                // have typed a question about a picture that never left.
+                if let Err(reason) = images_reach_the_model(client) {
+                    drop(m);
+                    self.say_refused(&reason);
+                    return false;
+                }
+                // Read first, mutate second: a clipboard with no image in it
+                // must leave the composer exactly as it was, and "exactly as it
+                // was" is easier to keep true when nothing was touched yet.
+                let Some(image) = self.surface.clipboard_image() else {
+                    drop(m);
+                    self.say_refused("剪贴板里没有图片");
+                    return false;
+                };
+                let label = m.attachments.add(image);
+                // At the caret, not appended: the marker is part of the
+                // sentence, and where it lands is where the person put it.
+                let at = m.caret.min(m.input.len());
+                // Safe on the caret's invariant, the same one `DeleteWord`
+                // relies on: every writer of `m.caret` leaves it on a character
+                // boundary.
+                #[allow(
+                    clippy::string_slice,
+                    reason = "the caret is kept on a character boundary by every writer of it"
+                )]
+                let head = &m.input[..at];
+                let gap = if !head.is_empty() && !head.ends_with(char::is_whitespace) {
+                    " "
+                } else {
+                    ""
+                };
+                let inserted = format!("{gap}{label}");
+                m.input.insert_str(at, &inserted);
+                m.caret = at + inserted.len();
             }
             Action::Cancel => {
                 m.activity = crate::moment::Activity::Stopping;
@@ -663,7 +727,7 @@ impl Tui {
                 let on = !self.surface.mouse();
                 self.surface.set_mouse(on);
                 let text = if on {
-                    "鼠标已收回:拖动选中并复制,点击工具调用折叠展开,滚轮滚动,esc 取消选中"
+                    "鼠标已收回:拖动选中并复制,点击思考或工具调用折叠展开那一个,滚轮滚动,esc 取消选中"
                         .to_string()
                 } else {
                     "鼠标已交还终端:改用终端自己的框选(可跨 scrollback)。折叠用 ctrl-t/ctrl-r,滚动用 pgup/pgdn,ctrl-o 收回鼠标"
@@ -1062,6 +1126,44 @@ fn recall_forward(m: &mut crate::moment::Moment) {
     m.caret = m.input.len();
 }
 
+/// Whether a picture attached to this conversation would actually reach the
+/// model. `Err` is the reason it would not, phrased for the person.
+///
+/// The provider is the only thing that can answer: an adapter that cannot carry
+/// image content degrades it to a plain-text caption, which is the right
+/// compromise for a conversation being *resumed* on a text-only model and a
+/// silent loss for a screenshot someone pasted a moment ago. Nothing in the
+/// screen could tell those apart, which is why the question is asked here
+/// instead of guessed from the model's name.
+///
+/// Asked of the *agent's own realm* — the same `LlmSvc` lookup the turn loop
+/// makes in `drive_as` — so the answer cannot disagree with what happens to the
+/// bytes on the wire. The empty slot is refused rather than waved through as a
+/// default, even though a mounted tree cannot currently be in that state: the
+/// `agent-loop` row depends on `llm`, so a tree without it does not start at
+/// all. Refusing is the safe direction for a match arm that has to say
+/// something, and it keeps the answer from being "sent" by omission if that
+/// dependency ever loosens.
+///
+/// This runs when the picture is taken, not when the message is sent, so it
+/// rests on one assumption: that the model cannot change between the two. In
+/// this front end that holds — `/patch` is the only thing that re-points the
+/// `llm` row, and it is a slash command, which cannot be run while a marker is
+/// in the composer because the line would no longer start with `/`. A model
+/// picker that swapped the row from a modal, leaving a draft intact underneath,
+/// would break it; that is the change this comment is here to catch.
+fn images_reach_the_model(client: &AgentClient) -> Result<(), String> {
+    match client.agent.ctx().service::<LlmSvc>() {
+        Some(provider) if provider.supports_vision() => Ok(()),
+        Some(provider) => Err(format!(
+            "当前模型 `{}` 看不了图片:贴进去也只会在发出去时被丢掉,所以没贴。\n\
+             换成能看图的模型(改 `llm` 行)再贴。",
+            provider.model_name()
+        )),
+        None => Err("这棵树里没有挂上模型(`llm` 行是空的),图片没有去处,所以没贴。".to_string()),
+    }
+}
+
 /// What a paste is allowed to put in the buffer.
 ///
 /// Pasted text is arbitrary bytes from somewhere else: a log full of colour
@@ -1243,8 +1345,7 @@ impl Plugin for TuiUiPlugin {
         // holds the questions, so it is what the pump releases on cancel.
         let wire = wire();
         let commands = wire.commands.clone();
-        let driven =
-            spawn_driver(ctx, wire, host.asks.clone(), CreateAgent::root(ctx)).await?;
+        let driven = spawn_driver(ctx, wire, host.asks.clone(), CreateAgent::root(ctx)).await?;
         let client = Arc::new(AgentClient {
             commands,
             agent: driven.agent.clone(),

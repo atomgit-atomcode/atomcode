@@ -33,6 +33,16 @@ struct OpenAiCompatRow {
     api_key_env: Option<String>,
     #[serde(default)]
     context_window: Option<u32>,
+    /// Can this model accept images? Left unset, the answer comes from the
+    /// model-name heuristic, which is a guess and cannot know about a gateway's
+    /// own ids. A gateway route can disagree with it in either direction — a
+    /// vision model with an unfamiliar name, or a text-only one whose name
+    /// happens to look like a family the heuristic trusts — so this is the one
+    /// place to overrule the guess. The patch target is the ROW id, `llm`, not
+    /// this adapter's name, and `--patch` takes a file rather than a string:
+    /// `[[patch]] id = "llm" config = { supports_vision = true }`.
+    #[serde(default)]
+    supports_vision: Option<bool>,
 }
 
 pub struct OpenAiCompatPlugin;
@@ -93,7 +103,13 @@ impl Plugin for OpenAiCompatPlugin {
             api_key.expect("checked"),
         );
 
-        let provider = openai_compat(&api_key, &base_url, &model, row.context_window)?;
+        let provider = openai_compat(
+            &api_key,
+            &base_url,
+            &model,
+            row.context_window,
+            row.supports_vision,
+        )?;
         let _ = ctx
             .provide::<LlmSvc>(Arc::new(provider))
             .map_err(|e| e.to_string())?;
@@ -108,6 +124,11 @@ impl Plugin for OpenAiCompatPlugin {
                  To switch model: change ATOMCODE_MODEL and restart. To use the \
                  account already configured in AtomCode instead, drop \
                  `--env-model` so the `llm` row is `llm-atomcode-config`.\n\
+                 Whether `{model}` can be sent images is guessed from its name. \
+                 That guess cannot know a gateway's own ids, so if it is wrong \
+                 either way, overrule it on the `llm` row: put \
+                 `[[patch]] id = \"llm\" config = {{ supports_vision = true }}` \
+                 in a file and pass it as `--patch <file>`.\n\
                  The model is NOT in the user-settings catalog on purpose — it \
                  is a row in the running tree, not a preference."
             ),
@@ -127,10 +148,17 @@ fn openai_compat(
     base_url: &str,
     model: &str,
     context_window: Option<u32>,
+    supports_vision: Option<bool>,
 ) -> Result<OpenAiCompatProvider, String> {
     let mut cfg = OpenAiCompatConfig::new(api_key, base_url, model);
     if let Some(window) = context_window {
         cfg.context_window = window;
+    }
+    // Over the heuristic `new()` just applied, and only when the row said so:
+    // an explicit answer about one gateway route beats a guess made from the
+    // model's name, in both directions.
+    if let Some(vision) = supports_vision {
+        cfg.supports_vision = vision;
     }
     OpenAiCompatProvider::new(cfg).map_err(|e| format!("provider init failed: {}", e.message))
 }
@@ -180,7 +208,11 @@ impl Plugin for LlmUtilityOpenAiCompatPlugin {
             .ok_or("llm-utility-openai-compat needs `base_url` or ATOMCODE_BASE_URL")?;
         let api_key =
             env(&key_env).ok_or_else(|| format!("llm-utility-openai-compat needs {key_env}"))?;
-        let provider = openai_compat(&api_key, &base_url, &row.model, row.context_window)?;
+        // No `supports_vision` here on purpose: a side call is a title or a
+        // summary, and no side call carries an image, so this slot has nothing
+        // for the flag to decide. A knob that cannot change an outcome is a
+        // line of config someone has to think about for no reason.
+        let provider = openai_compat(&api_key, &base_url, &row.model, row.context_window, None)?;
         let _ = ctx
             .provide::<LlmUtilitySvc>(Arc::new(provider))
             .map_err(|e| e.to_string())?;
@@ -213,6 +245,9 @@ impl Plugin for LlmUtilityReplayPlugin {
             .provide::<LlmUtilitySvc>(Arc::new(ReplayProvider {
                 script: row.script,
                 cursor: std::sync::atomic::AtomicUsize::new(0),
+                // Nothing is attached to a side call, so this slot has no
+                // pictures to carry whatever the conversation model can do.
+                vision: false,
             }))
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -224,6 +259,13 @@ struct ReplayRow {
     /// Each step is one model turn: optional text, optional tool calls.
     #[serde(default)]
     script: Vec<ReplayStep>,
+    /// Stand in for a model that can see pictures. FALSE by default, which is
+    /// what a scripted stand-in honestly is: nothing here looks at an image.
+    /// It is a knob rather than a constant because the alternative is an
+    /// image-attachment path no offline tree can exercise in either direction —
+    /// and this is the only tree the tests and `--offline` ever mount.
+    #[serde(default)]
+    supports_vision: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -252,6 +294,7 @@ struct ReplayCall {
 struct ReplayProvider {
     script: Vec<ReplayStep>,
     cursor: std::sync::atomic::AtomicUsize,
+    vision: bool,
 }
 
 #[async_trait]
@@ -262,6 +305,10 @@ impl LlmProvider for ReplayProvider {
 
     fn context_window(&self) -> u32 {
         128_000
+    }
+
+    fn supports_vision(&self) -> bool {
+        self.vision
     }
 
     async fn chat_stream(
@@ -359,6 +406,7 @@ impl Plugin for ReplayPlugin {
                     row.script
                 },
                 cursor: std::sync::atomic::AtomicUsize::new(0),
+                vision: row.supports_vision,
             }))
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -482,5 +530,52 @@ impl Plugin for AtomcodeConfigPlugin {
             .provide::<LlmSvc>(Arc::new(provider))
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The row's `supports_vision` is the one place a person can overrule the
+    // name heuristic, so it has to beat it in BOTH directions. The heuristic is
+    // a guess about a name; the row is a statement about a route, and a route
+    // can be a vision model the heuristic has never heard of, or a text-only
+    // one whose name looks like a family it trusts.
+    #[test]
+    fn the_row_overrules_the_name_heuristic_in_both_directions() {
+        let forced_on =
+            openai_compat("k", "https://gw/v1", "deepseek-v4", None, Some(true)).expect("build");
+        assert!(
+            forced_on.supports_vision(),
+            "an explicit true must beat a text-only-looking name"
+        );
+
+        let forced_off =
+            openai_compat("k", "https://gw/v1", "gpt-4o", None, Some(false)).expect("build");
+        assert!(
+            !forced_off.supports_vision(),
+            "an explicit false must beat a vision-looking name"
+        );
+    }
+
+    #[test]
+    fn an_unset_row_leaves_the_heuristic_in_charge() {
+        let unset = openai_compat("k", "https://gw/v1", "gpt-4o", None, None).expect("build");
+        assert!(unset.supports_vision(), "unset is not the same as false");
+    }
+
+    #[test]
+    fn the_row_parses_the_override_and_defaults_to_unset() {
+        let set: OpenAiCompatRow = serde_json::from_value(serde_json::json!({
+            "supports_vision": false
+        }))
+        .expect("parse with override");
+        assert_eq!(set.supports_vision, Some(false));
+
+        // Absent means "ask the heuristic", and it must not be read as `false`.
+        let absent: OpenAiCompatRow =
+            serde_json::from_value(serde_json::json!({})).expect("parse without override");
+        assert_eq!(absent.supports_vision, None);
     }
 }

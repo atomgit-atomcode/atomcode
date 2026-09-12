@@ -40,6 +40,7 @@
 
 pub mod ansi;
 pub mod ask;
+pub mod attach;
 pub mod block;
 pub mod caps;
 pub mod command;
