@@ -27,7 +27,8 @@ use serde_json::Value;
 
 use crate::agent::{Agent, MessageOrigin};
 use crate::events::{
-    AgentRequest, AssistantChunk, AssistantMessage, Chunk, ModelRequest, ModelResponse, PreStep,
+    AgentInfo, AgentRequest, AssistantChunk, AssistantMessage, Chunk, InboxInserted, ModelRequest,
+    ModelResponse, PreStep,
     RequestError, SessionEventCommitted, StepDecision, ToolBatch, ToolExec, ToolResultEvent,
     ToolsExecuteBatch, TurnEnd, TurnProgress, TurnStart, TurnStarted, TurnStopping,
 };
@@ -690,4 +691,51 @@ impl Plugin for AgentLoopPlugin {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+}
+
+// ---- driving an agent nobody holds a handle on -----------------------------
+
+/// An agent kept running by its inbox: whenever a message lands and no turn is
+/// in flight, one starts. Dropping this stops listening and stops the task.
+///
+/// For agents that are not behind a driver protocol — a team member, a goal
+/// the harness runs on its own. The handle pump does the same for the agent a
+/// driver holds.
+pub struct Driving {
+    _wake: atomcode_plexus::Disposable,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Driving {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub fn keep_driven(agent: Arc<Agent>) -> Result<Driving, String> {
+    let driver = agent
+        .ctx()
+        .require::<AgentLoopSvc>()
+        .map_err(|e| e.to_string())?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let me = agent.id();
+    let wake = agent.ctx().on_emit::<InboxInserted>(move |info: &AgentInfo| {
+        if info.id == me {
+            let _ = tx.send(());
+        }
+    });
+    let task = tokio::spawn(async move {
+        // Whatever was queued before anyone listened counts as a wake.
+        while agent.inbox().has_waking_input() {
+            driver.drive(&agent).await;
+        }
+        // Wakes are edge-triggered and the queue is level-checked: several
+        // arriving mid-turn collapse into one look at the inbox afterwards.
+        while rx.recv().await.is_some() {
+            while agent.inbox().has_waking_input() {
+                driver.drive(&agent).await;
+            }
+        }
+    });
+    Ok(Driving { _wake: wake, task })
 }

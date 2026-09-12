@@ -50,7 +50,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{Agent, MessageOrigin};
-use crate::events::SessionEventCommitted;
+use crate::events::{AgentInfo, InboxInserted, SessionEventCommitted};
 use crate::seams::{
     AgentHandleSource, AgentHandleSvc, AgentLoopSvc, AgentsSvc, ApprovalPolicy, CompactionSvc,
     Decision, LlmSvc, SessionSvc, ToolBox, ToolsSvc, UiSvc, UserInterface, UserQuestions,
@@ -612,6 +612,9 @@ fn spawn_turn(
 enum Woke {
     Command(Option<AgentCommand>),
     TurnDone,
+    /// Something reached the inbox from somewhere other than a command — a
+    /// peer, a timer, a goal controller.
+    Inbox,
 }
 
 /// Translate commands until the driver hangs up.
@@ -639,7 +642,24 @@ async fn pump(
     // Snapshots and compactions act on this agent's log, which lives in its
     // realm; the tree's context would not find it.
     let ctx = agent.ctx().clone();
-    let mut turn: Option<tokio::task::JoinHandle<()>> = None;
+    // Work that arrives without a command still has to run. The listener is
+    // on the agent's own context; a child's inbox event reaches here too
+    // (visibility is upward), so it is filtered to this agent.
+    let (woke_tx, mut woke_rx) = mpsc::unbounded_channel::<()>();
+    let me = agent.id();
+    let wake = ctx.on_emit::<InboxInserted>(move |info: &AgentInfo| {
+        if info.id == me {
+            let _ = woke_tx.send(());
+        }
+    });
+    // Anything that landed before the listener existed: this task is spawned
+    // at mount and a message can reach the inbox before it runs. Listener
+    // first, then the look — so nothing falls between them.
+    let mut turn: Option<tokio::task::JoinHandle<()>> = if agent.inbox().has_waking_input() {
+        Some(spawn_turn(driver.clone(), agent.clone()))
+    } else {
+        None
+    };
     // Snapshot requests that arrived while a turn was running.
     //
     // A driver asks for a snapshot to persist the conversation; answering it
@@ -654,6 +674,7 @@ async fn pump(
         let woke = tokio::select! {
             command = commands.recv() => Woke::Command(command),
             _ = finished(&mut turn) => Woke::TurnDone,
+            _ = woke_rx.recv() => Woke::Inbox,
         };
 
         let command = match woke {
@@ -668,6 +689,15 @@ async fn pump(
                 // A message that arrived after the loop decided it was done
                 // starts the next turn rather than waiting for one.
                 if agent.inbox().has_waking_input() {
+                    turn = Some(spawn_turn(driver.clone(), agent.clone()));
+                }
+                continue;
+            }
+            // The same rule as after a turn: a message starts one, an
+            // injection alone waits for one. A command's own message arrives
+            // here as well, harmlessly — the turn it started is already running.
+            Woke::Inbox => {
+                if turn.is_none() && agent.inbox().has_waking_input() {
                     turn = Some(spawn_turn(driver.clone(), agent.clone()));
                 }
                 continue;
@@ -755,6 +785,7 @@ async fn pump(
     // approval never observes the cancel.
     agent.cancel();
     asker.close();
+    wake.dispose();
     if let Some(handle) = turn.take() {
         let _ = handle.await;
     }

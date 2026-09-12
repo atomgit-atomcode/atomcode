@@ -608,3 +608,109 @@ async fn the_session_row_names_the_front_ends_own_agent() {
         .unwrap();
     assert_ne!(other.session_id(), "named-by-the-row");
 }
+
+// ---- work that arrives without a command still runs ----------------------
+
+async fn until_turns(agent: &Agent, want: usize) -> usize {
+    let mut turns = 0;
+    for _ in 0..200 {
+        turns = agent
+            .session()
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e.event, SessionEvent::TurnEnd { .. }))
+            .count();
+        if turns >= want {
+            return turns;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    turns
+}
+
+#[tokio::test]
+async fn a_message_wakes_an_idle_agent_nobody_is_driving() {
+    let dir = scratch("wake");
+    let app = start(tree(&dir, &talker(&["ok", "ok"]), &[])).await;
+    let agent = create_agent(&app).await.unwrap();
+    let driving = atomcode_harness::plugins::agent_loop::keep_driven(agent.clone()).unwrap();
+
+    // Nobody calls `drive`. A peer, a timer, a goal controller would do
+    // exactly this: put a message in the inbox and expect a turn.
+    agent.send("hello from nowhere");
+    assert_eq!(until_turns(&agent, 1).await, 1, "the message alone started a turn");
+
+    // An injection alone does not: context waits for a prompt.
+    agent.inject("some context", InjectionOrigin::Reminder);
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert_eq!(until_turns(&agent, 1).await, 1, "no second turn for context alone");
+
+    agent.send("and again");
+    assert_eq!(until_turns(&agent, 2).await, 2);
+    drop(driving);
+
+    // Listening stopped with the guard: a third message sits in the inbox.
+    agent.send("after the driver left");
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert_eq!(until_turns(&agent, 2).await, 2);
+    assert!(agent.inbox().has_waking_input(), "queued, not run");
+}
+
+#[tokio::test]
+async fn a_message_wakes_the_agent_behind_a_handle_too() {
+    use atomcode_harness::seams::AgentHandleSvc;
+    use atomcode_kernel::event::AgentEvent;
+    let dir = scratch("wake-handle");
+    let layers = vec![
+        bundle::base().unwrap(),
+        Layer::from_toml(bundle::HANDLE_APP).unwrap(),
+        Layer::from_toml(&talker(&["ok"])).unwrap(),
+        Layer::from_toml(
+            "[[patch]]\nid = \"trace\"\nconfig = { stream = false, tools = false, summary = false }",
+        )
+        .unwrap(),
+        Layer::from_toml(&format!(
+            "[[patch]]\nid = \"fs\"\nconfig = {{ root = {root:?} }}\n\n\
+             [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 4, working_dir = {root:?} }}\n\n\
+             [[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true\n\n\
+             [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {root:?}, home = {root:?} }}\n\n\
+             [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {root:?} }}\n",
+            root = dir.to_string_lossy()
+        ))
+        .unwrap(),
+    ];
+    let mut app = App::new(plugins::catalog(), ConfigTree::from_layers(layers).unwrap());
+    app.start().await.unwrap();
+    let mut handle = app
+        .context()
+        .service::<AgentHandleSvc>()
+        .unwrap()
+        .take()
+        .unwrap();
+    let agent = app.context().service::<AgentsSvc>().unwrap().list()[0].clone();
+
+    // Straight into the inbox — not a command over the wire.
+    agent.send("hello from a peer");
+    let mut saw_turn = false;
+    for _ in 0..200 {
+        match tokio::time::timeout(std::time::Duration::from_millis(50), handle.events.recv()).await
+        {
+            Ok(Some(AgentEvent::TurnComplete { .. })) => {
+                saw_turn = true;
+                break;
+            }
+            Ok(Some(_)) => continue,
+            _ => {}
+        }
+    }
+    assert!(
+        saw_turn,
+        "the pump woke on the inbox and ran the turn; log has {} events, status {:?}, inbox waking {}",
+        agent.session().len(),
+        agent.status(),
+        agent.inbox().has_waking_input()
+    );
+    let _ = handle
+        .commands
+        .send(atomcode_kernel::event::AgentCommand::Shutdown);
+}

@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use atomcode_kernel::message::ImageContent;
 
-use crate::events::{AgentCreated, AgentInfo};
+use crate::events::{AgentCreated, AgentInfo, InboxInserted};
 use crate::seams::{FsSvc, SessionDefaultsSvc, SessionPersistenceSvc, SessionSvc};
 use crate::session::{InjectionOrigin, LoggedEvent, SessionHeader, SessionLog};
 
@@ -419,12 +419,12 @@ impl Agent {
     /// Queue work. Safe to call while a turn is running — the driver claims it
     /// as the next step rather than starting a second turn.
     pub fn send(&self, text: impl Into<String>) {
-        self.inbox.send(text);
+        self.send_full(text, MessageOrigin::User, Vec::new());
     }
 
     /// Queue work the harness asked itself for. See [`MessageOrigin`].
     pub fn send_from(&self, text: impl Into<String>, origin: MessageOrigin) {
-        self.inbox.send_from(text, origin);
+        self.send_full(text, origin, Vec::new());
     }
 
     /// Queue a message with its attachments. See [`Inbox::send_full`].
@@ -435,6 +435,7 @@ impl Agent {
         images: Vec<ImageContent>,
     ) {
         self.inbox.send_full(text, origin, images);
+        self.woke();
     }
 
     /// Take every queued injection, leaving messages. See [`Inbox::claim_injections`].
@@ -449,6 +450,13 @@ impl Agent {
     /// model saw something it never did.
     pub fn inject(&self, text: impl Into<String>, origin: InjectionOrigin) {
         self.inbox.inject(text, origin);
+        self.woke();
+    }
+
+    /// Say the inbox changed. Whether that starts a turn is the driver's call
+    /// — an injection alone never does — but the driver has to be told.
+    fn woke(&self) {
+        self.ctx.emit::<InboxInserted>(&AgentInfo { id: self.id });
     }
 
     pub fn status(&self) -> AgentStatus {

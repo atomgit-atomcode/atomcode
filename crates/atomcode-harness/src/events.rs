@@ -281,6 +281,17 @@ plexus_event!(
 );
 
 plexus_event!(
+    /// Something reached an agent's inbox.
+    ///
+    /// What wakes a driver whose agent is idle. Before this, a turn began only
+    /// on a driver's command or because the previous turn left work queued —
+    /// so a message from a peer, a timer or a goal controller sat in the inbox
+    /// until a person happened to type. Emitted on the agent's own context, so
+    /// its driver hears it and so does anything supervising from above.
+    InboxInserted, "agent/inbox/inserted", Emit, AgentInfo
+);
+
+plexus_event!(
     /// Asked at the end of every round: should the turn stop here?
     ///
     /// The first listener with an opinion wins. This is how a round budget, a
