@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use atomcode_harness::plugins;
 use atomcode_harness::profile::Profiles;
-use atomcode_harness::seams::{AgentHandleSvc};
+use atomcode_harness::seams::AgentHandleSvc;
 use atomcode_kernel::agent::AgentHandle;
 use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
 use atomcode_plexus::{App, ConfigTree};

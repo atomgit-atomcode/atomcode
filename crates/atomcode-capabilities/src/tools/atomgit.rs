@@ -1324,7 +1324,8 @@ mod tests {
             .await;
         assert!(r.is_error, "{}", r.content);
         assert!(
-            r.content.contains("owner, repo, number and title are required"),
+            r.content
+                .contains("owner, repo, number and title are required"),
             "{}",
             r.content
         );

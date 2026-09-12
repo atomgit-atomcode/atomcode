@@ -383,9 +383,7 @@ disabled = false
 /// Takes the id, because "which conversation" is not something a harness should
 /// guess. `--continue` resolves the most recent one and produces this.
 pub fn resume_overlay(id: &str) -> String {
-    format!(
-        "[[patch]]\nid = \"session\"\nconfig = {{ id = {id:?}, resume = true }}\n"
-    )
+    format!("[[patch]]\nid = \"session\"\nconfig = {{ id = {id:?}, resume = true }}\n")
 }
 
 /// Allow everything. For a sandbox, a container, or an eval where the whole

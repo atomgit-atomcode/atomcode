@@ -563,10 +563,8 @@ async fn a_tree_level_policy_writes_into_the_log_of_the_agent_whose_turn_it_is()
     let dir = scratch("scoped-log");
     let app = start(tree(&dir, &talker(&["ok", "ok"]), &[])).await;
     let root = app.context();
-    let _policy = root.on_waterfall::<AgentRequest>(
-        Arc::new(WritesANotice { ctx: root.clone() }),
-        false,
-    );
+    let _policy =
+        root.on_waterfall::<AgentRequest>(Arc::new(WritesANotice { ctx: root.clone() }), false);
     let a = create_agent(&app).await.unwrap();
     let b = create_agent(&app).await.unwrap();
 
@@ -638,12 +636,20 @@ async fn a_message_wakes_an_idle_agent_nobody_is_driving() {
     // Nobody calls `drive`. A peer, a timer, a goal controller would do
     // exactly this: put a message in the inbox and expect a turn.
     agent.send("hello from nowhere");
-    assert_eq!(until_turns(&agent, 1).await, 1, "the message alone started a turn");
+    assert_eq!(
+        until_turns(&agent, 1).await,
+        1,
+        "the message alone started a turn"
+    );
 
     // An injection alone does not: context waits for a prompt.
     agent.inject("some context", InjectionOrigin::Reminder);
     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-    assert_eq!(until_turns(&agent, 1).await, 1, "no second turn for context alone");
+    assert_eq!(
+        until_turns(&agent, 1).await,
+        1,
+        "no second turn for context alone"
+    );
 
     agent.send("and again");
     assert_eq!(until_turns(&agent, 2).await, 2);

@@ -20,8 +20,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::agent::Agent;
 use crate::seams::{
-    AgentLoopSvc, AgentsSvc, ControlSvc, SessionTitleSvc, StopReason, UiSvc,
-    UserInterface, UserQuestions, UserQuestionsSvc,
+    AgentLoopSvc, AgentsSvc, ControlSvc, SessionTitleSvc, StopReason, UiSvc, UserInterface,
+    UserQuestions, UserQuestionsSvc,
 };
 
 fn parse<T: for<'de> Deserialize<'de> + Default>(config: &Value) -> Result<T, String> {

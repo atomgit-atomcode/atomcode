@@ -178,7 +178,8 @@ impl Plugin for LlmUtilityOpenAiCompatPlugin {
             .base_url
             .or_else(|| env("ATOMCODE_BASE_URL"))
             .ok_or("llm-utility-openai-compat needs `base_url` or ATOMCODE_BASE_URL")?;
-        let api_key = env(&key_env).ok_or_else(|| format!("llm-utility-openai-compat needs {key_env}"))?;
+        let api_key =
+            env(&key_env).ok_or_else(|| format!("llm-utility-openai-compat needs {key_env}"))?;
         let provider = openai_compat(&api_key, &base_url, &row.model, row.context_window)?;
         let _ = ctx
             .provide::<LlmUtilitySvc>(Arc::new(provider))

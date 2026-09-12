@@ -6,8 +6,7 @@ use atomcode_harness::agent::{CreateAgent, OnlySession};
 use std::sync::Arc;
 
 use atomcode_harness::seams::{
-    AgentsSvc,
-    SessionPersistenceSvc, SessionProjectionsSvc, StopReason,
+    AgentsSvc, SessionPersistenceSvc, SessionProjectionsSvc, StopReason,
 };
 use atomcode_harness::session::{
     assert_model_visible_is_logged, derive_messages, HeaderReason, InjectionOrigin, LoggedEvent,
@@ -706,11 +705,24 @@ async fn the_file_begins_with_a_header_and_the_events_follow() {
         .unwrap();
     let lines = lines_of(std::path::Path::new(&path));
     let header = &lines[0]["header"];
-    assert_eq!(header["id"], id, "first line names the session: {}", lines[0]);
-    assert_eq!(header["version"], atomcode_harness::session::SESSION_FORMAT_VERSION);
+    assert_eq!(
+        header["id"], id,
+        "first line names the session: {}",
+        lines[0]
+    );
+    assert_eq!(
+        header["version"],
+        atomcode_harness::session::SESSION_FORMAT_VERSION
+    );
     assert!(header["created_at"].as_u64().unwrap() > 0);
-    assert!(lines[0].get("seq").is_none(), "the header takes no sequence number");
-    assert!(lines[1].get("seq").is_some(), "and the events start right after");
+    assert!(
+        lines[0].get("seq").is_none(),
+        "the header takes no sequence number"
+    );
+    assert!(
+        lines[1].get("seq").is_some(),
+        "and the events start right after"
+    );
     assert_eq!(
         lines.iter().filter(|l| l.get("header").is_some()).count(),
         1,
@@ -782,7 +794,10 @@ async fn a_fork_carries_the_parents_events_under_its_own_name() {
             title: "the parent's name".into(),
         },
     );
-    assert_eq!(parent.session().title().as_deref(), Some("the parent's name"));
+    assert_eq!(
+        parent.session().title().as_deref(),
+        Some("the parent's name")
+    );
 
     // Fork-shaped: the child's seed is the parent's whole log so far.
     let prefix = parent.session().events();

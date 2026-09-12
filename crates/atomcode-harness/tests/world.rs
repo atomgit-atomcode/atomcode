@@ -165,10 +165,7 @@ async fn the_world_fences_paths_outside_its_root() {
     .await;
     run_turn(&app, "read it").await.unwrap();
 
-    let log = app
-        .context()
-        .only_session()
-        .unwrap();
+    let log = app.context().only_session().unwrap();
     let text: String = log
         .derive_messages()
         .iter()

@@ -176,7 +176,12 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
             let Some((key, value)) = line.split_once(':') else {
                 continue;
             };
-            let value = value.split('#').next().unwrap_or("").trim().trim_matches('"');
+            let value = value
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"');
             match key.trim() {
                 "permission" => {
                     permission = Some(match value {
@@ -225,7 +230,10 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
     }
     let persona = body.trim().to_string();
     if persona.is_empty() {
-        return Err(format!("{}: no persona after the frontmatter", path.display()));
+        return Err(format!(
+            "{}: no persona after the frontmatter",
+            path.display()
+        ));
     }
     Ok(Role {
         id,
@@ -412,7 +420,8 @@ struct TeamArgs {
 impl TeamTool {
     /// The agent whose turn is calling: the lead.
     fn lead(&self) -> Result<Arc<Agent>, String> {
-        let current = crate::agent::current().ok_or("`team` must be called from a running agent")?;
+        let current =
+            crate::agent::current().ok_or("`team` must be called from a running agent")?;
         let log = current
             .service::<SessionSvc>()
             .ok_or("the calling agent has no session")?;
@@ -423,7 +432,10 @@ impl TeamTool {
     }
 
     async fn delegate(&self, lead: &Arc<Agent>, args: TeamArgs) -> Result<String, String> {
-        let name = args.name.filter(|n| !n.trim().is_empty()).ok_or("`name` is required")?;
+        let name = args
+            .name
+            .filter(|n| !n.trim().is_empty())
+            .ok_or("`name` is required")?;
         let role_id = args.role.ok_or("`role` is required")?;
         let role = self
             .roles
@@ -433,16 +445,25 @@ impl TeamTool {
             .ok_or_else(|| {
                 format!(
                     "unknown role `{role_id}`; roles: {}",
-                    self.roles.iter().map(|r| r.id.as_str()).collect::<Vec<_>>().join(", ")
+                    self.roles
+                        .iter()
+                        .map(|r| r.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )
             })?;
-        let task = args.task.filter(|t| !t.trim().is_empty()).ok_or("`task` is required")?;
+        let task = args
+            .task
+            .filter(|t| !t.trim().is_empty())
+            .ok_or("`task` is required")?;
         let lead_session = lead.session_id().to_string();
         {
             let all = self.members.by_lead.lock().expect("members poisoned");
             let mine = all.get(&lead_session);
             if mine.is_some_and(|m| m.contains_key(&name)) {
-                return Err(format!("a member named `{name}` already exists; `tell` it instead"));
+                return Err(format!(
+                    "a member named `{name}` already exists; `tell` it instead"
+                ));
             }
             if mine.map(|m| m.len()).unwrap_or(0) >= self.max_members {
                 return Err(format!("the team is full ({} members)", self.max_members));
@@ -510,25 +531,25 @@ impl TeamTool {
             .create(
                 &self.ctx,
                 req.setup(Box::new(move |realm: &Context| {
-                        let mut held = Vec::new();
-                        held.push(
-                            realm
-                                .provide::<ToolsSvc>(tools_for_realm)
-                                .map_err(|e| e.to_string())?,
-                        );
-                        held.push(
-                            realm
-                                .provide::<crate::seams::SystemPromptSvc>(prompts.clone())
-                                .map_err(|e| e.to_string())?,
-                        );
-                        if let Some(model) = utility.clone() {
-                            held.push(realm.provide::<LlmSvc>(model).map_err(|e| e.to_string())?);
-                        }
-                        held.push(realm.on_serial::<TurnStopping>(Arc::new(ChildRoundCap {
-                            max_steps: max_rounds,
-                        })));
-                        Ok(held)
-                    })),
+                    let mut held = Vec::new();
+                    held.push(
+                        realm
+                            .provide::<ToolsSvc>(tools_for_realm)
+                            .map_err(|e| e.to_string())?,
+                    );
+                    held.push(
+                        realm
+                            .provide::<crate::seams::SystemPromptSvc>(prompts.clone())
+                            .map_err(|e| e.to_string())?,
+                    );
+                    if let Some(model) = utility.clone() {
+                        held.push(realm.provide::<LlmSvc>(model).map_err(|e| e.to_string())?);
+                    }
+                    held.push(realm.on_serial::<TurnStopping>(Arc::new(ChildRoundCap {
+                        max_steps: max_rounds,
+                    })));
+                    Ok(held)
+                })),
             )
             .await?;
         // The tool needs the member's registry id, which exists only now.
@@ -540,11 +561,10 @@ impl TeamTool {
             told: told_for_tool,
         }))?;
         let driving = keep_driven(child.clone())?;
-        self.members
-            .leads
-            .lock()
-            .expect("leads poisoned")
-            .insert(child.session_id().to_string(), (lead_session.clone(), name.clone()));
+        self.members.leads.lock().expect("leads poisoned").insert(
+            child.session_id().to_string(),
+            (lead_session.clone(), name.clone()),
+        );
         self.members
             .by_lead
             .lock()
@@ -567,8 +587,10 @@ impl TeamTool {
              to block on it or `status` to look.",
             role.id,
             match &worktree {
-                Some((dir, branch)) =>
-                    format!(", working in its own checkout {} on branch `{branch}`", dir.display()),
+                Some((dir, branch)) => format!(
+                    ", working in its own checkout {} on branch `{branch}`",
+                    dir.display()
+                ),
                 None => String::new(),
             }
         ))
@@ -597,7 +619,10 @@ impl TeamTool {
             .unwrap_or_else(|| repo.join(".atomcode").join("worktrees"))
             .join(name);
         if dir.exists() {
-            return Err(format!("{} already exists; stop the old member first", dir.display()));
+            return Err(format!(
+                "{} already exists; stop the old member first",
+                dir.display()
+            ));
         }
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -640,7 +665,12 @@ impl TeamTool {
             let all = self.members.by_lead.lock().expect("members poisoned");
             all.get(lead.session_id()).and_then(|m| m.get(name)).map(f)
         };
-        found.ok_or_else(|| format!("no member named `{name}`; live members: {}", self.roster(lead)))
+        found.ok_or_else(|| {
+            format!(
+                "no member named `{name}`; live members: {}",
+                self.roster(lead)
+            )
+        })
     }
 
     fn status(&self, lead: &Arc<Agent>) -> String {
@@ -672,7 +702,12 @@ impl TeamTool {
             .join("\n")
     }
 
-    async fn wait(&self, lead: &Arc<Agent>, name: &str, timeout: Duration) -> Result<String, String> {
+    async fn wait(
+        &self,
+        lead: &Arc<Agent>,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<String, String> {
         let agent = self.with_member(lead, name, |m| m.agent.clone())?;
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -682,11 +717,15 @@ impl TeamTool {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(format!("`{name}` is still working after {}s", timeout.as_secs()));
+                return Err(format!(
+                    "`{name}` is still working after {}s",
+                    timeout.as_secs()
+                ));
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        Ok(last_said(&agent.session()).unwrap_or_else(|| format!("`{name}` finished without saying anything")))
+        Ok(last_said(&agent.session())
+            .unwrap_or_else(|| format!("`{name}` finished without saying anything")))
     }
 
     async fn stop(&self, lead: &Arc<Agent>, name: Option<&str>) -> Result<String, String> {
@@ -977,7 +1016,10 @@ impl Plugin for TeamPlugin {
             .clone()
             .map(PathBuf::from)
             .unwrap_or_else(crate::home);
-        let mut dirs = vec![project.join(".atomcode").join("agents"), home.join("agents")];
+        let mut dirs = vec![
+            project.join(".atomcode").join("agents"),
+            home.join("agents"),
+        ];
         dirs.extend(row.roles_dirs.iter().map(PathBuf::from));
         let roles = load_roles(&dirs)?;
         let role_list = roles

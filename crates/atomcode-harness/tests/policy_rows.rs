@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use atomcode_harness::seams::{
-    Question, SessionTitleSvc, StopReason, ToolsSvc, UserQuestions, UserQuestionsSvc,
-    ANSWER_ALLOW, ANSWER_ALWAYS, ANSWER_DENY,
+    Question, SessionTitleSvc, StopReason, ToolsSvc, UserQuestions, UserQuestionsSvc, ANSWER_ALLOW,
+    ANSWER_ALWAYS, ANSWER_DENY,
 };
 use atomcode_harness::{bundle, plugins, run_turn};
 use atomcode_plexus::{App, ConfigTree, Context, Layer, Plugin};
@@ -393,8 +393,14 @@ async fn a_safe_tool_reading_a_key_is_refused_by_default() {
     let app = start(tree(&dir, &read_script(&key), &[])).await;
     run_turn(&app, "read it").await.unwrap();
     let text = transcript(&app);
-    assert!(text.contains("sensitive path"), "refused with the reason: {text}");
-    assert!(!text.contains("hunter2"), "and the secret never reached the model: {text}");
+    assert!(
+        text.contains("sensitive path"),
+        "refused with the reason: {text}"
+    );
+    assert!(
+        !text.contains("hunter2"),
+        "and the secret never reached the model: {text}"
+    );
 }
 
 #[tokio::test]
@@ -468,8 +474,16 @@ async fn interactive_approval_is_asked_about_the_sensitive_read_and_only_that() 
     run_turn(&app, "read it").await.unwrap();
     assert!(transcript(&app).contains("hunter2"), "yes means yes");
     let questions = asked.lock().unwrap().clone();
-    assert_eq!(questions.len(), 1, "asked once, by the gate, not again by approval: {questions:?}");
-    assert!(questions[0].contains("sensitive path"), "and the question says why: {}", questions[0]);
+    assert_eq!(
+        questions.len(),
+        1,
+        "asked once, by the gate, not again by approval: {questions:?}"
+    );
+    assert!(
+        questions[0].contains("sensitive path"),
+        "and the question says why: {}",
+        questions[0]
+    );
 }
 
 /// A human who allows the first call for good, and would refuse afterwards.

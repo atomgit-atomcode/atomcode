@@ -22,8 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::agent::AgentId;
 use crate::events::SessionEventCommitted;
 use crate::seams::{
-    AgentLoopSvc, AgentsSvc, ControlSvc, UiSvc, UserInterface, UserQuestions,
-    UserQuestionsSvc,
+    AgentLoopSvc, AgentsSvc, ControlSvc, UiSvc, UserInterface, UserQuestions, UserQuestionsSvc,
 };
 use crate::session::Committed;
 

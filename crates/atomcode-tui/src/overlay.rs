@@ -341,7 +341,10 @@ pub fn modal_rect(screen: Rect, size: (u8, u8), rows: Option<u16>) -> Rect {
     };
     // Two for the border. Never taller than the screen, and never so short
     // that the frame has nothing between its edges.
-    let h = rows.saturating_add(2).clamp(3, screen.h.max(3)).min(screen.h);
+    let h = rows
+        .saturating_add(2)
+        .clamp(3, screen.h.max(3))
+        .min(screen.h);
     Rect::new(rect.x, (screen.h.saturating_sub(h)) / 2, rect.w, h)
 }
 

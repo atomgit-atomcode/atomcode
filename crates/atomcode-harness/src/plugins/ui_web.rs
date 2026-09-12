@@ -23,8 +23,7 @@ use tokio::sync::{broadcast, oneshot};
 use crate::agent::Agent;
 use crate::events::SessionEventCommitted;
 use crate::seams::{
-    AgentLoopSvc, AgentsSvc, ControlSvc, UiSvc, UserInterface, UserQuestions,
-    UserQuestionsSvc,
+    AgentLoopSvc, AgentsSvc, ControlSvc, UiSvc, UserInterface, UserQuestions, UserQuestionsSvc,
 };
 use crate::session::Committed;
 

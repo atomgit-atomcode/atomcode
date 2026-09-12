@@ -92,15 +92,20 @@ async fn the_first_prompt_names_the_session_once() {
     let dir = scratch("first");
     let app = start(tree(&dir, &talker(&["ok", "ok"]), &[])).await;
     let agent = create_agent(&app).await.unwrap();
-    run_turn(&app, "make the build stop failing on windows please, it is urgent")
-        .await
-        .unwrap();
+    run_turn(
+        &app,
+        "make the build stop failing on windows please, it is urgent",
+    )
+    .await
+    .unwrap();
     assert_eq!(
         titled(&agent).await.as_deref(),
         Some("make the build stop failing on windows please"),
         "eight words of the first prompt, logged as a fact"
     );
-    run_turn(&app, "and then update the changelog").await.unwrap();
+    run_turn(&app, "and then update the changelog")
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(titles(&agent).len(), 1, "named once, not once per prompt");
 }
@@ -113,12 +118,20 @@ async fn the_utility_model_names_it_when_the_row_says_so() {
     // own answers.
     let utility = "[[insert]]\nid = \"llm-utility\"\nname = \"llm-utility-replay\"\n\
                    config = { script = [ { text = \"\\\"Windows build fix.\\\"\" } ] }";
-    let app = start(tree(&dir, &talker(&["the answer", "the answer"]), &[MODEL_NAMER, utility])).await;
+    let app = start(tree(
+        &dir,
+        &talker(&["the answer", "the answer"]),
+        &[MODEL_NAMER, utility],
+    ))
+    .await;
     let agent = create_agent(&app).await.unwrap();
     let outcome = run_turn(&app, "make the build stop failing on windows please")
         .await
         .unwrap();
-    assert_eq!(outcome.text, "the answer", "the conversation's script was not eaten");
+    assert_eq!(
+        outcome.text, "the answer",
+        "the conversation's script was not eaten"
+    );
     assert_eq!(
         titled(&agent).await.as_deref(),
         Some("Windows build fix"),

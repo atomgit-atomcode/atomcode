@@ -330,7 +330,12 @@ impl Overlay for AskCard {
             // the scope they are saying it to — and "every call of this tool"
             // is a very different promise from "this one command".
             if answer.value == ANSWER_ALWAYS {
-                if let Some(grant) = self.question.about.as_ref().and_then(|a| a.grant.as_deref()) {
+                if let Some(grant) = self
+                    .question
+                    .about
+                    .as_ref()
+                    .and_then(|a| a.grant.as_deref())
+                {
                     let covers = if grant.trim().is_empty() {
                         "这个工具的全部调用".to_string()
                     } else {
@@ -342,13 +347,7 @@ impl Overlay for AskCard {
             out.push(Line::from_spans(spans).truncate(w));
         }
         out.push(Line::empty());
-        out.push(
-            Line::styled(
-                width::take_width("  数字键选择 · esc 拒绝", w),
-                dim,
-            )
-            .truncate(w),
-        );
+        out.push(Line::styled(width::take_width("  数字键选择 · esc 拒绝", w), dim).truncate(w));
         out
     }
 
@@ -443,7 +442,11 @@ pub fn highlights(arguments: &str) -> Vec<(String, String)> {
         if let Some(found) = object.get(key).and_then(|v| v.as_str()) {
             out.push((
                 key.to_string(),
-                format!("{} 行 · {} 字", found.lines().count(), found.chars().count()),
+                format!(
+                    "{} 行 · {} 字",
+                    found.lines().count(),
+                    found.chars().count()
+                ),
             ));
         }
     }
@@ -532,10 +535,10 @@ mod tests {
 
     // ---- the card -------------------------------------------------------
 
-    use atomcode_harness::seams::{AboutCall, Answer, Question as Q};
     use crate::frame::Rect;
     use crate::moment::{Moment, Viewport};
     use crate::surface::{Key, KeyPress, Mods};
+    use atomcode_harness::seams::{AboutCall, Answer, Question as Q};
 
     fn approval(asker: Option<&str>, tool: &str, args: &str, grant: Option<&str>) -> Q {
         Q {

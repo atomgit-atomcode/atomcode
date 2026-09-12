@@ -66,7 +66,9 @@ async fn start(tree: ConfigTree) -> App {
     app.start().await.expect("must mount");
     // The tree's own agent, so the session exists before the first turn — what
     // the `session` row used to do at mount.
-    atomcode_harness::create_agent(&app).await.expect("an agent");
+    atomcode_harness::create_agent(&app)
+        .await
+        .expect("an agent");
     app
 }
 
@@ -334,12 +336,7 @@ config = { script = [
 ] }
 "#;
     let app = start(tree(&dir, &[call])).await;
-    let id = app
-        .context()
-        .only_session()
-        .unwrap()
-        .id()
-        .to_string();
+    let id = app.context().only_session().unwrap().id().to_string();
 
     let outcome = run_turn(&app, "what session is this?")
         .await

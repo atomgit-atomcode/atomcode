@@ -193,8 +193,14 @@ impl Tool for EditFileTool {
                             .to_string(),
                     );
                 }
-                if let Err(msg) =
-                    write_encoded_if_unchanged(self.world.as_ref(), &path, &raw, &fuzzy_result, file_encoding).await
+                if let Err(msg) = write_encoded_if_unchanged(
+                    self.world.as_ref(),
+                    &path,
+                    &raw,
+                    &fuzzy_result,
+                    file_encoding,
+                )
+                .await
                 {
                     return err(msg);
                 }
@@ -224,8 +230,14 @@ impl Tool for EditFileTool {
                             .to_string(),
                     );
                 }
-                if let Err(msg) =
-                    write_encoded_if_unchanged(self.world.as_ref(), &path, &raw, &ws_result, file_encoding).await
+                if let Err(msg) = write_encoded_if_unchanged(
+                    self.world.as_ref(),
+                    &path,
+                    &raw,
+                    &ws_result,
+                    file_encoding,
+                )
+                .await
                 {
                     return err(msg);
                 }
@@ -244,8 +256,14 @@ impl Tool for EditFileTool {
                 try_block_anchor_replace(&content, &a.old_string, &a.new_string)
             {
                 if anchor_result != content {
-                    if let Err(msg) =
-                        write_encoded_if_unchanged(self.world.as_ref(), &path, &raw, &anchor_result, file_encoding).await
+                    if let Err(msg) = write_encoded_if_unchanged(
+                        self.world.as_ref(),
+                        &path,
+                        &raw,
+                        &anchor_result,
+                        file_encoding,
+                    )
+                    .await
                     {
                         return err(msg);
                     }
@@ -286,7 +304,10 @@ impl Tool for EditFileTool {
         } else {
             content.replacen(&old_match, &new_match, 1)
         };
-        if let Err(msg) = write_encoded_if_unchanged(self.world.as_ref(), &path, &raw, &updated, file_encoding).await {
+        if let Err(msg) =
+            write_encoded_if_unchanged(self.world.as_ref(), &path, &raw, &updated, file_encoding)
+                .await
+        {
             return err(msg);
         }
         let replaced = if a.replace_all { count } else { 1 };

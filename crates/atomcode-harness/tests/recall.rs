@@ -65,7 +65,9 @@ async fn start(tree: ConfigTree) -> App {
     app.start().await.expect("must mount");
     // The tree's own agent, so the session exists before the first turn — what
     // the `session` row used to do at mount.
-    atomcode_harness::create_agent(&app).await.expect("an agent");
+    atomcode_harness::create_agent(&app)
+        .await
+        .expect("an agent");
     app
 }
 
@@ -91,12 +93,7 @@ async fn ask(app: &App, query: &str) -> String {
 /// Run one turn, then wait for the persistence listener to have written it.
 async fn say_and_settle(app: &App, text: &str) -> String {
     run_turn(app, text).await.expect("a turn");
-    let id = app
-        .context()
-        .only_session()
-        .unwrap()
-        .id()
-        .to_string();
+    let id = app.context().only_session().unwrap().id().to_string();
     let store = app.context().service::<SessionPersistenceSvc>().unwrap();
     for _ in 0..100 {
         if let Some(path) = store.location(&id) {

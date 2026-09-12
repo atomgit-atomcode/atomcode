@@ -148,7 +148,9 @@ async fn a_member_reports_to_the_lead_and_the_lead_hears_it_between_turns() {
     ))
     .await;
     let lead = create_agent(&app).await.unwrap();
-    let first = run_turn(&app, "find out where sessions are created").await.unwrap();
+    let first = run_turn(&app, "find out where sessions are created")
+        .await
+        .unwrap();
     assert_eq!(first.text, "delegated; waiting");
 
     // The member ran on its own driver, on the utility model, and spoke.
@@ -166,10 +168,17 @@ async fn a_member_reports_to_the_lead_and_the_lead_hears_it_between_turns() {
             _ => None,
         })
         .collect();
-    assert_eq!(scout_said, vec!["looking", "that is all"], "the member's own log");
+    assert_eq!(
+        scout_said,
+        vec!["looking", "that is all"],
+        "the member's own log"
+    );
     assert_eq!(
         peers(&scout),
-        vec![(lead.session_id().to_string(), "find where sessions are created".to_string())],
+        vec![(
+            lead.session_id().to_string(),
+            "find where sessions are created".to_string()
+        )],
         "the task arrived as a message from the lead"
     );
 
@@ -177,9 +186,18 @@ async fn a_member_reports_to_the_lead_and_the_lead_hears_it_between_turns() {
     // if it was quick, waiting in the inbox — and waking a driven lead —
     // otherwise. Either way it is a fact in the lead's log with the sender named.
     let heard = heard_by(&app, &lead).await;
-    assert_eq!(heard.len(), 1, "one report, not one per member turn: {heard:?}");
+    assert_eq!(
+        heard.len(),
+        1,
+        "one report, not one per member turn: {heard:?}"
+    );
     assert_eq!(heard[0].0, scout.session_id());
-    assert!(heard[0].1.contains("[scout] sessions are created in agent.rs"), "{heard:?}");
+    assert!(
+        heard[0]
+            .1
+            .contains("[scout] sessions are created in agent.rs"),
+        "{heard:?}"
+    );
 
     // The lead's model saw it as something said to it, with the sender named.
     let shown = lead
@@ -215,8 +233,16 @@ async fn a_member_that_finishes_silently_is_reported_on() {
     let heard = heard_by(&app, &lead).await;
     assert_eq!(heard.len(), 1, "{heard:?}");
     assert_eq!(heard[0].0, scout.session_id());
-    assert!(heard[0].1.starts_with("[scout finished turn 1"), "{}", heard[0].1);
-    assert!(heard[0].1.contains("found nothing worth saying"), "{}", heard[0].1);
+    assert!(
+        heard[0].1.starts_with("[scout finished turn 1"),
+        "{}",
+        heard[0].1
+    );
+    assert!(
+        heard[0].1.contains("found nothing worth saying"),
+        "{}",
+        heard[0].1
+    );
 }
 
 #[tokio::test]
@@ -239,16 +265,34 @@ async fn status_wait_tell_and_stop_are_the_leads_to_call() {
     assert_eq!(waited.content, "first answer");
 
     let status = as_lead(&app, &lead, r#"{"action":"status"}"#).await;
-    assert!(status.content.starts_with("scout (explorer): Idle"), "{}", status.content);
+    assert!(
+        status.content.starts_with("scout (explorer): Idle"),
+        "{}",
+        status.content
+    );
 
-    let told = as_lead(&app, &lead, r#"{"action":"tell","name":"scout","text":"and the tests?"}"#).await;
+    let told = as_lead(
+        &app,
+        &lead,
+        r#"{"action":"tell","name":"scout","text":"and the tests?"}"#,
+    )
+    .await;
     assert!(!told.is_error, "{}", told.content);
     until_idle(&scout).await;
     let waited = as_lead(&app, &lead, r#"{"action":"wait","name":"scout"}"#).await;
     assert_eq!(waited.content, "second answer");
-    assert_eq!(peers(&scout).len(), 2, "task, then the follow-up, both as the lead's words");
+    assert_eq!(
+        peers(&scout).len(),
+        2,
+        "task, then the follow-up, both as the lead's words"
+    );
 
-    let unknown = as_lead(&app, &lead, r#"{"action":"tell","name":"nobody","text":"hi"}"#).await;
+    let unknown = as_lead(
+        &app,
+        &lead,
+        r#"{"action":"tell","name":"nobody","text":"hi"}"#,
+    )
+    .await;
     assert!(unknown.is_error);
     assert!(
         unknown.content.contains("live members: scout (explorer)"),
@@ -258,10 +302,20 @@ async fn status_wait_tell_and_stop_are_the_leads_to_call() {
 
     let stopped = as_lead(&app, &lead, r#"{"action":"stop","name":"scout"}"#).await;
     assert_eq!(stopped.content, "stopped: scout");
-    assert!(agents.by_session(&scout_session).is_none(), "the member is gone");
-    assert_eq!(as_lead(&app, &lead, r#"{"action":"status"}"#).await.content, "no members");
+    assert!(
+        agents.by_session(&scout_session).is_none(),
+        "the member is gone"
+    );
+    assert_eq!(
+        as_lead(&app, &lead, r#"{"action":"status"}"#).await.content,
+        "no members"
+    );
     let gone = as_lead(&app, &lead, r#"{"action":"wait","name":"scout"}"#).await;
-    assert!(gone.content.contains("do not survive a restart"), "{}", gone.content);
+    assert!(
+        gone.content.contains("do not survive a restart"),
+        "{}",
+        gone.content
+    );
 }
 
 #[tokio::test]
@@ -281,9 +335,18 @@ async fn a_member_can_only_address_the_lead() {
         .unwrap();
     let names = scout.ctx().service::<ToolsSvc>().unwrap().names();
     assert!(names.contains(&"tell_parent".to_string()), "{names:?}");
-    assert!(!names.contains(&"team".to_string()), "a member cannot delegate: {names:?}");
-    assert!(!names.contains(&"bash".to_string()), "never a shell: {names:?}");
-    assert!(!names.contains(&"write_file".to_string()), "an explorer reads: {names:?}");
+    assert!(
+        !names.contains(&"team".to_string()),
+        "a member cannot delegate: {names:?}"
+    );
+    assert!(
+        !names.contains(&"bash".to_string()),
+        "never a shell: {names:?}"
+    );
+    assert!(
+        !names.contains(&"write_file".to_string()),
+        "an explorer reads: {names:?}"
+    );
 }
 
 // ---- roles are data ------------------------------------------------------
@@ -322,7 +385,10 @@ async fn a_role_comes_from_a_markdown_file_and_can_replace_a_built_in() {
         .expect("a role from a file is a role");
     let names = lib.ctx().service::<ToolsSvc>().unwrap().names();
     assert!(names.contains(&"read_file".to_string()) && names.contains(&"glob".to_string()));
-    assert!(!names.contains(&"grep".to_string()), "an explicit tool list replaces the default: {names:?}");
+    assert!(
+        !names.contains(&"grep".to_string()),
+        "an explicit tool list replaces the default: {names:?}"
+    );
     let prompt = lib
         .ctx()
         .service::<atomcode_harness::seams::SystemPromptSvc>()
@@ -339,10 +405,20 @@ async fn a_role_comes_from_a_markdown_file_and_can_replace_a_built_in() {
         .unwrap()
         .parameters_schema();
     let roles = schema["properties"]["role"]["enum"].to_string();
-    assert!(roles.contains("librarian") && roles.contains("explorer"), "{roles}");
-    let told = as_lead(&app, &lead, r#"{"action":"delegate","name":"x","role":"explorer","task":"t"}"#).await;
+    assert!(
+        roles.contains("librarian") && roles.contains("explorer"),
+        "{roles}"
+    );
+    let told = as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"x","role":"explorer","task":"t"}"#,
+    )
+    .await;
     assert!(!told.is_error, "{}", told.content);
-    let x = agents.by_session(&format!("{}/x", lead.session_id())).unwrap();
+    let x = agents
+        .by_session(&format!("{}/x", lead.session_id()))
+        .unwrap();
     let prompt = x
         .ctx()
         .service::<atomcode_harness::seams::SystemPromptSvc>()
@@ -354,13 +430,23 @@ async fn a_role_comes_from_a_markdown_file_and_can_replace_a_built_in() {
 #[tokio::test]
 async fn a_bad_role_file_refuses_to_mount() {
     let dir = scratch("bad-role");
-    write_role(&dir, "broken", "---\npermission: root\ndifficulty: simple\n---\nnope\n");
+    write_role(
+        &dir,
+        "broken",
+        "---\npermission: root\ndifficulty: simple\n---\nnope\n",
+    );
     let mut app = App::new(
         plugins::catalog(),
         tree(&dir, r#"{ text = "ok" }"#, r#"{ text = "ok" }"#),
     );
-    let err = app.start().await.expect_err("a role that names a permission that does not exist");
-    assert!(format!("{err:?}").contains("permission must be explore or worker"), "{err:?}");
+    let err = app
+        .start()
+        .await
+        .expect_err("a role that names a permission that does not exist");
+    assert!(
+        format!("{err:?}").contains("permission must be explore or worker"),
+        "{err:?}"
+    );
 }
 
 // ---- a writing member gets a checkout of its own ---------------------------
@@ -372,14 +458,21 @@ fn sh(dir: &std::path::Path, cmd: &str) -> String {
         .current_dir(dir)
         .output()
         .unwrap();
-    assert!(out.status.success(), "{cmd}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{cmd}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
 #[tokio::test]
 async fn a_worker_edits_in_its_own_worktree_and_the_branch_outlives_it() {
     let dir = scratch("worktree");
-    sh(&dir, "git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init");
+    sh(
+        &dir,
+        "git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init",
+    );
     // A worker on the utility model, so its script is its own.
     write_role(
         &dir,
@@ -402,15 +495,30 @@ async fn a_worker_edits_in_its_own_worktree_and_the_branch_outlives_it() {
     until_idle(&scribe).await;
 
     let worktree = dir.join(".atomcode").join("worktrees").join("scribe");
-    assert_eq!(scribe.cwd(), Some(&worktree), "the member's world is its checkout");
+    assert_eq!(
+        scribe.cwd(),
+        Some(&worktree),
+        "the member's world is its checkout"
+    );
     assert!(worktree.join("note.txt").exists(), "it wrote there");
     assert!(!dir.join("note.txt").exists(), "and not in the lead's tree");
     let status = as_lead(&app, &lead, r#"{"action":"status"}"#).await;
-    assert!(status.content.contains("branch `team/scribe-"), "{}", status.content);
+    assert!(
+        status.content.contains("branch `team/scribe-"),
+        "{}",
+        status.content
+    );
 
     let stopped = as_lead(&app, &lead, r#"{"action":"stop","name":"scribe"}"#).await;
-    assert!(stopped.content.contains("branch `team/scribe-"), "{}", stopped.content);
+    assert!(
+        stopped.content.contains("branch `team/scribe-"),
+        "{}",
+        stopped.content
+    );
     assert!(!worktree.exists(), "the checkout is gone");
     let branches = sh(&dir, "git branch --list 'team/*'");
-    assert!(branches.contains("team/scribe-"), "the branch stays for the lead: {branches}");
+    assert!(
+        branches.contains("team/scribe-"),
+        "the branch stays for the lead: {branches}"
+    );
 }

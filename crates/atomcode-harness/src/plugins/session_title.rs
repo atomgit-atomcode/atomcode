@@ -133,7 +133,6 @@ impl Plugin for SessionTitlePlugin {
     }
 }
 
-
 // ---- the utility model names it -------------------------------------------
 
 const TITLE_SYSTEM: &str = "You name conversations. Given the first message a person sent, \
@@ -179,14 +178,18 @@ impl ModelTitle {
             }
             Some(out)
         };
-        tokio::time::timeout(self.timeout, call).await.ok().flatten()
+        tokio::time::timeout(self.timeout, call)
+            .await
+            .ok()
+            .flatten()
     }
 }
 
 #[async_trait]
 impl SessionTitle for ModelTitle {
     fn describe(&self) -> String {
-        "the utility model, from the first prompt; the first prompt itself when there is none".into()
+        "the utility model, from the first prompt; the first prompt itself when there is none"
+            .into()
     }
 
     async fn title(&self, log: &SessionLog) -> Option<String> {
@@ -298,10 +301,9 @@ impl Plugin for TitleOnFirstPromptPlugin {
                 if !matches!(committed.event, SessionEvent::UserMessage { .. }) {
                     return;
                 }
-                let (Some(agents), Some(titler)) = (
-                    ctx.service::<AgentsSvc>(),
-                    ctx.service::<SessionTitleSvc>(),
-                ) else {
+                let (Some(agents), Some(titler)) =
+                    (ctx.service::<AgentsSvc>(), ctx.service::<SessionTitleSvc>())
+                else {
                     return;
                 };
                 let Some(agent) = agents.by_session(&committed.session) else {

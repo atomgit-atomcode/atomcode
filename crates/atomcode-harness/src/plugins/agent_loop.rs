@@ -28,13 +28,13 @@ use serde_json::Value;
 use crate::agent::{Agent, MessageOrigin};
 use crate::events::{
     AgentInfo, AgentRequest, AssistantChunk, AssistantMessage, Chunk, InboxInserted, ModelRequest,
-    ModelResponse, PreStep,
-    RequestError, SessionEventCommitted, StepDecision, ToolBatch, ToolExec, ToolResultEvent,
-    ToolsExecuteBatch, TurnEnd, TurnProgress, TurnStart, TurnStarted, TurnStopping,
+    ModelResponse, PreStep, RequestError, SessionEventCommitted, StepDecision, ToolBatch, ToolExec,
+    ToolResultEvent, ToolsExecuteBatch, TurnEnd, TurnProgress, TurnStart, TurnStarted,
+    TurnStopping,
 };
 use crate::seams::{
-    AgentLoop, AgentLoopSvc, LlmSvc, SessionProjectionsSvc, StopReason,
-    SystemPromptSvc, ToolsSvc, TurnOutcome,
+    AgentLoop, AgentLoopSvc, LlmSvc, SessionProjectionsSvc, StopReason, SystemPromptSvc, ToolsSvc,
+    TurnOutcome,
 };
 use crate::session::{Committed, HeaderReason, InjectionOrigin, SeqNo, SessionEvent, SessionLog};
 
@@ -738,11 +738,13 @@ pub fn keep_driven(agent: Arc<Agent>) -> Result<Driving, String> {
         .map_err(|e| e.to_string())?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let me = agent.id();
-    let wake = agent.ctx().on_emit::<InboxInserted>(move |info: &AgentInfo| {
-        if info.id == me {
-            let _ = tx.send(());
-        }
-    });
+    let wake = agent
+        .ctx()
+        .on_emit::<InboxInserted>(move |info: &AgentInfo| {
+            if info.id == me {
+                let _ = tx.send(());
+            }
+        });
     let task = tokio::spawn(async move {
         // Whatever was queued before anyone listened counts as a wake.
         while agent.inbox().has_waking_input() {

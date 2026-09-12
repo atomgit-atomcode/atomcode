@@ -17,9 +17,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use atomcode_harness::profile::Profiles;
-use atomcode_harness::seams::{
-    FindingsSvc, ShellSvc, SystemPromptSvc, ToolsSvc, UiSvc,
-};
+use atomcode_harness::seams::{FindingsSvc, ShellSvc, SystemPromptSvc, ToolsSvc, UiSvc};
 use atomcode_harness::{plugins, run_turn};
 use atomcode_plexus::{App, ConfigTree};
 

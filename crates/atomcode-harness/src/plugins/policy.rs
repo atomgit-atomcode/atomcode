@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use atomcode_capabilities::tools::repair_tool_args;
-use atomcode_kernel::tool::{ToolContext, RiskLevel, Tool, ToolCall, ToolResult};
+use atomcode_kernel::tool::{RiskLevel, Tool, ToolCall, ToolContext, ToolResult};
 use atomcode_plexus::{Context, Next, Plugin, Waterfall};
 use serde::Deserialize;
 use serde_json::Value;
@@ -385,10 +385,8 @@ impl Plugin for SensitivePathsPlugin {
         "ask before a read-only tool touches credentials, keys or `.env` — through the approval seam"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
-        let _ = ctx.on_waterfall::<ToolsExecute>(
-            Arc::new(SensitivePathGate { ctx: ctx.clone() }),
-            false,
-        );
+        let _ = ctx
+            .on_waterfall::<ToolsExecute>(Arc::new(SensitivePathGate { ctx: ctx.clone() }), false);
         Ok(())
     }
 }

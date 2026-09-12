@@ -3187,8 +3187,7 @@ impl RunningAgent {
                 let redump = last_truncated_text
                     .as_deref()
                     .is_some_and(|prev| truncation_is_redump(prev, &assistant_text));
-                if truncated && !redump && truncation_continuations < MAX_TRUNCATION_CONTINUATIONS
-                {
+                if truncated && !redump && truncation_continuations < MAX_TRUNCATION_CONTINUATIONS {
                     truncation_continuations += 1;
                     last_truncated_text = Some(assistant_text.clone());
                     self.rt.emit(AgentEvent::OutputTruncationRecovery {
@@ -5926,7 +5925,10 @@ mod truncation_redump_tests {
     fn genuine_continuation_is_not_a_redump() {
         let prev = "第 1 节:玩家可选性别,只画脸,滚动条调肤色……".repeat(20);
         let curr = "第 2 节:多点触控时其余脸随机肤色,来回判定加分……".repeat(20);
-        assert!(!truncation_is_redump(&prev, &curr), "different content = resume");
+        assert!(
+            !truncation_is_redump(&prev, &curr),
+            "different content = resume"
+        );
     }
 
     #[test]

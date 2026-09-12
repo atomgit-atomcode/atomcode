@@ -58,10 +58,9 @@ macro_rules! seam_catalog {
 
 use crate::seams::{
     AgentHandleSvc, AgentLoopSvc, AgentsSvc, ApprovalSvc, CodeIndexSvc, CompactionSvc, ControlSvc,
-    FindingsSvc, FsSvc, LlmSvc, LlmUtilitySvc, McpSvc, OpenerSvc, OperationsSvc, SessionDefaultsSvc,
-    SessionPersistenceSvc, SessionProjectionsSvc, SessionSvc, SessionTitleSvc, ShellSvc,
-    SkillsSvc, SubagentsSvc,
-    SystemPromptSvc, ToolsSvc, UiSvc, UserQuestionsSvc,
+    FindingsSvc, FsSvc, LlmSvc, LlmUtilitySvc, McpSvc, OpenerSvc, OperationsSvc,
+    SessionDefaultsSvc, SessionPersistenceSvc, SessionProjectionsSvc, SessionSvc, SessionTitleSvc,
+    ShellSvc, SkillsSvc, SubagentsSvc, SystemPromptSvc, ToolsSvc, UiSvc, UserQuestionsSvc,
 };
 
 seam_catalog!(

@@ -183,7 +183,9 @@ mod tests {
         std::fs::create_dir(d.path().join("src")).unwrap();
         std::fs::write(d.path().join("src/main.rs"), "fn main(){}").unwrap();
         std::fs::write(d.path().join("README.md"), "# hi").unwrap();
-        let r = ListDirTool::default().execute(r#"{"path":"."}"#, &ctx(d.path())).await;
+        let r = ListDirTool::default()
+            .execute(r#"{"path":"."}"#, &ctx(d.path()))
+            .await;
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("src/"), "{}", r.content);
         assert!(r.content.contains("  main.rs"), "{}", r.content);
@@ -195,7 +197,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir(d.path().join("target")).unwrap();
         std::fs::write(d.path().join("target/junk"), "x").unwrap();
-        let r = ListDirTool::default().execute(r#"{"path":"."}"#, &ctx(d.path())).await;
+        let r = ListDirTool::default()
+            .execute(r#"{"path":"."}"#, &ctx(d.path()))
+            .await;
         assert!(r.content.contains("target/ (skipped)"), "{}", r.content);
         assert!(!r.content.contains("junk"), "{}", r.content);
     }
@@ -203,7 +207,9 @@ mod tests {
     #[tokio::test]
     async fn invalid_json_args_error() {
         let d = tempfile::tempdir().unwrap();
-        let r = ListDirTool::default().execute("{not valid json", &ctx(d.path())).await;
+        let r = ListDirTool::default()
+            .execute("{not valid json", &ctx(d.path()))
+            .await;
         assert!(
             r.is_error,
             "malformed args must surface an error, not silently default"

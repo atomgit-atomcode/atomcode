@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use atomcode_harness::profile::Profiles;
 use atomcode_harness::seam_map::{
-    seam_definitions, seam_map, undeclared_services, HOST_CONSUMED, AGENT_PROVIDED, HOST_PROVIDED,
+    seam_definitions, seam_map, undeclared_services, AGENT_PROVIDED, HOST_CONSUMED, HOST_PROVIDED,
 };
 use atomcode_harness::seams::{LlmSvc, ToolsSvc, UiSvc};
 use atomcode_harness::{bundle, plugins};

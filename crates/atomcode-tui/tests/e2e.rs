@@ -291,11 +291,11 @@ async fn a_turn_the_model_never_answers_says_so_and_stops_spinning() {
     // `block_in_place`, not a bare sleep: a bare sleep pins this worker, and
     // the UI task the fact just woke sits in this worker's own run queue until
     // the hold ends — which hides the very race the hold is meant to expose.
-    let _hold = s
-        .app
-        .on_emit::<atomcode_harness::events::TurnEnd>(|_: &atomcode_harness::seams::TurnOutcome| {
+    let _hold = s.app.on_emit::<atomcode_harness::events::TurnEnd>(
+        |_: &atomcode_harness::seams::TurnOutcome| {
             tokio::task::block_in_place(|| std::thread::sleep(Duration::from_millis(300)));
-        });
+        },
+    );
     let task = s.open().await;
 
     s.term.type_line("hello?");
@@ -1134,11 +1134,11 @@ async fn with_no_card_row_the_question_is_still_asked_and_still_answered() {
     s.term.type_line("write it");
     until(&s, "write_file").await;
     let screen = s.screen();
+    assert!(!screen.contains("┌─ 审批"), "no row, no card:\n{screen}");
     assert!(
-        !screen.contains("┌─ 审批"),
-        "no row, no card:\n{screen}"
+        screen.contains("允许一次"),
+        "but the answers are there:\n{screen}"
     );
-    assert!(screen.contains("允许一次"), "but the answers are there:\n{screen}");
 
     s.term.press(KeyPress::ch('1'));
     s.quiet().await;

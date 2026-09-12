@@ -16,8 +16,8 @@ use crate::events::{
     ToolExec, ToolsExecute, TurnEnd, TurnProgress, TurnStart, TurnStarted, TurnStopping,
 };
 use crate::seams::{
-    AgentsSvc, Decision, SessionSvc, StopReason, ToolsSvc, TurnOutcome,
-    UserQuestions, UserQuestionsSvc,
+    AgentsSvc, Decision, SessionSvc, StopReason, ToolsSvc, TurnOutcome, UserQuestions,
+    UserQuestionsSvc,
 };
 
 use super::tools::{contribute_prompt, mount};

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use atomcode_harness::events::{AgentRequest, ModelRequest, ModelResponse, RequestError};
-use atomcode_harness::seams::{StopReason};
+use atomcode_harness::seams::StopReason;
 use atomcode_harness::session::SessionEvent;
 use atomcode_harness::{bundle, plugins, run_turn};
 use atomcode_plexus::{App, ConfigTree, Layer, Next, Waterfall};
