@@ -107,6 +107,16 @@ impl AgentClient {
 /// which is exactly when precision beats speed.
 const WHEEL_LINES: i32 = 1;
 
+/// How many wakes are answered before a frame is owed regardless.
+///
+/// The loop paints when the queue has run dry, so a burst of wakes — a turn
+/// committing a fact per token, and the handle saying a second thing about each
+/// one — is one repaint instead of one per token. This is what stops a producer
+/// that refills the queue as fast as the loop drains it from holding the screen
+/// without ever showing it: coalescing is a reason not to redraw each wake, not
+/// a reason never to redraw.
+const COALESCE_LIMIT: usize = 256;
+
 /// What woke the loop up.
 enum Wake {
     Fact,
@@ -262,16 +272,28 @@ impl UserInterface for Tui {
         }
 
         let mut quit = false;
+        // Whether what is on screen is out of date. `compose` walks the stream
+        // and encodes a whole screen, so a frame is composed when the loop is
+        // about to go idle on it rather than on the way past: a wake that
+        // changed nothing must not cost one. The first is owed — nothing has
+        // been drawn yet.
+        let mut stale = true;
+        // Wakes answered since that frame. See [`COALESCE_LIMIT`].
+        let mut coalesced = 0usize;
         while !quit {
-            // The reading the frame about to be painted is drawn from. Facts
-            // absorb against whatever the last one was — a frame at most out of
-            // date, and the only reading available between commits.
-            self.host.moment.write().expect("moment poisoned").now = clock.reading();
-            self.refresh_members(ctx, &mine);
-            // A question that arrived while the loop was asleep gets its modal
-            // here, before the frame it appears in is composed.
-            self.open_question();
-            self.paint();
+            if stale && (coalesced >= COALESCE_LIMIT || wake.is_empty()) {
+                // The reading the frame about to be painted is drawn from. Facts
+                // absorb against whatever the last one was — a frame at most out
+                // of date, and the only reading available between commits.
+                self.host.moment.write().expect("moment poisoned").now = clock.reading();
+                self.refresh_members(ctx, &mine);
+                // A question that arrived while the loop was asleep gets its
+                // modal here, before the frame it appears in is composed.
+                self.open_question();
+                self.paint();
+                stale = false;
+                coalesced = 0;
+            }
             let timer = self.host.modules.tick();
             let woke = match timer {
                 Some(every) => match tokio::time::timeout(every, wake.recv()).await {
@@ -281,15 +303,29 @@ impl UserInterface for Tui {
                 },
                 None => wake.recv().await.unwrap_or(Wake::Closed),
             };
+            coalesced += 1;
             match woke {
                 Wake::Closed => quit = true,
-                Wake::Fact => {}
-                Wake::Event(event) => self.on_event(event),
-                Wake::Act(action) => quit = self.act(action, &client),
-                Wake::Chose(chosen) => self.chose(chosen),
+                // The fact was folded into the stream by the listener that sent
+                // this, so what is drawn is a frame behind it now.
+                Wake::Fact => stale = true,
+                // Most of what arrives here moves nothing on the screen: a
+                // streamed delta is already in the transcript by the time it is
+                // projected into this event, and this is the same news again.
+                // `on_event` says which arrivals did move it.
+                Wake::Event(event) => stale |= self.on_event(event),
+                Wake::Act(action) => {
+                    quit = self.act(action, &client);
+                    stale = true;
+                }
+                Wake::Chose(chosen) => {
+                    self.chose(chosen);
+                    stale = true;
+                }
                 Wake::Tick => {
                     let mut m = self.host.moment.write().expect("moment poisoned");
                     m.tick = m.tick.wrapping_add(1);
+                    stale = true;
                 }
                 Wake::Input(Input::Resize(..)) => {
                     // A resize is the terminal reflowing its own screen under
@@ -303,6 +339,7 @@ impl UserInterface for Tui {
                     // can arrive before it has. `ctrl-l` is the other way to
                     // say the same thing.
                     self.surface.forget();
+                    stale = true;
                 }
                 // The wheel scrolls the conversation, not the terminal's own
                 // history — in the alternate screen that history is the shell's,
@@ -333,26 +370,31 @@ impl UserInterface for Tui {
                     if let Some(action) = action {
                         quit = self.act(action, &client);
                     }
+                    stale = true;
                 }
                 Wake::Input(Input::Paste(text)) => {
                     quit = self.act(Action::Paste(text), &client);
+                    stale = true;
                 }
                 // A modal has the keyboard while it is open, then the
                 // question, then the ordinary bindings. Exactly one owner at a
                 // time, decided here — that is what focus is.
                 Wake::Input(Input::Key(press)) if self.host.overlays.is_open() => {
                     self.host.overlays.key(press);
+                    stale = true;
                 }
                 // A question on screen gets first refusal on every key. Focus is
                 // arbitration, not composition: exactly one thing can hold it,
                 // and the host decides which.
                 Wake::Input(Input::Key(press)) if self.host.asks.is_waiting() => {
                     quit = self.answer_question(press);
+                    stale = true;
                 }
                 Wake::Input(Input::Key(press)) => {
                     if let Some(action) = self.keys.resolve(press) {
                         quit = self.act(action, &client);
                     }
+                    stale = true;
                 }
             }
         }
@@ -484,7 +526,12 @@ impl Tui {
     /// The agent's own events: they move the status line and answer the
     /// commands that asked for something, and nothing else. Content is not
     /// read from here — the transcript folds the log.
-    fn on_event(&self, event: AgentEvent) {
+    ///
+    /// Returns whether any of that changed what is drawn. Most of what arrives
+    /// does not: a streamed delta is in the transcript already, and this event
+    /// is the same news in another shape, so a frame for it would recompose the
+    /// picture that is already on the screen.
+    fn on_event(&self, event: AgentEvent) -> bool {
         use crate::moment::Activity;
         match event {
             AgentEvent::TurnStarted => self.set_activity(Activity::Working),
@@ -497,17 +544,24 @@ impl Tui {
                 } else {
                     self.say("暂时没有值得压缩的");
                 }
+                true
             }
             AgentEvent::Error { message, .. } => {
                 self.set_activity(Activity::Idle);
                 self.say_refused(&message);
+                true
             }
-            _ => {}
+            _ => false,
         }
     }
 
-    fn set_activity(&self, activity: crate::moment::Activity) {
-        self.host.moment.write().expect("moment poisoned").activity = activity;
+    /// Tell the status line what the agent is doing. `false` when it already
+    /// said so: the frame would be the one already up.
+    fn set_activity(&self, activity: crate::moment::Activity) -> bool {
+        let mut m = self.host.moment.write().expect("moment poisoned");
+        let changed = m.activity != activity;
+        m.activity = activity;
+        changed
     }
 
     fn say_refused(&self, text: &str) {

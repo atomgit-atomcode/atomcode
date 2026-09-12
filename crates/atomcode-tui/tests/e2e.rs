@@ -1464,3 +1464,32 @@ async fn with_no_card_row_the_question_is_still_asked_and_still_answered() {
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+/// A model's answer arrives a delta at a time — a word here — and every delta
+/// commits a fact and gets a second event out of the handle, so a word wakes
+/// the loop twice. At a frame apiece the screen falls further behind the longer
+/// the model talks, and the transcript on it is the thing being waited for.
+/// What is already queued is answered in one frame instead, and this counts
+/// frames against words because the whole point is that they are not the same
+/// number.
+#[tokio::test]
+async fn a_burst_of_deltas_costs_frames_not_one_per_delta() {
+    let dir = scratch("coalesce");
+    let words = 400;
+    let script = replay(&format!(r#"{{ text = "{}" }}"#, "ok ".repeat(words)));
+    let s = start(tree(&dir, &script, &[])).await;
+    let task = s.open().await;
+
+    let before = s.term.frame_count();
+    s.term.type_line("go");
+    s.quiet().await;
+    let painted = s.term.frame_count() - before;
+    println!("coalesce: {words} deltas -> {painted} frames");
+    assert!(
+        painted * 4 < words,
+        "{words} deltas cost {painted} frames, so what is queued is not being drained into one frame"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
