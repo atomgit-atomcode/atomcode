@@ -7,6 +7,7 @@ pub mod findings;
 pub mod handle;
 pub mod llm;
 pub mod loop_policy;
+pub mod opener;
 pub mod persona;
 pub mod policy;
 pub mod policy_rows;
@@ -53,6 +54,8 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(world::BashLocalPlugin))
         .register(Arc::new(world_tools::FsWorldToolsPlugin))
         .register(Arc::new(world_tools::SearchWorldToolsPlugin))
+        .register(Arc::new(opener::OpenerLocalPlugin))
+        .register(Arc::new(opener::OpenFileToolPlugin))
         .register(Arc::new(world_tools::BashWorldToolPlugin))
         .register(Arc::new(tools::FsToolsPlugin))
         .register(Arc::new(tools::SearchToolsPlugin))

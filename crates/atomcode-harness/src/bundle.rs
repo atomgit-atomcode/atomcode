@@ -502,6 +502,13 @@ disabled = true
 [[patch]]
 id = "approval-interactive"
 disabled = false
+
+# --- the person is at this machine: files can be shown to them ------------
+[[insert]]
+name = "opener-local"
+
+[[insert]]
+name = "tool-open-file"
 "#;
 
 /// A full-screen terminal UI over the same seams as the line-oriented one.
@@ -528,6 +535,13 @@ disabled = true
 [[patch]]
 id = "approval-interactive"
 disabled = false
+
+# --- the person is at this machine: files can be shown to them ------------
+[[insert]]
+name = "opener-local"
+
+[[insert]]
+name = "tool-open-file"
 "#;
 
 /// An HTTP server: events over SSE, messages over POST.

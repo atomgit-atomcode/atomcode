@@ -112,7 +112,10 @@ pub use edit::EditFileTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use list::ListDirTool;
-pub use open_file::{open_local_path, OpenFileTool, OpenFileWorkspaceGate};
+pub use open_file::{
+    open_local_path, open_local_url, LocalOpener, OpenFileTool, OpenFileWorkspaceGate, OpenTarget,
+    Opener,
+};
 pub use output_artifact::{
     artifact_id, ArtifactMiddleware, ArtifactStore, FetchOutputTool,
     ARTIFACT_TRUNCATION_MARKER_PREFIX, THRESHOLD_BYTES,
@@ -203,7 +206,7 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
     reg.register(Arc::new(WriteFileTool::default()));
     reg.register(Arc::new(EditFileTool::default()));
     reg.register(Arc::new(ListDirTool::default()));
-    reg.register(Arc::new(OpenFileTool));
+    reg.register(Arc::new(OpenFileTool::default()));
     reg.register(Arc::new(BashTool::default()));
     // Background job path for long-running commands (start/poll/kill) — the reference-
     // informed alternative to an ever-larger `timeout` (see tools::bash::background).

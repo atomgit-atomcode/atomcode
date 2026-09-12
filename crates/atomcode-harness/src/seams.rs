@@ -18,6 +18,7 @@ use atomcode_plexus::{plexus_service, Context};
 
 use crate::agent::{Agent, Agents};
 use crate::session::{LoggedEvent, SessionLog, SessionProjections};
+pub use atomcode_capabilities::tools::Opener;
 pub use atomcode_capabilities::world::{FileSystem, Shell};
 
 plexus_service!(LlmSvc => dyn LlmProvider, "llm", Seam, "Model adapter");
@@ -37,6 +38,7 @@ plexus_service!(SkillsSvc => SkillRegistry, "skills", Core, "Markdown skill cata
 plexus_service!(CodeIndexSvc => CodeIndex, "code-index", Core, "Shared lazily-built code graph");
 plexus_service!(FsSvc => dyn FileSystem, "fs", Seam, "One execution world's view of files");
 plexus_service!(ShellSvc => dyn Shell, "shell", Seam, "Shell execution for one world: spawn, stream, kill the tree");
+plexus_service!(OpenerSvc => dyn Opener, "opener", Seam, "Where a file or URL is shown to the person — the front end's to provide");
 plexus_service!(CompactionSvc => dyn Compaction, "compaction", Seam, "History compaction strategy");
 plexus_service!(SessionTitleSvc => dyn SessionTitle, "session-title", Seam, "How a session gets named");
 plexus_service!(UserQuestionsSvc => dyn UserQuestions, "user-questions", Seam, "Asking a human");

@@ -71,19 +71,20 @@ harness --profile repl --patch mine.toml
 
 | | dsh | 这个 spike |
 |---|---|---|
-| 服务缝 | 68 | **19** |
+| 服务缝 | 68 | **20** |
 | 插件 | 250 包 | **48** |
 | 事件 | 三个事件域 | **11** |
 | bundle / profile | 9 bundle + 5 profile 模板 | **7 bundle + 9 profile** |
 
-19 个缝：
+20 个缝：
 
 ```
 agents  agent-loop  ui                                   agent 注册表 / 循环 / 前端
 llm  tools  system-prompt  approval                      模型 / 工具 / 提示词 / 审批
 sessions  session-projections  session-persistence       会话事件日志 + 投影 + 持久化
 session-title  compaction                                标题 / 压缩
-fs  shell                                                执行世界
+fs  shell                                                执行世界（agent 所在的机器）
+opener                                                   呈现给人（人所在的机器；只有有人的前端提供）
 skills  code-index  mcp  user-questions  subagents       能力 / 索引 / 外部服务器 / 人类问答 / 委派
 ```
 
@@ -375,7 +376,7 @@ repair-args  →  approval  →  result-cap  →  [ 工具执行 ]
 | | 行数 |
 |---|---|
 | `atomcode-plexus`（内核 + 测试） | 2842 |
-| `atomcode-harness`（19 个缝 + 48 个插件 + 9 个 profile + launcher + 13 个测试文件） | 13100 |
+| `atomcode-harness`（20 个缝 + 50 个插件 + 9 个 profile + launcher + 13 个测试文件） | 13100 |
 | 合计 | **15942** |
 
 内核本身约 1900 行（不含测试），对照 vendor 的 cordis 是 2693 行 TS。

@@ -88,18 +88,42 @@ fn different_profiles_put_a_different_front_end_behind_the_same_agent() {
     assert_eq!(front_end("sdk"), "ui-jsonrpc");
     assert_eq!(front_end("embed"), "ui-quiet");
 
-    // And everything below is the same rows in each case.
+    // And everything below is the same rows in each case — with one named
+    // exception. `tool-open-file` acts on the machine the *person* is at, so it
+    // rides only with a front end that has a person at a display; every tool
+    // that acts on the agent's own world is there for all of them.
     let tools_in = |name: &str| {
-        profiles
+        let mut ids: Vec<String> = profiles
             .resolve(name, &[])
             .unwrap()
             .entries
             .iter()
             .filter(|e| e.id.starts_with("tool-") && !e.disabled)
-            .count()
+            .map(|e| e.id.clone())
+            .collect();
+        ids.sort();
+        ids
     };
-    assert_eq!(tools_in("oneshot"), tools_in("web"));
-    assert_eq!(tools_in("sdk"), tools_in("tui"));
+    let world_tools = |name: &str| {
+        let mut ids = tools_in(name);
+        ids.retain(|id| id != "tool-open-file");
+        ids
+    };
+    assert_eq!(world_tools("oneshot"), world_tools("web"));
+    assert_eq!(world_tools("sdk"), world_tools("tui"));
+    assert_eq!(world_tools("repl"), world_tools("headless"));
+    for with_person in ["repl", "tui"] {
+        assert!(
+            tools_in(with_person).contains(&"tool-open-file".to_string()),
+            "`{with_person}` has a person to show files to"
+        );
+    }
+    for nobody in ["oneshot", "web", "sdk", "embed", "headless"] {
+        assert!(
+            !tools_in(nobody).contains(&"tool-open-file".to_string()),
+            "`{nobody}` has nobody at this machine's display"
+        );
+    }
 }
 
 #[test]
