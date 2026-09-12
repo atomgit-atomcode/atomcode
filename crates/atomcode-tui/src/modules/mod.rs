@@ -2,4 +2,5 @@
 
 pub mod input;
 pub mod status;
+pub mod team;
 pub mod transcript;

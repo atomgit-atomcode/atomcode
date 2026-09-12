@@ -34,7 +34,7 @@ use serde_json::Value;
 use crate::command::Commands;
 use crate::layout::{LayoutOp, Side};
 use crate::module::{Modules, Mounted, Producer};
-use crate::modules::{input, status, transcript};
+use crate::modules::{input, status, team, transcript};
 use crate::plugin::{CommandsSvc, LayoutSvc, ModulesSvc};
 
 /// The screen, panel by panel — the one place that says what a full UI is made
@@ -58,6 +58,13 @@ name = "tui-panel-input"
 # Off by default, on with `--mascot`. A row, not a boolean on the UI row.
 [[insert]]
 name = "tui-panel-mascot"
+disabled = true
+
+# Off by default too: a screen that never delegates has no team to show, and a
+# panel that is always there saying "no members" is a row of chrome. Turn it on
+# where the team row is on.
+[[insert]]
+name = "tui-panel-team"
 disabled = true
 
 [[insert]]
@@ -86,6 +93,7 @@ pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
         Arc::new(StatusPanel),
         Arc::new(InputPanel),
         Arc::new(MascotPanel),
+        Arc::new(TeamPanel),
         Arc::new(ScreenCommandsRow),
         Arc::new(SessionCommandsRow),
         Arc::new(TreeCommandsRow),
@@ -201,6 +209,62 @@ impl Plugin for MascotPanel {
                     module: id.to_string(),
                     side: Side::Top,
                     size: Some(1),
+                },
+                &known,
+            )
+            .map_err(|e| format!("{e:?}"))?;
+
+        let m: Arc<Modules> = mods.clone();
+        let l = layout.clone();
+        let _ = ctx.effect(move || {
+            let known: Vec<String> = m.view_ids().into_iter().map(str::to_string).collect();
+            let _ = l.apply(
+                &LayoutOp::Hide {
+                    module: id.to_string(),
+                },
+                &known,
+            );
+            m.remove_view(id);
+        });
+        Ok(())
+    }
+}
+
+/// The team: who this agent delegated to and what they are doing.
+///
+/// It places itself the way the mascot does, through `LayoutOp::Show` — but at
+/// the bottom and with no size, which is the difference that matters. `Show`
+/// sizes a bottom panel by what it asks for rather than by a fixed number of
+/// cells, so the panel grows a line per member and shrinks back when the team
+/// is stopped. A fixed strip would be four blank rows for the six turns before
+/// anyone is delegated to.
+pub struct TeamPanel;
+
+#[async_trait]
+impl Plugin for TeamPanel {
+    fn name(&self) -> &'static str {
+        "tui-panel-team"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tui-modules", "tui-layout"]
+    }
+    fn description(&self) -> &'static str {
+        "the team strip: delegated members, what they are doing, what they last said"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let mods = ctx.require::<ModulesSvc>().map_err(|e| e.to_string())?;
+        let layout = ctx.require::<LayoutSvc>().map_err(|e| e.to_string())?;
+        let view = Arc::new(Mounted::<team::Team>::new());
+        let id = <team::Team as crate::module::View>::id();
+        mods.add_view(view)?;
+
+        let known: Vec<String> = mods.view_ids().into_iter().map(str::to_string).collect();
+        layout
+            .apply(
+                &LayoutOp::Show {
+                    module: id.to_string(),
+                    side: Side::Bottom,
+                    size: None,
                 },
                 &known,
             )

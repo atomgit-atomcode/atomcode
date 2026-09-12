@@ -32,6 +32,22 @@ pub enum Activity {
     Stopping,
 }
 
+/// Another agent running under this one: a team member, a delegated task.
+///
+/// Live truth from the agent registry, never a fact in this log — a member is
+/// created, starts a turn and is stopped without this conversation committing
+/// anything, which is exactly the kind of state [`Moment`] is for. What the
+/// screen may show of a member is that it exists, what it is doing, and what
+/// it has told this agent (docs/adr/0016): its own conversation is its own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemberNow {
+    /// The name the lead gave it — the last segment of its session id.
+    pub name: String,
+    pub activity: Activity,
+    /// Which turn it is on, in its own log.
+    pub turn: u64,
+}
+
 /// How far the stream is scrolled from the bottom, in rendered lines.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScrollPos(pub usize);
@@ -127,6 +143,9 @@ pub struct Moment {
     /// Where the agent is working. Not derivable from the log, which is
     /// exactly what this struct is for.
     pub cwd: String,
+    /// The agents running under this one, as the registry has them now.
+    /// Empty for a screen that never delegates, which is most of them.
+    pub members: Vec<MemberNow>,
     /// What the terminal can draw. Injected for the same reason as the clock:
     /// a module that read `TERM` would be right on the developer's machine and
     /// silently wrong on the user's. The surface detects once; everything above
@@ -142,6 +161,12 @@ impl Moment {
     pub fn typing(mut self, text: impl Into<String>) -> Self {
         self.input = text.into();
         self.caret = self.input.len();
+        self
+    }
+    /// Set who is running under this agent. Every field of this struct has to
+    /// be settable by a test, or it is not really injected state.
+    pub fn with_members(mut self, members: Vec<MemberNow>) -> Self {
+        self.members = members;
         self
     }
     pub fn at_tick(mut self, tick: u64) -> Self {

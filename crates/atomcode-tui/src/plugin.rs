@@ -198,8 +198,9 @@ impl UserInterface for Tui {
         let host = self.host.clone();
         let facts = wake_tx.clone();
         let mine = client.session().id().to_string();
+        let ours = mine.clone();
         let stream = ctx.on_emit::<SessionEventCommitted>(move |c: &Committed| {
-            if c.session != mine {
+            if c.session != ours {
                 return;
             }
             host.absorb(&c.event);
@@ -226,6 +227,7 @@ impl UserInterface for Tui {
 
         let mut quit = false;
         while !quit {
+            self.refresh_members(ctx, &mine);
             self.paint();
             let timer = self.host.modules.tick();
             let woke = match timer {
@@ -324,6 +326,48 @@ impl Tui {
     fn paint(&self) {
         let frame = self.host.compose(self.surface.size());
         self.surface.present(&frame);
+    }
+
+    /// Who else is running under this agent, as the registry has them now.
+    ///
+    /// Read fresh rather than folded, because there is nothing to fold: a
+    /// member is created, opens a turn and is stopped without this
+    /// conversation committing a single fact, and it must stay that way — a
+    /// member's log is its own. Cheap by construction: the registry is a map
+    /// read, and status and turn are one atomic load each, so this costs less
+    /// than the repaint it precedes.
+    fn refresh_members(&self, ctx: &Context, mine: &str) {
+        use atomcode_harness::agent::AgentStatus;
+        use atomcode_harness::seams::AgentsSvc;
+        use crate::moment::{Activity, MemberNow};
+
+        let Some(agents) = ctx.service::<AgentsSvc>() else {
+            return;
+        };
+        let mut members: Vec<MemberNow> = agents
+            .list()
+            .iter()
+            .filter(|a| a.parent() == Some(mine))
+            .map(|a| MemberNow {
+                name: a
+                    .session_id()
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(a.session_id())
+                    .to_string(),
+                activity: match a.status() {
+                    AgentStatus::Idle => Activity::Idle,
+                    AgentStatus::Working => Activity::Working,
+                    AgentStatus::Stopping => Activity::Stopping,
+                },
+                turn: a.session().current_turn(),
+            })
+            .collect();
+        members.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut moment = self.host.moment.write().expect("moment poisoned");
+        if moment.members != members {
+            moment.members = members;
+        }
     }
 
     /// Put a line of the UI's own into the conversation.

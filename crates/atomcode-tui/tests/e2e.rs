@@ -979,3 +979,69 @@ async fn a_member_s_own_conversation_stays_off_the_lead_s_screen() {
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+/// The other half of the same rule: what the screen *may* show of a member.
+///
+/// The panel is the lead's own knowledge, drawn where it can be glanced at —
+/// who it delegated to, with which role, whether they are still running, and
+/// the last thing each of them said to it. Everything on it is either a fact
+/// in this log or the agent registry's answer about now.
+#[tokio::test]
+async fn the_team_panel_says_who_is_on_the_team_and_what_each_last_said() {
+    let dir = scratch("team-panel");
+    let script = replay(
+        r#"{ text = "Delegating.", calls = [ { name = "team", args = { action = "delegate", name = "scout", role = "explorer", task = "look around" } } ] },
+           { text = "Delegated." },
+           { text = "Noted." }"#,
+    );
+    let team = format!(
+        "[[insert]]\nname = \"team-in-process\"\nconfig = {{ project_root = {dir:?} }}\n\n\
+         [[patch]]\nid = \"tui-panel-team\"\ndisabled = false\n\n\
+         [[insert]]\nid = \"llm-utility\"\nname = \"llm-utility-replay\"\n\
+         config = {{ script = [ \
+           {{ text = \"MEMBER-THINKING-OUT-LOUD\", calls = [ {{ name = \"tell_parent\", args = {{ text = \"sessions are made in agent.rs\" }} }} ] }}, \
+           {{ text = \"MEMBER-TRAILING-WORDS\" }} ] }}\n",
+        dir = dir.to_string_lossy(),
+    );
+    let s = start(tree(&dir, &script, &[&team])).await;
+    let task = s.open().await;
+
+    // Before anyone is delegated to, the panel is one line and says so.
+    let empty = s
+        .term
+        .last()
+        .unwrap()
+        .part("team")
+        .expect("the team panel is on screen")
+        .clone();
+    assert_eq!(empty.rect.h, 1, "an empty team takes one line");
+
+    s.term.type_line("have someone look around");
+    s.quiet().await;
+
+    let panel = s
+        .term
+        .last()
+        .unwrap()
+        .part("team")
+        .expect("the team panel is on screen")
+        .lines
+        .iter()
+        .map(|l| l.plain())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(panel.contains("1 名成员"), "the count:\n{panel}");
+    assert!(panel.contains("scout"), "the name:\n{panel}");
+    assert!(panel.contains("explorer"), "the role:\n{panel}");
+    assert!(
+        panel.contains("sessions are made in agent.rs"),
+        "the last thing it said to the lead:\n{panel}"
+    );
+    assert!(
+        !panel.contains("MEMBER-THINKING-OUT-LOUD"),
+        "and still nothing it said to itself:\n{panel}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
