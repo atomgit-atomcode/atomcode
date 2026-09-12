@@ -12,8 +12,15 @@ use crate::theme::Role;
 use crate::width;
 use atomcode_harness::seams::StopReason;
 
-fn dim() -> Style {
-    Style::new().dim()
+/// Metadata: the mark on a line, a tool's `· 6 行`, a folded thought.
+///
+/// A role, not SGR 2. `Style::dim` — "let the terminal decide how much darker"
+/// — is what this used to be, and it is why so much of the screen was grey: the
+/// contrast was chosen by the terminal, after the palette had done arithmetic
+/// to guarantee it, and nothing in the tree could measure the result. The role
+/// recedes by a measured amount instead, and `--probe-terminal` reports it.
+fn muted() -> Style {
+    Style::new().fg(Color::role(Role::Muted))
 }
 fn user() -> Style {
     Style::new().fg(Color::role(Role::Accent))
@@ -45,8 +52,11 @@ fn wrapped(text: &str, w: u16, style: Style, prefix: &str) -> Vec<Line> {
         // prefix itself, the prefix alone would overflow. Content must never
         // exceed the width it was given, whatever the reason.
         out.push(
-            Line::from_spans(vec![Span::styled(lead, dim()), Span::styled(piece, style)])
-                .truncate(w as usize),
+            Line::from_spans(vec![
+                Span::styled(lead, muted()),
+                Span::styled(piece, style),
+            ])
+            .truncate(w as usize),
         );
     }
     out
@@ -119,7 +129,7 @@ impl Content for ModelSaid {
             .lines()
             .find(|l| !l.trim().is_empty())
             .unwrap_or_default();
-        Line::styled(width::take_width(first, w as usize), dim())
+        Line::styled(width::take_width(first, w as usize), muted())
     }
 }
 
@@ -137,7 +147,7 @@ impl Content for ModelThought {
         hash_of(&["reasoning", &self.0])
     }
     fn lines(&self, w: u16) -> Vec<Line> {
-        wrapped(&self.0, w, dim(), "· ")
+        wrapped(&self.0, w, muted(), "· ")
     }
     fn summary(&self, w: u16) -> Line {
         let n = self.0.lines().count().max(1);
@@ -146,7 +156,7 @@ impl Content for ModelThought {
                 &format!("{} 思考 {n} 行", Caps::default().g(Glyph::Gutter)),
                 w as usize,
             ),
-            dim(),
+            muted(),
         )
     }
 }
@@ -177,7 +187,7 @@ impl ToolCallBlock {
             Outcome::Pending => ("⋯", tool()),
             Outcome::Ok(_) => ("✓", ok()),
             Outcome::Failed(_) => ("✗", bad()),
-            Outcome::Interrupted => ("—", dim()),
+            Outcome::Interrupted => ("—", muted()),
         }
     }
 
@@ -334,19 +344,19 @@ pub fn subject_of(tool: &str, args: &str) -> String {
 /// What came back, in a few words.
 fn outcome_note(outcome: &Outcome) -> (String, Style) {
     match outcome {
-        Outcome::Pending => ("运行中".into(), dim()),
-        Outcome::Interrupted => ("已中断".into(), dim()),
+        Outcome::Pending => ("运行中".into(), muted()),
+        Outcome::Interrupted => ("已中断".into(), muted()),
         Outcome::Failed(s) => {
             let first = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("失败");
             (format!("失败 · {}", clip(first, 60)), bad())
         }
-        Outcome::Ok(s) if s.trim().is_empty() => ("完成".into(), dim()),
+        Outcome::Ok(s) if s.trim().is_empty() => ("完成".into(), muted()),
         Outcome::Ok(s) => {
             let lines = s.lines().filter(|l| !l.trim().is_empty()).count();
             if lines > 1 {
-                (format!("{lines} 行"), dim())
+                (format!("{lines} 行"), muted())
             } else {
-                (clip(s.trim(), 60), dim())
+                (clip(s.trim(), 60), muted())
             }
         }
     }
@@ -411,7 +421,7 @@ impl Content for ToolCallBlock {
         let (note, note_style) = outcome_note(&self.outcome);
         out.push(
             Line::from_spans(vec![
-                Span::styled(format!("  {} ", caps.g(Glyph::Gutter)), dim()),
+                Span::styled(format!("  {} ", caps.g(Glyph::Gutter)), muted()),
                 Span::styled(note, note_style),
             ])
             .truncate(w as usize),
@@ -487,7 +497,7 @@ impl Content for NoticeBlock {
         hash_of(&["notice", &self.detail])
     }
     fn lines(&self, w: u16) -> Vec<Line> {
-        wrapped(&self.detail, w, dim(), "⚑ ")
+        wrapped(&self.detail, w, muted(), "⚑ ")
     }
 }
 
@@ -506,12 +516,12 @@ impl Content for InjectedBlock {
         hash_of(&["injected", &self.origin, &self.text])
     }
     fn lines(&self, w: u16) -> Vec<Line> {
-        wrapped(&self.text, w, dim(), &format!("[{}] ", self.origin))
+        wrapped(&self.text, w, muted(), &format!("[{}] ", self.origin))
     }
     fn summary(&self, w: u16) -> Line {
         Line::styled(
             width::take_width(&format!("[{}]", self.origin), w as usize),
-            dim(),
+            muted(),
         )
     }
 }
@@ -550,10 +560,10 @@ impl Content for ChoiceBlock {
         let ask = Style::new().fg(Color::role(Role::Warning));
         match &self.answer {
             Some(a) => {
-                let mut out = wrapped(&self.question, w, dim(), "? ");
+                let mut out = wrapped(&self.question, w, muted(), "? ");
                 out.push(
                     Line::from_spans(vec![
-                        Span::styled("  → ", dim()),
+                        Span::styled("  → ", muted()),
                         Span::styled(a.clone(), ok()),
                     ])
                     .truncate(w as usize),
@@ -582,7 +592,7 @@ impl Content for ChoiceBlock {
             Some(a) => format!("? {} → {a}", first_line(&self.question)),
             None => format!("? {}", first_line(&self.question)),
         };
-        Line::styled(width::take_width(&head, w as usize), dim())
+        Line::styled(width::take_width(&head, w as usize), muted())
     }
 }
 
@@ -614,7 +624,7 @@ impl Content for CommandSaid {
         ])
     }
     fn lines(&self, w: u16) -> Vec<Line> {
-        let style = if self.refused { bad() } else { dim() };
+        let style = if self.refused { bad() } else { muted() };
         let mut out = Vec::new();
         for line in self.text.split('\n') {
             out.extend(wrapped(line, w, style, "  "));
@@ -624,7 +634,7 @@ impl Content for CommandSaid {
     fn summary(&self, w: u16) -> Line {
         Line::styled(
             width::take_width(first_line(&self.text), w as usize),
-            if self.refused { bad() } else { dim() },
+            if self.refused { bad() } else { muted() },
         )
     }
 }
@@ -687,20 +697,31 @@ impl TurnStats {
             parts.push(format!("出 {}", token_count(self.completion)));
         }
         if let Some(hit) = self.cache_hit() {
-            parts.push(format!("缓存 {hit}%"));
+            parts.push(format!("缓存 {hit}"));
         }
         (!parts.is_empty()).then(|| parts.join(" · "))
     }
 
     /// The cached share of the context, or `None` if the provider said nothing.
-    ///
-    /// Not `0%` when it is zero: a provider that does not report caching reports
-    /// zero, and printing that would state a fact we do not have. The status
-    /// line drops a zero counter for the same reason.
-    fn cache_hit(&self) -> Option<u32> {
-        (self.cached > 0 && self.prompt > 0)
-            .then(|| (self.cached as u64 * 100 / self.prompt as u64) as u32)
+    fn cache_hit(&self) -> Option<String> {
+        cache_hit_rate(self.cached, self.prompt)
     }
+}
+
+/// The cached share of one request's context, as a percentage to two decimals.
+///
+/// `None` when the provider said nothing about caching: one that does not report
+/// it reports zero, and printing `0.00%` would state a fact we do not have — the
+/// same rule as the status line's dropped zero counter.
+///
+/// **Two decimals, and one function.** The live line, the end of a turn and the
+/// figure a person compares them against all describe the same request, on the
+/// same screen; `98%` beside `98.15%` is a disagreement someone has to stop and
+/// resolve, and at a context of tens of thousands of tokens the whole integer
+/// part is 99 for a long stretch — the decimals are the only part of this number
+/// that moves.
+pub fn cache_hit_rate(cached: u32, prompt: u32) -> Option<String> {
+    (cached > 0 && prompt > 0).then(|| format!("{:.2}%", cached as f64 * 100.0 / prompt as f64))
 }
 
 /// A token count as a person says it: exact while it is small enough to read,
@@ -730,15 +751,30 @@ fn turn_end_note(stop: StopReason) -> (Glyph, String, Style) {
     let warn = Style::new().fg(Color::role(Role::Warning));
     match stop {
         // The only clean end: the model answered and asked for nothing.
-        Stopped => (Glyph::Ok, "完成".to_string(), dim()),
+        Stopped => (Glyph::Ok, "完成".to_string(), muted()),
         // The person's own doing, so it is stated without alarm.
-        Cancelled => (Glyph::Interrupted, "已中断".to_string(), dim()),
-        // Both budgets are round budgets — the `round-cap` row and the loop's
-        // own fuse — and for a person they are one fact: this turn was long and
-        // was cut. Sending another message continues it.
-        MaxRounds | StoppedByPolicy | RunawayFuse => (
+        Cancelled => (Glyph::Interrupted, "已中断".to_string(), muted()),
+        // Three ways to be cut short, and they were one sentence here until a
+        // person went looking for a round budget that was not the thing that
+        // stopped them. `StopReason`'s own docs are the authority:
+        //
+        // * `MaxRounds` — the round budget ran out. That one really is rounds.
+        // * `StoppedByPolicy` — *a* `turn-stopping` listener ended it: "a round
+        //   budget, a deadline, a cost ceiling". The shipped `round-cap` row
+        //   returns this for its `max_seconds`, so in the default tree it means
+        //   the clock, and "轮数上限" was wrong for the only case that ships.
+        // * `RunawayFuse` — "not a policy: the fuse exists so a tree with no
+        //   stopping policy at all still terminates". Calling it a limit hides
+        //   the one actionable fact, which is that nothing was watching.
+        MaxRounds => (Glyph::Interrupted, "已中断 · 轮数用完了".to_string(), warn),
+        StoppedByPolicy => (
             Glyph::Interrupted,
-            "已中断 · 达到了本轮的轮数上限".to_string(),
+            "已中断 · 一条停止策略叫停(时限或预算)".to_string(),
+            warn,
+        ),
+        RunawayFuse => (
+            Glyph::Interrupted,
+            "已中断 · 兜底熔断,这棵树没挂停止策略".to_string(),
             warn,
         ),
         ToolLoopDetected => (
@@ -748,7 +784,16 @@ fn turn_end_note(stop: StopReason) -> (Glyph, String, Style) {
         ),
         InputRejected => (Glyph::Interrupted, "已中断 · 输入被拒绝".to_string(), warn),
         // A failure, with the provider's own sentence folded in below.
-        ProviderError | InvariantViolated => (Glyph::Fail, "已中断".to_string(), bad()),
+        ProviderError => (Glyph::Fail, "已中断".to_string(), bad()),
+        // Not a failed request: the log cannot explain what reached the model,
+        // and from here resume, fork and compaction are unsound. A person is
+        // owed that in words rather than sharing a sentence with a dead
+        // network — what they do next is start a new session, not retry.
+        InvariantViolated => (
+            Glyph::Fail,
+            "已中断 · 内部不变量被破坏,这条会话不宜再续".to_string(),
+            bad(),
+        ),
     }
 }
 
@@ -775,7 +820,7 @@ impl Content for TurnEndBlock {
         ])
     }
     /// A divider with the turn's outcome set into it, the way tuix closes a
-    /// turn: `───── ✓ 完成 · 4 步 · 入 90.7k · 出 4200 · 缓存 99% ─────`. A bare
+    /// turn: `───── ✓ 完成 · 4 步 · 入 90.7k · 出 4200 · 缓存 99.82% ─────`. A bare
     /// line of text at the left margin reads as something that was said; a
     /// captioned rule reads as a boundary.
     ///
@@ -819,7 +864,7 @@ impl Content for TurnEndBlock {
         let mut out = vec![crate::el::captioned_rule(
             &caption,
             w as usize,
-            dim(),
+            muted(),
             style,
         )];
         for line in under {
@@ -905,21 +950,49 @@ mod tests {
             .join("\n")
         };
 
-        for budget in [
+        // Three different ways to be cut short, and three different things a
+        // person would do about them — so three different sentences. They were
+        // one sentence about a round budget until someone went looking for a
+        // round budget that was not what stopped them.
+        let cut_short = [
             StopReason::MaxRounds,
             StopReason::StoppedByPolicy,
             StopReason::RunawayFuse,
-        ] {
-            let text = drawn(budget);
+        ];
+        for stop in cut_short {
+            let text = drawn(stop);
+            assert!(text.contains("已中断"), "{text}");
             assert!(
-                text.contains("已中断") && text.contains("轮数上限"),
-                "a budget that ran out must say so: {text}"
-            );
-            assert!(
-                !text.contains(&format!("{budget:?}")),
+                !text.contains(&format!("{stop:?}")),
                 "no variant name on the screen: {text}"
             );
         }
+        let said: Vec<String> = cut_short.into_iter().map(drawn).collect();
+        assert!(
+            said[0].contains("轮数"),
+            "the round budget is the one that is about rounds: {}",
+            said[0]
+        );
+        assert!(
+            !said[1].contains("轮数") && !said[2].contains("轮数"),
+            "and the other two are not, whatever the loop calls them: {said:?}"
+        );
+        assert!(
+            said[2].contains("没挂停止策略"),
+            "the fuse says the actionable thing: nothing was watching: {}",
+            said[2]
+        );
+        assert_eq!(
+            said.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            3,
+            "three reasons, three sentences: {said:?}"
+        );
+
+        let unsound = drawn(StopReason::InvariantViolated);
+        assert!(
+            unsound.contains("不宜再续"),
+            "a broken invariant is not a failed request: {unsound}"
+        );
 
         let clean = drawn(StopReason::Stopped);
         assert!(
@@ -971,7 +1044,7 @@ mod tests {
             },
         };
         let text = drawn(&block, 100);
-        for want in ["完成", "4 步", "入 90.7k", "出 4200", "缓存 99%"] {
+        for want in ["完成", "4 步", "入 90.7k", "出 4200", "缓存 99.82%"] {
             assert!(text.contains(want), "{want} missing from {text:?}");
         }
         assert_eq!(block.lines(100).len(), 1, "one rule, not a paragraph");
@@ -1041,7 +1114,7 @@ mod tests {
             // figures under itself, where they are wrapped mid-phrase — they
             // are all still said, which is the property.
             let flat: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-            for want in ["4步", "入90.7k", "出4200", "缓存99%"] {
+            for want in ["4步", "入90.7k", "出4200", "缓存99.82%"] {
                 assert!(flat.contains(want), "w={w}: {want} lost from {text:?}");
             }
             for line in block.lines(w) {
@@ -1079,6 +1152,30 @@ mod tests {
         assert_eq!(token_count(10_000), "10k");
         assert_eq!(token_count(90_659), "90.7k");
         assert_eq!(token_count(1_048_576), "1048.6k");
+    }
+
+    /// Two decimals, because the integer part stops moving: at a context of tens
+    /// of thousands of tokens served almost entirely from cache, `99` is the
+    /// whole integer part for as long as the number is worth reading — the
+    /// decimals are the part that changes between one request and the next.
+    #[test]
+    fn a_cache_share_keeps_two_decimals_and_nothing_is_claimed_from_a_zero() {
+        assert_eq!(cache_hit_rate(400, 1_200).as_deref(), Some("33.33%"));
+        assert_eq!(cache_hit_rate(90_496, 90_659).as_deref(), Some("99.82%"));
+        assert_eq!(cache_hit_rate(1, 3).as_deref(), Some("33.33%"));
+        assert_eq!(
+            cache_hit_rate(2, 3).as_deref(),
+            Some("66.67%"),
+            "rounded, not truncated"
+        );
+        // A provider that reports no caching reports zero, and a provider that
+        // answered nothing reports nothing: neither is a hit rate of zero.
+        assert_eq!(cache_hit_rate(0, 1_200), None);
+        assert_eq!(cache_hit_rate(400, 0), None);
+        // Not clamped: a reading of more cached tokens than the request carried
+        // is a provider saying something it cannot mean, and hiding that behind
+        // a tidy `100.00%` is the one thing this function must not do.
+        assert_eq!(cache_hit_rate(1_300, 1_200).as_deref(), Some("108.33%"));
     }
 
     #[test]
