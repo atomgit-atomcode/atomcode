@@ -310,9 +310,12 @@ pub fn subject_of(tool: &str, args: &str) -> String {
                 if !text.is_empty() {
                     // A path is recognisable by its tail; a command or a pattern
                     // by its head. Trimming the wrong end of a long path leaves
-                    // the useless half.
-                    return if text.len() > 48 && text.contains('/') {
-                        format!("…{}", &text[text.len() - 44..])
+                    // the useless half. Measured in cells, not bytes: the same
+                    // number of bytes is fewer characters in Chinese, and a byte
+                    // offset that landed mid-character used to panic the whole
+                    // TUI.
+                    return if width::str_width(text) > 48 && text.contains('/') {
+                        format!("…{}", width::take_width_from_end(text, 43))
                     } else {
                         text.to_string()
                     };
@@ -684,13 +687,20 @@ mod tests {
             error: Some(error.into()),
         };
         let lines = block.lines(100);
-        let text: String = lines.iter().map(|l| l.plain()).collect::<Vec<_>>().join("\n");
+        let text: String = lines
+            .iter()
+            .map(|l| l.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.contains("ProviderError"), "{text}");
         assert!(
             text.contains("nodename nor servname"),
             "the cause must reach the screen:\n{text}"
         );
-        assert!(lines.len() > 1, "wider than the rule means wrapped under it");
+        assert!(
+            lines.len() > 1,
+            "wider than the rule means wrapped under it"
+        );
         for line in &lines {
             assert!(line.width() <= 100, "{:?}", line.plain());
         }
@@ -784,5 +794,49 @@ mod tests {
             "an unknown tool still gets a subject, or the table would have to \
              track the catalog"
         );
+    }
+
+    #[test]
+    fn a_long_subject_is_trimmed_on_a_character_boundary_not_a_byte_one() {
+        // The command that killed the TUI four times: over 48 bytes, contains
+        // '/', and `text.len() - 44` landed inside a Chinese character. The old
+        // `&text[text.len() - 44..]` panicked here with "byte index 50 is not a
+        // char boundary" — `subject_of` is called while rendering, so the panic
+        // took the whole process down mid-turn.
+        let command = "中文".repeat(15) + "/尾";
+        assert!(
+            !command.is_char_boundary(command.len() - 44),
+            "the sample must reproduce the old panic, or it guards nothing"
+        );
+        let subject = subject_of("bash", &format!(r#"{{"command":"{command}"}}"#));
+        let tail = subject.trim_start_matches('…');
+        assert!(
+            subject.starts_with('…'),
+            "{subject:?} should be abbreviated"
+        );
+        assert!(
+            command.ends_with(tail),
+            "{tail:?} is not a suffix of the command"
+        );
+        // The budget is cells, so a Chinese path keeps as much as an ASCII one.
+        assert_eq!(width::str_width(&subject), 44, "{subject:?}");
+    }
+
+    #[test]
+    fn an_abbreviation_says_as_much_about_a_chinese_path_as_an_ascii_one() {
+        // 44 *bytes* is 44 ASCII characters but only fourteen CJK ones, so the
+        // byte offset truncated Chinese paths harder for no reason: the same
+        // path on screen, described less. Both now spend the same 44-cell
+        // budget, to within the one cell a two-wide character cannot fill —
+        // half a character is not a thing you can print.
+        let ascii = subject_of("bash", &format!(r#"{{"command":"/x/{}"}}"#, "a".repeat(60)));
+        let cjk = subject_of(
+            "bash",
+            &format!(r#"{{"command":"/x/{}"}}"#, "中".repeat(30)),
+        );
+        for subject in [&ascii, &cjk] {
+            let cells = width::str_width(subject);
+            assert!((43..=44).contains(&cells), "{subject:?} is {cells} cells");
+        }
     }
 }

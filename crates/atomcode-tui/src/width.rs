@@ -42,6 +42,33 @@ pub fn take_width(s: &str, max: usize) -> String {
     out
 }
 
+/// The longest suffix of `s` that fits in `max` cells, cut on grapheme
+/// boundaries — the tail-reading twin of `take_width`.
+///
+/// A path is recognised by its tail, so the abbreviation for one keeps the end.
+/// Slicing a byte offset instead (`&s[s.len() - 44..]`) is the other half of the
+/// mistake this module exists to prevent: the offset lands inside a multi-byte
+/// character and the slice panics, and even when it survives, 44 bytes is 44
+/// ASCII characters but only fourteen CJK ones — the same abbreviation says
+/// less about a Chinese path than an English one of the same width.
+pub fn take_width_from_end(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let mut out: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for g in s.graphemes(true).rev() {
+        let w = str_width(g);
+        if used + w > max {
+            break;
+        }
+        out.push(g);
+        used += w;
+    }
+    out.reverse();
+    out.concat()
+}
+
 /// Break `s` into lines no wider than `max` cells.
 ///
 /// Wraps at word boundaries where one exists, and hard-breaks a word longer
@@ -118,6 +145,58 @@ mod tests {
         let s = "e\u{0301}x"; // é as e + combining acute, then x
         assert_eq!(take_width(s, 1), "e\u{0301}");
         assert_eq!(take_width(s, 2), s);
+    }
+
+    #[test]
+    fn the_tail_is_read_in_cells_and_never_halved() {
+        assert_eq!(take_width_from_end("中文", 1), "");
+        assert_eq!(take_width_from_end("中文", 2), "文");
+        assert_eq!(take_width_from_end("中文", 3), "文");
+        assert_eq!(take_width_from_end("中文", 4), "中文");
+        // A wide character is dropped rather than half-shown, same as the head.
+        assert_eq!(take_width_from_end("中a", 1), "a");
+        // The two halves face opposite ways and agree on the whole.
+        assert_eq!(take_width("中文", 2), "中");
+        assert_eq!(take_width_from_end("中文", 2), "文");
+    }
+
+    #[test]
+    fn a_combining_mark_stays_with_its_base_at_the_tail_too() {
+        // é as e + combining acute is *one* grapheme and *one* cell — the mark
+        // must come along when the base does, and not be left behind.
+        let s = "中e\u{0301}";
+        assert_eq!(take_width_from_end(s, 1), "e\u{0301}");
+        assert_eq!(take_width_from_end(s, 2), "e\u{0301}");
+        assert_eq!(take_width_from_end(s, 3), s);
+    }
+
+    #[test]
+    fn the_tail_never_exceeds_its_budget() {
+        for max in 0..=20usize {
+            for s in [
+                "the quick brown fox",
+                "中文中文中文中文中文",
+                "/Users/lichao/项目/gitcode/ai/atomcode/src/content.rs",
+                "e\u{0301}\u{0301}mixed 中文 and ascii",
+                "",
+            ] {
+                let tail = take_width_from_end(s, max);
+                assert!(
+                    str_width(&tail) <= max,
+                    "{s:?} at {max}: {tail:?} is {} cells",
+                    str_width(&tail)
+                );
+                assert!(
+                    s.ends_with(&tail),
+                    "{s:?} at {max}: {tail:?} is not a suffix"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_width_is_empty_at_the_tail_not_an_infinite_loop() {
+        assert_eq!(take_width_from_end("anything", 0), "");
     }
 
     #[test]
