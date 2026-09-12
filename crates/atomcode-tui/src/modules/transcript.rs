@@ -14,7 +14,7 @@ use atomcode_harness::session::{InjectionOrigin, SessionEvent};
 use crate::block::{BlockId, Coord, StreamWriter};
 use crate::content::{
     InjectedBlock, ModelSaid, ModelThought, NoticeBlock, Outcome, ToolCallBlock, TurnEndBlock,
-    UserSaid,
+    TurnStats, UserSaid,
 };
 use crate::module::Producer;
 
@@ -28,6 +28,14 @@ struct Open {
     thought: Option<(BlockId, String)>,
     /// Tool calls waiting for their result, by `call_id`.
     calls: HashMap<String, (BlockId, ToolCallBlock)>,
+    /// What the turn in flight has cost so far, folded from its own `Usage` and
+    /// `StepEnd` facts and handed to the block that closes it.
+    ///
+    /// Folded here, by the producer that owns the turn's blocks, rather than
+    /// read off the status module: a producer folds its own facts, so live,
+    /// replay and resume cannot disagree about what a turn cost — the same
+    /// reason every other block is built here.
+    stats: TurnStats,
 }
 
 /// Turns session facts into what a person reads.
@@ -205,6 +213,10 @@ impl Producer for Transcript {
                     out.amend(id, Arc::new(block.with(Outcome::Interrupted)));
                     out.settle(id);
                 }
+                // Taken, not read: a turn's cost is spent when the turn ends,
+                // and the next `TurnStart` would otherwise be the only thing
+                // standing between one turn's figures and the next turn's line.
+                let stats = std::mem::take(&mut open.stats);
                 out.emit(
                     at,
                     Arc::new(TurnEndBlock {
@@ -214,12 +226,37 @@ impl Producer for Transcript {
                         // `content::turn_end_note`).
                         stop: *stop,
                         error: error.clone(),
+                        stats,
                     }),
                 );
             }
 
+            // What the turn cost, in the two facts that carry it. `step` and
+            // `round` are one counter in the loop, so the steps are read off
+            // the same number the requests are numbered with.
+            SessionEvent::StepEnd { step, .. } => open.stats.steps = *step,
+
+            // A round's usage, merged by the loop into one figure per round.
+            SessionEvent::Usage { usage, .. } => {
+                // `prompt` is the whole context this request sent — and the two
+                // obvious folds are both wrong. Summing counts the same opening
+                // prefix once per round; a running max cannot go down, so a turn
+                // whose context was compacted would keep reporting the size
+                // before the compaction. The last reading is the true one.
+                //
+                // `cached` is a part of that same request, so it is taken from
+                // the same reading rather than kept on its own: a hit rate is
+                // only meaningful against the request it came from.
+                open.stats.prompt = usage.prompt;
+                open.stats.cached = usage.cached;
+                // Output is the one figure that does add up: each round
+                // generated its own, and the loop has already folded whatever
+                // the provider re-sent within a round.
+                open.stats.completion += usage.completion;
+            }
+
             // Turn and step boundaries are coordinates, not blocks; request
-            // headers and usage are the status module's business.
+            // headers are the status module's business.
             _ => {}
         }
     }
@@ -307,6 +344,53 @@ mod tests {
             rendered[1][1].contains("失败"),
             "the failing one says so: {rendered:?}"
         );
+    }
+
+    #[test]
+    fn a_turn_that_reported_usage_closes_with_what_it_cost() {
+        // The corpus' turn 1: one step, one request reporting 1200 tokens of
+        // context of which 400 were cached, and 80 tokens out.
+        let s = fold(&conformance::facts());
+        let ends: Vec<String> = s
+            .slots()
+            .iter()
+            .filter(|x| x.block().kind() == "turn_end")
+            .map(|x| x.block().content.lines(60)[0].plain())
+            .collect();
+        assert_eq!(ends.len(), 2, "two turns end in the corpus: {ends:?}");
+        for want in ["1 步", "入 1200", "出 80", "缓存 33%"] {
+            assert!(ends[0].contains(want), "{want} missing from {:?}", ends[0]);
+        }
+        // Turn 2 reported nothing, so its line is the outcome alone — not a row
+        // of zeroes.
+        assert!(!ends[1].contains("步"), "{:?}", ends[1]);
+        assert!(!ends[1].contains("入"), "{:?}", ends[1]);
+    }
+
+    /// A turn's cost belongs to that turn. The corpus ends turn 1 and then
+    /// starts turn 2 without either reporting usage, which is exactly the case
+    /// where a fold that leaked would put turn 1's 1200 tokens on turn 2's line.
+    #[test]
+    fn one_turns_cost_never_lands_on_the_next_turns_line() {
+        let mut facts = conformance::facts();
+        // Give turn 2 a clean, figureless end.
+        facts.push(SessionEvent::TurnEnd {
+            turn: 2,
+            stop: atomcode_harness::seams::StopReason::Stopped,
+            error: None,
+        });
+        let s = fold(&facts);
+        let ends: Vec<String> = s
+            .slots()
+            .iter()
+            .filter(|x| x.block().kind() == "turn_end")
+            .map(|x| x.block().content.lines(60)[0].plain())
+            .collect();
+        let last = ends.last().expect("turn 2 ends");
+        assert!(last.contains("完成"), "{last:?}");
+        for leaked in ["1200", "80", "缓存", "步"] {
+            assert!(!last.contains(leaked), "{leaked} leaked into {last:?}");
+        }
     }
 
     #[test]

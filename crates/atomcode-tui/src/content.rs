@@ -642,6 +642,80 @@ impl Content for CommandSaid {
 pub struct TurnEndBlock {
     pub stop: StopReason,
     pub error: Option<String>,
+    /// What the turn cost. All-zero (the default) means the log recorded
+    /// nothing — a turn cut before its first request — and then the rule says
+    /// only how it ended, because a zero is noise pretending to be information.
+    pub stats: TurnStats,
+}
+
+/// What one turn cost, as its own facts recorded it.
+///
+/// Folded by whoever owns those facts and handed here as a value: the block
+/// draws these numbers, it does not know where usage comes from.
+///
+/// `prompt` is **not** a sum over the turn's rounds, and that is the whole trap
+/// in this type. It is the entire context one request sent, so a turn of four
+/// rounds sends the same opening prefix four times, growing; summing would
+/// count it four times and report a number with no meaning. `cached` is a part
+/// of that same request — read off the same reading, which is why the two are
+/// kept together instead of the ratio being folded on its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnStats {
+    /// Model requests the turn ran. `step` and `round` are one counter in the
+    /// turn loop, so this is both.
+    pub steps: u32,
+    /// The context the turn's **last** request sent.
+    pub prompt: u32,
+    /// Tokens the model generated, summed over the turn's rounds. Unlike
+    /// `prompt`, each round's output is new, so this one does add up.
+    pub completion: u32,
+    /// The cached part of `prompt`, from that same last request.
+    pub cached: u32,
+}
+
+impl TurnStats {
+    /// The figures worth printing, or `None` when there is nothing to say.
+    fn caption(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if self.steps > 0 {
+            parts.push(format!("{} 步", self.steps));
+        }
+        if self.prompt > 0 {
+            parts.push(format!("入 {}", token_count(self.prompt)));
+        }
+        if self.completion > 0 {
+            parts.push(format!("出 {}", token_count(self.completion)));
+        }
+        if let Some(hit) = self.cache_hit() {
+            parts.push(format!("缓存 {hit}%"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
+    /// The cached share of the context, or `None` if the provider said nothing.
+    ///
+    /// Not `0%` when it is zero: a provider that does not report caching reports
+    /// zero, and printing that would state a fact we do not have. The status
+    /// line drops a zero counter for the same reason.
+    fn cache_hit(&self) -> Option<u32> {
+        (self.cached > 0 && self.prompt > 0)
+            .then(|| (self.cached as u64 * 100 / self.prompt as u64) as u32)
+    }
+}
+
+/// A token count as a person says it: exact while it is small enough to read,
+/// rounded in thousands once it is not.
+///
+/// One function because the status line and the end of a turn report the same
+/// quantity on the same screen, and two renderings of one number is a
+/// disagreement a person has to stop and resolve.
+pub fn token_count(n: u32) -> String {
+    if n < 10_000 {
+        return n.to_string();
+    }
+    let thousands = format!("{:.1}", n as f64 / 1000.0);
+    let trimmed = thousands.strip_suffix(".0").unwrap_or(&thousands);
+    format!("{trimmed}k")
 }
 
 /// The mark and the words for one stop reason.
@@ -686,33 +760,71 @@ impl Content for TurnEndBlock {
         // The variant name is identity here, not presentation: it is never
         // drawn, and two turns that stopped for different reasons must not hash
         // alike even when neither has a cause attached.
+        //
+        // The cost is in here because the block now says it: two turns that
+        // stopped the same way cost different amounts, and the freeze
+        // instrument is about what a block says.
         hash_of(&[
             "turn_end",
             &format!("{:?}", self.stop),
             self.error.as_deref().unwrap_or(""),
+            &format!(
+                "{}:{}:{}:{}",
+                self.stats.steps, self.stats.prompt, self.stats.completion, self.stats.cached
+            ),
         ])
     }
     /// A divider with the turn's outcome set into it, the way tuix closes a
-    /// turn: `───── ✓ 完成 ─────`. A bare line of text at the left margin reads
-    /// as something that was said; a captioned rule reads as a boundary.
+    /// turn: `───── ✓ 完成 · 4 步 · 入 90.7k · 出 4200 · 缓存 99% ─────`. A bare
+    /// line of text at the left margin reads as something that was said; a
+    /// captioned rule reads as a boundary.
+    ///
+    /// What the turn cost is set into that same rule, because the boundary is
+    /// exactly where a person asks "what did that take". It is the *last* thing
+    /// to be added and the first to be dropped: `captioned_rule` throws away a
+    /// caption it cannot place, and how the turn ended is the one thing this
+    /// line is for. So the caption is built widest-first and falls back to the
+    /// outcome alone, with whatever was dropped going under the rule, wrapped —
+    /// the same ladder the cause of a failed turn already climbed.
     fn lines(&self, w: u16) -> Vec<Line> {
         let caps = Caps::default();
         let (mark, said, style) = turn_end_note(self.stop);
         let short = format!("{} {said}", caps.g(mark));
-        let Some(error) = &self.error else {
-            return vec![crate::el::captioned_rule(&short, w as usize, dim(), style)];
-        };
-        // A short cause sits in the rule the way a clean ending does. A long
-        // one is not dropped: `captioned_rule` drops a caption it cannot place,
-        // and the cause of a failed turn is the one caption a person must see —
-        // without it a dead network looks like a turn that ended in silence.
-        // So it goes under the rule, wrapped, however long the provider made it.
-        let full = format!("{short} · {error}");
-        if crate::el::caption_fits(&full, w as usize) {
-            return vec![crate::el::captioned_rule(&full, w as usize, dim(), style)];
+
+        // Under the rule, in the order they are worth reading: the cost first
+        // (it is about this turn), then the cause of a failure.
+        let mut under: Vec<String> = Vec::new();
+        let mut caption = short;
+        if let Some(stats) = self.stats.caption() {
+            let wider = format!("{caption} · {stats}");
+            if crate::el::caption_fits(&wider, w as usize) {
+                caption = wider;
+            } else {
+                under.push(stats);
+            }
         }
-        let mut out = vec![crate::el::captioned_rule(&short, w as usize, dim(), style)];
-        out.extend(wrapped(error, w, style, "  "));
+        if let Some(error) = &self.error {
+            // A cause can be long: a provider sentence for a dead network is
+            // wider than the screen. Set into the rule it would be dropped
+            // whole, and the turn would look like it ended in silence — so a
+            // long one goes under the rule, wrapped, however long it is.
+            let wider = format!("{caption} · {error}");
+            if crate::el::caption_fits(&wider, w as usize) {
+                caption = wider;
+            } else {
+                under.push(error.clone());
+            }
+        }
+
+        let mut out = vec![crate::el::captioned_rule(
+            &caption,
+            w as usize,
+            dim(),
+            style,
+        )];
+        for line in under {
+            out.extend(wrapped(&line, w, style, "  "));
+        }
         out
     }
 }
@@ -720,6 +832,16 @@ impl Content for TurnEndBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A block as it reaches the screen, as one string.
+    fn drawn(block: &dyn Content, w: u16) -> String {
+        block
+            .lines(w)
+            .iter()
+            .map(|l| l.plain())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     #[test]
     fn a_failed_turn_keeps_its_cause_on_screen_however_long_it_is() {
@@ -732,6 +854,7 @@ mod tests {
         let block = TurnEndBlock {
             stop: StopReason::ProviderError,
             error: Some(error.into()),
+            stats: TurnStats::default(),
         };
         let lines = block.lines(100);
         let text: String = lines
@@ -756,6 +879,7 @@ mod tests {
         let short = TurnEndBlock {
             stop: StopReason::Cancelled,
             error: Some("by the user".into()),
+            stats: TurnStats::default(),
         };
         let lines = short.lines(100);
         assert_eq!(lines.len(), 1);
@@ -769,12 +893,16 @@ mod tests {
     #[test]
     fn a_stop_reason_is_spoken_not_printed() {
         let drawn = |stop: StopReason| {
-            TurnEndBlock { stop, error: None }
-                .lines(80)
-                .iter()
-                .map(|l| l.plain())
-                .collect::<Vec<_>>()
-                .join("\n")
+            TurnEndBlock {
+                stop,
+                error: None,
+                stats: TurnStats::default(),
+            }
+            .lines(80)
+            .iter()
+            .map(|l| l.plain())
+            .collect::<Vec<_>>()
+            .join("\n")
         };
 
         for budget in [
@@ -825,6 +953,134 @@ mod tests {
         }
     }
 
+    /// What a turn cost, on the line that closes it.
+    ///
+    /// The figures are a real reading, not invented: a four-round turn whose
+    /// last request carried 90659 tokens of context, 90496 of them served from
+    /// cache, and which produced 4200 tokens of output.
+    #[test]
+    fn the_end_of_a_turn_says_what_it_cost() {
+        let block = TurnEndBlock {
+            stop: StopReason::Stopped,
+            error: None,
+            stats: TurnStats {
+                steps: 4,
+                prompt: 90_659,
+                completion: 4_200,
+                cached: 90_496,
+            },
+        };
+        let text = drawn(&block, 100);
+        for want in ["完成", "4 步", "入 90.7k", "出 4200", "缓存 99%"] {
+            assert!(text.contains(want), "{want} missing from {text:?}");
+        }
+        assert_eq!(block.lines(100).len(), 1, "one rule, not a paragraph");
+    }
+
+    /// A provider that says nothing about caching reports zero, and zero is not
+    /// a hit rate of nothing — it is a fact we do not have. Same rule as the
+    /// status line's dropped zero counter.
+    #[test]
+    fn no_reported_caching_is_not_reported_as_zero_percent() {
+        let block = TurnEndBlock {
+            stop: StopReason::Stopped,
+            error: None,
+            stats: TurnStats {
+                steps: 1,
+                prompt: 6_223,
+                completion: 28,
+                cached: 0,
+            },
+        };
+        let text = drawn(&block, 80);
+        assert!(!text.contains("缓存"), "{text:?}");
+        assert!(text.contains("入 6223"), "the rest is still said: {text:?}");
+    }
+
+    /// A turn the log recorded nothing about — cut before its first request —
+    /// is drawn exactly as it was before there were figures to draw.
+    #[test]
+    fn a_turn_with_nothing_recorded_says_only_how_it_ended() {
+        let block = TurnEndBlock {
+            stop: StopReason::Cancelled,
+            error: None,
+            stats: TurnStats::default(),
+        };
+        let lines = block.lines(80);
+        assert_eq!(lines.len(), 1, "nothing to say means no extra row");
+        let text = drawn(&block, 80);
+        assert!(text.contains("已中断"), "{text:?}");
+        for absent in ["步", "入", "出", "缓存", "%"] {
+            assert!(!text.contains(absent), "{absent} in {text:?}");
+        }
+    }
+
+    /// The outcome is what this line is for, so it is the one thing a narrow
+    /// screen may not take away. The figures are the first thing dropped, and
+    /// they go under the rule rather than nowhere.
+    #[test]
+    fn a_narrow_screen_drops_the_figures_before_it_drops_the_outcome() {
+        let block = TurnEndBlock {
+            stop: StopReason::Stopped,
+            error: None,
+            stats: TurnStats {
+                steps: 4,
+                prompt: 90_659,
+                completion: 4_200,
+                cached: 90_496,
+            },
+        };
+        let outcome = format!("{} 完成", Caps::default().g(Glyph::Ok));
+        let first = (0..200u16)
+            .find(|w| crate::el::caption_fits(&outcome, *w as usize))
+            .expect("the outcome fits on some screen");
+        for w in first..=120 {
+            let text = drawn(&block, w);
+            assert!(text.contains("完成"), "w={w}: {text:?}");
+            // Read with the whitespace taken out: a narrow rule moves the
+            // figures under itself, where they are wrapped mid-phrase — they
+            // are all still said, which is the property.
+            let flat: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            for want in ["4步", "入90.7k", "出4200", "缓存99%"] {
+                assert!(flat.contains(want), "w={w}: {want} lost from {text:?}");
+            }
+            for line in block.lines(w) {
+                assert!(line.width() <= w as usize, "w={w}: {:?}", line.plain());
+            }
+        }
+    }
+
+    /// The counted cells and the drawn cells are the same number, at every
+    /// width, for the widest caption this block can produce.
+    #[test]
+    fn a_turn_that_knows_a_lot_still_fits_the_line_it_is_given() {
+        let block = TurnEndBlock {
+            stop: StopReason::MaxRounds,
+            error: Some("context window exhausted mid-round".into()),
+            stats: TurnStats {
+                steps: 40,
+                prompt: 1_048_576,
+                completion: 123_456,
+                cached: 1_000_000,
+            },
+        };
+        for w in 0..160u16 {
+            for line in block.lines(w) {
+                assert!(line.width() <= w as usize, "w={w}: {:?}", line.plain());
+            }
+        }
+    }
+
+    #[test]
+    fn token_counts_are_exact_while_that_is_readable_and_rounded_after() {
+        assert_eq!(token_count(0), "0");
+        assert_eq!(token_count(28), "28");
+        assert_eq!(token_count(9_999), "9999");
+        assert_eq!(token_count(10_000), "10k");
+        assert_eq!(token_count(90_659), "90.7k");
+        assert_eq!(token_count(1_048_576), "1048.6k");
+    }
+
     #[test]
     fn content_never_draws_wider_than_it_was_given() {
         let items: Vec<Box<dyn Content>> = vec![
@@ -845,10 +1101,34 @@ mod tests {
             Box::new(TurnEndBlock {
                 stop: StopReason::RunawayFuse,
                 error: None,
+                stats: TurnStats::default(),
             }),
             Box::new(TurnEndBlock {
                 stop: StopReason::Cancelled,
                 error: Some("by the user".into()),
+                stats: TurnStats::default(),
+            }),
+            // With figures, and with figures plus a cause: the caption is
+            // longest here, so this is the case that would run off the edge.
+            Box::new(TurnEndBlock {
+                stop: StopReason::Stopped,
+                error: None,
+                stats: TurnStats {
+                    steps: 12,
+                    prompt: 128_456,
+                    completion: 9_876,
+                    cached: 120_000,
+                },
+            }),
+            Box::new(TurnEndBlock {
+                stop: StopReason::ProviderError,
+                error: Some("connection reset by peer while reading the response body".into()),
+                stats: TurnStats {
+                    steps: 3,
+                    prompt: 62_120,
+                    completion: 812,
+                    cached: 0,
+                },
             }),
         ];
         for item in &items {

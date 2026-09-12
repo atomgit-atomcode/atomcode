@@ -87,10 +87,7 @@ impl View for Status {
         if state.prompt_tokens > 0 {
             row.push(sep());
             row.push(El::styled(
-                format!(
-                    "{}k tok",
-                    (state.prompt_tokens as f32 / 1000.0).round() as u32
-                ),
+                format!("{} tok", crate::content::token_count(state.prompt_tokens)),
                 dim,
             ));
         }
@@ -233,6 +230,29 @@ mod tests {
         )[0]
         .plain();
         assert!(!line.contains("tok"), "{line:?}");
+    }
+
+    /// A small count is a count, not a rounding of itself to nothing. `14`
+    /// tokens is what a one-line exchange costs, and the line used to render it
+    /// as `0k tok` — a zero it had just decided not to print.
+    #[test]
+    fn a_small_count_is_not_rounded_away_to_zero() {
+        let st = State {
+            prompt_tokens: 14,
+            ..Default::default()
+        };
+        let line =
+            Status::render(&st, &Viewport::new(Rect::sized(70, 1), &Moment::default()))[0].plain();
+        assert!(line.contains("14 tok"), "{line:?}");
+
+        // And a large one is thousands, the same way the end of a turn says it.
+        let st = State {
+            prompt_tokens: 123_456,
+            ..Default::default()
+        };
+        let line =
+            Status::render(&st, &Viewport::new(Rect::sized(70, 1), &Moment::default()))[0].plain();
+        assert!(line.contains("123.5k tok"), "{line:?}");
     }
 
     #[test]
