@@ -1,19 +1,20 @@
-//! The harness's **headless** front end: a full-screen terminal UI assembled
-//! from plugins, whose reason for existing is that it can be driven with no
-//! terminal at all.
+//! The harness's front end: a full-screen terminal UI assembled from plugins,
+//! on its way to being **the** product UI.
 //!
-//! # What this is not
+//! # Where this stands
 //!
-//! It is **not** the product UI and is not becoming one. `atomcode-tuix` is,
-//! and it is 9× the size of this crate — 16 modals, 60 commands, a retained
-//! renderer. Matching it was tried and abandoned; see `docs/adr/0011` for the
-//! numbers and for why bridging tuix onto the harness is not the cheap option
-//! it looks like.
+//! `atomcode-tuix` is the UI that ships today. It is 9× the size of this crate
+//! and bound to `atomcode-coding` by concrete types, not a seam — which is why
+//! it is being replaced by this crate rather than bridged onto the harness.
+//! The decision, the gap it has to close and the order to close it in are in
+//! `docs/adr/0012`; the earlier "headless only" stance is `docs/adr/0011`,
+//! superseded. Don't read tuix for what to build; build it here as rows.
 //!
-//! What this crate does that tuix cannot: 20 end-to-end tests drive the whole
-//! UI with no tty, no model and no human; `--audit` checks an assembly on a
-//! machine with no terminal; `--demo` prints one composed frame. Two front ends
-//! behind one `ui` seam is what the seam is for.
+//! What makes this crate the one worth growing: 20 end-to-end tests drive the
+//! whole UI with no tty, no model and no human; `--audit` checks an assembly
+//! on a machine with no terminal; `--demo` prints one composed frame. The
+//! headless surface is a row next to the terminal one, so every feature added
+//! is testable the day it lands.
 //!
 //! Nothing here is a monolith with extension points bolted on. The host owns
 //! four things nobody else can — the surface, the event loop, layout
