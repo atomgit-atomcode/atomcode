@@ -724,12 +724,19 @@ pub fn plain_rule(w: usize, style: Style) -> Line {
 ///
 /// The turn separator: `───── ✓ 完成 · 2 轮 ─────`. Centred, because it reads as
 /// a divider with a label rather than as a line someone wrote.
+/// Whether [`captioned_rule`] would set this caption into the rule at width
+/// `w`, or fall back to a bare rule. Public so a block can decide to say the
+/// same thing another way — under the rule, wrapped — rather than lose it.
+pub fn caption_fits(caption: &str, w: usize) -> bool {
+    width::str_width(&format!(" {} ", caption.trim())) + 4 <= w
+}
+
 pub fn captioned_rule(caption: &str, w: usize, rule_style: Style, text_style: Style) -> Line {
-    let text = format!(" {} ", caption.trim());
-    let tw = width::str_width(&text);
-    if tw + 4 > w {
+    if !caption_fits(caption, w) {
         return plain_rule(w, rule_style);
     }
+    let text = format!(" {} ", caption.trim());
+    let tw = width::str_width(&text);
     let left = (w - tw) / 2;
     let right = w - tw - left;
     Line::from_spans(vec![

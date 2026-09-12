@@ -266,6 +266,56 @@ async fn typing_during_a_turn_is_folded_into_it_rather_than_queued() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+// Multi-threaded on purpose. The driver commits the turn's last fact and
+// marks the agent idle in one synchronous stretch; on the single-threaded test
+// runtime the UI task cannot run between the two, so the race this test exists
+// for cannot happen there — and a test that cannot fail proves nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_the_model_never_answers_says_so_and_stops_spinning() {
+    // No network, no key, a dead endpoint: every one of them reaches the loop
+    // as a request that fails, and the person is owed two things — the cause
+    // on the screen, and a status line that stops saying the agent is working.
+    // The message is the shape a provider really produces: one sentence far
+    // wider than the 80 columns this screen has.
+    let dir = scratch("failed");
+    let fail = r#"{ fail = "open failed: error sending request for url (https://openrouter.ai/api/v1/chat/completions): client error (Connect): dns error: failed to lookup address information: nodename nor servname provided, or not known" }"#;
+    // Wide enough that the status line's activity segment is on screen: at 80
+    // columns the working directory pushes it off the right edge, and an
+    // assertion about text that was never drawn passes for the wrong reason.
+    let wide = "[[patch]]\nid = \"surface\"\nconfig = { width = 160, height = 24 }\n";
+    let s = start(tree(&dir, &replay(fail), &[wide])).await;
+    // Hold the driver between "the turn ended" being committed and the agent
+    // being marked idle — the window a telemetry or trace subscriber occupies
+    // in a real tree, widened so the UI reliably lands inside it. A UI that
+    // reads the agent's status on that fact and never looks again is caught.
+    // `block_in_place`, not a bare sleep: a bare sleep pins this worker, and
+    // the UI task the fact just woke sits in this worker's own run queue until
+    // the hold ends — which hides the very race the hold is meant to expose.
+    let _hold = s
+        .app
+        .on_emit::<atomcode_harness::events::TurnEnd>(|_: &atomcode_harness::seams::TurnOutcome| {
+            tokio::task::block_in_place(|| std::thread::sleep(Duration::from_millis(300)));
+        });
+    let task = s.open().await;
+
+    s.term.type_line("hello?");
+    s.quiet().await;
+
+    let screen = s.screen();
+    assert!(screen.contains("ProviderError"), "the outcome:\n{screen}");
+    assert!(
+        screen.contains("nodename nor servname"),
+        "the cause, wrapped rather than dropped:\n{screen}"
+    );
+    assert!(
+        !screen.contains("运行中"),
+        "the status line must not claim a finished turn is running:\n{screen}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 #[tokio::test]
 async fn a_half_typed_line_survives_the_model_streaming_over_it() {
     let dir = scratch("halftyped");

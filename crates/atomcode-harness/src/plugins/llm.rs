@@ -140,6 +140,13 @@ struct ReplayStep {
     text: String,
     #[serde(default)]
     calls: Vec<ReplayCall>,
+    /// Fail the request instead, with this message. The dead network, the
+    /// missing key and the wrong URL all reach the loop as exactly this, and a
+    /// front end owes the person the same two things in every case — the
+    /// cause, and a status line that stops. Scripted here so that can be
+    /// tested without unplugging anything.
+    #[serde(default)]
+    fail: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -183,8 +190,15 @@ impl LlmProvider for ReplayProvider {
             .cloned()
             .unwrap_or_else(|| ReplayStep {
                 text: "(replay script exhausted)".into(),
-                calls: Vec::new(),
+                ..Default::default()
             });
+        if let Some(message) = step.fail {
+            return Err(ProviderError {
+                retryable: false,
+                message,
+                ..Default::default()
+            });
+        }
         let mut events = Vec::new();
         if !step.text.is_empty() {
             // Chunked, so anything downstream that renders a live stream is

@@ -648,17 +648,62 @@ impl Content for TurnEndBlock {
             Some(_) => (caps.g(Glyph::Fail), bad()),
             None => (caps.g(Glyph::Ok), dim()),
         };
-        let text = match &self.error {
-            Some(e) => format!("{mark} {} · {e}", self.stop),
-            None => format!("{mark} {}", self.stop),
+        let short = format!("{mark} {}", self.stop);
+        let Some(error) = &self.error else {
+            return vec![crate::el::captioned_rule(&short, w as usize, dim(), style)];
         };
-        vec![crate::el::captioned_rule(&text, w as usize, dim(), style)]
+        // A short cause sits in the rule the way a clean ending does. A long
+        // one is not dropped: `captioned_rule` drops a caption it cannot place,
+        // and the cause of a failed turn is the one caption a person must see —
+        // without it a dead network looks like a turn that ended in silence.
+        // So it goes under the rule, wrapped, however long the provider made it.
+        let full = format!("{short} · {error}");
+        if crate::el::caption_fits(&full, w as usize) {
+            return vec![crate::el::captioned_rule(&full, w as usize, dim(), style)];
+        }
+        let mut out = vec![crate::el::captioned_rule(&short, w as usize, dim(), style)];
+        out.extend(wrapped(error, w, style, "  "));
+        out
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_turn_keeps_its_cause_on_screen_however_long_it_is() {
+        // What a dead network produces: a provider sentence far wider than the
+        // screen. Set into the rule it would be dropped whole, and the turn
+        // would look like it ended in silence.
+        let error = "open failed: error sending request for url \
+                     (https://openrouter.ai/api/v1/chat/completions): client error (Connect): \
+                     dns error: failed to lookup address information: nodename nor servname provided";
+        let block = TurnEndBlock {
+            stop: "ProviderError".into(),
+            error: Some(error.into()),
+        };
+        let lines = block.lines(100);
+        let text: String = lines.iter().map(|l| l.plain()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("ProviderError"), "{text}");
+        assert!(
+            text.contains("nodename nor servname"),
+            "the cause must reach the screen:\n{text}"
+        );
+        assert!(lines.len() > 1, "wider than the rule means wrapped under it");
+        for line in &lines {
+            assert!(line.width() <= 100, "{:?}", line.plain());
+        }
+
+        // A short cause still sits in the rule, on one line.
+        let short = TurnEndBlock {
+            stop: "Cancelled".into(),
+            error: Some("by the user".into()),
+        };
+        let lines = short.lines(100);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].plain().contains("Cancelled · by the user"));
+    }
 
     #[test]
     fn content_never_draws_wider_than_it_was_given() {

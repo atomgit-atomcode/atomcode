@@ -287,6 +287,7 @@ impl Tui {
         let driver = driver.clone();
         let agent = agent.clone();
         let flag = self.driving.clone();
+        let wake = self.wake.lock().expect("wake poisoned").clone();
         tokio::spawn(async move {
             driver.drive(&agent).await;
             flag.store(false, Ordering::SeqCst);
@@ -299,6 +300,15 @@ impl Tui {
             {
                 driver.drive(&agent).await;
                 flag.store(false, Ordering::SeqCst);
+            }
+            // The driver commits the turn's last fact and only then marks the
+            // agent idle. The loop syncs the status line on facts, so on that
+            // last one it can still read `Working` — and nothing else was
+            // going to wake it. A turn the model never answered then sat under
+            // a spinner until the next keystroke. Here the driver has returned,
+            // which is the one moment the status is known to be settled.
+            if let Some(wake) = wake {
+                let _ = wake.send(Wake::Fact);
             }
         });
     }
