@@ -931,3 +931,51 @@ async fn a_layout_request_the_model_gets_wrong_comes_back_with_the_reason() {
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+// ---- more than one agent in the tree --------------------------------------
+
+/// The screen is one conversation's fold, not the tree's.
+///
+/// The listener that feeds the modules sits at the root realm, and a realm
+/// hears its descendants: every delegated member commits to its own log and
+/// every one of those facts reaches that listener. Folding them all into one
+/// stream interleaves two conversations by turn coordinate — a member's
+/// thinking, its tool calls and its turn ends land in the lead's transcript.
+/// What the lead may see of a member is what the member *told* it.
+#[tokio::test]
+async fn a_member_s_own_conversation_stays_off_the_lead_s_screen() {
+    let dir = scratch("team-crosstalk");
+    let script = replay(
+        r#"{ text = "Delegating.", calls = [ { name = "team", args = { action = "delegate", name = "scout", role = "explorer", task = "look around" } } ] },
+           { text = "Delegated." },
+           { text = "Noted." }"#,
+    );
+    // The member is an `explorer` — a simple role — so it runs on the utility
+    // slot, and its words are unmistakably its own.
+    let member = format!(
+        "[[insert]]\nname = \"team-in-process\"\nconfig = {{ project_root = {dir:?} }}\n\n\
+         [[insert]]\nid = \"llm-utility\"\nname = \"llm-utility-replay\"\n\
+         config = {{ script = [ \
+           {{ text = \"MEMBER-THINKING-OUT-LOUD\", calls = [ {{ name = \"tell_parent\", args = {{ text = \"scout reporting in\" }} }} ] }}, \
+           {{ text = \"MEMBER-TRAILING-WORDS\" }} ] }}\n",
+        dir = dir.to_string_lossy(),
+    );
+    let s = start(tree(&dir, &script, &[&member])).await;
+    let task = s.open().await;
+
+    s.term.type_line("have someone look around");
+    s.quiet().await;
+
+    let screen = s.screen();
+    assert!(
+        !screen.contains("MEMBER-THINKING-OUT-LOUD") && !screen.contains("MEMBER-TRAILING-WORDS"),
+        "the member's own conversation is not the lead's screen:\n{screen}"
+    );
+    assert!(
+        screen.contains("scout reporting in"),
+        "what the member told the lead is on it:\n{screen}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}

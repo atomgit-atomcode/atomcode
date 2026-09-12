@@ -187,9 +187,21 @@ impl UserInterface for Tui {
         // Every committed fact reaches the modules here and nowhere else: the
         // screen is a fold over the log, so a resumed session and a live one
         // produce the same picture.
+        //
+        // One screen, one conversation — the same rule the handle's own pump
+        // keeps. This listener sits at the root realm and a realm hears its
+        // descendants, so every delegated member's facts arrive here too;
+        // folding them in interleaves two conversations in one stream, which
+        // is what a person sees as two agents talking over each other. What
+        // the screen may show of a member is what the member *told* this
+        // agent, and that is a fact in this log.
         let host = self.host.clone();
         let facts = wake_tx.clone();
+        let mine = client.session().id().to_string();
         let stream = ctx.on_emit::<SessionEventCommitted>(move |c: &Committed| {
+            if c.session != mine {
+                return;
+            }
             host.absorb(&c.event);
             let _ = facts.send(Wake::Fact);
         });

@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use atomcode_harness::session::SessionEvent;
+use atomcode_harness::session::{InjectionOrigin, SessionEvent};
 
 use crate::block::{BlockId, Coord, StreamWriter};
 use crate::content::{
@@ -39,6 +39,22 @@ pub struct Transcript {
 impl Transcript {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+}
+
+/// What an injected block says about where it came from.
+///
+/// The kind, not the sender's id: a peer's message already names the sender
+/// in its own text, and a session id on screen is an identifier nobody reads.
+/// Debug-formatting the origin put `peer { from: "1789…/scout" }` in front of
+/// every report, which is a struct dump, not a label.
+fn origin_label(origin: &InjectionOrigin) -> String {
+    match origin {
+        InjectionOrigin::Peer { .. } => "peer".into(),
+        InjectionOrigin::Memory => "memory".into(),
+        InjectionOrigin::Reminder => "reminder".into(),
+        InjectionOrigin::Continuation => "continuation".into(),
+        InjectionOrigin::CompactionSummary => "compaction summary".into(),
     }
 }
 
@@ -170,7 +186,7 @@ impl Producer for Transcript {
                 out.emit(
                     at,
                     Arc::new(InjectedBlock {
-                        origin: format!("{origin:?}").to_lowercase(),
+                        origin: origin_label(origin),
                         text: text.clone(),
                     }),
                 );
