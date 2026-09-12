@@ -34,7 +34,7 @@ use serde_json::Value;
 use crate::command::Commands;
 use crate::layout::{LayoutOp, Side};
 use crate::module::{Modules, Mounted, Producer};
-use crate::modules::{input, status, team, transcript};
+use crate::modules::{input, status, team, todo, transcript};
 use crate::plugin::{CommandsSvc, LayoutSvc, ModulesSvc};
 
 /// The screen, panel by panel — the one place that says what a full UI is made
@@ -54,6 +54,13 @@ name = "tui-panel-status"
 
 [[insert]]
 name = "tui-panel-input"
+
+# On by default, unlike the mascot and the team strip: the list is only there
+# when the model has planned something, and a plan nobody can see is a plan
+# nobody follows. Mounted and placed by its own row, so `[[remove]]` takes it
+# off the screen.
+[[insert]]
+name = "tui-panel-todo"
 
 # Off by default, on with `--mascot`. A row, not a boolean on the UI row.
 [[insert]]
@@ -100,6 +107,7 @@ pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
         Arc::new(InputPanel),
         Arc::new(MascotPanel),
         Arc::new(TeamPanel),
+        Arc::new(TodoPanel),
         Arc::new(AskCardRow),
         Arc::new(ScreenCommandsRow),
         Arc::new(SessionCommandsRow),
@@ -263,6 +271,60 @@ impl Plugin for TeamPanel {
         let layout = ctx.require::<LayoutSvc>().map_err(|e| e.to_string())?;
         let view = Arc::new(Mounted::<team::Team>::new());
         let id = <team::Team as crate::module::View>::id();
+        mods.add_view(view)?;
+
+        let known: Vec<String> = mods.view_ids().into_iter().map(str::to_string).collect();
+        layout
+            .apply(
+                &LayoutOp::Show {
+                    module: id.to_string(),
+                    side: Side::Bottom,
+                    size: None,
+                },
+                &known,
+            )
+            .map_err(|e| format!("{e:?}"))?;
+
+        let m: Arc<Modules> = mods.clone();
+        let l = layout.clone();
+        let _ = ctx.effect(move || {
+            let known: Vec<String> = m.view_ids().into_iter().map(str::to_string).collect();
+            let _ = l.apply(
+                &LayoutOp::Hide {
+                    module: id.to_string(),
+                },
+                &known,
+            );
+            m.remove_view(id);
+        });
+        Ok(())
+    }
+}
+
+/// The todo list: what the session is working through.
+///
+/// Placed the way the team strip is — bottom, no size, so it is as tall as the
+/// plan and no taller. That matters more here than there: the panel asks for
+/// `Hug(0)` and draws nothing until the model has planned something, so a
+/// session that never calls `todowrite` pays a row, not a panel of "no tasks".
+pub struct TodoPanel;
+
+#[async_trait]
+impl Plugin for TodoPanel {
+    fn name(&self) -> &'static str {
+        "tui-panel-todo"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tui-modules", "tui-layout"]
+    }
+    fn description(&self) -> &'static str {
+        "the task list the model is working through, and what is left of it"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let mods = ctx.require::<ModulesSvc>().map_err(|e| e.to_string())?;
+        let layout = ctx.require::<LayoutSvc>().map_err(|e| e.to_string())?;
+        let view = Arc::new(Mounted::<todo::Todo>::new());
+        let id = <todo::Todo as crate::module::View>::id();
         mods.add_view(view)?;
 
         let known: Vec<String> = mods.view_ids().into_iter().map(str::to_string).collect();

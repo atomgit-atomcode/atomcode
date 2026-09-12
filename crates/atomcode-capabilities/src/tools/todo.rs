@@ -281,6 +281,21 @@ pub fn is_todo_plan(args: &str) -> bool {
     parse_todos(args).is_ok()
 }
 
+/// The tool the model calls. `todowrite` replaced an older `todo`; both names
+/// still appear in transcripts, so both are folded.
+pub const TOOL_NAME: &str = "todowrite";
+
+/// The retired name, read but never written. Kept so a resumed transcript that
+/// recorded `todo` calls folds to the same list as one recorded after the rename.
+pub const LEGACY_TOOL_NAME: &str = "todo";
+
+/// Whether a call by this name affects the list. One place for the rule, so a
+/// consumer that keeps calls of its own — the TUI's todo panel — cannot answer
+/// it differently from [`reduce_todos`], which is the fold they must agree on.
+pub fn is_todo_call(name: &str) -> bool {
+    name == TOOL_NAME || name == LEGACY_TOOL_NAME
+}
+
 /// Fold an ORDERED stream of `(tool_name, args)` todo-affecting calls into the current list.
 /// Baseline = the LAST call carrying a valid full LIST (`{"todos":[…]}`; positions become the
 /// stable 1-based ids); then every incremental `{"action":…}` call AFTER that baseline is
@@ -292,10 +307,7 @@ pub fn is_todo_plan(args: &str) -> bool {
 /// use this shape rule, so live / replay / injected views never diverge.
 pub fn reduce_todos<'a>(calls: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<TodoItem> {
     // Keep both names so a resumed transcript (legacy `todo` + `todowrite`) folds the same.
-    let calls: Vec<(&str, &str)> = calls
-        .into_iter()
-        .filter(|(n, _)| *n == "todowrite" || *n == "todo")
-        .collect();
+    let calls: Vec<(&str, &str)> = calls.into_iter().filter(|(n, _)| is_todo_call(n)).collect();
     let baseline = calls.iter().rposition(|(_, a)| is_todo_plan(a));
     let (mut list, start) = match baseline {
         Some(i) => (parse_todos(calls[i].1).unwrap_or_default(), i + 1),
@@ -360,7 +372,7 @@ actually done, never on intent.";
 #[async_trait]
 impl Tool for TodoTool {
     fn name(&self) -> &str {
-        "todowrite"
+        TOOL_NAME
     }
     fn description(&self) -> &str {
         TODOWRITE_DESCRIPTION
@@ -454,6 +466,29 @@ mod tests {
             progress: atomcode_kernel::tool::ProgressSink::noop(),
             requester: None,
         }
+    }
+
+    #[test]
+    fn the_name_rule_and_the_tool_agree() {
+        // A consumer that keeps calls of its own must be able to ask "is this a
+        // todo call" and get the same answer the fold uses. The tool's own name
+        // is the canonical one, so a rename cannot leave the rule behind — and
+        // the literal is pinned, so the rename is a decision rather than a typo.
+        assert_eq!(TodoTool::new().name(), "todowrite");
+        assert_eq!(TodoTool.name(), TOOL_NAME);
+        assert!(is_todo_call(TodoTool.name()));
+        assert!(is_todo_call(LEGACY_TOOL_NAME));
+        assert!(!is_todo_call("read_file"));
+        // Both names fold, which is the whole reason the legacy one is kept.
+        let list = reduce_todos([
+            (
+                LEGACY_TOOL_NAME,
+                r#"{"todos":[{"content":"a","status":"pending"}]}"#,
+            ),
+            (TOOL_NAME, r#"{"action":"add","content":"b"}"#),
+        ]);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[1].content, "b");
     }
 
     #[test]
@@ -983,11 +1018,6 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(result.content.contains("placeholder"), "{}", result.content);
-    }
-
-    #[test]
-    fn tool_name_is_todowrite() {
-        assert_eq!(TodoTool::new().name(), "todowrite");
     }
 
     #[test]

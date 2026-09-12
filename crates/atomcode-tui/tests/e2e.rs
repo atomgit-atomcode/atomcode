@@ -1192,6 +1192,117 @@ async fn the_team_panel_says_who_is_on_the_team_and_what_each_last_said() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+// ---- the todo panel ------------------------------------------------------
+
+/// The task list, as the model's own plan, on the screen.
+///
+/// The panel is a fold of the log rather than a list it keeps, so this also
+/// checks the seam that matters: the plan the model sent and the plan the person
+/// reads come from one derivation (`reduce_todos`), and an incremental update is
+/// applied against the plan in force rather than accumulated on its own.
+#[tokio::test]
+async fn the_todo_panel_shows_the_plan_the_model_sent() {
+    let dir = scratch("todo-panel");
+    let script = replay(
+        r#"{ text = "Planning.", calls = [
+             { name = "todowrite", args = { todos = [
+               { content = "读代码", status = "in_progress" },
+               { content = "写面板", status = "pending" } ] } } ] },
+           { text = "Started.", calls = [
+             { name = "todowrite", args = { action = "update", id = 1, status = "completed" } } ] },
+           { text = "Done." }"#,
+    );
+    let s = start(tree(&dir, &script, &[])).await;
+    let task = s.open().await;
+
+    // Before any plan there is no panel, not an empty one: the row is mounted,
+    // the panel asks for no rows, and the host places nothing — so the
+    // conversation keeps the row rather than a blank line of chrome.
+    assert!(
+        s.term.last().unwrap().part("todo").is_none(),
+        "a session with no plan has no todo panel"
+    );
+
+    s.term.type_line("plan it");
+    s.quiet().await;
+
+    let panel = s
+        .term
+        .last()
+        .unwrap()
+        .part("todo")
+        .expect("the todo panel is on screen")
+        .lines
+        .iter()
+        .map(|l| l.plain())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The plan, then one incremental patch to it: `#1` is completed by the
+    // second call, so the header must read that plan's counts — the `update`
+    // was applied against the list in force, not accumulated beside it.
+    assert!(panel.contains("任务"), "the header:\n{panel}");
+    assert!(panel.contains("1 已完成"), "the patched count:\n{panel}");
+    assert!(panel.contains("1 待办"), "{panel}");
+    assert!(panel.contains("#1") && panel.contains("读代码"), "{panel}");
+    assert!(panel.contains("#2") && panel.contains("写面板"), "{panel}");
+    assert!(
+        !panel.contains("todowrite"),
+        "the call is not the plan:\n{panel}"
+    );
+    // Placed *and* painted: `part` says the host gave it a rect, and only the
+    // flattened grid — the same one a screenshot and the exit dump come from —
+    // says the row reached the screen.
+    assert!(
+        s.term.last().unwrap().rows().join("\n").contains("任务"),
+        "the panel is on screen, not just in the parts list"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// And it goes away when the work does.
+///
+/// The panel is mounted for the whole session, so "it disappears" has to mean
+/// the row went back to the conversation rather than that a blank strip was left
+/// behind. That is the reason this is checked on the screen and not only in the
+/// module's own tests: `Hug(0)` is what gives the row back, and a panel drawn
+/// empty would pass a unit test while leaving a gap.
+#[tokio::test]
+async fn the_todo_panel_leaves_once_every_task_is_done() {
+    let dir = scratch("todo-finished");
+    let script = replay(
+        r#"{ text = "Planning.", calls = [
+             { name = "todowrite", args = { todos = [
+               { content = "读代码", status = "in_progress" },
+               { content = "写面板", status = "pending" } ] } } ] },
+           { text = "One.", calls = [
+             { name = "todowrite", args = { action = "update", id = 1, status = "completed" } } ] },
+           { text = "Two.", calls = [
+             { name = "todowrite", args = { action = "update", id = 2, status = "completed" } } ] },
+           { text = "All done." }"#,
+    );
+    let s = start(tree(&dir, &script, &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("plan it");
+    s.quiet().await;
+
+    let screen = s.term.last().unwrap();
+    assert!(
+        screen.part("todo").is_none(),
+        "the plan is finished, so the panel is gone: {:?}",
+        screen.part("todo").map(|p| p.lines.len())
+    );
+    // Gone, and not gone *blank*: the row it was using went back to the
+    // conversation, so the last thing said is still on screen.
+    let text = screen.rows().join("\n");
+    assert!(text.contains("All done."), "{text}");
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 // ---- approval ------------------------------------------------------------
 
 /// An approval says who wants it.

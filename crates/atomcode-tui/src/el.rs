@@ -503,7 +503,14 @@ impl El {
         match self {
             El::Empty => 0,
             El::Stream => 1,
-            El::Module(id) => wants(id).max(1),
+            // No `.max(1)`: `Height::Hug(0)` is a module saying it has nothing
+            // to say, and `Hug` is documented as "at most this many, fewer if
+            // it has less". Forcing a row would leave a blank line of chrome
+            // for a panel that is deliberately drawn only when it has content
+            // (the todo list before the model has planned anything). Squeezed
+            // to nothing means not placed — the same rule the overflow test
+            // below states, and the host then draws nothing there.
+            El::Module(id) => wants(id),
             // An inline subtree asks for one row. It could be laid to count
             // its lines, but not here: `wanted` has no width, and guessing one
             // would make the arbitration depend on a number nobody chose. A
@@ -976,6 +983,37 @@ mod tests {
 
     fn wants_one(_: &str) -> u16 {
         1
+    }
+
+    /// A module that asks for no rows: placed nowhere, not placed blank.
+    #[test]
+    fn a_module_that_asks_for_nothing_is_not_placed() {
+        let el = El::split(
+            Dir::Vertical,
+            Constraint::Fill,
+            El::Stream,
+            El::view("empty"),
+        );
+        let drawn = |id: &str| id != "empty";
+        let out = el.layout_with(Rect::sized(40, 10), &|id| {
+            if drawn(id) {
+                2
+            } else {
+                0
+            }
+        });
+        assert!(
+            !out.iter()
+                .any(|(e, _)| matches!(e, El::Module(id) if id == "empty")),
+            "no rect to draw into means no part at all"
+        );
+        // And the row it gave up goes to whatever else is on screen, rather
+        // than being left blank.
+        let stream = out
+            .iter()
+            .find_map(|(e, r)| matches!(e, El::Stream).then_some(r.h))
+            .expect("the stream is placed");
+        assert_eq!(stream, 10, "the whole area, since nothing else wants it");
     }
 
     fn placed(el: &El, w: u16, h: u16) -> Vec<(String, Rect)> {

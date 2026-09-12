@@ -663,6 +663,7 @@ version = "5.0.9"
 dependencies = [
  "arboard",
  "async-trait",
+ "atomcode-capabilities",
  "atomcode-harness",
  "atomcode-kernel",
  "atomcode-plexus",

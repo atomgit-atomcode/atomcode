@@ -15,6 +15,15 @@ atomcode-plexus = { path = "../atomcode-plexus" }
 atomcode-harness = { path = "../atomcode-harness" }
 # Value types only: SessionEvent carries kernel messages and tool calls.
 atomcode-kernel = { path = "../atomcode-kernel" }
+# The `tools` feature only, and only for the todo fold: the panel must derive the
+# list the *same* way the tool does (`reduce_todos`), or live, replay and resumed
+# views of the same session would disagree. Already in this build's graph — the
+# UI is a front end for the harness, which mounts these — so this adds no crate
+# that was not compiled anyway; the default `provider` feature (the whole HTTP
+# stack) is deliberately left off.
+atomcode-capabilities = { path = "../atomcode-capabilities", default-features = false, features = [
+    "tools",
+] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 # Reading the clipboard. The surface is the only row allowed to talk to the
 # terminal, and the clipboard is the terminal's — so the platform lives here,
