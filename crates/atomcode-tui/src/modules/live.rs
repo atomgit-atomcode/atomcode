@@ -1,13 +1,14 @@
 //! The live line: what this turn is doing, for how long, and for how much.
 //!
-//! One row above the composer, drawn only while a turn is in flight — with a
-//! blank row above it, so it is welded neither to the words above nor to the
-//! field's rule: the reserved row the composer keeps under it (`modules::tip`)
-//! is blank and there either way, so it does not need a margin of its own. It
-//! answers a question the conversation cannot: a block that has not arrived yet
-//! is not on screen, and the status line says where the session is, not what it
-//! is doing this second — so a turn that is thinking, or waiting on a model that
-//! has gone quiet, looks like a turn that has finished.
+//! One row above the composer, drawn only while a turn is in flight and the
+//! reader is at the bottom — with a blank row above it, so it is welded neither
+//! to the words above nor to the field's rule: the reserved row the composer
+//! keeps under it (`modules::tip`) is blank and there either way, so it does not
+//! need a margin of its own. It answers a question the conversation cannot: a
+//! block that has not arrived yet is not on screen, and the status line says
+//! where the session is, not what it is doing this second — so a turn that is
+//! thinking, or waiting on a model that has gone quiet, looks like a turn that
+//! has finished.
 //!
 //! Two sources, and the split is the point:
 //!
@@ -33,6 +34,13 @@
 //! is part of the composer, and `Show`'s two sides — above the conversation or
 //! below the status bar — are both wrong for a row whose whole job is to sit
 //! against the input box.
+//!
+//! **It goes away while the reader is scrolled up.** That is [`showing`]'s second
+//! question, and it is not the same one [`doing`] asks. A row nailed to the foot
+//! of the screen is a claim about *now* drawn over words somebody chose to look
+//! at instead, and "still running" is not worth a row of their conversation. It
+//! comes back at the bottom — which is where it is read from anyway, because that
+//! is where the turn's output arrives.
 
 use atomcode_harness::session::SessionEvent;
 
@@ -159,7 +167,7 @@ impl View for Live {
         if w == 0 || vp.rect.h == 0 {
             return Vec::new();
         }
-        let Some(words) = doing(state, vp.moment) else {
+        let Some(words) = showing(state, vp.moment) else {
             return Vec::new();
         };
 
@@ -210,14 +218,22 @@ impl View for Live {
         out
     }
 
-    /// The line and its margin while a turn is in flight, nothing between turns.
+    /// The line and its margin while a turn is in flight and the reader is at
+    /// the bottom; nothing at all otherwise.
     ///
-    /// `Hug(0)` is what hands the row back to the conversation, and it is asked
-    /// from the same predicate `render` draws from: the two disagreeing is
-    /// either a blank row of chrome above the composer or a line drawn outside
+    /// `Hug(0)` is what hands the row back to the conversation — between turns,
+    /// and for as long as somebody is scrolled up into it — and [`showing`] is
+    /// what answers, the same predicate `render` draws from: the two disagreeing
+    /// is either a blank row of chrome above the composer or a line drawn outside
     /// the rect it asked nothing for.
+    ///
+    /// Hiding *against* the scroll rather than travelling with the words is the
+    /// deliberate half. This module's rect is the composer's, and a row that drew
+    /// itself into the stream's scroll would be drawing outside it — the stream's
+    /// rows are the host's to count against the offset. So the line steps aside
+    /// and comes back, instead of following content it does not own.
     fn height(state: &State, moment: &Moment, _width: u16) -> Height {
-        match doing(state, moment) {
+        match showing(state, moment) {
             Some(_) => Height::Hug(ROWS),
             None => Height::Hug(0),
         }
@@ -251,6 +267,27 @@ const MARGIN: u16 = 1;
 
 /// What the line asks for in total: the blank row above and the words.
 const ROWS: u16 = 1 + MARGIN;
+
+/// The words this row is showing, or `None` when it is not on screen at all.
+///
+/// Two questions, and they are different ones. [`doing`] asks whether there is
+/// anything to say. This asks whether anybody is looking at the place it would be
+/// said in: a reader who has scrolled up is reading something else, and a row
+/// nailed to the foot of their screen while those words slide under it is chrome
+/// arguing with the conversation. So the line leaves with the words it belongs to
+/// and comes back at the bottom — where it is read from anyway, because that is
+/// where a turn's output arrives.
+///
+/// Both `render` and `height` ask *here*, which is the whole reason this is a
+/// function rather than a condition written twice: the two disagreeing is either
+/// a blank row of chrome above the composer or a line drawn where nothing was
+/// asked for.
+fn showing(state: &State, moment: &Moment) -> Option<String> {
+    if !moment.scroll.is_at_bottom() {
+        return None;
+    }
+    doing(state, moment)
+}
 
 /// What the line says is happening, or `None` when nothing is.
 ///
@@ -523,6 +560,60 @@ mod tests {
             Live::height(&state, &moment, 80),
             Height::Hug(2),
             "the margin is asked for, not seized"
+        );
+    }
+
+    #[test]
+    fn the_line_gets_out_of_the_way_while_the_reader_is_scrolled_up() {
+        // The one case where a claim about *now* is worth less than the rows it
+        // costs: somebody reading further back. It leaves with the words it
+        // belongs to — the margin too — and asks for nothing while it is gone, so
+        // the conversation keeps both rows.
+        let state = fold(&a_turn());
+        let mut moment = Moment::default().working().at_tick(0);
+        moment.now = Timestamp::millis(3_000);
+        moment.turn_started = Some(Timestamp::millis(0));
+
+        assert_eq!(
+            Live::height(&state, &moment, 80),
+            Height::Hug(ROWS),
+            "up while the reader is at the bottom"
+        );
+
+        // One line up is enough. The row is a claim about the foot of the
+        // conversation, and the foot is not on screen any more.
+        moment.scroll = crate::moment::ScrollPos(1);
+        assert!(
+            draw(&state, &moment, 80, ROWS).is_empty(),
+            "no words, and no blank row where they were"
+        );
+        assert_eq!(
+            Live::height(&state, &moment, 80),
+            Height::Hug(0),
+            "and it says so, which is how the rows get handed back"
+        );
+
+        // Height and render are one predicate, so they cannot disagree: the row
+        // asked for is the row filled, at either answer.
+        let asked = match Live::height(&state, &moment, 80) {
+            Height::Hug(n) => n,
+            other => panic!("the row is asked for as a hug, not {other:?}"),
+        };
+        assert_eq!(draw(&state, &moment, 80, asked).len(), asked as usize);
+
+        // Back at the bottom is back on screen — the same reading that hid it is
+        // the one that shows it again.
+        moment.scroll = crate::moment::ScrollPos::BOTTOM;
+        assert_eq!(
+            Live::height(&state, &moment, 80),
+            Height::Hug(ROWS),
+            "scrolling back down brings it back"
+        );
+        assert!(
+            draw(&state, &moment, 80, ROWS)
+                .iter()
+                .any(|l| l.contains("正在等待模型")),
+            "with what it was saying"
         );
     }
 

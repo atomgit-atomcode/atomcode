@@ -704,6 +704,53 @@ mod tests {
     }
 
     #[test]
+    fn a_scrolled_up_reader_is_not_shown_the_live_line() {
+        // The rows go back to the conversation rather than to the composer, and
+        // the field below does not move: the line is the only thing that stops
+        // being asked for.
+        use crate::modules::live;
+        let mods = Arc::new(Modules::new());
+        mods.add_producer(transcript::Transcript::new()).unwrap();
+        mods.add_view(Arc::new(Mounted::<live::Live>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<input::Input>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<status::Status>::new()))
+            .unwrap();
+        let h = Host::new(mods, default_layout());
+
+        h.absorb(&SessionEvent::TurnStart { turn: 1 });
+        {
+            let mut m = h.moment.write().unwrap();
+            m.activity = crate::moment::Activity::Working;
+            m.now = crate::moment::Timestamp::millis(4_000);
+        }
+        let at_bottom = h.compose((60, 12));
+        assert!(
+            at_bottom.part("live").is_some(),
+            "the line is up while the reader is at the bottom"
+        );
+        let field = at_bottom.part("input").expect("the field").rect;
+
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(1);
+        let scrolled = h.compose((60, 12));
+        assert!(
+            scrolled.part("live").is_none(),
+            "reading history is not looking at the foot of the conversation"
+        );
+        assert_eq!(
+            scrolled.part("input").expect("the field").rect,
+            field,
+            "the box does not move for it"
+        );
+        assert_eq!(
+            scrolled.part("stream").expect("the conversation").rect.h,
+            at_bottom.part("stream").expect("the conversation").rect.h + 2,
+            "and the line and its blank row are the words' again"
+        );
+    }
+
+    #[test]
     fn the_reserved_row_is_kept_and_a_tip_can_never_move_the_box() {
         use crate::modules::{live, tip};
         let mods = Arc::new(Modules::new());
