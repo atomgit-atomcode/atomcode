@@ -32,10 +32,9 @@ profiles:
   plan       read-only exploration: investigate and produce a plan
   repl       an interactive terminal session that can ask questions
   sdk        line-delimited JSON-RPC on stdio
-  tui        a full-screen terminal UI
   web        an HTTP server with a live event stream
 
-bundles: base, embed-app, oneshot-app, repl-app, sdk-app, tui-app, web-app
+bundles: base, embed-app, handle-app, oneshot-app, repl-app, sdk-app, web-app
 
 layer order: bundles -> the profile's patch -> ~/.atomcode/harness.patch.toml -> --patch overlays
 ```
@@ -44,7 +43,7 @@ layer order: bundles -> the profile's patch -> ~/.atomcode/harness.patch.toml ->
 
 ```sh
 harness --profile repl                  # 行式终端会话，能问人、能 steering
-harness --profile tui                   # 全屏终端 UI
+atui                                    # 全屏终端 UI（atomcode-tui 自己的 launcher）
 harness --profile web                   # HTTP + SSE 事件流 + 一个页面
 harness --profile sdk                   # stdio 上的 JSON-RPC，给程序用
 ```
@@ -63,7 +62,7 @@ $ echo '{"jsonrpc":"2.0","id":2,"method":"agent/send","params":{"text":"look"}}'
 ```sh
 harness --profile web --plan            # 浏览器里的只读探索
 harness --profile sdk --read-only       # 只读世界里的 JSON-RPC
-harness --profile tui --full            # 全屏 UI + 代码图 + 联网 + 委派
+atui --full                             # 全屏 UI + 代码图 + 联网 + 委派
 harness --profile repl --patch mine.toml
 ```
 
@@ -265,14 +264,14 @@ front_end.run(&app.context(), prompt).await
 |---|---|
 | `ui-oneshot` | 跑一个 prompt 就退出 |
 | `ui-repl` | 行式终端会话 |
-| `ui-tui` | 全屏终端 UI（crossterm），从会话日志渲染 |
+| `ui-tui2` | 全屏终端 UI，住在 `atomcode-tui`，由 `atui` 挂载；面板、按键、布局各自是行 |
 | `ui-web` | axum HTTP：一个页面 + SSE 事件流 + 一个 send 端点 |
 | `ui-jsonrpc` | stdio 上的行分隔 JSON-RPC，给程序用 |
 | `ui-quiet` | 什么都不做，嵌入时用 |
 
 **下面的一切不变**：`the_agent_underneath_is_identical_across_front_ends` 断言 oneshot / web / sdk / embed 四个 profile 的工具目录和 system prompt 逐字相同。换前端不改变模型能做什么，也不改变它被告知什么。
 
-`ui-tui` 值得单说：它**从会话日志渲染**，不是累积 print 调用。所以 resize、重画、重连看到的是真实的对话，而不是副作用的流水账——这正是事件日志那一节的直接兑现。
+`ui-tui2` 值得单说：它**从会话日志渲染**，不是累积 print 调用。所以 resize、重画、重连看到的是真实的对话，而不是副作用的流水账——这正是事件日志那一节的直接兑现。
 
 `ui-repl` 里 inbox 是支点：读取任务**直接把输入投递到 inbox**，只用 channel 发信号。如果输入先在 channel 里等主循环回来，它就只能开下一个 turn——steering 就没了。
 

@@ -585,7 +585,6 @@ dependencies = [
  "atomcode-plexus",
  "atomcode-review",
  "axum",
- "crossterm",
  "ctor",
  "futures",
  "serde",

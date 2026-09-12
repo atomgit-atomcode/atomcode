@@ -1,7 +1,9 @@
 //! `atui` — the launcher for the plugin-composed TUI.
 //!
 //! It adds three rows to the harness catalog and hands over. It knows nothing
-//! about panels, keys, streams or layout: those all arrive as config.
+//! about panels, keys, streams or layout: those all arrive as config. The
+//! flags every launcher takes come from `atomcode_harness::launch`; only the
+//! ones that need a screen are parsed here.
 //!
 //! ```text
 //! atui                              # a session, on the model your config names
@@ -15,11 +17,10 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use atomcode_harness::control::AppControl;
+use atomcode_harness::launch::{value, Flag, Launch, HELP_SHARED};
+use atomcode_harness::plugins;
 use atomcode_harness::profile::Profiles;
-use atomcode_harness::seams::{ControlSvc, UiSvc};
-use atomcode_harness::{bundle, plugins, seam_map};
-use atomcode_plexus::{App, PluginRegistry};
+use atomcode_plexus::PluginRegistry;
 use atomcode_tui::plugin::{HeadlessSurfacePlugin, TerminalSurfacePlugin, TuiUiPlugin};
 use atomcode_tui::rows;
 
@@ -73,9 +74,9 @@ id = "approval-interactive"
 disabled = false
 "#;
 
-/// Paint into memory. Auditing a composition, or running under CI, must not
-/// require a screen — a check that needs a tty is a check that cannot run where
-/// it matters most.
+/// Paint into memory. Auditing a composition, dumping it, or running under
+/// CI must not require a screen — a check that needs a tty is a check that
+/// cannot run where it matters most.
 const HEADLESS: &str = r#"
 [[patch]]
 id = "surface"
@@ -90,131 +91,87 @@ disabled = false
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let mut overlays: Vec<String> = vec![TUI2.to_string(), rows::SCREEN.to_string()];
-    let mut prompt: Option<String> = None;
-    let mut profile = "repl".to_string();
-    let mut dump = false;
-    let mut audit = false;
+    let help = format!("{HELP_HEAD}\n\n{HELP_SHARED}\n\n{HELP_KEYS}");
     let mut demo = false;
-
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--profile" | "-p" => match args.next() {
-                Some(name) => profile = name,
-                None => {
-                    eprintln!("--profile needs a name");
-                    return ExitCode::from(2);
-                }
-            },
-            "--offline" => overlays.push(bundle::OFFLINE.to_string()),
-            // Without this the env vars are simply not read — the config row
-            // is a different row, and it will happily send whatever key your
-            // config has, which is how "I exported three variables and got a
-            // 401" happens.
-            "--env-model" | "--env" => overlays.push(bundle::ENV_MODEL.to_string()),
-            "--mascot" => overlays.push(MASCOT.to_string()),
+    let parsed = Launch::new("repl", vec![TUI2.to_string(), rows::SCREEN.to_string()]).parse(
+        std::env::args().skip(1),
+        &help,
+        |flag, args, launch| match flag {
+            "--mascot" => {
+                launch.overlays.push(MASCOT.to_string());
+                Flag::Taken
+            }
             // The palette follows the terminal's own background unless told
             // otherwise; this is the "otherwise", for a terminal that will not
             // answer (some tmux and ssh setups) or answers wrongly.
-            "--theme" => match args.next() {
-                Some(name) => overlays.push(format!(
-                    "[[patch]]\nid = \"surface\"\nconfig = {{ theme = {name:?} }}\n"
-                )),
-                None => {
-                    eprintln!("--theme needs auto, dark or light");
-                    return ExitCode::from(2);
+            "--theme" => match value(args, "--theme", "auto, dark or light") {
+                Ok(name) => {
+                    launch.overlays.push(format!(
+                        "[[patch]]\nid = \"surface\"\nconfig = {{ theme = {name:?} }}\n"
+                    ));
+                    Flag::Taken
                 }
+                Err(code) => Flag::Exit(code),
             },
             // Give the mouse back to the terminal: click-drag selects text
             // again, and folding goes back to being a keyboard gesture.
-            "--no-mouse" => overlays
-                .push("[[patch]]\nid = \"surface\"\nconfig = { mouse = false }\n".to_string()),
-            "--yolo" => overlays.push(bundle::YOLO.to_string()),
-            "--read-only" => overlays.push(bundle::READ_ONLY.to_string()),
-            "--full" => overlays.push(bundle::FULL.to_string()),
-            "--model" | "-m" => match args.next() {
-                Some(name) => overlays.push(format!(
-                    "[[patch]]\nid = \"llm\"\nconfig = {{ model = {name:?} }}\n"
-                )),
-                None => {
-                    eprintln!("--model needs a selection id");
-                    return ExitCode::from(2);
-                }
-            },
+            "--no-mouse" => {
+                launch
+                    .overlays
+                    .push("[[patch]]\nid = \"surface\"\nconfig = { mouse = false }\n".to_string());
+                Flag::Taken
+            }
             // What the terminal answered, and what each role resolved to. The
             // first thing to run when something still looks wrong: it says
             // whether the terminal answered at all.
             "--probe-terminal" => {
                 print!("{}", atomcode_tui::surface::probe_report());
-                return ExitCode::SUCCESS;
+                Flag::Exit(ExitCode::SUCCESS)
             }
-            "--dump-config" => dump = true,
-            "--headless" => overlays.push(HEADLESS.to_string()),
-            "--audit" => {
-                audit = true;
-                overlays.push(HEADLESS.to_string());
+            // Here `--headless` swaps the surface, not the profile: the tree
+            // is the same one a person would get, painted into memory. The
+            // inspection switches ride on it, since mounting the terminal
+            // surface takes the screen.
+            "--headless" => {
+                launch.overlays.push(HEADLESS.to_string());
+                Flag::Taken
             }
-            "--demo" => {
-                demo = true;
-                overlays.push(HEADLESS.to_string());
+            "--audit" | "--dump-config" | "--demo" => {
+                launch.overlays.push(HEADLESS.to_string());
+                match flag {
+                    "--audit" => launch.audit = true,
+                    "--dump-config" => launch.dump = true,
+                    _ => demo = true,
+                }
+                Flag::Taken
             }
-            "-h" | "--help" => {
-                println!("{}", HELP);
-                return ExitCode::SUCCESS;
+            // This launcher is the full-screen front end; the others have
+            // `harness`.
+            "--ui" | "--repl" | "-i" | "--web" | "--sdk" | "--tui" | "--port" => {
+                eprintln!("`atui` is the full-screen front end; for `{flag}` use `harness`");
+                Flag::Exit(ExitCode::from(2))
             }
-            other if other.starts_with('-') => {
-                eprintln!("unknown flag `{other}` — try --help");
-                return ExitCode::from(2);
-            }
-            other => prompt = Some(other.to_string()),
-        }
-    }
-
-    let refs: Vec<&str> = overlays.iter().map(String::as_str).collect();
-    let tree = match Profiles::builtin().with_home().resolve(&profile, &refs) {
-        Ok(tree) => tree,
-        Err(e) => {
-            eprintln!("config error: {e}");
-            return ExitCode::from(2);
-        }
+            _ => Flag::NotMine,
+        },
+    );
+    let mut launch = match parsed {
+        Ok(launch) => launch,
+        Err(code) => return code,
     };
 
-    if dump {
-        print!("{}", tree.dump());
-        return ExitCode::SUCCESS;
+    let profiles = Profiles::builtin().with_home();
+    let catalog = catalog();
+    if let Some(code) = launch.preflight(&profiles, &catalog) {
+        return code;
     }
-
-    let mut app = App::new(catalog(), tree);
-    if let Err(e) = app.start().await {
-        eprintln!("failed to mount: {e}");
-        return ExitCode::FAILURE;
-    }
-
-    if audit {
-        // `tui-modules` is read by the launcher and by tests — its consumer is
-        // outside the tree by construction, like `ui` and `agent-handle`.
-        let mut consumed: Vec<&str> = seam_map::HOST_CONSUMED.to_vec();
-        consumed.push("tui-modules");
-        consumed.push("tui-commands");
-        let findings = app.audit_with(&consumed, seam_map::HOST_PROVIDED);
-        let defects = findings.iter().filter(|f| f.is_defect()).count();
-        for f in &findings {
-            println!("· {f}");
-        }
-        println!(
-            "{}",
-            if findings.is_empty() {
-                "composition is consistent".to_string()
-            } else {
-                format!("{defects} defect(s), {} note(s)", findings.len() - defects)
-            }
-        );
-        return if defects == 0 {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        };
+    let mounted = match launch.mount(catalog, &profiles).await {
+        Ok(mounted) => mounted,
+        Err(code) => return code,
+    };
+    // `tui-modules` and `tui-commands` are read by the launcher and by tests
+    // — their consumer is outside the tree by construction, like `ui`.
+    if let Some(code) = mounted.inspect(&profiles, &["tui-modules", "tui-commands"]) {
+        return code;
     }
 
     if demo {
@@ -222,7 +179,7 @@ async fn main() -> ExitCode {
         // with no tty, no model and no keyboard. It goes through the real
         // host, the real modules and the real encoder — a mock-up that did not
         // would be a picture of something that does not exist.
-        let ctx = app.context();
+        let ctx = mounted.app().context();
         let Some(surface) = ctx.service::<atomcode_tui::plugin::SurfaceSvc>() else {
             eprintln!("--demo needs a surface row");
             return ExitCode::FAILURE;
@@ -261,52 +218,25 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let ctx = app.context();
-    let ui = match ctx.require::<UiSvc>() {
-        Ok(ui) => ui,
-        Err(e) => {
-            eprintln!("no front end mounted: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    // Reconfiguring the running tree needs the `App`, which only the launcher
-    // holds — so it puts the capability in the tree for every front end to use.
-    let app = Arc::new(tokio::sync::Mutex::new(app));
-    let _control = ctx.provide::<ControlSvc>(Arc::new(AppControl::new(app.clone())));
-
-    match ui.run(&ctx, prompt).await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("{e}");
-            ExitCode::FAILURE
-        }
-    }
+    mounted.hand_over().await
 }
 
-const HELP: &str = "\
+const HELP_HEAD: &str = "\
 atui — a full-screen terminal UI assembled from plugin rows
 
 USAGE
     atui [FLAGS] [PROMPT]
 
-FLAGS
+SCREEN
     -p, --profile <name>   which composition to mount (default: repl)
-    -m, --model <id>       a model selection from your atomcode config
-        --offline          a scripted model; no network
-        --env-model        use ATOMCODE_BASE_URL / _MODEL / _API_KEY
         --mascot           show the cat
         --theme <t>        auto (ask the terminal), dark or light
         --no-mouse         leave the pointer to the terminal
-        --yolo             approve every tool call
-        --read-only        no writes, no shell
-        --full             code graph, web access, delegation
         --probe-terminal   what this terminal answered, and how it resolves
-        --dump-config      print the tree that would run
         --headless         paint into memory; no terminal needed
-        --audit            check the composition and exit
-        --demo             print one composed frame and exit（不需要终端）
-    -h, --help             this
+        --demo             print one composed frame and exit（不需要终端）";
 
+const HELP_KEYS: &str = "\
 KEYS
     enter        send            shift-enter    a line break (or ctrl-j)
     esc          back out one layer: the selection, then what you typed,

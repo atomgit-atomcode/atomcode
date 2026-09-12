@@ -22,7 +22,6 @@ pub mod tools;
 pub mod truncation;
 pub mod ui;
 pub mod ui_jsonrpc;
-pub mod ui_tui;
 pub mod ui_web;
 pub mod world;
 pub mod world_tools;
@@ -105,8 +104,6 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(ui::QuietUiPlugin))
         .register(Arc::new(ui_jsonrpc::JsonRpcUiPlugin))
         .register(Arc::new(handle::AgentHandlePlugin))
-        .register(Arc::new(ui_tui::TuiUiPlugin))
-        .register(Arc::new(ui_tui::TuiQuestionsPlugin))
         .register(Arc::new(ui_web::WebUiPlugin))
         .register(Arc::new(trace::TracePlugin));
     registry

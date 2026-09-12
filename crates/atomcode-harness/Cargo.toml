@@ -51,8 +51,6 @@ toml = "0.8"
 # The web front end. Already in the workspace's lock via atomcode-daemon, so
 # this adds a row to a build, not a tree to the dependency graph.
 axum = { version = "0.7", features = ["macros"] }
-# The full-screen terminal front end, likewise already in-tree via atomcode-tuix.
-crossterm = { version = "0.29", features = ["event-stream"] }
 # SSE bodies for the web front end; already in-tree via axum's own deps.
 async-stream = "0.3"
 

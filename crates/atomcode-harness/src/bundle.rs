@@ -511,39 +511,6 @@ name = "opener-local"
 name = "tool-open-file"
 "#;
 
-/// A full-screen terminal UI over the same seams as the line-oriented one.
-pub const TUI_APP: &str = r#"
-[[insert]]
-id = "ui"
-name = "ui-tui"
-
-[[patch]]
-id = "trace"
-config = { stream = false, tools = false, summary = false }
-
-# The TUI draws its own prompts inside the alternate screen, so the asker row
-# becomes the one that knows how.
-[[patch]]
-id = "user-questions-unattended"
-name = "user-questions-tui"
-disabled = false
-
-[[patch]]
-id = "approval"
-disabled = true
-
-[[patch]]
-id = "approval-interactive"
-disabled = false
-
-# --- the person is at this machine: files can be shown to them ------------
-[[insert]]
-name = "opener-local"
-
-[[insert]]
-name = "tool-open-file"
-"#;
-
 /// An HTTP server: events over SSE, messages over POST.
 pub const WEB_APP: &str = r#"
 [[insert]]
@@ -670,7 +637,6 @@ pub const BUNDLES: &[(&str, &str)] = &[
     ("base", BASE),
     ("oneshot-app", ONESHOT_APP),
     ("repl-app", REPL_APP),
-    ("tui-app", TUI_APP),
     ("web-app", WEB_APP),
     ("sdk-app", SDK_APP),
     ("handle-app", HANDLE_APP),
@@ -700,12 +666,6 @@ pub const PROFILES: &[(&str, &[&str], Option<&str>, &str)] = &[
         &["base", "repl-app"],
         None,
         "an interactive terminal session that can ask questions",
-    ),
-    (
-        "tui",
-        &["base", "tui-app"],
-        None,
-        "a full-screen terminal UI",
     ),
     (
         "web",
@@ -758,7 +718,6 @@ pub const PROFILES: &[(&str, &[&str], Option<&str>, &str)] = &[
 /// swap that left the wrong one behind would prompt into a screen nobody can see.
 pub fn ui_overlay(name: &str) -> String {
     let asker = match name {
-        "tui" => Some("user-questions-tui"),
         "repl" | "oneshot" => Some("user-questions-terminal"),
         // The web and JSON-RPC rows fill the slot themselves — a browser and a
         // client program are both someone who can answer. Only the quiet front
@@ -808,4 +767,4 @@ pub fn ui_overlay(name: &str) -> String {
 }
 
 /// Front ends `--ui` accepts.
-pub const UI_NAMES: &[&str] = &["oneshot", "repl", "tui", "web", "sdk", "handle", "quiet"];
+pub const UI_NAMES: &[&str] = &["oneshot", "repl", "web", "sdk", "handle", "quiet"];

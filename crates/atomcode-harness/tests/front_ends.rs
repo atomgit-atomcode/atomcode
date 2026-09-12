@@ -58,7 +58,6 @@ async fn every_front_end_fills_the_same_slot() {
         ("oneshot", "one prompt, one turn, exit"),
         ("embed", "no front end; the embedder drives"),
         ("repl", "interactive terminal session"),
-        ("tui", "full-screen terminal"),
         ("sdk", "line-delimited JSON-RPC on stdio"),
     ] {
         let app = start(tree(profile, &dir, &[])).await;
@@ -134,7 +133,8 @@ async fn a_front_end_with_a_terminal_can_ask_and_one_without_cannot() {
     drop(headless);
 
     // The terminal front ends fill the same slot with something that can.
-    for profile in ["repl", "tui"] {
+    {
+        let profile = "repl";
         let app = start(tree(profile, &dir, &[])).await;
         let questions = app
             .context()

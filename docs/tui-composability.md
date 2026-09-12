@@ -374,12 +374,12 @@ pub enum LayoutError {
 
 1. **模块之间没有共享可变状态。**
    (`tui` crate 内禁 `static .*Mutex|LazyLock` 的 lint)
-   反例已经存在:`ui_tui.rs` 的 `static CURRENT_INPUT: LazyLock<CurrentInput>` 是全局输入缓冲,
+   反例曾经存在(harness 的 `ui_tui.rs`,已删):`static CURRENT_INPUT: LazyLock<CurrentInput>` 是全局输入缓冲,
    一个进程里两个 agent 会串台——**「隔离看起来是真的,其实不是」的 UI 版本。**
 
 2. **`render` 不得有副作用,也不得是 async。**
    (类型:`fn render(&State, &Viewport) -> Vec<Line>`,拿不到 `Context`)
-   反例已经存在:`ui_tui.rs` 的 `draw()` 在绘制路径里 `titler.title(&log).await`。
+   反例曾经存在(同上):`draw()` 在绘制路径里 `titler.title(&log).await`。
    绘制依赖时序,而时序不在日志里。异步产物走 `SessionProjections` 先算好。
 
 3. **合成实时读模块表,不得启动时快照。**

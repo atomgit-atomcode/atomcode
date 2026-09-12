@@ -74,7 +74,8 @@ fn tool_names(app: &App) -> Vec<String> {
 async fn open_file_exists_exactly_where_a_person_is() {
     let dir = scratch("where");
     // A terminal front end has someone at a display: the tool is there.
-    for profile in ["repl", "tui"] {
+    {
+        let profile = "repl";
         let app = start(tree(profile, &dir, ANSWER, &[])).await;
         assert!(
             tool_names(&app).contains(&"open_file".to_string()),

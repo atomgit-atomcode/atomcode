@@ -83,7 +83,6 @@ fn different_profiles_put_a_different_front_end_behind_the_same_agent() {
     };
     assert_eq!(front_end("oneshot"), "ui-oneshot");
     assert_eq!(front_end("repl"), "ui-repl");
-    assert_eq!(front_end("tui"), "ui-tui");
     assert_eq!(front_end("web"), "ui-web");
     assert_eq!(front_end("sdk"), "ui-jsonrpc");
     assert_eq!(front_end("embed"), "ui-quiet");
@@ -110,9 +109,9 @@ fn different_profiles_put_a_different_front_end_behind_the_same_agent() {
         ids
     };
     assert_eq!(world_tools("oneshot"), world_tools("web"));
-    assert_eq!(world_tools("sdk"), world_tools("tui"));
     assert_eq!(world_tools("repl"), world_tools("headless"));
-    for with_person in ["repl", "tui"] {
+    {
+        let with_person = "repl";
         assert!(
             tools_in(with_person).contains(&"tool-open-file".to_string()),
             "`{with_person}` has a person to show files to"

@@ -352,7 +352,7 @@ async fn without_the_row_there_is_no_tool_and_nowhere_to_report() {
 async fn any_profile_runs_behind_any_front_end() {
     let dir = scratch("orthogonal");
     for profile in SPREAD {
-        for ui in ["oneshot", "repl", "tui", "web", "sdk", "quiet"] {
+        for ui in ["oneshot", "repl", "web", "sdk", "quiet"] {
             let overlay = atomcode_harness::bundle::ui_overlay(ui);
             let mut app = App::new(
                 plugins::catalog(),
