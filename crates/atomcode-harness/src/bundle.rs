@@ -67,6 +67,9 @@ name = "llm-atomcode-config"
 # --- the execution world: where files and processes actually live ----------
 # Point these two somewhere else (a container, a remote sandbox) and every
 # tool below follows, because no tool touches a path or spawns a process itself.
+# Unfenced by default: the person's own agent may reach anywhere on the disk,
+# and the approval rows below decide what it may change. Give `root` to fence
+# it; a delegated member, a read-only audit and a sandbox do.
 [[insert]]
 id = "fs"
 name = "fs-local"

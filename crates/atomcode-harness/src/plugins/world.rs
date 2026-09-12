@@ -45,22 +45,24 @@ impl Plugin for FsLocalPlugin {
         &["fs"]
     }
     fn description(&self) -> &'static str {
-        "the local disk, fenced to a root"
+        "the local disk; fenced to a root only when one is given"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
         let row: FsRow = parse(config)?;
-        let root = row
-            .root
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let _ = ctx
-            .provide::<FsSvc>(if row.read_only {
-                Arc::new(LocalFs::read_only(root)) as Arc<dyn FileSystem>
-            } else {
-                Arc::new(LocalFs::new(root))
-            })
-            .map_err(|e| e.to_string())?;
+        // No root, no fence. The conversation's own agent works the way the
+        // production stack does: anywhere on the disk, with the approval rows
+        // deciding what it may change and where. A fence is a hard boundary
+        // — nothing above it can talk it into a path — which is what a
+        // delegated member's worktree, a read-only audit or a sandbox wants,
+        // and what a person's main agent, reaching into ~/.cargo or a sibling
+        // repository, does not.
+        let world: Arc<dyn FileSystem> = match (row.root.map(PathBuf::from), row.read_only) {
+            (Some(root), true) => Arc::new(LocalFs::read_only(root)),
+            (Some(root), false) => Arc::new(LocalFs::new(root)),
+            (None, true) => Arc::new(LocalFs::read_only_unfenced()),
+            (None, false) => Arc::new(LocalFs::unfenced()),
+        };
+        let _ = ctx.provide::<FsSvc>(world).map_err(|e| e.to_string())?;
         Ok(())
     }
 }
@@ -82,14 +84,12 @@ impl Plugin for FsReadOnlyPlugin {
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
         let row: FsRow = parse(config)?;
-        let root = row
-            .root
-            .map(PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-        let _ = ctx
-            .provide::<FsSvc>(Arc::new(LocalFs::read_only(root)))
-            .map_err(|e| e.to_string())?;
+        // Read-only is the point of this row; a root is optional, as above.
+        let world: Arc<dyn FileSystem> = match row.root.map(PathBuf::from) {
+            Some(root) => Arc::new(LocalFs::read_only(root)),
+            None => Arc::new(LocalFs::read_only_unfenced()),
+        };
+        let _ = ctx.provide::<FsSvc>(world).map_err(|e| e.to_string())?;
         Ok(())
     }
 }

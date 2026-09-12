@@ -187,6 +187,42 @@ async fn the_world_fences_paths_outside_its_root() {
 }
 
 #[tokio::test]
+async fn without_a_root_the_world_is_not_fenced() {
+    let dir = scratch("unfenced");
+    let outside = std::env::temp_dir().join("plexus-outside-an-unfenced-root.txt");
+    std::fs::write(&outside, "reachable").unwrap();
+
+    // The test tree fences to the scratch dir; `config = {}` on a later layer
+    // takes the root away again, which is what the shipped base does.
+    let app = start(tree(
+        &dir,
+        &script_one(
+            "read_file",
+            &format!(r#"{{ file_path = {:?} }}"#, outside.to_string_lossy()),
+        ),
+        &[YOLO, "[[patch]]\nid = \"fs\"\nconfig = {}"],
+    ))
+    .await;
+    run_turn(&app, "read it").await.unwrap();
+
+    let text: String = app
+        .context()
+        .only_session()
+        .unwrap()
+        .derive_messages()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("reachable"),
+        "the conversation's own agent is not fenced: {text}"
+    );
+    assert!(!text.contains("outside the world's root"), "{text}");
+    let _ = std::fs::remove_file(outside);
+}
+
+#[tokio::test]
 async fn a_read_only_world_refuses_writes_even_with_approval_wide_open() {
     let dir = scratch("readonly");
     let target = dir.join("out.txt");
