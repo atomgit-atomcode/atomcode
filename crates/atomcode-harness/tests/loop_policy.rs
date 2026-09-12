@@ -103,6 +103,37 @@ async fn the_round_budget_is_a_row_and_the_loop_only_has_a_fuse() {
     assert_eq!(outcome.rounds, 5);
 }
 
+/// The budget is a row, so it can be retuned on a *running* system — which is
+/// what the front ends' `/patch` reaches. Mounted wide, then narrowed under the
+/// running turn's feet: the turn must obey the patched value, not the one the
+/// row was mounted with.
+#[tokio::test]
+async fn the_round_budget_is_reconfigurable_while_the_process_runs() {
+    let dir = scratch("hot-rounds");
+    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    let script = always_calls("read_file", r#"{ file_path = "a.txt" }"#);
+
+    // Wide enough that the mounted budget is not what ends this turn, and with
+    // the other two stoppers out so `round-cap` is the only thing deciding.
+    let wide = "[[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 1000 }\n\n\
+                [[remove]]\nid = \"repeat-fuse\"\n\n\
+                [[remove]]\nid = \"tool-loop-guard\"";
+    let mut app = start(tree(&dir, &script, &[wide])).await;
+
+    app.patch(
+        &Layer::from_toml("[[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 4 }").unwrap(),
+    )
+    .await
+    .expect("a running system takes a patch");
+
+    let outcome = run_turn(&app, "go").await.unwrap();
+    assert_eq!(outcome.stop, StopReason::MaxRounds);
+    assert_eq!(
+        outcome.rounds, 4,
+        "the patched budget, not the 1000 it was mounted with"
+    );
+}
+
 #[tokio::test]
 async fn a_wall_clock_deadline_is_the_same_row_with_different_config() {
     let dir = scratch("deadline");
