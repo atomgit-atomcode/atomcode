@@ -137,6 +137,11 @@ const XTERM: [Rgb; 16] = [
 pub struct Palette {
     bg: Rgb,
     bg_measured: bool,
+    /// What the terminal draws ordinary text in, if it said. Body text uses the
+    /// terminal's own foreground and therefore needs no number; [`Role::Muted`]
+    /// does, because "quieter than that" is a measurement against it rather
+    /// than a slot a scheme author guessed at.
+    fg: Option<Rgb>,
     slots: [Option<Rgb>; 16],
 }
 
@@ -155,6 +160,7 @@ impl Palette {
                 Theme::Light => (0xff, 0xff, 0xff),
             },
             bg_measured: false,
+            fg: None,
             slots: [None; 16],
         }
     }
@@ -162,6 +168,11 @@ impl Palette {
     pub fn with_background(mut self, rgb: Rgb) -> Self {
         self.bg = rgb;
         self.bg_measured = true;
+        self
+    }
+
+    pub fn with_foreground(mut self, rgb: Rgb) -> Self {
+        self.fg = Some(rgb);
         self
     }
 
@@ -174,6 +185,22 @@ impl Palette {
 
     pub fn background(&self) -> Rgb {
         self.bg
+    }
+
+    /// The terminal's own text colour, when it answered for it.
+    pub fn foreground(&self) -> Option<Rgb> {
+        self.fg
+    }
+
+    /// Whether the terminal itself said what this slot renders as.
+    ///
+    /// The distinction is the whole of [`Role::Muted`]'s bug report. A slot the
+    /// terminal did not answer is xterm's value for a *different* terminal's
+    /// scheme — plausible-looking, and the reason a status line measured at
+    /// 4.7:1 arrived on screen nearer 3:1: the arithmetic was right about a
+    /// colour nobody was rendering.
+    pub fn answered(&self, n: u8) -> bool {
+        self.slots.get(n as usize).is_some_and(Option::is_some)
     }
 
     /// Whether the background came from the terminal rather than an assumption.
@@ -272,20 +299,61 @@ fn lift(base: Rgb, bg: Rgb, need: f32) -> Rgb {
 /// The contrast a role must clear against the background.
 ///
 /// 4.5 is WCAG AA for body text and applies to anything carrying meaning — an
-/// error that cannot be read is worse than no error. Chrome sits at 3.0, AA for
-/// large text: a border that shouted would be a border competing with the words.
+/// error that cannot be read is worse than no error, and so is the line that
+/// says which model is running. Chrome sits at 3.0, AA for large text: a border
+/// that shouted would be a border competing with the words.
 ///
-/// `Muted` is the one role that wants *less* contrast, and its floor is what
-/// stops the resolver from over-serving it: at 3.0 a dim grey (`#666` on `#1e1e1e`
-/// is 2.97) just misses, the search falls through to near-white, and metadata
-/// ends up louder than the prose it annotates. The candidates are ordered
-/// quietest-first for the same reason.
+/// **`Muted` used to be the exception, at 2.5, and that was the bug.** The
+/// theory was that metadata should be less contrast than the prose it
+/// annotates; the effect was a status line, a tool's `· 6 行` and a folded
+/// thought that a person could not read without leaning in — and, because a slot
+/// is not a colour, one that measured 4.7:1 in xterm's numbers while the
+/// terminal painted it nearer 3:1. Hierarchy comes from muted being *quieter
+/// than the prose*, which is true at 4.5 against a foreground sitting at 13:1.
+/// It does not come from starving the contrast.
 fn floor(role: Role) -> f32 {
     match role {
-        Role::Muted => 2.5,
         Role::Border | Role::Mode => 3.0,
         _ => 4.5,
     }
+}
+
+/// How far [`Role::Muted`] is pulled from the terminal's own text colour toward
+/// its background — the whole definition of the role, when the terminal has
+/// told us both ends.
+///
+/// Two measured values and one ratio, instead of a slot number that means
+/// "whatever this terminal calls bright black". On a scheme whose foreground
+/// reads against its background, a third of the way is a grey that visibly
+/// recedes and still lands around 6:1 on a dark ground and 7:1 on paper — the
+/// range a person reads as "secondary text" without leaning in. `lift` raises it
+/// further if the terminal's own foreground is itself dim, so the floor holds
+/// whatever the scheme is.
+const MUTED_REACH: f32 = 0.35;
+
+/// Ink for metadata: the terminal's own text colour, moved toward its
+/// background, held at the floor. `None` when nothing measured anchors the
+/// colour at all.
+///
+/// The anchor is the terminal's own foreground when it answered for it. When it
+/// did not — OSC 10 is not implemented everywhere, and answering for the
+/// background is not a promise to answer for this — the *direction* is still a
+/// measurement, and xterm's default foreground for that direction is the right
+/// thing to start from. That is a milder assumption than the one this module
+/// refuses elsewhere: it does not guess which way the terminal leans, it only
+/// fills in the far end of a direction that was measured.
+fn muted_ink(p: &Palette, need: f32) -> Option<Rgb> {
+    let anchor = p.foreground().or_else(|| {
+        p.background_measured().then(|| match p.theme() {
+            Theme::Dark => XTERM[7],
+            Theme::Light => XTERM[0],
+        })
+    })?;
+    Some(lift(
+        mix(anchor, p.background(), MUTED_REACH),
+        p.background(),
+        need,
+    ))
 }
 
 /// The slots a role will accept, best first. Meaning, not brightness — which
@@ -333,44 +401,120 @@ pub fn resolve(role: Role, caps: Caps) -> Option<Color> {
             };
             Some(exact(ink, truecolor, p))
         }
-        _ => {
+        Role::Muted => {
             let need = floor(role);
-            let bg = p.background();
-            let slots = candidates(role);
-            // First choice: a slot the user's own scheme already defines, that
-            // measurably reads. This is the case that keeps the UI inside their
-            // colours instead of imposing ours.
-            if let Some(&n) = slots.iter().find(|&&n| contrast(p.slot(n), bg) >= need) {
+            // The scheme's own dim slot — but only a slot the terminal said it
+            // renders as. An unanswered slot is xterm's value, i.e. a guess
+            // about someone else's scheme, and for this role it is a *reliably*
+            // wrong guess: slot 8's whole job in most schemes is to be the
+            // dimmest grey there is. Believing it is how a status line that
+            // measured 4.7:1 arrived on screen nearer 3:1. See
+            // [`Palette::answered`].
+            //
+            // And it has to be the *quietest* slot that reads, not the first
+            // that reads: "quietest" cannot be a fixed order, because slot 8 is
+            // the dim one on a dark ground and one of the loud ones on a light
+            // ground. Contrast knows which way round the scheme is; a list of
+            // slot numbers does not.
+            if let Some(n) = quietest(role, caps, true) {
                 return Some(Color::Ansi(n));
             }
-            let mut base = slots.first().map(|&n| p.slot(n)).unwrap_or(bg);
-            // A scheme whose slot for this role is essentially grey gives the
-            // synthesiser no hue to preserve, and every role would come out the
-            // same grey — an error indistinguishable from a heading. Fall back
-            // to the standard hue for the slot, which at least keeps red red.
-            if chroma(base) < 12 {
-                if let Some(&n) = slots.first() {
-                    base = XTERM[n as usize];
-                }
+            // Otherwise the two measured ends: the terminal's own text colour,
+            // moved toward its own background until the ink recedes. Truecolor
+            // keeps the ratio that was just computed; an indexed terminal gets
+            // the nearest slot, which is the honest answer when slots are the
+            // only vocabulary it has.
+            if let Some(ink) = muted_ink(p, need) {
+                return Some(exact(ink, truecolor, p));
             }
-            if truecolor {
-                // Nothing in the scheme reads: keep the hue, move the lightness.
-                return Some(Color::rgb(lift(base, bg, need)));
-            }
-            // No truecolor to fall back on, so take the least bad slot rather
-            // than the most preferred one.
-            let best = slots
-                .iter()
-                .copied()
-                .max_by(|&a, &b| {
-                    contrast(p.slot(a), bg)
-                        .partial_cmp(&contrast(p.slot(b), bg))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .unwrap_or(7);
-            Some(Color::Ansi(best))
+            // Nobody answered: synthesise from the standard candidate and stop
+            // just above the floor. Taking an assumed slot here instead is what
+            // made metadata black — the loudest ink there is — on a white
+            // ground.
+            synthesise(role, caps)
+        }
+        _ => from_slots(role, caps),
+    }
+}
+
+/// The candidate slot for `role` that reads with the *least* contrast — the
+/// quietest ink that still clears the floor.
+///
+/// `only_answered` restricts it to slots the terminal reported the colour of.
+fn quietest(role: Role, caps: Caps, only_answered: bool) -> Option<u8> {
+    let p = &caps.palette;
+    let bg = p.background();
+    let need = floor(role);
+    candidates(role)
+        .iter()
+        .copied()
+        .filter(|&n| (!only_answered || p.answered(n)) && contrast(p.slot(n), bg) >= need)
+        .min_by(|&a, &b| {
+            contrast(p.slot(a), bg)
+                .partial_cmp(&contrast(p.slot(b), bg))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+/// Keep the role's hue and move the lightness: the colour's own anchor is the
+/// first candidate, which in a measured scheme is what the role *is*.
+///
+/// Used when nothing the scheme offers reads — including the case where nothing
+/// was measured at all.
+fn synthesise(role: Role, caps: Caps) -> Option<Color> {
+    let p = &caps.palette;
+    let truecolor = caps.colors == Colors::True;
+    let need = floor(role);
+    let bg = p.background();
+    let slots = candidates(role);
+    let mut base = slots.first().map(|&n| p.slot(n)).unwrap_or(bg);
+    // A scheme whose slot for this role is essentially grey gives the
+    // synthesiser no hue to preserve, and every role would come out the same
+    // grey — an error indistinguishable from a heading. Fall back to the
+    // standard hue for the slot, which at least keeps red red.
+    if chroma(base) < 12 {
+        if let Some(&n) = slots.first() {
+            base = XTERM[n as usize];
         }
     }
+    if truecolor {
+        return Some(Color::rgb(lift(base, bg, need)));
+    }
+    // No truecolor to fall back on, so take the least bad slot rather than the
+    // most preferred one.
+    let best = slots
+        .iter()
+        .copied()
+        .max_by(|&a, &b| {
+            contrast(p.slot(a), bg)
+                .partial_cmp(&contrast(p.slot(b), bg))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(7);
+    Some(Color::Ansi(best))
+}
+
+/// The slot table's answer: the first candidate the user's own scheme defines
+/// that measurably reads, or a synthesis from the best candidate there is.
+///
+/// This is what keeps the UI inside the colours the person chose, and it is the
+/// right answer whenever the slots are real — either because the terminal
+/// reported them, or because nothing at all was measured and the assumptions
+/// then agree with each other.
+fn from_slots(role: Role, caps: Caps) -> Option<Color> {
+    let p = &caps.palette;
+    let bg = p.background();
+    let need = floor(role);
+    // First choice: a slot the user's own scheme already defines, that
+    // measurably reads. This is the case that keeps the UI inside their
+    // colours instead of imposing ours.
+    if let Some(&n) = candidates(role)
+        .iter()
+        .find(|&&n| contrast(p.slot(n), bg) >= need)
+    {
+        return Some(Color::Ansi(n));
+    }
+    synthesise(role, caps)
 }
 
 /// An exact colour when the terminal has one, and the nearest slot when it does
@@ -427,6 +571,12 @@ pub fn explain(caps: Caps) -> Vec<String> {
                     format!("{role:?}")
                 );
             };
+            // `PanelBg` *is* the ground, so a contrast floor is not a question
+            // it can be asked: reporting it against the screen it sits on is
+            // how the one line about a raised surface read as a failure.
+            if role == Role::PanelBg {
+                return format!("  {:<11} {:<22} a raised surface", "PanelBg", what);
+            }
             // A panel is read against the panel, not against the screen behind.
             let against = match role {
                 Role::PanelFg => panel.unwrap_or_else(|| caps.palette.background()),
@@ -481,9 +631,15 @@ mod tests {
 
     #[test]
     fn metadata_stays_quieter_than_the_prose_it_annotates() {
-        // The over-correction this guards against: `Muted` missing a 3.0 floor
-        // by 0.03 and falling through to near-white, which is legible and
-        // wrong — the whole point of the role is that it recedes.
+        // The over-correction this guards against: `Muted` missing a floor by a
+        // hair and falling through to near-white, which is legible and wrong —
+        // the whole point of the role is that it recedes.
+        //
+        // "Quieter" means quieter than the strongest ink on that ground, which
+        // is the prose. Not quieter than the accent: a role's contrast ratio is
+        // a property of its hue as much as of its brightness, and cyan on white
+        // is a low-contrast accent however it is drawn. Comparing the two made
+        // this test read as a hierarchy rule while it was measuring a hue.
         for bg in [
             (0x1e, 0x1e, 0x1e),
             (0, 0, 0),
@@ -493,12 +649,11 @@ mod tests {
             let caps = caps_on(bg);
             let muted = seen(Role::Muted, caps).unwrap();
             let ratio = contrast(muted, bg);
-            assert!(ratio >= 2.5, "unreadable at {ratio:.2} on {bg:?}");
-            let loud = seen(Role::Accent, caps).unwrap();
+            assert!(ratio >= 4.5, "unreadable at {ratio:.2} on {bg:?}");
+            let loudest = contrast((255, 255, 255), bg).max(contrast((0, 0, 0), bg));
             assert!(
-                ratio < contrast(loud, bg),
-                "muted ({ratio:.2}) is louder than the accent ({:.2}) on {bg:?}",
-                contrast(loud, bg)
+                ratio < loudest,
+                "muted ({ratio:.2}) is as loud as plain text ({loudest:.2}) on {bg:?}"
             );
         }
     }
@@ -561,17 +716,125 @@ mod tests {
 
     #[test]
     fn the_users_own_scheme_is_preferred_over_a_colour_of_ours() {
-        // Synthesis is the fallback, not the default: on an ordinary terminal
-        // every role should land on a named slot, so the UI sits inside the
-        // scheme the user chose.
+        // Synthesis is the fallback, not the default: for a role that carries
+        // meaning as a hue, an ordinary terminal should land on one of its own
+        // named slots, so the UI sits inside the scheme the person chose.
+        //
+        // `Muted` is deliberately absent from this list — see the tests below.
+        // Its whole complaint was that a slot number is not a colour, and it is
+        // the role where believing an unanswered slot does the most damage,
+        // because slot 8's job in almost every scheme is to be the dimmest grey
+        // there is.
         for bg in [(0, 0, 0), (255, 255, 255)] {
             let caps = caps_on(bg);
-            for role in [Role::Accent, Role::Border, Role::Error, Role::Muted] {
+            for role in [Role::Accent, Role::Border, Role::Error] {
                 assert!(
                     matches!(resolve(role, caps), Some(Color::Ansi(_))),
                     "{role:?} on {bg:?} reached for a colour of its own"
                 );
             }
+        }
+    }
+
+    /// `Caps` as Warp hands them over — the terminal that produced the bug
+    /// report. It answers what its background is and nothing about its sixteen
+    /// slots, so `--probe-terminal` printed `slots answered: 0/16` and
+    /// `Muted ... slot 8 #7f7f7f contrast 4.68`. That colour was xterm's, not
+    /// Warp's: the arithmetic was right about a colour nobody was rendering,
+    /// and the status line arrived dimmer than the number said.
+    fn as_warp_reports_itself() -> Caps {
+        Caps {
+            palette: Palette::assumed(Theme::Dark)
+                .with_background((0x12, 0x12, 0x12))
+                .with_foreground((0xe5, 0xe5, 0xe5)),
+            colors: Colors::True,
+            ..Caps::default()
+        }
+    }
+
+    #[test]
+    fn metadata_is_made_from_the_two_ends_the_terminal_did_answer_for() {
+        let caps = as_warp_reports_itself();
+        let bg = (0x12, 0x12, 0x12);
+        let ink = (0xe5, 0xe5, 0xe5);
+        let muted = seen(Role::Muted, caps).unwrap();
+        let ratio = contrast(muted, bg);
+        assert!(ratio >= 4.5, "metadata at {ratio:.2}:1 is the bug report");
+        assert!(
+            ratio >= 5.0,
+            "at {ratio:.2}:1 it clears the floor and still reads as washed out"
+        );
+        assert!(
+            ratio < contrast(ink, bg),
+            "and it is quieter than the prose it annotates ({muted:?} vs {ink:?})"
+        );
+    }
+
+    #[test]
+    fn metadata_still_reads_when_only_the_background_was_answered() {
+        // OSC 10 is not implemented everywhere. The *direction* is still a
+        // measurement, so metadata must not fall back to an assumed slot 8 —
+        // the whole failure being repaired.
+        let caps = Caps {
+            palette: Palette::assumed(Theme::Dark).with_background((0x12, 0x12, 0x12)),
+            colors: Colors::True,
+            ..Caps::default()
+        };
+        assert!(!matches!(resolve(Role::Muted, caps), Some(Color::Ansi(8))));
+        let ratio = contrast(seen(Role::Muted, caps).unwrap(), (0x12, 0x12, 0x12));
+        assert!(ratio >= 4.5, "only {ratio:.2}:1");
+        // …and on paper, the other direction.
+        let light = Caps {
+            palette: Palette::assumed(Theme::Dark).with_background((0xff, 0xff, 0xff)),
+            colors: Colors::True,
+            ..Caps::default()
+        };
+        let ratio = contrast(seen(Role::Muted, light).unwrap(), (0xff, 0xff, 0xff));
+        assert!(ratio >= 4.5, "only {ratio:.2}:1 on paper");
+    }
+
+    #[test]
+    fn a_scheme_that_says_what_its_dim_colour_is_gets_to_use_it() {
+        // The other half: when the terminal does answer for the slot and it
+        // measurably reads, the person's own dim colour wins over our
+        // arithmetic — the same rule as every other role.
+        let p = Palette::assumed(Theme::Dark)
+            .with_background((0x12, 0x12, 0x12))
+            .with_slot(8, (0x9a, 0x9a, 0x9a));
+        let caps = Caps {
+            palette: p,
+            colors: Colors::True,
+            ..Caps::default()
+        };
+        assert_eq!(resolve(Role::Muted, caps), Some(Color::Ansi(8)));
+    }
+
+    #[test]
+    fn the_quietest_slot_that_reads_wins_on_either_ground() {
+        // "Quietest" cannot be a fixed order of slot numbers: slot 8 is the dim
+        // one on black and one of the loud ones on white. Reading the candidate
+        // list in order would put black — the loudest ink there is — on a white
+        // terminal as "muted", which is the shape of the bug this module is a
+        // reaction to.
+        for bg in [(0, 0, 0), (255, 255, 255)] {
+            let mut p = Palette::assumed(Theme::Dark).with_background(bg);
+            // Both answered, and only one of them reads on each ground.
+            for (n, rgb) in [(8u8, (0x8a, 0x8a, 0x8a)), (7, (0xe5, 0xe5, 0xe5))] {
+                p = p.with_slot(n, rgb);
+            }
+            let caps = Caps {
+                palette: p,
+                colors: Colors::True,
+                ..Caps::default()
+            };
+            let muted = seen(Role::Muted, caps).unwrap();
+            let ratio = contrast(muted, bg);
+            let loudest = contrast((255, 255, 255), bg).max(contrast((0, 0, 0), bg));
+            assert!(ratio >= 4.5, "{muted:?} on {bg:?} is only {ratio:.2}:1");
+            assert!(
+                ratio < loudest,
+                "{muted:?} on {bg:?} is {ratio:.2}:1 — as loud as plain text"
+            );
         }
     }
 

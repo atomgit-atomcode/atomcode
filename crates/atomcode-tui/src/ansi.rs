@@ -131,9 +131,6 @@ fn sgr(style: &Style, caps: crate::caps::Caps) -> String {
     if style.bold {
         parts.push("1".into());
     }
-    if style.dim {
-        parts.push("2".into());
-    }
     if style.italic {
         parts.push("3".into());
     }

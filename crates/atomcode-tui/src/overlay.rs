@@ -171,7 +171,7 @@ impl Overlay for Picker {
                         filter.clone()
                     },
                     if filter.is_empty() {
-                        Style::new().dim()
+                        Style::new().fg(Color::role(Role::Muted))
                     } else {
                         Style::new().fg(Color::role(Role::Warning))
                     },
@@ -200,7 +200,11 @@ impl Overlay for Picker {
             if !item.about.is_empty() {
                 spans.push(Span::styled(
                     format!("  {}", item.about),
-                    if here { base } else { Style::new().dim() },
+                    if here {
+                        base
+                    } else {
+                        Style::new().fg(Color::role(Role::Muted))
+                    },
                 ));
             }
             out.push(Line::from_spans(spans).truncate(w));
@@ -208,7 +212,7 @@ impl Overlay for Picker {
         if items.is_empty() {
             out.push(Line::styled(
                 width::take_width("  没有匹配的", w),
-                Style::new().dim(),
+                Style::new().fg(Color::role(Role::Muted)),
             ));
         }
         out

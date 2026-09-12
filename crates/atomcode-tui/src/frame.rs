@@ -65,12 +65,18 @@ impl Rect {
 
 /// How a run of text is drawn. Deliberately small: a theme maps meaning to
 /// colour, so modules speak in roles rather than in ANSI.
+///
+/// Attributes only — and deliberately not SGR 2 (`faint`). "Darker than
+/// whatever the terminal's foreground is" is a contrast the terminal picks,
+/// after the palette has done arithmetic to guarantee one, and nothing in this
+/// tree can measure the result. That is the same failure the role palette exists
+/// to remove. Metadata wants [`Role::Muted`]: a colour this tree chose, which
+/// `--probe-terminal` reports and a test can hold to a floor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Style {
     pub fg: Option<Color>,
     pub bg: Option<Color>,
     pub bold: bool,
-    pub dim: bool,
     pub italic: bool,
     pub underline: bool,
     pub reverse: bool,
@@ -82,7 +88,6 @@ impl Style {
             fg: None,
             bg: None,
             bold: false,
-            dim: false,
             italic: false,
             underline: false,
             reverse: false,
@@ -96,7 +101,6 @@ impl Style {
             fg: self.fg.or(base.fg),
             bg: self.bg.or(base.bg),
             bold: self.bold || base.bold,
-            dim: self.dim || base.dim,
             italic: self.italic || base.italic,
             underline: self.underline || base.underline,
             reverse: self.reverse || base.reverse,
@@ -113,10 +117,6 @@ impl Style {
     }
     pub const fn bold(mut self) -> Self {
         self.bold = true;
-        self
-    }
-    pub const fn dim(mut self) -> Self {
-        self.dim = true;
         self
     }
     pub const fn reverse(mut self) -> Self {

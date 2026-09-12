@@ -143,7 +143,10 @@ impl View for Todo {
         let label = theme::fg(Role::Secondary).bold();
         let counts = theme::fg(Role::Muted);
         let accent = theme::fg(Role::Brand);
-        let done = theme::fg(Role::Muted).dim();
+        // Done work recedes, but not by `dim`: stacking SGR 2 on a colour the
+        // palette already picked for "quiet" is how it became unreadable. The
+        // role is the whole of the recession.
+        let done = theme::fg(Role::Muted);
         let plain = theme::fg(Role::Secondary);
 
         let mut out = El::row(vec![
@@ -184,7 +187,7 @@ impl View for Todo {
                 Row::More { hidden } => out.extend(
                     El::row(vec![El::styled(
                         format!("   +{hidden} 更多"),
-                        theme::fg(Role::Muted).dim(),
+                        theme::fg(Role::Muted),
                     )])
                     .lay(w),
                 ),

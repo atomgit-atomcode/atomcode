@@ -711,6 +711,17 @@ pub fn probe_report() -> String {
         },
         palette.theme()
     );
+    // The other measured end. `Muted` is derived from it, so a terminal that
+    // does not answer for its foreground gets a muted that fell back to a slot
+    // table — which is a fact the report has to state, not hide.
+    let _ = writeln!(
+        out,
+        "  foreground: {}",
+        match palette.foreground() {
+            Some(fg) => format!("{} (answered by the terminal)", hex(fg)),
+            None => "assumed — the terminal did not answer".to_string(),
+        }
+    );
     let _ = writeln!(
         out,
         "  slots answered: {}/16{}",
@@ -752,7 +763,7 @@ pub fn probe_report() -> String {
 /// None of that is a failure mode: the resolver checks whatever it is given, so
 /// a wrong assumption costs contrast, not correctness.
 fn measure_palette() -> Palette {
-    let (bg, slots) = query_terminal();
+    let (bg, fg, slots) = query_terminal();
     let theme = bg
         .map(|rgb| {
             if crate::theme::luminance(rgb) > 0.18 {
@@ -766,6 +777,9 @@ fn measure_palette() -> Palette {
     let mut p = Palette::assumed(theme);
     if let Some(rgb) = bg {
         p = p.with_background(rgb);
+    }
+    if let Some(rgb) = fg {
+        p = p.with_foreground(rgb);
     }
     for (n, rgb) in slots {
         p = p.with_slot(n, rgb);
@@ -789,17 +803,22 @@ fn theme_from_colorfgbg(raw: &str) -> Option<Theme> {
     })
 }
 
-/// One exchange: the background and all sixteen slots, then a fence.
+/// One exchange: the background, the foreground and all sixteen slots, then a
+/// fence.
 ///
 /// Unix only — it needs the tty as a file descriptor, with a timeout, which is
 /// not something crossterm exposes. Elsewhere the palette is assumed and
 /// `COLORFGBG` and config still apply.
 #[cfg(unix)]
-fn query_terminal() -> (Option<Rgb>, Vec<(u8, Rgb)>) {
+fn query_terminal() -> (Option<Rgb>, Option<Rgb>, Vec<(u8, Rgb)>) {
     use std::os::fd::AsRawFd;
 
     let mut query: Vec<u8> = Vec::with_capacity(256);
     query.extend_from_slice(b"\x1b]11;?\x1b\\");
+    // OSC 10 as well: body text is drawn in the terminal's own foreground, and
+    // so is metadata (`theme::muted_ink`) — it is the one colour that is
+    // legible by construction, and a slot is not a substitute for it.
+    query.extend_from_slice(b"\x1b]10;?\x1b\\");
     for n in 0..16u8 {
         query.extend_from_slice(format!("\x1b]4;{n};?\x1b\\").as_bytes());
     }
@@ -811,7 +830,7 @@ fn query_terminal() -> (Option<Rgb>, Vec<(u8, Rgb)>) {
 
     let mut out = std::io::stdout();
     if out.write_all(&query).is_err() || out.flush().is_err() {
-        return (None, Vec::new());
+        return (None, None, Vec::new());
     }
 
     let stdin = std::io::stdin();
@@ -835,13 +854,13 @@ fn query_terminal() -> (Option<Rgb>, Vec<(u8, Rgb)>) {
             break;
         }
     }
-    (parse_osc11(&seen), parse_osc4(&seen))
+    (parse_osc11(&seen), parse_osc10(&seen), parse_osc4(&seen))
 }
 
 #[cfg(not(unix))]
-fn query_terminal() -> (Option<Rgb>, Vec<(u8, Rgb)>) {
+fn query_terminal() -> (Option<Rgb>, Option<Rgb>, Vec<(u8, Rgb)>) {
     // No tty descriptor to read a reply from. `COLORFGBG` and config remain.
-    (None, Vec::new())
+    (None, None, Vec::new())
 }
 
 /// Wait until `fd` has something to read, or the timeout passes.
@@ -947,6 +966,15 @@ fn parse_osc11(seen: &[u8]) -> Option<Rgb> {
     osc_payloads(seen)
         .iter()
         .find_map(|p| parse_colour(p.strip_prefix("11;")?))
+}
+
+/// The terminal's own text colour, from an OSC 10 reply. Absent on terminals
+/// that do not implement the query — `Secondary` and `ToolName` need no number
+/// at all, so only metadata feels it.
+fn parse_osc10(seen: &[u8]) -> Option<Rgb> {
+    osc_payloads(seen)
+        .iter()
+        .find_map(|p| parse_colour(p.strip_prefix("10;")?))
 }
 
 /// The slots, from the OSC 4 replies. Slots the terminal did not answer for are

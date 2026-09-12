@@ -5,7 +5,7 @@
 
 use atomcode_harness::session::SessionEvent;
 
-use crate::frame::{Line, Style};
+use crate::frame::Line;
 use crate::module::{Height, View};
 use crate::moment::{Activity, Viewport};
 use crate::theme::{self, Role};
@@ -250,7 +250,7 @@ impl View for Input {
             for (name, about) in state.menu.iter().take(room) {
                 rows.push(El::row(vec![
                     El::styled(format!("  /{name}"), theme::fg(Role::Accent)),
-                    El::styled(format!("  {about}"), Style::new().dim()),
+                    El::styled(format!("  {about}"), theme::fg(Role::Muted)),
                 ]));
             }
         }

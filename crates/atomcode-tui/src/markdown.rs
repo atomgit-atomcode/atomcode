@@ -31,7 +31,9 @@ fn link() -> Style {
     Style::new().fg(Color::role(Role::Accent)).underline()
 }
 fn fence() -> Style {
-    Style::new().dim()
+    // A role, not SGR 2: see `content::muted`. The terminal's own idea of
+    // "darker" is not a contrast ratio anybody in this tree can check.
+    Style::new().fg(Color::role(Role::Muted))
 }
 
 /// Render a markdown document at `w` cells.
