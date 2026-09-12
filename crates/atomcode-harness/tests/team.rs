@@ -29,6 +29,11 @@ fn scratch(tag: &str) -> PathBuf {
 /// The lead's script on `llm`, the members' on `llm-utility` — so each side's
 /// answers are its own and a test can say exactly who said what.
 fn tree(root: &std::path::Path, lead: &str, member: &str) -> ConfigTree {
+    tree_with(root, lead, member, "")
+}
+
+/// `team` is the team row's config, as TOML inline-table fields.
+fn tree_with(root: &std::path::Path, lead: &str, member: &str, team: &str) -> ConfigTree {
     let quiet =
         "[[patch]]\nid = \"trace\"\nconfig = { stream = false, tools = false, summary = false }";
     let empty_home = root.join("__no_user_skills__");
@@ -40,10 +45,11 @@ fn tree(root: &std::path::Path, lead: &str, member: &str) -> ConfigTree {
          [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {root:?} }}\n\n\
          [[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true\n\n\
          [[patch]]\nid = \"approval\"\nconfig = {{ mode = \"yolo\" }}\n\n\
-         [[insert]]\nname = \"team-in-process\"\n\n\
+         [[insert]]\nname = \"team-in-process\"\nconfig = {{ project_root = {root:?}, home = {home:?}{team} }}\n\n\
          [[insert]]\nid = \"llm-utility\"\nname = \"llm-utility-replay\"\nconfig = {{ script = [ {member} ] }}\n",
         root = root.to_string_lossy(),
-        home = empty_home.to_string_lossy()
+        home = empty_home.to_string_lossy(),
+        team = if team.is_empty() { String::new() } else { format!(", {team}") },
     );
     let lead = format!(
         "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [ {lead} ] }}"
@@ -183,7 +189,10 @@ async fn a_member_reports_to_the_lead_and_the_lead_hears_it_between_turns() {
         .map(|m| m.text.clone())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(shown.contains("[message from"), "{shown}");
+    assert!(
+        shown.contains("another agent's report, not the user"),
+        "the model is told whose words these are: {shown}"
+    );
 }
 
 #[tokio::test]
@@ -275,4 +284,133 @@ async fn a_member_can_only_address_the_lead() {
     assert!(!names.contains(&"team".to_string()), "a member cannot delegate: {names:?}");
     assert!(!names.contains(&"bash".to_string()), "never a shell: {names:?}");
     assert!(!names.contains(&"write_file".to_string()), "an explorer reads: {names:?}");
+}
+
+// ---- roles are data ------------------------------------------------------
+
+fn write_role(root: &std::path::Path, id: &str, body: &str) {
+    let dir = root.join(".atomcode").join("agents");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{id}.md")), body).unwrap();
+}
+
+#[tokio::test]
+async fn a_role_comes_from_a_markdown_file_and_can_replace_a_built_in() {
+    let dir = scratch("roles");
+    write_role(
+        &dir,
+        "librarian",
+        "---\npermission: explore\ndifficulty: simple\nwhen: cataloguing what exists\n\
+         tools: read_file, glob\n---\nYou catalogue. Report lists, not prose.\n",
+    );
+    write_role(
+        &dir,
+        "explorer",
+        "---\npermission: explore\ndifficulty: simple\n---\nYou are the house explorer, rewritten.\n",
+    );
+    let app = start(tree(
+        &dir,
+        r#"{ text = "delegating", calls = [ { name = "team", args = { action = "delegate", name = "lib", role = "librarian", task = "list the docs" } } ] }, { text = "delegated" }"#,
+        r#"{ text = "catalogued" }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    run_turn(&app, "go").await.unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let lib = agents
+        .by_session(&format!("{}/lib", lead.session_id()))
+        .expect("a role from a file is a role");
+    let names = lib.ctx().service::<ToolsSvc>().unwrap().names();
+    assert!(names.contains(&"read_file".to_string()) && names.contains(&"glob".to_string()));
+    assert!(!names.contains(&"grep".to_string()), "an explicit tool list replaces the default: {names:?}");
+    let prompt = lib
+        .ctx()
+        .service::<atomcode_harness::seams::SystemPromptSvc>()
+        .unwrap()
+        .render();
+    assert!(prompt.contains("You catalogue."), "{prompt}");
+
+    // The built-in was replaced by the file with its name.
+    let schema = app
+        .context()
+        .service::<ToolsSvc>()
+        .unwrap()
+        .get("team")
+        .unwrap()
+        .parameters_schema();
+    let roles = schema["properties"]["role"]["enum"].to_string();
+    assert!(roles.contains("librarian") && roles.contains("explorer"), "{roles}");
+    let told = as_lead(&app, &lead, r#"{"action":"delegate","name":"x","role":"explorer","task":"t"}"#).await;
+    assert!(!told.is_error, "{}", told.content);
+    let x = agents.by_session(&format!("{}/x", lead.session_id())).unwrap();
+    let prompt = x
+        .ctx()
+        .service::<atomcode_harness::seams::SystemPromptSvc>()
+        .unwrap()
+        .render();
+    assert!(prompt.contains("rewritten"), "{prompt}");
+}
+
+#[tokio::test]
+async fn a_bad_role_file_refuses_to_mount() {
+    let dir = scratch("bad-role");
+    write_role(&dir, "broken", "---\npermission: root\ndifficulty: simple\n---\nnope\n");
+    let mut app = App::new(
+        plugins::catalog(),
+        tree(&dir, r#"{ text = "ok" }"#, r#"{ text = "ok" }"#),
+    );
+    let err = app.start().await.expect_err("a role that names a permission that does not exist");
+    assert!(format!("{err:?}").contains("permission must be explore or worker"), "{err:?}");
+}
+
+// ---- a writing member gets a checkout of its own ---------------------------
+
+fn sh(dir: &std::path::Path, cmd: &str) -> String {
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{cmd}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+#[tokio::test]
+async fn a_worker_edits_in_its_own_worktree_and_the_branch_outlives_it() {
+    let dir = scratch("worktree");
+    sh(&dir, "git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init");
+    // A worker on the utility model, so its script is its own.
+    write_role(
+        &dir,
+        "scribe",
+        "---\npermission: worker\ndifficulty: simple\nwhen: writing a note\n---\nYou write what you are told.\n",
+    );
+    let app = start(tree_with(
+        &dir,
+        r#"{ text = "delegating", calls = [ { name = "team", args = { action = "delegate", name = "scribe", role = "scribe", task = "write hi into note.txt" } } ] }, { text = "delegated" }"#,
+        r#"{ text = "writing", calls = [ { name = "write_file", args = { file_path = "note.txt", content = "hi" } } ] }, { text = "written" }"#,
+        "worktrees = true",
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    run_turn(&app, "go").await.unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let scribe = agents
+        .by_session(&format!("{}/scribe", lead.session_id()))
+        .unwrap();
+    until_idle(&scribe).await;
+
+    let worktree = dir.join(".atomcode").join("worktrees").join("scribe");
+    assert_eq!(scribe.cwd(), Some(&worktree), "the member's world is its checkout");
+    assert!(worktree.join("note.txt").exists(), "it wrote there");
+    assert!(!dir.join("note.txt").exists(), "and not in the lead's tree");
+    let status = as_lead(&app, &lead, r#"{"action":"status"}"#).await;
+    assert!(status.content.contains("branch `team/scribe-"), "{}", status.content);
+
+    let stopped = as_lead(&app, &lead, r#"{"action":"stop","name":"scribe"}"#).await;
+    assert!(stopped.content.contains("branch `team/scribe-"), "{}", stopped.content);
+    assert!(!worktree.exists(), "the checkout is gone");
+    let branches = sh(&dir, "git branch --list 'team/*'");
+    assert!(branches.contains("team/scribe-"), "the branch stays for the lead: {branches}");
 }

@@ -483,10 +483,13 @@ pub fn derive_messages(events: &[LoggedEvent]) -> Vec<Message> {
                     // prompt; the rest are context, which is a system note.
                     InjectionOrigin::Continuation => Message::user(text),
                     // A peer's message is something to act on, not a note in
-                    // the margin: it speaks as the user, and says who it is.
-                    InjectionOrigin::Peer { from } => {
-                        Message::user(format!("[message from {from}]\n{text}"))
-                    }
+                    // the margin — but it is a report from another agent, not
+                    // the person's word, and it says so. Claude Code frames
+                    // teammate messages the same way: a peer cannot speak for
+                    // the user or grant what only the user can.
+                    InjectionOrigin::Peer { from } => Message::user(format!(
+                        "[message from {from} — another agent's report, not the user]\n{text}"
+                    )),
                     _ => Message::system(text),
                 };
                 message.synthetic = true;

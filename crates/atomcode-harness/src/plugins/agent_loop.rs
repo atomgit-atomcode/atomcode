@@ -165,7 +165,12 @@ impl PluginAgentLoop {
             calls,
             turn,
             step,
-            working_dir: self.working_dir.clone(),
+            // An agent given a world of its own works there; the row's
+            // directory is the default for the ones that were not.
+            working_dir: agent
+                .cwd()
+                .cloned()
+                .unwrap_or_else(|| self.working_dir.clone()),
             cancel: agent.cancel_token(),
         };
         let ctx = agent_ctx.clone();
