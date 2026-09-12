@@ -377,17 +377,33 @@ impl TeamTool {
         ))
     }
 
+    /// Who is on this lead's team right now. The model's memory of names is
+    /// only as good as its context — compaction folds old tool results away
+    /// and a restart loses the members entirely — so every refusal names the
+    /// live ones, and `status` is the source of truth.
+    fn roster(&self, lead: &Arc<Agent>) -> String {
+        let all = self.members.by_lead.lock().expect("members poisoned");
+        match all.get(lead.session_id()).filter(|m| !m.is_empty()) {
+            Some(mine) => mine
+                .iter()
+                .map(|(n, m)| format!("{n} ({})", m.role))
+                .collect::<Vec<_>>()
+                .join(", "),
+            None => "none — members do not survive a restart; `delegate` again".into(),
+        }
+    }
+
     fn with_member<R>(
         &self,
         lead: &Arc<Agent>,
         name: &str,
         f: impl FnOnce(&Member) -> R,
     ) -> Result<R, String> {
-        let all = self.members.by_lead.lock().expect("members poisoned");
-        all.get(lead.session_id())
-            .and_then(|m| m.get(name))
-            .map(f)
-            .ok_or_else(|| format!("no member named `{name}`"))
+        let found = {
+            let all = self.members.by_lead.lock().expect("members poisoned");
+            all.get(lead.session_id()).and_then(|m| m.get(name)).map(f)
+        };
+        found.ok_or_else(|| format!("no member named `{name}`; live members: {}", self.roster(lead)))
     }
 
     fn status(&self, lead: &Arc<Agent>) -> String {
@@ -445,7 +461,8 @@ impl TeamTool {
         let mut stopped = Vec::new();
         for n in names {
             let Some(member) = mine.remove(&n) else {
-                return Err(format!("no member named `{n}`"));
+                let live = mine.keys().cloned().collect::<Vec<_>>().join(", ");
+                return Err(format!("no member named `{n}`; live members: {live}"));
             };
             member.agent.cancel();
             self.members
@@ -489,7 +506,9 @@ impl Tool for TeamTool {
          Rules: a member sees none of this conversation, so state the task completely, with \
          paths. Members never have a shell — do not delegate builds or test runs. Names are \
          unique per team; to give an existing member more work, `tell` it. `explorer` and \
-         `docs_writer` run on the cheaper utility model; the other roles on this one.\n\
+         `docs_writer` run on the cheaper utility model; the other roles on this one. \
+         Members live in memory only: they do not survive a restart, and your history may \
+         mention members that are gone — `status` is the truth about who exists now.\n\
          \n\
          Example: {\"action\":\"delegate\",\"name\":\"scout\",\"role\":\"explorer\",\
          \"task\":\"Find where sessions are created in crates/atomcode-harness/src and report \

@@ -241,11 +241,18 @@ async fn status_wait_tell_and_stop_are_the_leads_to_call() {
 
     let unknown = as_lead(&app, &lead, r#"{"action":"tell","name":"nobody","text":"hi"}"#).await;
     assert!(unknown.is_error);
+    assert!(
+        unknown.content.contains("live members: scout (explorer)"),
+        "a refusal says who does exist: {}",
+        unknown.content
+    );
 
     let stopped = as_lead(&app, &lead, r#"{"action":"stop","name":"scout"}"#).await;
     assert_eq!(stopped.content, "stopped: scout");
     assert!(agents.by_session(&scout_session).is_none(), "the member is gone");
     assert_eq!(as_lead(&app, &lead, r#"{"action":"status"}"#).await.content, "no members");
+    let gone = as_lead(&app, &lead, r#"{"action":"wait","name":"scout"}"#).await;
+    assert!(gone.content.contains("do not survive a restart"), "{}", gone.content);
 }
 
 #[tokio::test]
