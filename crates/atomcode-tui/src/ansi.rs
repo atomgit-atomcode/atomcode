@@ -173,12 +173,30 @@ fn sgr(style: &Style, caps: crate::caps::Caps) -> String {
     }
 }
 
+/// Write one part's line, clipped to `width` cells.
+///
+/// The clipping happens **after** the text is made inert, because the two are
+/// about different counts of the same cells: `\t` is zero cells to
+/// [`crate::width::str_width`] and four to the terminal, so a row clipped first
+/// and substituted second is a row drawn past the rect it was given. See
+/// [`crate::text`] for why an inert row is not a nicety: the repaint diff skips
+/// a row whose bytes did not change, so a row that reached the terminal wrong
+/// is a row that stays wrong.
 fn write_line(out: &mut String, line: &Line, width: u16, caps: crate::caps::Caps) {
-    let clipped = line.truncate(width as usize);
-    for span in &clipped.spans {
+    let mut left = width as usize;
+    for span in &line.spans {
+        if left == 0 {
+            break;
+        }
+        let inert = crate::text::for_screen(&span.text);
+        let clipped = crate::width::take_width(&inert, left);
+        if clipped.is_empty() {
+            continue;
+        }
+        left -= crate::width::str_width(&clipped);
         // Swap first, then measure nothing: every substitution is the same
-        // number of columns, so clipping above stays correct.
-        let text = caps.text(&span.text);
+        // number of columns, so the clipping above stays correct.
+        let text = caps.text(&clipped);
         let codes = if caps.colors == crate::caps::Colors::None {
             String::new()
         } else {
@@ -355,6 +373,53 @@ mod tests {
         assert!(s.ends_with(SYNC_END), "{s:?}");
         assert_eq!(s.matches(SYNC_BEGIN).count(), 1);
         assert_eq!(s.matches(SYNC_END).count(), 1);
+    }
+
+    #[test]
+    fn a_drawn_row_can_never_move_the_cursor() {
+        // The invariant, and the failure it closes: foreign text reaches a row
+        // as spans, and a terminal is a state machine — one `\r` returns the
+        // cursor to column 1 and the rest of the row overwrites its beginning,
+        // one `\n` moves down a row (and scrolls the whole screen if it is on
+        // the last one), one raw escape recolours or clears. Our width
+        // arithmetic counts all three as zero cells, so the row we composed and
+        // the row the terminal draws are different rows — and `patch_from`
+        // skips a row whose bytes did not change, which is how that difference
+        // became permanent (ctrl-l or a resize was the only way out). CRLF
+        // files, `\r` progress bars, colourised diffs and tabbed source are all
+        // ordinary tool output, so this is the encoder's job, not a nicety.
+        let mut f = Frame::new(20, 1);
+        f.place(
+            "t",
+            Rect::new(0, 0, 20, 1),
+            vec![Line::raw("a\rb\tc\x1b[31md\n")],
+        );
+        let drawn = encode_rows(&f, crate::caps::Caps::default()).full();
+        assert!(
+            drawn.contains("\x1b[1;1H\x1b[K") && drawn.contains("ab    cd"),
+            "the row as it will be drawn: {drawn:?}"
+        );
+        assert!(!drawn.contains('\r'), "a CR moves the cursor: {drawn:?}");
+        assert!(!drawn.contains('\n'), "an LF scrolls the screen: {drawn:?}");
+        assert!(
+            !drawn.contains('\t'),
+            "a tab is the terminal's stop: {drawn:?}"
+        );
+        assert!(
+            !drawn.contains("[31m"),
+            "an escape from a tool's output is not ours to emit: {drawn:?}"
+        );
+    }
+
+    #[test]
+    fn a_tab_is_clipped_as_the_cells_it_becomes() {
+        // The case where "inert" and "counted" disagree, so the order of the
+        // two matters: clipping first would leave a row wider than its rect.
+        let mut f = Frame::new(4, 1);
+        f.place("t", Rect::new(0, 0, 4, 1), vec![Line::raw("a\tb")]);
+        let drawn = encode_rows(&f, crate::caps::Caps::default()).full();
+        assert!(drawn.contains("a   "), "{drawn:?}");
+        assert!(!drawn.contains('b'), "clipped to the cells it became");
     }
 
     #[test]

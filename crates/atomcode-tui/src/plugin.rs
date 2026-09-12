@@ -255,7 +255,19 @@ impl UserInterface for Tui {
                     let mut m = self.host.moment.write().expect("moment poisoned");
                     m.tick = m.tick.wrapping_add(1);
                 }
-                Wake::Input(Input::Resize(..)) => {}
+                Wake::Input(Input::Resize(..)) => {
+                    // A resize is the terminal reflowing its own screen under
+                    // us, and the repaint diff skips a row whose bytes did not
+                    // change — so a screen the terminal rewrapped would stay
+                    // rewrapped wherever our own content did not move. This is
+                    // the one moment we *know* the cache is describing a screen
+                    // that no longer exists; the size comparison in
+                    // `Rows::patch_from` only catches the case where the size
+                    // the terminal reports has already changed, and the event
+                    // can arrive before it has. `ctrl-l` is the other way to
+                    // say the same thing.
+                    self.surface.forget();
+                }
                 // The wheel scrolls the conversation, not the terminal's own
                 // history — in the alternate screen that history is the shell's,
                 // so a wheel the terminal keeps would scroll the wrong thing.
@@ -1164,61 +1176,12 @@ fn images_reach_the_model(client: &AgentClient) -> Result<(), String> {
     }
 }
 
-/// What a paste is allowed to put in the buffer.
-///
-/// Pasted text is arbitrary bytes from somewhere else: a log full of colour
-/// escapes, a Windows file with CRLF, a table indented with tabs. Every span
-/// this UI draws reaches the terminal verbatim, and the width arithmetic counts
-/// a control character as zero cells — so an escape sequence in a paste is a
-/// paste that can move the cursor, repaint the screen, or leave the alternate
-/// screen entirely. It is stripped here, on the way in, rather than guarded
-/// against at each of the places that later draw it.
-///
-/// Newlines survive, because they are content and the composer breaks on them.
-/// Tabs become spaces: they are the other character whose drawn width is not
-/// the width we counted.
+/// Pasted text is arbitrary bytes from somewhere else, and this crate has one
+/// place that decides what those bytes are allowed to become — see
+/// [`crate::text`]. Kept as a name here because the *policy* is the paste
+/// policy: a newline is content, and the composer breaks rows on it.
 fn sanitize_paste(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            // A whole escape sequence, not just the ESC: dropping the ESC alone
-            // would leave `[32m` sitting in the prompt as text.
-            '\x1b' => match chars.next() {
-                // CSI: parameters, then one final byte in @..~.
-                Some('[') => {
-                    for c in chars.by_ref() {
-                        if ('\x40'..='\x7e').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                // OSC: runs to BEL or to ST (`ESC \`).
-                Some(']') => {
-                    while let Some(c) = chars.next() {
-                        if c == '\x07' || (c == '\x1b' && chars.peek() == Some(&'\\')) {
-                            if c == '\x1b' {
-                                chars.next();
-                            }
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            },
-            '\r' => {
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-                out.push('\n');
-            }
-            '\n' => out.push('\n'),
-            '\t' => out.push_str("    "),
-            c if c.is_control() => {}
-            c => out.push(c),
-        }
-    }
-    out
+    crate::text::for_buffer(text)
 }
 
 async fn read_input(wake: mpsc::UnboundedSender<Wake>) {
@@ -1556,47 +1519,5 @@ mod history_tests {
         recall_back(&mut m);
         recall_forward(&mut m);
         assert_eq!(m.input, "mine");
-    }
-}
-
-#[cfg(test)]
-mod paste_tests {
-    use super::sanitize_paste;
-
-    #[test]
-    fn an_escape_sequence_in_a_paste_never_reaches_the_terminal() {
-        // The hazard: spans are written verbatim and a control character is
-        // counted as zero cells, so a pasted log could move the cursor, repaint
-        // the screen, or leave the alternate screen.
-        assert_eq!(sanitize_paste("\x1b[32mgreen\x1b[0m"), "green");
-        assert_eq!(sanitize_paste("before\x1b[2Jafter"), "beforeafter");
-        assert_eq!(sanitize_paste("\x1b]0;a title\x07x"), "x");
-        assert_eq!(sanitize_paste("\x1b]11;rgb:00/00/00\x1b\\x"), "x");
-        assert!(!sanitize_paste("\x1b[?1049lgone").contains('\x1b'));
-    }
-
-    #[test]
-    fn newlines_survive_because_they_are_content() {
-        // The composer breaks on them, and a paste that lost them would be a
-        // paste that silently changed what the user is sending.
-        assert_eq!(sanitize_paste("one\ntwo"), "one\ntwo");
-        assert_eq!(
-            sanitize_paste("crlf\r\nfile"),
-            "crlf\nfile",
-            "CRLF is one break"
-        );
-        assert_eq!(sanitize_paste("old\rmac"), "old\nmac");
-    }
-
-    #[test]
-    fn a_tab_becomes_spaces_because_its_drawn_width_is_not_the_counted_one() {
-        assert_eq!(sanitize_paste("a\tb"), "a    b");
-    }
-
-    #[test]
-    fn ordinary_text_is_untouched_including_chinese_and_emoji() {
-        for s in ["hello", "写一个网页", "🙂 ok", "path/to/file.rs:12"] {
-            assert_eq!(sanitize_paste(s), s);
-        }
     }
 }
