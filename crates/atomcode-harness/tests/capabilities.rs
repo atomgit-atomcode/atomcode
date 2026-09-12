@@ -295,6 +295,10 @@ id = "tool-search-world"
 [[remove]]
 id = "tool-todo"
 [[remove]]
+id = "todo-reminder"
+[[remove]]
+id = "tool-ask"
+[[remove]]
 id = "tool-bash-world"
 [[remove]]
 id = "persona-coding"

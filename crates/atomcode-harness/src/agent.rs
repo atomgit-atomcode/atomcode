@@ -67,6 +67,26 @@ pub fn scoped(ctx: &Context) -> Context {
     current().unwrap_or_else(|| ctx.clone())
 }
 
+/// The name of the delegated agent whose turn this is, if it is one.
+///
+/// `None` means the conversation itself — the agent the person is driving.
+/// A member is one that has a parent; its name is the last segment of its
+/// session id, which is the name the lead gave it when it delegated.
+///
+/// Here rather than in the two rows that want it: the approval gate and
+/// `ask_user` both put a question to a person, and "who is asking" has to read
+/// the same way in both or the person learns to distrust it.
+pub fn current_member_name(ctx: &Context) -> Option<String> {
+    let current = current()?;
+    let log = current.service::<crate::seams::SessionSvc>()?;
+    let agent = ctx
+        .service::<crate::seams::AgentsSvc>()?
+        .by_session(log.id())?;
+    agent.parent()?;
+    let id = agent.session_id();
+    Some(id.rsplit('/').next().unwrap_or(id).to_string())
+}
+
 /// Run `f` as this agent's turn: everything it awaits resolves in the agent's
 /// realm through [`scoped`].
 pub async fn as_agent<F: std::future::Future>(ctx: Context, f: F) -> F::Output {

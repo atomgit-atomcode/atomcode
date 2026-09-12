@@ -2,6 +2,7 @@
 
 pub mod agent_loop;
 pub mod agents;
+pub mod ask;
 pub mod capabilities;
 pub mod findings;
 pub mod handle;
@@ -19,6 +20,7 @@ pub mod session;
 pub mod session_title;
 pub mod subagent;
 pub mod team;
+pub mod todo_reminder;
 pub mod tool_exec;
 pub mod tools;
 pub mod truncation;
@@ -71,6 +73,8 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(findings::FindingsPlugin))
         .register(Arc::new(subagent::SubagentPlugin))
         .register(Arc::new(team::TeamPlugin))
+        .register(Arc::new(ask::AskPlugin))
+        .register(Arc::new(todo_reminder::TodoReminderPlugin))
         .register(Arc::new(recall::RecallPlugin))
         .register(Arc::new(self_knowledge::SelfKnowledgePlugin))
         .register(Arc::new(self_knowledge::ProjectInstructionsPlugin))

@@ -16,8 +16,7 @@ use crate::events::{
     ToolExec, ToolsExecute, TurnEnd, TurnProgress, TurnStart, TurnStarted, TurnStopping,
 };
 use crate::seams::{
-    AgentsSvc, Decision, SessionSvc, StopReason, ToolsSvc, TurnOutcome, UserQuestions,
-    UserQuestionsSvc,
+    Decision, SessionSvc, StopReason, ToolsSvc, TurnOutcome, UserQuestions, UserQuestionsSvc,
 };
 
 use super::tools::{contribute_prompt, mount};
@@ -276,12 +275,7 @@ impl AskingPolicy {
     /// delegated one; its name is the last segment of its session id, which is
     /// the name the lead gave it.
     fn asker(&self) -> Option<String> {
-        let current = crate::agent::current()?;
-        let log = current.service::<SessionSvc>()?;
-        let agent = self.ctx.service::<AgentsSvc>()?.by_session(log.id())?;
-        agent.parent()?;
-        let id = agent.session_id();
-        Some(id.rsplit('/').next().unwrap_or(id).to_string())
+        crate::agent::current_member_name(&self.ctx)
     }
 }
 

@@ -140,6 +140,19 @@ name = "recall"
 [[insert]]
 name = "tool-todo"
 
+# The list only helps while it is true, and a tool description is the furthest
+# thing in the prompt from the step being taken. This row watches the list
+# against the work and says so when the two have drifted apart.
+[[insert]]
+name = "todo-reminder"
+
+# Asking is a capability, not a manner. Without a tool for it the agent has two
+# moves when a decision is the person's — guess, or stop — and it guesses,
+# because guessing looks like progress. With no front end to ask, the tool says
+# so and the agent decides for itself; nothing hangs.
+[[insert]]
+name = "tool-ask"
+
 # Delegation runs a child agent in its own realm. Off by default: it multiplies
 # model calls, and a tree should opt into that.
 [[insert]]
@@ -268,9 +281,13 @@ name = "session-title-first-prompt"
 [[insert]]
 name = "session-title-on-first-prompt"
 
-# Dormant: nothing in the default tree asks a human, and a provider nobody
-# consumes is dead weight the audit rightly complains about. `--interactive`
-# turns it on together with the approval row that needs it.
+# Dormant, even though `tool-ask` now consumes this seam in every tree. One
+# provider per seam: `ui-handle`, the REPL's terminal asker and the full-screen
+# UI each claim `user-questions` when they mount, and an incumbent here makes
+# every one of those trees fail to start. A tree with no front end at all has
+# nobody to ask, and `ask_user` says exactly that — which is the same answer
+# this row would have given. `--interactive` turns it on for the approval row
+# that needs a provider without a front end.
 [[insert]]
 name = "user-questions-unattended"
 disabled = true

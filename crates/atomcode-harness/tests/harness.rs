@@ -286,6 +286,7 @@ async fn the_persona_is_a_fragment_not_a_privileged_message() {
             "tool-bash-world".to_string(),
             "tool-search-world".to_string(),
             "tool-todo".to_string(),
+            "tool-ask".to_string(),
             "codeintel".to_string(),
         ],
         "fragments are ranked, so the assembled prompt is stable across mount order"
