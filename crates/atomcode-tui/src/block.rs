@@ -17,7 +17,7 @@
 //! their positions never move. See `docs/adr/0004`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::frame::Line;
 
@@ -136,14 +136,41 @@ pub enum Slot {
     /// Still being produced. Its content may still change.
     Live(Block),
     /// Content frozen. Only presentation can change from here.
-    Settled(Arc<Block>),
+    Settled(Settled),
+}
+
+/// A settled block, and how many rows it was last measured to draw.
+///
+/// The count is kept here rather than in the painter because it is a fact about
+/// the block: settling *is* the promise that content cannot change, so the
+/// answer holds until the width does. A table in the host would need somebody
+/// to remember to evict it; this dies with the block it describes.
+#[derive(Debug)]
+pub struct Settled {
+    block: Arc<Block>,
+    /// `(width, rows)`. The width travels with the number, so a resize is a
+    /// different question rather than a stale answer.
+    rows: RwLock<Option<(u16, usize)>>,
+}
+
+impl Settled {
+    fn new(block: Arc<Block>) -> Self {
+        Self {
+            block,
+            rows: RwLock::new(None),
+        }
+    }
+
+    pub fn block(&self) -> &Block {
+        &self.block
+    }
 }
 
 impl Slot {
     pub fn block(&self) -> &Block {
         match self {
             Slot::Live(b) => b,
-            Slot::Settled(b) => b,
+            Slot::Settled(s) => s.block(),
         }
     }
     pub fn is_live(&self) -> bool {
@@ -151,6 +178,36 @@ impl Slot {
     }
     pub fn is_settled(&self) -> bool {
         matches!(self, Slot::Settled(_))
+    }
+
+    /// How many rows this block draws at `width` — and the lines themselves
+    /// when rendering them was the only way to find out.
+    ///
+    /// A settled block answers from its last measurement, because settling means
+    /// its content cannot have changed; a live block is rendered every time,
+    /// because it can have. The lines come back on a miss so that a caller which
+    /// is about to draw them does not render the same block twice — the whole
+    /// point being that the scroller and the painter ask one question and get
+    /// one answer.
+    pub fn rows_at(&self, width: u16) -> (usize, Option<Vec<Line>>) {
+        match self {
+            Slot::Live(b) => {
+                let lines = b.content.lines(width);
+                (lines.len(), Some(lines))
+            }
+            Slot::Settled(s) => {
+                let mut measured = s.rows.write().expect("rows poisoned");
+                if let Some((w, n)) = *measured {
+                    if w == width {
+                        return (n, None);
+                    }
+                }
+                let lines = s.block.content.lines(width);
+                let rows = lines.len();
+                *measured = Some((width, rows));
+                (rows, Some(lines))
+            }
+        }
     }
 }
 
@@ -258,12 +315,12 @@ impl StreamWriter<'_> {
             if let Slot::Live(b) = slot {
                 if b.id == id && b.producer == self.producer {
                     // `Live` is owned, so this moves rather than clones.
-                    let placeholder = Slot::Settled(Arc::new(Block {
+                    let placeholder = Slot::Settled(Settled::new(Arc::new(Block {
                         id,
                         at: b.at,
                         producer: b.producer,
                         content: b.content.clone(),
-                    }));
+                    })));
                     *slot = placeholder;
                     return true;
                 }

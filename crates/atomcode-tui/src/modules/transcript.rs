@@ -400,7 +400,9 @@ mod tests {
             .slots()
             .iter()
             .filter_map(|x| match x {
-                Slot::Settled(b) if b.kind() == "tool_call" => Some(b.content.lines(80)[0].plain()),
+                Slot::Settled(s) if s.block().kind() == "tool_call" => {
+                    Some(s.block().content.lines(80)[0].plain())
+                }
                 _ => None,
             })
             .collect();

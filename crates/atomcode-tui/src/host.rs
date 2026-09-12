@@ -412,7 +412,40 @@ impl Host {
             let mut lines = if foldable && pres.is_block_folded(block.id, kind) {
                 vec![block.content.summary(rect.w)]
             } else {
-                block.content.lines(rect.w)
+                // The one place a block is rendered for the screen. Its row count
+                // comes first, because a settled block already knows it: a block
+                // that lies entirely above the reader is then skipped in
+                // arithmetic instead of being rendered and thrown away, which is
+                // what makes scrolling back through a long conversation cost the
+                // screen rather than the session.
+                let (n, rendered) = slot.rows_at(rect.w);
+                // Not a neighbour if it draws nothing — same as the draw path
+                // below, which leaves `below` alone for an empty block.
+                if n == 0 {
+                    continue;
+                }
+                // A question in flight can already have filled the screen above
+                // this point, in which case nothing below it can be drawn.
+                if out.len() >= want {
+                    break;
+                }
+                // `<=` because a block whose last row is the first off-screen one
+                // is wholly above the reader. `skipped` never passes `scroll`:
+                // each pass adds n and the guard already proved it fits.
+                if n <= scroll.saturating_sub(skipped) {
+                    skipped += n;
+                    if below.is_some_and(|b| blank_between(b, kind)) {
+                        skipped += 1;
+                    }
+                    below = Some(kind);
+                    continue;
+                }
+                // A hit hands back no lines because it did not render any; this
+                // is the block being looked at, so it gets rendered now.
+                match rendered {
+                    Some(lines) => lines,
+                    None => block.content.lines(rect.w),
+                }
             };
             if lines.is_empty() {
                 continue;
@@ -622,6 +655,11 @@ impl Host {
     /// top goes out of reach the same way.
     ///
     /// [`stream_lines`]: Self::stream_lines
+    ///
+    /// The row count of a settled block is remembered on the block itself, so
+    /// this walks the whole conversation in arithmetic rather than in markdown.
+    /// It is called per chunk while the reader is scrolled back, which is the
+    /// one time the whole conversation is in the sum.
     pub fn stream_height(&self, width: u16) -> usize {
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
@@ -637,7 +675,7 @@ impl Host {
             let n = if !b.content.always_open() && pres.is_block_folded(b.id, b.kind()) {
                 1
             } else {
-                b.content.lines(width).len()
+                slot.rows_at(width).0
             };
             if n == 0 {
                 continue;
@@ -771,6 +809,131 @@ mod tests {
             h.absorb(&f);
         }
         h
+    }
+
+    /// Content that counts how many times it was asked to render.
+    ///
+    /// The claim under test is about a cost, and a cost needs an instrument:
+    /// nothing else about a frame can tell a block that was rendered from one
+    /// that was skipped in arithmetic.
+    #[derive(Debug)]
+    struct Counted {
+        lines: Vec<String>,
+        asked: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::block::Content for Counted {
+        fn kind(&self) -> &'static str {
+            "assistant"
+        }
+        fn content_hash(&self) -> crate::block::ContentHash {
+            crate::block::hash_of(&self.lines.iter().map(|l| l.as_str()).collect::<Vec<_>>())
+        }
+        fn lines(&self, _w: u16) -> Vec<crate::frame::Line> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.lines
+                .iter()
+                .map(|l| crate::frame::Line::raw(l.as_str()))
+                .collect()
+        }
+    }
+
+    /// A host holding `blocks` settled prose blocks, plus the counter they
+    /// report to. Three rows each, so the arithmetic in the test is easy to
+    /// follow against a twenty-row screen.
+    fn counted(blocks: usize) -> (Host, Arc<std::sync::atomic::AtomicUsize>) {
+        let h = host();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut s = h.stream.write().unwrap();
+        let mut w = s.writer("bench");
+        for i in 0..blocks {
+            w.emit(
+                crate::block::Coord::default(),
+                Arc::new(Counted {
+                    lines: vec![
+                        format!("paragraph {i}"),
+                        "second row".to_string(),
+                        "third row".to_string(),
+                    ],
+                    asked: asked.clone(),
+                }),
+            );
+        }
+        drop(w);
+        drop(s);
+        (h, asked)
+    }
+
+    #[test]
+    fn scrolling_back_renders_the_screen_and_not_the_session() {
+        // 「翻上去特别卡」. The painter walks newest-first and skips `scroll` rows
+        // to reach the viewport, so reaching it used to mean rendering every
+        // block newer than the reader — the whole session, per frame. A settled
+        // block knows its row count, so what is above the fold is now skipped in
+        // arithmetic.
+        //
+        // The bar is that one screenful costs the same in a long session as in a
+        // short one. A bound alone would pass for a cost that grows slowly.
+        let cost_of_one_scrolled_frame = |blocks: usize| -> usize {
+            let (h, asked) = counted(blocks);
+            let size = (80, 20);
+            let limit = h.scroll_limit(size, &h.moment.read().unwrap().clone());
+            h.moment.write().unwrap().scroll = crate::moment::ScrollPos(limit);
+            // Warm: the first paint after a jump to a new position measures what
+            // it shows. Measure the steady state, which is what a wheel costs.
+            let _ = h.compose(size);
+            asked.store(0, std::sync::atomic::Ordering::SeqCst);
+            let _ = h.compose(size);
+            asked.load(std::sync::atomic::Ordering::SeqCst)
+        };
+
+        let short = cost_of_one_scrolled_frame(60);
+        let long = cost_of_one_scrolled_frame(240);
+        assert!(
+            short <= 20 && long <= 20,
+            "one screenful of a scrolled frame rendered {short} (60 blocks) and \
+             {long} (240 blocks) blocks; the screen holds at most twenty rows"
+        );
+        assert_eq!(
+            short, long,
+            "a four-times-longer session made one scrolled frame cost more: what \
+             is above the fold is still being rendered"
+        );
+    }
+
+    #[test]
+    fn a_settled_block_is_measured_once_per_width_not_once_per_call() {
+        // The cheaper half of the same property, without scrolling: working out
+        // how tall a settled block is is a measurement, not a question — and
+        // `stream_height` is asked per chunk while the reader is scrolled back,
+        // so a re-render here is the whole session re-rendered per chunk.
+        //
+        // Once per block is the most that can be owed: the first walk has to
+        // measure what the screen never asked for, and nothing after it does.
+        // Whether the block is still *drawn* every frame is a different
+        // question, and not this one.
+        let (h, asked) = counted(20);
+        let _ = h.compose((80, 20));
+        let orders = std::sync::atomic::Ordering::SeqCst;
+
+        asked.store(0, orders);
+        let first = h.stream_height(80);
+        assert!(first > 0);
+        let measured = asked.load(orders);
+        assert!(
+            measured <= 20,
+            "the first walk measured {measured} blocks for a 20-block session"
+        );
+
+        asked.store(0, orders);
+        for _ in 0..5 {
+            let _ = h.stream_height(80);
+        }
+        assert_eq!(
+            asked.load(orders),
+            0,
+            "asking again how tall settled blocks are rendered them again"
+        );
     }
 
     #[test]
