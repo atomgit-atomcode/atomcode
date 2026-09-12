@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use atomcode_capabilities::tools::repair_tool_args;
-use atomcode_kernel::tool::{RiskLevel, Tool, ToolCall, ToolResult};
+use atomcode_kernel::tool::{ToolContext, RiskLevel, Tool, ToolCall, ToolResult};
 use atomcode_plexus::{Context, Next, Plugin, Waterfall};
 use serde::Deserialize;
 use serde_json::Value;
@@ -267,6 +267,126 @@ impl Plugin for ResultCapPlugin {
             Arc::new(CapResult {
                 max_bytes: row.max_bytes,
             }),
+            false,
+        );
+        Ok(())
+    }
+}
+
+// ---- sensitive paths --------------------------------------------------------
+
+/// A tool as the approval seam should see it when its arguments name a
+/// sensitive path: risky, whatever it says about itself.
+///
+/// Approval is risk-based, and `read_file` / `grep` / `glob` are `Safe` — so
+/// they never ask, and `~/.ssh/id_rsa` rides a tool result straight to the
+/// provider. This view changes nothing but the answer to `risk`, so the same
+/// asker, the same modes (deny-risky refuses, interactive asks, yolo allows)
+/// and the same remembered grants apply. No second approval seam.
+struct AsRisky {
+    inner: Arc<dyn Tool>,
+    name: String,
+}
+
+#[async_trait]
+impl Tool for AsRisky {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn parameters_schema(&self) -> Value {
+        self.inner.parameters_schema()
+    }
+    fn risk(&self, _args: &str) -> RiskLevel {
+        RiskLevel::Risky
+    }
+    fn read_only_hint(&self) -> bool {
+        self.inner.read_only_hint()
+    }
+    fn self_bounds_output(&self) -> bool {
+        self.inner.self_bounds_output()
+    }
+    fn parallel_safe(&self, args: &str) -> bool {
+        self.inner.parallel_safe(args)
+    }
+    fn always_grant_scope(&self, args: &str) -> String {
+        self.inner.always_grant_scope(args)
+    }
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
+        self.inner.execute(args, ctx).await
+    }
+}
+
+/// Before a `Safe` tool touches a sensitive path, ask the approval seam as if
+/// the tool were risky. Runs ahead of the approval gate; a risky tool is left
+/// to that gate, so nothing is asked twice.
+pub struct SensitivePathGate {
+    pub ctx: Context,
+}
+
+#[async_trait]
+impl Waterfall<ToolsExecute> for SensitivePathGate {
+    async fn handle(&self, exec: &mut ToolExec, next: Next<'_, ToolsExecute>) -> ToolResult {
+        if exec.pre_approved {
+            return next.run(exec).await;
+        }
+        let (Some(policy), Some(toolbox)) = (
+            self.ctx.service::<ApprovalSvc>(),
+            self.ctx.service::<ToolsSvc>(),
+        ) else {
+            return next.run(exec).await;
+        };
+        let Some(tool) = toolbox.get(&exec.call.name) else {
+            return next.run(exec).await;
+        };
+        if tool.risk(&exec.call.arguments) != RiskLevel::Safe {
+            return next.run(exec).await;
+        }
+        if !atomcode_capabilities::tools::sensitive_path::references_sensitive_path(
+            &exec.call.arguments,
+        ) {
+            return next.run(exec).await;
+        }
+        let as_risky: Arc<dyn Tool> = Arc::new(AsRisky {
+            name: format!("{} (sensitive path)", tool.name()),
+            inner: tool,
+        });
+        match policy.decide(&exec.call, &as_risky).await {
+            Decision::Allow => next.run(exec).await,
+            Decision::Deny(reason) => ToolResult {
+                call_id: exec.call.id.clone(),
+                content: format!(
+                    "Refused: the arguments name a sensitive path (credentials, keys, `.env`) \
+                     and {reason}"
+                ),
+                is_error: true,
+                images: vec![],
+            },
+        }
+    }
+}
+
+pub struct SensitivePathsPlugin;
+
+#[async_trait]
+impl Plugin for SensitivePathsPlugin {
+    fn name(&self) -> &'static str {
+        "sensitive-paths"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools"]
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["approval"]
+    }
+    fn description(&self) -> &'static str {
+        "ask before a read-only tool touches credentials, keys or `.env` — through the approval seam"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let _ = ctx.on_waterfall::<ToolsExecute>(
+            Arc::new(SensitivePathGate { ctx: ctx.clone() }),
             false,
         );
         Ok(())

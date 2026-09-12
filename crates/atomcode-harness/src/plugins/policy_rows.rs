@@ -271,9 +271,12 @@ impl crate::seams::ApprovalPolicy for AskingPolicy {
         let Some(questions) = self.ctx.service::<UserQuestionsSvc>() else {
             return Decision::Deny("no way to ask for approval".into());
         };
+        // The tool's own name, not the call's: a gate that presents a safe
+        // tool as risky says why in the name, and the person should see it.
         let question = format!(
             "Allow `{}` to run with these arguments?\n{}",
-            call.name, call.arguments
+            tool.name(),
+            call.arguments
         );
         match questions
             .ask(&question, &["yes".to_string(), "no".to_string()])

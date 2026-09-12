@@ -5,7 +5,7 @@
 use atomcode_harness::agent::OnlySession;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use atomcode_harness::seams::{
@@ -367,4 +367,106 @@ async fn the_todo_row_mounts_the_task_list() {
         .unwrap()
         .names()
         .contains(&"todowrite".to_string()));
+}
+
+// ---- sensitive paths --------------------------------------------------------
+
+fn read_script(path: &std::path::Path) -> String {
+    script_one(
+        "read_file",
+        &format!(r#"{{ file_path = {:?} }}"#, path.to_string_lossy()),
+    )
+}
+
+fn secret_at(dir: &std::path::Path, rel: &str) -> PathBuf {
+    let path = dir.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "hunter2").unwrap();
+    path
+}
+
+#[tokio::test]
+async fn a_safe_tool_reading_a_key_is_refused_by_default() {
+    let dir = scratch("sensitive-deny");
+    let key = secret_at(&dir, ".ssh/id_rsa");
+    let app = start(tree(&dir, &read_script(&key), &[])).await;
+    run_turn(&app, "read it").await.unwrap();
+    let text = transcript(&app);
+    assert!(text.contains("sensitive path"), "refused with the reason: {text}");
+    assert!(!text.contains("hunter2"), "and the secret never reached the model: {text}");
+}
+
+#[tokio::test]
+async fn an_env_template_is_not_a_secret() {
+    let dir = scratch("sensitive-template");
+    let template = secret_at(&dir, ".env.example");
+    let app = start(tree(&dir, &read_script(&template), &[])).await;
+    run_turn(&app, "read it").await.unwrap();
+    assert!(transcript(&app).contains("hunter2"));
+}
+
+#[tokio::test]
+async fn yolo_lets_a_sensitive_read_through() {
+    let dir = scratch("sensitive-yolo");
+    let key = secret_at(&dir, ".aws/credentials");
+    let app = start(tree(
+        &dir,
+        &read_script(&key),
+        &["[[patch]]\nid = \"approval\"\nconfig = { mode = \"yolo\" }"],
+    ))
+    .await;
+    run_turn(&app, "read it").await.unwrap();
+    assert!(transcript(&app).contains("hunter2"));
+}
+
+/// A human who counts what they were asked and always says yes.
+struct CountingYes(Arc<Mutex<Vec<String>>>);
+
+#[async_trait]
+impl UserQuestions for CountingYes {
+    fn describe(&self) -> String {
+        "scripted human (counting)".into()
+    }
+    async fn ask(&self, question: &str, _options: &[String]) -> Option<String> {
+        self.0.lock().unwrap().push(question.to_string());
+        Some("yes".into())
+    }
+}
+
+struct CountingYesPlugin(Arc<Mutex<Vec<String>>>);
+
+#[async_trait]
+impl Plugin for CountingYesPlugin {
+    fn name(&self) -> &'static str {
+        "user-questions-counting"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["user-questions"]
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<UserQuestionsSvc>(Arc::new(CountingYes(self.0.clone())))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn interactive_approval_is_asked_about_the_sensitive_read_and_only_that() {
+    let dir = scratch("sensitive-ask");
+    let key = secret_at(&dir, ".ssh/id_ed25519");
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = plugins::catalog();
+    registry.register(Arc::new(CountingYesPlugin(asked.clone())));
+    let swap = "[[patch]]\nid = \"user-questions-unattended\"\nname = \"user-questions-counting\"";
+    let mut app = App::new(
+        registry,
+        tree(&dir, &read_script(&key), &[bundle::INTERACTIVE, swap]),
+    );
+    app.start().await.unwrap();
+    run_turn(&app, "read it").await.unwrap();
+    assert!(transcript(&app).contains("hunter2"), "yes means yes");
+    let questions = asked.lock().unwrap().clone();
+    assert_eq!(questions.len(), 1, "asked once, by the gate, not again by approval: {questions:?}");
+    assert!(questions[0].contains("sensitive path"), "and the question says why: {}", questions[0]);
 }

@@ -210,6 +210,13 @@ name = "tool-args-repair"
 # No rules by default, so the row is inert until a user writes some.
 [[insert]]
 name = "permissions"
+
+# A read-only tool never asks, so it could read ~/.ssh or .env unasked. This
+# row asks the approval seam as if such a call were risky: deny-risky refuses,
+# interactive asks, yolo allows. Ahead of `approval`, which leaves risky tools
+# to that row.
+[[insert]]
+name = "sensitive-paths"
 config = { allow = [], deny = [] }
 
 [[insert]]

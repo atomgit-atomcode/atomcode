@@ -79,6 +79,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(persona::SecurityPersonaPlugin))
         .register(Arc::new(agent_loop::AgentLoopPlugin))
         .register(Arc::new(policy::RepairArgsPlugin))
+        .register(Arc::new(policy::SensitivePathsPlugin))
         .register(Arc::new(policy::ApprovalPlugin))
         .register(Arc::new(policy::ResultCapPlugin))
         .register(Arc::new(tool_exec::ParallelToolsPlugin))
