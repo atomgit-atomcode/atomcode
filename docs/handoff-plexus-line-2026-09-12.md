@@ -1,8 +1,13 @@
-# 交接:plexus 线,2026-09-12
+# 交接:plexus 线,2026-09-12(2026-09-13 夜续)
 
-分支 `feat/plexus-plugin-architecture`,整条线自 `origin/release/v5.1.0` 起 73 个 commit
-未 push,远端没有这条分支。工作区干净。(起手先 `git log --oneline origin/release/v5.1.0..HEAD`
+分支 `feat/plexus-plugin-architecture`,整条线自 `origin/release/v5.1.0` 起 91 个 commit
+未 push,远端没有这条分支。(起手先 `git log --oneline origin/release/v5.1.0..HEAD`
 看真实 HEAD;下面的形状与验证一节随 commit 更新。)
+
+**这棵树同时被两个会话写。** 09-12 夜起 tui 那条线由另一个 atui 会话在推进,工作区
+里常年有它在飞的改动。碰共享文件之前先 `git status` 看一眼,提交用显式路径而不是
+`git add -A`——今晚已经出过"它的半成品让树编译不过"和"差点把它没写完的功能扫进我的
+commit"各一次。
 
 ## 先读什么
 
@@ -68,12 +73,43 @@
   `tui-ask-card` 行是默认实现(弹框:谁在问、调用做什么、三个答案各覆盖什么);
   拆掉这行,问题退回流脚下的几行纯文本,照样能问能答。
 
+**09-13 夜(两个会话并行)**
+
+Agent 侧(`atomcode-harness`):
+- `plugins/ask.rs` / `tool-ask` 行:`ask_user` 让模型能把选择题交给人,走的是审批那条
+  `user-questions` 缝。以前问不出来是结构性的——工具没挂,而且 `exec.rs:58` 把
+  `requester` 写死成 `None`。每个问题 2..5 个选项;没人答 ≠ 同意,工具结果留一步可走。
+- `plugins/todo_reminder.rs` / `todo-reminder` 行:清单里还有活而最近 N 步没人碰,就
+  发一条 `<system-reminder>`。折叠用工具自己的 `reduce_todos`,所以工具/面板/提醒
+  三方不会有三种说法。
+- `persona.rs` 补两条:动手前一句话说要干什么;用人的语言回复**并且思考**(推理画在
+  屏幕上,一半是外语就是一半要先翻译的对话)。
+
+UI 侧(`atomcode-tui`,另一个会话):
+- `text.rs`:外来文本一进来就消毒(转义序列/CR/TAB)。根因链值得记住——画错的行
+  → 重画 diff 跳过"字节没变"的行 → 那行永远不重画 → 只有 ctrl-l 或 resize 能救。
+- `modules/todo.rs` / `tui-panel-todo`、`modules/live.rs` / `tui-panel-live`(回合在做
+  什么、多久、花了多少)、截图粘贴(`attach.rs` + `Surface::clipboard_image`)、
+  回合结尾横线上的花销、`theme.rs` 的 muted 从"猜一个槽位"改成"按终端自报的两端量"。
+- `el.rs` 的 `wanted()` 去掉了 `.max(1)`:`Height::Hug(0)` 现在真能隐身,没内容的面板
+  不再占一行。
+
+闸门:
+- `gates/tui-string-slice.sh`:`clippy::string_slice` 提 deny,每处切片必须写明为什么
+  安全。起因是 `subject_of` 按字节切长路径,中文命令把 TUI 打死了四次。
+- `gates/tui-layers.sh` 改成只读代码(剥整行注释与文件末尾的 `mod tests`),基线
+  43 → 21——一半"存量债"是文档。阴性对照补了"注释里的装饰符不算违规"。
+- `conformance::facts()` 带上敌意输入:够长、含 `/`、结尾一整段三字节汉字,于是
+  "留最后 N 字节"对任何不是 3 的倍数的 N 都落在字符中间。`a_hostile_argument_is_in_the_corpus`
+  守着这条输入不被改软。
+
 ## 怎么验证
 
 ```sh
-cargo test -p atomcode-harness -p atomcode-tui --no-fail-fast   # 516 全绿
+cargo test -p atomcode-harness -p atomcode-tui --no-fail-fast   # 600+ 全绿
 cargo clippy --no-deps -p atomcode-harness -p atomcode-plexus --all-targets -- -D warnings
-bash gates/tui-layers.sh && bash gates/tui-negative.sh && bash gates/tui-test-count.sh
+bash gates/tui-layers.sh && bash gates/tui-layers.spec.sh && bash gates/tui-negative.sh
+bash gates/tui-string-slice.sh && bash gates/tui-test-count.sh
 git status --short gates/     # 差分基线 gates/differential.baseline 只准降,不准动
 ```
 
@@ -101,7 +137,14 @@ telemetry 各几条,都是 rust 1.94 新 lint 的既有问题,不在本次范围
 5. **定时与 loop 行**:往 inbox 放 `Harness` 消息即可,机制已备;coding 的 `controllers.rs` 是策略参考。
 6. team 剩余:lead 取消级联、`report_finding` 进成员工具集、fork 切片器。
    (成员面板已落地:`tui-panel-team`;审批问题会说是哪个成员在问,见 `tui-ask-card`。)
-7. 会话剩余:`delete`、OS 租约、`Titled` 的 `/title` 之外的提交点。
+7. 截图粘贴欠三条(09-13 夜复核 tuix 后列的):剪贴板只有"原始字节"这一级——macOS 上
+   Finder ⌘C 与 iTerm2 只给 `public.file-url`,Windows 的 Qt 系截图工具给的 CF_DIBV5
+   `arboard` 会拒;发送顺序是"贴入顺序"而不是 marker 在文中的顺序;没有尺寸上限。
+   tuix 的 `try_paste_clipboard_image` 是三级回退,每级都写着是哪条真实报告逼出来的。
+8. `modules/todo.rs` 每帧折两遍(`render` 与 `height` 各调一次 `reduce_todos`,扫全部
+   历史调用);`text::for_screen` 每 span 一次分配。都可以改成在 `absorb` 折一次 /
+   返回 `Cow`。
+9. 会话剩余:`delete`、OS 租约、`Titled` 的 `/title` 之外的提交点。
 
 ## 踩过的坑
 
@@ -113,3 +156,16 @@ telemetry 各几条,都是 rust 1.94 新 lint 的既有问题,不在本次范围
 - `cargo test --keep-going` 不存在;`cargo build --tests --keep-going` 可以。
 - 事件可见性:监听器只看到自己 realm 及子孙 realm 的 emit;根发的事件子 realm 听不到。
 - 用 python 脚本批量改文件时,先打印原文再写模式:注释与空行会让模式失配,脚本半途失败会留下半写的文件。
+- 回合**中途**不能用 `inbox().inject`:`claim()` 明确规定"没有消息时注入留在原地——
+  注入是上下文,上下文不该要求开一个回合",于是中途的注入永远不被认领。要像重复熔断
+  那样直接 `session::commit` 成事实(`loop_policy.rs:618`)。
+- 在锁里 `commit` 会死锁:commit 发 `SessionEventCommitted`,重入你自己的监听器,而
+  `std::sync::Mutex` 不可重入。锁内决定、放锁再说。
+- 一条缝只能有一个提供者:把 `user-questions-unattended` 默认挂上,`ui-handle` /
+  REPL / 全屏 UI 三种树全都起不来,22 条差分判据当场红。
+- 闸门 grep 整个文件就会数到散文:`tui-layers` 因为两条引用界面文案的注释红了,而
+  仓库自己写过"首跑即红的闸门会被关掉"。规则说代码,闸门就该只读代码。
+- 按字节切 `&str` 是这个 crate 的头号杀手:`&text[text.len() - 44..]` 在中文命令上
+  panic,而它跑在渲染里——整个进程当场消失,消息进了 `$TMPDIR/atomcode-tui-<pid>.stderr.log`
+  那个没人看的文件。现在有 `gates/tui-string-slice.sh` 和 `surface.rs` 的 panic 钩子
+  (panic 时先还屏幕和 stderr,再链到原钩子)。
