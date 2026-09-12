@@ -474,16 +474,36 @@ impl Tool for TeamTool {
         "team"
     }
     fn description(&self) -> &str {
-        "Run a team of child agents that stay around. `delegate` creates a named member with a \
-         role and a task; `tell` sends it more; `status` lists members; `wait` blocks until one \
-         is idle and returns its last report; `stop` ends one or all. Members report back \
-         through messages you receive between turns."
+        "Run a team of named child agents that stay around between your turns.\n\
+         \n\
+         How it works: `delegate` creates a member with a role and a task and returns at \
+         once. The member works on its own and reports to you with `tell_parent`; each \
+         report reaches you as a message marked `[message from …]` — folded into your \
+         current turn if you are still working, or starting a new turn if you are idle. So \
+         delegate, then carry on or end your turn; you do not have to wait. Use `wait` only \
+         when you cannot proceed without the answer: it blocks your turn until that member \
+         is idle and returns its last report. `tell` sends a member more instructions — it \
+         keeps its context, so follow-ups are cheap. `status` lists members with their \
+         state. `stop` ends one member, or all with no name.\n\
+         \n\
+         Rules: a member sees none of this conversation, so state the task completely, with \
+         paths. Members never have a shell — do not delegate builds or test runs. Names are \
+         unique per team; to give an existing member more work, `tell` it. `explorer` and \
+         `docs_writer` run on the cheaper utility model; the other roles on this one.\n\
+         \n\
+         Example: {\"action\":\"delegate\",\"name\":\"scout\",\"role\":\"explorer\",\
+         \"task\":\"Find where sessions are created in crates/atomcode-harness/src and report \
+         file:line for each site.\"}"
     }
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["delegate", "tell", "status", "wait", "stop"] },
+                "action": {
+                    "type": "string",
+                    "enum": ["delegate", "tell", "status", "wait", "stop"],
+                    "description": "delegate needs name, role, task; tell needs name, text; wait needs name (timeout_secs optional); stop takes name or none for all; status takes nothing"
+                },
                 "name": { "type": "string", "description": "The member's name (delegate, tell, wait, stop)" },
                 "role": {
                     "type": "string",
