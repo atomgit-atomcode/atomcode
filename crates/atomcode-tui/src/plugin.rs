@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use atomcode_harness::events::SessionEventCommitted;
+use atomcode_harness::agent::{Agent, CreateAgent};
 use atomcode_harness::plugins::handle::{spawn as spawn_driver, wire, Driven};
 use atomcode_harness::seams::{UiSvc, UserInterface, UserQuestionsSvc};
 use atomcode_harness::session::Committed;
@@ -42,9 +43,15 @@ plexus_service!(AgentClientSvc => AgentClient, "tui-agent-client", Core, "The co
 /// once, under the differential gate. This row only turns keys into commands.
 pub struct AgentClient {
     commands: mpsc::UnboundedSender<AgentCommand>,
+    agent: Arc<Agent>,
 }
 
 impl AgentClient {
+    /// The conversation this screen shows. Read-only from here: every change
+    /// to it goes through a command.
+    pub fn session(&self) -> Arc<atomcode_harness::session::SessionLog> {
+        self.agent.session()
+    }
     pub fn send(&self, text: String) {
         let _ = self.commands.send(AgentCommand::SendMessage {
             text,
@@ -116,7 +123,7 @@ impl UserInterface for Tui {
     }
 
     async fn run(&self, ctx: &Context, initial: Option<String>) -> Result<(), String> {
-        let Driven { handle, done } = self
+        let Driven { handle, done, .. } = self
             .driven
             .lock()
             .expect("driven poisoned")
@@ -1023,11 +1030,12 @@ impl Plugin for TuiUiPlugin {
         "ui-tui2"
     }
     fn inject(&self) -> &'static [&'static str] {
-        &["agents", "agent-loop", "sessions", "surface"]
+        &["agents", "agent-loop", "surface"]
     }
     fn uses(&self) -> &'static [&'static str] {
-        // What the pump's projection reads, resolved live.
-        &["tools", "llm", "compaction"]
+        // What the pump's projection reads, resolved live; and where its own
+        // agent's session comes from.
+        &["tools", "llm", "compaction", "session-defaults"]
     }
     fn provides(&self) -> &'static [&'static str] {
         // It owns the screen, so it is the one that can ask. The registries it
@@ -1078,10 +1086,13 @@ impl Plugin for TuiUiPlugin {
         // The agent, behind the same pump every other driver uses. The screen
         // holds the questions, so it is what the pump releases on cancel.
         let wire = wire();
+        let commands = wire.commands.clone();
+        let driven =
+            spawn_driver(ctx, wire, host.asks.clone(), CreateAgent::root(ctx)).await?;
         let client = Arc::new(AgentClient {
-            commands: wire.commands.clone(),
+            commands,
+            agent: driven.agent.clone(),
         });
-        let driven = spawn_driver(ctx, wire, host.asks.clone())?;
         *tui.driven.lock().expect("driven poisoned") = Some(driven);
         *tui.client.lock().expect("client poisoned") = Some(client.clone());
         let _ = ctx

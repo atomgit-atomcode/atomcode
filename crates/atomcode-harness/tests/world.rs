@@ -1,6 +1,7 @@
 //! The execution world: containment, world swaps, and the claim that replacing a
 //! provider relocates everything built on it.
 
+use atomcode_harness::agent::OnlySession;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -166,7 +167,7 @@ async fn the_world_fences_paths_outside_its_root() {
 
     let log = app
         .context()
-        .service::<atomcode_harness::seams::SessionSvc>()
+        .only_session()
         .unwrap();
     let text: String = log
         .derive_messages()
@@ -260,7 +261,7 @@ async fn the_local_world_really_runs_commands() {
     run_turn(&app, "run it").await.unwrap();
     let text: String = app
         .context()
-        .service::<atomcode_harness::seams::SessionSvc>()
+        .only_session()
         .unwrap()
         .derive_messages()
         .iter()
@@ -283,7 +284,7 @@ async fn a_read_only_command_is_classified_safe_and_survives_deny_risky() {
     run_turn(&app, "run it").await.unwrap();
     let text: String = app
         .context()
-        .service::<atomcode_harness::seams::SessionSvc>()
+        .only_session()
         .unwrap()
         .derive_messages()
         .iter()
@@ -304,7 +305,7 @@ async fn a_read_only_command_is_classified_safe_and_survives_deny_risky() {
     run_turn(&app, "run it").await.unwrap();
     let text: String = app
         .context()
-        .service::<atomcode_harness::seams::SessionSvc>()
+        .only_session()
         .unwrap()
         .derive_messages()
         .iter()
@@ -352,7 +353,7 @@ async fn swapping_to_the_production_tools_keeps_the_model_facing_behaviour() {
 
 fn transcript(app: &App) -> String {
     app.context()
-        .service::<atomcode_harness::seams::SessionSvc>()
+        .only_session()
         .unwrap()
         .derive_messages()
         .iter()

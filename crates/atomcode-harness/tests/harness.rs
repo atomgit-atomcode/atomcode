@@ -4,10 +4,11 @@
 //! config row is what decides a behaviour, and that removing the row removes the
 //! behaviour rather than falling back to a default hidden in the loop.
 
+use atomcode_harness::agent::OnlySession;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use atomcode_harness::seams::{SessionSvc, StopReason, SystemPromptSvc, ToolsSvc};
+use atomcode_harness::seams::{StopReason, SystemPromptSvc, ToolsSvc};
 use atomcode_harness::{bundle, plugins, run_turn};
 use atomcode_plexus::{App, ConfigTree, Layer};
 
@@ -97,7 +98,7 @@ async fn start(tree: ConfigTree) -> App {
 /// path the loop itself uses to build a request.
 fn transcript(app: &App) -> String {
     app.context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .derive_messages()
         .iter()
@@ -114,7 +115,6 @@ async fn the_base_bundle_mounts_and_fills_every_seam() {
     for seam in [
         "llm",
         "tools",
-        "sessions",
         "session-projections",
         "session-persistence",
         "system-prompt",
@@ -123,6 +123,10 @@ async fn the_base_bundle_mounts_and_fills_every_seam() {
     ] {
         assert!(names.contains(&seam), "seam `{seam}` unfilled: {names:?}");
     }
+    // `sessions` is filled per agent, not per tree: it exists once an agent does.
+    assert!(!names.contains(&"sessions"), "no agent, no log: {names:?}");
+    atomcode_harness::create_agent(&app).await.unwrap();
+    assert!(app.context().only_session().is_some());
 }
 
 #[tokio::test]

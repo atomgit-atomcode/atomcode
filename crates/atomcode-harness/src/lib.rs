@@ -58,20 +58,19 @@ use std::sync::Arc;
 
 use atomcode_plexus::{App, PlexusError};
 
-use crate::agent::Agent;
-use crate::events::AgentInfo;
+use crate::agent::{Agent, CreateAgent};
 use crate::seams::{AgentLoopSvc, AgentsSvc, TurnOutcome};
 
-/// Create an agent in the running tree.
+/// Create an agent in the running tree, with the session the `session` row
+/// describes.
 ///
-/// It gets a realm of its own, so anything registered through `agent.ctx()` is
-/// scoped to it. Announced on `agent/created` so a UI or supervisor can attach
-/// without being told.
-pub fn create_agent(app: &App) -> Result<Arc<Agent>, PlexusError> {
+/// It gets a realm of its own with its own log, so anything registered through
+/// `agent.ctx()` is scoped to it. Announced on `agent/created` once it is
+/// whole, so a UI or supervisor can attach without being told.
+pub async fn create_agent(app: &App) -> Result<Arc<Agent>, String> {
     let ctx = app.context();
-    let agent = ctx.require::<AgentsSvc>()?.create(&ctx);
-    ctx.emit::<crate::events::AgentCreated>(&AgentInfo { id: agent.id() });
-    Ok(agent)
+    let agents = ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
+    agents.create(&ctx, CreateAgent::root(&ctx)).await
 }
 
 /// Drive one turn for an existing agent, whose inbox already has work.
@@ -84,8 +83,17 @@ pub async fn drive(app: &App, agent: &Agent) -> Result<TurnOutcome, PlexusError>
 ///
 /// The caller names no implementation — which is the point. A profile that
 /// mounts a different driver changes what this does with no change here.
-pub async fn run_turn(app: &App, prompt: &str) -> Result<TurnOutcome, PlexusError> {
-    let agent = create_agent(app)?;
+pub async fn run_turn(app: &App, prompt: &str) -> Result<TurnOutcome, String> {
+    // The tree's own conversation: the one agent if there is one, created if
+    // there is none. Two turns through here continue one session, which is
+    // what a caller with no handle on an agent means by "a turn".
+    let ctx = app.context();
+    let agents = ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
+    let agent = match agents.list().as_slice() {
+        [only] => only.clone(),
+        [] => create_agent(app).await?,
+        _ => return Err("several agents exist; drive one of them directly".into()),
+    };
     agent.send(prompt);
-    drive(app, &agent).await
+    drive(app, &agent).await.map_err(|e| e.to_string())
 }

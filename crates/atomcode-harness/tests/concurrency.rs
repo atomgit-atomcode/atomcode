@@ -1,13 +1,14 @@
 //! Two things ported out of the kernel's turn loop: overlapping the tool calls
 //! that are safe to overlap, and letting a cancellation actually reach a tool.
 
+use atomcode_harness::agent::OnlySession;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use atomcode_harness::seams::{SessionSvc, StopReason, ToolsSvc};
+use atomcode_harness::seams::{StopReason, ToolsSvc};
 use atomcode_harness::{bundle, create_agent, drive, plugins};
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
 use atomcode_plexus::{App, ConfigTree, Layer};
@@ -186,7 +187,7 @@ async fn read_only_calls_overlap() {
     .await;
 
     let started = Instant::now();
-    let agent = create_agent(&app).unwrap();
+    let agent = create_agent(&app).await.unwrap();
     agent.send("go");
     let outcome = drive(&app, &agent).await.unwrap();
     let elapsed = started.elapsed();
@@ -215,7 +216,7 @@ async fn a_side_effecting_call_runs_alone() {
     )
     .await;
 
-    let agent = create_agent(&app).unwrap();
+    let agent = create_agent(&app).await.unwrap();
     agent.send("go");
     drive(&app, &agent).await.unwrap();
 
@@ -251,7 +252,7 @@ async fn results_come_back_in_emission_order() {
     )
     .await;
 
-    let agent = create_agent(&app).unwrap();
+    let agent = create_agent(&app).await.unwrap();
     agent.send("go");
     drive(&app, &agent).await.unwrap();
 
@@ -259,7 +260,7 @@ async fn results_come_back_in_emission_order() {
     // the futures completed in — otherwise a replay is not reproducible.
     let ids: Vec<String> = app
         .context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .events()
         .into_iter()
@@ -296,7 +297,7 @@ async fn removing_the_scheduler_restores_serial_execution() {
     .await;
 
     let started = Instant::now();
-    let agent = create_agent(&app).unwrap();
+    let agent = create_agent(&app).await.unwrap();
     agent.send("go");
     drive(&app, &agent).await.unwrap();
 
@@ -318,7 +319,7 @@ async fn a_cancel_reaches_a_running_tool() {
     )
     .await;
 
-    let agent = create_agent(&app).unwrap();
+    let agent = create_agent(&app).await.unwrap();
     agent.send("go");
     let cancelling = agent.clone();
     tokio::spawn(async move {
@@ -356,7 +357,7 @@ async fn a_call_that_had_not_started_when_cancelled_never_runs() {
     )
     .await;
 
-    let agent = create_agent(&app).unwrap();
+    let agent = create_agent(&app).await.unwrap();
     agent.send("go");
     let cancelling = agent.clone();
     tokio::spawn(async move {
@@ -423,7 +424,7 @@ async fn the_coarse_fuse_catches_what_the_exact_guard_misses() {
     )
     .await;
 
-    let agent = create_agent(&app).unwrap();
+    let agent = create_agent(&app).await.unwrap();
     agent.send("go");
     let outcome = drive(&app, &agent).await.unwrap();
 
@@ -440,7 +441,7 @@ async fn the_coarse_fuse_catches_what_the_exact_guard_misses() {
 
     let transcript = app
         .context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .derive_messages()
         .iter()
@@ -481,7 +482,7 @@ config = { script = [
     )
     .await;
 
-    let agent = create_agent(&app).unwrap();
+    let agent = create_agent(&app).await.unwrap();
     agent.send("go");
     let outcome = drive(&app, &agent).await.unwrap();
     assert_eq!(
@@ -504,7 +505,7 @@ async fn removing_the_fuse_removes_the_stopping() {
     )
     .await;
 
-    let agent = create_agent(&app).unwrap();
+    let agent = create_agent(&app).await.unwrap();
     agent.send("go");
     let outcome = drive(&app, &agent).await.unwrap();
     assert_eq!(

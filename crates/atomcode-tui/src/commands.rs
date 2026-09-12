@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use atomcode_harness::seams::{CompactionSvc, ControlSvc, SessionSvc, ToolsSvc};
+use atomcode_harness::seams::{CompactionSvc, ControlSvc, ToolsSvc};
 use atomcode_plexus::Context;
 
 use crate::command::{Command, CommandSet, Commands, Outcome};
@@ -77,8 +77,13 @@ impl CommandSet for SessionCommands {
         SESSION.to_vec()
     }
     async fn run(&self, name: &str, args: &str, ctx: &Context) -> Outcome {
-        let Some(log) = ctx.service::<SessionSvc>() else {
-            return Outcome::Refused("这棵树没挂会话日志".into());
+        // The screen's agent owns the conversation; the tree has no log of
+        // its own any more.
+        let Some(log) = ctx
+            .service::<crate::plugin::AgentClientSvc>()
+            .map(|c| c.session())
+        else {
+            return Outcome::Refused("这块屏幕没接上 agent".into());
         };
         match name {
             "compact" => {

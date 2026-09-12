@@ -226,7 +226,12 @@ impl Tool for RecallTool {
         };
         // The live session's events are in the log, not yet necessarily on disk,
         // so it is folded in from the log itself rather than re-read.
-        let live = self.ctx.service::<SessionSvc>();
+        let live = crate::agent::scoped(&self.ctx)
+            .service::<SessionSvc>()
+            .or_else(|| {
+                use crate::agent::OnlySession;
+                self.ctx.only_session()
+            });
         let live_id = live.as_ref().map(|l| l.id().to_string());
 
         let mut turns: Vec<Turn> = Vec::new();
@@ -309,7 +314,7 @@ impl Plugin for RecallPlugin {
     fn uses(&self) -> &'static [&'static str] {
         // Both are read at call time: a tree with no store still mounts the
         // tool, and the tool says there is no history rather than pretending.
-        &["session-persistence", "sessions", "operations"]
+        &["session-persistence", "operations"]
     }
     fn description(&self) -> &'static str {
         "search this project's past sessions through the persistence seam"

@@ -2,10 +2,11 @@
 //! persistence round-trip, and the invariant that keeps a side channel from
 //! growing into the prompt.
 
+use atomcode_harness::agent::OnlySession;
 use std::sync::Arc;
 
 use atomcode_harness::seams::{
-    SessionPersistenceSvc, SessionProjectionsSvc, SessionSvc, StopReason,
+    SessionPersistenceSvc, SessionProjectionsSvc, StopReason,
 };
 use atomcode_harness::session::{
     assert_model_visible_is_logged, derive_messages, HeaderReason, InjectionOrigin, LoggedEvent,
@@ -320,7 +321,7 @@ async fn a_turn_records_every_fact_and_folds_the_projections() {
     run_turn(&app, "say hello").await.unwrap();
 
     let ctx = app.context();
-    let log = ctx.service::<SessionSvc>().unwrap();
+    let log = ctx.only_session().unwrap();
     let kinds: Vec<String> = log
         .events()
         .iter()
@@ -373,7 +374,7 @@ async fn persistence_is_a_listener_and_round_trips_the_log() {
     run_turn(&app, "persist me").await.unwrap();
 
     let ctx = app.context();
-    let id = ctx.service::<SessionSvc>().unwrap().id().to_string();
+    let id = ctx.only_session().unwrap().id().to_string();
     let store = ctx.service::<SessionPersistenceSvc>().unwrap();
 
     // The listener writes off the turn's critical path, so give the spawned
@@ -471,12 +472,13 @@ config = { script = [ { text = "answered" } ] }
     let rows = format!(
         "[[patch]]\nid = \"skills\"\nconfig = {{ project_root = {work:?}, home = {work:?} }}\n\n\
          [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {work:?} }}\n\n\
-         [[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ root = {root:?}, resume = {resume} }}\n{id}",
+         [[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ root = {root:?} }}\n{id}",
         work = sandbox.to_string_lossy(),
         root = home.join("sessions").to_string_lossy(),
-        resume = resume,
         id = session_id
-            .map(|id| format!("\n[[patch]]\nid = \"session\"\nconfig = {{ id = {id:?} }}\n"))
+            .map(|id| {
+                format!("\n[[patch]]\nid = \"session\"\nconfig = {{ id = {id:?}, resume = {resume} }}\n")
+            })
             .unwrap_or_default()
     );
     let mut layers = vec![bundle::base().unwrap()];
@@ -517,12 +519,13 @@ async fn a_resumed_session_carries_its_history_to_the_model() {
 
     let mut second = App::new(plugins::catalog(), resumable(&home, Some(id), true));
     second.start().await.unwrap();
+    atomcode_harness::create_agent(&second).await.unwrap();
 
     // The whole point: the model's view is rebuilt from the log, so the second
     // process sees what the first one said.
     let projected = second
         .context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .derive_messages()
         .iter()
@@ -550,6 +553,7 @@ async fn a_resumed_session_continues_its_turn_numbering() {
 
     let mut second = App::new(plugins::catalog(), resumable(&home, Some(id), true));
     second.start().await.unwrap();
+    atomcode_harness::create_agent(&second).await.unwrap();
     let outcome = run_turn(&second, "three").await.unwrap();
 
     // Restarting at 1 would give a transcript keyed by (session, turn)
@@ -570,9 +574,10 @@ async fn the_turn_boundary_survives_a_round_trip() {
 
     let mut second = App::new(plugins::catalog(), resumable(&home, Some(id), true));
     second.start().await.unwrap();
+    atomcode_harness::create_agent(&second).await.unwrap();
     let turns = second
         .context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .events()
         .into_iter()
@@ -600,8 +605,9 @@ async fn resume_is_off_unless_asked_for() {
 
     let mut second = App::new(plugins::catalog(), resumable(&home, Some(id), false));
     second.start().await.unwrap();
+    atomcode_harness::create_agent(&second).await.unwrap();
     assert!(
-        second.context().service::<SessionSvc>().unwrap().is_empty(),
+        second.context().only_session().unwrap().is_empty(),
         "a new session must not silently inherit an old one"
     );
 }
@@ -638,7 +644,7 @@ async fn facts_a_plugin_writes_survive_a_resume() {
 
     let injected_live = first
         .context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .events()
         .into_iter()
@@ -649,7 +655,8 @@ async fn facts_a_plugin_writes_survive_a_resume() {
 
     let mut second = App::new(plugins::catalog(), resumable(&home, Some(id), true));
     second.start().await.unwrap();
-    let restored = second.context().service::<SessionSvc>().unwrap();
+    atomcode_harness::create_agent(&second).await.unwrap();
+    let restored = second.context().only_session().unwrap();
     let injected_after = restored
         .events()
         .into_iter()

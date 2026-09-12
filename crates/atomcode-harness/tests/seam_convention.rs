@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use atomcode_harness::profile::Profiles;
 use atomcode_harness::seam_map::{
-    seam_definitions, seam_map, undeclared_services, HOST_CONSUMED, HOST_PROVIDED,
+    seam_definitions, seam_map, undeclared_services, HOST_CONSUMED, AGENT_PROVIDED, HOST_PROVIDED,
 };
 use atomcode_harness::seams::{LlmSvc, ToolsSvc, UiSvc};
 use atomcode_harness::{bundle, plugins};
@@ -73,7 +73,11 @@ fn every_seam_definition_has_at_least_one_provider() {
     // plugin has one.
     let orphans: Vec<&str> = seam_map(&plugins::catalog())
         .into_iter()
-        .filter(|row| row.providers.is_empty() && !HOST_PROVIDED.contains(&row.name))
+        .filter(|row| {
+            row.providers.is_empty()
+                && !HOST_PROVIDED.contains(&row.name)
+                && !AGENT_PROVIDED.contains(&row.name)
+        })
         .map(|row| row.name)
         .collect();
     assert!(orphans.is_empty(), "seams with no provider: {orphans:?}");

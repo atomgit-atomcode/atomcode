@@ -274,9 +274,6 @@ impl Plugin for SessionTitlePlugin {
     fn name(&self) -> &'static str {
         "session-title-first-prompt"
     }
-    fn uses(&self) -> &'static [&'static str] {
-        &["sessions"]
-    }
     fn provides(&self) -> &'static [&'static str] {
         &["session-title"]
     }
@@ -418,9 +415,6 @@ impl Plugin for TelemetryPlugin {
     fn name(&self) -> &'static str {
         "telemetry"
     }
-    fn inject(&self) -> &'static [&'static str] {
-        &["sessions"]
-    }
     fn uses(&self) -> &'static [&'static str] {
         // It reports whatever the projection registry has folded; with no
         // projections mounted the line simply carries no token totals.
@@ -450,7 +444,7 @@ impl Plugin for TelemetryPlugin {
                 .service::<crate::seams::SessionProjectionsSvc>()
                 .and_then(|p| p.state_of("tokenTotals"))
                 .unwrap_or(Value::Null);
-            let title = ctx_for_end
+            let title = crate::agent::scoped(&ctx_for_end)
                 .service::<SessionSvc>()
                 .map(|s| s.id().to_string())
                 .unwrap_or_default();

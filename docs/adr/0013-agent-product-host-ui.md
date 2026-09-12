@@ -1,6 +1,7 @@
 # AtomCode 分成 Agent / Product / Host / UI 四层
 
 状态: 已决定(2026-09-12)。承接 [`0012`](./0012-atomcode-tui-replaces-tuix.md)。
+多会话这一项已由 [`0014`](./0014-an-agent-owns-its-session-and-world.md) 落地。
 
 ## 背景
 

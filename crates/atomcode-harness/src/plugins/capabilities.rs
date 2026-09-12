@@ -271,9 +271,6 @@ impl Plugin for MemoryPlugin {
     fn name(&self) -> &'static str {
         "memory"
     }
-    fn inject(&self) -> &'static [&'static str] {
-        &["sessions"]
-    }
     fn uses(&self) -> &'static [&'static str] {
         // The tool half is optional: a tree with no catalog still gets the
         // injection, which is the half that works with no model cooperation.
@@ -341,7 +338,7 @@ impl Plugin for MemoryPlugin {
                 if started.turn != 1 {
                     return;
                 }
-                let Some(session) = ctx.service::<SessionSvc>() else {
+                let Some(session) = crate::agent::scoped(&ctx).service::<SessionSvc>() else {
                     return;
                 };
                 crate::session::commit(

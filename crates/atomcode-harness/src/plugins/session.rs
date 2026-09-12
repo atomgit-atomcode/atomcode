@@ -13,18 +13,32 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::events::SessionEventCommitted;
-use crate::seams::{SessionPersistence, SessionPersistenceSvc, SessionProjectionsSvc, SessionSvc};
+use crate::seams::{
+    SessionDefaults, SessionDefaultsSvc, SessionPersistence, SessionPersistenceSvc,
+    SessionProjectionsSvc,
+};
 use crate::session::{
-    Committed, LoggedEvent, ProjectionUnit, SessionEvent, SessionLog, SessionProjections,
+    Committed, LoggedEvent, ProjectionUnit, SessionEvent, SessionProjections,
 };
 
 #[derive(Debug, Deserialize, Default)]
 struct SessionRow {
-    /// Explicit id, so a caller can resume a known session. Minted when absent.
+    /// Explicit id for the front end's own agent, so a caller can resume a
+    /// known session. Minted when absent.
     #[serde(default)]
     id: Option<String>,
+    /// Replay `id`'s stored log before the first turn. There is no separate
+    /// snapshot format: the log *is* the snapshot, so a resume is a replay.
+    #[serde(default)]
+    resume: bool,
 }
 
+/// The `session` row.
+///
+/// It used to provide the tree's one log, and every agent shared it. Now a log
+/// belongs to an agent — created with it, provided into its realm, torn down
+/// with it — and this row only says how the front end's own agent gets its
+/// identity. See [`crate::agent::CreateAgent::root`].
 pub struct SessionPlugin;
 
 #[async_trait]
@@ -33,36 +47,23 @@ impl Plugin for SessionPlugin {
         "session"
     }
     fn provides(&self) -> &'static [&'static str] {
-        &["sessions"]
+        &["session-defaults"]
     }
     fn description(&self) -> &'static str {
-        "the append-only session log everything else is derived from"
+        "which session the front end's own agent gets, and whether to resume it"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
         let row: SessionRow = parse(config)?;
-        let id = row.id.unwrap_or_else(mint_session_id);
         let _ = ctx
-            .provide::<SessionSvc>(Arc::new(SessionLog::new(id)))
+            .provide::<SessionDefaultsSvc>(Arc::new(SessionDefaults {
+                id: row.id,
+                resume: row.resume,
+            }))
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 }
 
-fn mint_session_id() -> String {
-    // Wall clock plus pid: unique enough to name a file, and readable in a
-    // directory listing, which is what session ids are actually for.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    format!("{now}-{}", std::process::id())
-}
-
-// ---- projections --------------------------------------------------------
-
-/// Turn boundaries: where each turn started and how it ended. The loop needs
-/// it, a UI needs it, a compactor needs it — so it is one shared unit rather
-/// than three scans of the log.
 struct TurnBoundary;
 
 impl ProjectionUnit for TurnBoundary {
@@ -166,15 +167,6 @@ struct PersistenceRow {
     /// Defaults to the process cwd.
     #[serde(default)]
     project_root: Option<String>,
-    /// Load the session's existing events at mount time.
-    ///
-    /// There is no separate snapshot format to restore from: the log *is* the
-    /// snapshot. Everything a resumed session needs — the model's view, the
-    /// turn numbering, the compaction boundaries — is derived from the same
-    /// events a live session appends, so a resume is a replay and not a second
-    /// representation that can drift from the first.
-    #[serde(default)]
-    resume: bool,
 }
 
 pub(crate) struct JsonlStore {
@@ -309,11 +301,8 @@ impl Plugin for SessionPersistenceJsonlPlugin {
     fn name(&self) -> &'static str {
         "session-persistence-jsonl"
     }
-    fn inject(&self) -> &'static [&'static str] {
-        &["sessions"]
-    }
     fn uses(&self) -> &'static [&'static str] {
-        &["session-persistence", "operations"]
+        &["session-persistence", "operations", "agents"]
     }
     fn provides(&self) -> &'static [&'static str] {
         &["session-persistence"]
@@ -345,10 +334,9 @@ impl Plugin for SessionPersistenceJsonlPlugin {
                 "SESSIONS. Every committed fact of this session is appended to \n\
                  `{}`. Sessions are bucketed per project, so the `recall` tool \n\
                  searches this project's history and not the whole machine's.\n\
-                 To resume one: set `resume = true` on the \
-                 `session-persistence-jsonl` row and `id = \"<session-id>\"` on \
-                 the `session` row. There is no snapshot format — the log IS the \
-                 snapshot, so a resume is a replay.",
+                 To resume one: set `id = \"<session-id>\"` and `resume = true` \
+                 on the `session` row. There is no snapshot format — the log IS \
+                 the snapshot, so a resume is a replay.",
                 store.dir().display()
             ),
         );
@@ -358,35 +346,24 @@ impl Plugin for SessionPersistenceJsonlPlugin {
 
         // The store is fed by listening, not by the loop calling it. That is
         // what lets persistence be removed without the loop changing.
-        let session = ctx.require::<SessionSvc>().map_err(|e| e.to_string())?;
-        let id = session.id().to_string();
-
-        if row.resume {
-            let events = store.load(&id).await?;
-            if !events.is_empty() {
-                let turns = events
-                    .iter()
-                    .filter(|e| matches!(e.event, SessionEvent::TurnStart { .. }))
-                    .count();
-                // Sequence numbers and the turn counter come from the data, not
-                // re-minted: a transcript keyed by (session, turn) would collect
-                // duplicate keys after the first resume otherwise.
-                session.restore(events);
-                eprintln!(
-                    "\x1b[2mresumed `{id}` — {turns} turn(s), {} event(s)\x1b[0m",
-                    session.len()
-                );
-            }
-        }
+        //
+        // Every agent's log, by the id the fact carries — except a delegated
+        // child's, whose transcript is its parent's business and not a session
+        // of its own. The agent is resolved live rather than captured: it may
+        // be gone by the time its last fact is flushed, and persisting that
+        // fact is still right.
+        let agents_ctx = ctx.clone();
         let _ = ctx.on_emit::<SessionEventCommitted>(move |committed: &Committed| {
-            // A delegated child commits to its own log, and this listener is
-            // above both. Writing its facts here would interleave two
-            // conversations in one file and make the parent unresumable.
-            if committed.session != id {
+            let keep = agents_ctx
+                .service::<crate::seams::AgentsSvc>()
+                .and_then(|a| a.by_session(&committed.session))
+                .map(|a| a.persist())
+                .unwrap_or(true);
+            if !keep {
                 return;
             }
             let store = store.clone();
-            let id = id.clone();
+            let id = committed.session.clone();
             let logged = committed.logged();
             // Fire-and-forget: a slow disk must not stall the turn, and a
             // failed write is reported, never fatal to the conversation.

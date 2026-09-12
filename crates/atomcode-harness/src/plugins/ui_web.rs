@@ -21,9 +21,9 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::agent::Agent;
-use crate::events::{AgentCreated, AgentInfo, SessionEventCommitted};
+use crate::events::SessionEventCommitted;
 use crate::seams::{
-    AgentLoopSvc, AgentsSvc, ControlSvc, SessionSvc, UiSvc, UserInterface, UserQuestions,
+    AgentLoopSvc, AgentsSvc, ControlSvc, UiSvc, UserInterface, UserQuestions,
     UserQuestionsSvc,
 };
 use crate::session::Committed;
@@ -148,8 +148,9 @@ impl UserInterface for WebUi {
 
     async fn run(&self, ctx: &Context, initial: Option<String>) -> Result<(), String> {
         let agents = ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
-        let agent = agents.create(ctx);
-        ctx.emit::<AgentCreated>(&AgentInfo { id: agent.id() });
+        let agent = agents
+            .create(ctx, crate::agent::CreateAgent::root(ctx))
+            .await?;
 
         let events = self.events.clone();
         let fanout = events.clone();
@@ -289,9 +290,7 @@ async fn rows(State(web): State<Web>) -> Json<Value> {
 }
 
 async fn state_of(State(web): State<Web>) -> Json<Value> {
-    let messages = web
-        .ctx
-        .service::<SessionSvc>()
+    let messages = Some(web.agent.session())
         .map(|log| {
             log.derive_messages()
                 .iter()
@@ -317,9 +316,7 @@ async fn replay(
     State(web): State<Web>,
     axum::extract::Query(q): axum::extract::Query<After>,
 ) -> Json<Value> {
-    let events = web
-        .ctx
-        .service::<SessionSvc>()
+    let events = Some(web.agent.session())
         .map(|log| {
             log.since(q.after)
                 .iter()
@@ -400,7 +397,7 @@ impl Plugin for WebUiPlugin {
         &["agents", "agent-loop"]
     }
     fn uses(&self) -> &'static [&'static str] {
-        &["ui", "sessions", "control"]
+        &["ui", "control", "session-defaults"]
     }
     fn provides(&self) -> &'static [&'static str] {
         // The browser is a person to ask, so this row fills both — and both at

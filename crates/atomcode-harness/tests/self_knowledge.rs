@@ -12,12 +12,13 @@
 //! * and with the row removed, none of it may be true — otherwise the tests
 //!   above are passing for a reason that has nothing to do with this row.
 
+use atomcode_harness::agent::OnlySession;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use atomcode_harness::seams::{SessionSvc, SystemPromptSvc, ToolsSvc};
+use atomcode_harness::seams::{SystemPromptSvc, ToolsSvc};
 use atomcode_harness::{bundle, plugins, run_turn};
 use atomcode_kernel::tool::{ProgressSink, Tool, ToolContext, ToolResult};
 use atomcode_plexus::{App, ConfigTree, Layer};
@@ -63,6 +64,9 @@ fn tree(root: &std::path::Path, extra: &[&str]) -> ConfigTree {
 async fn start(tree: ConfigTree) -> App {
     let mut app = App::new(plugins::catalog(), tree);
     app.start().await.expect("must mount");
+    // The tree's own agent, so the session exists before the first turn — what
+    // the `session` row used to do at mount.
+    atomcode_harness::create_agent(&app).await.expect("an agent");
     app
 }
 
@@ -105,8 +109,8 @@ async fn the_prompt_stays_identical_across_sessions() {
     let a = start(tree(&dir, &[])).await;
     let b = start(tree(&dir, &[])).await;
     assert_ne!(
-        a.context().service::<SessionSvc>().unwrap().id(),
-        b.context().service::<SessionSvc>().unwrap().id(),
+        a.context().only_session().unwrap().id(),
+        b.context().only_session().unwrap().id(),
         "two different sessions, by construction"
     );
     assert_eq!(
@@ -268,7 +272,7 @@ async fn the_answer_is_read_from_the_live_tree_not_frozen_at_mount() {
 async fn it_reports_the_session_the_log_actually_holds() {
     let dir = scratch("session-aspect");
     let app = start(tree(&dir, &[])).await;
-    let log = app.context().service::<SessionSvc>().unwrap();
+    let log = app.context().only_session().unwrap();
 
     let before = ask(&app, "session").await;
     assert!(before.contains(log.id()), "{before}");
@@ -326,7 +330,7 @@ config = { script = [
     let app = start(tree(&dir, &[call])).await;
     let id = app
         .context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .id()
         .to_string();
@@ -338,7 +342,7 @@ config = { script = [
 
     let logged = app
         .context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .events()
         .into_iter()

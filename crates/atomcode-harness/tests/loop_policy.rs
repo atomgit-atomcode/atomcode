@@ -1,13 +1,14 @@
 //! Turn policy as rows: the round budget, provider retry, compaction and the
 //! no-progress guard are none of the loop's business.
 
+use atomcode_harness::agent::OnlySession;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use atomcode_harness::events::{AgentRequest, ModelRequest, ModelResponse, RequestError};
-use atomcode_harness::seams::{CompactionSvc, SessionSvc, StopReason};
+use atomcode_harness::seams::{CompactionSvc, StopReason};
 use atomcode_harness::session::SessionEvent;
 use atomcode_harness::{bundle, plugins, run_turn};
 use atomcode_plexus::{App, ConfigTree, Layer, Next, Waterfall};
@@ -286,7 +287,7 @@ async fn compaction_cuts_the_projection_and_leaves_the_log_whole() {
     run_turn(&app, "second question").await.unwrap();
     run_turn(&app, "third question").await.unwrap();
 
-    let log = app.context().service::<SessionSvc>().unwrap();
+    let log = app.context().only_session().unwrap();
     let compactions = log
         .events()
         .into_iter()
@@ -335,7 +336,7 @@ async fn the_guard_warns_then_ends_a_turn_that_is_not_progressing() {
     assert_eq!(outcome.stop, StopReason::ToolLoopDetected);
     let text = app
         .context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .derive_messages()
         .iter()

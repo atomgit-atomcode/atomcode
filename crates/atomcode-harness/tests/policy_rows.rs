@@ -2,13 +2,14 @@
 //! rules, plan mode, session titles, the human-question seam, telemetry and a
 //! cost ceiling.
 
+use atomcode_harness::agent::OnlySession;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use atomcode_harness::seams::{
-    SessionSvc, SessionTitleSvc, StopReason, ToolsSvc, UserQuestions, UserQuestionsSvc,
+    SessionTitleSvc, StopReason, ToolsSvc, UserQuestions, UserQuestionsSvc,
 };
 use atomcode_harness::{bundle, plugins, run_turn};
 use atomcode_plexus::{App, ConfigTree, Context, Layer, Plugin};
@@ -74,7 +75,7 @@ async fn start(tree: ConfigTree) -> App {
 
 fn transcript(app: &App) -> String {
     app.context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .derive_messages()
         .iter()
@@ -213,7 +214,7 @@ async fn a_session_is_named_from_its_first_prompt_without_a_model_call() {
     let title = ctx
         .service::<SessionTitleSvc>()
         .unwrap()
-        .title(&ctx.service::<SessionSvc>().unwrap())
+        .title(&ctx.only_session().unwrap())
         .await
         .unwrap();
     assert_eq!(title, "make the build stop failing on windows please");
@@ -231,7 +232,7 @@ async fn a_session_is_named_from_its_first_prompt_without_a_model_call() {
     let title = ctx
         .service::<SessionTitleSvc>()
         .unwrap()
-        .title(&ctx.service::<SessionSvc>().unwrap())
+        .title(&ctx.only_session().unwrap())
         .await
         .unwrap();
     assert_eq!(title, "make the build");

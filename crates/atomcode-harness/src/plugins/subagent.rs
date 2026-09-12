@@ -25,12 +25,11 @@ use atomcode_plexus::{Context, Plugin};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::events::{AgentCreated, AgentInfo, TurnProgress, TurnStopping};
+use crate::events::{TurnProgress, TurnStopping};
 use crate::seams::{
     AgentLoopSvc, AgentsSvc, SessionSvc, StopReason, SubagentOutcome, Subagents, SubagentsSvc,
     SystemPromptSvc, ToolBox, ToolsSvc,
 };
-use crate::session::SessionLog;
 
 use super::tools::{contribute_prompt, mount};
 
@@ -75,62 +74,57 @@ impl Subagents for InProcessSubagents {
 
         // A real agent, in a realm of its own, visible in the registry — a UI
         // watching delegated work sees it the same way it sees any other agent.
-        let child = agents.create(&self.ctx);
-        self.ctx.emit::<AgentCreated>(&AgentInfo { id: child.id() });
-
-        // Its own catalog, derived from the parent's by name. This is a
-        // *different* `tools` slot layered over the parent's, not a mutation of
-        // it, so the parent's catalog is untouched throughout.
         let restricted = Arc::new(ToolBox::new());
         for name in &self.allowed_tools {
             if let Some(tool) = parent_tools.get(name) {
                 if let Err(e) = restricted.register(tool) {
-                    agents.remove(child.id());
                     return SubagentOutcome::failed(e);
                 }
             }
         }
-
-        // Its own conversation and its own prompt, by the same move. Each
-        // registration is held so the child's world can be torn down exactly
-        // when the child is done — the parent plugin's fiber must not
-        // accumulate one of these per delegation.
-        let log = Arc::new(SessionLog::new(format!("sub-{}", child.id())));
         let prompts = Arc::new(crate::seams::PromptRegistry::new());
         prompts.contribute("subagent", 0, instructions);
 
-        let mut overrides = match (
-            child.ctx().provide::<ToolsSvc>(restricted),
-            child.ctx().provide::<SessionSvc>(log.clone()),
-            child.ctx().provide::<SystemPromptSvc>(prompts),
-        ) {
-            (Ok(tools), Ok(session), Ok(prompt)) => vec![tools, session, prompt],
-            _ => {
-                agents.remove(child.id());
-                return SubagentOutcome::failed("could not give the subagent its own world");
-            }
+        // Its own conversation, its own tools and its own prompt, composed
+        // before anyone can see it. The parent's session is the one whose turn
+        // this tool call is running in. Not persisted: a delegated child's
+        // transcript is the parent's business, not a session of its own.
+        let parent = crate::agent::current()
+            .and_then(|c| c.service::<SessionSvc>())
+            .map(|log| log.id().to_string());
+        let mut req = crate::agent::CreateAgent::new()
+            .id(format!("sub-{}", crate::agent::mint_session_id()))
+            .persist(false)
+            .setup(Box::new(move |realm: &Context| {
+                Ok(vec![
+                    realm
+                        .provide::<ToolsSvc>(restricted)
+                        .map_err(|e| e.to_string())?,
+                    realm
+                        .provide::<SystemPromptSvc>(prompts)
+                        .map_err(|e| e.to_string())?,
+                ])
+            }));
+        if let Some(parent) = parent {
+            req = req.parent(parent);
+        }
+        let child = match agents.create(&self.ctx, req).await {
+            Ok(child) => child,
+            Err(e) => return SubagentOutcome::failed(e),
         };
+        let log = child.session();
 
-        // A round budget for this child alone, registered in its realm. The
-        // parent's own budget is untouched, and this one disappears with the
-        // child — per-agent policy, which is what an agent-scoped realm is for.
-        overrides.push(
-            child
-                .ctx()
-                .on_serial::<TurnStopping>(Arc::new(ChildRoundCap {
-                    max_steps: self.max_rounds,
-                })),
-        );
+        let round_cap = child
+            .ctx()
+            .on_serial::<TurnStopping>(Arc::new(ChildRoundCap {
+                max_steps: self.max_rounds,
+            }));
 
-        // The same driver as the parent. It resolves `tools`, `sessions` and
-        // `system-prompt` through the child's context and finds the child's,
-        // while `llm` and every root policy still resolve to the parent's.
         child.send(task);
         let outcome = driver.drive(&child).await;
 
-        for disposable in overrides {
-            disposable.dispose();
-        }
+        round_cap.dispose();
+        // Removing the agent tears down what was mounted for it alone.
         agents.remove(child.id());
 
         SubagentOutcome {
@@ -276,7 +270,7 @@ impl Plugin for SubagentPlugin {
     }
     fn uses(&self) -> &'static [&'static str] {
         // Read at spawn time to derive the child's world from the parent's.
-        &["subagents", "sessions", "agent-loop", "system-prompt"]
+        &["subagents", "agent-loop", "system-prompt"]
     }
     fn provides(&self) -> &'static [&'static str] {
         &["subagents"]

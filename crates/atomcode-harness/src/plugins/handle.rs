@@ -50,13 +50,13 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{Agent, MessageOrigin};
-use crate::events::{AgentCreated, AgentInfo, SessionEventCommitted};
+use crate::events::SessionEventCommitted;
 use crate::seams::{
     AgentHandleSource, AgentHandleSvc, AgentLoopSvc, AgentsSvc, ApprovalPolicy, CompactionSvc,
     Decision, LlmSvc, SessionSvc, ToolBox, ToolsSvc, UiSvc, UserInterface, UserQuestions,
     UserQuestionsSvc,
 };
-use crate::session::{Committed, SessionEvent, SessionLog};
+use crate::session::{Committed, SessionEvent};
 
 // ---- outward: session facts, as a driver's events -----------------------
 
@@ -635,6 +635,9 @@ async fn pump(
         });
         return;
     };
+    // Snapshots and compactions act on this agent's log, which lives in its
+    // realm; the tree's context would not find it.
+    let ctx = agent.ctx().clone();
     let mut turn: Option<tokio::task::JoinHandle<()>> = None;
     // Snapshot requests that arrived while a turn was running.
     //
@@ -868,6 +871,9 @@ pub fn wire() -> Wire {
 /// A driver running: the handle to speak through, and the moment it hangs up.
 pub struct Driven {
     pub handle: AgentHandle,
+    /// The agent behind the handle, for a front end that lives in the same
+    /// process and wants its log or its realm without going through the wire.
+    pub agent: Arc<Agent>,
     /// Resolves once the pump has stopped: the turn is over and the asker is
     /// closed. What a front end waits on before it returns.
     pub done: oneshot::Receiver<()>,
@@ -884,7 +890,12 @@ pub struct Driven {
 ///
 /// `answers` is whoever holds the questions — the handle's own [`Asker`], or a
 /// screen that draws them.
-pub fn spawn(ctx: &Context, wire: Wire, answers: Arc<dyn Answers>) -> Result<Driven, String> {
+pub async fn spawn(
+    ctx: &Context,
+    wire: Wire,
+    answers: Arc<dyn Answers>,
+    req: crate::agent::CreateAgent,
+) -> Result<Driven, String> {
     let Wire {
         commands,
         events,
@@ -894,16 +905,10 @@ pub fn spawn(ctx: &Context, wire: Wire, answers: Arc<dyn Answers>) -> Result<Dri
 
     // One agent, created here rather than on the first message, so the
     // registry and any `agent/created` observer see it before the driver
-    // can send anything.
+    // can send anything. Its log comes with it.
     let agents = ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
-    let agent = agents.create(ctx);
-    ctx.emit::<AgentCreated>(&AgentInfo { id: agent.id() });
-
-    let session: Option<Arc<SessionLog>> = ctx.service::<SessionSvc>();
-    let session_id = session
-        .as_ref()
-        .map(|s| s.id().to_string())
-        .unwrap_or_default();
+    let agent = agents.create(ctx, req).await?;
+    let session_id = agent.session_id().to_string();
     let projector = Arc::new(Mutex::new(Projector {
         tools: ctx.service::<ToolsSvc>(),
         ctx_window: ctx
@@ -934,8 +939,9 @@ pub fn spawn(ctx: &Context, wire: Wire, answers: Arc<dyn Answers>) -> Result<Dri
 
     let (done_tx, done_rx) = oneshot::channel();
     let pump_ctx = ctx.clone();
+    let pump_agent = agent.clone();
     let task = tokio::spawn(async move {
-        pump(pump_ctx, agent, answers, events, command_rx).await;
+        pump(pump_ctx, pump_agent, answers, events, command_rx).await;
         // The listener holds a clone of the sender; revoking it is what
         // lets the event channel close, so a driver reading to the end sees
         // the end. Dropping only the local handles would hang it forever.
@@ -950,6 +956,7 @@ pub fn spawn(ctx: &Context, wire: Wire, answers: Arc<dyn Answers>) -> Result<Dri
             task,
         },
         done: done_rx,
+        agent,
     })
 }
 
@@ -981,12 +988,12 @@ impl Plugin for AgentHandlePlugin {
         "ui-handle"
     }
     fn inject(&self) -> &'static [&'static str] {
-        &["agents", "agent-loop", "sessions"]
+        &["agents", "agent-loop"]
     }
     fn uses(&self) -> &'static [&'static str] {
         // `approval` because the gate resolves the policy per call rather than
         // capturing it — the same reason the static approval row declares it.
-        &["tools", "llm", "compaction", "approval"]
+        &["tools", "llm", "compaction", "approval", "session-defaults"]
     }
     fn provides(&self) -> &'static [&'static str] {
         // A driver renders prompts and answers them, so it fills the asking
@@ -1028,7 +1035,8 @@ impl Plugin for AgentHandlePlugin {
         );
 
         let initial = wire.commands.clone();
-        let Driven { handle, done } = spawn(ctx, wire, asker)?;
+        let Driven { handle, done, .. } =
+            spawn(ctx, wire, asker, crate::agent::CreateAgent::root(ctx)).await?;
 
         let front = Arc::new(HandleFrontEnd {
             handle: Mutex::new(Some(handle)),

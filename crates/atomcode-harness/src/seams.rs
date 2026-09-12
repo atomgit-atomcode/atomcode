@@ -31,7 +31,8 @@ plexus_service!(SystemPromptSvc => PromptRegistry, "system-prompt", Core, "Order
 // asked, so a row can describe a knob in as much detail as the knob deserves
 // without that detail costing tokens on every single request.
 plexus_service!(OperationsSvc => PromptRegistry, "operations", Core, "How to work the running system, described by the rows that own each knob");
-plexus_service!(SessionSvc => SessionLog, "sessions", Core, "The append-only session log");
+plexus_service!(SessionSvc => SessionLog, "sessions", Core, "The append-only session log of the agent whose realm this is");
+plexus_service!(SessionDefaultsSvc => SessionDefaults, "session-defaults", Core, "What the front end's own agent is told about its session: an id, whether to resume it");
 plexus_service!(SessionProjectionsSvc => SessionProjections, "session-projections", Core, "Incremental folds over the log");
 plexus_service!(SessionPersistenceSvc => dyn SessionPersistence, "session-persistence", Seam, "Durable session storage");
 plexus_service!(SkillsSvc => SkillRegistry, "skills", Core, "Markdown skill catalog");
@@ -214,6 +215,16 @@ pub trait SessionPersistence: Send + Sync {
     fn location(&self, _session_id: &str) -> Option<String> {
         None
     }
+}
+
+/// The `session` row's answer for the agent a front end creates on its own:
+/// which id it gets and whether that id's stored log is replayed first. Read
+/// by [`crate::agent::CreateAgent::root`]; an agent created any other way — a
+/// delegated child, an ACP session — names its own.
+#[derive(Clone, Debug, Default)]
+pub struct SessionDefaults {
+    pub id: Option<String>,
+    pub resume: bool,
 }
 
 /// Where to cut the history, and what to leave in its place.

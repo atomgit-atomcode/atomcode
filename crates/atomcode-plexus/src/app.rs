@@ -325,7 +325,13 @@ impl App {
             }
             // The reverse — a slot filled by a fiber whose plugin never
             // declared it — is read off the service table's ownership records.
-            for service in self.root.services.owned_by(*fiber) {
+            // Root realm only: what a row mounts into an agent's realm is that
+            // agent's world, not the row's surface.
+            for service in self
+                .root
+                .services
+                .owned_by_in(*fiber, crate::realm::ROOT_REALM)
+            {
                 if !plugin.provides().contains(&service) {
                     findings.push(AuditFinding::ProvidedButNotDeclared {
                         entry: id.clone(),

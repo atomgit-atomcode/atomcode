@@ -10,10 +10,11 @@
 //!   findable, because the log is not the working set;
 //! * and a log written before bucketing existed still resumes.
 
+use atomcode_harness::agent::OnlySession;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use atomcode_harness::seams::{SessionPersistenceSvc, SessionSvc, ToolsSvc};
+use atomcode_harness::seams::{SessionPersistenceSvc, ToolsSvc};
 use atomcode_harness::{bundle, plugins, run_turn};
 use atomcode_kernel::tool::{ProgressSink, ToolContext};
 use atomcode_plexus::{App, ConfigTree, Layer};
@@ -62,6 +63,9 @@ fn tree(store: &Path, project: &Path, say: &str, extra: &[&str]) -> ConfigTree {
 async fn start(tree: ConfigTree) -> App {
     let mut app = App::new(plugins::catalog(), tree);
     app.start().await.expect("must mount");
+    // The tree's own agent, so the session exists before the first turn — what
+    // the `session` row used to do at mount.
+    atomcode_harness::create_agent(&app).await.expect("an agent");
     app
 }
 
@@ -89,7 +93,7 @@ async fn say_and_settle(app: &App, text: &str) -> String {
     run_turn(app, text).await.expect("a turn");
     let id = app
         .context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .id()
         .to_string();
@@ -245,16 +249,16 @@ async fn a_log_written_before_bucketing_still_resumes() {
         &project,
         "ok",
         &[&format!(
-            "[[patch]]\nid = \"session\"\nconfig = {{ id = \"{id}\" }}\n\n\
+            "[[patch]]\nid = \"session\"\nconfig = {{ id = \"{id}\", resume = true }}\n\n\
              [[patch]]\nid = \"session-persistence-jsonl\"\n\
-             config = {{ root = {store:?}, project_root = {project:?}, resume = true }}",
+             config = {{ root = {store:?}, project_root = {project:?} }}",
             store = store.to_string_lossy(),
             project = project.to_string_lossy(),
         )],
     ))
     .await;
 
-    let log = app.context().service::<SessionSvc>().unwrap();
+    let log = app.context().only_session().unwrap();
     assert_eq!(log.id(), id);
     assert!(
         log.len() >= 2,

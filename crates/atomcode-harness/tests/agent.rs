@@ -1,17 +1,18 @@
 //! The agent as an entity: a registry, an inbox, a realm, and turns that are
 //! not function calls.
 
+use atomcode_harness::agent::OnlySession;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use atomcode_harness::agent::{Agent, AgentStatus};
+use atomcode_harness::agent::{Agent, AgentStatus, CreateAgent};
 use atomcode_harness::events::{
     AgentRequest, ModelRequest, ModelResponse, PreStep, RequestError, StepDecision, ToolExec,
     ToolsExecute,
 };
-use atomcode_harness::seams::{AgentsSvc, SessionSvc, StopReason, ToolsSvc};
+use atomcode_harness::seams::{AgentsSvc, FsSvc, SessionSvc, StopReason, ToolsSvc};
 use atomcode_harness::session::{InjectionOrigin, SessionEvent};
 use atomcode_harness::{bundle, create_agent, drive, plugins, run_turn};
 use atomcode_kernel::tool::ToolResult;
@@ -74,7 +75,7 @@ async fn start(tree: ConfigTree) -> App {
 
 fn events(app: &App) -> Vec<SessionEvent> {
     app.context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .events()
         .into_iter()
@@ -91,8 +92,8 @@ async fn agents_are_findable_without_being_handed_around() {
     let registry = app.context().service::<AgentsSvc>().unwrap();
     assert!(registry.is_empty());
 
-    let a = create_agent(&app).unwrap();
-    let b = create_agent(&app).unwrap();
+    let a = create_agent(&app).await.unwrap();
+    let b = create_agent(&app).await.unwrap();
     assert_eq!(registry.len(), 2);
     assert_eq!(registry.get(a.id()).unwrap().id(), a.id());
     assert_eq!(registry.list().len(), 2);
@@ -106,8 +107,8 @@ async fn agents_are_findable_without_being_handed_around() {
 async fn each_agent_gets_a_realm_of_its_own() {
     let dir = scratch("realms");
     let app = start(tree(&dir, &talker(&["ok"]), &[])).await;
-    let a = create_agent(&app).unwrap();
-    let b = create_agent(&app).unwrap();
+    let a = create_agent(&app).await.unwrap();
+    let b = create_agent(&app).await.unwrap();
 
     // A tool catalog for `a` alone.
     let just_for_a = Arc::new(atomcode_harness::seams::ToolBox::new());
@@ -137,7 +138,7 @@ async fn each_agent_gets_a_realm_of_its_own() {
 async fn an_injection_alone_never_opens_a_turn() {
     let dir = scratch("inject-only");
     let app = start(tree(&dir, &talker(&["ok"]), &[])).await;
-    let agent = create_agent(&app).unwrap();
+    let agent = create_agent(&app).await.unwrap();
 
     agent.inject("some background context", InjectionOrigin::Reminder);
     let outcome = drive(&app, &agent).await.unwrap();
@@ -155,7 +156,7 @@ async fn an_injection_alone_never_opens_a_turn() {
 async fn an_injection_rides_in_with_the_next_message() {
     let dir = scratch("inject-rides");
     let app = start(tree(&dir, &talker(&["ok"]), &[])).await;
-    let agent = create_agent(&app).unwrap();
+    let agent = create_agent(&app).await.unwrap();
 
     agent.inject("remember: the user prefers Rust", InjectionOrigin::Memory);
     agent.send("what should I use?");
@@ -180,7 +181,7 @@ async fn an_injection_rides_in_with_the_next_message() {
 async fn one_message_per_step_so_the_model_sees_them_in_order() {
     let dir = scratch("order");
     let app = start(tree(&dir, &talker(&["first answer", "second answer"]), &[])).await;
-    let agent = create_agent(&app).unwrap();
+    let agent = create_agent(&app).await.unwrap();
 
     agent.send("question one");
     agent.send("question two");
@@ -270,7 +271,7 @@ impl Waterfall<AgentRequest> for SendsMidTurn {
 async fn a_message_arriving_mid_turn_joins_the_turn_already_running() {
     let dir = scratch("steering");
     let app = start(tree(&dir, &talker(&["first", "second"]), &[])).await;
-    let agent = create_agent(&app).unwrap();
+    let agent = create_agent(&app).await.unwrap();
 
     let _guard = app.context().on_waterfall::<AgentRequest>(
         Arc::new(SendsMidTurn {
@@ -405,7 +406,7 @@ config = { script = [
 "#;
     let yolo = "[[patch]]\nid = \"approval\"\nconfig = { mode = \"yolo\" }";
     let app = start(tree(&dir, script, &[yolo])).await;
-    let agent = create_agent(&app).unwrap();
+    let agent = create_agent(&app).await.unwrap();
     let guard = app.context().on_waterfall::<ToolsExecute>(
         Arc::new(CancelsMidTurn {
             agent: agent.clone(),
@@ -446,7 +447,7 @@ config = { script = [
 async fn status_tracks_the_turn() {
     let dir = scratch("status");
     let app = start(tree(&dir, &talker(&["ok"]), &[])).await;
-    let agent = create_agent(&app).unwrap();
+    let agent = create_agent(&app).await.unwrap();
     assert_eq!(agent.status(), AgentStatus::Idle);
 
     agent.send("go");
@@ -462,8 +463,8 @@ async fn status_tracks_the_turn() {
 async fn two_agents_share_a_process_without_sharing_a_turn() {
     let dir = scratch("two");
     let app = start(tree(&dir, &talker(&["for a", "for b"]), &[])).await;
-    let a = create_agent(&app).unwrap();
-    let b = create_agent(&app).unwrap();
+    let a = create_agent(&app).await.unwrap();
+    let b = create_agent(&app).await.unwrap();
 
     a.send("question from a");
     let first = drive(&app, &a).await.unwrap();
@@ -473,4 +474,137 @@ async fn two_agents_share_a_process_without_sharing_a_turn() {
     assert_eq!(first.text, "for a");
     assert_eq!(second.text, "for b");
     assert_ne!(a.id(), b.id());
+}
+
+// ---- an agent owns its session and its world ----------------------------
+
+#[tokio::test]
+async fn two_agents_keep_their_own_sessions_and_worlds() {
+    let dir = scratch("own-session");
+    let elsewhere = scratch("own-world");
+    let app = start(tree(&dir, &talker(&["ok"]), &[])).await;
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+
+    let a = agents
+        .create(&app.context(), CreateAgent::new().id("a"))
+        .await
+        .unwrap();
+    let b = agents
+        .create(
+            &app.context(),
+            CreateAgent::new().id("b").cwd(elsewhere.clone()),
+        )
+        .await
+        .unwrap();
+
+    // Two logs, not one shared: the tree itself holds none.
+    assert_eq!(a.session_id(), "a");
+    assert_eq!(b.session_id(), "b");
+    assert!(
+        !app.context().service_names().contains(&"sessions"),
+        "the tree has no log of its own"
+    );
+
+    a.send("hello");
+    drive(&app, &a).await.unwrap();
+    assert!(!a.session().is_empty(), "a spoke");
+    assert!(b.session().is_empty(), "b did not, and did not hear a");
+
+    // Two worlds: `b` was given a root of its own, `a` has the tree's.
+    let a_root = a.ctx().service::<FsSvc>().unwrap().root();
+    let b_root = b.ctx().service::<FsSvc>().unwrap().root();
+    assert_eq!(b_root, elsewhere);
+    assert_ne!(a_root, b_root);
+
+    // Removing an agent takes its world with it: the realm no longer resolves
+    // a log, and the registry no longer knows the session.
+    let b_ctx = b.ctx().clone();
+    agents.remove(b.id());
+    assert!(b_ctx.service::<SessionSvc>().is_none());
+    assert!(agents.by_session("b").is_none());
+    assert!(agents.by_session("a").is_some());
+}
+
+/// A policy registered once, at the top of the tree, that writes a fact into
+/// "the" log — the shape of every compaction, recovery and truncation row.
+struct WritesANotice {
+    ctx: atomcode_plexus::Context,
+}
+
+#[async_trait]
+impl Waterfall<AgentRequest> for WritesANotice {
+    async fn handle(
+        &self,
+        req: &mut ModelRequest,
+        next: Next<'_, AgentRequest>,
+    ) -> Result<ModelResponse, RequestError> {
+        // Through the running agent, not through the plugin's own context.
+        let scoped = atomcode_harness::agent::scoped(&self.ctx);
+        if let Some(log) = scoped.service::<SessionSvc>() {
+            atomcode_harness::session::commit(
+                &scoped,
+                &log,
+                SessionEvent::Injected {
+                    turn: log.current_turn(),
+                    text: "a fact from a tree-level policy".into(),
+                    origin: InjectionOrigin::Continuation,
+                },
+            );
+        }
+        next.run(req).await
+    }
+}
+
+#[tokio::test]
+async fn a_tree_level_policy_writes_into_the_log_of_the_agent_whose_turn_it_is() {
+    // The bug this closes: a listener at the top of the tree resolved `sessions`
+    // through its own context and always found the tree's one log, so a
+    // delegated child's compaction cut the parent's history.
+    let dir = scratch("scoped-log");
+    let app = start(tree(&dir, &talker(&["ok", "ok"]), &[])).await;
+    let root = app.context();
+    let _policy = root.on_waterfall::<AgentRequest>(
+        Arc::new(WritesANotice { ctx: root.clone() }),
+        false,
+    );
+    let a = create_agent(&app).await.unwrap();
+    let b = create_agent(&app).await.unwrap();
+
+    b.send("only b speaks");
+    drive(&app, &b).await.unwrap();
+
+    let injected = |agent: &Agent| {
+        agent
+            .session()
+            .events()
+            .into_iter()
+            .filter(|e| matches!(e.event, SessionEvent::Injected { .. }))
+            .count()
+    };
+    assert_eq!(injected(&b), 1, "the fact landed in b's log");
+    assert_eq!(injected(&a), 0, "and not in a's");
+    assert!(
+        atomcode_harness::agent::current().is_none(),
+        "outside a turn there is no running agent"
+    );
+}
+
+#[tokio::test]
+async fn the_session_row_names_the_front_ends_own_agent() {
+    let dir = scratch("defaults");
+    let app = start(tree(
+        &dir,
+        &talker(&["ok"]),
+        &["[[patch]]\nid = \"session\"\nconfig = { id = \"named-by-the-row\" }"],
+    ))
+    .await;
+    let own = create_agent(&app).await.unwrap();
+    assert_eq!(own.session_id(), "named-by-the-row");
+    // An agent created any other way names its own.
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let other = agents
+        .create(&app.context(), CreateAgent::new())
+        .await
+        .unwrap();
+    assert_ne!(other.session_id(), "named-by-the-row");
 }

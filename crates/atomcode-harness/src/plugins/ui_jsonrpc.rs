@@ -20,9 +20,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::AgentId;
-use crate::events::{AgentCreated, AgentInfo, SessionEventCommitted};
+use crate::events::SessionEventCommitted;
 use crate::seams::{
-    AgentLoopSvc, AgentsSvc, ControlSvc, SessionSvc, UiSvc, UserInterface, UserQuestions,
+    AgentLoopSvc, AgentsSvc, ControlSvc, UiSvc, UserInterface, UserQuestions,
     UserQuestionsSvc,
 };
 use crate::session::Committed;
@@ -167,8 +167,9 @@ impl UserInterface for JsonRpc {
         });
 
         if let Some(text) = initial {
-            let agent = agents.create(ctx);
-            ctx.emit::<AgentCreated>(&AgentInfo { id: agent.id() });
+            let agent = agents
+                .create(ctx, crate::agent::CreateAgent::root(ctx))
+                .await?;
             agent.send(text);
             let outcome = driver.drive(&agent).await;
             let _ = out_tx.send(json!({
@@ -228,8 +229,9 @@ impl JsonRpc {
         let agents = ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
         match call.method.as_str() {
             "agent/create" => {
-                let agent = agents.create(ctx);
-                ctx.emit::<AgentCreated>(&AgentInfo { id: agent.id() });
+                let agent = agents
+                    .create(ctx, crate::agent::CreateAgent::root(ctx))
+                    .await?;
                 Ok(Some(json!({ "agent": agent.id() })))
             }
             "agent/list" => Ok(Some(json!({
@@ -243,7 +245,7 @@ impl JsonRpc {
             // wants to interleave sends its next `agent/send` from another
             // connection, and the inbox folds it into the running turn.
             "agent/send" => {
-                let agent = self.resolve(ctx, &call.params)?;
+                let agent = self.resolve(ctx, &call.params).await?;
                 let text = call
                     .params
                     .get("text")
@@ -255,7 +257,7 @@ impl JsonRpc {
                 Ok(Some(outcome_json(&outcome, agent.id())))
             }
             "agent/inject" => {
-                let agent = self.resolve(ctx, &call.params)?;
+                let agent = self.resolve(ctx, &call.params).await?;
                 let text = call
                     .params
                     .get("text")
@@ -265,12 +267,12 @@ impl JsonRpc {
                 Ok(Some(json!({ "queued": true })))
             }
             "agent/cancel" => {
-                let agent = self.resolve(ctx, &call.params)?;
+                let agent = self.resolve(ctx, &call.params).await?;
                 agent.cancel();
                 Ok(Some(json!({ "cancelled": true })))
             }
             "session/transcript" => {
-                let log = ctx.require::<SessionSvc>().map_err(|e| e.to_string())?;
+                let log = self.resolve(ctx, &call.params).await?.session();
                 Ok(Some(json!({
                     "messages": log
                         .derive_messages()
@@ -280,7 +282,7 @@ impl JsonRpc {
                 })))
             }
             "session/events" => {
-                let log = ctx.require::<SessionSvc>().map_err(|e| e.to_string())?;
+                let log = self.resolve(ctx, &call.params).await?.session();
                 let after = call
                     .params
                     .get("after")
@@ -344,7 +346,11 @@ impl JsonRpc {
         }
     }
 
-    fn resolve(&self, ctx: &Context, params: &Value) -> Result<Arc<crate::agent::Agent>, String> {
+    async fn resolve(
+        &self,
+        ctx: &Context,
+        params: &Value,
+    ) -> Result<Arc<crate::agent::Agent>, String> {
         let agents = ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
         match params.get("agent").and_then(Value::as_u64) {
             Some(id) => agents
@@ -355,9 +361,9 @@ impl JsonRpc {
             None => match agents.list().as_slice() {
                 [only] => Ok(only.clone()),
                 [] => {
-                    let agent = agents.create(ctx);
-                    ctx.emit::<AgentCreated>(&AgentInfo { id: agent.id() });
-                    Ok(agent)
+                    agents
+                        .create(ctx, crate::agent::CreateAgent::root(ctx))
+                        .await
                 }
                 _ => Err("several agents exist; name one with `agent`".into()),
             },
@@ -396,7 +402,7 @@ impl Plugin for JsonRpcUiPlugin {
         &["agents", "agent-loop"]
     }
     fn uses(&self) -> &'static [&'static str] {
-        &["ui", "sessions", "control"]
+        &["ui", "control", "session-defaults"]
     }
     fn provides(&self) -> &'static [&'static str] {
         // A program on the other end can answer, so this row fills both.

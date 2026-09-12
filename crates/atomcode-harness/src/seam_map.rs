@@ -58,8 +58,9 @@ macro_rules! seam_catalog {
 
 use crate::seams::{
     AgentHandleSvc, AgentLoopSvc, AgentsSvc, ApprovalSvc, CodeIndexSvc, CompactionSvc, ControlSvc,
-    FindingsSvc, FsSvc, LlmSvc, McpSvc, OpenerSvc, OperationsSvc, SessionPersistenceSvc,
-    SessionProjectionsSvc, SessionSvc, SessionTitleSvc, ShellSvc, SkillsSvc, SubagentsSvc,
+    FindingsSvc, FsSvc, LlmSvc, McpSvc, OpenerSvc, OperationsSvc, SessionDefaultsSvc,
+    SessionPersistenceSvc, SessionProjectionsSvc, SessionSvc, SessionTitleSvc, ShellSvc,
+    SkillsSvc, SubagentsSvc,
     SystemPromptSvc, ToolsSvc, UiSvc, UserQuestionsSvc,
 };
 
@@ -70,6 +71,7 @@ seam_catalog!(
     ToolsSvc,
     SystemPromptSvc,
     SessionSvc,
+    SessionDefaultsSvc,
     SessionProjectionsSvc,
     SessionPersistenceSvc,
     SessionTitleSvc,
@@ -100,6 +102,12 @@ seam_catalog!(
 /// can offer reconfiguration of the running tree.
 pub const HOST_PROVIDED: &[&str] = &["control"];
 
+/// Slots no row fills because they belong to an agent, not to the tree: the
+/// agent registry provides each agent's own log into its realm when the agent
+/// is created (`Agents::create`). Declared here so the map can say who fills
+/// them, and so the "every seam has a provider" rule knows they are not orphans.
+pub const AGENT_PROVIDED: &[&str] = &["sessions"];
+
 pub const HOST_CONSUMED: &[&str] = &[
     // The launcher resolves `ui` and hands over; `run_turn` and friends reach
     // for the rest.
@@ -110,6 +118,9 @@ pub const HOST_CONSUMED: &[&str] = &[
     "agent-loop",
     "agents",
     "sessions",
+    // `create_agent` / `run_turn` give the tree's own agent the session the
+    // `session` row describes.
+    "session-defaults",
     "session-title",
     // The handle exists for whoever embeds this harness. Its consumer is
     // outside the tree by construction — that is what makes it a handle.

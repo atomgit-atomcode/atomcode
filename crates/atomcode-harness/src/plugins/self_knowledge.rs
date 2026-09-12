@@ -60,7 +60,15 @@ struct Introspect {
 
 impl Introspect {
     fn session(&self) -> String {
-        let Some(log) = self.ctx.service::<SessionSvc>() else {
+        // Inside a turn, the agent whose turn it is; outside one — a driver
+        // asking on its own — the only agent there is.
+        let Some(log) = crate::agent::scoped(&self.ctx)
+            .service::<SessionSvc>()
+            .or_else(|| {
+                use crate::agent::OnlySession;
+                self.ctx.only_session()
+            })
+        else {
             return "session: no session log is mounted in this tree.".into();
         };
         let id = log.id().to_string();
@@ -272,7 +280,7 @@ impl Plugin for SelfKnowledgePlugin {
         // plain statement of absence, so none of it is a hard dependency. That
         // is what lets this row mount in an eval tree with no catalog and no
         // store and still be correct about having neither.
-        &["tools", "sessions", "session-persistence", "operations"]
+        &["tools", "session-persistence", "operations"]
     }
     fn description(&self) -> &'static str {
         "tell the model what it is assembled from, from the live tree"

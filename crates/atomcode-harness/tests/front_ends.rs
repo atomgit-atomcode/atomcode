@@ -1,10 +1,11 @@
 //! Front ends as rows: five of them, one slot, and nothing below them changes.
 
+use atomcode_harness::agent::OnlySession;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use atomcode_harness::profile::Profiles;
-use atomcode_harness::seams::{SessionSvc, ToolsSvc, UiSvc, UserQuestionsSvc};
+use atomcode_harness::seams::{ToolsSvc, UiSvc, UserQuestionsSvc};
 use atomcode_harness::{bundle, plugins};
 use atomcode_plexus::{App, ConfigTree};
 
@@ -159,7 +160,7 @@ async fn the_quiet_front_end_returns_without_doing_anything() {
         .await
         .expect("the embedder drives, so this is a no-op");
     assert!(
-        ctx.service::<SessionSvc>().unwrap().is_empty(),
+        ctx.only_session().is_none_or(|log| log.is_empty()),
         "it must not have started a turn behind the embedder's back"
     );
 }
@@ -176,7 +177,7 @@ async fn the_one_shot_front_end_runs_the_prompt_it_is_given() {
         .unwrap();
 
     let transcript = ctx
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .derive_messages()
         .iter()

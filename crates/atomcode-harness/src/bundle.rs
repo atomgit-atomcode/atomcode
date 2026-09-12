@@ -365,8 +365,7 @@ disabled = false
 /// guess. `--continue` resolves the most recent one and produces this.
 pub fn resume_overlay(id: &str) -> String {
     format!(
-        "[[patch]]\nid = \"session\"\nconfig = {{ id = {id:?} }}\n\n\
-         [[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ resume = true }}\n"
+        "[[patch]]\nid = \"session\"\nconfig = {{ id = {id:?}, resume = true }}\n"
     )
 }
 

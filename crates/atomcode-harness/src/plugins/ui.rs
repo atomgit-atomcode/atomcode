@@ -19,9 +19,8 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::agent::Agent;
-use crate::events::{AgentCreated, AgentInfo};
 use crate::seams::{
-    AgentLoopSvc, AgentsSvc, ControlSvc, SessionSvc, SessionTitleSvc, StopReason, UiSvc,
+    AgentLoopSvc, AgentsSvc, ControlSvc, SessionTitleSvc, StopReason, UiSvc,
     UserInterface, UserQuestions, UserQuestionsSvc,
 };
 
@@ -33,11 +32,11 @@ fn parse<T: for<'de> Deserialize<'de> + Default>(config: &Value) -> Result<T, St
 }
 
 /// Create an agent and announce it, so observers attach without being told.
-fn spawn_agent(ctx: &Context) -> Result<Arc<Agent>, String> {
+async fn spawn_agent(ctx: &Context) -> Result<Arc<Agent>, String> {
     let agents = ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
-    let agent = agents.create(ctx);
-    ctx.emit::<AgentCreated>(&AgentInfo { id: agent.id() });
-    Ok(agent)
+    agents
+        .create(ctx, crate::agent::CreateAgent::root(ctx))
+        .await
 }
 
 // ---- one-shot -----------------------------------------------------------
@@ -55,7 +54,7 @@ impl UserInterface for OneShot {
             return Err("this front end needs a prompt".into());
         };
         let driver = ctx.require::<AgentLoopSvc>().map_err(|e| e.to_string())?;
-        let agent = spawn_agent(ctx)?;
+        let agent = spawn_agent(ctx).await?;
         agent.send(prompt);
         let outcome = driver.drive(&agent).await;
         match outcome.error {
@@ -74,6 +73,10 @@ impl Plugin for OneShotUiPlugin {
     }
     fn inject(&self) -> &'static [&'static str] {
         &["agents", "agent-loop"]
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        // Its own agent's session comes from the `session` row.
+        &["session-defaults"]
     }
     fn provides(&self) -> &'static [&'static str] {
         &["ui"]
@@ -179,7 +182,7 @@ impl UserInterface for Repl {
 
     async fn run(&self, ctx: &Context, initial: Option<String>) -> Result<(), String> {
         let driver = ctx.require::<AgentLoopSvc>().map_err(|e| e.to_string())?;
-        let agent = spawn_agent(ctx)?;
+        let agent = spawn_agent(ctx).await?;
 
         if self.banner {
             eprintln!(
@@ -331,7 +334,7 @@ impl Repl {
             "/title" => {
                 let title = match (
                     ctx.service::<SessionTitleSvc>(),
-                    ctx.service::<SessionSvc>(),
+                    Some(agent.session()),
                 ) {
                     (Some(titler), Some(log)) => titler.title(&log).await,
                     _ => None,
@@ -432,7 +435,7 @@ impl Plugin for ReplUiPlugin {
         &["agents", "agent-loop"]
     }
     fn uses(&self) -> &'static [&'static str] {
-        &["ui", "sessions", "session-title", "control"]
+        &["ui", "session-title", "control", "session-defaults"]
     }
     fn provides(&self) -> &'static [&'static str] {
         // Only the front end. Asking is `user-questions-terminal`'s row — a

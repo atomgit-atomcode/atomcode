@@ -6,6 +6,7 @@
 //! when the row is, absent when it is not, and decided by the provider's own
 //! classification rather than by matching on message text.
 
+use atomcode_harness::agent::OnlySession;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use atomcode_harness::events::{AgentRequest, ModelRequest, ModelResponse, RequestError};
-use atomcode_harness::seams::{SessionSvc, StopReason};
+use atomcode_harness::seams::{StopReason};
 use atomcode_harness::session::SessionEvent;
 use atomcode_harness::{bundle, plugins, run_turn};
 use atomcode_plexus::{App, ConfigTree, Layer, Next, Waterfall};
@@ -171,7 +172,7 @@ async fn a_recovery_a_person_should_know_about_is_logged_not_printed() {
     let app = start(tree(&dir, &[fast])).await;
     run_with(&app, 2, rate_limited(Some(0))).await;
 
-    let log = app.context().service::<SessionSvc>().unwrap();
+    let log = app.context().only_session().unwrap();
     let notices: Vec<_> = log
         .events()
         .into_iter()
@@ -273,7 +274,7 @@ async fn an_overflow_compacts_and_retries_with_less_history() {
     // stopped seeing the earlier turns.
     let compactions = app
         .context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .events()
         .into_iter()
@@ -487,7 +488,7 @@ async fn a_truncated_answer_gets_a_resume_nudge_as_a_logged_fact() {
 
     let injected: Vec<String> = app
         .context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .events()
         .into_iter()
@@ -538,7 +539,7 @@ async fn a_call_cut_mid_arguments_is_refused_rather_than_run() {
     );
     let transcript = app
         .context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .derive_messages()
         .iter()
@@ -577,7 +578,7 @@ async fn a_complete_call_in_a_truncated_response_still_runs() {
     run_turn(&app, "go").await.unwrap();
     let transcript = app
         .context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .derive_messages()
         .iter()
@@ -616,7 +617,7 @@ async fn the_nudging_itself_is_bounded() {
     run_turn(&app, "go").await.unwrap();
     let nudges = app
         .context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .events()
         .into_iter()
@@ -679,7 +680,7 @@ async fn a_broken_stream_keeps_what_it_produced() {
 
     let transcript = app
         .context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .derive_messages()
         .iter()
@@ -741,7 +742,7 @@ async fn an_open_failure_has_nothing_to_preserve() {
     assert_eq!(run.stop, StopReason::Stopped, "the plain retry handles it");
     let injected = app
         .context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .events()
         .into_iter()

@@ -9,13 +9,14 @@
 //! the subagent code: a policy the parent runs under still governs the child,
 //! because realm visibility only runs one way.
 
+use atomcode_harness::agent::OnlySession;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use atomcode_harness::events::{ToolExec, ToolsExecute};
-use atomcode_harness::seams::{SessionSvc, StopReason, SubagentsSvc, ToolsSvc};
+use atomcode_harness::seams::{StopReason, SubagentsSvc, ToolsSvc};
 use atomcode_harness::{bundle, plugins, run_turn};
 use atomcode_kernel::tool::ToolResult;
 use atomcode_plexus::{App, ConfigTree, Layer, Next, Waterfall};
@@ -83,15 +84,19 @@ async fn start(tree: ConfigTree) -> App {
     app
 }
 
+/// The parent's conversation — empty when nothing ever spoke as the parent,
+/// which is what a child spawned directly, with no turn around it, sees.
 fn parent_transcript(app: &App) -> String {
     app.context()
-        .service::<SessionSvc>()
-        .unwrap()
-        .derive_messages()
-        .iter()
-        .map(|m| m.text.clone())
-        .collect::<Vec<_>>()
-        .join("\n")
+        .only_session()
+        .map(|log| {
+            log.derive_messages()
+                .iter()
+                .map(|m| m.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 #[tokio::test]
@@ -249,7 +254,7 @@ async fn the_childs_conversation_never_enters_the_parents_log() {
     let app = start(tree(&dir, &script, &[YOLO])).await;
     run_turn(&app, "delegate").await.unwrap();
 
-    let events = app.context().service::<SessionSvc>().unwrap().events();
+    let events = app.context().only_session().unwrap().events();
     let rendered = format!("{events:?}");
     assert!(
         !rendered.contains("child-only detail"),

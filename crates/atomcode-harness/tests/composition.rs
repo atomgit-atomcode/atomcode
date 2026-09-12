@@ -12,12 +12,13 @@
 //! so the read-only tests below deliberately open approval all the way and still
 //! expect the write to fail.
 
+use atomcode_harness::agent::OnlySession;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use atomcode_harness::profile::Profiles;
 use atomcode_harness::seams::{
-    FindingsSvc, SessionSvc, ShellSvc, SystemPromptSvc, ToolsSvc, UiSvc,
+    FindingsSvc, ShellSvc, SystemPromptSvc, ToolsSvc, UiSvc,
 };
 use atomcode_harness::{plugins, run_turn};
 use atomcode_plexus::{App, ConfigTree};
@@ -82,7 +83,7 @@ fn tools_of(app: &App) -> Vec<String> {
 
 fn transcript(app: &App) -> String {
     app.context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .derive_messages()
         .iter()

@@ -6,13 +6,14 @@
 //! for the one conversation it asked about, with approvals it can actually
 //! answer.
 
+use atomcode_harness::agent::OnlySession;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use atomcode_harness::plugins;
 use atomcode_harness::profile::Profiles;
-use atomcode_harness::seams::{AgentHandleSvc, SessionSvc};
+use atomcode_harness::seams::{AgentHandleSvc};
 use atomcode_kernel::agent::AgentHandle;
 use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
 use atomcode_plexus::{App, ConfigTree};
@@ -596,7 +597,7 @@ async fn a_synthetic_message_runs_a_turn_without_becoming_something_the_user_sai
     let events = drain_turn(&mut handle).await;
     assert_eq!(text_of(&events), "Continuing.", "it really ran a turn");
 
-    let log = app.context().service::<SessionSvc>().unwrap();
+    let log = app.context().only_session().unwrap();
     let logged = log.events();
     assert!(
         logged.iter().any(|e| matches!(

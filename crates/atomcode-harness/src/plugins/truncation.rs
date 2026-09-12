@@ -100,7 +100,7 @@ impl Waterfall<AgentRequest> for OnTruncation {
             .map(|call| !looks_complete(&call.arguments))
             .unwrap_or(false);
 
-        if let Some(session) = self.ctx.service::<SessionSvc>() {
+        if let Some(session) = crate::agent::scoped(&self.ctx).service::<SessionSvc>() {
             // Tell the driver as well as the model. The nudge is model-visible;
             // that the answer was cut off and is being resumed is something a
             // person watching the screen should also see.
@@ -230,9 +230,6 @@ pub struct TruncationPlugin;
 impl Plugin for TruncationPlugin {
     fn name(&self) -> &'static str {
         "truncation-recovery"
-    }
-    fn uses(&self) -> &'static [&'static str] {
-        &["sessions"]
     }
     fn description(&self) -> &'static str {
         "resume after an output-limit cut, and refuse a call whose arguments were cut"

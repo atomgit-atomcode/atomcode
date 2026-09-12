@@ -308,7 +308,7 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
         next: Next<'_, AgentRequest>,
     ) -> Result<ModelResponse, RequestError> {
         let (Some(session), Some(compaction)) = (
-            self.ctx.service::<SessionSvc>(),
+            crate::agent::scoped(&self.ctx).service::<SessionSvc>(),
             self.ctx.service::<CompactionSvc>(),
         ) else {
             return next.run(req).await;
@@ -362,9 +362,6 @@ pub struct CompactionPlugin;
 impl Plugin for CompactionPlugin {
     fn name(&self) -> &'static str {
         "compaction-tail"
-    }
-    fn inject(&self) -> &'static [&'static str] {
-        &["sessions"]
     }
     fn uses(&self) -> &'static [&'static str] {
         // It reads its own slot back through the context (so a later patch can
@@ -563,7 +560,7 @@ impl Waterfall<ToolsExecuteBatch> for RepeatFuse {
                 drop(state);
                 // Logged as a fact with provenance, like every other thing the
                 // harness tells the model on its own initiative.
-                if let Some(session) = self.ctx.service::<SessionSvc>() {
+                if let Some(session) = crate::agent::scoped(&self.ctx).service::<SessionSvc>() {
                     crate::session::commit(
                         &self.ctx,
                         &session,
@@ -601,9 +598,6 @@ impl Plugin for RepeatFusePlugin {
     }
     fn inject(&self) -> &'static [&'static str] {
         &["tools"]
-    }
-    fn uses(&self) -> &'static [&'static str] {
-        &["sessions"]
     }
     fn description(&self) -> &'static str {
         "nudge, then stop, when the same calls repeat regardless of what they return"

@@ -1,10 +1,11 @@
 //! The capability rows: each mounts real AtomCode capabilities, each is
 //! optional, and each takes its guidance with it when it leaves.
 
+use atomcode_harness::agent::OnlySession;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use atomcode_harness::seams::{SessionSvc, SkillsSvc, SystemPromptSvc, ToolsSvc};
+use atomcode_harness::seams::{SkillsSvc, SystemPromptSvc, ToolsSvc};
 use atomcode_harness::session::{InjectionOrigin, SessionEvent};
 use atomcode_harness::{bundle, plugins, run_turn};
 use atomcode_plexus::{App, ConfigTree, Layer};
@@ -89,7 +90,7 @@ async fn start(tree: ConfigTree) -> App {
 
 fn transcript(app: &App) -> String {
     app.context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .derive_messages()
         .iter()
@@ -207,7 +208,7 @@ async fn memory_is_injected_as_a_logged_fact_with_provenance() {
     let app = start(tree(&dir, STOP, &[])).await;
     run_turn(&app, "hello").await.unwrap();
 
-    let log = app.context().service::<SessionSvc>().unwrap();
+    let log = app.context().only_session().unwrap();
     let injected: Vec<_> = log
         .events()
         .into_iter()
@@ -241,7 +242,7 @@ async fn memory_is_injected_once_not_every_turn() {
 
     let count = app
         .context()
-        .service::<SessionSvc>()
+        .only_session()
         .unwrap()
         .events()
         .into_iter()

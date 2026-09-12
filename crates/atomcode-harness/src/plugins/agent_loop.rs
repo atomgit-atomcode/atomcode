@@ -32,7 +32,7 @@ use crate::events::{
     ToolsExecuteBatch, TurnEnd, TurnProgress, TurnStart, TurnStarted, TurnStopping,
 };
 use crate::seams::{
-    AgentLoop, AgentLoopSvc, LlmSvc, SessionProjectionsSvc, SessionSvc, StopReason,
+    AgentLoop, AgentLoopSvc, LlmSvc, SessionProjectionsSvc, StopReason,
     SystemPromptSvc, ToolsSvc, TurnOutcome,
 };
 use crate::session::{Committed, HeaderReason, InjectionOrigin, SeqNo, SessionEvent, SessionLog};
@@ -302,12 +302,18 @@ async fn stream_once(
 #[async_trait]
 impl AgentLoop for PluginAgentLoop {
     async fn drive(&self, agent: &Agent) -> TurnOutcome {
+        // The whole turn runs as this agent, so a listener registered at the
+        // top of the tree still resolves this agent's log and world.
+        crate::agent::as_agent(agent.ctx().clone(), self.drive_as(agent)).await
+    }
+}
+
+impl PluginAgentLoop {
+    async fn drive_as(&self, agent: &Agent) -> TurnOutcome {
         // The agent's own context, so anything scoped to this agent — an
         // overridden tool catalog, an agent-local policy — is what resolves.
         let ctx = agent.ctx().clone();
-        let Some(session) = ctx.service::<SessionSvc>() else {
-            return failed("no session log");
-        };
+        let session = agent.session();
         let Some(provider) = ctx.service::<LlmSvc>() else {
             return failed("no llm provider");
         };
@@ -649,7 +655,7 @@ impl Plugin for AgentLoopPlugin {
         // harness without them still runs, it just sends no system message and
         // folds no state. Injecting them would make optional contributors hard
         // dependencies.
-        &["llm", "tools", "sessions"]
+        &["llm", "tools"]
     }
     fn uses(&self) -> &'static [&'static str] {
         // Resolved per round, and the turn runs without them: no system message

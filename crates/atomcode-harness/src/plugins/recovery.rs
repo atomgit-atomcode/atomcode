@@ -80,7 +80,7 @@ fn default_fallback() -> u64 {
 /// meant to inform, and a state that only exists on stderr cannot be rendered
 /// by a panel, replayed on resume, or constructed in a test.
 fn notice(ctx: &Context, notice: crate::session::NoticeKind, detail: String) {
-    if let Some(session) = ctx.service::<SessionSvc>() {
+    if let Some(session) = crate::agent::scoped(ctx).service::<SessionSvc>() {
         crate::session::commit(
             ctx,
             &session,
@@ -219,7 +219,7 @@ impl Waterfall<AgentRequest> for OverflowLadder {
                 Ok(response) => return Ok(response),
                 Err(error) if error.context_overflow && attempt < self.max_attempts => {
                     let (Some(session), Some(compaction)) = (
-                        self.ctx.service::<SessionSvc>(),
+                        crate::agent::scoped(&self.ctx).service::<SessionSvc>(),
                         self.ctx.service::<CompactionSvc>(),
                     ) else {
                         // Nothing can shrink the history, so retrying would
@@ -276,9 +276,6 @@ pub struct OverflowPlugin;
 impl Plugin for OverflowPlugin {
     fn name(&self) -> &'static str {
         "compaction-overflow"
-    }
-    fn inject(&self) -> &'static [&'static str] {
-        &["sessions"]
     }
     fn uses(&self) -> &'static [&'static str] {
         &["compaction"]
@@ -499,7 +496,7 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                 if used > self.max_recoveries {
                     return Err(error);
                 }
-                let Some(session) = self.ctx.service::<SessionSvc>() else {
+                let Some(session) = crate::agent::scoped(&self.ctx).service::<SessionSvc>() else {
                     return Err(error);
                 };
 
@@ -565,9 +562,6 @@ pub struct StreamRecoveryPlugin;
 impl Plugin for StreamRecoveryPlugin {
     fn name(&self) -> &'static str {
         "llm-stream-recovery"
-    }
-    fn inject(&self) -> &'static [&'static str] {
-        &["sessions"]
     }
     fn description(&self) -> &'static str {
         "keep what a broken stream produced and continue from it"

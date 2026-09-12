@@ -115,14 +115,18 @@
 | ui · agent-handle · agent-loop | Seam | 前端、句柄源、回合驱动 |
 | findings · subagents | Seam | 结构化结论汇集、委派 |
 | tools · system-prompt · operations · skills · mcp · code-index | Core | 活的目录与注册表 |
-| sessions · session-projections | Core | 日志与增量投影 |
+| sessions · session-projections | Core | 日志与增量投影;`sessions` 由 `Agents::create` 填进每个 agent 的 realm,树根没有(0014) |
+| session-defaults | Core | `session` 行:前端自己那个 agent 的 id 与是否 resume |
 | agents · control | Core | agent 注册表、运行中重配 |
 
 **事件**:`tools/execute` 与 `agent/request` 是 waterfall,策略行(参数修复、审批、结果封顶、
 压缩、溢出重试、截断续写)是挂在上面的监听器,顺序由行序表达。
 
 **realm**:每个 agent 一个 realm,子 agent fork 自父;服务表与事件总线用同一个
-`visible_from`,子 agent 看不到父的服务,也画不到父的屏幕。
+`visible_from`,子 agent 看不到父的服务,也画不到父的屏幕。**agent 拥有自己的会话与
+世界**(0014):`Agents::create(ctx, CreateAgent)` 在发布前把日志、cwd 和 `setup` 装进
+realm;树级监听器通过任务局部的「当前 agent」(`agent::scoped`)解析日志,不再有全局
+的一份。session id 就是 agent 的身份,ACP 的 `session/new` 直接映射到它。
 
 **配置树**:四层叠加,内置 bundle → `$ATOMCODE_HOME/profiles/` → `harness.patch.toml`
 → 命令行 overlay。操作词汇 insert / patch / remove / disabled。`--dump-config` 与
@@ -278,6 +282,7 @@ tui 线永远对着 replay 模型与 Headless surface 开发;新命令只由 har
 | 0011 | (已取代)tui 是无头前端 |
 | 0012 | tui 替换 tuix |
 | 0013 | Agent / Product / Host / UI 四层、缺口清单、ACP |
+| 0014 | agent 拥有自己的会话与世界;`session` 行只给默认值 |
 
 相关文档:[`plexus-plugin-architecture.md`](./plexus-plugin-architecture.md)(底座与 spike 记录)、
 [`tui-composability.md`](./tui-composability.md)(TUI 的时间与空间可组合性)、

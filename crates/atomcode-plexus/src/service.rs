@@ -200,12 +200,18 @@ impl ServiceTable {
     /// Names of the slots a given fiber filled. The other half of the audit:
     /// a provider that never declared what it provides is as invisible to the
     /// capability map as one that declared and never delivered.
-    pub fn owned_by(&self, owner: FiberId) -> Vec<&'static str> {
+    /// The slots this fiber filled in one realm only.
+    ///
+    /// What the audit reads: a row's declared surface is what it provides to
+    /// the tree, and a service it mounts into a forked realm — an agent's own
+    /// log, a delegated child's tool set — is that agent's world, not the
+    /// row's.
+    pub fn owned_by_in(&self, owner: FiberId, realm: RealmId) -> Vec<&'static str> {
         let slots = self.slots.read().expect("service table poisoned");
         let mut names: Vec<&'static str> = slots
-            .values()
-            .filter(|slot| slot.owner == owner)
-            .map(|slot| slot.name)
+            .iter()
+            .filter(|((r, _), slot)| *r == realm && slot.owner == owner)
+            .map(|(_, slot)| slot.name)
             .collect();
         names.sort_unstable();
         names
