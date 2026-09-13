@@ -137,33 +137,46 @@ Answers}`、`agent::{Agent, AgentStatus}`、`profile::Profiles`、`launch::{valu
 
 1. `TUI2` overlay(surface 行、trace 静音、独立 asker 让位)是**宿主侧的树组装**,
    随 host 搬走;它现在住在 UI 二进制里,正是"UI 知道 Agent 细节"的一例。
-2. `UI_NAMES`(`bundle.rs:822`,今天 `["oneshot","repl","web","sdk","handle","quiet"]`)
-   补 `"tui"`;`--tui` 那条拒绝消失;`--ui tui` 成为运行它的方式。
-3. **`atui` 这个二进制要么消失,要么变成宿主侧的薄壳**。它**不能留在
-   `atomcode-tui`**——留在一个 UI crate 里就等于 UI 仍拥有入口,原则 1 没满足;而
-   它若改成宿主侧的壳,又必须**不依赖 `atomcode-tui`(UI 认 Host 就违反了 0013 的反向)**,
-   所以它只能依赖宿主库 + UI 的行。
+2. **`--tui` 从"被拒绝"变成"普通 flag"**(§5.2):今天 `launch.rs:120` 与
+   `atui.rs:150` 各有一份拒绝,都要删;`UI_NAMES`(`bundle.rs:822`)不必补 `"tui"`——
+   它是 flag,不是 `--ui` 的取值。
+3. **`atui` 这个二进制不再是入口。** 它**不能留在 `atomcode-tui`**——留在一个 UI
+   crate 里就等于 UI 仍拥有入口,原则 1 没满足;它也不能改成宿主侧的壳,因为那必须
+   **依赖 `atomcode-tui`** 去挂 `ui-tui2` 行,而 UI 认 Host 就违反 0013 的反向。
+   所以:入口收进 `atomcode --tui`,UI crate 只提供**行**(`ui-tui2` 与屏幕面板)。
 4. **依赖方向翻成该有的样子:Host → UI 的行;UI → 中立协议。** 今天靠
    `atomcode-tui/Cargo.toml:15` 依赖 `atomcode-harness`,而那正是因为 `Launch` 住在
    harness(§3(b))。host 搬走之后,这条反向依赖同时消失——**这一搬同时满足原则 1 与 2**。
 
-#### 5.2 需要人拍板的一处(UX)
+#### 5.2 入口形态由用户定:`atomcode --tui`(不是保留 `atui`)
 
-`atui` 是日常入口(本机就是 `./target/debug/atui --env-model …`)。收进 CLI 之后有两种:
+用户定:**以后的入口是 `atomcode --tui`**,`atui` 这个二进制不再作为入口。理由与原则 1
+同源——入口属于 host,而 `atui` 现在「成为 host」这件事本身就是**不对的**(§5 的那三
+条证据是症状,不是设计)。所以:
 
-- **保留二进制名 `atui`**,做成宿主 crate 里的薄壳(只解析屏幕相关的 flag + 挂
-  `ui-tui2` 行)——肌肉记忆不变;
-- **只留 `atomcode --ui tui`**,少一个二进制。
+- **`atui` 二进制消失**(或退化成内部测试用的壳,不再是面向人的入口);
+- `--tui` 在宿主里变成**换个 UI 行**的普通 flag,与 `--repl`/`--web`/`--sdk` 同级——
+  今天它在 `launch.rs:120` 是被**拒绝**的(`exit 2`),`atui.rs:150` 那份拒绝也随之删;
+- `--ui tui` 不再需要单独存在(它就是 `--tui`),`UI_NAMES` 里也不必露 `"tui"`——
+  它是 flag,不是 `--ui` 的取值;
+- 一条测试要**反向**:今天 `launch.rs` 的
+  `the_full_screen_front_end_is_not_a_row_here` 把 `--tui` 与 `--ui tui` 钉成 `exit 2`,
+  它守的是"UI 不能被宿主选"这个错状态。改造后它应该变成「`--tui` 挂上 `ui-tui2` 行」
+  的判据。
 
-本页按第一种记(改动最小、且不夺走既有入口),但这是**产品选择,不是架构必然**。
+我先前把这一条记成"保留二进制名的薄壳,标注为产品选择"——那是**回避决定**,不是记决定。
+用户的原话就是 `atomcode --tui`,照此记。
 
 #### 5.3 一个风险,记在案
 
 `atomcode-cli` 今天是**旧 tuix 栈的宿主**(`atomcode-cli/Cargo.toml:34` 依赖
 `atomcode-tuix`),且**不依赖** `atomcode-harness`/`atomcode-tui`。host 落进去意味着
 一个 crate 在迁移期同时托两个栈。备选是**新建 `atomcode-host` 库 crate**,让
-`atomcode`、`atomcode-daemon`、`atui` 壳三方共用——daemon 确实需要同一个宿主库。
-本页记用户的选择(CLI),把这个备选留在"权衡过"里。
+`atomcode`、`atomcode-daemon` 共用——daemon 确实需要同一个宿主库。本页记用户的选择
+(CLI),把这个备选留在"权衡过"里。
+
+注意 §5.2 的选择**加重了**这里:入口统一到 `atomcode` 之后,这个 crate 同时是
+「旧栈宿主 + 新栈宿主 + 唯一入口」,迁移期责任更集中。搬迁时这一条要重新评估一次。
 
 ## 权衡过、没做的
 
@@ -176,7 +189,7 @@ Answers}`、`agent::{Agent, AgentStatus}`、`profile::Profiles`、`launch::{valu
 - **新建 `atomcode-host` 库 crate 而不是落进 CLI**(§5.3):`atomcode` 今天同时是旧 tuix
   栈的宿主,一个 crate 托两个栈是迁移期风险;而 daemon 也需要同一个宿主库。不取的理由
   是用户的选择(入口属于 CLI),不是因为这条更好或更差——它值得在 §5.3 的搬迁里
-  重新评估一次。
+  重新评估一次(§5.2 把入口也统一过去之后,这条备选的吸引力比先前更大)。
 - **让 plexus 知道 host 的概念**(配置来源、进程环境):通用容器里塞宿主关注点,
   0013 的依赖方向反过来破。ADR 0017 已定「容器提供遍历、宿主注入展开器」。
 - **把入口收到单一二进制**(`atomcode --ui tui`):今天每个前端一个 `main`,是因为
@@ -201,9 +214,10 @@ Answers}`、`agent::{Agent, AgentStatus}`、`profile::Profiles`、`launch::{valu
 - **依赖方向(L1 做完后)**:`atomcode-tui` 的 `Cargo.toml` 除测试外不依赖 Agent
   **实现** crate——今天它依赖 `atomcode-harness`(§3(b))。这条可以用读 `Cargo.toml`
   的守卫钉住,形状同上面那条读源码的。
-- **入口唯一(§5 做完后)**:候选行里**不该再出现第二个 `main`**——
-  今天 `atui.rs` 与 `harness.rs` 各有一个。可执行的判定:`--ui tui` 与 `--ui oneshot`
-  都能被**同一个**宿主二进制接受(今天 `--ui tui` 报错,正是因为它不是行)。
+- **入口唯一(§5 做完后)**:面向人的入口只剩 `atomcode`——`atui.rs` 与 `harness.rs`
+  的 `main` 不再是入口。可执行的判定:`atomcode --tui` 与 `atomcode --repl` 都由
+  同一个二进制接受,且 `--tui` 挂的是 `ui-tui2` 行(今天两处都报 `exit 2`:
+  `launch.rs:120`、`atui.rs:150`)。
 
 ## 未做
 
