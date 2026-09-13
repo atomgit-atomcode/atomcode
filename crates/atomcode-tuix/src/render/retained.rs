@@ -3306,9 +3306,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // would eat the entire row, `truncate_path` replaces leading
         // segments with ".../" and keeps only the last segment.
         let model_str = if !status.model.is_empty() {
+            use std::fmt::Write;
             let mut s = scrub_controls(&status.model);
+            // Channel suffix (only set when the model name is ambiguous) goes
+            // between the name and the `[effort]` badge: `model (Channel) [max]`.
+            if let Some(ref channel) = status.model_channel {
+                let _ = write!(s, " ({})", scrub_controls(channel));
+            }
             if let Some(ref effort) = status.reasoning_effort {
-                use std::fmt::Write;
                 let _ = write!(s, " [{}]", effort);
             }
             s
@@ -12262,6 +12267,7 @@ mod tests {
     fn status_basic() -> StatusLine {
         StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/project/atomcode".into(),
             history: None,
             search: None,
@@ -12283,6 +12289,34 @@ mod tests {
             next_prompt_suggestion: None,
             round_cap_panel: None,
         }
+    }
+
+    #[test]
+    fn status_row_channel_suffix_sits_between_model_name_and_effort() {
+        let (r, _counter) = new_counting(80, 24);
+        let mut status = status_basic();
+        status.model_channel = Some("TaoToken".into());
+        status.reasoning_effort = Some("max".into());
+
+        let row = r.build_status_row(&status, 80, false);
+        let visible: String = row.iter().map(|cell| cell.ch).collect();
+        assert!(
+            visible.contains("glm-5 (TaoToken) [max]"),
+            "channel goes between the model name and the [effort] badge: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn status_row_omits_channel_suffix_when_unset() {
+        let (r, _counter) = new_counting(80, 24);
+        let mut status = status_basic();
+        status.reasoning_effort = Some("max".into());
+        // model_channel stays None (unique model name) — no parens shown.
+
+        let row = r.build_status_row(&status, 80, false);
+        let visible: String = row.iter().map(|cell| cell.ch).collect();
+        assert!(visible.contains("glm-5 [max]"), "{visible:?}");
+        assert!(!visible.contains('('), "no channel parens when unset: {visible:?}");
     }
 
     #[test]
@@ -12658,6 +12692,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12714,6 +12749,7 @@ mod tests {
         let shell_fg = role(r.caps, Role::Shell);
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12789,6 +12825,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12840,6 +12877,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12895,6 +12933,7 @@ mod tests {
         let plan_fg = role(r.caps, Role::Plan);
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12950,6 +12989,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12992,6 +13032,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -25979,6 +26020,7 @@ mod tests {
         // 3 options + 1 hint = approval_rows=4.
         let mut status = StatusLine {
             model: String::new(), // no status row (has_status=false → status_rows=0)
+            model_channel: None,
             cwd: String::new(),
             history: None,
             search: None,

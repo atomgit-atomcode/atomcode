@@ -926,6 +926,35 @@ impl Config {
         out
     }
 
+    /// Channel (account) label that disambiguates the active model in compact UI
+    /// like the TUI footer — returns `Some(label)` ONLY when the active model's
+    /// wire name collides with another configured model (the same rule the webui
+    /// model picker uses), and `None` when the name is unique so nothing is shown.
+    ///
+    /// The label is the owning account's `display_name`, falling back to the
+    /// account id — which for a legacy `[providers.*]` entry is the provider name
+    /// itself, so both schemas yield a sensible channel name. Returns `None` for
+    /// an unknown/empty selection.
+    pub fn disambiguating_channel_label(&self, selection: &str) -> Option<String> {
+        if selection.is_empty() {
+            return None;
+        }
+        let models = self.logical_models();
+        let active = models.get(selection)?;
+        // Only disambiguate when the wire model NAME is shared by 2+ configured
+        // models (i.e. the bare name alone can't tell the user which channel).
+        let shares_name = models.values().filter(|m| m.model == active.model).count() > 1;
+        if !shares_name {
+            return None;
+        }
+        let label = self
+            .logical_accounts()
+            .get(&active.account)
+            .and_then(|a| a.display_name.clone())
+            .unwrap_or_else(|| active.account.clone());
+        (!label.is_empty()).then_some(label)
+    }
+
     /// Diagnostics for exact id collisions between new-schema entries and
     /// legacy provider names (the new-schema entry wins). Visible, not silent.
     pub fn model_catalog_collisions(&self) -> Vec<String> {
@@ -4472,6 +4501,71 @@ context_window = 131072
         let toml = "default_model = \"acc/ds\"\n\n[provider_accounts.acc]\nprovider = \"deepseek\"\napi_key = \"sk-x\"\n\n[models.\"acc/ds\"]\naccount = \"acc\"\nmodel = \"deepseek-chat\"\ncontext_window = 200000\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.default_context_window(), 200000);
+    }
+
+    #[test]
+    fn disambiguating_channel_label_only_fires_on_a_shared_model_name() {
+        // Two accounts expose the SAME wire model name; a third is unique.
+        let toml = r#"
+default_model = "atomgit/ds"
+[provider_accounts.atomgit]
+provider = "openai"
+display_name = "AtomGit"
+[provider_accounts.taotoken]
+provider = "openai"
+[models."atomgit/ds"]
+account = "atomgit"
+model = "deepseek-v4-flash"
+[models."taotoken/ds"]
+account = "taotoken"
+model = "deepseek-v4-flash"
+[models."atomgit/glm"]
+account = "atomgit"
+model = "glm-5.1"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+
+        // Shared name → the owning account's display_name.
+        assert_eq!(
+            cfg.disambiguating_channel_label("atomgit/ds").as_deref(),
+            Some("AtomGit")
+        );
+        // Shared name, account WITHOUT display_name → fall back to the account id.
+        assert_eq!(
+            cfg.disambiguating_channel_label("taotoken/ds").as_deref(),
+            Some("taotoken")
+        );
+        // Unique wire name → no suffix.
+        assert_eq!(cfg.disambiguating_channel_label("atomgit/glm"), None);
+        // Unknown / empty selection → no suffix (never panics).
+        assert_eq!(cfg.disambiguating_channel_label("nope"), None);
+        assert_eq!(cfg.disambiguating_channel_label(""), None);
+    }
+
+    #[test]
+    fn disambiguating_channel_label_handles_legacy_providers() {
+        // Legacy `[providers.*]` with the same model name → the provider key is
+        // the channel label (there is no separate account for legacy entries).
+        let toml = r#"
+default_provider = "AtomGit"
+[providers.AtomGit]
+type = "openai"
+model = "deepseek-v4-flash"
+base_url = "https://a.invalid/v1"
+[providers.TaoToken]
+type = "openai"
+model = "deepseek-v4-flash"
+base_url = "https://b.invalid/v1"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.disambiguating_channel_label("AtomGit").as_deref(),
+            Some("AtomGit")
+        );
+        assert_eq!(
+            cfg.disambiguating_channel_label("TaoToken").as_deref(),
+            Some("TaoToken")
+        );
     }
 
     #[test]

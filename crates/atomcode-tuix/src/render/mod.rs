@@ -614,6 +614,12 @@ pub struct ModeBadge {
 #[derive(Debug, Clone, Default)]
 pub struct StatusLine {
     pub model: String,
+    /// Channel (provider account) label shown as `model (Channel)` — ONLY when
+    /// the bare model name is ambiguous across configured accounts (mirrors the
+    /// webui picker's disambiguation). `None` when the name is unique, so the
+    /// common single-channel case stays clean. See
+    /// `Config::disambiguating_channel_label`.
+    pub model_channel: Option<String>,
     pub cwd: String, // HOME replaced with "~"
     /// Messages submitted during the active turn but not yet accepted at a
     /// model/tool boundary. Rendered as a transient panel above the composer.

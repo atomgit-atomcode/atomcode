@@ -28863,6 +28863,15 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     } else {
         ctx.model_name.clone()
     };
+    // Channel (account) suffix, ONLY when the bare model name is ambiguous across
+    // configured accounts — so a multi-channel user can see which budget/channel
+    // is live (mirrors the webui picker's `model (Channel)` disambiguation).
+    let model_channel = if no_provider {
+        None
+    } else {
+        ctx.config
+            .disambiguating_channel_label(&ctx.provider_selection)
+    };
     // Mode badge (`ModeBadge`): a single left-aligned badge that covers all
     // non-default modes. The badge carries both its label and its colour slot
     // (`BadgeColour`), so the renderer just maps the slot to a `CellStyle`.
@@ -29064,6 +29073,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     };
     crate::render::StatusLine {
         model,
+        model_channel,
         cwd,
         pending_messages: state
             .pending_steers
