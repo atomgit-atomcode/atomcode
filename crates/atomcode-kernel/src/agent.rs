@@ -4941,7 +4941,7 @@ mod internal_continuation_compaction_tests {
         assert_eq!(calls.len(), 2, "the continuation must still run normally");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn later_summary_stage_is_not_blocked_by_an_earlier_noop_stage() {
         let provider = Arc::new(
             MockProvider::new(vec![

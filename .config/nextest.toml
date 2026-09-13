@@ -1,0 +1,42 @@
+# nextest 配置。
+#
+# 为什么要有这个文件:`cargo test` 一个 test binary 跑完才跑下一个,这个仓库
+# 光 atomcode-kernel 就有 28 个 integration test binary。实测 kernel 那 305 个
+# 测试 `cargo test` 要 570s(CPU 只用 1.3s,全在空等),nextest 跨 binary 进程级
+# 并行是 29.9s。
+#
+# 另一个副作用是正确性:仓库里 10+ 个测试文件用 set_var / set_current_dir,
+# 在 cargo test 的线程模型下它们共享同一个进程的环境变量,nextest 每个测试
+# 独立进程,反而更安全。
+#
+# 盲区:nextest 不跑 doctest。本仓库只有 12 个真 doctest(其余是
+# text/json/toml/ignore 标记),需要时 `cargo test --doc` 另跑。
+
+[profile.default]
+# 默认等于逻辑核数(这台机 8)。单个 test binary ~88MB,各自还带 tokio runtime,
+# 留出余量避免把 16GB 打穿。
+#
+# 注意:2026-09-13 `cargo nextest run --workspace` 曾在「枚举测试列表」阶段被
+# 系统 SIGKILL,当时磁盘 99% 满 + swap 耗尽。主因是构建把磁盘填满,不是并发度
+# 本身 —— 下面这个限流是保险,不是已证实的解药。磁盘余量才是硬前提。
+test-threads = 6
+
+# 超 30s 的测试标记为 slow;4 个周期(120s)还不结束就当挂死终止。
+# 已知慢测试:spike_claims 27s、liveness / failure_perception 各 6.6s ——
+# 这些是 tokio 真 sleep / retry 超时,kernel 已有 19 处用 start_paused 虚拟
+# 时钟,这几个没用上,改过去可降到毫秒级。
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# 失败输出即时打印 + 收尾再汇总一次,不用往上翻屏。
+failure-output = "immediate-final"
+
+# 收尾时连 slow 测试一起列出来,让 real-sleep 债务持续可见。
+final-status-level = "slow"
+
+[profile.ci]
+# CI 要看全貌,不要一红就停。
+fail-fast = false
+failure-output = "immediate-final"
+final-status-level = "slow"
+# 重试会掩盖 flaky,所以只给 1 次,且 CI 日志里会标出 TRY 次数。
+retries = 1

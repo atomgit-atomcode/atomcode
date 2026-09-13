@@ -27,6 +27,13 @@ panic = "abort"        # Remove panic unwinding code — saves ~200-500KB
 [profile.test]
 debug = "line-tables-only" # Smaller binaries, faster linker
 
+# 487 个依赖的完整 DWARF 是 target/ 体积与链接时间的大头,而开发时几乎不会
+# 单步进第三方库。只砍依赖的 debuginfo,workspace 内自己的 crate 不动
+# (profile.dev 默认 debug=2 照旧)。依赖里 panic 仍有符号名,只是没有行号。
+# `cargo test` 的依赖走 dev profile,所以这条对 test 路径同样生效。
+[profile.dev.package."*"]
+debug = 0
+
 [workspace.package]
 version = "5.0.9"
 edition = "2021"

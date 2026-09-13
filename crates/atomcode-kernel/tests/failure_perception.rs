@@ -565,7 +565,7 @@ async fn cancel_reason() {
 }
 
 // ── A stream timeout ends with StopReason::Timeout ───────────────────────────
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn timeout_reason() {
     let reg = ToolRegistry::new();
     let provider = Arc::new(atomcode_kernel::testkit::SilentStreamProvider::new(vec![

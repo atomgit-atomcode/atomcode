@@ -401,7 +401,7 @@ async fn tool_call_delta_only_stall_does_not_fire_a_bogus_recovery() {
 // times (with backoff), then clean-fails: on_error + Error (mentions timeout) +
 // TurnComplete — never looping forever, never a bogus success. Slower than (1a)
 // because it walks the full backoff ladder, so it gets a generous guard.
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn stream_timeout_exhausts_retries_then_fails() {
     let reg = ToolRegistry::new();
     let provider = Arc::new(StallThenProvider::new(100, vec![]));

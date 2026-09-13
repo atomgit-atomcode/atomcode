@@ -317,7 +317,7 @@ struct NoVerdictHook;
 #[async_trait]
 impl LifecycleHooks for NoVerdictHook {}
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn first_fallback_429_retries_silently_without_banner() {
     let provider = Arc::new(Once429Provider::new());
     let handle = spawn_agent(provider.clone(), Arc::new(NoVerdictHook));
@@ -439,7 +439,7 @@ impl LlmProvider for Twice429ThenOkProvider {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn second_fallback_429_surfaces_after_a_silent_first() {
     let provider = Arc::new(Twice429ThenOkProvider {
         calls: AtomicU32::new(0),

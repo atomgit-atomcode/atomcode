@@ -242,7 +242,7 @@ impl Tool for BlockForeverTool {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn tool_cancel_check_positive_and_negative() {
     // A cooperative tool that bails on cancel passes.
     let observed = Arc::new(AtomicBool::new(false));
@@ -318,7 +318,7 @@ impl ToolMiddleware for ParkAfterMiddleware {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn middleware_harness_catches_violations() {
     assert_check_failed(
         &conformance::middleware::check(Arc::new(ParkForeverMiddleware)).await,
@@ -465,7 +465,7 @@ impl LlmProvider for PanicOnOptionsProvider {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn provider_harness_catches_violations() {
     // Opens OK, then pends forever → the stream never terminates.
     assert_check_failed(

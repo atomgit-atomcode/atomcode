@@ -114,6 +114,18 @@ wire DTO 展开：
 ## 验证与交付
 
 - 修改过程中运行最小相关测试；一个逻辑单元完成后运行受影响 crate 的测试。
+
+### 测试与构建命令（2026-09-13 实测定标，勿凭直觉推翻）
+
+- 跑测试用 `cargo nextest run -p <crate>`，不用 `cargo test`。`cargo test` 一个 test binary 跑完才跑下一个，kernel 有 28 个 integration test binary：同一套 305 个测试，`cargo test` 要 570s（其中 CPU 只占 1.3s，其余全在空等），nextest 0.64s。配置在 `.config/nextest.toml`。
+- nextest 不跑 doctest。全仓只有 12 个真 doctest（其余是 `text`/`json`/`toml`/`ignore` 标记），需要时 `cargo test --doc` 另跑。
+- 新增 async 测试，只要被测路径上有超时、退避或重试（provider retry、rate limit、stream timeout、conformance check timeout），一律写 `#[tokio::test(flavor = "current_thread", start_paused = true)]`，让 `tokio::time::sleep` 走虚拟时钟。裸 `#[tokio::test]` 会真等墙钟时间——sleep 往往不在测试里而在被测的生产代码里（如 `agent.rs` 的重试退避），grep 测试文件是看不出来的。kernel 曾有 11 个这样的测试，最慢单个 27s，合计占整套 305 个测试时间的 97%。范式见 `crates/atomcode-kernel/tests/tool_batch.rs`。
+- 虚拟时钟不会让测试变空过：断言打在可观测结果上（重试是否耗尽、approval 问了几次），逻辑没跑到就会红。但 `start_paused` 要求 current_thread，改之前确认该测试不依赖真并行（无 `std::thread`、`spawn_blocking`、`block_on`）。
+- 按 crate 跑 `-p <crate>`，不要随手 `--workspace`。9 个 consumer 各开不同的 `atomcode-capabilities` feature 子集，resolver v2 刻意不跨 crate 统一 feature，于是这个 95k 行的库会被编 19 次（单份 28–138MB）；全量构建 91 个 test binary 一次吃掉 8.5GB 磁盘。2026-09-13 一次全量 nextest 把磁盘顶到 99%、swap 耗尽，test binary 被 SIGKILL，整个 66GB `target/` 随后消失。
+- 不要给 dev profile 加 `[profile.dev.build-override] opt-level = 3`。已做过 A/B，结论为负：冷 check capabilities 从 21.7s 变 42.0s（多烧 144s CPU 把 syn/serde_derive 编成 -O3），稳态 CPU 无差异（1.95s vs 2.00s）。全仓 derive 密度约每 280 行一个，这笔一次性成本摊不平。
+- `[profile.dev.package."*"] debug = 0` 只砍依赖的 debuginfo，workspace 内自己的 crate 保留（已验证：`tokio.o` 的 `__debug` 段数 0、`kernel.o` 5）。不要改成对整个 dev profile 生效，那会连自己代码的单步调试一起砍掉。
+- 已排除的加速手段，别重复试：换链接器（macOS 已是 Apple 新 ld，`rust-lld` 不支持 mach-o）、sccache（不同 feature 组合是不同缓存键，救不了 19 个变体，还要额外磁盘）、砍 test binary 的 debuginfo（`profile.test` 的 `line-tables-only` 早已生效，strip 一个 98MB 的 binary 只掉 10MB）。
+- `cargo check` 从来不是瓶颈：冷编译 capabilities 21.7s，稳态重编 2.5s。遇到"编译慢"先分清是 check 慢还是 test 慢，再分清是 CPU 饱和还是 I/O 等待（对比 `/usr/bin/time -p` 的 real 与 user+sys）。
 - 仅当变更跨 crate、公共协议、持久化格式、workspace 依赖或构建配置时，运行相关 workspace 检查。
 - `cargo test` 已完成相同编译验证时，不紧接着重复运行 `cargo check`；代码和环境未变化时不盲目重跑失败命令。
 - 纯文档、注释和格式修改可以不运行测试，但必须检查 diff 和文档内部一致性。
