@@ -3301,16 +3301,34 @@ mod tests {
             .iter()
             .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
             .expect("turn markdown");
+        // `.cas.jsonl` shares the `jsonl` extension, so match on the full name.
+        let name_ends = |path: &&std::path::PathBuf, suffix: &str| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(suffix))
+        };
         let jsonl = files
             .iter()
-            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+            .find(|p| name_ends(p, ".jsonl") && !name_ends(p, ".cas.jsonl"))
             .expect("per-round request jsonl");
+        let cas = files
+            .iter()
+            .find(|p| name_ends(p, ".cas.jsonl"))
+            .expect("content-addressed store");
         assert!(std::fs::read_to_string(markdown)
             .unwrap()
             .contains("**Response:**\nlooks good"));
         let request = std::fs::read_to_string(jsonl).unwrap();
         assert!(request.contains("\"model\":\"logged-model\""));
-        assert!(request.contains("record this turn"));
+        // v2 records reference message bodies by hash; the prompt text lives once
+        // in the cas store. Rehydrate to confirm the full request is recoverable.
+        let record: serde_json::Value =
+            serde_json::from_str(request.lines().next().unwrap()).unwrap();
+        let index = atomcode_capabilities::datalog::build_cas_index(
+            &std::fs::read_to_string(cas).unwrap(),
+        );
+        let full = atomcode_capabilities::datalog::rehydrate_record(&record, &index);
+        assert!(full["messages"].to_string().contains("record this turn"));
     }
 
     #[tokio::test]

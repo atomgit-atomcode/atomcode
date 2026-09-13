@@ -34,6 +34,110 @@ use atomcode_kernel::tool::{Tool, ToolCall, ToolDef, ToolResult};
 static HOOK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const IO_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// On-disk record format version written into every `.jsonl` line. `1` (or a
+/// missing field) is the legacy full-snapshot layout where each line embeds the
+/// entire `messages`/`tools` arrays; `2` is the content-addressed layout where a
+/// line carries `message_refs`/`tool_refs` — arrays of small per-turn integer
+/// blob ids — and the bodies live once in the sibling `<stem>.cas.jsonl`.
+/// Readers branch on this — see [`rehydrate_record`].
+const RECORD_FORMAT_VERSION: u32 = 2;
+
+/// Serialize each body and intern it against `seen` (content-addressed by the
+/// `sha256` of its bytes, kept only as a compact 32-byte map key). The first
+/// time a body is seen this turn it is assigned the next integer id from
+/// `next_id` and appended as one `<stem>.cas.jsonl` line
+/// (`{"i":<id>,"k":<kind>,"c":<body>}`); repeats reuse the existing id. Returns
+/// the ordered id list to store in the record — small integers, NOT 64-char
+/// hashes, so a record listing the whole growing history stays cheap. `kind`
+/// tags the blob (`"m"` message / `"t"` tool). An unserializable body yields
+/// `None` (a `null` ref) so the record stays positionally correct.
+///
+/// Best-effort note: an id is minted (and `seen` updated) when the cas line is
+/// queued, not when it lands. If that queued append later fails on the writer
+/// thread (disk full / EACCES), the body is lost for the rest of the turn and
+/// every record referencing that id rehydrates to `null` — this layer never
+/// changes a turn's behavior, so it does not retry.
+fn intern_bodies<T: serde::Serialize>(
+    seen: &mut HashMap<[u8; 32], u32>,
+    next_id: &mut u32,
+    kind: &str,
+    bodies: &[T],
+    cas_lines: &mut String,
+) -> Vec<Option<u32>> {
+    use sha2::{Digest, Sha256};
+    bodies
+        .iter()
+        .map(|body| {
+            let json = serde_json::to_string(body).ok()?;
+            let key: [u8; 32] = Sha256::digest(json.as_bytes()).into();
+            if let Some(id) = seen.get(&key) {
+                return Some(*id);
+            }
+            let id = *next_id;
+            *next_id = next_id.saturating_add(1);
+            seen.insert(key, id);
+            let _ = writeln!(cas_lines, "{{\"i\":{id},\"k\":\"{kind}\",\"c\":{json}}}");
+            Some(id)
+        })
+        .collect()
+}
+
+/// Parse a `<stem>.cas.jsonl` body into an `id → body` map. Blank or malformed
+/// lines are skipped — the store is a best-effort debug artifact.
+pub fn build_cas_index(cas_contents: &str) -> HashMap<u32, serde_json::Value> {
+    let mut index = HashMap::new();
+    for line in cas_contents.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let (Some(id), Some(body)) = (
+            value.get("i").and_then(|v| v.as_u64()),
+            value.get("c"),
+        ) {
+            index.insert(id as u32, body.clone());
+        }
+    }
+    index
+}
+
+/// Reconstruct a full request record from a `v:2` content-addressed `.jsonl`
+/// line: replace `message_refs`/`tool_refs` (arrays of integer blob ids) with
+/// the `messages`/`tools` arrays looked up in `index` (built via
+/// [`build_cas_index`] from the sibling cas file). A legacy v1 record — one that
+/// already embeds `messages` and has no `*_refs` — is returned unchanged. A ref
+/// that is `null` or has no matching blob rehydrates to `null`, preserving arity
+/// and order.
+pub fn rehydrate_record(
+    record: &serde_json::Value,
+    index: &HashMap<u32, serde_json::Value>,
+) -> serde_json::Value {
+    let mut out = record.clone();
+    let Some(object) = out.as_object_mut() else {
+        return out;
+    };
+    for (ref_key, body_key) in [("message_refs", "messages"), ("tool_refs", "tools")] {
+        let Some(refs) = object.get(ref_key).and_then(|v| v.as_array()).cloned() else {
+            continue;
+        };
+        let bodies: Vec<serde_json::Value> = refs
+            .iter()
+            .map(|reference| {
+                reference
+                    .as_u64()
+                    .and_then(|id| u32::try_from(id).ok())
+                    .and_then(|id| index.get(&id).cloned())
+                    .unwrap_or(serde_json::Value::Null)
+            })
+            .collect();
+        object.remove(ref_key);
+        object.insert(body_key.to_string(), serde_json::Value::Array(bodies));
+    }
+    out
+}
+
 /// Native-runtime datalog writer. All filesystem failures are deliberately ignored:
 /// observability must never change a turn's behavior or terminal.
 pub struct DatalogHook {
@@ -51,6 +155,18 @@ struct TurnLog {
     prompt: String,
     markdown_path: Option<PathBuf>,
     jsonl_path: Option<PathBuf>,
+    /// Sibling content-addressed store for this turn: `<stem>.cas.jsonl`. Each
+    /// unique message/tool body is appended once; `.jsonl` records reference them
+    /// by hash. Deleted alongside the `.jsonl`/`.md` by any retention sweep.
+    cas_path: Option<PathBuf>,
+    /// Interning table for `cas_path` this turn: `sha256(body) → integer blob id`.
+    /// The 32-byte key dedups (one write per unique body); the small id is what
+    /// records store, so listing the whole growing history stays cheap. Together
+    /// they turn the old O(n²) full-history rewrite into one write per unique body.
+    blob_ids: HashMap<[u8; 32], u32>,
+    /// Next integer blob id to hand out this turn (shared across message/tool
+    /// blobs so every id in `cas_path` is unique). Reset per turn.
+    next_blob_id: u32,
     initialization_attempted: bool,
     started: Option<Instant>,
     rounds: u32,
@@ -70,7 +186,7 @@ enum WriteOp {
         directory: PathBuf,
         filename_stem: String,
         markdown: String,
-        reply: tokio::sync::oneshot::Sender<Option<(PathBuf, PathBuf)>>,
+        reply: tokio::sync::oneshot::Sender<Option<(PathBuf, PathBuf, PathBuf)>>,
     },
     Append {
         path: PathBuf,
@@ -135,6 +251,9 @@ impl DatalogHook {
         state.prompt.push_str(prompt);
         state.markdown_path = None;
         state.jsonl_path = None;
+        state.cas_path = None;
+        state.blob_ids.clear();
+        state.next_blob_id = 0;
         state.initialization_attempted = false;
         state.started = Some(Instant::now());
         state.rounds = 0;
@@ -147,7 +266,10 @@ impl DatalogHook {
     async fn initialize_turn(&self, ctx: &TurnCtx) -> bool {
         let prompt = {
             let mut state = self.lock();
-            if state.markdown_path.is_some() && state.jsonl_path.is_some() {
+            if state.markdown_path.is_some()
+                && state.jsonl_path.is_some()
+                && state.cas_path.is_some()
+            {
                 return true;
             }
             if state.initialization_attempted {
@@ -187,7 +309,7 @@ impl DatalogHook {
         let _ = writeln!(markdown, "## User\n```\n{prompt}\n```\n");
         let _ = writeln!(markdown, "## Agent\n");
 
-        let Some((markdown_path, jsonl_path)) = self
+        let Some((markdown_path, jsonl_path, cas_path)) = self
             .writer
             .initialize(directory, filename_stem, markdown)
             .await
@@ -200,6 +322,7 @@ impl DatalogHook {
         }
         state.markdown_path = Some(markdown_path);
         state.jsonl_path = Some(jsonl_path);
+        state.cas_path = Some(cas_path);
         true
     }
 
@@ -237,7 +360,20 @@ impl LifecycleHooks for DatalogHook {
             .map(|message| u64::from(message.estimate_tokens()))
             .sum();
         state.rounds = state.rounds.max(ctx.round);
+        // Content-address the two arrays that dominate this record. Round N+1's
+        // history is round N's plus a few new messages, so nearly every hash is
+        // already interned — the body is written to `<stem>.cas.jsonl` once and the
+        // record only carries the (small) ordered hash list. This is what removes
+        // the old O(n²) full-history rewrite. An unserializable body degrades to an
+        // empty ref rather than aborting the record (rehydration tolerates it).
+        let mut cas_lines = String::new();
+        let log = &mut *state;
+        let message_refs =
+            intern_bodies(&mut log.blob_ids, &mut log.next_blob_id, "m", messages, &mut cas_lines);
+        let tool_refs =
+            intern_bodies(&mut log.blob_ids, &mut log.next_blob_id, "t", tools, &mut cas_lines);
         let record = serde_json::json!({
+            "v": RECORD_FORMAT_VERSION,
             "step": ctx.round,
             "session_id": ctx.session_id.as_deref().map(|id| id.as_ref()).unwrap_or(""),
             "turn_id": ctx.turn_id,
@@ -247,11 +383,19 @@ impl LifecycleHooks for DatalogHook {
             "message_count": messages.len(),
             "estimated_tokens": estimated_tokens,
             "tool_count": tools.len(),
-            "messages": messages,
-            "tools": tools,
+            "message_refs": message_refs,
+            "tool_refs": tool_refs,
             "options": options,
             "cache_epoch": ctx.cache_epoch,
         });
+        // Blobs before the record that references them: both go through the single
+        // writer thread, so appending the cas lines first keeps a reader from ever
+        // seeing a ref whose body has not landed yet.
+        if let Some(cas) = &state.cas_path {
+            if !cas_lines.is_empty() {
+                self.writer.append(cas.clone(), cas_lines);
+            }
+        }
         if let (Some(path), Ok(line)) = (&state.jsonl_path, serde_json::to_string(&record)) {
             self.writer.append(path.clone(), format!("{line}\n"));
         }
@@ -399,7 +543,7 @@ impl DatalogWriter {
         directory: PathBuf,
         filename_stem: String,
         markdown: String,
-    ) -> Option<(PathBuf, PathBuf)> {
+    ) -> Option<(PathBuf, PathBuf, PathBuf)> {
         let (reply, receive) = tokio::sync::oneshot::channel();
         self.tx
             .send(WriteOp::Initialize {
@@ -437,9 +581,10 @@ fn writer_loop(rx: mpsc::Receiver<WriteOp>) {
                 reply,
             } => {
                 let result = initialize_files(&directory, &filename_stem, markdown.as_bytes());
-                if let Err(Some((markdown_path, jsonl_path))) = reply.send(result) {
+                if let Err(Some((markdown_path, jsonl_path, cas_path))) = reply.send(result) {
                     let _ = fs::remove_file(markdown_path);
                     let _ = fs::remove_file(jsonl_path);
+                    let _ = fs::remove_file(cas_path);
                 }
             }
             WriteOp::Append { path, content } => {
@@ -458,7 +603,7 @@ fn initialize_files(
     directory: &Path,
     filename_stem: &str,
     markdown: &[u8],
-) -> Option<(PathBuf, PathBuf)> {
+) -> Option<(PathBuf, PathBuf, PathBuf)> {
     ensure_private_directory(directory).ok()?;
     for suffix in 0..1000 {
         let stem = if suffix == 0 {
@@ -468,6 +613,7 @@ fn initialize_files(
         };
         let markdown_path = directory.join(format!("{stem}.md"));
         let jsonl_path = directory.join(format!("{stem}.jsonl"));
+        let cas_path = directory.join(format!("{stem}.cas.jsonl"));
         let Ok(mut markdown_file) = create_private_file(&markdown_path) else {
             continue;
         };
@@ -475,10 +621,15 @@ fn initialize_files(
             let _ = fs::remove_file(&markdown_path);
             continue;
         }
-        match create_private_file(&jsonl_path) {
-            Ok(_) => return Some((markdown_path, jsonl_path)),
+        if create_private_file(&jsonl_path).is_err() {
+            let _ = fs::remove_file(&markdown_path);
+            continue;
+        }
+        match create_private_file(&cas_path) {
+            Ok(_) => return Some((markdown_path, jsonl_path, cas_path)),
             Err(_) => {
                 let _ = fs::remove_file(&markdown_path);
+                let _ = fs::remove_file(&jsonl_path);
             }
         }
     }
@@ -734,13 +885,17 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect();
-        let markdown_path = files
-            .iter()
-            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
-            .unwrap();
+        // `.cas.jsonl` also has extension `jsonl`, so match on the full name.
+        let name_ends = |path: &&PathBuf, suffix: &str| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(suffix))
+        };
+        let markdown_path = files.iter().find(|p| name_ends(p, ".md")).unwrap();
+        let cas_path = files.iter().find(|p| name_ends(p, ".cas.jsonl")).unwrap();
         let jsonl_path = files
             .iter()
-            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+            .find(|p| name_ends(p, ".jsonl") && !name_ends(p, ".cas.jsonl"))
             .unwrap();
         let markdown = fs::read_to_string(markdown_path).unwrap();
         assert!(markdown.contains("## User"));
@@ -751,7 +906,65 @@ mod tests {
         assert!(markdown.contains("**Error:** sample failure"));
         assert!(markdown.contains("**Stats:** 2 turns, 1 tool calls"));
         assert!(markdown.contains("reason=ProviderError"));
-        assert_eq!(fs::read_to_string(jsonl_path).unwrap().lines().count(), 2);
+
+        // Two rounds → two records, and each is the content-addressed v2 shape:
+        // refs in the record, no inline `messages`.
+        let jsonl = fs::read_to_string(jsonl_path).unwrap();
+        assert_eq!(jsonl.lines().count(), 2);
+        let record: serde_json::Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+        assert_eq!(record["v"], RECORD_FORMAT_VERSION);
+        assert!(record.get("messages").is_none());
+        assert_eq!(record["message_refs"].as_array().unwrap().len(), 1);
+
+        // Both rounds sent the SAME single message, so the cas holds exactly one
+        // blob — the write-amplification fix, proven directly.
+        let cas = fs::read_to_string(cas_path).unwrap();
+        assert_eq!(cas.lines().count(), 1);
+
+        // And a single record + its cas file fully reconstructs the request.
+        let full = rehydrate_record(&record, &build_cas_index(&cas));
+        assert!(full.get("message_refs").is_none());
+        assert!(full["messages"].to_string().contains("inspect this"));
+    }
+
+    #[test]
+    fn intern_dedupes_repeats_and_rehydrate_round_trips() {
+        // Round 1 sends [a]; round 2 sends [a, b]. `a` is interned once even though
+        // it is sent in both rounds — cas grows by the delta (b), not the full set.
+        let mut seen = HashMap::new();
+        let mut next_id = 0u32;
+        let mut cas = String::new();
+        let a = serde_json::json!({"role":"user","text":"a"});
+        let b = serde_json::json!({"role":"user","text":"b"});
+        let refs1 = intern_bodies(&mut seen, &mut next_id, "m", std::slice::from_ref(&a), &mut cas);
+        let refs2 = intern_bodies(&mut seen, &mut next_id, "m", &[a.clone(), b.clone()], &mut cas);
+        assert_eq!(refs2[0], refs1[0], "identical body → same blob id");
+        assert_eq!(cas.lines().count(), 2, "a interned once despite two sends");
+
+        let record = serde_json::json!({ "v": 2, "message_refs": refs2, "tool_refs": [] });
+        let full = rehydrate_record(&record, &build_cas_index(&cas));
+        assert_eq!(full["messages"][0], a);
+        assert_eq!(full["messages"][1], b);
+        assert_eq!(full["tools"], serde_json::json!([]));
+        assert!(full.get("message_refs").is_none());
+    }
+
+    #[test]
+    fn rehydrate_leaves_legacy_v1_record_untouched() {
+        // A pre-existing full-snapshot record has no `*_refs` — pass it through as-is.
+        let v1 = serde_json::json!({ "step": 1, "messages": [{"text":"x"}], "tools": [] });
+        assert_eq!(rehydrate_record(&v1, &HashMap::new()), v1);
+    }
+
+    #[test]
+    fn rehydrate_missing_blob_becomes_null_preserving_arity() {
+        let record = serde_json::json!({
+            "v": 2, "message_refs": [7, 9], "tool_refs": []
+        });
+        let full = rehydrate_record(&record, &HashMap::new());
+        assert_eq!(full["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(full["messages"][0], serde_json::Value::Null);
+        assert_eq!(full["messages"][1], serde_json::Value::Null);
     }
 
     #[tokio::test]
@@ -798,7 +1011,8 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect();
-        assert_eq!(files.len(), 4);
+        // Two hooks × three files each (`.md` + `.jsonl` + `.cas.jsonl`).
+        assert_eq!(files.len(), 6);
         assert!(files.iter().all(|path| {
             path.file_name()
                 .unwrap()
