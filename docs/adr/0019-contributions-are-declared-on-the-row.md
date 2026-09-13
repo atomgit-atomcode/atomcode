@@ -32,14 +32,20 @@
 参考实现(dsh,`~/project/deepseek-harness`)的做法是**命令式注册**:
 `packages/fs/tool-fs/src/read.ts:68` 的 `applyReadTool` 里
 `ctx.tools.register(defineTool({…}))` + `ctx.systemPrompt.section({…})`,和 atomcode 的
-`tools.register` + `contribute_prompt` **一模一样**。它那张图准,靠的不是声明贡献,而是:
+`tools.register` + `contribute_prompt` **一模一样**。它那张图准,靠的不是声明贡献,而是**静态发现 + 手写表 + 断言**:
 
 ```ts
 // scripts/gen-doc-graphs.ts:716
-assertServiceRolesComplete(services)   // 扫源码得到所有 ctx.<key>,断言都在手写表里分类过
+assertServiceRolesComplete(services)   // 断言每个发现的 ctx.<key> 都在手写表里分类过
 ```
 
-**扫源码发现 + 手写表分类 + 断言对齐**,表里的 providers/consumers 是**手写维护**的。
+注意 `services` **不是 grep 出来的**:它来自 `@deepseek-ai/dsh-typert-generator`
+(`packages/typert/generator/src/analyzer.ts` 用 `ts.createProgram` / `ts.SourceFile`,
+即 TypeScript **编译器 API + 类型检查器**)。这一点要紧——因为要拿到「贡献的**名字**」,
+必须做类型级连接:atomcode 的 `toolbox.register(Arc::new(ReadFileTool::with_world(…)))`
+里,名字在另一个文件的 `impl Tool::name()` 里,grep 拿不到。而 dsh 的
+`ctx.tools.register(defineTool({ name: 'read', … }))` 名字是内联字面量,好办。
+**语言差异决定了不能照抄这条路**,不是取舍。
 
 atomcode 已经有自己的等价物(声明 + 闸门),所以这条路不抄。要改的是**一个具体的缺口**:
 
@@ -51,7 +57,7 @@ atomcode 已经有自己的等价物(声明 + 闸门),所以这条路不抄。�
 |---|---|
 | `tools` 行建目录,十几个行往里 register | 每个贡献者声明 `provides = ["tools"]`(它已经在了),并在声明里带上**贡献的项名** |
 | `adjust_layout` 是 tui 行 `apply` 里的匿名值 | `tui-layout` 成为**它自己的行**(`provides = ["tools", "system-prompt"]`),`adjust_layout` 与 `tui-layout` 那段提示词由它贡献 |
-| 24 处 `contribute_prompt(ctx, "id", order, text)` | 行声明 `provides = ["system-prompt"]` + 贡献项名;顺序与文本仍在 `apply`(它们是数据,不是接线) |
+| `contribute_prompt(ctx, "id", order, text)` 的 ~24 处调用 | **不用改**:它们全部经由 `tools.rs:43` 这一个入口,由入口记录 |
 
 ### 2. `Plugin` 加一个「我贡献了哪些具名项」的声明
 
@@ -94,9 +100,43 @@ tools  — The live tool catalog            [Core]
 后半条是这条设计能否维系的唯一保证——否则又是一张靠人记的表(dsh 靠
 `assertServiceRolesComplete` 断言,这里是同一个位置)。
 
-可执行的做法:让 `tools::mount` / `contribute_prompt` 这两个**唯一的写入口**记录
-「谁写的、写了什么」(它们已经有 `ctx`),`--audit` 把它与 `contributes()` 对照。
-两个入口就是两个地方,不必给每个调用点加参数。
+可执行的做法:让**入口**记录「谁写的、写了什么」。两个入口已经在 `ctx` 里,而且本来
+就知道名字:
+
+```rust
+// plugins/tools.rs:28 —— 工具的唯一入口
+pub(super) fn mount(ctx: &Context, tools: Vec<Arc<dyn Tool>>) -> Result<(), String> {
+    for tool in tools {
+        let name = tool.name().to_string();     // ← 名字就在手边
+        toolbox.register(tool)?;
+        record(ctx.entry(), name);              // ← 新增:记在行上
+        …
+    }
+}
+// plugins/tools.rs:43 —— 提示词片段的唯一入口
+pub(super) fn contribute_prompt(ctx: &Context, id: &str, rank: i32, text: &str) {
+    prompts.contribute(id, rank, text);
+    record(ctx.entry(), id);                    // ← 新增
+    …
+}
+```
+
+`Context::entry()`(`plexus/src/context.rs:69`)返回行 id,所以这是**运行时事实**,
+不是静态推断。它比静态扫描更硬:守卫(`if let Some(tools) = …`)、`ctx.inject` 的延后
+贡献、realm 覆盖,**都自动是对的**——没真注册的行就没有记录。
+
+**落地清单(实测,不是估计):**
+
+| 类别 | 数量 | 位置 |
+|---|---|---|
+| 工具入口 | 1 | `tools.rs:28` `mount` |
+| 提示词入口 | 1 | `tools.rs:43` `contribute_prompt` |
+| **绕过入口的真贡献** | **4** | `self_knowledge.rs:367`、`recall.rs:326`、`capabilities.rs:307`、`tui/plugin.rs:1453` |
+| 第二个注册表(要加第三个入口) | 2 | `session.rs:146-147`(`SessionProjections`) |
+| **不是贡献,不用管** | — | `mod.rs:47-124`/`atui.rs:30-32` 是**插件目录**注册;`team.rs:525`/`subagent.rs:80` 是从父目录**复制**进受限盒子(`for name in &self.allowed_tools { … restricted.register(tool) }`) |
+
+所以工作量是「**收回 4 个绕过点 + 给 projections 加一个入口**」,不是先前说的
+「改 24 处」。
 
 ## 与 ADR 0018 的关系
 
@@ -112,9 +152,14 @@ tools  — The live tool catalog            [Core]
 
 - **容器收集贡献**(`ServiceKey` 加元素类型 + 折叠契约、`provide` 支持多值):
   **作废**。理由见 §5。
-- **扫源码发现贡献**(抄 dsh 的 `assertServiceRolesComplete`):Rust 没有反射,
-  `apply` 体里的 `register` 在编译期不可见——**做不到**。dsh 能做是因为 TS 的 AST 可扫。
-  这是语言差异,不是取舍。**这条正是本设计必须走「显式声明」的原因。**
+- **扫源码发现贡献**(抄 dsh 的静态发现 + `assertServiceRolesComplete`):dsh 用的是
+  TypeScript **编译器 API + 类型检查器**(`typert/generator/src/analyzer.ts`),不是 grep
+  ——因为要把 `register(X)` 连到 X 贡献的**名字**上。Rust 侧要么有等价的类型级分析
+  (得写 proc-macro 或 rust-analyzer 级工具),要么**根本不扫**:入口在运行时记录
+  (§4)已经给出更硬的事实。**所以不是"做不到",是"不需要"。**
+  若坚持静态:grep 有三个具体失败模式——(a) 算不出归属哪个行(一个文件常含多个插件:
+  `world_tools.rs` 两个、`tools.rs` 四个);(b) 算不出贡献的名字(`ReadFileTool::with_world`
+  的名字在另一个文件);(c) 不知道有没有真的注册(守卫 / `ctx.inject` 延后)。
 - **给每个贡献项各建一行**(`adjust_layout` 一行、每个 prompt 片段一行):最彻底,
   可单独 patch,但会导致 ~24 个行只为一段文本存在,`--dump-config` 噪音过大。取中道:
   **行为行,贡献项名在声明里列**。
