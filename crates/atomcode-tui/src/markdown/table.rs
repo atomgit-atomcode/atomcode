@@ -202,6 +202,10 @@ fn split_row(line: &str) -> Vec<String> {
                 current = String::new();
                 // A trailing delimiter ends the row; anything after it is not a
                 // cell.
+                #[allow(
+                    clippy::string_slice,
+                    reason = "`i` is an index from `line.char_indices()` above, so `i + 1` is the end of the one-byte `|` and both are char boundaries"
+                )]
                 if line[i + 1..].trim().is_empty() {
                     break;
                 }
@@ -593,6 +597,10 @@ mod tests {
 
     /// The cell at which `mark` starts — the thing that has to agree across rows.
     fn column_at(row: &str, mark: &str) -> usize {
+        #[allow(
+            clippy::string_slice,
+            reason = "`str::find` returns a byte offset that is always a char boundary"
+        )]
         width::str_width(&row[..row.find(mark).expect("mark not in row")])
     }
 
@@ -835,7 +843,13 @@ mod tests {
         let out = drawn(&rows, 40);
         // '说明' begins at the same cell index on the header row as 'cd' does on
         // the body row — the whole point of measuring in cells, not chars.
-        let col = |s: &str, mark: &str| width::str_width(&s[..s.find(mark).unwrap()]);
+        let col = |s: &str, mark: &str| {
+            #[allow(
+                clippy::string_slice,
+                reason = "`str::find` returns a byte offset that is always a char boundary"
+            )]
+            width::str_width(&s[..s.find(mark).unwrap()])
+        };
         assert_eq!(col(&out[0], "说明"), col(&out[2], "cd"));
     }
 
@@ -934,7 +948,13 @@ mod tests {
         let labels: Vec<usize> = out
             .iter()
             .filter(|l| l.contains('：'))
-            .map(|l| width::str_width(&l[..l.find('：').unwrap()]))
+            .map(|l| {
+                #[allow(
+                    clippy::string_slice,
+                    reason = "`str::find` returns a byte offset that is always a char boundary"
+                )]
+                width::str_width(&l[..l.find('：').unwrap()])
+            })
             .collect();
         assert_eq!(labels.len(), 2, "expected a record per row: {out:?}");
         assert_eq!(labels[0], labels[1], "labels are ragged: {out:?}");

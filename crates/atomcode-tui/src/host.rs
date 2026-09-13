@@ -177,6 +177,15 @@ impl Presentation {
 /// moves is still a selection, and ctrl-r still does them all at once.
 const CLICKABLE: [&str; 2] = ["tool_call", "reasoning"];
 
+/// Which foldable block, and what kind, owns a painted row.
+///
+/// `None` for a row that belongs to nobody — a blank, or a question not yet in
+/// the stream — and `Some` for one a click can fold. Named because the concrete
+/// type appears twice in one signature and once more as the accumulator beside
+/// it, and `Vec<Option<(BlockId, &'static str)>>` three times over is a type a
+/// reader has to re-derive each time instead of recognising.
+type RowOwner = Option<(BlockId, &'static str)>;
+
 /// Whether a blank row goes on the seam between two stacked blocks.
 ///
 /// `upper` is the block nearer the top of the screen, `lower` the one under it.
@@ -547,13 +556,13 @@ impl Host {
     /// Bottom-anchored: what a person is reading is the newest thing. Blocks
     /// are rendered newest-first until the rect is full, then reversed — so the
     /// cost is O(what fits), not O(the conversation).
-    fn stream_lines(&self, rect: Rect) -> (Vec<Line>, Vec<Option<(BlockId, &'static str)>>) {
+    fn stream_lines(&self, rect: Rect) -> (Vec<Line>, Vec<RowOwner>) {
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         let mut out: Vec<Line> = Vec::new();
         // Grown in lockstep with `out`, so a row and its owner cannot get out
         // of step — the alternative is two loops that agree until one changes.
-        let mut owner: Vec<Option<(BlockId, &'static str)>> = Vec::new();
+        let mut owner: Vec<RowOwner> = Vec::new();
         let want = rect.h as usize;
 
         // A question in flight sits at the foot of the stream. It is not in the
@@ -1128,7 +1137,10 @@ mod tests {
                 }),
             );
         }
-        drop(w);
+        // `drop(s)` is load-bearing and `drop(w)` was not: `RwLockWriteGuard` has
+        // a `Drop`, so its borrow of the stream lasts to the end of the scope and
+        // `h` could not be moved without it; `StreamWriter` has none, so its
+        // borrow already ended at its last use above.
         drop(s);
         (h, asked)
     }

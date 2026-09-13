@@ -39,7 +39,7 @@ const MAX_ROWS: usize = 10;
 
 /// How many rows of typed text fit in a rect this tall.
 fn typed_room(h: u16) -> usize {
-    (h as usize).saturating_sub(RULES).min(MAX_ROWS).max(1)
+    (h as usize).saturating_sub(RULES).clamp(1, MAX_ROWS)
 }
 
 /// The typed text as it is drawn, and where the caret lands in it.
@@ -449,6 +449,26 @@ mod tests {
         at_start.caret = 0;
         let out = draw(&state, &at_start, 40, n);
         assert!(out[1].contains("row 1"), "{out:?}");
+    }
+
+    #[test]
+    fn the_floor_of_the_field_is_one_row_however_short_the_rect_is() {
+        // The cap is pinned above (`capped, not unbounded`); the floor was not.
+        // It is the half that a height at or below the two rules runs into: the
+        // rules come off first, the subtraction saturates to zero, and a room of
+        // zero rows is a composer with nowhere to type — worse than a cramped
+        // one, because the caret has no cell to land on.
+        for h in 0..=(RULES as u16 + 1) {
+            assert_eq!(
+                typed_room(h),
+                1,
+                "at height {h} the field got {} rows",
+                typed_room(h)
+            );
+        }
+        // One row past the rules is already two, so the floor is a floor and not
+        // a thumb on the scale.
+        assert_eq!(typed_room(RULES as u16 + 2), 2);
     }
 
     #[test]

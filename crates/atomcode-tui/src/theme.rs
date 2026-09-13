@@ -286,7 +286,7 @@ fn lift(base: Rgb, bg: Rgb, need: f32) -> Rgb {
             }
             if ratio >= need {
                 // The smaller move keeps more of the original hue.
-                if winner.map_or(true, |(s, _)| step < s) {
+                if winner.is_none_or(|(s, _)| step < s) {
                     winner = Some((step, c));
                 }
                 break;
