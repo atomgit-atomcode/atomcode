@@ -64,9 +64,18 @@ step() {                       # step <name> <cmd...>
 
 [ "$BLESS" = 1 ] && export TUI_BLESS=1
 
-step "值类型与几何（单元）"        cargo test -q -p atomcode-tui --lib
-[ "$FAST" = 1 ] || step "集成与端到端"  cargo test -q -p atomcode-tui --tests
-[ "$FAST" = 1 ] || step "宿主 harness 未被弄坏" cargo test -q -p atomcode-harness
+# 测试用 nextest 跑，不用 `cargo test`：后者一个 test binary 跑完才跑下一个，
+# 而每步还包着 TUI_GATE_TIMEOUT（默认 300s）的硬超时 —— 串行跑法会把这道门
+# 推向超时，而超时在这里按失败处理。判据口径不变（2026-09-13 两边都是 397）。
+# 细节见 AGENTS.md「测试与构建命令」。
+if ! cargo nextest --version >/dev/null 2>&1; then
+  printf '\033[31m  FAIL\033[0m %s\n' "缺 cargo-nextest（见 https://nexte.st 安装）"
+  exit 1
+fi
+
+step "值类型与几何（单元）"        cargo nextest run -p atomcode-tui --lib
+[ "$FAST" = 1 ] || step "集成与端到端"  cargo nextest run -p atomcode-tui --tests
+[ "$FAST" = 1 ] || step "宿主 harness 未被弄坏" cargo nextest run -p atomcode-harness
 [ "$FAST" = 1 ] || step "启动器能构建"  cargo build -q -p atomcode-tui
 [ "$FAST" = 1 ] || step "启动器能审计（无 tty）" ./target/debug/atui --offline --audit
 [ "$FAST" = 1 ] || step "判据只能增不能减"     gates/tui-test-count.sh

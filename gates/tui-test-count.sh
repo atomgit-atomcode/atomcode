@@ -10,15 +10,26 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BASE=${TUI_TEST_BASELINE:-gates/tui-test-count.baseline}
-CMD=${TUI_TEST_CMD:-"cargo test -q -p atomcode-tui"}
+# 用 nextest 而不是 cargo test：`cargo test` 一个 test binary 跑完才跑下一个，
+# 在这个仓库里代价很大（见 AGENTS.md「测试与构建命令」）。计数口径已核对过：
+# 2026-09-13 两边都是 397（cargo test 的 365+0+32+0 == nextest 的 397 tests run）。
+# nextest 不跑 doctest，而 atomcode-tui 的 2 个 ``` 块都是 ignore/text，可跑 doctest
+# 为 0 —— 所以换 runner 不会让这个棘轮掉一个数。
+CMD=${TUI_TEST_CMD:-"cargo nextest run -p atomcode-tui"}
+
+if ! cargo nextest --version >/dev/null 2>&1; then
+  echo "  ✗ 需要 cargo-nextest（见 https://nexte.st 安装）"
+  exit 1
+fi
 
 out=$(eval "$CMD" 2>&1)
-if echo "$out" | grep -qE "^error|FAILED"; then
+# nextest 的失败面：编译期 `error...`、单测 `FAIL [`、汇总行 `N failed`。
+if echo "$out" | grep -qE "^error|FAIL \[|[1-9][0-9]* failed"; then
   echo "  ✗ 测试没跑通，数量无从谈起"
   echo "$out" | tail -5
   exit 1
 fi
-n=$(echo "$out" | grep -oE '^test result: ok\. [0-9]+' | grep -oE '[0-9]+' | paste -sd+ - | bc)
+n=$(echo "$out" | grep -oE '[0-9]+ tests run' | grep -oE '^[0-9]+' | head -1)
 n=${n:-0}
 
 base=""
