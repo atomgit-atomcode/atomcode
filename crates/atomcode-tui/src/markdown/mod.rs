@@ -364,7 +364,11 @@ fn style_with_italic(mut s: Style) -> Style {
 
 /// Wrap styled runs to `w`, keeping a prefix on the first line and an
 /// equivalent indent on the rest.
-fn wrap_spans(spans: &[Span], w: u16, prefix: &str, prefix_style: Style) -> Vec<Line> {
+///
+/// Shared with the blocks that wrap their own head rather than cut it — a tool
+/// call's expanded line shows the command whole, and this is the same wrapping
+/// the prose goes through.
+pub(crate) fn wrap_spans(spans: &[Span], w: u16, prefix: &str, prefix_style: Style) -> Vec<Line> {
     let indent = width::str_width(prefix);
     let body = (w as usize).saturating_sub(indent).max(1);
     let mut out: Vec<Line> = Vec::new();
@@ -372,45 +376,63 @@ fn wrap_spans(spans: &[Span], w: u16, prefix: &str, prefix_style: Style) -> Vec<
     let mut used = 0usize;
 
     for span in spans {
-        for word in span.text.split_inclusive(' ') {
-            let ww = width::str_width(word);
-            if used > 0 && used + ww > body {
+        // A newline in the source is a break in the output, not a byte of a
+        // word. A `Line` that keeps one is written by the terminal as extra rows
+        // the scroll is not counting, so everything under it is drawn on top of
+        // what it covered — which is what a command written over several rows
+        // (a heredoc) used to do to the transcript.
+        for (i, segment) in span.text.split('\n').enumerate() {
+            let segment = segment.strip_suffix('\r').unwrap_or(segment);
+            if i > 0 {
                 out.push(std::mem::replace(
                     &mut current,
                     Line::from_spans(vec![Span::styled(" ".repeat(indent), prefix_style)]),
                 ));
                 used = 0;
             }
-            if ww > body {
-                // A token longer than the line: hard-break it, never loop.
-                let mut rest = word;
-                while !rest.is_empty() {
-                    let room = body - used;
-                    let piece = width::take_width(rest, room);
-                    if piece.is_empty() {
-                        out.push(std::mem::replace(
-                            &mut current,
-                            Line::from_spans(vec![Span::styled(" ".repeat(indent), prefix_style)]),
-                        ));
-                        used = 0;
-                        if room == body {
-                            break; // cannot fit even on a fresh line
-                        }
-                        continue;
-                    }
-                    #[allow(
-                        clippy::string_slice,
-                        reason = "`piece` is a take_width prefix of `rest`, so its length is a boundary"
-                    )]
-                    {
-                        rest = &rest[piece.len()..];
-                    }
-                    used += width::str_width(&piece);
-                    current.push(Span::styled(piece, span.style));
+            for word in segment.split_inclusive(' ') {
+                let ww = width::str_width(word);
+                if used > 0 && used + ww > body {
+                    out.push(std::mem::replace(
+                        &mut current,
+                        Line::from_spans(vec![Span::styled(" ".repeat(indent), prefix_style)]),
+                    ));
+                    used = 0;
                 }
-            } else {
-                current.push(Span::styled(word.to_string(), span.style));
-                used += ww;
+                if ww > body {
+                    // A token longer than the line: hard-break it, never loop.
+                    let mut rest = word;
+                    while !rest.is_empty() {
+                        let room = body - used;
+                        let piece = width::take_width(rest, room);
+                        if piece.is_empty() {
+                            out.push(std::mem::replace(
+                                &mut current,
+                                Line::from_spans(vec![Span::styled(
+                                    " ".repeat(indent),
+                                    prefix_style,
+                                )]),
+                            ));
+                            used = 0;
+                            if room == body {
+                                break; // cannot fit even on a fresh line
+                            }
+                            continue;
+                        }
+                        #[allow(
+                            clippy::string_slice,
+                            reason = "`piece` is a take_width prefix of `rest`, so its length is a boundary"
+                        )]
+                        {
+                            rest = &rest[piece.len()..];
+                        }
+                        used += width::str_width(&piece);
+                        current.push(Span::styled(piece, span.style));
+                    }
+                } else {
+                    current.push(Span::styled(word.to_string(), span.style));
+                    used += ww;
+                }
             }
         }
     }

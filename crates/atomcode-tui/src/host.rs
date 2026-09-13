@@ -147,10 +147,15 @@ impl Presentation {
         self.by_block.clear();
     }
 
-    /// Fold or unfold one block. The pointing gesture.
-    pub fn toggle_block(&mut self, id: BlockId, kind: &str) {
-        let folded = self.is_block_folded(id, kind);
-        self.by_block.insert(id, !folded);
+    /// Say what a block is folded to, flatly.
+    ///
+    /// Flatly and not as a toggle, because a run of calls is set together: the
+    /// host asks what the run is and writes the same answer to every member, and
+    /// a per-block toggle would flip each one against its own state. The host is
+    /// the only thing that folds one block, because a click has to know what a
+    /// block's *run* is before it can mean anything — see `Host::toggle_block`.
+    pub fn set_block(&mut self, id: BlockId, folded: bool) {
+        self.by_block.insert(id, folded);
     }
 }
 
@@ -213,6 +218,178 @@ fn blank_between(upper: &str, lower: &str) -> bool {
         return true;
     }
     (upper == "tool_call") != (lower == "tool_call")
+}
+
+/// Whether a call may be shown behind the same lid as its neighbours.
+///
+/// A skill is out: it is drawn open (`always_open`), so it is not behind a lid
+/// of its own and cannot be behind somebody else's. A hidden block is out too,
+/// but it is *transparent* rather than a divider — see [`run_from`].
+fn behind_a_lid(block: &crate::block::Block) -> bool {
+    block.kind() == "tool_call" && !block.content.always_open()
+}
+
+/// Whether this slot is a call the screen actually draws, and so a member of a
+/// run.
+fn drawn_call(slots: &[crate::block::Slot], i: usize, pres: &Presentation) -> bool {
+    !pres.is_hidden(slots[i].block().kind()) && behind_a_lid(slots[i].block())
+}
+
+/// The run of drawn calls starting at `start`, and the slot the scan stopped on.
+///
+/// A hidden block is stepped over, not stopped at. A reader cannot see one — it
+/// draws no rows — so it is not a seam in what was done: two calls with a
+/// thought between them ran back to back, and the thought is not a reason to
+/// spend a second `●` on them. Counting a hidden slot as the end of a run put
+/// every call of a working session behind a lid of its own, because the model
+/// thinks between calls — four calls that ran back to back, drawn as four rows
+/// that each said `1`.
+fn run_from(
+    slots: &[crate::block::Slot],
+    start: usize,
+    pres: &Presentation,
+) -> (Vec<usize>, usize) {
+    let mut members = vec![start];
+    let mut j = start + 1;
+    while j < slots.len() {
+        if pres.is_hidden(slots[j].block().kind()) {
+            j += 1;
+            continue;
+        }
+        if !behind_a_lid(slots[j].block()) {
+            break;
+        }
+        members.push(j);
+        j += 1;
+    }
+    (members, j)
+}
+
+/// The run a slot's rows are drawn as, when they are drawn behind one lid.
+#[derive(Clone, Copy)]
+struct Run {
+    /// The slot the lid is drawn at: the run's last call. The painter walks the
+    /// stream backwards and so reaches it first, and the rows of the calls
+    /// before it are painted there.
+    last: usize,
+    /// How many calls are behind the lid. A count of *calls*, not the width of
+    /// the span: a hidden block inside a run takes a slot and is not one of
+    /// them, and `4 个工具` over three calls would be a lie about what ran.
+    count: usize,
+}
+
+/// Which slots a lid answers for.
+///
+/// A run of calls is one piece of work — four calls that each said nothing are
+/// four rows of noise, and the transcript is read for what was done, not for
+/// how many round trips it took. So a run of consecutive folded calls is drawn
+/// as one lid: how many there were, the last command, and its result.
+///
+/// Only *folded* runs merge. A call the reader has opened is the one thing they
+/// are looking at, and burying it back inside a lid would answer a click by
+/// taking the answer away. It also makes the merged form a pure consequence of
+/// the fold state: nothing else has to be kept in step.
+struct Lids {
+    /// Per slot: the run it belongs to, when it is in one that merges. One
+    /// vector rather than a map and a set, because this is asked once per slot
+    /// per frame and the runs *are* contiguous.
+    runs: Vec<Option<Run>>,
+}
+
+impl Lids {
+    /// The run drawn at this slot, when this slot is the last of a merged run.
+    ///
+    /// The last member, because the painter walks the stream backwards and so
+    /// reaches it first — the lid is drawn there and covers the rest.
+    fn at(&self, i: usize) -> Option<Run> {
+        self.runs.get(i).copied().flatten().filter(|r| r.last == i)
+    }
+
+    /// Whether this slot's rows were already painted by a lid.
+    fn covers(&self, i: usize) -> bool {
+        self.runs
+            .get(i)
+            .copied()
+            .flatten()
+            .is_some_and(|r| r.last != i)
+    }
+}
+
+fn lids(slots: &[crate::block::Slot], pres: &Presentation) -> Lids {
+    let mut runs: Vec<Option<Run>> = vec![None; slots.len()];
+    let mut i = 0usize;
+    while i < slots.len() {
+        if !drawn_call(slots, i, pres) {
+            i += 1;
+            continue;
+        }
+        let (members, next) = run_from(slots, i, pres);
+        let all_folded = members
+            .iter()
+            .all(|m| pres.is_block_folded(slots[*m].block().id, "tool_call"));
+        if members.len() > 1 && all_folded {
+            let run = Run {
+                last: *members.last().expect("a run has a first member"),
+                count: members.len(),
+            };
+            for m in members {
+                runs[m] = Some(run);
+            }
+        }
+        i = next;
+    }
+    Lids { runs }
+}
+
+/// The one lid a merged run is drawn as, from its last call.
+fn lid_lines(
+    slots: &[crate::block::Slot],
+    last: usize,
+    count: usize,
+    w: u16,
+) -> Vec<crate::frame::Line> {
+    match slots[last].block().content.as_tool_call() {
+        Some(call) => crate::content::ToolCallBlock::group_lines(call, count, w),
+        // Unreachable while `behind_a_lid` and `as_tool_call` agree; a row of
+        // nothing is what keeps a disagreement from taking the screen down.
+        None => Vec::new(),
+    }
+}
+
+/// The run of calls a block belongs to, itself included.
+///
+/// The same run `lids` would merge, asked from a block instead of from the
+/// stream: one call alone for anything that is not a call, so a click on prose
+/// or on a thought folds exactly what it landed on. Same membership rule — a
+/// hidden block is stepped over — because a lid that says `4 个工具` and then
+/// hands over three of them is a lie about what was behind it.
+fn run_around(
+    slots: &[crate::block::Slot],
+    pres: &Presentation,
+    id: crate::block::BlockId,
+) -> Vec<crate::block::BlockId> {
+    let Some(at) = slots.iter().position(|s| s.block().id == id) else {
+        return vec![id];
+    };
+    if !behind_a_lid(slots[at].block()) {
+        return vec![id];
+    }
+    // Back to the run's first call: over the members, and over the hidden slots
+    // between them, stopping at the first thing that is neither.
+    let mut start = at;
+    let mut j = at;
+    while j > 0 {
+        j -= 1;
+        if pres.is_hidden(slots[j].block().kind()) {
+            continue;
+        }
+        if !behind_a_lid(slots[j].block()) {
+            break;
+        }
+        start = j;
+    }
+    let (members, _) = run_from(slots, start, pres);
+    members.into_iter().map(|m| slots[m].block().id).collect()
 }
 
 /// Which block each row of the stream came from, and where the stream was.
@@ -416,7 +593,14 @@ impl Host {
         // a neighbour, whatever its kind says.
         let mut below: Option<&'static str> = None;
 
-        for slot in stream.slots().iter().rev() {
+        let lids = lids(stream.slots(), &pres);
+
+        for (i, slot) in stream.slots().iter().enumerate().rev() {
+            // The earlier calls of a merged run were drawn by the lid at the end
+            // of it, which this backwards walk reached first.
+            if lids.covers(i) {
+                continue;
+            }
             let block = slot.block();
             let kind = block.kind();
             // A kind the reader has taken off the screen draws nothing at all —
@@ -426,13 +610,20 @@ impl Host {
             if pres.is_hidden(kind) {
                 continue;
             }
+            let lid = lids.at(i);
             // Two different questions. Reasoning and tool calls both fold — that
             // is what ctrl-r and ctrl-t are — but what a click may fold is
             // narrower than what folds: prose is out, because it is what the
             // transcript is for and most of the screen is things the model said.
             let foldable = !block.content.always_open();
-            let clickable = foldable && CLICKABLE.contains(&kind);
-            let mut lines = if foldable && pres.is_block_folded(block.id, kind) {
+            let mut own = (foldable && CLICKABLE.contains(&kind)).then_some((block.id, kind));
+            let mut lines = if let Some(run) = lid {
+                // A run of folded calls behind one lid. Its rows are owned by
+                // the last call, so a click anywhere on the lid folds the run
+                // that drew it — which is the only thing that click could mean.
+                own = Some((block.id, kind));
+                lid_lines(stream.slots(), i, run.count, rect.w)
+            } else if foldable && pres.is_block_folded(block.id, kind) {
                 vec![block.content.summary(rect.w)]
             } else {
                 // The one place a block is rendered for the screen. Its row count
@@ -473,6 +664,23 @@ impl Host {
             if lines.is_empty() {
                 continue;
             }
+            // A lid's rows are a run's, not one block's, so `rows_at` cannot
+            // measure them and the same skip is decided here instead — same
+            // arithmetic, same reason.
+            if lid.is_some() {
+                let n = lines.len();
+                if out.len() >= want {
+                    break;
+                }
+                if n <= scroll.saturating_sub(skipped) {
+                    skipped += n;
+                    if below.is_some_and(|b| blank_between(kind, b)) {
+                        skipped += 1;
+                    }
+                    below = Some(kind);
+                    continue;
+                }
+            }
             let blank = below.is_some_and(|b| blank_between(kind, b));
             below = Some(kind);
             // The blank belongs to the seam between this block and the one
@@ -498,7 +706,7 @@ impl Host {
                     break;
                 }
                 out.push(line);
-                owner.push(clickable.then_some((block.id, kind)));
+                owner.push(own);
             }
             if out.len() >= want {
                 break;
@@ -690,17 +898,23 @@ impl Host {
         // Walking forwards, so the block seen last is the one *above* the
         // current one — `blank_between` takes (upper, lower).
         let mut above: Option<&'static str> = None;
-        for slot in stream.slots() {
+        let lids = lids(stream.slots(), &pres);
+        for (i, slot) in stream.slots().iter().enumerate() {
+            // A merged run is one row-block: its earlier members were drawn by
+            // the lid at the end of it, so they are not rows and not neighbours.
+            if lids.covers(i) {
+                continue;
+            }
             let b = slot.block();
             // What is not drawn is not a row of the transcript — and by the same
             // token it is not a neighbour, so the blanks around it stay put.
             if pres.is_hidden(b.kind()) {
                 continue;
             }
-            let n = if !b.content.always_open() && pres.is_block_folded(b.id, b.kind()) {
-                1
-            } else {
-                slot.rows_at(width).0
+            let n = match lids.at(i) {
+                Some(run) => lid_lines(stream.slots(), i, run.count, width).len(),
+                None if !b.content.always_open() && pres.is_block_folded(b.id, b.kind()) => 1,
+                None => slot.rows_at(width).0,
             };
             if n == 0 {
                 continue;
@@ -718,6 +932,36 @@ impl Host {
     /// can be folded.
     pub fn block_at(&self, x: u16, y: u16) -> Option<(BlockId, &'static str)> {
         self.hits.lock().expect("hits poisoned").at(x, y)
+    }
+
+    /// Fold or unfold what a click landed on.
+    ///
+    /// A run of calls is drawn as one lid, so a click on it opens the whole run:
+    /// a lid that says `4 个工具` and then hands over one of them would be a lie
+    /// about what was behind it. The run is found by the block clicked, not by
+    /// where the lid is drawn, so the same call answers the same way whether it
+    /// is behind a lid or open on its own.
+    ///
+    /// One state for the whole run, both ways: folding any call of an open run
+    /// puts the run away. Keeping them in step is what makes the merged form a
+    /// consequence of the fold state rather than a second thing to maintain.
+    pub fn toggle_block(&self, id: BlockId, kind: &str) {
+        let stream = self.stream.read().expect("stream poisoned");
+        let slots = stream.slots();
+        // Read first and let the guard go: the run is asked of the state a click
+        // was answered against, and the write below needs the lock to itself.
+        let run = {
+            let pres = self.presentation.read().expect("presentation poisoned");
+            run_around(slots, &pres, id)
+        };
+        let mut pres = self.presentation.write().expect("presentation poisoned");
+        // `is_block_folded` and not the raw choice: a call nobody has spoken
+        // about follows its kind, and every kind but reasoning defaults to
+        // folded.
+        let folded = pres.is_block_folded(id, kind);
+        for block in run {
+            pres.set_block(block, !folded);
+        }
     }
 
     /// Whether a point is on the "back to the bottom" badge.
@@ -964,7 +1208,11 @@ mod tests {
     #[test]
     fn a_frame_has_a_status_bar_a_conversation_and_a_prompt() {
         let h = fed();
-        let f = h.compose((80, 24));
+        // Tall enough for the whole conformance corpus: the point here is that
+        // the three regions coexist and the stream holds real content, and at a
+        // height the conversation does not fit, the oldest row — the user's own
+        // question — is correctly the first thing to go.
+        let f = h.compose((80, 40));
         assert!(f.part("status").is_some());
         assert!(f.part("stream").is_some());
         assert!(f.part("input").is_some());
@@ -1013,9 +1261,9 @@ mod tests {
 
     #[test]
     fn two_calls_in_a_row_stay_one_stretch_of_work() {
-        // The other half of the same decision: a run of tools is one thought,
-        // and a gap between each of them would be a screen that no longer shows
-        // in one glance what was done.
+        // The other half of the same decision: a run of tools is one thought, so
+        // nothing goes between them — not a blank row, and now not a row of their
+        // own each either. The run is drawn as one lid whose rows are adjacent.
         let h = fed();
         let rows: Vec<String> = h
             .compose((80, 40))
@@ -1025,35 +1273,127 @@ mod tests {
             .iter()
             .map(|l| l.plain())
             .collect();
-        let first = rows
+        let count = rows
             .iter()
-            .position(|r| r.contains("read_file(a.rs)"))
-            .expect("the first call");
-        let second = rows
-            .iter()
-            .position(|r| r.contains("read_file(b.rs)"))
-            .expect("the second call");
-        assert_eq!(
-            second,
-            first + 1,
-            "a run of tools was broken up: {:?}",
-            &rows[first..=second]
+            .position(|r| r.contains("2 个工具"))
+            .expect("the run's lid");
+        for row in &rows[count..count + 3] {
+            assert!(
+                !row.trim().is_empty(),
+                "a blank row was put inside the run: {:?}",
+                &rows[count..count + 3]
+            );
+        }
+        assert!(
+            rows[count + 1].contains("read_file(b.rs)"),
+            "the last call is not the row under the count: {:?}",
+            &rows[count..count + 3]
         );
     }
 
     #[test]
-    fn the_blanks_are_rows_the_scroll_can_reach() {
-        // A blank the painter drew and the height forgot is a row of the
-        // transcript that scrolling can never arrive at — the top of a long
-        // conversation would stop a few rows short.
+    fn a_run_of_folded_calls_is_one_lid_that_says_how_many() {
+        // 「合并工具块」. A run of calls is one piece of work, and four rows that
+        // each said nothing are four rows of noise. The lid says how many there
+        // were, and shows the *last* command and its result — the run ends with
+        // the thing that was being looked for.
         let h = fed();
-        let size = (80, 12);
-        let m = Moment::default();
-        let limit = h.scroll_limit(size, &m);
-        assert!(limit > 0, "the conversation does not fit in 12 rows");
-        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(limit);
         let rows: Vec<String> = h
+            .compose((80, 40))
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        let count = rows
+            .iter()
+            .position(|r| r.contains("2 个工具"))
+            .expect("the lid does not say how many calls there were");
+        assert!(
+            !rows.iter().any(|r| r.contains("read_file(a.rs)")),
+            "the first call is still on the screen, so nothing merged:\n{rows:#?}"
+        );
+        // The last call, on the rows under the count: the command, then what it
+        // returned — the same two rows a single folded call draws.
+        assert!(
+            rows[count + 1].contains("read_file(b.rs)"),
+            "the last command is not under the count: {:?}",
+            &rows[count..count + 3]
+        );
+        assert!(
+            rows[count + 2].contains("失败"),
+            "the last call's result is not under it: {:?}",
+            &rows[count..count + 3]
+        );
+    }
+
+    #[test]
+    fn clicking_the_lid_opens_every_call_in_the_run() {
+        // 「点击要全部展开…有多个也要展开」. One row stands for several calls, so
+        // the click has to hand back all of them — commands and outputs. Opening
+        // one of them would be a lid that answered a click by keeping the rest
+        // of what it was covering.
+        let h = fed();
+        let size = (80, 40);
+        let before = h.compose(size).rows().join("\n");
+        assert!(before.contains("2 个工具"), "nothing merged:\n{before}");
+
+        let rect = h.compose(size).part("stream").unwrap().rect;
+        // The count row is the lid's, and a click on it lands on the last call.
+        let (id, kind) = (rect.y..rect.bottom())
+            .filter_map(|y| h.block_at(2, y))
+            .next()
+            .expect("the lid answers a click");
+        h.toggle_block(id, kind);
+
+        let open = h
             .compose(size)
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect::<Vec<_>>();
+        let text = open.join("\n");
+        assert!(
+            !text.contains("2 个工具"),
+            "the lid is still drawn after the click:\n{text}"
+        );
+        // Every call of the run is open: its command on one row and its result on
+        // the next. A call left folded would have put the result on the command's
+        // own row — which is exactly the difference this click has to make, and
+        // the reason a weaker assertion here would pass while one of the two
+        // calls was still behind a lid.
+        for (name, result) in [
+            ("read_file(a.rs)", "fn main() {}"),
+            ("read_file(b.rs)", "no such file"),
+        ] {
+            let head = open
+                .iter()
+                .position(|r| r.contains(name))
+                .unwrap_or_else(|| panic!("{name} never appeared:\n{text}"));
+            assert!(
+                !open[head].contains(result),
+                "{name} is still a one-line lid: {:?}",
+                &open[head..head + 2]
+            );
+            assert!(
+                open[head + 1].contains(result),
+                "{name} did not open onto its result: {:?}",
+                &open[head..head + 2]
+            );
+        }
+    }
+
+    #[test]
+    fn only_consecutive_calls_share_a_lid() {
+        // The corpus has a second call after a notice and an injection. A lid
+        // that swallowed it would report `3 个工具` over three things that did not
+        // happen together.
+        let h = fed();
+        let rows: Vec<String> = h
+            .compose((80, 40))
             .part("stream")
             .expect("the conversation")
             .lines
@@ -1061,8 +1401,98 @@ mod tests {
             .map(|l| l.plain())
             .collect();
         assert!(
-            rows.iter().any(|r| r.contains("fix the build")),
-            "scrolled to the limit and the first thing said is not there: {rows:?}"
+            !rows.iter().any(|r| r.contains("3 个工具")),
+            "a lid swallowed a call from another run:\n{rows:#?}"
+        );
+        // The lone call is drawn as itself, with no count over it.
+        assert!(
+            rows.iter().any(|r| r.contains("看看那个目录")),
+            "the second turn's call is missing:\n{rows:#?}"
+        );
+    }
+
+    /// A thought between two calls does not end the run.
+    ///
+    /// The reader cannot see the thought: reasoning is hidden, so it draws no
+    /// rows and is not a seam in what was done. Treating it as one — which is
+    /// what the scan did, whatever its comment said — put *every* call of a
+    /// working session behind a lid of its own: the model thinks before each
+    /// call, so four calls that ran back to back were drawn as four rows that
+    /// each said `1`.
+    #[test]
+    fn a_hidden_thought_between_two_calls_does_not_break_the_run() {
+        let h = host();
+        let call = |round: u32, id: &str| SessionEvent::AssistantMessage {
+            turn: 1,
+            round,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"ls"}"#.into(),
+            }],
+        };
+        h.absorb(&call(1, "c1"));
+        h.absorb(&SessionEvent::ToolResultLogged {
+            turn: 1,
+            round: 1,
+            call_id: "c1".into(),
+            content: "a.rs".into(),
+            is_error: false,
+            images: Vec::new(),
+        });
+        // The working between the two calls, as it really arrives: a reasoning
+        // chunk, then the message that made the call.
+        h.absorb(&SessionEvent::AssistantChunk {
+            turn: 1,
+            round: 2,
+            delta: "hmm".into(),
+            reasoning: true,
+        });
+        h.absorb(&call(2, "c2"));
+        h.absorb(&SessionEvent::ToolResultLogged {
+            turn: 1,
+            round: 2,
+            call_id: "c2".into(),
+            content: "a.rs".into(),
+            is_error: false,
+            images: Vec::new(),
+        });
+
+        let rows: Vec<String> = h
+            .compose((80, 40))
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        // The premise, or the test guards nothing: the thought is on no row.
+        assert!(
+            !rows.iter().any(|r| r.contains("思考")),
+            "reasoning is on screen, so this is not the case under test:\n{rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("2 个工具")),
+            "the run was cut in two by a block nobody can see:\n{rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("1 个工具")),
+            "a lid over one call:\n{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_single_call_is_not_a_run_of_one() {
+        // A lid over one call would say `1 个工具` and then show the call — a row
+        // spent saying nothing. The count only exists where there is something
+        // to count.
+        let h = fed();
+        let rows = h.compose((80, 40)).rows().join("\n");
+        assert!(
+            !rows.contains("1 个工具"),
+            "a count over a single call:\n{rows}"
         );
     }
 
@@ -1133,6 +1563,31 @@ mod tests {
             rows[rule + 1].trim().is_empty(),
             "no blank between the rule and the next question: {:?}",
             &rows[rule..=rule + 2]
+        );
+    }
+
+    #[test]
+    fn the_blanks_are_rows_the_scroll_can_reach() {
+        // A blank the painter drew and the height forgot is a row of the
+        // transcript that scrolling can never arrive at — the top of a long
+        // conversation would stop a few rows short.
+        let h = fed();
+        let size = (80, 12);
+        let m = Moment::default();
+        let limit = h.scroll_limit(size, &m);
+        assert!(limit > 0, "the conversation does not fit in 12 rows");
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(limit);
+        let rows: Vec<String> = h
+            .compose(size)
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("fix the build")),
+            "scrolled to the limit and the first thing said is not there: {rows:?}"
         );
     }
 
@@ -1346,10 +1801,10 @@ mod tests {
             .find(|(_, kind)| *kind == "tool_call")
             .expect("a tool call on screen");
         let before = h.compose(size).rows().join("\n");
-        h.presentation.write().unwrap().toggle_block(id, kind);
+        h.toggle_block(id, kind);
         let folded = h.compose(size).rows().join("\n");
         assert_ne!(before, folded, "clicking a block changed nothing");
-        h.presentation.write().unwrap().toggle_block(id, kind);
+        h.toggle_block(id, kind);
         assert_eq!(h.compose(size).rows().join("\n"), before, "not an inverse");
     }
 
@@ -1430,14 +1885,14 @@ mod tests {
             .filter_map(|y| h.block_at(2, y))
             .find(|(_, kind)| *kind == "reasoning")
             .expect("the folded thought answers a click");
-        h.presentation.write().unwrap().toggle_block(id, kind);
+        h.toggle_block(id, kind);
         let open = h.compose(size).rows().join("\n");
         assert!(
             open.contains("hmm"),
             "the click showed the working:\n{open}"
         );
 
-        h.presentation.write().unwrap().toggle_block(id, kind);
+        h.toggle_block(id, kind);
         assert_eq!(
             h.compose(size).rows().join("\n"),
             folded,
@@ -1551,14 +2006,15 @@ mod tests {
     }
 
     #[test]
-    fn folding_one_block_leaves_its_siblings_alone() {
-        // The difference between the pointing gesture and the keyboard one. A
-        // click that folded every tool call would change six other things the
-        // person was looking at.
+    fn folding_one_block_moves_its_run_and_nothing_else() {
+        // The pointing gesture is still the narrow one: ctrl-t moves every tool
+        // call in the transcript, and a click must not. What it does move is the
+        // run the clicked call belongs to — a lid that says `2 个工具` and then
+        // hands over one of them is a lie about what was behind it.
         let h = fed();
         let size = (80, 40);
         let _ = h.compose(size);
-        let ids: Vec<_> = {
+        let calls: Vec<_> = {
             let stream = h.stream.read().unwrap();
             stream
                 .slots()
@@ -1567,19 +2023,35 @@ mod tests {
                 .filter(|(_, k)| *k == "tool_call")
                 .collect()
         };
-        assert!(ids.len() >= 2, "need two tool calls to tell them apart");
-        let pres = || {
+        // The corpus has two runs, separated by the notice and the injection
+        // between them, so the second is a different run from the first.
+        assert!(calls.len() >= 3, "need two separate runs");
+        let folded = |id| {
             h.presentation
                 .read()
                 .unwrap()
-                .is_block_folded(ids[1].0, ids[1].1)
+                .is_block_folded(id, "tool_call")
         };
-        let other = pres();
-        h.presentation
-            .write()
-            .unwrap()
-            .toggle_block(ids[0].0, ids[0].1);
-        assert_eq!(pres(), other, "the sibling moved too");
+        let untouched = calls.last().expect("a call in the second run").0;
+        let was = folded(untouched);
+
+        h.toggle_block(calls[0].0, "tool_call");
+
+        assert_eq!(
+            folded(calls[0].0),
+            !was,
+            "the call that was clicked did not move"
+        );
+        assert_eq!(
+            folded(calls[1].0),
+            !was,
+            "its run-mate stayed behind, so the lid would lie"
+        );
+        assert_eq!(
+            folded(untouched),
+            was,
+            "a call in another run moved too: that is the keyboard gesture"
+        );
     }
 
     #[test]

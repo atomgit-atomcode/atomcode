@@ -121,6 +121,17 @@ pub trait Content: Send + Sync + std::fmt::Debug {
     fn summary(&self, width: u16) -> Line {
         self.lines(width).into_iter().next().unwrap_or_default()
     }
+
+    /// This block as a tool call, when it is one.
+    ///
+    /// The screen draws a run of folded calls as a single lid — `● 4 个工具`
+    /// followed by the last command and its result — and drawing that is the
+    /// host's job, not the block's. So the host needs the call itself rather
+    /// than only its kind. A named accessor instead of a downcast: one case,
+    /// stated, and impossible to get wrong at the call site.
+    fn as_tool_call(&self) -> Option<&crate::content::ToolCallBlock> {
+        None
+    }
 }
 
 /// One entry in the stream.

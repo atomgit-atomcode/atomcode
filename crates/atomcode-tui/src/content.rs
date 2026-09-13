@@ -219,6 +219,60 @@ impl ToolCallBlock {
             outcome,
         }
     }
+
+    /// The opening line: whatever marks it, the tool, and the subject — whole.
+    ///
+    /// Whole rather than abbreviated, and wrapped rather than cut: expanding a
+    /// call is how a reader asks what actually ran, and a command ending in `…`
+    /// is not an answer to that question. `lead` is what marks the line, and its
+    /// width is the indent its continuations hang under.
+    fn head(&self, w: u16, lead: &str, lead_style: Style) -> Vec<Line> {
+        let look = look(&self.name);
+        let subject = subject_of(&self.name, &self.args);
+        let name = match look.verb {
+            Some(verb) => verb.to_string(),
+            None => self.name.clone(),
+        };
+        let mut spans = vec![Span::styled(name, tool())];
+        if !subject.is_empty() {
+            spans.push(Span::raw(format!("({subject})")));
+        }
+        crate::markdown::wrap_spans(&spans, w, lead, lead_style)
+    }
+
+    /// `⎿ what came back` — the line under the head.
+    fn note_line(&self, w: u16) -> Line {
+        let (note, note_style) = outcome_note(&self.outcome);
+        Line::from_spans(vec![
+            Span::styled(format!("  {} ", Caps::default().g(Glyph::Gutter)), muted()),
+            Span::styled(note, note_style),
+        ])
+        .truncate(w as usize)
+    }
+
+    /// A run of calls behind one lid.
+    ///
+    /// The count is the headline: a run of calls is one piece of work, and what
+    /// a reader wants from a folded transcript is how much of it there was —
+    /// four calls that all said nothing are four rows of noise. The *last*
+    /// command is the one shown, because a run ends with the thing that was
+    /// being looked for, and it is that command whose result is on the line
+    /// under it.
+    ///
+    /// Both of the last call's rows are its own, so the lid is the same two rows
+    /// a single folded call draws, with the count above them — folding a run
+    /// changes how many rows there are, not what the rows are.
+    pub fn group_lines(last: &ToolCallBlock, count: usize, w: u16) -> Vec<Line> {
+        let caps = Caps::default();
+        let mut out = vec![Line::from_spans(vec![
+            Span::styled(format!("{} ", caps.g(Glyph::ToolMark)), last.mark().1),
+            Span::styled(format!("{count} 个工具"), muted()),
+        ])
+        .truncate(w as usize)];
+        out.extend(last.head(w, &format!("  {} ", caps.g(Glyph::Gutter)), muted()));
+        out.push(last.note_line(w));
+        out
+    }
 }
 
 // ---- what kind of tool call this is -------------------------------------
@@ -315,6 +369,12 @@ pub fn look(tool: &str) -> Look {
 ///
 /// Falls back to the raw argument text so an unknown tool still says something
 /// — an empty subject reads as "nothing happened", which is worse than noisy.
+/// The thing a call acted on, whole.
+///
+/// Whole, not abbreviated: this is what the *expanded* form shows, and
+/// expanding a call is a request to see what actually ran. The folded summary
+/// abbreviates separately, against the width it has — see [`ToolCallBlock`]'s
+/// `summary`.
 pub fn subject_of(tool: &str, args: &str) -> String {
     let look = look(tool);
     let parsed: Option<serde_json::Value> = serde_json::from_str(args).ok();
@@ -327,17 +387,7 @@ pub fn subject_of(tool: &str, args: &str) -> String {
                 };
                 let text = text.trim();
                 if !text.is_empty() {
-                    // A path is recognisable by its tail; a command or a pattern
-                    // by its head. Trimming the wrong end of a long path leaves
-                    // the useless half. Measured in cells, not bytes: the same
-                    // number of bytes is fewer characters in Chinese, and a byte
-                    // offset that landed mid-character used to panic the whole
-                    // TUI.
-                    return if width::str_width(text) > 48 && text.contains('/') {
-                        format!("…{}", width::take_width_from_end(text, 43))
-                    } else {
-                        text.to_string()
-                    };
+                    return text.to_string();
                 }
             }
         }
@@ -345,7 +395,7 @@ pub fn subject_of(tool: &str, args: &str) -> String {
             return String::new();
         }
     }
-    let flat = args.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = flatten(args);
     flat.trim_matches(|c| c == '{' || c == '}').to_string()
 }
 
@@ -370,8 +420,17 @@ fn outcome_note(outcome: &Outcome) -> (String, Style) {
     }
 }
 
+/// `s` as one row.
+///
+/// A line is not a paragraph: whatever the source used newlines for, a row of
+/// the transcript is one row, and text that keeps them is written where the
+/// scroll is not counting.
+fn flatten(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn clip(s: &str, cells: usize) -> String {
-    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = flatten(s);
     if width::str_width(&flat) <= cells {
         return flat;
     }
@@ -404,36 +463,19 @@ impl Content for ToolCallBlock {
     /// first result line is metadata in muted grey — subordinate to both the
     /// assistant text above and the call header, which is what makes a screenful
     /// of tool calls skimmable.
+    ///
+    /// The head wraps instead of being cut. Expanding is how a reader asks to
+    /// see what actually ran, and a command that ends in `…` is not an answer
+    /// to that question — so the whole subject goes on the screen, over as many
+    /// rows as it takes, hanging under the marker.
     fn lines(&self, w: u16) -> Vec<Line> {
         if w == 0 {
             return Vec::new();
         }
         let caps = Caps::default();
-        let look = look(&self.name);
-        let subject = subject_of(&self.name, &self.args);
-        let name = match look.verb {
-            Some(verb) => verb.to_string(),
-            None => self.name.clone(),
-        };
-        let head = Line::from_spans(vec![
-            Span::styled(format!("{} ", caps.g(Glyph::ToolMark)), self.mark().1),
-            Span::styled(name, tool()),
-            Span::raw(if subject.is_empty() {
-                String::new()
-            } else {
-                format!("({subject})")
-            }),
-        ]);
-        let mut out = vec![head.truncate(w as usize)];
-
-        let (note, note_style) = outcome_note(&self.outcome);
-        out.push(
-            Line::from_spans(vec![
-                Span::styled(format!("  {} ", caps.g(Glyph::Gutter)), muted()),
-                Span::styled(note, note_style),
-            ])
-            .truncate(w as usize),
-        );
+        let lead = format!("{} ", caps.g(Glyph::ToolMark));
+        let mut out = self.head(w, &lead, self.mark().1);
+        out.push(self.note_line(w));
 
         let body = match &self.outcome {
             Outcome::Ok(s) | Outcome::Failed(s) => s.as_str(),
@@ -456,11 +498,50 @@ impl Content for ToolCallBlock {
     /// folded call said what was *asked* and nothing about what came back —
     /// exactly the half a reader already knows. This one names the tool, the
     /// thing it acted on, and what it returned.
+    ///
+    /// The subject is abbreviated to fit the room the rest of the line leaves,
+    /// rather than to a fixed budget and then cut again by the line's own
+    /// truncation: that cut landed on whatever happened to be last, which for a
+    /// long command was the result note — the folded line lost its ending while
+    /// keeping a command nobody could finish reading.
     fn summary(&self, w: u16) -> Line {
         let (_mark, style) = self.mark();
         let look = look(&self.name);
-        let subject = subject_of(&self.name, &self.args);
+        let name = match look.verb {
+            Some(verb) => verb.to_string(),
+            None => self.name.clone(),
+        };
         let (note, note_style) = outcome_note(&self.outcome);
+        // The note is capped to a share of the line. It is the secondary half —
+        // the reader is scanning for *what ran* — and an uncapped one-line
+        // result (clipped at sixty cells) could otherwise leave no room for the
+        // call it came from.
+        let note = if note.is_empty() {
+            note
+        } else {
+            clip(&note, (w as usize / 3).clamp(12, 48))
+        };
+        // One row by construction, so a command's own newlines have to go: a
+        // heredoc's body would otherwise be written as extra *physical* rows
+        // under a line the scroll counted as one — the terminal moves down, the
+        // accounting does not, and what the next block draws lands on top of it.
+        let full = flatten(&subject_of(&self.name, &self.args));
+        let has_subject = !full.is_empty();
+        // What is already spoken for: the mark and its space, the tool's name,
+        // the parentheses, and the ` · ` that introduces the note.
+        let fixed = 2
+            + width::str_width(&name)
+            + if has_subject { 2 } else { 0 }
+            + if note.is_empty() {
+                0
+            } else {
+                3 + width::str_width(&note)
+            };
+        let subject = if has_subject {
+            width::elide_middle(&full, (w as usize).saturating_sub(fixed))
+        } else {
+            String::new()
+        };
 
         let mut spans = vec![Span::styled(
             format!("{} ", Caps::default().g(Glyph::ToolMark)),
@@ -468,18 +549,18 @@ impl Content for ToolCallBlock {
         )];
         // `name(subject)` — the same shape as the expanded form, so folding
         // changes how much you see and not what you are looking at.
-        match look.verb {
-            // A verb replaces the tool name when the name is machinery rather
-            // than meaning: `$ cargo test` reads; `bash {"command":…}` does not.
-            Some(verb) => spans.push(Span::styled(verb.to_string(), tool())),
-            None => spans.push(Span::styled(self.name.clone(), tool())),
-        }
-        if !subject.is_empty() {
+        //
+        // A verb replaces the tool name when the name is machinery rather than
+        // meaning: `$ cargo test` reads; `bash {"command":…}` does not.
+        spans.push(Span::styled(name, tool()));
+        if has_subject {
             spans.push(Span::raw(format!("({subject})")));
         }
         if !note.is_empty() {
             spans.push(Span::styled(format!(" · {note}"), note_style));
         }
+        // Belt and braces at the widths where nothing fits: content must never
+        // draw wider than it was given.
         Line::from_spans(spans).truncate(w as usize)
     }
 
@@ -488,6 +569,11 @@ impl Content for ToolCallBlock {
     /// thing on the screen.
     fn always_open(&self) -> bool {
         look(&self.name).always_open
+    }
+
+    /// It is one, which is how the host gets at the call behind the lid.
+    fn as_tool_call(&self) -> Option<&ToolCallBlock> {
+        Some(self)
     }
 }
 
@@ -1300,42 +1386,174 @@ mod tests {
         // The command that killed the TUI four times: over 48 bytes, contains
         // '/', and `text.len() - 44` landed inside a Chinese character. The old
         // `&text[text.len() - 44..]` panicked here with "byte index 50 is not a
-        // char boundary" — `subject_of` is called while rendering, so the panic
+        // char boundary" — the abbreviation runs while rendering, so the panic
         // took the whole process down mid-turn.
+        //
+        // Asserted through `summary`, because that is where the cut now lives:
+        // `subject_of` returns the command whole and the folded line abbreviates
+        // it to the room it has.
         let command = "中文".repeat(15) + "/尾";
         assert!(
             !command.is_char_boundary(command.len() - 44),
             "the sample must reproduce the old panic, or it guards nothing"
         );
-        let subject = subject_of("bash", &format!(r#"{{"command":"{command}"}}"#));
-        let tail = subject.trim_start_matches('…');
+        let c = ToolCallBlock::pending("c", "bash", format!(r#"{{"command":"{command}"}}"#));
+        let line = c.summary(60).plain();
+        assert!(line.contains('…'), "{line:?} should be abbreviated");
+        // Reading the line back is what panicked before: a cut at a byte offset
+        // produced a string that could not be sliced again at all.
+        let _ = line.chars().count();
         assert!(
-            subject.starts_with('…'),
-            "{subject:?} should be abbreviated"
+            width::str_width(&line) <= 60,
+            "{line:?} is {} cells",
+            width::str_width(&line)
         );
+    }
+
+    #[test]
+    fn no_row_keeps_a_newline_from_the_command_it_shows() {
+        // A heredoc is one command written over several rows, and both forms of
+        // the call have to be made of rows. A `Line` that keeps a newline is
+        // written by the terminal as extra rows the scroll is not counting, so
+        // whatever the next block draws lands on top of it: the lid put
+        // `PY) · 34 行` on a row of its own, and the expanded head did the same
+        // with the whole body.
+        let command = "cd /tmp && python3 - <<'PY'\nimport json\nprint('hi')\nPY";
+        // The args as they really arrive: the newlines are in the *value*, which
+        // is what `subject_of` parses back out — a hand-written literal would be
+        // invalid JSON and take the fallback path instead.
+        let args = serde_json::json!({ "command": command }).to_string();
+        let c = ToolCallBlock::pending("c", "bash", &args);
+
+        let lid = c.summary(200).plain();
         assert!(
-            command.ends_with(tail),
-            "{tail:?} is not a suffix of the command"
+            !lid.contains('\n') && !lid.contains('\r'),
+            "the lid is more than one row: {lid:?}"
         );
-        // The budget is cells, so a Chinese path keeps as much as an ASCII one.
-        assert_eq!(width::str_width(&subject), 44, "{subject:?}");
+        // Still the command, still readable at both ends.
+        assert!(lid.starts_with("● $(cd /tmp"), "{lid:?}");
+        assert!(lid.ends_with("PY) · 运行中"), "{lid:?}");
+
+        // Expanded: over as many rows as it takes, and every one of them one row.
+        let rows = c.lines(200);
+        assert!(rows.len() > 1, "the command came out as one row: {rows:#?}");
+        for (i, line) in rows.iter().enumerate() {
+            let text = line.plain();
+            assert!(
+                !text.contains('\n') && !text.contains('\r'),
+                "row {i} of the expanded head carries a newline: {text:?}"
+            );
+        }
+        // The body is on those rows rather than lost with the newlines.
+        assert!(
+            rows.iter().any(|l| l.plain().contains("import json")),
+            "{rows:#?}"
+        );
     }
 
     #[test]
     fn an_abbreviation_says_as_much_about_a_chinese_path_as_an_ascii_one() {
-        // 44 *bytes* is 44 ASCII characters but only fourteen CJK ones, so the
-        // byte offset truncated Chinese paths harder for no reason: the same
-        // path on screen, described less. Both now spend the same 44-cell
-        // budget, to within the one cell a two-wide character cannot fill —
-        // half a character is not a thing you can print.
-        let ascii = subject_of("bash", &format!(r#"{{"command":"/x/{}"}}"#, "a".repeat(60)));
-        let cjk = subject_of(
+        // The budget is cells, not bytes: 44 *bytes* is 44 ASCII characters but
+        // only fourteen CJK ones, so a byte budget truncated Chinese commands
+        // harder for no reason — the same command on screen, described less.
+        // Both spend the same budget to within the one cell a two-wide
+        // character cannot fill — half a character is not a thing you can print.
+        let ascii = ToolCallBlock::pending(
+            "c",
             "bash",
-            &format!(r#"{{"command":"/x/{}"}}"#, "中".repeat(30)),
+            format!(r#"{{"command":"/x/{}"}}"#, "a".repeat(120)),
         );
-        for subject in [&ascii, &cjk] {
-            let cells = width::str_width(subject);
-            assert!((43..=44).contains(&cells), "{subject:?} is {cells} cells");
+        let cjk = ToolCallBlock::pending(
+            "c",
+            "bash",
+            format!(r#"{{"command":"/x/{}"}}"#, "中".repeat(60)),
+        );
+        let a = width::str_width(&ascii.summary(60).plain());
+        let c = width::str_width(&cjk.summary(60).plain());
+        assert!(
+            (a as i64 - c as i64).abs() <= 1,
+            "ascii {a} vs cjk {c} cells"
+        );
+        assert_eq!(a, 60, "the line does not use the width it was given");
+    }
+
+    #[test]
+    fn the_folded_line_keeps_both_ends_of_the_command_and_its_result() {
+        // 「摘要太短，看不清楚」. The folded line used to cut the subject to 44
+        // cells from the *end* — dropping `$ git log` and keeping a tail nobody
+        // can place — and the line's own truncation then ate the result note off
+        // the far end. A reader scanning for what ran got neither end.
+        let command = "git log --oneline --all --decorate --stat --author=lichao";
+        let mut c = ToolCallBlock::pending("c", "bash", format!(r#"{{"command":"{command}"}}"#));
+        c = c.with(Outcome::Ok("a\nb\nc".into()));
+        // Narrower than the command, so the line is forced to abbreviate.
+        let line = c.summary(48).plain();
+        assert!(line.contains('…'), "nothing was abbreviated: {line:?}");
+        assert!(
+            line.starts_with("● $(git log"),
+            "the head of the command is gone: {line:?}"
+        );
+        assert!(
+            line.contains("lichao"),
+            "the tail of the command is gone: {line:?}"
+        );
+        assert!(
+            line.ends_with("· 3 行"),
+            "the result was cut off the end: {line:?}"
+        );
+        assert!(
+            width::str_width(&line) <= 48,
+            "{line:?} is {} cells",
+            width::str_width(&line)
+        );
+    }
+
+    #[test]
+    fn expanding_a_call_shows_the_command_whole_rather_than_abbreviated() {
+        // 「点击展开时，命令同样展开全部」. The expanded head used to be the same
+        // 44-cell abbreviation as the folded line and was then truncated at the
+        // width, so clicking a call could reveal *less* of the command than the
+        // summary it replaced.
+        let command = "git log --oneline --all --decorate --stat --author=lichao";
+        let c = ToolCallBlock::pending("c", "bash", format!(r#"{{"command":"{command}"}}"#));
+        for w in [40u16, 72, 120] {
+            let head: String = c
+                .lines(w)
+                .iter()
+                .map(|l| l.plain())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let flat: String = head.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                flat.contains(command),
+                "at {w} the command is not whole:\n{head}"
+            );
+            assert!(
+                !head.contains('…'),
+                "at {w} the expanded head is still abbreviated:\n{head}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrapped_head_stays_inside_the_width_it_was_given() {
+        // The expanded head now runs over several rows. A hanging indent added
+        // after the wrap is exactly how a row ends up one cell too wide, which
+        // the containment check would then reject.
+        let c = ToolCallBlock::pending(
+            "c",
+            "bash",
+            format!(r#"{{"command":"{}"}}"#, "中".repeat(80)),
+        );
+        for w in 1u16..=40 {
+            for line in c.lines(w) {
+                assert!(
+                    width::str_width(&line.plain()) <= w as usize,
+                    "at {w}: {:?} is {} cells",
+                    line.plain(),
+                    width::str_width(&line.plain())
+                );
+            }
         }
     }
 }

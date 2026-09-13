@@ -808,11 +808,7 @@ impl Tui {
                 // it was, and what appears, appears *below* it.
                 let size = self.surface.size();
                 let before = self.host.stream_height(size.0);
-                self.host
-                    .presentation
-                    .write()
-                    .expect("presentation poisoned")
-                    .toggle_block(id, kind);
+                self.host.toggle_block(id, kind);
                 let grew = self.host.stream_height(size.0) as i64 - before as i64;
                 let mut m = self.host.moment.write().expect("moment poisoned");
                 let max = self.host.scroll_limit(size, &m) as i64;

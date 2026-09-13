@@ -69,6 +69,35 @@ pub fn take_width_from_end(s: &str, max: usize) -> String {
     out.concat()
 }
 
+/// Abbreviate `s` to `max` cells by dropping the middle: `head…tail`.
+///
+/// Both ends are kept, because of what is abbreviated here: a command is
+/// recognised by its head *and* its tail (`git log … --stat` says which command
+/// and which flag), and a path is recognised by its tail while its root says
+/// which tree. Keeping one end and cutting the other — what the call sites did
+/// before this — throws away half of what the reader was looking for.
+///
+/// The head gets the odd cell, since a command verb is a whole word at the
+/// front and a squeezed tail still names a file. Never splits a grapheme, and
+/// never returns more than `max` cells.
+pub fn elide_middle(s: &str, max: usize) -> String {
+    if str_width(s) <= max {
+        return s.to_string();
+    }
+    const ELLIPSIS: &str = "…";
+    let ell = str_width(ELLIPSIS);
+    if max <= ell {
+        return take_width(ELLIPSIS, max);
+    }
+    let keep = max - ell;
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let mut out = take_width(s, head);
+    out.push_str(ELLIPSIS);
+    out.push_str(&take_width_from_end(s, tail));
+    out
+}
+
 /// Break `s` into lines no wider than `max` cells.
 ///
 /// Wraps at word boundaries where one exists, and hard-breaks a word longer
@@ -234,5 +263,42 @@ mod tests {
     fn zero_width_is_empty_not_an_infinite_loop() {
         assert!(wrap("anything", 0).is_empty());
         assert_eq!(take_width("anything", 0), "");
+    }
+
+    #[test]
+    fn an_abbreviation_keeps_both_ends_of_what_it_cuts() {
+        let command = "git log --oneline --all --decorate --stat --author=lichao";
+        let short = elide_middle(command, 24);
+        assert_eq!(str_width(&short), 24, "{short:?}");
+        assert!(short.starts_with("git log "), "lost the verb: {short:?}");
+        assert!(short.ends_with("lichao"), "lost the flag: {short:?}");
+        assert_eq!(short.matches('…').count(), 1, "one mark: {short:?}");
+    }
+
+    #[test]
+    fn a_subject_that_fits_is_left_exactly_as_it_was() {
+        assert_eq!(elide_middle("a.rs", 10), "a.rs");
+        assert_eq!(elide_middle("a.rs", 4), "a.rs", "exactly width: no mark");
+    }
+
+    #[test]
+    fn an_abbreviation_never_exceeds_its_budget_or_halves_a_character() {
+        // The budget is in cells and the cut lands between graphemes, which is
+        // the same guarantee `take_width*` gives — this is the composed claim.
+        let command = "中文".repeat(20);
+        for max in 0..=40usize {
+            let out = elide_middle(&command, max);
+            assert!(
+                str_width(&out) <= max,
+                "at {max}: {out:?} is {} cells",
+                str_width(&out)
+            );
+            // Reading it back must not panic, which is what a byte cut did.
+            let _ = out.chars().count();
+        }
+        assert_eq!(elide_middle(&command, 0), "", "no room for the mark itself");
+        assert_eq!(elide_middle(&command, 1), "…", "the mark alone fits in one");
+        // A wide character is dropped rather than half-shown, as at both ends.
+        assert_eq!(str_width(&elide_middle(&command, 5)), 5);
     }
 }
