@@ -286,29 +286,29 @@ telemetry 各几条,都是 rust 1.94 新 lint 的既有问题,不在本次范围
     守卫已经在:`harness/tests/reasoning_effort.rs` 的 `only_one_module_reads_the_environment`
     与 `only_one_module_loads_the_model_config` 读源码,禁止 `env::var` / `Config::load`
     出现在 `model_source.rs` 之外。搬迁后这两条测试要跟着换目录。
-11. **行拿到的 config 应当是终态**(原则,尚未做到)。「各种形式的配置(文件、环境、默认)
-    应当在同一个地方合成一次,进到 `apply(ctx, config)` 里的就只剩一份真源」——行不该
-    再去够任何东西。今天没做到,两个具体缺口:
+11. **行拿到的 config 应当是终态** —— 形状已定成 ADR,见
+    [`adr/0017-config-is-assembled-at-fold-time.md`](adr/0017-config-is-assembled-at-fold-time.md)
+    (状态:提议)。一句话:**变量展开、配置文件读取、patch 合并都在折树时做完,`apply`
+    只读自己那份 config**。要点与今天的差距:
 
-    **(a) 配置树没有变量展开,所以 bundle 写不出「这台机器的 home」。** base bundle 的
-    `skills` 行是 `[[insert]] name = "skills"`,**没有 config**,于是 `row.home` 恒为 `None`,
-    `plugins/capabilities.rs:87` 的 `.or_else(|| user_home())` 是**常态路径**而不是兜底。
-    `$ATOMCODE_HOME` 这个事实在仓库里被读了**三次**,其中
-    `capabilities/skills/registry.rs:264` 在 **L1**(按 ADR 0013 不该读进程环境),
-    `skills/render.rs:98` 的注释自己承认这是个靠人记的约定(「the two must stay in step」)。
+    - 展开是**折树时的一趟遍历**(`ConfigTree::from_layers`),不是读点的逐字段行为。
+      它已是唯一漏斗(`Profiles::resolve` 与约 20 个手搓树的测试都走它),插在
+      `Profiles::resolve` 会漏掉后者,失败形态是**测试里的 `${HOME}` 成了字面量**。
+    - `${VAR}` / `${VAR:-默认}` 语法**已经存在**,而且**有两份实现**
+      (`config/provider.rs:332`、`capabilities/mcp/config.rs:524`)——收敛成一份。
+    - 未定义变量**启动即失败**(要兜底就写 `${VAR:-默认}`,与"我忘了设"可区分)。
+    - **敏感值是一个类型,不是一条例外通道**:`Secret` 的 `Serialize` 打码,于是
+      `--dump-config`、`control.rs::row_label`、日志这些路径**自动**安全——
+      打码做在类型上而不是打印点上,新加的打印点不会漏。我先前写的"密钥不能进树、
+      只能放变量名"是把它当例外,不如这个。
+    - plexus 只提供那一趟遍历,展开器由**宿主注入**:通用容器不该知道"进程环境"
+      是什么(0013)。
 
-    统一点是**「层变成树」的那一处**——`ConfigTree::from_layers`(`plexus/src/loader.rs:166`)
-    或其上的 `Profiles::resolve`(`harness/src/profile.rs:134`)。在那儿做一次
-    `${VAR}` 展开,bundle 才写得出 `home = "${HOME}"`,行才可能只读 config。
-    不是小改:展开点要么进 plexus(通用底座),要么进 profile;而**约 20 个测试文件手搓
-    配置树**(直接 `ConfigTree::from_layers`),绕开 `Profiles`,展开点选错就会出现
-    「测试里的 `${HOME}` 是字面量」。
-
-    **(b) 密钥是例外,而且要说明白为什么。** `api_key` 不能落进配置树——树会被
-    `--dump-config` 打印、会被写进日志。所以密钥这条只能是「config 里放**变量名**,
-    由一个解析器读」,这正是 `model_source::DEFAULT_API_KEY_ENV` 在做的事。也就是说
-    「唯一真源」对**非密钥的机器派生值**是「宿主合成进行 config」,对**密钥**是
-    「名字进 config,读的人只有一个」。两条都满足原则的实质(只有一个真源),形式不同。
+    完成后 0013 的边界才立住:capabilities(L1)**不再读进程环境**——
+    `runtime_skill_dirs` 收 `atomcode_home` 参数,`registry.rs:264` 与
+    `render.rs:98` 那两个读者消失;skills 行才能从"无 config + `row.home` 兜底"
+    变成 `config = { home = "${HOME}" }`,那个 `.or_else(user_home)`
+    (`plugins/capabilities.rs:90`)才删得掉。
 
 ## 踩过的坑
 
