@@ -36,22 +36,26 @@ use std::time::Duration;
 /// App-attribution headers sent to OpenRouter so real user traffic is credited
 /// to a public "AtomCode" app entry on openrouter.ai (rankings / app page).
 ///
-/// Per OpenRouter's app-attribution contract:
-///   - `HTTP-Referer` is the app's STABLE identifier (primary domain) — it alone
-///     creates the app page;
-///   - `X-OpenRouter-Title` is the display name on the rankings;
-///   - `X-OpenRouter-Categories` places the app in the marketplace categories.
+/// Per OpenRouter's documented app-attribution contract these are the ONLY two
+/// header names it reads (https://openrouter.ai/docs/api-reference/overview):
+///   - `HTTP-Referer` is the app's STABLE identifier (primary URL) — it creates
+///     the app page and is how the request is matched to a listed app;
+///   - `X-Title` is the display name on the rankings / app leaderboard.
 ///
-/// These are sent ONLY when the request actually targets `openrouter.ai` (see
+/// These two together are what identify the request as coming from a recognized
+/// agentic harness. Free models gated to "agentic harnesses" 403 without them —
+/// earlier we sent `X-OpenRouter-Title` / `X-OpenRouter-Categories`, header names
+/// OpenRouter does NOT read, so the app was never recognized and the gate failed.
+///
+/// Sent ONLY when the request actually targets `openrouter.ai` (see
 /// [`is_openrouter_url`]) so other OpenAI-compatible endpoints — including
 /// AtomGit's own signing gateway — never receive them.
-pub const OPENROUTER_ATTRIBUTION_HEADERS: &[(&str, &str); 3] = &[
+pub const OPENROUTER_ATTRIBUTION_HEADERS: &[(&str, &str); 2] = &[
     (
         "HTTP-Referer",
         "https://gitcode.com/atomgit_atomcode/atomcode",
     ),
-    ("X-OpenRouter-Title", "AtomCode"),
-    ("X-OpenRouter-Categories", "cli-agent"),
+    ("X-Title", "AtomCode"),
 ];
 
 /// True when `url` targets the OpenRouter API (any path under the `openrouter.ai`
@@ -4137,7 +4141,7 @@ mod tests {
     fn apply_openrouter_attribution_only_targets_openrouter() {
         let client = reqwest::Client::new();
 
-        // OpenRouter endpoint → all three attribution headers present.
+        // OpenRouter endpoint → the attribution headers present.
         let req = client
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header(reqwest::header::CONTENT_TYPE, "application/json");
@@ -4152,6 +4156,19 @@ mod tests {
                 "{name} must be set on openrouter.ai"
             );
         }
+        // Pin OpenRouter's exact documented header names — these are what identify
+        // the app and unlock "agentic harness" free models. A rename here (e.g. the
+        // old `X-OpenRouter-Title`) silently reintroduces the 403 gate, so assert
+        // the wire names directly rather than only looping the constant.
+        assert_eq!(
+            built.headers().get("X-Title").and_then(|v| v.to_str().ok()),
+            Some("AtomCode"),
+            "OpenRouter reads `X-Title` (not `X-OpenRouter-Title`) for the app name"
+        );
+        assert!(
+            built.headers().contains_key("HTTP-Referer"),
+            "OpenRouter reads `HTTP-Referer` to match the listed app"
+        );
 
         // Non-OpenRouter endpoint → NONE of the attribution headers leak.
         let req = client
