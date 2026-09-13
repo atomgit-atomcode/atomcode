@@ -287,6 +287,114 @@ impl Rows {
     }
 }
 
+/// A frame's screen contents, kept so the next frame can skip the rows that
+/// did not move.
+///
+/// [`Rows`] is what a frame encodes to; this is what a frame *is*, plus that
+/// encoding, so two frames can be compared row by row before either is turned
+/// into bytes. That order is the point: the expensive half of painting is
+/// [`write_line`] — it escapes, clips and allocates per span — and a diff that
+/// runs *after* encoding has already paid for every row it is about to skip.
+/// An unchanged row here is neither encoded nor written; its previous payload
+/// is carried over verbatim.
+///
+/// `lines[i]` is the whole row as drawn, which is what the comparison is on: a
+/// part covering a cell later than another part is what wins, exactly as the
+/// encoder resolves it. `rows` is the result — row payloads the terminal can be
+/// given one at a time, plus the trailing cursor sequence.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Lines {
+    lines: Vec<Line>,
+    rows: Rows,
+}
+
+impl Lines {
+    /// Encode `frame`, reusing `prev`'s payload for every row whose drawn
+    /// contents are unchanged.
+    ///
+    /// `prev` is ignored when it is for another size: a terminal that reflowed
+    /// the screen is not a diff, and every row is encoded afresh.
+    pub fn of(frame: &Frame, caps: crate::caps::Caps, prev: Option<&Lines>) -> Lines {
+        let w = frame.size.w;
+        let h = frame.size.h as usize;
+        // What each row is drawn as, later parts over earlier — the same
+        // resolution `encode_rows` performs, kept as values rather than bytes so
+        // the comparison below costs no formatting.
+        let mut lines: Vec<Line> = vec![Line::empty(); h];
+        for part in &frame.parts {
+            for (dy, line) in part.lines.iter().enumerate() {
+                if dy >= part.rect.h as usize {
+                    break;
+                }
+                if let Some(slot) = lines.get_mut(part.rect.y as usize + dy) {
+                    *slot = line.clone();
+                }
+            }
+        }
+        let prev = prev.filter(|p| p.rows.size == (w, frame.size.h));
+        let dirty: Vec<bool> = (0..h)
+            .map(|i| prev.is_none_or(|p| p.lines.get(i) != lines.get(i)))
+            .collect();
+        let mut payloads: Vec<String> = (0..h)
+            .map(|i| match prev {
+                Some(p) if !dirty[i] => p.rows.rows[i].clone(),
+                _ => {
+                    #[cfg(test)]
+                    ROWS_ENCODED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    String::from(ERASE_LINE)
+                }
+            })
+            .collect();
+        // Only the rows that moved are drawn, and only into their own payload:
+        // the erasure and the absolute positioning each of them needs is the
+        // same work `encode_rows` does for all of them.
+        for part in &frame.parts {
+            for (dy, line) in part.lines.iter().enumerate() {
+                if dy >= part.rect.h as usize {
+                    break;
+                }
+                let row = part.rect.y as usize + dy;
+                if row >= h || !dirty[row] {
+                    continue;
+                }
+                let col = part.rect.x as usize + 1;
+                let _ = write!(payloads[row], "\x1b[{};{col}H", row + 1);
+                write_line(&mut payloads[row], line, part.rect.w, caps);
+            }
+        }
+        let cursor = match frame.cursor {
+            Some((x, y)) => format!("\x1b[{};{}H\x1b[?25h", y + 1, x + 1),
+            None => "\x1b[?25l".to_string(),
+        };
+        Lines {
+            lines,
+            rows: Rows {
+                size: (w, frame.size.h),
+                rows: payloads,
+                cursor,
+            },
+        }
+    }
+
+    /// Every row, as one write. A first paint, or a resize.
+    pub fn full(&self) -> String {
+        self.rows.full()
+    }
+
+    /// Only the rows whose payload changed. Empty when nothing did.
+    pub fn patch_from(&self, prev: Option<&Lines>) -> String {
+        self.rows.patch_from(prev.map(|p| &p.rows))
+    }
+}
+
+/// Rows encoded, ever. Test-only, so a test can assert that an unchanged frame
+/// encodes none of them — the property this whole type exists for, and one that
+/// equality of output cannot show, because re-encoding an unchanged row would
+/// produce the same bytes.
+#[cfg(test)]
+pub(crate) static ROWS_ENCODED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Encode a frame row by row. See [`Rows`].
 pub fn encode_rows(frame: &Frame, caps: crate::caps::Caps) -> Rows {
     let h = frame.size.h as usize;
@@ -332,6 +440,17 @@ mod tests {
     use super::*;
     use crate::frame::{Rect, Span};
 
+    /// [`ROWS_ENCODED`] is process-global, so the tests that read it must not
+    /// run beside each other. Held rather than asserted, and poisoning is
+    /// ignored: a panic in one is the report, not a second failure here.
+    static ENCODE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn counting_alone() -> std::sync::MutexGuard<'static, ()> {
+        ENCODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn a_plain_frame_positions_every_part_absolutely() {
         let mut f = Frame::new(20, 3);
@@ -370,6 +489,96 @@ mod tests {
         assert!(s.ends_with(SYNC_END), "{s:?}");
         assert_eq!(s.matches(SYNC_BEGIN).count(), 1);
         assert_eq!(s.matches(SYNC_END).count(), 1);
+    }
+
+    /// A first paint through the row cache is the encoder it replaced, byte for
+    /// byte. The cache is an optimisation of encoding, not a second renderer:
+    /// if the two ever diverge, every screen the diff considers "changed" would
+    /// be compared against bytes that never came from the same place.
+    #[test]
+    fn a_first_paint_is_byte_for_byte_the_encoder_it_replaced() {
+        let caps = crate::caps::Caps::default();
+        let mut f = Frame::new(20, 4);
+        f.place(
+            "a",
+            Rect::new(0, 0, 20, 2),
+            vec![Line::raw("body"), Line::styled("more", Style::new().bold())],
+        );
+        f.place("b", Rect::new(3, 3, 17, 1), vec![Line::raw("status")]);
+        f.cursor = Some((5, 3));
+        assert_eq!(
+            Lines::of(&f, caps, None).full(),
+            encode_rows(&f, caps).full()
+        );
+    }
+
+    /// An unchanged frame encodes no row at all — and that is a property of the
+    /// encoder, not of the write.
+    ///
+    /// Re-encoding an unchanged row would produce the same bytes, so comparing
+    /// output cannot tell "skipped" from "re-encoded"; the count can. Counting
+    /// is the only way to hold the property the whole type exists for.
+    #[test]
+    fn an_unchanged_frame_does_not_encode_a_single_row() {
+        let _alone = counting_alone();
+        let caps = crate::caps::Caps::default();
+        let mut f = Frame::new(12, 3);
+        f.place("b", Rect::new(0, 0, 12, 1), vec![Line::raw("body")]);
+        f.place("s", Rect::new(0, 2, 12, 1), vec![Line::raw("status")]);
+        let first = Lines::of(&f, caps, None);
+
+        ROWS_ENCODED.store(0, std::sync::atomic::Ordering::Relaxed);
+        let again = Lines::of(&f, caps, Some(&first));
+        assert_eq!(
+            ROWS_ENCODED.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "an identical frame re-encoded a row"
+        );
+        assert!(again.patch_from(Some(&first)).is_empty());
+    }
+
+    #[test]
+    fn only_the_row_that_moved_is_encoded() {
+        let _alone = counting_alone();
+        let caps = crate::caps::Caps::default();
+        let mut f = Frame::new(12, 3);
+        f.place("b", Rect::new(0, 0, 12, 1), vec![Line::raw("body")]);
+        f.place("s", Rect::new(0, 2, 12, 1), vec![Line::raw("· thinking")]);
+        let first = Lines::of(&f, caps, None);
+
+        let mut moved = Frame::new(12, 3);
+        moved.place("b", Rect::new(0, 0, 12, 1), vec![Line::raw("body")]);
+        moved.place("s", Rect::new(0, 2, 12, 1), vec![Line::raw("⋯ thinking")]);
+        ROWS_ENCODED.store(0, std::sync::atomic::Ordering::Relaxed);
+        let next = Lines::of(&moved, caps, Some(&first));
+        assert_eq!(
+            ROWS_ENCODED.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a one-row change encoded more than that row"
+        );
+        let patch = next.patch_from(Some(&first));
+        assert!(patch.contains("\x1b[3;1H"), "the status row: {patch:?}");
+        assert!(!patch.contains("\x1b[1;1H"), "the body row did not move");
+    }
+
+    #[test]
+    fn a_resize_encodes_every_row_rather_than_reusing_a_reflow() {
+        let _alone = counting_alone();
+        let caps = crate::caps::Caps::default();
+        let mut small = Frame::new(12, 3);
+        small.place("b", Rect::new(0, 0, 12, 1), vec![Line::raw("body")]);
+        let first = Lines::of(&small, caps, None);
+
+        let mut big = Frame::new(12, 5);
+        big.place("b", Rect::new(0, 0, 12, 1), vec![Line::raw("body")]);
+        ROWS_ENCODED.store(0, std::sync::atomic::Ordering::Relaxed);
+        let next = Lines::of(&big, caps, Some(&first));
+        assert_eq!(
+            ROWS_ENCODED.load(std::sync::atomic::Ordering::Relaxed),
+            5,
+            "a reflowed screen is not a diff"
+        );
+        assert_eq!(next.patch_from(Some(&first)), next.full());
     }
 
     #[test]

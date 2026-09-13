@@ -389,9 +389,13 @@ struct StderrHeld;
 impl Terminal {
     /// The bytes this frame would send, given what is already on the screen —
     /// and the record of it, so the next frame can be a diff too.
+    ///
+    /// The previous frame goes in as the *input* to encoding, not just to the
+    /// diff that follows it: an unchanged row is skipped before it is escaped
+    /// and clipped, which is where the per-frame cost was.
     fn patch(&self, frame: &Frame) -> String {
-        let next = ansi::encode_rows(frame, self.caps);
         let mut last = self.painted.0.lock().expect("last frame poisoned");
+        let next = ansi::Lines::of(frame, self.caps, last.as_ref());
         let out = next.patch_from(last.as_ref());
         *last = Some(next);
         out
@@ -1000,7 +1004,7 @@ fn parse_osc4(seen: &[u8]) -> Vec<(u8, Rgb)> {
 /// arrive at the terminal as a full erase and a full redraw, whether or not a
 /// single cell had changed. That is a screen that never settles.
 #[derive(Debug, Default)]
-pub struct LastPainted(Mutex<Option<ansi::Rows>>);
+pub struct LastPainted(Mutex<Option<ansi::Lines>>);
 
 impl LastPainted {
     /// Forget what was painted, so the next frame is drawn in full. For after

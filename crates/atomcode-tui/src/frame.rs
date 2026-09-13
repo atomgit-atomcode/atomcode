@@ -164,7 +164,12 @@ impl Color {
 
 /// A run of text sharing one style. Lines are made of these so a renderer can
 /// emit one escape sequence per run rather than one per character.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Hash` is derived rather than hand-written because it feeds the repaint
+/// diff: a style field added later must change a row's fingerprint, or the row
+/// it was added to would keep painting its old bytes. Deriving it makes that
+/// the default instead of the thing someone has to remember.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Span {
     pub text: String,
     pub style: Style,
@@ -191,7 +196,7 @@ impl Span {
 }
 
 /// One rendered row.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Line {
     pub spans: Vec<Span>,
 }
