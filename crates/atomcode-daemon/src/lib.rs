@@ -1336,9 +1336,88 @@ fn is_loopback_authority(authority: &str) -> bool {
     if let Some(rest) = authority.strip_prefix("[::1]") {
         return rest.is_empty() || rest.starts_with(':');
     }
+    // Bare IPv6 loopback (`--host ::1`, no brackets/port). The `split(':')` below
+    // treats the IPv6 separators as a host:port boundary and yields "", so match
+    // it explicitly — otherwise a legit loopback bind is classified as remote.
+    if authority == "::1" {
+        return true;
+    }
 
     let host = authority.split(':').next().unwrap_or(authority);
     matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Env var an operator sets to acknowledge that an unauthenticated daemon bound
+/// to a remote-reachable address is intentional AND network-isolated.
+pub(crate) const ALLOW_REMOTE_NO_AUTH_ENV: &str = "ATOMCODE_DANGEROUSLY_ALLOW_REMOTE_NO_AUTH";
+
+/// Verdict for the "unauthenticated + remotely reachable" startup guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteNoAuthGuard {
+    /// Safe combination — proceed silently (auth enforced, or loopback-only).
+    Safe,
+    /// Dangerous combination, but the operator explicitly opted in — proceed
+    /// with a loud runtime warning.
+    AllowedWithWarning,
+    /// Dangerous combination with no opt-in — refuse to start (fail closed).
+    Refuse,
+}
+
+/// Fail-closed guard against the cross-tenant footgun: an UNAUTHENTICATED daemon
+/// (`--no-auth`, i.e. `enforce_token == false`) bound to a NON-loopback address
+/// (`0.0.0.0` / a routable IP) exposes the full agent-control + `/fs/*` +
+/// `/config` (API keys) surface to anyone who can reach the port — e.g. sibling
+/// pods in a shared cluster. Only that exact combination is gated; a
+/// token-enforcing daemon, or a loopback-only bind, is always `Safe`. An
+/// operator with real network isolation opts back in via
+/// [`ALLOW_REMOTE_NO_AUTH_ENV`] (`=1`/`true`), which downgrades to a warning.
+fn evaluate_remote_no_auth_guard(
+    enforce_token: bool,
+    bind_host: &str,
+    allow_override: Option<&str>,
+) -> RemoteNoAuthGuard {
+    if enforce_token || is_loopback_authority(bind_host) {
+        return RemoteNoAuthGuard::Safe;
+    }
+    let opted_in = matches!(allow_override, Some(v) if v == "1" || v.eq_ignore_ascii_case("true"));
+    if opted_in {
+        RemoteNoAuthGuard::AllowedWithWarning
+    } else {
+        RemoteNoAuthGuard::Refuse
+    }
+}
+
+/// The address the guard should judge — the prebound listener's REAL `local_addr`
+/// when present (authoritative over the `host` string, which is a config/display
+/// value that could diverge from the actual socket), else the `host` string.
+fn effective_bind_host(host: &str, prebound: Option<&tokio::net::TcpListener>) -> String {
+    prebound
+        .and_then(|l| l.local_addr().ok())
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| host.to_string())
+}
+
+/// Refuse-to-start message for the unauthenticated-remote guard. `bound` is the
+/// address that triggered it (see [`effective_bind_host`]).
+fn remote_no_auth_refuse_message(bound: &str) -> String {
+    format!(
+        "拒绝启动:--no-auth(未鉴权)+ 绑定到非本机地址({bound})会把完整的 agent 控制 / \
+         文件系统 / 配置(含 API key)接口暴露给任何能访问该端口的人(如共享集群里的其他 Pod),\
+         属跨租户 RCE 风险。请任选其一:① 去掉 --no-auth 改用 token 鉴权(推荐);\
+         ② 绑定回 127.0.0.1;③ 若确有网络隔离(K8s NetworkPolicy/私网),\
+         设 {ALLOW_REMOTE_NO_AUTH_ENV}=1 显式放行。"
+    )
+}
+
+/// Loud runtime warning when the operator opted in to unauthenticated-remote.
+fn remote_no_auth_warn_message(bound: &str) -> String {
+    format!(
+        "⚠ SECURITY: starting UNAUTHENTICATED (--no-auth) on {bound} — the full agent-control \
+         / filesystem / config API is reachable with NO auth. {ALLOW_REMOTE_NO_AUTH_ENV} is set, \
+         so this is allowed; ensure real network isolation (K8s NetworkPolicy / private network), \
+         else anyone who can reach this port can read/write files, steal API keys, and run tasks \
+         as you."
+    )
 }
 
 /// Whether this client can receive interactive approval prompts.
@@ -6244,6 +6323,32 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         ..
     } = opts;
 
+    // Step 0: Security guardrail — refuse to start an UNAUTHENTICATED daemon on a
+    // remotely-reachable bind. `--no-auth` + `0.0.0.0` exposes the full
+    // agent-control / filesystem / config(API-key) API to anyone who can reach
+    // the port (e.g. sibling pods), a cross-tenant RCE footgun. Fail closed; an
+    // operator with real network isolation opts back in via the env var. The
+    // prebound listener's REAL address wins over the `host` string so the guard
+    // can't be fooled by a config value that diverges from the actual socket.
+    let bound = effective_bind_host(&host, prebound_listener.as_ref());
+    match evaluate_remote_no_auth_guard(
+        webui_tokens.is_some(),
+        &bound,
+        std::env::var(ALLOW_REMOTE_NO_AUTH_ENV).ok().as_deref(),
+    ) {
+        RemoteNoAuthGuard::Safe => {}
+        RemoteNoAuthGuard::AllowedWithWarning => {
+            let msg = remote_no_auth_warn_message(&bound);
+            tracing::warn!("{msg}");
+            if !quiet {
+                eprintln!("{msg}");
+            }
+        }
+        RemoteNoAuthGuard::Refuse => {
+            anyhow::bail!(remote_no_auth_refuse_message(&bound));
+        }
+    }
+
     // Step 1: Load config (R1.1, R1.5) — tolerate errors, fallback to default.
     // Also seed the offline verdict + note ONCE from config + env here, before
     // telemetry init and any tool/provider assembly (Step 4).
@@ -9133,6 +9238,102 @@ mod channel_mode_tests {
             false,
             "127.0.0.1"
         ));
+    }
+
+    #[test]
+    fn remote_no_auth_guard_only_gates_unauth_plus_remote_bind() {
+        use RemoteNoAuthGuard::*;
+        // Token-enforcing daemon is always safe, even bound to 0.0.0.0.
+        assert_eq!(
+            evaluate_remote_no_auth_guard(true, "0.0.0.0", None),
+            Safe
+        );
+        // Unauthenticated but loopback-only is safe (VSCode / standalone local),
+        // including bare + bracketed IPv6 loopback.
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "127.0.0.1", None),
+            Safe
+        );
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "localhost:17321", None),
+            Safe
+        );
+        assert_eq!(evaluate_remote_no_auth_guard(false, "::1", None), Safe);
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "[::1]:13456", None),
+            Safe
+        );
+        // `::` (all IPv6 interfaces) is NOT loopback → still gated.
+        assert_eq!(evaluate_remote_no_auth_guard(false, "::", None), Refuse);
+        // The dangerous combo — unauthenticated + remotely reachable — refuses…
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "0.0.0.0", None),
+            Refuse
+        );
+        // …including a bind to a specific routable IP (peers can still reach it).
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "10.247.58.157", None),
+            Refuse
+        );
+    }
+
+    #[test]
+    fn remote_no_auth_guard_env_opt_in_downgrades_to_warning() {
+        use RemoteNoAuthGuard::*;
+        // Explicit opt-in (for operators with real network isolation) → warn, not refuse.
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "0.0.0.0", Some("1")),
+            AllowedWithWarning
+        );
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "0.0.0.0", Some("true")),
+            AllowedWithWarning
+        );
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "0.0.0.0", Some("TRUE")),
+            AllowedWithWarning
+        );
+        // A non-affirmative value is NOT an opt-in — still refuse.
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "0.0.0.0", Some("0")),
+            Refuse
+        );
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "0.0.0.0", Some("")),
+            Refuse
+        );
+        // The override never loosens a safe combo (stays Safe, no spurious warning).
+        assert_eq!(
+            evaluate_remote_no_auth_guard(true, "0.0.0.0", Some("1")),
+            Safe
+        );
+    }
+
+    #[test]
+    fn remote_no_auth_messages_interpolate_bound_addr_and_env_name() {
+        // Guards against a `bail!`/`format!` capture regression: the real address
+        // and env-var name must appear, never the literal `{bound}` placeholder.
+        let refuse = remote_no_auth_refuse_message("10.247.58.157");
+        assert!(refuse.contains("10.247.58.157"), "{refuse}");
+        assert!(refuse.contains(ALLOW_REMOTE_NO_AUTH_ENV), "{refuse}");
+        assert!(!refuse.contains("{bound}"), "{refuse}");
+
+        let warn = remote_no_auth_warn_message("0.0.0.0");
+        assert!(warn.contains("0.0.0.0"), "{warn}");
+        assert!(warn.contains(ALLOW_REMOTE_NO_AUTH_ENV), "{warn}");
+    }
+
+    #[tokio::test]
+    async fn effective_bind_host_prefers_the_prebound_listeners_real_addr() {
+        // No prebound listener → the `host` string is used verbatim.
+        assert_eq!(effective_bind_host("127.0.0.1", None), "127.0.0.1");
+        // A listener bound to 0.0.0.0 is authoritative even if `host` LIES
+        // "127.0.0.1" — this is what closes the guard-bypass gap.
+        let public = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        assert_eq!(effective_bind_host("127.0.0.1", Some(&public)), "0.0.0.0");
+        // A loopback listener reports loopback regardless of the host string.
+        let loopback = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        assert_eq!(effective_bind_host("0.0.0.0", Some(&loopback)), "127.0.0.1");
     }
 
     #[test]
