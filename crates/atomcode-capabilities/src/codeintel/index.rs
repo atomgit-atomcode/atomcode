@@ -26,6 +26,13 @@ fn classify_symbol_kind(ts: &str) -> SymbolKind {
         "trait_item" => SymbolKind::Trait,
         "interface_declaration" | "interface_type" => SymbolKind::Interface,
         "enum_item" | "enum_declaration" | "enum_specifier" => SymbolKind::Enum,
+        // Kotlin: singletons/companions are type-bearing → Class; a property/enum
+        // entry map to Variable/Constant. (`class_declaration` already covers
+        // Kotlin class/interface/enum-class; `function_declaration` covers both
+        // top-level funs and methods.)
+        "object_declaration" | "companion_object" => SymbolKind::Class,
+        "enum_entry" => SymbolKind::Constant,
+        "property_declaration" => SymbolKind::Variable,
         "const_item" | "const_declaration" => SymbolKind::Constant,
         "let_declaration" | "variable_declaration" | "static_item" => SymbolKind::Variable,
         "mod_item" | "module" => SymbolKind::Module,
@@ -133,7 +140,7 @@ fn parse_file(path: &Path, source: &str) -> Option<(Vec<SymbolNode>, Vec<RawCall
 /// Extensions walked into the graph (matches production's INDEXED set + variants).
 const INDEXED_EXTS: &[&str] = &[
     "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "mts", "tsx", "go", "java", "c", "h", "cc", "cpp",
-    "cxx", "hpp", "hh",
+    "cxx", "hpp", "hh", "kt", "kts",
 ];
 
 /// A walked source file + the inputs to its staleness fingerprint.

@@ -130,6 +130,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn traces_kotlin_callers_across_files() {
+        // End-to-end proof the Kotlin call graph works: .kt files are walked,
+        // symbols + call edges extracted, and trace_callers resolves cross-file.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("Target.kt"), "fun target() {}\nclass Widget {}\n").unwrap();
+        // callerA does a plain call; makeWidget does a constructor call `Widget()`
+        // (Kotlin constructors parse as a plain call → must produce a callee edge).
+        std::fs::write(
+            d.path().join("Caller.kt"),
+            "fun callerA() { target() }\nfun makeWidget() { Widget() }\n",
+        )
+        .unwrap();
+        let tool = TraceCallersTool::new(Arc::new(CodeIndex::new()));
+        let ctx = ToolContext {
+            working_dir: d.path().to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
+        let r = tool.execute(r#"{"symbol":"target"}"#, &ctx).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("callerA"), "{}", r.content);
+        // Constructor call edge: `Widget()` in makeWidget → the Widget class.
+        let w = tool.execute(r#"{"symbol":"Widget"}"#, &ctx).await;
+        assert!(!w.is_error, "{}", w.content);
+        assert!(w.content.contains("makeWidget"), "{}", w.content);
+    }
+
+    #[tokio::test]
     async fn missing_symbol_errors() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("a.rs"), "fn x() {}\n").unwrap();

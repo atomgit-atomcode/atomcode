@@ -103,6 +103,10 @@ tree-sitter-cpp = { version = "0.23", optional = true }
 tree-sitter-c-sharp = { version = "0.23", optional = true }
 tree-sitter-html = { version = "0.23", optional = true }
 tree-sitter-php = { version = "0.24", optional = true }
+# Kotlin grammar: the ast-grep-maintained fork (`tree-sitter-kotlin-sg`), the same one
+# oh-my-pi ships, aliased to `tree_sitter_kotlin` for a clean import name. Covers the
+# main JVM language beside Java (SpringBoot / Android / KMP).
+tree-sitter-kotlin = { version = "0.4", package = "tree-sitter-kotlin-sg", optional = true }
 # `lsp` capability deps: detect whether a language server is installed + file:// URIs.
 which = { version = "7", optional = true }
 url = { version = "2", optional = true }
@@ -162,6 +166,7 @@ codeintel = [
     "dep:tree-sitter-javascript", "dep:tree-sitter-typescript", "dep:tree-sitter-go",
     "dep:tree-sitter-java", "dep:tree-sitter-c", "dep:tree-sitter-cpp",
     "dep:tree-sitter-c-sharp", "dep:tree-sitter-html", "dep:tree-sitter-php",
+    "dep:tree-sitter-kotlin",
     # the cross-file graph layer (build_graph) walks the repo gitignore-aware
     "dep:ignore",
 ]

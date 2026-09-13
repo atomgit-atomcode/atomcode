@@ -20,6 +20,7 @@ pub enum Lang {
     CSharp,
     Html,
     Php,
+    Kotlin,
 }
 
 impl Lang {
@@ -38,6 +39,7 @@ impl Lang {
             Lang::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             Lang::Html => tree_sitter_html::LANGUAGE.into(),
             Lang::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+            Lang::Kotlin => tree_sitter_kotlin::LANGUAGE.into(),
         }
     }
 
@@ -57,6 +59,7 @@ impl Lang {
             Lang::CSharp => include_str!("queries/csharp.scm"),
             Lang::Html => include_str!("queries/html.scm"),
             Lang::Php => include_str!("queries/php.scm"),
+            Lang::Kotlin => include_str!("queries/kotlin.scm"),
         }
     }
 
@@ -71,6 +74,7 @@ impl Lang {
             }
             Lang::Java => include_str!("queries/java_calls.scm"),
             Lang::Go => include_str!("queries/go_calls.scm"),
+            Lang::Kotlin => include_str!("queries/kotlin_calls.scm"),
             _ => return None,
         })
     }
@@ -89,6 +93,7 @@ impl Lang {
                 | Lang::Java
                 | Lang::C
                 | Lang::Cpp
+                | Lang::Kotlin
         )
     }
 
@@ -108,6 +113,7 @@ impl Lang {
             "cs" => Lang::CSharp,
             "html" | "htm" => Lang::Html,
             "php" => Lang::Php,
+            "kt" | "kts" => Lang::Kotlin,
             _ => return None,
         })
     }
@@ -124,6 +130,8 @@ mod tests {
         assert_eq!(Lang::detect(Path::new("x/y/z.py")), Some(Lang::Python));
         assert_eq!(Lang::detect(Path::new("a.tsx")), Some(Lang::Tsx));
         assert_eq!(Lang::detect(Path::new("a.hpp")), Some(Lang::Cpp));
+        assert_eq!(Lang::detect(Path::new("Main.kt")), Some(Lang::Kotlin));
+        assert_eq!(Lang::detect(Path::new("build.gradle.kts")), Some(Lang::Kotlin));
         assert_eq!(Lang::detect(Path::new("a.unknownext")), None);
         assert_eq!(Lang::detect(Path::new("noext")), None);
     }
@@ -144,6 +152,7 @@ mod tests {
             Lang::CSharp,
             Lang::Html,
             Lang::Php,
+            Lang::Kotlin,
         ] {
             match tree_sitter::Query::new(&lang.grammar(), lang.symbols_query()) {
                 Ok(q) => {
@@ -159,6 +168,36 @@ mod tests {
         assert!(
             failures.is_empty(),
             "query compile failures:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn every_calls_query_compiles_with_callee_capture() {
+        let mut failures = Vec::new();
+        for lang in [
+            Lang::Rust,
+            Lang::Python,
+            Lang::JavaScript,
+            Lang::TypeScript,
+            Lang::Tsx,
+            Lang::Go,
+            Lang::Java,
+            Lang::Kotlin,
+        ] {
+            let Some(q_src) = lang.calls_query() else {
+                failures.push(format!("{lang:?}: expected a calls query"));
+                continue;
+            };
+            match tree_sitter::Query::new(&lang.grammar(), q_src) {
+                Ok(q) if q.capture_index_for_name("callee").is_some() => {}
+                Ok(_) => failures.push(format!("{lang:?}: calls query missing @callee")),
+                Err(e) => failures.push(format!("{lang:?}: {e:?}")),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "calls query failures:\n{}",
             failures.join("\n")
         );
     }
