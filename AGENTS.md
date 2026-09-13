@@ -117,10 +117,23 @@ wire DTO 展开：
 
 ### 测试与构建命令（2026-09-13 实测定标，勿凭直觉推翻）
 
-- 跑测试用 `cargo nextest run -p <crate>`，不用 `cargo test`。`cargo test` 一个 test binary 跑完才跑下一个，kernel 有 28 个 integration test binary：同一套 305 个测试，`cargo test` 要 570s（其中 CPU 只占 1.3s，其余全在空等），nextest 0.64s。配置在 `.config/nextest.toml`。
-- nextest 不跑 doctest。全仓只有 12 个真 doctest（其余是 `text`/`json`/`toml`/`ignore` 标记），需要时 `cargo test --doc` 另跑。
+- 跑测试用 `cargo nextest run -p <crate>`，不用 `cargo test`。`cargo test` 一个 test binary 跑完才跑下一个，nextest 跨 binary 进程级并行。配置在 `.config/nextest.toml`。
+- **但 nextest 不是无条件更快，收益与该 crate 的 test binary 数量成正比**（2026-09-13 实测，同一套测试）：
+
+  | crate | test binary 数 | `cargo test` | nextest | + 虚拟时钟 |
+  | --- | --- | --- | --- | --- |
+  | kernel（305 个测试） | 28 | 570s | 31.4s | **0.64s** |
+  | harness（280 个测试） | 22 | — | 14.8s | **4.04s** |
+  | tui（397 个测试） | 1（几乎全是 lib 单测） | 1.63s | 2.12s | — |
+
+  tui 反而略慢：只有一个 binary，`cargo test` 的串行短板压根不发作，显出来的是 nextest 的进程启动开销。所以判断依据是 binary 数量，不是"nextest 更快"这句话本身。改门或改脚本前先数一下 `ls crates/<c>/tests/*.rs | wc -l`。
+- nextest 不跑 doctest。全仓 24 个 doc 代码块，带 `text`/`json`/`toml` 语言标记和 `ignore` 的都不跑——数 ``` 的个数会高估可跑数量，`atomcode-tui` 的 2 个块实测就是 0 passed / 2 ignored。真要确认某个 crate 丢没丢覆盖，跑 `cargo test --doc -p <crate>` 看 `test result` 那行，别靠 grep 估。
 - 新增 async 测试，只要被测路径上有超时、退避或重试（provider retry、rate limit、stream timeout、conformance check timeout），一律写 `#[tokio::test(flavor = "current_thread", start_paused = true)]`，让 `tokio::time::sleep` 走虚拟时钟。裸 `#[tokio::test]` 会真等墙钟时间——sleep 往往不在测试里而在被测的生产代码里（如 `agent.rs` 的重试退避），grep 测试文件是看不出来的。kernel 曾有 11 个这样的测试，最慢单个 27s，合计占整套 305 个测试时间的 97%。范式见 `crates/atomcode-kernel/tests/tool_batch.rs`。
 - 虚拟时钟不会让测试变空过：断言打在可观测结果上（重试是否耗尽、approval 问了几次），逻辑没跑到就会红。但 `start_paused` 要求 current_thread，改之前确认该测试不依赖真并行（无 `std::thread`、`spawn_blocking`、`block_on`）。
+- **转之前先看该测试怎么断言时间，这里有两个陷阱**（2026-09-13 在 `harness/tests/recovery.rs` 踩到）：
+  - 上界断言 `started.elapsed() < Duration::from_secs(20)`（"必须有界"）：若 `Instant` 来自 `std::time`，虚拟钟下真实时间几乎不走，断言变成恒真，判据当场作废。修法是把 `Instant` 换成 `tokio::time::Instant` —— 未暂停时等价 std，暂停时跟随虚拟钟，于是"超时被误写成 30s"这类退化仍然抓得住。
+  - 下界断言 `run.elapsed >= Duration::from_millis(900)`（"必须真等过"）：**这种测试不要转**，虚拟钟会让它失去意义甚至判红。`recovery.rs` 的 `a_real_retry_after_is_honoured_over_any_guess` 和 `concurrency.rs` 就是这一类，它们至今仍真等墙钟时间，是刻意的。
+  - 一句话：只转慢榜上的测试，且先 grep 一遍 `elapsed`。
 - 按 crate 跑 `-p <crate>`，不要随手 `--workspace`。9 个 consumer 各开不同的 `atomcode-capabilities` feature 子集，resolver v2 刻意不跨 crate 统一 feature，于是这个 95k 行的库会被编 19 次（单份 28–138MB）；全量构建 91 个 test binary 一次吃掉 8.5GB 磁盘。2026-09-13 一次全量 nextest 把磁盘顶到 99%、swap 耗尽，test binary 被 SIGKILL，整个 66GB `target/` 随后消失。
 - 不要给 dev profile 加 `[profile.dev.build-override] opt-level = 3`。已做过 A/B，结论为负：冷 check capabilities 从 21.7s 变 42.0s（多烧 144s CPU 把 syn/serde_derive 编成 -O3），稳态 CPU 无差异（1.95s vs 2.00s）。全仓 derive 密度约每 280 行一个，这笔一次性成本摊不平。
 - `[profile.dev.package."*"] debug = 0` 只砍依赖的 debuginfo，workspace 内自己的 crate 保留（已验证：`tokio.o` 的 `__debug` 段数 0、`kernel.o` 5）。不要改成对整个 dev profile 生效，那会连自己代码的单步调试一起砍掉。
