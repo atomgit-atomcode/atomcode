@@ -711,7 +711,7 @@ impl Host {
             .expect("stream poisoned")
             .slots()
             .iter()
-            .filter(|s| matches!(s, Slot::Live(_)))
+            .filter(|s| matches!(s, Slot::Live(..)))
             .count()
     }
 }

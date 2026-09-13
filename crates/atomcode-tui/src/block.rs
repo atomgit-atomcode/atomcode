@@ -19,7 +19,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::frame::Line;
+use crate::frame::{Line, Style};
 
 /// Stable identity for a block, for presentation and for folding targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -96,6 +96,18 @@ pub trait Content: Send + Sync + std::fmt::Debug {
     /// Render at a width. Called every frame; must be pure.
     fn lines(&self, width: u16) -> Vec<Line>;
 
+    /// The text this block is growing, when it can only ever grow.
+    ///
+    /// A streaming answer is one block whose text is appended to and never
+    /// edited, and it is re-rendered every frame — so the honest way to make a
+    /// frame cost the *new* text rather than the whole answer is to know that
+    /// the text only extends. `None` for every other block: the cache this
+    /// feeds is only correct for that shape, and a block that edits itself would
+    /// silently keep stale lines.
+    fn growing_text(&self) -> Option<&str> {
+        None
+    }
+
     /// Refuse to be folded.
     ///
     /// For the rare block whose whole point is that it happened — a skill being
@@ -134,9 +146,39 @@ impl Block {
 #[derive(Debug)]
 pub enum Slot {
     /// Still being produced. Its content may still change.
-    Live(Block),
+    Live(Block, LiveCache),
     /// Content frozen. Only presentation can change from here.
     Settled(Settled),
+}
+
+/// A live block's last render, so the next frame renders only what is new.
+///
+/// A live block is re-rendered every frame — it can have changed — and a
+/// streaming answer only ever grows, so re-parsing all of it to add a word is
+/// what makes a frame cost the length of the answer. Everything before the last
+/// settled line boundary is fixed, so it is kept and only the tail is rendered
+/// again. This dies with the block it describes, like [`Settled`]'s row count.
+#[derive(Debug, Default)]
+pub struct LiveCache(RwLock<Option<CachedRender>>);
+
+/// How many times a live re-render resumed from the cache. Test-only: whether a
+/// frame rendered one line or the whole answer cannot be seen in its output,
+/// only in the work it did.
+#[cfg(test)]
+pub(crate) static LIVE_RESUMES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+struct CachedRender {
+    width: u16,
+    /// The source the lines were rendered from, whole. The prefix check against
+    /// it is what makes reuse safe: text that was extended is text the kept
+    /// lines still describe, and text that was edited is not.
+    source: String,
+    lines: Vec<Line>,
+    /// Byte offset in `source`, and line count in `lines`, up to which nothing
+    /// can change. See [`crate::markdown::render_settled`].
+    settled: usize,
+    settled_lines: usize,
 }
 
 /// A settled block, and how many rows it was last measured to draw.
@@ -169,12 +211,12 @@ impl Settled {
 impl Slot {
     pub fn block(&self) -> &Block {
         match self {
-            Slot::Live(b) => b,
+            Slot::Live(b, _) => b,
             Slot::Settled(s) => s.block(),
         }
     }
     pub fn is_live(&self) -> bool {
-        matches!(self, Slot::Live(_))
+        matches!(self, Slot::Live(..))
     }
     pub fn is_settled(&self) -> bool {
         matches!(self, Slot::Settled(_))
@@ -191,8 +233,53 @@ impl Slot {
     /// one answer.
     pub fn rows_at(&self, width: u16) -> (usize, Option<Vec<Line>>) {
         match self {
-            Slot::Live(b) => {
-                let lines = b.content.lines(width);
+            Slot::Live(b, cache) => {
+                let Some(text) = b.content.growing_text() else {
+                    let lines = b.content.lines(width);
+                    return (lines.len(), Some(lines));
+                };
+                let mut cached = cache.0.write().expect("live cache poisoned");
+                let base = Style::new();
+                // Reuse what is settled only when the same width rendered it and
+                // the text is an extension of what did. Anything else — a
+                // resize, an edit, a different block — renders the whole thing.
+                let resume = cached
+                    .as_ref()
+                    .filter(|c| c.width == width && text.starts_with(&c.source));
+                #[cfg(test)]
+                if resume.is_some() {
+                    LIVE_RESUMES.fetch_add(1, Ordering::Relaxed);
+                }
+                let (lines, settled, settled_lines) = match resume {
+                    Some(c) => {
+                        // Everything before the last settled boundary is fixed;
+                        // render from there, which is the part still in flux.
+                        let mut lines = c.lines[..c.settled_lines].to_vec();
+                        #[allow(
+                            clippy::string_slice,
+                            reason = "`c.settled` is a byte offset this render produced at a line boundary — the byte after a `\\n` — and `text` extends `c.source` byte for byte (the `starts_with` above), so the same offset is a char boundary in `text` too"
+                        )]
+                        let rest = &text[c.settled..];
+                        let tail = crate::markdown::render_settled(rest, width, base);
+                        lines.extend(tail.lines);
+                        (
+                            lines,
+                            c.settled + tail.settled,
+                            c.settled_lines + tail.settled_lines,
+                        )
+                    }
+                    None => {
+                        let r = crate::markdown::render_settled(text, width, base);
+                        (r.lines, r.settled, r.settled_lines)
+                    }
+                };
+                *cached = Some(CachedRender {
+                    width,
+                    source: text.to_string(),
+                    lines: lines.clone(),
+                    settled,
+                    settled_lines,
+                });
                 (lines.len(), Some(lines))
             }
             Slot::Settled(s) => {
@@ -278,12 +365,15 @@ impl StreamWriter<'_> {
     /// Append a new block, `Live`.
     pub fn open(&mut self, at: Coord, content: Arc<dyn Content>) -> BlockId {
         let id = BlockId(self.stream.next_id.fetch_add(1, Ordering::SeqCst) + 1);
-        self.stream.slots.push(Slot::Live(Block {
-            id,
-            at,
-            producer: self.producer,
-            content,
-        }));
+        self.stream.slots.push(Slot::Live(
+            Block {
+                id,
+                at,
+                producer: self.producer,
+                content,
+            },
+            LiveCache::default(),
+        ));
         id
     }
 
@@ -299,7 +389,7 @@ impl StreamWriter<'_> {
     /// else's — never a panic, and never a silent write to a frozen block.
     pub fn amend(&mut self, id: BlockId, content: Arc<dyn Content>) -> bool {
         for slot in self.stream.slots.iter_mut() {
-            if let Slot::Live(b) = slot {
+            if let Slot::Live(b, _) = slot {
                 if b.id == id && b.producer == self.producer {
                     b.content = content;
                     return true;
@@ -312,7 +402,7 @@ impl StreamWriter<'_> {
     /// Freeze a block. Idempotent, and a no-op for someone else's.
     pub fn settle(&mut self, id: BlockId) -> bool {
         for slot in self.stream.slots.iter_mut() {
-            if let Slot::Live(b) = slot {
+            if let Slot::Live(b, _) = slot {
                 if b.id == id && b.producer == self.producer {
                     // `Live` is owned, so this moves rather than clones.
                     let placeholder = Slot::Settled(Settled::new(Arc::new(Block {
@@ -336,7 +426,7 @@ impl StreamWriter<'_> {
             .slots
             .iter()
             .filter_map(|s| match s {
-                Slot::Live(b) if b.producer == self.producer => Some(b.id),
+                Slot::Live(b, _) if b.producer == self.producer => Some(b.id),
                 _ => None,
             })
             .collect();
@@ -351,7 +441,7 @@ impl StreamWriter<'_> {
             .slots
             .iter()
             .filter_map(|s| match s {
-                Slot::Live(b) if b.producer == self.producer => Some(b.id),
+                Slot::Live(b, _) if b.producer == self.producer => Some(b.id),
                 _ => None,
             })
             .collect()
@@ -451,5 +541,114 @@ mod tests {
         // A `DefaultHasher` would make this test pass and CI fail.
         assert_eq!(hash_of(&["hello"]), hash_of(&["hello"]));
         assert_ne!(hash_of(&["hello"]), hash_of(&["hell", "o"]));
+    }
+
+    // ---- the live render cache -------------------------------------------
+
+    use crate::content::ModelSaid;
+    use std::sync::atomic::Ordering as At;
+
+    /// The resume count is process-global, so tests that read it must not run
+    /// beside each other.
+    static LIVE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn live_alone() -> std::sync::MutexGuard<'static, ()> {
+        LIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn grew(text: &str) -> Arc<dyn Content> {
+        Arc::new(ModelSaid(text.to_string()))
+    }
+
+    fn resumes() -> u64 {
+        LIVE_RESUMES.load(At::Relaxed)
+    }
+
+    #[test]
+    fn a_growing_block_renders_only_the_new_tail() {
+        let _alone = live_alone();
+        let mut s = Stream::new();
+        let id = {
+            let mut w = s.writer("model");
+            w.open(Coord::new(1, 1), grew("first line\n\n"))
+        };
+
+        // The first render has nothing to resume from, and is the whole text.
+        LIVE_RESUMES.store(0, At::Relaxed);
+        let (n1, l1) = s.get(id).unwrap().rows_at(30);
+        assert_eq!(resumes(), 0, "nothing was rendered to resume from");
+        assert_eq!(
+            l1.unwrap(),
+            crate::markdown::render("first line\n\n", 30, Style::new())
+        );
+
+        // A word appended: the second render resumes, and still describes the
+        // whole answer.
+        {
+            let mut w = s.writer("model");
+            w.amend(id, grew("first line\n\nsecond paragraph, still going\n"));
+        }
+        LIVE_RESUMES.store(0, At::Relaxed);
+        let (n2, l2) = s.get(id).unwrap().rows_at(30);
+        assert_eq!(resumes(), 1, "the growing render resumed from the cache");
+        assert_eq!(
+            l2.unwrap(),
+            crate::markdown::render(
+                "first line\n\nsecond paragraph, still going\n",
+                30,
+                Style::new()
+            )
+        );
+        assert!(n2 > n1, "the block got taller");
+    }
+
+    #[test]
+    fn text_that_was_not_extended_is_not_reused() {
+        // The cache is safe only because a streaming answer is append-only. An
+        // edit that is not an extension must fall back to a full render, or the
+        // kept lines would describe something the block no longer says.
+        let _alone = live_alone();
+        let mut s = Stream::new();
+        let id = {
+            let mut w = s.writer("model");
+            w.open(Coord::new(1, 1), grew("first answer\n"))
+        };
+        let _ = s.get(id).unwrap().rows_at(30);
+
+        {
+            let mut w = s.writer("model");
+            w.amend(id, grew("a completely different answer\n"));
+        }
+        LIVE_RESUMES.store(0, At::Relaxed);
+        let (_, lines) = s.get(id).unwrap().rows_at(30);
+        assert_eq!(resumes(), 0, "an edit is not an append");
+        assert_eq!(
+            lines.unwrap(),
+            crate::markdown::render("a completely different answer\n", 30, Style::new())
+        );
+    }
+
+    #[test]
+    fn a_resize_starts_the_render_over() {
+        let _alone = live_alone();
+        let mut s = Stream::new();
+        let id = {
+            let mut w = s.writer("model");
+            w.open(
+                Coord::new(1, 1),
+                grew("a line long enough to wrap differently\n"),
+            )
+        };
+        let _ = s.get(id).unwrap().rows_at(30);
+
+        LIVE_RESUMES.store(0, At::Relaxed);
+        let (_, lines) = s.get(id).unwrap().rows_at(12);
+        assert_eq!(resumes(), 0, "another width is another render");
+        assert_eq!(
+            lines.unwrap(),
+            crate::markdown::render("a line long enough to wrap differently\n", 12, Style::new())
+        );
     }
 }

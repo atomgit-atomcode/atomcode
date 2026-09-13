@@ -38,14 +38,54 @@ fn fence() -> Style {
 
 /// Render a markdown document at `w` cells.
 pub fn render(text: &str, w: u16, base: Style) -> Vec<Line> {
+    render_settled(text, w, base).lines
+}
+
+/// What a render produced, and how much of it can never change again.
+pub struct Rendered {
+    pub lines: Vec<Line>,
+    /// Byte offset in the source past which appending more text cannot change
+    /// `lines[..settled_lines]`.
+    pub settled: usize,
+    /// How many of `lines` that prefix covers.
+    pub settled_lines: usize,
+}
+
+/// Render `text`, and report the point past which it is settled.
+///
+/// The streaming answer is one block whose text only grows, and re-rendering
+/// all of it every frame is what makes a frame cost the length of the answer.
+/// Everything up to `settled` is fixed: it ends on a line boundary, outside any
+/// fence. A caller may keep `lines[..settled_lines]` and render only the rest
+/// next time, because appending source lines can change nothing before the last
+/// boundary that was outside a fence.
+///
+/// An open fence is the one thing that is *not* settled, wherever it starts:
+/// its body is emitted only when the fence closes, and the rule above it then
+/// gains the language label — both retroactive. So `settled` stays before the
+/// opener until the closing fence is seen.
+pub fn render_settled(text: &str, w: u16, base: Style) -> Rendered {
     if w == 0 {
-        return Vec::new();
+        return Rendered {
+            lines: Vec::new(),
+            settled: 0,
+            settled_lines: 0,
+        };
     }
     let mut out = Vec::new();
     let mut in_code: Option<String> = None;
     let mut code_lines: Vec<String> = Vec::new();
+    // The offset of the last line boundary seen outside a fence, and how many
+    // lines had been produced by then.
+    let mut settled = 0usize;
+    let mut settled_lines = 0usize;
+    let mut off = 0usize;
 
     for raw in text.split('\n') {
+        let line_end = off + raw.len();
+        // A segment not followed by a newline is the still-arriving last line,
+        // which more text can extend — so it is never a settled boundary.
+        let complete = line_end < text.len();
         let trimmed = raw.trim_end();
         // Fences first: inside a block, nothing else is markdown.
         if let Some(rest) = trimmed.trim_start().strip_prefix("```") {
@@ -56,35 +96,42 @@ pub fn render(text: &str, w: u16, base: Style) -> Vec<Line> {
                 }
                 None => in_code = Some(rest.trim().to_string()),
             }
-            continue;
-        }
-        if in_code.is_some() {
+        } else if in_code.is_some() {
             code_lines.push(trimmed.to_string());
-            continue;
-        }
-
-        let t = trimmed.trim_start();
-        let indent = trimmed.len() - t.len();
-
-        if t.is_empty() {
-            out.push(Line::empty());
-        } else if let Some((level, title)) = heading_of(t) {
-            let hashes = "#".repeat(level as usize);
-            out.extend(wrap_spans(
-                &inline(title, heading()),
-                w,
-                &format!("{hashes} "),
-                heading(),
-            ));
-        } else if is_rule(t) {
-            out.push(Line::styled("─".repeat(w as usize), fence()));
-        } else if let Some(body) = t.strip_prefix("> ").or_else(|| t.strip_prefix(">")) {
-            out.extend(wrap_spans(&inline(body, quote()), w, "▏ ", quote()));
-        } else if let Some((marker, body)) = list_item(t) {
-            let lead = format!("{}{marker} ", " ".repeat(indent));
-            out.extend(wrap_spans(&inline(body, base), w, &lead, bullet()));
         } else {
-            out.extend(wrap_spans(&inline(t, base), w, &" ".repeat(indent), base));
+            let t = trimmed.trim_start();
+            let indent = trimmed.len() - t.len();
+
+            if t.is_empty() {
+                out.push(Line::empty());
+            } else if let Some((level, title)) = heading_of(t) {
+                let hashes = "#".repeat(level as usize);
+                out.extend(wrap_spans(
+                    &inline(title, heading()),
+                    w,
+                    &format!("{hashes} "),
+                    heading(),
+                ));
+            } else if is_rule(t) {
+                out.push(Line::styled("─".repeat(w as usize), fence()));
+            } else if let Some(body) = t.strip_prefix("> ").or_else(|| t.strip_prefix(">")) {
+                out.extend(wrap_spans(&inline(body, quote()), w, "▏ ", quote()));
+            } else if let Some((marker, body)) = list_item(t) {
+                let lead = format!("{}{marker} ", " ".repeat(indent));
+                out.extend(wrap_spans(&inline(body, base), w, &lead, bullet()));
+            } else {
+                out.extend(wrap_spans(
+                    &inline(t, base),
+                    w,
+                    " ".repeat(indent).as_str(),
+                    base,
+                ));
+            }
+        }
+        off = if complete { line_end + 1 } else { line_end };
+        if complete && in_code.is_none() {
+            settled = off;
+            settled_lines = out.len();
         }
     }
     // An unterminated fence is common in a stream that is still arriving; show
@@ -92,7 +139,11 @@ pub fn render(text: &str, w: u16, base: Style) -> Vec<Line> {
     if in_code.is_some() && !code_lines.is_empty() {
         out.extend(code_block(&code_lines, "", w));
     }
-    out
+    Rendered {
+        lines: out,
+        settled,
+        settled_lines,
+    }
 }
 
 fn heading_of(t: &str) -> Option<(u8, &str)> {
@@ -470,6 +521,97 @@ mod tests {
             .iter()
             .map(|l| l.plain())
             .collect()
+    }
+
+    /// Documents a streaming answer passes through, including every fence state
+    /// and every partial-character boundary: the point of the settled render is
+    /// that it can be resumed, and a corpus without a fence would not test that.
+    const CORPUS: &[&str] = &[
+        "one line, no newline",
+        "one line\n",
+        "first\nsecond\nthird\n",
+        "para one\n\npara two\n\npara three\n",
+        "# Heading\n\nbody under it\n",
+        "- a\n- b\n  - c\n",
+        "> quoted\n> more\n",
+        "before\n```rust\nfn main() {}\n```\nafter\n",
+        // An open fence: the rule above it gains `rust` only when it closes.
+        "before\n```rust\nfn main() {\n",
+        // Streaming in: nothing is complete yet.
+        "half a li",
+        "中文段落也要能换行\n第二行\n",
+        "```\nno language\n```\n",
+        "",
+        "\n\n\n",
+    ];
+
+    /// The settled render is the one it replaced: same lines, always.
+    #[test]
+    fn rendering_is_unchanged_by_reporting_where_it_settled() {
+        for doc in CORPUS {
+            for w in [1u16, 3, 8, 20, 80] {
+                assert_eq!(
+                    render(doc, w, Style::new()),
+                    render_settled(doc, w, Style::new()).lines,
+                    "doc {doc:?} at width {w}"
+                );
+            }
+        }
+    }
+
+    /// The property a caller resumes on: the settled prefix, rendered on its
+    /// own, is exactly the lines the full render put there. If this held only
+    /// sometimes, keeping the prefix would paint stale lines.
+    #[test]
+    fn the_settled_prefix_renders_the_same_on_its_own() {
+        for doc in CORPUS {
+            for w in [3u16, 8, 20, 80] {
+                let r = render_settled(doc, w, Style::new());
+                #[allow(
+                    clippy::string_slice,
+                    reason = "`r.settled` is an offset this renderer produced at a line boundary (the byte after a `\\n`), so it is a char boundary"
+                )]
+                let prefix = &doc[..r.settled];
+                // Truncated, because `render("")` is one empty line while
+                // nothing settled is zero lines: an empty prefix has nothing to
+                // carry over, and the caller renders the whole text instead.
+                let mut prefix_lines = render(prefix, w, Style::new());
+                prefix_lines.truncate(r.settled_lines);
+                assert_eq!(
+                    prefix_lines,
+                    r.lines[..r.settled_lines].to_vec(),
+                    "prefix {prefix:?} of {doc:?} at width {w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_open_fence_is_never_settled_past_its_opening() {
+        // The block is emitted only when the fence closes, and the rule above it
+        // then gains the language label — so everything from the opener on is
+        // still in flux, and the settled prefix must stop before it.
+        let text = "intro\n\n```rust\nfn main() {\n    let x = 1;\n";
+        let r = render_settled(text, 40, Style::new());
+        #[allow(
+            clippy::string_slice,
+            reason = "`r.settled` is an offset this renderer produced at a line boundary (the byte after a `\\n`), so it is a char boundary"
+        )]
+        let prefix = &text[..r.settled];
+        assert_eq!(
+            prefix, "intro\n\n",
+            "settled stops at the last boundary outside the fence"
+        );
+        // Closing the fence settles the whole block — everything but the empty
+        // line after the final newline, which more text could still extend.
+        let closed = format!("{text}```\n");
+        let r = render_settled(&closed, 40, Style::new());
+        assert_eq!(r.settled, closed.len());
+        assert_eq!(
+            r.settled_lines + 1,
+            r.lines.len(),
+            "the still-arriving last line is not settled"
+        );
     }
 
     #[test]

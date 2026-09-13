@@ -123,6 +123,9 @@ impl Content for ModelSaid {
     fn lines(&self, w: u16) -> Vec<Line> {
         crate::markdown::render(&self.0, w, Style::new())
     }
+    fn growing_text(&self) -> Option<&str> {
+        Some(&self.0)
+    }
     fn summary(&self, w: u16) -> Line {
         let first = self
             .0
