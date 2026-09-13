@@ -287,7 +287,7 @@ tui 线永远对着 replay 模型与 Headless surface 开发;新命令只由 har
 | 0015 | `llm-utility` 旁路模型缝;会话标题并行起名、落成 `Titled` 事件 |
 | 0016 | agent team:inbox 有消息就叫醒空闲 agent(定时 / loop 的前置);同伴消息是带来源的日志事实,成员只认 lead |
 | 0017 | 配置统一在折树时装配:变量展开一趟遍历、敏感值用类型打码;`apply` 只读终态 config |
-| 0018 | Host 契约:入口、薄组装、读取位置、越界症状;接线是**声明在 host、建立在行**(不是 host 里的连接代码) |
+| 0018 | Host 契约:入口、薄组装、读取位置、越界症状;**接线由 host 建立**(今天不是:机制缺口 + UI 整块依赖 harness + 服务定位器) |
 
 相关文档:[`plexus-plugin-architecture.md`](./plexus-plugin-architecture.md)(底座与 spike 记录)、
 [`tui-composability.md`](./tui-composability.md)(TUI 的时间与空间可组合性)、
