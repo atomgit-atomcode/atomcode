@@ -1,6 +1,6 @@
 //! `trace_callees` — forward call graph (what a symbol calls), BFS to a depth. `Safe`.
 
-use super::index::CodeIndex;
+use super::index::{CodeIndex, IndexLimits};
 use super::{canonical, display_path, err, ok};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
@@ -65,7 +65,10 @@ impl Tool for TraceCalleesTool {
 }
 
 fn render(index: &CodeIndex, root: &Path, symbol: &str, depth: usize) -> ToolResult {
-    let g = index.get(root);
+    let g = match index.get_limited(root, &IndexLimits::default()) {
+        Ok(g) => g,
+        Err(e) => return err(format!("trace_callees: {}", e)),
+    };
     let croot = canonical(root);
     let root: &Path = &croot;
     let matches = g.find_by_name(symbol);

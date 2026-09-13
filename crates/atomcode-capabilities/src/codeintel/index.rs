@@ -6,7 +6,7 @@
 use super::graph::{CodeGraph, Edge, EdgeKind, SymbolId, SymbolKind, SymbolNode, Visibility};
 use super::lang::Lang;
 use super::symbols::{extract_symbols, Symbol};
-use ignore::WalkBuilder;
+use ignore::{DirEntry, WalkBuilder};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -144,6 +144,7 @@ const INDEXED_EXTS: &[&str] = &[
 ];
 
 /// A walked source file + the inputs to its staleness fingerprint.
+#[derive(Debug)]
 struct Walked {
     path: PathBuf,
     /// mtime in NANOSECONDS — coarse whole seconds would miss a same-second edit and
@@ -154,17 +155,119 @@ struct Walked {
     len: u64,
 }
 
-/// Walk `root` (assumed already canonical) for indexable source files + staleness inputs.
-fn collect_files(root: &Path) -> Vec<Walked> {
+/// Bytes as MiB, for the human-facing oversize messages.
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+/// Bounds on the index walk. An unbounded walk of a huge non-hidden working directory
+/// (e.g. `C:/Users/<name>` including `AppData`) makes the graph tools hang for tens of
+/// minutes with no return (issue #1538), so the walk is capped: the first time the
+/// source-file count or the accumulated source bytes exceed a cap, the walk aborts with
+/// an actionable error instead of continuing (it NEVER returns a silent partial set).
+/// The defaults are generous — a real repository fits far below them — but bound the
+/// worst case to a walk, not a parse, of the whole tree.
+#[derive(Debug, Clone)]
+pub struct IndexLimits {
+    pub max_files: usize,
+    pub max_total_bytes: u64,
+}
+
+impl Default for IndexLimits {
+    fn default() -> Self {
+        Self {
+            // ~20k source files: far above any normal repo (a large monorepo is
+            // typically a few thousand), small enough that a walk is still fast.
+            max_files: 20_000,
+            // 256 MiB of indexed source bytes: a full monorepo of code, and an
+            // AppData-scale tree blows past it within seconds of walking.
+            max_total_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+/// The index walk aborted early because the working directory is too large to index.
+/// Carries the limits so the caller can render an actionable message.
+#[derive(Debug, Clone)]
+pub struct IndexError {
+    pub reason: String,
+}
+
+impl IndexError {
+    pub fn oversize(reason: String) -> Self {
+        Self { reason }
+    }
+}
+
+impl std::fmt::Display for IndexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for IndexError {}
+
+/// Directory names that never contain indexable project source — build output,
+/// dependency caches, and temp areas. Skipped for EVERY walk (independent of the
+/// [`IndexLimits`] caps) so a huge workdir is both faster and more likely to fit the
+/// caps. Covers the classic offender behind issue #1538 (`AppData\Local\Temp` on
+/// Windows) plus the OS temp dir (`TMPDIR`/`TEMP`).
+fn is_default_excluded_dir(name: &str) -> bool {
+    matches!(
+        name,
+        "node_modules" | "target" | ".venv" | "venv" | "__pycache__" | "tmp" | "temp"
+    ) || name.eq_ignore_ascii_case("appdata")
+}
+
+/// Build the shared WalkBuilder options: gitignore-aware + default dir excludes.
+/// (The `ignore` builder methods return `&mut WalkBuilder`, so the options are set
+/// as statements and the owned builder returned at the end.)
+fn build_walk(root: &Path) -> WalkBuilder {
+    let mut walker = WalkBuilder::new(root);
+    walker.hidden(true);
+    walker.git_ignore(true);
+    walker.git_global(true);
+    walker.git_exclude(true);
+    // The filter closure is 'static, so it needs an OWNED copy of the root path.
+    let root_owned = root.to_path_buf();
+    walker.filter_entry(move |e: &DirEntry| {
+        // Never prune the walk root itself (e.g. when the workdir IS under the OS
+        // temp dir) — that would silently walk nothing.
+        if e.path() == root_owned.as_path() {
+            return true;
+        }
+        if e.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            let name = e.file_name().to_string_lossy().to_string();
+            let path = e.path().to_path_buf();
+            return !is_default_excluded_dir(&name) && !is_in_os_temp_dir(&path);
+        }
+        true
+    });
+    walker
+}
+
+/// Is `path` inside the OS temp dir (`TMPDIR` on Unix, `TEMP`/`TMP` on Windows)?
+fn is_in_os_temp_dir(path: &Path) -> bool {
+    for var in ["TMPDIR", "TEMP", "TMP"] {
+        if let Some(dir) = std::env::var_os(var) {
+            if !dir.is_empty() {
+                let dir = Path::new(&dir);
+                if path == dir || path.starts_with(dir) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Walk `root` (assumed already canonical) for indexable source files + staleness
+/// inputs. `limits` caps the walk (see [`IndexLimits`]); the first cap breach aborts
+/// with `IndexError::oversize` — never a silent partial file set.
+fn collect_files_limited(root: &Path, limits: &IndexLimits) -> Result<Vec<Walked>, IndexError> {
     let mut out = Vec::new();
-    for entry in WalkBuilder::new(root)
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .build()
-        .flatten()
-    {
+    let mut total_bytes: u64 = 0;
+    for entry in build_walk(root).build().flatten() {
         let p = entry.path();
         if !p.is_file() {
             continue;
@@ -185,14 +288,44 @@ fn collect_files(root: &Path) -> Vec<Walked> {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let len = md.as_ref().map(|m| m.len()).unwrap_or(0);
+        // Cap checks run BEFORE the file joins the set, so `out` never holds more than
+        // the cap and the reported counts are exact (no off-by-one fudging).
+        if out.len() >= limits.max_files {
+            return Err(IndexError::oversize(format!(
+                "working directory too large to index ({} source files so far, limit {}) - start \
+                 AtomCode from a project subdirectory such as the repository root",
+                out.len(),
+                limits.max_files
+            )));
+        }
+        let bytes_after = total_bytes.saturating_add(len);
+        if bytes_after > limits.max_total_bytes {
+            return Err(IndexError::oversize(format!(
+                "working directory too large to index (over {:.1} MiB of source in {} files, \
+                 limit {:.1} MiB) - start AtomCode from a project subdirectory such as the \
+                 repository root",
+                mib(bytes_after),
+                out.len(),
+                mib(limits.max_total_bytes)
+            )));
+        }
         out.push(Walked {
             path: p.to_path_buf(),
             mtime_ns,
             len,
         });
+        total_bytes = bytes_after;
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
-    out
+    Ok(out)
+}
+
+/// Walk `root` (assumed already canonical) for indexable source files + staleness
+/// inputs, with [`IndexLimits::default`] caps. An oversize walk yields an EMPTY file
+/// set (the caller then builds an empty graph — never a hang, never a partial set).
+/// [`CodeIndex::get_limited`] is the fallible entry point that surfaces the error.
+fn collect_files(root: &Path) -> Vec<Walked> {
+    collect_files_limited(root, &IndexLimits::default()).unwrap_or_default()
 }
 
 fn fingerprint(files: &[Walked]) -> u64 {
@@ -298,6 +431,9 @@ fn build_from_files(root: &Path, files: Vec<Walked>) -> CodeGraph {
 }
 
 /// Build a fresh code graph for `root` (walk → parse → resolve). O(repo), CPU-bound.
+/// Applies the default directory excludes and the [`IndexLimits::default`] caps; if the
+/// walk is oversize it returns an EMPTY graph (never a hang, never a partial graph). The
+/// graph TOOLS surface a proper error instead, via [`CodeIndex::get_limited`].
 pub fn build_graph(root: &Path) -> CodeGraph {
     let root = super::canonical(root);
     build_from_files(&root, collect_files(&root))
@@ -315,18 +451,35 @@ impl CodeIndex {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Cached graph for `root`, built with [`IndexLimits::default`]. An oversize walk
+    /// (issue #1538) yields an EMPTY graph instead of hanging; call
+    /// [`Self::get_limited`] when the caller must surface the reason rather than a
+    /// silently empty result.
     pub fn get(&self, root: &Path) -> Arc<CodeGraph> {
+        self.get_limited(root, &IndexLimits::default())
+            .unwrap_or_else(|_| Arc::new(CodeGraph::new()))
+    }
+
+    /// Like [`get`](Self::get) but propagates an oversize walk failure (issue #1538)
+    /// instead of hiding it behind an empty graph, so a tool can surface an actionable
+    /// message. Cache key is the file-set fingerprint (excludes limits); `limits` only
+    /// bound the walk itself.
+    pub fn get_limited(
+        &self,
+        root: &Path,
+        limits: &IndexLimits,
+    ) -> Result<Arc<CodeGraph>, IndexError> {
         let root = super::canonical(root);
-        let files = collect_files(&root);
+        let files = collect_files_limited(&root, limits)?;
         let fp = fingerprint(&files);
         if let Some((cfp, g)) = self.cache.lock().unwrap().as_ref() {
             if *cfp == fp {
-                return g.clone();
+                return Ok(g.clone());
             }
         }
         let g = Arc::new(build_from_files(&root, files));
         *self.cache.lock().unwrap() = Some((fp, g.clone()));
-        g
+        Ok(g)
     }
 }
 
@@ -522,6 +675,79 @@ mod tests {
         assert!(
             !b_callees.iter().any(|e| e.to == alpha.id),
             "b.rs::handler must NOT call alpha"
+        );
+    }
+
+    #[test]
+    fn oversize_file_limit_aborts_walk() {
+        // 7 source files > cap of 4 → the walk must abort with the oversize error,
+        // never return a silent partial set of the first few files, and never walk on.
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..7 {
+            std::fs::write(d.path().join(format!("f{i}.rs")), "fn f() {}\n").unwrap();
+        }
+        let limits = IndexLimits {
+            max_files: 4,
+            ..IndexLimits::default()
+        };
+        let r = collect_files_limited(d.path(), &limits);
+        assert!(
+            r.is_err(),
+            "oversize tree must error, not walk on: {:?}",
+            r.as_ref().map(|v| v.len())
+        );
+        let reason = r.unwrap_err().reason;
+        assert!(reason.contains("too large to index"), "{}", reason);
+        assert!(reason.contains("source files"), "{}", reason);
+    }
+
+    #[test]
+    fn oversize_byte_limit_aborts_walk() {
+        // 40 files (far under the file cap) but ~148 KiB of source > the 128 KiB cap.
+        let chunk = "fn f() { let x = 1234567890; }\n".repeat(120);
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..40 {
+            std::fs::write(d.path().join(format!("f{i}.rs")), &chunk).unwrap();
+        }
+        let limits = IndexLimits {
+            max_total_bytes: 128 * 1024,
+            ..IndexLimits::default()
+        };
+        let r = collect_files_limited(d.path(), &limits);
+        assert!(
+            r.is_err(),
+            "oversize tree must error on the byte cap: {:?}",
+            r.as_ref().map(|v| v.len())
+        );
+        let reason = r.unwrap_err().reason;
+        assert!(reason.contains("too large to index"), "{}", reason);
+        assert!(reason.contains("MiB of source"), "{}", reason);
+    }
+
+    #[test]
+    fn default_excludes_skip_temp_and_build_dirs() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("main.rs"), "fn main() {}\n").unwrap();
+        for sub in ["node_modules", "target", ".venv", "tmp"] {
+            let dir = d.path().join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("lib.rs"), "fn dep() {}\n").unwrap();
+        }
+        // The Windows layout behind issue #1538, exercised cross-platform:
+        // `AppData\Local\Temp` source must never be walked (AppData is name-excluded).
+        let appdata_temp = d.path().join("AppData/Local/Temp");
+        std::fs::create_dir_all(&appdata_temp).unwrap();
+        std::fs::write(appdata_temp.join("junk.rs"), "fn j() {}\n").unwrap();
+
+        let files = collect_files_limited(d.path(), &IndexLimits::default()).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|w| w.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["main.rs".to_string()],
+            "only the normal source file may be walked; walked: {names:?}"
         );
     }
 }
