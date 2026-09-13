@@ -42,24 +42,31 @@ struct Call {
 #[derive(Default)]
 pub struct State {
     calls: Vec<Call>,
+    /// The fold of `calls`, kept rather than recomputed.
+    ///
+    /// `render` and `height` both have to ask whether there is a panel at all —
+    /// `Hug(0)` is what hands the row back to the conversation, so if they
+    /// disagreed the screen would carry a blank line of chrome — and the honest
+    /// way to make them agree is one answer, not the same `reduce_todos` call
+    /// twice. It also costs: `reduce_todos` walks every call ever made, and a
+    /// frame asked it twice.
+    items: Vec<TodoItem>,
 }
 
 pub struct Todo;
 
-/// The list the panel draws: the calls that still count, folded — and nothing
-/// once every item of it is done.
+/// Fold the calls into the list the panel draws.
 ///
-/// Empty therefore means one of two things, and both are "no panel": the model
-/// has not planned anything yet, or it has finished what it planned. A finished
-/// list is not worth a permanent row — the `✓` landed in the transcript with the
-/// call that earned it, and `/todo` still prints the whole thing — so the panel
+/// Empty means one of two things, and both are "no panel": the model has not
+/// planned anything yet, or it has finished what it planned. A finished list is
+/// not worth a permanent row — the `✓` landed in the transcript with the call
+/// that earned it, and `/todo` still prints the whole thing — so the panel
 /// retires instead of standing there summarising work nobody has left to do.
 ///
-/// The rule lives here rather than in `render` because `height` has to ask the
-/// same question: `Hug(0)` is what hands the row back to the conversation, and a
-/// `render` that disagreed with it would leave a blank line of chrome.
-fn todos(state: &State) -> Vec<TodoItem> {
-    let items = reduce_todos(
+/// Called only where `calls` changes, which is what makes it a fold per fact
+/// rather than a fold per frame.
+fn refold(state: &mut State) {
+    let mut items = reduce_todos(
         state
             .calls
             .iter()
@@ -68,9 +75,9 @@ fn todos(state: &State) -> Vec<TodoItem> {
     );
     // `all` on an empty list is true, which is the answer we want there too.
     if items.iter().all(|t| t.status == TodoStatus::Completed) {
-        return Vec::new();
+        items.clear();
     }
-    items
+    state.items = items;
 }
 
 impl View for Todo {
@@ -86,6 +93,7 @@ impl View for Todo {
             // whether it will be accepted. `todowrite` validates its own
             // arguments, so a bad plan comes back as an error result below.
             SessionEvent::AssistantMessage { tool_calls, .. } => {
+                let before = state.calls.len();
                 for call in tool_calls.iter().filter(|c| is_todo_call(&c.name)) {
                     state.calls.push(Call {
                         id: call.id.clone(),
@@ -93,6 +101,9 @@ impl View for Todo {
                         args: call.arguments.clone(),
                         failed: false,
                     });
+                }
+                if state.calls.len() != before {
+                    refold(state);
                 }
             }
 
@@ -102,8 +113,13 @@ impl View for Todo {
                 if !*is_error {
                     return;
                 }
+                let mut hit = false;
                 if let Some(call) = state.calls.iter_mut().find(|c| c.id == *call_id) {
                     call.failed = true;
+                    hit = true;
+                }
+                if hit {
+                    refold(state);
                 }
             }
 
@@ -116,7 +132,10 @@ impl View for Todo {
             SessionEvent::TurnEnd {
                 stop: StopReason::Cancelled,
                 ..
-            } => state.calls.clear(),
+            } => {
+                state.calls.clear();
+                refold(state);
+            }
 
             _ => {}
         }
@@ -127,17 +146,17 @@ impl View for Todo {
         if w == 0 || vp.rect.h == 0 {
             return Vec::new();
         }
-        let items = todos(state);
+        let items = &state.items;
         if items.is_empty() {
             // Nothing to say: no plan yet, or every item of one finished (see
-            // `todos`). `Hug(0)` already asked for nothing; drawing a header
+            // `refold`). `Hug(0)` already asked for nothing; drawing a header
             // saying "no tasks" would be a row of chrome on a screen that is
             // mostly conversation.
             return Vec::new();
         }
 
-        let rows = window(&items, vp.rect.h as usize);
-        let (completed, in_progress, total) = todo_counts(&items);
+        let rows = window(items, vp.rect.h as usize);
+        let (completed, in_progress, total) = todo_counts(items);
         let open = total.saturating_sub(completed + in_progress);
         let unicode = vp.moment.caps.unicode;
         let label = theme::fg(Role::Secondary).bold();
@@ -199,7 +218,7 @@ impl View for Todo {
     /// A header plus a line each, content-sized: the host caps it, so a plan
     /// that outgrows the screen loses the fold, not the panel.
     fn height(state: &State, _: &Moment, _: u16) -> Height {
-        let items = todos(state).len();
+        let items = state.items.len();
         Height::Hug(if items == 0 {
             0
         } else {

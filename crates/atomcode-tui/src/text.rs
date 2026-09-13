@@ -32,6 +32,7 @@
 //!   frame: every control character goes, and a tab becomes the spaces it is
 //!   drawn as.
 
+use std::borrow::Cow;
 use std::iter::Peekable;
 use std::str::Chars;
 
@@ -70,7 +71,15 @@ pub fn for_buffer(text: &str) -> String {
 /// The last fence before the terminal, and the only one that can be: every
 /// drawn span passes through here on its way to bytes, so this is where the
 /// invariant *no byte we emit moves the cursor* can actually be held.
-pub fn for_screen(text: &str) -> String {
+///
+/// Borrowed when there is nothing to strip, which is the overwhelmingly common
+/// case — every span of every row goes through here, and allocating a `String`
+/// to tell it that `hello` is `hello` was the encoder's per-span cost. A row
+/// with a control character in it is the exception, and pays for the copy.
+pub fn for_screen(text: &str) -> Cow<'_, str> {
+    if !needs_sanitising(text) {
+        return Cow::Borrowed(text);
+    }
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -81,7 +90,21 @@ pub fn for_screen(text: &str) -> String {
             c => out.push(c),
         }
     }
-    out
+    Cow::Owned(out)
+}
+
+/// Whether [`for_screen`] would change anything.
+///
+/// A byte test, not a `char` walk: UTF-8 continuation bytes are all `>= 0x80`,
+/// so no multibyte character can hide a C0 control or DEL from it. C1 controls
+/// (`U+0080..=U+009F`) *are* `char::is_control` and arrive as the pair `C2 80..9F`,
+/// so they are matched as a pair rather than missed.
+fn needs_sanitising(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().any(|b| *b < 0x20 || *b == 0x7f)
+        || bytes
+            .windows(2)
+            .any(|pair| pair[0] == 0xc2 && (0x80..=0x9f).contains(&pair[1]))
 }
 
 /// Consume one escape sequence, if the cursor is sitting on the `ESC` that
@@ -157,6 +180,27 @@ mod tests {
             assert_eq!(for_buffer(s), s);
             assert_eq!(for_screen(s), s);
         }
+    }
+
+    #[test]
+    fn clean_text_is_borrowed_so_a_span_that_needs_no_work_allocates_nothing() {
+        // Every span of every drawn row passes through `for_screen`; handing
+        // back a fresh `String` for text that has nothing to strip was a
+        // per-span allocation in the encoder.
+        assert!(matches!(for_screen("hello 世界"), Cow::Borrowed(_)));
+        // And the copy really is only for text that needs one.
+        assert!(matches!(for_screen("a\tb"), Cow::Owned(_)));
+    }
+
+    #[test]
+    fn a_c1_control_character_is_stripped_like_any_other() {
+        // `char::is_control` covers U+0080..=U+009F, which the byte test that
+        // decides whether to borrow must not miss — they arrive as two bytes,
+        // so a scan for `b < 0x20` alone would pass them through.
+        assert_eq!(for_screen("a\u{9b}b"), "ab");
+        assert_eq!(for_screen("a\u{80}b"), "ab");
+        // The neighbouring non-controls are left alone.
+        assert_eq!(for_screen("a\u{a0}b"), "a\u{a0}b", "NBSP is content");
     }
 
     #[test]
