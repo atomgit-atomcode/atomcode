@@ -51,6 +51,22 @@ jobs:
       - name: cargo check (all crates, all targets)
         run: cargo check --workspace --all-targets
 
+      # `cargo test` runs one test binary to completion before starting the
+      # next, and this workspace has 91 integration test files. Measured on
+      # atomcode-kernel's 305 tests: `cargo test` 570s, of which only 1.3s was
+      # CPU — the rest was idle waiting. nextest runs them process-per-test
+      # across binaries: 0.64s. Process isolation also suits what this suite
+      # does to the host (the spawns and port binds noted below) better than
+      # `cargo test`'s threads-in-one-process model.
+      # See AGENTS.md, "测试与构建命令".
+      #
+      # Report-only like the two steps that consume it: this is infrastructure
+      # for a gate that cannot fail a PR yet, so a transient download failure
+      # must not fail one either. Promote it together with them.
+      - name: Install cargo-nextest
+        continue-on-error: true
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+
       # Report-only for now. The suite is green locally on macOS
       # (5711 passed / 0 failed at ecc9781a), but it has not yet run on a
       # Linux runner and it touches the host in ways CI often refuses:
@@ -58,9 +74,23 @@ jobs:
       # PROMOTE THIS: once a run is green here, delete the
       # `continue-on-error` line below — a test gate that cannot fail a PR is
       # not a gate.
-      - name: cargo test (all crates)
+      #
+      # `--profile ci` is the block in `.config/nextest.toml`: no fail-fast (a
+      # first Linux run should report every failure, not just the first), one
+      # retry (aimed at the port binds), `test-threads = "num-cpus"` so the
+      # runner's core count wins over the dev machine's tuned value, and a
+      # slow-test timeout loosened to 60s/240s so a slower runner does not make
+      # its debut red on timing alone.
+      - name: cargo nextest (all crates)
         continue-on-error: true
-        run: cargo test --workspace
+        run: cargo nextest run --workspace --profile ci
+
+      # nextest does not run doctests — this keeps that coverage, which the
+      # `cargo test --workspace` above used to carry. Report-only on the same
+      # contract as the step above; promote both together.
+      - name: cargo test --doc (all crates)
+        continue-on-error: true
+        run: cargo test --workspace --doc
 
   lint:
     name: fmt (blocking) + clippy (report only)

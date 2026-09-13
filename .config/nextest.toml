@@ -39,4 +39,11 @@ fail-fast = false
 failure-output = "immediate-final"
 final-status-level = "slow"
 # 重试会掩盖 flaky,所以只给 1 次,且 CI 日志里会标出 TRY 次数。
+# 这里留 1 次是冲着 runner 上的端口占用去的(测试里有 ~24 处 port bind)。
 retries = 1
+# 不要继承 default 的 test-threads = 6 —— 那是按某台 8 核开发机调的,
+# runner 的核数不一样,写死会过度订阅或闲着。
+test-threads = "num-cpus"
+# 也放宽 default 的 30s/120s:CI runner 比开发机慢,而且这道门还没在 Linux 上
+# 绿过一次。首跑因超时判红,最可能的结果是有人把门关掉,而不是去修测试。
+slow-timeout = { period = "60s", terminate-after = 4 }
