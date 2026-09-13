@@ -290,6 +290,8 @@ tui 线永远对着 replay 模型与 Headless surface 开发;新命令只由 har
 | 0018 | Host 契约:唯一入口 `atomcode`(`harness` 不是入口、`atui` 不再是 host);薄组装;读取位置;越界症状;**接线由 host 建立**(今天不是) |
 | 0019 | 贡献者要能被声明:把 `apply` 里的 register 提到行上(`contributes()`),`--dump-seams` 多一列,**不造收集机制** |
 
+执行计划:[`assembly-and-host-plan.md`](./assembly-and-host-plan.md)(0017/0018/0019 的落地顺序与判据)。
+
 相关文档:[`plexus-plugin-architecture.md`](./plexus-plugin-architecture.md)(底座与 spike 记录)、
 [`tui-composability.md`](./tui-composability.md)(TUI 的时间与空间可组合性)、
 `gates/`(差分基线与 TUI 闸门)。
