@@ -61,6 +61,16 @@ impl Plugin for SkillsPlugin {
     fn name(&self) -> &'static str {
         "skills"
     }
+    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
+        // (slot, item): what this row puts into which shared catalog. The value
+        // is still handed over in `apply`; this is the name, so the capability
+        // map and `--audit` can say who gave it.
+        &[
+            ("tools", "list_skills"),
+            ("tools", "use_skill"),
+            ("system-prompt", "skills"),
+        ]
+    }
     fn inject(&self) -> &'static [&'static str] {
         &["tools"]
     }
@@ -142,6 +152,17 @@ impl Plugin for CodeIntelPlugin {
     fn name(&self) -> &'static str {
         "codeintel"
     }
+    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
+        // (slot, item): what this row puts into which shared catalog. The value
+        // is still handed over in `apply`; this is the name, so the capability
+        // map and `--audit` can say who gave it.
+        &[
+            ("tools", "find_references"),
+            ("tools", "list_symbols"),
+            ("tools", "read_symbol"),
+            ("system-prompt", "codeintel"),
+        ]
+    }
     fn inject(&self) -> &'static [&'static str] {
         &["tools"]
     }
@@ -177,6 +198,19 @@ pub struct CodeGraphPlugin;
 impl Plugin for CodeGraphPlugin {
     fn name(&self) -> &'static str {
         "code-graph"
+    }
+    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
+        // (slot, item): what this row puts into which shared catalog. The value
+        // is still handed over in `apply`; this is the name, so the capability
+        // map and `--audit` can say who gave it.
+        &[
+            ("tools", "blast_radius"),
+            ("system-prompt", "code-graph"),
+            ("tools", "file_dependencies"),
+            ("tools", "trace_callees"),
+            ("tools", "trace_callers"),
+            ("tools", "trace_chain"),
+        ]
     }
     fn inject(&self) -> &'static [&'static str] {
         &["tools"]
@@ -228,6 +262,16 @@ impl Plugin for WebPlugin {
     fn name(&self) -> &'static str {
         "tool-web"
     }
+    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
+        // (slot, item): what this row puts into which shared catalog. The value
+        // is still handed over in `apply`; this is the name, so the capability
+        // map and `--audit` can say who gave it.
+        &[
+            ("system-prompt", "tool-web"),
+            ("tools", "web_fetch"),
+            ("tools", "web_search"),
+        ]
+    }
     fn inject(&self) -> &'static [&'static str] {
         &["tools"]
     }
@@ -274,6 +318,12 @@ impl Plugin for MemoryPlugin {
     fn name(&self) -> &'static str {
         "memory"
     }
+    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
+        // (slot, item): what this row puts into which shared catalog. The value
+        // is still handed over in `apply`; this is the name, so the capability
+        // map and `--audit` can say who gave it.
+        &[("tools", "memory")]
+    }
     fn uses(&self) -> &'static [&'static str] {
         // The tool half is optional: a tree with no catalog still gets the
         // injection, which is the half that works with no model cooperation.
@@ -303,11 +353,12 @@ impl Plugin for MemoryPlugin {
         // never add to it, which made "remember that I prefer X" a request only
         // a human could carry out — in a system whose whole point is that the
         // agent carries things out.
-        if let Some(toolbox) = ctx.service::<crate::seams::ToolsSvc>() {
-            toolbox.register(Arc::new(atomcode_capabilities::tools::MemoryTool))?;
-            let toolbox = toolbox.clone();
-            let _ = ctx.effect(move || toolbox.unregister("memory"));
-        }
+        // Through the shared mount path, so the contribution is recorded with
+        // this row's name (`--audit` compares that against `contributes()`).
+        super::tools::mount(
+            ctx,
+            vec![Arc::new(atomcode_capabilities::tools::MemoryTool)],
+        )?;
 
         crate::plugins::self_knowledge::describes(
             ctx,

@@ -33,6 +33,10 @@ pub(super) fn mount(ctx: &Context, tools: Vec<Arc<dyn Tool>>) -> Result<(), Stri
     for tool in tools {
         let name = tool.name().to_string();
         toolbox.register(tool)?;
+        // Recorded here because this is the one place that has both halves: the
+        // name and the row it came from. `--audit` reads these back and compares
+        // them with what the row declared in `Plugin::contributes`.
+        ctx.note_contribution("tools", &name);
         let toolbox = toolbox.clone();
         let _ = ctx.effect(move || toolbox.unregister(&name));
     }
@@ -45,6 +49,7 @@ pub(super) fn contribute_prompt(ctx: &Context, id: &str, rank: i32, text: &str) 
         return;
     };
     prompts.contribute(id, rank, text);
+    ctx.note_contribution("system-prompt", id);
     let id = id.to_string();
     let prompts = prompts.clone();
     let _ = ctx.effect(move || prompts.remove(&id));
@@ -64,6 +69,19 @@ pub struct FsToolsPlugin;
 impl Plugin for FsToolsPlugin {
     fn name(&self) -> &'static str {
         "tool-fs"
+    }
+    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
+        // (slot, item): what this row puts into which shared catalog. The value
+        // is still handed over in `apply`; this is the name, so the capability
+        // map and `--audit` can say who gave it. Same four tool names as
+        // `tool-fs-world` — exactly one of the two may be mounted.
+        &[
+            ("tools", "read_file"),
+            ("tools", "write_file"),
+            ("tools", "edit_file"),
+            ("tools", "list_directory"),
+            ("system-prompt", "tool-fs"),
+        ]
     }
     fn inject(&self) -> &'static [&'static str] {
         &["tools"]
@@ -103,6 +121,12 @@ pub struct BashToolPlugin;
 impl Plugin for BashToolPlugin {
     fn name(&self) -> &'static str {
         "tool-bash"
+    }
+    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
+        // (slot, item): what this row puts into which shared catalog. The value
+        // is still handed over in `apply`; this is the name, so the capability
+        // map and `--audit` can say who gave it.
+        &[("tools", "bash"), ("system-prompt", "tool-bash")]
     }
     fn inject(&self) -> &'static [&'static str] {
         &["tools"]
@@ -156,6 +180,16 @@ pub struct SearchToolsPlugin;
 impl Plugin for SearchToolsPlugin {
     fn name(&self) -> &'static str {
         "tool-search"
+    }
+    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
+        // (slot, item): what this row puts into which shared catalog. The value
+        // is still handed over in `apply`; this is the name, so the capability
+        // map and `--audit` can say who gave it.
+        &[
+            ("tools", "glob"),
+            ("tools", "grep"),
+            ("system-prompt", "tool-search"),
+        ]
     }
     fn inject(&self) -> &'static [&'static str] {
         &["tools"]

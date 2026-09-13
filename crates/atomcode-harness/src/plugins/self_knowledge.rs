@@ -286,6 +286,15 @@ impl Plugin for SelfKnowledgePlugin {
     fn name(&self) -> &'static str {
         "self-knowledge"
     }
+    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
+        // (slot, item): what this row puts into which shared catalog. The value
+        // is still handed over in `apply`; this is the name, so the capability
+        // map and `--audit` can say who gave it.
+        &[
+            ("tools", "describe_self"),
+            ("system-prompt", "self-knowledge"),
+        ]
+    }
     fn inject(&self) -> &'static [&'static str] {
         // The fragment is the irreducible half — a row that contributes nothing
         // to the prompt cannot tell the agent to stop guessing.
@@ -360,13 +369,13 @@ that is running.";
 
         // The tool half is optional so this row can mount in a tree with no
         // catalog — an eval harness, say — and still say who it is.
-        if let Some(toolbox) = ctx.service::<ToolsSvc>() {
-            let tool = Arc::new(DescribeSelf {
-                inner: Introspect { ctx: ctx.clone() },
-            });
-            toolbox.register(tool)?;
-            let toolbox = toolbox.clone();
-            let _ = ctx.effect(move || toolbox.unregister("describe_self"));
+        if ctx.service::<ToolsSvc>().is_some() {
+            super::tools::mount(
+                ctx,
+                vec![Arc::new(DescribeSelf {
+                    inner: Introspect { ctx: ctx.clone() },
+                })],
+            )?;
         }
         Ok(())
     }
@@ -403,6 +412,12 @@ struct InstructionsRow {
 impl Plugin for ProjectInstructionsPlugin {
     fn name(&self) -> &'static str {
         "project-instructions"
+    }
+    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
+        // (slot, item): what this row puts into which shared catalog. The value
+        // is still handed over in `apply`; this is the name, so the capability
+        // map and `--audit` can say who gave it.
+        &[("system-prompt", "project-instructions")]
     }
     fn inject(&self) -> &'static [&'static str] {
         &["system-prompt"]

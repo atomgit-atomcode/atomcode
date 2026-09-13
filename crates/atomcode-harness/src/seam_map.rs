@@ -27,6 +27,13 @@ pub struct SeamRow {
     /// caller like `run_turn`. Without this the map reports "consumed by
     /// nothing" for the one service the whole binary exists to call.
     pub host_consumer: bool,
+    /// `(item, row)` pairs: what each row puts **into** this slot.
+    ///
+    /// Separate from `providers` because a catalog has one holder and many
+    /// contributors. `providers` answered "who owns `tools`" and nothing
+    /// answered "who put `adjust_layout` in it", which is the question anyone
+    /// actually asks.
+    pub contributions: Vec<(&'static str, &'static str)>,
 }
 
 impl SeamRow {
@@ -133,6 +140,8 @@ pub fn seam_map(registry: &PluginRegistry) -> Vec<SeamRow> {
     let mut providers: BTreeMap<&'static str, Vec<&'static str>> = BTreeMap::new();
     let mut consumers: BTreeMap<&'static str, Vec<&'static str>> = BTreeMap::new();
     let mut optional: BTreeMap<&'static str, Vec<&'static str>> = BTreeMap::new();
+    let mut contributions: BTreeMap<&'static str, Vec<(&'static str, &'static str)>> =
+        BTreeMap::new();
     for name in registry.names() {
         let Some(plugin) = registry.get(name) else {
             continue;
@@ -146,6 +155,13 @@ pub fn seam_map(registry: &PluginRegistry) -> Vec<SeamRow> {
         for service in plugin.uses() {
             optional.entry(service).or_default().push(name);
         }
+        // Declared contributions, each naming its own slot: a contributor
+        // usually only `inject`s the slot (it reads the catalog to add to it)
+        // while the holder is a different row, so `provides` cannot supply the
+        // attribution.
+        for (slot, item) in plugin.contributes() {
+            contributions.entry(slot).or_default().push((item, name));
+        }
     }
 
     seam_definitions()
@@ -158,6 +174,7 @@ pub fn seam_map(registry: &PluginRegistry) -> Vec<SeamRow> {
             consumers: consumers.get(name).cloned().unwrap_or_default(),
             optional_consumers: optional.get(name).cloned().unwrap_or_default(),
             host_consumer: HOST_CONSUMED.contains(&name),
+            contributions: contributions.get(name).cloned().unwrap_or_default(),
         })
         .collect()
 }
@@ -206,6 +223,20 @@ pub fn render_table(rows: &[SeamRow]) -> String {
                     row.providers.join(", ")
                 }
             ));
+            if !row.contributions.is_empty() {
+                // Sorted by item: the question is "who gave us X", and a stable
+                // order keeps the output diffable.
+                let mut items = row.contributions.clone();
+                items.sort_unstable();
+                out.push_str(&format!(
+                    "    contributing: {}\n",
+                    items
+                        .iter()
+                        .map(|(item, row)| format!("{item} ({row})"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
             let mut readers: Vec<String> = row.consumers.iter().map(|c| c.to_string()).collect();
             readers.extend(
                 row.optional_consumers

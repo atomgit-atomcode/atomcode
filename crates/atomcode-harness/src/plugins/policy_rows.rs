@@ -37,6 +37,12 @@ impl Plugin for TodoPlugin {
     fn name(&self) -> &'static str {
         "tool-todo"
     }
+    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
+        // (slot, item): what this row puts into which shared catalog. The value
+        // is still handed over in `apply`; this is the name, so the capability
+        // map and `--audit` can say who gave it.
+        &[("tools", "todowrite"), ("system-prompt", "tool-todo")]
+    }
     fn inject(&self) -> &'static [&'static str] {
         &["tools"]
     }
@@ -184,6 +190,12 @@ pub struct PlanModePlugin;
 impl Plugin for PlanModePlugin {
     fn name(&self) -> &'static str {
         "plan-mode"
+    }
+    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
+        // (slot, item): what this row puts into which shared catalog. The value
+        // is still handed over in `apply`; this is the name, so the capability
+        // map and `--audit` can say who gave it.
+        &[("system-prompt", "plan-mode")]
     }
     fn inject(&self) -> &'static [&'static str] {
         &["tools"]

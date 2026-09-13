@@ -53,6 +53,12 @@ impl Plugin for OpenFileToolPlugin {
     fn name(&self) -> &'static str {
         "tool-open-file"
     }
+    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
+        // (slot, item): what this row puts into which shared catalog. The value
+        // is still handed over in `apply`; this is the name, so the capability
+        // map and `--audit` can say who gave it.
+        &[("tools", "open_file")]
+    }
     fn inject(&self) -> &'static [&'static str] {
         &["tools", "opener"]
     }

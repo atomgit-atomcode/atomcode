@@ -1354,6 +1354,12 @@ impl Plugin for TuiUiPlugin {
     fn name(&self) -> &'static str {
         "ui-tui2"
     }
+    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
+        // The screen's own tool: the model can rearrange the layout it is being
+        // read through. Named so the capability map says which row gave the
+        // model this, instead of it appearing out of `apply`.
+        &[("tools", "adjust_layout")]
+    }
     fn inject(&self) -> &'static [&'static str] {
         &["agents", "agent-loop", "surface"]
     }
@@ -1451,6 +1457,11 @@ impl Plugin for TuiUiPlugin {
                     modules: host.modules.clone(),
                 });
             tools.register(tool).map_err(|e| e.to_string())?;
+            // The harness's `tools::mount` is the shared write path and records
+            // the contribution there; this row is in another crate and reaches
+            // the catalog directly, so it files the same record itself. Without
+            // it `--audit` cannot see that this row gave the model a tool.
+            ctx.note_contribution("tools", "adjust_layout");
             let t = tools.clone();
             let _ = ctx.effect(move || t.unregister("adjust_layout"));
         }

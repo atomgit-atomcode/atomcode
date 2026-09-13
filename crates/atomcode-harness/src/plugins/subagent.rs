@@ -265,6 +265,12 @@ impl Plugin for SubagentPlugin {
     fn name(&self) -> &'static str {
         "subagent-in-process"
     }
+    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
+        // (slot, item): what this row puts into which shared catalog. The value
+        // is still handed over in `apply`; this is the name, so the capability
+        // map and `--audit` can say who gave it.
+        &[("system-prompt", "subagent"), ("tools", "task")]
+    }
     fn inject(&self) -> &'static [&'static str] {
         &["tools", "llm", "agents"]
     }
