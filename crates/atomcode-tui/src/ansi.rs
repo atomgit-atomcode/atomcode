@@ -497,6 +497,9 @@ mod tests {
     /// be compared against bytes that never came from the same place.
     #[test]
     fn a_first_paint_is_byte_for_byte_the_encoder_it_replaced() {
+        // It encodes, so it moves the shared counter: hold the lock the tests
+        // that read it hold.
+        let _alone = counting_alone();
         let caps = crate::caps::Caps::default();
         let mut f = Frame::new(20, 4);
         f.place(
