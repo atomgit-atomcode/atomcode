@@ -189,6 +189,11 @@ const TREE: &[Command] = &[
     Command::new("rows-list", "把行列出来,不开模态"),
     Command::new("tools-list", "列出模型能用的工具"),
     Command::new("audit", "检查这棵树的组合是否自洽"),
+    Command::taking(
+        "effort",
+        "<low|medium|high|xhigh|max>",
+        "运行时改思考强度(与模型无关;开关在 llm 行的 thinking_type)",
+    ),
     Command::taking("patch", "<TOML>", "在运行中改一行配置"),
 ];
 
@@ -289,6 +294,39 @@ impl CommandSet for TreeCommands {
                 Ok(what) => Outcome::Said(what),
                 Err(e) => Outcome::Refused(e),
             },
+            // A level is the session's, not the model route's, so this survives
+            // a model switch. The switch itself is NOT here on purpose: whether
+            // a route can reason at all is `thinking_type` on the `llm` row.
+            "effort" => {
+                let wanted = args.trim();
+                // One vocabulary, taken from the place that defines it, so this
+                // command cannot offer a level nothing parses.
+                let levels = atomcode_harness::REASONING_EFFORT_LEVELS;
+                let current = control
+                    .row_config(atomcode_harness::REASONING_EFFORT_ROW)
+                    .await
+                    .and_then(|c| c.get("level").and_then(|v| v.as_str()).map(str::to_string));
+                if wanted.is_empty() {
+                    return Outcome::Said(format!(
+                        "当前思考强度:{}\n可选:{}",
+                        current.unwrap_or_else(|| "端点默认".into()),
+                        levels.join(", ")
+                    ));
+                }
+                if !levels.contains(&wanted) {
+                    return Outcome::Refused(format!(
+                        "未知强度 `{wanted}`;可选:{}",
+                        levels.join(", ")
+                    ));
+                }
+                let toml = format!(
+                    "[[patch]]\nid = \"reasoning-effort\"\nconfig = {{ level = {wanted:?} }}\n"
+                );
+                match control.patch(&toml).await {
+                    Ok(what) => Outcome::Said(format!("思考强度 → {wanted}\n{what}")),
+                    Err(e) => Outcome::Refused(e),
+                }
+            }
             _ => Outcome::Quiet,
         }
     }

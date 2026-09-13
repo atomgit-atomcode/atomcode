@@ -1493,3 +1493,79 @@ async fn a_burst_of_deltas_costs_frames_not_one_per_delta() {
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+/// `/effort` must actually move the row in a running screen, not merely be
+/// listed in the menu: the seam it needs (`control`) is provided by the
+/// launcher, so a front end can have the row and the command and still fail
+/// here if that is not wired.
+#[tokio::test]
+async fn the_effort_command_moves_the_row_while_the_screen_runs() {
+    use atomcode_harness::REASONING_EFFORT_ROW;
+
+    let dir = scratch("effort-cmd");
+    let (s, app) = with_control(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    let level_now = |app: &Arc<tokio::sync::Mutex<App>>| {
+        let app = app.clone();
+        async move {
+            let guard = app.lock().await;
+            guard
+                .tree()
+                .entries
+                .iter()
+                .find(|e| e.id == REASONING_EFFORT_ROW)
+                .and_then(|e| {
+                    e.config
+                        .get("level")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+        }
+    };
+
+    assert_eq!(
+        level_now(&app).await,
+        None,
+        "the base bundle mounts the row with no opinion"
+    );
+
+    s.term.type_line("/effort high");
+    s.quiet().await;
+    assert_eq!(
+        level_now(&app).await.as_deref(),
+        Some("high"),
+        "the command must move the row, not just say it did"
+    );
+    assert!(
+        s.screen().contains("high"),
+        "and say so on screen:\n{}",
+        s.screen()
+    );
+
+    // With no argument it reports the current setting rather than changing it.
+    s.term.type_line("/effort");
+    s.quiet().await;
+    assert!(
+        s.screen().contains("high"),
+        "the current level is shown:\n{}",
+        s.screen()
+    );
+
+    // A value nothing parses is refused, and the row keeps what it had.
+    s.term.type_line("/effort bogus");
+    s.quiet().await;
+    assert!(
+        s.screen().contains("未知"),
+        "an unknown level is refused:\n{}",
+        s.screen()
+    );
+    assert_eq!(
+        level_now(&app).await.as_deref(),
+        Some("high"),
+        "a refused value must not disturb the row"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
