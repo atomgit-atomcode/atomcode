@@ -10,7 +10,10 @@ use atomcode_harness::agent::OnlySession;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// tokio 的 Instant:未暂停时等价 std,`start_paused` 下跟随虚拟时钟,
+// 于是下面那些 `elapsed() < N` 的上界断言在虚拟钟上依然是真判据。
+use tokio::time::Instant;
 
 use async_trait::async_trait;
 use atomcode_harness::events::{AgentRequest, ModelRequest, ModelResponse, RequestError};
@@ -352,7 +355,7 @@ async fn recovery_reads_the_providers_classification_not_the_message() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn an_empty_response_is_a_typed_failure_and_is_retried() {
     let dir = scratch("empty");
     let app = start(tree(&dir, &[])).await;
@@ -384,7 +387,7 @@ impl Waterfall<AgentRequest> for Hangs {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_request_that_never_returns_is_bounded() {
     let dir = scratch("hang");
     let row = "[[patch]]\nid = \"llm-request-timeout\"\nconfig = { request_secs = 1 }";
@@ -405,7 +408,7 @@ async fn a_request_that_never_returns_is_bounded() {
     assert!(outcome.error.unwrap_or_default().contains("exceeded"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn the_timeout_bounds_the_retries_too() {
     let dir = scratch("hang-total");
     // Three retries of a 10-minute hang under a 1s ceiling: the ceiling has to
@@ -698,7 +701,7 @@ async fn a_broken_stream_keeps_what_it_produced() {
     assert!(transcript.contains("and then finished"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn stream_recovery_is_bounded() {
     let dir = scratch("partial-forever");
     let row = "[[patch]]\nid = \"llm-stream-recovery\"\nconfig = { max_recoveries = 1 }";
@@ -723,7 +726,7 @@ async fn stream_recovery_is_bounded() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn an_open_failure_has_nothing_to_preserve() {
     let dir = scratch("no-partial");
     let app = start(tree(&dir, &[])).await;
