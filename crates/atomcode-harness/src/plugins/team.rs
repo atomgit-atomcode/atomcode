@@ -24,17 +24,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use atomcode_kernel::provider::ReasoningEffort;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
-use atomcode_plexus::{Context, Plugin};
+use atomcode_plexus::{Context, Next, Plugin, Waterfall};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::agent::{Agent, AgentId, CreateAgent, MessageOrigin};
-use crate::events::{SessionEventCommitted, TurnStopping};
+use crate::events::{
+    AgentRequest, ModelRequest, ModelResponse, RequestError, SessionEventCommitted, TurnStopping,
+};
 use crate::seams::{
     AgentsSvc, FsSvc, LlmSvc, LlmUtilitySvc, SessionSvc, ShellSvc, ToolBox, ToolsSvc,
 };
 use crate::session::{Committed, SessionEvent};
+use crate::REASONING_EFFORT_LEVELS;
 
 use super::agent_loop::{keep_driven, Driving};
 use super::subagent::ChildRoundCap;
@@ -71,12 +75,21 @@ struct Role {
     when: String,
     /// An explicit tool list, instead of the permission's default set.
     tools: Option<Vec<String>>,
+    /// How hard this member should think, when the role says. `None` leaves the
+    /// session's own setting (the `reasoning-effort` row) in charge.
+    ///
+    /// Belongs on the role for the same reason `difficulty` does: the model
+    /// already does not get to pick its own tier, and "this job is a review, not
+    /// a listing" is a fact about the job. A role that says nothing inherits,
+    /// so a project only writes `effort` where it wants to differ.
+    effort: Option<ReasoningEffort>,
 }
 
 fn built_in(
     id: &str,
     permission: Permission,
     difficulty: Difficulty,
+    effort: ReasoningEffort,
     persona: &str,
     when: &str,
 ) -> Role {
@@ -87,6 +100,7 @@ fn built_in(
         persona: persona.into(),
         when: when.into(),
         tools: None,
+        effort: Some(effort),
     }
 }
 
@@ -96,6 +110,12 @@ fn built_in_roles() -> Vec<Role> {
             "explorer",
             Permission::Explore,
             Difficulty::Simple,
+            // Simple roles answer a narrow question, and they run on the utility
+            // provider with thinking already off — so this is a floor, not the
+            // main lever. It is here so that a deployment that points the
+            // utility slot at a *thinking* model still gets the cheap tier it
+            // asked for.
+            ReasoningEffort::Low,
             "You find things: code paths, call chains, where a symbol lives. You report \
              locations with file and line, and you do not speculate.",
             "code search and call-chain discovery",
@@ -104,6 +124,10 @@ fn built_in_roles() -> Vec<Role> {
             "reviewer",
             Permission::Explore,
             Difficulty::Hard,
+            // Hard roles inherit the conversation's model, so this is where the
+            // tier is actually decided. Judging a change is the most demanding
+            // thing a member does.
+            ReasoningEffort::Max,
             "You review code for defects and risks. You report each issue with the file, \
              the line range and why it matters, and you change nothing.",
             "reviewing a change or a file for problems",
@@ -112,6 +136,7 @@ fn built_in_roles() -> Vec<Role> {
             "implementer",
             Permission::Worker,
             Difficulty::Hard,
+            ReasoningEffort::Max,
             "You implement what you are asked, in the files you are told about. You make \
              the smallest change that does the job and report exactly what you changed.",
             "a self-contained change with a clear scope",
@@ -120,6 +145,7 @@ fn built_in_roles() -> Vec<Role> {
             "tester",
             Permission::Worker,
             Difficulty::Hard,
+            ReasoningEffort::Max,
             "You write and adjust tests. You report which tests you touched and what each \
              one proves.",
             "adding or fixing tests for a change",
@@ -128,6 +154,7 @@ fn built_in_roles() -> Vec<Role> {
             "docs_writer",
             Permission::Worker,
             Difficulty::Simple,
+            ReasoningEffort::Low,
             "You write and edit documentation. You keep to the facts you were given and \
              report which files you touched.",
             "documentation for something already decided",
@@ -142,6 +169,7 @@ fn built_in_roles() -> Vec<Role> {
 /// ---
 /// permission: explore        # or worker
 /// difficulty: simple         # or hard
+/// effort: low                # optional; how hard this member thinks
 /// when: cataloguing what exists
 /// tools: read_file, grep     # optional; replaces the permission's default set
 /// ---
@@ -163,6 +191,7 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
     }
     let mut permission = None;
     let mut difficulty = None;
+    let mut effort = None;
     let mut when = String::new();
     let mut tools = None;
     let mut body = String::new();
@@ -207,6 +236,20 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
                         }
                     })
                 }
+                // A typo here would be a member that quietly thinks at the
+                // default rate while the file says otherwise — the same silent
+                // no-op `permission` and `difficulty` refuse, so this refuses it
+                // too rather than falling back to no opinion.
+                "effort" => {
+                    effort = Some(ReasoningEffort::from_config(Some(value)).ok_or_else(|| {
+                        format!(
+                            "{}: effort must be one of {}, not `{other}`",
+                            path.display(),
+                            REASONING_EFFORT_LEVELS.join(", "),
+                            other = value
+                        )
+                    })?)
+                }
                 "when" => when = value.to_string(),
                 "tools" => {
                     tools = Some(
@@ -244,6 +287,7 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
         persona,
         when,
         tools,
+        effort,
     })
 }
 
@@ -513,6 +557,9 @@ impl TeamTool {
             Difficulty::Simple => self.ctx.service::<LlmUtilitySvc>(),
             Difficulty::Hard => None,
         };
+        // Captured out of `role` before the realm closure takes `tools_for_realm`
+        // and friends; the closure is `move` and `role` is not otherwise kept.
+        let role_effort = role.effort;
         let member_id = format!("{lead_session}/{name}");
         let lead_id = lead.id();
         let member_name = name.clone();
@@ -527,31 +574,47 @@ impl TeamTool {
         if let Some((dir, _)) = &worktree {
             req = req.cwd(dir.clone());
         }
-        let child = agents
-            .create(
-                &self.ctx,
-                req.setup(Box::new(move |realm: &Context| {
-                    let mut held = Vec::new();
-                    held.push(
-                        realm
-                            .provide::<ToolsSvc>(tools_for_realm)
-                            .map_err(|e| e.to_string())?,
-                    );
-                    held.push(
-                        realm
-                            .provide::<crate::seams::SystemPromptSvc>(prompts.clone())
-                            .map_err(|e| e.to_string())?,
-                    );
-                    if let Some(model) = utility.clone() {
-                        held.push(realm.provide::<LlmSvc>(model).map_err(|e| e.to_string())?);
-                    }
-                    held.push(realm.on_serial::<TurnStopping>(Arc::new(ChildRoundCap {
-                        max_steps: max_rounds,
-                    })));
-                    Ok(held)
-                })),
-            )
-            .await?;
+        let child =
+            agents
+                .create(
+                    &self.ctx,
+                    req.setup(Box::new(move |realm: &Context| {
+                        let mut held = Vec::new();
+                        held.push(
+                            realm
+                                .provide::<ToolsSvc>(tools_for_realm)
+                                .map_err(|e| e.to_string())?,
+                        );
+                        held.push(
+                            realm
+                                .provide::<crate::seams::SystemPromptSvc>(prompts.clone())
+                                .map_err(|e| e.to_string())?,
+                        );
+                        if let Some(model) = utility.clone() {
+                            held.push(realm.provide::<LlmSvc>(model).map_err(|e| e.to_string())?);
+                        }
+                        held.push(realm.on_serial::<TurnStopping>(Arc::new(ChildRoundCap {
+                            max_steps: max_rounds,
+                        })));
+                        // The role's thinking tier, on this member's own realm.
+                        //
+                        // Here rather than somewhere global because a member is the
+                        // only thing that is per-role: the level is a fact about the
+                        // job this member was delegated, so it has to be scoped to
+                        // the member or two members in one team would share an
+                        // answer. `prepend` because this is more specific than the
+                        // session's `reasoning-effort` row, which still fills in for
+                        // any role that states no effort of its own.
+                        if let Some(effort) = role_effort {
+                            held.push(realm.on_waterfall::<AgentRequest>(
+                                Arc::new(RoleEffort { effort }),
+                                true,
+                            ));
+                        }
+                        Ok(held)
+                    })),
+                )
+                .await?;
         // The tool needs the member's registry id, which exists only now.
         restricted.register(Arc::new(TellParent {
             agents: agents_for_tool,
@@ -979,6 +1042,29 @@ impl Default for TeamRow {
             worktrees: false,
             worktrees_dir: None,
         }
+    }
+}
+
+/// Writes one role's thinking tier onto every request that member makes.
+///
+/// Deliberately narrow: it sets the level and touches nothing else, so the
+/// session-wide row, the provider's own `thinking_type`, and every other
+/// per-call option keep working underneath it. Registered on the member's realm
+/// with `prepend`, because a role that names a tier knows better than the
+/// session default it would otherwise inherit.
+struct RoleEffort {
+    effort: ReasoningEffort,
+}
+
+#[async_trait]
+impl Waterfall<AgentRequest> for RoleEffort {
+    async fn handle(
+        &self,
+        req: &mut ModelRequest,
+        next: Next<'_, AgentRequest>,
+    ) -> Result<ModelResponse, RequestError> {
+        req.options.reasoning_effort = Some(self.effort);
+        next.run(req).await
     }
 }
 

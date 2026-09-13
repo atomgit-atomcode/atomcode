@@ -2,13 +2,14 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use atomcode_harness::agent::{Agent, AgentStatus};
 use atomcode_harness::seams::{AgentsSvc, ToolsSvc};
 use atomcode_harness::session::{InjectionOrigin, SessionEvent};
 use atomcode_harness::{bundle, create_agent, drive, plugins, run_turn};
+use atomcode_kernel::provider::ReasoningEffort;
 use atomcode_kernel::tool::{ProgressSink, ToolContext};
 use atomcode_plexus::{App, ConfigTree, Layer};
 
@@ -520,5 +521,136 @@ async fn a_worker_edits_in_its_own_worktree_and_the_branch_outlives_it() {
     assert!(
         branches.contains("team/scribe-"),
         "the branch stays for the lead: {branches}"
+    );
+}
+
+// ---- the role's thinking tier ---------------------------------------------
+
+/// Records what each model request carried, so a test can say what tier a
+/// member's turn actually ran at rather than what the config claimed.
+struct EffortSpy(Arc<Mutex<Vec<Option<ReasoningEffort>>>>);
+
+#[async_trait::async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for EffortSpy {
+    async fn handle(
+        &self,
+        req: &mut atomcode_harness::events::ModelRequest,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::AgentRequest>,
+    ) -> Result<atomcode_harness::events::ModelResponse, atomcode_harness::events::RequestError>
+    {
+        self.0.lock().unwrap().push(req.options.reasoning_effort);
+        next.run(req).await
+    }
+}
+
+/// The role decides the tier, and that decision reaches the request. Registered
+/// as a spy at the root (which a member's realm can see, since visibility is
+/// one-way down), so a member's own realm listener runs first and the spy
+/// reports the result.
+#[tokio::test]
+async fn a_members_tier_comes_from_its_role() {
+    let dir = scratch("role-effort");
+    write_role(
+        &dir,
+        "librarian",
+        "---\npermission: explore\ndifficulty: simple\neffort: low\n---\nYou catalogue.\n",
+    );
+    write_role(
+        &dir,
+        "grader",
+        "---\npermission: explore\ndifficulty: hard\neffort: max\n---\nYou grade.\n",
+    );
+    let app = start(tree(
+        &dir,
+        r#"{ text = "delegating", calls = [ { name = "team", args = { action = "delegate", name = "lib", role = "librarian", task = "list the docs" } } ] },
+          { text = "again", calls = [ { name = "team", args = { action = "delegate", name = "gr", role = "grader", task = "grade it" } } ] },
+          { text = "done" }"#,
+        r#"{ text = "catalogued" }"#,
+    ))
+    .await;
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let _guard = app
+        .context()
+        .on_waterfall::<atomcode_harness::events::AgentRequest>(
+            Arc::new(EffortSpy(seen.clone())),
+            false,
+        );
+
+    run_turn(&app, "go").await.unwrap();
+
+    let recorded = seen.lock().unwrap().clone();
+    assert!(
+        recorded.contains(&Some(ReasoningEffort::Low)),
+        "the simple role asked for `low`: {recorded:?}"
+    );
+    assert!(
+        recorded.contains(&Some(ReasoningEffort::Max)),
+        "the hard role asked for `max`: {recorded:?}"
+    );
+}
+
+/// A role that states no effort must not have one invented for it — the
+/// session's own row stays in charge, which is what makes `effort` optional in
+/// a role file rather than something every project has to repeat.
+#[tokio::test]
+async fn a_role_without_an_effort_line_inherits_the_session_setting() {
+    let dir = scratch("role-effort-inherit");
+    write_role(
+        &dir,
+        "librarian",
+        "---\npermission: explore\ndifficulty: simple\n---\nYou catalogue.\n",
+    );
+    let app = start(tree(
+        &dir,
+        r#"{ text = "delegating", calls = [ { name = "team", args = { action = "delegate", name = "lib", role = "librarian", task = "list the docs" } } ] }"#,
+        r#"{ text = "catalogued" }"#,
+    ))
+    .await;
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let _guard = app
+        .context()
+        .on_waterfall::<atomcode_harness::events::AgentRequest>(
+            Arc::new(EffortSpy(seen.clone())),
+            false,
+        );
+
+    run_turn(&app, "go").await.unwrap();
+    assert!(
+        seen.lock().unwrap().iter().all(|e| e.is_none()),
+        "the role said nothing, so nothing may be set on its behalf: {:?}",
+        seen.lock().unwrap()
+    );
+}
+
+/// A misspelled tier must be an error, not a silent fallback to the default: a
+/// role file that says `effort: hihg` and a member that quietly thinks at the
+/// session's rate is the kind of bug nobody notices until the bill.
+///
+/// It fails at MOUNT, not at the first turn — the roles are read when the row
+/// applies, so a bad file is caught before any work can be delegated under it.
+#[tokio::test]
+async fn a_typo_in_a_roles_effort_is_refused_at_mount() {
+    let dir = scratch("role-effort-typo");
+    write_role(
+        &dir,
+        "librarian",
+        "---\npermission: explore\ndifficulty: simple\neffort: hihg\n---\nYou catalogue.\n",
+    );
+    let tree = tree(
+        &dir,
+        r#"{ text = "delegating", calls = [ { name = "team", args = { action = "delegate", name = "lib", role = "librarian", task = "list the docs" } } ] }"#,
+        r#"{ text = "catalogued" }"#,
+    );
+    let mut app = App::new(plugins::catalog(), tree);
+    let err = app
+        .start()
+        .await
+        .expect_err("a bad role file must stop the mount");
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("hihg") && rendered.contains("effort"),
+        "the finding must name the file, the key and the value: {rendered}"
     );
 }
