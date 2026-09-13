@@ -66,18 +66,6 @@ impl Context {
     }
 
     /// The config row id this context belongs to (`<root>` for the host).
-    /// Note that this row put `name` into one of the slots it provides.
-    ///
-    /// Called by the slot's write path — the one place that knows both the name
-    /// and the row it came from — so `--audit` can compare what a row actually
-    /// contributed against what it declared in
-    /// [`Plugin::contributes`](crate::Plugin::contributes).
-    pub fn note_contribution(&self, slot: &'static str, item: &str) {
-        if let Some(fiber) = self.root.fibers.get(self.fiber) {
-            fiber.note_contribution(slot, item);
-        }
-    }
-
     pub fn entry(&self) -> String {
         self.root
             .fibers

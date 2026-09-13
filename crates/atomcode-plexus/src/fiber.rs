@@ -49,14 +49,6 @@ pub(crate) struct FiberState {
     pub parent: FiberId,
     ledger: Mutex<Vec<Option<Effect>>>,
     status: Mutex<FiberStatus>,
-    /// Named items this row put into the slots it provides, in the order it
-    /// said them. Kept beside `entry`/`plugin` because it is the same kind of
-    /// fact — what this row *is* — and dropped with the fiber, so a
-    /// patched-away row takes its record with it.
-    /// `(slot, item)` — the slot comes from the write path, which is the only
-    /// thing that knows a tool mount lands in `tools` and a fragment in
-    /// `system-prompt`.
-    contributions: Mutex<Vec<(&'static str, String)>>,
 }
 
 impl FiberState {
@@ -68,25 +60,7 @@ impl FiberState {
             parent,
             ledger: Mutex::new(Vec::new()),
             status: Mutex::new(FiberStatus::Pending),
-            contributions: Mutex::new(Vec::new()),
         }
-    }
-
-    /// Note one contribution by name. Called from the slot's own write path, so
-    /// the record is what actually happened rather than what was declared.
-    pub(crate) fn note_contribution(&self, slot: &'static str, item: &str) {
-        self.contributions
-            .lock()
-            .expect("fiber contributions poisoned")
-            .push((slot, item.to_string()));
-    }
-
-    /// What this row contributed, for `--audit` and the capability map.
-    pub(crate) fn contributions(&self) -> Vec<(&'static str, String)> {
-        self.contributions
-            .lock()
-            .expect("fiber contributions poisoned")
-            .clone()
     }
 
     /// File an effect and return its slot index.

@@ -51,12 +51,6 @@ impl Plugin for CodingPersonaPlugin {
     fn name(&self) -> &'static str {
         "persona-coding"
     }
-    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
-        // (slot, item): what this row puts into which shared catalog. The value
-        // is still handed over in `apply`; this is the name, so the capability
-        // map and `--audit` can say who gave it.
-        &[("system-prompt", "persona-coding")]
-    }
     fn inject(&self) -> &'static [&'static str] {
         &["system-prompt"]
     }

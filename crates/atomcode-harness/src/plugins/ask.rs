@@ -174,12 +174,6 @@ impl Plugin for AskPlugin {
     fn name(&self) -> &'static str {
         "tool-ask"
     }
-    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
-        // (slot, item): what this row puts into which shared catalog. The value
-        // is still handed over in `apply`; this is the name, so the capability
-        // map and `--audit` can say who gave it.
-        &[("tools", "ask_user"), ("system-prompt", "tool-ask")]
-    }
     fn inject(&self) -> &'static [&'static str] {
         &["tools"]
     }

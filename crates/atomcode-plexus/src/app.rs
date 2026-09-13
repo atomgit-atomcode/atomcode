@@ -268,21 +268,6 @@ impl App {
     ///
     /// Returns an empty vec when the tree is consistent. Intended for a test and
     /// for a `--dump-seams`-style command, not for the hot path.
-    /// What each mounted row contributed, by row id. Read from the fibers, so
-    /// it is what happened rather than what was declared.
-    pub fn contributions(&self) -> std::collections::HashMap<String, Vec<(&'static str, String)>> {
-        self.mounted
-            .iter()
-            .filter_map(|(id, fiber)| {
-                self.root
-                    .fibers
-                    .get(*fiber)
-                    .map(|f| (id.clone(), f.contributions()))
-            })
-            .filter(|(_, names)| !names.is_empty())
-            .collect()
-    }
-
     pub fn audit(&self) -> Vec<AuditFinding> {
         self.audit_with_host(&[])
     }
@@ -354,35 +339,6 @@ impl App {
                     });
                 }
             }
-
-            // What the row actually put in, against what it declared. Both
-            // directions are defects: an undeclared contribution is invisible
-            // on the map (the thing this whole field exists to fix), and a
-            // declared-but-missing one is a promise the map would otherwise
-            // repeat to the next reader.
-            let actual = self
-                .root
-                .fibers
-                .get(*fiber)
-                .map(|f| f.contributions())
-                .unwrap_or_default();
-            let declared: Vec<(&'static str, &'static str)> = plugin.contributes().to_vec();
-            for (slot, item) in &actual {
-                if !declared.iter().any(|(s, i)| s == slot && i == item) {
-                    findings.push(AuditFinding::ContributedButNotDeclared {
-                        entry: id.clone(),
-                        slot,
-                        item: item.clone(),
-                    });
-                }
-            }
-            // The other direction — declared and not contributed — is
-            // deliberately NOT checked: a contribution can be conditional
-            // (`skills` says nothing when no skill is installed, `tool-web` when
-            // the overlay is off), so "declared but absent" is a legitimate
-            // state in some tree, and a check that fires on it would be noise.
-            // The declaration is therefore read as "this row *can* contribute
-            // this", which is what the capability map says.
         }
 
         for service in &live {
@@ -442,17 +398,6 @@ pub enum AuditFinding {
         service: &'static str,
         consumers: Vec<String>,
     },
-    /// The row put this item into a slot and never said so in
-    /// `Plugin::contributes`.
-    ///
-    /// The same defect as `ProvidedButNotDeclared`, one level down: a catalog
-    /// has one holder and many contributors, and only the contributors can be
-    /// wrong about what they added.
-    ContributedButNotDeclared {
-        entry: String,
-        slot: &'static str,
-        item: String,
-    },
 }
 
 impl AuditFinding {
@@ -463,14 +408,6 @@ impl AuditFinding {
     /// a front end that can ask questions under a policy that never asks, say —
     /// so it must not fail a build on its own.
     pub fn is_defect(&self) -> bool {
-        // `ProvidedButUnused` is an observation rather than a defect: a service
-        // nobody reads in this composition is usually worth removing, but it is
-        // a legitimate state — a front end that can ask questions under a policy
-        // that never asks, say.
-        //
-        // `ContributedButNotDeclared` IS a defect, and the one that matters: an
-        // undeclared contribution is invisible on the capability map, which is
-        // the whole reason `contributes` exists.
         !matches!(self, Self::ProvidedButUnused { .. })
     }
 
@@ -480,9 +417,6 @@ impl AuditFinding {
             Self::ProvidedButNotDeclared { entry, service } => (1, format!("{entry}:{service}")),
             Self::InjectedButUnprovidable { service, .. } => (2, service.to_string()),
             Self::ProvidedButUnused { service } => (3, service.to_string()),
-            Self::ContributedButNotDeclared { entry, slot, item } => {
-                (4, format!("{entry}:{slot}:{item}"))
-            }
         }
     }
 }
@@ -497,12 +431,6 @@ impl std::fmt::Display for AuditFinding {
             Self::ProvidedButNotDeclared { entry, service } => write!(
                 f,
                 "`{entry}` provides `{service}` without declaring it — the capability map cannot see it"
-            ),
-            Self::ContributedButNotDeclared { entry, slot, item } => write!(
-                f,
-                "`{entry}` put `{item}` into `{slot}` without declaring it — add \
-                 `(\"{slot}\", \"{item}\")` to this row's `contributes()` so the map can \
-                 say who gave it"
             ),
             Self::ProvidedButUnused { service } => {
                 write!(f, "`{service}` is provided but nothing injects it")

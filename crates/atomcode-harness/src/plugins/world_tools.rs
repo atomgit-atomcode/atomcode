@@ -41,18 +41,6 @@ impl Plugin for FsWorldToolsPlugin {
     fn name(&self) -> &'static str {
         "tool-fs-world"
     }
-    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
-        // (slot, item): what this row puts into which shared catalog. The value
-        // is still handed over in `apply`; this is the name, so the capability
-        // map and `--audit` can say who gave it.
-        &[
-            ("tools", "edit_file"),
-            ("tools", "list_directory"),
-            ("tools", "read_file"),
-            ("tools", "write_file"),
-            ("system-prompt", "tool-fs-world"),
-        ]
-    }
     fn inject(&self) -> &'static [&'static str] {
         &["tools", "fs"]
     }
@@ -98,16 +86,6 @@ impl Plugin for SearchWorldToolsPlugin {
     fn name(&self) -> &'static str {
         "tool-search-world"
     }
-    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
-        // (slot, item): what this row puts into which shared catalog. The value
-        // is still handed over in `apply`; this is the name, so the capability
-        // map and `--audit` can say who gave it.
-        &[
-            ("tools", "glob"),
-            ("tools", "grep"),
-            ("system-prompt", "tool-search-world"),
-        ]
-    }
     fn inject(&self) -> &'static [&'static str] {
         &["tools", "fs"]
     }
@@ -146,12 +124,6 @@ pub struct BashWorldToolPlugin;
 impl Plugin for BashWorldToolPlugin {
     fn name(&self) -> &'static str {
         "tool-bash-world"
-    }
-    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
-        // (slot, item): what this row puts into which shared catalog. The value
-        // is still handed over in `apply`; this is the name, so the capability
-        // map and `--audit` can say who gave it.
-        &[("tools", "bash"), ("system-prompt", "tool-bash-world")]
     }
     fn inject(&self) -> &'static [&'static str] {
         &["tools", "shell"]

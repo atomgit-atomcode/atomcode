@@ -59,22 +59,6 @@ pub trait Plugin: Send + Sync + 'static {
         &[]
     }
 
-    /// The `(slot, item)` pairs this plugin puts **into** shared catalogs.
-    ///
-    /// Note this is *not* [`provides`](Self::provides): a contributor usually
-    /// only `inject`s the slot (it reads the catalog to add to it), while the
-    /// holder is a different row. So the slot has to be named here — `tools`
-    /// has one holder and a dozen contributors, and the map could say who owns
-    /// the catalog but not who put anything in it.
-    ///
-    /// Declarative only. The value is still handed over in
-    /// [`apply`](Self::apply) — that is where the `Context` is, and where a
-    /// contribution may legitimately depend on services resolved at mount time.
-    /// This is the *name*, so the map and `--audit` can see it.
-    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
-        &[]
-    }
-
     /// One-line description for introspection output.
     fn description(&self) -> &'static str {
         ""

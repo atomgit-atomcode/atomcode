@@ -308,12 +308,6 @@ impl Plugin for RecallPlugin {
     fn name(&self) -> &'static str {
         "recall"
     }
-    fn contributes(&self) -> &'static [(&'static str, &'static str)] {
-        // (slot, item): what this row puts into which shared catalog. The value
-        // is still handed over in `apply`; this is the name, so the capability
-        // map and `--audit` can say who gave it.
-        &[("tools", "recall")]
-    }
     fn inject(&self) -> &'static [&'static str] {
         &["tools"]
     }
@@ -326,7 +320,12 @@ impl Plugin for RecallPlugin {
         "search this project's past sessions through the persistence seam"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
-        super::tools::mount(ctx, vec![Arc::new(RecallTool { ctx: ctx.clone() })])?;
+        let toolbox = ctx
+            .require::<crate::seams::ToolsSvc>()
+            .map_err(|e| e.to_string())?;
+        toolbox.register(Arc::new(RecallTool { ctx: ctx.clone() }))?;
+        let toolbox = toolbox.clone();
+        let _ = ctx.effect(move || toolbox.unregister("recall"));
         crate::plugins::self_knowledge::describes(
             ctx,
             "recall",
