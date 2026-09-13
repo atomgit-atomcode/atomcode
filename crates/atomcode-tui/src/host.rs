@@ -172,24 +172,47 @@ impl Presentation {
 /// moves is still a selection, and ctrl-r still does them all at once.
 const CLICKABLE: [&str; 2] = ["tool_call", "reasoning"];
 
-/// Whether a blank row goes between two blocks stacked next to each other.
+/// Whether a blank row goes on the seam between two stacked blocks.
+///
+/// `upper` is the block nearer the top of the screen, `lower` the one under it.
+/// The order is part of the signature because one of the rules is not symmetric:
+/// both call sites pass the pair this way round even though the painter walks
+/// the stream backwards.
 ///
 /// A tool call is its own paragraph. Without a row between them the model's
 /// prose runs straight into the `●` header and the two read as one wall — the
 /// sentence and the thing that was run at the same level. One blank row is the
 /// whole of the fix, and it goes on *both* sides of a call, because
 /// `⎿ ok · 12 行` followed by the next sentence has the same problem the other
-/// way round.
+/// way round — hence the two-sided test below.
 ///
 /// Nothing goes between two tool calls. A run of them is one thought, and a
 /// screen of six calls separated by five gaps is a screen that no longer shows
 /// what was done in one glance.
 ///
+/// The turn's closing rule is a separator — `──── ✓ 完成 · 3 步 ────` — and gets
+/// a row of air on both sides unconditionally. It is the one row that is *about*
+/// the transcript rather than part of it, and pressed against the prose above
+/// and the next question below it stops reading as a boundary and starts
+/// reading as one more line of the answer.
+///
+/// The user's message opens a paragraph downwards: the answer starts under a
+/// blank rather than directly under the bar, where it would read as the first
+/// line of what was asked rather than as a reply to it. Nothing is needed above
+/// it, because what is normally there is the closing rule — which now carries
+/// its own margin.
+///
 /// One definition, consulted by both the painter and the height the scroll is
 /// measured against — the two have to agree or the last rows of a long
 /// transcript become unreachable.
-fn blank_between(a: &str, b: &str) -> bool {
-    (a == "tool_call") != (b == "tool_call")
+fn blank_between(upper: &str, lower: &str) -> bool {
+    if upper == "turn_end" || lower == "turn_end" {
+        return true;
+    }
+    if upper == "user" {
+        return true;
+    }
+    (upper == "tool_call") != (lower == "tool_call")
 }
 
 /// Which block each row of the stream came from, and where the stream was.
@@ -434,7 +457,7 @@ impl Host {
                 // each pass adds n and the guard already proved it fits.
                 if n <= scroll.saturating_sub(skipped) {
                     skipped += n;
-                    if below.is_some_and(|b| blank_between(b, kind)) {
+                    if below.is_some_and(|b| blank_between(kind, b)) {
                         skipped += 1;
                     }
                     below = Some(kind);
@@ -450,7 +473,7 @@ impl Host {
             if lines.is_empty() {
                 continue;
             }
-            let blank = below.is_some_and(|b| blank_between(b, kind));
+            let blank = below.is_some_and(|b| blank_between(kind, b));
             below = Some(kind);
             // The blank belongs to the seam between this block and the one
             // below it, so it goes into the buffer first: rows go in
@@ -664,7 +687,9 @@ impl Host {
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         let mut total = 0usize;
-        let mut below: Option<&'static str> = None;
+        // Walking forwards, so the block seen last is the one *above* the
+        // current one — `blank_between` takes (upper, lower).
+        let mut above: Option<&'static str> = None;
         for slot in stream.slots() {
             let b = slot.block();
             // What is not drawn is not a row of the transcript — and by the same
@@ -680,10 +705,10 @@ impl Host {
             if n == 0 {
                 continue;
             }
-            if below.is_some_and(|k| blank_between(k, b.kind())) {
+            if above.is_some_and(|k| blank_between(k, b.kind())) {
                 total += 1;
             }
-            below = Some(b.kind());
+            above = Some(b.kind());
             total += n;
         }
         total
@@ -1038,6 +1063,76 @@ mod tests {
         assert!(
             rows.iter().any(|r| r.contains("fix the build")),
             "scrolled to the limit and the first thing said is not there: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_users_message_opens_a_paragraph_the_answer_starts_under() {
+        // What you asked is the row you scan for. With the reply's first row
+        // directly under the bar, the bar reads as the opening line of the
+        // answer — the same collapse as prose running into a `●` header.
+        //
+        // `now break it` is the case that pins both halves at once: the turn
+        // above it ends in a closing rule (whose own margin is the row above
+        // the bar), and the model's prose begins under the bar.
+        let h = fed();
+        let rows: Vec<String> = h
+            .compose((80, 40))
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        let asked = rows
+            .iter()
+            .position(|r| r.contains("now break it"))
+            .expect("what was asked");
+        assert!(
+            rows[asked + 1].trim().is_empty(),
+            "the answer starts on the bar instead of under it: {:?}",
+            &rows[asked..asked + 3]
+        );
+        assert!(
+            rows[asked + 2].contains("看看那个目录"),
+            "and the row after the blank is the model's: {:?}",
+            &rows[asked..asked + 3]
+        );
+    }
+
+    #[test]
+    fn the_closing_rule_has_a_row_of_air_on_both_sides() {
+        // The separator is the one row that is *about* the transcript: pressed
+        // against the prose above and the next question below, it reads as one
+        // more line of the answer instead of a boundary between two turns.
+        let h = fed();
+        let rows: Vec<String> = h
+            .compose((80, 40))
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        let rule = rows
+            .iter()
+            .position(|r| r.contains("完成") && r.contains('─'))
+            .expect("the first turn's closing rule");
+        // The prose it closes, a blank, the rule, a blank, the next question.
+        assert!(
+            rows[rule - 2].contains("Fixed it") && rows[rule + 2].contains("now break it"),
+            "the rule is not between the two turns: {:?}",
+            &rows[rule - 2..=rule + 2]
+        );
+        assert!(
+            rows[rule - 1].trim().is_empty(),
+            "no blank between the prose and the rule: {:?}",
+            &rows[rule - 2..=rule]
+        );
+        assert!(
+            rows[rule + 1].trim().is_empty(),
+            "no blank between the rule and the next question: {:?}",
+            &rows[rule..=rule + 2]
         );
     }
 

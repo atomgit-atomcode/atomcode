@@ -78,6 +78,11 @@ impl Content for UserSaid {
     /// The background is the point: in a screen of assistant prose and tool
     /// output, the bar is where you scan to find "what did I ask". A chevron
     /// alone gets lost among the `●` and `⎿` markers around it.
+    ///
+    /// Spacing around it is not decided here: a block draws its own content and
+    /// nothing else, and the blank row under the bar belongs to the seam between
+    /// two blocks — see `host::blank_between`, which is the one place that
+    /// decides it for both the painter and the scroll.
     fn lines(&self, w: u16) -> Vec<Line> {
         // Roles, not colours. This used to name `Theme::Dark` outright, which
         // is how the whole transcript stayed dark on a light screen: a module
