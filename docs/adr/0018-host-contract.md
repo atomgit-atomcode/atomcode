@@ -16,8 +16,10 @@
 
 ### 0. 八条原则(逐条)
 
-1. **程序的入口应该由 host 提供。** 用户进一步定:host **落到 CLI**
-   (`crates/atomcode-cli`,包名 `atomcode`),因为那是程序入口。
+1. **程序的入口应该由 host 提供。** 用户进一步定:唯一的入口是 `atomcode`
+   (`crates/atomcode-cli`,包名 `atomcode`)。**`harness` 不是程序入口**(它是开发用的
+   驱动,见 §5.4);`--repl` / `--web` / `--sdk` 这三个 flag 也不保留(它们是
+   `--profile` 的纯糖,见 §5.1)。
 2. **Host 是一层很薄的组装层。**
 3. **所有的配置读取、环境变量读取应该在 host 上完成。**
 4. **Host 应该组装 Agent 能力 + Product 能力 + 对外的协议或 UI。**
@@ -112,7 +114,7 @@ Answers}`、`agent::{Agent, AgentStatus}`、`profile::Profiles`、`launch::{valu
 
 | 原则 | 今天 | 差距 |
 |---|---|---|
-| ① 入口 | **四个入口**:`atomcode`(cli,旧 tuix 栈的宿主)、`atomcode-daemon`、`atui`、`harness`。后两个是 plexus 栈的**第二个和第三个 host**(见 §5) | 流程是 host 的(`Launch::parse` → `mount` → `hand_over`),**入口不是**。按用户决定收进 CLI |
+| ① 入口 | **五个入口**:`atomcode`(cli,旧 tuix 栈宿主)、**`atomcode-clix`**(另一条新栈,D 层 driver)、`atomcode-daemon`、`atui`、`harness`。后两个是 plexus 栈的**第二个和第三个 host** | 流程是 host 的(`Launch::parse` → `mount` → `hand_over`),**入口不是**。按用户决定:唯一入口 `atomcode`,另见 §5.4(`harness` 不是入口) |
 | ② 薄组装层 | `launch.rs` / `bundle.rs` / `plugins/ui*.rs` **住在 `atomcode-harness`** | `architecture-target.md:58` 已列「要移出」,`:236` 自认「harness 含 UI 行与 launch」。待办 10 |
 | ③ 读取在 host | `model_source.rs` 在 harness;`capabilities` 读 `$ATOMCODE_HOME` 三次 | 待办 10 + ADR 0017 |
 | ④ 组装四层 | `Profiles::resolve`(`profile.rs:134`)+ `bundle::base()` + profile overlays 已在做 | **机制对,位置错** |
@@ -137,55 +139,107 @@ Answers}`、`agent::{Agent, AgentStatus}`、`profile::Profiles`、`launch::{valu
 
 1. `TUI2` overlay(surface 行、trace 静音、独立 asker 让位)是**宿主侧的树组装**,
    随 host 搬走;它现在住在 UI 二进制里,正是"UI 知道 Agent 细节"的一例。
-2. **`--tui` 从"被拒绝"变成"普通 flag"**(§5.2):今天 `launch.rs:120` 与
-   `atui.rs:150` 各有一份拒绝,都要删;`UI_NAMES`(`bundle.rs:822`)不必补 `"tui"`——
-   它是 flag,不是 `--ui` 的取值。
-3. **`atui` 这个二进制不再是入口。** 它**不能留在 `atomcode-tui`**——留在一个 UI
+2. **入口面收成三条,不多不少**(用户定):
+   - **`--tui`** —— 产品入口。**是 `-p tui` 的糖**,所以两种写法等价;
+   - **`-p/--profile <name>`** —— 通用机制,profile 自带它要的 UI 行
+     (`repl-app` → `ui-repl`、`web-app` → `ui-web`、`sdk-app` → `ui-jsonrpc`);
+   - **`--ui <name>`** —— 正交的换前端开关(任何 profile 之下都可用)。这是 0013 明确
+     看重的那条"同一个 agent 背后换一个前端",保留。
+3. **删掉的是三个纯糖 flag**:`--repl` / `-i` / `--web` / `--sdk`
+   (`launch.rs:115-117`)。它们自己的说明就写着 "shorthand for `--profile X`"
+   (`harness.rs:62-65`),而 profile 已经选了同一个 UI 行——**两条路到一个地方**。
+   删它们没有任何损失,**也没有测试依赖**(`launch.rs` 的测试用的是 `-p repl`)。
+4. **`ui_overlay` 的 `tui` 映射是必需的**,不是对称性:插件真名是 **`ui-tui2`**
+   (带 `2`,`plugin.rs:1355`),而 `ui_overlay` 是按名字拼 `ui-{name}` 的
+   (`bundle.rs:785`)。不映射就会拼出 `ui-tui`——一个**不存在的行**。现有的同类映射
+   先例就在同一个函数里:`sdk => jsonrpc`。所以:
+   `UI_NAMES`(`bundle.rs:822`)加 `"tui"`,`ui_overlay` 加 `"tui" => "tui2"`。
+   *(本页上一版把这条写反了,写成"UI_NAMES 不必露 tui"——见 §5.5 的更正。)*
+5. **`atui` 这个二进制不再是入口。** 它**不能留在 `atomcode-tui`**——留在一个 UI
    crate 里就等于 UI 仍拥有入口,原则 1 没满足;它也不能改成宿主侧的壳,因为那必须
    **依赖 `atomcode-tui`** 去挂 `ui-tui2` 行,而 UI 认 Host 就违反 0013 的反向。
-   所以:入口收进 `atomcode --tui`,UI crate 只提供**行**(`ui-tui2` 与屏幕面板)。
-4. **依赖方向翻成该有的样子:Host → UI 的行;UI → 中立协议。** 今天靠
-   `atomcode-tui/Cargo.toml:15` 依赖 `atomcode-harness`,而那正是因为 `Launch` 住在
-   harness(§3(b))。host 搬走之后,这条反向依赖同时消失——**这一搬同时满足原则 1 与 2**。
+6. **两处拒绝要删**:今天宿主与 atui 各拦一份——`launch.rs:120`(宿主共享表,
+   `exit 2`)与 `atui.rs:150`(atui 自己拦的,把 `--ui/--repl/--web/--sdk/--tui/--port`
+   一起判掉)。后者随 `atui` 一起消失。
+7. **一条测试要反向**:`launch.rs` 的
+   `the_full_screen_front_end_is_not_a_row_here` 今天把 `--tui` 与 `--ui tui` 钉成
+   `exit 2`,守的是"UI 不能被宿主选"这个错状态。改造后应变成「`--tui` 挂上 `ui-tui2`
+   行」的判据。
+8. **一个 gate 要改**:`gates/tui.sh:80` 是全仓**唯一**一处脚本调二进制,调的就是
+   `./target/debug/atui --offline --audit`。入口改名后要变成 `atomcode --tui --offline
+   --audit`(或它等价的 headless 形式);`atomcode-tui/Cargo.toml:9-10` 的
+   `[[bin]] name = "atui"` 同时删。
 
-#### 5.2 入口形态由用户定:`atomcode --tui`(不是保留 `atui`)
+#### 5.2 入口形态由用户定:`atomcode --tui`
 
-用户定:**以后的入口是 `atomcode --tui`**,`atui` 这个二进制不再作为入口。理由与原则 1
-同源——入口属于 host,而 `atui` 现在「成为 host」这件事本身就是**不对的**(§5 的那三
-条证据是症状,不是设计)。所以:
+用户定:**入口是 `atomcode --tui`**,`atui` 这个二进制不再作为入口。理由与原则 1 同源
+——入口属于 host,而 `atui` 现在「成为 host」这件事本身就是**不对的**(§5 那三条证据
+是症状,不是设计)。
 
-- **`atui` 二进制消失**(或退化成内部测试用的壳,不再是面向人的入口);
-- **`TUI2` overlay 变成 `TUI_APP` 这个 profile**(精确落点):它现在住在
+- **`atui` 二进制消失**;
+- **`TUI2` overlay 变成 `TUI_APP` 这个 profile —— 这是精确落点。** 它现在住在
   `atui.rs:40`,内容是 surface 行 + `ui` 的 patch + trace 静音 + asker/approval 重排
-  ——那是**宿主侧的组装**,不是一个 UI 的行。而 `bundle.rs` 已有六个同类常量
+  ——那是**宿主侧的组装**,不是一个 UI 的行。而 `bundle.rs` 里**已经有六个同类常量**
   (`ONESHOT_APP:515`、`REPL_APP:539`、`WEB_APP:567`、`SDK_APP:593`、`HANDLE_APP:625`、
-  `EMBED_APP:649`,表在 `:690`),**唯独缺 `TUI_APP`**——缺的原因是 TUI 的 profile 不在
-  宿主手里。所以 `atomcode --tui` = 选 `tui` profile,与 `--repl`/`--web`/`--sdk` 同形;
-- `--tui` 在宿主里变成**换个 UI 行**的普通 flag,与 `--repl`/`--web`/`--sdk` 同级——
-  今天它在 `launch.rs:120` 是被**拒绝**的(`exit 2`),`atui.rs:150` 那份拒绝也随之删;
-- `--ui tui` 不再需要单独存在(它就是 `--tui`),`UI_NAMES` 里也不必露 `"tui"`——
-  它是 flag,不是 `--ui` 的取值;
-- **UI 侧只留行**:`rows::SCREEN`(`atomcode-tui/src/rows.rs:48`)与
-  `rows::catalog()`(`:117`)已经是这个形状,`ui-tui2` 插件也在 UI crate 里
-  (`plugin.rs:1355`)。宿主挂 `TUI_APP` + `SCREEN` ——**这就是原则 4 说的组装**;
-- 一条测试要**反向**:今天 `launch.rs` 的
-  `the_full_screen_front_end_is_not_a_row_here` 把 `--tui` 与 `--ui tui` 钉成 `exit 2`,
-  它守的是"UI 不能被宿主选"这个错状态。改造后它应该变成「`--tui` 挂上 `ui-tui2` 行」
-  的判据。
+  `EMBED_APP:649`,注册表在 `:690`),**唯独缺 `TUI_APP`**——缺的原因正是 TUI 的 profile
+  不在宿主手里。所以落点是现成的模式,不用发明:`TUI2` → `TUI_APP`,`-p tui` 与 `--tui`
+  都选它;
+- `ui_overlay("tui") => "tui2"` 的映射是**必需的**(理由见 §5.1 第 4 条:插件叫
+  `ui-tui2`,直接拼会得到不存在的 `ui-tui`);
+- **UI 侧只留行**:`rows::SCREEN`(`rows.rs:48`)与 `rows::catalog()`(`:117`)已经是
+  这个形状,`ui-tui2` 插件也在 UI crate 里(`plugin.rs:1355`)。宿主挂
+  `TUI_APP` + `SCREEN` ——**这就是原则 4 说的组装**;
+- **依赖方向翻成该有的样子:Host → UI 的行;UI → 中立协议。** 今天靠
+  `atomcode-tui/Cargo.toml:15` 依赖 `atomcode-harness`,而那正是因为 `Launch` 住在
+  harness(§3(b))。host 搬走之后,这条反向依赖同时消失——**这一搬同时满足原则 1 与 2**。
 
-我先前把这一条记成"保留二进制名的薄壳,标注为产品选择"——那是**回避决定**,不是记决定。
-用户的原话就是 `atomcode --tui`,照此记。
-
-#### 5.3 一个风险,记在案
+#### 5.3 一个风险,记在案:`atomcode` 迁移期要托三个角色
 
 `atomcode-cli` 今天是**旧 tuix 栈的宿主**(`atomcode-cli/Cargo.toml:34` 依赖
-`atomcode-tuix`),且**不依赖** `atomcode-harness`/`atomcode-tui`。host 落进去意味着
-一个 crate 在迁移期同时托两个栈。备选是**新建 `atomcode-host` 库 crate**,让
-`atomcode`、`atomcode-daemon` 共用——daemon 确实需要同一个宿主库。本页记用户的选择
-(CLI),把这个备选留在"权衡过"里。
+`atomcode-tuix`),且**完全不依赖** `atomcode-harness`/`atomcode-tui`(除 `tuix` 外那条
+依赖表里没有这两个)。落地成 host 意味着它要:
 
-注意 §5.2 的选择**加重了**这里:入口统一到 `atomcode` 之后,这个 crate 同时是
-「旧栈宿主 + 新栈宿主 + 唯一入口」,迁移期责任更集中。搬迁时这一条要重新评估一次。
+1. 兼**旧栈宿主**,
+2. 成为**新栈宿主**——为此**新增整条 plexus 栈的依赖,含 `atomcode-tui`**(要挂
+   `ui-tui2`,插件在 UI crate 里),
+3. 成为**唯一入口**。
+
+第 2 条有个具体代价,先前没写:**CLI 无论跑不跑 TUI 都要链接 UI crate**,除非加 feature
+门(加门就要决定默认开不开,又是一个决定)。备选是**新建 `atomcode-host` 库 crate**,
+让 `atomcode` 与 `atomcode-daemon` 共用宿主逻辑——daemon 确实需要它。本页按用户的
+选择记(CLI),备选留在"权衡过"里并注明**搬迁时要重新评估一次**。
+
+#### 5.4 `harness` 不是程序入口
+
+用户定:`harness` 不是入口。核实后站得住,而且它是**唯一一个没有隐藏代价**的收口:
+
+- 它作为二进制**只被自己的文档引用**(`docs/plexus-plugin-architecture.md:12-19` 的
+  `cargo run -p atomcode-harness --bin harness`),**没有任何 gate 或 CI 调它**
+  (`gates/tui.sh:78` 跑的是 `cargo nextest run -p atomcode-harness`——那个**包**的测试,
+  不是这个二进制);
+- 它的能力**已经被 `atomcode -p <profile>` 覆盖**:它自己做的事就是
+  `Launch::new("oneshot", …)` → `mount` → `hand_over`(`harness.rs:24-…`),与 atui 的
+  main 同形、只是 profile 默认不同。
+- 所以它降级为**开发驱动**:要么删掉,要么留成不带产品承诺的 dev 二进制。若删,
+  `docs/plexus-plugin-architecture.md` 那三处示例要改成 `atomcode -p oneshot`。
+  **本页按"不再是入口"记;删或留留待搬迁时定**(留着的唯一价值是不必为了看一眼
+  oneshot 而走产品入口)。
+
+#### 5.5 本节(v5)的更正记录
+
+- **五个入口,不是四个**。§4 ① 上一版写"四个入口",漏了 **`atomcode-clix`**
+  (`crates/atomcode-clix`,自述"Standalone new-stack CLI (D-layer driver):`code` 驱动
+  完整 coding agent、`review` 驱动 review agent")。它是**另一条新栈**,不走 plexus 树
+  ——所以"入口统一"要处理的栈不止两个。
+- **`UI_NAMES` 必须含 `"tui"`**。上一版写"不必露,它是 flag 不是 `--ui` 的取值"——
+  错了:上一版还把 `--tui` 说成"与 `--repl/--web/--sdk` 同级",而那三个 flag **本身
+  就是 `--ui` 的取值**(`launch.rs:115-117` 就是 `ui_overlay(...)`),
+  `tests/profile.rs:84-88` 正是拿 `--ui` 的名字做断言。用户随后定那三个 flag **不保留**,
+  但 `--ui tui` 仍然要能用,所以 `UI_NAMES` 与 `ui_overlay` 两处都要加 `tui`
+  (映射到 `tui2`,理由见 §5.1 第 4 条)。
+- **`gates/tui.sh:80` 会断**。上一版完全没提:它是全仓唯一调二进制的脚本,调的是
+  `./target/debug/atui`。入口改名后必须一起改(§5.1 第 8 条)。
+- §3.1(接线)那处更正另立,因为它是**原则性**的,不只是 §5 的细节。
 
 ## 权衡过、没做的
 
@@ -224,9 +278,12 @@ Answers}`、`agent::{Agent, AgentStatus}`、`profile::Profiles`、`launch::{valu
   **实现** crate——今天它依赖 `atomcode-harness`(§3(b))。这条可以用读 `Cargo.toml`
   的守卫钉住,形状同上面那条读源码的。
 - **入口唯一(§5 做完后)**:面向人的入口只剩 `atomcode`——`atui.rs` 与 `harness.rs`
-  的 `main` 不再是入口。可执行的判定:`atomcode --tui` 与 `atomcode --repl` 都由
+  的 `main` 不再是入口。可执行的判定:`atomcode --tui` 与 `atomcode -p oneshot` 都由
   同一个二进制接受,且 `--tui` 挂的是 `ui-tui2` 行(今天两处都报 `exit 2`:
   `launch.rs:120`、`atui.rs:150`)。
+- **入口面只有三条(§5.1)**:`--tui`、`-p/--profile`、`--ui`。可执行:`--repl`/`--web`/
+  `--sdk` 不再被接受而是报未知 flag——**今天它们被接受**,所以这条闸门现在应当判红,
+  这是预期的(它是一条"欠债"闸门,不是当下状态)。
 
 ## 未做
 
