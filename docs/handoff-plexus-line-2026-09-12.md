@@ -1,6 +1,6 @@
 # 交接:plexus 线,2026-09-12(2026-09-13 夜续)
 
-分支 `feat/plexus-plugin-architecture`,整条线自 `origin/release/v5.1.0` 起 91 个 commit
+分支 `feat/plexus-plugin-architecture`,整条线自 `origin/release/v5.1.0` 起 103 个 commit
 未 push,远端没有这条分支。(起手先 `git log --oneline origin/release/v5.1.0..HEAD`
 看真实 HEAD;下面的形状与验证一节随 commit 更新。)
 
@@ -103,15 +103,45 @@ UI 侧(`atomcode-tui`,另一个会话):
   "留最后 N 字节"对任何不是 3 的倍数的 N 都落在字符中间。`a_hostile_argument_is_in_the_corpus`
   守着这条输入不被改软。
 
+**09-13 深夜:单帧成本(UI)与摘要行(Agent)**
+
+UI 侧(`atomcode-tui`),按"什么在变贵"排的:
+- `ansi::Lines`(3110386c):diff 挪到 encode **之前**。上一帧每行的 payload 留着,逐行比对,
+  没变的行直接沿用——一次 encode 都不做。原来的 `patch_from` 省的是 write,而贵的是
+  encode(`write_line` 每 span 都要 escape/clip/分配,与帧内容无关的 ~0.29ms/帧常数)。
+  范围:行变不变按**屏幕行**算,而 stream 底对齐,追加一行会让整屏上移、仍全编码;省掉的
+  是"行数不变"那些帧(空闲 spinner、输入框打字)。`ROWS_ENCODED` 计数器直接证明跳过的行
+  确实没被编码(等值输出证明不了),读它的四条判据共用一把锁(0116b28e)。
+- `Slot::Live` 的 `LiveCache` + `markdown::render_settled`(4ceb1d1d):流式块原来每帧整篇重渲。
+  现在 `render_settled` 报出**定稿边界**(在行边界上、且不在围栏内),`rows_at` 只在"宽度
+  相同且新文本 `starts_with` 上一帧源"时复用整段已渲行。围栏是唯一会回溯的东西,所以边界
+  在开口围栏前停住。`Content::growing_text` 是可选声明——只有 `ModelSaid` 实现它。
+- `modules/todo.rs` 折一次 + `text::for_screen` 回 `Cow`(e983d984):`render` 与 `height`
+  原来各折一遍 `reduce_todos`(扫全部历史调用),现在在 `calls` 真变的那几处折一次存
+  `State.items`;`for_screen` 没有控制字符就 `Borrowed`(按字节扫,并按对匹配 C1)。
+- 残余:`rows_at` 的契约**没变**,仍是 `(总行数, Option<Vec<Line>>)`——`stream_height` 与
+  滚动边界依赖它,所以每帧仍把整屏 `Vec<Line>` 物化一份。见「下一步」第 4 条。
+
+Agent 侧(`atomcode-harness`):
+- `plugins/compaction.rs` / `compaction-summary` 行(4defaa25):同一个 compaction 缝的另一半
+  ——折**同一个区间**,边界抽成 `settled_span` 两个策略共用;摘要走 `llm-utility`;任何模型
+  帮不上忙的路径(没挂 utility / 报错 / 超时 / 答空)都落回模型无关的清单,回退文案与
+  `compaction-tail` 逐字相同——provider 挂了降级的是摘要的质量,不是压缩这件事。触发器
+  `mount_compaction_trigger` 也抽出来两行共用(否则换进来的策略永远不触发)。一行一个
+  provider,所以这是 patch 里 `[[remove]] compaction-tail` + `[[insert]] compaction-summary`
+  的**替换**;BASE 默认仍是模型无关那行。
+
 ## 怎么验证
 
 ```sh
-cargo test -p atomcode-harness -p atomcode-tui --no-fail-fast   # 600+ 全绿
+cargo test -p atomcode-harness -p atomcode-tui --no-fail-fast   # 全绿
 cargo clippy --no-deps -p atomcode-harness -p atomcode-plexus --all-targets -- -D warnings
 bash gates/tui-layers.sh && bash gates/tui-layers.spec.sh && bash gates/tui-negative.sh
-bash gates/tui-string-slice.sh && bash gates/tui-test-count.sh
+bash gates/tui-string-slice.sh && bash gates/tui-test-count.sh   # tui 单包判据 352
 git status --short gates/     # 差分基线 gates/differential.baseline 只准降,不准动
 ```
+
+`gates/tui-test-count.baseline` 是 352(tui 单包;harness 不计在内),只升不降。
 
 `gates/tui.sh` 的 clippy 步骤会红:tui 的 host.rs / input.rs / theme.rs 三条,kernel 与
 telemetry 各几条,都是 rust 1.94 新 lint 的既有问题,不在本次范围。
@@ -123,6 +153,8 @@ telemetry 各几条,都是 rust 1.94 新 lint 的既有问题,不在本次范围
 3. 生产 profile 要不要默认开模型起名。
 4. steering vs 定时:定时消息在回合中到达会折进当前回合,「每小时跑一遍」需要「等回合结束」语义。
 5. 成员到成员直接通话不开;ACP 与 tui 里成员输出怎么呈现。
+6. capabilities 那三个审批 gate 怎么接(下一步第 5 条):重写成 harness 的 `ToolsExecute`
+   监听,还是给 gate 加一个不依赖 kernel `RequestCtx` 的端口。两条都动公开形状,不替人定。
 
 ## 下一步(建议顺序)
 
@@ -130,20 +162,28 @@ telemetry 各几条,都是 rust 1.94 新 lint 的既有问题,不在本次范围
    只在 replay 上测过。
 2. **`ui-acp` 行**:移植 `crates/atomcode-cli/src/acp/`(7.7k 行)到句柄协议之上;多会话已就绪
    (`CreateAgent` + `by_session`),差 fs/terminal 客户端世界行、RejectAlways、config option 白名单。
-3. **`compaction-summary` 行**:把 capabilities 的 `OverflowCompaction`(stub + 模型摘要)接到
-   `compaction` 缝,摘要走 `llm-utility`;顺便让 `/compact <focus>` 的 focus 进策略签名。
-4. **ToolMiddleware 适配行**:CredentialBashGate / WriteApprovalGate / BashWorkspaceGate 原样
-   挂上(4.6k 行实现已在 capabilities)。
-5. **定时与 loop 行**:往 inbox 放 `Harness` 消息即可,机制已备;coding 的 `controllers.rs` 是策略参考。
-6. team 剩余:lead 取消级联、`report_finding` 进成员工具集、fork 切片器。
+3. **`/compact <focus>` 的 focus 进策略签名**:`Compaction::compact(&self, log)`
+   (`seams.rs:302`)现在还只吃 log,人给的侧重点到不了策略。摘要行本身已完成
+   (`compaction-summary`,见上),这条只剩这个签名。
+4. **`rows_at` 返回可见窗口**:live 块增量渲染(4ceb1d1d)省掉的是整篇重解析,每帧那次
+   `Vec<Line>` 物化还在。改契约会波及 `stream_height` 与滚动边界算法,是独立一步,也是
+   tui 单帧成本这条线上最后一项。
+5. **capabilities 的审批 gate 怎么接——要人先拍板**:`ToolMiddleware` 是 **kernel** 的
+   trait(`crates/atomcode-kernel/src/middleware.rs:35`),`CredentialBashGate` /
+   `WriteApprovalGate` / `BashWorkspaceGate` 实现的正是它(`credential_bash_gate.rs:516` /
+   `write_approval.rs:302` / `bash_workspace_gate.rs:791`),`before` 收 `&RequestCtx`
+   (`credential_bash_gate.rs:487`)。而 harness 的回合循环是 `agent-loop` 行,它自己的闸门
+   是另一套 `Waterfall<ToolsExecute>`(`policy.rs:138` 的 `ApprovalGate`、`:330` 的
+   `SensitivePathGate`;`policy_rows.rs:84` 的 `PermissionGate`、`:157` 的 `PlanModeGate`),
+   全仓对 `ToolMiddleware` 零引用。所以不是「原样挂上」:要么把三个 gate 重写成
+   `ToolsExecute` 监听,要么给 gate 加一个不依赖 `RequestCtx` 的端口。见「未决」第 6 条。
+6. **定时与 loop 行**:往 inbox 放 `Harness` 消息即可,机制已备;coding 的 `controllers.rs` 是策略参考。
+7. team 剩余:lead 取消级联、`report_finding` 进成员工具集、fork 切片器。
    (成员面板已落地:`tui-panel-team`;审批问题会说是哪个成员在问,见 `tui-ask-card`。)
-7. 截图粘贴欠三条(09-13 夜复核 tuix 后列的):剪贴板只有"原始字节"这一级——macOS 上
+8. 截图粘贴欠三条(09-13 夜复核 tuix 后列的):剪贴板只有"原始字节"这一级——macOS 上
    Finder ⌘C 与 iTerm2 只给 `public.file-url`,Windows 的 Qt 系截图工具给的 CF_DIBV5
    `arboard` 会拒;发送顺序是"贴入顺序"而不是 marker 在文中的顺序;没有尺寸上限。
    tuix 的 `try_paste_clipboard_image` 是三级回退,每级都写着是哪条真实报告逼出来的。
-8. `modules/todo.rs` 每帧折两遍(`render` 与 `height` 各调一次 `reduce_todos`,扫全部
-   历史调用);`text::for_screen` 每 span 一次分配。都可以改成在 `absorb` 折一次 /
-   返回 `Cow`。
 9. 会话剩余:`delete`、OS 租约、`Titled` 的 `/title` 之外的提交点。
 
 ## 踩过的坑
