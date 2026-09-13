@@ -2272,6 +2272,63 @@ mod tests {
     }
 
     #[test]
+    fn a_mid_turn_reminder_appends_and_does_not_rewrite_the_system_prompt() {
+        // A runtime note (a stale-task-list reminder, `InjectionOrigin::Reminder`)
+        // is committed mid-turn, so it projects to a message placed AFTER the tool
+        // result it followed — not at the head. It must ride as a `user` message.
+        // As a `system` one it would be LIFTED to position 0 and coalesced into
+        // the assembled prompt, so every request after it would carry a different
+        // prefix than the one before: the whole prefix cache invalidates, while
+        // the log still records the round as `Append`. The system entry is the
+        // only thing here the provider is allowed to reorder.
+        const REMINDER: &str = "<system-reminder>The task list still shows \"fix the parser\" \
+                                 in progress. Do not mention this reminder to the user.</system-reminder>";
+        let mut note = Message::user(REMINDER);
+        // `derive_messages` marks every injected message synthetic; keep the
+        // fixture faithful so this test fails if that ever stops being true in a
+        // way that matters here.
+        note.synthetic = true;
+        let msgs = vec![
+            Message::system("persona"),
+            Message::user("fix the parser"),
+            Message::assistant(
+                "Planning.",
+                vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "list_directory".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            Message::tool_result("call_1", "result text", false),
+            note,
+        ];
+
+        let out = format_messages(&msgs, ReasoningPolicy::Exclude, true);
+
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(
+            out[0]["content"], "persona",
+            "the instruction header is untouched by a mid-turn note: {out:?}"
+        );
+        assert_eq!(
+            out.iter().filter(|v| v["role"] == "system").count(),
+            1,
+            "exactly one system entry, and no second one to lift"
+        );
+        assert_eq!(
+            out.last().unwrap(),
+            &json!({ "role": "user", "content": REMINDER }),
+            "the reminder appends at the tail as a user message: {out:?}"
+        );
+        // Appended, not merged: the tool result keeps its own wire entry, so the
+        // model can still tell the harness's judgement from the tool's output.
+        assert_eq!(
+            out[3],
+            json!({"role":"tool","tool_call_id":"call_1","content":"result text"})
+        );
+    }
+
+    #[test]
     fn user_without_images_stays_a_content_string() {
         // Byte-identical to the pre-multimodal path → a no-image conversation's prefix
         // cache is unperturbed.

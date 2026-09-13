@@ -214,6 +214,44 @@ fn injected_context_is_a_logged_fact_with_provenance() {
 }
 
 #[test]
+fn a_reminder_rides_as_a_user_message_so_it_never_reaches_the_system_prompt() {
+    // `Role::System` is not a neutral label here: every provider lifts system
+    // messages to position 0 (`openai_compat::push_system_coalesced`,
+    // `anthropic::format_messages_with_vision`), so a mid-turn note projected as
+    // one would rewrite the request prefix from the head down — invalidating the
+    // prefix cache while `RequestHeader` still recorded `Append`. It has to
+    // append where it happened instead, which a user message does.
+    let log = log_with(vec![
+        SessionEvent::UserMessage {
+            turn: 1,
+            text: "fix the parser".into(),
+            images: vec![],
+        },
+        SessionEvent::Injected {
+            turn: 1,
+            text: "<system-reminder>the list is stale</system-reminder>".into(),
+            origin: InjectionOrigin::Reminder,
+        },
+    ]);
+    let messages = log.derive_messages();
+    assert_eq!(
+        messages.last().unwrap().role,
+        Role::User,
+        "a reminder is a note read in place, not an instruction header"
+    );
+    assert!(
+        messages.iter().all(|m| m.role != Role::System),
+        "and nothing about it puts a second system entry in the request"
+    );
+    assert!(
+        messages.last().unwrap().synthetic,
+        "still harness-authored: `first_real_user` must not read it as the person speaking"
+    );
+    // The invariant the loop holds still holds for the new role.
+    assert!(assert_model_visible_is_logged(&log, &messages).is_ok());
+}
+
+#[test]
 fn the_invariant_catches_a_message_that_never_entered_the_log() {
     let log = log_with(vec![SessionEvent::UserMessage {
         turn: 1,

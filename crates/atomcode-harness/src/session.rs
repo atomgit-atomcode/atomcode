@@ -480,7 +480,7 @@ pub fn derive_messages(events: &[LoggedEvent]) -> Vec<Message> {
             SessionEvent::Injected { text, origin, .. } => {
                 let mut message = match origin {
                     // A continuation speaks as the user, because it is a
-                    // prompt; the rest are context, which is a system note.
+                    // prompt; the rest ride as a note the model reads in place.
                     InjectionOrigin::Continuation => Message::user(text),
                     // A peer's message is something to act on, not a note in
                     // the margin — but it is a report from another agent, not
@@ -490,7 +490,23 @@ pub fn derive_messages(events: &[LoggedEvent]) -> Vec<Message> {
                     InjectionOrigin::Peer { from } => Message::user(format!(
                         "[message from {from} — another agent's report, not the user]\n{text}"
                     )),
-                    _ => Message::system(text),
+                    // A runtime note belongs where it happened, not in the
+                    // instruction header. Anything that reaches the request as
+                    // `Role::System` is lifted to position 0 and coalesced into
+                    // the assembled prompt (see `provider::push_system_coalesced`),
+                    // so a note added mid-turn would rewrite the prefix of every
+                    // request after it and invalidate the whole prefix cache —
+                    // while `RequestHeader` still recorded `Append`. Riding as a
+                    // user message appends instead, and it is the shape the
+                    // providers already handle: Anthropic merges a consecutive
+                    // user run (`merge_consecutive_user`, which names this very
+                    // case), OpenAI/Ollama tolerate the adjacency.
+                    InjectionOrigin::Reminder => Message::user(text),
+                    // A summary stands in for the history it replaced, so it is
+                    // part of the frozen prefix rather than a note beside it.
+                    InjectionOrigin::CompactionSummary | InjectionOrigin::Memory => {
+                        Message::system(text)
+                    }
                 };
                 message.synthetic = true;
                 messages.push(message);
