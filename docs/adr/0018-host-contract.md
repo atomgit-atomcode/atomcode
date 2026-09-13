@@ -155,10 +155,19 @@ Answers}`、`agent::{Agent, AgentStatus}`、`profile::Profiles`、`launch::{valu
 条证据是症状,不是设计)。所以:
 
 - **`atui` 二进制消失**(或退化成内部测试用的壳,不再是面向人的入口);
+- **`TUI2` overlay 变成 `TUI_APP` 这个 profile**(精确落点):它现在住在
+  `atui.rs:40`,内容是 surface 行 + `ui` 的 patch + trace 静音 + asker/approval 重排
+  ——那是**宿主侧的组装**,不是一个 UI 的行。而 `bundle.rs` 已有六个同类常量
+  (`ONESHOT_APP:515`、`REPL_APP:539`、`WEB_APP:567`、`SDK_APP:593`、`HANDLE_APP:625`、
+  `EMBED_APP:649`,表在 `:690`),**唯独缺 `TUI_APP`**——缺的原因是 TUI 的 profile 不在
+  宿主手里。所以 `atomcode --tui` = 选 `tui` profile,与 `--repl`/`--web`/`--sdk` 同形;
 - `--tui` 在宿主里变成**换个 UI 行**的普通 flag,与 `--repl`/`--web`/`--sdk` 同级——
   今天它在 `launch.rs:120` 是被**拒绝**的(`exit 2`),`atui.rs:150` 那份拒绝也随之删;
 - `--ui tui` 不再需要单独存在(它就是 `--tui`),`UI_NAMES` 里也不必露 `"tui"`——
   它是 flag,不是 `--ui` 的取值;
+- **UI 侧只留行**:`rows::SCREEN`(`atomcode-tui/src/rows.rs:48`)与
+  `rows::catalog()`(`:117`)已经是这个形状,`ui-tui2` 插件也在 UI crate 里
+  (`plugin.rs:1355`)。宿主挂 `TUI_APP` + `SCREEN` ——**这就是原则 4 说的组装**;
 - 一条测试要**反向**:今天 `launch.rs` 的
   `the_full_screen_front_end_is_not_a_row_here` 把 `--tui` 与 `--ui tui` 钉成 `exit 2`,
   它守的是"UI 不能被宿主选"这个错状态。改造后它应该变成「`--tui` 挂上 `ui-tui2` 行」
