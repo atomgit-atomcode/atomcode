@@ -7,13 +7,25 @@
 //!
 //! Deliberately partial. It covers what a coding conversation actually
 //! contains — fenced code, inline code, emphasis, headings, lists, quotes,
-//! links — and stops there. Tables, footnotes and HTML are not rendered
-//! specially; they come out as text, which is honest and readable, rather than
-//! half-supported.
+//! links, and GFM tables ([`table`]) — and stops there. Footnotes, HTML and
+//! setext headings are not rendered specially; they come out as text, which is
+//! honest and readable, rather than half-supported.
 
 use crate::frame::{Color, Line, Span, Style};
 use crate::theme::Role;
 use crate::width;
+
+mod table;
+
+/// Markdown's one decoration: the rule, under a heading and around a fenced
+/// block, and under a table's header.
+///
+/// Named once, and for a reason beyond tidiness: `caps::downgrade` rewrites it
+/// to `-` at paint time on a terminal that cannot show it, so what matters is
+/// that every one of them is the *same* character. (The layering ratchet counts
+/// this glyph per occurrence in the source, which is the other half of the same
+/// argument — one site, one decision.)
+pub(super) const RULE: &str = "─";
 
 fn code() -> Style {
     Style::new().fg(Color::role(Role::Warning))
@@ -56,14 +68,20 @@ pub struct Rendered {
 /// The streaming answer is one block whose text only grows, and re-rendering
 /// all of it every frame is what makes a frame cost the length of the answer.
 /// Everything up to `settled` is fixed: it ends on a line boundary, outside any
-/// fence. A caller may keep `lines[..settled_lines]` and render only the rest
-/// next time, because appending source lines can change nothing before the last
-/// boundary that was outside a fence.
+/// fence and outside any table block. A caller may keep `lines[..settled_lines]`
+/// and render only the rest next time, because appending source lines can change
+/// nothing before the last boundary that was outside both.
 ///
-/// An open fence is the one thing that is *not* settled, wherever it starts:
-/// its body is emitted only when the fence closes, and the rule above it then
-/// gains the language label — both retroactive. So `settled` stays before the
-/// opener until the closing fence is seen.
+/// Two things are *not* settled, wherever they start:
+///
+/// * an **open fence** — its body is emitted only when the fence closes, and the
+///   rule above it then gains the language label, both retroactively;
+/// * a **buffered table block** — a row is only known to be a table row once a
+///   delimiter row shows up, and every row's arrival can change every column's
+///   width, so the whole block is re-laid-out at once.
+///
+/// So `settled` stays before the opener, and before the first buffered row,
+/// until each is resolved.
 pub fn render_settled(text: &str, w: u16, base: Style) -> Rendered {
     if w == 0 {
         return Rendered {
@@ -75,6 +93,8 @@ pub fn render_settled(text: &str, w: u16, base: Style) -> Rendered {
     let mut out = Vec::new();
     let mut in_code: Option<String> = None;
     let mut code_lines: Vec<String> = Vec::new();
+    // Rows of a table block that has not ended yet. See `settled` above.
+    let mut table_rows: Vec<String> = Vec::new();
     // The offset of the last line boundary seen outside a fence, and how many
     // lines had been produced by then.
     let mut settled = 0usize;
@@ -87,8 +107,11 @@ pub fn render_settled(text: &str, w: u16, base: Style) -> Rendered {
         // which more text can extend — so it is never a settled boundary.
         let complete = line_end < text.len();
         let trimmed = raw.trim_end();
+        let body = trimmed.trim_start();
+        let indent = trimmed.len() - body.len();
         // Fences first: inside a block, nothing else is markdown.
-        if let Some(rest) = trimmed.trim_start().strip_prefix("```") {
+        if let Some(rest) = body.strip_prefix("```") {
+            flush_table(&mut table_rows, &mut out, w, base);
             match in_code.take() {
                 Some(lang) => {
                     out.extend(code_block(&code_lines, &lang, w));
@@ -99,51 +122,103 @@ pub fn render_settled(text: &str, w: u16, base: Style) -> Rendered {
         } else if in_code.is_some() {
             code_lines.push(trimmed.to_string());
         } else {
-            let t = trimmed.trim_start();
-            let indent = trimmed.len() - t.len();
-
-            if t.is_empty() {
-                out.push(Line::empty());
-            } else if let Some((level, title)) = heading_of(t) {
-                let hashes = "#".repeat(level as usize);
-                out.extend(wrap_spans(
-                    &inline(title, heading()),
-                    w,
-                    &format!("{hashes} "),
-                    heading(),
-                ));
-            } else if is_rule(t) {
-                out.push(Line::styled("─".repeat(w as usize), fence()));
-            } else if let Some(body) = t.strip_prefix("> ").or_else(|| t.strip_prefix(">")) {
-                out.extend(wrap_spans(&inline(body, quote()), w, "▏ ", quote()));
-            } else if let Some((marker, body)) = list_item(t) {
-                let lead = format!("{}{marker} ", " ".repeat(indent));
-                out.extend(wrap_spans(&inline(body, base), w, &lead, bullet()));
-            } else {
-                out.extend(wrap_spans(
-                    &inline(t, base),
-                    w,
-                    " ".repeat(indent).as_str(),
-                    base,
-                ));
+            match table_row(body) {
+                Some(row) => table_rows.push(row),
+                None => {
+                    flush_table(&mut table_rows, &mut out, w, base);
+                    out.extend(ordinary_line(body, indent, w, base));
+                }
             }
         }
         off = if complete { line_end + 1 } else { line_end };
-        if complete && in_code.is_none() {
+        if complete && in_code.is_none() && table_rows.is_empty() {
             settled = off;
             settled_lines = out.len();
         }
     }
     // An unterminated fence is common in a stream that is still arriving; show
-    // what there is rather than swallowing it.
+    // what there is rather than swallowing it. A table block that never got its
+    // closing blank line is the same case.
     if in_code.is_some() && !code_lines.is_empty() {
         out.extend(code_block(&code_lines, "", w));
     }
+    flush_table(&mut table_rows, &mut out, w, base);
     Rendered {
         lines: out,
         settled,
         settled_lines,
     }
+}
+
+/// One line as a table row — its canonical `|` form — or `None` when it cannot
+/// be one.
+///
+/// Deliberately broad: any line that splits into two or more cells is buffered,
+/// because GFM tables need not have leading or trailing `|` and weak models emit
+/// both forms. What it must *not* swallow is a line that already has a meaning
+/// of its own, so everything this renderer treats as block structure — a
+/// heading, a rule, a quote, a list item — is excluded here. A bullet that
+/// merely mentions a pipe (`- option A | option B`) is a list item, and losing
+/// its marker to a table that then turns out not to exist is the bug that guard
+/// comes from.
+fn table_row(t: &str) -> Option<String> {
+    if t.is_empty()
+        || heading_of(t).is_some()
+        || is_rule(t)
+        || t.starts_with('>')
+        || list_item(t).is_some()
+    {
+        return None;
+    }
+    table::row(t)
+}
+
+/// Emit a buffered table block — or hand it back as ordinary lines.
+///
+/// A block of pipe-splitting lines is only a table when a delimiter row
+/// (`---|---`) is among them; a paragraph that happens to contain a `|` is
+/// prose, and drawing a box around it would invent structure that is not there.
+fn flush_table(rows: &mut Vec<String>, out: &mut Vec<Line>, w: u16, base: Style) {
+    let buffered = std::mem::take(rows);
+    if buffered.is_empty() {
+        return;
+    }
+    match table::render(&buffered, w, base) {
+        Some(lines) => out.extend(lines),
+        None => {
+            for row in &buffered {
+                out.extend(ordinary_line(row.trim_start(), 0, w, base));
+            }
+        }
+    }
+}
+
+/// One line that is not part of a table: a blank, a heading, a rule, a quote, a
+/// list item, or prose.
+fn ordinary_line(t: &str, indent: usize, w: u16, base: Style) -> Vec<Line> {
+    if t.is_empty() {
+        return vec![Line::empty()];
+    }
+    if let Some((level, title)) = heading_of(t) {
+        let hashes = "#".repeat(level as usize);
+        return wrap_spans(
+            &inline(title, heading()),
+            w,
+            &format!("{hashes} "),
+            heading(),
+        );
+    }
+    if is_rule(t) {
+        return vec![Line::styled(RULE.repeat(w as usize), fence())];
+    }
+    if let Some(b) = t.strip_prefix("> ").or_else(|| t.strip_prefix(">")) {
+        return wrap_spans(&inline(b, quote()), w, "▏ ", quote());
+    }
+    if let Some((marker, b)) = list_item(t) {
+        let lead = format!("{}{marker} ", " ".repeat(indent));
+        return wrap_spans(&inline(b, base), w, &lead, bullet());
+    }
+    wrap_spans(&inline(t, base), w, " ".repeat(indent).as_str(), base)
 }
 
 fn heading_of(t: &str) -> Option<(u8, &str)> {
@@ -347,19 +422,19 @@ fn wrap_spans(spans: &[Span], w: u16, prefix: &str, prefix_style: Style) -> Vec<
 fn code_block(lines: &[String], lang: &str, w: u16) -> Vec<Line> {
     let mut out = Vec::new();
     let label = if lang.is_empty() {
-        "─".repeat(w as usize)
+        RULE.repeat(w as usize)
     } else {
-        let head = format!("─ {lang} ");
+        let head = format!("{RULE} {lang} ");
         format!(
             "{head}{}",
-            "─".repeat((w as usize).saturating_sub(width::str_width(&head)))
+            RULE.repeat((w as usize).saturating_sub(width::str_width(&head)))
         )
     };
     out.push(Line::styled(width::take_width(&label, w as usize), fence()));
     for line in lines {
         out.push(Line::from_spans(highlight(line, lang)).truncate(w as usize));
     }
-    out.push(Line::styled("─".repeat(w as usize), fence()));
+    out.push(Line::styled(RULE.repeat(w as usize), fence()));
     out
 }
 
@@ -543,6 +618,15 @@ mod tests {
         "```\nno language\n```\n",
         "",
         "\n\n\n",
+        // Tables, in the three states they arrive in: whole, with the delimiter
+        // row still missing, and still missing rows after the delimiter.
+        "| a | b |\n|---|---|\n| 1 | 2 |\n",
+        "para\n\n| 名称 | 说明 |\n|---|---|\n| 中文 | x |\n\nafter\n",
+        "| a | b |\n| 1 | 2 |\n",
+        "before\n\n| a | b |\n|---|---|\n| 1 | 2 |",
+        "┌───┬───┐\n│ a │ b │\n└───┴───┘\n",
+        // A pipe that is not a table, next to one that is.
+        "see a | b\n| a | b |\n|---|---|\n",
     ];
 
     /// The settled render is the one it replaced: same lines, always.
@@ -612,6 +696,123 @@ mod tests {
             r.lines.len(),
             "the still-arriving last line is not settled"
         );
+    }
+
+    /// The other half of the resume contract, and the half `LiveCache` actually
+    /// relies on: the source from `settled` on, rendered on its own, is exactly
+    /// the lines the full render put after the prefix. If a table block leaked
+    /// across that boundary, the resumed render would draw it twice.
+    #[test]
+    fn the_tail_past_settled_renders_the_rest_of_the_lines() {
+        for doc in CORPUS {
+            for w in [3u16, 8, 20, 80] {
+                let r = render_settled(doc, w, Style::new());
+                #[allow(
+                    clippy::string_slice,
+                    reason = "`r.settled` is an offset this renderer produced at a line boundary (the byte after a `\\n`), so it is a char boundary"
+                )]
+                let tail = &doc[r.settled..];
+                assert_eq!(
+                    render(tail, w, Style::new()),
+                    r.lines[r.settled_lines..].to_vec(),
+                    "tail {tail:?} of {doc:?} at width {w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_buffered_table_is_never_settled_past_its_first_row() {
+        // The delimiter row may still be arriving, and it decides whether this is
+        // a table at all — so nothing from the first row on is settled.
+        let text = "intro\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let r = render_settled(text, 40, Style::new());
+        #[allow(
+            clippy::string_slice,
+            reason = "`r.settled` is an offset this renderer produced at a line boundary (the byte after a `\\n`), so it is a char boundary"
+        )]
+        let prefix = &text[..r.settled];
+        assert_eq!(
+            prefix, "intro\n\n",
+            "settled stops before the first buffered row"
+        );
+        // A line that ends the block resolves it, and everything up to the
+        // still-arriving last line settles again.
+        let closed = format!("{text}\n");
+        let r = render_settled(&closed, 40, Style::new());
+        assert_eq!(r.settled, closed.len());
+        assert_eq!(r.settled_lines + 1, r.lines.len());
+    }
+
+    #[test]
+    fn a_table_at_the_end_of_a_stream_is_still_drawn() {
+        // The block never got its closing blank line: no row may be swallowed.
+        let out = plain("text\n\n| 名称 | 说明 |\n|---|---|\n| 中文 | x |", 40);
+        assert!(
+            out.iter().all(|l| !l.contains('|')),
+            "the pipes leaked into the output: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.contains("中文") && l.contains('x')),
+            "the table was not drawn: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_column_table_is_drawn_rather_than_left_as_pipes() {
+        // A one-column table is still a table: it arrived here as the literal
+        // pipes it was written with, because every row of it splits into a
+        // single cell.
+        let out = plain("| 只有一列 |\n|:---|\n| 单列也要画出来 |", 40);
+        assert!(
+            out.iter().all(|l| !l.contains('|')),
+            "the pipes leaked into the output: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.contains("单列也要画出来")),
+            "the table was not drawn: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.contains('─')),
+            "no rule under the header: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_list_item_that_mentions_a_pipe_keeps_its_bullet() {
+        let out = plain("- option A | option B\n1. run a | run b", 40);
+        assert_eq!(out[0], "• option A | option B");
+        assert_eq!(out[1], "1. run a | run b");
+    }
+
+    #[test]
+    fn prose_with_a_pipe_comes_out_as_prose() {
+        // Broad detection buffers this; no delimiter row means it was never a
+        // table, and it must come back out looking like what was written.
+        assert_eq!(
+            plain("see a | b in the docs", 40)[0],
+            "see a | b in the docs"
+        );
+        let out = plain("use a | b\nor c | d", 40);
+        assert_eq!(out[0], "use a | b");
+        assert_eq!(out[1], "or c | d");
+    }
+
+    #[test]
+    fn a_heading_or_quote_that_mentions_a_pipe_is_not_a_table_row() {
+        let out = plain("## a | b\n> c | d", 40);
+        assert_eq!(out[0], "## a | b");
+        assert_eq!(out[1], "▏ c | d");
+    }
+
+    #[test]
+    fn a_box_drawing_table_arriving_as_text_is_drawn_as_a_table() {
+        let out = plain("┌──────┬──────┐\n│ a    │ b    │\n└──────┴──────┘", 40);
+        assert!(
+            !out.iter().any(|l| l.contains('│') || l.contains('┌')),
+            "the drawn borders leaked into the output: {out:?}"
+        );
+        assert!(out.iter().any(|l| l.contains("a    b")), "{out:?}");
     }
 
     #[test]
