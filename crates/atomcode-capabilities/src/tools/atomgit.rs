@@ -347,7 +347,8 @@ impl Tool for AtomgitIssueTool {
         "Operate on AtomGit issues. action: \"list\" (owner+repo; optional \
          state=open|closed|all, limit), \"view\" (owner+repo+number), \"create\" \
          (owner+repo+title; optional body), \"update\" (owner+repo+number+title; \
-         optional body, state=reopen|close), \"comment_create\"/\"comment_view\" \
+         optional body, state=reopen|close), \"close\" (owner+repo+number), \
+         \"comment_create\"/\"comment_view\" \
          (owner+repo+number; body for create), \"comment_edit\"/\"comment_delete\" \
          (owner+repo+comment_id; body for edit)."
     }
@@ -356,7 +357,7 @@ impl Tool for AtomgitIssueTool {
             "type": "object",
             "properties": {
                 "action": { "type": "string", "enum": [
-                    "list","view","create","update",
+                    "list","view","create","update","close",
                     "comment_create","comment_view","comment_edit","comment_delete"
                 ]},
                 "owner": { "type": "string" },
@@ -424,6 +425,14 @@ impl Tool for AtomgitIssueTool {
                 _ => err(
                     "atomgit_issue update: owner, repo, number and title are required".to_string(),
                 ),
+            },
+            "close" => match need_owner_repo_number(a.owner, a.repo, a.number, "atomgit_issue close")
+            {
+                Ok((o, r, n)) => match c.issue_close(&o, &r, n).await {
+                    Ok(i) => ok(format!("Closed {}", render_issue(&i))),
+                    Err(e) => err(e),
+                },
+                Err(e) => e,
             },
             "comment_create" => match need_owner_repo_number(
                 a.owner,
@@ -1312,6 +1321,38 @@ mod tests {
             )
             .await;
         assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("#5"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn issue_close_renders() {
+        // close needs only owner+repo+number: GET for the title, then PATCH state=close.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v5/repos/o/r/issues/5"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"number":5,"title":"T","state":"open"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v5/repos/o/issues/5"))
+            .and(body_json(json!({ "repo": "r", "title": "T", "state": "close" })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"number":5,"title":"T","state":"closed"})),
+            )
+            .mount(&server)
+            .await;
+        let r = issue_tool(&server)
+            .execute(
+                r#"{"action":"close","owner":"o","repo":"r","number":5}"#,
+                &ctx(),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("Closed"), "{}", r.content);
         assert!(r.content.contains("#5"), "{}", r.content);
     }
 

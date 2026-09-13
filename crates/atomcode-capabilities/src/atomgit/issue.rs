@@ -71,6 +71,27 @@ impl AtomgitClient {
             .await
     }
 
+    /// Close an issue. The AtomGit issue-update endpoint (see [`issue_update`]) requires
+    /// `title` in the body, so — unlike `pr_close` which patches a bare `{state:closed}` —
+    /// we first fetch the issue to obtain its current title, then PATCH `state=close`.
+    ///
+    /// [`issue_update`]: Self::issue_update
+    pub async fn issue_close(&self, owner: &str, repo: &str, number: u64) -> Result<Issue, String> {
+        let current = self.issue_view(owner, repo, number).await?;
+        // Guard: `title` is `#[serde(default)]`, so a degraded upstream response could
+        // yield an empty title. Re-sending it in the PATCH would either be rejected or
+        // clobber the stored title to empty — refuse rather than corrupt the issue.
+        if current.title.is_empty() {
+            return Err(format!(
+                "atomgit issue #{number} has no title in the fetched response; \
+                 refusing to close (would overwrite the title). Use `update` with an \
+                 explicit title + state=close instead."
+            ));
+        }
+        self.issue_update(owner, repo, number, &current.title, None, Some("close"))
+            .await
+    }
+
     /// `POST /repos/{o}/{r}/issues/{number}/comments`.
     pub async fn issue_comment_create(
         &self,
@@ -198,6 +219,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(i.number, 5);
+    }
+
+    #[tokio::test]
+    async fn close_fetches_title_then_patches_state() {
+        // No dedicated close endpoint: GET the issue for its title, then PATCH
+        // (owner-scoped) with repo+title+state=close in the body.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v5/repos/o/r/issues/5"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"number":5,"title":"Bug","state":"open"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v5/repos/o/issues/5"))
+            .and(body_json(json!({ "repo": "r", "title": "Bug", "state": "close" })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"number":5,"title":"Bug","state":"closed"})),
+            )
+            .mount(&server)
+            .await;
+        let i = client(&server).issue_close("o", "r", 5).await.unwrap();
+        assert_eq!(i.state, "closed");
+    }
+
+    #[tokio::test]
+    async fn close_refuses_when_fetched_title_is_empty() {
+        // Degraded GET (no title) → refuse to PATCH so we never clobber the title.
+        // No PATCH mock is mounted: if the guard were missing, the PATCH would 404.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v5/repos/o/r/issues/5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"number":5})))
+            .mount(&server)
+            .await;
+        let e = client(&server).issue_close("o", "r", 5).await.unwrap_err();
+        assert!(e.contains("no title"), "{e}");
     }
 
     #[tokio::test]
