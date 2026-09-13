@@ -31,11 +31,29 @@ pub mod control;
 pub mod events;
 pub mod exec;
 pub mod launch;
+pub mod model_source;
 pub mod plugins;
 pub mod profile;
 pub mod seam_map;
 pub mod seams;
 pub mod session;
+
+/// The reasoning-effort levels a model may be asked for, re-exported from the
+/// one place that defines them so a front end can offer exactly the values the
+/// rest of the stack accepts.
+///
+/// A re-export rather than a second list: a front end that spelled its own would
+/// be able to offer a level nothing parses, or hide one that works — and the
+/// two would drift with nothing to catch it.
+pub use atomcode_config::config::REASONING_EFFORT_LEVELS;
+
+/// The id of the row that carries the session's reasoning-effort level.
+///
+/// Spelled once, because three places have to agree on it: the bundle mounts it,
+/// `--effort` patches it, and `/effort` patches and reads it. A typo in any of
+/// them would address a row that does not exist — which the tree reports as "no
+/// such row" only if the caller asks; a silent no-op is the other outcome.
+pub const REASONING_EFFORT_ROW: &str = "reasoning-effort";
 
 use std::path::PathBuf;
 
@@ -44,14 +62,9 @@ use std::path::PathBuf;
 /// One resolver, so every persisting plugin agrees on the root and a test can
 /// redirect all of them at once.
 pub fn home() -> PathBuf {
-    if let Ok(dir) = std::env::var("ATOMCODE_HOME") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
-    }
-    std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".atomcode"))
-        .unwrap_or_else(|_| PathBuf::from(".atomcode"))
+    // Delegates: the answer lives in `model_source` with the rest of "where do
+    // things live", so there is one definition of it rather than one per caller.
+    model_source::atomcode_home()
 }
 
 use std::sync::Arc;

@@ -13,13 +13,8 @@ use futures::stream::BoxStream;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::model_source;
 use crate::seams::{LlmSvc, LlmUtilitySvc};
-
-/// An environment variable, treating empty as unset — an exported-but-blank
-/// variable is a mistake, not a value.
-fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
-}
 
 /// The half of a model description that is a measurement rather than a knob:
 /// how large a window the mounted provider reports, and where that number came
@@ -34,6 +29,11 @@ fn env(name: &str) -> Option<String> {
 /// happens to look configured are the same `u32`; only the row knows which one
 /// it handed over, and a reader who cannot tell them apart will trust a
 /// default as if it were a fact about the model.
+/// See [`OpenAiCompatRow::supports_reasoning_effort`] for why this is `true`.
+fn default_supports_effort() -> bool {
+    true
+}
+
 fn context_line(window: u32, origin: &str) -> String {
     format!(
         "Context window: {window} tokens ({origin}). Auto-compaction fires as a \
@@ -64,6 +64,34 @@ struct OpenAiCompatRow {
     /// `[[patch]] id = "llm" config = { supports_vision = true }`.
     #[serde(default)]
     supports_vision: Option<bool>,
+    /// `thinking.type` in the request body — the reasoning switch, for a
+    /// gateway that has one. `"disabled"` is what a reasoning model is told to
+    /// skip its chain of thought, and it is the only lever that turns reasoning
+    /// *off* rather than down: `reasoning_effort` has no `none` step, and the
+    /// ladder is not what starves a short side call.
+    ///
+    /// Opaque on purpose. Gateways disagree on the vocabulary and on whether
+    /// they accept the object at all, so the row passes the string through
+    /// rather than this crate guessing — and the default stays `None`, which
+    /// omits the whole object, because a gateway that does not know `thinking`
+    /// may reject the request outright. Setting this opts into that risk; it is
+    /// never on by itself.
+    #[serde(default)]
+    thinking_type: Option<String>,
+    /// `thinking.keep` — Kimi K2.6 preserved thinking. Omitted unless set.
+    #[serde(default)]
+    thinking_keep: Option<String>,
+    /// Does this route accept a top-level `reasoning_effort`? Endpoint
+    /// capability, not a level — and unlike [`AtomcodeConfigPlugin`], this row is
+    /// hand-written and names an arbitrary OpenAI-compatible gateway, so there
+    /// is no `[models.*]` entry to read it from. Default `true`: an endpoint a
+    /// person wired up by hand is assumed to take the field the reasoning-effort
+    /// row offers, and if it does not, the adapter remembers the rejection for
+    /// the session and stops sending it. Defaulting to `false` instead would
+    /// make a configured level silently do nothing, which is the one failure
+    /// this whole feature exists to avoid.
+    #[serde(default = "default_supports_effort")]
+    supports_reasoning_effort: bool,
 }
 
 pub struct OpenAiCompatPlugin;
@@ -86,50 +114,49 @@ impl Plugin for OpenAiCompatPlugin {
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
         let row: OpenAiCompatRow =
             serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?;
-        let key_env = row
-            .api_key_env
-            .clone()
-            .unwrap_or_else(|| "ATOMCODE_API_KEY".into());
-        let base_url = row.base_url.or_else(|| env("ATOMCODE_BASE_URL"));
-        let model = row.model.or_else(|| env("ATOMCODE_MODEL"));
-        let api_key = env(&key_env);
-
-        // Report every missing piece at once, and name the ways out. A failure
-        // at mount time is the first thing a new user sees; telling them about
-        // one of three missing variables wastes three attempts.
-        let mut missing = Vec::new();
-        if base_url.is_none() {
-            missing.push("ATOMCODE_BASE_URL");
-        }
-        if model.is_none() {
-            missing.push("ATOMCODE_MODEL");
-        }
-        if api_key.is_none() {
-            missing.push(key_env.as_str());
-        }
-        if !missing.is_empty() {
-            return Err(format!(
-                "this row needs {}.\n  \
-                 - already configured AtomCode? use the `llm-atomcode-config` row instead, \
-                 which reads ~/.atomcode/config.toml\n  \
-                 - just trying it out? add --offline for a scripted model that needs no key\n  \
-                 - or set them: export {}=…",
-                missing.join(", "),
-                missing.join("=… ")
-            ));
-        }
+        // One source, resolved in one place. A row may state its own endpoint;
+        // what it leaves out comes from the environment, with the fallbacks and
+        // the error text owned by `model_source` rather than re-derived here.
+        // One implementation of "where a model comes from", asked rather than
+        // re-derived: this row says only what it knows, and `ConfigAndEnv` owns
+        // the config file, the environment and how they rank.
+        let source = model_source::ConfigAndEnv {
+            home: crate::home(),
+        };
+        let want = match (row.base_url.as_deref(), row.model.as_deref()) {
+            (Some(base_url), Some(model)) => model_source::Want::Explicit {
+                base_url,
+                model,
+                // What the row said, and nothing more: which variable to use
+                // when a row names none is a policy, and it lives in
+                // `model_source` with the rest of the resolution.
+                api_key_env: row.api_key_env.as_deref(),
+            },
+            _ => model_source::Want::Environment {
+                api_key_env: row.api_key_env.as_deref(),
+            },
+        };
+        let resolved = source.resolve(want)?;
         let (base_url, model, api_key) = (
-            base_url.expect("checked"),
-            model.expect("checked"),
-            api_key.expect("checked"),
+            resolved.base_url.clone(),
+            resolved.model.clone(),
+            resolved.api_key.clone(),
         );
-
         let provider = openai_compat(
             &api_key,
             &base_url,
             &model,
-            row.context_window,
-            row.supports_vision,
+            AdapterKnobs {
+                // The row's own value wins; the environment source has none, and
+                // the row is where it is stated.
+                context_window: row.context_window.or(resolved.context_window),
+                supports_vision: row.supports_vision.or(resolved.supports_vision),
+                thinking_type: row.thinking_type.as_deref(),
+                thinking_keep: row.thinking_keep.as_deref(),
+                supports_reasoning_effort: Some(
+                    row.supports_reasoning_effort || resolved.supports_reasoning_effort,
+                ),
+            },
         )?;
         // Read the window off the provider, not off the row: the row is an
         // `Option`, the provider is the resolved number, and the resolved number
@@ -147,6 +174,13 @@ impl Plugin for OpenAiCompatPlugin {
         let _ = ctx
             .provide::<LlmSvc>(Arc::new(provider))
             .map_err(|e| e.to_string())?;
+        // For the sentence only: which variable holds the key, so the person can
+        // go set it. The *decision* is `DEFAULT_API_KEY_ENV`'s; this just shows
+        // whichever name the resolution used.
+        let key_var = row
+            .api_key_env
+            .as_deref()
+            .unwrap_or(model_source::DEFAULT_API_KEY_ENV);
         crate::plugins::self_knowledge::describes(
             ctx,
             "model",
@@ -154,7 +188,7 @@ impl Plugin for OpenAiCompatPlugin {
             format!(
                 "MODEL. This tree talks to `{model}` at `{base_url}`, through the \
                  `llm-openai-compat` row reading ATOMCODE_BASE_URL / \
-                 ATOMCODE_MODEL / {key_env}.\n\
+                 ATOMCODE_MODEL / {key_var}.\n\
                  {}\n\
                  To set it, the patch target is the ROW id, `llm`, and `--patch` \
                  takes a file rather than a string: \
@@ -176,6 +210,22 @@ impl Plugin for OpenAiCompatPlugin {
     }
 }
 
+/// The row-level knobs that reach the adapter, gathered so a caller adding one
+/// does not have to re-thread a positional list through every construction site
+/// and test. `None` on any field means "the row said nothing", which is what
+/// leaves the adapter's own default standing.
+#[derive(Debug, Default)]
+struct AdapterKnobs<'a> {
+    context_window: Option<u32>,
+    supports_vision: Option<bool>,
+    thinking_type: Option<&'a str>,
+    thinking_keep: Option<&'a str>,
+    /// Whether this route accepts a `reasoning_effort` at all — endpoint
+    /// capability, not a level. `None` means "the row did not say", and what
+    /// that defaults to differs by row: see the call sites.
+    supports_reasoning_effort: Option<bool>,
+}
+
 /// A scripted provider: same seam, no network.
 ///
 /// Its reason for existing is not testing convenience — it is the cheapest proof
@@ -186,18 +236,29 @@ fn openai_compat(
     api_key: &str,
     base_url: &str,
     model: &str,
-    context_window: Option<u32>,
-    supports_vision: Option<bool>,
+    knobs: AdapterKnobs<'_>,
 ) -> Result<OpenAiCompatProvider, String> {
     let mut cfg = OpenAiCompatConfig::new(api_key, base_url, model);
-    if let Some(window) = context_window {
+    if let Some(window) = knobs.context_window {
         cfg.context_window = window;
     }
     // Over the heuristic `new()` just applied, and only when the row said so:
     // an explicit answer about one gateway route beats a guess made from the
     // model's name, in both directions.
-    if let Some(vision) = supports_vision {
+    if let Some(vision) = knobs.supports_vision {
         cfg.supports_vision = vision;
+    }
+    // Straight through, unresolved: these are the gateway's vocabulary, not
+    // ours. Left unset, the adapter omits the `thinking` object entirely, which
+    // is the only form every gateway is known to accept.
+    if let Some(kind) = knobs.thinking_type {
+        cfg.thinking_type = Some(kind.to_string());
+    }
+    if let Some(keep) = knobs.thinking_keep {
+        cfg.thinking_keep = Some(keep.to_string());
+    }
+    if let Some(accepts) = knobs.supports_reasoning_effort {
+        cfg.supports_reasoning_effort = accepts;
     }
     OpenAiCompatProvider::new(cfg).map_err(|e| format!("provider init failed: {}", e.message))
 }
@@ -222,6 +283,24 @@ struct UtilityRow {
     api_key_env: Option<String>,
     #[serde(default)]
     context_window: Option<u32>,
+    /// Same two knobs, same pass-through, as on the conversation row — spelled
+    /// out rather than shared, because a side call is exactly where the switch
+    /// earns its keep: a title asked of a reasoning model spends its whole
+    /// budget thinking and comes back with no answer at all.
+    #[serde(default)]
+    thinking_type: Option<String>,
+    #[serde(default)]
+    thinking_keep: Option<String>,
+    /// Does this route accept a top-level `reasoning_effort`? Same field, same
+    /// default and the same reasoning as on the conversation row — and it
+    /// matters here for the same reason: the simple team roles put their tier on
+    /// requests that this slot serves, so without it a role's `effort: low`
+    /// would be set and then silently dropped at the adapter. Whether it has an
+    /// effect in a given tree is the tree's business (with `thinking_type`
+    /// `disabled` the provider passes no thinking at all), but being *dropped*
+    /// is not something a row should do quietly.
+    #[serde(default = "default_supports_effort")]
+    supports_reasoning_effort: bool,
 }
 
 pub struct LlmUtilityOpenAiCompatPlugin;
@@ -240,18 +319,41 @@ impl Plugin for LlmUtilityOpenAiCompatPlugin {
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
         let row: UtilityRow =
             serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?;
-        let key_env = row.api_key_env.unwrap_or_else(|| "ATOMCODE_API_KEY".into());
-        let base_url = row
-            .base_url
-            .or_else(|| env("ATOMCODE_BASE_URL"))
-            .ok_or("llm-utility-openai-compat needs `base_url` or ATOMCODE_BASE_URL")?;
-        let api_key =
-            env(&key_env).ok_or_else(|| format!("llm-utility-openai-compat needs {key_env}"))?;
+        // The same one source as the conversation row, so "same gateway,
+        // smaller model" falls back identically in both. Only the model is
+        // required here; the endpoint and the key are the ones the tree is
+        // already using unless this row overrides them.
+        let source = model_source::ConfigAndEnv {
+            home: crate::home(),
+        };
+        let want = match row.base_url.as_deref() {
+            Some(base_url) => model_source::Want::Explicit {
+                base_url,
+                model: &row.model,
+                api_key_env: row.api_key_env.as_deref(),
+            },
+            None => model_source::Want::EnvironmentWithModel {
+                api_key_env: row.api_key_env.as_deref(),
+                model: &row.model,
+            },
+        };
+        let endpoint = source.resolve(want)?;
         // No `supports_vision` here on purpose: a side call is a title or a
         // summary, and no side call carries an image, so this slot has nothing
         // for the flag to decide. A knob that cannot change an outcome is a
         // line of config someone has to think about for no reason.
-        let provider = openai_compat(&api_key, &base_url, &row.model, row.context_window, None)?;
+        let provider = openai_compat(
+            &endpoint.api_key,
+            &endpoint.base_url,
+            &endpoint.model,
+            AdapterKnobs {
+                context_window: row.context_window.or(endpoint.context_window),
+                thinking_type: row.thinking_type.as_deref(),
+                thinking_keep: row.thinking_keep.as_deref(),
+                supports_reasoning_effort: Some(row.supports_reasoning_effort),
+                ..AdapterKnobs::default()
+            },
+        )?;
         let _ = ctx
             .provide::<LlmUtilitySvc>(Arc::new(provider))
             .map_err(|e| e.to_string())?;
@@ -533,39 +635,32 @@ impl Plugin for AtomcodeConfigPlugin {
             ));
         }
 
-        let cfg = atomcode_config::config::Config::load(&path)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        let resolved = cfg
-            .resolve_model(row.model.as_deref())
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+        // Resolution lives in `model_source`; this row only says *which* source
+        // it wants and which `[models.*]` selection. The file itself, and the
+        // account/key rules around it, are read in one place.
+        let source = model_source::ConfigAndEnv {
+            home: crate::home(),
+        };
+        let endpoint = source.resolve(model_source::Want::UserConfig {
+            selection: row.model.as_deref(),
+        })?;
 
-        let base_url = resolved
-            .base_url
-            .ok_or_else(|| format!("account `{}` has no base_url", resolved.account_id))?;
-        // A managed account may hold its credential elsewhere (an OAuth token
-        // store). Say which account, so the fix is obvious.
-        let api_key = resolved
-            .api_key
-            .filter(|k| !k.trim().is_empty())
-            .ok_or_else(|| {
-                format!(
-                    "account `{}` has no usable api_key in {} — log in with AtomCode, or pick \
-                 another model with `config = {{ model = \"…\" }}` on this row",
-                    resolved.account_id,
-                    path.display()
-                )
-            })?;
-
-        let mut provider_cfg = OpenAiCompatConfig::new(&api_key, &base_url, &resolved.model);
-        provider_cfg.context_window = resolved.context_window as u32;
-        provider_cfg.supports_vision = resolved.supports_vision;
+        let mut provider_cfg =
+            OpenAiCompatConfig::new(&endpoint.api_key, &endpoint.base_url, &endpoint.model);
+        if let Some(window) = endpoint.context_window {
+            provider_cfg.context_window = window;
+        }
+        if let Some(vision) = endpoint.supports_vision {
+            provider_cfg.supports_vision = vision;
+        }
+        provider_cfg.thinking_type = endpoint.thinking_type.clone();
+        provider_cfg.thinking_keep = endpoint.thinking_keep.clone();
+        provider_cfg.supports_reasoning_effort = endpoint.supports_reasoning_effort;
         let provider = OpenAiCompatProvider::new(provider_cfg)
             .map_err(|e| format!("provider init failed: {}", e.message))?;
         eprintln!(
-            "\x1b[2musing `{}` ({}) from {}\x1b[0m",
-            resolved.selection_id,
-            resolved.model,
-            path.display()
+            "\x1b[2musing `{}` from {}\x1b[0m",
+            endpoint.model, endpoint.origin
         );
         crate::plugins::self_knowledge::describes(
             ctx,
@@ -585,9 +680,9 @@ impl Plugin for AtomcodeConfigPlugin {
                  ATOMCODE_API_KEY — that swaps this row for `llm-openai-compat`.\n\
                  The model is NOT in the user-settings catalog on purpose — it \
                  is a row in the running tree, not a preference.",
-                resolved.selection_id,
-                resolved.model,
-                path.display(),
+                row.model.as_deref().unwrap_or("(the configured default)"),
+                endpoint.model,
+                endpoint.origin,
                 context_line(
                     provider.context_window(),
                     "from this model's `[models.*]` entry in that file"
@@ -612,15 +707,31 @@ mod tests {
     // one whose name looks like a family it trusts.
     #[test]
     fn the_row_overrules_the_name_heuristic_in_both_directions() {
-        let forced_on =
-            openai_compat("k", "https://gw/v1", "deepseek-v4", None, Some(true)).expect("build");
+        let forced_on = openai_compat(
+            "k",
+            "https://gw/v1",
+            "deepseek-v4",
+            AdapterKnobs {
+                supports_vision: Some(true),
+                ..AdapterKnobs::default()
+            },
+        )
+        .expect("build");
         assert!(
             forced_on.supports_vision(),
             "an explicit true must beat a text-only-looking name"
         );
 
-        let forced_off =
-            openai_compat("k", "https://gw/v1", "gpt-4o", None, Some(false)).expect("build");
+        let forced_off = openai_compat(
+            "k",
+            "https://gw/v1",
+            "gpt-4o",
+            AdapterKnobs {
+                supports_vision: Some(false),
+                ..AdapterKnobs::default()
+            },
+        )
+        .expect("build");
         assert!(
             !forced_off.supports_vision(),
             "an explicit false must beat a vision-looking name"
@@ -629,7 +740,8 @@ mod tests {
 
     #[test]
     fn an_unset_row_leaves_the_heuristic_in_charge() {
-        let unset = openai_compat("k", "https://gw/v1", "gpt-4o", None, None).expect("build");
+        let unset =
+            openai_compat("k", "https://gw/v1", "gpt-4o", AdapterKnobs::default()).expect("build");
         assert!(unset.supports_vision(), "unset is not the same as false");
     }
 
@@ -647,14 +759,50 @@ mod tests {
         assert_eq!(absent.supports_vision, None);
     }
 
+    /// Both rows take the reasoning switch, and on both an absent field must
+    /// stay absent — `None` is what makes the adapter omit the `thinking`
+    /// object, which is the only shape every gateway is known to accept. A
+    /// default that filled something in would send it to gateways that have
+    /// never heard of the key.
+    #[test]
+    fn both_rows_take_the_thinking_switch_and_leaving_it_out_stays_out() {
+        let conversation: OpenAiCompatRow = serde_json::from_value(serde_json::json!({
+            "thinking_type": "disabled"
+        }))
+        .expect("parse with the switch");
+        assert_eq!(conversation.thinking_type.as_deref(), Some("disabled"));
+
+        let utility: UtilityRow = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "thinking_type": "disabled",
+            "thinking_keep": "all"
+        }))
+        .expect("parse the utility row with the switch");
+        assert_eq!(utility.thinking_type.as_deref(), Some("disabled"));
+        assert_eq!(utility.thinking_keep.as_deref(), Some("all"));
+
+        let absent: UtilityRow = serde_json::from_value(serde_json::json!({ "model": "m" }))
+            .expect("parse without the switch");
+        assert_eq!(absent.thinking_type, None, "absent must not become a value");
+        assert_eq!(absent.thinking_keep, None);
+    }
+
     /// The end of the chain that matters: the number a person writes on the row
     /// is the number `context_window()` reports, which is what the compaction
     /// trigger divides by. A window that stops somewhere short of the provider
     /// leaves compaction firing against the wrong budget.
     #[test]
     fn the_configured_window_reaches_the_provider() {
-        let provider = openai_compat("k", "https://gw/v1", "some-1m-model", Some(1_000_000), None)
-            .expect("build");
+        let provider = openai_compat(
+            "k",
+            "https://gw/v1",
+            "some-1m-model",
+            AdapterKnobs {
+                context_window: Some(1_000_000),
+                ..AdapterKnobs::default()
+            },
+        )
+        .expect("build");
         assert_eq!(
             provider.context_window(),
             1_000_000,
@@ -667,8 +815,16 @@ mod tests {
     /// another rather than checking each separately.
     #[test]
     fn the_description_carries_the_providers_own_window() {
-        let provider =
-            openai_compat("k", "https://gw/v1", "m", Some(262_144), None).expect("build");
+        let provider = openai_compat(
+            "k",
+            "https://gw/v1",
+            "m",
+            AdapterKnobs {
+                context_window: Some(262_144),
+                ..AdapterKnobs::default()
+            },
+        )
+        .expect("build");
         let line = context_line(provider.context_window(), "stated on the `llm` row");
         assert!(
             line.contains("262144"),

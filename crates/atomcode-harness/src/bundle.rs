@@ -130,6 +130,24 @@ disabled = true
 [[insert]]
 name = "memory"
 
+# How hard the model should think (`reasoning_effort`). Left unset, which is
+# "no opinion": the endpoint's own default stands (DeepSeek's is `high`).
+#
+# A row of its own, deliberately NOT part of the `llm` row: a `--model` patch
+# replaces that row wholesale and would take the level with it. Here it survives
+# every model switch. Use `/effort` or `--effort` to set it.
+#
+# Whether to reason at all is a different value and stays on the route
+# (`thinking_type` on the `llm` row): a route that cannot reason is a fact about
+# the route, not a preference.
+#
+# Neither value says whether the endpoint accepts the field: that is the route's
+# business (`supports_reasoning_effort` on the provider), and a gateway that
+# rejects it is remembered for the session.
+[[insert]]
+name = "reasoning-effort"
+config = {}
+
 # Searching the log the harness already writes. Separate from `memory`: memory
 # is what the user chose to state, recall is everything that was said — and a
 # system that only remembers what someone thought to write down remembers very
@@ -428,7 +446,8 @@ pub const ENV_MODEL: &str = r#"
 [[patch]]
 id = "llm"
 name = "llm-openai-compat"
-config = { api_key_env = "ATOMCODE_API_KEY" }
+# No `api_key_env`: the default is a name, and it is defined once in
+# `model_source`. Naming it here too is how two definitions of a default begin.
 "#;
 
 /// Swap the local tool implementations for the production ones. Same tool

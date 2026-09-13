@@ -105,6 +105,15 @@ impl Control for AppControl {
             Err(_) => Vec::new(),
         }
     }
+
+    async fn row_config(&self, id: &str) -> Option<serde_json::Value> {
+        let app = self.app.try_lock().ok()?;
+        app.tree()
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.config.clone())
+    }
 }
 
 /// The shape both sides of a diff are compared in.

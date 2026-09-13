@@ -148,6 +148,28 @@ impl Launch {
                         "[[patch]]\nid = \"llm\"\nconfig = {{ model = {name:?} }}\n"
                     ));
                 }
+                // How hard the model should think. A row of its own rather than
+                // a field on `llm`: that row is replaced wholesale by `--model`
+                // and `/model`, so a level kept there would be reset by every
+                // model switch.
+                //
+                // Only the level: whether to reason at all is the route's
+                // business (`thinking_type` on the `llm` row), because a route
+                // that cannot reason is a fact about the route.
+                "--effort" => {
+                    let level = value(&mut args, "--effort", "low, medium, high, xhigh or max")?;
+                    if !atomcode_config::config::REASONING_EFFORT_LEVELS.contains(&level.as_str()) {
+                        eprintln!(
+                            "unknown effort `{level}`; known: {}",
+                            atomcode_config::config::REASONING_EFFORT_LEVELS.join(", ")
+                        );
+                        return Err(ExitCode::from(2));
+                    }
+                    self.overlays.push(format!(
+                        "[[patch]]\nid = {:?}\nconfig = {{ level = {level:?} }}\n",
+                        crate::REASONING_EFFORT_ROW
+                    ));
+                }
                 "--read-only" => self.overlays.push(bundle::READ_ONLY.to_string()),
                 "--native-tools" => self.overlays.push(bundle::NATIVE_TOOLS.to_string()),
                 "--full" => self.overlays.push(bundle::FULL.to_string()),
@@ -396,6 +418,10 @@ pub const HELP_SHARED: &str = "\
 OVERLAYS (stacked last, after the profile and your home patch):
     --offline        swap the `llm` row for a scripted provider (no API key)
     -m, --model <ID> pick a `[models.*]` selection from ~/.atomcode/config.toml
+    --effort <LEVEL> how hard the model should think: low, medium, high, xhigh
+                     or max. Kept on its own row, so switching models does not
+                     reset it. Whether to reason at all is the route's business —
+                     `thinking_type` on the `llm` row.
     --env-model      take the model from ATOMCODE_BASE_URL/_MODEL/_API_KEY
                      instead of ~/.atomcode/config.toml
     --plan           read-only exploration: refuse every mutating tool
@@ -455,6 +481,7 @@ mod tests {
     fn a_flag_nobody_owns_is_an_error_not_a_prompt() {
         assert_eq!(shared("--mascot").err(), Some(ExitCode::from(2)));
         assert_eq!(shared("--model").err(), Some(ExitCode::from(2)));
+        assert_eq!(shared("--effort").err(), Some(ExitCode::from(2)));
         assert_eq!(shared("--ui nope").err(), Some(ExitCode::from(2)));
     }
 

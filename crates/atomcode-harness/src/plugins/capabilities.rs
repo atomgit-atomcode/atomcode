@@ -81,10 +81,13 @@ impl Plugin for SkillsPlugin {
             .map(PathBuf::from)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
+        // A named resolver, not a bare environment read: which directory a
+        // person's skills live under is a decision, and it is made in
+        // `model_source` beside the other ones about where things live.
         let home = row
             .home
             .map(PathBuf::from)
-            .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
+            .or_else(crate::model_source::user_home)
             .unwrap_or_else(|| PathBuf::from("."));
         let mut dirs = runtime_skill_dirs(&home, &project);
         dirs.extend(row.dirs.iter().map(PathBuf::from));

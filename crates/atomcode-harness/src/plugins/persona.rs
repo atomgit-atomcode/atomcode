@@ -106,9 +106,16 @@ impl Plugin for ReviewPersonaPlugin {
         } else {
             serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
         };
+        // No environment read: the model name is asked of whatever provider is
+        // actually mounted, which is the same answer from any source — config
+        // file, environment, or a scripted one in a test.
         let model = row
             .model
-            .or_else(|| std::env::var("ATOMCODE_MODEL").ok())
+            .clone()
+            .or_else(|| {
+                ctx.service::<crate::seams::LlmSvc>()
+                    .map(|p| p.model_name().to_string())
+            })
             .unwrap_or_default();
         super::tools::contribute_prompt(
             ctx,

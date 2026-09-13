@@ -13,6 +13,7 @@ pub mod opener;
 pub mod persona;
 pub mod policy;
 pub mod policy_rows;
+pub mod reasoning_effort;
 pub mod recall;
 pub mod recovery;
 pub mod registries;
@@ -98,6 +99,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(recovery::StreamRecoveryPlugin))
         .register(Arc::new(loop_policy::CompactionPlugin))
         .register(Arc::new(compaction::CompactionSummaryPlugin))
+        .register(Arc::new(reasoning_effort::ReasoningEffortPlugin))
         .register(Arc::new(loop_policy::ToolLoopGuardPlugin))
         .register(Arc::new(loop_policy::RepeatFusePlugin))
         .register(Arc::new(policy_rows::TodoPlugin))

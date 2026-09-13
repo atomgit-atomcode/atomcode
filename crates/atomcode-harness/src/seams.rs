@@ -325,6 +325,10 @@ pub trait Control: Send + Sync {
 
     /// Row ids currently in the tree, with whether each is enabled.
     async fn rows(&self) -> Vec<(String, String, bool)>;
+
+    /// One row's config, as the JSON the tree holds. `None` when there is no
+    /// such row.
+    async fn row_config(&self, id: &str) -> Option<serde_json::Value>;
 }
 
 /// Handing out a driver-protocol handle.
