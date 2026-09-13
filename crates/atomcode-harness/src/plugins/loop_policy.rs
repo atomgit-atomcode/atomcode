@@ -241,14 +241,14 @@ impl Plugin for RetryPlugin {
 // ---- compaction ---------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-struct CompactionRow {
+pub(crate) struct CompactionRow {
     /// Compact once the last request's prompt tokens exceed this fraction of
     /// the model's window.
     #[serde(default = "default_threshold")]
-    threshold: f32,
+    pub(crate) threshold: f32,
     /// Turns to keep verbatim below the summary.
     #[serde(default = "default_keep")]
-    keep_turns: u64,
+    pub(crate) keep_turns: u64,
 }
 
 impl Default for CompactionRow {
@@ -266,6 +266,69 @@ fn default_threshold() -> f32 {
 
 fn default_keep() -> u64 {
     2
+}
+
+/// The span a compaction folds away, and a plain-text digest of it.
+///
+/// Shared by the model-free and the model-written strategy so the two agree on
+/// *what* is compacted and on the material a summary is built from — the
+/// boundary is a policy decision, and a second copy of it would be a second
+/// answer to the same question.
+pub(crate) struct CompactedSpan {
+    pub(crate) through: crate::session::SeqNo,
+    /// What was asked, one line each, and the tools that were used. No header
+    /// and no closing instruction: each strategy wraps it in its own words.
+    pub(crate) digest: String,
+}
+
+/// The span a compaction would fold away at this depth. `None` when every turn
+/// still fits inside `keep_turns`, or when nothing was asked in the ones that do
+/// not — there is nothing worth summarizing then.
+pub(crate) fn settled_span(
+    log: &crate::session::SessionLog,
+    keep_turns: u64,
+) -> Option<CompactedSpan> {
+    let events = log.events();
+    let current = log.current_turn();
+    let cutoff = current.saturating_sub(keep_turns);
+    if cutoff == 0 {
+        return None;
+    }
+    let boundary = events
+        .iter()
+        .filter(|e| e.event.turn() <= cutoff)
+        .map(|e| e.seq)
+        .max()?;
+
+    let mut prompts = Vec::new();
+    let mut tools = Vec::new();
+    for logged in events.iter().filter(|e| e.seq <= boundary) {
+        match &logged.event {
+            SessionEvent::UserMessage { text, .. } => prompts.push(text.clone()),
+            SessionEvent::AssistantMessage { tool_calls, .. } => {
+                tools.extend(tool_calls.iter().map(|c| c.name.clone()));
+            }
+            _ => {}
+        }
+    }
+    if prompts.is_empty() {
+        return None;
+    }
+    tools.sort();
+    tools.dedup();
+    let mut digest = String::new();
+    for prompt in &prompts {
+        digest.push_str("- ");
+        digest.push_str(&truncate(prompt, 200));
+        digest.push('\n');
+    }
+    if !tools.is_empty() {
+        digest.push_str(&format!("Tools used: {}\n", tools.join(", ")));
+    }
+    Some(CompactedSpan {
+        through: boundary,
+        digest,
+    })
 }
 
 /// Summarize by listing what happened rather than by asking a model.
@@ -287,50 +350,16 @@ impl Compaction for TailCompaction {
     }
 
     async fn compact(&self, log: &crate::session::SessionLog) -> Option<CompactionDecision> {
-        let events = log.events();
-        let current = log.current_turn();
-        let cutoff = current.saturating_sub(self.keep_turns);
-        if cutoff == 0 {
-            return None;
-        }
-        let boundary = events
-            .iter()
-            .filter(|e| e.event.turn() <= cutoff)
-            .map(|e| e.seq)
-            .max()?;
-
-        let mut prompts = Vec::new();
-        let mut tools = Vec::new();
-        for logged in events.iter().filter(|e| e.seq <= boundary) {
-            match &logged.event {
-                SessionEvent::UserMessage { text, .. } => prompts.push(text.clone()),
-                SessionEvent::AssistantMessage { tool_calls, .. } => {
-                    tools.extend(tool_calls.iter().map(|c| c.name.clone()));
-                }
-                _ => {}
-            }
-        }
-        if prompts.is_empty() {
-            return None;
-        }
-        tools.sort();
-        tools.dedup();
+        let span = settled_span(log, self.keep_turns)?;
         let mut summary = String::from(
             "=== EARLIER IN THIS SESSION ===\nThese turns were compacted. What was asked:\n",
         );
-        for prompt in &prompts {
-            summary.push_str("- ");
-            summary.push_str(&truncate(prompt, 200));
-            summary.push('\n');
-        }
-        if !tools.is_empty() {
-            summary.push_str(&format!("Tools used: {}\n", tools.join(", ")));
-        }
+        summary.push_str(&span.digest);
         summary.push_str(
             "Ask again for any detail you need from before this point rather than assuming it.\n",
         );
         Some(CompactionDecision {
-            through: boundary,
+            through: span.through,
             summary,
         })
     }
@@ -437,15 +466,25 @@ impl Plugin for CompactionPlugin {
                 keep_turns: row.keep_turns,
             }))
             .map_err(|e| e.to_string())?;
-        let _ = ctx.on_waterfall::<AgentRequest>(
-            Arc::new(CompactBeforeRequest {
-                ctx: ctx.clone(),
-                threshold: row.threshold,
-            }),
-            false,
-        );
+        mount_compaction_trigger(ctx, row.threshold);
         Ok(())
     }
+}
+
+/// Mount the automatic-compaction trigger.
+///
+/// *When* to compact is one decision, and it lives here rather than inside a
+/// strategy: a deployment that swaps the strategy for a model-written one still
+/// wants compaction to fire at the same pressure. Both rows call this, and a
+/// replacement strategy that forgot to would be a strategy that never runs.
+pub(crate) fn mount_compaction_trigger(ctx: &Context, threshold: f32) {
+    let _ = ctx.on_waterfall::<AgentRequest>(
+        Arc::new(CompactBeforeRequest {
+            ctx: ctx.clone(),
+            threshold,
+        }),
+        false,
+    );
 }
 
 // ---- tool-loop guard ----------------------------------------------------

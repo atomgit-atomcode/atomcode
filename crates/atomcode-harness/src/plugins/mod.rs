@@ -4,6 +4,7 @@ pub mod agent_loop;
 pub mod agents;
 pub mod ask;
 pub mod capabilities;
+pub mod compaction;
 pub mod findings;
 pub mod handle;
 pub mod llm;
@@ -96,6 +97,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(recovery::ReasoningFilterPlugin))
         .register(Arc::new(recovery::StreamRecoveryPlugin))
         .register(Arc::new(loop_policy::CompactionPlugin))
+        .register(Arc::new(compaction::CompactionSummaryPlugin))
         .register(Arc::new(loop_policy::ToolLoopGuardPlugin))
         .register(Arc::new(loop_policy::RepeatFusePlugin))
         .register(Arc::new(policy_rows::TodoPlugin))

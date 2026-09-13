@@ -350,6 +350,89 @@ async fn compaction_cuts_the_projection_and_leaves_the_log_whole() {
     assert_eq!(raw, 3, "every user message is still in the log");
 }
 
+// ---- compaction written by the utility model -----------------------------
+
+/// Swapping the strategy is a patch, not a rebuild: remove the model-free row,
+/// insert the summarising one. One seam has one provider, so they replace.
+fn swap_compaction(extra: &[&str]) -> Vec<String> {
+    let mut rows = vec![
+        "[[remove]]\nid = \"compaction-tail\"".to_string(),
+        "[[insert]]\nid = \"compaction-summary\"\nname = \"compaction-summary\"\n\
+         config = { threshold = 0.0000001, keep_turns = 1 }"
+            .to_string(),
+    ];
+    rows.extend(extra.iter().map(|s| s.to_string()));
+    rows
+}
+
+#[tokio::test]
+async fn the_utility_model_writes_the_summary_when_the_summary_row_is_mounted() {
+    let dir = scratch("summary-model");
+    // A script per call, because the eager threshold compacts more than once.
+    let utility = "[[insert]]\nid = \"llm-utility\"\nname = \"llm-utility-replay\"\n\
+                   config = { script = [ { text = \"WE-AGREED-TO-USE-POSTGRES\" }, \
+                                         { text = \"WE-AGREED-TO-USE-POSTGRES\" }, \
+                                         { text = \"WE-AGREED-TO-USE-POSTGRES\" } ] }";
+    let rows = swap_compaction(&[utility]);
+    let extra: Vec<&str> = rows.iter().map(String::as_str).collect();
+    let app = start(tree(&dir, NEVER_STOPS, &extra)).await;
+    assert!(
+        app.context().service_names().contains(&"compaction"),
+        "the swap left the seam filled"
+    );
+
+    run_turn(&app, "first question").await.unwrap();
+    run_turn(&app, "second question").await.unwrap();
+    run_turn(&app, "third question").await.unwrap();
+
+    let log = app.context().only_session().unwrap();
+    let projected = log
+        .derive_messages()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        projected.contains("WE-AGREED-TO-USE-POSTGRES"),
+        "the model's summary is what the continuation sees: {projected}"
+    );
+    assert!(
+        !projected.contains("first question"),
+        "and it replaced the raw list rather than joining it: {projected}"
+    );
+}
+
+#[tokio::test]
+async fn without_a_utility_model_the_summary_falls_back_to_the_model_free_list() {
+    let dir = scratch("summary-fallback");
+    // Mounted with no `llm-utility` row at all: the call resolves to nothing and
+    // the model-free text stands, so a provider that is down degrades the
+    // *quality* of the summary and nothing else.
+    let rows = swap_compaction(&[]);
+    let extra: Vec<&str> = rows.iter().map(String::as_str).collect();
+    let app = start(tree(&dir, NEVER_STOPS, &extra)).await;
+
+    run_turn(&app, "first question").await.unwrap();
+    run_turn(&app, "second question").await.unwrap();
+    run_turn(&app, "third question").await.unwrap();
+
+    let log = app.context().only_session().unwrap();
+    let projected = log
+        .derive_messages()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        projected.contains("EARLIER IN THIS SESSION"),
+        "the fallback is the same block the model-free row would have written: {projected}"
+    );
+    assert!(
+        projected.contains("first question"),
+        "and it still names what was asked: {projected}"
+    );
+}
+
 // ---- tool-loop guard ----------------------------------------------------
 
 #[tokio::test]
