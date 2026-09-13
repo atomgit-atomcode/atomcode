@@ -66,6 +66,25 @@ fn origin_label(origin: &InjectionOrigin) -> String {
     }
 }
 
+/// What an injected block is filed under, for the screen.
+///
+/// One kind per origin, and not the same string as the label above, because the
+/// two answer to different readers. The label is read by a person; this is keyed
+/// by [`Presentation`], which decides what opens on screen. Keeping them apart
+/// is what lets `/showinject reminder` name a thing without also naming the text
+/// that appears next to it — labels are prose, and prose is free to change.
+///
+/// [`Presentation`]: crate::host::Presentation
+pub(crate) fn origin_kind(origin: &InjectionOrigin) -> &'static str {
+    match origin {
+        InjectionOrigin::Peer { .. } => "injected:peer",
+        InjectionOrigin::Memory => "injected:memory",
+        InjectionOrigin::Reminder => "injected:reminder",
+        InjectionOrigin::Continuation => "injected:continuation",
+        InjectionOrigin::CompactionSummary => "injected:compaction",
+    }
+}
+
 impl Producer for Transcript {
     fn id(&self) -> &'static str {
         ID
@@ -194,6 +213,7 @@ impl Producer for Transcript {
                 out.emit(
                     at,
                     Arc::new(InjectedBlock {
+                        kind: origin_kind(origin),
                         origin: origin_label(origin),
                         text: text.clone(),
                     }),
@@ -447,10 +467,27 @@ mod tests {
             "reasoning",
             "tool_call",
             "notice",
-            "injected",
+            "injected:reminder",
+            "injected:peer",
             "turn_end",
         ] {
             assert!(k.contains(&want), "`{want}` never appeared: {k:?}");
         }
+
+        // In the stream is not the same as on the screen, and the difference is
+        // the whole point of keying an injection by its origin: both of these are
+        // facts, both are in the content hashes, and only one of them is painted.
+        // Asserted here, next to the kinds, because a block that stopped being
+        // produced at all would otherwise pass the presentation test by simply
+        // never arriving.
+        let p = crate::host::Presentation::default_folds();
+        assert!(
+            p.is_hidden("injected:reminder"),
+            "the environment's own reminder is on screen by default"
+        );
+        assert!(
+            !p.is_hidden("injected:peer"),
+            "a teammate's report is not the environment talking to itself"
+        );
     }
 }

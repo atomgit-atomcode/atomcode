@@ -23,6 +23,10 @@ const SCREEN: &[Command] = &[
     Command::new("clear", "清空输入行"),
     Command::new("reasoning", "思考:一行、全文、收起,循环"),
     Command::new("tools", "展开或折叠工具调用的结果"),
+    Command::new(
+        "showinject",
+        "环境注入:收起、只留标签、全文,循环;不带名字则全部",
+    ),
     Command::new("mascot", "显示或隐藏吉祥物"),
     Command::new("mouse", "把鼠标交还终端,或收回来"),
     Command::new("keys", "列出快捷键"),
@@ -36,12 +40,16 @@ impl CommandSet for ScreenCommands {
     fn commands(&self) -> Vec<Command> {
         SCREEN.to_vec()
     }
-    async fn run(&self, name: &str, _args: &str, _ctx: &Context) -> Outcome {
+    async fn run(&self, name: &str, args: &str, _ctx: &Context) -> Outcome {
         match name {
             "quit" | "exit" => Outcome::Do(Action::Quit),
             "clear" => Outcome::Do(Action::Clear),
             "reasoning" => Outcome::Do(Action::ToggleFold("reasoning")),
             "tools" => Outcome::Do(Action::ToggleFold("tool_call")),
+            "showinject" => match showinject(&args.to_ascii_lowercase()) {
+                Ok(action) => Outcome::Do(action),
+                Err(why) => Outcome::Refused(why),
+            },
             "mascot" => Outcome::Do(Action::ToggleModule("mascot")),
             "mouse" => Outcome::Do(Action::ToggleMouse),
             "keys" => Outcome::Said(
@@ -50,12 +58,55 @@ impl CommandSet for ScreenCommands {
                  上/下 在输入里移动游标,到头则翻历史 · 点击输入框定位游标\n\
                  pgup/pgdn 与滚轮滚动对话\n\
                  ctrl-r 思考(一行/全文/收起,循环) · ctrl-t 折叠工具 · ctrl-n 吉祥物 · ctrl-l 重画屏幕\n\
+                 /showinject [名字] 环境注入(默认不显示;不带名字则全部,all 含同伴报告)\n\
                  拖动选中并复制 · esc 取消选中 · 点击思考或工具调用折叠展开那一个\n\
                  ctrl-o 把鼠标交还终端(改用终端自己的框选)"
                     .into(),
             ),
             _ => Outcome::Quiet,
         }
+    }
+}
+
+/// Turn `/showinject <what>` into the one action it means.
+///
+/// Split out from the dispatch because the interesting part is the refusal, and
+/// a refusal that has to be written to be tested is a refusal that says what the
+/// alternatives were. `/showinject` with nothing after it is the group — every
+/// environmental injection at once — since that is the thing a person forms an
+/// opinion about, not any one of them.
+///
+/// A named one is the same `Hidden → Folded → Open → Hidden` cycle `/reasoning`
+/// is, with `Folded` standing in the label `[reminder]` alone: the useful middle
+/// state for something that is off the screen because it is noise but is not
+/// hidden from anybody who goes looking.
+fn showinject(what: &str) -> Result<Action, String> {
+    if what.is_empty() {
+        return Ok(Action::ToggleFolds(
+            crate::content::ENVIRONMENTAL_INJECTIONS.to_vec(),
+        ));
+    }
+    // `all` rather than a fourth name: every kind in the table, peers included,
+    // because "show me the injections" is a question about the screen and a
+    // teammate's report is an injection flatly.
+    if what == "all" {
+        return Ok(Action::ToggleFolds(
+            crate::content::INJECTIONS
+                .iter()
+                .map(|(_, kind)| *kind)
+                .collect(),
+        ));
+    }
+    match crate::content::injected_kind(what) {
+        Some(kind) => Ok(Action::ToggleFold(kind)),
+        None => Err(format!(
+            "没有 `{what}` 这种注入;可以写 {} 或 all",
+            crate::content::INJECTIONS
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+                .join(" / ")
+        )),
     }
 }
 
@@ -502,5 +553,59 @@ mod tests {
             c.dispatch("/reasoning", &app.context()).await,
             Outcome::Do(Action::ToggleFold("reasoning"))
         );
+    }
+
+    #[tokio::test]
+    async fn showinject_names_one_injection_the_group_or_all_of_them() {
+        let c = builtin_for_test();
+        let app = bare();
+
+        // Bare: the group, which is the gesture a person forms an opinion about.
+        assert_eq!(
+            c.dispatch("/showinject", &app.context()).await,
+            Outcome::Do(Action::ToggleFolds(
+                crate::content::ENVIRONMENTAL_INJECTIONS.to_vec()
+            ))
+        );
+        // One, by the name that appears in the menu and by the kind that appears
+        // in a fold state. Both spellings, because people name what they see.
+        assert_eq!(
+            c.dispatch("/showinject reminder", &app.context()).await,
+            Outcome::Do(Action::ToggleFold("injected:reminder"))
+        );
+        assert_eq!(
+            c.dispatch("/showinject injected:reminder", &app.context())
+                .await,
+            Outcome::Do(Action::ToggleFold("injected:reminder"))
+        );
+        // The injection a person may want most, since it is the one that is off
+        // the screen and also the one carrying someone else's words.
+        assert_eq!(
+            c.dispatch("/showinject peer", &app.context()).await,
+            Outcome::Do(Action::ToggleFold("injected:peer"))
+        );
+        assert_eq!(
+            c.dispatch("/showinject all", &app.context()).await,
+            Outcome::Do(Action::ToggleFolds(
+                crate::content::INJECTIONS.iter().map(|(_, k)| *k).collect()
+            ))
+        );
+
+        // Case is not the person's problem: the word is lower-cased before it is
+        // looked up, so what arrives from a menu or a paste lands the same way.
+        assert_eq!(
+            c.dispatch("/showinject REMINDER", &app.context()).await,
+            Outcome::Do(Action::ToggleFold("injected:reminder"))
+        );
+
+        // And a refusal names what would have worked. A silent no-op here looks
+        // exactly like the injection not being there.
+        match c.dispatch("/showinject nonsense", &app.context()).await {
+            Outcome::Refused(why) => {
+                assert!(why.contains("reminder"), "{why}");
+                assert!(why.contains("all"), "{why}");
+            }
+            other => panic!("a name nobody has should be refused, not {other:?}"),
+        }
     }
 }

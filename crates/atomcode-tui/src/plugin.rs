@@ -900,6 +900,15 @@ impl Tui {
                     .toggle(kind);
                 return false;
             }
+            Action::ToggleFolds(kinds) => {
+                drop(m);
+                self.host
+                    .presentation
+                    .write()
+                    .expect("presentation poisoned")
+                    .toggle_many(kinds);
+                return false;
+            }
             Action::ToggleModule(id) => {
                 drop(m);
                 self.toggle_module(id);

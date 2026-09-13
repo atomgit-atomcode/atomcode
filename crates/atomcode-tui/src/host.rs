@@ -37,18 +37,23 @@ pub enum Showing {
     Hidden,
 }
 
-/// The kinds a reader may take off the screen entirely.
+/// Whether a kind may be taken off the screen entirely.
 ///
-/// Reasoning, and nothing else. It is the working rather than the answer — the
-/// one thing the model produces that a person may reasonably want gone once
-/// they have read it — and it opens hidden for that reason. Everything else on
-/// the stream is content: what was asked, what was answered, what a tool
-/// returned. Putting a lid over those is a different decision, and `ctrl-t`
-/// already makes it.
+/// Reasoning, and the environment's own injections — see
+/// [`ENVIRONMENTAL_INJECTIONS`]. It is the working rather than the answer: the
+/// two things on the stream that a person may reasonably want gone once they
+/// have read them, and both open hidden for that reason. Everything else is
+/// content: what was asked, what was answered, what a tool returned, what a
+/// teammate reported. Putting a lid over those is a different decision, and
+/// `ctrl-t` already makes it.
 ///
-/// A list rather than a flag on the block, for the same reason [`CLICKABLE`] is
-/// one: it is about what the screen does, not about what the block is.
-const HIDEABLE: [&str; 1] = ["reasoning"];
+/// A predicate rather than a flag on the block, for the same reason [`CLICKABLE`]
+/// is a list: it is about what the screen does, not about what the block is.
+///
+/// [`ENVIRONMENTAL_INJECTIONS`]: crate::content::ENVIRONMENTAL_INJECTIONS
+fn hideable(kind: &str) -> bool {
+    kind == "reasoning" || crate::content::ENVIRONMENTAL_INJECTIONS.contains(&kind)
+}
 
 /// Which blocks are shown how. Kept here, keyed by kind, rather than on the
 /// block — which is what makes "folding does not change content" structural.
@@ -67,19 +72,34 @@ pub struct Presentation {
 }
 
 impl Presentation {
-    /// How the screen opens: reasoning away, tool calls behind a lid.
+    /// How the screen opens: reasoning and the environment's own injections
+    /// away, tool calls behind a lid.
     ///
     /// Both are the working rather than the answer, and a transcript is read for
     /// the answer. Tool calls keep a lid where reasoning does not, because
     /// *what was run* is part of that answer: someone glancing at a transcript
     /// wants to know that a file was read, not what the model was thinking
     /// while it read it.
+    ///
+    /// Reasoning and the environment's own injections both open off the screen,
+    /// and both come back one step at a time: a one-row lid, then the whole
+    /// thing, then away again — `ctrl-r` for the first, `/showinject` for the
+    /// second. The difference is the audience: a thought is the model working and
+    /// a person may want to watch it arrive, while an injection is the harness
+    /// talking to the model and nobody is reading `<system-reminder>` on purpose.
+    /// Hiding it is the same decision either way.
     pub fn default_folds() -> Self {
+        let mut by_kind: Vec<(&'static str, Showing)> = vec![
+            ("reasoning", Showing::Hidden),
+            ("tool_call", Showing::Folded),
+        ];
+        by_kind.extend(
+            crate::content::ENVIRONMENTAL_INJECTIONS
+                .iter()
+                .map(|kind| (*kind, Showing::Hidden)),
+        );
         Self {
-            by_kind: vec![
-                ("reasoning", Showing::Hidden),
-                ("tool_call", Showing::Folded),
-            ],
+            by_kind,
             by_block: std::collections::HashMap::new(),
         }
     }
@@ -140,11 +160,23 @@ impl Presentation {
         let next = match self.showing(kind) {
             Showing::Hidden => Showing::Folded,
             Showing::Folded => Showing::Open,
-            Showing::Open if HIDEABLE.contains(&kind) => Showing::Hidden,
+            Showing::Open if hideable(kind) => Showing::Hidden,
             Showing::Open => Showing::Folded,
         };
         self.set(kind, next);
         self.by_block.clear();
+    }
+
+    /// The same gesture over a group, each member stepped once.
+    ///
+    /// Each one steps on its own state rather than being set to the first
+    /// member's: a group whose members have been driven apart by hand would
+    /// otherwise snap them all to wherever the first one happened to be, which is
+    /// the group gesture overruling the individual one rather than adding to it.
+    pub fn toggle_many(&mut self, kinds: impl IntoIterator<Item = &'static str>) {
+        for kind in kinds {
+            self.toggle(kind);
+        }
     }
 
     /// Say what a block is folded to, flatly.
@@ -2227,6 +2259,67 @@ mod tests {
         assert!(
             lid.iter().any(|r| r.contains("fix the build")),
             "shown: scrolled to the limit and the first thing said is gone: {lid:?}"
+        );
+    }
+
+    #[test]
+    fn the_environments_own_injections_are_off_the_screen_and_a_peers_is_not() {
+        // The corpus carries both, and they arrive as the same `SessionEvent` with
+        // a different `origin`. That is the pair this test exists for: if the two
+        // were keyed alike, hiding the reminder would hide the report, and the
+        // team's answer would be gone from the transcript with nothing saying so.
+        let h = fed();
+        let screen = h.compose((80, 40)).rows().join("\n");
+
+        assert!(
+            !screen.contains("system-reminder") && !screen.contains("[reminder]"),
+            "the reminder is on screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("sessions are made in agent.rs"),
+            "a teammate's report is an answer, and it is gone:\n{screen}"
+        );
+
+        // And back, one step at a time — the hidable cycle, same as reasoning: a
+        // lid naming the kind, then the text, then away again. The group gesture
+        // is `/showinject` with no argument.
+        h.presentation
+            .write()
+            .unwrap()
+            .toggle_many(crate::content::ENVIRONMENTAL_INJECTIONS.to_vec());
+        let lid = h.compose((80, 40)).rows().join("\n");
+        assert!(
+            lid.contains("[reminder]"),
+            "the group gesture did not put a lid on it:\n{lid}"
+        );
+        assert!(
+            !lid.contains("keep going"),
+            "a lid spends a row, not the text:\n{lid}"
+        );
+        assert!(
+            !lid.contains("[memory]") && !lid.contains("[continuation]"),
+            "a kind with nothing on screen grew a lid:\n{lid}"
+        );
+
+        h.presentation
+            .write()
+            .unwrap()
+            .toggle_many(crate::content::ENVIRONMENTAL_INJECTIONS.to_vec());
+        let open = h.compose((80, 40)).rows().join("\n");
+        assert!(
+            open.contains("keep going"),
+            "expanding shows what it said:\n{open}"
+        );
+
+        // Round again, back to where the screen started.
+        h.presentation
+            .write()
+            .unwrap()
+            .toggle_many(crate::content::ENVIRONMENTAL_INJECTIONS.to_vec());
+        assert_eq!(
+            h.compose((80, 40)).rows().join("\n"),
+            screen,
+            "the cycle does not come back round"
         );
     }
 

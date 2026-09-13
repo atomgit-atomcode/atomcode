@@ -63,6 +63,15 @@ pub enum Action {
     /// lid, then the whole thing, then — for a kind that may be hidden — off
     /// the screen.
     ToggleFold(&'static str),
+    /// The same over several kinds at once, which is what `/showinject` with no
+    /// argument is: one gesture over the environment's injections. The group is
+    /// the unit a person has an opinion about — nobody wants to be told they may
+    /// show the reminder but not the memory.
+    ///
+    /// A `Vec` rather than the `&'static [&'static str]` the group constant is,
+    /// because `all` is built at dispatch time and leaking it to make the types
+    /// match would be a leak per keystroke. The list is five strings long.
+    ToggleFolds(Vec<&'static str>),
     /// Show or hide a module.
     ToggleModule(&'static str),
     /// Change the screen's shape. The third entry point into `Layout::apply`,

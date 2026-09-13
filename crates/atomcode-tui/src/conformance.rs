@@ -112,6 +112,17 @@ pub fn facts() -> Vec<SessionEvent> {
             text: "<system-reminder>keep going</system-reminder>".into(),
             origin: InjectionOrigin::Reminder,
         },
+        // The second origin, because the two are the pair the screen has to get
+        // right: same event, and one opens on screen where the other does not. A
+        // corpus with only a reminder would pass whether or not `Injected` is
+        // keyed by origin, which is the whole distinction.
+        SessionEvent::Injected {
+            turn: 1,
+            text: "[scout] sessions are made in agent.rs".into(),
+            origin: InjectionOrigin::Peer {
+                from: "lead-1/scout".into(),
+            },
+        },
         SessionEvent::AssistantMessage {
             turn: 1,
             round: 2,

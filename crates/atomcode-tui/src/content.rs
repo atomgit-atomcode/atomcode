@@ -598,16 +598,22 @@ impl Content for NoticeBlock {
 /// Model-visible context the harness added on its own initiative.
 #[derive(Debug)]
 pub struct InjectedBlock {
+    /// Which injection this is, as `Presentation` keys it — `injected:reminder`
+    /// and so on. Separate from [`origin`](Self::origin) on purpose: that one is
+    /// the label a person reads (`[compaction summary]`), this one is the key the
+    /// screen folds by. A stray space in a label is a typo; the same space in a
+    /// key is a kind nobody can ever hide.
+    pub kind: &'static str,
     pub origin: String,
     pub text: String,
 }
 
 impl Content for InjectedBlock {
     fn kind(&self) -> &'static str {
-        "injected"
+        self.kind
     }
     fn content_hash(&self) -> ContentHash {
-        hash_of(&["injected", &self.origin, &self.text])
+        hash_of(&[self.kind, &self.origin, &self.text])
     }
     fn lines(&self, w: u16) -> Vec<Line> {
         wrapped(&self.text, w, muted(), &format!("[{}] ", self.origin))
@@ -618,6 +624,60 @@ impl Content for InjectedBlock {
             muted(),
         )
     }
+}
+
+/// Every injection there is, as *(the word a person types, the kind the screen
+/// files it under)*.
+///
+/// One table, because three places have to agree about it and two of them are
+/// bare string lists: `origin_kind` names a block, the presentation decides
+/// which kinds open off-screen, and `/showinject` is how a person overrules it.
+/// A hand-kept list in three files does not fail loudly when they drift — it
+/// fails as a block nobody can hide, or a name nobody can type, and both look
+/// exactly like the feature working.
+pub const INJECTIONS: &[(&str, &str)] = &[
+    ("reminder", "injected:reminder"),
+    ("memory", "injected:memory"),
+    ("continuation", "injected:continuation"),
+    ("compaction", "injected:compaction"),
+    ("peer", "injected:peer"),
+];
+
+/// The injections the screen opens without.
+///
+/// Context the harness added on its own initiative, addressed to the model: a
+/// compaction summary, a recalled memory, a `keep going` nudge. The agent needs
+/// them in the log and the person reading the transcript is not the audience for
+/// them, so they stay in the stream — in the content hashes, in `/transcript`,
+/// in what the model was actually sent — and are simply not painted.
+///
+/// `injected:peer` is deliberately not here. A teammate's report is an answer
+/// somebody asked for, and the team panel is showing it for that reason.
+///
+/// A slice of strings rather than a filter over [`INJECTIONS`], because both
+/// consumers need it as a `&'static [&'static str]` — the default fold state and
+/// the group gesture `/showinject` runs.
+/// `the_injection_tables_agree_with_each_other` is what keeps the duplication
+/// honest.
+pub const ENVIRONMENTAL_INJECTIONS: &[&str] = &[
+    "injected:reminder",
+    "injected:memory",
+    "injected:continuation",
+    "injected:compaction",
+];
+
+/// Resolve what a person typed after `/showinject` to the kind it names.
+///
+/// The short word and the full kind both work. The full one is what a fold state
+/// and `/transcript` show, and people name what they can see; the short one is
+/// what they get from typing `/showinject ` and reading the menu.
+pub fn injected_kind(word: &str) -> Option<&'static str> {
+    let word = word.trim().to_ascii_lowercase();
+    let word = word.strip_prefix("injected:").unwrap_or(&word);
+    INJECTIONS
+        .iter()
+        .find(|(name, _)| *name == word)
+        .map(|(_, kind)| *kind)
 }
 
 /// A question put to the person, and — once they answer — what they said.
@@ -1555,5 +1615,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_injection_tables_agree_with_each_other() {
+        // Three lists have to say the same thing — `origin_kind` names the block,
+        // `INJECTIONS` is what `/showinject` accepts, and `ENVIRONMENTAL_INJECTIONS`
+        // is what opens hidden — and nothing but this test is watching them. The
+        // failure they drift into is silent both ways: a kind with no name is a
+        // block nobody can type their way back to, and a name with no kind is a
+        // refusal for something that is on the screen.
+        use crate::modules::transcript::origin_kind;
+        use atomcode_harness::session::InjectionOrigin;
+
+        let every = [
+            InjectionOrigin::Reminder,
+            InjectionOrigin::Memory,
+            InjectionOrigin::Continuation,
+            InjectionOrigin::CompactionSummary,
+            InjectionOrigin::Peer {
+                from: "lead-1/scout".into(),
+            },
+        ];
+        for origin in &every {
+            let kind = origin_kind(origin);
+            assert!(
+                INJECTIONS.iter().any(|(_, k)| *k == kind),
+                "{origin:?} is filed under `{kind}`, which no name in INJECTIONS reaches"
+            );
+        }
+
+        for (name, kind) in INJECTIONS {
+            assert_eq!(
+                injected_kind(name),
+                Some(*kind),
+                "`/showinject {name}` does not resolve to the kind it names"
+            );
+            assert_eq!(
+                injected_kind(kind),
+                Some(*kind),
+                "`/showinject {kind}` does not resolve to itself"
+            );
+        }
+
+        // The group is a subset, and it is the group minus the peer: a teammate's
+        // report is the one injection that is an answer rather than a nudge.
+        for kind in ENVIRONMENTAL_INJECTIONS {
+            assert!(
+                INJECTIONS.iter().any(|(_, k)| k == kind),
+                "`{kind}` opens hidden but has no name to type"
+            );
+            assert_ne!(*kind, origin_kind(&every[4]), "a peer report opens hidden");
+        }
+        assert!(
+            ENVIRONMENTAL_INJECTIONS.len() < INJECTIONS.len(),
+            "the group gesture and `all` are the same gesture, so nothing is hidden by default"
+        );
+    }
+
+    #[test]
+    fn an_injection_is_labelled_by_its_origin_not_by_its_kind() {
+        // The two are deliberately different strings: one is read, one is keyed.
+        // A label that drifted into a kind would put `injected:` in front of every
+        // reminder on screen, and a kind that drifted into a label would be a fold
+        // state keyed by prose — the second is invisible, the first is not.
+        let b = InjectedBlock {
+            kind: "injected:reminder",
+            origin: "reminder".into(),
+            text: "keep going".into(),
+        };
+        assert_eq!(b.kind(), "injected:reminder");
+        assert_eq!(b.lines(40)[0].plain(), "[reminder] keep going");
+        assert_eq!(b.summary(40).plain(), "[reminder]");
     }
 }
