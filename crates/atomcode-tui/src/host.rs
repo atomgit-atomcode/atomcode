@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use atomcode_harness::session::SessionEvent;
 
 use crate::block::{BlockId, Slot, Stream};
-use crate::frame::{Frame, Line, Rect};
+use crate::caps::{Caps, Glyph};
+use crate::frame::{Frame, Line, Rect, Span, Style};
 use crate::module::{Height, Modules};
 use crate::moment::Moment;
 use crate::region::Region;
@@ -259,6 +260,86 @@ fn blank_between(upper: &str, lower: &str) -> bool {
         return true;
     }
     (upper == "tool_call") != (lower == "tool_call")
+}
+
+/// What a block of this kind opens with, if it opens with anything.
+///
+/// A turn arrives as an interleaving of prose, tool calls and thoughts, and they
+/// all used to begin in the same column: what the model *said* and what it *ran*
+/// were told apart only by reading them. So the answer opens with the same `●` a
+/// call does, and is set in by the width of it — the reply's words land in the
+/// very column a call's `⎿` hangs in, which is what makes them one piece of
+/// work rather than two that happen to sit near each other.
+///
+/// The mark is the colour of the words it opens rather than a colour of its own,
+/// which is why it is uncoloured: body text states no colour by design (see
+/// `theme`), and a mark that named one would come apart from its text the first
+/// time the palette moved. It is `●` and not a new glyph because it is the same
+/// mark — the screen says "here is a piece of this turn" in one shape.
+///
+/// The rule lives here, next to [`blank_between`], because a mark and a margin
+/// are facts about how the screen shows a block and not about what the block
+/// says: the same block at the same width is the same content wherever it is
+/// drawn, and `content_hash` must not move because somebody changed the layout.
+///
+/// Users are out: their message is a full-width bar on purpose (see
+/// `content::UserSaid`), and setting it in would eat the bar's whole point. A
+/// thought is out too — it is chrome over the answer, and `· 思考 3 行` already
+/// says what it is.
+fn opener(kind: &str) -> Option<Span> {
+    match kind {
+        "assistant" => Some(Span::styled(
+            format!("{} ", Caps::default().g(Glyph::ToolMark)),
+            Style::new(),
+        )),
+        _ => None,
+    }
+}
+
+/// How far a block of this kind is set in from the left edge, in cells.
+///
+/// The width of the [`opener`] and nothing else, so that "the words start where
+/// the mark ends" is one fact rather than two that agree today.
+fn inset(kind: &str) -> u16 {
+    opener(kind).map_or(0, |mark| mark.width() as u16)
+}
+
+/// Set every line in from the left edge by the opener's width, never past `w`.
+///
+/// The opener goes on the first line that has anything on it rather than on line
+/// zero: an answer may begin with a blank row of its own, and a `●` alone above
+/// the answer is a mark pointing at nothing. The blank rows ahead of it still
+/// take their width, invisibly, so the block stays a rectangle.
+///
+/// The cells carry no style, so they inherit the row's background rather than
+/// naming one — the same reason [`blank_between`]'s row is [`Line::empty`].
+fn set_in(lines: Vec<Line>, open: Option<Span>, w: u16) -> Vec<Line> {
+    let Some(open) = open else {
+        return lines;
+    };
+    let pad = open.width() as u16;
+    let blank = Span::styled(" ".repeat(pad as usize), Style::new());
+    let mut marked = false;
+    lines
+        .into_iter()
+        .map(|line| {
+            let empty = line.spans.iter().all(|s| s.text.trim().is_empty());
+            let lead = if !marked && !empty {
+                marked = true;
+                open.clone()
+            } else {
+                blank.clone()
+            };
+            let mut spans = Vec::with_capacity(line.spans.len() + 1);
+            spans.push(lead);
+            spans.extend(line.spans);
+            // The caller rendered into `w - pad`, so this cut should never bite.
+            // It is here anyway because the other half of the same promise is
+            // asserted by `content_never_draws_wider_than_it_was_given`: content
+            // never exceeds the width it was given, whatever the reason.
+            Line::from_spans(spans).truncate(w as usize)
+        })
+        .collect()
 }
 
 /// Whether a call may be shown behind the same lid as its neighbours.
@@ -658,14 +739,20 @@ impl Host {
             // transcript is for and most of the screen is things the model said.
             let foldable = !block.content.always_open();
             let mut own = (foldable && CLICKABLE.contains(&kind)).then_some((block.id, kind));
-            let mut lines = if let Some(run) = lid {
+            // The column this block leaves on the left, and the width that is
+            // actually left to draw in. Every render below is asked for `room`,
+            // never `rect.w` — content wrapped to the full width and then set in
+            // would overflow, and the cut in `set_in` would eat its last cells.
+            let pad = inset(kind);
+            let room = rect.w.saturating_sub(pad);
+            let lines = if let Some(run) = lid {
                 // A run of folded calls behind one lid. Its rows are owned by
                 // the last call, so a click anywhere on the lid folds the run
                 // that drew it — which is the only thing that click could mean.
                 own = Some((block.id, kind));
-                lid_lines(stream.slots(), i, run.count, rect.w)
+                lid_lines(stream.slots(), i, run.count, room)
             } else if foldable && pres.is_block_folded(block.id, kind) {
-                vec![block.content.summary(rect.w)]
+                vec![block.content.summary(room)]
             } else {
                 // The one place a block is rendered for the screen. Its row count
                 // comes first, because a settled block already knows it: a block
@@ -673,7 +760,7 @@ impl Host {
                 // arithmetic instead of being rendered and thrown away, which is
                 // what makes scrolling back through a long conversation cost the
                 // screen rather than the session.
-                let (n, rendered) = slot.rows_at(rect.w);
+                let (n, rendered) = slot.rows_at(room);
                 // Not a neighbour if it draws nothing — same as the draw path
                 // below, which leaves `below` alone for an empty block.
                 if n == 0 {
@@ -699,9 +786,16 @@ impl Host {
                 // is the block being looked at, so it gets rendered now.
                 match rendered {
                     Some(lines) => lines,
-                    None => block.content.lines(rect.w),
+                    None => block.content.lines(room),
                 }
             };
+            // The margin is added after the block has drawn, not asked of it:
+            // the two renderers a block has — `lines` and the incremental
+            // `render_settled` the live cache drives — are both reached from
+            // here, so one call covers a streaming answer and a settled one
+            // alike. Doing it inside the block would mean doing it twice, and
+            // the two would drift the moment one of them was missed.
+            let mut lines = set_in(lines, opener(kind), rect.w);
             if lines.is_empty() {
                 continue;
             }
@@ -952,10 +1046,19 @@ impl Host {
             if pres.is_hidden(b.kind()) {
                 continue;
             }
+            // The same width the painter will use, and for the same reason it
+            // exists: a row count is only the painter's if it was measured at
+            // the width the painter draws at, and a block that is set in draws
+            // two cells narrower. Measuring here at the full width would count
+            // the wraps of a *wider* column than the one on screen, so a long
+            // reply would come out shorter in the sum than it is in the frame —
+            // and the last rows of it would be exactly that many rows out of
+            // reach at the bottom of the scroll.
+            let room = width.saturating_sub(inset(b.kind()));
             let n = match lids.at(i) {
-                Some(run) => lid_lines(stream.slots(), i, run.count, width).len(),
+                Some(run) => lid_lines(stream.slots(), i, run.count, room).len(),
                 None if !b.content.always_open() && pres.is_block_folded(b.id, b.kind()) => 1,
-                None => slot.rows_at(width).0,
+                None => slot.rows_at(room).0,
             };
             if n == 0 {
                 continue;
@@ -1571,6 +1674,312 @@ mod tests {
             rows[asked + 2].contains("看看那个目录"),
             "and the row after the blank is the model's: {:?}",
             &rows[asked..asked + 3]
+        );
+    }
+
+    /// How far `row` starts from the left edge, in cells.
+    fn leading(row: &str) -> usize {
+        row.len() - row.trim_start().len()
+    }
+
+    /// The column a row's *words* start in, past the mark that opens it.
+    ///
+    /// An answer opens with the same `●` a call does, so "the answer is set in"
+    /// and "the answer lines up with its result" are two different numbers on
+    /// one row. This is the second: `● Looking.` has its words in column two,
+    /// and so does `  ⎿ 20 行`, which is the pair that has to agree.
+    fn words(row: &str) -> usize {
+        let mark = format!("{} ", Caps::default().g(Glyph::ToolMark));
+        if row.starts_with(&mark) {
+            crate::width::str_width(&mark)
+        } else {
+            leading(row)
+        }
+    }
+
+    /// The rows the conversation drew, newest last.
+    fn stream_rows(h: &Host, size: (u16, u16)) -> Vec<String> {
+        h.compose(size)
+            .part("stream")
+            .expect("the conversation")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect()
+    }
+
+    #[test]
+    fn the_reply_is_set_in_and_the_work_that_produced_it_is_not() {
+        // A turn is prose, calls and notices stacked in one column, and they
+        // used to be told apart only by being read. The reply opens with the
+        // same `●` a call does, which puts its words in the column a call's
+        // result hangs in — the eye finds what the model *said* in the same
+        // shape it finds what the model *ran*, and neither is mistaken for the
+        // other.
+        //
+        // The other half is the assertion that keeps this from becoming "mark
+        // everything": the notice and the user's own bar stay flush left. A rule
+        // applied by kind has to be checked on the kinds it excludes, or it is
+        // indistinguishable from a rule applied to nothing.
+        let rows = stream_rows(&fed(), (64, 30));
+        let prose = rows
+            .iter()
+            .find(|r| r.contains("Fixed it"))
+            .expect("the model's reply");
+        assert!(
+            prose.starts_with(&format!("{} ", Caps::default().g(Glyph::ToolMark))),
+            "the reply does not open with a mark: {prose:?}"
+        );
+        // Against the tool call's own gutter rather than against `2`: what is
+        // being claimed is that the two line up, and a bare number here would
+        // keep passing if both moved apart together.
+        let gutter = rows
+            .iter()
+            .find(|r| r.contains('⎿'))
+            .expect("a tool result hanging in its gutter");
+        assert_eq!(
+            words(prose),
+            words(gutter),
+            "the reply and the tool result do not start in the same column: \
+             {prose:?} vs {gutter:?}"
+        );
+        assert!(
+            words(prose) > 0,
+            "the reply's words start at the margin, so nothing is set in: {prose:?}"
+        );
+
+        let call = rows
+            .iter()
+            .find(|r| r.contains("cd /Users"))
+            .expect("a tool call");
+        assert_eq!(leading(call), 0, "the call was set in too: {call:?}");
+
+        let notice = rows
+            .iter()
+            .find(|r| r.contains("rate limited"))
+            .expect("a notice");
+        assert_eq!(leading(notice), 0, "the notice was set in too: {notice:?}");
+
+        let bar = rows
+            .iter()
+            .find(|r| r.contains("fix the build"))
+            .expect("what was asked");
+        assert_eq!(
+            leading(bar),
+            0,
+            "the user's bar was set in, which eats its point: {bar:?}"
+        );
+    }
+
+    #[test]
+    fn a_reply_sits_in_the_same_column_while_it_streams_and_once_it_is_done() {
+        // A reply has two renderers, and the mark and its margin have to be in
+        // neither of them. While the answer is arriving it is drawn by the live
+        // cache, which parses the text itself (`markdown::render_settled`) so
+        // that a frame costs the new text rather than the whole answer; once the
+        // turn ends the same block is settled and drawn by `Content::lines`. A
+        // margin put inside the block — the obvious place, and the first one I
+        // wrote — reaches the second and not the first, and the prose then jumps
+        // two cells sideways at the exact moment the answer lands.
+        //
+        // `set_in` is called where both renderers return, which is what this
+        // asserts. It is also why the mark is not `ModelSaid`'s business.
+        let facts = conformance::facts();
+        // Through the last chunk: the text block is open and still growing.
+        let streaming = host();
+        for f in &facts[..6] {
+            streaming.absorb(f);
+        }
+        // …and one fact further, which is the message that settles it.
+        let done = host();
+        for f in &facts[..8] {
+            done.absorb(f);
+        }
+
+        let live = stream_rows(&streaming, (64, 30));
+        let settled = stream_rows(&done, (64, 30));
+        let arriving = live
+            .iter()
+            .find(|r| r.contains("Looking."))
+            .expect("the answer as it arrives");
+        let landed = settled
+            .iter()
+            .find(|r| r.contains("Looking."))
+            .expect("the same answer once it is done");
+
+        assert!(
+            arriving.starts_with(&format!("{} ", Caps::default().g(Glyph::ToolMark))),
+            "a streaming reply does not open with a mark: {arriving:?}"
+        );
+        assert!(
+            words(arriving) > 0,
+            "a streaming reply's words start at the margin: {arriving:?}"
+        );
+        assert_eq!(
+            arriving, landed,
+            "the reply moved when it settled: {arriving:?} became {landed:?}"
+        );
+    }
+
+    #[test]
+    fn the_mark_opens_the_reply_once_and_the_rows_under_it_line_up() {
+        // The mark is the *block's* — it says "here is a piece of this turn" —
+        // so it goes on the block once. On every row it would read as a list of
+        // separate things; on none of the rows after the first, the
+        // continuation drifts a column left. So this is a test of the shape and
+        // not only of the first row.
+        let h = host();
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: "第一行很长很长很长很长很长很长很长很长\n第二行".into(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+        });
+        let rows = stream_rows(&h, (40, 20));
+        let mark = format!("{} ", Caps::default().g(Glyph::ToolMark));
+        let first = rows
+            .iter()
+            .find(|r| !r.trim().is_empty())
+            .expect("the reply");
+        assert!(
+            first.starts_with(&mark),
+            "the reply does not open with a mark: {first:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.contains(&mark)).count(),
+            1,
+            "the mark belongs to the block, not to each of its rows: {rows:?}"
+        );
+        // `words` is the mark's width on the first row and the leading blanks on
+        // the rest, so one equality says both halves of "it lines up".
+        let column = crate::width::str_width(&mark);
+        for row in rows.iter().filter(|r| !r.trim().is_empty()) {
+            assert_eq!(
+                words(row),
+                column,
+                "a row of the reply is not in the reply's column: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reply_leaves_exactly_the_room_its_mark_takes() {
+        // Two numbers have to be the same one: the width the answer is rendered
+        // into, and the width the mark it opens with actually occupies. If the
+        // renderer is handed *more* room than the mark takes, the row the mark
+        // is prepended to is one cell too wide and its last character is cut
+        // off — the failure is silent, because a truncated character is not a
+        // crash and the arithmetic on both sides still agrees with itself.
+        //
+        // `inset` is what makes them one fact, and this is what says so. The
+        // assertion is against the glyph rather than against `inset`, so an
+        // `inset` that stopped reading the mark would be caught rather than
+        // agreeing with itself.
+        let mark = format!("{} ", Caps::default().g(Glyph::ToolMark));
+        assert_eq!(
+            inset("assistant"),
+            crate::width::str_width(&mark) as u16,
+            "the reply is set in by something other than the mark it draws"
+        );
+
+        // And the consequence: a reply that fills its room exactly keeps every
+        // character, rather than losing the one the mark's second cell eats.
+        const W: u16 = 40;
+        let room = (W - inset("assistant")) as usize;
+        let text = "字".repeat(room / 2);
+        let h = host();
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: text.clone(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+        });
+        let drawn: String = stream_rows(&h, (W, 20))
+            .iter()
+            .map(|r| {
+                r.trim_start_matches(' ')
+                    .trim_start_matches(&mark)
+                    .to_string()
+            })
+            .filter(|r| !r.trim().is_empty())
+            .collect();
+        assert_eq!(
+            drawn.matches('字').count(),
+            text.matches('字').count(),
+            "the reply lost characters to the width it was drawn at: {drawn:?}"
+        );
+        for row in stream_rows(&h, (W, 20)) {
+            assert!(
+                crate::width::str_width(&row) <= W as usize,
+                "a row was drawn wider than the screen: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrapped_reply_is_measured_at_the_width_it_is_drawn_at() {
+        // The scroll bound is "what there is to read, minus what is already on
+        // screen", so it and the frame have to be the same number. A reply that
+        // is measured at the full width and drawn narrower by the mark's two
+        // cells wraps into more rows than were counted — and the difference is
+        // exactly the rows at the top of the reply that the limit then says do
+        // not exist.
+        //
+        // The length *is* the test. Two cells of wrap is the whole difference
+        // between the widths, so a fixture that wraps the same either way would
+        // pass against the bug. These are full-width characters because the
+        // arithmetic has to be exact: 320 cells is eight rows of 40 and nine of
+        // 38, which is the one row that tells the two widths apart.
+        const CELLS: usize = 320;
+        let h = host();
+        let long = "这".repeat(CELLS / 2);
+        assert_eq!(
+            crate::width::str_width(&long),
+            CELLS,
+            "the fixture is not the width this test's arithmetic is written against"
+        );
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: long,
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+        });
+        // What the painter actually draws, counted off a screen tall enough to
+        // hold the whole reply — so this is the frame's number, not the sum's.
+        let drawn = stream_rows(&h, (40, 40))
+            .iter()
+            .filter(|r| !r.trim().is_empty())
+            .count();
+        assert!(
+            drawn > 8,
+            "the fixture wraps into {drawn} rows; this test needs more than the \
+             eight a 40-cell measure gives it"
+        );
+        assert_eq!(
+            h.stream_height(40),
+            drawn,
+            "the sum says there are {} rows to read and the frame drew {drawn}: \
+             the reply was measured at the full 40 cells instead of the 38 it \
+             is set in by, and the rows that difference makes are the rows at \
+             the top of it that cannot be scrolled to",
+            h.stream_height(40),
+        );
+
+        // And the consequence, rather than only the arithmetic: scrolled as far
+        // back as the bound allows, the oldest row of the reply is on screen —
+        // with the mark on it, which is the row that says the wrap started where
+        // it was measured rather than a row below it.
+        let size = (40, 8);
+        let limit = h.scroll_limit(size, &Moment::default());
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(limit);
+        let rows = stream_rows(&h, size);
+        assert!(
+            rows[0].starts_with(&format!("{} 这", Caps::default().g(Glyph::ToolMark))),
+            "scrolled all the way back and the reply is not what is on screen: {:?}",
+            &rows[..3]
         );
     }
 

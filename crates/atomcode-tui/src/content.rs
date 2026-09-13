@@ -34,6 +34,28 @@ fn bad() -> Style {
 fn ok() -> Style {
     Style::new().fg(Color::role(Role::Success))
 }
+/// Work in flight, and the one thing in a turn that is not a finished fact.
+///
+/// The same role `modules::live` colours the running turn with, so "still going"
+/// is one colour on one screen rather than two that have to be kept in step.
+fn warn() -> Style {
+    Style::new().fg(Color::role(Role::Warning))
+}
+/// A call that has receded behind a fold.
+///
+/// The heading role, so a folded line reads as scaffolding over the answer
+/// rather than as one more thing being said: an expanded call is a fact the
+/// reader is looking at, a folded one is a fact they have chosen not to. The
+/// whole summary takes it — name, subject and mark alike — because a line that
+/// stated two colours would be saying two things.
+///
+/// It overrides the state a call is in, deliberately. A run that is still going
+/// is [`warn`] *while it is open*, where the reader is watching it; folded, it
+/// has already told the reader it exists, and the live line below is where "in
+/// flight" is stated.
+fn fold() -> Style {
+    Style::new().fg(Color::role(Role::Accent))
+}
 
 fn wrapped(text: &str, w: u16, style: Style, prefix: &str) -> Vec<Line> {
     if w == 0 {
@@ -180,6 +202,15 @@ pub enum Outcome {
     Interrupted,
 }
 
+/// The column a tool call's result hangs in from the left edge of the stream.
+///
+/// The `●` opens a call at the margin and what came back hangs under it, two
+/// cells in — `● read_file(a.rs)` over `  ⎿ 20 行`. An answer is set in by the
+/// same amount, and it reads this number rather than naming one of its own, so
+/// that "the reply lines up with the work that produced it" is one fact instead
+/// of two that happen to agree today. See `host::inset`.
+pub(crate) const GUTTER: usize = 2;
+
 /// A tool call and, once it lands, its result. One block, two facts.
 #[derive(Debug)]
 pub struct ToolCallBlock {
@@ -192,10 +223,25 @@ pub struct ToolCallBlock {
 impl ToolCallBlock {
     fn mark(&self) -> (&'static str, Style) {
         match &self.outcome {
-            Outcome::Pending => ("⋯", tool()),
+            Outcome::Pending => ("⋯", warn()),
             Outcome::Ok(_) => ("✓", ok()),
             Outcome::Failed(_) => ("✗", bad()),
             Outcome::Interrupted => ("—", muted()),
+        }
+    }
+
+    /// The colour the call's name is drawn in.
+    ///
+    /// Uncoloured once the call is a fact about the past: it sits in a line that
+    /// already has a marker, so a colour here would be a second thing saying
+    /// what the marker says. While the call is *running* the whole head takes
+    /// [`Role::Warning`], the colour the live line uses for work in flight — so
+    /// which calls are still going is something the screen says, rather than
+    /// something the reader works out by comparing the clock to the last result.
+    fn name_style(&self) -> Style {
+        match &self.outcome {
+            Outcome::Pending => warn(),
+            _ => tool(),
         }
     }
 
@@ -226,16 +272,22 @@ impl ToolCallBlock {
     /// call is how a reader asks what actually ran, and a command ending in `…`
     /// is not an answer to that question. `lead` is what marks the line, and its
     /// width is the indent its continuations hang under.
-    fn head(&self, w: u16, lead: &str, lead_style: Style) -> Vec<Line> {
+    ///
+    /// `name_style` is the caller's because the same line is drawn twice at two
+    /// different volumes: open, where the call is the subject of the screen, and
+    /// folded behind a lid, where it recedes. Which one it is, is a fact about
+    /// the screen and not about the call, so it is passed in rather than decided
+    /// here — see [`fold`].
+    fn head(&self, w: u16, lead: &str, lead_style: Style, name_style: Style) -> Vec<Line> {
         let look = look(&self.name);
         let subject = subject_of(&self.name, &self.args);
         let name = match look.verb {
             Some(verb) => verb.to_string(),
             None => self.name.clone(),
         };
-        let mut spans = vec![Span::styled(name, tool())];
+        let mut spans = vec![Span::styled(name, name_style)];
         if !subject.is_empty() {
-            spans.push(Span::raw(format!("({subject})")));
+            spans.push(Span::styled(format!("({subject})"), name_style));
         }
         crate::markdown::wrap_spans(&spans, w, lead, lead_style)
     }
@@ -244,7 +296,14 @@ impl ToolCallBlock {
     fn note_line(&self, w: u16) -> Line {
         let (note, note_style) = outcome_note(&self.outcome);
         Line::from_spans(vec![
-            Span::styled(format!("  {} ", Caps::default().g(Glyph::Gutter)), muted()),
+            Span::styled(
+                format!(
+                    "{}{} ",
+                    " ".repeat(GUTTER),
+                    Caps::default().g(Glyph::Gutter)
+                ),
+                muted(),
+            ),
             Span::styled(note, note_style),
         ])
         .truncate(w as usize)
@@ -262,14 +321,20 @@ impl ToolCallBlock {
     /// Both of the last call's rows are its own, so the lid is the same two rows
     /// a single folded call draws, with the count above them — folding a run
     /// changes how many rows there are, not what the rows are.
+    ///
+    /// The whole lid is at [`fold`]'s volume, and the count stays [`muted`]:
+    /// the count is a figure *about* the work rather than the work, and it was
+    /// already the quieter of the two — painting it in the heading role would
+    /// have made the folded line louder than the open one it replaces.
     pub fn group_lines(last: &ToolCallBlock, count: usize, w: u16) -> Vec<Line> {
         let caps = Caps::default();
         let mut out = vec![Line::from_spans(vec![
-            Span::styled(format!("{} ", caps.g(Glyph::ToolMark)), last.mark().1),
+            Span::styled(format!("{} ", caps.g(Glyph::ToolMark)), fold()),
             Span::styled(format!("{count} 个工具"), muted()),
         ])
         .truncate(w as usize)];
-        out.extend(last.head(w, &format!("  {} ", caps.g(Glyph::Gutter)), muted()));
+        let lead = format!("{}{} ", " ".repeat(GUTTER), caps.g(Glyph::Gutter));
+        out.extend(last.head(w, &lead, muted(), fold()));
         out.push(last.note_line(w));
         out
     }
@@ -474,7 +539,7 @@ impl Content for ToolCallBlock {
         }
         let caps = Caps::default();
         let lead = format!("{} ", caps.g(Glyph::ToolMark));
-        let mut out = self.head(w, &lead, self.mark().1);
+        let mut out = self.head(w, &lead, self.mark().1, self.name_style());
         out.push(self.note_line(w));
 
         let body = match &self.outcome {
@@ -504,8 +569,14 @@ impl Content for ToolCallBlock {
     /// truncation: that cut landed on whatever happened to be last, which for a
     /// long command was the result note — the folded line lost its ending while
     /// keeping a command nobody could finish reading.
+    ///
+    /// One row at [`fold`]'s volume: the mark, the name and the subject are the
+    /// summary, and the summary is what the reader has chosen to put away. The
+    /// note keeps its own style, because it is not the summary — it is the
+    /// answer, and a failed call's red is the one thing on a folded line that
+    /// has to survive being folded.
     fn summary(&self, w: u16) -> Line {
-        let (_mark, style) = self.mark();
+        let style = fold();
         let look = look(&self.name);
         let name = match look.verb {
             Some(verb) => verb.to_string(),
@@ -552,9 +623,9 @@ impl Content for ToolCallBlock {
         //
         // A verb replaces the tool name when the name is machinery rather than
         // meaning: `$ cargo test` reads; `bash {"command":…}` does not.
-        spans.push(Span::styled(name, tool()));
+        spans.push(Span::styled(name, style));
         if has_subject {
-            spans.push(Span::raw(format!("({subject})")));
+            spans.push(Span::styled(format!("({subject})"), style));
         }
         if !note.is_empty() {
             spans.push(Span::styled(format!(" · {note}"), note_style));
@@ -1415,6 +1486,123 @@ mod tests {
         let pending = ToolCallBlock::pending("c1", "bash", "{}");
         let done = pending.with(Outcome::Ok("done".into()));
         assert_ne!(pending.content_hash(), done.content_hash());
+    }
+
+    /// Work in flight is the one thing in a turn that is not a finished fact,
+    /// and the whole head says so: the mark *and* the tool's name take the
+    /// warning role, because a screen where only a dot changed colour is a
+    /// screen you have to squint at to answer "is anything still running".
+    ///
+    /// The assertion is on the role, never on a colour: a test that named
+    /// `#ffcc00` would pass on a palette where yellow reads as red, and would
+    /// have to be edited the first time the theme moved.
+    #[test]
+    fn a_running_call_is_the_warning_colour_and_a_finished_one_is_not() {
+        let warn = Some(crate::frame::Color::role(Role::Warning));
+
+        let running = ToolCallBlock::pending("c", "read_file", r#"{"file_path":"a.rs"}"#);
+        assert_eq!(running.mark().1.fg, warn, "{:?}", running.mark());
+        let head = running.lines(60).remove(0);
+        let named = head
+            .spans
+            .iter()
+            .find(|s| s.text.contains("read_file"))
+            .expect("the tool's name");
+        assert_eq!(named.style.fg, warn, "the name is not in flight: {head:?}");
+
+        // The other half: a call that has an answer is a fact about the past,
+        // and the successful and failed marks are their own colours rather than
+        // the warning one — otherwise everything is "in flight" and the colour
+        // stops meaning anything.
+        for done in [
+            Outcome::Ok("20 行".into()),
+            Outcome::Failed("no such file".into()),
+            Outcome::Interrupted,
+        ] {
+            let block =
+                ToolCallBlock::pending("c", "read_file", r#"{"file_path":"a.rs"}"#).with(done);
+            assert_ne!(block.mark().1.fg, warn, "{:?}", block.mark());
+            let head = block.lines(60).remove(0);
+            let named = head
+                .spans
+                .iter()
+                .find(|s| s.text.contains("read_file"))
+                .expect("the tool's name");
+            assert_ne!(
+                named.style.fg, warn,
+                "a settled call is still in flight: {head:?}"
+            );
+        }
+    }
+
+    /// A folded call recedes: it is scaffolding over the answer rather than one
+    /// more thing being said, so its summary takes the heading role — and takes
+    /// it *instead of* the state it is in. A run still going is yellow while it
+    /// is open; folded it is heading-coloured like everything else, because the
+    /// reader has already been told it exists and the live line is where "still
+    /// running" is stated.
+    ///
+    /// The note is the exception, and deliberately: `失败 · …` is the answer
+    /// rather than the summary, and a fold must not swallow that.
+    #[test]
+    fn a_folded_call_recedes_to_the_heading_colour_and_keeps_its_failure_note() {
+        let heading = Some(crate::frame::Color::role(Role::Accent));
+        let pending = ToolCallBlock::pending(
+            "c",
+            "read_file",
+            r#"{"file_path":"/Users/x/crates/atomcode-tui/src/content.rs"}"#,
+        );
+
+        let folded = pending.summary(80);
+        let named = folded
+            .spans
+            .iter()
+            .find(|s| s.text.contains("read_file"))
+            .expect("the tool's name");
+        assert_eq!(named.style.fg, heading, "the folded name is not receding");
+        let subject = folded
+            .spans
+            .iter()
+            .find(|s| s.text.contains("content.rs"))
+            .expect("the subject");
+        assert_eq!(
+            subject.style.fg, heading,
+            "the folded subject is not receding"
+        );
+        // The whole line, so a folded line cannot be half-loud.
+        assert_ne!(
+            folded.spans.first().expect("the mark").style.fg,
+            Some(crate::frame::Color::role(Role::Warning)),
+            "a folded call is still painted as in flight: {folded:?}"
+        );
+
+        // And the note survives the fold in its own colour.
+        let failed = pending.with(Outcome::Failed("no such file".into()));
+        let line = failed.summary(80);
+        let note = line
+            .spans
+            .iter()
+            .find(|s| s.text.contains("失败"))
+            .expect("the failure note");
+        assert_eq!(
+            note.style.fg,
+            Some(crate::frame::Color::role(Role::Error)),
+            "a fold swallowed the one thing that had to survive it: {line:?}"
+        );
+
+        // A run behind one lid is the same drawing, so it recedes too.
+        let lid = ToolCallBlock::group_lines(&failed, 3, 80);
+        let head = lid.iter().find(|l| l.plain().contains("read_file"));
+        let head = head.expect("the last call under the lid");
+        let named = head
+            .spans
+            .iter()
+            .find(|s| s.text.contains("read_file"))
+            .expect("the tool's name");
+        assert_eq!(
+            named.style.fg, heading,
+            "a merged run is not folded like a single one: {head:?}"
+        );
     }
 
     #[test]
