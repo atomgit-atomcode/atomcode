@@ -422,7 +422,9 @@ MODEL:
     By default the `llm` row reads ~/.atomcode/config.toml — the provider you
     already configured for AtomCode. Use --env-model to take it from
     ATOMCODE_BASE_URL / ATOMCODE_MODEL / ATOMCODE_API_KEY instead, or --offline
-    for a scripted model that needs no credentials at all.
+    for a scripted model that needs no credentials at all. The window that
+    auto-compaction measures against is `context_window` on the `llm` row in
+    either case.
 
 ENV:
     ATOMCODE_HOME    config.toml, profiles/ and harness.patch.toml are read from here";

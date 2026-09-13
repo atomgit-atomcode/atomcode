@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use atomcode_harness::seams::{SystemPromptSvc, ToolsSvc};
+use atomcode_harness::seams::{LlmSvc, SystemPromptSvc, ToolsSvc};
 use atomcode_harness::{bundle, plugins, run_turn};
 use atomcode_kernel::tool::{ProgressSink, Tool, ToolContext, ToolResult};
 use atomcode_plexus::{App, ConfigTree, Layer};
@@ -388,6 +388,98 @@ async fn every_mounted_row_can_describe_its_own_knobs() {
     assert!(
         ops.contains(&dir.to_string_lossy().to_string()),
         "the memory paths must be this tree's, not a template:\n{ops}"
+    );
+}
+
+#[tokio::test]
+async fn the_reported_context_window_is_the_one_the_provider_reports() {
+    // A number in prose is a claim, not a measurement. The judge here is
+    // external: the `llm` seam's own `context_window()`, which is what the
+    // compaction trigger divides by. If the description were written from the
+    // row's raw config instead, the two would agree when a window is stated —
+    // so the interesting half of this test is the tree where it is not.
+    let dir = scratch("ctx-window");
+    let stated = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [ { text = "ok" } ], context_window = 262144 }
+"#;
+    let app = start(tree(&dir, &[stated])).await;
+    let reported = app
+        .context()
+        .service::<LlmSvc>()
+        .expect("an llm seam")
+        .context_window();
+    assert_eq!(reported, 262_144, "the row's number reaches the provider");
+
+    let ops = ask(&app, "operations").await;
+    assert!(
+        ops.contains("262144"),
+        "the description must carry the window the provider reports:\n{ops}"
+    );
+    assert!(
+        ops.contains("stated on the `llm` row"),
+        "and must say where the number came from:\n{ops}"
+    );
+}
+
+#[tokio::test]
+async fn an_unstated_window_is_reported_as_a_default_not_as_a_fact() {
+    // 128000 is what the adapter falls back to, and it is also a plausible
+    // real window for a real model. Presented identically, a reader would take
+    // the fallback for a property of the model they just mounted.
+    let dir = scratch("ctx-default");
+    let app = start(tree(&dir, &[])).await;
+    let reported = app
+        .context()
+        .service::<LlmSvc>()
+        .expect("an llm seam")
+        .context_window();
+
+    let ops = ask(&app, "operations").await;
+    let line = ops
+        .lines()
+        .find(|l| l.contains("Context window:"))
+        .unwrap_or_else(|| panic!("no window line to judge:\n{ops}"));
+    assert!(
+        line.contains(&reported.to_string()),
+        "the fallback must still be the provider's own number:\n{line}"
+    );
+    assert!(
+        line.contains("default"),
+        "and must read as a fallback rather than as a fact about the model:\n{line}"
+    );
+}
+
+#[tokio::test]
+async fn the_env_model_rows_window_comes_from_its_own_row() {
+    // The row a `--env-model` launch mounts, which is the one a person is most
+    // likely to be running — and the one where the number has two possible
+    // sources, because `context_window` may or may not be there. Both halves
+    // are judged against the seam rather than against the sentence.
+    let dir = scratch("ctx-env-row");
+    std::env::set_var("ATOMCODE_TEST_WINDOW_KEY", "not-a-real-key");
+    let row = r#"
+[[patch]]
+id = "llm"
+name = "llm-openai-compat"
+config = { base_url = "https://gw.invalid/v1", model = "some-model", api_key_env = "ATOMCODE_TEST_WINDOW_KEY", context_window = 1_000_000 }
+"#;
+    let app = start(tree(&dir, &[row])).await;
+    std::env::remove_var("ATOMCODE_TEST_WINDOW_KEY");
+
+    let reported = app
+        .context()
+        .service::<LlmSvc>()
+        .expect("an llm seam")
+        .context_window();
+    assert_eq!(reported, 1_000_000, "the row's window reaches the provider");
+
+    let ops = ask(&app, "operations").await;
+    assert!(
+        ops.contains("Context window: 1000000 tokens (stated on the `llm` row)"),
+        "the env-model row must report its own configured window:\n{ops}"
     );
 }
 

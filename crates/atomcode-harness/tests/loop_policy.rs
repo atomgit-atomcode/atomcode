@@ -350,6 +350,67 @@ async fn compaction_cuts_the_projection_and_leaves_the_log_whole() {
     assert_eq!(raw, 3, "every user message is still in the log");
 }
 
+/// The window is what the trigger divides by, so the same conversation and the
+/// same threshold must compact at one window and not at another.
+///
+/// The replay model reports 100 prompt tokens, so `0.0005` puts the bar at 64
+/// of a 128k window — crossed — and at 500 of a 1M one — not crossed. Only the
+/// window differs between the two runs.
+///
+/// This is the bug the row's `context_window` exists to prevent: a 1M-token
+/// model whose window was never stated falls back to 128k, so it compacts at a
+/// fraction of the context it actually had.
+#[tokio::test]
+async fn the_window_decides_whether_compaction_fires() {
+    const THRESHOLD: &str = "0.0005";
+    let script = |window: &str| {
+        format!(
+            "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\n\
+             config = {{ context_window = {window}, script = [ {{ text = \"ok\" }} ] }}"
+        )
+    };
+    let eager =
+        format!("[[patch]]\nid = \"compaction-tail\"\nconfig = {{ threshold = {THRESHOLD}, keep_turns = 1 }}");
+
+    let count_compactions = |log: &atomcode_harness::session::SessionLog| {
+        log.events()
+            .into_iter()
+            .filter(|e| matches!(e.event, SessionEvent::Compacted { .. }))
+            .count()
+    };
+
+    // 128k: 100 prompt tokens clears 64, so compaction fires.
+    let dir = scratch("window-small");
+    let app = start(tree(&dir, &script("128000"), &[&eager])).await;
+    run_turn(&app, "first question").await.unwrap();
+    run_turn(&app, "second question").await.unwrap();
+    let small = app.context().only_session().unwrap();
+    assert!(
+        count_compactions(&small) >= 1,
+        "a 128k window must compact well before a 1M one would"
+    );
+    drop(app);
+
+    // 1M: the same 100 tokens is nowhere near 500, so nothing fires.
+    let dir = scratch("window-large");
+    let app = start(tree(&dir, &script("1000000"), &[&eager])).await;
+    run_turn(&app, "first question").await.unwrap();
+    run_turn(&app, "second question").await.unwrap();
+    let large = app.context().only_session().unwrap();
+    assert_eq!(
+        count_compactions(&large),
+        0,
+        "a 1M window must not compact on the same history that a 128k one compacts"
+    );
+    assert!(
+        large
+            .derive_messages()
+            .iter()
+            .any(|m| m.text.contains("first question")),
+        "and the history must still be whole"
+    );
+}
+
 // ---- compaction written by the utility model -----------------------------
 
 /// Swapping the strategy is a patch, not a rebuild: remove the model-free row,

@@ -21,6 +21,27 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// The half of a model description that is a measurement rather than a knob:
+/// how large a window the mounted provider reports, and where that number came
+/// from.
+///
+/// Shared by every row that can fill `llm`, because whoever asks how big the
+/// context is must get the same sentence and the same number whichever adapter
+/// happens to be mounted. The number is the provider's own `context_window()`,
+/// not the row's config, so it cannot disagree with what compaction divides by.
+///
+/// `origin` is not decoration. A window someone configured and a fallback that
+/// happens to look configured are the same `u32`; only the row knows which one
+/// it handed over, and a reader who cannot tell them apart will trust a
+/// default as if it were a fact about the model.
+fn context_line(window: u32, origin: &str) -> String {
+    format!(
+        "Context window: {window} tokens ({origin}). Auto-compaction fires as a \
+         fraction of this window, so a window smaller than the model's real one \
+         compacts early and a larger one overruns the provider."
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct OpenAiCompatRow {
     #[serde(default)]
@@ -110,6 +131,19 @@ impl Plugin for OpenAiCompatPlugin {
             row.context_window,
             row.supports_vision,
         )?;
+        // Read the window off the provider, not off the row: the row is an
+        // `Option`, the provider is the resolved number, and the resolved number
+        // is what the compaction trigger divides by. Reported from the raw
+        // config, the two could disagree exactly when the config is silent —
+        // which is the case a reader most needs told apart.
+        let window = provider.context_window();
+        let window_origin = match row.context_window {
+            Some(_) => "stated on the `llm` row".to_string(),
+            None => "the adapter's fallback, because this row states no \
+                     `context_window` — nothing in this tree knows what this \
+                     model really holds"
+                .to_string(),
+        };
         let _ = ctx
             .provide::<LlmSvc>(Arc::new(provider))
             .map_err(|e| e.to_string())?;
@@ -121,6 +155,10 @@ impl Plugin for OpenAiCompatPlugin {
                 "MODEL. This tree talks to `{model}` at `{base_url}`, through the \
                  `llm-openai-compat` row reading ATOMCODE_BASE_URL / \
                  ATOMCODE_MODEL / {key_env}.\n\
+                 {}\n\
+                 To set it, the patch target is the ROW id, `llm`, and `--patch` \
+                 takes a file rather than a string: \
+                 `[[patch]] id = \"llm\" config = {{ context_window = 1000000 }}`.\n\
                  To switch model: change ATOMCODE_MODEL and restart. To use the \
                  account already configured in AtomCode instead, drop \
                  `--env-model` so the `llm` row is `llm-atomcode-config`.\n\
@@ -130,7 +168,8 @@ impl Plugin for OpenAiCompatPlugin {
                  `[[patch]] id = \"llm\" config = {{ supports_vision = true }}` \
                  in a file and pass it as `--patch <file>`.\n\
                  The model is NOT in the user-settings catalog on purpose — it \
-                 is a row in the running tree, not a preference."
+                 is a row in the running tree, not a preference.",
+                context_line(window, &window_origin)
             ),
         );
         Ok(())
@@ -248,6 +287,9 @@ impl Plugin for LlmUtilityReplayPlugin {
                 // Nothing is attached to a side call, so this slot has no
                 // pictures to carry whatever the conversation model can do.
                 vision: false,
+                // A side call has no conversation to compact, so no consumer
+                // reads this slot's window.
+                context_window: row.context_window.unwrap_or(128_000),
             }))
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -266,6 +308,14 @@ struct ReplayRow {
     /// and this is the only tree the tests and `--offline` ever mount.
     #[serde(default)]
     supports_vision: bool,
+    /// How large a window the stand-in claims. `None` keeps the built-in
+    /// 128k. Same reasoning as `supports_vision` above: the window is what the
+    /// compaction trigger divides by, so without a knob here no offline tree
+    /// can exercise compaction at a window other than 128k — including the
+    /// case that matters, a long-context model where the default would compact
+    /// far too early.
+    #[serde(default)]
+    context_window: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -295,6 +345,7 @@ struct ReplayProvider {
     script: Vec<ReplayStep>,
     cursor: std::sync::atomic::AtomicUsize,
     vision: bool,
+    context_window: u32,
 }
 
 #[async_trait]
@@ -304,7 +355,7 @@ impl LlmProvider for ReplayProvider {
     }
 
     fn context_window(&self) -> u32 {
-        128_000
+        self.context_window
     }
 
     fn supports_vision(&self) -> bool {
@@ -385,28 +436,38 @@ impl Plugin for ReplayPlugin {
         } else {
             serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
         };
+        // One binding feeds both the provider and the description. There is no
+        // adapter `new()` in between to resolve anything, so the number the
+        // provider reports IS this binding — described and enforced cannot
+        // drift.
+        let window = row.context_window.unwrap_or(128_000);
+        let window_origin = match row.context_window {
+            Some(_) => "stated on the `llm` row",
+            None => "the built-in default, because this row states no `context_window`",
+        };
+        crate::plugins::self_knowledge::describes(
+            ctx,
+            "model",
+            5,
+            format!(
+                "MODEL. There is no model. The `llm` row is \
+                 `llm-replay`, a scripted stand-in with {} canned \
+                 answer(s) and no network — used by `--offline` and \
+                 by every test. Nothing you say reaches a provider.\n\
+                 {}\n\
+                 To talk to a real one, restart without `--offline`, \
+                 or with `--env-model` plus ATOMCODE_BASE_URL / \
+                 ATOMCODE_MODEL / ATOMCODE_API_KEY.",
+                row.script.len(),
+                context_line(window, window_origin)
+            ),
+        );
         let _ = ctx
             .provide::<LlmSvc>(Arc::new(ReplayProvider {
-                script: {
-                    crate::plugins::self_knowledge::describes(
-                        ctx,
-                        "model",
-                        5,
-                        format!(
-                            "MODEL. There is no model. The `llm` row is \
-                             `llm-replay`, a scripted stand-in with {} canned \
-                             answer(s) and no network — used by `--offline` and \
-                             by every test. Nothing you say reaches a provider. \
-                             To talk to a real one, restart without `--offline`, \
-                             or with `--env-model` plus ATOMCODE_BASE_URL / \
-                             ATOMCODE_MODEL / ATOMCODE_API_KEY.",
-                            row.script.len()
-                        ),
-                    );
-                    row.script
-                },
+                script: row.script,
                 cursor: std::sync::atomic::AtomicUsize::new(0),
                 vision: row.supports_vision,
+                context_window: window,
             }))
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -513,6 +574,9 @@ impl Plugin for AtomcodeConfigPlugin {
             format!(
                 "MODEL. This tree uses selection `{}` (model `{}`) from `{}`, via \
                  the `llm-atomcode-config` row.\n\
+                 {}\n\
+                 To change it, put `context_window` in that model's `[models.*]` \
+                 entry; this row reads the window from there and reports it.\n\
                  To switch model: change the selection in that file (the \
                  `/model` picker writes it), or put `config = {{ model = \"…\" }}` \
                  on the `llm` row.\n\
@@ -523,7 +587,11 @@ impl Plugin for AtomcodeConfigPlugin {
                  is a row in the running tree, not a preference.",
                 resolved.selection_id,
                 resolved.model,
-                path.display()
+                path.display(),
+                context_line(
+                    provider.context_window(),
+                    "from this model's `[models.*]` entry in that file"
+                )
             ),
         );
         let _ = ctx
@@ -577,5 +645,49 @@ mod tests {
         let absent: OpenAiCompatRow =
             serde_json::from_value(serde_json::json!({})).expect("parse without override");
         assert_eq!(absent.supports_vision, None);
+    }
+
+    /// The end of the chain that matters: the number a person writes on the row
+    /// is the number `context_window()` reports, which is what the compaction
+    /// trigger divides by. A window that stops somewhere short of the provider
+    /// leaves compaction firing against the wrong budget.
+    #[test]
+    fn the_configured_window_reaches_the_provider() {
+        let provider = openai_compat("k", "https://gw/v1", "some-1m-model", Some(1_000_000), None)
+            .expect("build");
+        assert_eq!(
+            provider.context_window(),
+            1_000_000,
+            "an explicit window must be what the provider reports"
+        );
+    }
+
+    /// What the agent is told must be the number the provider holds. The two
+    /// used to be able to disagree in the silent case, so this pins them to one
+    /// another rather than checking each separately.
+    #[test]
+    fn the_description_carries_the_providers_own_window() {
+        let provider =
+            openai_compat("k", "https://gw/v1", "m", Some(262_144), None).expect("build");
+        let line = context_line(provider.context_window(), "stated on the `llm` row");
+        assert!(
+            line.contains("262144"),
+            "the reported window must be the provider's:\n{line}"
+        );
+    }
+
+    /// A fallback that reads like a fact is worse than no number: a reader
+    /// cannot tell the two apart, so they trust a default as a property of the
+    /// model. The origin is what separates them, and it has to survive.
+    #[test]
+    fn a_fallback_window_is_not_reported_as_if_it_were_known() {
+        let built_in = context_line(128_000, "the built-in default");
+        assert!(built_in.contains("128000"), "{built_in}");
+        assert!(built_in.contains("default"), "{built_in}");
+
+        // …and the configured phrasing is distinguishable from it.
+        let stated = context_line(1_000_000, "stated on the `llm` row");
+        assert!(stated.contains("stated"), "{stated}");
+        assert!(!stated.contains("default"), "{stated}");
     }
 }
