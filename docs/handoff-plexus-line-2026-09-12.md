@@ -131,6 +131,82 @@ Agent 侧(`atomcode-harness`):
   provider,所以这是 patch 里 `[[remove]] compaction-tail` + `[[insert]] compaction-summary`
   的**替换**;BASE 默认仍是模型无关那行。
 
+**09-14:思考开关/强度、模型来源收口**(本会话)
+
+Agent 侧(`atomcode-harness`):
+- `plugins/llm.rs`:三条填模型的行都多两个原样透传的字段 `thinking_type` /
+  `thinking_keep`(Kimi 系 `thinking` 对象的两个键,默认 `None` = 整个对象不发,因为没见过
+  这个键的网关会 400),以及 `supports_reasoning_effort`(端点是否吃顶层
+  `reasoning_effort`)。**默认 `true`**,`llm-atomcode-config` 行用
+  `endpoint_supports_reasoning_effort(resolved.reasoning_effort, reasoning_effort_levels)`
+  推——和 CLI/tuix/daemon 同一个函数。默认 `false` 的失败形态是「配了却静默不发」,
+  那正是这轮一直在修的坑。
+- `model_source.rs`(新):**模型来源的唯一读取点**。`Want`(行声明它要什么:
+  `Explicit` / `UserConfig` / `Environment` / `EnvironmentWithModel`)→ `ModelEndpoint`
+  (统一形状,含 `origin` 说明这个数从哪来)。`ConfigAndEnv` 是那个实现:行的字段 >
+  `~/.atomcode/config.toml`(`Config::load` + `resolve_model`)> `ATOMCODE_*`。三条 `llm*`
+  行、`persona.rs`、`home()`、`capabilities.rs` 的 `HOME` 全部改经它;`env::var` 与
+  `Config::load` 在别处清零。见「下一步」第 10 条——**它层位不对**(读配置按 ADR 0013
+  是 Host 的事),要和 `launch.rs`/`ui*.rs` 一起搬。
+- `plugins/reasoning_effort.rs`(新)+ `reasoning-effort` 行(BASE 默认挂,`config = {}`):
+  会话的思考强度,`ChatOptions::reasoning_effort` 的每请求注入,走 `agent/request`
+  waterfall。**独立成行而不是 `llm` 行的字段**,因为 patch 是整体替换——档位挂在 `llm`
+  上会被每一次 `--model` / `/model` 抹掉。没写档位就一个 listener 都不挂。
+- `plugins/team.rs`:角色 frontmatter 多一个 `effort` 键(可选,五个内建角色都带:
+  explorer/docs_writer=low,reviewer/implementer/tester=max),成员 realm 里
+  `on_waterfall(prepend)` 写进它每个请求——所以在成员自己的 realm 上,不跨成员,
+  而会话级那行仍给没声明 `effort` 的角色兜底。非法值在**挂载时**报错(mount 就失败,
+  不是等第一个回合),和 `permission`/`difficulty` 一致。
+- `launch.rs`:`--effort <low|medium|high|xhigh|max>`,patch 的是 `reasoning-effort` 那行。
+  `--model` 恢复原样(解析时 push overlay)——两 flag 合成一条 patch 的做法随档位换行
+  一起撤了。
+- `seams.rs` / `control.rs`:`Control` 多一个 `row_config(id)`(读一行 config 的 JSON),
+  `/effort` 无参时要显示当前值。原打算的 `amend_row`(合并写一行)撤了:现在根本不需要。
+- `lib.rs`:`REASONING_EFFORT_LEVELS` 转出(档位只有一个定义处)+ `REASONING_EFFORT_ROW`
+  常量(行 id 在 bundle/CLI/TUI 三处必须一致,拼错就是静默打空)。
+
+UI 侧(`atomcode-tui`):
+- `commands.rs` / `tui-commands-tree` 多一个 `/effort`:无参显示当前档位,有参 patch
+  `reasoning-effort` 行。判据在 `tests/e2e.rs`(`the_effort_command_moves_the_row_while_the_screen_runs`)
+  ——断言的是**行真的变了**,不是屏幕说了什么。
+- 顺带发现 `control` 缝由 `hand_over` 给每个前端填(`launch.rs:371`),所以 TUI 的
+  `/rows`、`/patch`、`/effort` 一直都能用。
+
+判据:
+- `harness/tests/reasoning_effort.rs`(新):插件的 7 条(未配置=什么都不说、只有档位
+  ≠ 开关、每个档位都到得了、非法值不生效)+ `switching_the_model_keeps_the_level`
+  (**这条是本设计存在的理由**:按 `--model` 的方式整体替换 `llm` 行,档位必须还在)
+  + 两条守卫。
+- 两条守卫读源码,不是为了测行为,是为了**防退化**:
+  `only_one_module_reads_the_environment` / `only_one_module_loads_the_model_config`,
+  禁止 `env::var` / `Config::load` 出现在 `model_source.rs` 之外。判据刻意收窄:
+  `current_dir()` / `temp_dir()` / `args()` 是进程事实,不是配置来源,不算违规(第一版
+  判宽了,把 9 处无害的 `current_dir()` 也算成违规)。
+- `harness/tests/team.rs` 三条:角色的档位真的到请求上(两个角色一起委派,`low` 和
+  `max` 都出现)、没声明 `effort` 的角色不被代替说话、非法值在 mount 时被拒。
+
+踩过的坑(这轮教训):
+- **`reasoning_effort` 的档位和「关思考」是两回事**,不是一条梯子。DeepSeek 官方
+  (chat/completions 文档)写:`thinking.type` 控制开关,`reasoning_effort` 的
+  `low/high/max` 是 **enable** thinking 的三档;`medium`/`xhigh` 被接受并映射到 `high`。
+  所以「给简单任务低强度」拿到的是「思考开着但便宜」,要真便宜只能关。
+- **推理会吃光小预算,而且是静默回退**。起名的默认 `max_tokens = 32`,
+  `deepseek-flash` 一个 "say hi" 就烧 22–25 个 reasoning token,于是 32 个 token 在
+  推理中途被砍断、一个 `TextDelta` 都出不来、`ask()` 返回 `None`、**静默**回退成
+  「第一条提问原样」。同样的成因让压缩摘要在默认 1024 下也落回模型无关清单。
+  成因是推理占预算,不是预算小——所以解在 `thinking_type = "disabled"`,不是抬预算。
+- **`thinking` 和 `reasoning_effort` 同发时,`disabled` 赢**(实测:`disabled` + `max`
+  依然 `reasoning_content` 不出现、无 reasoning tokens),所以两档可以共存,Simple
+  角色(走已关思考的 utility provider)不用特殊处理。
+- 判据容易搞错的一处:压缩摘要**两条路径都以 `=== EARLIER IN THIS SESSION ===`
+  开头**(`compaction.rs:108-114` 的 match 两支都写它),区分回退与模型写的标记是
+  **结尾的 footer**「Ask again for any detail…」。拿 header 判会得出相反的结论——
+  我第一次就判错了,据此写了一版错误注释。
+- 一度把 `model-source` 做成服务并给三行加 `inject`,**全部入口死锁**:
+  `Deadlock { pending: [("llm", ["model-source"]), ("agent-loop", ["llm"])] }`。根因是
+  时机——`inject` 等的是服务,而 `hand_over` 在 `app.start()` **之后**才 provide。
+  已撤,理由写在「下一步」第 10 条。
+
 ## 怎么验证
 
 ```sh
@@ -185,6 +261,54 @@ telemetry 各几条,都是 rust 1.94 新 lint 的既有问题,不在本次范围
    `arboard` 会拒;发送顺序是"贴入顺序"而不是 marker 在文中的顺序;没有尺寸上限。
    tuix 的 `try_paste_clipboard_image` 是三级回退,每级都写着是哪条真实报告逼出来的。
 9. 会话剩余:`delete`、OS 租约、`Titled` 的 `/title` 之外的提交点。
+10. **把 `model_source` 搬去宿主 crate(与 `launch.rs`/`ui*.rs` 同一趟)。** 新增的
+    `harness/src/model_source.rs`(与本文同批改动,尚未提交)是模型来源的唯一读取点——
+    `Config::load` + `resolve_model` 与 `ATOMCODE_*` 的读法都收在这里,三行 `llm*` 只声明
+    「我要哪个来源」(`Want::Explicit` / `UserConfig` / `Environment` /
+    `EnvironmentWithModel`)。
+    但**读配置按 ADR 0013 是 Host 的事**(`docs/adr/0013-*.md:41`),而这个文件现在住在
+    Agent 层(harness),和 `architecture-target.md:58` 点名要移出的 `launch.rs`、`ui*.rs`
+    同类。搬迁时一起走,别单开一趟。
+
+    **不要再把它做成缝**(试过,已撤):做成 `ModelSourceSvc` + 行 `inject` 会死锁——
+    `inject` 让行**等待**服务,而 `hand_over` 是在 `app.start()` **之后**才 provide 的
+    (`launch.rs:371`),于是任何自己挂树的入口都挂不上:
+
+    ```
+    must mount: Deadlock { pending: [("llm", ["model-source"]), ("agent-loop", ["llm"])] }
+    ```
+
+    照 `seam_map::HOST_PROVIDED` 也得不出「它该是代码在宿主层」:`control` 在里面是因为它是
+    `hand_over` 填的;而同样被 ADR 称作「Host 填的缝」的 `session-persistence`,实际是
+    **bundle 里的一行**填的(`session-persistence-jsonl`),不在那份名单里。ADR 那句话说的是
+    「宿主的产品选择决定哪一行填它」,不是「代码位置在宿主层」。
+
+    守卫已经在:`harness/tests/reasoning_effort.rs` 的 `only_one_module_reads_the_environment`
+    与 `only_one_module_loads_the_model_config` 读源码,禁止 `env::var` / `Config::load`
+    出现在 `model_source.rs` 之外。搬迁后这两条测试要跟着换目录。
+11. **行拿到的 config 应当是终态**(原则,尚未做到)。「各种形式的配置(文件、环境、默认)
+    应当在同一个地方合成一次,进到 `apply(ctx, config)` 里的就只剩一份真源」——行不该
+    再去够任何东西。今天没做到,两个具体缺口:
+
+    **(a) 配置树没有变量展开,所以 bundle 写不出「这台机器的 home」。** base bundle 的
+    `skills` 行是 `[[insert]] name = "skills"`,**没有 config**,于是 `row.home` 恒为 `None`,
+    `plugins/capabilities.rs:87` 的 `.or_else(|| user_home())` 是**常态路径**而不是兜底。
+    `$ATOMCODE_HOME` 这个事实在仓库里被读了**三次**,其中
+    `capabilities/skills/registry.rs:264` 在 **L1**(按 ADR 0013 不该读进程环境),
+    `skills/render.rs:98` 的注释自己承认这是个靠人记的约定(「the two must stay in step」)。
+
+    统一点是**「层变成树」的那一处**——`ConfigTree::from_layers`(`plexus/src/loader.rs:166`)
+    或其上的 `Profiles::resolve`(`harness/src/profile.rs:134`)。在那儿做一次
+    `${VAR}` 展开,bundle 才写得出 `home = "${HOME}"`,行才可能只读 config。
+    不是小改:展开点要么进 plexus(通用底座),要么进 profile;而**约 20 个测试文件手搓
+    配置树**(直接 `ConfigTree::from_layers`),绕开 `Profiles`,展开点选错就会出现
+    「测试里的 `${HOME}` 是字面量」。
+
+    **(b) 密钥是例外,而且要说明白为什么。** `api_key` 不能落进配置树——树会被
+    `--dump-config` 打印、会被写进日志。所以密钥这条只能是「config 里放**变量名**,
+    由一个解析器读」,这正是 `model_source::DEFAULT_API_KEY_ENV` 在做的事。也就是说
+    「唯一真源」对**非密钥的机器派生值**是「宿主合成进行 config」,对**密钥**是
+    「名字进 config,读的人只有一个」。两条都满足原则的实质(只有一个真源),形式不同。
 
 ## 踩过的坑
 
