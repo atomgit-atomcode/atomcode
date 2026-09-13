@@ -207,58 +207,31 @@ impl std::fmt::Display for IndexError {
 
 impl std::error::Error for IndexError {}
 
-/// Directory names that never contain indexable project source — build output,
-/// dependency caches, and temp areas. Skipped for EVERY walk (independent of the
-/// [`IndexLimits`] caps) so a huge workdir is both faster and more likely to fit the
-/// caps. Covers the classic offender behind issue #1538 (`AppData\Local\Temp` on
-/// Windows) plus the OS temp dir (`TMPDIR`/`TEMP`).
-fn is_default_excluded_dir(name: &str) -> bool {
-    matches!(
-        name,
-        "node_modules" | "target" | ".venv" | "venv" | "__pycache__" | "tmp" | "temp"
-    ) || name.eq_ignore_ascii_case("appdata")
-}
-
-/// Build the shared WalkBuilder options: gitignore-aware + default dir excludes.
-/// (The `ignore` builder methods return `&mut WalkBuilder`, so the options are set
-/// as statements and the owned builder returned at the end.)
+/// Build the shared WalkBuilder options: gitignore-aware + the crate-wide directory
+/// excludes ([`crate::pathutil::is_skip_dir`], the same list grep/glob/list use). Those
+/// cover build output, dependency caches, VCS metadata, and temp/`AppData` dirs — the
+/// classic offenders behind a huge non-repo workdir (issue #1538). Sharing the one
+/// list keeps codeintel consistent with the other walkers instead of maintaining a
+/// second copy that drifts. (The `ignore` builder methods return `&mut WalkBuilder`,
+/// so options are set as statements and the owned builder returned at the end.)
 fn build_walk(root: &Path) -> WalkBuilder {
     let mut walker = WalkBuilder::new(root);
     walker.hidden(true);
     walker.git_ignore(true);
     walker.git_global(true);
     walker.git_exclude(true);
-    // The filter closure is 'static, so it needs an OWNED copy of the root path.
-    let root_owned = root.to_path_buf();
-    walker.filter_entry(move |e: &DirEntry| {
-        // Never prune the walk root itself (e.g. when the workdir IS under the OS
-        // temp dir) — that would silently walk nothing.
-        if e.path() == root_owned.as_path() {
-            return true;
-        }
+    walker.filter_entry(|e: &DirEntry| {
+        // Prune excluded DIRECTORIES (whole subtree); never prune files. The `ignore`
+        // crate never passes the walk-root entry here (depth 0 is exempt), so a workdir
+        // that is itself named like a skip-dir is still walked.
         if e.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-            let name = e.file_name().to_string_lossy().to_string();
-            let path = e.path().to_path_buf();
-            return !is_default_excluded_dir(&name) && !is_in_os_temp_dir(&path);
+            if let Some(name) = e.file_name().to_str() {
+                return !crate::pathutil::is_skip_dir(name);
+            }
         }
         true
     });
     walker
-}
-
-/// Is `path` inside the OS temp dir (`TMPDIR` on Unix, `TEMP`/`TMP` on Windows)?
-fn is_in_os_temp_dir(path: &Path) -> bool {
-    for var in ["TMPDIR", "TEMP", "TMP"] {
-        if let Some(dir) = std::env::var_os(var) {
-            if !dir.is_empty() {
-                let dir = Path::new(&dir);
-                if path == dir || path.starts_with(dir) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }
 
 /// Walk `root` (assumed already canonical) for indexable source files + staleness

@@ -7,6 +7,41 @@
 
 use std::path::{Path, PathBuf};
 
+/// Directories never descended into during a walk (build artifacts / VCS / caches /
+/// temp). Shared by the `tools` walkers (grep/glob/list/search_replace) AND the
+/// `codeintel` index walk — one list so they can never drift. Lives here (ungated)
+/// rather than in `tools/` because `codeintel` is independent of the `tools` feature.
+pub(crate) const SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    ".git",
+    "target",
+    "__pycache__",
+    ".next",
+    "dist",
+    "build",
+    ".cache",
+    "vendor",
+    ".venv",
+    "venv",
+    ".idea",
+    ".vscode",
+    "datalog",
+    "logs",
+    "log",
+    ".atomcode",
+    ".claude",
+    "runs",
+    "tmp",
+    "temp",
+];
+
+/// Should a directory with this name be skipped during a walk? `AppData` is matched
+/// case-insensitively — on Windows a huge `C:/Users/<name>` workdir buries the tree
+/// under `AppData\Local\Temp` (issue #1538), and it is never project source.
+pub(crate) fn is_skip_dir(name: &str) -> bool {
+    SKIP_DIRS.contains(&name) || name.starts_with(".venv-") || name.eq_ignore_ascii_case("appdata")
+}
+
 /// The user's home directory, dependency-free (`HOME`, or `USERPROFILE` on Windows).
 pub(crate) fn home_dir() -> Option<PathBuf> {
     #[cfg(windows)]
