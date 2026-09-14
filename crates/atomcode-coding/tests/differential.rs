@@ -1852,7 +1852,6 @@ async fn on_harness(
         "[[patch]]\nid = \"trace\"\nconfig = {{ stream = false, tools = false, summary = false }}\n\n\
          [[patch]]\nid = \"mcp\"\ndisabled = true\n\n\
          [[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true\n\n\
-         [[patch]]\nid = \"approval\"\ndisabled = true\n\n\
          [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 8, working_dir = {dir:?} }}\n\n\
          [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n\n\
          [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {dir:?} }}\n\n\
@@ -1860,9 +1859,14 @@ async fn on_harness(
         dir = dir.to_string_lossy(),
         home = empty.to_string_lossy(),
     );
-    let (handle, mut app) = atomcode_coding::on_harness::mount(dir, script, &[quiet.as_str()])
-        .await
-        .expect("the coding-on-harness tree must mount");
+    let (handle, mut app) = atomcode_coding::on_harness::mount(
+        dir,
+        atomcode_coding::on_harness::Presence::Attended,
+        script,
+        &[quiet.as_str()],
+    )
+    .await
+    .expect("the coding-on-harness tree must mount");
     let steps = drive_until(handle, commands, &[]).await;
     app.stop();
     steps
@@ -1985,7 +1989,6 @@ async fn on_harness_answering(
         "[[patch]]\nid = \"trace\"\nconfig = {{ stream = false, tools = false, summary = false }}\n\n\
          [[patch]]\nid = \"mcp\"\ndisabled = true\n\n\
          [[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true\n\n\
-         [[patch]]\nid = \"approval\"\ndisabled = true\n\n\
          [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 8, working_dir = {dir:?} }}\n\n\
          [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n\n\
          [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {dir:?} }}\n\n\
@@ -2006,9 +2009,14 @@ async fn on_harness_answering(
     // from `ui-handle`; and enabling `approval-interactive` collides with
     // `ui-handle` over `approval` itself. Both errors were the tree saying the
     // front end had already answered this question.
-    let (handle, mut app) = atomcode_coding::on_harness::mount(dir, script, &[quiet.as_str()])
-        .await
-        .expect("the coding-on-harness tree must mount");
+    let (handle, mut app) = atomcode_coding::on_harness::mount(
+        dir,
+        atomcode_coding::on_harness::Presence::Attended,
+        script,
+        &[quiet.as_str()],
+    )
+    .await
+    .expect("the coding-on-harness tree must mount");
     let steps = drive_answering(handle, commands, &[], None, answer).await;
     app.stop();
     steps
@@ -2117,4 +2125,65 @@ async fn a_refusal_is_the_call_not_the_turn_on_both_engines() {
         );
     }
     let _ = std::fs::remove_file(&outside);
+}
+
+#[tokio::test]
+async fn headless_refuses_what_attended_would_ask_about() {
+    // The other half of the rule, and its negative control. `Attended` above now
+    // agrees with coding to the event — which on its own would also be true of an
+    // assembly that simply never fenced anything. What makes the rule a rule is
+    // that the SAME call, with nobody to ask, is refused.
+    //
+    // A prompt nobody answers is an auto-approval wearing a question mark, and a
+    // subagent is exactly where that would go unnoticed.
+    let dir = scratch("headless");
+    let outside = dir.parent().unwrap().join("outside-headless.txt");
+    let _ = std::fs::remove_file(&outside);
+    let empty = dir.join("__no_skills_hl__");
+    let _ = std::fs::create_dir_all(&empty);
+    let quiet = format!(
+        "[[patch]]\nid = \"trace\"\nconfig = {{ stream = false, tools = false, summary = false }}\n\n\
+         [[patch]]\nid = \"mcp\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 8, working_dir = {dir:?} }}\n\n\
+         [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n\n\
+         [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {dir:?} }}\n\n\
+         [[patch]]\nid = \"project-instructions\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n",
+        dir = dir.to_string_lossy(),
+        home = empty.to_string_lossy(),
+    );
+    let args = r#"{"file_path":"../outside-headless.txt","content":"x"}"#;
+    let script = Script::new(&[
+        Reply::call("c1", "write_file", args),
+        Reply::Text("written"),
+    ]);
+    let (handle, mut app) = atomcode_coding::on_harness::mount(
+        &dir,
+        atomcode_coding::on_harness::Presence::Headless,
+        script,
+        &[quiet.as_str()],
+    )
+    .await
+    .expect("the headless tree must mount");
+    let steps = drive_answering(handle, say("write it"), &[], None, allow()).await;
+    app.stop();
+    let report = render(&steps, &steps);
+
+    assert!(
+        steps
+            .iter()
+            .any(|s| s.kind == "ToolResult" && s.detail.contains("error=true")),
+        "工作区外的写必须被拒{report}"
+    );
+    assert_eq!(
+        steps.iter().filter(|s| s.kind == "Request").count(),
+        0,
+        "没人在,就不该假装问{report}"
+    );
+    assert!(!outside.exists(), "文件不该被写出来{report}");
+    assert_eq!(
+        steps.iter().filter(|s| s.kind == "TurnComplete").count(),
+        1,
+        "拒绝结束的是调用,不是回合{report}"
+    );
 }

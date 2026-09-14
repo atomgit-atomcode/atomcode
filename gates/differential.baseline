@@ -25,5 +25,5 @@ two_tool_calls_prod=0
 plain_turn_rows=0
 one_tool_call_rows=0
 several_rounds_rows=0
-approval_refusal_rows=2
-approval_write_outside_rows=2
+approval_refusal_rows=0
+approval_write_outside_rows=0
