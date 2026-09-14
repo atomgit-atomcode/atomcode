@@ -519,6 +519,25 @@ async fn drive_answering(
 
 // ---- the two engines -----------------------------------------------------
 
+/// A scratch dir that is NOT under the system temp roots.
+///
+/// `scratch` below uses `std::env::temp_dir()`, and `write_approval`'s
+/// `path_in_temp_dir` deliberately treats anything under a temp root as benign —
+/// a throwaway write, not project code. So every "write outside the workspace"
+/// scenario built on `scratch` was writing INTO the temp dir and being
+/// auto-approved by design: zero approval requests, zero divergence, and nothing
+/// measured. Under `target/` the question is a real one again.
+fn scratch_outside_temp(tag: &str) -> std::path::PathBuf {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::SeqCst);
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/diff-scratch")
+        .join(format!("{}-{tag}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch outside temp");
+    dir
+}
+
 fn scratch(tag: &str) -> std::path::PathBuf {
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::SeqCst);
@@ -2160,21 +2179,32 @@ fn write_outside(rel: &'static str) -> Arc<Script> {
 
 #[tokio::test]
 async fn a_write_outside_the_workspace_diverges_and_here_is_why() {
-    // Kept under its original name because the name is the history: this DID
-    // diverge (coding wrote the file, the harness refused it, and neither
-    // asked), and that finding is what produced the `Presence` rule. Attended
-    // no longer fences, so both engines now write it and the ratchet is 0.
+    // This scenario has been wrong twice, and both times it read as GREEN.
     //
-    // What it measures TODAY is therefore the settled half of that rule:
-    // with a person reachable, a write next door is not refused out of hand on
-    // either engine. The half that makes it a rule — the same call REFUSED with
-    // nobody to ask — is `headless_refuses_what_attended_would_ask_about`.
+    // First it described a divergence the `Presence` rule had already closed.
+    // Then — found while mapping what is left before the default path can
+    // switch — it turned out neither engine was ASKING at all, and the reason
+    // was the rig: `scratch()` hands out a directory under the system temp
+    // root, `write_approval::path_in_temp_dir` deliberately treats anything
+    // under a temp root as a benign throwaway write, and so `../x.txt` from a
+    // temp scratch dir is auto-approved by design on BOTH engines. Zero
+    // requests, zero divergence, nothing measured. The `allow()` answer was
+    // never consumed.
     //
-    // Worth knowing while reading this: neither engine ASKS here either, so the
-    // `allow()` answer below is never consumed. The scenario that genuinely
-    // exercises the approval round-trip is `a_refusal_is_the_call_not_the_turn`
-    // below, which uses a call both engines really do stop for.
-    let dir = scratch("ask-yes");
+    // `scratch_outside_temp` makes the question real again, and with a real
+    // question both engines ask — which is the good news. What they disagree
+    // about is WHEN:
+    //
+    //   链式  Request approval → ToolStarted → ToolResult
+    //   行式  ToolStarted → Request approval → ToolResult
+    //
+    // The same `ui-handle` property that
+    // `a_refused_call_still_reads_as_started_on_the_harness` owns, and the
+    // fourth scenario to carry it — but the worst-looking instance: a person
+    // watching sees the write announced as started and is THEN asked whether to
+    // allow it. Frozen at 2 (one difference, reported twice because the
+    // alignment cannot pair events that moved past each other).
+    let dir = scratch_outside_temp("ask-yes");
     let outside = dir.parent().unwrap().join("outside-yes.txt");
     let _ = std::fs::remove_file(&outside);
     let (a, b, report) = ask_chain_vs_rows(
