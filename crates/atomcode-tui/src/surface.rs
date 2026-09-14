@@ -187,6 +187,38 @@ pub trait Surface: Send + Sync {
         false
     }
 
+    /// The mouse mode this side believes the terminal's tracker is in.
+    fn pointer_mode(&self) -> crate::ansi::Pointer {
+        crate::ansi::Pointer::Terminal
+    }
+
+    /// Say the mouse mode again, whether or not this side believes it is
+    /// already there.
+    ///
+    /// The terminal can put its own tracker back without telling us: a session
+    /// restore, a tab or split switch, a reset written by anything else that
+    /// holds the tty. The obvious answer — ask — is not available, and the
+    /// reason is worth writing down because it is not obvious. The query is
+    /// `CSI ? 1002 $ p` and the reply is `CSI ? 1002 ; 1 $ y`; crossterm parses
+    /// `CSI ?` by looking at the *last* byte and only knows `u` and `c`:
+    ///
+    /// ```text
+    /// b'?' => match buffer[buffer.len() - 1] {
+    ///     b'u' => …keyboard flags…, b'c' => …device attributes…, _ => None,
+    /// },
+    /// ```
+    ///
+    /// `None` there means "wait for more bytes", and the reader keeps the
+    /// buffer — so a `$y` reply never drains, and every real keypress after it
+    /// is appended to a sequence that can never parse. Asking the terminal this
+    /// question costs the whole input stream.
+    ///
+    /// Saying the mode again is idempotent — a DECSET for a mode that is already
+    /// set changes nothing — so the answer is to repeat rather than to ask.
+    /// Nothing goes out while the pointer is believed to be the terminal's:
+    /// there is nothing to take back.
+    fn heal_mouse(&self) {}
+
     /// Forget what is believed to be on screen, so the next frame is painted
     /// in full.
     ///
@@ -561,6 +593,20 @@ impl Surface for Headless {
     }
     fn motion(&self) -> bool {
         self.pointer_mode() == crate::ansi::Pointer::ButtonsAndHover
+    }
+    fn pointer_mode(&self) -> crate::ansi::Pointer {
+        Headless::pointer_mode(self)
+    }
+    /// Recorded like every other mouse escape, so a test can see the repetition
+    /// the real terminal would have received — and so the two surfaces cannot
+    /// drift apart on *whether* they heal.
+    fn heal_mouse(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.grab.load(Ordering::SeqCst) {
+            return;
+        }
+        let bytes = self.pointer_mode().escape().to_string();
+        self.escapes.lock().expect("headless poisoned").push(bytes);
     }
     fn as_any_headless(&self) -> Option<Arc<Headless>> {
         self.me
@@ -1343,6 +1389,26 @@ impl Surface for Terminal {
     }
     fn motion(&self) -> bool {
         self.pointer_mode() == ansi::Pointer::ButtonsAndHover
+    }
+    /// Forwards to the inherent method by name rather than through `self.`,
+    /// which would resolve back to itself: an inherent `pointer_mode` shadows a
+    /// trait one, so `self.pointer_mode()` here means the inherent method — but
+    /// a reader (and a future rename) deserves the explicit form, since the
+    /// trait's *default* answer is `Terminal` and a missing forward is a
+    /// silent "the terminal has the mouse" on a machine where it does not.
+    fn pointer_mode(&self) -> crate::ansi::Pointer {
+        Terminal::pointer_mode(self)
+    }
+    fn heal_mouse(&self) {
+        use std::sync::atomic::Ordering;
+        // Nothing to say while the pointer is the terminal's: the state we
+        // would be repeating is the one already in force.
+        if !self.grab.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut out = std::io::stdout();
+        let _ = out.write_all(self.pointer_mode().escape().as_bytes());
+        let _ = out.flush();
     }
     fn forget(&self) {
         self.painted.forget();

@@ -2328,3 +2328,64 @@ async fn the_effort_command_moves_the_row_while_the_screen_runs() {
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+#[tokio::test]
+async fn a_hover_with_nothing_following_the_pointer_says_the_mode_again_and_says_so() {
+    // The terminal can put its own tracker back without telling us — a session
+    // restore, a tab switch, a reset from anything else holding the tty. There
+    // is no way to ask (see `Surface::heal_mouse`: the `$y` reply never drains
+    // out of crossterm's parser), so the signal is behavioural: a plain move
+    // arrives *only* while free motion is reporting, and free motion is asked
+    // for exactly while the menu is up. A move with no menu is the one piece of
+    // evidence available that the tracker is not where this side left it.
+    let dir = scratch("heal-hover");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    let before = s.term.escapes().len();
+    assert!(
+        !s.screen().contains("鼠标被终端收回"),
+        "nothing said before anything happened:\n{}",
+        s.screen()
+    );
+
+    // A move, with no menu open. Nothing asked for it.
+    let field = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("input")
+        .expect("the composer")
+        .rect;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Hover, field.x + 2, field.y);
+    s.quiet().await;
+
+    // Said again, as the whole mode — so a terminal that dropped the grab is
+    // back in button reporting. The state does not change (this side never
+    // thought it had changed), which is exactly why the tip is owed.
+    let sent = s.term.escapes();
+    assert!(sent.len() > before, "the mode was not said again: {sent:?}");
+    assert_eq!(
+        sent.last().map(String::as_str),
+        Some(atomcode_tui::ansi::MOUSE_ON),
+        "and it is the whole mode, not a delta"
+    );
+    assert_eq!(
+        s.term.pointer_mode(),
+        atomcode_tui::ansi::Pointer::Buttons,
+        "still in button reporting — healing is not a state change"
+    );
+
+    // And the person is told, on the reserved row, because the click they were
+    // about to make would have gone to the terminal instead.
+    assert!(
+        s.screen().contains("鼠标被终端收回"),
+        "the person was not told:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}

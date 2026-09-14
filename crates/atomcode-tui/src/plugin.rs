@@ -319,6 +319,27 @@ impl UserInterface for Tui {
                 None => wake.recv().await.unwrap_or(Wake::Closed),
             };
             coalesced += 1;
+            // The pointer's own vocabulary, needed in the patterns below rather
+            // than only inside an arm body.
+            use crate::surface::Click;
+            // Say the mouse mode again on the wakes that can follow a terminal
+            // putting its own tracker back without telling us — every tick, and
+            // everything the pointer or the keyboard sends. A menu opening or
+            // closing is the other moment worth repeating at: a terminal that
+            // dropped the grab while the menu was up never saw either request,
+            // and this is the first wake carrying the new state. Idempotent by
+            // construction (a DECSET for a mode already set changes nothing),
+            // so the cost is bytes and no state.
+            //
+            // Here rather than at the top of the loop because `woke` is what
+            // says which of these it was, and before the `match` because the
+            // pointer arms `continue` past anything below.
+            if matches!(
+                &woke,
+                Wake::Tick | Wake::Input(Input::Mouse(..)) | Wake::Input(Input::Key(_))
+            ) {
+                self.surface.heal_mouse();
+            }
             match woke {
                 Wake::Closed => quit = true,
                 // The fact was folded into the stream by the listener that sent
@@ -340,6 +361,27 @@ impl UserInterface for Tui {
                 Wake::Tick => {
                     let mut m = self.host.moment.write().expect("moment poisoned");
                     m.tick = m.tick.wrapping_add(1);
+                    stale = true;
+                }
+                // A move is the one event the tracker sends for a reason we did
+                // not ask for: `Moved` arrives only while free motion is
+                // reporting, and free motion is asked for exactly while the
+                // menu is up. Seeing one with the menu down is the one piece of
+                // evidence available that the terminal's tracker is not where
+                // this side left it — which is what a session restore, a tab
+                // switch or a stray reset from anything else holding the tty
+                // does to it. Say the mode again, and say so, because the
+                // pointer was in the terminal's hands until the next click
+                // brought it back.
+                //
+                // Not a query: see `Surface::heal_mouse` for why asking is not
+                // an option here.
+                Wake::Input(Input::Mouse(Click::Hover, ..)) if !self.host.context_menu_open() => {
+                    self.surface.heal_mouse();
+                    self.host.say(
+                        "鼠标被终端收回了,已自动要回;若再次发生,ctrl-o 可手动切换",
+                        false,
+                    );
                     stale = true;
                 }
                 Wake::Input(Input::Resize(..)) => {
