@@ -45,6 +45,8 @@
   9124aed2  裁判铺宽:3 条 → 20 条
   9471d802  自纠错回路补成行(verify-cadence)
   4d63c0c6  催检查不能盖过人的话
+  79988b53  修正本文档"下一步"(原来漏了三项)
+  52e912d3  执行边界补成行 + 审批那两条根本没在测审批
 ```
 
 **两个分支都没 push。** 第二个分支尚未合回第一个。
@@ -59,8 +61,10 @@
                  其中 20 条为 0
                  compact_rows=1 / truncated_rows=2 / truncated_redump_rows=2
                  —— 与最小路径的基线逐个相等
-approval_*     审批,两侧都开着跑                     2 条,全 0(曾是 2)
+approval_*     审批,两侧都开着跑                     2 条
 verify_cadence_* 自纠错回路,三态(headless / attended / 人禁了命令) 全 0
+exec_policy_rows 人划的执行边界                        1(见下)
+refused_call_started_rows                             1(见下,这条就是为它开的)
 ```
 
 差分台 53/53，coding 全量 523/523。
@@ -71,6 +75,35 @@ truncated_redump=2，一模一样。也就是说**生产那条中间件链没有
 
 **仍然没有覆盖到的**：多 agent 编排、真 provider、session 持久化落盘
 （`session-persistence-jsonl` 在差分里是关掉的）。
+
+### 一条属于 harness 的分歧（`refused_call_started_rows=1`）
+
+**每一个被拒的调用，在行式这边都会闪一下「开始了」。**
+
+```
+链式  Request approval → ToolResult error=true
+行式  ToolStarted bash → Request approval → ToolResult error=true
+```
+
+`ui-handle` 在 assistant 消息落盘那一刻就为每个**已挂载**的工具合成
+`ToolStarted`，比 `tools/execute-batch`、比 `tools/execute`、比任何能拒绝的东西
+都早；coding 的链式是中间件放行之后才宣告，所以被拒的调用根本不会被宣告。
+
+这不是某个产品行的问题（`execution-policy` 行第一版就是这么误判自己的，白花一轮）。
+`handle.rs` 已经守了隔壁那个 case——「没挂载的工具不宣告」，注释里说那也是差分
+发现的——所以**修法的形状是现成的，且属于 `ui-handle`**。两条基线携带它
+（`approval_refusal_rows`、`exec_policy_rows`），`refused_call_started_rows`
+这条场景专门认领它，修好时把三条一起降。
+
+### 上一版交接把两条审批场景说成「全 0」，那是因为它们没在测审批
+
+- `approval_refusal_rows` 复用「往工作区外写」的脚本再答 `deny`，但两个引擎对
+  那次写**都不问**，`deny` 从来没被消费过——它一边断言「拒绝结束的是调用」，
+  一边看着一次成功的写。换成两边真会停下来问的递归 `rm` 之后，基线是诚实的 1。
+  **0 不是好成绩，是没在测。**
+- `approval_write_outside_rows` 的注释描述的分歧，正是 `Presence` 规则关掉的那个，
+  已经过期了（名字保留，因为那个名字就是这段历史）。
+- 好消息：审批缝**本身**是通的，两个引擎都发 `Request approval`、都按答案拒。
 
 ## 已定的决策（不要重议）
 
@@ -133,23 +166,19 @@ fs2 文件锁，锁基线文件本身。
 | 缺的东西 | 是什么 | 状态 |
 |---|---|---|
 | `VerifyCadenceHook` | 改了代码不检查就走 → 补一轮追问 | **已补**(`9471d802`) |
-| `TurnExecutionPolicy` | 每回合的用户执行边界(「不要跑任何命令」) | 未补 |
+| `TurnExecutionPolicy` | 每回合的用户执行边界(「不要跑任何命令」) | **已补**(`52e912d3`) |
 | `SkillFirstHook` | 先用 skill 的推动 | 未补 |
 | `DatalogHook` | 落盘的 transcript(hook + middleware 各一半) | 未补 |
 | `CCExternalHooks` | 用户的 `hooks.json` 外部钩子 | 未补 |
 | `GitPushLabelMiddleware` | — | 够不着,在 `atomgit` feature 后面,开它要拉 reqwest+auth |
 | `PermissionRuleGate` | — | 不用搬,harness `permissions` 行已自实现 |
 
-1. **`TurnExecutionPolicy` 换壳** —— 现在最该做的一个，因为它是**安全边界**：
-   生产链把它注册在「每一个可能 `Allow` 的中间件之前」。形状很顺：
-   `pre_request` → `AgentRequest` 瀑布的 `next.run` 之前读 `req.messages`；
-   `before` → `Waterfall<ToolsExecute>`，挡掉策略禁止的 bash。一行注册两处，
-   共享一个 `Arc`。判断函数 `execution_policy_for_messages` 已经收 `&[Message]`。
-   **写场景的办法**：让脚本在被禁的前提下去跑 bash，比较两边是否都拒。
-2. **`SkillFirstHook` / `DatalogHook` / `CCExternalHooks`** —— 都不是审批闸门。
+1. **`SkillFirstHook` / `DatalogHook` / `CCExternalHooks`** —— 都不是审批闸门。
    `cc-hooks` 要给 harness 开一个 feature（只需 `tools`+`dirs`+`tokio/process`，
    代价接近零）。`DatalogHook` 的观测价值是实打实的（memory 里那条
    「TUI 看不到 ≠ 没生效，先 grep datalog」说的就是它）。
+2. **`ui-handle` 的 `ToolStarted` 缺口**（上面那节）。属于 harness，不属于这条线，
+   但切默认路径前该有人看一眼：它影响每一条拒绝路径。
 3. **然后才切 `build_coding_agent` 的默认路径**，并留一个逃生开关（参照当初
    `--engine v1`）。
 4. 阶段二：把 `on_harness.rs` 里的 `CODING_ROWS` 常量变成可配置数据。
@@ -170,12 +199,15 @@ fs2 文件锁，锁基线文件本身。
 - **负对照是必须的**：只测「headless 两边都追问」等于没测，一个从不追问的行清单
   也能通过 attended 那一半。三态都要写:headless 追、attended 不追、人禁了命令
   也不追。第三条上线时先验过「把判断摘掉测试会红」才算数。
+- **一条 0 分歧的场景，先确认它真的触发了它要测的东西。** 上面那两条审批场景
+  就是反例:绿了一整条线，因为两边都没走到审批。看一眼 render，确认该出现的事件
+  （这里是 `Request`）真的在，比多写三条场景管用。
 
 ## 怎么验证
 
 ```sh
-cargo nextest run -p atomcode-coding --test differential   # 53/53,裁判
-cargo nextest run -p atomcode-coding                       # 523/523
+cargo nextest run -p atomcode-coding --test differential   # 55/55,裁判
+cargo nextest run -p atomcode-coding                       # 526/526
 cargo nextest run -p atomcode-capabilities                 # 909/909
 cargo nextest run -p atomcode-harness --test policy_rows   # 24/24(全量会红,见上)
 git status --short gates/                                  # 基线只准降,不准手改
