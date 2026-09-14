@@ -266,7 +266,7 @@ pub(crate) fn stream_read_error_message(
                 format!("网络连接中断:远端关闭或重置了连接,自动重连 {attempts} 次后仍失败,可重试。")
             }
             StreamReadRecovery::PartialResponse => {
-                "响应中断:为避免重复输出或工具执行,未自动重放;已保留可安全保存的部分回复,可继续。"
+                "响应中断:为避免重复输出或工具执行,未自动重放;已保留可安全保存的部分回复。无需重开会话——直接回复(例如「继续」)即可,模型会带着已保留的部分接着往下。"
                     .to_string()
             }
         };
@@ -863,6 +863,13 @@ mod tests {
         let partial = stream_read_error_message(&e, StreamReadRecovery::PartialResponse);
         assert!(partial.contains("为避免重复输出或工具执行"));
         assert!(partial.contains("已保留可安全保存的部分回复"));
+        // Recovery is now ACTIONABLE (the report's gap: "可继续" told users nothing,
+        // so they reopened the session). It must point at replying to continue, and
+        // that no session reopen is needed.
+        assert!(
+            partial.contains("直接回复") && partial.contains("无需重开会话"),
+            "PartialResponse must give an actionable recovery entry: {partial}"
+        );
         assert!(!partial.contains("自动重连仍失败"));
         // The PartialResponse lead is self-contained — no "网络连接中断" double-中断.
         assert!(!partial.contains("网络连接中断"));
