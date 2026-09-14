@@ -26,7 +26,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use atomcode_capabilities::tools::{
-    BashTool, EditFileTool, GlobTool, GrepTool, ListDirTool, ReadFileTool, WriteFileTool,
+    BashTool, EditFileTool, GlobTool, GrepTool, ListDirTool, ReadFileTool,
+    SearchReplaceTool, WriteFileTool,
 };
 use atomcode_kernel::tool::Tool;
 use atomcode_plexus::{Context, Plugin};
@@ -58,6 +59,12 @@ impl Plugin for FsWorldToolsPlugin {
             Arc::new(WriteFileTool::with_world(fs.clone())),
             Arc::new(EditFileTool::with_world(fs.clone())),
             Arc::new(ListDirTool::with_world(fs.clone())),
+            // Same family, same argument. Its own doc says routing through the
+            // world is why it waited for `walk` — "a fenced or read-only world
+            // refuses the write it would have refused for `write_file`" — so
+            // leaving it out was an omission, not a boundary. Found by comparing
+            // this catalog against the chain's.
+            Arc::new(SearchReplaceTool::with_world(fs.clone())),
         ];
         super::tools::mount(ctx, tools)?;
         // The model is told which world it is in, because "the file is not

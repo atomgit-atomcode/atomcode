@@ -327,6 +327,9 @@ id = "approval"
             "edit_file".to_string(),
             "list_directory".to_string(),
             "read_file".to_string(),
+            // Bound to the same world as the rest of `tool-fs-world`, which is
+            // why it belongs in that row and not beside it.
+            "search_replace".to_string(),
             "write_file".to_string()
         ],
         "what is left is exactly what the surviving rows mounted"

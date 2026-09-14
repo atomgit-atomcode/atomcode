@@ -559,6 +559,17 @@ impl Plugin for OutputArtifactPlugin {
             return Err("`tool-output-artifact` needs `config = { dir = … }`".into());
         };
         let store = Arc::new(atomcode_capabilities::tools::ArtifactStore::new(dir));
+        // The spill message tells the model, verbatim: "To read more:
+        // fetch_output(artifact_id=…)". A row that truncated a result and named
+        // a tool it had not mounted would be sending the model after something
+        // that does not exist — which is what this row did until a catalog
+        // comparison against the chain turned it up.
+        super::tools::mount(
+            ctx,
+            vec![Arc::new(atomcode_capabilities::tools::FetchOutputTool::new(
+                store.clone(),
+            ))],
+        )?;
         let spill = Arc::new(atomcode_capabilities::tools::ArtifactMiddleware::new(store));
         // Appended: it rewrites the RESULT, so it must see what every earlier
         // listener produced.

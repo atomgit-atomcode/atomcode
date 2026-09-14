@@ -104,6 +104,28 @@ name = "skill-first"
 [[insert]]
 name = "execution-policy"
 
+# Tools the chain has always offered, off in `base` because a generic harness
+# should not assume a Rust/ast-grep toolchain or pay for a code graph. A coding
+# product assumes both. Found by comparing the two engines' catalogs, not by
+# reading either one.
+[[patch]]
+id = "tool-ast-grep"
+disabled = false
+
+[[patch]]
+id = "code-graph"
+disabled = false
+
+# `open_file` and the thing that can open one. `opener-local` rides in the repl
+# and tui bundles rather than `base`, because a harness with nobody at a display
+# has nowhere to open anything — but this assembly is driven through `ui-handle`,
+# which means a person IS there.
+[[insert]]
+name = "opener-local"
+
+[[insert]]
+name = "tool-open-file"
+
 # Coding's own persona, in place of the harness's generic one. `{model}` is
 # rewritten by a `/model` patch so this row remounts with it.
 [[insert]]

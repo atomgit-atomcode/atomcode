@@ -90,6 +90,12 @@ struct Script {
     /// reason this field exists — so a fixture that can only ever be called
     /// "script" cannot exercise anything model-gated on either engine.
     model: String,
+    /// Tool names offered on the last request.
+    ///
+    /// What the model was OFFERED is as much a part of the product as what it
+    /// was told: an engine that mounts a different catalog is a different
+    /// agent, and no event in the stream says so.
+    tools: std::sync::Mutex<Vec<String>>,
     /// Every request, as the model received it.
     ///
     /// The event stream and the snapshot both miss an EPHEMERAL request tail:
@@ -106,6 +112,7 @@ impl Script {
             replies: replies.to_vec(),
             cursor: AtomicUsize::new(0),
             model: "script".into(),
+            tools: std::sync::Mutex::new(Vec::new()),
             seen: std::sync::Mutex::new(Vec::new()),
         })
     }
@@ -118,9 +125,17 @@ impl Script {
             replies: self.replies.clone(),
             cursor: AtomicUsize::new(0),
             model: model.into(),
+            tools: std::sync::Mutex::new(Vec::new()),
             seen: std::sync::Mutex::new(Vec::new()),
         })
     }
+    /// The tool names the model was offered, sorted.
+    fn tools(&self) -> Vec<String> {
+        let mut names = self.tools.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        names.sort();
+        names
+    }
+
     /// Everything the model was shown, request by request, flattened to text.
     fn seen(&self) -> String {
         self.seen
@@ -145,13 +160,15 @@ impl LlmProvider for Script {
     async fn chat_stream(
         &self,
         messages: &[Message],
-        _tools: &[ToolDef],
+        tools: &[ToolDef],
         _options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
         self.seen
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(messages.to_vec());
+        *self.tools.lock().unwrap_or_else(|e| e.into_inner()) =
+            tools.iter().map(|t| t.name.clone()).collect();
         let i = self.cursor.fetch_add(1, Ordering::SeqCst);
         // Past the end of the script, stop cleanly rather than failing: a
         // fixture running out is not a provider outage, and one engine taking
@@ -3712,4 +3729,86 @@ async fn a_logout_takes_the_credentials_and_leaves_the_agent() {
          scenario exists to forbid"
     );
     app.stop();
+}
+
+// ---- what the model is offered ------------------------------------------
+//
+// A whole class of divergence no event can carry. The tool catalog is as much
+// the product as the persona is: an engine that offers a different set of tools
+// IS a different agent, and every scenario here would still pass — they only
+// exercise the handful of tools they happen to call.
+//
+// It caught `task` and `team` missing from the row list on the first run, which
+// is a subagent capability the chain has and the tree did not.
+
+/// The tool names each engine offers the model for the same turn.
+async fn catalogs(dir: &std::path::Path) -> (Vec<String>, Vec<String>) {
+    let chain = Script::text(&["ok"]);
+    let _ = reference_production(chain.clone(), dir, say("hi")).await;
+    let rows = Script::text(&["ok"]);
+    let (handle, mut app) = on_harness_handle(rows.clone(), dir).await;
+    let _ = drive_answering(handle, say("hi"), &[], None, allow()).await;
+    app.stop();
+    (chain.tools(), rows.tools())
+}
+
+/// Differences that are DECISIONS, each with its reason. Anything else is drift.
+///
+/// The list is the point: it is short because the first run was not — eleven
+/// tools were missing from the row list, and every one of them turned out to be
+/// a row that existed and was not mounted, or a tool a row forgot to bring with
+/// it. What is left are four things somebody has to decide, not fix.
+const KNOWN_TOOL_DIFFERENCES: &[(&str, &str)] = &[
+    (
+        "request_user_input",
+        "chain-only NAME for the same capability the tree mounts as `ask_user`.          One of them has to win, and whichever does, the persona and the prompts          that name it have to move with it.",
+    ),
+    (
+        "ask_user",
+        "the tree's name for `request_user_input`. See above — this pair is one          decision, not two gaps.",
+    ),
+    (
+        "list_sessions",
+        "chain-only, and not a port: it lists coding's own `SessionManager`          sessions, while the harness keeps its own JSONL log. A `list_sessions`          here would list different things under the same name.",
+    ),
+    (
+        "describe_self",
+        "tree-only, and deliberately: the harness persona tells the model to call          it rather than guess what it is made of, which is true of an agent          assembled from rows at runtime and not of a fixed chain.",
+    ),
+];
+
+#[tokio::test]
+async fn both_engines_offer_the_model_the_same_tools() {
+    let dir = scratch("tool-catalog");
+    seed(&dir);
+    let (chain, rows) = catalogs(&dir).await;
+
+    let known = |name: &String| KNOWN_TOOL_DIFFERENCES.iter().any(|(n, _)| n == name);
+    let missing: Vec<&String> = chain
+        .iter()
+        .filter(|n| !rows.contains(n) && !known(n))
+        .collect();
+    let extra: Vec<&String> = rows
+        .iter()
+        .filter(|n| !chain.contains(n) && !known(n))
+        .collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "the two engines offer different tools, and the difference is not one of \
+         the recorded decisions — that is a different agent, and no event in the \
+         stream would say so.\n  只有链式有: {missing:?}\n  只有行式有: {extra:?}"
+    );
+
+    // And the recorded decisions have to stay real. One that quietly stopped
+    // being a difference would leave a note explaining something that is no
+    // longer true — which is worse than no note.
+    for (name, why) in KNOWN_TOOL_DIFFERENCES {
+        let on_chain = chain.iter().any(|n| n == name);
+        let on_rows = rows.iter().any(|n| n == name);
+        assert_ne!(
+            on_chain, on_rows,
+            "`{name}` is recorded as a known difference ({why}) but both engines \
+             now agree about it — drop the entry rather than leaving a stale reason"
+        );
+    }
 }
