@@ -573,16 +573,6 @@ async fn reference(
     reference_until(script, dir, commands, &[]).await
 }
 
-async fn reference_cancelling(
-    script: Arc<Script>,
-    dir: &std::path::Path,
-    commands: Vec<AgentCommand>,
-) -> Vec<Step> {
-    let cfg = atomcode_coding::CodingAgentConfig::new("k", "http://unused.test/v1", "script", dir);
-    let agent = atomcode_coding::build_coding_agent_with(&cfg, script);
-    drive_with(agent.spawn(), commands, &[], Some(AgentCommand::Cancel)).await
-}
-
 fn coding_agent(script: Arc<Script>, dir: &std::path::Path) -> atomcode_kernel::agent::Agent {
     let cfg = atomcode_coding::CodingAgentConfig::new("k", "http://unused.test/v1", "script", dir);
     atomcode_coding::build_coding_agent_with(&cfg, script)
@@ -636,9 +626,14 @@ async fn reference_until(
 // blind to exactly the row this product turns on — so it is on, and the criterion
 // compares the two lists that actually ship.
 //
-// `review` is the same shape and is still off: it is the last gate that hides a
-// difference rather than avoiding one, because the row list has no `code_review`
-// yet. Turning it on is how that gets found, not how it gets fixed.
+// `subagents` was off for neither reason — `PrepareOptions::default()` simply
+// says `Disabled` and nobody raised it. It is on now, because every shipped
+// driver passes `Enabled`: with it off, the criterion agreed that neither engine
+// had `task`, which is the exact question a person had to ask by hand.
+//
+// `review` is the same shape as `web` and is still off: it is the last gate that
+// hides a difference rather than avoiding one, because the row list has no
+// `code_review` yet. Turning it on is how that gets found, not how it gets fixed.
 
 async fn production_agent(
     script: Arc<Script>,
@@ -650,6 +645,7 @@ async fn production_agent(
         web: true,
         review: false,
         memory: false,
+        subagents: atomcode_coding::SubagentPolicy::Enabled,
         skill_dirs: Some(Vec::new()),
         ..Default::default()
     };
@@ -675,14 +671,6 @@ async fn candidate(
     commands: Vec<AgentCommand>,
 ) -> Vec<Step> {
     candidate_until(script, dir, commands, &[]).await
-}
-
-async fn candidate_cancelling(
-    script: Arc<Script>,
-    dir: &std::path::Path,
-    commands: Vec<AgentCommand>,
-) -> Vec<Step> {
-    candidate_inner(script, dir, commands, &[], Some(AgentCommand::Cancel)).await
 }
 
 async fn candidate_late(
@@ -1215,12 +1203,20 @@ async fn a_cancel_lands() {
     // feels, and it does not show up in the event stream at all — the same
     // events arrive, just late.
     let script = || Script::new(&[Reply::Slow(400, "working")]);
+    // Both engines are assembled BEFORE either stopwatch starts. Assembling one
+    // is not the thing being measured, it is not bounded, and under a loaded
+    // suite it is easily tens of milliseconds — a budget that includes it is a
+    // budget that reports the machine's load as a cancellation bug.
+    let reference = coding_agent(script(), &dir);
+    let (candidate, mut app) = candidate_handle(script(), &dir).await;
+
     let started = std::time::Instant::now();
-    let a = reference_cancelling(script(), &dir, cmds()).await;
+    let a = drive_with(reference.spawn(), cmds(), &[], Some(AgentCommand::Cancel)).await;
     let took_reference = started.elapsed();
     let started = std::time::Instant::now();
-    let b = candidate_cancelling(script(), &dir, cmds()).await;
+    let b = drive_with(candidate, cmds(), &[], Some(AgentCommand::Cancel)).await;
     let took_candidate = started.elapsed();
+    app.stop();
     let report = render(&a, &b);
     ratchet("cancel", divergences(&a, &b), &report);
 
@@ -1941,7 +1937,8 @@ fn quiet_rows(dir: &std::path::Path) -> String {
          [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 8, working_dir = {dir:?} }}\n\n\
          [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n\n\
          [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {dir:?} }}\n\n\
-         [[patch]]\nid = \"project-instructions\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n",
+         [[patch]]\nid = \"project-instructions\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n\n\
+         [[patch]]\nid = \"team-in-process\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n",
         dir = dir.to_string_lossy(),
         home = empty.to_string_lossy(),
     )
@@ -2336,7 +2333,8 @@ async fn headless_refuses_what_attended_would_ask_about() {
          [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 8, working_dir = {dir:?} }}\n\n\
          [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n\n\
          [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {dir:?} }}\n\n\
-         [[patch]]\nid = \"project-instructions\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n",
+         [[patch]]\nid = \"project-instructions\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n\n\
+         [[patch]]\nid = \"team-in-process\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n",
         dir = dir.to_string_lossy(),
         home = empty.to_string_lossy(),
     );

@@ -152,14 +152,20 @@ name = "todo-reminder"
 [[insert]]
 name = "tool-ask"
 
-# Delegation. Off, and it is an open decision rather than a settled one: the
-# shipped drivers pass `SubagentPolicy::Enabled`, so the chain mounts `task`
-# and `team` and this tree does not. Turning it on here needs `team-in-process`
-# beside it and the differential's chain options raised to match, or the
-# catalog criterion is comparing two subsets and calling them equal.
+# Delegation, both halves of it. Every shipped driver passes
+# `SubagentPolicy::Enabled`, so the chain has always mounted `task` and `team`;
+# base leaves them off because a generic tree should opt into multiplying model
+# calls. A person asked why this engine had no subagent, and the answer was
+# that it inherited an abstention — which is this whole list's reason to exist.
+#
+# `task` runs a child in its own realm with a reduced tool set and hands back
+# only the answer. `team` is the other shape: named members with roles that
+# stay, report back, and can be told more.
 [[insert]]
 name = "subagent-in-process"
-disabled = true
+
+[[insert]]
+name = "team-in-process"
 
 # External MCP servers are other people's processes. On in the chain
 # (`mcp: true`), off here for the same reason the rig patches it off on both
