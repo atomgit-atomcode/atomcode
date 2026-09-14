@@ -3174,3 +3174,137 @@ async fn a_strong_model_is_not_nudged_and_the_pointer_is_not_doubled() {
         rows_script.seen()
     );
 }
+
+// ---- the datalog --------------------------------------------------------
+//
+// Judged on the FILES, not the event stream: the datalog emits no events at
+// all, and an engine that wrote nothing would look identical to one that wrote
+// everything in every other scenario here.
+//
+// Pointed at a scratch directory on both sides. The real default is
+// `~/.atomcode/datalog`, and a rig that writes to the developer's home is not a
+// rig.
+
+/// Everything the datalog wrote, markdown and jsonl, as (markdown, jsonl).
+fn datalog_files(root: &std::path::Path) -> (String, String) {
+    let mut markdown = String::new();
+    let mut jsonl = String::new();
+    fn walk(dir: &std::path::Path, markdown: &mut String, jsonl: &mut String) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, markdown, jsonl);
+            } else if path.extension().is_some_and(|e| e == "md") {
+                markdown.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            } else if path.extension().is_some_and(|e| e == "jsonl") {
+                jsonl.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            }
+        }
+    }
+    walk(root, &mut markdown, &mut jsonl);
+    (markdown, jsonl)
+}
+
+#[tokio::test]
+async fn the_datalog_records_the_same_turn_on_both_engines() {
+    let dir = scratch("datalog-onharness");
+    seed(&dir);
+    let logs = dir.join("logs");
+    let script = || {
+        Script::new(&[
+            Reply::call("c1", "read_file", r#"{"file_path":"a.rs"}"#),
+            Reply::Text("that is an empty main"),
+        ])
+    };
+
+    // The chain: `datalog.enabled` is false by default, so the scenario turns it
+    // on the way a user would.
+    let mut cfg =
+        atomcode_coding::CodingAgentConfig::new("k", "http://unused.test/v1", "script", &dir);
+    cfg.datalog = atomcode_config::config::DatalogConfig {
+        enabled: true,
+        dir: Some(logs.join("chain").to_string_lossy().into_owned()),
+    };
+    let opts = atomcode_coding::parts::PrepareOptions {
+        mcp: false,
+        web: false,
+        review: false,
+        memory: false,
+        skill_dirs: Some(Vec::new()),
+        ..Default::default()
+    };
+    let mut parts = atomcode_coding::parts::prepare(&cfg, opts)
+        .await
+        .expect("prepare");
+    let chain = atomcode_coding::parts::assemble(&mut parts, &cfg, script()).expect("assemble");
+    let _ = drive_until(chain.spawn(), say("read a.rs"), &[]).await;
+
+    // The rows: an extra layer inserting the row, because for this one mounting
+    // IS enabling — it is deliberately absent from `CODING_ROWS`.
+    let quiet = quiet_rows(&dir);
+    let insert = format!(
+        "[[insert]]\nname = \"datalog\"\nconfig = {{ working_dir = {dir:?}, dir = {log:?} }}\n",
+        dir = dir.to_string_lossy(),
+        log = logs.join("rows").to_string_lossy(),
+    );
+    let (handle, mut app) = atomcode_coding::on_harness::mount(
+        &dir,
+        atomcode_coding::on_harness::Presence::Attended,
+        script(),
+        &[quiet.as_str(), insert.as_str()],
+    )
+    .await
+    .expect("the tree with a datalog must mount");
+    let _ = drive_answering(handle, say("read a.rs"), &[], None, allow()).await;
+    app.stop();
+    // The turn-end flush is spawned on the rows side (`emit` dispatches sync
+    // listeners, so there is nowhere to await), which means the last write can
+    // still be in flight when the turn ends. Give it a moment rather than
+    // asserting on a race.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    for (who, root) in [("链式", logs.join("chain")), ("行式", logs.join("rows"))] {
+        let (markdown, jsonl) = datalog_files(&root);
+        assert!(
+            !markdown.is_empty() && !jsonl.is_empty(),
+            "{who}: 什么都没写 —— 这条场景对空目录和对满目录一样绿,所以先验这个"
+        );
+        assert!(
+            markdown.contains("read a.rs"),
+            "{who}: 提问要在 transcript 里\n{markdown}"
+        );
+        assert!(
+            markdown.contains("read_file"),
+            "{who}: 工具调用要在\n{markdown}"
+        );
+        assert!(
+            markdown.contains("that is an empty main"),
+            "{who}: 回答也要在\n{markdown}"
+        );
+        assert!(
+            markdown.contains("**Stats:**"),
+            "{who}: 回合结束要落一行统计\n{markdown}"
+        );
+        // The JSONL is the half that exists nowhere else: the assembled request.
+        // A transcript without it is a nicer-looking session log.
+        let records: Vec<serde_json::Value> = jsonl
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("每行都得是 JSON"))
+            .collect();
+        assert_eq!(records.len(), 2, "{who}: 两轮模型调用,两条记录");
+        for record in &records {
+            assert!(
+                record["messages"].as_array().is_some_and(|m| !m.is_empty()),
+                "{who}: 记录里必须有发出去的那组消息 —— 这正是它唯一的存在理由\n{record}"
+            );
+            assert!(
+                record["tools"].as_array().is_some_and(|t| !t.is_empty()),
+                "{who}: 工具清单也要在\n{record}"
+            );
+        }
+    }
+}

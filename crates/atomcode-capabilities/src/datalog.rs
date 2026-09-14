@@ -211,14 +211,30 @@ impl DatalogHook {
     }
 }
 
-#[async_trait]
-impl LifecycleHooks for DatalogHook {
-    async fn user_prompt_submit(&self, text: &mut String) -> Result<(), String> {
-        self.start_turn(text);
-        Ok(())
+/// The datalog as a SINK, apart from the seams that drive it.
+///
+/// `DatalogHook` was written as one struct wearing two kernel traits, with every
+/// decision inlined in the trait methods. The harness reaches the same moments
+/// through entirely different seams (`turn/start`, `agent/request`,
+/// `tool/result`, `turn/end`), so the `datalog` row drives these directly.
+///
+/// Same split as the approval gates and the verify cadence before it: what to
+/// write is decided once, and how it is delivered is the assembly's business.
+impl DatalogHook {
+    /// A new turn opened, with the text that opened it.
+    pub fn begin_turn(&self, prompt: &str) {
+        self.start_turn(prompt);
     }
 
-    async fn on_request(
+    /// A request is about to go to the model — the JSONL record.
+    ///
+    /// The reason this row cannot be a plain session-log listener: the log
+    /// holds FACTS (a user message, an assistant message, a tool result), and
+    /// this record is the ASSEMBLED REQUEST — the system prompt as sent, every
+    /// message, the tools, the options, the cache epoch. That is exactly what a
+    /// prompt-cache or "did the model actually see it" investigation needs, and
+    /// it exists nowhere else.
+    pub async fn record_request(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
@@ -239,7 +255,7 @@ impl LifecycleHooks for DatalogHook {
         state.rounds = state.rounds.max(ctx.round);
         let record = serde_json::json!({
             "step": ctx.round,
-            "session_id": ctx.session_id.as_deref().map(|id| id.as_ref()).unwrap_or(""),
+            "session_id": ctx.session_id.as_deref().unwrap_or(""),
             "turn_id": ctx.turn_id,
             "request_id": ctx.request_id,
             "model": self.model,
@@ -268,7 +284,8 @@ impl LifecycleHooks for DatalogHook {
         self.append_markdown(markdown);
     }
 
-    async fn on_model_response(&self, response: &mut Message) {
+    /// What the model answered.
+    pub fn record_response(&self, response: &Message) {
         let mut state = self.lock();
         if !state.active {
             return;
@@ -313,14 +330,60 @@ impl LifecycleHooks for DatalogHook {
         self.append_markdown(markdown);
     }
 
-    async fn on_error(&self, error: &str) {
+    /// Something went wrong mid-turn.
+    pub fn record_error(&self, error: &str) {
         if !self.lock().active {
             return;
         }
         self.append_markdown(format!("**Error:** {error}\n\n"));
     }
 
-    async fn turn_complete(&self, _convo: &Conversation, reason: &StopReason, _ctx: &TurnCtx) {
+    /// Remember a call id's tool name, so its result can be labelled.
+    pub fn note_tool_call(&self, id: &str, name: &str) {
+        let mut state = self.lock();
+        if state.active {
+            state.tool_names.insert(id.to_string(), name.to_string());
+        }
+    }
+
+    /// One tool result.
+    pub fn record_tool_result(&self, result: &ToolResult) {
+        let mut state = self.lock();
+        if !state.active {
+            return;
+        }
+        let name = state
+            .tool_names
+            .remove(&result.call_id)
+            .unwrap_or_else(|| "unknown".to_string());
+        drop(state);
+        let status = if result.is_error { "error" } else { "ok" };
+        self.append_markdown(format!(
+            "**Tool result:** `{name}` (`{}`, {status})\n```\n{}\n```\n\n",
+            result.call_id, result.content
+        ));
+    }
+
+    /// Wait until everything queued has actually been written.
+    ///
+    /// Separate from [`Self::finish_turn`] because the write is a channel push
+    /// and the wait is not: a sync listener can do the first and spawn the
+    /// second, while the kernel hook does both in order as it always did.
+    pub async fn flush(&self) {
+        self.writer.barrier().await;
+    }
+
+    /// The turn ended; write the stats.
+    pub fn finish_turn(&self, reason: &StopReason) {
+        self.finish_turn_named(&format!("{reason:?}"));
+    }
+
+    /// As [`Self::finish_turn`], for a caller whose stop reason is its own type.
+    ///
+    /// The harness has a `StopReason` of its own, and the datalog only ever
+    /// rendered this value with `{:?}` — so taking the rendering keeps the two
+    /// crates from having to agree on an enum neither of them owns.
+    pub fn finish_turn_named(&self, reason: &str) {
         let markdown = {
             let mut state = self.lock();
             if !state.active {
@@ -337,13 +400,43 @@ impl LifecycleHooks for DatalogHook {
             let _ = writeln!(
                 markdown,
                 "---\n**Stats:** {rounds} turns, {tool_calls} tool calls, {duration:.1}s, {total_tokens} tokens\n\
-                 **End:** reason={reason:?}",
+                 **End:** reason={reason}",
             );
             state.active = false;
             markdown
         };
         self.append_markdown(markdown);
-        self.writer.barrier().await;
+    }
+}
+
+#[async_trait]
+impl LifecycleHooks for DatalogHook {
+    async fn user_prompt_submit(&self, text: &mut String) -> Result<(), String> {
+        self.begin_turn(text);
+        Ok(())
+    }
+
+    async fn on_request(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        options: &ChatOptions,
+        ctx: &TurnCtx,
+    ) {
+        self.record_request(messages, tools, options, ctx).await;
+    }
+
+    async fn on_model_response(&self, response: &mut Message) {
+        self.record_response(response);
+    }
+
+    async fn on_error(&self, error: &str) {
+        self.record_error(error);
+    }
+
+    async fn turn_complete(&self, _convo: &Conversation, reason: &StopReason, _ctx: &TurnCtx) {
+        self.finish_turn(reason);
+        self.flush().await;
     }
 }
 
@@ -355,10 +448,7 @@ impl ToolMiddleware for DatalogHook {
         _tool: &Arc<dyn Tool>,
         _rt: &RequestCtx,
     ) -> atomcode_kernel::middleware::BeforeOutcome {
-        let mut state = self.lock();
-        if state.active {
-            state.tool_names.insert(call.id.clone(), call.name.clone());
-        }
+        self.note_tool_call(&call.id, &call.name);
         atomcode_kernel::middleware::BeforeOutcome::Proceed
     }
 
@@ -367,20 +457,7 @@ impl ToolMiddleware for DatalogHook {
         result: &mut ToolResult,
         _tool: Option<&std::sync::Arc<dyn atomcode_kernel::tool::Tool>>,
     ) -> AfterOutcome {
-        let mut state = self.lock();
-        if !state.active {
-            return AfterOutcome::Proceed;
-        }
-        let name = state
-            .tool_names
-            .remove(&result.call_id)
-            .unwrap_or_else(|| "unknown".to_string());
-        drop(state);
-        let status = if result.is_error { "error" } else { "ok" };
-        self.append_markdown(format!(
-            "**Tool result:** `{name}` (`{}`, {status})\n```\n{}\n```\n\n",
-            result.call_id, result.content
-        ));
+        self.record_tool_result(result);
         AfterOutcome::Proceed
     }
 }

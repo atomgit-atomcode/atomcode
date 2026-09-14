@@ -228,6 +228,11 @@ pub async fn mount(
     registry.register(Arc::new(ExecutionPolicyPlugin));
     registry.register(Arc::new(SkillCatalogPlugin));
     registry.register(Arc::new(SkillFirstPlugin));
+    // Registered but NOT in `CODING_ROWS`, and that is the whole design: for
+    // this row, mounting IS enabling, and the datalog writes a full transcript
+    // of every request to the user's disk. `datalog.enabled` defaults to false
+    // in config.toml for the same reason. A host that wants it inserts the row.
+    registry.register(Arc::new(DatalogPlugin));
     registry.register(Arc::new(InjectProvider(provider)));
 
     let mut app = App::new(registry, tree);
@@ -639,6 +644,154 @@ impl Plugin for SkillFirstPlugin {
         // putting it at the tail — is not spent by something appending after it.
         let _ = ctx.on_waterfall::<atomcode_harness::events::AgentRequest>(
             Arc::new(SkillFirst { ctx: ctx.clone() }),
+            false,
+        );
+        Ok(())
+    }
+}
+
+// ---- the datalog --------------------------------------------------------
+//
+// Not a session-log listener, which is the first thing to try and the wrong
+// answer. The session log holds FACTS — a user message, an assistant message, a
+// tool result — and the datalog's JSONL record is the ASSEMBLED REQUEST: the
+// system prompt exactly as sent, every message, the tools, the options, the
+// cache epoch. That is what a prompt-cache or a "did the model actually see it"
+// investigation reads, and it exists nowhere else in the system.
+//
+// So it needs `agent/request`, plus three cheap listeners for the turn's shape.
+// Four seams here against six kernel hook methods there, and the sink between
+// them is the same object.
+
+struct Datalog {
+    sink: Arc<atomcode_capabilities::datalog::DatalogHook>,
+}
+
+#[async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Datalog {
+    async fn handle(
+        &self,
+        req: &mut atomcode_harness::events::ModelRequest,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::AgentRequest>,
+    ) -> Result<atomcode_harness::events::ModelResponse, atomcode_harness::events::RequestError>
+    {
+        // Innermost by registration, so the record is the request the PROVIDER
+        // saw: a retry, an overflow trim or a skill-first tail all happen
+        // outside this, and a record taken before them would describe a request
+        // that was never sent. Being wrong in that direction is worse than
+        // useless — it is a log that lies while looking authoritative.
+        let ctx = atomcode_kernel::hook::TurnCtx {
+            turn_id: req.turn,
+            round: req.round,
+            request_id: req.round as u64,
+            ..Default::default()
+        };
+        self.sink
+            .record_request(&req.messages, &req.tools, &req.options, &ctx)
+            .await;
+        let answered = next.run(req).await;
+        match &answered {
+            Ok(response) => {
+                let mut message = atomcode_kernel::message::Message::assistant(
+                    response.text.clone(),
+                    response.tool_calls.clone(),
+                );
+                if !response.reasoning.is_empty() {
+                    message.reasoning = Some(response.reasoning.clone());
+                }
+                self.sink.record_response(&message);
+            }
+            Err(error) => self.sink.record_error(&error.message),
+        }
+        answered
+    }
+}
+
+/// Writes a per-turn markdown transcript and one JSONL record per round.
+pub struct DatalogPlugin;
+
+#[derive(serde::Deserialize, Default)]
+struct DatalogRow {
+    #[serde(default)]
+    working_dir: String,
+    /// Root the per-project directory is created under. Same meaning as
+    /// `datalog.dir` in config.toml, including `~` and the relative form.
+    #[serde(default)]
+    dir: Option<String>,
+}
+
+#[async_trait]
+impl Plugin for DatalogPlugin {
+    fn name(&self) -> &'static str {
+        "datalog"
+    }
+    fn description(&self) -> &'static str {
+        "write every request, response and tool result to a per-turn transcript"
+    }
+    async fn apply(&self, ctx: &Context, config: &serde_json::Value) -> Result<(), String> {
+        let row: DatalogRow = if config.is_null() {
+            DatalogRow::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        // Mounting the row IS enabling it — there is no `enabled = false` here,
+        // because a row you do not want is a row you do not insert. The config
+        // flag exists in `config.toml` for a chain that is always assembled.
+        let cfg = atomcode_config::config::DatalogConfig {
+            enabled: true,
+            dir: row.dir,
+        };
+        let llm = ctx.service::<atomcode_harness::seams::LlmSvc>();
+        let model = llm
+            .as_ref()
+            .map(|l| l.model_name().to_string())
+            .unwrap_or_default();
+        let context_window = llm.as_ref().map(|l| l.context_window()).unwrap_or(0);
+        let Some(sink) = atomcode_capabilities::datalog::DatalogHook::new(
+            std::path::PathBuf::from(row.working_dir),
+            &cfg,
+            model,
+            context_window,
+        ) else {
+            return Ok(());
+        };
+        let sink = Arc::new(sink);
+
+        // A turn opened, and with what. `TurnStarted` carries the prompt, which
+        // is the one thing `user_prompt_submit` was for.
+        let opened = sink.clone();
+        let _ = ctx.on_emit::<atomcode_harness::events::TurnStart>(
+            move |started: &atomcode_harness::events::TurnStarted| {
+                opened.begin_turn(&started.prompt);
+            },
+        );
+        // Tool results, in the order they land. These listeners are SYNC, which
+        // is why `record_tool_result` was made sync: spawning a task per result
+        // would interleave the markdown and produce a transcript in an order
+        // nothing actually happened in.
+        let tooled = sink.clone();
+        let _ = ctx.on_emit::<atomcode_harness::events::ToolResultEvent>(
+            move |result: &atomcode_kernel::tool::ToolResult| {
+                tooled.record_tool_result(result);
+            },
+        );
+        let ended = sink.clone();
+        let _ = ctx.on_emit::<atomcode_harness::events::TurnEnd>(
+            move |outcome: &atomcode_harness::seams::TurnOutcome| {
+                if let Some(error) = &outcome.error {
+                    ended.record_error(error);
+                }
+                ended.finish_turn_named(&format!("{:?}", outcome.stop));
+                // The stats are written by the line above; only the WAIT is
+                // spawned. `emit` dispatches sync listeners, so there is nowhere
+                // here to await — and what would be awaited is a flush, not a
+                // write, so nothing is lost but the timing of the fsync.
+                let flushing = ended.clone();
+                tokio::spawn(async move { flushing.flush().await });
+            },
+        );
+        let _ = ctx.on_waterfall::<atomcode_harness::events::AgentRequest>(
+            Arc::new(Datalog { sink }),
             false,
         );
         Ok(())
