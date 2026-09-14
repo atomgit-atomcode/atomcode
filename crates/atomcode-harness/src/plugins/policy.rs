@@ -566,9 +566,9 @@ impl Plugin for OutputArtifactPlugin {
         // comparison against the chain turned it up.
         super::tools::mount(
             ctx,
-            vec![Arc::new(atomcode_capabilities::tools::FetchOutputTool::new(
-                store.clone(),
-            ))],
+            vec![Arc::new(
+                atomcode_capabilities::tools::FetchOutputTool::new(store.clone()),
+            )],
         )?;
         let spill = Arc::new(atomcode_capabilities::tools::ArtifactMiddleware::new(store));
         // Appended: it rewrites the RESULT, so it must see what every earlier

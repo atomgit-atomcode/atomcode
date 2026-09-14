@@ -26,8 +26,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use atomcode_capabilities::tools::{
-    BashTool, EditFileTool, GlobTool, GrepTool, ListDirTool, ReadFileTool,
-    SearchReplaceTool, WriteFileTool,
+    BashTool, EditFileTool, GlobTool, GrepTool, ListDirTool, ReadFileTool, SearchReplaceTool,
+    WriteFileTool,
 };
 use atomcode_kernel::tool::Tool;
 use atomcode_plexus::{Context, Plugin};
