@@ -1839,16 +1839,13 @@ async fn the_provider_fails_mid_stream_in_production() {
 // (`on_harness::mount`). If the two agree, the chain can be replaced by the list
 // without anything above noticing — which is the swap, stated as a measurement.
 
-async fn on_harness(
-    script: Arc<Script>,
-    dir: &std::path::Path,
-    commands: Vec<AgentCommand>,
-) -> Vec<Step> {
+/// The hermetic scoping every on-harness scenario shares.
+///
+/// Nothing may reach the network, a subprocess, or the developer's own disk.
+fn quiet_rows(dir: &std::path::Path) -> String {
     let empty = dir.join("__no_skills__");
     let _ = std::fs::create_dir_all(&empty);
-    // The same hermetic scoping the plain candidate uses: nothing may reach the
-    // network, a subprocess, or the developer's own disk.
-    let quiet = format!(
+    format!(
         "[[patch]]\nid = \"trace\"\nconfig = {{ stream = false, tools = false, summary = false }}\n\n\
          [[patch]]\nid = \"mcp\"\ndisabled = true\n\n\
          [[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true\n\n\
@@ -1858,18 +1855,106 @@ async fn on_harness(
          [[patch]]\nid = \"project-instructions\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n",
         dir = dir.to_string_lossy(),
         home = empty.to_string_lossy(),
-    );
-    let (handle, mut app) = atomcode_coding::on_harness::mount(
+    )
+}
+
+/// A mounted coding-on-harness tree and its handle.
+///
+/// Both, for the same reason `candidate_handle` returns both: dropping the `App`
+/// unloads every row, and the next command would go to a conversation whose
+/// services have all been torn down.
+async fn on_harness_handle(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+) -> (AgentHandle, atomcode_plexus::App) {
+    let quiet = quiet_rows(dir);
+    atomcode_coding::on_harness::mount(
         dir,
         atomcode_coding::on_harness::Presence::Attended,
         script,
         &[quiet.as_str()],
     )
     .await
-    .expect("the coding-on-harness tree must mount");
-    let steps = drive_until(handle, commands, &[]).await;
+    .expect("the coding-on-harness tree must mount")
+}
+
+async fn on_harness_inner(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+    also: &[&str],
+    late: Option<AgentCommand>,
+    answer: serde_json::Value,
+) -> Vec<Step> {
+    let (handle, mut app) = on_harness_handle(script, dir).await;
+    let steps = drive_answering(handle, commands, also, late, answer).await;
     app.stop();
     steps
+}
+
+async fn on_harness(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+) -> Vec<Step> {
+    on_harness_inner(script, dir, commands, &[], None, allow()).await
+}
+
+async fn on_harness_until(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+    also: &[&str],
+) -> Vec<Step> {
+    on_harness_inner(script, dir, commands, also, None, allow()).await
+}
+
+async fn on_harness_late(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+    late: AgentCommand,
+) -> Vec<Step> {
+    on_harness_inner(script, dir, commands, &[], Some(late), allow()).await
+}
+
+// The production side needs the same three drivers, or half the scenario list
+// below could only be run against one of the two engines — which is not a
+// differential at all.
+
+async fn reference_production_until(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+    also: &[&str],
+) -> Vec<Step> {
+    drive_until(production_agent(script, dir).await.spawn(), commands, also).await
+}
+
+async fn reference_production_late(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+    late: AgentCommand,
+) -> Vec<Step> {
+    drive_with(
+        production_agent(script, dir).await.spawn(),
+        commands,
+        &[],
+        Some(late),
+    )
+    .await
+}
+
+/// Render and ratchet a pair of runs the caller drove itself.
+///
+/// `chain_vs_rows` covers the scenarios whose two sides are driven identically;
+/// the ones that cancel, steer, or wait for a late reply are not, and inventing
+/// a closure shape general enough for all of them costs more than this line.
+fn judge(key: &str, a: &[Step], b: &[Step]) -> String {
+    let report = render(a, b);
+    ratchet(key, divergences(a, b), &report);
+    report
 }
 
 /// One scenario through coding's own chain and the same product as a row list.
@@ -1975,51 +2060,28 @@ async fn reference_production_answering(
     drive_answering(agent.spawn(), commands, &[], None, answer).await
 }
 
+/// The same tree, with the driver answering approvals.
+///
+/// Disabling the `approval` row is what ENABLES asking here, which reads
+/// backwards until you see who fills the seam: that row is the `deny-risky`
+/// policy (refuse, never ask), and turning it off lets `ui-handle` claim
+/// `approval` and round-trip the driver instead. `ui-handle` PROVIDES the
+/// `approval` seam itself — behind the handle protocol the driver IS the
+/// person, so a call that needs authorization round-trips as
+/// `AgentEvent::Request`, the same observable coding's `ApprovalMiddleware`
+/// produces. Two earlier attempts here are worth recording:
+/// `bundle::INTERACTIVE` also enables `user-questions-unattended`, which takes
+/// the `user-questions` seam away from `ui-handle`; and enabling
+/// `approval-interactive` collides with `ui-handle` over `approval` itself.
+/// Both errors were the tree saying the front end had already answered this
+/// question.
 async fn on_harness_answering(
     script: Arc<Script>,
     dir: &std::path::Path,
     commands: Vec<AgentCommand>,
     answer: serde_json::Value,
 ) -> Vec<Step> {
-    let empty = dir.join("__no_skills_ask__");
-    let _ = std::fs::create_dir_all(&empty);
-    // Same hermetic scoping as the other on-harness scenarios, plus `INTERACTIVE`:
-    // it turns off the `deny-risky` policy and turns on the one that asks.
-    let quiet = format!(
-        "[[patch]]\nid = \"trace\"\nconfig = {{ stream = false, tools = false, summary = false }}\n\n\
-         [[patch]]\nid = \"mcp\"\ndisabled = true\n\n\
-         [[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true\n\n\
-         [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 8, working_dir = {dir:?} }}\n\n\
-         [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n\n\
-         [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {dir:?} }}\n\n\
-         [[patch]]\nid = \"project-instructions\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n",
-        dir = dir.to_string_lossy(),
-        home = empty.to_string_lossy(),
-    );
-    // Disabling the `approval` row is what ENABLES asking here, which reads
-    // backwards until you see who fills the seam: that row is the `deny-risky`
-    // policy (refuse, never ask), and turning it off lets `ui-handle` claim
-    // `approval` and round-trip the driver instead. Behind the handle protocol
-    // the driver IS the person. `ui-handle` PROVIDES the `approval` seam itself —
-    // behind the handle protocol the driver is the person, so a call that needs
-    // authorization round-trips as `AgentEvent::Request`, which is the same
-    // observable coding's `ApprovalMiddleware` produces. Two earlier attempts
-    // here are worth recording: `bundle::INTERACTIVE` also enables
-    // `user-questions-unattended`, which takes the `user-questions` seam away
-    // from `ui-handle`; and enabling `approval-interactive` collides with
-    // `ui-handle` over `approval` itself. Both errors were the tree saying the
-    // front end had already answered this question.
-    let (handle, mut app) = atomcode_coding::on_harness::mount(
-        dir,
-        atomcode_coding::on_harness::Presence::Attended,
-        script,
-        &[quiet.as_str()],
-    )
-    .await
-    .expect("the coding-on-harness tree must mount");
-    let steps = drive_answering(handle, commands, &[], None, answer).await;
-    app.stop();
-    steps
+    on_harness_inner(script, dir, commands, &[], None, answer).await
 }
 
 /// One approval scenario through both engines.
@@ -2186,4 +2248,492 @@ async fn headless_refuses_what_attended_would_ask_about() {
         1,
         "拒绝结束的是调用,不是回合{report}"
     );
+}
+
+// ---- the rest of the scenario list, on the harness -----------------------
+//
+// Until now the chain-vs-rows comparison covered three happy paths: a plain
+// turn, one tool call, several rounds. Everything that makes an engine swap
+// frightening — a cancel landing mid-round, a second message folding into a
+// running turn, a truncated response, a 503 with a `Retry-After`, a compaction,
+// a snapshot round trip — was measured only against the MINIMAL path, an engine
+// nobody ships. So the rig was quietest exactly where the risk lives.
+//
+// These are the same scripts and the same invariants as the minimal-path
+// scenarios above, with the production assembly on one side and the row list on
+// the other, under `*_rows` keys.
+
+#[tokio::test]
+async fn two_tool_calls_at_once_on_the_harness() {
+    let dir = scratch("two-tools-onharness");
+    seed(&dir);
+    let (a, b, report) = chain_vs_rows(
+        "two_tool_calls_rows",
+        &dir,
+        || {
+            Script::new(&[
+                Reply::Calls(
+                    "reading both",
+                    vec![
+                        ("c1", "read_file", r#"{"file_path":"a.rs"}"#),
+                        ("c2", "read_file", r#"{"file_path":"b.rs"}"#),
+                    ],
+                ),
+                Reply::Text("both read"),
+            ])
+        },
+        || say("read both"),
+    )
+    .await;
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        let started = steps.iter().filter(|s| s.kind == "ToolStarted").count();
+        let results = steps.iter().filter(|s| s.kind == "ToolResult").count();
+        assert_eq!(
+            started, results,
+            "{who}: 每个开始的调用都必须有结果，否则驱动方会永远等那一个{report}"
+        );
+        assert_eq!(started, 2, "{who}: 两个调用{report}");
+    }
+}
+
+#[tokio::test]
+async fn one_of_two_parallel_tools_fails_on_the_harness() {
+    let dir = scratch("mixed-batch-onharness");
+    seed(&dir);
+    let (a, b, report) = chain_vs_rows(
+        "mixed_batch_rows",
+        &dir,
+        || {
+            Script::new(&[
+                Reply::Calls(
+                    "both",
+                    vec![
+                        ("c1", "read_file", r#"{"file_path":"a.rs"}"#),
+                        ("c2", "read_file", r#"{"file_path":"missing.rs"}"#),
+                    ],
+                ),
+                Reply::Text("one worked"),
+            ])
+        },
+        || say("read both"),
+    )
+    .await;
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "ToolResult").count(),
+            2,
+            "{who}: 两个调用两个结果，成败无关{report}"
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|s| s.kind == "ToolBatchCompleted")
+                .count(),
+            1,
+            "{who}: 部分失败也要合上批次，否则 UI 上那一组永远转圈{report}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.kind == "ToolResult" && s.detail.contains("error=true")),
+            "{who}: 失败的那个要被报成失败{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_tool_that_does_not_exist_on_the_harness() {
+    let dir = scratch("no-such-tool-onharness");
+    let (a, b, report) = chain_vs_rows(
+        "unknown_tool_rows",
+        &dir,
+        || {
+            Script::new(&[
+                Reply::call("c1", "no_such_tool", "{}"),
+                Reply::Text("ah, my mistake"),
+            ])
+        },
+        || say("use it"),
+    )
+    .await;
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert!(
+            !steps.iter().any(|s| s.kind == "TIMEOUT"),
+            "{who}: 未知工具不能挂死回合{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_provider_fails_mid_stream_on_the_harness() {
+    let dir = scratch("provider-fails-onharness");
+    let (a, b, report) = chain_vs_rows(
+        "provider_error_rows",
+        &dir,
+        || Script::new(&[Reply::Fail("upstream exploded")]),
+        || say("go"),
+    )
+    .await;
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        let terminals = steps
+            .iter()
+            .filter(|s| matches!(s.kind, "TurnComplete" | "Error"))
+            .count();
+        assert!(terminals >= 1, "{who}: 失败也要终结回合{report}");
+        assert!(
+            !steps.iter().any(|s| s.kind == "TIMEOUT"),
+            "{who}: 失败不能表现成挂死{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_provider_fails_while_a_tool_call_is_outstanding_on_the_harness() {
+    // The dangling-call case: every `tool_call` in the history must have a
+    // paired result, or the next request is malformed and the conversation is
+    // stuck. A row list that drops the pairing would look fine event-for-event
+    // right up until the next turn.
+    let dir = scratch("dangling-onharness");
+    seed(&dir);
+    let (a, b, report) = chain_vs_rows(
+        "dangling_call_rows",
+        &dir,
+        || {
+            Script::new(&[
+                Reply::call("c1", "read_file", r#"{"file_path":"a.rs"}"#),
+                Reply::Fail("died holding the bag"),
+            ])
+        },
+        || say("read it"),
+    )
+    .await;
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        let started = steps.iter().filter(|s| s.kind == "ToolStarted").count();
+        let results = steps.iter().filter(|s| s.kind == "ToolResult").count();
+        assert_eq!(
+            started, results,
+            "{who}: provider 死掉也不能留下没有结果的调用{report}"
+        );
+        assert!(
+            !steps.iter().any(|s| s.kind == "TIMEOUT"),
+            "{who}: 必须终结{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_lands_on_the_harness() {
+    // The timing half of this does not show up in the event stream at all: the
+    // same events arrive either way, just late. A row list that queued the
+    // cancel behind the in-flight request would pass every event comparison and
+    // still feel broken to a person holding ctrl-c.
+    let dir = scratch("cancel-onharness");
+    let script = || Script::new(&[Reply::Slow(400, "working")]);
+
+    // Both engines are built BEFORE either clock starts. The first version of
+    // this timed `production_agent()` too, and `prepare()` is a real async
+    // setup step — it read 416ms for a 400ms round and blamed the cancel. It
+    // would also have been unfair the other way: mounting a plexus tree is not
+    // free either, and neither cost is what this scenario is about.
+    let chain = production_agent(script(), &dir).await;
+    let started = std::time::Instant::now();
+    let a = drive_with(chain.spawn(), say("go"), &[], Some(AgentCommand::Cancel)).await;
+    let took_chain = started.elapsed();
+
+    let (handle, mut app) = on_harness_handle(script(), &dir).await;
+    let started = std::time::Instant::now();
+    let b = drive_answering(handle, say("go"), &[], Some(AgentCommand::Cancel), allow()).await;
+    let took_rows = started.elapsed();
+    app.stop();
+    let report = judge("cancel_rows", &a, &b);
+
+    for (who, took) in [("链式", took_chain), ("行式", took_rows)] {
+        assert!(
+            took < std::time::Duration::from_millis(380),
+            "{who}: 取消用了 {took:?} —— 那一轮本来就要 400ms，说明它在等回合跑完\
+             而不是中断它{report}"
+        );
+    }
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert!(
+            !steps.iter().any(|s| s.kind == "TIMEOUT"),
+            "{who}: 取消之后回合必须结束{report}"
+        );
+        // `Cancelled` is a notification, not a terminal: it arrives BESIDE the
+        // `TurnComplete` that closes the turn. Counting it here read 2 on both
+        // engines — the assertion was wrong, not the engines.
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|s| matches!(s.kind, "TurnComplete" | "Error"))
+                .count(),
+            1,
+            "{who}: 恰好一个终结{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_second_message_steers_the_running_turn_on_the_harness() {
+    let dir = scratch("steer-onharness");
+    let script = || Script::new(&[Reply::Slow(300, "first"), Reply::Text("second")]);
+    let later = || AgentCommand::SendMessage {
+        text: "and also this".into(),
+        images: Vec::new(),
+    };
+    let a = reference_production_late(script(), &dir, say("start"), later()).await;
+    let b = on_harness_late(script(), &dir, say("start"), later()).await;
+    let report = judge("steering_rows", &a, &b);
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "TurnStarted").count(),
+            1,
+            "{who}: 插话折进正在跑的回合，不另开一个{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_truncated_response_on_the_harness() {
+    // Frozen at 2, the same number the minimal path carries: both engines run
+    // the recovery round and both report the same two usages, differing only in
+    // whether the first is reported before or after the recovery notice. A
+    // driver accumulating usage cannot tell. What matters for the swap is that
+    // the production chain adds NO new divergence on top of it.
+    let dir = scratch("truncated-onharness");
+    let (a, b, report) = chain_vs_rows(
+        "truncated_rows",
+        &dir,
+        || Script::new(&[Reply::Truncated("this got cut off mid-")]),
+        || say("write a long thing"),
+    )
+    .await;
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert!(
+            !steps.iter().any(|s| s.kind == "TIMEOUT"),
+            "{who}: 截断不能让回合悬着{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_truncation_the_model_answers_by_redumping_on_the_harness() {
+    // Frozen at 2 for the same reason as the single truncation above.
+    let dir = scratch("truncated-redump-onharness");
+    let (a, b, report) = chain_vs_rows(
+        "truncated_redump_rows",
+        &dir,
+        || Script::new(&[Reply::Truncated(REDUMPED), Reply::Truncated(REDUMPED)]),
+        || say("write a long thing"),
+    )
+    .await;
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert!(
+            !steps.iter().any(|s| s.kind == "TIMEOUT"),
+            "{who}: 重灌不能把回合挂死{report}"
+        );
+        let recoveries = steps
+            .iter()
+            .filter(|s| s.kind == "TruncationRecovery")
+            .count();
+        assert_eq!(recoveries, 1, "{who}: 检测到重灌后不能再盲续{report}");
+    }
+}
+
+#[tokio::test]
+async fn a_transient_open_failure_with_a_retry_after_on_the_harness() {
+    let dir = scratch("retry-after-onharness");
+    let (a, b, report) = chain_vs_rows(
+        "retry_after_rows",
+        &dir,
+        || {
+            Script::new(&[
+                Reply::OpenFail("no upstream available", Some(1)),
+                Reply::Text("recovered"),
+            ])
+        },
+        || say("go"),
+    )
+    .await;
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert!(
+            !steps.iter().any(|s| s.kind == "Error"),
+            "{who}: 认了 Retry-After 的瞬时 503 不该以错误收场{report}"
+        );
+        assert!(
+            steps.iter().any(|s| s.kind == "TurnComplete"),
+            "{who}: 重试后回合要正常结束{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_manual_compaction_on_the_harness() {
+    let dir = scratch("compact-onharness");
+    let cmds = || {
+        vec![
+            AgentCommand::SendMessage {
+                text: "hi".into(),
+                images: Vec::new(),
+            },
+            AgentCommand::Compact { focus: None },
+        ]
+    };
+    let a = reference_production_until(Script::text(&["ok"]), &dir, cmds(), &[]).await;
+    let b = on_harness_until(Script::text(&["ok"]), &dir, cmds(), &[]).await;
+    // Frozen at 1, the same as the minimal path: the row list emits
+    // `CompactionStarted` where the chain goes straight to `Compacted`. That
+    // event exists precisely so a driver can show "compacting…" before a
+    // possibly multi-second summary, and an engine cannot know in advance that
+    // a compaction will be quick — announcing it is the documented behaviour.
+    let report = judge("compact_rows", &a, &b);
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert!(
+            !steps.iter().any(|s| s.kind == "TIMEOUT"),
+            "{who}: 压缩请求不能挂住{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_snapshot_round_trip_on_the_harness() {
+    // A driver asks for a snapshot and waits. If the row list cannot answer,
+    // everything above it stalls — and the stall would be invisible to every
+    // other scenario here, because none of them ask.
+    let dir = scratch("snapshot-onharness");
+    let cmds = || {
+        vec![
+            AgentCommand::SendMessage {
+                text: "hi".into(),
+                images: Vec::new(),
+            },
+            AgentCommand::Snapshot,
+        ]
+    };
+    let a = reference_production_until(Script::text(&["ok"]), &dir, cmds(), &["Snapshot"]).await;
+    let b = on_harness_until(Script::text(&["ok"]), &dir, cmds(), &["Snapshot"]).await;
+    let report = judge("snapshot_rows", &a, &b);
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert!(
+            steps.iter().any(|s| s.kind == "Snapshot"),
+            "{who}: 问了快照就得答{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_message_carrying_context_on_the_harness() {
+    let dir = scratch("context-onharness");
+    let cmds = || {
+        vec![AgentCommand::SendMessageWithContext {
+            text: "given that, what next?".into(),
+            images: Vec::new(),
+            context: "the build is broken".into(),
+        }]
+    };
+    let a = reference_production(Script::text(&["fix it"]), &dir, cmds()).await;
+    let b = on_harness(Script::text(&["fix it"]), &dir, cmds()).await;
+    let report = judge("with_context_rows", &a, &b);
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "TurnStarted").count(),
+            1,
+            "{who}: 一条命令一个回合{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_synthetic_message_on_the_harness() {
+    let dir = scratch("synthetic-onharness");
+    let cmds = || {
+        vec![AgentCommand::SendSyntheticMessage {
+            text: "keep going".into(),
+        }]
+    };
+    let a = reference_production(Script::text(&["carrying on"]), &dir, cmds()).await;
+    let b = on_harness(Script::text(&["carrying on"]), &dir, cmds()).await;
+    let report = judge("synthetic_rows", &a, &b);
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert!(
+            !steps.iter().any(|s| s.kind == "TIMEOUT"),
+            "{who}: 合成消息也要跑完一个回合{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_second_turn_sees_the_first_on_the_harness() {
+    // Continuity across turns. The row list holds the conversation in a service
+    // rather than in a middleware chain's captured state, so "does turn two see
+    // turn one" is a question the swap genuinely reopens.
+    let dir = scratch("two-turns-onharness");
+    let script = || Script::text(&["first answer", "second answer"]);
+    let asked = ["remember the number 41", "what number?"];
+
+    let a = drive_turns(production_agent(script(), &dir).await.spawn(), &asked).await;
+    let (handle, mut app) = on_harness_handle(script(), &dir).await;
+    let b = drive_turns(handle, &asked).await;
+    app.stop();
+    let report = judge("two_turns_rows", &a, &b);
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "TurnStarted").count(),
+            2,
+            "{who}: 两条消息两个回合{report}"
+        );
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "TurnComplete").count(),
+            2,
+            "{who}: 各自终结{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_context_a_message_carries_reaches_the_model_on_the_harness() {
+    // Not a diff: an event-stream comparison cannot answer this. Every event
+    // could match while the context was silently dropped on the way to the
+    // provider. The judge is the snapshot — what the model was actually shown.
+    let dir = scratch("context-visible-onharness");
+    let cmds = || {
+        vec![AgentCommand::SendMessageWithContext {
+            text: "what is broken?".into(),
+            images: Vec::new(),
+            context: "the build fails on line 41".into(),
+        }]
+    };
+    let seen_chain = transcript(
+        production_agent(Script::text(&["ok"]), &dir).await.spawn(),
+        cmds(),
+    )
+    .await;
+    let (handle, mut app) = on_harness_handle(Script::text(&["ok"]), &dir).await;
+    let seen_rows = transcript(handle, cmds()).await;
+    app.stop();
+
+    for (who, seen) in [("链式", &seen_chain), ("行式", &seen_rows)] {
+        assert!(
+            seen.contains("the build fails on line 41"),
+            "{who}: 上下文没到模型面前：\n{seen}"
+        );
+        assert!(
+            seen.contains("what is broken?"),
+            "{who}: 提问也得在：\n{seen}"
+        );
+    }
 }
