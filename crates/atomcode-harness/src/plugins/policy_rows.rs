@@ -294,12 +294,20 @@ impl crate::seams::ApprovalPolicy for AskingPolicy {
         let scope = tool.always_grant_scope(&call.arguments);
         // The remembered key is the tool and its scope; the scope alone is what
         // the person is shown, because the tool is already on the card.
+        // `NEVER_GRANT` is a gate saying "this one may never be remembered"
+        // (writing to a credential file, say). Then there is nothing to look up,
+        // and — below — nothing to offer: showing "always allow" for a decision
+        // that will be asked again anyway tells the person something untrue.
+        // NOT the empty scope, which several tools already use to mean the
+        // opposite: a TOOL-WIDE grant.
+        let grantable = scope != crate::seams::NEVER_GRANT;
         let grant = format!("{}::{scope}", tool.name());
-        if self
-            .granted
-            .lock()
-            .expect("grants poisoned")
-            .contains(&grant)
+        if grantable
+            && self
+                .granted
+                .lock()
+                .expect("grants poisoned")
+                .contains(&grant)
         {
             return Decision::Allow;
         }
@@ -312,16 +320,28 @@ impl crate::seams::ApprovalPolicy for AskingPolicy {
                 Some(who) => format!("Allow `{}` to run, asked for by `{who}`?", tool.name()),
                 None => format!("Allow `{}` to run?", tool.name()),
             },
-            options: vec![
-                crate::seams::Answer::labelled(crate::seams::ANSWER_ALLOW, "allow once"),
-                crate::seams::Answer::labelled(crate::seams::ANSWER_ALWAYS, "always allow"),
-                crate::seams::Answer::labelled(crate::seams::ANSWER_DENY, "deny"),
-            ],
+            options: {
+                let mut o = vec![crate::seams::Answer::labelled(
+                    crate::seams::ANSWER_ALLOW,
+                    "allow once",
+                )];
+                if grantable {
+                    o.push(crate::seams::Answer::labelled(
+                        crate::seams::ANSWER_ALWAYS,
+                        "always allow",
+                    ));
+                }
+                o.push(crate::seams::Answer::labelled(
+                    crate::seams::ANSWER_DENY,
+                    "deny",
+                ));
+                o
+            },
             asker,
             about: Some(crate::seams::AboutCall {
                 tool: tool.name().to_string(),
                 arguments: call.arguments.clone(),
-                grant: Some(scope),
+                grant: grantable.then_some(scope),
             }),
         };
         match questions.ask(&question).await.as_deref() {

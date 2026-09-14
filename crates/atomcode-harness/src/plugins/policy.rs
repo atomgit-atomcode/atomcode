@@ -286,6 +286,22 @@ impl Plugin for ResultCapPlugin {
 struct AsRisky {
     inner: Arc<dyn Tool>,
     name: String,
+    /// What an `allow always` should be remembered against, when the gate has a
+    /// narrower idea of "the same call" than the raw arguments. `None` = whatever
+    /// the wrapped tool says.
+    ///
+    /// It matters because the grant store is keyed `{tool}::{scope}`: a gate that
+    /// remembered raw arguments would re-ask for every spelling of one decision.
+    scope: Option<String>,
+    /// Whether "allow always" may be offered at all.
+    ///
+    /// `false` for decisions that must be taken every time — writing to a
+    /// credential file is the case that forced it. The honest way to express that
+    /// is to NOT OFFER the option: a person who is shown "always allow", presses
+    /// it, and is asked again next time has been told something untrue about
+    /// their own permission. An empty grant scope is how that reaches the
+    /// approval policy, which reads it and drops the option.
+    grantable: bool,
 }
 
 #[async_trait]
@@ -312,7 +328,12 @@ impl Tool for AsRisky {
         self.inner.parallel_safe(args)
     }
     fn always_grant_scope(&self, args: &str) -> String {
-        self.inner.always_grant_scope(args)
+        if !self.grantable {
+            return crate::seams::NEVER_GRANT.to_string();
+        }
+        self.scope
+            .clone()
+            .unwrap_or_else(|| self.inner.always_grant_scope(args))
     }
     async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         self.inner.execute(args, ctx).await
@@ -352,6 +373,8 @@ impl Waterfall<ToolsExecute> for SensitivePathGate {
         let as_risky: Arc<dyn Tool> = Arc::new(AsRisky {
             name: format!("{} (sensitive path)", tool.name()),
             inner: tool,
+            scope: None,
+            grantable: true,
         });
         match policy.decide(&exec.call, &as_risky).await {
             Decision::Allow => next.run(exec).await,
@@ -545,6 +568,368 @@ impl Plugin for OutputArtifactPlugin {
                 spill,
             }),
             false,
+        );
+        Ok(())
+    }
+}
+
+// ---- credentials in the generic shell ------------------------------------
+//
+// The third gate to move, and the first that has to ASK. Everything about the
+// asking is delegated: the row decides only WHETHER this call touches
+// credentials (`credential_shell_verdict`, shared with the kernel shell), then
+// hands the question to the `approval` seam, which owns the prompt, the wording
+// and the `{tool}::{scope}` grant memory.
+//
+// That is the structural difference from coding, where each gate carried its own
+// `PermissionStore`: here one store answers for every gate, so "allow always"
+// means the same thing no matter which gate asked.
+
+struct CredentialShell {
+    ctx: Context,
+    policy: atomcode_capabilities::tools::CredentialShellPolicy,
+}
+
+#[async_trait]
+impl Waterfall<ToolsExecute> for CredentialShell {
+    async fn handle(&self, exec: &mut ToolExec, next: Next<'_, ToolsExecute>) -> ToolResult {
+        use atomcode_capabilities::tools::credential_bash_gate::{
+            credential_shell_verdict, grant_scope, CredentialShellVerdict,
+            CREDENTIAL_BASH_DENIAL_REASON,
+        };
+        if exec.pre_approved {
+            return next.run(exec).await;
+        }
+        let policy = self.ctx.service::<ApprovalSvc>();
+        // No `approval` row mounted is this shell's "nobody to ask": the same
+        // condition the kernel gate reads off a missing `PermissionStore`.
+        let verdict = credential_shell_verdict(
+            self.policy,
+            &exec.call.name,
+            &exec.call.arguments,
+            policy.is_some(),
+        );
+        let refuse = |reason: &str| ToolResult {
+            call_id: exec.call.id.clone(),
+            content: format!("Refused: {reason}"),
+            is_error: true,
+            images: vec![],
+        };
+        match verdict {
+            CredentialShellVerdict::NotOurs => return next.run(exec).await,
+            // The turn-ending variant of `strict` is a kernel notion (it carries a
+            // `PolicyIntervention`); here the call is refused and the loop decides
+            // what to do with a refusal, which is the harness's own vocabulary.
+            CredentialShellVerdict::DenyTurn | CredentialShellVerdict::Deny => {
+                return refuse(CREDENTIAL_BASH_DENIAL_REASON)
+            }
+            CredentialShellVerdict::Ask => {}
+        }
+        let (Some(policy), Some(toolbox)) = (policy, self.ctx.service::<ToolsSvc>()) else {
+            return refuse(CREDENTIAL_BASH_DENIAL_REASON);
+        };
+        let Some(tool) = toolbox.get(&exec.call.name) else {
+            return next.run(exec).await;
+        };
+        let asking: Arc<dyn Tool> = Arc::new(AsRisky {
+            name: format!("{} (credential access)", tool.name()),
+            inner: tool,
+            // Keyed on the SAME normalized scope the kernel gate grants against,
+            // so one "allow always" covers the same set of commands either way.
+            scope: Some(grant_scope(&exec.call.arguments)),
+            grantable: true,
+        });
+        match policy.decide(&exec.call, &asking).await {
+            Decision::Allow => {
+                exec.pre_approved = true;
+                next.run(exec).await
+            }
+            Decision::Deny(why) => refuse(&format!("{CREDENTIAL_BASH_DENIAL_REASON} ({why})")),
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CredentialShellRow {
+    /// `off` | `prompt` | `strict`. Defaults to the L1 default (`prompt`).
+    policy: Option<String>,
+}
+
+pub struct CredentialShellPlugin;
+
+#[async_trait]
+impl Plugin for CredentialShellPlugin {
+    fn name(&self) -> &'static str {
+        "tool-credential-shell"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools"]
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["approval"]
+    }
+    fn description(&self) -> &'static str {
+        "a shell command that would expose credentials is asked about, or refused"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        use atomcode_capabilities::tools::CredentialShellPolicy;
+        let row: CredentialShellRow = if config.is_null() {
+            CredentialShellRow::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        let policy = match row.policy.as_deref() {
+            None | Some("prompt") => CredentialShellPolicy::Prompt,
+            Some("off") => CredentialShellPolicy::Off,
+            Some("strict") => CredentialShellPolicy::Strict,
+            Some(other) => {
+                return Err(format!(
+                    "`tool-credential-shell` policy must be off / prompt / strict, not `{other}`"
+                ))
+            }
+        };
+        let _ = ctx.on_waterfall::<ToolsExecute>(
+            Arc::new(CredentialShell {
+                ctx: ctx.clone(),
+                policy,
+            }),
+            true,
+        );
+        Ok(())
+    }
+}
+
+// ---- writes outside the workspace ---------------------------------------
+//
+// The fourth gate, and the first that needs "ask, but never remember": writing
+// to a key or a `.env` is asked about EVERY time. That reaches the approval
+// policy as an empty grant scope, which drops the "always allow" option rather
+// than offering a button that would not hold.
+
+struct WriteApproval {
+    ctx: Context,
+    working_dir: std::path::PathBuf,
+    accept_edits: bool,
+}
+
+#[async_trait]
+impl Waterfall<ToolsExecute> for WriteApproval {
+    async fn handle(&self, exec: &mut ToolExec, next: Next<'_, ToolsExecute>) -> ToolResult {
+        use atomcode_capabilities::tools::write_approval::{write_verdict, WriteVerdict};
+        if exec.pre_approved {
+            return next.run(exec).await;
+        }
+        let verdict = write_verdict(
+            &exec.call.name,
+            &exec.call.arguments,
+            Some(self.working_dir.as_path()),
+            self.accept_edits,
+        )
+        .await;
+        let (grantable, scope) = match verdict {
+            WriteVerdict::NotOurs => return next.run(exec).await,
+            // Authorized without asking — say so downstream so no later gate asks.
+            WriteVerdict::Allow(_) => {
+                exec.pre_approved = true;
+                return next.run(exec).await;
+            }
+            WriteVerdict::Ask { grantable, scope } => (grantable, scope),
+        };
+        let (Some(policy), Some(toolbox)) = (
+            self.ctx.service::<ApprovalSvc>(),
+            self.ctx.service::<ToolsSvc>(),
+        ) else {
+            return next.run(exec).await;
+        };
+        let Some(tool) = toolbox.get(&exec.call.name) else {
+            return next.run(exec).await;
+        };
+        let asking: Arc<dyn Tool> = Arc::new(AsRisky {
+            name: if grantable {
+                format!("{} (outside the workspace)", tool.name())
+            } else {
+                format!("{} (sensitive target)", tool.name())
+            },
+            inner: tool,
+            scope: Some(scope),
+            grantable,
+        });
+        match policy.decide(&exec.call, &asking).await {
+            Decision::Allow => {
+                // The person said yes: say so downstream, or the ordinary
+                // approval behind this row asks the same question again.
+                exec.pre_approved = true;
+                next.run(exec).await
+            }
+            Decision::Deny(why) => ToolResult {
+                call_id: exec.call.id.clone(),
+                content: format!("Refused: {why}"),
+                is_error: true,
+                images: vec![],
+            },
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct WriteApprovalRow {
+    working_dir: Option<String>,
+    /// Auto-approve non-sensitive edits. Coding carries this as a live flag the
+    /// person toggles mid-session; here it is mount-time, like the other rows'
+    /// working dir. Making it live is a later, visible change — not silent drift.
+    accept_edits: bool,
+}
+
+pub struct WriteApprovalPlugin;
+
+#[async_trait]
+impl Plugin for WriteApprovalPlugin {
+    fn name(&self) -> &'static str {
+        "tool-write-approval"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools"]
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["approval"]
+    }
+    fn description(&self) -> &'static str {
+        "a write outside the workspace is asked about; a sensitive one, every time"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: WriteApprovalRow = if config.is_null() {
+            WriteApprovalRow::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        let working_dir = std::path::PathBuf::from(row.working_dir.as_deref().unwrap_or("."));
+        let _ = ctx.on_waterfall::<ToolsExecute>(
+            Arc::new(WriteApproval {
+                ctx: ctx.clone(),
+                working_dir,
+                accept_edits: row.accept_edits,
+            }),
+            true,
+        );
+        Ok(())
+    }
+}
+
+// ---- destructive bash outside the workspace ------------------------------
+//
+// The fifth and last of coding's approval gates.
+//
+// Unlike the others this one does NOT share its whole shell with the kernel
+// gate. The DETECTION is shared (`bash_workspace_verdict` calls the same
+// `scan_destructive_bash`, `mv_moves` and workspace classification); what
+// differs is the bookkeeping. The kernel gate grants per out-of-workspace
+// DIRECTORY and auto-allows only when every one of them is already granted;
+// the harness store holds one scope per decision, so the verdict joins those
+// directories into a single scope.
+//
+// That is narrower — a later command touching only one of those directories
+// asks again — and narrower is the safe direction. It also makes the "ride
+// along" hazard the kernel gate guards against by hand
+// (`rm /granted/x && mv ws_file /tmp/stolen`) impossible by construction.
+
+struct BashWorkspace {
+    ctx: Context,
+    working_dir: std::path::PathBuf,
+}
+
+#[async_trait]
+impl Waterfall<ToolsExecute> for BashWorkspace {
+    async fn handle(&self, exec: &mut ToolExec, next: Next<'_, ToolsExecute>) -> ToolResult {
+        use atomcode_capabilities::tools::bash_workspace_gate::{
+            bash_workspace_verdict, BashWorkspaceVerdict,
+        };
+        if exec.pre_approved {
+            return next.run(exec).await;
+        }
+        let (Some(policy), Some(toolbox)) = (
+            self.ctx.service::<ApprovalSvc>(),
+            self.ctx.service::<ToolsSvc>(),
+        ) else {
+            return next.run(exec).await;
+        };
+        let Some(tool) = toolbox.get(&exec.call.name) else {
+            return next.run(exec).await;
+        };
+        let verdict = bash_workspace_verdict(
+            &exec.call.name,
+            &exec.call.arguments,
+            Some(self.working_dir.as_path()),
+            &tool.always_grant_scope(&exec.call.arguments),
+        )
+        .await;
+        let (grantable, scope) = match verdict {
+            // In-workspace is a DEFER, not an allow: a recursive `rm` is still risky
+            // and must reach the ordinary approval behind us.
+            BashWorkspaceVerdict::Defer => return next.run(exec).await,
+            BashWorkspaceVerdict::Ask { grantable, scope } => (grantable, scope),
+        };
+        let asking: Arc<dyn Tool> = Arc::new(AsRisky {
+            name: if grantable {
+                format!("{} (writes outside the workspace)", tool.name())
+            } else {
+                format!("{} (destructive, sensitive target)", tool.name())
+            },
+            inner: tool,
+            scope: Some(scope),
+            grantable,
+        });
+        match policy.decide(&exec.call, &asking).await {
+            Decision::Allow => {
+                exec.pre_approved = true;
+                next.run(exec).await
+            }
+            Decision::Deny(why) => ToolResult {
+                call_id: exec.call.id.clone(),
+                content: format!("Refused: a destructive command was not approved ({why})"),
+                is_error: true,
+                images: vec![],
+            },
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct BashWorkspaceRow {
+    working_dir: Option<String>,
+}
+
+pub struct BashWorkspacePlugin;
+
+#[async_trait]
+impl Plugin for BashWorkspacePlugin {
+    fn name(&self) -> &'static str {
+        "tool-bash-workspace"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools"]
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["approval"]
+    }
+    fn description(&self) -> &'static str {
+        "a destructive shell command reaching outside the workspace is asked about"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: BashWorkspaceRow = if config.is_null() {
+            BashWorkspaceRow::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        let working_dir = std::path::PathBuf::from(row.working_dir.as_deref().unwrap_or("."));
+        let _ = ctx.on_waterfall::<ToolsExecute>(
+            Arc::new(BashWorkspace {
+                ctx: ctx.clone(),
+                working_dir,
+            }),
+            true,
         );
         Ok(())
     }

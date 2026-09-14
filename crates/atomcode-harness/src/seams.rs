@@ -541,6 +541,16 @@ pub trait AgentLoop: Send + Sync {
 }
 
 /// Whether a tool call may run, asked before execution.
+/// A grant scope meaning "this decision may never be remembered".
+///
+/// It needs a value of its own because EMPTY is already taken: several tools
+/// return an empty scope to mean a TOOL-WIDE grant — "always allow every edit
+/// this session" (`tools/edit.rs`, `tools/parallel_edit.rs`). Reusing empty for
+/// "never" silently turned those into un-grantable, which is how this constant
+/// came to exist. A NUL byte is not a path, an argument or a command, so nothing
+/// real collides with it.
+pub const NEVER_GRANT: &str = "\u{0}never-grant";
+
 #[async_trait]
 pub trait ApprovalPolicy: Send + Sync {
     async fn decide(
