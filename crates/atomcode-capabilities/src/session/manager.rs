@@ -22,7 +22,7 @@ use serde::{de::IgnoredAny, Deserialize, Serialize};
 use super::presentation::{
     DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole, MAX_PRESENTATION_BYTES,
 };
-use super::transcript::{TurnTimestamp, RECORD_VERSION};
+use super::transcript::{TurnRecord, TurnTimestamp, RECORD_VERSION};
 
 /// Fast-listing metadata for ONE session — read to populate a `/resume` picker WITHOUT
 /// parsing the (large) snapshot / transcript files. Persisted as `<id>.meta`.
@@ -3008,6 +3008,50 @@ impl SessionManager {
         Ok(timestamps)
     }
 
+    /// Load the FULL per-turn transcript for `id` from `<id>.jsonl` — the same
+    /// never-compacted ground truth the `recall` tool reads. Unlike the runtime
+    /// snapshot, this is UNAFFECTED by compaction, so a UI can show the complete
+    /// session trajectory (including turns compaction dropped from the snapshot).
+    /// A missing file is an empty transcript (the session may not have completed a
+    /// turn yet); memory is bounded by the same `MAX_JSONL_*` caps recall uses.
+    pub fn load_transcript_records(&self, id: &str) -> SessionResult<Vec<TurnRecord>> {
+        let path = self.jsonl_path(id)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(io_at(&path, error)),
+        }
+        // `for_each_jsonl_line` already gates the file at `MAX_JSONL_BYTES` before reading,
+        // so no separate byte pre-check is needed. The per-line count cap below is the one
+        // guard we add over the sibling `load_transcript_timestamps`: we accumulate a `Vec`
+        // of full records (it only builds a turn-keyed map), so bound the record count too.
+        let mut out = Vec::new();
+        for_each_jsonl_line(&path, |line| {
+            if out.len() >= MAX_JSONL_LINES {
+                return Err(SessionStoreError::TooLarge {
+                    kind: "session transcript lines",
+                    limit: MAX_JSONL_LINES,
+                    actual: out.len() + 1,
+                });
+            }
+            let record: TurnRecord =
+                serde_json::from_slice(line).map_err(|error| SessionStoreError::Corrupt {
+                    kind: "transcript record",
+                    message: format!("{}: {error}", path.display()),
+                })?;
+            if record.v > RECORD_VERSION {
+                return Err(SessionStoreError::FutureSchema {
+                    kind: "transcript record",
+                    found: record.v,
+                    supported: RECORD_VERSION,
+                });
+            }
+            out.push(record);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     fn ensure_native_writable(&self, id: &str, operation: &'static str) -> SessionResult<()> {
         match self.read_meta(id) {
             Ok(meta) if meta.owner == StorageOwner::Legacy => {
@@ -4520,6 +4564,42 @@ mod tests {
         assert_eq!(timestamps[&7].completed_at, 1_700_000_000_123);
         assert_eq!(timestamps[&8].started_at, None);
         assert_eq!(timestamps[&8].completed_at, 1_700_000_001_123);
+    }
+
+    #[test]
+    fn transcript_records_load_full_bodies_and_missing_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        // Missing transcript → empty, not an error.
+        assert!(mgr.load_transcript_records("missing").unwrap().is_empty());
+
+        for turn in 1..=3u64 {
+            let line = serde_json::json!({
+                "v": 1,
+                "ts": 1_700_000_000_000_i64 + turn as i64,
+                "iso": "2023-11-14T22:13:20.000Z",
+                "session_id": "s1",
+                "turn_id": turn,
+                "undone": false,
+                "user": format!("question {turn}"),
+                "assistant": format!("answer {turn}"),
+                "tools": [],
+                "usage": { "prompt": 1, "completion": 2, "cached": 0 }
+            });
+            let mut bytes = serde_json::to_vec(&line).unwrap();
+            bytes.push(b'\n');
+            mgr.append_jsonl_line("s1", &bytes).unwrap();
+        }
+
+        // The FULL trajectory comes back — every turn with its raw bodies, including
+        // the early turns a snapshot compaction would have dropped. This is the read
+        // the daemon transcript endpoint serves to the UI.
+        let records = mgr.load_transcript_records("s1").unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].turn_id, 1);
+        assert_eq!(records[0].user, "question 1");
+        assert_eq!(records[0].assistant, "answer 1");
+        assert_eq!(records[2].user, "question 3");
     }
 
     fn presentation_entry(anchor: DisplayAnchor, text: &str) -> PresentationEntry {

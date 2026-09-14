@@ -2190,6 +2190,56 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
     }
 }
 
+/// The full, never-compacted per-turn trajectory of a session — the same ground
+/// truth the `recall` tool reads (`<id>.jsonl`), turn-granular and UNAFFECTED by
+/// compaction, so a UI can surface history the runtime snapshot dropped.
+#[derive(serde::Serialize)]
+struct SessionTranscript {
+    session_id: String,
+    turns: Vec<atomcode_capabilities::session::TurnRecord>,
+}
+
+/// GET /projects/:hash/sessions/:id/transcript - Full never-compacted per-turn
+/// trajectory. READ-ONLY: it does not touch the runtime snapshot, compaction, or
+/// what the model sees — it only exposes the transcript that is already written on
+/// every turn. Serves the UI's "view compacted history" affordance.
+async fn get_session_transcript(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
+    // Gate on the session resolving, mirroring `get_session_detail`'s 404 semantics.
+    match crate::legacy_convert::load_catalog_session_view_in_project(&hash, &id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, Json("Session not found")).into_response(),
+        Err(e) => {
+            return (StatusCode::NOT_FOUND, Json(format!("Failed to load session: {e}")))
+                .into_response();
+        }
+    }
+    let task_hash = hash.clone();
+    let task_id = id.clone();
+    let loaded = tokio::task::spawn_blocking(move || {
+        let manager =
+            NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(&task_hash));
+        manager.load_transcript_records(&task_id)
+    })
+    .await;
+    match loaded {
+        Ok(Ok(turns)) => Json(SessionTranscript {
+            session_id: id,
+            turns,
+        })
+        .into_response(),
+        Ok(Err(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(format!("transcript unavailable: {error}")),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(format!("transcript task failed: {error}")),
+        )
+            .into_response(),
+    }
+}
+
 /// Display-only image sidecar: the ORIGINAL images of VL-preprocessed user messages.
 ///
 /// When the active model lacks vision, the runtime's VL seam strips the image from the
@@ -6481,6 +6531,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route(
             "/projects/:hash/sessions/:id",
             get(get_session_detail).delete(delete_session),
+        )
+        .route(
+            "/projects/:hash/sessions/:id/transcript",
+            get(get_session_transcript),
         )
         .route("/projects/:hash/sessions/:id/rename", patch(rename_session))
         .route("/projects/:hash/sessions/:id/repair", post(repair_session))
