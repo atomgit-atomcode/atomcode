@@ -41,6 +41,10 @@
 分支 feat/coding-on-harness-approval   worktree: .claude/worktrees/approval-diff
   6504f4ca  审批差分上线,找出一处真分歧
   2f59c73b  Presence 规则,分歧 2 → 0
+  f2f5be3e  本文档
+  9124aed2  裁判铺宽:3 条 → 20 条
+  9471d802  自纠错回路补成行(verify-cadence)
+  4d63c0c6  催检查不能盖过人的话
 ```
 
 **两个分支都没 push。** 第二个分支尚未合回第一个。
@@ -51,15 +55,22 @@
 
 ```
 *_prod         coding 生产链 vs 通用 harness 树     6 条,全 0
-*_rows         coding 生产链 vs coding 装在 harness  3 条,全 0
+*_rows         coding 生产链 vs coding 装在 harness 23 条
+                 其中 20 条为 0
+                 compact_rows=1 / truncated_rows=2 / truncated_redump_rows=2
+                 —— 与最小路径的基线逐个相等
 approval_*     审批,两侧都开着跑                     2 条,全 0(曾是 2)
-truncated / truncated_redump                        各 2(最小路径的既有分歧)
+verify_cadence_* 自纠错回路,三态(headless / attended / 人禁了命令) 全 0
 ```
 
-差分台 34/34，coding 全量 505/505，capabilities 909/909。
+差分台 53/53，coding 全量 523/523。
 
-**没有覆盖到的**：取消、steering、截断、重试、压缩、快照 —— 这些只在 `*_prod`
-上跑过，**没在 `*_rows`（即 coding-on-harness）上跑过**。铺宽它们是下一步。
+`*_rows` 那三个非零值**不是新分歧**：最小路径本来就是 compact=1、truncated=2、
+truncated_redump=2，一模一样。也就是说**生产那条中间件链没有引入任何新偏离**，
+行清单对两个参考的偏差是同一处、同一大小。三处都在测试里写了为什么是良性的。
+
+**仍然没有覆盖到的**：多 agent 编排、真 provider、session 持久化落盘
+（`session-persistence-jsonl` 在差分里是关掉的）。
 
 ## 已定的决策（不要重议）
 
@@ -112,22 +123,59 @@ fs2 文件锁，锁基线文件本身。
 
 ## 下一步（建议顺序）
 
-1. **把 `*_rows` 铺到和 `*_prod` 一样宽** —— 取消、steering、截断、重试、压缩、
-   快照各跑一遍。体力活，但每步都有裁判。
-2. **`DatalogHook` / `CCExternalHooks` 换壳** —— 生产链上仅剩的两个。都不是审批
-   闸门，各带一半 `LifecycleHooks`，要映射到 harness 另一套缝；`cc-hooks` 还要给
-   harness 开一个 feature（只需 `tools`+`dirs`+`tokio/process`，代价接近零）。
-   `GitPushLabelMiddleware` 够不着（在 `atomgit` feature 后面，开它要拉 reqwest +
-   auth，不值得）。`PermissionRuleGate` 不用搬（harness `permissions` 行已自实现）。
+> **这一节 09-14 重写过一次。** 原来的第 2 步写「`DatalogHook` / `CCExternalHooks`
+> —— 生产链上仅剩的两个」，**这句是错的，别照着它估工作量**。照单核对
+> `parts::assemble` 的 15 个 `ToolMiddleware` + 13 个 `LifecycleHooks` 之后，
+> 真正没有对应行的是**五个**，其中最要紧的一个当时根本没被点到。
+
+### 生产链还缺的行（逐条核对过，2026-09-14）
+
+| 缺的东西 | 是什么 | 状态 |
+|---|---|---|
+| `VerifyCadenceHook` | 改了代码不检查就走 → 补一轮追问 | **已补**(`9471d802`) |
+| `TurnExecutionPolicy` | 每回合的用户执行边界(「不要跑任何命令」) | 未补 |
+| `SkillFirstHook` | 先用 skill 的推动 | 未补 |
+| `DatalogHook` | 落盘的 transcript(hook + middleware 各一半) | 未补 |
+| `CCExternalHooks` | 用户的 `hooks.json` 外部钩子 | 未补 |
+| `GitPushLabelMiddleware` | — | 够不着,在 `atomgit` feature 后面,开它要拉 reqwest+auth |
+| `PermissionRuleGate` | — | 不用搬,harness `permissions` 行已自实现 |
+
+1. **`TurnExecutionPolicy` 换壳** —— 现在最该做的一个，因为它是**安全边界**：
+   生产链把它注册在「每一个可能 `Allow` 的中间件之前」。形状很顺：
+   `pre_request` → `AgentRequest` 瀑布的 `next.run` 之前读 `req.messages`；
+   `before` → `Waterfall<ToolsExecute>`，挡掉策略禁止的 bash。一行注册两处，
+   共享一个 `Arc`。判断函数 `execution_policy_for_messages` 已经收 `&[Message]`。
+   **写场景的办法**：让脚本在被禁的前提下去跑 bash，比较两边是否都拒。
+2. **`SkillFirstHook` / `DatalogHook` / `CCExternalHooks`** —— 都不是审批闸门。
+   `cc-hooks` 要给 harness 开一个 feature（只需 `tools`+`dirs`+`tokio/process`，
+   代价接近零）。`DatalogHook` 的观测价值是实打实的（memory 里那条
+   「TUI 看不到 ≠ 没生效，先 grep datalog」说的就是它）。
 3. **然后才切 `build_coding_agent` 的默认路径**，并留一个逃生开关（参照当初
    `--engine v1`）。
 4. 阶段二：把 `on_harness.rs` 里的 `CODING_ROWS` 常量变成可配置数据。
 
+### 补 VerifyCadence 时学到的、下一条也用得上的
+
+- **harness 没有 `offer_continuation`，但续问是做得到的**，而且
+  `truncation-recovery` 行早就在这么干：`agent/request` 看刚跑完那一轮，
+  要续就往 agent 的 inbox 里 `send_from(text, MessageOrigin::Harness)`。
+  循环判「回合结束了没」时重读的正是 `inbox().has_waking_input()`。
+- 用 `MessageOrigin::Harness` 入队，会记成 `InjectionOrigin::Continuation`，
+  渲染成一条 **synthetic user 消息** —— 跟 `offer_continuation` 产出的完全一样，
+  所以 `verify_reminder_already_present` / `current_real_user_start` 原样可用。
+- **瀑布注册用 `prepend = true`（最外层）**，这样看到的是*结算后*的那一轮：
+  限流等待、重试、溢出裁剪、截断续写都发生在它里面。
+- 判断抽成中立函数（`&Conversation` → `&[Message]`），跟五个闸门同一个手法。
+  两种形状问同一个问题、发同一句话，纪律不会在两套装配之间漂。
+- **负对照是必须的**：只测「headless 两边都追问」等于没测，一个从不追问的行清单
+  也能通过 attended 那一半。三态都要写:headless 追、attended 不追、人禁了命令
+  也不追。第三条上线时先验过「把判断摘掉测试会红」才算数。
+
 ## 怎么验证
 
 ```sh
-cargo nextest run -p atomcode-coding --test differential   # 34/34,裁判
-cargo nextest run -p atomcode-coding                       # 505/505
+cargo nextest run -p atomcode-coding --test differential   # 53/53,裁判
+cargo nextest run -p atomcode-coding                       # 523/523
 cargo nextest run -p atomcode-capabilities                 # 909/909
 cargo nextest run -p atomcode-harness --test policy_rows   # 24/24(全量会红,见上)
 git status --short gates/                                  # 基线只准降,不准手改
