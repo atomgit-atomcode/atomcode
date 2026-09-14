@@ -1162,12 +1162,19 @@ impl Tui {
         }
     }
 
-    /// The menu a right-click opens over the composer.
+    /// The menu a right-click opens, and what is in it.
     ///
-    /// Right-click anywhere opens it: the menu is about what is being typed, and
-    /// requiring the pointer to be inside the field would make it disappear
-    /// exactly when someone reached for it — the field is two rows tall and the
-    /// pointer is rarely already on it.
+    /// Where the press landed decides what can be done there. `清空` and `发送`
+    /// act on what is being typed, and a press over the conversation is about the
+    /// text it landed on — offering them there would be a menu whose items
+    /// belong to a box that is not under the pointer. So outside the composer
+    /// the menu keeps the one thing that is still true of the press: copying
+    /// what is selected. Inside it, the four the composer has.
+    ///
+    /// The press is answered from the last painted frame (`Host::field_rect`)
+    /// rather than from a fresh compose: which rect the field had is what was on
+    /// screen when the button went down, and re-deriving it here could disagree
+    /// with the picture the person was looking at.
     fn open_composer_menu(&self, x: u16, y: u16) {
         // What "copy" will act on, named: a selection is what this menu is
         // about when there is one, and a label that says "全文" over a selection
@@ -1181,12 +1188,28 @@ impl Tui {
         } else {
             crate::menu::Item::new("copy", "复制全文").about("把输入框写到剪贴板")
         };
-        let items = vec![
-            copy,
-            crate::menu::Item::new("paste", "粘贴").about("从剪贴板插入"),
-            crate::menu::Item::new("clear", "清空").about("丢掉草稿和附件"),
-            crate::menu::Item::new("send", "发送").about("把这一条交给模型"),
-        ];
+        let in_composer = self
+            .host
+            .field_rect()
+            .is_some_and(|field| field.contains(x, y));
+        let items = if in_composer {
+            vec![
+                copy,
+                crate::menu::Item::new("paste", "粘贴").about("从剪贴板插入"),
+                crate::menu::Item::new("clear", "清空").about("丢掉草稿和附件"),
+                crate::menu::Item::new("send", "发送").about("把这一条交给模型"),
+            ]
+        } else if selected {
+            // Over the conversation with something selected: the press is about
+            // those words, so copying them is the whole menu. No second entry
+            // and nothing that acts on the composer.
+            vec![copy]
+        } else {
+            // Nothing was selected, so there is nothing a press here can ask
+            // for. An empty menu opens nothing rather than a menu of verbs that
+            // would act somewhere the pointer is not.
+            Vec::new()
+        };
         self.host.open_context_menu((x, y), items);
     }
 
@@ -1212,7 +1235,11 @@ impl Tui {
                     let text = self.host.compose(self.surface.size()).selected_text(&sel);
                     if !text.is_empty() {
                         self.surface.copy(&text);
-                        self.say("已复制选中的内容");
+                        // The reserved row above the field, not the stream: this
+                        // is true of *now*, and a block for it would push the
+                        // conversation up a row for a sentence nobody reads
+                        // twice.
+                        self.host.say("已复制选中的内容", false);
                         return false;
                     }
                 }
@@ -1226,21 +1253,27 @@ impl Tui {
                 if text.is_empty() {
                     // Not an error: a person may open the menu on an empty
                     // composer to see what is there. Say why nothing happened,
-                    // and name the thing that was empty.
-                    self.say_refused(if selected.is_some() {
-                        "选中的内容没有可复制的文字"
-                    } else {
-                        "没有可复制的内容"
-                    });
+                    // and name the thing that was empty — on the tip row, since
+                    // nothing happened and nothing belongs in the conversation.
+                    self.host.say(
+                        if selected.is_some() {
+                            "选中的内容没有可复制的文字"
+                        } else {
+                            "没有可复制的内容"
+                        },
+                        true,
+                    );
                     return false;
                 }
                 self.surface.copy(&text);
-                self.say("已复制到剪贴板");
+                self.host.say("已复制到剪贴板", false);
                 false
             }
             "paste" => {
                 let Some(text) = self.surface.clipboard_text() else {
-                    self.say_refused("剪贴板里没有文本");
+                    // The menu's own refusal, so it belongs on the tip row with
+                    // the rest of them rather than in the conversation.
+                    self.host.say("剪贴板里没有文本", true);
                     return false;
                 };
                 self.act(Action::Paste(text), client)

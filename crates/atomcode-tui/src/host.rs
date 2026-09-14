@@ -14,7 +14,7 @@ use crate::block::{BlockId, Slot, Stream};
 use crate::caps::{Caps, Glyph};
 use crate::frame::{Frame, Line, Rect, Span, Style};
 use crate::module::{Height, Modules};
-use crate::moment::Moment;
+use crate::moment::{Moment, Notice};
 use crate::region::Region;
 
 /// How a kind of block is shown.
@@ -802,6 +802,28 @@ impl Host {
 
     pub fn context_menu_open(&self) -> bool {
         self.context_menu.read().expect("menu poisoned").is_some()
+    }
+
+    /// Say something on the reserved row above the field, for
+    /// [`NOTICE_MS`](crate::moment::NOTICE_MS) and then no longer.
+    ///
+    /// The place for anything the screen has to report that is *about now*: a
+    /// clipboard write, a refusal, a mode change. Deliberately not the stream —
+    /// a block for "已复制" pushes the whole conversation up a row for a sentence
+    /// nobody reads twice, and a block is for what happened, not for what has
+    /// just become true. The row is already reserved for it, so saying this
+    /// moves nothing.
+    ///
+    /// The expiry is stamped here, where the clock is, and travels with the text:
+    /// the module that draws it compares two readings it was handed rather than
+    /// asking a clock of its own (`docs/adr/0008`).
+    ///
+    /// `refused` is the same distinction `content::CommandSaid` draws — it could
+    /// not be done — so "已复制" and "没有可复制的内容" never look alike.
+    pub fn say(&self, text: impl Into<String>, refused: bool) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let now = m.now;
+        m.notice = Some(Notice::for_ms(text, refused, now, crate::moment::NOTICE_MS));
     }
 
     /// Run a key against the open menu, returning the step it produced. `None`
@@ -2574,6 +2596,82 @@ mod tests {
             removed.part("stream").expect("the conversation").rect.h,
             running.part("stream").expect("the conversation").rect.h + 1,
             "and the row is handed back to the words"
+        );
+    }
+
+    #[test]
+    fn a_tip_is_said_for_a_moment_and_moves_nothing() {
+        // What the reserved row is for. Saying something is not an event in the
+        // conversation — the whole reason it is not a block is that a block for
+        // "已复制" pushed every row of the conversation up one.
+        use crate::modules::{live, tip};
+        use crate::moment::{Timestamp, NOTICE_MS};
+        let mods = Arc::new(Modules::new());
+        mods.add_producer(transcript::Transcript::new()).unwrap();
+        mods.add_view(Arc::new(Mounted::<live::Live>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<tip::Tip>::new())).unwrap();
+        mods.add_view(Arc::new(Mounted::<input::Input>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<status::Status>::new()))
+            .unwrap();
+        let h = Host::new(mods, default_layout());
+
+        let resting = h.compose((60, 12));
+        let field = resting.part("input").expect("the field").rect;
+        let stream = resting.part("stream").expect("the words").rect;
+
+        // The clock is the host's: the expiry is stamped from the reading the
+        // frame is drawn from, and the module that draws it is handed the
+        // result rather than asking a clock of its own.
+        h.moment.write().unwrap().now = Timestamp::millis(1_000);
+        h.say("已复制到剪贴板", false);
+        let said = h.compose((60, 12));
+
+        let tip: String = said
+            .part("tip")
+            .expect("the reserved row")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert!(tip.contains("已复制到剪贴板"), "the row says it: {tip:?}");
+        assert_eq!(
+            said.part("input").expect("the field").rect,
+            field,
+            "saying something does not move the field"
+        );
+        assert_eq!(
+            said.part("stream").expect("the words").rect,
+            stream,
+            "and takes no row from the conversation"
+        );
+        assert!(
+            said.part("stream")
+                .expect("the words")
+                .lines
+                .iter()
+                .all(|l| !l.plain().contains("已复制")),
+            "and the conversation is not told at all"
+        );
+
+        // The reading the loop reaches three seconds later: gone, with nobody
+        // having had to clear it.
+        h.moment.write().unwrap().now = Timestamp::millis(1_000 + NOTICE_MS);
+        let after = h.compose((60, 12));
+        assert!(
+            after
+                .part("tip")
+                .expect("the row is still reserved")
+                .lines
+                .iter()
+                .all(|l| l.plain().trim().is_empty()),
+            "a tip expires on its own"
+        );
+        assert_eq!(
+            after.part("input").expect("the field").rect,
+            field,
+            "and nothing moved when it did"
         );
     }
 

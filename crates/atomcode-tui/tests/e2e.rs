@@ -831,6 +831,23 @@ fn right_click(s: &Session, x: u16, y: u16) {
         .pointer(atomcode_tui::surface::Click::RightPress, x, y);
 }
 
+/// Right-click on the composer, where its four items live.
+///
+/// The field's rect is read off the last frame rather than guessed at a row: the
+/// composer's position depends on what is above it, and where the press lands
+/// now decides what the menu offers — a press over the conversation is not the
+/// composer's menu.
+fn right_click_composer(s: &Session) {
+    let field = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("input")
+        .expect("the composer")
+        .rect;
+    right_click(s, field.x + 2, field.y);
+}
+
 #[tokio::test]
 async fn right_click_on_the_composer_opens_a_menu_that_does_what_it_says() {
     // The path a person takes: type something, right-click, pick "复制全文",
@@ -898,7 +915,7 @@ async fn the_menu_s_paste_reads_the_clipboard_into_what_is_being_typed() {
     // the case that would pass by accident.
     s.term.press(KeyPress::plain(Key::Home));
     s.quiet().await;
-    right_click(&s, 4, 8);
+    right_click_composer(&s);
     s.quiet().await;
 
     // Down to 粘贴, and pick it.
@@ -930,7 +947,7 @@ async fn a_pointer_chooses_the_row_the_words_were_drawn_on() {
     s.term.set_clipboard_text("head ");
     s.term.press(KeyPress::plain(Key::Home));
     s.quiet().await;
-    right_click(&s, 4, 8);
+    right_click_composer(&s);
     s.quiet().await;
 
     let menu = s
@@ -970,7 +987,7 @@ async fn the_menu_s_send_hands_the_line_to_the_model() {
 
     s.term.type_text("say it through the menu");
     s.quiet().await;
-    right_click(&s, 4, 8);
+    right_click_composer(&s);
     s.quiet().await;
     for _ in 0..3 {
         s.term.press(KeyPress::plain(Key::Down));
@@ -996,7 +1013,7 @@ async fn a_click_away_puts_the_menu_away_and_still_does_its_own_job() {
 
     s.term.type_text("keep me");
     s.quiet().await;
-    right_click(&s, 4, 8);
+    right_click_composer(&s);
     s.quiet().await;
     assert!(s.screen().contains("复制全文"), "{}", s.screen());
 
@@ -1027,7 +1044,7 @@ async fn esc_puts_the_menu_away_without_picking_anything() {
 
     s.term.type_text("untouched");
     s.quiet().await;
-    right_click(&s, 4, 8);
+    right_click_composer(&s);
     s.quiet().await;
     assert!(s.screen().contains("复制全文"));
 
@@ -1067,7 +1084,7 @@ async fn moving_the_pointer_over_a_row_makes_it_the_highlighted_one() {
     s.term.set_clipboard_text("head ");
     s.term.press(KeyPress::plain(Key::Home));
     s.quiet().await;
-    right_click(&s, 4, 8);
+    right_click_composer(&s);
     s.quiet().await;
 
     let menu = s
@@ -1202,6 +1219,156 @@ async fn right_click_over_a_selection_copies_the_selection_and_not_the_field() {
 }
 
 #[tokio::test]
+async fn copying_says_so_on_the_tip_row_and_not_in_the_conversation() {
+    // A copy is true of *now*: it is not an event in the conversation, and a
+    // block for it pushed every row of the conversation up one to make room for
+    // a sentence nobody reads twice. It belongs on the row that was reserved for
+    // exactly this — and it has to go away by itself, because a tip that had to
+    // be cleared would be worse than no tip.
+    let dir = scratch("menu-copy-tip");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_text("hello composer");
+    s.quiet().await;
+    let parted = s.term.last().expect("a frame");
+    let field = parted.part("input").expect("the field").rect;
+    let words = parted.part("stream").expect("the words").lines.len();
+
+    right_click(&s, field.x + 4, field.y);
+    s.quiet().await;
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+
+    assert_eq!(
+        s.term.clipboard_text().as_deref(),
+        Some("hello composer"),
+        "the copy happened"
+    );
+
+    let frame = s.term.last().expect("a frame");
+    let tip: String = frame
+        .part("tip")
+        .expect("the reserved row")
+        .lines
+        .iter()
+        .map(|l| l.plain())
+        .collect();
+    assert!(
+        tip.contains("已复制到剪贴板"),
+        "the tip row says so: {tip:?}"
+    );
+    let conversation: String = frame
+        .part("stream")
+        .expect("the words")
+        .lines
+        .iter()
+        .map(|l| l.plain())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !conversation.contains("已复制"),
+        "and the conversation is not told:\n{conversation}"
+    );
+    assert_eq!(
+        frame.part("stream").expect("the words").lines.len(),
+        words,
+        "the conversation did not grow a row for it:\n{conversation}"
+    );
+
+    // Three seconds on, nobody having asked: gone. The frame after it paints the
+    // same blank row, so the field is where it was.
+    tokio::time::sleep(Duration::from_millis(3_200)).await;
+    s.quiet().await;
+    let later = s.term.last().expect("a frame");
+    let tip: String = later
+        .part("tip")
+        .expect("the row is still reserved")
+        .lines
+        .iter()
+        .map(|l| l.plain())
+        .collect();
+    assert!(
+        tip.trim().is_empty(),
+        "the tip went away by itself: {tip:?}"
+    );
+    assert_eq!(
+        later.part("input").expect("the field").rect,
+        field,
+        "and the box did not move when it did"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn a_right_click_outside_the_composer_offers_only_what_belongs_there() {
+    // 清空 and 发送 act on what is being typed, so a press over the conversation
+    // must not offer them: they belong to a box the pointer is not in. What is
+    // left is what is still true of the press — the text it landed on.
+    let dir = scratch("menu-outside");
+    let s = start(tree(&dir, &replay(r#"{ text = "the model spoke" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("ask a question");
+    s.quiet().await;
+
+    // In the conversation, with nothing selected: nothing a press here can ask
+    // for, so nothing is offered.
+    let stream = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("stream")
+        .expect("the words")
+        .rect;
+    right_click(&s, stream.x + 2, stream.y);
+    s.quiet().await;
+    let screen = s.screen();
+    assert!(
+        !screen.contains("清空") && !screen.contains("发送") && !screen.contains("粘贴"),
+        "no composer verbs outside the composer:\n{screen}"
+    );
+    assert!(
+        !screen.contains("复制全文"),
+        "and not the field's copy either — the field is not what was pressed:\n{screen}"
+    );
+
+    // With something selected, the menu is about those words: copy them, and
+    // nothing that would act on the composer.
+    let row = s
+        .screen()
+        .lines()
+        .position(|l| l.contains("spoke"))
+        .expect("the answer is on screen") as u16;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, stream.x, row);
+    s.term
+        .pointer(atomcode_tui::surface::Click::Drag, stream.right() - 1, row);
+    s.term.pointer(
+        atomcode_tui::surface::Click::Release,
+        stream.right() - 1,
+        row,
+    );
+    s.quiet().await;
+    right_click(&s, stream.x + 2, row);
+    s.quiet().await;
+    let screen = s.screen();
+    assert!(
+        screen.contains("复制选中"),
+        "the menu copies what is selected:\n{screen}"
+    );
+    assert!(
+        !screen.contains("清空") && !screen.contains("发送") && !screen.contains("粘贴"),
+        "and offers nothing that belongs to the composer:\n{screen}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
 async fn the_menu_over_a_selection_keeps_its_own_colours() {
     // The menu is a panel raised over the screen, so what it covers it covers.
     // It did not: the selection was highlighted after the menu was drawn, so a
@@ -1284,7 +1451,7 @@ async fn the_menu_asks_the_terminal_for_the_pointer_only_while_it_is_open() {
         "the screen asks for free motion with nothing following the pointer"
     );
 
-    right_click(&s, 4, 8);
+    right_click_composer(&s);
     s.quiet().await;
     assert!(s.screen().contains("复制全文"), "the menu opened");
     assert!(
@@ -1322,7 +1489,7 @@ async fn moving_the_pointer_across_the_menu_chooses_nothing() {
 
     s.term.type_text("keep me");
     s.quiet().await;
-    right_click(&s, 4, 8);
+    right_click_composer(&s);
     s.quiet().await;
 
     let menu = s
@@ -1350,14 +1517,19 @@ async fn moving_the_pointer_across_the_menu_chooses_nothing() {
         screen.contains("复制全文"),
         "a move over the menu chose something and closed it:\n{screen}"
     );
+
+    // That the draft survived is proven once the menu is out of the way: the
+    // panel is anchored at the cell it was asked for, and over the composer that
+    // is the composer's own rows, so "keep me" is under it rather than gone.
+    // Reading it off the screen with the menu up would test the overlap.
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
     assert!(
-        screen.contains("keep me"),
-        "a move cleared the draft:\n{screen}"
+        s.screen().contains("keep me"),
+        "a move cleared the draft:\n{}",
+        s.screen()
     );
 
-    // Esc first: the menu still holds the keyboard, which is the point of the
-    // test — a pointer that only travelled past did not close it.
-    s.term.press(KeyPress::plain(Key::Esc));
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
