@@ -623,9 +623,22 @@ async fn reference_until(
 // gate. These run the same scripts through the real assembly, under their own
 // ratchet keys so the minimal-path numbers stay readable beside them.
 //
-// `mcp` / `web` / `review` / `memory` are off: each reaches the network, a
-// subprocess or the user's disk, and a rig that needs any of those is not a rig.
-// Everything they gate is additive to the chain, so the chain itself is intact.
+// What the gates below are for, and what they cost:
+//
+// `mcp` connects other people's processes at prepare time and `memory` reads the
+// developer's own home directory, so both stay off — and both are off on the row
+// side too, so the comparison is still a comparison.
+//
+// `web` used to be off with them, on the reasoning that "everything they gate is
+// additive, so the chain itself is intact". True of behaviour and false of the
+// catalog: mounting `web_fetch`/`web_search` performs no I/O, only CALLING them
+// does, and no scenario here calls one. Off, it made the tool-catalog criterion
+// blind to exactly the row this product turns on — so it is on, and the criterion
+// compares the two lists that actually ship.
+//
+// `review` is the same shape and is still off: it is the last gate that hides a
+// difference rather than avoiding one, because the row list has no `code_review`
+// yet. Turning it on is how that gets found, not how it gets fixed.
 
 async fn production_agent(
     script: Arc<Script>,
@@ -634,7 +647,7 @@ async fn production_agent(
     let cfg = atomcode_coding::CodingAgentConfig::new("k", "http://unused.test/v1", "script", dir);
     let opts = atomcode_coding::parts::PrepareOptions {
         mcp: false,
-        web: false,
+        web: true,
         review: false,
         memory: false,
         skill_dirs: Some(Vec::new()),

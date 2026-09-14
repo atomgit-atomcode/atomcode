@@ -55,6 +55,14 @@ impl Profiles {
         for (name, source) in crate::bundle::BUNDLES {
             bundles.insert((*name).to_string(), (*source).to_string());
         }
+        // `base` was one bundle before it was split into the machine and the
+        // product decisions. A profile on disk that names it is a deployment's
+        // file, not ours, so the name keeps meaning what it meant: both halves,
+        // in the order `bundle::base()` composes them.
+        bundles.insert(
+            "base".to_string(),
+            format!("{}\n{}", crate::bundle::INFRA, crate::bundle::DEFAULTS),
+        );
         let mut profiles = BTreeMap::new();
         for (name, bundles_list, patch, description) in crate::bundle::PROFILES {
             profiles.insert(

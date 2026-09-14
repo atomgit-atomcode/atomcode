@@ -12,8 +12,13 @@
 
 use atomcode_plexus::{ConfigTree, Layer, Result};
 
-/// The shared base: registries, a model adapter, tools, policy, the loop.
-pub const BASE: &str = r#"
+/// The machine: registries, the session log, the loop, and the recovery
+/// policies that keep it running. Nothing here is a product decision — there is
+/// no version of "an agent" that wants a different `tool-args-repair`.
+///
+/// Split out of `BASE` so a product can take the machine whole and still say
+/// for itself what its agent can DO. See [`DEFAULTS`].
+pub const INFRA: &str = r#"
 # --- agents: the registry everything else finds live work through -----------
 [[insert]]
 name = "agents"
@@ -78,58 +83,6 @@ name = "fs-local"
 id = "shell"
 name = "bash-local"
 
-# --- capabilities, all routed through the world above ----------------------
-[[insert]]
-name = "tool-fs-world"
-
-[[insert]]
-name = "tool-search-world"
-
-# Structural search: cheap to mount, but only the audit variants ask the kind of
-# question it answers, so base leaves it off.
-[[insert]]
-name = "tool-ast-grep"
-disabled = true
-
-[[insert]]
-name = "tool-bash-world"
-
-# The production local implementations, mounted dormant. They claim the same
-# tool names as the world-routed rows, so enabling one means disabling the
-# other — the catalog refuses a duplicate rather than silently picking.
-[[insert]]
-name = "tool-fs"
-disabled = true
-
-[[insert]]
-name = "tool-search"
-disabled = true
-
-[[insert]]
-name = "tool-bash"
-disabled = true
-
-# --- capabilities that are not part of the execution world ------------------
-[[insert]]
-name = "skills"
-
-[[insert]]
-name = "codeintel"
-
-# The graph layer builds and caches a whole-repo index; opt in when the work
-# needs cross-file reasoning rather than paying for it on every run.
-[[insert]]
-name = "code-graph"
-disabled = true
-
-# Reaches the public internet, so it is a deliberate choice, not a default.
-[[insert]]
-name = "tool-web"
-disabled = true
-
-[[insert]]
-name = "memory"
-
 # How hard the model should think (`reasoning_effort`). Left unset, which is
 # "no opinion": the endpoint's own default stands (DeepSeek's is `high`).
 #
@@ -147,43 +100,6 @@ name = "memory"
 [[insert]]
 name = "reasoning-effort"
 config = {}
-
-# Searching the log the harness already writes. Separate from `memory`: memory
-# is what the user chose to state, recall is everything that was said — and a
-# system that only remembers what someone thought to write down remembers very
-# little.
-[[insert]]
-name = "recall"
-
-[[insert]]
-name = "tool-todo"
-
-# The list only helps while it is true, and a tool description is the furthest
-# thing in the prompt from the step being taken. This row watches the list
-# against the work and says so when the two have drifted apart.
-[[insert]]
-name = "todo-reminder"
-
-# Asking is a capability, not a manner. Without a tool for it the agent has two
-# moves when a decision is the person's — guess, or stop — and it guesses,
-# because guessing looks like progress. With no front end to ask, the tool says
-# so and the agent decides for itself; nothing hangs.
-[[insert]]
-name = "tool-ask"
-
-# Delegation runs a child agent in its own realm. Off by default: it multiplies
-# model calls, and a tree should opt into that.
-[[insert]]
-name = "subagent-in-process"
-disabled = true
-
-# External MCP servers are other people's processes: opt in.
-[[insert]]
-name = "mcp"
-disabled = true
-
-[[insert]]
-name = "persona-coding"
 
 # --- turn policy: what the loop deliberately does not decide ---------------
 [[insert]]
@@ -238,6 +154,132 @@ config = { nudge_at = 3, stop_at = 6 }
 [[insert]]
 name = "tool-args-repair"
 
+[[insert]]
+name = "tool-result-cap"
+config = { max_bytes = 65536 }
+
+# Scheduling is a policy, not loop code: remove this row and a round's calls
+# run one at a time, which is always correct and sometimes slow.
+[[insert]]
+name = "tool-exec-parallel"
+config = { max_parallel = 4 }
+
+# --- the driver --------------------------------------------------------------
+# `max_rounds` here is the runaway fuse, not the budget: the budget is the
+# `round-cap` row above. Remove that row and this is all that stops a loop.
+[[insert]]
+name = "agent-loop"
+config = { max_rounds = 100 }
+
+# --- session-level services -------------------------------------------------
+[[insert]]
+name = "session-title-first-prompt"
+
+[[insert]]
+name = "token-budget"
+config = { max_prompt_tokens = 0 }
+"#;
+
+/// The shipped product decisions: which tools exist, which persona, how
+/// approval behaves, who renders.
+///
+/// Every one of these is a row some product would set differently, and a
+/// generic harness can only abstain — which is why twelve of them ship off.
+/// Abstention is the right default HERE and the wrong default for a product
+/// built on top: a coding agent that inherits this list silently lacks the
+/// code graph, `ast_grep`, the web tools and a subagent, and finds out one
+/// support question at a time. A product that wants to own those decisions
+/// takes [`INFRA`] and writes its own list instead of patching this one.
+pub const DEFAULTS: &str = r#"
+# --- capabilities, all routed through the world above ----------------------
+[[insert]]
+name = "tool-fs-world"
+
+[[insert]]
+name = "tool-search-world"
+
+# Structural search: cheap to mount, but only the audit variants ask the kind of
+# question it answers, so base leaves it off.
+[[insert]]
+name = "tool-ast-grep"
+disabled = true
+
+[[insert]]
+name = "tool-bash-world"
+
+# The production local implementations, mounted dormant. They claim the same
+# tool names as the world-routed rows, so enabling one means disabling the
+# other — the catalog refuses a duplicate rather than silently picking.
+[[insert]]
+name = "tool-fs"
+disabled = true
+
+[[insert]]
+name = "tool-search"
+disabled = true
+
+[[insert]]
+name = "tool-bash"
+disabled = true
+
+# --- capabilities that are not part of the execution world ------------------
+[[insert]]
+name = "skills"
+
+[[insert]]
+name = "codeintel"
+
+# The graph layer builds and caches a whole-repo index; opt in when the work
+# needs cross-file reasoning rather than paying for it on every run.
+[[insert]]
+name = "code-graph"
+disabled = true
+
+# Reaches the public internet, so it is a deliberate choice, not a default.
+[[insert]]
+name = "tool-web"
+disabled = true
+
+[[insert]]
+name = "memory"
+
+# Searching the log the harness already writes. Separate from `memory`: memory
+# is what the user chose to state, recall is everything that was said — and a
+# system that only remembers what someone thought to write down remembers very
+# little.
+[[insert]]
+name = "recall"
+
+[[insert]]
+name = "tool-todo"
+
+# The list only helps while it is true, and a tool description is the furthest
+# thing in the prompt from the step being taken. This row watches the list
+# against the work and says so when the two have drifted apart.
+[[insert]]
+name = "todo-reminder"
+
+# Asking is a capability, not a manner. Without a tool for it the agent has two
+# moves when a decision is the person's — guess, or stop — and it guesses,
+# because guessing looks like progress. With no front end to ask, the tool says
+# so and the agent decides for itself; nothing hangs.
+[[insert]]
+name = "tool-ask"
+
+# Delegation runs a child agent in its own realm. Off by default: it multiplies
+# model calls, and a tree should opt into that.
+[[insert]]
+name = "subagent-in-process"
+disabled = true
+
+# External MCP servers are other people's processes: opt in.
+[[insert]]
+name = "mcp"
+disabled = true
+
+[[insert]]
+name = "persona-coding"
+
 # No rules by default, so the row is inert until a user writes some.
 [[insert]]
 name = "permissions"
@@ -266,29 +308,8 @@ name = "plan-mode"
 disabled = true
 
 [[insert]]
-name = "tool-result-cap"
-config = { max_bytes = 65536 }
-
-# Scheduling is a policy, not loop code: remove this row and a round's calls
-# run one at a time, which is always correct and sometimes slow.
-[[insert]]
-name = "tool-exec-parallel"
-config = { max_parallel = 4 }
-
-# --- the driver --------------------------------------------------------------
-# `max_rounds` here is the runaway fuse, not the budget: the budget is the
-# `round-cap` row above. Remove that row and this is all that stops a loop.
-[[insert]]
-name = "agent-loop"
-config = { max_rounds = 100 }
-
-[[insert]]
 name = "trace"
 config = { stream = true, tools = true, summary = true }
-
-# --- session-level services -------------------------------------------------
-[[insert]]
-name = "session-title-first-prompt"
 
 # Names the session as soon as the first prompt lands, in the background, and
 # logs the name. Which namer answers is the row above: the first prompt by
@@ -313,11 +334,11 @@ disabled = true
 [[insert]]
 name = "telemetry"
 disabled = true
-
-[[insert]]
-name = "token-budget"
-config = { max_prompt_tokens = 0 }
 "#;
+
+/// `INFRA` + `DEFAULTS`, which is what `BASE` always was. Every existing caller
+/// keeps the tree it had.
+pub const BASE_PARTS: [&str; 2] = [INFRA, DEFAULTS];
 
 /// Swap the model for a scripted one. The only row it touches is `llm`; the
 /// loop, tools, policy and tracing rows are untouched and cannot tell.
@@ -492,7 +513,12 @@ disabled = false
 "#;
 
 pub fn base() -> Result<Layer> {
-    Layer::from_toml(BASE)
+    Layer::from_toml(&format!("{INFRA}\n{DEFAULTS}"))
+}
+
+/// The machine without the product decisions, for a product that writes its own.
+pub fn infra() -> Result<Layer> {
+    Layer::from_toml(INFRA)
 }
 
 /// Stack the base bundle with any number of patch layers, in order.
@@ -686,7 +712,10 @@ disabled = true
 
 /// Every bundle by name, for profiles to reference.
 pub const BUNDLES: &[(&str, &str)] = &[
-    ("base", BASE),
+    // `base` is the two halves, in the order `base()` composes them. A profile
+    // naming "base" gets exactly the tree it always did.
+    ("infra", INFRA),
+    ("defaults", DEFAULTS),
     ("oneshot-app", ONESHOT_APP),
     ("repl-app", REPL_APP),
     ("web-app", WEB_APP),
@@ -709,55 +738,55 @@ pub const BUNDLES: &[(&str, &str)] = &[
 pub const PROFILES: &[(&str, &[&str], Option<&str>, &str)] = &[
     (
         "oneshot",
-        &["base", "oneshot-app"],
+        &["infra", "defaults", "oneshot-app"],
         None,
         "one prompt, one turn, exit",
     ),
     (
         "repl",
-        &["base", "repl-app"],
+        &["infra", "defaults", "repl-app"],
         None,
         "an interactive terminal session that can ask questions",
     ),
     (
         "web",
-        &["base", "web-app"],
+        &["infra", "defaults", "web-app"],
         None,
         "an HTTP server with a live event stream",
     ),
     (
         "sdk",
-        &["base", "sdk-app"],
+        &["infra", "defaults", "sdk-app"],
         None,
         "line-delimited JSON-RPC on stdio",
     ),
     (
         "embed",
-        &["base", "embed-app"],
+        &["infra", "defaults", "embed-app"],
         None,
         "no front end; a library caller drives",
     ),
     (
         "handle",
-        &["base", "handle-app"],
+        &["infra", "defaults", "handle-app"],
         None,
         "an AgentHandle for the shipped TUI, daemon and WebUI to drive",
     ),
     (
         "headless",
-        &["base", "oneshot-app"],
+        &["infra", "defaults", "oneshot-app"],
         Some(HEADLESS_PATCH),
         "one prompt, no rendering, no persistence — for evals and CI",
     ),
     (
         "plan",
-        &["base", "repl-app"],
+        &["infra", "defaults", "repl-app"],
         Some(PLAN),
         "read-only exploration: investigate and produce a plan",
     ),
     (
         "full",
-        &["base", "repl-app"],
+        &["infra", "defaults", "repl-app"],
         Some(FULL),
         "everything on: code graph, web access, delegation",
     ),

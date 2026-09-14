@@ -285,7 +285,12 @@ fn a_malformed_profile_is_skipped_not_fatal() {
 #[test]
 fn explain_states_the_layer_order() {
     let text = Profiles::builtin().explain("headless");
-    assert!(text.contains("bundle `base`"));
+    // The shipped profiles name the two halves `base` was split into, so the
+    // explanation says what is actually layered rather than a name that now
+    // stands for two things. `base` itself still resolves — a deployment's own
+    // profile file may still name it — it is just not what we ship.
+    assert!(text.contains("bundle `infra`"));
+    assert!(text.contains("bundle `defaults`"));
     assert!(text.contains("bundle `oneshot-app`"));
     assert!(text.contains("the profile's own patch"));
     assert!(text.contains("harness.patch.toml"));

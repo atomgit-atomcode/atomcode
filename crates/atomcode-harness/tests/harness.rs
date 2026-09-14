@@ -323,6 +323,20 @@ async fn an_unknown_tool_names_what_is_actually_mounted() {
     );
 }
 
+fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk(&path, out);
+        } else if path.extension().is_some_and(|e| e == "jsonl") {
+            out.push(path);
+        }
+    }
+}
+
 /// Facts reach the file in the order they were committed.
 ///
 /// A sequence number is minted when a fact commits, so the log's ORDER is the
@@ -363,25 +377,25 @@ async fn the_log_reaches_the_disk_in_the_order_it_was_committed() {
     // A second turn, so there is enough traffic for a race to show.
     run_turn(&app, "and again").await.unwrap();
 
-    // Let the writer drain: the queue is deliberately off the turn's path, so
-    // the last few facts can still be in flight when the turn returns.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
     let root = atomcode_harness::home().join("sessions");
-    let mut written: Vec<PathBuf> = Vec::new();
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|e| e == "jsonl") {
-                out.push(path);
-            }
+    // Wait for the writer to drain rather than guessing how long it takes: the
+    // queue is deliberately off the turn's path, so the last facts are still in
+    // flight when the turn returns. A fixed sleep here was flaky under a full
+    // parallel run — which is the one condition that matters, because that is
+    // when the writer is slowest.
+    for _ in 0..200 {
+        let mut seen = Vec::new();
+        walk(&root, &mut seen);
+        if seen.iter().any(|p| {
+            std::fs::read_to_string(p)
+                .map(|t| t.lines().filter(|l| l.contains("turn_end")).count() >= 2)
+                .unwrap_or(false)
+        }) {
+            break;
         }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+    let mut written: Vec<PathBuf> = Vec::new();
     walk(&root, &mut written);
     assert!(
         !written.is_empty(),

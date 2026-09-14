@@ -55,7 +55,188 @@ pub enum Presence {
     Headless,
 }
 
-/// The rows this product adds on top of the harness `base` assembly.
+/// What this agent can DO, said by this product instead of inherited.
+///
+/// The harness ships its own answer (`bundle::DEFAULTS`) and until now this
+/// assembly took it and patched the disagreements. That reads fine and is wrong
+/// in one specific way: the harness is generic, so every row it cannot be sure
+/// about ships OFF — no ast-grep toolchain assumed, no whole-repo graph paid
+/// for, no network reached. Abstention is the right default THERE and the wrong
+/// one here, because a product does not experience an inherited abstention as a
+/// question. It experiences it as a capability that used to work, and finds out
+/// one support question at a time — which is exactly how `ast_grep`, the code
+/// graph and `open_file` were found missing, each by a person, none by a test.
+///
+/// So this is not a diff against base. It is the whole answer, and a row added
+/// to `bundle::DEFAULTS` tomorrow does not silently arrive here.
+/// [`atomcode_harness::bundle::INFRA`] — the registries, the session log, the
+/// loop, the recovery policies — is still taken whole, because none of that is
+/// a product decision: there is no version of a coding agent that wants a
+/// different `tool-args-repair`.
+///
+/// Read it against `parts::PrepareOptions`, which is where the hand-written
+/// chain says the same things in Rust.
+const CODING_DEFAULTS: &str = r#"
+# --- what the model can do to the repository ------------------------------
+# All routed through the execution world (`fs`/`shell`), so the fence and the
+# approval seam apply to every one of them rather than to whoever remembered.
+[[insert]]
+name = "tool-fs-world"
+
+[[insert]]
+name = "tool-search-world"
+
+# Structural search. Base leaves it off because a generic harness cannot assume
+# an ast-grep toolchain; a coding agent assumes one.
+[[insert]]
+name = "tool-ast-grep"
+
+[[insert]]
+name = "tool-bash-world"
+
+# The local implementations of the same three, mounted dormant. They claim the
+# same tool names as the world-routed rows above, so enabling one means
+# disabling its twin — the catalog refuses a duplicate rather than silently
+# picking. Kept in the list so a host that wants the unrouted ones has a row to
+# patch instead of a crate to fork.
+[[insert]]
+name = "tool-fs"
+disabled = true
+
+[[insert]]
+name = "tool-search"
+disabled = true
+
+[[insert]]
+name = "tool-bash"
+disabled = true
+
+# --- what the model can do that is not the repository ----------------------
+[[insert]]
+name = "skills"
+
+[[insert]]
+name = "codeintel"
+
+# The graph layer builds and caches a whole-repo index. Base leaves it off
+# because a generic run should not pay for one; this product's whole job is
+# cross-file reasoning, so it pays.
+[[insert]]
+name = "code-graph"
+
+# Reaches the public internet. Off in base as a deliberate choice; on here,
+# because the chain has had `web: true` in `PrepareOptions::default()` since
+# before this tree existed and every shipped driver leaves it on.
+[[insert]]
+name = "tool-web"
+
+[[insert]]
+name = "memory"
+
+# Searching the log the harness already writes. Separate from `memory`: memory
+# is what the user chose to state, recall is everything that was said.
+[[insert]]
+name = "recall"
+
+[[insert]]
+name = "tool-todo"
+
+# The list only helps while it is true, and a tool description is the furthest
+# thing in the prompt from the step being taken.
+[[insert]]
+name = "todo-reminder"
+
+# Asking is a capability, not a manner. Without a tool for it the agent has two
+# moves when a decision is the person's — guess, or stop — and it guesses,
+# because guessing looks like progress.
+[[insert]]
+name = "tool-ask"
+
+# Delegation. Off, and it is an open decision rather than a settled one: the
+# shipped drivers pass `SubagentPolicy::Enabled`, so the chain mounts `task`
+# and `team` and this tree does not. Turning it on here needs `team-in-process`
+# beside it and the differential's chain options raised to match, or the
+# catalog criterion is comparing two subsets and calling them equal.
+[[insert]]
+name = "subagent-in-process"
+disabled = true
+
+# External MCP servers are other people's processes. On in the chain
+# (`mcp: true`), off here for the same reason the rig patches it off on both
+# sides: connecting them is a side effect, and this row has not been driven
+# through a real server on this engine yet.
+[[insert]]
+name = "mcp"
+disabled = true
+
+# --- who the agent is, and what it may do without asking -------------------
+# `persona-coding`, the harness's generic identity row, is deliberately absent:
+# `persona-atomcode` in `CODING_ROWS` fills that slot in this product's own
+# words, and two personas in one system prompt is worse than either.
+
+# No rules by default, so the row is inert until a user writes some.
+[[insert]]
+name = "permissions"
+
+# A read-only tool never asks, so it could read ~/.ssh or .env unasked. This
+# row asks the approval seam as if such a call were risky.
+[[insert]]
+name = "sensitive-paths"
+config = { allow = [], deny = [] }
+
+# Base's never-asks policy row, off in both presences. `ui-handle` claims the
+# `approval` seam and round-trips the question to the driver; one provider per
+# seam, so leaving this enabled would make the tree fail to start. It stays in
+# the list, disabled, because an assembly with no front end wants exactly this
+# row back — and then it is a patch, not a fork.
+[[insert]]
+name = "approval"
+config = { mode = "deny-risky" }
+disabled = true
+
+# The interactive alternative to the row above: same seam, but it asks the
+# terminal directly. This product asks through its driver instead.
+[[insert]]
+name = "approval-interactive"
+disabled = true
+
+# Read-only exploration. Off by default; `--plan` turns it on.
+[[insert]]
+name = "plan-mode"
+disabled = true
+
+# On in base because the harness binary has no other front end. Off here, and
+# not as a nicety: with a driver rendering, this row printed every assistant
+# token a SECOND time, and a headless run answered "pongpong".
+[[insert]]
+name = "trace"
+config = { stream = true, tools = true, summary = true }
+disabled = true
+
+# Names the session as soon as the first prompt lands, in the background.
+[[insert]]
+name = "session-title-on-first-prompt"
+
+# Dormant, and must stay so: `ui-handle` claims `user-questions` when it mounts,
+# and an incumbent here makes the tree fail to start. A tree with no front end
+# at all wants this row back, the same way it wants `approval` back.
+[[insert]]
+name = "user-questions-unattended"
+disabled = true
+
+[[insert]]
+name = "telemetry"
+disabled = true
+"#;
+
+/// The rows that are this product, on top of [`CODING_DEFAULTS`].
+///
+/// The split between the two lists is: `CODING_DEFAULTS` answers the same
+/// questions the harness answers for itself (which tools, which stance), so it
+/// reads as a list of decisions. This one is what no generic harness has a
+/// version of — the approval gates the chain expresses as kernel middleware,
+/// coding's persona, its verify cadence, its skill steering, and the driver
+/// protocol the runtime talks to.
 ///
 /// Deliberately not a profile in `atomcode-harness`: that crate's `PROFILES`
 /// table says product specializations stay out of it, "what stops this crate
@@ -104,18 +285,6 @@ name = "skill-first"
 [[insert]]
 name = "execution-policy"
 
-# Tools the chain has always offered, off in `base` because a generic harness
-# should not assume a Rust/ast-grep toolchain or pay for a code graph. A coding
-# product assumes both. Found by comparing the two engines' catalogs, not by
-# reading either one.
-[[patch]]
-id = "tool-ast-grep"
-disabled = false
-
-[[patch]]
-id = "code-graph"
-disabled = false
-
 # `open_file` and the thing that can open one. `opener-local` rides in the repl
 # and tui bundles rather than `base`, because a harness with nobody at a display
 # has nowhere to open anything — but this assembly is driven through `ui-handle`,
@@ -143,17 +312,6 @@ config = { working_dir = "{working_dir}", force = {force_verify} }
 # The driver protocol: this is what `CodingRuntimeHandle` drives.
 [[insert]]
 name = "ui-handle"
-
-# ...and because a driver is rendering, the tree must not also write to the
-# terminal. `trace` is on in `base` because the harness binary has no other
-# front end; here it produced every assistant token TWICE — once from `trace`'s
-# own `print!`, once from the driver — and a headless run answered "pongpong".
-#
-# Found by running it, not by the rig: the differential patches `trace` off for
-# quiet output, and in doing so masked this exactly.
-[[patch]]
-id = "trace"
-disabled = true
 "#;
 
 /// The coding overlay with this working directory substituted in.
@@ -379,22 +537,14 @@ pub async fn mount_swappable(
     // Headless: fenced, and the `approval` row stays the `deny-risky` one that
     // refuses without asking — there is nobody to ask.
     //
-    // Disabling `approval` is what lets `ui-handle` claim the seam and round-trip
-    // the driver, which reads backwards until you notice the row being disabled
-    // is the policy that never asks.
+    // Only the fence. Which row answers `approval` is not presence-dependent and
+    // is settled once, in `CODING_DEFAULTS`: base's never-asks row is off in both
+    // modes because `ui-handle` claims that seam and round-trips the driver, and
+    // mounting `ui-handle` at all means a driver is present.
     let boundary = match presence {
-        Presence::Attended => "[[patch]]\nid = \"fs\"\nconfig = {}\n\n\
-             [[patch]]\nid = \"approval\"\ndisabled = true\n"
-            .to_string(),
-        // The FENCE is what this mode enforces. "Never ask" is the front end's
-        // business, not this overlay's: mounting `ui-handle` at all means a driver
-        // is present, so an assembly that wanted nobody-to-ask would pick a
-        // different front end and leave base's `deny-risky` row in place. Here the
-        // row is still disabled — otherwise it and `ui-handle` fight over the
-        // `approval` seam — and the boundary is held by the root instead.
+        Presence::Attended => "[[patch]]\nid = \"fs\"\nconfig = {}\n".to_string(),
         Presence::Headless => format!(
-            "[[patch]]\nid = \"fs\"\nconfig = {{ root = {wd:?} }}\n\n\
-             [[patch]]\nid = \"approval\"\ndisabled = true\n",
+            "[[patch]]\nid = \"fs\"\nconfig = {{ root = {wd:?} }}\n",
             wd = working_dir.to_string_lossy(),
         ),
     };
@@ -405,8 +555,12 @@ pub async fn mount_swappable(
         wd = working_dir.to_string_lossy(),
         pid = provider_id,
     );
-    let mut layers = vec![atomcode_harness::bundle::base().map_err(|e| e.to_string())?];
+    // `infra`, not `base`: the machine is the harness's, the product decisions
+    // are this crate's. See [`CODING_DEFAULTS`] for why that is not the same as
+    // taking base and patching it.
+    let mut layers = vec![atomcode_harness::bundle::infra().map_err(|e| e.to_string())?];
     for src in [
+        CODING_DEFAULTS,
         scoped.as_str(),
         coding_overlay(working_dir, &artifacts, presence, &model).as_str(),
     ] {
