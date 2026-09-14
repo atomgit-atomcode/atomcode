@@ -60,9 +60,12 @@
 
 - `origin/feat/plexus-plugin-architecture` **远端是有的**，但落后本地 25 个 commit。
 - `feat/coding-on-harness-approval`（本线）**远端没有**。
-- **09-14：把 `feat/plexus-plugin-architecture` 合进了本线**（`390ea135`）——
-  方向是「追平」，不是「交付」：那条分支在主 checkout 里被另一个会话占着，
-  合进去不是我能做的，也不该做。
+- **合并方向：一律 `feat/plexus-plugin-architecture` → `feat/coding-on-harness-approval`。**
+  （2026-09-14 用户明确：「这个要合回 feat/coding-on-harness-approval」。）
+  本线是主干，plexus 那条往这边并，**不要反过来**。09-14 合过一次：`390ea135`。
+
+  两条佐证：本线已是 plexus 的超集（`HEAD..plexus` = 0），而 plexus 在主
+  checkout 里被另一个会话占着，从本 worktree 根本 check out 不了它。
 - 合进来的 3 个 commit 全是 tui（tip 行、右键菜单、面板浮层），**与本线零重叠**
   （本线动的是 harness + coding + `gates/differential.baseline`，他们动的是
   `atomcode-tui/*` + `gates/tui-test-count.baseline`）。合完两边一起跑：
