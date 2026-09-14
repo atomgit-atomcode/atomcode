@@ -233,6 +233,11 @@ pub async fn mount(
     // of every request to the user's disk. `datalog.enabled` defaults to false
     // in config.toml for the same reason. A host that wants it inserts the row.
     registry.register(Arc::new(DatalogPlugin));
+    // Also registered but NOT in `CODING_ROWS`: this one runs the person's own
+    // external commands. The row is inert without a `hooks.json`, but "inert"
+    // is not the same as "mounted by default" — a host that wants CC hooks
+    // inserts it, the way the chain mounts the engine only when one exists.
+    registry.register(Arc::new(CcHooksPlugin));
     registry.register(Arc::new(InjectProvider(provider)));
 
     let mut app = App::new(registry, tree);
@@ -793,6 +798,249 @@ impl Plugin for DatalogPlugin {
         let _ = ctx.on_waterfall::<atomcode_harness::events::AgentRequest>(
             Arc::new(Datalog { sink }),
             false,
+        );
+        Ok(())
+    }
+}
+
+// ---- the user's own hooks -----------------------------------------------
+//
+// `hooks.json`: external commands the PERSON configured, run at CC-compatible
+// moments. Inert unless they wrote one — `CCExternalHooks::load_with_extra`
+// returns an empty engine and the chain does not mount it.
+//
+// Most of it needed no extraction at all. `user_prompt_submit`, `session_start`
+// and `turn_complete` are already neutral — they take a `&mut String`, a
+// `&mut Conversation`, a `&StopReason` — so the row calls the trait methods
+// directly. Only the PreToolUse fold had to be split, and for exactly one
+// reason: resolving a hook's `ask` into a real prompt goes through `RequestCtx`
+// in the chain and through the `approval` seam here.
+//
+// The seam map, four against six:
+//   agent/pre-step  → session_start (once) + user_prompt_submit
+//   tools/execute   → pre_tool_gate → [ask] → post_tool
+//   turn/end        → turn_complete   (observation only, so spawning is faithful)
+//   (session_end has no harness moment yet; see the row's doc comment)
+
+/// Forces an approval prompt for one call, and refuses to remember the answer.
+///
+/// A hook-forced `ask` is deliberately NOT grantable: "always" would turn the
+/// person's explicit "stop and ask me about this" into a one-time question. The
+/// chain says the same thing by having no grant store on that path.
+struct CcAsk(Arc<dyn atomcode_kernel::tool::Tool>);
+
+#[async_trait]
+impl atomcode_kernel::tool::Tool for CcAsk {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn description(&self) -> &str {
+        self.0.description()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.0.parameters_schema()
+    }
+    fn risk(&self, _args: &str) -> atomcode_kernel::tool::RiskLevel {
+        // Risky whatever the tool normally is: the hook asked for a prompt, and
+        // a Safe tool would skip straight past one.
+        atomcode_kernel::tool::RiskLevel::Risky
+    }
+    fn always_grant_scope(&self, _args: &str) -> String {
+        atomcode_harness::seams::NEVER_GRANT.to_string()
+    }
+    async fn execute(
+        &self,
+        args: &str,
+        ctx: &atomcode_kernel::tool::ToolContext,
+    ) -> atomcode_kernel::tool::ToolResult {
+        self.0.execute(args, ctx).await
+    }
+}
+
+struct CcHooks {
+    ctx: Context,
+    engine: Arc<atomcode_capabilities::cc_hooks::CCExternalHooks>,
+    /// SessionStart runs once, lazily, on the first step.
+    ///
+    /// Not on `AgentCreated`: that listener is sync, so the hooks would have to
+    /// be spawned, and a spawned SessionStart can land AFTER the first request —
+    /// which is the one thing its context must precede. Here it is awaited
+    /// inside the step that is about to run.
+    started: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::PreStep> for CcHooks {
+    async fn handle(
+        &self,
+        decision: &mut atomcode_harness::events::StepDecision,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::PreStep>,
+    ) -> atomcode_harness::events::StepDecision {
+        use atomcode_kernel::hook::LifecycleHooks;
+        if !self.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let mut convo = atomcode_kernel::message::Conversation::new();
+            self.engine.session_start(&mut convo, false).await;
+            for message in convo.messages {
+                decision.injections.push((
+                    message.text,
+                    atomcode_harness::session::InjectionOrigin::Reminder,
+                ));
+            }
+        }
+        if let Some(text) = &mut decision.message {
+            if let Err(reason) = self.engine.user_prompt_submit(text).await {
+                // The person's hook said no. `rejected` ends the turn without a
+                // step, which is what "block this prompt" means here.
+                decision.rejected = Some(reason);
+                return decision.clone();
+            }
+        }
+        next.run(decision).await
+    }
+}
+
+#[async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::ToolsExecute> for CcHooks {
+    async fn handle(
+        &self,
+        exec: &mut atomcode_harness::events::ToolExec,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::ToolsExecute>,
+    ) -> atomcode_kernel::tool::ToolResult {
+        use atomcode_kernel::middleware::{AfterOutcome, BeforeOutcome};
+        let call_id = exec.call.id.clone();
+        let refuse = move |reason: String| atomcode_kernel::tool::ToolResult {
+            call_id,
+            content: reason,
+            is_error: true,
+            images: vec![],
+        };
+        // The fold may REWRITE the arguments (CC `updatedInput`), so it works on
+        // the live call rather than a copy.
+        let mut gate = self.engine.pre_tool_gate(&mut exec.call).await;
+        if matches!(gate, BeforeOutcome::Ask { .. }) {
+            gate = match (
+                self.ctx.service::<atomcode_harness::seams::ApprovalSvc>(),
+                self.ctx
+                    .service::<atomcode_harness::seams::ToolsSvc>()
+                    .and_then(|t| t.get(&exec.call.name)),
+            ) {
+                (Some(policy), Some(tool)) => {
+                    let asking: Arc<dyn atomcode_kernel::tool::Tool> = Arc::new(CcAsk(tool));
+                    match policy.decide(&exec.call, &asking).await {
+                        atomcode_harness::seams::Decision::Allow => {
+                            BeforeOutcome::Allow { reason: None }
+                        }
+                        atomcode_harness::seams::Decision::Deny(reason) => {
+                            BeforeOutcome::Deny { reason }
+                        }
+                    }
+                }
+                // Nobody to ask. The chain fails CLOSED here for the same reason:
+                // a forced ask that silently becomes a yes is worse than a
+                // refusal, because the person asked to be stopped.
+                _ => BeforeOutcome::Deny {
+                    reason: format!("hook asked for approval, nobody to ask: {}", exec.call.name),
+                },
+            };
+        }
+        self.engine.note_call_for_post(&exec.call, &gate);
+        match gate {
+            BeforeOutcome::Deny { reason } | BeforeOutcome::DenyTurn { reason } => {
+                return refuse(reason)
+            }
+            // An explicit hook `allow` short-circuits the downstream gates, which
+            // is the point of saying it.
+            BeforeOutcome::Allow { .. } => exec.pre_approved = true,
+            _ => {}
+        }
+        let mut result = next.run(exec).await;
+        if let AfterOutcome::Block { reason } = self.engine.post_tool(&mut result).await {
+            // PostToolUse `block` speaks TO THE MODEL after the fact; the call
+            // already ran, so this appends rather than replacing the result.
+            result.content.push_str("\n\n");
+            result.content.push_str(&reason);
+            result.is_error = true;
+        }
+        result
+    }
+}
+
+/// Runs the user's `hooks.json` at the CC-compatible moments.
+pub struct CcHooksPlugin;
+
+#[derive(serde::Deserialize, Default)]
+struct CcHooksRow {
+    #[serde(default)]
+    working_dir: String,
+    /// Stamped into every CC payload as `session_id`, so a hook can correlate.
+    #[serde(default)]
+    session_id: String,
+}
+
+#[async_trait]
+impl Plugin for CcHooksPlugin {
+    fn name(&self) -> &'static str {
+        "cc-hooks"
+    }
+    fn description(&self) -> &'static str {
+        "run the user's hooks.json at the Claude-Code-compatible moments"
+    }
+    async fn apply(&self, ctx: &Context, config: &serde_json::Value) -> Result<(), String> {
+        let row: CcHooksRow = if config.is_null() {
+            CcHooksRow::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        let working_dir = std::path::PathBuf::from(&row.working_dir);
+        let mut engine = atomcode_capabilities::cc_hooks::CCExternalHooks::load_with_extra(
+            &working_dir,
+            Vec::new(),
+        );
+        if !row.session_id.is_empty() {
+            engine = engine.with_session_id(&row.session_id);
+        }
+        // No hooks configured → register nothing at all, so the no-hooks path
+        // costs exactly what it costs in the chain: nothing.
+        if engine.is_empty() {
+            return Ok(());
+        }
+        let hooks = Arc::new(CcHooks {
+            ctx: ctx.clone(),
+            engine: Arc::new(engine),
+            started: std::sync::atomic::AtomicBool::new(false),
+        });
+        let _ = ctx.on_waterfall::<atomcode_harness::events::PreStep>(hooks.clone(), false);
+        // Prepended: the person's own hook decides before any built-in gate gets
+        // to auto-approve the call out from under it. The chain registers it in
+        // the same position, ahead of the workspace and approval gates.
+        let _ = ctx.on_waterfall::<atomcode_harness::events::ToolsExecute>(hooks.clone(), true);
+        let ended = hooks.clone();
+        let _ = ctx.on_emit::<atomcode_harness::events::TurnEnd>(
+            move |outcome: &atomcode_harness::seams::TurnOutcome| {
+                use atomcode_harness::seams::StopReason as Harness;
+                // The one branch CC actually reads off this value is Stop vs
+                // StopFailure, and `stop_is_failure` keys on a provider/stream
+                // failure — so that is the distinction worth carrying across two
+                // enums neither crate owns.
+                let reason = match outcome.stop {
+                    Harness::ProviderError => atomcode_kernel::event::StopReason::ProviderError,
+                    _ => atomcode_kernel::event::StopReason::Stopped,
+                };
+                let engine = ended.engine.clone();
+                // Spawned, and faithfully so: `turn_complete` is documented
+                // "observation only — fire all matching hooks and ignore output",
+                // so nothing downstream is waiting on the answer.
+                tokio::spawn(async move {
+                    use atomcode_kernel::hook::LifecycleHooks;
+                    engine
+                        .turn_complete(
+                            &atomcode_kernel::message::Conversation::new(),
+                            &reason,
+                            &atomcode_kernel::hook::TurnCtx::default(),
+                        )
+                        .await;
+                });
+            },
         );
         Ok(())
     }

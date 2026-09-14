@@ -3308,3 +3308,131 @@ async fn the_datalog_records_the_same_turn_on_both_engines() {
         }
     }
 }
+
+// ---- the user's own hooks -----------------------------------------------
+//
+// The one place this rig knowingly spawns a subprocess. It has to: the whole
+// feature IS running the person's external command, and a fixture that stubs
+// the command out would test the fold and not the thing. The commands are
+// `/bin/sh` one-liners writing to the scratch dir.
+
+/// A hooks file where both engines look for one: `<project>/.hooks.json`.
+///
+/// NOT `.claude/settings.json` in CC's nested-array shape, which is what the
+/// first version of this wrote — the scenario then passed with zero divergences
+/// because NEITHER engine found the file, which is the failure mode the
+/// "does it actually fire" assertion exists to catch.
+fn seed_hooks(dir: &std::path::Path, body: &str) {
+    std::fs::write(dir.join(".hooks.json"), body).expect("hooks file");
+}
+
+/// A PreToolUse hook that denies `read_file`.
+fn deny_read_file() -> String {
+    serde_json::json!({
+        "hooks": {
+            "no-reading": {
+                "event": "PreToolUse",
+                "matcher": "read_file",
+                "command": "printf '{\"hookSpecificOutput\":{\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"nope, not that file\"}}'",
+            },
+        },
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_users_hook_can_refuse_a_tool_on_both_engines() {
+    let dir = scratch("cc-hooks-onharness");
+    seed(&dir);
+    seed_hooks(&dir, &deny_read_file());
+    let script = || {
+        Script::new(&[
+            Reply::call("c1", "read_file", r#"{"file_path":"a.rs"}"#),
+            Reply::Text("could not read it"),
+        ])
+    };
+
+    let a = reference_production(script(), &dir, say("read a.rs")).await;
+
+    let quiet = quiet_rows(&dir);
+    let insert = format!(
+        "[[insert]]\nname = \"cc-hooks\"\nconfig = {{ working_dir = {dir:?} }}\n",
+        dir = dir.to_string_lossy(),
+    );
+    let (handle, mut app) = atomcode_coding::on_harness::mount(
+        &dir,
+        atomcode_coding::on_harness::Presence::Attended,
+        script(),
+        &[quiet.as_str(), insert.as_str()],
+    )
+    .await
+    .expect("the tree with cc-hooks must mount");
+    let b = drive_answering(handle, say("read a.rs"), &[], None, allow()).await;
+    app.stop();
+    // Frozen at 1, and it is the `ToolStarted` gap that
+    // `a_refused_call_still_reads_as_started_on_the_harness` owns — the third
+    // scenario to carry it, which is the point: it is ONE harness-side property
+    // of every refusal path, not three separate bugs in three product rows.
+    let report = judge("cc_hooks_deny_rows", &a, &b);
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.kind == "ToolResult" && s.detail.contains("error=true")),
+            "{who}: 人自己配的钩子说不,就得是不{report}"
+        );
+    }
+    // The file still exists and still says what it said. Cheap, and it is the
+    // assertion that would have caught the first version writing the fixture to
+    // a path nothing reads.
+    assert!(
+        std::fs::read_to_string(dir.join(".hooks.json"))
+            .unwrap_or_default()
+            .contains("PreToolUse"),
+        "夹具必须落在两个引擎都会去读的那个路径上"
+    );
+}
+
+#[tokio::test]
+async fn without_a_hooks_file_nothing_is_mounted_and_nothing_changes() {
+    // The negative control, and the one that makes the scenario above mean
+    // something: a row that refused every `read_file` regardless would pass it
+    // too. Same script, same tree, no `hooks.json` — the call must go through.
+    let dir = scratch("cc-hooks-absent");
+    seed(&dir);
+    let script = || {
+        Script::new(&[
+            Reply::call("c1", "read_file", r#"{"file_path":"a.rs"}"#),
+            Reply::Text("read it"),
+        ])
+    };
+
+    let a = reference_production(script(), &dir, say("read a.rs")).await;
+
+    let quiet = quiet_rows(&dir);
+    let insert = format!(
+        "[[insert]]\nname = \"cc-hooks\"\nconfig = {{ working_dir = {dir:?} }}\n",
+        dir = dir.to_string_lossy(),
+    );
+    let (handle, mut app) = atomcode_coding::on_harness::mount(
+        &dir,
+        atomcode_coding::on_harness::Presence::Attended,
+        script(),
+        &[quiet.as_str(), insert.as_str()],
+    )
+    .await
+    .expect("the tree must mount with an inert cc-hooks row");
+    let b = drive_answering(handle, say("read a.rs"), &[], None, allow()).await;
+    app.stop();
+    let report = judge("cc_hooks_absent_rows", &a, &b);
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.kind == "ToolResult" && s.detail.contains("error=false")),
+            "{who}: 没配钩子就什么都不该变{report}"
+        );
+    }
+}

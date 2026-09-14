@@ -764,6 +764,42 @@ impl ToolMiddleware for CCExternalHooks {
         _tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
     ) -> BeforeOutcome {
+        let mut gate = self.pre_tool_gate(call).await;
+        // Resolve a folded `ask` (CC `permissionDecision:"ask"`) into a REAL approval
+        // prompt. The kernel has no L0 approval mechanism (it treats `Ask` as a no-op), so
+        // — like `BashWorkspaceGate` / `WriteApprovalGate` — we round-trip the driver here
+        // and map the decision. This middleware runs BEFORE the downstream auto-approve
+        // gates, so returning `Allow` on approval short-circuits them: an explicit hook
+        // "ask" forces a prompt even for an in-workspace edit or a Safe read, which would
+        // otherwise auto-approve and drop the "ask" silently. Resolved AFTER the fold so a
+        // later hook's `Deny` still outranks it (Deny > Ask).
+        if matches!(gate, BeforeOutcome::Ask { .. }) {
+            gate = self.resolve_ask(call, rt).await;
+        }
+        self.note_call_for_post(call, &gate);
+        gate
+    }
+
+    async fn after(
+        &self,
+        result: &mut ToolResult,
+        _tool: Option<&std::sync::Arc<dyn atomcode_kernel::tool::Tool>>,
+    ) -> AfterOutcome {
+        self.post_tool(result).await
+    }
+}
+
+/// The CC hook engine as a SINK, apart from the seams that drive it.
+///
+/// Only ONE thing in the whole `before` fold is kernel-shaped: resolving a
+/// hook's `ask` into a real prompt, which the chain does through `RequestCtx`
+/// and the harness does through the `approval` seam. Everything else — running
+/// the matching hooks, the `updatedInput` rewrite, the most-restrictive fold,
+/// the CC exit-code contract — is the same judgement either way, so it is
+/// written once and the two assemblies differ in one line.
+impl CCExternalHooks {
+    /// The PreToolUse fold, with an `ask` left UNRESOLVED for the caller.
+    pub async fn pre_tool_gate(&self, call: &mut ToolCall) -> BeforeOutcome {
         // PreToolUse stdin: tool_input is the PARSED args object (CC sends an
         // object, not a string), falling back to the raw string if unparseable.
         let tool_input: Value = serde_json::from_str(&call.arguments)
@@ -847,34 +883,23 @@ impl ToolMiddleware for CCExternalHooks {
                 break; // deny is final.
             }
         }
-        // Resolve a folded `ask` (CC `permissionDecision:"ask"`) into a REAL approval
-        // prompt. The kernel has no L0 approval mechanism (it treats `Ask` as a no-op), so
-        // — like `BashWorkspaceGate` / `WriteApprovalGate` — we round-trip the driver here
-        // and map the decision. This middleware runs BEFORE the downstream auto-approve
-        // gates, so returning `Allow` on approval short-circuits them: an explicit hook
-        // "ask" forces a prompt even for an in-workspace edit or a Safe read, which would
-        // otherwise auto-approve and drop the "ask" silently. Resolved AFTER the fold so a
-        // later hook's `Deny` still outranks it (Deny > Ask).
-        if matches!(gate, BeforeOutcome::Ask { .. }) {
-            gate = self.resolve_ask(call, rt).await;
-        }
-        // Remember this call's tool name for PostToolUse / PostToolUseFailure `after`
-        // (kernel hands it no tool name), but ONLY for a call that will actually run — a
-        // Deny here means the tool is blocked, so its post-tool hook must not fire.
-        // `after` removes the entry.
+        gate
+    }
+
+    /// Remember this call's tool name for PostToolUse / PostToolUseFailure
+    /// (neither engine threads a tool name into the post-tool seam), but ONLY
+    /// for a call that will actually run — a `Deny` means the tool is blocked,
+    /// so its post-tool hook must not fire. [`Self::post_tool`] removes it.
+    pub fn note_call_for_post(&self, call: &ToolCall, gate: &BeforeOutcome) {
         if self.has_post_tool_hooks && !gate.is_deny() {
             if let Ok(mut m) = self.call_tools.lock() {
                 m.insert(call.id.clone(), call.name.clone());
             }
         }
-        gate
     }
 
-    async fn after(
-        &self,
-        result: &mut ToolResult,
-        _tool: Option<&std::sync::Arc<dyn atomcode_kernel::tool::Tool>>,
-    ) -> AfterOutcome {
+    /// The PostToolUse / PostToolUseFailure fold. Nothing kernel-shaped here.
+    pub async fn post_tool(&self, result: &mut ToolResult) -> AfterOutcome {
         // Recover the tool name `before` stashed for this call_id (kernel doesn't thread
         // it into `after`), so PostToolUse / PostToolUseFailure tool-name matchers are
         // honored. Absent ⇒ the call never ran our `before` (e.g. denied earlier) ⇒ only

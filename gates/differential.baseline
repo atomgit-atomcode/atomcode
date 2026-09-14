@@ -47,3 +47,5 @@ verify_cadence_forbidden_rows=0
 exec_policy_rows=1
 approval_refusal_rows=1
 refused_call_started_rows=1
+cc_hooks_absent_rows=0
+cc_hooks_deny_rows=1
