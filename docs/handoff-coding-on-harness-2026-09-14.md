@@ -47,7 +47,14 @@
   4d63c0c6  催检查不能盖过人的话
   79988b53  修正本文档"下一步"(原来漏了三项)
   52e912d3  执行边界补成行 + 审批那两条根本没在测审批
+  4c973541  交接同步
+  3a6f7a6f  技能:目录 + skill-first
+  e2fdfad4  datalog 补成行
+  9c923012  用户的 hooks.json 补成行
 ```
+
+**生产链上没有对应行的东西,现在只剩一个**:`GitPushLabelMiddleware`,
+在 `atomgit` feature 后面(开它要拉 reqwest + auth,不值得)。
 
 **两个分支都没 push。** 第二个分支尚未合回第一个。
 
@@ -167,23 +174,30 @@ fs2 文件锁，锁基线文件本身。
 |---|---|---|
 | `VerifyCadenceHook` | 改了代码不检查就走 → 补一轮追问 | **已补**(`9471d802`) |
 | `TurnExecutionPolicy` | 每回合的用户执行边界(「不要跑任何命令」) | **已补**(`52e912d3`) |
-| `SkillFirstHook` | 先用 skill 的推动 | 未补 |
-| `DatalogHook` | 落盘的 transcript(hook + middleware 各一半) | 未补 |
-| `CCExternalHooks` | 用户的 `hooks.json` 外部钩子 | 未补 |
+| `SkillFirstHook` | 先用 skill 的推动 | **已补**(`3a6f7a6f`) |
+| `SkillCatalogHook` | 整份技能目录进系统提示 | **已补**(`3a6f7a6f`,原表漏了这条) |
+| `DatalogHook` | 落盘的 transcript(hook + middleware 各一半) | **已补**(`e2fdfad4`) |
+| `CCExternalHooks` | 用户的 `hooks.json` 外部钩子 | **已补**(`9c923012`) |
 | `GitPushLabelMiddleware` | — | 够不着,在 `atomgit` feature 后面,开它要拉 reqwest+auth |
 | `PermissionRuleGate` | — | 不用搬,harness `permissions` 行已自实现 |
 
-1. **`SkillFirstHook` / `DatalogHook` / `CCExternalHooks`** —— 都不是审批闸门。
-   `cc-hooks` 要给 harness 开一个 feature（只需 `tools`+`dirs`+`tokio/process`，
-   代价接近零）。`DatalogHook` 的观测价值是实打实的（memory 里那条
-   「TUI 看不到 ≠ 没生效，先 grep datalog」说的就是它）。
-2. **`ui-handle` 的 `ToolStarted` 缺口**（上面那节）。属于 harness，不属于这条线，
-   但切默认路径前该有人看一眼：它影响每一条拒绝路径。
+1. **`ui-handle` 的 `ToolStarted` 缺口**（上面那节）。属于 harness，不属于这条线，
+   但切默认路径前该有人看一眼：它影响每一条拒绝路径，现在有三条基线带着它
+   （`approval_refusal_rows`、`exec_policy_rows`、`cc_hooks_deny_rows`）。
+2. **五个闸门行进 `plugins::catalog()`**，等另一条线放开 `plugins/mod.rs`。
+   现在由 `on_harness::mount` 显式注册，能跑，但不该长期这样。
 3. **然后才切 `build_coding_agent` 的默认路径**，并留一个逃生开关（参照当初
-   `--engine v1`）。
+   `--engine v1`）。切之前要先答的两个问题，都不是技术问题：
+   - **技能目录 vs 指针**。coding 内联整份目录，通用 harness 只报数量 + 让你
+     `list_skills`。`skill-catalog-inline` 保持了 coding 今天的行为（内联），
+     因为这条线的前提是「上面什么都不变」——但那是每次请求都要付的 token，
+     值得有人明确拍一次板。
+   - **`datalog` / `cc-hooks` 两行都刻意不在 `CODING_ROWS` 里**：前者往用户磁盘
+     写每一次请求的完整记录，后者跑用户自己的外部命令。对它们来说挂载即启用。
+     切默认路径时别顺手把它们加进去。
 4. 阶段二：把 `on_harness.rs` 里的 `CODING_ROWS` 常量变成可配置数据。
 
-### 补 VerifyCadence 时学到的、下一条也用得上的
+### 抽行时反复用上的几条
 
 - **harness 没有 `offer_continuation`，但续问是做得到的**，而且
   `truncation-recovery` 行早就在这么干：`agent/request` 看刚跑完那一轮，
@@ -201,14 +215,26 @@ fs2 文件锁，锁基线文件本身。
   也不追。第三条上线时先验过「把判断摘掉测试会红」才算数。
 - **一条 0 分歧的场景，先确认它真的触发了它要测的东西。** 上面那两条审批场景
   就是反例:绿了一整条线，因为两边都没走到审批。看一眼 render，确认该出现的事件
-  （这里是 `Request`）真的在，比多写三条场景管用。
+  （这里是 `Request`）真的在，比多写三条场景管用。这个错本会话又犯了一次:
+  cc-hooks 的第一版夹具写成 `.claude/settings.json` 配 CC 的嵌套数组格式，
+  两个引擎都没找到文件，分歧 0，全绿。真正的路径是 `<project>/.hooks.json`。
+- **`cargo nextest run -p <crate>` 不等于编译了整个 crate。** 先前报的
+  「capabilities 909 全绿」根本没编译 `datalog.rs` —— 它在
+  `#[cfg(feature = "session")]` 后面。带 feature 跑是 1124 条。
+  验证命令那一节已按 feature 分开写。
+- **差分台能判的东西比事件流多，但要先给它眼睛。** 临时请求尾巴（skill-first
+  这类）不落日志、不发事件、快照也照不出来 —— `transcript` 那条辅助函数会对
+  两个发给模型完全不同内容的引擎报「一致」。现在 `Script` 记下每次请求
+  （`seen()`），也可以自称是别的模型（`as_model`），因为真实行为按模型名分支。
+  datalog / cc-hooks 两条则直接按**文件**和**子进程副作用**判。
 
 ## 怎么验证
 
 ```sh
-cargo nextest run -p atomcode-coding --test differential   # 55/55,裁判
-cargo nextest run -p atomcode-coding                       # 526/526
-cargo nextest run -p atomcode-capabilities                 # 909/909
+cargo nextest run -p atomcode-coding --test differential   # 60/60,裁判
+cargo nextest run -p atomcode-coding                       # 531/531
+cargo nextest run -p atomcode-capabilities --features session   # 1124/1124
+cargo nextest run -p atomcode-capabilities --features cc-hooks  # 939/939
 cargo nextest run -p atomcode-harness --test policy_rows   # 24/24(全量会红,见上)
 git status --short gates/                                  # 基线只准降,不准手改
 ```
