@@ -76,10 +76,36 @@ fn validate_question(req: &UserInputRequest) -> Result<(), String> {
     Ok(())
 }
 
-/// Parse raw tool args into a `UserInputRequest`. Rejects choice modes with no options.
+/// Fill in a default `mode` when the model omits it — weak models frequently drop this
+/// required field and the call would otherwise hard-fail with `missing field 'mode'`.
+/// Infer intent from `options`: a non-empty `options` array means a choice (`single`),
+/// otherwise free-form (`text`). A `mode` that is already present (even explicit `text`
+/// alongside options) is left untouched. No-op on a non-object value.
+fn fill_default_mode(value: &mut serde_json::Value) {
+    let serde_json::Value::Object(map) = value else {
+        return;
+    };
+    let missing = map.get("mode").map(serde_json::Value::is_null).unwrap_or(true);
+    if !missing {
+        return;
+    }
+    let has_options = map
+        .get("options")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    let inferred = if has_options { "single" } else { "text" };
+    map.insert("mode".into(), serde_json::Value::String(inferred.into()));
+}
+
+/// Parse raw tool args into a `UserInputRequest`. A missing `mode` is inferred from
+/// `options` (see [`fill_default_mode`]); choice modes with no options are rejected.
 /// Returns a human message on failure (never panics).
 pub fn parse_args(args: &str) -> Result<UserInputRequest, String> {
-    let mut req: UserInputRequest = serde_json::from_str(args)
+    let mut value: serde_json::Value = serde_json::from_str(args)
+        .map_err(|e| format!("invalid request_user_input arguments: {e}"))?;
+    fill_default_mode(&mut value);
+    let mut req: UserInputRequest = serde_json::from_value(value)
         .map_err(|e| format!("invalid request_user_input arguments: {e}"))?;
     // Keep accepting the legacy field for wire compatibility, but a
     // human-facing question must always leave the user a free-form escape hatch.
@@ -100,7 +126,9 @@ pub fn parse_batch(args: &str) -> Result<(Vec<UserInputRequest>, bool), String> 
         }
         let mut out = Vec::new();
         for q in qs.iter().take(MAX_QUESTIONS) {
-            let mut req: UserInputRequest = serde_json::from_value(q.clone())
+            let mut q = q.clone();
+            fill_default_mode(&mut q);
+            let mut req: UserInputRequest = serde_json::from_value(q)
                 .map_err(|e| format!("invalid question in `questions`: {e}"))?;
             req.custom = true;
             validate_question(&req)?;
@@ -248,9 +276,11 @@ impl Tool for RequestUserInputTool {
          offer choices for THEM to pick/select from (e.g. \"recommend a few X for me to \
          choose\", \"let me pick one\"), surface the concrete options HERE (set \
          `mode`=\"multiple\" when they may want to select several) instead of writing the \
-         list as prose. For ONE question, set `header`, `question`, `mode` \
-         (\"single\"=pick one, \"multiple\"=pick any, \"text\"=free-form) and `options` \
-         (non-empty for single/multiple). To ask up to 4 related questions answered in ONE \
+         list as prose. For ONE question, set `header`, `question`, and `options` \
+         (non-empty for a choice question); `mode` is optional — omit it and it is inferred \
+         (\"single\" when `options` is given, else \"text\"), but set it explicitly to \
+         \"multiple\" when the user may pick several (or \"text\" to force free-form). To ask \
+         up to 4 related questions answered in ONE \
          interaction, pass a `questions` array of those same objects instead. A free-text \
          \"type your own answer\" row is always added automatically for single/multiple, so do \
          NOT add your own \"Other\"/catch-all option. Keep each \
@@ -260,11 +290,11 @@ impl Tool for RequestUserInputTool {
     fn parameters_schema(&self) -> serde_json::Value {
         let question = serde_json::json!({
             "type": "object",
-            "required": ["header", "question", "mode"],
+            "required": ["header", "question"],
             "properties": {
                 "header": {"type": "string", "description": "Very short label (a few words)."},
                 "question": {"type": "string", "description": "One clear sentence, ideally ending in '?'."},
-                "mode": {"type": "string", "enum": ["single", "multiple", "text"]},
+                "mode": {"type": "string", "enum": ["single", "multiple", "text"], "description": "Optional; if omitted, defaults to \"single\" when `options` is non-empty, else \"text\"."},
                 "options": {
                     "type": "array",
                     "description": "Choices for single/multiple; omit for text.",
@@ -345,6 +375,50 @@ mod tests {
     fn parse_text_ignores_options() {
         let r = parse_args(r#"{"header":"H","question":"Q?","mode":"text"}"#).unwrap();
         assert_eq!(r.mode, UserInputMode::Text);
+    }
+
+    #[test]
+    fn omitted_mode_with_options_infers_single() {
+        // Weak models drop the required `mode`; a call carrying `options` clearly wants
+        // a choice → infer `single` instead of hard-failing with `missing field 'mode'`.
+        let r = parse_args(
+            r#"{"header":"H","question":"Q?","options":[{"label":"A"},{"label":"B"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.mode, UserInputMode::Single);
+        assert_eq!(r.options.len(), 2);
+    }
+
+    #[test]
+    fn omitted_mode_without_options_infers_text() {
+        let r = parse_args(r#"{"header":"H","question":"Q?"}"#).unwrap();
+        assert_eq!(r.mode, UserInputMode::Text);
+    }
+
+    #[test]
+    fn explicit_mode_is_never_overridden_by_inference() {
+        // Explicit `text` alongside options stays text (options are ignored per
+        // `parse_text_ignores_options`), and null is treated as omitted.
+        let r = parse_args(r#"{"header":"H","question":"Q?","mode":"text","options":[{"label":"A"}]}"#)
+            .unwrap();
+        assert_eq!(r.mode, UserInputMode::Text);
+        let r = parse_args(r#"{"header":"H","question":"Q?","mode":null,"options":[{"label":"A"}]}"#)
+            .unwrap();
+        assert_eq!(r.mode, UserInputMode::Single);
+    }
+
+    #[test]
+    fn batch_infers_mode_per_question() {
+        let (reqs, is_batch) = parse_batch(
+            r#"{"questions":[
+                {"header":"A","question":"Q1?","options":[{"label":"x"}]},
+                {"header":"B","question":"Q2?"}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(is_batch);
+        assert_eq!(reqs[0].mode, UserInputMode::Single);
+        assert_eq!(reqs[1].mode, UserInputMode::Text);
     }
 
     #[test]
