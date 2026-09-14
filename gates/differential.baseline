@@ -42,3 +42,5 @@ retry_after_rows=0
 provider_error_rows=0
 dangling_call_rows=0
 two_tool_calls_rows=0
+verify_cadence_rows=0
+verify_cadence_attended_rows=0

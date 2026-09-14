@@ -8,3 +8,10 @@
 mod verify;
 
 pub use verify::VerifyCadenceHook;
+/// The judgement, separate from the shape it is delivered in.
+///
+/// `VerifyCadenceHook` is one shape (the kernel's `offer_continuation`); the
+/// `verify-cadence` row in [`crate::on_harness`] is the other (`agent/request`
+/// plus the inbox). Both ask [`unverified_edit`] the same question and send the
+/// same [`NUDGE`], so the discipline cannot drift between the two assemblies.
+pub use verify::{unverified_edit, NudgedEdit, NUDGE};

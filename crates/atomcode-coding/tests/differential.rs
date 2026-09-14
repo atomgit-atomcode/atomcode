@@ -2737,3 +2737,118 @@ async fn the_context_a_message_carries_reaches_the_model_on_the_harness() {
         );
     }
 }
+
+// ---- the self-correction loop, on the harness ---------------------------
+//
+// One of the three things this crate says it owns (lib.rs: assembly, persona,
+// discipline). It was the one thing nothing here measured: no other script
+// edits a file and then walks away, which is the exact shape the cadence
+// exists for. Asked directly, the rig answered immediately — the chain ran a
+// third model call and the row list stopped at two.
+//
+// Both sides are UNATTENDED here, which is what makes it a comparison:
+// `CodingAgentConfig::new` leaves `interactive: false`, so the chain's cadence
+// is armed, and `Presence::Headless` is the row list's way of saying the same
+// thing. An attended pair is the negative control below.
+
+/// A mounted headless tree and its handle.
+async fn on_harness_headless(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+) -> (AgentHandle, atomcode_plexus::App) {
+    let quiet = quiet_rows(dir);
+    atomcode_coding::on_harness::mount(
+        dir,
+        atomcode_coding::on_harness::Presence::Headless,
+        script,
+        &[quiet.as_str()],
+    )
+    .await
+    .expect("the headless coding-on-harness tree must mount")
+}
+
+/// An in-workspace code edit the model walks away from without checking.
+fn edits_and_stops() -> Arc<Script> {
+    Script::new(&[
+        Reply::call(
+            "c1",
+            "write_file",
+            r#"{"file_path":"a.rs","content":"fn main() { let x: i32 = 1; }"}"#,
+        ),
+        Reply::Text("done"),
+        Reply::Text("checked, it compiles"),
+    ])
+}
+
+/// Model calls in a run, one `Usage` apiece.
+///
+/// The observable the cadence moves: a continuation is one more round, and a
+/// round is one more request. Nothing else in the stream distinguishes "the
+/// turn ended" from "the turn ended after being asked to check its work".
+fn model_calls(steps: &[Step]) -> usize {
+    steps.iter().filter(|s| s.kind == "Usage").count()
+}
+
+#[tokio::test]
+async fn an_edit_that_was_never_verified_is_asked_about_on_both_engines() {
+    let dir = scratch("verify-cadence-onharness");
+    seed(&dir);
+    let a = reference_production(edits_and_stops(), &dir, say("fix a.rs")).await;
+    let (handle, mut app) = on_harness_headless(edits_and_stops(), &dir).await;
+    let b = drive_answering(handle, say("fix a.rs"), &[], None, allow()).await;
+    app.stop();
+    let report = judge("verify_cadence_rows", &a, &b);
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert_eq!(
+            model_calls(steps),
+            3,
+            "{who}: 改了代码就走,必须多问一轮 —— 两轮说明根本没问{report}"
+        );
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "TurnStarted").count(),
+            1,
+            "{who}: 续问折进同一个回合,不另开一个{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_attended_run_does_not_force_the_check() {
+    // The negative control, and the half that makes it a rule rather than a
+    // behaviour. `Attended` agreeing with an armed chain would also be true of
+    // a row list that simply never nudged — what makes it a rule is that the
+    // SAME edit, with a person watching, is left alone on both engines.
+    //
+    // A present human sees the edit and can ask for the check; forcing it
+    // spends a round on something they were about to decide themselves.
+    let dir = scratch("verify-cadence-attended");
+    seed(&dir);
+    let mut cfg =
+        atomcode_coding::CodingAgentConfig::new("k", "http://unused.test/v1", "script", &dir);
+    cfg.interactive = true;
+    let opts = atomcode_coding::parts::PrepareOptions {
+        mcp: false,
+        web: false,
+        review: false,
+        memory: false,
+        skill_dirs: Some(Vec::new()),
+        ..Default::default()
+    };
+    let mut parts = atomcode_coding::parts::prepare(&cfg, opts)
+        .await
+        .expect("prepare");
+    let chain =
+        atomcode_coding::parts::assemble(&mut parts, &cfg, edits_and_stops()).expect("assemble");
+    let a = drive_until(chain.spawn(), say("fix a.rs"), &[]).await;
+    let b = on_harness(edits_and_stops(), &dir, say("fix a.rs")).await;
+    let report = judge("verify_cadence_attended_rows", &a, &b);
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert_eq!(
+            model_calls(steps),
+            2,
+            "{who}: 有人看着就别强制查 —— 多出来的那轮是抢了人的活{report}"
+        );
+    }
+}

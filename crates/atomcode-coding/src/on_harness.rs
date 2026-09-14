@@ -62,7 +62,8 @@ pub enum Presence {
 /// from being the place four products quietly fork". A coding assembly is a
 /// product, so the list lives with the product.
 ///
-/// `{working_dir}` is substituted by [`coding_overlay`].
+/// `{working_dir}`, `{artifacts}` and `{force_verify}` are substituted by
+/// [`coding_overlay`].
 const CODING_ROWS: &str = r#"
 # Approval gates that the hand-written chain mounts as kernel `ToolMiddleware`s.
 # Same judgements — each row calls the same L1 function the middleware does —
@@ -87,16 +88,33 @@ config = { working_dir = "{working_dir}" }
 name = "tool-output-artifact"
 config = { dir = "{artifacts}" }
 
+# The self-correction loop: an in-workspace code edit the model walked away
+# from without checking gets one nudge. `force` follows presence, the same rule
+# `CodingAgentConfig::is_attended` applies to `VerifyCadenceHook`: a person who
+# is watching can ask for the check themselves.
+[[insert]]
+name = "verify-cadence"
+config = { working_dir = "{working_dir}", force = {force_verify} }
+
 # The driver protocol: this is what `CodingRuntimeHandle` drives.
 [[insert]]
 name = "ui-handle"
 "#;
 
 /// The coding overlay with this working directory substituted in.
-pub fn coding_overlay(working_dir: &Path, artifacts: &Path) -> String {
+pub fn coding_overlay(working_dir: &Path, artifacts: &Path, presence: Presence) -> String {
     CODING_ROWS
         .replace("{working_dir}", &working_dir.to_string_lossy())
         .replace("{artifacts}", &artifacts.to_string_lossy())
+        .replace(
+            "{force_verify}",
+            // Same rule as the fence above, read the other way round: with
+            // nobody watching, the agent has to be its own reviewer.
+            match presence {
+                Presence::Attended => "false",
+                Presence::Headless => "true",
+            },
+        )
 }
 
 /// Put a caller-supplied provider into the tree's `llm` seam.
@@ -145,10 +163,9 @@ pub async fn mount(
     // the driver, which reads backwards until you notice the row being disabled
     // is the policy that never asks.
     let boundary = match presence {
-        Presence::Attended => format!(
-            "[[patch]]\nid = \"fs\"\nconfig = {{}}\n\n\
-             [[patch]]\nid = \"approval\"\ndisabled = true\n",
-        ),
+        Presence::Attended => "[[patch]]\nid = \"fs\"\nconfig = {}\n\n\
+             [[patch]]\nid = \"approval\"\ndisabled = true\n"
+            .to_string(),
         // The FENCE is what this mode enforces. "Never ask" is the front end's
         // business, not this overlay's: mounting `ui-handle` at all means a driver
         // is present, so an assembly that wanted nobody-to-ask would pick a
@@ -170,7 +187,7 @@ pub async fn mount(
     let mut layers = vec![atomcode_harness::bundle::base().map_err(|e| e.to_string())?];
     for src in [
         scoped.as_str(),
-        coding_overlay(working_dir, &artifacts).as_str(),
+        coding_overlay(working_dir, &artifacts, presence).as_str(),
     ] {
         layers.push(Layer::from_toml(src).map_err(|e| e.to_string())?);
     }
@@ -191,6 +208,7 @@ pub async fn mount(
     registry.register(Arc::new(policy::WriteApprovalPlugin));
     registry.register(Arc::new(policy::BashWorkspacePlugin));
     registry.register(Arc::new(policy::OutputArtifactPlugin));
+    registry.register(Arc::new(VerifyCadencePlugin));
     registry.register(Arc::new(InjectProvider(provider)));
 
     let mut app = App::new(registry, tree);
@@ -202,4 +220,135 @@ pub async fn mount(
         .take()
         .ok_or("the handle, once")?;
     Ok((handle, app))
+}
+
+// ---- the verify cadence, as a row ---------------------------------------
+//
+// One of the three things this crate says it owns (lib.rs: assembly, persona,
+// discipline). In the hand-written chain it is `VerifyCadenceHook`, sitting on
+// the kernel's `offer_continuation`. The harness has no such hook — but it has
+// the two halves the discipline actually needs, and they are already how the
+// `truncation-recovery` row keeps a turn alive:
+//
+//   1. `agent/request` to see the round that just finished, and
+//   2. the agent's inbox, whose `has_waking_input()` is exactly what the loop
+//      re-reads before deciding the turn is over.
+//
+// A message queued with `MessageOrigin::Harness` is logged as
+// `InjectionOrigin::Continuation` and rendered as a SYNTHETIC user message —
+// the same thing `offer_continuation` produces, which is why
+// `verify_reminder_already_present` and `current_real_user_start` keep working
+// against it unchanged.
+//
+// The differential found this: the chain ran a third model call after an
+// unverified edit and the row list stopped at two. Nothing else in the scenario
+// list edits a file and then walks away, so it was invisible until asked.
+
+/// Asks the model to check code it edited and did not verify.
+struct VerifyCadence {
+    ctx: Context,
+    workspace: std::path::PathBuf,
+    /// The edit already nudged for, so one edit is asked about once.
+    nudged: std::sync::Mutex<Option<crate::discipline::NudgedEdit>>,
+}
+
+#[async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for VerifyCadence {
+    async fn handle(
+        &self,
+        req: &mut atomcode_harness::events::ModelRequest,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::AgentRequest>,
+    ) -> Result<atomcode_harness::events::ModelResponse, atomcode_harness::events::RequestError>
+    {
+        let response = next.run(req).await?;
+        // A round that asked for tools is not finished, and the loop will carry
+        // on by itself. The cadence is about the round where the model says it
+        // is done.
+        if !response.tool_calls.is_empty() || response.truncated {
+            return Ok(response);
+        }
+        // `req.messages` is what the model was shown: the edit and its result
+        // are both in there, which is the whole history the judgement needs.
+        let Some(edit) = crate::discipline::unverified_edit(&req.messages, &self.workspace) else {
+            return Ok(response);
+        };
+        {
+            let mut nudged = self.nudged.lock().unwrap_or_else(|e| e.into_inner());
+            if nudged.as_ref() == Some(&edit) {
+                // Already asked about this exact edit. Asking again would spend
+                // the budget on the same answer; let the turn stop.
+                return Ok(response);
+            }
+            *nudged = Some(edit);
+        }
+        let Some(agent) = atomcode_harness::agent::scoped(&self.ctx)
+            .service::<atomcode_harness::seams::SessionSvc>()
+            .and_then(|session| {
+                let id = session.id().to_string();
+                self.ctx
+                    .service::<atomcode_harness::seams::AgentsSvc>()
+                    .and_then(|agents| agents.by_session(&id))
+            })
+        else {
+            return Ok(response);
+        };
+        // A message, not an injection: an injection is context that rides along
+        // with the next message and never wakes anything, which is precisely
+        // the difference between a note and a continuation.
+        agent.inbox().send_from(
+            crate::discipline::NUDGE,
+            atomcode_harness::agent::MessageOrigin::Harness,
+        );
+        Ok(response)
+    }
+}
+
+/// Mounts the verify cadence.
+pub struct VerifyCadencePlugin;
+
+#[derive(serde::Deserialize)]
+struct VerifyCadenceRow {
+    #[serde(default)]
+    working_dir: String,
+    /// Whether to FORCE the check. Off when a person is attending: they see the
+    /// edit and can ask for the check themselves, which is the same rule
+    /// `CodingAgentConfig::is_attended` applies to the hook.
+    #[serde(default)]
+    force: bool,
+}
+
+#[async_trait]
+impl Plugin for VerifyCadencePlugin {
+    fn name(&self) -> &'static str {
+        "verify-cadence"
+    }
+    fn description(&self) -> &'static str {
+        "ask the model to check code it edited and walked away from"
+    }
+    async fn apply(&self, ctx: &Context, config: &serde_json::Value) -> Result<(), String> {
+        let row: VerifyCadenceRow = if config.is_null() {
+            VerifyCadenceRow {
+                working_dir: String::new(),
+                force: false,
+            }
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        if !row.force {
+            return Ok(());
+        }
+        // Outermost, so the round it judges is the SETTLED one: a rate-limit
+        // wait, a retry, an overflow trim and a truncation resume all happen
+        // inside this, and a cadence that fired on an intermediate response
+        // would nudge about an answer the model never finished giving.
+        let _ = ctx.on_waterfall::<atomcode_harness::events::AgentRequest>(
+            Arc::new(VerifyCadence {
+                ctx: ctx.clone(),
+                workspace: std::path::PathBuf::from(row.working_dir),
+                nudged: std::sync::Mutex::new(None),
+            }),
+            true,
+        );
+        Ok(())
+    }
 }

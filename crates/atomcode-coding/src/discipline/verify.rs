@@ -15,12 +15,13 @@
 use crate::execution_policy::{execution_policy_for_messages, TurnExecutionPolicy};
 use async_trait::async_trait;
 use atomcode_kernel::hook::{Continuation, LifecycleHooks};
-use atomcode_kernel::message::{Conversation, Role};
+use atomcode_kernel::message::{Conversation, Message, Role};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const NUDGE: &str = "You made code edits but have not verified them. Run a fast check \
+/// What the model is asked, when it edited code and walked away.
+pub const NUDGE: &str = "You made code edits but have not verified them. Run a fast check \
 (`cargo check`, `tsc --noEmit`, or the equivalent for this project) to catch errors \
 before finishing. Do NOT start a long-running process (dev server, watcher, full build).";
 
@@ -52,8 +53,14 @@ struct State {
     nudged_for: Option<NudgedEdit>,
 }
 
+/// The edit a conversation owes a check for.
+///
+/// Public because the judgement is now shared: the hook below acts on it
+/// through the kernel's `offer_continuation`, and the harness row acts on the
+/// same value through `agent/request` + the inbox. Two shapes, one decision —
+/// the same split the five approval gates already went through.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct NudgedEdit {
+pub struct NudgedEdit {
     turn_start: usize,
     edit_id: String,
 }
@@ -269,9 +276,8 @@ fn segment_is_work(seg: &str) -> bool {
     }
 }
 
-fn current_real_user_start(convo: &Conversation) -> usize {
-    convo
-        .messages
+fn current_real_user_start(messages: &[Message]) -> usize {
+    messages
         .iter()
         .rposition(|m| m.role == Role::User && !m.synthetic)
         .unwrap_or(0)
@@ -280,8 +286,8 @@ fn current_real_user_start(convo: &Conversation) -> usize {
 /// Scan the conversation: returns the tool_call_id of the most recent successful edit
 /// IF it has no VERIFYING `bash` after it (i.e. unverified), else `None`. A `bash` that is
 /// merely read-only (`ls`/`echo`/…) does not count — see [`bash_verifies`].
-fn unverified_edit(convo: &Conversation, workspace: &Path) -> Option<NudgedEdit> {
-    let start = current_real_user_start(convo);
+pub fn unverified_edit(messages: &[Message], workspace: &Path) -> Option<NudgedEdit> {
+    let start = current_real_user_start(messages);
     // Tool-call ids are assigned by the assistant message that precedes the matching
     // tool-result message, so a single forward pass can resolve a result's tool name.
     let mut names: HashMap<&str, &str> = HashMap::new();
@@ -292,7 +298,7 @@ fn unverified_edit(convo: &Conversation, workspace: &Path) -> Option<NudgedEdit>
     let mut last_edit_id: Option<String> = None;
     let mut bash_after_edit = false;
 
-    for msg in &convo.messages[start..] {
+    for msg in &messages[start..] {
         match msg.role {
             Role::Assistant => {
                 for tc in &msg.tool_calls {
@@ -353,9 +359,9 @@ fn unverified_edit(convo: &Conversation, workspace: &Path) -> Option<NudgedEdit>
     }
 }
 
-fn verify_reminder_already_present(convo: &Conversation, edit: &NudgedEdit) -> bool {
+fn verify_reminder_already_present(messages: &[Message], edit: &NudgedEdit) -> bool {
     let mut after_edit = false;
-    for msg in &convo.messages[edit.turn_start..] {
+    for msg in &messages[edit.turn_start..] {
         if msg.role == Role::Tool
             && msg.tool_call_id.as_deref() == Some(edit.edit_id.as_str())
             && !msg.is_error
@@ -407,8 +413,8 @@ impl LifecycleHooks for VerifyCadenceHook {
         {
             return None;
         }
-        let edit = unverified_edit(convo, &self.workspace)?;
-        if verify_reminder_already_present(convo, &edit) {
+        let edit = unverified_edit(&convo.messages, &self.workspace)?;
+        if verify_reminder_already_present(&convo.messages, &edit) {
             return None;
         }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
