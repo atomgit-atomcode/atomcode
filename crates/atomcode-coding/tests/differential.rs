@@ -3466,3 +3466,66 @@ async fn without_a_hooks_file_nothing_is_mounted_and_nothing_changes() {
         );
     }
 }
+
+#[tokio::test]
+async fn an_always_covers_the_scope_not_just_the_one_call() {
+    // "Always allow" is a statement about a SET of calls, and which set is the
+    // gate's to decide — `Tool::always_grant_scope`: a write grants its
+    // DIRECTORY, a bash command grants that command.
+    //
+    // Two writes to DIFFERENT files in the SAME directory outside the
+    // workspace, the first answered `allow_always`. One approval request, not
+    // two, or the person is re-asked for something they already answered.
+    //
+    // This could not be written until two things were fixed: the rig was
+    // writing into the temp dir (so neither engine asked at all), and
+    // `ui-handle`'s `Asker` keyed its grants on the exact argument bytes (so
+    // the scope the five gate rows compute was ignored — the second file asked
+    // again). Both are why the scenario is here.
+    let dir = scratch_outside_temp("grant-scope");
+    let outside = dir.parent().unwrap();
+    for name in ["scope-a.txt", "scope-b.txt"] {
+        let _ = std::fs::remove_file(outside.join(name));
+    }
+    let script = || {
+        Script::new(&[
+            Reply::call(
+                "c1",
+                "write_file",
+                r#"{"file_path":"../scope-a.txt","content":"x"}"#,
+            ),
+            Reply::call(
+                "c2",
+                "write_file",
+                r#"{"file_path":"../scope-b.txt","content":"y"}"#,
+            ),
+            Reply::Text("both written"),
+        ])
+    };
+
+    let (a, b, report) = ask_chain_vs_rows(
+        "grant_scope_rows",
+        &dir,
+        script,
+        || say("write both"),
+        serde_json::json!({ "decision": "allow_always" }),
+    )
+    .await;
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "Request").count(),
+            1,
+            "{who}: 同一个目录下的第二次写不该再问一遍 —— \
+             『总是允许』说的是一个范围,不是一次调用{report}"
+        );
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "ToolResult").count(),
+            2,
+            "{who}: 两次写都要落地{report}"
+        );
+    }
+    for name in ["scope-a.txt", "scope-b.txt"] {
+        let _ = std::fs::remove_file(outside.join(name));
+    }
+}

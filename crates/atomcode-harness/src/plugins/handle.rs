@@ -369,10 +369,20 @@ struct Asker {
     events: Mutex<Option<mpsc::UnboundedSender<AgentEvent>>>,
     pending: Mutex<HashMap<RequestId, oneshot::Sender<Value>>>,
     next_id: AtomicU64,
-    /// Calls the driver said to stop asking about, as `(tool, arguments)`.
-    /// Exact bytes, not the tool name: "always allow this" is a statement about
-    /// the call that was shown, not about everything the tool can do.
-    granted: Mutex<HashSet<(String, String)>>,
+    /// Calls the driver said to stop asking about, as `{tool}::{scope}`.
+    ///
+    /// The SCOPE, not the exact argument bytes. "Always allow" is a statement
+    /// about a set of calls, and which set is the gate's to decide — that is
+    /// what [`Tool::always_grant_scope`] is for: a write grants its directory, a
+    /// bash command grants that command, a tool with nothing to say grants
+    /// itself tool-wide. Keying on the bytes quietly narrowed every one of those
+    /// to "this one call", so a person who answered "always allow writes here"
+    /// was asked again about the very next file in the same directory.
+    ///
+    /// Same key shape as `policy_rows::AskingPolicy`, deliberately: two
+    /// implementations of one seam that remember different things are two
+    /// different products.
+    granted: Mutex<HashSet<String>>,
     timeout: Duration,
 }
 
@@ -459,8 +469,15 @@ impl ApprovalPolicy for Asker {
         if matches!(tool.risk(&call.arguments), RiskLevel::Safe) {
             return Decision::Allow;
         }
-        let key = (call.name.clone(), call.arguments.clone());
-        if self.granted.lock().expect("grants poisoned").contains(&key) {
+        // `NEVER_GRANT` is a gate saying "this one may never be remembered" — a
+        // write to a credential file, or a hook whose whole point was to stop
+        // and ask every time. Then there is nothing to look up and nothing to
+        // record, whatever the driver answers. NOT the empty scope, which
+        // several tools already use to mean the opposite: a tool-wide grant.
+        let scope = tool.always_grant_scope(&call.arguments);
+        let grantable = scope != crate::seams::NEVER_GRANT;
+        let key = format!("{}::{scope}", tool.name());
+        if grantable && self.granted.lock().expect("grants poisoned").contains(&key) {
             return Decision::Allow;
         }
         let request = ApprovalRequest {
@@ -482,7 +499,13 @@ impl ApprovalPolicy for Asker {
         match PermissionDecision::from_value(&answer.unwrap_or(Value::Null)) {
             PermissionDecision::AllowOnce => Decision::Allow,
             PermissionDecision::AllowAlways => {
-                self.granted.lock().expect("grants poisoned").insert(key);
+                // An "always" for something un-grantable is honoured as an
+                // allow-once rather than refused: the person did say yes. It is
+                // simply not remembered, which is the whole meaning of
+                // `NEVER_GRANT`.
+                if grantable {
+                    self.granted.lock().expect("grants poisoned").insert(key);
+                }
                 Decision::Allow
             }
             PermissionDecision::Deny => Decision::Deny(format!("`{}` was not approved", call.name)),

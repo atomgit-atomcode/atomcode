@@ -49,3 +49,4 @@ refused_call_started_rows=1
 cc_hooks_absent_rows=0
 cc_hooks_deny_rows=1
 approval_write_outside_rows=2
+grant_scope_rows=2
