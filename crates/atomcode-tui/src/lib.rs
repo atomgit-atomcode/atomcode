@@ -54,6 +54,7 @@ pub mod keymap;
 pub mod layout;
 pub mod layout_tool;
 pub mod markdown;
+pub mod menu;
 pub mod module;
 pub mod modules;
 pub mod moment;

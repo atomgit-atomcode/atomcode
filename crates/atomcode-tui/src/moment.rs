@@ -108,6 +108,50 @@ impl Selection {
     }
 }
 
+/// How long a [`Notice`] is shown for, in milliseconds.
+///
+/// Three seconds: long enough to read a short line without hunting for it, short
+/// enough that it is gone before it becomes something to clear. It is a constant
+/// rather than a per-call argument because a tip that lasted longer in one place
+/// than another would be a second lifetime nobody chose.
+pub const NOTICE_MS: u64 = 3_000;
+
+/// Something the screen has to say for a moment and then stop saying.
+///
+/// Transient by construction: the reading it stops at travels with the text, so
+/// drawing one is still a pure function of injected state — `render` compares
+/// two numbers it was handed rather than reading a clock, which is the rule the
+/// whole crate is built on (docs/adr/0008). An expiry the module had to compute
+/// itself would be a second clock in the tree, and the live line would drift
+/// from the tip.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notice {
+    pub text: String,
+    /// On the same clock as [`Moment::now`]. Drawn while `now < until`, gone
+    /// from `until` on.
+    pub until: Timestamp,
+    /// It could not be done. Shown differently, for the same reason
+    /// `content::CommandSaid` distinguishes them: "here is your answer" and "I
+    /// could not do that" must never look the same.
+    pub refused: bool,
+}
+
+impl Notice {
+    /// One that has `for_ms` of the session's own clock left to live.
+    pub fn for_ms(text: impl Into<String>, refused: bool, now: Timestamp, for_ms: u64) -> Self {
+        Self {
+            text: text.into(),
+            until: Timestamp::millis(now.0.saturating_add(for_ms)),
+            refused,
+        }
+    }
+
+    /// Whether it still has something to say at `now`.
+    pub fn is_live(&self, now: Timestamp) -> bool {
+        now < self.until
+    }
+}
+
 /// The non-derivable half of what a module renders from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Moment {
@@ -167,6 +211,13 @@ pub struct Moment {
     /// silently wrong on the user's. The surface detects once; everything above
     /// is handed the answer.
     pub caps: crate::caps::Caps,
+    /// What the row above the field is saying for a moment, if anything.
+    ///
+    /// Here rather than in the tip module's folded state because it is exactly
+    /// what this struct is for: it is true of *now* and is not a fact — nothing
+    /// in the log is a tip, and copying text to the clipboard commits nothing.
+    /// It carries its own expiry so the module draws it without a clock.
+    pub notice: Option<Notice>,
 }
 
 impl Moment {
@@ -187,6 +238,13 @@ impl Moment {
     }
     pub fn at_tick(mut self, tick: u64) -> Self {
         self.tick = tick;
+        self
+    }
+    /// Say something for a moment, at `now`. The same call the host makes, so a
+    /// test exercises the real expiry rather than one it wrote itself.
+    pub fn with_notice(mut self, text: impl Into<String>, refused: bool, now: Timestamp) -> Self {
+        self.now = now;
+        self.notice = Some(Notice::for_ms(text, refused, now, NOTICE_MS));
         self
     }
 }

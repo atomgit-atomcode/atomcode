@@ -75,11 +75,34 @@ pub const LEAVE: &str = "\x1b[?25h\x1b[<u\x1b[?2004l\x1b[?1007l\x1b[?7h\x1b[?104
 /// default because a tool call that folds when clicked is worth more than a
 /// selection gesture that needs a modifier.
 ///
-/// Motion is deliberately not requested (no 1002, no 1003): nothing here
-/// follows a pointer, and asking would mean a packet per cell crossed.
+/// Motion is asked for only as far as a drag needs it (1002): the pointer
+/// moving *with a button held* is what a selection is. Free motion — the
+/// pointer crossing cells with nothing held — is a separate switch
+/// ([`MOUSE_MOTION_ON`]) because it costs a packet per cell crossed, and only
+/// something that follows the pointer is worth that.
 pub const MOUSE_ON: &str = "\x1b[?1002h\x1b[?1006h";
-/// The exact inverse of [`MOUSE_ON`].
-pub const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l";
+/// The exact inverse of [`MOUSE_ON`], and then some: it also turns off free
+/// motion, so the pointer can be handed back from any state.
+///
+/// That extra term is not symmetry for its own sake. `MOUSE_MOTION_ON` is
+/// turned on and off while the program runs, so "the mouse is off" can be
+/// asked for at a moment when motion is still on — and a shell that inherits
+/// 1003 prints a stream of escape sequences every time the pointer moves.
+pub const MOUSE_OFF: &str = "\x1b[?1003l\x1b[?1006l\x1b[?1002l";
+
+/// Ask the terminal to report the pointer moving with no button held (DECSET
+/// 1003, "any-event" tracking).
+///
+/// This is the only mode that reports a plain hover, and it is the reason the
+/// composer's context menu can follow the pointer instead of only answering
+/// clicks. It is a switch of its own rather than part of [`MOUSE_ON`] because
+/// the price is per cell: with it on, every cell the pointer crosses is an
+/// event, and the pointer crosses cells all day. Whoever turns it on owes the
+/// terminal a [`MOUSE_MOTION_OFF`] — [`MOUSE_OFF`] covers the case where that
+/// debt is still outstanding when the mouse is handed back.
+pub const MOUSE_MOTION_ON: &str = "\x1b[?1003h";
+/// The exact inverse of [`MOUSE_MOTION_ON`].
+pub const MOUSE_MOTION_OFF: &str = "\x1b[?1003l";
 
 /// Put text on the system clipboard, through the terminal (OSC 52).
 ///
@@ -709,10 +732,23 @@ mod tests {
         // same obligation: a shell left reporting the pointer prints garbage
         // on every click.
         // 1002, not 1000: motion *while a button is held* is what a drag is,
-        // and without it a selection cannot be followed. Not 1003, which
-        // reports every cell the pointer crosses whether or not anyone asked.
+        // and without it a selection cannot be followed. 1003 — every cell the
+        // pointer crosses, held or not — is the expensive one, and is asked for
+        // by the one thing that follows the pointer rather than left on.
         assert!(MOUSE_ON.contains("?1002h") && MOUSE_OFF.contains("?1002l"));
-        assert!(!MOUSE_ON.contains("?1003"), "free motion is never needed");
+        assert!(
+            !MOUSE_ON.contains("?1003"),
+            "free motion comes on only for the thing that follows the pointer"
+        );
+        assert_eq!(MOUSE_MOTION_ON, "\x1b[?1003h");
+        assert_eq!(MOUSE_MOTION_OFF, "\x1b[?1003l");
+        // Handing the mouse back has to take free motion with it, whichever
+        // order the two were asked for in: a shell left in 1003 gets an event
+        // per cell and prints it.
+        assert!(
+            MOUSE_OFF.contains("?1003l"),
+            "the pointer cannot be handed back while still reporting free motion"
+        );
         assert!(MOUSE_ON.contains("?1006h") && MOUSE_OFF.contains("?1006l"));
     }
 }

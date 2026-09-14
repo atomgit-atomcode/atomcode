@@ -85,10 +85,19 @@ pub enum Role {
     /// Foreground and background of a raised panel.
     PanelFg,
     PanelBg,
+    /// The band across the one row of a panel that is being pointed at.
+    ///
+    /// A second step from the same ground as `PanelBg`, not the panel's colours
+    /// inverted: "here" is a lighter patch of the same surface. Inverting is
+    /// what it used to be, and on a dark terminal that is a near-white bar
+    /// across a near-black panel — the loudest thing on screen, and the only
+    /// mark in this file that was a guess about how a terminal paints instead of
+    /// a measurement against it.
+    PanelSelBg,
 }
 
 /// Every role, so a check can walk them instead of keeping a list in step.
-pub const ROLES: [Role; 14] = [
+pub const ROLES: [Role; 15] = [
     Role::Brand,
     Role::Accent,
     Role::Border,
@@ -103,6 +112,7 @@ pub const ROLES: [Role; 14] = [
     Role::Mode,
     Role::PanelFg,
     Role::PanelBg,
+    Role::PanelSelBg,
 ];
 
 /// xterm's sixteen, the fallback for a terminal that will not say what its own
@@ -368,18 +378,32 @@ fn candidates(role: Role) -> &'static [u8] {
         Role::Error | Role::DiffRemove => &[9, 1],
         Role::Success | Role::DiffAdd => &[10, 2],
         Role::Mode => &[12, 4, 13, 5],
-        Role::Secondary | Role::ToolName | Role::PanelFg | Role::PanelBg => &[],
+        Role::Secondary | Role::ToolName | Role::PanelFg | Role::PanelBg | Role::PanelSelBg => &[],
     }
 }
 
 /// A raised surface: the background moved a little away from itself, so a panel
 /// reads as sitting on top rather than as a hole.
 fn panel_bg(p: &Palette) -> Rgb {
+    panel_ground(p, PANEL_REACH)
+}
+
+/// How far a raised surface is moved off the screen's own background.
+const PANEL_REACH: f32 = 0.12;
+/// How far the band on the pointed-at row is moved: the same direction again, so
+/// it is the same surface one step brighter rather than a second colour. Small
+/// on purpose — this marks a row, it does not shout about it, and the whole
+/// complaint about the thing it replaces was that it shouted.
+const PANEL_SEL_REACH: f32 = 0.24;
+
+/// A panel surface `reach` of the way off the background, in the direction the
+/// theme leans. Two of these are one surface and the row being pointed at on it.
+fn panel_ground(p: &Palette, reach: f32) -> Rgb {
     let toward = match p.theme() {
         Theme::Dark => (255, 255, 255),
         Theme::Light => (0, 0, 0),
     };
-    mix(p.background(), toward, 0.12)
+    mix(p.background(), toward, reach)
 }
 
 /// The colour for a role, or `None` for "leave the terminal's own".
@@ -391,6 +415,7 @@ pub fn resolve(role: Role, caps: Caps) -> Option<Color> {
     match role {
         Role::Secondary | Role::ToolName => None,
         Role::PanelBg => Some(exact(panel_bg(p), truecolor, p)),
+        Role::PanelSelBg => Some(exact(panel_ground(p, PANEL_SEL_REACH), truecolor, p)),
         Role::PanelFg => {
             // Read against the panel, not against the screen behind it.
             let on = panel_bg(p);
@@ -577,6 +602,19 @@ pub fn explain(caps: Caps) -> Vec<String> {
             if role == Role::PanelBg {
                 return format!("  {:<11} {:<22} a raised surface", "PanelBg", what);
             }
+            // Not a contrast question either: this role exists to be a *different*
+            // patch of the same surface, and its worth is the step it makes.
+            if role == Role::PanelSelBg {
+                let step = rgb_of(resolve(Role::PanelBg, caps)).map(|(_, c)| c);
+                let how = match step {
+                    Some(step) => format!(" one step above {}", hex(step)),
+                    None => String::new(),
+                };
+                return format!(
+                    "  {:<11} {:<22} the pointed-at row on a panel{how}",
+                    "PanelSelBg", what
+                );
+            }
             // A panel is read against the panel, not against the screen behind.
             let against = match role {
                 Role::PanelFg => panel.unwrap_or_else(|| caps.palette.background()),
@@ -670,8 +708,8 @@ mod tests {
                 for b in (0..=255u8).step_by(51) {
                     let caps = caps_on((r, g, b));
                     for role in ROLES {
-                        if matches!(role, Role::PanelFg | Role::PanelBg) {
-                            continue; // measured against the panel, below
+                        if matches!(role, Role::PanelFg | Role::PanelBg | Role::PanelSelBg) {
+                            continue; // surfaces and the ink on them, below
                         }
                         let Some(c) = seen(role, caps) else { continue };
                         let ratio = contrast(c, (r, g, b));
@@ -704,13 +742,27 @@ mod tests {
         ] {
             let caps = caps_on(bg);
             let panel = seen(Role::PanelBg, caps).unwrap();
+            let pointed = seen(Role::PanelSelBg, caps).unwrap();
             let ink = seen(Role::PanelFg, caps).unwrap();
             assert!(
                 contrast(ink, panel) >= 4.5,
                 "panel {ink:?} on {panel:?} over {bg:?} is {:.2}",
                 contrast(ink, panel)
             );
+            assert!(
+                contrast(ink, pointed) >= 4.5,
+                "the row being pointed at {ink:?} on {pointed:?} over {bg:?} is {:.2}",
+                contrast(ink, pointed)
+            );
             assert_ne!(panel, bg, "a raised panel has to be visible as one");
+            assert_ne!(
+                pointed, panel,
+                "the pointed-at row has to be a step off the panel it is on"
+            );
+            assert!(
+                contrast(pointed, bg) > contrast(panel, bg),
+                "and the step has to be *away* from the ground: {pointed:?} over {bg:?}"
+            );
         }
     }
 

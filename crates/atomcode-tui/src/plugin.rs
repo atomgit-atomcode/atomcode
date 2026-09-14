@@ -281,6 +281,21 @@ impl UserInterface for Tui {
         // Wakes answered since that frame. See [`COALESCE_LIMIT`].
         let mut coalesced = 0usize;
         while !quit {
+            // The composer's menu is the one thing here that follows the
+            // pointer, so free motion is on exactly while it is up: with it on,
+            // the terminal reports every cell the pointer crosses, and with
+            // nothing following the pointer that is a packet per cell for
+            // nothing. Asked here, at the top of every iteration, rather than
+            // at each place the menu opens and closes — there are five of those
+            // and one question, and a question asked in one place cannot
+            // disagree with the answer. It has to be here rather than at the
+            // foot of the loop because the pointer paths `continue` past
+            // anything down there.
+            //
+            // This is a request to the terminal, not a redraw: it changes what
+            // the terminal *sends*, not what is on the screen, which is why it
+            // is not folded into `stale`.
+            self.surface.set_motion(self.host.context_menu_open());
             if stale && (coalesced >= COALESCE_LIMIT || wake.is_empty()) {
                 // The reading the frame about to be painted is drawn from. Facts
                 // absorb against whatever the last one was — a frame at most out
@@ -346,6 +361,17 @@ impl UserInterface for Tui {
                 // so a wheel the terminal keeps would scroll the wrong thing.
                 Wake::Input(Input::Mouse(click, x, y)) => {
                     use crate::surface::Click;
+                    // The composer's menu, before anything else looks at the
+                    // pointer. A menu that is up takes the press: choosing from
+                    // it is what a press means while it is there. A press
+                    // anywhere else puts it away *and* still means what it
+                    // meant, which is why "dismissed" falls through rather than
+                    // swallowing the event.
+                    if let Some(handled) = self.pointer_in_menu(click, x, y, &client) {
+                        quit = handled;
+                        stale = true;
+                        continue;
+                    }
                     // A press is not yet a click and not yet a selection —
                     // which it becomes is decided at the release, by whether
                     // the pointer moved. Deciding at the press would mean
@@ -366,6 +392,25 @@ impl UserInterface for Tui {
                                 None => None,
                             }
                         }
+                        // A move is not a press: it is the one pointer event
+                        // that asks for nothing. The menu is the only thing
+                        // here that follows a pointer, so it is asked; a move
+                        // that changes no row paints nothing, because the
+                        // terminal sends one per cell and a frame each would
+                        // make the highlight cost more than it is worth.
+                        //
+                        // Asked only when a menu is up, because this arrives for
+                        // every cell the pointer crosses and the size is an
+                        // ioctl on a real terminal: with nothing open there is
+                        // nothing to ask, and the pointer moves all day.
+                        Click::Hover => {
+                            if self.host.context_menu_open() {
+                                stale |= self.host.context_menu_hover(x, y, self.surface.size());
+                            }
+                            continue;
+                        }
+                        // Handled above, and never reached.
+                        Click::RightPress => None,
                     };
                     if let Some(action) = action {
                         quit = self.act(action, &client);
@@ -381,6 +426,17 @@ impl UserInterface for Tui {
                 // time, decided here — that is what focus is.
                 Wake::Input(Input::Key(press)) if self.host.overlays.is_open() => {
                     self.host.overlays.key(press);
+                    stale = true;
+                }
+                // The composer's menu, above the question and the ordinary
+                // bindings for the same reason the modal is: it was opened
+                // deliberately, and what it is for is being read right now.
+                Wake::Input(Input::Key(press)) if self.host.context_menu_open() => {
+                    if let Some(crate::menu::Step::Picked(value)) =
+                        self.host.context_menu_key(press)
+                    {
+                        quit = self.run_menu_item(&value, &client);
+                    }
                     stale = true;
                 }
                 // A question on screen gets first refusal on every key. Focus is
@@ -1061,8 +1117,170 @@ impl Tui {
                 .collect(),
             _ => Vec::new(),
         };
-        if let Some(view) = self.host.modules.view(crate::modules::input::ID) {
-            view.set_menu(menu);
+        self.host.set_menu(menu);
+    }
+
+    /// Handle a pointer press against the composer's context menu.
+    ///
+    /// `None` means "this press was not the menu's business" — either nothing
+    /// was open, or the press was the right button that opens it. `Some(quit)`
+    /// means it was, and the event should not be looked at again: a press on a
+    /// menu row is a choice, and a press elsewhere while a menu is up closes it
+    /// and is *also* allowed to keep meaning whatever it meant — which is why
+    /// `Outside` returns `Some` only after the menu is already closed but lets
+    /// the caller decide, by returning `None` for it below.
+    fn pointer_in_menu(
+        &self,
+        click: crate::surface::Click,
+        x: u16,
+        y: u16,
+        client: &AgentClient,
+    ) -> Option<bool> {
+        use crate::host::ContextClick;
+        use crate::surface::Click;
+        // A move is not a press. It is the menu following the pointer, not the
+        // pointer asking the menu for something — and letting it through here
+        // would make a menu pick, and close on, the row the pointer merely
+        // crossed on its way somewhere else.
+        if matches!(click, Click::Hover) {
+            return None;
+        }
+        // The gesture that opens it is not handled by it.
+        if matches!(click, Click::RightPress) {
+            self.open_composer_menu(x, y);
+            return Some(false);
+        }
+        let size = self.surface.size();
+        match self.host.context_menu_click(x, y, size) {
+            ContextClick::NotOpen => None,
+            ContextClick::Picked(crate::menu::Step::Picked(value)) => {
+                Some(self.run_menu_item(&value, client))
+            }
+            // Esc would have gone through the keyboard path; a click outside is
+            // the same dismissal, and the press still means what it meant.
+            ContextClick::Picked(_) | ContextClick::Outside => None,
+        }
+    }
+
+    /// The menu a right-click opens, and what is in it.
+    ///
+    /// Where the press landed decides what can be done there. `清空` and `发送`
+    /// act on what is being typed, and a press over the conversation is about the
+    /// text it landed on — offering them there would be a menu whose items
+    /// belong to a box that is not under the pointer. So outside the composer
+    /// the menu keeps the one thing that is still true of the press: copying
+    /// what is selected. Inside it, the four the composer has.
+    ///
+    /// The press is answered from the last painted frame (`Host::field_rect`)
+    /// rather than from a fresh compose: which rect the field had is what was on
+    /// screen when the button went down, and re-deriving it here could disagree
+    /// with the picture the person was looking at.
+    fn open_composer_menu(&self, x: u16, y: u16) {
+        // What "copy" will act on, named: a selection is what this menu is
+        // about when there is one, and a label that says "全文" over a selection
+        // is the menu lying about what the next key press will do.
+        let selected = {
+            let m = self.host.moment.read().expect("moment poisoned");
+            m.selection.is_some_and(|s| !s.is_empty())
+        };
+        let copy = if selected {
+            crate::menu::Item::new("copy", "复制选中").about("把选中的文字写到剪贴板")
+        } else {
+            crate::menu::Item::new("copy", "复制全文").about("把输入框写到剪贴板")
+        };
+        let in_composer = self
+            .host
+            .field_rect()
+            .is_some_and(|field| field.contains(x, y));
+        let items = if in_composer {
+            vec![
+                copy,
+                crate::menu::Item::new("paste", "粘贴").about("从剪贴板插入"),
+                crate::menu::Item::new("clear", "清空").about("丢掉草稿和附件"),
+                crate::menu::Item::new("send", "发送").about("把这一条交给模型"),
+            ]
+        } else if selected {
+            // Over the conversation with something selected: the press is about
+            // those words, so copying them is the whole menu. No second entry
+            // and nothing that acts on the composer.
+            vec![copy]
+        } else {
+            // Nothing was selected, so there is nothing a press here can ask
+            // for. An empty menu opens nothing rather than a menu of verbs that
+            // would act somewhere the pointer is not.
+            Vec::new()
+        };
+        self.host.open_context_menu((x, y), items);
+    }
+
+    /// Do what a menu item says. Returns `true` to quit.
+    ///
+    /// A thin adapter over the same [`Action`]s the keys produce — the menu is a
+    /// third way to ask for something the keymap already knows how to do, which
+    /// is the point of `Action` being the vocabulary all three share. Nothing
+    /// here is a second implementation of paste or send.
+    fn run_menu_item(&self, value: &str, client: &AgentClient) -> bool {
+        match value {
+            "copy" => {
+                // A selection first: it is what is on screen and what the menu
+                // is about when it exists. The field is the fallback, not the
+                // first answer — `复制全文` sent a selection to the clipboard as
+                // the composer's contents, which on a right-click over selected
+                // text copied the wrong thing entirely.
+                let selected = {
+                    let m = self.host.moment.read().expect("moment poisoned");
+                    m.selection.filter(|s| !s.is_empty())
+                };
+                if let Some(sel) = selected {
+                    let text = self.host.compose(self.surface.size()).selected_text(&sel);
+                    if !text.is_empty() {
+                        self.surface.copy(&text);
+                        // The reserved row above the field, not the stream: this
+                        // is true of *now*, and a block for it would push the
+                        // conversation up a row for a sentence nobody reads
+                        // twice.
+                        self.host.say("已复制选中的内容", false);
+                        return false;
+                    }
+                }
+                let text = self
+                    .host
+                    .moment
+                    .read()
+                    .expect("moment poisoned")
+                    .input
+                    .clone();
+                if text.is_empty() {
+                    // Not an error: a person may open the menu on an empty
+                    // composer to see what is there. Say why nothing happened,
+                    // and name the thing that was empty — on the tip row, since
+                    // nothing happened and nothing belongs in the conversation.
+                    self.host.say(
+                        if selected.is_some() {
+                            "选中的内容没有可复制的文字"
+                        } else {
+                            "没有可复制的内容"
+                        },
+                        true,
+                    );
+                    return false;
+                }
+                self.surface.copy(&text);
+                self.host.say("已复制到剪贴板", false);
+                false
+            }
+            "paste" => {
+                let Some(text) = self.surface.clipboard_text() else {
+                    // The menu's own refusal, so it belongs on the tip row with
+                    // the rest of them rather than in the conversation.
+                    self.host.say("剪贴板里没有文本", true);
+                    return false;
+                };
+                self.act(Action::Paste(text), client)
+            }
+            "clear" => self.act(Action::Clear, client),
+            "send" => self.act(Action::Submit, client),
+            _ => false,
         }
     }
 

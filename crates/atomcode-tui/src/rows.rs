@@ -339,10 +339,16 @@ impl Plugin for TeamPanel {
 
 /// The todo list: what the session is working through.
 ///
-/// Placed the way the team strip is — bottom, no size, so it is as tall as the
-/// plan and no taller. That matters more here than there: the panel asks for
-/// `Hug(0)` and draws nothing until the model has planned something, so a
-/// session that never calls `todowrite` pays a row, not a panel of "no tasks".
+/// Mounted here, placed by `host::composer` — the same seam the live line and
+/// the tip row use. It belongs in the composer, above the live line and against
+/// the field, rather than at the bottom of the screen where it used to put
+/// itself: the plan is part of what the current turn is doing, not a panel
+/// about the session, and under the input box it was the last thing anyone
+/// looked at.
+///
+/// It asks for `Hug(0)` and draws nothing until the model has planned
+/// something, so a session that never calls `todowrite` pays no rows at all —
+/// the flex closes up around it, exactly as it does for an idle live line.
 pub struct TodoPanel;
 
 #[async_trait]
@@ -351,42 +357,20 @@ impl Plugin for TodoPanel {
         "tui-panel-todo"
     }
     fn inject(&self) -> &'static [&'static str] {
-        &["tui-modules", "tui-layout"]
+        &["tui-modules"]
     }
     fn description(&self) -> &'static str {
         "the task list the model is working through, and what is left of it"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let mods = ctx.require::<ModulesSvc>().map_err(|e| e.to_string())?;
-        let layout = ctx.require::<LayoutSvc>().map_err(|e| e.to_string())?;
         let view = Arc::new(Mounted::<todo::Todo>::new());
         let id = <todo::Todo as crate::module::View>::id();
         mods.add_view(view)?;
-
-        let known: Vec<String> = mods.view_ids().into_iter().map(str::to_string).collect();
-        layout
-            .apply(
-                &LayoutOp::Show {
-                    module: id.to_string(),
-                    side: Side::Bottom,
-                    size: None,
-                },
-                &known,
-            )
-            .map_err(|e| format!("{e:?}"))?;
-
+        // Mount only. Where it goes is the composer's to write — `LayoutOp::Show`
+        // has no side that means "above the field".
         let m: Arc<Modules> = mods.clone();
-        let l = layout.clone();
-        let _ = ctx.effect(move || {
-            let known: Vec<String> = m.view_ids().into_iter().map(str::to_string).collect();
-            let _ = l.apply(
-                &LayoutOp::Hide {
-                    module: id.to_string(),
-                },
-                &known,
-            );
-            m.remove_view(id);
-        });
+        let _ = ctx.effect(move || m.remove_view(id));
         Ok(())
     }
 }

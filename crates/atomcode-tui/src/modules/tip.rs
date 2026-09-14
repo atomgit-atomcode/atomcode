@@ -25,10 +25,11 @@
 //! geometry could not do either, and every edit to what this says would be an
 //! edit to the layout arithmetic of the text field.
 //!
-//! Nothing writes a tip yet. That is a state, not an omission: what this module
-//! owes the screen today is the *row*, and the difference between "no tip" and
-//! "a tip" is nothing on screen — so the day something does write one, it
-//! changes only what this file draws, not where anything sits.
+//! Nothing folds into a tip, and nothing ever will: a tip is not a fact. What
+//! this row draws is [`Moment::notice`](crate::moment::Moment::notice) — a line
+//! the host was asked to say for a moment, with the reading it expires at
+//! travelling alongside it. So the state below stays empty and every tip is read
+//! off the moment, the way the live line reads its clock.
 
 use atomcode_harness::session::SessionEvent;
 
@@ -40,13 +41,12 @@ use crate::theme::{self, Role};
 
 pub const ID: &str = "tip";
 
-/// What this row has to say, and there is nothing to fold yet.
+/// What this row has to say, and there is nothing to fold.
 ///
 /// Facts arrive through [`View::absorb`] and are deliberately dropped: nothing
 /// in the log is a tip. A tip is about what a person could do next, which is a
-/// question about the *moment* rather than about what has happened — so if one
-/// is ever written, it will be read off the viewport the way the live line reads
-/// its clock, and this struct will stay empty.
+/// question about the *moment* rather than about what has happened — so it is
+/// read off the viewport and this struct stays empty.
 #[derive(Default)]
 pub struct State;
 
@@ -64,21 +64,30 @@ impl View for Tip {
     /// One row, right-aligned by construction.
     ///
     /// The `Spacer` eats the slack and the text sits against the right edge, so
-    /// whatever this eventually says lands where a tip belongs — out of the way
-    /// of the words being typed, still on screen — without the row itself
-    /// needing to know how wide it is. Empty today, and an empty row laid out
-    /// this way is a row of blanks rather than nothing: the reservation is what
-    /// is being drawn.
+    /// a tip lands out of the way of the words being typed, still on screen,
+    /// without the row itself needing to know how wide it is. An expired notice
+    /// draws the same blank row — the reservation is what is being drawn, and a
+    /// row of blanks is not the same thing as no row at all.
+    ///
+    /// A refusal is drawn in the error role, not the muted one: the tip row is
+    /// small and quiet, and "done" and "could not" must not be the same colour
+    /// simply because they share a row.
     fn render(_state: &State, vp: &Viewport<'_>) -> Vec<Line> {
         let w = vp.rect.w;
         if w == 0 || vp.rect.h == 0 {
             return Vec::new();
         }
-        El::row(vec![
-            El::Spacer,
-            El::styled(String::new(), theme::fg(Role::Muted)),
-        ])
-        .lay(w)
+        let live = vp
+            .moment
+            .notice
+            .as_ref()
+            .filter(|n| n.is_live(vp.moment.now));
+        let (text, role) = match live {
+            Some(n) if n.refused => (n.text.clone(), Role::Error),
+            Some(n) => (n.text.clone(), Role::Muted),
+            None => (String::new(), Role::Muted),
+        };
+        El::row(vec![El::Spacer, El::styled(text, theme::fg(role))]).lay(w)
     }
 
     /// Always one row — the point of the module.
@@ -105,15 +114,21 @@ mod tests {
     use crate::caps::{Caps, Glyph};
     use crate::frame::Rect;
     use crate::module::{Mounted, ViewObject};
-    use crate::moment::Moment;
+    use crate::moment::{Moment, Timestamp};
     use crate::width;
 
     crate::tui_conformance!(view Tip as tip_conformance);
 
+    fn draw_at(moment: &Moment, w: u16, h: u16) -> Vec<Line> {
+        let vp = Viewport::new(Rect::sized(w, h), moment);
+        Tip::render(&State, &vp)
+    }
+
     fn draw(w: u16, h: u16) -> Vec<String> {
-        let moment = Moment::default();
-        let vp = Viewport::new(Rect::sized(w, h), &moment);
-        Tip::render(&State, &vp).iter().map(|l| l.plain()).collect()
+        draw_at(&Moment::default(), w, h)
+            .iter()
+            .map(|l| l.plain())
+            .collect()
     }
 
     #[test]
@@ -145,20 +160,78 @@ mod tests {
     #[test]
     fn whatever_it_says_will_land_against_the_right_edge() {
         // The alignment is structural, not a number to get right later: the
-        // `Spacer` eats the slack. Checked against the row's own layout, at
-        // widths where the arithmetic could go wrong, so that the day a tip is
-        // written this test is already holding the edge.
+        // `Spacer` eats the slack. Driven with a real notice through `render`
+        // rather than laid out by hand, so what is checked is the row that is
+        // actually drawn at widths where the arithmetic could go wrong.
         for w in [8u16, 20, 41, 80] {
-            let placed =
-                El::row(vec![El::Spacer, El::styled("tip", theme::fg(Role::Muted))]).lay(w);
-            let line = placed.first().expect("one row");
+            let moment = Moment::default().with_notice("已复制", false, Timestamp::millis(0));
+            let out = draw_at(&moment, w, 1);
+            let line = out.first().expect("one row");
             assert_eq!(width::str_width(&line.plain()), w as usize, "w={w}");
             assert!(
-                line.plain().ends_with("tip"),
+                line.plain().ends_with("已复制"),
                 "w={w}: a tip belongs at the right edge, not adrift: {:?}",
                 line.plain()
             );
         }
+    }
+
+    #[test]
+    fn a_notice_is_drawn_until_its_reading_passes_and_blank_after() {
+        // The whole point of carrying the expiry with the text: the row says
+        // something for a while and then stops, and the *module* decides that
+        // from two injected numbers. A module that read a clock would be right
+        // here and wrong in the test loop.
+        let says = Moment::default().with_notice("已复制到剪贴板", false, Timestamp::millis(1_000));
+        assert!(
+            draw_at(&says, 40, 1)[0].plain().contains("已复制到剪贴板"),
+            "it is drawn while it is live"
+        );
+
+        // One reading before the end: still there. The last live reading is the
+        // one below the expiry, which is the boundary worth holding.
+        let mut last = says.clone();
+        last.now = Timestamp::millis(3_999);
+        assert!(
+            draw_at(&last, 40, 1)[0].plain().contains("已复制到剪贴板"),
+            "live right up to the reading before the expiry"
+        );
+
+        // At the expiry: gone, and the row is still a row of blanks rather than
+        // nothing — the reservation does not come and go with the news.
+        let mut off = says;
+        off.now = Timestamp::millis(4_000);
+        let out = draw_at(&off, 40, 1);
+        assert_eq!(out.len(), 1, "the row is still asked for");
+        assert!(
+            out[0].plain().trim().is_empty(),
+            "the tip is gone at its expiry: {:?}",
+            out[0].plain()
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_not_drawn_in_the_colour_of_a_success() {
+        // Same row, two meanings, and the row is small enough that the wording
+        // is all there is room for. "已复制" and "没有可复制的内容" must not be
+        // the same grey.
+        let said = Moment::default().with_notice("已复制到剪贴板", false, Timestamp::millis(0));
+        let refused = Moment::default().with_notice("没有可复制的内容", true, Timestamp::millis(0));
+        let ink = |m: &Moment| {
+            let rows = draw_at(m, 40, 1);
+            rows[0]
+                .spans
+                .iter()
+                .find(|s| !s.text.trim().is_empty())
+                .map(|s| s.style)
+                .expect("the words")
+        };
+        assert_ne!(
+            ink(&said),
+            ink(&refused),
+            "a refusal wears its own role, not the one good news wears"
+        );
+        assert_eq!(ink(&refused), theme::fg(Role::Error));
     }
 
     #[test]

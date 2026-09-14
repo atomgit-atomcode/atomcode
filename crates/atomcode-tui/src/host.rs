@@ -14,7 +14,7 @@ use crate::block::{BlockId, Slot, Stream};
 use crate::caps::{Caps, Glyph};
 use crate::frame::{Frame, Line, Rect, Span, Style};
 use crate::module::{Height, Modules};
-use crate::moment::Moment;
+use crate::moment::{Moment, Notice};
 use crate::region::Region;
 
 /// How a kind of block is shown.
@@ -605,11 +605,58 @@ impl Hits {
     }
 }
 
+/// What a pointer press did to the open context menu.
+///
+/// Three outcomes rather than a bool, because "nothing was open" and "what was
+/// open was not clicked" lead to different things: the first falls through to
+/// the ordinary click handling, the second dismisses and *also* falls through.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextClick {
+    /// No menu was open.
+    NotOpen,
+    /// A menu was open and the press was not on it. The caller has already had
+    /// it closed for them.
+    Outside,
+    /// The press chose an item, or dismissed the menu with nothing.
+    Picked(crate::menu::Step),
+}
+
+/// A line widened to the rect with the panel's own style.
+///
+/// A floating part covers what it is drawn over only where it puts a cell down,
+/// and a text span ends where its text ends. Filling the rest of the row is what
+/// makes the menu a surface over the conversation rather than words with the
+/// conversation visible through them.
+fn pad(line: Line, w: usize, style: Style) -> Line {
+    let used = line.width();
+    if used >= w {
+        return line.truncate(w);
+    }
+    let mut spans = line.spans;
+    spans.push(Span::styled(" ".repeat(w - used), style));
+    Line::from_spans(spans).truncate(w)
+}
+
 /// Everything the screen is composed from.
 pub struct Host {
     pub stream: RwLock<Stream>,
     /// Slash commands, contributed by rows.
     pub commands: Arc<crate::command::Commands>,
+    /// The slash menu — what to show while a command is being typed.
+    ///
+    /// Kept here rather than in the input module because it is two different
+    /// concerns in one place: the host owns the command registry, and the menu
+    /// is drawn *over* the layout rather than inside the field. A module that
+    /// owned it would have to be told, and a module that draws it inside its
+    /// own rect is a module that resizes the conversation when a slash is
+    /// typed. Empty means nothing to suggest.
+    menu: RwLock<Vec<(String, String)>>,
+    /// The composer's context menu, when the secondary button opened one.
+    ///
+    /// Beside the slash menu and for the same reason: it is drawn *over* the
+    /// layout rather than inside the field, so nothing is resized to make room
+    /// for it. `None` means nothing is open.
+    context_menu: RwLock<Option<crate::menu::Menu>>,
     /// At most one modal. Focus is arbitration, not composition.
     pub overlays: Arc<crate::overlay::Overlays>,
     /// Questions waiting for the person. Rendered as a live block at the foot
@@ -638,6 +685,8 @@ impl Host {
             // rows (`crate::rows`); a Host that pre-filled this would make
             // `[[remove]] id = "tui-commands-tree"` a lie.
             commands: Arc::new(crate::command::Commands::new()),
+            menu: RwLock::new(Vec::new()),
+            context_menu: RwLock::new(None),
             overlays: Arc::new(crate::overlay::Overlays::new()),
             asks: crate::ask::Asks::new(),
             modules: modules.clone(),
@@ -720,6 +769,192 @@ impl Host {
 
     pub fn painted(&self) -> u64 {
         *self.painted.lock().expect("counter poisoned")
+    }
+
+    /// Replace the slash menu. Empty closes it.
+    ///
+    /// Set by whoever owns the command registry — the front end — because the
+    /// menu's *contents* are a question about commands, not about the screen.
+    /// Where it is drawn is this struct's business, not the caller's.
+    pub fn set_menu(&self, menu: Vec<(String, String)>) {
+        *self.menu.write().expect("menu poisoned") = menu;
+    }
+
+    /// Open the composer's context menu at a cell. Empty items opens nothing.
+    ///
+    /// The host keeps the open menu because the host is what draws it — a
+    /// module cannot draw outside its own rect, and this panel is deliberately
+    /// drawn outside the field's. What is *in* it, and what picking an item
+    /// means, stays with the caller.
+    pub fn open_context_menu(&self, at: (u16, u16), items: Vec<crate::menu::Item>) {
+        *self.context_menu.write().expect("menu poisoned") = crate::menu::Menu::new(at, items);
+    }
+
+    /// Close it, if it is open. Returns whether there was one, so a caller can
+    /// tell "closed it" from "there was nothing to close".
+    pub fn close_context_menu(&self) -> bool {
+        self.context_menu
+            .write()
+            .expect("menu poisoned")
+            .take()
+            .is_some()
+    }
+
+    pub fn context_menu_open(&self) -> bool {
+        self.context_menu.read().expect("menu poisoned").is_some()
+    }
+
+    /// Say something on the reserved row above the field, for
+    /// [`NOTICE_MS`](crate::moment::NOTICE_MS) and then no longer.
+    ///
+    /// The place for anything the screen has to report that is *about now*: a
+    /// clipboard write, a refusal, a mode change. Deliberately not the stream —
+    /// a block for "已复制" pushes the whole conversation up a row for a sentence
+    /// nobody reads twice, and a block is for what happened, not for what has
+    /// just become true. The row is already reserved for it, so saying this
+    /// moves nothing.
+    ///
+    /// The expiry is stamped here, where the clock is, and travels with the text:
+    /// the module that draws it compares two readings it was handed rather than
+    /// asking a clock of its own (`docs/adr/0008`).
+    ///
+    /// `refused` is the same distinction `content::CommandSaid` draws — it could
+    /// not be done — so "已复制" and "没有可复制的内容" never look alike.
+    pub fn say(&self, text: impl Into<String>, refused: bool) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let now = m.now;
+        m.notice = Some(Notice::for_ms(text, refused, now, crate::moment::NOTICE_MS));
+    }
+
+    /// Run a key against the open menu, returning the step it produced. `None`
+    /// when nothing is open, so the caller falls through to the ordinary keys —
+    /// focus is arbitration, and this is where the menu is given it or not.
+    pub fn context_menu_key(&self, press: crate::surface::KeyPress) -> Option<crate::menu::Step> {
+        let mut held = self.context_menu.write().expect("menu poisoned");
+        let menu = held.as_mut()?;
+        let step = menu.key(press);
+        if !matches!(step, crate::menu::Step::Stay) {
+            *held = None;
+        }
+        Some(step)
+    }
+
+    /// A pointer move over the open menu: point at the row it is over. `true`
+    /// when that changed which row is pointed at, and so a frame is owed.
+    ///
+    /// A move that changes no row answers `false` for the reason the whole
+    /// gesture is affordable: the terminal reports one of these per cell the
+    /// pointer crosses, and painting a frame for each would trade a cheap
+    /// highlight for a busy one.
+    ///
+    /// Nothing is open is not an error and not news: the pointer moves over the
+    /// screen all the time.
+    pub fn context_menu_hover(&self, x: u16, y: u16, size: (u16, u16)) -> bool {
+        let mut held = self.context_menu.write().expect("menu poisoned");
+        let Some(menu) = held.as_mut() else {
+            return false;
+        };
+        menu.hover(x, y, size.0, size.1)
+    }
+
+    /// A pointer press against the open menu. `NotOpen` when nothing is open;
+    /// `Outside` when it was open but the press was elsewhere, which the caller
+    /// treats as "dismiss, and let the press mean whatever it meant".
+    ///
+    /// The screen size is a parameter rather than a field because the surface is
+    /// the authority on it and this struct has no business keeping a second
+    /// copy that could disagree by a frame.
+    pub fn context_menu_click(&self, x: u16, y: u16, size: (u16, u16)) -> ContextClick {
+        let mut held = self.context_menu.write().expect("menu poisoned");
+        let Some(menu) = held.as_mut() else {
+            return ContextClick::NotOpen;
+        };
+        match menu.click(x, y, size.0, size.1) {
+            Some(step) => {
+                *held = None;
+                ContextClick::Picked(step)
+            }
+            // A press anywhere else puts it away. The menu is a thing that was
+            // raised over the screen, and the first press that is not for it is
+            // someone done with it — leaving it up would mean a click on the
+            // conversation both did its own thing and left a panel behind.
+            None => {
+                *held = None;
+                ContextClick::Outside
+            }
+        }
+    }
+
+    /// How tall the slash menu would like to be, and at most what it may be.
+    ///
+    /// Capped well short of the screen so it reads as something that rose out
+    /// of the prompt rather than as a second transcript.
+    fn menu_rows(&self, menu: &[(String, String)]) -> u16 {
+        (menu.len() as u16).clamp(1, 10)
+    }
+
+    /// Where the menu rises to, over the layout.
+    ///
+    /// Bottom-anchored to the input field's own top edge and one row taller
+    /// than the list, so its first row is a blank margin against the field's
+    /// top rule: the menu appears to grow *out of* the prompt. Every row above
+    /// that top edge is drawn over whatever the layout put there, and nothing
+    /// is given up for it — the rects of the stream, the composer and the
+    /// status bar are unchanged by the menu being open.
+    fn menu_rect(&self, frame: &Frame, screen: Rect, rows: u16) -> Option<Rect> {
+        let field = frame.part(crate::modules::input::ID)?.rect;
+        // One for the margin, and no more than fits above the field.
+        let want = rows.saturating_add(1).min(field.y);
+        if want == 0 {
+            return None;
+        }
+        let x = field.x;
+        let w = field.w.min(screen.w.saturating_sub(x));
+        if w == 0 {
+            return None;
+        }
+        let y = field.y - want;
+        // `want` rows bottom-aligned in the rect, so the last of them is the
+        // margin and the list itself hangs from there.
+        Some(Rect::new(x, y, w, want))
+    }
+
+    /// The menu's rows, top to bottom in `rect`, with its margin last.
+    fn menu_lines(&self, rect: Rect, menu: &[(String, String)]) -> Vec<Line> {
+        let w = rect.w as usize;
+        let mut out: Vec<Line> = Vec::with_capacity(rect.h as usize);
+        let room = (rect.h as usize).saturating_sub(1);
+        let style = crate::theme::bg(crate::theme::Role::PanelBg)
+            .under(crate::theme::fg(crate::theme::Role::PanelFg));
+        for i in 0..room {
+            let line = match menu.get(i) {
+                Some((name, about)) => {
+                    let mut spans = vec![
+                        Span::styled("  /".to_string(), style),
+                        Span::styled(
+                            name.clone(),
+                            crate::theme::fg(crate::theme::Role::Accent).under(style),
+                        ),
+                    ];
+                    if !about.is_empty() {
+                        spans.push(Span::styled(
+                            format!("  {about}"),
+                            crate::theme::fg(crate::theme::Role::Muted).under(style),
+                        ));
+                    }
+                    Line::from_spans(spans)
+                }
+                // Never reached in practice: the rect is sized to the list, and
+                // this is what keeps a short list from showing the screen
+                // through its own panel.
+                None => Line::empty(),
+            };
+            out.push(pad(line, w, style));
+        }
+        // The margin: one blank row of the panel's colour, so the list reads as
+        // a surface lifted off the prompt rather than as text floating on it.
+        out.push(Line::styled(" ".repeat(w), style).truncate(w));
+        out
     }
 
     /// Render the stream's tail into `rect`.
@@ -979,6 +1214,17 @@ impl Host {
             }
         }
 
+        // The slash menu rises over the layout, out of the prompt. Drawn here,
+        // after every region has its rect, so it composes as an overlay rather
+        // than as a region: nothing above the field is resized to make room,
+        // and the rows it covers are covered rather than taken away.
+        let menu = self.menu.read().expect("menu poisoned").clone();
+        if !menu.is_empty() {
+            if let Some(rect) = self.menu_rect(&frame, Rect::sized(w, h), self.menu_rows(&menu)) {
+                frame.place("menu", rect, self.menu_lines(rect, &menu));
+            }
+        }
+
         // Held back, so the conversation has moved on below the fold. Say how
         // far, and make saying so the way back — a person who has scrolled up
         // should not have to know that ctrl-e or End exists.
@@ -1035,6 +1281,20 @@ impl Host {
         // rectangle on the screen, and the screen is what was pointed at.
         if let Some(sel) = moment.selection {
             frame.highlight(&sel);
+        }
+
+        // Last of all, and after the selection on purpose: the context menu is
+        // a panel that was raised over the screen, so it wins every cell it
+        // covers. Drawn before the highlight it would be recoloured by a
+        // selection that runs under it — the menu's own rows came out striped
+        // where a selection crossed them, which is what a menu covering what it
+        // covers is not supposed to look like.
+        if let Some(menu) = self.context_menu.read().expect("menu poisoned").clone() {
+            let rect = menu.rect(w, h);
+            if !rect.is_empty() {
+                let vp = crate::moment::Viewport::new(rect, &moment);
+                frame.place("context-menu", rect, menu.render(&vp));
+            }
         }
 
         debug_assert!(
@@ -1206,21 +1466,26 @@ fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16
         .unwrap_or(1)
 }
 
-/// The composer: the live line and the reserved tip row above the field.
+/// The composer: the task list, the live line, and the reserved tip row above
+/// the field.
 ///
 /// One definition, because every arrangement that has an input has this above
 /// it — the input box is where a person's eyes are, and the one thing that
 /// answers "is it stuck?" belongs against it rather than in a panel beside the
-/// conversation.
+/// conversation. The task list is here for the same reason: it is what the
+/// current turn is working through, and it reads as part of the working rather
+/// than as a panel about it.
 ///
-/// Written into the tree rather than claimed by the live line's own row the way
-/// the mascot claims its strip: `LayoutOp::Show` has two sides, above the
-/// conversation and below the status bar, and both are the wrong side of the
-/// input box.
+/// Written into the tree rather than claimed by each row's own `LayoutOp::Show`
+/// the way the mascot claims its strip: `Show` has two sides, above the
+/// conversation and below the status line, and both are the wrong side of the
+/// input box. That is why the todo list — which used to place itself at the
+/// bottom, under the field — is a member here instead.
 ///
-/// The live line is `Hug`-ish: it asks for no rows between turns, so the
-/// composer closes up around the field instead of standing on a blank row. The
-/// tip row beneath it is the deliberate exception — it asks for its row always,
+/// All three are `Hug`-ish: the live line and the task list ask for no rows
+/// between turns and no panel until the model has planned something, so the
+/// composer closes up around the field instead of standing on blank rows. The
+/// tip row beneath is the deliberate exception — it asks for its row always,
 /// which is why a tip can never move the box out from under a hand reaching for
 /// it. See `modules::tip`.
 ///
@@ -1235,6 +1500,7 @@ pub fn composer() -> Region {
     Region::flex(
         Dir::Vertical,
         vec![
+            Item::hug(Region::view(crate::modules::todo::ID)),
             Item::hug(Region::view(crate::modules::live::ID)),
             Item::hug(Region::view(crate::modules::tip::ID)),
             Item::grow(Region::view(crate::modules::input::ID)),
@@ -2334,6 +2600,82 @@ mod tests {
     }
 
     #[test]
+    fn a_tip_is_said_for_a_moment_and_moves_nothing() {
+        // What the reserved row is for. Saying something is not an event in the
+        // conversation — the whole reason it is not a block is that a block for
+        // "已复制" pushed every row of the conversation up one.
+        use crate::modules::{live, tip};
+        use crate::moment::{Timestamp, NOTICE_MS};
+        let mods = Arc::new(Modules::new());
+        mods.add_producer(transcript::Transcript::new()).unwrap();
+        mods.add_view(Arc::new(Mounted::<live::Live>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<tip::Tip>::new())).unwrap();
+        mods.add_view(Arc::new(Mounted::<input::Input>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<status::Status>::new()))
+            .unwrap();
+        let h = Host::new(mods, default_layout());
+
+        let resting = h.compose((60, 12));
+        let field = resting.part("input").expect("the field").rect;
+        let stream = resting.part("stream").expect("the words").rect;
+
+        // The clock is the host's: the expiry is stamped from the reading the
+        // frame is drawn from, and the module that draws it is handed the
+        // result rather than asking a clock of its own.
+        h.moment.write().unwrap().now = Timestamp::millis(1_000);
+        h.say("已复制到剪贴板", false);
+        let said = h.compose((60, 12));
+
+        let tip: String = said
+            .part("tip")
+            .expect("the reserved row")
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect();
+        assert!(tip.contains("已复制到剪贴板"), "the row says it: {tip:?}");
+        assert_eq!(
+            said.part("input").expect("the field").rect,
+            field,
+            "saying something does not move the field"
+        );
+        assert_eq!(
+            said.part("stream").expect("the words").rect,
+            stream,
+            "and takes no row from the conversation"
+        );
+        assert!(
+            said.part("stream")
+                .expect("the words")
+                .lines
+                .iter()
+                .all(|l| !l.plain().contains("已复制")),
+            "and the conversation is not told at all"
+        );
+
+        // The reading the loop reaches three seconds later: gone, with nobody
+        // having had to clear it.
+        h.moment.write().unwrap().now = Timestamp::millis(1_000 + NOTICE_MS);
+        let after = h.compose((60, 12));
+        assert!(
+            after
+                .part("tip")
+                .expect("the row is still reserved")
+                .lines
+                .iter()
+                .all(|l| l.plain().trim().is_empty()),
+            "a tip expires on its own"
+        );
+        assert_eq!(
+            after.part("input").expect("the field").rect,
+            field,
+            "and nothing moved when it did"
+        );
+    }
+
+    #[test]
     fn a_click_lands_on_the_block_that_was_painted_there() {
         // The click is answered from the frame that was actually on screen, not
         // from a re-derived one: the two would drift the moment anything
@@ -2836,6 +3178,226 @@ mod tests {
             screen,
             "the cycle does not come back round"
         );
+    }
+
+    #[test]
+    fn the_slash_menu_floats_over_the_layout_and_moves_nothing() {
+        // 「上拉，盖在上面，不改变其它组件的大小」. The menu is drawn as a part
+        // after the layout has been resolved, so opening it must not move a
+        // single rect: the conversation keeps its rows, the field keeps its
+        // height, the status bar stays put. It covers what is above the field
+        // instead of taking room from it.
+        let h = fed();
+        let size = (80, 24);
+        let before = h.compose(size);
+        let stream = before.part("stream").expect("the conversation").rect;
+        let field = before.part("input").expect("the field").rect;
+        let status = before.part("status").expect("the status line").rect;
+
+        h.set_menu(vec![
+            ("help".into(), "看命令".into()),
+            ("compact".into(), "压缩上下文".into()),
+        ]);
+        let after = h.compose(size);
+
+        let menu = after.part("menu").expect("the menu is on screen");
+        assert_eq!(
+            after.part("stream").unwrap().rect,
+            stream,
+            "the conversation was resized to make room for the menu"
+        );
+        assert_eq!(
+            after.part("input").unwrap().rect,
+            field,
+            "the field was resized to make room for the menu"
+        );
+        assert_eq!(after.part("status").unwrap().rect, status);
+        assert_eq!(
+            menu.rect.w, field.w,
+            "the menu lines up with the field it rose out of"
+        );
+        assert_eq!(
+            menu.rect.bottom(),
+            field.y,
+            "the menu sits directly against the field's top rule, its margin row included"
+        );
+        assert!(
+            menu.rect.y < field.y,
+            "the menu rose into the space above the field"
+        );
+        let drawn = &menu.lines;
+        assert!(
+            drawn.iter().any(|l| l.plain().contains("/help")),
+            "the menu's own contents are drawn: {drawn:?}"
+        );
+        // The point of it being a panel rather than a list of words: every row
+        // is filled to the rect with the panel's background, so what it covers
+        // is covered. A row of text spans that stopped at the last word would
+        // let the conversation show through on the right.
+        let want = Some(crate::frame::Color::role(crate::theme::Role::PanelBg));
+        for (i, line) in drawn.iter().enumerate() {
+            assert_eq!(
+                line.width(),
+                menu.rect.w as usize,
+                "menu row {i} does not fill the panel: {line:?}"
+            );
+            let bg = menu
+                .lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.style.bg).collect::<Vec<_>>())
+                .nth(i)
+                .unwrap();
+            assert!(
+                line.spans.iter().all(|s| s.style.bg == want),
+                "menu row {i} has cells with no background ({bg:?}): {line:?}"
+            );
+        }
+
+        h.set_menu(Vec::new());
+        assert!(
+            h.compose(size).part("menu").is_none(),
+            "closing the menu takes its part away"
+        );
+    }
+
+    #[test]
+    fn the_context_menu_floats_over_the_layout_and_moves_nothing() {
+        // The same rule the slash menu follows, and for the same reason: a
+        // panel that resizes the conversation as it appears is worse than none.
+        // It also has to sit *under the pointer*, which is the difference
+        // between this one and the slash menu.
+        let h = fed();
+        let size = (80, 24);
+        let before = h.compose(size);
+        let stream = before.part("stream").expect("the conversation").rect;
+        let field = before.part("input").expect("the field").rect;
+
+        h.open_context_menu(
+            (6, field.y + 1),
+            vec![
+                crate::menu::Item::new("copy", "复制全文"),
+                crate::menu::Item::new("paste", "粘贴"),
+            ],
+        );
+        let after = h.compose(size);
+
+        assert_eq!(
+            after.part("stream").unwrap().rect,
+            stream,
+            "the conversation was resized to make room for the menu"
+        );
+        assert_eq!(
+            after.part("input").unwrap().rect,
+            field,
+            "the field was resized to make room for the menu"
+        );
+        let menu = after.part("context-menu").expect("the menu is on screen");
+        assert_eq!(menu.rect.x, 6, "it opens at the cell it was asked for");
+        assert_eq!(
+            menu.rect.y,
+            field.y + 1,
+            "its first item sits under the pointer"
+        );
+        let drawn: Vec<String> = menu.lines.iter().map(|l| l.plain()).collect();
+        assert!(
+            drawn.iter().any(|l| l.contains("复制全文")),
+            "the menu's own items are drawn: {drawn:?}"
+        );
+
+        assert!(h.close_context_menu(), "closing says there was one");
+        assert!(
+            h.compose(size).part("context-menu").is_none(),
+            "closing the menu takes its part away"
+        );
+        assert!(
+            !h.close_context_menu(),
+            "closing again says there was nothing to close"
+        );
+    }
+
+    #[test]
+    fn the_context_menu_takes_its_own_keys_and_gives_them_back_when_it_closes() {
+        use crate::surface::KeyPress;
+        let h = fed();
+        assert!(
+            h.context_menu_key(KeyPress::plain(crate::surface::Key::Down))
+                .is_none(),
+            "with nothing open the menu claims no keys"
+        );
+
+        h.open_context_menu(
+            (0, 0),
+            vec![
+                crate::menu::Item::new("copy", "复制全文"),
+                crate::menu::Item::new("send", "发送"),
+            ],
+        );
+        let step = h
+            .context_menu_key(KeyPress::plain(crate::surface::Key::Down))
+            .expect("an open menu claims the key");
+        assert_eq!(step, crate::menu::Step::Stay, "moving keeps it open");
+        assert!(h.context_menu_open());
+
+        let step = h
+            .context_menu_key(KeyPress::plain(crate::surface::Key::Enter))
+            .expect("still open");
+        assert_eq!(step, crate::menu::Step::Picked("send".into()));
+        assert!(
+            !h.context_menu_open(),
+            "picking an item closes the menu — it does not stay up over the answer"
+        );
+
+        // And the keyboard is the screen's again, not the closed menu's.
+        h.open_context_menu((0, 0), vec![crate::menu::Item::new("copy", "复制全文")]);
+        assert_eq!(
+            h.context_menu_key(KeyPress::plain(crate::surface::Key::Esc)),
+            Some(crate::menu::Step::Dismissed)
+        );
+        assert!(!h.context_menu_open());
+    }
+
+    #[test]
+    fn a_press_outside_the_context_menu_closes_it_without_choosing() {
+        use crate::host::ContextClick;
+        let h = fed();
+        let field = h.compose((80, 24)).part("input").unwrap().rect;
+        h.open_context_menu(
+            (6, field.y),
+            vec![crate::menu::Item::new("copy", "复制全文")],
+        );
+
+        // Far from the menu: the caller is told it was not a choice, and the
+        // menu has been put away so the press can mean whatever it meant.
+        assert_eq!(
+            h.context_menu_click(0, 0, (80, 24)),
+            ContextClick::Outside,
+            "a press elsewhere is not a choice off the menu"
+        );
+        assert!(!h.context_menu_open());
+
+        // With nothing open, the menu has no opinion about the pointer at all.
+        assert_eq!(h.context_menu_click(0, 0, (80, 24)), ContextClick::NotOpen);
+    }
+
+    #[test]
+    fn a_press_on_a_row_picks_that_row() {
+        use crate::host::ContextClick;
+        let h = fed();
+        let field = h.compose((80, 24)).part("input").unwrap().rect;
+        h.open_context_menu(
+            (6, field.y),
+            vec![
+                crate::menu::Item::new("copy", "复制全文"),
+                crate::menu::Item::new("send", "发送"),
+            ],
+        );
+        let rect = h.compose((80, 24)).part("context-menu").expect("open").rect;
+        assert_eq!(
+            h.context_menu_click(rect.x, rect.y + 1, (80, 24)),
+            ContextClick::Picked(crate::menu::Step::Picked("send".into())),
+            "the row under the pointer is the row that is chosen"
+        );
+        assert!(!h.context_menu_open());
     }
 
     #[test]
