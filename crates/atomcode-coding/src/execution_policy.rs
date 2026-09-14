@@ -80,7 +80,7 @@ impl TurnExecutionPolicy {
             .store(execution_policy_from_text(text).0, Ordering::Release);
     }
 
-    fn update_from_messages(&self, messages: &[Message]) {
+    pub(crate) fn update_from_messages(&self, messages: &[Message]) {
         self.current
             .store(execution_policy_for_messages(messages).0, Ordering::Release);
     }
@@ -93,6 +93,23 @@ impl LifecycleHooks for TurnExecutionPolicy {
     }
 }
 
+/// What the model is told when the person forbade this.
+pub(crate) const BLOCKED: &str =
+    "Blocked by the current user's execution restriction for this turn.";
+
+/// Whether the current restriction forbids this call.
+///
+/// The judgement, apart from the shape it is delivered in: the chain asks
+/// through `ToolMiddleware::before` below, the `execution-policy` row asks
+/// through `Waterfall<ToolsExecute>`. One implementation, so a boundary the
+/// person set cannot mean two different things in two assemblies.
+pub(crate) fn blocks_call(policy: ExecutionPolicy, tool_name: &str, arguments: &str) -> bool {
+    if tool_name != "bash" {
+        return false;
+    }
+    policy.blocks_bash(&bash_command(arguments).unwrap_or_default())
+}
+
 #[async_trait]
 impl ToolMiddleware for TurnExecutionPolicy {
     async fn before(
@@ -101,14 +118,8 @@ impl ToolMiddleware for TurnExecutionPolicy {
         _tool: &Arc<dyn Tool>,
         _rt: &RequestCtx,
     ) -> BeforeOutcome {
-        if call.name != "bash" {
-            return BeforeOutcome::Proceed;
-        }
-        let command = bash_command(&call.arguments).unwrap_or_default();
-        if self.current().blocks_bash(&command) {
-            BeforeOutcome::deny(
-                "Blocked by the current user's execution restriction for this turn.",
-            )
+        if blocks_call(self.current(), &call.name, &call.arguments) {
+            BeforeOutcome::deny(BLOCKED)
         } else {
             BeforeOutcome::Proceed
         }

@@ -2120,20 +2120,20 @@ fn write_outside(rel: &'static str) -> Arc<Script> {
 
 #[tokio::test]
 async fn a_write_outside_the_workspace_diverges_and_here_is_why() {
-    // A REAL divergence, recorded rather than papered over.
+    // Kept under its original name because the name is the history: this DID
+    // diverge (coding wrote the file, the harness refused it, and neither
+    // asked), and that finding is what produced the `Presence` rule. Attended
+    // no longer fences, so both engines now write it and the ratchet is 0.
     //
-    //   coding   ToolResult error=false   — the write went through
-    //   harness  ToolResult error=true    — the write was refused
+    // What it measures TODAY is therefore the settled half of that rule:
+    // with a person reachable, a write next door is not refused out of hand on
+    // either engine. The half that makes it a rule — the same call REFUSED with
+    // nobody to ask — is `headless_refuses_what_attended_would_ask_about`.
     //
-    // and NEITHER asked. The two engines manage the same concern with different
-    // mechanisms: the harness `fs` row FENCES by root, so a target outside it is
-    // refused before anything approval-shaped is consulted; coding does not fence
-    // the write tools and leaves the question to `WriteApprovalGate`, which — with
-    // no human wired in this rig — let it through.
-    //
-    // Which is right is a decision, not a bug, and it has to be made before the
-    // default path can be switched: one engine writes the file, the other does
-    // not. The ratchet holds the number so nobody discovers this twice.
+    // Worth knowing while reading this: neither engine ASKS here either, so the
+    // `allow()` answer below is never consumed. The scenario that genuinely
+    // exercises the approval round-trip is `a_refusal_is_the_call_not_the_turn`
+    // below, which uses a call both engines really do stop for.
     let dir = scratch("ask-yes");
     let outside = dir.parent().unwrap().join("outside-yes.txt");
     let _ = std::fs::remove_file(&outside);
@@ -2163,30 +2163,56 @@ async fn a_write_outside_the_workspace_diverges_and_here_is_why() {
 
 #[tokio::test]
 async fn a_refusal_is_the_call_not_the_turn_on_both_engines() {
-    // The same scenario answered `deny`. The point is not which engine refuses —
-    // that is the divergence above — but that a refusal ends the CALL and the turn
-    // carries on, on both. An engine that ended the turn instead would strand a
-    // driver mid-conversation, and that failure is invisible in a green test that
-    // only checks the file.
+    // The one scenario here that genuinely round-trips the approval seam.
+    //
+    // Its first version reused the write-outside script and answered `deny`.
+    // That was vacuous: neither engine ASKS about that write, so the `deny`
+    // was never consumed and the test asserted "a refusal ends the call" while
+    // watching a successful write. It passed for a year of reasons that had
+    // nothing to do with refusal.
+    //
+    // A recursive `rm` is a call both engines really do stop for, which is what
+    // makes the answer mean something: `Request approval` on both, refused on
+    // both. The claim is not which engine refuses — it is that a refusal ends
+    // the CALL and the turn carries on. An engine that ended the turn instead
+    // would strand a driver mid-conversation, and that failure is invisible in a
+    // green test that only checks the file.
     let dir = scratch("ask-no");
-    let outside = dir.parent().unwrap().join("outside-no.txt");
-    let _ = std::fs::remove_file(&outside);
     let (a, b, report) = ask_chain_vs_rows(
         "approval_refusal_rows",
         &dir,
-        || write_outside("../outside-no.txt"),
-        || say("write it"),
+        || {
+            Script::new(&[
+                Reply::call(
+                    "c1",
+                    "bash",
+                    r#"{"command":"rm -rf /tmp/nope-does-not-exist"}"#,
+                ),
+                Reply::Text("stopped"),
+            ])
+        },
+        || say("clean it up"),
         deny(),
     )
     .await;
     for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "Request").count(),
+            1,
+            "{who}: 这一条的全部意义就是真的问了人一次{report}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.kind == "ToolResult" && s.detail.contains("error=true")),
+            "{who}: 答了 deny,调用就得失败{report}"
+        );
         assert_eq!(
             steps.iter().filter(|s| s.kind == "TurnComplete").count(),
             1,
             "{who}: 拒绝结束的是调用,不是回合{report}"
         );
     }
-    let _ = std::fs::remove_file(&outside);
 }
 
 #[tokio::test]
@@ -2878,4 +2904,92 @@ async fn a_user_who_forbade_the_shell_is_not_nudged_into_using_it() {
             "{who}: 人说了不许跑命令,就不能再被催着去跑{report}"
         );
     }
+}
+
+// ---- the per-turn execution boundary ------------------------------------
+//
+// `TurnExecutionPolicy`, which the production chain registers BEFORE every
+// middleware that can `Allow` — because an `Allow` from an approval gate
+// short-circuits everything downstream, and a boundary the user set must not be
+// something a gate can wave through.
+//
+// It is a boundary the person states in plain language mid-conversation ("do
+// not run any command"), so nothing in the tree configuration expresses it: it
+// has to be re-read from the messages every round.
+
+#[tokio::test]
+async fn a_command_the_user_forbade_is_refused_on_both_engines() {
+    let dir = scratch("exec-policy-onharness");
+    seed(&dir);
+    let script = || {
+        Script::new(&[
+            Reply::call("c1", "bash", r#"{"command":"echo hi"}"#),
+            Reply::Text("ran it"),
+        ])
+    };
+    let asked = || say("check the build, and do not run any command");
+    let a = reference_production(script(), &dir, asked()).await;
+    let (handle, mut app) = on_harness_headless(script(), &dir).await;
+    let b = drive_answering(handle, asked(), &[], None, allow()).await;
+    app.stop();
+    let report = judge("exec_policy_rows", &a, &b);
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.kind == "ToolResult" && s.detail.contains("error=true")),
+            "{who}: 人这一回合禁掉的命令必须被拒 —— 审批闸门的 Allow 不该能放行它{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_refused_call_still_reads_as_started_on_the_harness() {
+    // A general property of the two engines, given its own name so it is found
+    // once rather than rediscovered as a bug in whichever row happens to refuse
+    // something next. It cost exactly that: the `execution-policy` row's first
+    // theory was that it had introduced this, and it had not.
+    //
+    //   链式  Request approval → ToolResult error=true
+    //   行式  ToolStarted bash → Request approval → ToolResult error=true
+    //
+    // `ui-handle` synthesises `ToolStarted` for every MOUNTED tool the moment
+    // the assistant message is logged — earlier than `tools/execute-batch`,
+    // earlier than `tools/execute`, earlier than anything that could refuse.
+    // Coding's chain announces a call only after its middleware has let it
+    // through, so a refused call is never announced at all.
+    //
+    // Consequence for a driver: every refused call flashes as a tool that
+    // started and instantly failed. `handle.rs` already guards the neighbouring
+    // case — a tool nobody mounted is not announced, with a comment saying a
+    // differential run found it — so the shape of the fix is known and it
+    // belongs to `ui-handle`, not to any product row. Frozen at 1 until then.
+    //
+    // Two scenarios carry this divergence (`approval_refusal_rows` and
+    // `exec_policy_rows`); this one states it.
+    let dir = scratch("started-gap");
+    seed(&dir);
+    let script = || {
+        Script::new(&[
+            Reply::call(
+                "c1",
+                "bash",
+                r#"{"command":"rm -rf /tmp/nope-does-not-exist"}"#,
+            ),
+            Reply::Text("stopped"),
+        ])
+    };
+    let a = reference_production_answering(script(), &dir, say("clean it"), deny()).await;
+    let b = on_harness_answering(script(), &dir, say("clean it"), deny()).await;
+    let report = judge("refused_call_started_rows", &a, &b);
+
+    let started = |steps: &[Step]| steps.iter().filter(|s| s.kind == "ToolStarted").count();
+    assert_eq!(started(&a), 0, "链式:被拒的调用不该被宣告开始过{report}");
+    assert_eq!(
+        started(&b),
+        1,
+        "行式:这正是本条记录的差异 —— 若它变成 0,说明 ui-handle 修好了,\
+         把本条连同两处基线一起降下来{report}"
+    );
 }

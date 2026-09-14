@@ -88,6 +88,12 @@ config = { working_dir = "{working_dir}" }
 name = "tool-output-artifact"
 config = { dir = "{artifacts}" }
 
+# The per-turn execution boundary the person states in prose ("do not run any
+# command"). Registered outermost on tools/execute, above every approval gate:
+# an Allow short-circuits everything downstream, and this must survive that.
+[[insert]]
+name = "execution-policy"
+
 # The self-correction loop: an in-workspace code edit the model walked away
 # from without checking gets one nudge. `force` follows presence, the same rule
 # `CodingAgentConfig::is_attended` applies to `VerifyCadenceHook`: a person who
@@ -209,6 +215,7 @@ pub async fn mount(
     registry.register(Arc::new(policy::BashWorkspacePlugin));
     registry.register(Arc::new(policy::OutputArtifactPlugin));
     registry.register(Arc::new(VerifyCadencePlugin));
+    registry.register(Arc::new(ExecutionPolicyPlugin));
     registry.register(Arc::new(InjectProvider(provider)));
 
     let mut app = App::new(registry, tree);
@@ -357,6 +364,149 @@ impl Plugin for VerifyCadencePlugin {
             }),
             true,
         );
+        Ok(())
+    }
+}
+
+// ---- the per-turn execution boundary, as a row --------------------------
+//
+// The production chain registers `TurnExecutionPolicy` BEFORE every middleware
+// that can `Allow`, and the comment there says why: an `Allow` short-circuits
+// everything downstream, so a boundary the person set must not be something an
+// approval gate can wave through. The row keeps that property by sitting
+// outermost on `tools/execute` — a later gate's `Allow` never reaches it,
+// because it never delegates.
+//
+// The differential found this one too, and starkly: the chain refused the call
+// before the tool started, while the row list ran the command.
+//
+// Two halves, one shared handle, because the halves learn and enforce at
+// different moments:
+//   - `agent/request`, before delegating: re-read the restriction from the
+//     messages. It is stated in prose mid-conversation, so nothing in the tree
+//     configuration can express it and every round has to look again.
+//   - `tools/execute`, outermost: refuse what the restriction forbids.
+
+struct ExecutionBoundary {
+    policy: Arc<crate::execution_policy::TurnExecutionPolicy>,
+}
+
+#[async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for ExecutionBoundary {
+    async fn handle(
+        &self,
+        req: &mut atomcode_harness::events::ModelRequest,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::AgentRequest>,
+    ) -> Result<atomcode_harness::events::ModelResponse, atomcode_harness::events::RequestError>
+    {
+        // BEFORE delegating: the calls this round produces are gated on what
+        // the person said, and they are gated by the other half below, which
+        // has no messages of its own to read.
+        self.policy.update_from_messages(&req.messages);
+        next.run(req).await
+    }
+}
+
+#[async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::ToolsExecuteBatch> for ExecutionBoundary {
+    async fn handle(
+        &self,
+        batch: &mut atomcode_harness::events::ToolBatch,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::ToolsExecuteBatch>,
+    ) -> Vec<atomcode_kernel::tool::ToolResult> {
+        // The BATCH seam, not `tools/execute`, for the same reason
+        // `RefuseTruncatedCalls` uses it: a call that must not run should be
+        // held back before a scheduler picks it up, not refused once it is
+        // already in flight.
+        //
+        // It does NOT close the `ToolStarted` gap — that was this row's first
+        // theory and it is wrong. `ui-handle` announces every MOUNTED tool as
+        // started the moment the assistant message is logged, which is earlier
+        // than either tool seam, so a refused call still reads as "started" to a
+        // driver. That is a general property of the two engines rather than
+        // anything this row does: the plain approval path shows it too. See
+        // `a_refused_call_still_reads_as_started_on_the_harness` in the
+        // differential, which owns the finding.
+        //
+        // Deliberately NOT consulting `pre_approved`. Every other gate does,
+        // because approval is something a person can grant; this is the
+        // person's own restriction, and "already approved" is precisely the
+        // short-circuit it exists to survive.
+        let policy = self.policy.current();
+        let blocked: Vec<usize> = batch
+            .calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| {
+                crate::execution_policy::blocks_call(policy, &call.name, &call.arguments)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if blocked.is_empty() {
+            return next.run(batch).await;
+        }
+
+        // Hold back the forbidden ones and let the rest through: a round that
+        // also contained allowed calls should not lose them.
+        //
+        // Denying is returning a result, not raising: the model must see why
+        // its call did not run, and the history has to stay pairable.
+        let refused: Vec<(usize, atomcode_kernel::tool::ToolResult)> = blocked
+            .iter()
+            .map(|&i| {
+                (
+                    i,
+                    atomcode_kernel::tool::ToolResult {
+                        call_id: batch.calls[i].id.clone(),
+                        content: crate::execution_policy::BLOCKED.to_string(),
+                        is_error: true,
+                        images: vec![],
+                    },
+                )
+            })
+            .collect();
+        batch.calls = batch
+            .calls
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !blocked.contains(i))
+            .map(|(_, call)| call.clone())
+            .collect();
+        let mut results = if batch.calls.is_empty() {
+            Vec::new()
+        } else {
+            next.run(batch).await
+        };
+        // Back where the model expects them, so results still line up with the
+        // calls it emitted.
+        for (index, result) in refused {
+            let at = index.min(results.len());
+            results.insert(at, result);
+        }
+        results
+    }
+}
+
+/// Mounts the per-turn execution boundary.
+pub struct ExecutionPolicyPlugin;
+
+#[async_trait]
+impl Plugin for ExecutionPolicyPlugin {
+    fn name(&self) -> &'static str {
+        "execution-policy"
+    }
+    fn description(&self) -> &'static str {
+        "refuse what the person forbade for this turn, above any approval"
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        let boundary = Arc::new(ExecutionBoundary {
+            policy: Arc::new(crate::execution_policy::TurnExecutionPolicy::new()),
+        });
+        let _ = ctx.on_waterfall::<atomcode_harness::events::AgentRequest>(boundary.clone(), true);
+        // Outermost, which is this row's whole point: a gate that returns
+        // `Allow` never delegates further, so anything registered inside it
+        // would be skipped by the very short-circuit the boundary must survive.
+        let _ = ctx.on_waterfall::<atomcode_harness::events::ToolsExecuteBatch>(boundary, true);
         Ok(())
     }
 }
