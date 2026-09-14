@@ -210,6 +210,34 @@ let key = (call.name.clone(), call.arguments.clone());
 
 ## 已定的决策（不要重议）
 
+**技能目录内联，不建开关（2026-09-14 用户拍板）。** 通用 harness 的 `skills` 行
+只给一句指针（113 字节），coding 内联整份目录（1044 字节固定引导语 + 列表体，
+预算上限 `CATALOG_BYTE_BUDGET = 8000`，最坏约 9 KB）。`skill-catalog-inline` 行
+保持内联，并**故意用通用行同一个 fragment id 贡献**，让目录顶掉指针而不是并排。
+
+三条理由，第二条是量的时候撞见的：
+
+1. 它是**系统提示片段**，属缓存前缀——有 prompt cache 时 9 KB 是一次性代价，
+   不是每次请求都付。
+2. **L1 已经站在内联这边了。** `capabilities` 里有四段面向模型的文字写着
+   「看系统提示里的 `=== AVAILABLE SKILLS ===`」——`skills/use_skill.rs:37,46`
+   和 `tools/web_fetch.rs:79,264`。而通用 harness 只给指针，**那个 section
+   根本不存在**。这是既有的不一致，与本线无关，但它说明落单的是那句指针。
+3. 反悔是**对称**的，且没有结构性锁定：两个方向都只是改 7 段散文
+   （上面四段 + `coding/skill_first.rs:59` + `persona.rs:386,486`），
+   `grep "AVAILABLE SKILLS"` 全找得到。加 `mode` 开关只能切「行」，切不动那
+   7 段文字——维护两套措辞是长期成本，而切换需求没人提出过
+   （参见 [[feedback-over-engineering]] 那次「为了以后好换造脚手架」的失败）。
+
+真实反悔成本 = 半天改字 + **一轮跨模型验证**（提示词改动不能只在一个模型上
+dogfood，见 `feedback_cross_model_verify`）。
+
+**一个没人验过的角落（内联路线自己的洞）：** 装了几十个技能的用户会顶到 8000
+字节预算，那时按 `source_rank` 截断。截断之后 `skill-first` 那句「如果匹配目录里
+某条描述，你必须调 `use_skill`」还成不成立？目录里已经没有那条了，而催促还在催。
+没测过。
+
+
 | 决策 | 理由 / 出处 |
 |---|---|
 | 依赖方向 `coding → harness`，harness 对 coding 零引用 | 反向边会成环；差分台已搬到 coding 侧 |
