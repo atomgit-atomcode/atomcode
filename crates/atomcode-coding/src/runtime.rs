@@ -4445,7 +4445,19 @@ fn spawn_runtime_owner_with_optional_agent(
                         // returns, `controls.state` is what `status()` reads, the
                         // driver renders four events in order, and a sessionless
                         // run still has a snapshot to keep.
-                        if Engine::from_env() == Engine::Harness {
+                        // `agent.is_some()` is load-bearing. A patch replaces
+                        // what is behind a seam; it cannot bring back an agent
+                        // that was torn down, and `ui-handle` hands its handle
+                        // out exactly once — so after a `DeactivateProvider`
+                        // (what `/logout` does) there is nothing to patch
+                        // underneath. Recovery from that has to rebuild, which
+                        // is the chain path below.
+                        //
+                        // Without this guard the runtime reported Ready after a
+                        // `/logout` → `/login` and then refused every turn with
+                        // `ProviderUnavailable`: the provider had been swapped
+                        // behind a seam nobody was reading.
+                        if Engine::from_env() == Engine::Harness && agent.is_some() {
                             if let (Some(app), Some(slots)) = (
                                 runtime.harness_app.as_mut(),
                                 runtime.harness_providers.clone(),
@@ -12075,6 +12087,33 @@ mod tests {
             RuntimeGeneration(2)
         );
         assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    /// Recovery has to hand back a runtime that can actually run a turn.
+    ///
+    /// The scenario above stops at `phase == Ready`, and that is not the same
+    /// claim: a deactivate STOPS the agent, so a recovery path that only put a
+    /// new provider in place would report Ready with nothing behind it. On the
+    /// harness engine that is a live hazard — a model swap there is a patch,
+    /// and a patch cannot bring back an agent that was torn down — so this
+    /// submits after recovering and insists the turn starts.
+    #[tokio::test]
+    async fn a_recovered_runtime_can_actually_run_a_turn() {
+        let mut runtime = CodingRuntime::start(native_start(false)).await.unwrap();
+        runtime
+            .handle
+            .deactivate_provider(ProviderUnavailableReason::AuthenticationRequired)
+            .await
+            .unwrap();
+        let next = CodingAgentConfig::new("key", "https://example.test/v1", "after-login", ".");
+        runtime.handle.reassemble_provider(next).await.unwrap();
+
+        let receipt = runtime.handle.submit(UserInput::from("after login")).await;
+        assert!(
+            matches!(receipt, Ok(SubmitReceipt::Started { .. })),
+            "a recovered runtime reported Ready but could not start a turn: {receipt:?}"
+        );
         runtime.handle.shutdown().await.unwrap();
     }
 
