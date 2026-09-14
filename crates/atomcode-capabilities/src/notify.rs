@@ -90,7 +90,10 @@ pub fn set_terminal_focus_state(focused: Option<bool>) {
     TERMINAL_FOCUS_STATE.store(encoded, Ordering::Relaxed);
 }
 
-fn terminal_focus_state() -> Option<bool> {
+/// The last observed terminal focus state: `Some(true)` focused, `Some(false)`
+/// unfocused, `None` unknown (focus reporting unsupported or not yet observed).
+/// Read by the TUI to recover from a refocus whose `FocusGained` never arrived.
+pub fn terminal_focus_state() -> Option<bool> {
     match TERMINAL_FOCUS_STATE.load(Ordering::Relaxed) {
         FOCUS_TRUE => Some(true),
         FOCUS_FALSE => Some(false),

@@ -13526,6 +13526,61 @@ fn coalesce_drag_events(
     (latest, None)
 }
 
+/// A key/paste is proof the terminal is focused NOW. When we AFFIRMATIVELY believe we
+/// are unfocused (`Some(false)` — a `FocusLost` arrived but the matching `FocusGained`
+/// never did, a common Windows-console asymmetry where the diff cache goes stale while
+/// the host drops paints), the deferred flush would repaint against that stale cache and
+/// the just-typed characters wouldn't appear until a later event. Such input means we
+/// must do the same cold `force_repaint` the `FocusChanged(true)` path would have.
+///
+/// Gated to `Some(false)` ONLY: `Some(true)` needs nothing, and `None` (focus reporting
+/// unsupported / unknown) is deliberately left alone so this never becomes a per-keystroke
+/// full repaint. Fires at most once per observed defocus, then `set_terminal_focus_state`
+/// flips us back to focused.
+fn input_recovers_stale_focus(ev: &InputEvent, focus_state: Option<bool>) -> bool {
+    focus_state == Some(false) && matches!(ev, InputEvent::Key(_) | InputEvent::Paste(_))
+}
+
+#[cfg(test)]
+mod focus_recovery_tests {
+    use super::input_recovers_stale_focus;
+    use crate::input::InputEvent;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key() -> InputEvent {
+        InputEvent::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()))
+    }
+
+    #[test]
+    fn recovers_only_when_known_unfocused_on_key_or_paste() {
+        // The bug: a FocusLost was seen (Some(false)) but no matching FocusGained →
+        // the next key/paste must trigger the cold repaint.
+        assert!(input_recovers_stale_focus(&key(), Some(false)));
+        assert!(input_recovers_stale_focus(&InputEvent::Paste("x".into()), Some(false)));
+    }
+
+    #[test]
+    fn no_repaint_when_focused_or_unknown() {
+        // Already focused → nothing stale; unknown → left to the real focus event so
+        // this never degrades into a per-keystroke full repaint.
+        assert!(!input_recovers_stale_focus(&key(), Some(true)));
+        assert!(!input_recovers_stale_focus(&key(), None));
+    }
+
+    #[test]
+    fn non_input_events_never_trigger_recovery() {
+        // Resize / FocusChanged themselves are not "focus-proof" input.
+        assert!(!input_recovers_stale_focus(
+            &InputEvent::Resize(80, 24),
+            Some(false)
+        ));
+        assert!(!input_recovers_stale_focus(
+            &InputEvent::FocusChanged(true),
+            Some(false)
+        ));
+    }
+}
+
 fn handle_input(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -13606,6 +13661,15 @@ fn handle_input(
     }
     if !matches!(ev, InputEvent::Pointer(_)) {
         app.menu.pointer_cancel();
+    }
+
+    // Windows focus-recovery fallback (issue: input not echoing after Alt+Tab). If we
+    // affirmatively believed we were unfocused and now receive a key/paste, the refocus
+    // was missed (no `FocusGained`); refresh the stale diff cache with the same cold
+    // repaint the focus-event path uses, then mark focused so this fires only once.
+    if input_recovers_stale_focus(&ev, atomcode_capabilities::notify::terminal_focus_state()) {
+        atomcode_capabilities::notify::set_terminal_focus_state(Some(true));
+        renderer.force_repaint();
     }
 
     match ev {
