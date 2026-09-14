@@ -322,3 +322,103 @@ async fn an_unknown_tool_names_what_is_actually_mounted() {
         "the error lists the live catalog"
     );
 }
+
+/// Facts reach the file in the order they were committed.
+///
+/// A sequence number is minted when a fact commits, so the log's ORDER is the
+/// conversation. Nothing sorts on the way back in: `JsonlStore::parse` reads
+/// lines in file order, `SessionLog::restore` stores them as given, and
+/// `derive_messages` folds them as stored. So a file written out of order is a
+/// resumed conversation in the wrong order — two tool results swapped, or
+/// context landing after the message it was meant to precede.
+///
+/// This was not a hypothetical: persistence used to `tokio::spawn` one task per
+/// committed fact, and the tasks raced. Real sessions on disk came out with
+/// 10–18% of all facts out of order, and 2–10 of the model-visible ones each.
+/// It went unnoticed because every other test either disables persistence or
+/// only checks that the events are PRESENT.
+///
+/// `multi_thread` is load-bearing. On the default current-thread runtime the
+/// spawned writes drain in spawn order and this scenario passes against the
+/// very bug it was written for — verified by putting the bug back. The engine
+/// that wrote those real sessions is multi-threaded, so the test's runtime has
+/// to be too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_log_reaches_the_disk_in_the_order_it_was_committed() {
+    let dir = scratch("persist-order");
+    let file = dir.join("note.txt");
+    let app = start(tree(
+        &script_one(
+            "write_file",
+            &format!(
+                "{{ file_path = {:?}, content = \"x\" }}",
+                file.to_string_lossy()
+            ),
+        ),
+        &dir,
+        &[],
+    ))
+    .await;
+    run_turn(&app, "write it").await.unwrap();
+    // A second turn, so there is enough traffic for a race to show.
+    run_turn(&app, "and again").await.unwrap();
+
+    // Let the writer drain: the queue is deliberately off the turn's path, so
+    // the last few facts can still be in flight when the turn returns.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let root = atomcode_harness::home().join("sessions");
+    let mut written: Vec<PathBuf> = Vec::new();
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "jsonl") {
+                out.push(path);
+            }
+        }
+    }
+    walk(&root, &mut written);
+    assert!(
+        !written.is_empty(),
+        "nothing was persisted under {root:?} — this scenario would pass on an \
+         empty directory otherwise, which is the failure it exists to catch"
+    );
+
+    for path in written {
+        let text = std::fs::read_to_string(&path).expect("read the session back");
+        let mut seqs = Vec::new();
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let value: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("{}: not JSON: {e}", path.display()));
+            // The header carries no event and no sequence number.
+            if value.get("header").is_some() && value.get("event").is_none() {
+                continue;
+            }
+            seqs.push(
+                value
+                    .get("seq")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            );
+        }
+        assert!(
+            seqs.len() > 4,
+            "{}: too few facts to mean anything",
+            path.display()
+        );
+        let mut sorted = seqs.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            seqs,
+            sorted,
+            "{}: the file is not in sequence order — a resume would replay this \
+             conversation scrambled",
+            path.display()
+        );
+    }
+}

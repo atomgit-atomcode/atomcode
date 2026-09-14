@@ -430,6 +430,43 @@ impl Plugin for SessionPersistenceJsonlPlugin {
             }
         });
 
+        // ONE writer, fed by a queue — not a task per event.
+        //
+        // The previous shape spawned a `tokio::spawn` per committed fact, for a
+        // good reason (a slow disk must not stall the turn) and with a bad
+        // consequence: the tasks raced, so the file was written in whatever
+        // order the scheduler happened to pick. Sequence numbers are minted in
+        // order at commit; the LINES were not in that order. Measured on real
+        // sessions: ~10-18% of all facts out of order, and 2-10 of the
+        // MODEL-VISIBLE ones per session — and nothing sorts on the way back in
+        // (`JsonlStore::parse` reads lines in file order, `SessionLog::restore`
+        // stores them as given, `derive_messages` folds them as stored). A
+        // resumed conversation could therefore show the model two tool results
+        // swapped, or context after the message it was meant to precede.
+        //
+        // A queue keeps the property that mattered — the turn never waits on the
+        // disk, because `send` is non-blocking — and restores the one that was
+        // lost, because a single consumer appends in the order it receives.
+        // Same shape as `capabilities::datalog::DatalogWriter`, for the same
+        // reason.
+        //
+        // The task ends when the sender drops, which happens when this row
+        // unloads: no shutdown handshake, and nothing left writing into a store
+        // whose row is gone.
+        let (writes, mut queue) =
+            tokio::sync::mpsc::unbounded_channel::<(String, crate::session::LoggedEvent)>();
+        let writer_store = store.clone();
+        tokio::spawn(async move {
+            while let Some((id, logged)) = queue.recv().await {
+                if let Err(e) = writer_store
+                    .append(&id, std::slice::from_ref(&logged))
+                    .await
+                {
+                    eprintln!("session-persistence: {e}");
+                }
+            }
+        });
+
         let agents_ctx = ctx.clone();
         let _ = ctx.on_emit::<SessionEventCommitted>(move |committed: &Committed| {
             let keep = agents_ctx
@@ -440,16 +477,10 @@ impl Plugin for SessionPersistenceJsonlPlugin {
             if !keep {
                 return;
             }
-            let store = store.clone();
-            let id = committed.session.clone();
-            let logged = committed.logged();
-            // Fire-and-forget: a slow disk must not stall the turn, and a
-            // failed write is reported, never fatal to the conversation.
-            tokio::spawn(async move {
-                if let Err(e) = store.append(&id, std::slice::from_ref(&logged)).await {
-                    eprintln!("session-persistence: {e}");
-                }
-            });
+            // Non-blocking, so the turn still never waits on the disk. A closed
+            // channel means the row is unloading; the fact is dropped rather
+            // than reported, because "we are shutting down" is not a failure.
+            let _ = writes.send((committed.session.clone(), committed.logged()));
         });
         Ok(())
     }
