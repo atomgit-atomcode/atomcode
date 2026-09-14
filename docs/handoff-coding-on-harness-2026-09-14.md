@@ -112,6 +112,84 @@ truncated_redump=2，一模一样。也就是说**生产那条中间件链没有
   已经过期了（名字保留，因为那个名字就是这段历史）。
 - 好消息：审批缝**本身**是通的，两个引擎都发 `Request approval`、都按答案拒。
 
+## 运行时那一半：逐条测绘（2026-09-14）
+
+前面几节讲的是**引擎**。引擎基本到位了。真正的距离在**运行时**，而这一节是它的账。
+
+```
+runtime.rs        15,811 行,68 个 pub 方法
+CodingParts       ~45 个字段
+runtime 伸手进去   20 个不同的字段/方法
+on_harness::mount 交出 (AgentHandle, App) —— 就这两样
+```
+
+### 三个 `assemble()` 调用点，性质完全不同
+
+| | 做什么 | 换到 harness |
+|---|---|---|
+| ① spawn（`runtime.rs:1995`） | 建 agent 然后 `.spawn()` | **今天就能换** —— 两边交出同一个 `AgentHandle`，差分证的正是这个 |
+| ② `/model` 切换（`:4441`） | 拿新 config **重新装配整个 agent** | `ControlSvc::patch(toml)` —— 换机制，不是换实现 |
+| ③ reprepare（`:7084`） | 同上 | 同上 |
+
+**差分台只证明了 ①。** 它没有、也不可能用现在这套场景证明 ②③：那不是「同一个引擎跑同一个脚本」，是「跑着的 agent 怎么被改」。
+
+### 20 个句柄的去向
+
+| 组 | 访问次数 | harness 对应物 | 判定 |
+|---|---|---|---|
+| **session / resume** | `session`×17、`set_runtime_resume`×5、`runtime_resume_snapshot`、`publish_staged_session`、`inherit_runtime_continuity` | `SessionSvc`(`SessionLog`)、`SessionPersistenceSvc`、`SessionDefaults` | **形状不同**。coding 传一个 `SessionSnapshot` + OS 锁 lease + `staged_fresh`（装配成功前不进目录）；harness 的 `SessionDefaults` 是 `{ id, resume: bool }` |
+| **team** | `team_manager`×15 | `team` / `team-in-process` 行**存在但不在 base bundle** | 要显式插行，再把 `TeamRunManager` 的 generation / event_sender 映射过去 |
+| **快照持久化状态** | `snapshot_persistence_status`×11、`snapshot_hook`×3、`take/report_*`×4、`take_cost_persistence_warning` | **没有** | 是「你这次会话可能没存住」的告警信箱。类型在 L1（`capabilities::session::snapshot::SnapshotPersistenceStatus`）可直接复用，但 harness 没有这条告警通道 |
+| **模式开关** | `bypass_mode`×4、`plan_mode`×3、`accept_edits`×3 | `plan-mode` 行（base 里 `disabled = true`）；`accept_edits` 是 **mount-time 配置**；`bypass` **没有** | 见下 |
+| **MCP** | `withdraw_mcp_tools`×2、`mcp_statuses`×2、`mcp_tools_for_server`、`mcp_readiness_receiver` | `McpSvc => McpRegistry` —— **同一个类型** | **机械**：改成从树里 resolve，四个都是 `McpRegistry` 的薄包装 |
+| **杂项** | `register_extra_tool`、`rate_limit_source` | `ToolBox::register/unregister`、`llm-rate-limit` 行 | 机械 |
+
+### 最关键的一条结构差异
+
+`CodingParts` 自己的文档注释说得最准：
+
+> Everything `assemble` composes — **and everything a respawn must REUSE so state survives**（approval grants, hook state, session identity）。
+
+`inherit_runtime_continuity` 逐字实现了它：
+
+```rust
+self.plan_mode    = Arc::clone(&previous.plan_mode);
+self.bypass_mode  = Arc::clone(&previous.bypass_mode);
+self.accept_edits = Arc::clone(&previous.accept_edits);
+self.approval     = Arc::clone(&previous.approval);
+```
+
+**coding 的模型是：重新装配一个新 agent，但把旧状态 `Arc::clone` 交给它。**
+
+harness 的 `App::patch`（`plexus/src/app.rs:200`）是另一回事：
+
+```rust
+Some(new) if new.name != old.name || new.config != old.config || old.disabled => {
+    self.unload_row(id);          // 状态没了
+    to_mount.push(new.clone());
+}
+```
+
+**config 变了的行会被卸载重挂，它持有的状态归零；config 没变的行原地不动。**
+
+对 `/model` 切换这**比 coding 现在的做法好**：只有 `llm` 行重挂，授权、模式、会话全不受影响，而 coding 要重新装配整条链再把状态搬回去。
+
+但反过来：任何「必须跨重配存活」的状态，harness 没有对应机制。coding 那四个 `Arc::clone` 就是这份清单。切默认路径前必须逐个回答：它是重挂就没了（可以接受），还是必须活下来（需要新机制）。
+
+### 顺带验出来的一个洞（已在代码里确认，尚未被测量）
+
+`ui-handle` 提供 `approval` 时用的 `Asker::decide`（`plugins/handle.rs:462`）用**参数原字节**做授权键：
+
+```rust
+let key = (call.name.clone(), call.arguments.clone());
+```
+
+它**从不调用 `Tool::always_grant_scope`**。而那五个闸门行专门算了 scope（写按**目录**、bash 按**命令**），就是为了让一次「总是允许」覆盖和链式相同的范围。在 coding-on-harness 树里（`approval` 由 `ui-handle` 提供，这是 `Presence` 设计决定的），**那个 scope 被忽略**：「总是允许这个目录」退化成「总是允许这一次调用」，下一个文件还会再问。
+
+`NEVER_GRANT` 同理会被忽略 —— 包括 `cc-hooks` 那条「钩子强制的询问不该被记住」。
+
+没被差分抓到，因为写那条路径在此之前**根本没问过**（见下一节）。
+
 ## 已定的决策（不要重议）
 
 | 决策 | 理由 / 出处 |
