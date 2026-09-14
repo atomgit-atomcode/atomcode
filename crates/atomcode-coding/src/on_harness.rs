@@ -267,6 +267,14 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Veri
         if !response.tool_calls.is_empty() || response.truncated {
             return Ok(response);
         }
+        // A user who said "don't run tests" is not asking to be nudged into
+        // running them. The hook consults the same policy; a row that skipped
+        // this would override the person it is supposed to be standing in for.
+        if crate::execution_policy::execution_policy_for_messages(&req.messages)
+            .skips_verification()
+        {
+            return Ok(response);
+        }
         // `req.messages` is what the model was shown: the edit and its result
         // are both in there, which is the whole history the judgement needs.
         let Some(edit) = crate::discipline::unverified_edit(&req.messages, &self.workspace) else {

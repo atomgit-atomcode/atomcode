@@ -2852,3 +2852,30 @@ async fn an_attended_run_does_not_force_the_check() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_user_who_forbade_the_shell_is_not_nudged_into_using_it() {
+    // The cadence must not override the person it stands in for. Headless on
+    // both sides — the mode where the nudge IS forced — so the only thing that
+    // can hold it back is the user's own instruction.
+    //
+    // This is the gap the first version of the row shipped with: it asked
+    // `unverified_edit` and nothing else, so a user who said "no shell
+    // commands" would have been nudged to run one anyway.
+    let dir = scratch("verify-cadence-forbidden");
+    seed(&dir);
+    let asked = || say("fix a.rs, and do not run any command");
+    let a = reference_production(edits_and_stops(), &dir, asked()).await;
+    let (handle, mut app) = on_harness_headless(edits_and_stops(), &dir).await;
+    let b = drive_answering(handle, asked(), &[], None, allow()).await;
+    app.stop();
+    let report = judge("verify_cadence_forbidden_rows", &a, &b);
+
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert_eq!(
+            model_calls(steps),
+            2,
+            "{who}: 人说了不许跑命令,就不能再被催着去跑{report}"
+        );
+    }
+}
