@@ -223,18 +223,14 @@ pub async fn mount(
     }
     let tree = ConfigTree::from_layers(layers).map_err(|e| e.to_string())?;
 
-    // The five gate rows are not in `plugins::catalog()` yet — the file that
-    // registers rows is being rewritten by another line of work. Registering them
-    // here is also where they belong by the rule quoted above: rows a product's
-    // assembly contributes, mounted from the same catalog. When the catalog is
-    // free, the generic ones move into it and these lines go.
+    // The five approval gates now come from `plugins::catalog()` with everything
+    // else: they ask through the `approval` seam and call the same L1 decision
+    // functions the kernel middleware calls, so nothing about them is specific
+    // to this product. Registering them here would have kept the harness binary
+    // and every other assembly from ever mounting them.
+    //
+    // What IS registered here is what this crate owns: the coding discipline.
     let mut registry = atomcode_harness::plugins::catalog();
-    use atomcode_harness::plugins::policy;
-    registry.register(Arc::new(policy::OpenFileWorkspacePlugin));
-    registry.register(Arc::new(policy::CredentialShellPlugin));
-    registry.register(Arc::new(policy::WriteApprovalPlugin));
-    registry.register(Arc::new(policy::BashWorkspacePlugin));
-    registry.register(Arc::new(policy::OutputArtifactPlugin));
     registry.register(Arc::new(VerifyCadencePlugin));
     registry.register(Arc::new(ExecutionPolicyPlugin));
     registry.register(Arc::new(SkillCatalogPlugin));

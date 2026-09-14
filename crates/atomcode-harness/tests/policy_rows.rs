@@ -669,11 +669,6 @@ async fn asked_about_opening(
 ) -> Vec<String> {
     let asked = Arc::new(Mutex::new(Vec::new()));
     let mut registry = plugins::catalog();
-    // NOT in `plugins::catalog()` yet — the file that registers rows is being
-    // rewritten by another line of work, so the row is mounted explicitly here.
-    registry.register(Arc::new(
-        atomcode_harness::plugins::policy::OpenFileWorkspacePlugin,
-    ));
     registry.register(Arc::new(CountingYesPlugin(asked.clone())));
     registry.register(Arc::new(RecordingPlugin(Arc::new(Recording::default()))));
     // `tool-open-file` and an `opener` live in `REPL_APP`, which would also mount a
@@ -745,11 +740,7 @@ fn bash_script(command: &str) -> String {
 /// Returns (the transcript, the artifact dir).
 async fn spilled(dir: &std::path::Path, command: &str) -> (String, PathBuf) {
     let artifacts = dir.join("artifacts");
-    let mut registry = plugins::catalog();
-    // Not in `plugins::catalog()` yet — see the note on the open_file row above.
-    registry.register(Arc::new(
-        atomcode_harness::plugins::policy::OutputArtifactPlugin,
-    ));
+    let registry = plugins::catalog();
     let insert = format!(
         "[[insert]]\nname = \"tool-output-artifact\"\nconfig = {{ dir = {a:?} }}",
         a = artifacts.to_string_lossy()
@@ -853,15 +844,6 @@ async fn questions_from(
 ) -> Vec<(String, Vec<String>)> {
     let asked = Arc::new(Mutex::new(Vec::new()));
     let mut registry = plugins::catalog();
-    registry.register(Arc::new(
-        atomcode_harness::plugins::policy::CredentialShellPlugin,
-    ));
-    registry.register(Arc::new(
-        atomcode_harness::plugins::policy::WriteApprovalPlugin,
-    ));
-    registry.register(Arc::new(
-        atomcode_harness::plugins::policy::BashWorkspacePlugin,
-    ));
     registry.register(Arc::new(RecorderPlugin(asked.clone())));
     let insert = format!(
         "[[insert]]\nname = {row:?}\nconfig = {{ working_dir = {d:?} }}",
@@ -955,5 +937,87 @@ async fn an_ordinary_in_workspace_write_is_not_asked_about() {
     assert!(
         asked.is_empty(),
         "an in-workspace write just runs: {asked:?}"
+    );
+}
+
+/// What the gate rows change, stated as a pair.
+///
+/// Mounting them was the point of putting them in `plugins::catalog()`: they
+/// were registered by hand inside `atomcode_coding::on_harness::mount`, so only
+/// that one assembly could use them — the harness binary could not, and neither
+/// could any other product, which is the opposite of what a generic row is for.
+///
+/// Getting the ASSERTION right took three tries, and the two dead ends are worth
+/// keeping because both read green:
+///
+/// 1. Asserting that a write OUTSIDE the workspace is refused. The `fs` fence
+///    refuses it first — `tree()` patches `fs` with a `root` — so the scenario
+///    passed with the gate rows deleted.
+/// 2. Same, with the fence off. Now base's `approval` row refuses it: `write_file`
+///    is `Risky` and `user-questions-unattended` is the nobody-to-ask policy.
+///    Still nothing to do with the gates.
+///
+/// The gates' actual job is the opposite of refusing: `tool-write-approval`
+/// ALLOWS an in-workspace, non-sensitive write that the generic policy would
+/// otherwise stop for. So that is what the pair measures.
+fn gate_rows(dir: &std::path::Path) -> String {
+    format!(
+        "[[insert]]\nname = \"tool-open-file-workspace\"\nconfig = {{ working_dir = {dir:?} }}\n\n\
+         [[insert]]\nname = \"tool-credential-shell\"\n\n\
+         [[insert]]\nname = \"tool-write-approval\"\nconfig = {{ working_dir = {dir:?} }}\n\n\
+         [[insert]]\nname = \"tool-bash-workspace\"\nconfig = {{ working_dir = {dir:?} }}\n\n\
+         [[insert]]\nname = \"tool-output-artifact\"\nconfig = {{ dir = {art:?} }}\n",
+        dir = dir.to_string_lossy(),
+        art = dir.join("artifacts").to_string_lossy(),
+    )
+}
+
+#[tokio::test]
+async fn the_approval_gates_mount_from_the_plain_catalog_and_let_a_workspace_write_through() {
+    let dir = scratch("catalog-gates");
+    let inside = dir.join("inside.txt");
+    let script = script_one(
+        "write_file",
+        &format!(
+            "{{ file_path = {:?}, content = \"x\" }}",
+            inside.to_string_lossy()
+        ),
+    );
+    // `plugins::catalog()` via `start` — no product crate registers anything.
+    // `start` panics on a row name the registry does not know, so mounting at
+    // all is half of what this asserts.
+    let app = start(tree(&dir, &script, &[gate_rows(&dir).as_str()])).await;
+    run_turn(&app, "write it").await.unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&inside).unwrap_or_default(),
+        "x",
+        "an in-workspace write did not land: the gate mounted but did not \
+         pre-approve, so base's `approval` row refused it with nobody to ask"
+    );
+}
+
+#[tokio::test]
+async fn without_the_gate_rows_the_same_workspace_write_is_refused() {
+    // The negative control. Same tree, same write, no gate rows: base's
+    // `approval` row sees a `Risky` tool and nobody to ask, and refuses. That
+    // is what makes the scenario above about THE GATES and not about the tree
+    // being permissive.
+    let dir = scratch("catalog-no-gates");
+    let inside = dir.join("inside.txt");
+    let script = script_one(
+        "write_file",
+        &format!(
+            "{{ file_path = {:?}, content = \"x\" }}",
+            inside.to_string_lossy()
+        ),
+    );
+    let app = start(tree(&dir, &script, &[])).await;
+    run_turn(&app, "write it").await.unwrap();
+
+    assert!(
+        !inside.exists(),
+        "the write landed without any gate mounted — then the scenario above \
+         proves nothing about the gates"
     );
 }
