@@ -4512,6 +4512,17 @@ fn spawn_runtime_owner_with_optional_agent(
                                 let reasoning_effort_applicable =
                                     runtime.config.supports_reasoning_effort;
                                 resources = Some(runtime);
+                                // A provider is available again. Needed for the
+                                // LOGIN half of `/logout` → `/login`: a plain
+                                // `/model` never leaves these unset, so the first
+                                // version of this branch did not touch them — and
+                                // a recovered runtime then reported Ready while
+                                // refusing every turn as `ProviderUnavailable`.
+                                agent_available = true;
+                                provider_unavailable_reason = None;
+                                controls
+                                    .provider_unavailable_reason
+                                    .store(0, Ordering::Release);
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
                                 pending_steer_acknowledgements.clear();
@@ -4817,6 +4828,128 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut pending_requests,
                             active_turn.is_some(),
                         );
+                        // On the harness, a logout takes the CREDENTIALS out of
+                        // the tree and leaves the agent where it is.
+                        //
+                        // The chain has to stop the agent because the provider is
+                        // baked into the assembled chain; here it lives behind a
+                        // seam, so revoking it is swapping what is behind that
+                        // seam for something holding nothing. The session, its
+                        // conversation and its handle all survive, which is what
+                        // lets the LOGIN afterwards be another swap rather than a
+                        // rebuild — and therefore what keeps a `/logout` →
+                        // `/login` from quietly moving the session back onto the
+                        // chain for the rest of its life.
+                        let harness_logout = Engine::from_env() == Engine::Harness
+                            && agent.is_some()
+                            && resources
+                                .as_ref()
+                                .is_some_and(|r| r.harness_providers.is_some());
+                        if harness_logout {
+                            let stop_report = {
+                                let live = agent.as_mut().expect("checked above");
+                                quiesce_current_agent(
+                                    live,
+                                    &mut compactions,
+                                    &mut observed_tokens,
+                                    &runtime_event_tx,
+                                    CompactionInterruption::RuntimeReconfigured,
+                                    resources
+                                        .as_ref()
+                                        .map(|runtime| &runtime.parts.team_manager),
+                                    resources.as_ref().and_then(|runtime| {
+                                        runtime.parts.snapshot_persistence_status()
+                                    }),
+                                )
+                                .await
+                            };
+                            if let Some(runtime) = resources.as_mut() {
+                                if let (Some(app), Some(slots)) = (
+                                    runtime.harness_app.as_mut(),
+                                    runtime.harness_providers.clone(),
+                                ) {
+                                    if let Err(error) =
+                                        crate::on_harness::deactivate_provider(app, slots.as_ref())
+                                            .await
+                                    {
+                                        // The tree is unchanged on a failed patch,
+                                        // so the credentials are still in it. Say
+                                        // so rather than reporting a logout that
+                                        // did not happen.
+                                        controls.state.store(
+                                            runtime_phase_state(
+                                                generation,
+                                                RuntimePhase::Ready,
+                                            ),
+                                            Ordering::Release,
+                                        );
+                                        let _ = done
+                                            .send(Err(RuntimeError::ReconfigureFailed(error)));
+                                        continue;
+                                    }
+                                }
+                                preserve_sessionless_snapshot(runtime, &stop_report);
+                                if let Some(provider) =
+                                    runtime.config.subagent_fast_provider.as_ref()
+                                {
+                                    provider.reset(Arc::new(|| None));
+                                }
+                                if let Some(provider) =
+                                    runtime.config.subagent_capable_provider.as_ref()
+                                {
+                                    provider.reset(Arc::new(|| None));
+                                }
+                            }
+                            finish_stopped_native_turn(
+                                &stop_report,
+                                resources.as_ref(),
+                                &mut active_turn,
+                                &mut terminal_reason,
+                                &mut turn_stats,
+                                &mut conversation_revision,
+                                &mut snapshot_waiters,
+                                &runtime_event_tx,
+                            );
+                            generation = generation.wrapping_add(1);
+                            event_generation.store(generation, Ordering::Release);
+                            pending_steer_acknowledgements.clear();
+                            agent_available = false;
+                            provider_unavailable_reason = Some(reason);
+                            controls.provider_unavailable_reason.store(
+                                encode_provider_unavailable_reason(Some(reason)),
+                                Ordering::Release,
+                            );
+                            observed_tokens = None;
+                            snapshot_in_flight = false;
+                            controls.state.store(
+                                runtime_phase_state(
+                                    generation,
+                                    RuntimePhase::AwaitingProvider,
+                                ),
+                                Ordering::Release,
+                            );
+                            if let Some(intervention) = pending_policy_intervention.take() {
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::PolicyInterventionCleared {
+                                        intervention_id: intervention.id,
+                                    },
+                                );
+                            }
+                            // `ProviderUnavailable`, not `Reconfigured`: a logout
+                            // is not a reconfiguration that landed, it is a
+                            // capability going away, and the driver renders the
+                            // two differently. `forced` is false because nothing
+                            // was forced — the agent was asked to stop its turn
+                            // and it is still there.
+                            let _ = runtime_event_tx.send(
+                                CodingRuntimeEvent::ProviderUnavailable {
+                                    reason,
+                                    forced: stop_report.forced,
+                                },
+                            );
+                            let _ = done.send(Ok(RuntimeGeneration(generation)));
+                            continue;
+                        }
                         let stop_report = stop_current_agent(
                             &mut agent,
                             &mut compactions,
@@ -7694,6 +7827,80 @@ fn record_stopped_conversation_event(report: &mut StopReport, event: &AgentEvent
         }
         _ => {}
     }
+}
+
+/// End whatever the agent is doing and read its conversation back, WITHOUT
+/// taking the handle.
+///
+/// [`stop_current_agent`] is the chain's shape: it `take()`s the handle, sends
+/// `Shutdown` and lets the agent die, because on that engine a provider change
+/// means rebuilding the agent anyway. On the harness the agent is the thing
+/// worth keeping — the provider lives behind a seam and can be swapped under it
+/// — so this cancels the turn instead of ending the agent, and asks for the
+/// snapshot the caller still needs.
+async fn quiesce_current_agent(
+    agent: &mut AgentHandle,
+    compactions: &mut CompactionTracker,
+    observed_tokens: &mut Option<usize>,
+    runtime_event_tx: &RuntimeEventEmitter,
+    reason: CompactionInterruption,
+    team_manager: Option<&crate::team::TeamRunManager>,
+    persistence_status: Option<SnapshotPersistenceStatus>,
+) -> StopReport {
+    // Detached team members are background work started under the credentials
+    // being revoked; a logout must end them for the same reason it ends the
+    // provider.
+    if let Some(manager) = team_manager {
+        manager.stop_all().await;
+    }
+    let mut report = StopReport::default();
+    let _ = agent.commands.send(AgentCommand::Cancel);
+    let _ = agent.commands.send(AgentCommand::Snapshot);
+    let timeout = tokio::time::sleep(std::time::Duration::from_secs(5));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            event = agent.events.recv() => match event {
+                Some(event) => {
+                    record_stopped_conversation_event(&mut report, &event);
+                    match handle_compaction_event(
+                        event,
+                        compactions,
+                        observed_tokens,
+                        runtime_event_tx,
+                    ) {
+                        Some(AgentEvent::Usage(meta)) => {
+                            *observed_tokens = Some(meta.used_tokens as usize);
+                        }
+                        Some(AgentEvent::TurnComplete { reason }) => {
+                            report.reason = Some(reason);
+                        }
+                        Some(AgentEvent::Snapshot { snapshot }) => {
+                            report.snapshot = Some(snapshot);
+                            report.snapshot_after_turn_terminal = report.reason.is_some();
+                            // The snapshot is the last thing asked for, so it is
+                            // also the signal that the agent is quiet again.
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                // The agent ended on its own; nothing more will arrive.
+                None => break,
+            },
+            () = &mut timeout => {
+                // Not fatal and not `forced`: the agent is still alive and the
+                // caller keeps its handle. The snapshot is simply missing, which
+                // `preserve_sessionless_snapshot` already treats as "nothing to
+                // preserve".
+                break;
+            }
+        }
+    }
+    compactions.interrupt_all(reason, runtime_event_tx);
+    emit_terminal_persistence_warnings(persistence_status.as_ref(), runtime_event_tx);
+    report.persistence_failure = persistence_status.and_then(|s| s.take_uncertain_commit());
+    report
 }
 
 async fn stop_current_agent(

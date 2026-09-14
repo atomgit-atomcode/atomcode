@@ -241,6 +241,55 @@ pub async fn swap_provider(
     app.patch(&layer).await.map_err(|e| e.to_string())
 }
 
+/// What fills the `llm` seam after a logout.
+///
+/// Deactivating a provider is a SECURITY act — the credentials must stop living
+/// in this process — and on the chain that means tearing the agent down, because
+/// the provider is baked into the assembled chain. Here it does not: the
+/// credentials live in the provider object, and the provider lives behind a
+/// seam, so removing them is swapping what is behind it.
+///
+/// The seam cannot simply be emptied: rows that `inject` `llm` would be
+/// unloaded with it. So it is filled with something that holds nothing and
+/// refuses everything. In practice nothing calls it — the runtime marks itself
+/// unavailable and rejects a turn before it reaches the agent — but a
+/// placeholder that silently succeeded would be a much worse thing to be wrong
+/// about than one that says why.
+struct NoProvider;
+
+#[async_trait]
+impl LlmProvider for NoProvider {
+    fn model_name(&self) -> &str {
+        "(signed out)"
+    }
+    async fn chat_stream(
+        &self,
+        _messages: &[atomcode_kernel::message::Message],
+        _tools: &[atomcode_kernel::tool::ToolDef],
+        _options: &atomcode_kernel::provider::ChatOptions,
+    ) -> Result<
+        futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+        atomcode_kernel::stream::ProviderError,
+    > {
+        Err(atomcode_kernel::stream::ProviderError {
+            retryable: false,
+            message: "signed out: no provider is configured".into(),
+            http_status: None,
+            code: None,
+            retry_after_secs: None,
+        })
+    }
+}
+
+/// Take the credentials out of the tree without taking the agent with them.
+///
+/// The counterpart of [`swap_provider`], and the reason a logout does not have
+/// to end a session on this engine: the agent, its conversation and its handle
+/// all survive, and a later login is another swap.
+pub async fn deactivate_provider(app: &mut App, slots: &ProviderSlots) -> Result<(), String> {
+    swap_provider(app, slots, Arc::new(NoProvider), "(signed out)").await
+}
+
 /// Hands the tree whichever provider its config names.
 struct InjectProvider(Arc<ProviderSlots>);
 

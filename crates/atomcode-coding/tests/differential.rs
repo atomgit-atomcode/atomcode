@@ -3644,3 +3644,72 @@ async fn a_model_switch_renames_the_persona_too() {
     );
     app.stop();
 }
+
+#[tokio::test]
+async fn a_logout_takes_the_credentials_and_leaves_the_agent() {
+    // What `/logout` must do on this engine, and what it must NOT do.
+    //
+    // MUST: the credentials stop living in the process. They live in the
+    // provider object, and the provider lives behind a seam, so revoking them is
+    // swapping what is behind that seam.
+    //
+    // MUST NOT: end the session. The chain has no choice — its provider is baked
+    // into the assembled chain, so a logout tears the agent down and the login
+    // afterwards rebuilds it. Here that would silently move the session onto the
+    // chain engine for the rest of its life, which is the whole thing this line
+    // exists to avoid.
+    //
+    // The agent surviving is what makes the login afterwards another swap. It is
+    // observable because `ui-handle` hands its handle out EXACTLY ONCE: if the
+    // tree had rebuilt its agent, a second one would be waiting.
+    let dir = scratch("logout-keeps-agent");
+    let quiet = quiet_rows(&dir);
+    let (handle, mut app, slots) = atomcode_coding::on_harness::mount_swappable(
+        &dir,
+        atomcode_coding::on_harness::Presence::Attended,
+        Script::text(&["ok"]).as_model("signed-in-model"),
+        &[quiet.as_str()],
+    )
+    .await
+    .expect("mount");
+    drop(handle);
+
+    let seam_model = |app: &atomcode_plexus::App| {
+        app.context()
+            .service::<atomcode_harness::seams::LlmSvc>()
+            .map(|p| p.model_name().to_string())
+            .unwrap_or_default()
+    };
+    assert_eq!(seam_model(&app), "signed-in-model");
+
+    atomcode_coding::on_harness::deactivate_provider(&mut app, slots.as_ref())
+        .await
+        .expect("logout");
+    assert_eq!(
+        seam_model(&app),
+        "(signed out)",
+        "the credentials are still behind the seam after a logout"
+    );
+
+    // And the login afterwards is another swap, not a rebuild.
+    atomcode_coding::on_harness::swap_provider(
+        &mut app,
+        slots.as_ref(),
+        Script::text(&["ok"]).as_model("signed-in-again"),
+        "signed-in-again",
+    )
+    .await
+    .expect("login");
+    assert_eq!(seam_model(&app), "signed-in-again");
+
+    assert!(
+        app.context()
+            .service::<atomcode_harness::seams::AgentHandleSvc>()
+            .and_then(|h| h.take())
+            .is_none(),
+        "the tree handed out a second handle: the logout tore the agent down and \
+         the login rebuilt it, which is exactly the silent engine switch this \
+         scenario exists to forbid"
+    );
+    app.stop();
+}
