@@ -27,6 +27,91 @@
 个」说的是 coding 对 **tuix** 的外向 API，不是它对引擎的接口。拿它估工作量会大幅
 高估。）
 
+## 09-15 增量（本页其余小节按此校准）
+
+本页写于 09-14。09-15 又落了 9 个 commit，其中三件改变了这条线的形状，
+后面小节里跟它们冲突的说法都以这里为准。
+
+```
+78b4d33e..9c5e72c1   ToolStarted 缺口、会话日志顺序、五个闸门进 catalog
+8c08749d  /model:探针被证伪,代码丢弃(见下面那一节,结论已被推翻)
+7646cfa9  /model 在 harness 上是一次 patch,不是一次重建
+fb35fbc8  /logout 之后只能重建——patch 换不回一个被拆掉的 agent
+d4079e66  /logout 也留在 harness 上——凭据被拿走,agent 留下
+a5a08c35  工具清单成为判据——第一次跑就报出 11 个缺口
+86213ec5  fmt
+d4023f8f  coding 不再继承 harness 的产品决定,自己写这份清单   ← 形状改变
+7284a3d3  harness 上也有子 agent 了——task 和 team 两行都挂上
+850d9e40  tool-web 变成一个能被设置的行——后端可配,离线不挂
+```
+
+### 一、`/model` 和 `/logout` 已经在 harness 上（推翻了下面那一节的结论）
+
+下面「`/model` 换到 harness：先别投」那一节写于探针被证伪之后，用户当时说
+「丢掉」。**随后用户说「不，要做完 /model」，再后来说「不行，要做完整。
+不能自动切回去」**，于是两条都做完了：
+
+- `/model` 是一次 `App::patch`（`llm` 行换 `provider_id` + `persona-atomcode`
+  换 `model`），agent 不重建，handle 不换。
+- `/logout` 把 `NoProvider` 换进 `llm` 缝——**凭据离开进程，agent 留下**。
+  它不会悄悄掉回链式；一个自动掉回去的逃生口等于这条线没做完。
+
+那一节里"缺的每一样都跟换 agent 无关,是跟调用方/UI 的契约"仍然成立，
+现在那些契约都由 harness 分支自己履行（`quiesce_current_agent` 取消 + 存快照，
+generation 自增、`Reconfiguring` 事件、相位都照旧走）。
+
+### 二、工具清单成为判据
+
+`Script` 现在记下每次请求被提供了哪些工具（`tools()`）。**模型被提供了什么，
+和模型被告知了什么一样是产品的一部分**，而事件流里没有任何东西会说这件事——
+65 条场景全绿也发现不了，它们只调用自己碰巧要用的那几个。
+
+第一次跑就报出 11 个差异，没有一个是"harness 做不到"，全是行没挂或行忘了
+带工具。剩下 4 个是决定不是遗漏，写成带理由的明单
+`KNOWN_TOOL_DIFFERENCES`，判据还反过来盯着它：任何一条悄悄不再是差异，
+就要求删掉它。
+
+**起因值得记住**：用户问 harness 上有没有子 agent，我去读代码推理，推错了。
+用户说「还是你不仔细，测一下原来的引擎装配了什么东西就能判断出来」、
+「要写成判据」。判据会一直说话，探针只说一次，读代码连一次都不算。
+
+### 三、base 拆成 INFRA / DEFAULTS，coding 自己写清单
+
+用户：「不要用 harness base，coding 完全定义呢？」→「拆出来吧」。
+
+    bundle::INFRA     30 行,机器本身:注册表、会话日志、循环、恢复策略
+    bundle::DEFAULTS  29 行,产品决定:挂哪些工具、哪个人格、审批姿态、谁渲染
+    bundle::base()    仍然是两者相加,九个出厂 profile 与部署方自写的 profile
+                      文件一个字都不用改
+
+`on_harness::mount_swappable` 现在取 `bundle::infra()` + 自己的
+`CODING_DEFAULTS` + `CODING_ROWS`。**这不是一份对 base 的 diff**——往
+`bundle::DEFAULTS` 加一行不会悄悄到 coding 这里来。
+
+为什么非拆不可：通用底座拿不准的每一行都出厂即关，而**产品不会把继承来的
+弃权体验成一个问句，只会体验成一个本来能用的能力没了**，并且是一次一个支持
+问题地发现。`ast_grep`、code graph、`open_file`、子 agent、web 五样都是人
+发现的，没有一个是测试发现的。
+
+随后按这份清单补上的：`task` / `team`（`subagent-in-process` +
+`team-in-process`，出厂三个 driver 全都传 `SubagentPolicy::Enabled`）、
+`tool-web`（链式 `PrepareOptions::default()` 的 `web` 从来是 true）。
+
+### 四、rig 的两个盲点（顺手关掉一个，留了一个明说）
+
+差分台在链式那边关了 `mcp` / `web` / `review` / `memory`，注释写的是
+"它们门住的东西对链式都是增量"。这话**对行为成立，对工具清单不成立**：
+关着的那几行正好是 coding 真正打开的那几行，判据于是在两个子集之间比较。
+
+- `web`、`subagents`：已在两边打开。挂工具不产生 I/O，调用才会，而没有
+  场景调用它们。
+- `mcp`、`memory`：两边都关，那是避开副作用（连别人的进程 / 读开发者家目录），
+  不是藏起差异。
+- **`review` 仍然关着，并且是已知盲点**：行清单里没有 `code_review`。
+  打开它是发现问题的方式，不是修好它的方式——修法是给 harness 加一个
+  `tool-code-review` 行（`atomcode-harness` 已经依赖 `atomcode-review`，
+  `persona-review` 行就在那儿）。
+
 ## 现在在哪
 
 ```
@@ -300,7 +385,13 @@ clone 之后 `Cargo.toml` 和 `src/lib.rs` 会显示为修改——**绝不能�
 改成 `#[tokio::test(flavor = "multi_thread")]` 立刻红。真实二进制是多线程的，
 测试的 runtime 也必须是。
 
-## `/model` 换到 harness：探过了，结论是先别投（2026-09-15）
+## `/model` 换到 harness：探过了，结论是先别投（2026-09-15，**已被推翻**）
+
+> ⚠️ **这一节的结论不再成立，保留是因为过程有用。** 用户随后说「不，要做完
+> /model」，`/model` 与 `/logout` 都已经落在 harness 上（`7646cfa9`、`fb35fbc8`、
+> `d4079e66`）。见上面「09-15 增量」第一条。下面记的是**为什么第一次估错**，
+> 那部分仍然值得读。
+
 
 **判断（我的）**：`runtime.rs` 那 279 行重装配（停 agent、验终结、fail-close 未决
 请求、重建、generation 自增、恢复快照）之所以是 279 行，是因为**链式必须把一个
@@ -441,18 +532,36 @@ fs2 文件锁，锁基线文件本身。
 | `PermissionRuleGate` | — | 不用搬,harness `permissions` 行已自实现 |
 
 1. ~~`ui-handle` 的 `ToolStarted` 缺口~~ —— **已修（`78b4d33e`）**，见上。
-2. **五个闸门行进 `plugins::catalog()`**，等另一条线放开 `plugins/mod.rs`。
-   现在由 `on_harness::mount` 显式注册，能跑，但不该长期这样。
-3. **然后才切 `build_coding_agent` 的默认路径**，并留一个逃生开关（参照当初
-   `--engine v1`）。切之前要先答的两个问题，都不是技术问题：
-   - **技能目录 vs 指针**。coding 内联整份目录，通用 harness 只报数量 + 让你
-     `list_skills`。`skill-catalog-inline` 保持了 coding 今天的行为（内联），
-     因为这条线的前提是「上面什么都不变」——但那是每次请求都要付的 token，
-     值得有人明确拍一次板。
-   - **`datalog` / `cc-hooks` 两行都刻意不在 `CODING_ROWS` 里**：前者往用户磁盘
-     写每一次请求的完整记录，后者跑用户自己的外部命令。对它们来说挂载即启用。
-     切默认路径时别顺手把它们加进去。
-4. 阶段二：把 `on_harness.rs` 里的 `CODING_ROWS` 常量变成可配置数据。
+2. ~~五个闸门行进 `plugins::catalog()`~~ —— **已做（`9c5e72c1`）**。
+3. **快照 / 会话那 6 个**，这是现在唯一挡在「切默认路径」前面的东西：
+
+   ```
+   failed_sessionless_restore_rolls_back_to_the_original_snapshot
+   native_undo_rollback_persistence_failure_is_sticky
+   provider_reassemble_updates_cost_attribution_and_failed_reload_keeps_current_model
+   rewind_catalog_and_conversation_scope_are_runtime_owned
+   runtime_replays_a_safe_recovered_prompt_through_a_normal_turn
+   undo_preserves_snapshot_identity_and_reassembles_sessionless_runtime
+   ```
+
+   共同的形状：它们读 coding 自己的 `SessionManager` / 快照，而 harness 引擎
+   从不喂那一套（harness 有自己的 JSONL 日志）。**先判清每一条是「行式缺能力」
+   还是「测试测的是链式的内部表示」**，别一上来就补代码——`list_sessions`
+   那条已记在 `KNOWN_TOOL_DIFFERENCES` 里，同名不同物。
+4. **`/cd`（`Reprepare` 分支）仍然是链式独有。** `/model`、`/logout` 都已落地，
+   这是最后一条还会掉回链式的运行时命令。
+5. **`tool-code-review` 行**，然后把 rig 链式那边的 `review` 也打开——
+   这是工具清单判据最后一个已知盲点（见上「09-15 增量」第四条）。
+6. **切 `build_coding_agent` 的默认路径**，留一个逃生开关（`ATOMCODE_ENGINE=chain`，
+   现在的默认值反过来）。切之前仍然要注意：
+   - `datalog` / `cc-hooks` 两行**刻意不在 `CODING_DEFAULTS` 里**：前者往用户
+     磁盘写每一次请求的完整记录，后者跑用户自己的外部命令。对它们来说挂载即启用。
+   - `mcp` 行**在清单里但是关着**（链式出厂 `mcp: true`）：连别人的进程是
+     副作用，且这一行还没在这个引擎上对着真 MCP server 跑过。切默认路径前
+     要么跑一次把它打开，要么明说这个引擎暂时没有 MCP。
+7. 阶段二：把 `CODING_DEFAULTS` / `CODING_ROWS` 两个常量变成可配置数据。
+   **拆完之后这一步小了很多**——`CODING_DEFAULTS` 本身已经是一份清单而不是
+   一串补丁，剩下的是让它从文件读。
 
 ### 抽行时反复用上的几条
 
@@ -488,9 +597,11 @@ fs2 文件锁，锁基线文件本身。
 ## 怎么验证
 
 ```sh
-cargo nextest run -p atomcode-coding --test differential   # 61/61,裁判
-cargo nextest run -p atomcode-coding                       # 532/532
-cargo nextest run -p atomcode-harness                      # 292/292
+cargo nextest run -p atomcode-coding --test differential   # 66/66,裁判
+cargo nextest run -p atomcode-coding                       # 538/538(链式)
+ATOMCODE_ENGINE=harness cargo nextest run -p atomcode-coding  # 532/538
+cargo nextest run -p atomcode-harness                      # 296/296
+cargo nextest run -p atomcode-tui                          # 466/466
 cargo nextest run -p atomcode-capabilities --features session   # 1124/1124
 cargo nextest run -p atomcode-capabilities --features cc-hooks  # 939/939
 cargo nextest run -p atomcode-harness --test policy_rows   # 24/24(全量会红,见上)
