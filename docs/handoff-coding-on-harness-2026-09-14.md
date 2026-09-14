@@ -60,12 +60,26 @@
 
 - `origin/feat/plexus-plugin-architecture` **远端是有的**，但落后本地 25 个 commit。
 - `feat/coding-on-harness-approval`（本线）**远端没有**。
-- **合并方向：一律 `feat/plexus-plugin-architecture` → `feat/coding-on-harness-approval`。**
-  （2026-09-14 用户明确：「这个要合回 feat/coding-on-harness-approval」。）
-  本线是主干，plexus 那条往这边并，**不要反过来**。09-14 合过一次：`390ea135`。
+- **合并方向：本线 → `feat/plexus-plugin-architecture`。**
+  2026-09-14 用户明确：「这个要合回 **feat/plexus-plugin-architecture**」。
 
-  两条佐证：本线已是 plexus 的超集（`HEAD..plexus` = 0），而 plexus 在主
-  checkout 里被另一个会话占着，从本 worktree 根本 check out 不了它。
+  > 上一版这里把这句话记反了（写成「合回 feat/coding-on-harness-approval」，
+  > 并据此把「合回 plexus」当成错误待办删掉）。那是错的，已更正。本线是一条
+  > **特性分支**，plexus 才是这条线的主干。
+
+  09-14 已做的是**反方向的追平**（`390ea135`：plexus → 本线），目的是提前
+  验证冲突面，不是交付。真正的交付还没做。
+
+  **怎么做（快进，因为本线已是 plexus 的超集，`HEAD..plexus` = 0）：**
+
+  ```sh
+  cd /Users/lichao/project/gitcode/ai/atomcode   # plexus 在主 checkout
+  git merge --ff-only feat/coding-on-harness-approval
+  ```
+
+  **不能从本 worktree 做**：`git worktree list` 显示 plexus 被主 checkout 占着，
+  同一分支不能两处 check out。而且主 checkout 里另一个会话可能有未提交的工作，
+  快进会在它脚下换文件——**合之前先确认那边干净**。
 - 合进来的 3 个 commit 全是 tui（tip 行、右键菜单、面板浮层），**与本线零重叠**
   （本线动的是 harness + coding + `gates/differential.baseline`，他们动的是
   `atomcode-tui/*` + `gates/tui-test-count.baseline`）。合完两边一起跑：
