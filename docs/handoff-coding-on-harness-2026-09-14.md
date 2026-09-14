@@ -56,7 +56,18 @@
 **生产链上没有对应行的东西,现在只剩一个**:`GitPushLabelMiddleware`,
 在 `atomgit` feature 后面(开它要拉 reqwest + auth,不值得)。
 
-**两个分支都没 push。** 第二个分支尚未合回第一个。
+**分支状态（2026-09-14 复查，前一版记的「远端无此分支」是错的）：**
+
+- `origin/feat/plexus-plugin-architecture` **远端是有的**，但落后本地 25 个 commit。
+- `feat/coding-on-harness-approval`（本线）**远端没有**。
+- **09-14：把 `feat/plexus-plugin-architecture` 合进了本线**（`390ea135`）——
+  方向是「追平」，不是「交付」：那条分支在主 checkout 里被另一个会话占着，
+  合进去不是我能做的，也不该做。
+- 合进来的 3 个 commit 全是 tui（tip 行、右键菜单、面板浮层），**与本线零重叠**
+  （本线动的是 harness + coding + `gates/differential.baseline`，他们动的是
+  `atomcode-tui/*` + `gates/tui-test-count.baseline`）。合完两边一起跑：
+  harness+coding 825/825、tui 466/466。
+- **用户 09-14 决定：先不 push。** 所以 48 个 commit 仍然只在这台机器上。
 
 ## 已经证明了什么
 
