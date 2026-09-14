@@ -84,6 +84,20 @@ impl Reply {
 struct Script {
     replies: Vec<Reply>,
     cursor: AtomicUsize,
+    /// What the model claims to be.
+    ///
+    /// Real behaviour branches on it — `model_needs_firm_execution` is the
+    /// reason this field exists — so a fixture that can only ever be called
+    /// "script" cannot exercise anything model-gated on either engine.
+    model: String,
+    /// Every request, as the model received it.
+    ///
+    /// The event stream and the snapshot both miss an EPHEMERAL request tail:
+    /// it is appended to the request and never logged, so no event carries it
+    /// and no snapshot shows it. Several coding behaviours are exactly that
+    /// shape (the skill-first nudge, the plan-mode reminder), which made them
+    /// invisible to this rig until it started keeping the requests.
+    seen: std::sync::Mutex<Vec<Vec<Message>>>,
 }
 
 impl Script {
@@ -91,27 +105,53 @@ impl Script {
         Arc::new(Script {
             replies: replies.to_vec(),
             cursor: AtomicUsize::new(0),
+            model: "script".into(),
+            seen: std::sync::Mutex::new(Vec::new()),
         })
     }
     fn text(replies: &[&'static str]) -> Arc<Script> {
         Script::new(&replies.iter().map(|t| Reply::Text(t)).collect::<Vec<_>>())
+    }
+    /// The same script, claiming to be a different model.
+    fn as_model(self: Arc<Script>, model: &str) -> Arc<Script> {
+        Arc::new(Script {
+            replies: self.replies.clone(),
+            cursor: AtomicUsize::new(0),
+            model: model.into(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+    /// Everything the model was shown, request by request, flattened to text.
+    fn seen(&self) -> String {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .flatten()
+            .map(|m| format!("{:?}: {}", m.role, m.text))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
 #[async_trait]
 impl LlmProvider for Script {
     fn model_name(&self) -> &str {
-        "script"
+        &self.model
     }
     fn context_window(&self) -> u32 {
         128_000
     }
     async fn chat_stream(
         &self,
-        _messages: &[Message],
+        messages: &[Message],
         _tools: &[ToolDef],
         _options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(messages.to_vec());
         let i = self.cursor.fetch_add(1, Ordering::SeqCst);
         // Past the end of the script, stop cleanly rather than failing: a
         // fixture running out is not a provider outage, and one engine taking
@@ -2991,5 +3031,146 @@ async fn a_refused_call_still_reads_as_started_on_the_harness() {
         1,
         "行式:这正是本条记录的差异 —— 若它变成 0,说明 ui-handle 修好了,\
          把本条连同两处基线一起降下来{report}"
+    );
+}
+
+// ---- the skill-first nudge ----------------------------------------------
+//
+// A whole class this rig could not see until now: an EPHEMERAL request tail.
+// It is appended to the request and never logged, so no event carries it and no
+// snapshot shows it — `transcript` above asks for a snapshot and would report
+// "identical" for two engines that sent the model completely different things.
+//
+// The judge here is what the provider was handed. `Script::seen()`.
+
+/// One skill, where both engines look for skills.
+fn seed_skill(dir: &std::path::Path) {
+    let skill = dir.join(".claude/skills/tidy-imports");
+    std::fs::create_dir_all(&skill).expect("skill dir");
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: tidy-imports\ndescription: Reorder and dedupe imports in a file\n---\n\n\
+         Read the file, sort the imports, write it back.\n",
+    )
+    .expect("skill");
+}
+
+/// The production assembly, told it is a model that needs firm steering, with
+/// skills actually loaded.
+async fn reference_production_as(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    model: &str,
+    commands: Vec<AgentCommand>,
+) -> Vec<Step> {
+    let cfg = atomcode_coding::CodingAgentConfig::new("k", "http://unused.test/v1", model, dir);
+    let opts = atomcode_coding::parts::PrepareOptions {
+        mcp: false,
+        web: false,
+        review: false,
+        memory: false,
+        // NOT `Some(vec![])` here, unlike every other scenario: this one is
+        // about the skill catalog, and an empty catalog makes the behaviour a
+        // no-op by design on both engines.
+        skill_dirs: None,
+        ..Default::default()
+    };
+    let mut parts = atomcode_coding::parts::prepare(&cfg, opts)
+        .await
+        .expect("prepare");
+    let agent = atomcode_coding::parts::assemble(&mut parts, &cfg, script).expect("assemble");
+    drive_until(agent.spawn(), commands, &[]).await
+}
+
+#[tokio::test]
+async fn a_weak_model_is_told_to_check_the_skills_first_on_both_engines() {
+    // DeepSeek and Qwen under-weight the soft `## SKILLS:` guidance and open by
+    // exploring instead of loading a matching process skill, so the chain
+    // injects the directive at the request TAIL on the opening turn, where
+    // recency is highest.
+    //
+    // Both sides claim to be `deepseek-chat` — the chain through `cfg.model`,
+    // the rows through `LlmProvider::model_name()` — because the behaviour is
+    // gated on the model and a fixture stuck calling itself "script" could
+    // never reach it.
+    let dir = scratch("skill-first-onharness");
+    seed(&dir);
+    seed_skill(&dir);
+
+    let chain_script = Script::text(&["ok"]).as_model("deepseek-chat");
+    let _ = reference_production_as(
+        chain_script.clone(),
+        &dir,
+        "deepseek-chat",
+        say("tidy the imports in a.rs"),
+    )
+    .await;
+
+    let rows_script = Script::text(&["ok"]).as_model("deepseek-chat");
+    let (handle, mut app) = on_harness_handle(rows_script.clone(), &dir).await;
+    let _ = drive_answering(handle, say("tidy the imports in a.rs"), &[], None, allow()).await;
+    app.stop();
+
+    const DIRECTIVE: &str = "you MUST call `use_skill`";
+    for (who, seen) in [("链式", chain_script.seen()), ("行式", rows_script.seen())] {
+        assert!(
+            seen.contains("tidy-imports"),
+            "{who}: 连技能目录都没到模型面前,这条场景就没在测它该测的东西:\n{seen}"
+        );
+        assert!(
+            seen.contains(DIRECTIVE),
+            "{who}: 弱模型必须在动手前被要求先查技能目录\n{seen}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_strong_model_is_not_nudged_and_the_pointer_is_not_doubled() {
+    // Two negative controls in one run, because both are about what must NOT be
+    // in the prompt.
+    //
+    // 1. The nudge is for models that need firm steering. A strong model getting
+    //    it too would mean the gate does nothing, and "both engines agree" would
+    //    be true of a row that always fires.
+    // 2. `skill-catalog-inline` contributes under the generic row's fragment id
+    //    ON PURPOSE, so the catalog REPLACES the "call `list_skills` to see
+    //    them" pointer instead of sitting beside it. If that ever stops working
+    //    the model gets told about its skills twice, in two different shapes,
+    //    and nothing else here would notice.
+    let dir = scratch("skill-first-strong");
+    seed(&dir);
+    seed_skill(&dir);
+
+    let chain_script = Script::text(&["ok"]).as_model("claude-opus-5");
+    let _ = reference_production_as(
+        chain_script.clone(),
+        &dir,
+        "claude-opus-5",
+        say("tidy the imports in a.rs"),
+    )
+    .await;
+
+    let rows_script = Script::text(&["ok"]).as_model("claude-opus-5");
+    let (handle, mut app) = on_harness_handle(rows_script.clone(), &dir).await;
+    let _ = drive_answering(handle, say("tidy the imports in a.rs"), &[], None, allow()).await;
+    app.stop();
+
+    for (who, seen) in [("链式", chain_script.seen()), ("行式", rows_script.seen())] {
+        assert!(
+            seen.contains("tidy-imports"),
+            "{who}: 目录还是要在,只是不该被催{seen}"
+        );
+        assert!(
+            !seen.contains("you MUST call `use_skill`"),
+            "{who}: 强模型不该吃这一记催promt —— 那说明开关根本没起作用\n{seen}"
+        );
+    }
+    assert!(
+        !rows_script
+            .seen()
+            .contains("Call `list_skills` to see them"),
+        "行式:目录该顶掉那句指针,而不是并排站着 —— 同一件事说两遍,\
+         两种形状\n{}",
+        rows_script.seen()
     );
 }

@@ -88,6 +88,16 @@ config = { working_dir = "{working_dir}" }
 name = "tool-output-artifact"
 config = { dir = "{artifacts}" }
 
+# How the model is told about skills. The generic `skills` row advertises a
+# count and a pointer; coding lists the catalog, because every other piece of
+# its skill steering refers to that catalog by name.
+[[insert]]
+name = "skill-catalog-inline"
+
+# …and a weak model is told to read it before doing anything else.
+[[insert]]
+name = "skill-first"
+
 # The per-turn execution boundary the person states in prose ("do not run any
 # command"). Registered outermost on tools/execute, above every approval gate:
 # an Allow short-circuits everything downstream, and this must survive that.
@@ -216,6 +226,8 @@ pub async fn mount(
     registry.register(Arc::new(policy::OutputArtifactPlugin));
     registry.register(Arc::new(VerifyCadencePlugin));
     registry.register(Arc::new(ExecutionPolicyPlugin));
+    registry.register(Arc::new(SkillCatalogPlugin));
+    registry.register(Arc::new(SkillFirstPlugin));
     registry.register(Arc::new(InjectProvider(provider)));
 
     let mut app = App::new(registry, tree);
@@ -507,6 +519,128 @@ impl Plugin for ExecutionPolicyPlugin {
         // `Allow` never delegates further, so anything registered inside it
         // would be skipped by the very short-circuit the boundary must survive.
         let _ = ctx.on_waterfall::<atomcode_harness::events::ToolsExecuteBatch>(boundary, true);
+        Ok(())
+    }
+}
+
+// ---- how the model is told about skills ---------------------------------
+//
+// The bigger of the two findings here, and it is not a hook at all. The generic
+// harness `skills` row advertises a POINTER — "1 skill(s) are available. Call
+// `list_skills` to see them" — which is the right default for a harness that
+// cannot know how many skills a deployment installs: a catalog costs tokens on
+// every single request.
+//
+// Coding inlines the whole catalog, names and descriptions, and has a reason on
+// the record: registering `use_skill` without telling the model what exists made
+// skills "basically never fire" (see `skills::catalog_hook`). Every other piece
+// of coding's skill steering — the persona line, the `use_skill` description,
+// and the skill-first nudge below — refers to "the `=== AVAILABLE SKILLS ===`
+// catalog above". Without it they point at nothing.
+//
+// So this row is a product overriding a harness default, which is what a product
+// row is for. It contributes under the SAME fragment id the generic row uses,
+// replacing rather than appending: two descriptions of the same thing in one
+// system prompt is worse than either alone.
+
+/// Fragment id and rank of the generic `skills` advertisement, which this
+/// replaces. Same id is the mechanism (`PromptRegistry::contribute` retains by
+/// id), and it is deliberate rather than incidental.
+const SKILLS_FRAGMENT: (&str, i32) = ("skills", 60);
+
+/// Puts the full skill catalog in the system prompt.
+pub struct SkillCatalogPlugin;
+
+#[async_trait]
+impl Plugin for SkillCatalogPlugin {
+    fn name(&self) -> &'static str {
+        "skill-catalog-inline"
+    }
+    fn description(&self) -> &'static str {
+        "list the installed skills in the system prompt, not just their count"
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        let Some(skills) = ctx.service::<atomcode_harness::seams::SkillsSvc>() else {
+            return Ok(());
+        };
+        // No skills → leave the generic row's judgement alone. It already says
+        // nothing when the count is zero, and a catalog header over an empty
+        // list is worse than silence.
+        let Some(catalog) = skills.render_catalog() else {
+            return Ok(());
+        };
+        let Some(prompts) = ctx.service::<atomcode_harness::seams::SystemPromptSvc>() else {
+            return Ok(());
+        };
+        let (id, rank) = SKILLS_FRAGMENT;
+        prompts.contribute(id, rank, catalog);
+        Ok(())
+    }
+}
+
+/// Tells a weak model to check the catalog before it does anything else.
+struct SkillFirst {
+    ctx: Context,
+}
+
+#[async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for SkillFirst {
+    async fn handle(
+        &self,
+        req: &mut atomcode_harness::events::ModelRequest,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::AgentRequest>,
+    ) -> Result<atomcode_harness::events::ModelResponse, atomcode_harness::events::RequestError>
+    {
+        // Opening turn only, and round 1 of it: the reminder has to land before
+        // the model's first action, not after it has already gone exploring.
+        // `ModelRequest` carries both numbers, so this is the same condition the
+        // hook writes as `ctx.turn_id != 1 || ctx.round != 1`.
+        if req.turn != 1 || req.round != 1 {
+            return next.run(req).await;
+        }
+        let enabled = self
+            .ctx
+            .service::<atomcode_harness::seams::LlmSvc>()
+            .is_some_and(|llm| crate::persona::model_needs_firm_execution(llm.model_name()))
+            && self
+                .ctx
+                .service::<atomcode_harness::seams::SkillsSvc>()
+                .is_some_and(|skills| !skills.is_empty());
+        if !enabled {
+            return next.run(req).await;
+        }
+        // Appended to the REQUEST, not committed to the log: it is ephemeral
+        // steering for one round, and a log full of nudges is a log nobody can
+        // read. The loop's "model-visible content is logged" invariant is
+        // checked on the assembled messages before the request is built, so a
+        // tail added here is outside it by construction.
+        req.messages
+            .push(atomcode_capabilities::reminder::synthetic_system_reminder(
+                crate::skill_first::SKILL_FIRST_BODY,
+            ));
+        next.run(req).await
+    }
+}
+
+/// Mounts the opening-turn skill-first reminder.
+pub struct SkillFirstPlugin;
+
+#[async_trait]
+impl Plugin for SkillFirstPlugin {
+    fn name(&self) -> &'static str {
+        "skill-first"
+    }
+    fn description(&self) -> &'static str {
+        "make a weak model check the skill catalog before it starts exploring"
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        // Innermost (`prepend = false`): the tail should be the last thing added
+        // before the provider sees the request, so recency — the whole point of
+        // putting it at the tail — is not spent by something appending after it.
+        let _ = ctx.on_waterfall::<atomcode_harness::events::AgentRequest>(
+            Arc::new(SkillFirst { ctx: ctx.clone() }),
+            false,
+        );
         Ok(())
     }
 }

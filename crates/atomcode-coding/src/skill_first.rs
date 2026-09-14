@@ -45,13 +45,21 @@ impl SkillFirstHook {
     /// The forceful skill-first reminder body (pure, testable). Wrapped by
     /// `system_reminder` before injection.
     fn body() -> &'static str {
-        "Before you explore the codebase, plan, or propose a solution: check the \
+        SKILL_FIRST_BODY
+    }
+}
+
+/// The reminder itself, apart from the shape it is delivered in.
+///
+/// The hook above delivers it through the kernel's `pre_request`; the
+/// `skill-first` row in [`crate::on_harness`] appends it to `agent/request`.
+/// Same words, or the two assemblies steer the same weak model differently.
+pub(crate) const SKILL_FIRST_BODY: &str =
+    "Before you explore the codebase, plan, or propose a solution: check the \
 \"=== AVAILABLE SKILLS ===\" catalog above. If this request matches a skill's description \
 shown in that catalog, you MUST call `use_skill` with that exact listed name NOW and let it \
 drive. Never infer a skill name merely from the task type. If no listed description matches, \
-proceed normally without `use_skill`."
-    }
-}
+proceed normally without `use_skill`.";
 
 #[async_trait]
 impl LifecycleHooks for SkillFirstHook {
