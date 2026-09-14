@@ -3015,29 +3015,24 @@ async fn a_command_the_user_forbade_is_refused_on_both_engines() {
 }
 
 #[tokio::test]
-async fn a_refused_call_still_reads_as_started_on_the_harness() {
-    // A general property of the two engines, given its own name so it is found
-    // once rather than rediscovered as a bug in whichever row happens to refuse
-    // something next. It cost exactly that: the `execution-policy` row's first
-    // theory was that it had introduced this, and it had not.
+async fn a_refused_call_is_never_announced_as_started() {
+    // This scenario was opened to RECORD a divergence and is kept to assert it
+    // stays closed. What it used to read:
     //
     //   链式  Request approval → ToolResult error=true
     //   行式  ToolStarted bash → Request approval → ToolResult error=true
     //
-    // `ui-handle` synthesises `ToolStarted` for every MOUNTED tool the moment
-    // the assistant message is logged — earlier than `tools/execute-batch`,
-    // earlier than `tools/execute`, earlier than anything that could refuse.
-    // Coding's chain announces a call only after its middleware has let it
-    // through, so a refused call is never announced at all.
+    // `ui-handle` synthesised `ToolStarted` from the assistant message, which
+    // is committed before approval, plan mode, the workspace gates or a user's
+    // hook have had a say. So every refused call flashed as a tool that started
+    // and instantly failed — and a write read as under way before the person
+    // was asked to allow it. Four scenarios carried it; it was one property of
+    // the projection, not four bugs.
     //
-    // Consequence for a driver: every refused call flashes as a tool that
-    // started and instantly failed. `handle.rs` already guards the neighbouring
-    // case — a tool nobody mounted is not announced, with a comment saying a
-    // differential run found it — so the shape of the fix is known and it
-    // belongs to `ui-handle`, not to any product row. Frozen at 1 until then.
-    //
-    // Two scenarios carry this divergence (`approval_refusal_rows` and
-    // `exec_policy_rows`); this one states it.
+    // The fix is a fact rather than a better guess: `SessionEvent::ToolStarted`,
+    // committed in `exec.rs` where every waterfall listener has delegated —
+    // the same position the kernel emits its own `ToolStarted` from
+    // ("as THIS tool actually starts", `agent.rs`).
     let dir = scratch("started-gap");
     seed(&dir);
     let script = || {
@@ -3054,14 +3049,19 @@ async fn a_refused_call_still_reads_as_started_on_the_harness() {
     let b = on_harness_answering(script(), &dir, say("clean it"), deny()).await;
     let report = judge("refused_call_started_rows", &a, &b);
 
-    let started = |steps: &[Step]| steps.iter().filter(|s| s.kind == "ToolStarted").count();
-    assert_eq!(started(&a), 0, "链式:被拒的调用不该被宣告开始过{report}");
-    assert_eq!(
-        started(&b),
-        1,
-        "行式:这正是本条记录的差异 —— 若它变成 0,说明 ui-handle 修好了,\
-         把本条连同两处基线一起降下来{report}"
-    );
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "ToolStarted").count(),
+            0,
+            "{who}: 被拒的调用不该被宣告开始过{report}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.kind == "ToolResult" && s.detail.contains("error=true")),
+            "{who}: 但它确实要有一个失败结果 —— 否则这条场景对「什么都没发生」也绿{report}"
+        );
+    }
 }
 
 // ---- the skill-first nudge ----------------------------------------------

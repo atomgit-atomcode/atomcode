@@ -133,6 +133,23 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
     },
+    /// A call got past every gate and is about to run.
+    ///
+    /// Not derivable from `AssistantMessage`: that fact says the model ASKED
+    /// for a call, and it is committed before approval, plan mode, the
+    /// workspace gates or a user's own hook have had a say. A driver that
+    /// announced a tool as started from it showed every REFUSED call as one
+    /// that began and instantly failed — and, worse, showed "writing file…"
+    /// and only then asked whether to allow it.
+    ///
+    /// Carries the whole call because that is what a driver renders, and
+    /// because a gate may have rewritten the arguments on the way through
+    /// (`updatedInput`): what started is what runs, not what was asked for.
+    ToolStarted {
+        turn: u64,
+        round: u32,
+        call: ToolCall,
+    },
     ToolResultLogged {
         turn: u64,
         round: u32,
@@ -207,6 +224,7 @@ impl SessionEvent {
             | Self::RequestHeader { turn, .. }
             | Self::AssistantChunk { turn, .. }
             | Self::AssistantMessage { turn, .. }
+            | Self::ToolStarted { turn, .. }
             | Self::ToolResultLogged { turn, .. }
             | Self::Injected { turn, .. }
             | Self::Compacted { turn, .. }
@@ -234,7 +252,16 @@ impl SessionEvent {
 /// Bumped when the on-disk shape of a session changes in a way a reader must
 /// know about. A reader that meets a version it does not know refuses the
 /// file rather than guessing.
-pub const SESSION_FORMAT_VERSION: u32 = 1;
+///
+/// **2** — added [`SessionEvent::ToolStarted`]. Additive in Rust (the enum is
+/// `#[non_exhaustive]`, so a consumer folding over the facts it knows still
+/// compiles) but NOT additive on disk: the enum is `#[serde(tag = "kind")]`
+/// and `JsonlStore::parse` propagates a parse error, so an older reader meeting
+/// this fact fails the whole file rather than skipping the line. Refusing by
+/// version is the same outcome stated honestly, which is what this constant is
+/// for. Making the reader skip what it does not understand would be a different
+/// trade — "guess" instead of "refuse" — and belongs to whoever owns that call.
+pub const SESSION_FORMAT_VERSION: u32 = 2;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()

@@ -720,6 +720,20 @@ fn the_projection_is_a_pure_fold_over_the_log() {
                 reasoning: String::new(),
                 tool_calls: vec![call("a", "read_file"), call("b", "read_file")],
             },
+            // Both calls got past the gates, so both are recorded as started.
+            // The assistant message above says only that the model ASKED — a
+            // refused call would have a result here and no start, which is the
+            // whole reason this is a fact rather than a derivation.
+            Fact::ToolStarted {
+                turn: 1,
+                round: 1,
+                call: call("a", "read_file"),
+            },
+            Fact::ToolStarted {
+                turn: 1,
+                round: 1,
+                call: call("b", "read_file"),
+            },
             Fact::ToolResultLogged {
                 turn: 1,
                 round: 1,
@@ -778,6 +792,48 @@ fn the_projection_is_a_pure_fold_over_the_log() {
     // A user message is what the driver just sent; echoing it back would render
     // it twice.
     assert!(!names(&events).contains(&"TextDelta_user"));
+}
+
+#[test]
+fn a_call_that_never_ran_never_reads_as_started() {
+    use atomcode_harness::plugins::handle::replay as project;
+    use atomcode_harness::session::SessionEvent as Fact;
+    use atomcode_kernel::tool::ToolCall;
+
+    // A gate refused it: the model asked, a result came back, and in between
+    // nothing started. The driver must be told exactly that.
+    //
+    // This used to be impossible to express. `ToolStarted` was derived from the
+    // assistant message, which is committed before approval, plan mode, the
+    // workspace gates or a user's hook have had a say — so every refused call
+    // read as one that began and instantly failed, and a write read as under
+    // way before the person was asked to allow it.
+    let events = project(
+        &[
+            Fact::AssistantMessage {
+                turn: 1,
+                round: 1,
+                text: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "a".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+            },
+            Fact::ToolResultLogged {
+                turn: 1,
+                round: 1,
+                call_id: "a".into(),
+                content: "Refused: the user declined".into(),
+                is_error: true,
+                images: Vec::new(),
+            },
+        ],
+        1000,
+    );
+
+    assert_eq!(names(&events), vec!["ToolResult"]);
 }
 
 #[test]

@@ -33,7 +33,9 @@ pub async fn execute_one(
             let ctx = ctx.clone();
             let cancel = cancel.clone();
             let working_dir = working_dir.clone();
+            // The call as it stands AFTER the gates, arguments and all.
             let call = exec.call.clone();
+            let (exec_turn, exec_round) = (exec.turn, exec.round);
             Box::pin(async move {
                 let Some(toolbox) = ctx.service::<ToolsSvc>() else {
                     return error_result(&call.id, "no tool catalog is mounted");
@@ -57,6 +59,28 @@ pub async fn execute_one(
                     progress: ProgressSink::noop(),
                     requester: None,
                 };
+                // The one moment "this call is running" becomes true: every
+                // waterfall listener delegated, so no gate refused it and no
+                // scheduler held it back. Committed here rather than derived
+                // from the assistant message, which is a fact about what the
+                // model ASKED for and lands long before any of them decided.
+                //
+                // After the unknown-tool check above, so a tool nobody mounted
+                // never announces a start it cannot have — the guard a driver
+                // used to keep for itself.
+                if let Some(session) =
+                    crate::agent::scoped(&ctx).service::<crate::seams::SessionSvc>()
+                {
+                    crate::session::commit(
+                        &ctx,
+                        &session,
+                        crate::session::SessionEvent::ToolStarted {
+                            turn: exec_turn,
+                            round: exec_round,
+                            call: call.clone(),
+                        },
+                    );
+                }
                 let mut result = tool.execute(&call.arguments, &tool_ctx).await;
                 // Tools mint their own id-less results; pairing is the caller's.
                 result.call_id = call.id.clone();

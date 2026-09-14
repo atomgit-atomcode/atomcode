@@ -86,18 +86,11 @@ struct Projector {
 }
 
 impl Projector {
-    /// Whether this tool is one the catalog will actually dispatch.
-    ///
-    /// Announces when it cannot tell. Suppressing on "no catalog visible" would
-    /// drop *every* `ToolStarted` in a tree with no `tools` row — silently, and
-    /// only for the drivers that need those events most. The rule is: stay
-    /// quiet only when we know for certain the tool is absent.
-    fn mounted(&self, name: &str) -> bool {
-        match self.tools.as_ref() {
-            Some(tools) => tools.get(name).is_some(),
-            None => true,
-        }
-    }
+    // `mounted()` lived here: a guess at whether a named tool would actually
+    // dispatch, so an unmounted one was not announced as started. The guess is
+    // gone because the question is now answered rather than predicted —
+    // `SessionEvent::ToolStarted` is committed past the catalog lookup, so a
+    // tool nobody mounted commits nothing and there is nothing to suppress.
 
     fn parallel_safe(&self, name: &str, arguments: &str) -> bool {
         self.tools
@@ -158,18 +151,18 @@ impl Projector {
                         started: Instant::now(),
                     });
                 }
-                for call in tool_calls {
-                    // Only for a tool that will actually run. A model naming a
-                    // tool nobody mounted is ordinary, and announcing that it
-                    // *started* is a lie the driver then has to unpick — the
-                    // reference engine goes straight to the failed result, and
-                    // a differential run showed this as the only difference on
-                    // that path.
-                    if self.mounted(&call.name) {
-                        out.push(AgentEvent::ToolStarted { call: call.clone() });
-                    }
-                }
+                // No `ToolStarted` here. This fact says the model ASKED, and
+                // it is committed before approval, plan mode, the workspace
+                // gates or a user's hook have had a say — so announcing a start
+                // from it showed every refused call as one that began and
+                // instantly failed, and showed a write as under way before the
+                // person was asked to allow it. `SessionEvent::ToolStarted`,
+                // committed where the call actually runs, is the fact for that.
                 out
+            }
+
+            SessionEvent::ToolStarted { call, .. } => {
+                vec![AgentEvent::ToolStarted { call: call.clone() }]
             }
 
             SessionEvent::ToolResultLogged {
