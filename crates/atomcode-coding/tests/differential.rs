@@ -3742,6 +3742,51 @@ async fn a_logout_takes_the_credentials_and_leaves_the_agent() {
     app.stop();
 }
 
+/// And "the credentials stop living in this process" has to mean the object,
+/// not the seam.
+///
+/// The scenario above asks the seam what is behind it, which a logout that
+/// merely hid the provider would also pass. This one holds a `Weak` to the
+/// signed-in provider and asks whether anything still holds it — the one
+/// question a security claim about credentials is actually making.
+///
+/// It failed the first time it was written: `ProviderSlots` kept every provider
+/// it had ever been handed, so after the logout the credentialled one was
+/// unreachable and alive. Ids are still never reused; the table just stops at
+/// one entry.
+#[tokio::test]
+async fn a_logout_drops_the_provider_object_and_not_only_the_seam() {
+    let dir = scratch("logout-drops-provider");
+    let quiet = quiet_rows(&dir);
+    let signed_in = Script::text(&["ok"]).as_model("signed-in-model");
+    let watch = Arc::downgrade(&signed_in);
+
+    let (handle, mut app, slots) = atomcode_coding::on_harness::mount_swappable(
+        &dir,
+        atomcode_coding::on_harness::Presence::Attended,
+        signed_in.clone(),
+        &[quiet.as_str()],
+    )
+    .await
+    .expect("mount");
+    drop(handle);
+    drop(signed_in);
+    assert!(
+        watch.upgrade().is_some(),
+        "the tree must be holding the provider while signed in, or the assertion          below proves nothing"
+    );
+
+    atomcode_coding::on_harness::deactivate_provider(&mut app, slots.as_ref())
+        .await
+        .expect("logout");
+
+    assert!(
+        watch.upgrade().is_none(),
+        "after a logout something in this process is still holding the          credentialled provider — a logout that only changes what the seam          ANSWERS has not taken the credentials anywhere"
+    );
+    app.stop();
+}
+
 // ---- what the model is offered ------------------------------------------
 //
 // A whole class of divergence no event can carry. The tool catalog is as much

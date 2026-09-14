@@ -414,13 +414,24 @@ impl ProviderSlots {
     ///
     /// Ids are never reused: a patch only remounts a row whose config CHANGED,
     /// so reusing an id would make a swap a no-op.
+    ///
+    /// **The table holds exactly one provider — the current one.** It started
+    /// out accumulating every provider it was ever handed, which reads
+    /// harmlessly (ids are small, and nothing looks up an old one) and was a
+    /// hole: after `/logout` the credentialled provider was unreachable through
+    /// the seam and still ALIVE in this map, which is precisely the thing a
+    /// logout is supposed to end. Dropping the old entry here is what makes
+    /// [`deactivate_provider`]'s claim true rather than nearly true.
+    ///
+    /// Safe because nobody resolves an old id: `llm-injected` looks its id up
+    /// once at mount and then holds the `Arc` itself, and a row retried out of
+    /// `App::pending` re-reads the tree, which by then names the new id.
     pub fn insert(&self, provider: Arc<dyn LlmProvider>) -> String {
         let n = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let id = format!("gen-{n}");
-        self.slots
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id.clone(), provider);
+        let mut slots = self.slots.write().unwrap_or_else(|e| e.into_inner());
+        slots.clear();
+        slots.insert(id.clone(), provider);
         id
     }
 
