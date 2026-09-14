@@ -324,20 +324,23 @@ impl UserInterface for Tui {
             use crate::surface::Click;
             // Say the mouse mode again on the wakes that can follow a terminal
             // putting its own tracker back without telling us — every tick, and
-            // everything the pointer or the keyboard sends. A menu opening or
-            // closing is the other moment worth repeating at: a terminal that
-            // dropped the grab while the menu was up never saw either request,
-            // and this is the first wake carrying the new state. Idempotent by
-            // construction (a DECSET for a mode already set changes nothing),
-            // so the cost is bytes and no state.
+            // every keystroke. Idempotent by construction (a DECSET for a mode
+            // already set changes nothing), so the cost is bytes and no state.
+            //
+            // Deliberately *not* on mouse events, which is the tempting case to
+            // include and the one that would cost the most: an arriving mouse
+            // event is itself proof that the tracker is on, so repeating the
+            // mode there buys nothing. While the menu is up it is worse than
+            // nothing — free motion reports every cell the pointer crosses, so
+            // healing on each of those is exactly the packet-per-cell price
+            // `ansi::MOUSE_MOTION_ON` exists to avoid, paid for information the
+            // event already carries. The one mouse event worth acting on is the
+            // one that should not have arrived at all; see the `Hover` arm below.
             //
             // Here rather than at the top of the loop because `woke` is what
             // says which of these it was, and before the `match` because the
             // pointer arms `continue` past anything below.
-            if matches!(
-                &woke,
-                Wake::Tick | Wake::Input(Input::Mouse(..)) | Wake::Input(Input::Key(_))
-            ) {
+            if matches!(&woke, Wake::Tick | Wake::Input(Input::Key(_))) {
                 self.surface.heal_mouse();
             }
             match woke {

@@ -2389,3 +2389,54 @@ async fn a_hover_with_nothing_following_the_pointer_says_the_mode_again_and_says
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+#[tokio::test]
+async fn a_move_that_was_asked_for_says_nothing_again() {
+    // The other half of the healing rule, and the half with a cost attached: an
+    // arriving mouse event is itself proof that the tracker is on, so repeating
+    // the mode on one buys nothing. While the menu is up it is worse than
+    // nothing — free motion reports every cell the pointer crosses, so healing
+    // per event would hand the terminal a packet per cell, which is the exact
+    // price `MOUSE_MOTION_ON` is written to avoid paying.
+    //
+    // Counted as a burst rather than one event, so a tick landing in the window
+    // cannot be read as the per-event healing this is about: ticks heal (that is
+    // the other half of the rule), and at 110ms a short burst has room for very
+    // few of them.
+    let dir = scratch("heal-no-op");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    right_click_composer(&s);
+    s.quiet().await;
+    assert!(s.screen().contains("复制全文"), "the menu is up");
+
+    let hovered = 24usize;
+    let before = s.term.escapes().len();
+    let field = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("input")
+        .expect("the composer")
+        .rect;
+    for i in 0..hovered {
+        s.term.pointer(
+            atomcode_tui::surface::Click::Hover,
+            field.x + (i as u16 % 4),
+            field.y,
+        );
+    }
+    s.quiet().await;
+    let grew = s.term.escapes().len() - before;
+
+    assert!(
+        grew * 2 < hovered,
+        "{hovered} moves the menu asked for produced {grew} escapes — the mode \
+         is being repeated per event, and the terminal is paying per cell"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
