@@ -22,3 +22,6 @@ one_tool_call_prod=0
 several_rounds_prod=0
 provider_error_prod=0
 two_tool_calls_prod=0
+plain_turn_rows=0
+one_tool_call_rows=0
+several_rounds_rows=0

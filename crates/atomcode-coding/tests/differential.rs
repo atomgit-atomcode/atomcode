@@ -1831,3 +1831,117 @@ async fn the_provider_fails_mid_stream_in_production() {
     )
     .await;
 }
+
+// ---- coding, assembled ON the harness ------------------------------------
+//
+// The third engine, and the one this whole file exists for. `reference_production`
+// is coding's own chain; this is the SAME product assembled as a row list
+// (`on_harness::mount`). If the two agree, the chain can be replaced by the list
+// without anything above noticing — which is the swap, stated as a measurement.
+
+async fn on_harness(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+) -> Vec<Step> {
+    let empty = dir.join("__no_skills__");
+    let _ = std::fs::create_dir_all(&empty);
+    // The same hermetic scoping the plain candidate uses: nothing may reach the
+    // network, a subprocess, or the developer's own disk.
+    let quiet = format!(
+        "[[patch]]\nid = \"trace\"\nconfig = {{ stream = false, tools = false, summary = false }}\n\n\
+         [[patch]]\nid = \"mcp\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"approval\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 8, working_dir = {dir:?} }}\n\n\
+         [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n\n\
+         [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {dir:?} }}\n\n\
+         [[patch]]\nid = \"project-instructions\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n",
+        dir = dir.to_string_lossy(),
+        home = empty.to_string_lossy(),
+    );
+    let (handle, mut app) = atomcode_coding::on_harness::mount(dir, script, &[quiet.as_str()])
+        .await
+        .expect("the coding-on-harness tree must mount");
+    let steps = drive_until(handle, commands, &[]).await;
+    app.stop();
+    steps
+}
+
+/// One scenario through coding's own chain and the same product as a row list.
+async fn chain_vs_rows(
+    key: &str,
+    dir: &std::path::Path,
+    script: impl Fn() -> Arc<Script>,
+    cmds: impl Fn() -> Vec<AgentCommand>,
+) -> (Vec<Step>, Vec<Step>, String) {
+    let a = reference_production(script(), dir, cmds()).await;
+    let b = on_harness(script(), dir, cmds()).await;
+    let report = render(&a, &b);
+    ratchet(key, divergences(&a, &b), &report);
+    (a, b, report)
+}
+
+#[tokio::test]
+async fn a_plain_turn_on_the_harness() {
+    let dir = scratch("plain-onharness");
+    let (a, b, report) = chain_vs_rows(
+        "plain_turn_rows",
+        &dir,
+        || Script::text(&["hello"]),
+        || say("say hello"),
+    )
+    .await;
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        let terminals = steps
+            .iter()
+            .filter(|s| matches!(s.kind, "TurnComplete" | "Error" | "Cancelled"))
+            .count();
+        assert_eq!(terminals, 1, "{who} 的终结事件不是一个{report}");
+    }
+}
+
+#[tokio::test]
+async fn one_tool_call_on_the_harness() {
+    let dir = scratch("one-tool-onharness");
+    seed(&dir);
+    let (a, b, report) = chain_vs_rows(
+        "one_tool_call_rows",
+        &dir,
+        || {
+            Script::new(&[
+                Reply::call("c1", "read_file", r#"{"file_path":"a.rs"}"#),
+                Reply::Text("that is an empty main"),
+            ])
+        },
+        || say("read a.rs"),
+    )
+    .await;
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        let started = steps.iter().position(|s| s.kind == "ToolStarted");
+        let result = steps.iter().position(|s| s.kind == "ToolResult");
+        assert!(
+            matches!((started, result), (Some(x), Some(y)) if x < y),
+            "{who}: 工具必须先开始后有结果{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn several_rounds_on_the_harness() {
+    let dir = scratch("rounds-onharness");
+    seed(&dir);
+    let _ = chain_vs_rows(
+        "several_rounds_rows",
+        &dir,
+        || {
+            Script::new(&[
+                Reply::call("c1", "read_file", r#"{"file_path":"a.rs"}"#),
+                Reply::call("c2", "read_file", r#"{"file_path":"b.rs"}"#),
+                Reply::Text("read them both"),
+            ])
+        },
+        || say("read both, one at a time"),
+    )
+    .await;
+}

@@ -11,6 +11,13 @@ atomgit = ["atomcode-capabilities/atomgit"]
 
 [dependencies]
 atomcode-kernel = { path = "../atomcode-kernel" }
+# The engine underneath. The dependency points THIS way on purpose: the question
+# is whether coding can sit ON the harness, so the harness must know nothing of
+# coding — it used to carry the differential rig and a dev edge back to here,
+# which made the pair mutually referential and prejudged the direction.
+atomcode-harness = { path = "../atomcode-harness" }
+# The container the harness assembles in: `App` / `ConfigTree` / `Layer`.
+atomcode-plexus = { path = "../atomcode-plexus" }
 # Config system leaf consumed directly by the coding assembly.
 atomcode-config = { path = "../atomcode-config" }
 # The FULL capability set: L2 is the opinionated assembly — a coding agent ships
@@ -51,16 +58,6 @@ serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 
 [dev-dependencies]
-# The candidate engine, for the differential rig (`tests/differential.rs`) only.
-#
-# The dependency points THIS way on purpose. The question being measured is
-# whether coding could sit ON the harness, so the harness must not know about
-# coding — it used to carry the rig and a `dev-dependencies` edge back to here,
-# which made the pair mutually referential and prejudged the direction. The rig
-# lives with the reference engine now; the harness depends on nothing of ours.
-atomcode-harness = { path = "../atomcode-harness" }
-# The rig mounts a plexus tree (`App` / `ConfigTree` / `Layer`) as the candidate.
-atomcode-plexus = { path = "../atomcode-plexus" }
 # The differential ratchet takes a cross-PROCESS lock on `gates/differential.baseline`.
 # An in-process Mutex used to be enough because `cargo test` runs a binary's tests as
 # threads; `cargo nextest` runs each as its own process, so a process-local lock guards
