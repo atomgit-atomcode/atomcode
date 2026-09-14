@@ -18,9 +18,6 @@ pub struct State {
     /// Whether anything has been said yet, so the first prompt can be helpful
     /// and later ones can get out of the way.
     pub spoke: bool,
-    /// The slash menu, when a command is being typed. Set by the host, which
-    /// owns the command registry — the module only draws it.
-    pub menu: Vec<(String, String)>,
 }
 
 /// Rows the rules above and below the field eat, and cells the prompt eats.
@@ -202,7 +199,7 @@ impl View for Input {
     ///
     /// (This departs from `atomcode-tuix`, which uses one rule. The two front
     /// ends now differ here on purpose.)
-    fn render(state: &State, vp: &Viewport<'_>) -> Vec<Line> {
+    fn render(_state: &State, vp: &Viewport<'_>) -> Vec<Line> {
         use crate::el::El;
 
         let w = vp.rect.w;
@@ -242,40 +239,25 @@ impl View for Input {
 
         rows.push(rule());
 
-        // The menu hangs below the closed field rather than inside it — it is
-        // not something being typed. A discovery surface that pushed the prompt
-        // off the screen would be worse than no discovery surface.
-        if !state.menu.is_empty() {
-            let room = (vp.rect.h as usize).saturating_sub(rows.len());
-            for (name, about) in state.menu.iter().take(room) {
-                rows.push(El::row(vec![
-                    El::styled(format!("  /{name}"), theme::fg(Role::Accent)),
-                    El::styled(format!("  {about}"), theme::fg(Role::Muted)),
-                ]));
-            }
-        }
+        // The slash menu is not drawn here any more. It used to hang below this
+        // rule and be counted in `height`, which meant opening it pushed the
+        // conversation up — a discovery surface that resizes the thing beside
+        // it as it appears. It is now a floating part the host stacks over the
+        // layout: it rises out of the prompt and covers what is above it, and
+        // nothing else on screen moves. See `Host::menu_rect`.
         El::col(rows).lay(w)
     }
 
-    fn set_menu(state: &mut State, menu: Vec<(String, String)>) {
-        state.menu = menu;
-    }
-
-    /// The rule, the typed text, and the menu when it is open.
+    /// The rule, the typed text, and nothing else.
     ///
     /// Asked from the moment rather than from state, because the text is not
     /// this module's state — it lives in `Moment`. Asking from state alone is
     /// what pinned the composer at one row: a pasted stack trace went into the
     /// buffer whole and was sent whole, but only its first line was ever drawn.
-    fn height(state: &State, moment: &crate::moment::Moment, width: u16) -> Height {
+    fn height(_state: &State, moment: &crate::moment::Moment, width: u16) -> Height {
         let body = body_width(width);
         let typed = lay(&moment.input, moment.caret, body).0.len().min(MAX_ROWS);
-        let rows = RULES + typed.max(1);
-        Height::Hug(if state.menu.is_empty() {
-            rows as u16
-        } else {
-            (rows + state.menu.len()).min(14) as u16
-        })
+        Height::Hug((RULES + typed.max(1)) as u16)
     }
 }
 
@@ -384,24 +366,14 @@ mod tests {
     }
 
     #[test]
-    fn the_slash_menu_appears_under_the_prompt_and_gives_the_room_back() {
-        let mut state = State::default();
+    fn the_field_keeps_its_height_whether_or_not_a_menu_is_open() {
+        // The menu is drawn over the layout, not inside this module, so opening
+        // it must not change how tall the field asks to be — that request is
+        // what used to push the conversation up when a slash was typed.
+        let state = State::default();
         let m = Moment::default();
         assert!(matches!(Input::height(&state, &m, 40), Height::Hug(3)));
-        Input::set_menu(&mut state, vec![("help".into(), "看命令".into())]);
-        let out = draw(&state, &Moment::default(), 40, 6);
-        let at = out
-            .iter()
-            .position(|l| l.contains("/help"))
-            .expect("no menu");
-        assert!(
-            at > out
-                .iter()
-                .rposition(|l| l.starts_with(Caps::default().g(Glyph::Horizontal)))
-                .unwrap(),
-            "the menu hangs below the closed field, not inside it: {out:?}"
-        );
-        assert!(matches!(Input::height(&state, &m, 40), Height::Hug(n) if n > 3));
+        assert!(matches!(Input::height(&state, &m, 40), Height::Hug(3)));
     }
 
     #[test]

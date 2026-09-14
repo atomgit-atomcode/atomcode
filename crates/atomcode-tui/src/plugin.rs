@@ -1061,9 +1061,7 @@ impl Tui {
                 .collect(),
             _ => Vec::new(),
         };
-        if let Some(view) = self.host.modules.view(crate::modules::input::ID) {
-            view.set_menu(menu);
-        }
+        self.host.set_menu(menu);
     }
 
     /// Run a slash command and put what it said on the screen.

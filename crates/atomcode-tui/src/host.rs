@@ -605,11 +605,36 @@ impl Hits {
     }
 }
 
+/// A line widened to the rect with the panel's own style.
+///
+/// A floating part covers what it is drawn over only where it puts a cell down,
+/// and a text span ends where its text ends. Filling the rest of the row is what
+/// makes the menu a surface over the conversation rather than words with the
+/// conversation visible through them.
+fn pad(line: Line, w: usize, style: Style) -> Line {
+    let used = line.width();
+    if used >= w {
+        return line.truncate(w);
+    }
+    let mut spans = line.spans;
+    spans.push(Span::styled(" ".repeat(w - used), style));
+    Line::from_spans(spans).truncate(w)
+}
+
 /// Everything the screen is composed from.
 pub struct Host {
     pub stream: RwLock<Stream>,
     /// Slash commands, contributed by rows.
     pub commands: Arc<crate::command::Commands>,
+    /// The slash menu — what to show while a command is being typed.
+    ///
+    /// Kept here rather than in the input module because it is two different
+    /// concerns in one place: the host owns the command registry, and the menu
+    /// is drawn *over* the layout rather than inside the field. A module that
+    /// owned it would have to be told, and a module that draws it inside its
+    /// own rect is a module that resizes the conversation when a slash is
+    /// typed. Empty means nothing to suggest.
+    menu: RwLock<Vec<(String, String)>>,
     /// At most one modal. Focus is arbitration, not composition.
     pub overlays: Arc<crate::overlay::Overlays>,
     /// Questions waiting for the person. Rendered as a live block at the foot
@@ -638,6 +663,7 @@ impl Host {
             // rows (`crate::rows`); a Host that pre-filled this would make
             // `[[remove]] id = "tui-commands-tree"` a lie.
             commands: Arc::new(crate::command::Commands::new()),
+            menu: RwLock::new(Vec::new()),
             overlays: Arc::new(crate::overlay::Overlays::new()),
             asks: crate::ask::Asks::new(),
             modules: modules.clone(),
@@ -720,6 +746,87 @@ impl Host {
 
     pub fn painted(&self) -> u64 {
         *self.painted.lock().expect("counter poisoned")
+    }
+
+    /// Replace the slash menu. Empty closes it.
+    ///
+    /// Set by whoever owns the command registry — the front end — because the
+    /// menu's *contents* are a question about commands, not about the screen.
+    /// Where it is drawn is this struct's business, not the caller's.
+    pub fn set_menu(&self, menu: Vec<(String, String)>) {
+        *self.menu.write().expect("menu poisoned") = menu;
+    }
+
+    /// How tall the slash menu would like to be, and at most what it may be.
+    ///
+    /// Capped well short of the screen so it reads as something that rose out
+    /// of the prompt rather than as a second transcript.
+    fn menu_rows(&self, menu: &[(String, String)]) -> u16 {
+        (menu.len() as u16).clamp(1, 10)
+    }
+
+    /// Where the menu rises to, over the layout.
+    ///
+    /// Bottom-anchored to the input field's own top edge and one row taller
+    /// than the list, so its first row is a blank margin against the field's
+    /// top rule: the menu appears to grow *out of* the prompt. Every row above
+    /// that top edge is drawn over whatever the layout put there, and nothing
+    /// is given up for it — the rects of the stream, the composer and the
+    /// status bar are unchanged by the menu being open.
+    fn menu_rect(&self, frame: &Frame, screen: Rect, rows: u16) -> Option<Rect> {
+        let field = frame.part(crate::modules::input::ID)?.rect;
+        // One for the margin, and no more than fits above the field.
+        let want = rows.saturating_add(1).min(field.y);
+        if want == 0 {
+            return None;
+        }
+        let x = field.x;
+        let w = field.w.min(screen.w.saturating_sub(x));
+        if w == 0 {
+            return None;
+        }
+        let y = field.y - want;
+        // `want` rows bottom-aligned in the rect, so the last of them is the
+        // margin and the list itself hangs from there.
+        Some(Rect::new(x, y, w, want))
+    }
+
+    /// The menu's rows, top to bottom in `rect`, with its margin last.
+    fn menu_lines(&self, rect: Rect, menu: &[(String, String)]) -> Vec<Line> {
+        let w = rect.w as usize;
+        let mut out: Vec<Line> = Vec::with_capacity(rect.h as usize);
+        let room = (rect.h as usize).saturating_sub(1);
+        let style = crate::theme::bg(crate::theme::Role::PanelBg)
+            .under(crate::theme::fg(crate::theme::Role::PanelFg));
+        for i in 0..room {
+            let line = match menu.get(i) {
+                Some((name, about)) => {
+                    let mut spans = vec![
+                        Span::styled("  /".to_string(), style),
+                        Span::styled(
+                            name.clone(),
+                            crate::theme::fg(crate::theme::Role::Accent).under(style),
+                        ),
+                    ];
+                    if !about.is_empty() {
+                        spans.push(Span::styled(
+                            format!("  {about}"),
+                            crate::theme::fg(crate::theme::Role::Muted).under(style),
+                        ));
+                    }
+                    Line::from_spans(spans)
+                }
+                // Never reached in practice: the rect is sized to the list, and
+                // this is what keeps a short list from showing the screen
+                // through its own panel.
+                None => Line::empty(),
+            };
+            out.push(pad(line, w, style));
+        }
+        // The margin: one blank row of the panel's colour, so the list reads as
+        // a surface lifted off the prompt rather than as text floating on it.
+        out.push(Line::styled(" ".repeat(w), style).truncate(w));
+        out
     }
 
     /// Render the stream's tail into `rect`.
@@ -979,6 +1086,17 @@ impl Host {
             }
         }
 
+        // The slash menu rises over the layout, out of the prompt. Drawn here,
+        // after every region has its rect, so it composes as an overlay rather
+        // than as a region: nothing above the field is resized to make room,
+        // and the rows it covers are covered rather than taken away.
+        let menu = self.menu.read().expect("menu poisoned").clone();
+        if !menu.is_empty() {
+            if let Some(rect) = self.menu_rect(&frame, Rect::sized(w, h), self.menu_rows(&menu)) {
+                frame.place("menu", rect, self.menu_lines(rect, &menu));
+            }
+        }
+
         // Held back, so the conversation has moved on below the fold. Say how
         // far, and make saying so the way back — a person who has scrolled up
         // should not have to know that ctrl-e or End exists.
@@ -1206,21 +1324,26 @@ fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16
         .unwrap_or(1)
 }
 
-/// The composer: the live line and the reserved tip row above the field.
+/// The composer: the task list, the live line, and the reserved tip row above
+/// the field.
 ///
 /// One definition, because every arrangement that has an input has this above
 /// it — the input box is where a person's eyes are, and the one thing that
 /// answers "is it stuck?" belongs against it rather than in a panel beside the
-/// conversation.
+/// conversation. The task list is here for the same reason: it is what the
+/// current turn is working through, and it reads as part of the working rather
+/// than as a panel about it.
 ///
-/// Written into the tree rather than claimed by the live line's own row the way
-/// the mascot claims its strip: `LayoutOp::Show` has two sides, above the
-/// conversation and below the status bar, and both are the wrong side of the
-/// input box.
+/// Written into the tree rather than claimed by each row's own `LayoutOp::Show`
+/// the way the mascot claims its strip: `Show` has two sides, above the
+/// conversation and below the status line, and both are the wrong side of the
+/// input box. That is why the todo list — which used to place itself at the
+/// bottom, under the field — is a member here instead.
 ///
-/// The live line is `Hug`-ish: it asks for no rows between turns, so the
-/// composer closes up around the field instead of standing on a blank row. The
-/// tip row beneath it is the deliberate exception — it asks for its row always,
+/// All three are `Hug`-ish: the live line and the task list ask for no rows
+/// between turns and no panel until the model has planned something, so the
+/// composer closes up around the field instead of standing on blank rows. The
+/// tip row beneath is the deliberate exception — it asks for its row always,
 /// which is why a tip can never move the box out from under a hand reaching for
 /// it. See `modules::tip`.
 ///
@@ -1235,6 +1358,7 @@ pub fn composer() -> Region {
     Region::flex(
         Dir::Vertical,
         vec![
+            Item::hug(Region::view(crate::modules::todo::ID)),
             Item::hug(Region::view(crate::modules::live::ID)),
             Item::hug(Region::view(crate::modules::tip::ID)),
             Item::grow(Region::view(crate::modules::input::ID)),
@@ -2835,6 +2959,86 @@ mod tests {
             h.compose((80, 40)).rows().join("\n"),
             screen,
             "the cycle does not come back round"
+        );
+    }
+
+    #[test]
+    fn the_slash_menu_floats_over_the_layout_and_moves_nothing() {
+        // 「上拉，盖在上面，不改变其它组件的大小」. The menu is drawn as a part
+        // after the layout has been resolved, so opening it must not move a
+        // single rect: the conversation keeps its rows, the field keeps its
+        // height, the status bar stays put. It covers what is above the field
+        // instead of taking room from it.
+        let h = fed();
+        let size = (80, 24);
+        let before = h.compose(size);
+        let stream = before.part("stream").expect("the conversation").rect;
+        let field = before.part("input").expect("the field").rect;
+        let status = before.part("status").expect("the status line").rect;
+
+        h.set_menu(vec![
+            ("help".into(), "看命令".into()),
+            ("compact".into(), "压缩上下文".into()),
+        ]);
+        let after = h.compose(size);
+
+        let menu = after.part("menu").expect("the menu is on screen");
+        assert_eq!(
+            after.part("stream").unwrap().rect,
+            stream,
+            "the conversation was resized to make room for the menu"
+        );
+        assert_eq!(
+            after.part("input").unwrap().rect,
+            field,
+            "the field was resized to make room for the menu"
+        );
+        assert_eq!(after.part("status").unwrap().rect, status);
+        assert_eq!(
+            menu.rect.w, field.w,
+            "the menu lines up with the field it rose out of"
+        );
+        assert_eq!(
+            menu.rect.bottom(),
+            field.y,
+            "the menu sits directly against the field's top rule, its margin row included"
+        );
+        assert!(
+            menu.rect.y < field.y,
+            "the menu rose into the space above the field"
+        );
+        let drawn = &menu.lines;
+        assert!(
+            drawn.iter().any(|l| l.plain().contains("/help")),
+            "the menu's own contents are drawn: {drawn:?}"
+        );
+        // The point of it being a panel rather than a list of words: every row
+        // is filled to the rect with the panel's background, so what it covers
+        // is covered. A row of text spans that stopped at the last word would
+        // let the conversation show through on the right.
+        let want = Some(crate::frame::Color::role(crate::theme::Role::PanelBg));
+        for (i, line) in drawn.iter().enumerate() {
+            assert_eq!(
+                line.width(),
+                menu.rect.w as usize,
+                "menu row {i} does not fill the panel: {line:?}"
+            );
+            let bg = menu
+                .lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.style.bg).collect::<Vec<_>>())
+                .nth(i)
+                .unwrap();
+            assert!(
+                line.spans.iter().all(|s| s.style.bg == want),
+                "menu row {i} has cells with no background ({bg:?}): {line:?}"
+            );
+        }
+
+        h.set_menu(Vec::new());
+        assert!(
+            h.compose(size).part("menu").is_none(),
+            "closing the menu takes its part away"
         );
     }
 
