@@ -89,11 +89,26 @@ impl KeyPress {
 pub enum Click {
     /// The primary button went down at this cell.
     Press,
+    /// The secondary button went down here.
+    ///
+    /// Not a second [`Click::Press`]: a press is the start of a caret or a
+    /// selection, and a menu would then move the caret every time one was
+    /// opened. Two intentions that arrive as the same event shape, told apart
+    /// at the only layer that can still tell — the one reading the terminal.
+    RightPress,
     /// The pointer moved with the button held. What a drag is made of.
     Drag,
     /// …and came up here. A release at the cell it was pressed on is a click;
     /// anywhere else it is the end of a selection.
     Release,
+    /// The pointer moved here with nothing held. Not a press and not a drag.
+    ///
+    /// Reported rather than dropped because the composer's menu is the one
+    /// thing in this UI that follows a pointer: it uses this to know which of
+    /// its rows the pointer is over. Nothing else reads it, and a move that
+    /// changes no row is expected to cost no repaint — which is the only reason
+    /// a stream of these is affordable at all.
+    Hover,
     WheelUp,
     WheelDown,
 }
@@ -155,6 +170,23 @@ pub trait Surface: Send + Sync {
         false
     }
 
+    /// Ask for the pointer's *free* motion — the pointer crossing cells with
+    /// nothing held — or stop asking for it.
+    ///
+    /// Separate from [`Surface::set_mouse`] because it is a different trade in
+    /// the same currency: the mouse itself is worth taking because a click that
+    /// folds a tool call is worth more than a selection gesture, and free
+    /// motion is worth taking only for as long as something on screen follows
+    /// the pointer. The composer's context menu does — it lights the row the
+    /// pointer is over — so it turns this on while it is open and off again
+    /// when it closes. Asking for what is already the case does nothing.
+    fn set_motion(&self, _on: bool) {}
+
+    /// Whether free motion is currently requested.
+    fn motion(&self) -> bool {
+        false
+    }
+
     /// Forget what is believed to be on screen, so the next frame is painted
     /// in full.
     ///
@@ -171,6 +203,21 @@ pub trait Surface: Send + Sync {
     /// terminal, and the terminal is what has a clipboard — see
     /// [`crate::ansi::set_clipboard`] for why not `pbcopy`.
     fn copy(&self, _text: &str) {}
+
+    /// Take what the clipboard holds as text.
+    ///
+    /// The reading half of [`Surface::copy`], behind the same seam for the same
+    /// reason: a clipboard is the terminal's, so the one layer allowed to touch
+    /// the terminal is where `arboard` lives. Above this line pasted text is a
+    /// value, which is what lets the paste path be driven end to end with no
+    /// clipboard and no human.
+    ///
+    /// `None` is the ordinary answer — the clipboard holds an image, or holds
+    /// nothing — and not a failure. That is why a composer can say "there is no
+    /// text in the clipboard" without calling anything an error.
+    fn clipboard_text(&self) -> Option<String> {
+        None
+    }
 
     /// Take an image off the system clipboard, as the value the model sees.
     ///
@@ -213,9 +260,18 @@ pub struct Headless {
     /// means never, on the path where "no image in the clipboard" is the
     /// ordinary case.
     clipboard: Mutex<Option<atomcode_kernel::message::ImageContent>>,
+    /// What a scripted clipboard holds as text. Separate from the image above
+    /// because they are separate clipboard flavours, and a test that says "the
+    /// clipboard holds text" must not also be saying "it holds a picture".
+    clipboard_text: Mutex<Option<String>>,
     /// A weak handle back to the `Arc` this lives in, so a consumer holding
     /// `Arc<dyn Surface>` can get the recorder back without downcasting.
     me: Mutex<Option<std::sync::Weak<Headless>>>,
+    /// Whether free motion is being asked for, as a real terminal would have
+    /// been told. Kept so a test can assert the request went out at all: the
+    /// events a menu consumes are scripted here, and a scripted event says
+    /// nothing about whether a terminal would ever have sent one.
+    motion: std::sync::atomic::AtomicBool,
 }
 
 impl Headless {
@@ -227,7 +283,9 @@ impl Headless {
             keys,
             incoming: Mutex::new(Some(incoming)),
             clipboard: Mutex::new(None),
+            clipboard_text: Mutex::new(None),
             me: Mutex::new(None),
+            motion: std::sync::atomic::AtomicBool::new(false),
         });
         *me.me.lock().expect("headless poisoned") = Some(Arc::downgrade(&me));
         me
@@ -241,6 +299,29 @@ impl Headless {
     /// Empty it again, so the "nothing to paste" path is reachable too.
     pub fn clear_clipboard(&self) {
         *self.clipboard.lock().expect("headless poisoned") = None;
+    }
+
+    /// Put text on the scripted clipboard, as a test would after copying from
+    /// another window. What a real clipboard is for, scripted.
+    pub fn set_clipboard_text(&self, text: impl Into<String>) {
+        *self.clipboard_text.lock().expect("headless poisoned") = Some(text.into());
+    }
+
+    /// What a copy under test put on the clipboard. Text, so a test can assert
+    /// the words rather than that "something" was written.
+    pub fn clipboard_text(&self) -> Option<String> {
+        self.clipboard_text
+            .lock()
+            .expect("headless poisoned")
+            .clone()
+    }
+
+    /// Feed a pointer event, the way the terminal would.
+    ///
+    /// A scripted mouse, for the same reason as the scripted clipboard: the
+    /// right-button path is otherwise only ever exercised by a hand.
+    pub fn pointer(&self, click: Click, x: u16, y: u16) {
+        let _ = self.keys.send(Input::Mouse(click, x, y));
     }
 
     /// Press a key.
@@ -347,8 +428,33 @@ impl Surface for Headless {
     fn take_input(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<Input>> {
         self.incoming.lock().expect("headless poisoned").take()
     }
+    /// The scripted clipboard is one text buffer: a copy writes it and a paste
+    /// reads it, so the round trip a person performs works with no clipboard,
+    /// and a test can watch either end.
+    fn copy(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        *self.clipboard_text.lock().expect("headless poisoned") = Some(text.to_string());
+    }
+    fn clipboard_text(&self) -> Option<String> {
+        self.clipboard_text
+            .lock()
+            .expect("headless poisoned")
+            .clone()
+    }
     fn clipboard_image(&self) -> Option<atomcode_kernel::message::ImageContent> {
         self.clipboard.lock().expect("headless poisoned").clone()
+    }
+    /// Recorded rather than written anywhere, which is the point: a scripted
+    /// pointer already delivers the events a menu reads, so without recording
+    /// the request a test could not tell "the menu asked for motion" from "the
+    /// menu was handed motion by a test that assumed a terminal would".
+    fn set_motion(&self, on: bool) {
+        self.motion.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn motion(&self) -> bool {
+        self.motion.load(std::sync::atomic::Ordering::SeqCst)
     }
     fn as_any_headless(&self) -> Option<Arc<Headless>> {
         self.me
@@ -369,6 +475,10 @@ impl Surface for Headless {
 pub struct Terminal {
     raw: bool,
     mouse: std::sync::atomic::AtomicBool,
+    /// Whether free motion (1003) is currently asked for. Separate from
+    /// `mouse` because it is asked for by the thing that follows the pointer,
+    /// for as long as that thing is on screen.
+    motion: std::sync::atomic::AtomicBool,
     caps: crate::caps::Caps,
     painted: LastPainted,
     /// Where stderr was sent while we hold the screen, and the descriptor it
@@ -435,6 +545,7 @@ impl Terminal {
         Ok(Self {
             raw: true,
             mouse: std::sync::atomic::AtomicBool::new(mouse),
+            motion: std::sync::atomic::AtomicBool::new(false),
             caps,
             painted: LastPainted::default(),
             stderr,
@@ -620,6 +731,20 @@ fn encode_rgba_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> 
         writer.write_image_data(rgba).ok()?;
     }
     Some(out)
+}
+
+/// Read text off the system clipboard.
+///
+/// The counterpart of [`read_clipboard_image`], and the same seam: the one
+/// layer that may touch the terminal is the one that owns `arboard`. Empty text
+/// is reported as `None`, because "the clipboard holds an empty string" and
+/// "the clipboard holds no text" are the same thing to everyone above this
+/// line, and collapsing them here means no caller has to decide what to say
+/// about a paste of nothing.
+fn read_clipboard_text() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let text = clipboard.get_text().ok()?;
+    (!text.is_empty()).then_some(text)
 }
 
 /// Hand the text to whatever this machine uses for a clipboard.
@@ -1042,9 +1167,41 @@ impl Surface for Terminal {
         let mut out = std::io::stdout();
         let _ = out.write_all(if on { ansi::MOUSE_ON } else { ansi::MOUSE_OFF }.as_bytes());
         let _ = out.flush();
+        // `MOUSE_OFF` turns free motion off as well — a pointer handed back
+        // mid-hover must not leave the terminal reporting every cell it
+        // crosses. The record has to say the same thing the terminal was told.
+        if !on {
+            self.motion.store(false, Ordering::SeqCst);
+        }
     }
     fn mouse(&self) -> bool {
         self.mouse.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// Turn free motion on or off.
+    ///
+    /// Only when the mouse is ours: reporting motion with the pointer handed
+    /// back would be asking for events nothing here owns, and asking for them
+    /// while a person is selecting text with the terminal's own gesture is
+    /// exactly the packet-per-cell cost the switch exists to avoid.
+    fn set_motion(&self, on: bool) {
+        use std::sync::atomic::Ordering;
+        let on = on && self.mouse.load(Ordering::SeqCst);
+        if self.motion.swap(on, Ordering::SeqCst) == on {
+            return;
+        }
+        let mut out = std::io::stdout();
+        let _ = out.write_all(
+            if on {
+                ansi::MOUSE_MOTION_ON
+            } else {
+                ansi::MOUSE_MOTION_OFF
+            }
+            .as_bytes(),
+        );
+        let _ = out.flush();
+    }
+    fn motion(&self) -> bool {
+        self.motion.load(std::sync::atomic::Ordering::SeqCst)
     }
     fn forget(&self) {
         self.painted.forget();
@@ -1067,6 +1224,9 @@ impl Surface for Terminal {
     }
     fn clipboard_image(&self) -> Option<atomcode_kernel::message::ImageContent> {
         read_clipboard_image()
+    }
+    fn clipboard_text(&self) -> Option<String> {
+        read_clipboard_text()
     }
     fn restore(&self) {
         self.painted.forget();
@@ -1099,14 +1259,22 @@ pub fn from_crossterm(event: crossterm::event::Event) -> Option<Input> {
     match event {
         Event::Resize(w, h) => Some(Input::Resize(w, h)),
         Event::Paste(text) => Some(Input::Paste(text)),
-        // Press, not release: a fold should happen under the finger. Drags and
-        // moves are dropped — this UI has nothing that follows a pointer, and
-        // reporting them would be a stream of events nothing reads.
+        // Press, not release: a fold should happen under the finger. A move is
+        // reported rather than dropped — the menu is the one thing here that
+        // follows a pointer and it needs to know which row it is over. The
+        // terminal sends these whether or not anyone reads them (crossterm
+        // captures with any-motion tracking on), so the reader is the whole
+        // cost.
         Event::Mouse(m) => {
             let click = match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => Click::Press,
+                // The secondary button opens a menu; it is never a caret and
+                // never a selection, which is why it is a distinct `Click`
+                // rather than a second `Press`.
+                MouseEventKind::Down(MouseButton::Right) => Click::RightPress,
                 MouseEventKind::Drag(MouseButton::Left) => Click::Drag,
                 MouseEventKind::Up(MouseButton::Left) => Click::Release,
+                MouseEventKind::Moved => Click::Hover,
                 MouseEventKind::ScrollUp => Click::WheelUp,
                 MouseEventKind::ScrollDown => Click::WheelDown,
                 _ => return None,
@@ -1323,6 +1491,31 @@ mod tests {
         assert!(
             from_crossterm(Event::Key(release)).is_none(),
             "a release must not read as a second press"
+        );
+    }
+
+    #[test]
+    fn a_move_arrives_as_a_hover_and_not_as_any_kind_of_press() {
+        // The menu follows the pointer off this, and the rest of the UI must not
+        // read it as anything that asks for something. A `Moved` translated to
+        // `Press` would move the caret on every cell the pointer crossed.
+        use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+        let moved = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 7,
+            row: 9,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert_eq!(
+            from_crossterm(Event::Mouse(moved)),
+            Some(Input::Mouse(Click::Hover, 7, 9))
+        );
+        let mut dragged = moved;
+        dragged.kind = MouseEventKind::Drag(MouseButton::Left);
+        assert_eq!(
+            from_crossterm(Event::Mouse(dragged)),
+            Some(Input::Mouse(Click::Drag, 7, 9)),
+            "a move with the button held is still a drag, not a hover"
         );
     }
 

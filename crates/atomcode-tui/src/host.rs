@@ -605,6 +605,22 @@ impl Hits {
     }
 }
 
+/// What a pointer press did to the open context menu.
+///
+/// Three outcomes rather than a bool, because "nothing was open" and "what was
+/// open was not clicked" lead to different things: the first falls through to
+/// the ordinary click handling, the second dismisses and *also* falls through.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextClick {
+    /// No menu was open.
+    NotOpen,
+    /// A menu was open and the press was not on it. The caller has already had
+    /// it closed for them.
+    Outside,
+    /// The press chose an item, or dismissed the menu with nothing.
+    Picked(crate::menu::Step),
+}
+
 /// A line widened to the rect with the panel's own style.
 ///
 /// A floating part covers what it is drawn over only where it puts a cell down,
@@ -635,6 +651,12 @@ pub struct Host {
     /// own rect is a module that resizes the conversation when a slash is
     /// typed. Empty means nothing to suggest.
     menu: RwLock<Vec<(String, String)>>,
+    /// The composer's context menu, when the secondary button opened one.
+    ///
+    /// Beside the slash menu and for the same reason: it is drawn *over* the
+    /// layout rather than inside the field, so nothing is resized to make room
+    /// for it. `None` means nothing is open.
+    context_menu: RwLock<Option<crate::menu::Menu>>,
     /// At most one modal. Focus is arbitration, not composition.
     pub overlays: Arc<crate::overlay::Overlays>,
     /// Questions waiting for the person. Rendered as a live block at the foot
@@ -664,6 +686,7 @@ impl Host {
             // `[[remove]] id = "tui-commands-tree"` a lie.
             commands: Arc::new(crate::command::Commands::new()),
             menu: RwLock::new(Vec::new()),
+            context_menu: RwLock::new(None),
             overlays: Arc::new(crate::overlay::Overlays::new()),
             asks: crate::ask::Asks::new(),
             modules: modules.clone(),
@@ -755,6 +778,89 @@ impl Host {
     /// Where it is drawn is this struct's business, not the caller's.
     pub fn set_menu(&self, menu: Vec<(String, String)>) {
         *self.menu.write().expect("menu poisoned") = menu;
+    }
+
+    /// Open the composer's context menu at a cell. Empty items opens nothing.
+    ///
+    /// The host keeps the open menu because the host is what draws it — a
+    /// module cannot draw outside its own rect, and this panel is deliberately
+    /// drawn outside the field's. What is *in* it, and what picking an item
+    /// means, stays with the caller.
+    pub fn open_context_menu(&self, at: (u16, u16), items: Vec<crate::menu::Item>) {
+        *self.context_menu.write().expect("menu poisoned") = crate::menu::Menu::new(at, items);
+    }
+
+    /// Close it, if it is open. Returns whether there was one, so a caller can
+    /// tell "closed it" from "there was nothing to close".
+    pub fn close_context_menu(&self) -> bool {
+        self.context_menu
+            .write()
+            .expect("menu poisoned")
+            .take()
+            .is_some()
+    }
+
+    pub fn context_menu_open(&self) -> bool {
+        self.context_menu.read().expect("menu poisoned").is_some()
+    }
+
+    /// Run a key against the open menu, returning the step it produced. `None`
+    /// when nothing is open, so the caller falls through to the ordinary keys —
+    /// focus is arbitration, and this is where the menu is given it or not.
+    pub fn context_menu_key(&self, press: crate::surface::KeyPress) -> Option<crate::menu::Step> {
+        let mut held = self.context_menu.write().expect("menu poisoned");
+        let menu = held.as_mut()?;
+        let step = menu.key(press);
+        if !matches!(step, crate::menu::Step::Stay) {
+            *held = None;
+        }
+        Some(step)
+    }
+
+    /// A pointer move over the open menu: point at the row it is over. `true`
+    /// when that changed which row is pointed at, and so a frame is owed.
+    ///
+    /// A move that changes no row answers `false` for the reason the whole
+    /// gesture is affordable: the terminal reports one of these per cell the
+    /// pointer crosses, and painting a frame for each would trade a cheap
+    /// highlight for a busy one.
+    ///
+    /// Nothing is open is not an error and not news: the pointer moves over the
+    /// screen all the time.
+    pub fn context_menu_hover(&self, x: u16, y: u16, size: (u16, u16)) -> bool {
+        let mut held = self.context_menu.write().expect("menu poisoned");
+        let Some(menu) = held.as_mut() else {
+            return false;
+        };
+        menu.hover(x, y, size.0, size.1)
+    }
+
+    /// A pointer press against the open menu. `NotOpen` when nothing is open;
+    /// `Outside` when it was open but the press was elsewhere, which the caller
+    /// treats as "dismiss, and let the press mean whatever it meant".
+    ///
+    /// The screen size is a parameter rather than a field because the surface is
+    /// the authority on it and this struct has no business keeping a second
+    /// copy that could disagree by a frame.
+    pub fn context_menu_click(&self, x: u16, y: u16, size: (u16, u16)) -> ContextClick {
+        let mut held = self.context_menu.write().expect("menu poisoned");
+        let Some(menu) = held.as_mut() else {
+            return ContextClick::NotOpen;
+        };
+        match menu.click(x, y, size.0, size.1) {
+            Some(step) => {
+                *held = None;
+                ContextClick::Picked(step)
+            }
+            // A press anywhere else puts it away. The menu is a thing that was
+            // raised over the screen, and the first press that is not for it is
+            // someone done with it — leaving it up would mean a click on the
+            // conversation both did its own thing and left a panel behind.
+            None => {
+                *held = None;
+                ContextClick::Outside
+            }
+        }
     }
 
     /// How tall the slash menu would like to be, and at most what it may be.
@@ -1153,6 +1259,20 @@ impl Host {
         // rectangle on the screen, and the screen is what was pointed at.
         if let Some(sel) = moment.selection {
             frame.highlight(&sel);
+        }
+
+        // Last of all, and after the selection on purpose: the context menu is
+        // a panel that was raised over the screen, so it wins every cell it
+        // covers. Drawn before the highlight it would be recoloured by a
+        // selection that runs under it — the menu's own rows came out striped
+        // where a selection crossed them, which is what a menu covering what it
+        // covers is not supposed to look like.
+        if let Some(menu) = self.context_menu.read().expect("menu poisoned").clone() {
+            let rect = menu.rect(w, h);
+            if !rect.is_empty() {
+                let vp = crate::moment::Viewport::new(rect, &moment);
+                frame.place("context-menu", rect, menu.render(&vp));
+            }
         }
 
         debug_assert!(
@@ -3040,6 +3160,146 @@ mod tests {
             h.compose(size).part("menu").is_none(),
             "closing the menu takes its part away"
         );
+    }
+
+    #[test]
+    fn the_context_menu_floats_over_the_layout_and_moves_nothing() {
+        // The same rule the slash menu follows, and for the same reason: a
+        // panel that resizes the conversation as it appears is worse than none.
+        // It also has to sit *under the pointer*, which is the difference
+        // between this one and the slash menu.
+        let h = fed();
+        let size = (80, 24);
+        let before = h.compose(size);
+        let stream = before.part("stream").expect("the conversation").rect;
+        let field = before.part("input").expect("the field").rect;
+
+        h.open_context_menu(
+            (6, field.y + 1),
+            vec![
+                crate::menu::Item::new("copy", "复制全文"),
+                crate::menu::Item::new("paste", "粘贴"),
+            ],
+        );
+        let after = h.compose(size);
+
+        assert_eq!(
+            after.part("stream").unwrap().rect,
+            stream,
+            "the conversation was resized to make room for the menu"
+        );
+        assert_eq!(
+            after.part("input").unwrap().rect,
+            field,
+            "the field was resized to make room for the menu"
+        );
+        let menu = after.part("context-menu").expect("the menu is on screen");
+        assert_eq!(menu.rect.x, 6, "it opens at the cell it was asked for");
+        assert_eq!(
+            menu.rect.y,
+            field.y + 1,
+            "its first item sits under the pointer"
+        );
+        let drawn: Vec<String> = menu.lines.iter().map(|l| l.plain()).collect();
+        assert!(
+            drawn.iter().any(|l| l.contains("复制全文")),
+            "the menu's own items are drawn: {drawn:?}"
+        );
+
+        assert!(h.close_context_menu(), "closing says there was one");
+        assert!(
+            h.compose(size).part("context-menu").is_none(),
+            "closing the menu takes its part away"
+        );
+        assert!(
+            !h.close_context_menu(),
+            "closing again says there was nothing to close"
+        );
+    }
+
+    #[test]
+    fn the_context_menu_takes_its_own_keys_and_gives_them_back_when_it_closes() {
+        use crate::surface::KeyPress;
+        let h = fed();
+        assert!(
+            h.context_menu_key(KeyPress::plain(crate::surface::Key::Down))
+                .is_none(),
+            "with nothing open the menu claims no keys"
+        );
+
+        h.open_context_menu(
+            (0, 0),
+            vec![
+                crate::menu::Item::new("copy", "复制全文"),
+                crate::menu::Item::new("send", "发送"),
+            ],
+        );
+        let step = h
+            .context_menu_key(KeyPress::plain(crate::surface::Key::Down))
+            .expect("an open menu claims the key");
+        assert_eq!(step, crate::menu::Step::Stay, "moving keeps it open");
+        assert!(h.context_menu_open());
+
+        let step = h
+            .context_menu_key(KeyPress::plain(crate::surface::Key::Enter))
+            .expect("still open");
+        assert_eq!(step, crate::menu::Step::Picked("send".into()));
+        assert!(
+            !h.context_menu_open(),
+            "picking an item closes the menu — it does not stay up over the answer"
+        );
+
+        // And the keyboard is the screen's again, not the closed menu's.
+        h.open_context_menu((0, 0), vec![crate::menu::Item::new("copy", "复制全文")]);
+        assert_eq!(
+            h.context_menu_key(KeyPress::plain(crate::surface::Key::Esc)),
+            Some(crate::menu::Step::Dismissed)
+        );
+        assert!(!h.context_menu_open());
+    }
+
+    #[test]
+    fn a_press_outside_the_context_menu_closes_it_without_choosing() {
+        use crate::host::ContextClick;
+        let h = fed();
+        let field = h.compose((80, 24)).part("input").unwrap().rect;
+        h.open_context_menu(
+            (6, field.y),
+            vec![crate::menu::Item::new("copy", "复制全文")],
+        );
+
+        // Far from the menu: the caller is told it was not a choice, and the
+        // menu has been put away so the press can mean whatever it meant.
+        assert_eq!(
+            h.context_menu_click(0, 0, (80, 24)),
+            ContextClick::Outside,
+            "a press elsewhere is not a choice off the menu"
+        );
+        assert!(!h.context_menu_open());
+
+        // With nothing open, the menu has no opinion about the pointer at all.
+        assert_eq!(h.context_menu_click(0, 0, (80, 24)), ContextClick::NotOpen);
+    }
+
+    #[test]
+    fn a_press_on_a_row_picks_that_row() {
+        use crate::host::ContextClick;
+        let h = fed();
+        let field = h.compose((80, 24)).part("input").unwrap().rect;
+        h.open_context_menu(
+            (6, field.y),
+            vec![
+                crate::menu::Item::new("copy", "复制全文"),
+                crate::menu::Item::new("send", "发送"),
+            ],
+        );
+        let rect = h.compose((80, 24)).part("context-menu").expect("open").rect;
+        assert_eq!(
+            h.context_menu_click(rect.x, rect.y + 1, (80, 24)),
+            ContextClick::Picked(crate::menu::Step::Picked("send".into())),
+            "the row under the pointer is the row that is chosen"
+        );
+        assert!(!h.context_menu_open());
     }
 
     #[test]

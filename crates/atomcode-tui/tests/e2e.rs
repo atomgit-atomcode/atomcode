@@ -13,7 +13,7 @@ use std::time::Duration;
 use atomcode_harness::seams::{UiSvc, UserInterface};
 use atomcode_plexus::{App, ConfigTree, Layer, PluginRegistry};
 use atomcode_tui::plugin::{HeadlessSurfacePlugin, SurfaceSvc, TuiUiPlugin};
-use atomcode_tui::surface::{Headless, Key, KeyPress};
+use atomcode_tui::surface::{Headless, Key, KeyPress, Surface};
 
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
@@ -822,6 +822,546 @@ async fn typing_a_slash_shows_what_is_available_and_narrows_as_you_type() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+// ---- right-click on the composer ----------------------------------------
+
+/// The surface is the only thing that can put a pointer event in, so a test
+/// reaches the menu the way a hand does: through the recorder.
+fn right_click(s: &Session, x: u16, y: u16) {
+    s.term
+        .pointer(atomcode_tui::surface::Click::RightPress, x, y);
+}
+
+#[tokio::test]
+async fn right_click_on_the_composer_opens_a_menu_that_does_what_it_says() {
+    // The path a person takes: type something, right-click, pick "复制全文",
+    // and find the words on the clipboard. Nothing here is a unit test of the
+    // menu — it went in as a right button and came out as a clipboard write.
+    let dir = scratch("right-click");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_text("hello composer");
+    s.quiet().await;
+    assert!(
+        !s.screen().contains("复制全文"),
+        "no menu until it is asked for:\n{}",
+        s.screen()
+    );
+
+    // On the composer's own row, which is where the field is.
+    let field = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("input")
+        .expect("the composer")
+        .rect;
+    right_click(&s, field.x + 4, field.y);
+    s.quiet().await;
+
+    let screen = s.screen();
+    assert!(screen.contains("复制全文"), "the menu opened:\n{screen}");
+    assert!(screen.contains("粘贴") && screen.contains("清空") && screen.contains("发送"));
+    assert!(
+        s.term.last().unwrap().part("context-menu").is_some(),
+        "it is on screen as a panel of its own"
+    );
+
+    // The first item, chosen with the keyboard the way a menu is used.
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+    assert_eq!(
+        s.term.clipboard_text().as_deref(),
+        Some("hello composer"),
+        "复制全文 put the composer on the clipboard"
+    );
+    assert!(
+        !s.screen().contains("复制全文"),
+        "picking closed the menu:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn the_menu_s_paste_reads_the_clipboard_into_what_is_being_typed() {
+    let dir = scratch("menu-paste");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_text("tail");
+    s.term.set_clipboard_text("head ");
+    // Home first, so the paste has somewhere to land other than the end: what
+    // is under test is "at the caret", and a paste that only ever appends is
+    // the case that would pass by accident.
+    s.term.press(KeyPress::plain(Key::Home));
+    s.quiet().await;
+    right_click(&s, 4, 8);
+    s.quiet().await;
+
+    // Down to 粘贴, and pick it.
+    s.term.press(KeyPress::plain(Key::Down));
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+    assert!(
+        s.screen().contains("head tail"),
+        "the clipboard went in at the caret:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn a_pointer_chooses_the_row_the_words_were_drawn_on() {
+    // The menu is opened by the secondary button, so the primary button has to
+    // be able to use it: a menu you can only drive from the keyboard is a menu
+    // half the people who reach for the mouse cannot use. And it has to choose
+    // the row that was *clicked* — not the row the pointer's own geometry would
+    // have been under had the menu not slid up to fit the screen.
+    let dir = scratch("menu-click");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_text("tail");
+    s.term.set_clipboard_text("head ");
+    s.term.press(KeyPress::plain(Key::Home));
+    s.quiet().await;
+    right_click(&s, 4, 8);
+    s.quiet().await;
+
+    let menu = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("context-menu")
+        .expect("the menu opened")
+        .rect;
+    // The row "粘贴" was drawn on, read off the part rather than re-derived.
+    let paste = menu.y + 1;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, menu.x + 2, paste);
+    s.quiet().await;
+
+    let screen = s.screen();
+    assert!(
+        screen.contains("head tail"),
+        "the click on that row ran that row:\n{screen}"
+    );
+    assert!(
+        !screen.contains("复制全文"),
+        "and choosing closed the menu:\n{screen}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn the_menu_s_send_hands_the_line_to_the_model() {
+    // "发送" is not a second way to send: it is the same action the Enter key
+    // resolves to, which is the whole reason the menu speaks `Action`.
+    let dir = scratch("menu-send");
+    let s = start(tree(&dir, &replay(r#"{ text = "heard you" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_text("say it through the menu");
+    s.quiet().await;
+    right_click(&s, 4, 8);
+    s.quiet().await;
+    for _ in 0..3 {
+        s.term.press(KeyPress::plain(Key::Down));
+    }
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+
+    let screen = s.screen();
+    assert!(
+        screen.contains("heard you"),
+        "the model was asked:\n{screen}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn a_click_away_puts_the_menu_away_and_still_does_its_own_job() {
+    let dir = scratch("menu-dismiss");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_text("keep me");
+    s.quiet().await;
+    right_click(&s, 4, 8);
+    s.quiet().await;
+    assert!(s.screen().contains("复制全文"), "{}", s.screen());
+
+    // Somewhere else entirely — the far corner of the conversation.
+    s.term.pointer(atomcode_tui::surface::Click::Press, 1, 1);
+    s.term.pointer(atomcode_tui::surface::Click::Release, 1, 1);
+    s.quiet().await;
+
+    let screen = s.screen();
+    assert!(
+        !screen.contains("复制全文"),
+        "the press put it away:\n{screen}"
+    );
+    assert!(
+        screen.contains("keep me"),
+        "and the draft is untouched — dismissing is not clearing:\n{screen}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn esc_puts_the_menu_away_without_picking_anything() {
+    let dir = scratch("menu-esc");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_text("untouched");
+    s.quiet().await;
+    right_click(&s, 4, 8);
+    s.quiet().await;
+    assert!(s.screen().contains("复制全文"));
+
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
+    let screen = s.screen();
+    assert!(!screen.contains("复制全文"), "{screen}");
+    assert!(
+        screen.contains("untouched"),
+        "esc closed the menu, not the draft:\n{screen}"
+    );
+    assert_eq!(
+        s.term.clipboard_text(),
+        None,
+        "nothing was copied on the way out"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn moving_the_pointer_over_a_row_makes_it_the_highlighted_one() {
+    // The pointer says which row it means before it clicks. Read off the drawn
+    // part — the row whose background is the brighter panel — because "the menu
+    // tracks the pointer" and "the menu paints the pointer's row" are two
+    // different claims and only the second one is the feature.
+    //
+    // The screen row matters, not the index within the part: read off the index
+    // and any hover that repaints the same shape passes, including one that
+    // slid the whole panel a row down the screen under the pointer.
+    let dir = scratch("menu-hover");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_text("tail");
+    s.term.set_clipboard_text("head ");
+    s.term.press(KeyPress::plain(Key::Home));
+    s.quiet().await;
+    right_click(&s, 4, 8);
+    s.quiet().await;
+
+    let menu = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("context-menu")
+        .expect("the menu opened")
+        .rect;
+    let bright = Some(atomcode_tui::Color::role(
+        atomcode_tui::theme::Role::PanelSelBg,
+    ));
+    let lit_row = |s: &Session| -> Option<u16> {
+        let part = s
+            .term
+            .last()
+            .expect("a frame")
+            .part("context-menu")?
+            .clone();
+        (0..part.lines.len())
+            .find(|i| part.lines[*i].spans[0].style.bg == bright)
+            .map(|i| part.rect.y + i as u16)
+    };
+
+    assert_eq!(
+        lit_row(&s),
+        Some(menu.y),
+        "the menu opens pointing at its first row"
+    );
+
+    // Onto "粘贴", one row down.
+    s.term
+        .pointer(atomcode_tui::surface::Click::Hover, menu.x + 2, menu.y + 1);
+    s.quiet().await;
+    assert_eq!(
+        lit_row(&s),
+        Some(menu.y + 1),
+        "the row the pointer is over is not the row drawn brighter:\n{}",
+        s.screen()
+    );
+
+    // And the row that is lit is the row a key would take: a highlight over one
+    // row while Enter takes another is the bug this is about.
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+    let screen = s.screen();
+    assert!(
+        screen.contains("head tail"),
+        "enter did not take the row the pointer was over:\n{screen}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn right_click_over_a_selection_copies_the_selection_and_not_the_field() {
+    // A right-click usually lands on text that was just selected, and the menu
+    // it opens is about *that*. The copy item sent the composer's contents
+    // instead, which over a selection is a different buffer entirely — and an
+    // empty one, which is why the answer used to be "没有可复制的内容".
+    let dir = scratch("menu-copy-selection");
+    let s = start(tree(&dir, &replay(r#"{ text = "the model spoke" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("ask a question");
+    s.quiet().await;
+
+    // A draft left in the field, so "it copied the field" has a way to show.
+    s.term.type_text("draft in the field");
+    s.quiet().await;
+
+    // Select a run of the answer by dragging across the row it is drawn on.
+    let row = s
+        .screen()
+        .lines()
+        .position(|l| l.contains("spoke"))
+        .expect("the answer is on screen") as u16;
+    let stream = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("stream")
+        .expect("the conversation")
+        .rect;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, stream.x, row);
+    s.term
+        .pointer(atomcode_tui::surface::Click::Drag, stream.right() - 1, row);
+    s.term.pointer(
+        atomcode_tui::surface::Click::Release,
+        stream.right() - 1,
+        row,
+    );
+    s.quiet().await;
+
+    let taken = s
+        .term
+        .clipboard_text()
+        .expect("the drag copied what it covered");
+    assert!(
+        taken.contains("spoke"),
+        "the drag selected the answer: {taken:?}"
+    );
+
+    // Now the menu, opened on the selection. Wipe the clipboard first, so a
+    // menu that copies nothing at all cannot pass by leaving the drag's text.
+    right_click(&s, stream.x + 2, row);
+    s.quiet().await;
+    let screen = s.screen();
+    assert!(
+        screen.contains("复制选中"),
+        "the menu says what it will copy:\n{screen}"
+    );
+    s.term.set_clipboard_text("<untouched>");
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+
+    assert_eq!(
+        s.term.clipboard_text().as_deref(),
+        Some(taken.as_str()),
+        "the menu copied the selection"
+    );
+    assert_ne!(
+        s.term.clipboard_text().as_deref(),
+        Some("draft in the field"),
+        "the menu copied the field over a selection"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn the_menu_over_a_selection_keeps_its_own_colours() {
+    // The menu is a panel raised over the screen, so what it covers it covers.
+    // It did not: the selection was highlighted after the menu was drawn, so a
+    // menu opened on selected text came out striped with the selection running
+    // through its rows.
+    let dir = scratch("menu-over-selection");
+    let s = start(tree(&dir, &replay(r#"{ text = "the model spoke" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("ask a question");
+    s.quiet().await;
+
+    let row = s
+        .screen()
+        .lines()
+        .position(|l| l.contains("spoke"))
+        .expect("the answer is on screen") as u16;
+    let stream = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("stream")
+        .expect("the conversation")
+        .rect;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, stream.x, row);
+    s.term
+        .pointer(atomcode_tui::surface::Click::Drag, stream.right() - 1, row);
+    s.term.pointer(
+        atomcode_tui::surface::Click::Release,
+        stream.right() - 1,
+        row,
+    );
+    s.quiet().await;
+
+    // Open the menu on the selected row, so the two have to share cells.
+    right_click(&s, stream.x + 2, row);
+    s.quiet().await;
+
+    let part = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("context-menu")
+        .expect("the menu opened")
+        .clone();
+    assert!(
+        part.rect.contains(stream.x + 2, row),
+        "the menu has to cover the row the selection is on, or this proves \
+         nothing: menu {:?}, selected row {row}",
+        part.rect
+    );
+    for (i, line) in part.lines.iter().enumerate() {
+        assert!(
+            line.spans.iter().all(|s| !s.style.reverse),
+            "menu row {i} was recoloured by the selection under it: {line:?}"
+        );
+    }
+
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn the_menu_asks_the_terminal_for_the_pointer_only_while_it_is_open() {
+    // The hover tests above feed `Click::Hover` straight into the recorder, so
+    // they pass whether or not a real terminal would ever have sent one. It
+    // would not: a plain hover is DECSET 1003, and the screen asks for it only
+    // for as long as something follows the pointer. This is the assertion that
+    // the request goes out — the regression being a menu that lights the row
+    // under the pointer on a machine where the pointer's row never arrives.
+    let dir = scratch("menu-motion");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.quiet().await;
+    assert!(
+        !s.term.motion(),
+        "the screen asks for free motion with nothing following the pointer"
+    );
+
+    right_click(&s, 4, 8);
+    s.quiet().await;
+    assert!(s.screen().contains("复制全文"), "the menu opened");
+    assert!(
+        s.term.motion(),
+        "the menu follows the pointer, so the terminal has to be reporting it"
+    );
+
+    // And it is handed back when the menu goes away — a terminal left in 1003
+    // sends an event for every cell the pointer crosses for the rest of the
+    // session, for nothing.
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
+    assert!(
+        !s.screen().contains("复制全文"),
+        "esc closed the menu:\n{}",
+        s.screen()
+    );
+    assert!(
+        !s.term.motion(),
+        "the menu closed but the terminal is still reporting every cell"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn moving_the_pointer_across_the_menu_chooses_nothing() {
+    // A move is not a press. If it were routed as one, sliding across the menu
+    // on the way to somewhere else would pick a row and close the panel —
+    // "清空" under a pointer that never clicked.
+    let dir = scratch("menu-hover-past");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+
+    s.term.type_text("keep me");
+    s.quiet().await;
+    right_click(&s, 4, 8);
+    s.quiet().await;
+
+    let menu = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("context-menu")
+        .expect("the menu opened")
+        .rect;
+    // Straight across every row, then off the right edge.
+    for dy in 0..menu.h {
+        s.term
+            .pointer(atomcode_tui::surface::Click::Hover, menu.x + 2, menu.y + dy);
+        s.quiet().await;
+    }
+    s.term.pointer(
+        atomcode_tui::surface::Click::Hover,
+        menu.right() + 5,
+        menu.y,
+    );
+    s.quiet().await;
+
+    let screen = s.screen();
+    assert!(
+        screen.contains("复制全文"),
+        "a move over the menu chose something and closed it:\n{screen}"
+    );
+    assert!(
+        screen.contains("keep me"),
+        "a move cleared the draft:\n{screen}"
+    );
+
+    // Esc first: the menu still holds the keyboard, which is the point of the
+    // test — a pointer that only travelled past did not close it.
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 #[tokio::test]
 async fn a_command_answers_on_screen_and_never_reaches_the_model() {
     let dir = scratch("cmd");
@@ -1309,6 +1849,30 @@ async fn the_todo_panel_shows_the_plan_the_model_sent() {
         s.term.last().unwrap().rows().join("\n").contains("任务"),
         "the panel is on screen, not just in the parts list"
     );
+
+    // Above the field, not under it. The panel used to place itself at the
+    // bottom of the screen with `LayoutOp::Show`, which put it below the input
+    // box — the last place anyone looks for what is being worked on.
+    let screen = s.term.last().unwrap();
+    let todo = screen.part("todo").expect("the task list").rect;
+    let field = screen.part("input").expect("the field").rect;
+    assert!(
+        todo.bottom() <= field.y,
+        "the task list sits above the field: todo {todo:?}, field {field:?}"
+    );
+    // And above the live line, when there is one: the composer's order is
+    // task list, live line, tip, field.
+    if let Some(live) = screen.part("live") {
+        assert!(
+            todo.bottom() <= live.rect.y,
+            "the task list sits above the live line: todo {todo:?}, live {:?}",
+            live.rect
+        );
+    } else {
+        // No live line while idle, so the task list is simply above the tip
+        // row's blank and the field's top rule.
+        assert!(todo.y < field.y);
+    }
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
