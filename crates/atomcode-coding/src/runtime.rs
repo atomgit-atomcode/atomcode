@@ -801,6 +801,15 @@ struct RuntimeResources {
     provider_factory: Arc<dyn CodingProviderFactory>,
     plugin_hooks: Arc<dyn PluginHookSource>,
     parts: crate::CodingParts,
+    /// The mounted tree, on the harness engine. `None` on the chain.
+    ///
+    /// Held, never read: unloading it would tear down every row under a live
+    /// handle. When the harness carries the reassembly paths too, this is what
+    /// `ControlSvc::patch` will be reached through.
+    ///
+    /// Never read ON PURPOSE — it is held for its `Drop`, not its value.
+    #[allow(dead_code)]
+    harness_app: Option<atomcode_plexus::App>,
     wakeup_tx: mpsc::UnboundedSender<WakeupRequest>,
     loop_active: Arc<std::sync::atomic::AtomicBool>,
     image_preprocessor: Option<Arc<dyn ImagePreprocessor>>,
@@ -826,6 +835,36 @@ pub struct CodingRuntime {
 pub struct RuntimeSessionInfo {
     pub id: String,
     pub resumed: bool,
+}
+
+/// Which engine runs the turns.
+///
+/// The hand-written chain is the default and stays the default until the
+/// harness carries everything the runtime asks of it — which it does not yet:
+/// `/model`, `/cd`, plan mode, accept-edits and the MCP controls all reach into
+/// `CodingParts` handles that a mounted tree does not hand back. See
+/// `docs/handoff-coding-on-harness-2026-09-14.md`.
+///
+/// `ATOMCODE_ENGINE=harness` opts one process in. Deliberately an env var
+/// rather than config: this is a development escape hatch for measuring how
+/// much of the runtime the harness can already carry, not a product setting,
+/// and it should be awkward to leave on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Engine {
+    /// `parts::assemble` — the chain this crate has always shipped.
+    Chain,
+    /// `on_harness::mount` — the same product as a row list.
+    Harness,
+}
+
+impl Engine {
+    /// Read once per runtime start, so a turn cannot change engines midway.
+    pub fn from_env() -> Self {
+        match std::env::var("ATOMCODE_ENGINE").as_deref() {
+            Ok("harness") => Self::Harness,
+            _ => Self::Chain,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1986,16 +2025,45 @@ impl CodingRuntime {
             id: binding.id.clone(),
             resumed: binding.resume.is_some(),
         });
+        // Mounted only on the harness engine, and kept for exactly one reason:
+        // dropping the `App` unloads every row, and the next command would
+        // reach a conversation whose services are gone. It rides in
+        // `RuntimeResources` with `parts` because it is the same kind of thing —
+        // what a respawn must not lose.
+        let mut harness_app: Option<atomcode_plexus::App> = None;
+        let engine = Engine::from_env();
         let (kernel_agent, unavailable_reason) = match bootstrap {
             ProviderBootstrap::Unavailable(reason) => (None, Some(reason)),
             ProviderBootstrap::Required | ProviderBootstrap::RecoverAuthentication => {
                 match provider_factory.build(&agent, session_id) {
                     Ok(provider) => (
-                        Some(
-                            assemble(&mut parts, &agent, provider)
+                        Some(match engine {
+                            Engine::Chain => assemble(&mut parts, &agent, provider)
                                 .map_err(RuntimeStartError::Assemble)?
                                 .spawn(),
-                        ),
+                            Engine::Harness => {
+                                // Presence follows the same rule the overlay
+                                // uses: a person who can answer means asking,
+                                // nobody means fencing.
+                                let presence = if agent.is_attended() {
+                                    crate::on_harness::Presence::Attended
+                                } else {
+                                    crate::on_harness::Presence::Headless
+                                };
+                                let (handle, app) = crate::on_harness::mount(
+                                    &agent.working_dir,
+                                    presence,
+                                    provider,
+                                    &[],
+                                )
+                                .await
+                                .map_err(|e| {
+                                    RuntimeStartError::Assemble(std::io::Error::other(e))
+                                })?;
+                                harness_app = Some(app);
+                                handle
+                            }
+                        }),
                         None,
                     ),
                     Err(crate::ProviderBuildError::Authentication(_))
@@ -2040,6 +2108,7 @@ impl CodingRuntime {
                 provider_factory,
                 plugin_hooks,
                 parts,
+                harness_app,
                 wakeup_tx,
                 loop_active,
                 image_preprocessor,
@@ -4817,6 +4886,25 @@ fn spawn_runtime_owner_with_optional_agent(
                                 provider_factory: runtime.provider_factory.clone(),
                                 plugin_hooks: runtime.plugin_hooks.clone(),
                                 parts,
+                                // Chain-only path. `reprepare` rebuilds the
+                                // agent from `parts`, which is the hand-written
+                                // chain — so on the harness engine a /model swap
+                                // or a /cd drops back to the chain for the rest
+                                // of the session. Saying so out loud beats
+                                // discovering it from behaviour: the whole point
+                                // of the escape hatch is measuring what the
+                                // harness carries, and a silent fallback would
+                                // make every later reading a lie.
+                                harness_app: {
+                                    if Engine::from_env() == Engine::Harness {
+                                        eprintln!(
+                                            "ATOMCODE_ENGINE=harness: reassembly is not on the \
+                                             harness engine yet — this session continues on the \
+                                             hand-written chain"
+                                        );
+                                    }
+                                    None
+                                },
                                 wakeup_tx: runtime.wakeup_tx.clone(),
                                 loop_active: Arc::clone(&runtime.loop_active),
                                 // Preserve the injected VL hook across reprepare
@@ -9035,6 +9123,7 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
             wakeup_tx: wakeup_tx.clone(),
             loop_active: loop_active.clone(),
             image_preprocessor: None,
@@ -9136,6 +9225,7 @@ mod tests {
             provider_factory: start.provider_factory,
             plugin_hooks: start.plugin_hooks,
             parts,
+            harness_app: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -9284,6 +9374,7 @@ mod tests {
             provider_factory: start.provider_factory,
             plugin_hooks: start.plugin_hooks,
             parts,
+            harness_app: None,
             wakeup_tx,
             loop_active,
             image_preprocessor: None,
@@ -9374,6 +9465,7 @@ mod tests {
             provider_factory: start.provider_factory,
             plugin_hooks: start.plugin_hooks,
             parts,
+            harness_app: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -11989,6 +12081,7 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -12173,6 +12266,7 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: pp,
@@ -12578,6 +12672,7 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -12673,6 +12768,7 @@ mod tests {
             provider_factory: factory.clone(),
             plugin_hooks,
             parts,
+            harness_app: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -12736,6 +12832,7 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
             wakeup_tx: wakeup_tx.clone(),
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -12858,6 +12955,7 @@ mod tests {
             provider_factory: Arc::new(PendingProviderFactory),
             plugin_hooks,
             parts,
+            harness_app: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -12967,6 +13065,7 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -13035,6 +13134,7 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
             wakeup_tx: wakeup_tx.clone(),
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -13137,6 +13237,7 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -13235,6 +13336,7 @@ mod tests {
             provider_factory: start.provider_factory,
             plugin_hooks: start.plugin_hooks,
             parts,
+            harness_app: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -13414,6 +13516,7 @@ mod tests {
             provider_factory: start.provider_factory,
             plugin_hooks: start.plugin_hooks,
             parts,
+            harness_app: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -14971,6 +15074,7 @@ mod tests {
             provider_factory,
             plugin_hooks,
             parts,
+            harness_app: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor,
