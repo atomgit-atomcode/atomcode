@@ -1945,3 +1945,176 @@ async fn several_rounds_on_the_harness() {
     )
     .await;
 }
+
+// ---- the approval line, on both engines ----------------------------------
+//
+// The gap this closes. Until now approval was the one thing the rig could not
+// compare: the candidate tree mounted `approval` disabled, and the three
+// approval scenarios above compare the candidate to ITSELF (`render(&steps,
+// &steps)`). So the five gates that were moved onto the harness — the whole
+// approval gradient — had no independent judge at all.
+//
+// They CAN be compared, because both engines ask through the same channel in the
+// end: coding's `ApprovalMiddleware` round-trips the driver via `RequestCtx`, and
+// the harness's `approval-interactive` asks `user-questions`, which the
+// `ui-handle` row fills with an `Asker` that round-trips the driver too. Two
+// different insides, one observable: `AgentEvent::Request`, answered with
+// `AgentCommand::Respond`.
+
+async fn reference_production_answering(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+    answer: serde_json::Value,
+) -> Vec<Step> {
+    let agent = production_agent(script, dir).await;
+    drive_answering(agent.spawn(), commands, &[], None, answer).await
+}
+
+async fn on_harness_answering(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+    answer: serde_json::Value,
+) -> Vec<Step> {
+    let empty = dir.join("__no_skills_ask__");
+    let _ = std::fs::create_dir_all(&empty);
+    // Same hermetic scoping as the other on-harness scenarios, plus `INTERACTIVE`:
+    // it turns off the `deny-risky` policy and turns on the one that asks.
+    let quiet = format!(
+        "[[patch]]\nid = \"trace\"\nconfig = {{ stream = false, tools = false, summary = false }}\n\n\
+         [[patch]]\nid = \"mcp\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"approval\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 8, working_dir = {dir:?} }}\n\n\
+         [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n\n\
+         [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {dir:?} }}\n\n\
+         [[patch]]\nid = \"project-instructions\"\nconfig = {{ project_root = {dir:?}, home = {home:?} }}\n",
+        dir = dir.to_string_lossy(),
+        home = empty.to_string_lossy(),
+    );
+    // Disabling the `approval` row is what ENABLES asking here, which reads
+    // backwards until you see who fills the seam: that row is the `deny-risky`
+    // policy (refuse, never ask), and turning it off lets `ui-handle` claim
+    // `approval` and round-trip the driver instead. Behind the handle protocol
+    // the driver IS the person. `ui-handle` PROVIDES the `approval` seam itself —
+    // behind the handle protocol the driver is the person, so a call that needs
+    // authorization round-trips as `AgentEvent::Request`, which is the same
+    // observable coding's `ApprovalMiddleware` produces. Two earlier attempts
+    // here are worth recording: `bundle::INTERACTIVE` also enables
+    // `user-questions-unattended`, which takes the `user-questions` seam away
+    // from `ui-handle`; and enabling `approval-interactive` collides with
+    // `ui-handle` over `approval` itself. Both errors were the tree saying the
+    // front end had already answered this question.
+    let (handle, mut app) = atomcode_coding::on_harness::mount(dir, script, &[quiet.as_str()])
+        .await
+        .expect("the coding-on-harness tree must mount");
+    let steps = drive_answering(handle, commands, &[], None, answer).await;
+    app.stop();
+    steps
+}
+
+/// One approval scenario through both engines.
+async fn ask_chain_vs_rows(
+    key: &str,
+    dir: &std::path::Path,
+    script: impl Fn() -> Arc<Script>,
+    cmds: impl Fn() -> Vec<AgentCommand>,
+    answer: serde_json::Value,
+) -> (Vec<Step>, Vec<Step>, String) {
+    let a = reference_production_answering(script(), dir, cmds(), answer.clone()).await;
+    let b = on_harness_answering(script(), dir, cmds(), answer).await;
+    let report = render(&a, &b);
+    ratchet(key, divergences(&a, &b), &report);
+    (a, b, report)
+}
+
+/// A write to a path OUTSIDE the workspace: risky on both engines, and the first
+/// thing either of them should want a person for.
+///
+/// A LITERAL relative path, resolved against the working dir — `../x` from the
+/// scratch dir lands in its parent, outside the workspace. Literal because
+/// `Reply::call` takes `&'static str`, and relative because that is also the
+/// shape a model actually produces.
+fn write_outside(rel: &'static str) -> Arc<Script> {
+    let args: &'static str = match rel {
+        "../outside-yes.txt" => r#"{"file_path":"../outside-yes.txt","content":"x"}"#,
+        "../outside-no.txt" => r#"{"file_path":"../outside-no.txt","content":"x"}"#,
+        other => panic!("unknown fixture path {other}"),
+    };
+    Script::new(&[
+        Reply::call("c1", "write_file", args),
+        Reply::Text("written"),
+    ])
+}
+
+#[tokio::test]
+async fn a_write_outside_the_workspace_diverges_and_here_is_why() {
+    // A REAL divergence, recorded rather than papered over.
+    //
+    //   coding   ToolResult error=false   — the write went through
+    //   harness  ToolResult error=true    — the write was refused
+    //
+    // and NEITHER asked. The two engines manage the same concern with different
+    // mechanisms: the harness `fs` row FENCES by root, so a target outside it is
+    // refused before anything approval-shaped is consulted; coding does not fence
+    // the write tools and leaves the question to `WriteApprovalGate`, which — with
+    // no human wired in this rig — let it through.
+    //
+    // Which is right is a decision, not a bug, and it has to be made before the
+    // default path can be switched: one engine writes the file, the other does
+    // not. The ratchet holds the number so nobody discovers this twice.
+    let dir = scratch("ask-yes");
+    let outside = dir.parent().unwrap().join("outside-yes.txt");
+    let _ = std::fs::remove_file(&outside);
+    let (a, b, report) = ask_chain_vs_rows(
+        "approval_write_outside_rows",
+        &dir,
+        || write_outside("../outside-yes.txt"),
+        || say("write it"),
+        allow(),
+    )
+    .await;
+    // Whatever else differs, neither engine may hang or run two turns: a driver
+    // that sees no terminal waits forever, and one that sees two runs twice.
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "TurnComplete").count(),
+            1,
+            "{who}: 仍然只有一个终结{report}"
+        );
+        assert!(
+            !steps.iter().any(|s| s.kind == "TIMEOUT"),
+            "{who}: 回合必须结束{report}"
+        );
+    }
+    let _ = std::fs::remove_file(&outside);
+}
+
+#[tokio::test]
+async fn a_refusal_is_the_call_not_the_turn_on_both_engines() {
+    // The same scenario answered `deny`. The point is not which engine refuses —
+    // that is the divergence above — but that a refusal ends the CALL and the turn
+    // carries on, on both. An engine that ended the turn instead would strand a
+    // driver mid-conversation, and that failure is invisible in a green test that
+    // only checks the file.
+    let dir = scratch("ask-no");
+    let outside = dir.parent().unwrap().join("outside-no.txt");
+    let _ = std::fs::remove_file(&outside);
+    let (a, b, report) = ask_chain_vs_rows(
+        "approval_refusal_rows",
+        &dir,
+        || write_outside("../outside-no.txt"),
+        || say("write it"),
+        deny(),
+    )
+    .await;
+    for (who, steps) in [("链式", &a), ("行式", &b)] {
+        assert_eq!(
+            steps.iter().filter(|s| s.kind == "TurnComplete").count(),
+            1,
+            "{who}: 拒绝结束的是调用,不是回合{report}"
+        );
+    }
+    let _ = std::fs::remove_file(&outside);
+}
