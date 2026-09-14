@@ -111,23 +111,29 @@ impl ArtifactMiddleware {
     }
 }
 
-#[async_trait::async_trait]
-impl atomcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
-    async fn after(
+impl ArtifactMiddleware {
+    /// Spill an oversized result to the store and leave head+tail inline.
+    ///
+    /// The judgement, with no opinion about how it is delivered — the kernel
+    /// `ToolMiddleware::after` below wears one shell, a harness `tools/execute`
+    /// listener wears the other, and both call this. `self_bounds_output` is
+    /// passed as a plain bool rather than the resolved tool so neither shell has
+    /// to agree with the other about how a tool is looked up.
+    pub async fn spill(
         &self,
         result: &mut atomcode_kernel::tool::ToolResult,
-        tool: Option<&Arc<dyn atomcode_kernel::tool::Tool>>,
-    ) -> atomcode_kernel::middleware::AfterOutcome {
+        self_bounds_output: bool,
+    ) {
         // A tool that bounds and structures its own output (e.g. `read_file`: self-capped,
         // 1-based line numbers, pagination) must reach the model WHOLE — head/tail
         // truncation would corrupt it. Read the contract off the resolved tool, so this is
         // robust even if an earlier `before` short-circuited the chain with `Allow`.
-        if tool.is_some_and(|t| t.self_bounds_output()) {
-            return atomcode_kernel::middleware::AfterOutcome::Proceed;
+        if self_bounds_output {
+            return;
         }
         let total = result.content.len();
         if total <= THRESHOLD_BYTES {
-            return atomcode_kernel::middleware::AfterOutcome::Proceed;
+            return;
         }
         let head_end = head_boundary(&result.content, PREVIEW_HALF);
         let tail_begin = tail_start(&result.content, PREVIEW_HALF);
@@ -143,7 +149,7 @@ Full output unavailable (exceeds {MAX_ARTIFACT_BYTES}-byte artifact ceiling).]\n
                 tail.len()
             );
             result.content = format!("{head}{marker}{tail}");
-            return atomcode_kernel::middleware::AfterOutcome::Proceed;
+            return;
         }
 
         let marker = match self.store.put(result.content.as_bytes()) {
@@ -161,6 +167,20 @@ Full output unavailable (could not be saved).]\n\n",
             ),
         };
         result.content = format!("{head}{marker}{tail}");
+    }
+}
+
+#[async_trait::async_trait]
+impl atomcode_kernel::middleware::ToolMiddleware for ArtifactMiddleware {
+    async fn after(
+        &self,
+        result: &mut atomcode_kernel::tool::ToolResult,
+        tool: Option<&Arc<dyn atomcode_kernel::tool::Tool>>,
+    ) -> atomcode_kernel::middleware::AfterOutcome {
+        // Read the contract off the RESOLVED tool, so this is robust even if an
+        // earlier `before` short-circuited the chain with `Allow`.
+        self.spill(result, tool.is_some_and(|t| t.self_bounds_output()))
+            .await;
         atomcode_kernel::middleware::AfterOutcome::Proceed
     }
 }

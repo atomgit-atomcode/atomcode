@@ -729,3 +729,75 @@ async fn an_open_file_outside_the_workspace_is_still_asked_about() {
         "a target outside the workspace still reaches the human: {asked:?}"
     );
 }
+
+// ---- oversized output spills to an artifact -----------------------------
+//
+// `bash` is risky, so these run with the default (unattended) approval that
+// allows safe calls only — which would refuse the call before it ever produced
+// output. `yolo` is what makes the RESULT, not the authorization, the thing
+// under test.
+
+fn bash_script(command: &str) -> String {
+    script_one("bash", &format!(r#"{{ command = {command:?} }}"#))
+}
+
+/// Mount the spill row over a scratch artifact dir and run one bash call.
+/// Returns (the transcript, the artifact dir).
+async fn spilled(dir: &std::path::Path, command: &str) -> (String, PathBuf) {
+    let artifacts = dir.join("artifacts");
+    let mut registry = plugins::catalog();
+    // Not in `plugins::catalog()` yet — see the note on the open_file row above.
+    registry.register(Arc::new(
+        atomcode_harness::plugins::policy::OutputArtifactPlugin,
+    ));
+    let insert = format!(
+        "[[insert]]\nname = \"tool-output-artifact\"\nconfig = {{ dir = {a:?} }}",
+        a = artifacts.to_string_lossy()
+    );
+    let yolo = "[[patch]]\nid = \"approval\"\nconfig = { mode = \"yolo\" }";
+    // `start()` builds its own App from `plugins::catalog()`, which would drop the
+    // registration above — the row is not in the catalog yet.
+    let mut app = App::new(registry, tree(dir, &bash_script(command), &[yolo, &insert]));
+    app.start().await.unwrap();
+    run_turn(&app, "run it").await.unwrap();
+    (transcript(&app), artifacts)
+}
+
+#[tokio::test]
+async fn an_oversized_tool_result_is_shown_head_and_tail_and_saved_whole() {
+    let dir = scratch("artifact-big");
+    // 16 KiB is the threshold; 40 000 bytes clears it without approaching the
+    // 4 MiB artifact ceiling (which is a different branch, with no artifact id).
+    let (text, artifacts) = spilled(&dir, "printf 'x%.0s' $(seq 1 40000)").await;
+    assert!(
+        text.contains("output truncated"),
+        "an oversized result says it was cut: {}",
+        &text[..text.len().min(400)]
+    );
+    assert!(
+        text.contains("fetch_output(artifact_id="),
+        "and says how to read the rest: {}",
+        &text[..text.len().min(400)]
+    );
+    let saved: Vec<_> = std::fs::read_dir(&artifacts)
+        .map(|d| d.flatten().collect())
+        .unwrap_or_default();
+    assert_eq!(saved.len(), 1, "the whole output is on disk: {saved:?}");
+}
+
+#[tokio::test]
+async fn a_small_tool_result_is_left_alone() {
+    // The negative control. Without it, a row that truncated everything — or one
+    // that did nothing and let some other layer do the cutting — reads the same.
+    let dir = scratch("artifact-small");
+    let (text, artifacts) = spilled(&dir, "echo hello").await;
+    assert!(text.contains("hello"), "the output is there: {text}");
+    assert!(
+        !text.contains("output truncated"),
+        "and nothing was cut: {text}"
+    );
+    assert!(
+        !artifacts.exists() || std::fs::read_dir(&artifacts).unwrap().next().is_none(),
+        "nothing was written to the store either"
+    );
+}

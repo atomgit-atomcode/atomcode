@@ -464,3 +464,88 @@ impl Plugin for OpenFileWorkspacePlugin {
         Ok(())
     }
 }
+
+// ---- oversized tool output spills to an artifact -------------------------
+//
+// The second gate to wear the harness shell, and the one that shows what the
+// shape is actually worth. The kernel trait splits a tool call into two calls —
+// `before` and `after` — so anything that needs to know in `after` what it saw
+// in `before` has to carry state between them itself (`GitPushLabelMiddleware`
+// keeps a `Mutex<HashSet<call_id>>` for exactly that, and for nothing else).
+// A waterfall listener sits on BOTH sides of `next.run`, so that correlation is
+// just a local variable.
+//
+// This one only needs the `after` side, so it reads as: run it, then spill.
+
+struct OutputArtifact {
+    ctx: Context,
+    spill: Arc<atomcode_capabilities::tools::ArtifactMiddleware>,
+}
+
+#[async_trait]
+impl Waterfall<ToolsExecute> for OutputArtifact {
+    async fn handle(&self, exec: &mut ToolExec, next: Next<'_, ToolsExecute>) -> ToolResult {
+        // Taken before the call: `exec` is borrowed for the duration of `run`.
+        let name = exec.call.name.clone();
+        let mut result = next.run(exec).await;
+        // A tool that bounds and structures its own output (`read_file`: self-capped,
+        // 1-based line numbers, paginated) must reach the model WHOLE — head/tail
+        // truncation would corrupt it. Ask the resolved tool, not the call.
+        let self_bounds = self
+            .ctx
+            .service::<ToolsSvc>()
+            .and_then(|t| t.get(&name))
+            .is_some_and(|t| t.self_bounds_output());
+        self.spill.spill(&mut result, self_bounds).await;
+        result
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct OutputArtifactRow {
+    /// Where spilled outputs are written. Coding derives this from the session
+    /// directory and mounts nothing when there is no session — same rule here:
+    /// no `dir`, no row, because an artifact nobody can fetch later is worse
+    /// than not truncating at all.
+    dir: Option<String>,
+}
+
+pub struct OutputArtifactPlugin;
+
+#[async_trait]
+impl Plugin for OutputArtifactPlugin {
+    fn name(&self) -> &'static str {
+        "tool-output-artifact"
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["tools"]
+    }
+    fn description(&self) -> &'static str {
+        "an oversized tool result is saved whole and shown head + tail"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: OutputArtifactRow = if config.is_null() {
+            OutputArtifactRow::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        let Some(dir) = row.dir else {
+            // Mounted without a place to put them: say so rather than silently
+            // truncating into nowhere.
+            return Err("`tool-output-artifact` needs `config = { dir = … }`".into());
+        };
+        let store = Arc::new(atomcode_capabilities::tools::ArtifactStore::new(dir));
+        let spill = Arc::new(atomcode_capabilities::tools::ArtifactMiddleware::new(store));
+        // Appended: it rewrites the RESULT, so it must see what every earlier
+        // listener produced.
+        let _ = ctx.on_waterfall::<ToolsExecute>(
+            Arc::new(OutputArtifact {
+                ctx: ctx.clone(),
+                spill,
+            }),
+            false,
+        );
+        Ok(())
+    }
+}
