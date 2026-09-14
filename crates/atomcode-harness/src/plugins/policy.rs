@@ -390,3 +390,77 @@ impl Plugin for SensitivePathsPlugin {
         Ok(())
     }
 }
+
+// ---- open_file workspace pre-approval ------------------------------------
+//
+// The first of coding's `ToolMiddleware` gates to wear the harness shell.
+//
+// The judgement itself did not move and was not copied: it lives in
+// `OpenFileWorkspaceGate::authorizes` (L1), which the kernel middleware also
+// calls. Only the vocabulary for saying "already authorized" differs — there
+// `BeforeOutcome::Allow`, here `ToolExec::pre_approved`, and both mean the same
+// thing to the gate downstream: do not ask about this one.
+//
+// That split is the point. A gate rewritten rather than shared would be two
+// judgements that agree today, which is a different and worse thing than one
+// judgement with two shells.
+
+struct OpenFileWorkspace {
+    gate: Arc<atomcode_capabilities::tools::OpenFileWorkspaceGate>,
+}
+
+#[async_trait]
+impl Waterfall<ToolsExecute> for OpenFileWorkspace {
+    async fn handle(&self, exec: &mut ToolExec, next: Next<'_, ToolsExecute>) -> ToolResult {
+        // Marking an already-marked call is not wrong, just work: something
+        // upstream already settled it.
+        if !exec.pre_approved
+            && self
+                .gate
+                .authorizes(&exec.call.name, &exec.call.arguments)
+                .await
+        {
+            exec.pre_approved = true;
+        }
+        next.run(exec).await
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct OpenFileWorkspaceRow {
+    /// The workspace boundary. The L1 gate can follow a live `change_dir` through
+    /// a shared cwd handle; this row pins it at mount time, same as `agent-loop`
+    /// and `fs` do with theirs. Following a mid-session move is a later
+    /// refinement, and a visible one — not silent drift.
+    working_dir: Option<String>,
+}
+
+pub struct OpenFileWorkspacePlugin;
+
+#[async_trait]
+impl Plugin for OpenFileWorkspacePlugin {
+    fn name(&self) -> &'static str {
+        "tool-open-file-workspace"
+    }
+    fn description(&self) -> &'static str {
+        "an open_file target inside the workspace needs no approval"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        // `Value::Null` is what a row with no `config =` block gets, and
+        // `from_value` rejects it — so the default has to be reached explicitly.
+        let row: OpenFileWorkspaceRow = if config.is_null() {
+            OpenFileWorkspaceRow::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        let root = std::path::PathBuf::from(row.working_dir.as_deref().unwrap_or("."));
+        let gate = Arc::new(atomcode_capabilities::tools::OpenFileWorkspaceGate::pinned(
+            root,
+        ));
+        // NOT prepended: this only ever *widens* (marks pre-approved), so it must
+        // run after anything that may narrow or rewrite the call.
+        let _ = ctx.on_waterfall::<ToolsExecute>(Arc::new(OpenFileWorkspace { gate }), false);
+        Ok(())
+    }
+}

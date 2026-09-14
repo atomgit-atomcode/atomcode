@@ -446,6 +446,41 @@ impl OpenFileWorkspaceGate {
     }
 }
 
+impl OpenFileWorkspaceGate {
+    /// The decision, with no opinion about how it is delivered.
+    ///
+    /// Extracted so the SAME judgement can wear two shells: the kernel
+    /// [`ToolMiddleware`] below, and a harness `tools/execute` listener that sets
+    /// `pre_approved`. Both mean "this one is already authorized, do not ask" —
+    /// only the vocabulary for saying so differs. Keeping the judgement here, and
+    /// not in either shell, is what stops the two from drifting apart.
+    ///
+    /// `true` = the target is inside the workspace, so the call needs no approval.
+    /// Every uncertainty (unparseable args, poisoned lock, a canonicalize that
+    /// times out) returns `false`: "cannot decide" defers to approval, never
+    /// auto-approves.
+    pub async fn authorizes(&self, tool_name: &str, arguments: &str) -> bool {
+        if tool_name != "open_file" {
+            return false;
+        }
+        // Snapshot the live cwd. A poisoned lock means we can't tell where we are — defer to
+        // approval rather than risk a wrong auto-approve (and never panic: kernel is panic=abort).
+        let cwd = match self.cwd.read() {
+            Ok(g) => g.clone(),
+            Err(_) => return false,
+        };
+        // `target_in_workspace` CANONICALIZES paths (filesystem syscalls). Run it OFF the async
+        // worker, bounded: a stalled mount as the cwd would otherwise block `canonicalize()` for
+        // minutes inline and freeze the kernel turn loop (Esc/Ctrl-C dead). On timeout → `false`,
+        // the same conservative "can't decide → defer to approval" default the check already uses.
+        let args = arguments.to_string();
+        super::run_bounded(super::GATE_FS_TIMEOUT, false, move || {
+            Self::target_in_workspace(&args, &cwd)
+        })
+        .await
+    }
+}
+
 #[async_trait]
 impl ToolMiddleware for OpenFileWorkspaceGate {
     async fn before(
@@ -454,28 +489,7 @@ impl ToolMiddleware for OpenFileWorkspaceGate {
         tool: &Arc<dyn Tool>,
         _rt: &RequestCtx,
     ) -> BeforeOutcome {
-        if tool.name() != "open_file" {
-            return BeforeOutcome::Proceed;
-        }
-        // Snapshot the live cwd. A poisoned lock means we can't tell where we are — defer to
-        // approval rather than risk a wrong auto-approve (and never panic: kernel is panic=abort).
-        let cwd = match self.cwd.read() {
-            Ok(g) => g.clone(),
-            Err(_) => return BeforeOutcome::Proceed,
-        };
-        // `target_in_workspace` CANONICALIZES paths (filesystem syscalls). Run it OFF the async
-        // worker, bounded: a stalled mount as the cwd would otherwise block `canonicalize()` for
-        // minutes inline and freeze the kernel turn loop (Esc/Ctrl-C dead). On timeout → `false`,
-        // the same conservative "can't decide → defer to approval" default the check already uses.
-        let in_workspace = {
-            let args = call.arguments.clone();
-            let cwd = cwd.clone();
-            super::run_bounded(super::GATE_FS_TIMEOUT, false, move || {
-                Self::target_in_workspace(&args, &cwd)
-            })
-            .await
-        };
-        if in_workspace {
+        if self.authorizes(tool.name(), &call.arguments).await {
             BeforeOutcome::Allow {
                 reason: Some("open_file target is inside the workspace".into()),
             }

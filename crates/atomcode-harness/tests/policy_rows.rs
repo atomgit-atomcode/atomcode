@@ -8,9 +8,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use atomcode_capabilities::tools::{OpenTarget, Opener};
 use atomcode_harness::seams::{
-    Question, SessionTitleSvc, StopReason, ToolsSvc, UserQuestions, UserQuestionsSvc, ANSWER_ALLOW,
-    ANSWER_ALWAYS, ANSWER_DENY,
+    OpenerSvc, Question, SessionTitleSvc, StopReason, ToolsSvc, UserQuestions, UserQuestionsSvc,
+    ANSWER_ALLOW, ANSWER_ALWAYS, ANSWER_DENY,
 };
 use atomcode_harness::{bundle, plugins, run_turn};
 use atomcode_plexus::{App, ConfigTree, Context, Layer, Plugin};
@@ -610,4 +611,121 @@ async fn an_answer_nobody_offered_is_a_refusal() {
     run_turn(&app, "write it").await.unwrap();
     assert!(!dir.join("a.txt").exists(), "unrecognised is not consent");
     assert!(transcript(&app).contains("the user declined"));
+}
+
+// ---- open_file workspace pre-approval -----------------------------------
+//
+// `tool-open-file-workspace` is the first of coding's kernel `ToolMiddleware`
+// gates to wear the harness shell. Its whole observable effect is a NEGATIVE:
+// the human is not asked. So it needs both directions — a test that only proves
+// "not asked" is also passed by a row that does nothing at all.
+
+/// An opener that records instead of launching a GUI app.
+#[derive(Default)]
+struct Recording(Mutex<Vec<OpenTarget>>);
+
+#[async_trait]
+impl Opener for Recording {
+    fn describe(&self) -> String {
+        "a recording opener (nothing is launched)".into()
+    }
+    async fn open(&self, target: &OpenTarget) -> Result<String, String> {
+        self.0.lock().unwrap().push(target.clone());
+        Ok("recorded".into())
+    }
+}
+
+struct RecordingPlugin(Arc<Recording>);
+
+#[async_trait]
+impl Plugin for RecordingPlugin {
+    fn name(&self) -> &'static str {
+        "opener-recording"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["opener"]
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<OpenerSvc>(self.0.clone())
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+fn open_script(path: &std::path::Path) -> String {
+    script_one(
+        "open_file",
+        &format!(r#"{{ file_path = {:?} }}"#, path.to_string_lossy()),
+    )
+}
+
+/// Mount the gate row, an interactive approval, a human who counts, and an
+/// opener that launches nothing. Returns what the human was asked.
+async fn asked_about_opening(
+    dir: &std::path::Path,
+    workspace: &std::path::Path,
+    target: &std::path::Path,
+) -> Vec<String> {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = plugins::catalog();
+    // NOT in `plugins::catalog()` yet — the file that registers rows is being
+    // rewritten by another line of work, so the row is mounted explicitly here.
+    registry.register(Arc::new(
+        atomcode_harness::plugins::policy::OpenFileWorkspacePlugin,
+    ));
+    registry.register(Arc::new(CountingYesPlugin(asked.clone())));
+    registry.register(Arc::new(RecordingPlugin(Arc::new(Recording::default()))));
+    // `tool-open-file` and an `opener` live in `REPL_APP`, which would also mount a
+    // front end that reads stdin. Insert just the two rows this needs instead — the
+    // recording opener fills the `opener` seam, so nothing is launched.
+    let insert = format!(
+        "[[insert]]\nname = \"opener-recording\"\n\n\
+         [[insert]]\nname = \"tool-open-file\"\n\n\
+         [[insert]]\nname = \"tool-open-file-workspace\"\nconfig = {{ working_dir = {ws:?} }}",
+        ws = workspace.to_string_lossy()
+    );
+    let swap_human =
+        "[[patch]]\nid = \"user-questions-unattended\"\nname = \"user-questions-counting\"";
+    let mut app = App::new(
+        registry,
+        tree(
+            dir,
+            &open_script(target),
+            &[bundle::INTERACTIVE, swap_human, &insert],
+        ),
+    );
+    app.start().await.unwrap();
+    run_turn(&app, "open it").await.unwrap();
+    let out = asked.lock().unwrap().clone();
+    out
+}
+
+#[tokio::test]
+async fn an_open_file_inside_the_workspace_is_not_asked_about() {
+    let dir = scratch("open-inside");
+    let target = dir.join("note.txt");
+    std::fs::write(&target, "hello").unwrap();
+    let asked = asked_about_opening(&dir, &dir, &target).await;
+    assert!(
+        asked.is_empty(),
+        "an in-workspace target is pre-approved, so nobody is asked: {asked:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_open_file_outside_the_workspace_is_still_asked_about() {
+    // The negative control for the test above. `open_file` is `RiskLevel::Risky`,
+    // so silence here would mean the row had pre-approved everything — which
+    // reads identically to "the row works" unless something is asked.
+    let dir = scratch("open-outside");
+    let elsewhere = scratch("open-outside-elsewhere");
+    let target = elsewhere.join("note.txt");
+    std::fs::write(&target, "hello").unwrap();
+    let asked = asked_about_opening(&dir, &dir, &target).await;
+    assert_eq!(
+        asked.len(),
+        1,
+        "a target outside the workspace still reaches the human: {asked:?}"
+    );
 }
