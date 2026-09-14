@@ -51,6 +51,16 @@ serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 
 [dev-dependencies]
+# The candidate engine, for the differential rig (`tests/differential.rs`) only.
+#
+# The dependency points THIS way on purpose. The question being measured is
+# whether coding could sit ON the harness, so the harness must not know about
+# coding — it used to carry the rig and a `dev-dependencies` edge back to here,
+# which made the pair mutually referential and prejudged the direction. The rig
+# lives with the reference engine now; the harness depends on nothing of ours.
+atomcode-harness = { path = "../atomcode-harness" }
+# The rig mounts a plexus tree (`App` / `ConfigTree` / `Layer`) as the candidate.
+atomcode-plexus = { path = "../atomcode-plexus" }
 # in-memory capturing Telemetry for the TelemetryHook test.
 atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }
 # Enable reset_offline_verdict_for_test() for offline-gate tests.
