@@ -484,6 +484,7 @@ dependencies = [
  "chrono",
  "ctor",
  "dirs",
+ "fs2",
  "futures",
  "serde",
  "serde_json",

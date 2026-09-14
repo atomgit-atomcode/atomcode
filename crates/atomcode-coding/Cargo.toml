@@ -61,6 +61,12 @@ tracing = "0.1"
 atomcode-harness = { path = "../atomcode-harness" }
 # The rig mounts a plexus tree (`App` / `ConfigTree` / `Layer`) as the candidate.
 atomcode-plexus = { path = "../atomcode-plexus" }
+# The differential ratchet takes a cross-PROCESS lock on `gates/differential.baseline`.
+# An in-process Mutex used to be enough because `cargo test` runs a binary's tests as
+# threads; `cargo nextest` runs each as its own process, so a process-local lock guards
+# nothing and the read-modify-write races — silently, since a lost entry looks like a
+# first run.
+fs2 = "0.4"
 # in-memory capturing Telemetry for the TelemetryHook test.
 atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }
 # Enable reset_offline_verdict_for_test() for offline-gate tests.

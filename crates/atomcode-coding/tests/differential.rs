@@ -533,6 +533,52 @@ async fn reference_until(
     drive_until(agent.spawn(), commands, also).await
 }
 
+// ---- the production reference -------------------------------------------
+//
+// `build_coding_agent_with` above is, by its own doc comment, the "MINIMAL sync
+// path (tools + codeintel only)". Production does not use it: it runs the
+// two-phase `prepare` → `assemble`, which mounts roughly fourteen
+// `ToolMiddleware`s (the approval gates, datalog, artifact spill, …) that the
+// minimal path never sees.
+//
+// So the parity this file measured until now was parity against a stripped-down
+// engine. That is the wrong oracle for a migration whose whole difficulty IS
+// that middleware chain — it would report "green" for a swap that drops every
+// gate. These run the same scripts through the real assembly, under their own
+// ratchet keys so the minimal-path numbers stay readable beside them.
+//
+// `mcp` / `web` / `review` / `memory` are off: each reaches the network, a
+// subprocess or the user's disk, and a rig that needs any of those is not a rig.
+// Everything they gate is additive to the chain, so the chain itself is intact.
+
+async fn production_agent(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+) -> atomcode_kernel::agent::Agent {
+    let cfg = atomcode_coding::CodingAgentConfig::new("k", "http://unused.test/v1", "script", dir);
+    let opts = atomcode_coding::parts::PrepareOptions {
+        mcp: false,
+        web: false,
+        review: false,
+        memory: false,
+        skill_dirs: Some(Vec::new()),
+        ..Default::default()
+    };
+    let mut parts = atomcode_coding::parts::prepare(&cfg, opts)
+        .await
+        .expect("the production prepare must succeed in the rig");
+    atomcode_coding::parts::assemble(&mut parts, &cfg, script)
+        .expect("the production assemble must succeed in the rig")
+}
+
+async fn reference_production(
+    script: Arc<Script>,
+    dir: &std::path::Path,
+    commands: Vec<AgentCommand>,
+) -> Vec<Step> {
+    drive_until(production_agent(script, dir).await.spawn(), commands, &[]).await
+}
+
 /// The candidate: a plexus tree providing `agent-handle`.
 async fn candidate(
     script: Arc<Script>,
@@ -775,26 +821,64 @@ fn divergences(a: &[Step], b: &[Step]) -> usize {
 /// a gate that gets deleted. What must not happen is the number growing without
 /// anyone noticing.
 fn ratchet(name: &str, count: usize, report: &str) {
-    // Tests in one binary run concurrently and this is a read-modify-write on a
-    // shared file. Without the lock the two baselines raced and one was lost —
-    // silently, because a missing entry just looks like "first run".
-    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    use fs2::FileExt;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../gates/differential.baseline");
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+
+    // A read-modify-write on a file shared by every scenario, so it needs a lock —
+    // and the lock has to be a CROSS-PROCESS one. This used to be a `static Mutex`,
+    // which was enough only because `cargo test` runs a binary's tests as threads in
+    // one process. `cargo nextest` gives each test its own process, so a process-local
+    // lock guards nothing: two scenarios both read the old text, both append their own
+    // line, and the second write loses the first. Silently — a missing entry is
+    // indistinguishable from a first run, which is exactly the failure this guards.
+    //
+    // Locking the baseline file itself (rather than a sidecar) keeps the lock and the
+    // data inseparable: there is no path where one exists without the other.
+    let mut f = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("⊙ {name}: 打不开基线文件({e}),跳过棘轮{report}");
+            return;
+        }
+    };
+    if let Err(e) = f.lock_exclusive() {
+        eprintln!("⊙ {name}: 锁不上基线文件({e}),跳过棘轮{report}");
+        return;
+    }
+    let mut text = String::new();
+    let _ = f.read_to_string(&mut text);
+
     let base: Option<usize> = text
         .lines()
         .find_map(|l| l.strip_prefix(&format!("{name}="))?.trim().parse().ok());
+
+    let rewrite = |f: &mut std::fs::File, body: &str| {
+        let _ = f.set_len(0);
+        let _ = f.seek(SeekFrom::Start(0));
+        let _ = f.write_all(body.as_bytes());
+    };
+
     match base {
         None => {
             let mut all = text;
             all.push_str(&format!("{name}={count}\n"));
-            let _ = std::fs::create_dir_all(path.parent().unwrap());
-            let _ = std::fs::write(&path, all);
+            rewrite(&mut f, &all);
             eprintln!("⊙ {name}: 建立基线 {count} 处分歧{report}");
         }
         Some(base) if count > base => {
+            // Drop the lock before unwinding so a panicking scenario cannot wedge
+            // the others behind a lock held by a dead process's file handle.
+            let _ = FileExt::unlock(&f);
             panic!("{name}: 分歧从 {base} 涨到 {count}{report}");
         }
         Some(base) if count < base => {
@@ -803,11 +887,12 @@ fn ratchet(name: &str, count: usize, report: &str) {
                 .filter(|l| !l.starts_with(&format!("{name}=")))
                 .map(|l| format!("{l}\n"))
                 .collect();
-            let _ = std::fs::write(&path, format!("{kept}{name}={count}\n"));
+            rewrite(&mut f, &format!("{kept}{name}={count}\n"));
             eprintln!("✓ {name}: {count} 处分歧（基线从 {base} 降到 {count}）{report}");
         }
         Some(_) => eprintln!("✓ {name}: {count} 处分歧（持平）"),
     }
+    let _ = FileExt::unlock(&f);
 }
 
 // ---- the measurements ----------------------------------------------------
@@ -1580,4 +1665,169 @@ async fn a_snapshot_round_trip() {
     let b = candidate_until(Script::text(&["ok"]), &dir, cmds(), &["Snapshot"]).await;
     let report = render(&a, &b);
     ratchet("snapshot", divergences(&a, &b), &report);
+}
+
+// ---- the same scenarios, against the PRODUCTION assembly -----------------
+//
+// Their own ratchet keys (`*_prod`) so the minimal-path numbers stay readable
+// beside them: the two measure different engines, and collapsing them would
+// hide which one moved.
+
+/// One scenario through the production assembly and the candidate tree.
+async fn prod_vs_candidate(
+    key: &str,
+    dir: &std::path::Path,
+    script: impl Fn() -> Arc<Script>,
+    cmds: impl Fn() -> Vec<AgentCommand>,
+) -> (Vec<Step>, Vec<Step>, String) {
+    let a = reference_production(script(), dir, cmds()).await;
+    let b = candidate(script(), dir, cmds()).await;
+    let report = render(&a, &b);
+    ratchet(key, divergences(&a, &b), &report);
+    (a, b, report)
+}
+
+fn say(text: &str) -> Vec<AgentCommand> {
+    vec![AgentCommand::SendMessage {
+        text: text.into(),
+        images: Vec::new(),
+    }]
+}
+
+#[tokio::test]
+async fn a_plain_turn_in_production() {
+    let dir = scratch("plain-prod");
+    let (a, b, report) = prod_vs_candidate(
+        "plain_turn_prod",
+        &dir,
+        || Script::text(&["hello"]),
+        || say("say hello"),
+    )
+    .await;
+    for (who, steps) in [("参考（生产）", &a), ("候选", &b)] {
+        let terminals = steps
+            .iter()
+            .filter(|s| matches!(s.kind, "TurnComplete" | "Error" | "Cancelled"))
+            .count();
+        assert_eq!(terminals, 1, "{who} 的终结事件不是一个{report}");
+    }
+}
+
+#[tokio::test]
+async fn one_tool_call_in_production() {
+    // The first scenario that actually crosses the production middleware chain:
+    // argument repair, plan mode, the workspace and credential gates, approval,
+    // datalog, artifact spill. The minimal path mounts almost none of them.
+    let dir = scratch("one-tool-prod");
+    seed(&dir);
+    let (a, b, report) = prod_vs_candidate(
+        "one_tool_call_prod",
+        &dir,
+        || {
+            Script::new(&[
+                Reply::call("c1", "read_file", r#"{"file_path":"a.rs"}"#),
+                Reply::Text("that is an empty main"),
+            ])
+        },
+        || say("read a.rs"),
+    )
+    .await;
+    for (who, steps) in [("参考（生产）", &a), ("候选", &b)] {
+        let started = steps.iter().position(|s| s.kind == "ToolStarted");
+        let result = steps.iter().position(|s| s.kind == "ToolResult");
+        assert!(
+            matches!((started, result), (Some(x), Some(y)) if x < y),
+            "{who}: 工具必须先开始后有结果{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn two_tool_calls_at_once_in_production() {
+    let dir = scratch("two-tools-prod");
+    seed(&dir);
+    let (a, b, report) = prod_vs_candidate(
+        "two_tool_calls_prod",
+        &dir,
+        || {
+            Script::new(&[
+                Reply::Calls(
+                    "reading both",
+                    vec![
+                        ("c1", "read_file", r#"{"file_path":"a.rs"}"#),
+                        ("c2", "read_file", r#"{"file_path":"b.rs"}"#),
+                    ],
+                ),
+                Reply::Text("both read"),
+            ])
+        },
+        || say("read both"),
+    )
+    .await;
+    // Every call that started must land, or a driver waits on one that never does.
+    for (who, steps) in [("参考（生产）", &a), ("候选", &b)] {
+        let started = steps.iter().filter(|s| s.kind == "ToolStarted").count();
+        let landed = steps.iter().filter(|s| s.kind == "ToolResult").count();
+        assert_eq!(started, landed, "{who}: 开始与落地的工具数不等{report}");
+    }
+}
+
+#[tokio::test]
+async fn several_rounds_in_production() {
+    let dir = scratch("rounds-prod");
+    seed(&dir);
+    let (_a, _b, _report) = prod_vs_candidate(
+        "several_rounds_prod",
+        &dir,
+        || {
+            Script::new(&[
+                Reply::call("c1", "read_file", r#"{"file_path":"a.rs"}"#),
+                Reply::call("c2", "read_file", r#"{"file_path":"b.rs"}"#),
+                Reply::Text("read them both"),
+            ])
+        },
+        || say("read both, one at a time"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn one_of_two_parallel_tools_fails_in_production() {
+    let dir = scratch("mixed-prod");
+    seed(&dir);
+    let (a, b, report) = prod_vs_candidate(
+        "mixed_batch_prod",
+        &dir,
+        || {
+            Script::new(&[
+                Reply::Calls(
+                    "both",
+                    vec![
+                        ("c1", "read_file", r#"{"file_path":"a.rs"}"#),
+                        ("c2", "read_file", r#"{"file_path":"missing.rs"}"#),
+                    ],
+                ),
+                Reply::Text("one worked"),
+            ])
+        },
+        || say("read both"),
+    )
+    .await;
+    for (who, steps) in [("参考（生产）", &a), ("候选", &b)] {
+        let started = steps.iter().filter(|s| s.kind == "ToolStarted").count();
+        let landed = steps.iter().filter(|s| s.kind == "ToolResult").count();
+        assert_eq!(started, landed, "{who}: 一个失败不该让另一个悬空{report}");
+    }
+}
+
+#[tokio::test]
+async fn the_provider_fails_mid_stream_in_production() {
+    let dir = scratch("provider-error-prod");
+    let (_a, _b, _report) = prod_vs_candidate(
+        "provider_error_prod",
+        &dir,
+        || Script::new(&[Reply::Fail("upstream exploded")]),
+        || say("go"),
+    )
+    .await;
 }
