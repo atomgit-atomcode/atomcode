@@ -185,7 +185,15 @@ struct CachedRender {
     /// it is what makes reuse safe: text that was extended is text the kept
     /// lines still describe, and text that was edited is not.
     source: String,
-    lines: Vec<Line>,
+    /// The rows this render produced, shared with whoever is drawing them.
+    ///
+    /// A handle rather than a copy: a frame wants a screenful of a block that
+    /// may be hundreds of rows tall, so handing the rows over and letting the
+    /// frame take the window it can show keeps a frame's cost the screen's
+    /// rather than the answer's. The next render mutates these in place when
+    /// this is the only handle left — which it is once the frame that took the
+    /// last one has been painted and dropped — and copies when it is not.
+    lines: Arc<Vec<Line>>,
     /// Byte offset in `source`, and line count in `lines`, up to which nothing
     /// can change. See [`crate::markdown::render_settled`].
     settled: usize,
@@ -233,65 +241,71 @@ impl Slot {
         matches!(self, Slot::Settled(_))
     }
 
-    /// How many rows this block draws at `width` — and the lines themselves
+    /// How many rows this block draws at `width` — and the rows themselves
     /// when rendering them was the only way to find out.
     ///
     /// A settled block answers from its last measurement, because settling means
     /// its content cannot have changed; a live block is rendered every time,
-    /// because it can have. The lines come back on a miss so that a caller which
+    /// because it can have. The rows come back on a miss so that a caller which
     /// is about to draw them does not render the same block twice — the whole
     /// point being that the scroller and the painter ask one question and get
     /// one answer.
-    pub fn rows_at(&self, width: u16) -> (usize, Option<Vec<Line>>) {
+    ///
+    /// They come back as a shared handle, not a copy. A block can be taller than
+    /// the screen and a frame can only show a screenful of it, so the caller
+    /// takes the window it has room for out of these rather than paying to
+    /// duplicate rows it will drop. Held by the caller only for as long as it is
+    /// drawing, which is what lets the next render extend them in place.
+    pub fn rows_at(&self, width: u16) -> (usize, Option<Arc<Vec<Line>>>) {
         match self {
             Slot::Live(b, cache) => {
                 let Some(text) = b.content.growing_text() else {
                     let lines = b.content.lines(width);
-                    return (lines.len(), Some(lines));
+                    return (lines.len(), Some(Arc::new(lines)));
                 };
                 let mut cached = cache.0.write().expect("live cache poisoned");
                 let base = Style::new();
-                // Reuse what is settled only when the same width rendered it and
-                // the text is an extension of what did. Anything else — a
-                // resize, an edit, a different block — renders the whole thing.
-                let resume = cached
-                    .as_ref()
-                    .filter(|c| c.width == width && text.starts_with(&c.source));
-                #[cfg(test)]
-                if resume.is_some() {
-                    LIVE_RESUMES.fetch_add(1, Ordering::Relaxed);
-                }
-                let (lines, settled, settled_lines) = match resume {
-                    Some(c) => {
+                let rendered = match cached.take() {
+                    // Reuse what is settled only when the same width rendered it
+                    // and the text is an extension of what did. Anything else — a
+                    // resize, an edit, a different block — renders the whole
+                    // thing.
+                    Some(mut c) if c.width == width && text.starts_with(&c.source) => {
+                        #[cfg(test)]
+                        LIVE_RESUMES.fetch_add(1, Ordering::Relaxed);
                         // Everything before the last settled boundary is fixed;
                         // render from there, which is the part still in flux.
-                        let mut lines = c.lines[..c.settled_lines].to_vec();
+                        let lines = Arc::make_mut(&mut c.lines);
+                        lines.truncate(c.settled_lines);
                         #[allow(
                             clippy::string_slice,
                             reason = "`c.settled` is a byte offset this render produced at a line boundary — the byte after a `\\n` — and `text` extends `c.source` byte for byte (the `starts_with` above), so the same offset is a char boundary in `text` too"
                         )]
-                        let rest = &text[c.settled..];
-                        let tail = crate::markdown::render_settled(rest, width, base);
+                        let tail = crate::markdown::render_settled(&text[c.settled..], width, base);
                         lines.extend(tail.lines);
-                        (
-                            lines,
-                            c.settled + tail.settled,
-                            c.settled_lines + tail.settled_lines,
-                        )
+                        c.settled += tail.settled;
+                        c.settled_lines += tail.settled_lines;
+                        // Kept, not replaced: the same buffer, so a growing
+                        // answer does not re-allocate its own source every frame.
+                        c.source.clear();
+                        c.source.push_str(text);
+                        c
                     }
-                    None => {
+                    _ => {
                         let r = crate::markdown::render_settled(text, width, base);
-                        (r.lines, r.settled, r.settled_lines)
+                        CachedRender {
+                            width,
+                            source: text.to_string(),
+                            lines: Arc::new(r.lines),
+                            settled: r.settled,
+                            settled_lines: r.settled_lines,
+                        }
                     }
                 };
-                *cached = Some(CachedRender {
-                    width,
-                    source: text.to_string(),
-                    lines: lines.clone(),
-                    settled,
-                    settled_lines,
-                });
-                (lines.len(), Some(lines))
+                let lines = Arc::clone(&rendered.lines);
+                *cached = Some(rendered);
+                let n = lines.len();
+                (n, Some(lines))
             }
             Slot::Settled(s) => {
                 let mut measured = s.rows.write().expect("rows poisoned");
@@ -303,7 +317,7 @@ impl Slot {
                 let lines = s.block.content.lines(width);
                 let rows = lines.len();
                 *measured = Some((width, rows));
-                (rows, Some(lines))
+                (rows, Some(Arc::new(lines)))
             }
         }
     }
@@ -591,7 +605,7 @@ mod tests {
         let (n1, l1) = s.get(id).unwrap().rows_at(30);
         assert_eq!(resumes(), 0, "nothing was rendered to resume from");
         assert_eq!(
-            l1.unwrap(),
+            *l1.unwrap(),
             crate::markdown::render("first line\n\n", 30, Style::new())
         );
 
@@ -605,7 +619,7 @@ mod tests {
         let (n2, l2) = s.get(id).unwrap().rows_at(30);
         assert_eq!(resumes(), 1, "the growing render resumed from the cache");
         assert_eq!(
-            l2.unwrap(),
+            *l2.unwrap(),
             crate::markdown::render(
                 "first line\n\nsecond paragraph, still going\n",
                 30,
@@ -636,8 +650,45 @@ mod tests {
         let (_, lines) = s.get(id).unwrap().rows_at(30);
         assert_eq!(resumes(), 0, "an edit is not an append");
         assert_eq!(
-            lines.unwrap(),
+            *lines.unwrap(),
             crate::markdown::render("a completely different answer\n", 30, Style::new())
+        );
+    }
+
+    #[test]
+    fn the_rows_a_frame_drew_are_extended_in_place_not_copied_out() {
+        // The cost this exists for. A frame wants a screenful of a block that
+        // may be hundreds of rows tall, so the cache hands the rows over instead
+        // of copying them out — and the next render extends that same buffer.
+        // Copying them out would put the whole answer back into every frame,
+        // which is what the incremental render was for. Not visible in a frame's
+        // output, so it is asserted on the render that followed.
+        let _alone = live_alone();
+        let mut s = Stream::new();
+        let id = {
+            let mut w = s.writer("model");
+            w.open(Coord::new(1, 1), grew("first line\n\n"))
+        };
+
+        let first = s.get(id).unwrap().rows_at(30).1.expect("a first render");
+        let rows = first.len();
+        let home = Arc::as_ptr(&first) as usize;
+        // The frame that took these has been painted and dropped by now, which
+        // is what leaves this the only handle on them.
+        drop(first);
+
+        {
+            let mut w = s.writer("model");
+            w.amend(id, grew("first line\n\nsecond paragraph, still going\n"));
+        }
+        let second = s.get(id).unwrap().rows_at(30).1.expect("a second render");
+        assert!(second.len() > rows, "the block got taller");
+        assert_eq!(
+            Arc::as_ptr(&second) as usize,
+            home,
+            "the rows came back in a new buffer: the frame's rows were copied \
+             out of the cache, so the answer was re-materialised for the frame \
+             instead of being extended in place"
         );
     }
 
@@ -658,7 +709,7 @@ mod tests {
         let (_, lines) = s.get(id).unwrap().rows_at(12);
         assert_eq!(resumes(), 0, "another width is another render");
         assert_eq!(
-            lines.unwrap(),
+            *lines.unwrap(),
             crate::markdown::render("a line long enough to wrap differently\n", 12, Style::new())
         );
     }

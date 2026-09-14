@@ -304,42 +304,100 @@ fn inset(kind: &str) -> u16 {
     opener(kind).map_or(0, |mark| mark.width() as u16)
 }
 
-/// Set every line in from the left edge by the opener's width, never past `w`.
+/// One row in from the left edge by the opener's width, never past `w`.
 ///
-/// The opener goes on the first line that has anything on it rather than on line
+/// The opener goes on the first row that has anything on it rather than on row
 /// zero: an answer may begin with a blank row of its own, and a `●` alone above
 /// the answer is a mark pointing at nothing. The blank rows ahead of it still
-/// take their width, invisibly, so the block stays a rectangle.
+/// take their width, invisibly, so the block stays a rectangle — which is why
+/// the caller says which lead this row gets rather than leaving it to be worked
+/// out here, where the rows above it are no longer in hand.
 ///
 /// The cells carry no style, so they inherit the row's background rather than
 /// naming one — the same reason [`blank_between`]'s row is [`Line::empty`].
-fn set_in(lines: Vec<Line>, open: Option<Span>, w: u16) -> Vec<Line> {
+fn set_in_row(line: &Line, lead: Span, w: u16) -> Line {
+    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    spans.push(lead);
+    spans.extend(line.spans.iter().cloned());
+    // The caller rendered into `w - pad`, so this cut should never bite. It is
+    // here anyway because the other half of the same promise is asserted by
+    // `content_never_draws_wider_than_it_was_given`: content never exceeds the
+    // width it was given, whatever the reason. Asked before cutting, because
+    // `Line::truncate` copies unconditionally and this is a row of a frame.
+    let mut out = Line::from_spans(spans);
+    if out.width() > w as usize {
+        out = out.truncate(w as usize);
+    }
+    out
+}
+
+/// Whether a row is one a person would call empty.
+fn blank_row(line: &Line) -> bool {
+    line.spans.iter().all(|s| s.text.trim().is_empty())
+}
+
+// How many rows the frames composed on this thread have copied into themselves.
+//
+// Test-only, and per-thread so a frame composed by one test is not counted
+// against another. Whether a frame costs the screen or the block cannot be seen
+// in what it draws — the same rows come out either way — only in the work it
+// did, which is the same reason `block::LIVE_RESUMES` exists.
+#[cfg(test)]
+thread_local! {
+    static COPIED_ROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Put the rows of a block that can land on the screen into the frame.
+///
+/// `lines` is the whole block, `rows` the window the scroll has left at — a
+/// range into `lines`, already clamped to it by the caller. Only the window is
+/// set in: a block may be taller than the whole rect, and the rows above it are
+/// neither copied nor dropped, which is what keeps a frame's cost the screen's
+/// rather than the block's.
+///
+/// Rows go in bottom-first: the buffer is filled from the foot of the screen up,
+/// and is reversed once at the end.
+fn window_into(
+    out: &mut Vec<Line>,
+    owner: &mut Vec<RowOwner>,
+    lines: &[Line],
+    rows: std::ops::Range<usize>,
+    open: Option<Span>,
+    w: u16,
+    own: RowOwner,
+) {
+    let window = &lines[rows.clone()];
+    #[cfg(test)]
+    COPIED_ROWS.with(|n| n.set(n.get() + window.len() as u64));
     let Some(open) = open else {
-        return lines;
+        for line in window.iter().rev() {
+            out.push(line.clone());
+            owner.push(own);
+        }
+        return;
     };
-    let pad = open.width() as u16;
-    let blank = Span::styled(" ".repeat(pad as usize), Style::new());
-    let mut marked = false;
-    lines
-        .into_iter()
-        .map(|line| {
-            let empty = line.spans.iter().all(|s| s.text.trim().is_empty());
-            let lead = if !marked && !empty {
-                marked = true;
+    let blank = Span::styled(" ".repeat(open.width()), Style::new());
+    // Which row of the window is the block's first with anything on it. Every
+    // row before that one takes the margin and no mark, and a window that opens
+    // below it takes the margin for all of its rows — the same rows in the same
+    // order [`set_in_row`] would have been handed, block or no block.
+    let marked = lines
+        .iter()
+        .position(|line| !blank_row(line))
+        .filter(|at| *at >= rows.start)
+        .map(|at| at - rows.start);
+    for (i, line) in window.iter().enumerate().rev() {
+        out.push(set_in_row(
+            line,
+            if marked == Some(i) {
                 open.clone()
             } else {
                 blank.clone()
-            };
-            let mut spans = Vec::with_capacity(line.spans.len() + 1);
-            spans.push(lead);
-            spans.extend(line.spans);
-            // The caller rendered into `w - pad`, so this cut should never bite.
-            // It is here anyway because the other half of the same promise is
-            // asserted by `content_never_draws_wider_than_it_was_given`: content
-            // never exceeds the width it was given, whatever the reason.
-            Line::from_spans(spans).truncate(w as usize)
-        })
-        .collect()
+            },
+            w,
+        ));
+        owner.push(own);
+    }
 }
 
 /// Whether a call may be shown behind the same lid as its neighbours.
@@ -742,17 +800,18 @@ impl Host {
             // The column this block leaves on the left, and the width that is
             // actually left to draw in. Every render below is asked for `room`,
             // never `rect.w` — content wrapped to the full width and then set in
-            // would overflow, and the cut in `set_in` would eat its last cells.
+            // would overflow, and the cut in `set_in_row` would eat its last
+            // cells.
             let pad = inset(kind);
             let room = rect.w.saturating_sub(pad);
-            let lines = if let Some(run) = lid {
+            let lines: Arc<Vec<Line>> = if let Some(run) = lid {
                 // A run of folded calls behind one lid. Its rows are owned by
                 // the last call, so a click anywhere on the lid folds the run
                 // that drew it — which is the only thing that click could mean.
                 own = Some((block.id, kind));
-                lid_lines(stream.slots(), i, run.count, room)
+                Arc::new(lid_lines(stream.slots(), i, run.count, room))
             } else if foldable && pres.is_block_folded(block.id, kind) {
-                vec![block.content.summary(room)]
+                Arc::new(vec![block.content.summary(room)])
             } else {
                 // The one place a block is rendered for the screen. Its row count
                 // comes first, because a settled block already knows it: a block
@@ -782,39 +841,32 @@ impl Host {
                     below = Some(kind);
                     continue;
                 }
-                // A hit hands back no lines because it did not render any; this
-                // is the block being looked at, so it gets rendered now.
+                // A hit hands back the rows it measured with — the block's own,
+                // shared rather than copied, since a frame wants a screenful of
+                // them at most. A miss is rendered now, for the same reason the
+                // count came first: this is a block the reader can see.
                 match rendered {
                     Some(lines) => lines,
-                    None => block.content.lines(room),
+                    None => Arc::new(block.content.lines(room)),
                 }
             };
-            // The margin is added after the block has drawn, not asked of it:
-            // the two renderers a block has — `lines` and the incremental
-            // `render_settled` the live cache drives — are both reached from
-            // here, so one call covers a streaming answer and a settled one
-            // alike. Doing it inside the block would mean doing it twice, and
-            // the two would drift the moment one of them was missed.
-            let mut lines = set_in(lines, opener(kind), rect.w);
             if lines.is_empty() {
                 continue;
             }
             // A lid's rows are a run's, not one block's, so `rows_at` cannot
             // measure them and the same skip is decided here instead — same
             // arithmetic, same reason.
-            if lid.is_some() {
-                let n = lines.len();
-                if out.len() >= want {
-                    break;
+            let n = lines.len();
+            if out.len() >= want {
+                break;
+            }
+            if n <= scroll.saturating_sub(skipped) {
+                skipped += n;
+                if below.is_some_and(|b| blank_between(kind, b)) {
+                    skipped += 1;
                 }
-                if n <= scroll.saturating_sub(skipped) {
-                    skipped += n;
-                    if below.is_some_and(|b| blank_between(kind, b)) {
-                        skipped += 1;
-                    }
-                    below = Some(kind);
-                    continue;
-                }
+                below = Some(kind);
+                continue;
             }
             let blank = below.is_some_and(|b| blank_between(kind, b));
             below = Some(kind);
@@ -831,18 +883,30 @@ impl Host {
                     owner.push(None);
                 }
             }
-            lines.reverse();
-            for line in lines {
-                if skipped < scroll {
-                    skipped += 1;
-                    continue;
-                }
-                if out.len() >= want {
-                    break;
-                }
-                out.push(line);
-                owner.push(own);
-            }
+            // The margin is added as the rows go in, and only to the rows that go
+            // in: the two renderers a block has — `lines` and the incremental
+            // `render_settled` the live cache drives — are both reached above, so
+            // one call covers a streaming answer and a settled one alike. Doing
+            // it inside the block would mean doing it twice, and the two would
+            // drift the moment one of them was missed.
+            //
+            // Rows counted from the bottom, because the scroll offset is: the
+            // first `scroll - skipped` of them are above the window and are
+            // stepped over, and of what is left the rect takes what it has room
+            // for. Everything above that is not copied at all — a block can be
+            // taller than the screen, and it is the screen the frame costs.
+            let from_bottom = scroll.saturating_sub(skipped).min(n);
+            let take = want.saturating_sub(out.len()).min(n - from_bottom);
+            skipped += from_bottom;
+            window_into(
+                &mut out,
+                &mut owner,
+                &lines,
+                n - from_bottom - take..n - from_bottom,
+                opener(kind),
+                rect.w,
+                own,
+            );
             if out.len() >= want {
                 break;
             }
@@ -1349,6 +1413,48 @@ mod tests {
             asked.load(orders),
             0,
             "asking again how tall settled blocks are rendered them again"
+        );
+    }
+
+    #[test]
+    fn a_frame_copies_the_screen_not_the_block() {
+        // One block taller than the rect, and a reader who can only see the
+        // rect: only the rect is set in and copied. Asserted on the rows copied
+        // rather than on the frame, because the same rows come out of a frame
+        // that copied four hundred others on the way past.
+        //
+        // This is about the *block*, not the session — what is above the fold is
+        // already skipped in arithmetic. A block bigger than the screen is the
+        // same promise one level down: the rows it draws are the rect's, and the
+        // rows it does not draw are nobody's cost.
+        let h = host();
+        {
+            let mut s = h.stream.write().unwrap();
+            s.writer("bench").emit(
+                crate::block::Coord::default(),
+                Arc::new(Counted {
+                    lines: (0..400).map(|i| format!("row {i}")).collect(),
+                    asked: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }),
+            );
+        }
+        let size = (80, 12);
+        // Two frames: the first has to measure the block, the second is the
+        // steady state a scroll or a tick pays for.
+        let _ = h.compose(size);
+        COPIED_ROWS.with(|rows| rows.set(0));
+        let frame = h.compose(size);
+        let drawn = frame.part("stream").expect("the conversation").lines.len();
+        assert!(
+            drawn > 0 && drawn < 400,
+            "the block is taller than the rect: {drawn} rows were drawn"
+        );
+        let copied = COPIED_ROWS.with(|rows| rows.get());
+        assert_eq!(
+            copied, drawn as u64,
+            "the frame copied {copied} rows into a {drawn}-row rect: rows it \
+             could not draw were set in on the way, so a frame cost the block \
+             rather than the screen"
         );
     }
 
