@@ -83,9 +83,9 @@ truncated_redump=2，一模一样。也就是说**生产那条中间件链没有
 **仍然没有覆盖到的**：多 agent 编排、真 provider、session 持久化落盘
 （`session-persistence-jsonl` 在差分里是关掉的）。
 
-### 一条属于 harness 的分歧（`refused_call_started_rows=1`）
+### ~~一条属于 harness 的分歧~~ —— 已修（`78b4d33e`）
 
-**每一个被拒的调用，在行式这边都会闪一下「开始了」。**
+**曾经：每一个被拒的调用，在行式这边都会闪一下「开始了」。**
 
 ```
 链式  Request approval → ToolResult error=true
@@ -97,10 +97,28 @@ truncated_redump=2，一模一样。也就是说**生产那条中间件链没有
 都早；coding 的链式是中间件放行之后才宣告，所以被拒的调用根本不会被宣告。
 
 这不是某个产品行的问题（`execution-policy` 行第一版就是这么误判自己的，白花一轮）。
-`handle.rs` 已经守了隔壁那个 case——「没挂载的工具不宣告」，注释里说那也是差分
-发现的——所以**修法的形状是现成的，且属于 `ui-handle`**。两条基线携带它
-（`approval_refusal_rows`、`exec_policy_rows`），`refused_call_started_rows`
-这条场景专门认领它，修好时把三条一起降。
+
+**修法不是「更聪明的猜」，是补一条事实。** 日志里本来只有「模型要求调用」
+（`AssistantMessage`，闸门之前）和「调完了」（`ToolResultLogged`），中间
+**「它到底跑没跑」哪儿都没有**——想区分「被拒」和「跑挂了」只能解析 content
+的散文。新增 `SessionEvent::ToolStarted`，提交在 `exec.rs` 的瀑布终点（每个
+监听器都放行之后），投影改从它发。这跟内核是同一个位置：`agent.rs` 那句
+`events.send` 的注释写着 *"as THIS tool actually starts"*，被取消的工具
+*"does not start, emits no ToolStarted"*——**回到内核已立的规矩**。
+
+事实带整个 `ToolCall`，顺带补上另一个缺口：`tool-args-repair`（`policy.rs:36`）
+和 cc-hooks 的 `updatedInput` 都会在执行前改写参数，而日志里只有模型要求的
+那份。现在「真正跑的是什么」有记录了。
+
+**代价：`SESSION_FORMAT_VERSION` 1 → 2。** 枚举是 `#[non_exhaustive]`，Rust 侧
+加变体是加性的；磁盘上不是——`serde(tag="kind")` 遇到不认识的 kind 会报错，
+`JsonlStore::parse` 又用 `?` 传播，旧读端会拒掉整个文件。**这个改动之后写出的
+会话，旧构建打不开。** 把读端改成宽容是另一笔取舍（「猜」而不是「拒」），
+留给拥有那个决定的人。
+
+**七处分歧一起清零**：`exec_policy` 1→0、`approval_refusal` 1→0、
+`cc_hooks_deny` 1→0、`refused_call_started` 1→0、`approval_write_outside` 2→0、
+`grant_scope` 2→0。
 
 ### 上一版交接把两条审批场景说成「全 0」，那是因为它们没在测审批
 
@@ -232,10 +250,9 @@ fs2 文件锁，锁基线文件本身。
   正被另一条线重写（把 UI 行移出 catalog，ADR 0018 §5）。`git commit -- <path>`
   取工作区内容，提交它会把别人没写完的改动卷走。目前由 `on_harness::mount` 与
   测试显式注册。**那边落地后，通用的几个应移进 catalog。**
-- **`cargo nextest run -p atomcode-harness` 全量是红的**，7 个测试文件
-  （composition / concurrency / front_ends / opener / profile / recovery /
-  seam_convention），报错都是 `entry 'ui' names plugin 'ui-quiet', which is not in
-  the registry` —— 对应上面那条未完成的改动，**与本线无关**。
+- ~~`cargo nextest run -p atomcode-harness` 全量是红的~~ —— **09-14 复查已全绿
+  （292/292）**。那批 `entry 'ui' names plugin 'ui-quiet'` 的报错来自另一条线
+  当时未提交的工作，从未进过本 worktree。
 - `gates/differential.baseline` **没有任何地方在读它**（gates/、CI、Makefile 全仓
   grep 不到消费者）。棘轮跑在测试里，门口没人拦。接上是一行的事。
 
@@ -259,9 +276,7 @@ fs2 文件锁，锁基线文件本身。
 | `GitPushLabelMiddleware` | — | 够不着,在 `atomgit` feature 后面,开它要拉 reqwest+auth |
 | `PermissionRuleGate` | — | 不用搬,harness `permissions` 行已自实现 |
 
-1. **`ui-handle` 的 `ToolStarted` 缺口**（上面那节）。属于 harness，不属于这条线，
-   但切默认路径前该有人看一眼：它影响每一条拒绝路径，现在有三条基线带着它
-   （`approval_refusal_rows`、`exec_policy_rows`、`cc_hooks_deny_rows`）。
+1. ~~`ui-handle` 的 `ToolStarted` 缺口~~ —— **已修（`78b4d33e`）**，见上。
 2. **五个闸门行进 `plugins::catalog()`**，等另一条线放开 `plugins/mod.rs`。
    现在由 `on_harness::mount` 显式注册，能跑，但不该长期这样。
 3. **然后才切 `build_coding_agent` 的默认路径**，并留一个逃生开关（参照当初
@@ -309,8 +324,9 @@ fs2 文件锁，锁基线文件本身。
 ## 怎么验证
 
 ```sh
-cargo nextest run -p atomcode-coding --test differential   # 60/60,裁判
-cargo nextest run -p atomcode-coding                       # 531/531
+cargo nextest run -p atomcode-coding --test differential   # 61/61,裁判
+cargo nextest run -p atomcode-coding                       # 532/532
+cargo nextest run -p atomcode-harness                      # 292/292
 cargo nextest run -p atomcode-capabilities --features session   # 1124/1124
 cargo nextest run -p atomcode-capabilities --features cc-hooks  # 939/939
 cargo nextest run -p atomcode-harness --test policy_rows   # 24/24(全量会红,见上)
