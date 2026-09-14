@@ -1474,6 +1474,29 @@ async fn the_menu_asks_the_terminal_for_the_pointer_only_while_it_is_open() {
         "the menu closed but the terminal is still reporting every cell"
     );
 
+    // …and what is handed back is the *hover*, not the pointer. One tracker,
+    // three mutually exclusive settings: the `1003l` that stops free motion
+    // stops the clicks with it, so closing the menu has to leave the terminal in
+    // button reporting. Asserted as the state rather than as the bytes, because
+    // the bug was that the two were thought to be the same thing — the old pair
+    // of flags said "no hover" and could not say "and still no buttons", so the
+    // pointer was gone for the rest of the session and `ctrl-o` needed two
+    // presses to return it: the first turned off what was already off.
+    assert_eq!(
+        s.term.pointer_mode(),
+        atomcode_tui::ansi::Pointer::Buttons,
+        "closing the menu gave the clicks away with the hover"
+    );
+    // The bytes agree with the state, which is what a real terminal reads. Named
+    // as the constant rather than through `Pointer::escape` on purpose: asking
+    // the function under test what it produced is not an oracle, and this
+    // assertion is the one that notices the escape going back to a bare `1003l`.
+    assert_eq!(
+        s.term.escapes().last().map(String::as_str),
+        Some(atomcode_tui::ansi::MOUSE_ON),
+        "and that is what went out on the wire"
+    );
+
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }

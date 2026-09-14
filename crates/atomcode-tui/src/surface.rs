@@ -244,6 +244,31 @@ pub trait Surface: Send + Sync {
 
 // ---- headless -----------------------------------------------------------
 
+/// [`Pointer`](crate::ansi::Pointer) as a number, for the two surfaces that
+/// keep it in an atomic.
+///
+/// A value and not a bit pattern: a state added to the enum is a state these
+/// have to be taught, rather than a number that silently comes to mean something
+/// else. Both surfaces use the same pair, so the recorder and the writer cannot
+/// disagree about which state they are in.
+fn pointer_state(p: crate::ansi::Pointer) -> u8 {
+    use crate::ansi::Pointer;
+    match p {
+        Pointer::Terminal => 0,
+        Pointer::Buttons => 1,
+        Pointer::ButtonsAndHover => 2,
+    }
+}
+
+fn pointer_from_state(n: u8) -> crate::ansi::Pointer {
+    use crate::ansi::Pointer;
+    match n {
+        1 => Pointer::Buttons,
+        2 => Pointer::ButtonsAndHover,
+        _ => Pointer::Terminal,
+    }
+}
+
 /// A surface that paints into memory and remembers everything.
 ///
 /// The whole automated loop rests on this: no tty, no escape-sequence guessing,
@@ -271,7 +296,21 @@ pub struct Headless {
     /// been told. Kept so a test can assert the request went out at all: the
     /// events a menu consumes are scripted here, and a scripted event says
     /// nothing about whether a terminal would ever have sent one.
-    motion: std::sync::atomic::AtomicBool,
+    ///
+    /// The intents, not the state — the state is derived by [`Headless::pointer`]
+    /// exactly the way the terminal's is, so a test cannot pass on a pair of
+    /// flags that the terminal would never have been put into.
+    grab: std::sync::atomic::AtomicBool,
+    hover: std::sync::atomic::AtomicBool,
+    /// Which setting of the mouse tracker this surface last said it was in.
+    state: std::sync::atomic::AtomicU8,
+    /// Every mouse-mode escape the real terminal would have received, in order.
+    ///
+    /// The bytes rather than another flag, because the bug this exists to catch
+    /// was in the *sequence*: closing the menu sent `1003l` on its own, which a
+    /// terminal reads as "no mouse at all", while the flag it was asserted
+    /// against said the same thing either way.
+    escapes: Mutex<Vec<String>>,
 }
 
 impl Headless {
@@ -285,7 +324,10 @@ impl Headless {
             clipboard: Mutex::new(None),
             clipboard_text: Mutex::new(None),
             me: Mutex::new(None),
-            motion: std::sync::atomic::AtomicBool::new(false),
+            grab: std::sync::atomic::AtomicBool::new(true),
+            hover: std::sync::atomic::AtomicBool::new(false),
+            state: std::sync::atomic::AtomicU8::new(pointer_state(crate::ansi::Pointer::Buttons)),
+            escapes: Mutex::new(Vec::new()),
         });
         *me.me.lock().expect("headless poisoned") = Some(Arc::downgrade(&me));
         me
@@ -407,6 +449,43 @@ impl Headless {
         self.last().map(|f| ansi::encode(&f)).unwrap_or_default()
     }
 
+    /// Every mouse-mode escape the real terminal would have received, in order.
+    ///
+    /// What `motion()` cannot say. Closing the menu owes the terminal a `1002h`
+    /// — the tracker it just cleared — and a flag that reads `false` either way
+    /// cannot tell that apart from handing the pointer back for good.
+    pub fn escapes(&self) -> Vec<String> {
+        self.escapes.lock().expect("headless poisoned").clone()
+    }
+
+    /// The state this surface last said the terminal's tracker was in.
+    ///
+    /// The semantic view of [`Headless::escapes`]: the bytes say what was
+    /// written, this says what it means. A test that cares about behaviour wants
+    /// this one, and a test that cares about the wire wants the other.
+    pub fn pointer_mode(&self) -> crate::ansi::Pointer {
+        pointer_from_state(self.state.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Record the escape that moves the tracker to where the intents say it
+    /// should be — the same derivation, and the same "only when it changes", as
+    /// the terminal surface's.
+    fn record_pointer(&self) {
+        use std::sync::atomic::Ordering;
+        let want = crate::ansi::Pointer::from_intents(
+            self.grab.load(Ordering::SeqCst),
+            self.hover.load(Ordering::SeqCst),
+        );
+        let Some(escape) = want.escape_from(self.pointer_mode()) else {
+            return;
+        };
+        self.state.store(pointer_state(want), Ordering::SeqCst);
+        self.escapes
+            .lock()
+            .expect("headless poisoned")
+            .push(escape.to_string());
+    }
+
     pub fn clear(&self) {
         self.frames.lock().expect("headless poisoned").clear();
     }
@@ -450,11 +529,38 @@ impl Surface for Headless {
     /// pointer already delivers the events a menu reads, so without recording
     /// the request a test could not tell "the menu asked for motion" from "the
     /// menu was handed motion by a test that assumed a terminal would".
+    ///
+    /// The bytes the terminal surface would have written, not just the flag, so
+    /// the same test can see *what* was asked for — which is the whole
+    /// difference between staying in button reporting and giving the pointer up.
+    ///
+    /// `set_mouse` is here for the same reason, and has the same shape as the
+    /// terminal's: this surface has to model *both* intents, because the state
+    /// that matters is derived from the pair rather than from either one.
+    fn set_mouse(&self, on: bool) {
+        use std::sync::atomic::Ordering;
+        if self.grab.swap(on, Ordering::SeqCst) == on {
+            return;
+        }
+        // Same as the terminal: handing the pointer back takes the hover with
+        // it, so the two sides cannot disagree about what was asked for.
+        if !on {
+            self.hover.store(false, Ordering::SeqCst);
+        }
+        self.record_pointer();
+    }
+    fn mouse(&self) -> bool {
+        self.grab.load(std::sync::atomic::Ordering::SeqCst)
+    }
     fn set_motion(&self, on: bool) {
-        self.motion.store(on, std::sync::atomic::Ordering::SeqCst);
+        use std::sync::atomic::Ordering;
+        if self.hover.swap(on, Ordering::SeqCst) == on {
+            return;
+        }
+        self.record_pointer();
     }
     fn motion(&self) -> bool {
-        self.motion.load(std::sync::atomic::Ordering::SeqCst)
+        self.pointer_mode() == crate::ansi::Pointer::ButtonsAndHover
     }
     fn as_any_headless(&self) -> Option<Arc<Headless>> {
         self.me
@@ -474,11 +580,23 @@ impl Surface for Headless {
 /// addressable — native scrollback is not. See `docs/adr/0006`.
 pub struct Terminal {
     raw: bool,
-    mouse: std::sync::atomic::AtomicBool,
-    /// Whether free motion (1003) is currently asked for. Separate from
-    /// `mouse` because it is asked for by the thing that follows the pointer,
-    /// for as long as that thing is on screen.
-    motion: std::sync::atomic::AtomicBool,
+    /// Which setting the terminal's mouse tracker is on, as this side believes.
+    ///
+    /// One enum rather than `mouse` and `motion` flags, because the terminal
+    /// keeps one tracker: two booleans here can say "no hover and no buttons",
+    /// which is not a state the two intents can add up to, and which the old
+    /// pair expressed by accident — it thought it was in 1002 while the
+    /// terminal had left reporting entirely.
+    ///
+    /// This is the record of what was *told*; the two intents it is derived from
+    /// are [`Terminal::grab`] and [`Terminal::hover`]. Both have to be kept,
+    /// because the loop asks for the hover on every iteration and a derived
+    /// value alone cannot tell "already there" from "asked for again".
+    state: std::sync::atomic::AtomicU8,
+    /// Whether the pointer is ours at all.
+    grab: std::sync::atomic::AtomicBool,
+    /// Whether the thing that follows the pointer asked for free motion.
+    hover: std::sync::atomic::AtomicBool,
     caps: crate::caps::Caps,
     painted: LastPainted,
     /// Where stderr was sent while we hold the screen, and the descriptor it
@@ -519,9 +637,12 @@ impl Terminal {
         crossterm::terminal::enable_raw_mode()?;
         let mut out = std::io::stdout();
         out.write_all(ansi::ENTER.as_bytes())?;
-        if mouse {
-            out.write_all(ansi::MOUSE_ON.as_bytes())?;
-        }
+        let pointer = if mouse {
+            ansi::Pointer::Buttons
+        } else {
+            ansi::Pointer::Terminal
+        };
+        out.write_all(pointer.escape().as_bytes())?;
         out.flush()?;
         let mut caps = crate::caps::Caps::detect();
         // Inside the alternate screen on purpose: a terminal that does not know
@@ -544,12 +665,41 @@ impl Terminal {
         arm_panic_restore(None);
         Ok(Self {
             raw: true,
-            mouse: std::sync::atomic::AtomicBool::new(mouse),
-            motion: std::sync::atomic::AtomicBool::new(false),
+            state: std::sync::atomic::AtomicU8::new(pointer_state(pointer)),
+            grab: std::sync::atomic::AtomicBool::new(mouse),
+            hover: std::sync::atomic::AtomicBool::new(false),
             caps,
             painted: LastPainted::default(),
             stderr,
         })
+    }
+
+    /// What the terminal was last told its mouse tracker should be.
+    fn pointer_mode(&self) -> ansi::Pointer {
+        pointer_from_state(self.state.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Put the terminal's mouse tracker where the two intents say it should be.
+    ///
+    /// The only place the tracker is written. Everything that changes an intent
+    /// — the grab, the hover — lands here rather than writing a byte of its own,
+    /// which is what keeps the record and the terminal from disagreeing: the
+    /// bytes are always the whole target state, and only when it is not already
+    /// the state.
+    fn refresh_pointer(&self) {
+        use std::sync::atomic::Ordering;
+        let want = ansi::Pointer::from_intents(
+            self.grab.load(Ordering::SeqCst),
+            self.hover.load(Ordering::SeqCst),
+        );
+        let had = self.pointer_mode();
+        let Some(escape) = want.escape_from(had) else {
+            return;
+        };
+        self.state.store(pointer_state(want), Ordering::SeqCst);
+        let mut out = std::io::stdout();
+        let _ = out.write_all(escape.as_bytes());
+        let _ = out.flush();
     }
 }
 
@@ -1161,47 +1311,38 @@ impl Surface for Terminal {
     }
     fn set_mouse(&self, on: bool) {
         use std::sync::atomic::Ordering;
-        if self.mouse.swap(on, Ordering::SeqCst) == on {
+        if self.grab.swap(on, Ordering::SeqCst) == on {
             return;
         }
-        let mut out = std::io::stdout();
-        let _ = out.write_all(if on { ansi::MOUSE_ON } else { ansi::MOUSE_OFF }.as_bytes());
-        let _ = out.flush();
-        // `MOUSE_OFF` turns free motion off as well — a pointer handed back
-        // mid-hover must not leave the terminal reporting every cell it
-        // crosses. The record has to say the same thing the terminal was told.
+        // Handing it back mid-hover must not leave the terminal reporting every
+        // cell the pointer crosses — and the record has to say what the terminal
+        // was told, so the hover *intent* goes with it rather than only the
+        // state derived from it.
         if !on {
-            self.motion.store(false, Ordering::SeqCst);
+            self.hover.store(false, Ordering::SeqCst);
         }
+        self.refresh_pointer();
     }
     fn mouse(&self) -> bool {
-        self.mouse.load(std::sync::atomic::Ordering::SeqCst)
+        self.grab.load(std::sync::atomic::Ordering::SeqCst)
     }
     /// Turn free motion on or off.
     ///
     /// Only when the mouse is ours: reporting motion with the pointer handed
     /// back would be asking for events nothing here owns, and asking for them
     /// while a person is selecting text with the terminal's own gesture is
-    /// exactly the packet-per-cell cost the switch exists to avoid.
+    /// exactly the packet-per-cell cost the switch exists to avoid. That
+    /// conjunction is `Pointer::from_intents` rather than an `&&` here, so this
+    /// side cannot ask for a state the terminal does not have.
     fn set_motion(&self, on: bool) {
         use std::sync::atomic::Ordering;
-        let on = on && self.mouse.load(Ordering::SeqCst);
-        if self.motion.swap(on, Ordering::SeqCst) == on {
+        if self.hover.swap(on, Ordering::SeqCst) == on {
             return;
         }
-        let mut out = std::io::stdout();
-        let _ = out.write_all(
-            if on {
-                ansi::MOUSE_MOTION_ON
-            } else {
-                ansi::MOUSE_MOTION_OFF
-            }
-            .as_bytes(),
-        );
-        let _ = out.flush();
+        self.refresh_pointer();
     }
     fn motion(&self) -> bool {
-        self.motion.load(std::sync::atomic::Ordering::SeqCst)
+        self.pointer_mode() == ansi::Pointer::ButtonsAndHover
     }
     fn forget(&self) {
         self.painted.forget();
