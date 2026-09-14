@@ -1917,15 +1917,38 @@ impl RunningAgent {
         ctx: &TurnCtx,
         internal_cancel: bool,
     ) {
-        if self.keep_interrupted_context {
+        // PRESERVE mode keeps WORK, not an abandoned prompt. A turn cancelled before the
+        // assistant produced anything (persisted no assistant/tool message) has no progress
+        // to keep — preserving its bare user message only contaminates the NEXT turn: a weak
+        // model reads the abandoned prompt as live intent (the reported bug where a cancelled
+        // "commit + push to release/x" leaked into an unrelated follow-up). So an EMPTY
+        // cancelled turn rolls back even in preserve mode; the TUI still restores the prompt
+        // to the input box for edit-and-resend. Mirrors oh-my-pi dropping interrupted turns
+        // that produced nothing before the next prompt.
+        // `get(rollback_len..)` not direct indexing: a mid-turn overflow compaction can shrink
+        // history BELOW `rollback_len` (documented on the truncate below), and a bare slice
+        // would panic there. None ⇒ no tail ⇒ no work ⇒ undo (the truncate stays a safe no-op).
+        let turn_did_work = convo
+            .messages
+            .get(rollback_len..)
+            .is_some_and(|tail| {
+                tail.iter().any(|m| {
+                    matches!(
+                        m.role,
+                        crate::message::Role::Assistant | crate::message::Role::Tool
+                    )
+                })
+            });
+        if self.keep_interrupted_context && turn_did_work {
             // PRESERVE: keep this turn's partial assistant/tool work; backfill a
             // `(cancelled)` result for every dangling tool_call so the wire stays
             // API-valid. APPEND-ONLY — prefix-cache safe. Mirrors v1's
             // `Conversation::cancel_current_turn`.
             convo.backfill_cancelled_tool_results();
         } else {
-            // CANCEL = UNDO (default): roll back to before the user message so the
-            // cancelled prompt + partial work leaves NO trace.
+            // CANCEL = UNDO: roll back to before the user message so the cancelled prompt +
+            // partial work leaves NO trace. Taken for the kernel-default undo mode AND for an
+            // empty cancel in preserve mode (nothing worth keeping).
             convo.messages.truncate(rollback_len);
         }
         if !internal_cancel {
