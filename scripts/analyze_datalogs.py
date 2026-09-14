@@ -11,6 +11,7 @@ Usage:
     python3 scripts/analyze_datalogs.py --deep /path/to/datalog/   # Claude Code deep analysis on FAIL turns
 """
 
+import json
 import re
 import sys
 import os
@@ -38,50 +39,108 @@ class TurnAnalysis:
     files_edited: dict = field(default_factory=dict)  # filename -> count
     tools_used: dict = field(default_factory=dict)    # tool -> count
     bash_commands: list = field(default_factory=list)
+    round_ms: list = field(default_factory=list)      # per-round LLM latency (ms)
+    tool_ms: list = field(default_factory=list)       # (tool, dur_ms) per tool call
+
+
+def _arg_path(args: str) -> str:
+    """Best-effort target path from a tool-call's JSON args (current datalogs record
+    args as JSON like `{"path":"src/x.rs"}` / `{"file_path":"…"}`). Falls back to a
+    trailing-segment heuristic for non-JSON/legacy args. Returns the basename."""
+    raw = args
+    try:
+        obj = json.loads(args)
+        if isinstance(obj, dict):
+            for key in ("path", "file_path", "file", "target_file", "filename"):
+                if isinstance(obj.get(key), str):
+                    raw = obj[key]
+                    break
+    except (ValueError, TypeError):
+        pass
+    raw = raw.rsplit("/", 1)[-1] if "/" in raw else raw
+    return re.sub(r'\s+L\d+-\d+$', '', raw)
 
 
 def parse_datalog(path: str) -> dict:
-    """Parse a datalog .md file into structured data."""
+    """Parse a datalog .md file (current grammar emitted by datalog.rs) into
+    structured data.
+
+    Grammar (per turn file):
+      - `## User\\n```\\n<prompt>\\n``` `
+      - per round: `### Turn N` + `  _[request: …]_`, then tool-call bullets
+        `- <tool> `<args>`` and a per-round line `  _[tokens: … dur=Nms]_`
+        (or `  _[dur=Nms]_` when usage is absent).
+      - per tool: ``**Tool result:** `<tool>` (`<id>`, <status>[, dur=Nms])`` then
+        a fenced output block.
+      - `**Stats:** N turns, M tool calls, X.Xs, …` at the end.
+    A "step" here is one executed tool call (tool + args + output), reconstructed by
+    pairing tool-call bullets with tool-result blocks in execution order.
+    """
     text = open(path).read()
 
-    # Extract user prompt
+    # Extract user prompt.
     user_match = re.search(r'## User\n```\n(.*?)\n```', text, re.DOTALL)
     user_prompt = user_match.group(1).strip() if user_match else ""
 
-    # Extract stats
-    stats_match = re.search(r'\*\*Stats:\*\* (\d+) steps?, ([\d.]+)s', text)
-    total_steps = int(stats_match.group(1)) if stats_match else 0
-    duration = float(stats_match.group(2)) if stats_match else 0
-
-    # Extract steps
-    steps = []
-    step_pattern = re.compile(
-        r'\*\*Step (\d+)\*\* > (\w[\w ]*?)(?:\s+`(.*?)`)?(?:\s+\((\d+) bytes\))?\n'
-        r'(.*?)(?=\n\*\*Step |\n\*\*Response|\n---|\Z)',
-        re.DOTALL
+    # Stats: "N turns, M tool calls, X.Xs" (only `duration` is load-bearing here;
+    # `total_steps` is derived from the reconstructed steps below).
+    stats_match = re.search(
+        r'\*\*Stats:\*\*\s+\d+\s+turns?,\s+\d+\s+tool calls?,\s+([\d.]+)s', text
     )
-    for m in step_pattern.finditer(text):
-        step_num = int(m.group(1))
-        tool = m.group(2).strip()
-        args_preview = m.group(3) or ""
-        output_preview = m.group(5).strip()
+    duration = float(stats_match.group(1)) if stats_match else 0.0
+
+    # Tool-call bullets: `- <tool> `<args>`` (backticks inside args are escaped as \`).
+    call_pat = re.compile(r'^- (\w[\w./-]*) `(.*)`\s*$', re.MULTILINE)
+    calls = [(m.group(1), m.group(2).replace('\\`', '`')) for m in call_pat.finditer(text)]
+
+    # Tool-result blocks (authoritative per executed tool): name, status, optional
+    # duration, fenced output.
+    result_pat = re.compile(
+        r'\*\*Tool result:\*\* `([^`]+)` \(`[^`]*`, (\w+)(?:, dur=(\d+)ms)?\)\n```\n(.*?)\n```',
+        re.DOTALL,
+    )
+    results = [
+        {
+            "tool": m.group(1),
+            "status": m.group(2),
+            "dur_ms": int(m.group(3)) if m.group(3) else None,
+            "output": m.group(4).strip(),
+        }
+        for m in result_pat.finditer(text)
+    ]
+
+    # Reconstruct steps by pairing each result with its call's args in execution order.
+    steps = []
+    for i, r in enumerate(results):
+        if i < len(calls) and calls[i][0] == r["tool"]:
+            args = calls[i][1]
+        else:  # order drifted (rare); fall back to the first same-named call.
+            args = next((a for (n, a) in calls if n == r["tool"]), "")
         steps.append({
-            "num": step_num,
-            "tool": tool,
-            "args": args_preview,
-            "output": output_preview,
+            "num": i + 1,
+            "tool": r["tool"],
+            "args": args,
+            "output": r["output"],
+            "status": r["status"],
+            "dur_ms": r["dur_ms"],
         })
 
-    # Extract response
+    # Per-round LLM latency: `_[tokens: … dur=Nms]_` or standalone `_[dur=Nms]_`.
+    round_ms = [int(x) for x in re.findall(r'_\[(?:tokens:[^\]]*?)?dur=(\d+)ms\]_', text)]
+    # Per-tool duration from the result blocks.
+    tool_ms = [(s["tool"], s["dur_ms"]) for s in steps if s["dur_ms"] is not None]
+
     resp_match = re.search(r'\*\*Response:\*\*\n(.*?)(?=\n---|\Z)', text, re.DOTALL)
     response = resp_match.group(1).strip() if resp_match else ""
 
     return {
         "file": os.path.basename(path),
         "user_prompt": user_prompt,
-        "total_steps": total_steps,
+        "total_steps": len(steps),
         "duration": duration,
         "steps": steps,
+        "round_ms": round_ms,
+        "tool_ms": tool_ms,
         "response": response,
     }
 
@@ -93,6 +152,8 @@ def analyze(data: dict) -> TurnAnalysis:
         user_prompt=data["user_prompt"],
         total_steps=data["total_steps"],
         duration_secs=data["duration"],
+        round_ms=data.get("round_ms", []),
+        tool_ms=data.get("tool_ms", []),
     )
 
     steps = data["steps"]
@@ -109,21 +170,18 @@ def analyze(data: dict) -> TurnAnalysis:
         t.tools_used[tool] = t.tools_used.get(tool, 0) + 1
 
         # Track file reads
-        if tool == "Read File":
-            # Extract filename from args (after .../
-            fname = args.rsplit("/", 1)[-1] if "/" in args else args
-            # Remove line range suffix like " L59-139"
-            fname = re.sub(r'\s+L\d+-\d+$', '', fname)
+        if tool == "read_file":
+            fname = _arg_path(args)
             t.files_read[fname] = t.files_read.get(fname, 0) + 1
 
         # Track file edits
-        if tool == "Edit File":
-            fname = args.rsplit("/", 1)[-1] if "/" in args else args
+        if tool in ("edit_file", "search_replace"):
+            fname = _arg_path(args)
             t.files_edited[fname] = t.files_edited.get(fname, 0) + 1
 
         # Track file writes (overwrites)
-        if tool == "Write File":
-            fname = args.rsplit("/", 1)[-1] if "/" in args else args
+        if tool == "write_file":
+            fname = _arg_path(args)
             if "Overwrote" in output or "Overwrote" in args:
                 t.issues.append(Issue(
                     "HIGH", "write-existing-file",
@@ -132,7 +190,7 @@ def analyze(data: dict) -> TurnAnalysis:
                 ))
 
         # Track bash commands
-        if tool == "Bash":
+        if tool == "bash":
             cmd = args
             t.bash_commands.append((num, cmd))
 
@@ -166,7 +224,9 @@ def analyze(data: dict) -> TurnAnalysis:
                 ))
 
         # Edit failures
-        if tool == "Edit File" and ("old_string not found" in output or output.startswith("x ")):
+        if tool in ("edit_file", "search_replace") and (
+            "old_string not found" in output or output.startswith("x ") or output.startswith("✗")
+        ):
             t.issues.append(Issue(
                 "MEDIUM", "edit-failed",
                 f"Step {num}: edit_file failed (old_string not found)",
@@ -243,7 +303,7 @@ def analyze(data: dict) -> TurnAnalysis:
     # No final verification
     if t.total_steps > 3:
         last_tools = [s["tool"] for s in steps[-3:]] if len(steps) >= 3 else []
-        has_verify = any(t == "Bash" for t in last_tools)
+        has_verify = any(t == "bash" for t in last_tools)
         if not has_verify and t.total_steps > 5:
             t.issues.append(Issue(
                 "MEDIUM", "no-final-verify",
@@ -334,6 +394,19 @@ def format_report(analyses: list) -> str:
         lines.append(f"### {a.file} — {status}")
         lines.append(f"- **Prompt:** \"{a.user_prompt[:80]}\"")
         lines.append(f"- **Steps:** {a.total_steps} | **Duration:** {a.duration_secs:.0f}s")
+
+        # Request-level timing (from the per-round / per-tool `dur=` markers).
+        timing = []
+        if a.round_ms:
+            timing.append(
+                f"{len(a.round_ms)} rounds, slowest {max(a.round_ms)}ms, total {sum(a.round_ms)}ms"
+            )
+        timed_tools = [(name, ms) for (name, ms) in a.tool_ms if ms is not None]
+        if timed_tools:
+            slow_tool, slow_ms = max(timed_tools, key=lambda x: x[1])
+            timing.append(f"slowest tool `{slow_tool}` {slow_ms}ms")
+        if timing:
+            lines.append(f"- **Timing:** {'; '.join(timing)}")
 
         if a.files_read:
             reads = ", ".join(f"{f}({c}x)" for f, c in sorted(a.files_read.items(), key=lambda x: -x[1]) if c > 1)
