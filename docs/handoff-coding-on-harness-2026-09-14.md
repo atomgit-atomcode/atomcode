@@ -208,6 +208,70 @@ let key = (call.name.clone(), call.arguments.clone());
 
 没被差分抓到，因为写那条路径在此之前**根本没问过**（见下一节）。
 
+## 真跑起来了（2026-09-14）
+
+`ATOMCODE_ENGINE=harness` 起的会话，**真网关认证 + 真模型 + 真工具调用**，
+和链式逐字一致：
+
+```
+              链式                                harness
+纯文本        pong                                同
+带工具        It prints `hello from answer_42`.   同
+```
+
+在此之前 61 条差分场景**全部**是脚本 provider。
+
+### 怎么构建（这一步卡了两次）
+
+```sh
+# 1. 私有签名 crate:clone,不要 cp。项目自己的做法在
+#    ~/project/gitcode/ai/atomcode-build-official/build-official.sh
+rm -rf crates/atomcode-codingplan-crypto
+git clone --depth 1 <私有库> crates/atomcode-codingplan-crypto
+
+# 2. feature 必须显式带上
+cargo build -p atomcode --bin atomcode --features atomcode/codingplan-crypto
+```
+
+**新建的 worktree 一定拿到的是仓库里那份占位符**（`lib.rs` 是 tracked 的），
+所以一定会 panic `request signing requires the official build`。
+clone 之后 `Cargo.toml` 和 `src/lib.rs` 会显示为修改——**绝不能提交**，
+用完 `git checkout HEAD -- crates/atomcode-codingplan-crypto/` 还原。
+
+### 试用要点
+
+- 用 `--provider <名字>` 在**启动前**定 provider。`/provider`、`/model`、`/cd`
+  走的是重配置那条路，在 harness 引擎上**会掉回链式**（会打印一行说明；看到
+  那行之后的读数作废）。
+- `/undo`、rewind 已知是坏的（快照机器在 `parts` 里，而 harness 引擎下
+  `parts` 准备了但它的 agent 从不跑）。
+
+### 两个只有真跑才会暴露的缺陷
+
+**1. 树和驱动各打印一遍（`96b8789c`）。** 无头模式答 "pongpong"。`trace` 行在
+`base` 里默认 `stream = true`，自己 `print!` 到 stdout，而驱动方也在打印同一份。
+挂了 `ui-handle` 就意味着驱动方在渲染，树不能再往终端写——overlay 里关掉。
+
+**差分台正好盖住了它**：`quiet_rows` 为了让测试输出干净，自己把 `trace` patch 掉了。
+
+**2. 会话日志不按顺序落盘（`a645cd87`，既有问题，非本线引入）。**
+持久化对每条事件 `tokio::spawn` 一个任务，它们互相赛跑；seq 在提交时按序分配，
+落盘顺序由调度器决定。而回读的三步都不排序（`parse` 按文件序 → `restore`
+原样存 → `derive_messages` 原样折叠），**resume 会重放出错乱的历史**。
+
+磁盘上量过 274 个 jsonl：**132 个的模型可见事件乱了序**，绝大多数是 v1
+（本分支之前的构建写的，主要是 atui 那条线）。改成一个写入器 + mpsc 队列。
+
+> **这两条合起来是一条教训：测试为了干净而关掉的东西，可能正是要测的东西。**
+> 本会话四次「绿着的场景其实没在测」，只有这两次是靠真跑才发现的。
+
+### 写并发测试的人注意
+
+持久化那条测试第一版**没有牙**——把 bug 放回去它照样绿。因为 `#[tokio::test]`
+默认是**单线程** runtime，spawn 出来的任务按 FIFO 跑完，竞态根本不出现。
+改成 `#[tokio::test(flavor = "multi_thread")]` 立刻红。真实二进制是多线程的，
+测试的 runtime 也必须是。
+
 ## 已定的决策（不要重议）
 
 **技能目录内联，不建开关（2026-09-14 用户拍板）。** 通用 harness 的 `skills` 行
