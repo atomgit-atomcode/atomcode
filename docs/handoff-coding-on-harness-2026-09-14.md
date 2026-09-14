@@ -29,7 +29,7 @@
 
 ## 09-15 增量（本页其余小节按此校准）
 
-本页写于 09-14。09-15 又落了 9 个 commit，其中三件改变了这条线的形状，
+本页写于 09-14。09-15 又落了 12 个 commit，其中三件改变了这条线的形状，
 后面小节里跟它们冲突的说法都以这里为准。
 
 ```
@@ -43,6 +43,9 @@ a5a08c35  工具清单成为判据——第一次跑就报出 11 个缺口
 d4023f8f  coding 不再继承 harness 的产品决定,自己写这份清单   ← 形状改变
 7284a3d3  harness 上也有子 agent 了——task 和 team 两行都挂上
 850d9e40  tool-web 变成一个能被设置的行——后端可配,离线不挂
+a7875da9  本文档
+c298ea08  /logout 之后凭据真的走了——provider 表只留当前那一个
+8cec1282  code_review 成为一行——判据最后一个已知盲点关掉了
 ```
 
 ### 一、`/model` 和 `/logout` 已经在 harness 上（推翻了下面那一节的结论）
@@ -97,20 +100,32 @@ generation 自增、`Reconfiguring` 事件、相位都照旧走）。
 `team-in-process`，出厂三个 driver 全都传 `SubagentPolicy::Enabled`）、
 `tool-web`（链式 `PrepareOptions::default()` 的 `web` 从来是 true）。
 
-### 四、rig 的两个盲点（顺手关掉一个，留了一个明说）
+### 四、rig 的盲点（已关完，只剩两个两边同关的）
 
 差分台在链式那边关了 `mcp` / `web` / `review` / `memory`，注释写的是
 "它们门住的东西对链式都是增量"。这话**对行为成立，对工具清单不成立**：
 关着的那几行正好是 coding 真正打开的那几行，判据于是在两个子集之间比较。
 
-- `web`、`subagents`：已在两边打开。挂工具不产生 I/O，调用才会，而没有
-  场景调用它们。
+- `web`、`subagents`、`review`：**都已在两边打开**。挂工具不产生 I/O，
+  调用才会，而没有场景调用它们。`review` 是最后一个，连带补了
+  `tool-code-review` 行（`8cec1282`）。
 - `mcp`、`memory`：两边都关，那是避开副作用（连别人的进程 / 读开发者家目录），
-  不是藏起差异。
-- **`review` 仍然关着，并且是已知盲点**：行清单里没有 `code_review`。
-  打开它是发现问题的方式，不是修好它的方式——修法是给 harness 加一个
-  `tool-code-review` 行（`atomcode-harness` 已经依赖 `atomcode-review`，
-  `persona-review` 行就在那儿）。
+  不是藏起差异。**切默认路径前 `mcp` 要么真跑一次，要么明说这个引擎没有。**
+
+### 五、捕获了 `llm` 的行，必须跟 `llm` 一起 patch（一条会反复踩的规则）
+
+`App::patch` 只重挂**自己那一条**配置变了的行，`Fibers::unload` 又只向
+孩子级联、不向消费者级联。所以一个在挂载时从 `llm` 缝取走 provider 并
+自己持有的行，`/model` 之后还在跟旧模型说话，`/logout` 之后还攥着凭据。
+
+`swap_provider` 因此一次 patch 三行：`llm` + `persona-atomcode` +
+`tool-code-review`。**新增这类行时要记得加进去**，判据是
+`a_logout_drops_the_provider_object_and_not_only_the_seam`——它拿 `Weak`
+问"还有没有人握着它"，摘掉任何一行都会报红。
+
+顺带：`ProviderSlots` 原来把每个交给它的 provider 都留着（`c298ea08` 修），
+于是"注销把凭据带走"这句话当时只是接近为真。**写下一句安全断言之后，
+先写一条能证伪它的判据。**
 
 ## 现在在哪
 
@@ -550,8 +565,8 @@ fs2 文件锁，锁基线文件本身。
    那条已记在 `KNOWN_TOOL_DIFFERENCES` 里，同名不同物。
 4. **`/cd`（`Reprepare` 分支）仍然是链式独有。** `/model`、`/logout` 都已落地，
    这是最后一条还会掉回链式的运行时命令。
-5. **`tool-code-review` 行**，然后把 rig 链式那边的 `review` 也打开——
-   这是工具清单判据最后一个已知盲点（见上「09-15 增量」第四条）。
+5. ~~`tool-code-review` 行~~ —— **已做（`8cec1282`）**，rig 两边的 `review`
+   都打开了。
 6. **切 `build_coding_agent` 的默认路径**，留一个逃生开关（`ATOMCODE_ENGINE=chain`，
    现在的默认值反过来）。切之前仍然要注意：
    - `datalog` / `cc-hooks` 两行**刻意不在 `CODING_DEFAULTS` 里**：前者往用户
@@ -597,9 +612,9 @@ fs2 文件锁，锁基线文件本身。
 ## 怎么验证
 
 ```sh
-cargo nextest run -p atomcode-coding --test differential   # 66/66,裁判
-cargo nextest run -p atomcode-coding                       # 538/538(链式)
-ATOMCODE_ENGINE=harness cargo nextest run -p atomcode-coding  # 532/538
+cargo nextest run -p atomcode-coding --test differential   # 67/67,裁判
+cargo nextest run -p atomcode-coding                       # 539/539(链式)
+ATOMCODE_ENGINE=harness cargo nextest run -p atomcode-coding  # 533/539
 cargo nextest run -p atomcode-harness                      # 296/296
 cargo nextest run -p atomcode-tui                          # 466/466
 cargo nextest run -p atomcode-capabilities --features session   # 1124/1124
