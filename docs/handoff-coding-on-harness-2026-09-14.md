@@ -300,6 +300,50 @@ clone 之后 `Cargo.toml` 和 `src/lib.rs` 会显示为修改——**绝不能�
 改成 `#[tokio::test(flavor = "multi_thread")]` 立刻红。真实二进制是多线程的，
 测试的 runtime 也必须是。
 
+## `/model` 换到 harness：探过了，结论是先别投（2026-09-15）
+
+**判断（我的）**：`runtime.rs` 那 279 行重装配（停 agent、验终结、fail-close 未决
+请求、重建、generation 自增、恢复快照）之所以是 279 行，是因为**链式必须把一个
+`AgentHandle` 换成另一个**；harness 上 handle 不换，`agent-loop` 每回合现取
+`LlmSvc`，所以换掉缝后面那个 provider 就是 `/model` 的全部，~15 行。
+
+**探针**（`SwappableProvider` + `mount_swappable` + 一个分支，已丢弃）**证伪了它**：
+
+```
+基线              433/439
+探针 v1           430/439
+探针 v2(补契约)    432/439     ← 61 行代码,仍不如基线
+```
+
+**修好 0 个，弄坏 1 个**（`provider_reassemble_preserves_the_latest_sessionless_snapshot`）。
+
+机制那半是对的：分支确实跑了，provider 确实换了，`reassemble_provider` 返回了对的
+generation，`context_stats` 报出新模型。**错的是「~15 行」**——缺的每一样都跟换
+agent 无关，是**跟调用方/UI 的契约**：
+
+| 漏掉的 | 谁在依赖 |
+|---|---|
+| `generation` 自增 | 不只是过滤陈旧事件,**是返回给调用方的回执** |
+| `controls.state` 存相位 | `handle.status().generation` |
+| `Reconfiguring` 事件 | UI 依赖四个事件的顺序 |
+| `preserve_sessionless_snapshot` | 无会话运行的快照 |
+
+**两条更正，都是我之前分簇错了：**
+
+1. 那唯一失败的 reassemble 测试（`..._updates_cost_attribution_...`）**根本不是关于
+   重装配的**——它读 coding 的 `SessionManager` 算成本，而 harness 引擎从不喂那套。
+   它属于快照/会话那一簇。真实分簇是 **6 个快照/会话 + 0 个 reassemble**。
+2. **`/model` 在 harness 引擎上本来就能用**——它落到链式分支重建了一个链式 agent，
+   测试全绿。那行「静默掉回链式」的警告描述的是一个**功能正确、只是没在 harness 上
+   跑**的路径，不是一个坏掉的功能。
+
+**所以：`/model` 的收益比看上去小得多，不是下一步。** 真正卡住的是快照/会话那 6 个。
+
+（探针里那个 `Box::leak` 是为绕开 `LlmProvider::model_name(&self) -> &str` 编的。
+真要做原生 `/model`，正路是让 `llm` 行从**配置**构造 provider，于是 `/model` 变成一次
+普通的 `patch`——代价是把 coding 的 `provider_factory`（认证、CodingPlan、子 agent
+分层、视觉探测）搬进树里。那笔投资等快照那一簇做完再谈。）
+
 ## 已定的决策（不要重议）
 
 **技能目录内联，不建开关（2026-09-14 用户拍板）。** 通用 harness 的 `skills` 行
