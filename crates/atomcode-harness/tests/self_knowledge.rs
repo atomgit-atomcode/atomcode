@@ -668,3 +668,37 @@ async fn the_row_takes_its_tool_and_its_fragment_away_when_it_unloads() {
         .get("describe_self")
         .is_some());
 }
+
+/// A knob nobody can read is a knob nobody can set.
+///
+/// `tool-web`'s search backend was hardwired until the coding tree turned the
+/// row on and found the person's `provider` setting had nowhere to land. The
+/// judge here is the same one this file uses everywhere: the answer must come
+/// from the RUNNING tree, so the same tree without the setting must not say it.
+#[tokio::test]
+async fn the_web_row_reports_the_search_backend_it_was_given() {
+    let root = scratch("web-backend");
+    let told = start(tree(
+        &root,
+        &["[[patch]]\nid = \"tool-web\"\ndisabled = false\nconfig = { provider = \"duckduckgo\" }\n"],
+    ))
+    .await;
+    let said = ask(&told, "operations").await;
+    assert!(
+        said.contains("duckduckgo"),
+        "the row was given a backend and cannot say which:\n{said}"
+    );
+
+    let root = scratch("web-backend-default");
+    let untold = start(tree(
+        &root,
+        &["[[patch]]\nid = \"tool-web\"\ndisabled = false\n"],
+    ))
+    .await;
+    let said = ask(&untold, "operations").await;
+    assert!(
+        !said.contains("duckduckgo"),
+        "unset, it must not claim a backend it was never given — otherwise the \
+         assertion above passes against a hard-coded string:\n{said}"
+    );
+}

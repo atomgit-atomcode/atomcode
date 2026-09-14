@@ -2054,11 +2054,20 @@ impl CodingRuntime {
                                 } else {
                                     crate::on_harness::Presence::Headless
                                 };
+                                // What the person wrote in `config.toml` and
+                                // the chain reads off this struct. Empty for a
+                                // default config, so the tree is unchanged.
+                                let from_config = crate::on_harness::config_rows(&agent);
+                                let extra: Vec<&str> = if from_config.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    vec![from_config.as_str()]
+                                };
                                 let (handle, app, providers) = crate::on_harness::mount_swappable(
                                     &agent.working_dir,
                                     presence,
                                     provider,
-                                    &[],
+                                    &extra,
                                 )
                                 .await
                                 .map_err(|e| {

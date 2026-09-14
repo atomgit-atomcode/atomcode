@@ -3823,3 +3823,49 @@ async fn both_engines_offer_the_model_the_same_tools() {
         );
     }
 }
+
+/// Offline means the same thing on both engines: not "the web tools fail", but
+/// "the web tools are not offered".
+///
+/// The chain has always made that judgement at assembly (`opts.web &&
+/// !is_offline_active()`). The row list reached this criterion without it — it
+/// mounted `web_search` and `web_fetch` unconditionally, so an offline session
+/// would have had a persona saying there is no public network and two tools in
+/// the catalog promising one. The tools do not refuse on their own; they would
+/// try, fail, and tell the model the internet is broken.
+#[tokio::test]
+#[serial_test::serial(offline_verdict)]
+async fn offline_takes_the_web_tools_off_both_engines() {
+    use atomcode_config::config::offline::{seed_offline_verdict, OfflineMode};
+
+    let dir = scratch("offline-web");
+    seed(&dir);
+
+    seed_offline_verdict(OfflineMode::On, None);
+    let offline = catalogs(&dir).await;
+    // Back to online BEFORE any assertion: a panic here must not leave the
+    // process verdict flipped for whatever test shares it.
+    seed_offline_verdict(OfflineMode::Off, None);
+    let online = catalogs(&dir).await;
+
+    let web = |names: &Vec<String>| {
+        names
+            .iter()
+            .filter(|n| *n == "web_search" || *n == "web_fetch")
+            .count()
+    };
+    for (who, names) in [("链式", &offline.0), ("行式", &offline.1)] {
+        assert_eq!(
+            web(names),
+            0,
+            "{who}: 离线时不该把 web 工具放进清单 —— {names:?}"
+        );
+    }
+    for (who, names) in [("链式", &online.0), ("行式", &online.1)] {
+        assert_eq!(
+            web(names),
+            2,
+            "{who}: 在线时两个 web 工具都该在 —— 否则上面那条断言什么也没证明{names:?}"
+        );
+    }
+}

@@ -236,6 +236,9 @@ name = "code-graph"
 disabled = true
 
 # Reaches the public internet, so it is a deliberate choice, not a default.
+# `config = { provider = "…" }` picks the search backend (else the
+# `ATOMCODE_WEB_SEARCH_PROVIDER` env knob, else the tool's own default). In
+# offline mode the row mounts nothing even when enabled.
 [[insert]]
 name = "tool-web"
 disabled = true

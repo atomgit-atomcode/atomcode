@@ -127,6 +127,11 @@ name = "code-graph"
 # Reaches the public internet. Off in base as a deliberate choice; on here,
 # because the chain has had `web: true` in `PrepareOptions::default()` since
 # before this tree existed and every shipped driver leaves it on.
+#
+# No `provider` set, which means the `ATOMCODE_WEB_SEARCH_PROVIDER` env knob and
+# then the tool's default — the same order the chain resolves, minus
+# `config.toml`'s `web_search_provider`, which this row cannot see. In offline
+# mode the row mounts nothing, so the catalog matches what the persona says.
 [[insert]]
 name = "tool-web"
 
@@ -319,6 +324,35 @@ config = { working_dir = "{working_dir}", force = {force_verify} }
 [[insert]]
 name = "ui-handle"
 "#;
+
+/// What a `CodingAgentConfig` has to say to the rows.
+///
+/// The chain reads the person's `config.toml` straight off that struct, field by
+/// field, at the point each capability is built. The tree reads its knobs from
+/// row config instead, so somebody has to carry the values across — and this is
+/// that somebody, in one place, rather than a field remembered at one call site
+/// and forgotten at the next.
+///
+/// Deliberately short, and deliberately not a mapping of the whole struct: a
+/// field belongs here once its row exists and can use it. `web_search_provider`
+/// is the first, and it is here because turning `tool-web` on is what revealed
+/// that the row had no way to be told which backend to use — the person's
+/// `[web_search] provider = "duckduckgo"` would have been read by the chain and
+/// silently dropped by the tree.
+pub fn config_rows(cfg: &crate::CodingAgentConfig) -> String {
+    let mut out = String::new();
+    if let Some(provider) = cfg
+        .web_search_provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        out.push_str(&format!(
+            "[[patch]]\nid = \"tool-web\"\nconfig = {{ provider = {provider:?} }}\n\n"
+        ));
+    }
+    out
+}
 
 /// The coding overlay with this working directory substituted in.
 pub fn coding_overlay(

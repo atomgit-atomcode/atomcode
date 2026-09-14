@@ -221,6 +221,15 @@ impl Plugin for CodeGraphPlugin {
 
 // ---- web ----------------------------------------------------------------
 
+#[derive(Debug, Deserialize, Default)]
+struct WebRow {
+    /// Which search backend answers `web_search`. Unset falls back to the
+    /// `ATOMCODE_WEB_SEARCH_PROVIDER` environment knob, and then to the tool's
+    /// own default; an unknown name maps to that default rather than failing.
+    #[serde(default)]
+    provider: Option<String>,
+}
+
 pub struct WebPlugin;
 
 #[async_trait]
@@ -234,13 +243,33 @@ impl Plugin for WebPlugin {
     fn description(&self) -> &'static str {
         "web search and fetch"
     }
-    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: WebRow = if config.is_null() {
+            WebRow::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        // Told the process is offline, this row mounts nothing. The tools
+        // themselves do not refuse — they would try, fail, and tell the model
+        // the internet is broken — and a persona that has already said there is
+        // no public network while two tools sit in the catalog promising one is
+        // worse than either. Same judgement the hand-written chain makes, at the
+        // same place: whether to OFFER the capability.
+        if atomcode_config::config::offline::is_offline_active() {
+            return Ok(());
+        }
+        let provider = row
+            .provider
+            .clone()
+            .filter(|p| !p.trim().is_empty())
+            .or_else(crate::model_source::web_search_provider);
+        let search = match &provider {
+            Some(name) => WebSearchTool::with_provider(name),
+            None => WebSearchTool::new(),
+        };
         mount(
             ctx,
-            vec![
-                Arc::new(WebSearchTool::new()) as Arc<dyn Tool>,
-                Arc::new(WebFetchTool),
-            ],
+            vec![Arc::new(search) as Arc<dyn Tool>, Arc::new(WebFetchTool)],
         )?;
         contribute_prompt(
             ctx,
@@ -248,6 +277,20 @@ impl Plugin for WebPlugin {
             61,
             "`web_search` and `web_fetch` reach the public internet. Prefer them over guessing \
              at an API you cannot read locally.",
+        );
+        crate::plugins::self_knowledge::describes(
+            ctx,
+            "web",
+            61,
+            format!(
+                "WEB — `web_search` and `web_fetch` reach the public internet. The search \
+                 backend is {backend}; set it with this row's `provider` config or the \
+                 `ATOMCODE_WEB_SEARCH_PROVIDER` environment variable, and an unknown name \
+                 falls back to the default rather than failing. When the process is in \
+                 offline mode this row mounts nothing at all, so neither tool appears in \
+                 the catalog.",
+                backend = provider.as_deref().unwrap_or("the default"),
+            ),
         );
         Ok(())
     }

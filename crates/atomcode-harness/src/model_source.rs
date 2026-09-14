@@ -272,6 +272,19 @@ pub fn user_home() -> Option<PathBuf> {
     var.map(PathBuf::from)
 }
 
+/// Which backend answers `web_search`, when the row does not name one.
+///
+/// Not a model, and here anyway: this module is where "which variable holds
+/// this" is decided, and the alternative is the row reading the environment
+/// itself — which is exactly the shape the criterion in
+/// `tests/reasoning_effort.rs` exists to stop. It caught this one on the way in.
+///
+/// `None` means the row said nothing and the environment said nothing; the tool
+/// picks its own default, and an unknown name falls back to it too.
+pub fn web_search_provider() -> Option<String> {
+    env("ATOMCODE_WEB_SEARCH_PROVIDER")
+}
+
 /// One key variable, for a caller that states its own endpoint and only needs
 /// the credential.
 fn api_key_from_env(key_env: &str) -> Result<String, String> {
