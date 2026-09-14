@@ -8,7 +8,7 @@ use axum::{
     extract::State,
     http::{
         header::{AUTHORIZATION, COOKIE},
-        StatusCode,
+        HeaderMap, StatusCode,
     },
     middleware::Next,
     response::Response,
@@ -19,6 +19,8 @@ use uuid::Uuid;
 
 /// `X-Atom-User-Id` 请求头名，App 端通过中继透传桌面端进行双向校验。
 const APP_USER_ID_HEADER: &str = "x-atom-user-id";
+/// Carries the daemon credential through a relay that consumes Authorization.
+const DAEMON_AUTHORIZATION_HEADER: &str = "x-atomcode-daemon-authorization";
 
 /// Name of the HttpOnly cookie that carries the webui token after the
 /// `/?token=` handoff (see `serve_webui_index` in lib.rs). Keeping the
@@ -89,6 +91,23 @@ pub fn token_from_header(value: Option<&str>) -> Option<String> {
     }
 }
 
+/// Extract the daemon token from a relay-specific header before falling back
+/// to Authorization for direct Pod access.
+pub fn token_from_request_headers(headers: &HeaderMap) -> Option<String> {
+    token_from_header(
+        headers
+            .get(DAEMON_AUTHORIZATION_HEADER)
+            .and_then(|value| value.to_str().ok()),
+    )
+    .or_else(|| {
+        token_from_header(
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+        )
+    })
+}
+
 /// 从 `Cookie` 头解析 `atomcode_webui=<token>`。Cookie 是 `/?token=` 交接后
 /// 凭证的主要载体（HttpOnly，前端 JS / 浏览器插件读不到），EventSource/同源
 /// fetch 会自动携带。空值视为无。
@@ -125,17 +144,13 @@ pub async fn require_webui_token(
     // (programmatic clients, legacy URL-token front-ends) OR the HttpOnly
     // `atomcode_webui` cookie set by the `/?token=` handoff. Header wins
     // when both are present.
-    let header = req
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|h| h.to_str().ok());
+    let token = token_from_request_headers(req.headers());
     let cookie = req.headers().get(COOKIE).and_then(|h| h.to_str().ok());
     // Read THIS instance's port-scoped cookie name so a sibling `/webui` on a
     // different localhost port (which shares the cookie jar) can't shadow us.
     // Use THIS instance's pre-resolved port-scoped cookie name (computed once on
     // AppState) so a sibling `/webui` on another localhost port can't shadow us.
-    let token =
-        token_from_header(header).or_else(|| token_from_cookie(cookie, &state.webui_cookie_name));
+    let token = token.or_else(|| token_from_cookie(cookie, &state.webui_cookie_name));
     match token {
         Some(tok) if state.webui_tokens.is_valid(&tok) => Ok(next.run(req).await),
         _ => Err(StatusCode::UNAUTHORIZED),
@@ -206,6 +221,20 @@ mod tests {
         );
         assert_eq!(token_from_header(Some("abc123")), None);
         assert_eq!(token_from_header(None), None);
+    }
+
+    #[test]
+    fn relay_token_header_takes_precedence_over_authorization() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer oauth-token".parse().unwrap());
+        headers.insert(
+            DAEMON_AUTHORIZATION_HEADER,
+            "Bearer daemon-token".parse().unwrap(),
+        );
+        assert_eq!(
+            token_from_request_headers(&headers),
+            Some("daemon-token".to_string())
+        );
     }
 
     #[test]
