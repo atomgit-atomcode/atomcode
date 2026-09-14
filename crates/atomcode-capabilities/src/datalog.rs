@@ -42,6 +42,14 @@ const IO_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50
 /// Readers branch on this — see [`rehydrate_record`].
 const RECORD_FORMAT_VERSION: u32 = 2;
 
+/// Render a per-round / per-tool duration as the trailing markdown fragment
+/// `, dur=<N>ms`, or the empty string when timing is unavailable — a tool result whose
+/// `before` was never observed, or a response with no preceding request. Kept pure so
+/// the datalog output format is unit-tested without a live turn or the tool middleware.
+fn dur_suffix(dur_ms: Option<u128>) -> String {
+    dur_ms.map(|ms| format!(", dur={ms}ms")).unwrap_or_default()
+}
+
 /// Serialize each body and intern it against `seen` (content-addressed by the
 /// `sha256` of its bytes, kept only as a compact 32-byte map key). The first
 /// time a body is seen this turn it is assigned the next integer id from
@@ -169,11 +177,17 @@ struct TurnLog {
     next_blob_id: u32,
     initialization_attempted: bool,
     started: Option<Instant>,
+    /// Wall-clock start of the CURRENT round's request (set in `on_request`, read in
+    /// `on_model_response` to record per-round latency the aggregate turn stats lose).
+    round_started: Option<Instant>,
     rounds: u32,
     tool_calls: usize,
     total_tokens: u64,
     active: bool,
     tool_names: HashMap<String, String>,
+    /// Per-tool-call start time keyed by `call_id` (set in `before`, read in `after`)
+    /// so each tool-result line can report its own duration.
+    tool_started: HashMap<String, Instant>,
 }
 
 #[derive(Clone)]
@@ -256,11 +270,13 @@ impl DatalogHook {
         state.next_blob_id = 0;
         state.initialization_attempted = false;
         state.started = Some(Instant::now());
+        state.round_started = None;
         state.rounds = 0;
         state.tool_calls = 0;
         state.total_tokens = 0;
         state.active = true;
         state.tool_names.clear();
+        state.tool_started.clear();
     }
 
     async fn initialize_turn(&self, ctx: &TurnCtx) -> bool {
@@ -355,6 +371,9 @@ impl LifecycleHooks for DatalogHook {
         if !state.active {
             return;
         }
+        // Mark the start of THIS round's request; `on_model_response` reads it to record
+        // the per-round latency the aggregate turn duration otherwise loses.
+        state.round_started = Some(Instant::now());
         let estimated_tokens: u64 = messages
             .iter()
             .map(|message| u64::from(message.estimate_tokens()))
@@ -443,15 +462,22 @@ impl LifecycleHooks for DatalogHook {
             }
         }
         state.tool_calls = state.tool_calls.saturating_add(response.tool_calls.len());
+        // Per-round latency (request → this response). `take` so a stray second response
+        // without an intervening request can't reuse a stale start. Appended to the token
+        // line when usage is present, else emitted standalone — every round gets a duration.
+        let round_ms = state.round_started.take().map(|t| t.elapsed().as_millis());
         if let Some(meta) = &response.meta {
             state.total_tokens = state.total_tokens.saturating_add(u64::from(
                 meta.tokens.prompt.saturating_add(meta.tokens.completion),
             ));
+            let dur = dur_suffix(round_ms);
             let _ = writeln!(
                 markdown,
-                "  _[tokens: prompt={}+completion={}, cache={}tok]_\n",
+                "  _[tokens: prompt={}+completion={}, cache={}tok{dur}]_\n",
                 meta.tokens.prompt, meta.tokens.completion, meta.tokens.cached
             );
+        } else if let Some(ms) = round_ms {
+            let _ = writeln!(markdown, "  _[dur={ms}ms]_\n");
         }
         drop(state);
         self.append_markdown(markdown);
@@ -502,6 +528,7 @@ impl ToolMiddleware for DatalogHook {
         let mut state = self.lock();
         if state.active {
             state.tool_names.insert(call.id.clone(), call.name.clone());
+            state.tool_started.insert(call.id.clone(), Instant::now());
         }
         atomcode_kernel::middleware::BeforeOutcome::Proceed
     }
@@ -519,10 +546,16 @@ impl ToolMiddleware for DatalogHook {
             .tool_names
             .remove(&result.call_id)
             .unwrap_or_else(|| "unknown".to_string());
+        let dur = dur_suffix(
+            state
+                .tool_started
+                .remove(&result.call_id)
+                .map(|t| t.elapsed().as_millis()),
+        );
         drop(state);
         let status = if result.is_error { "error" } else { "ok" };
         self.append_markdown(format!(
-            "**Tool result:** `{name}` (`{}`, {status})\n```\n{}\n```\n\n",
+            "**Tool result:** `{name}` (`{}`, {status}{dur})\n```\n{}\n```\n\n",
             result.call_id, result.content
         ));
         AfterOutcome::Proceed
@@ -726,6 +759,15 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn dur_suffix_renders_only_when_timed() {
+        assert_eq!(dur_suffix(Some(0)), ", dur=0ms");
+        assert_eq!(dur_suffix(Some(23_221)), ", dur=23221ms");
+        // Untimed (e.g. a tool result whose `before` was never observed) → no suffix,
+        // leaving the line exactly as it was before this feature.
+        assert_eq!(dur_suffix(None), "");
+    }
+
+    #[test]
     fn disabled_config_does_not_create_a_hook() {
         let config = DatalogConfig {
             enabled: false,
@@ -901,11 +943,20 @@ mod tests {
         assert!(markdown.contains("## User"));
         assert!(markdown.contains("### Turn 2"));
         assert!(markdown.contains("- read_file"));
-        assert!(markdown.contains("**Tool result:** `read_file` (`call-1`, ok)"));
+        // Tool-result line (this test drives `after` without `before`, so no tool
+        // duration is recorded; the `, dur=` suffix is unit-tested via `dur_suffix`).
+        assert!(markdown.contains("**Tool result:** `read_file` (`call-1`, ok"));
         assert!(markdown.contains("tool output"));
         assert!(markdown.contains("**Error:** sample failure"));
         assert!(markdown.contains("**Stats:** 2 turns, 1 tool calls"));
         assert!(markdown.contains("reason=ProviderError"));
+        // Per-round latency is recorded (value is timing-dependent, so assert the
+        // marker, not a number). The response here carries no usage meta, so it lands
+        // as the standalone `_[dur=Nms]_` line.
+        assert!(
+            markdown.contains("dur=") && markdown.contains("ms]"),
+            "per-round duration marker missing: {markdown}"
+        );
 
         // Two rounds → two records, and each is the content-addressed v2 shape:
         // refs in the record, no inline `messages`.
