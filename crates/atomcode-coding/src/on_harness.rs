@@ -115,6 +115,17 @@ config = { working_dir = "{working_dir}", force = {force_verify} }
 # The driver protocol: this is what `CodingRuntimeHandle` drives.
 [[insert]]
 name = "ui-handle"
+
+# ...and because a driver is rendering, the tree must not also write to the
+# terminal. `trace` is on in `base` because the harness binary has no other
+# front end; here it produced every assistant token TWICE — once from `trace`'s
+# own `print!`, once from the driver — and a headless run answered "pongpong".
+#
+# Found by running it, not by the rig: the differential patches `trace` off for
+# quiet output, and in doing so masked this exactly.
+[[patch]]
+id = "trace"
+disabled = true
 "#;
 
 /// The coding overlay with this working directory substituted in.
