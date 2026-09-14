@@ -104,6 +104,12 @@ name = "skill-first"
 [[insert]]
 name = "execution-policy"
 
+# Coding's own persona, in place of the harness's generic one. `{model}` is
+# rewritten by a `/model` patch so this row remounts with it.
+[[insert]]
+name = "persona-atomcode"
+config = { model = "{model}" }
+
 # The self-correction loop: an in-workspace code edit the model walked away
 # from without checking gets one nudge. `force` follows presence, the same rule
 # `CodingAgentConfig::is_attended` applies to `VerifyCadenceHook`: a person who
@@ -129,10 +135,16 @@ disabled = true
 "#;
 
 /// The coding overlay with this working directory substituted in.
-pub fn coding_overlay(working_dir: &Path, artifacts: &Path, presence: Presence) -> String {
+pub fn coding_overlay(
+    working_dir: &Path,
+    artifacts: &Path,
+    presence: Presence,
+    model: &str,
+) -> String {
     CODING_ROWS
         .replace("{working_dir}", &working_dir.to_string_lossy())
         .replace("{artifacts}", &artifacts.to_string_lossy())
+        .replace("{model}", model)
         .replace(
             "{force_verify}",
             // Same rule as the fence above, read the other way round: with
@@ -144,11 +156,98 @@ pub fn coding_overlay(working_dir: &Path, artifacts: &Path, presence: Presence) 
         )
 }
 
-/// Put a caller-supplied provider into the tree's `llm` seam.
+/// Providers the host has built, addressable from a config row by id.
 ///
-/// The row is named so a patch can address it; the provider itself comes from
-/// the caller because choosing one is the host's business, not a row's.
-struct InjectProvider(Arc<dyn LlmProvider>);
+/// The indirection is what makes `/model` an ordinary config change. Building a
+/// provider is the host's business — it needs auth, the CodingPlan account,
+/// subagent tiers, vision detection — so the row must not do it. But a row that
+/// CAPTURES one can never be given another: the plugin instance holds it, and
+/// patching the row's config would remount the same captured value.
+///
+/// So the host keeps the table and the row keeps an id. Putting a different
+/// provider behind the `llm` seam is then: add it to the table, patch the row's
+/// `provider_id`. `App::patch` unloads and remounts a row whose config changed,
+/// the row looks up the new id, and the next turn resolves it — `agent-loop`
+/// reads `LlmSvc` per turn, so nothing has to be told.
+///
+/// The agent survives that remount. Rows are sibling fibers under
+/// `ROOT_FIBER`, and `Fibers::unload` cascades to CHILDREN, not to consumers —
+/// so unloading `llm` leaves `agent-loop` and `ui-handle` running. That is the
+/// whole reason a model swap here does not have to rebuild anything.
+pub struct ProviderSlots {
+    slots: std::sync::RwLock<std::collections::HashMap<String, Arc<dyn LlmProvider>>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl ProviderSlots {
+    /// A table holding one provider, and the id the `llm` row should name.
+    pub fn new(initial: Arc<dyn LlmProvider>) -> (Arc<Self>, String) {
+        let table = Arc::new(Self {
+            slots: std::sync::RwLock::new(std::collections::HashMap::new()),
+            next: std::sync::atomic::AtomicU64::new(0),
+        });
+        let id = table.insert(initial);
+        (table, id)
+    }
+
+    /// Add a provider and return the id a row can name it by.
+    ///
+    /// Ids are never reused: a patch only remounts a row whose config CHANGED,
+    /// so reusing an id would make a swap a no-op.
+    pub fn insert(&self, provider: Arc<dyn LlmProvider>) -> String {
+        let n = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = format!("gen-{n}");
+        self.slots
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.clone(), provider);
+        id
+    }
+
+    fn get(&self, id: &str) -> Option<Arc<dyn LlmProvider>> {
+        self.slots
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+    }
+}
+
+/// Put a newly built provider behind the `llm` seam.
+///
+/// Returns once the row has remounted, so the caller can rely on the next turn
+/// using it. Between the unload and the remount `llm` is absent; a turn started
+/// in that window would fail with "no llm provider", which is why the runtime
+/// does this only while no turn is active.
+/// `model` is the name the CONFIG asked for, not `next.model_name()`. A provider
+/// factory may hand back something whose self-reported name does not match what
+/// was requested — the test factories do exactly that — and the persona's
+/// identity line should say what the person chose.
+pub async fn swap_provider(
+    app: &mut App,
+    slots: &ProviderSlots,
+    next: Arc<dyn LlmProvider>,
+    model: &str,
+) -> Result<(), String> {
+    let id = slots.insert(next);
+    // Both rows, one patch. The persona bakes the model into its identity line,
+    // so a swap that moved only `llm` would leave the model reading a first
+    // line that names the model it used to be.
+    let layer = Layer::from_toml(&format!(
+        "[[patch]]\nid = \"llm\"\nconfig = {{ provider_id = {id:?} }}\n\n\
+         [[patch]]\nid = \"persona-atomcode\"\nconfig = {{ model = {model:?} }}\n"
+    ))
+    .map_err(|e| e.to_string())?;
+    app.patch(&layer).await.map_err(|e| e.to_string())
+}
+
+/// Hands the tree whichever provider its config names.
+struct InjectProvider(Arc<ProviderSlots>);
+
+#[derive(serde::Deserialize)]
+struct LlmRow {
+    provider_id: String,
+}
 
 #[async_trait]
 impl Plugin for InjectProvider {
@@ -159,11 +258,17 @@ impl Plugin for InjectProvider {
         &["llm"]
     }
     fn description(&self) -> &'static str {
-        "the provider the host constructed, handed to the tree"
+        "the provider the host built, named by id so a patch can change it"
     }
-    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+    async fn apply(&self, ctx: &Context, config: &serde_json::Value) -> Result<(), String> {
+        let row: LlmRow =
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?;
+        let provider = self
+            .0
+            .get(&row.provider_id)
+            .ok_or_else(|| format!("no provider registered as `{}`", row.provider_id))?;
         let _ = ctx
-            .provide::<atomcode_harness::seams::LlmSvc>(self.0.clone())
+            .provide::<atomcode_harness::seams::LlmSvc>(provider)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -180,6 +285,23 @@ pub async fn mount(
     provider: Arc<dyn LlmProvider>,
     extra_layers: &[&str],
 ) -> Result<(AgentHandle, App), String> {
+    let (handle, app, _) = mount_swappable(working_dir, presence, provider, extra_layers).await?;
+    Ok((handle, app))
+}
+
+/// As [`mount`], but the caller keeps the provider table.
+///
+/// Holding it is what makes a later `/model` a patch rather than a rebuild —
+/// see [`ProviderSlots`] and [`swap_provider`]. A caller that never switches
+/// models can use [`mount`] and ignore it.
+pub async fn mount_swappable(
+    working_dir: &Path,
+    presence: Presence,
+    provider: Arc<dyn LlmProvider>,
+    extra_layers: &[&str],
+) -> Result<(AgentHandle, App, Arc<ProviderSlots>), String> {
+    let model = provider.model_name().to_string();
+    let (providers, provider_id) = ProviderSlots::new(provider);
     let artifacts = working_dir.join(".atomcode").join("artifacts");
     // The two halves of one rule. Attended: no `root`, so the fs world is not
     // fenced and a target next door reaches `tool-write-approval`, which asks.
@@ -208,13 +330,14 @@ pub async fn mount(
     let scoped = format!(
         "{boundary}\n\
          [[patch]]\nid = \"agent-loop\"\nconfig = {{ working_dir = {wd:?} }}\n\n\
-         [[patch]]\nid = \"llm\"\nname = \"llm-injected\"\nconfig = {{}}\n",
+         [[patch]]\nid = \"llm\"\nname = \"llm-injected\"\nconfig = {{ provider_id = {pid:?} }}\n",
         wd = working_dir.to_string_lossy(),
+        pid = provider_id,
     );
     let mut layers = vec![atomcode_harness::bundle::base().map_err(|e| e.to_string())?];
     for src in [
         scoped.as_str(),
-        coding_overlay(working_dir, &artifacts, presence).as_str(),
+        coding_overlay(working_dir, &artifacts, presence, &model).as_str(),
     ] {
         layers.push(Layer::from_toml(src).map_err(|e| e.to_string())?);
     }
@@ -232,6 +355,7 @@ pub async fn mount(
     // What IS registered here is what this crate owns: the coding discipline.
     let mut registry = atomcode_harness::plugins::catalog();
     registry.register(Arc::new(VerifyCadencePlugin));
+    registry.register(Arc::new(CodingPersonaPlugin));
     registry.register(Arc::new(ExecutionPolicyPlugin));
     registry.register(Arc::new(SkillCatalogPlugin));
     registry.register(Arc::new(SkillFirstPlugin));
@@ -245,7 +369,7 @@ pub async fn mount(
     // is not the same as "mounted by default" — a host that wants CC hooks
     // inserts it, the way the chain mounts the engine only when one exists.
     registry.register(Arc::new(CcHooksPlugin));
-    registry.register(Arc::new(InjectProvider(provider)));
+    registry.register(Arc::new(InjectProvider(providers.clone())));
 
     let mut app = App::new(registry, tree);
     app.start().await.map_err(|e| e.to_string())?;
@@ -255,7 +379,7 @@ pub async fn mount(
         .ok_or("the `ui-handle` row must provide a handle")?
         .take()
         .ok_or("the handle, once")?;
-    Ok((handle, app))
+    Ok((handle, app, providers))
 }
 
 // ---- the verify cadence, as a row ---------------------------------------
@@ -1049,6 +1173,70 @@ impl Plugin for CcHooksPlugin {
                 });
             },
         );
+        Ok(())
+    }
+}
+
+// ---- the persona --------------------------------------------------------
+//
+// `lib.rs` says this crate owns three things: assembly, PERSONA, discipline.
+// The discipline came across as `verify-cadence`; the persona had not, and
+// nothing noticed — the harness's own `persona-coding` row was filling the slot
+// with entirely different words:
+//
+//   coding   "You are AtomCode, an AI coding agent by AtomGit running the {model} model…"
+//   harness  "You are a coding agent working in a real repository…"
+//
+// The differential could not see it: `normalise` records a `Snapshot` as the
+// LIST OF ROLES, never the text, so two engines can send the model completely
+// different instructions and compare equal. It surfaced only when `/model`
+// stopped falling back to the chain — the test that asserts the persona had
+// been passing because the fallback rebuilt a chain agent, persona and all.
+
+/// Contributes coding's own persona, displacing the generic one.
+///
+/// Same fragment id as the harness row on purpose: two personas in one system
+/// prompt is worse than either.
+pub struct CodingPersonaPlugin;
+
+#[derive(serde::Deserialize, Default)]
+struct PersonaRow {
+    /// The model the identity line names. Carried in config rather than read
+    /// from the `llm` seam so that a `/model` patch, which rewrites it, also
+    /// remounts this row — a persona still naming the old model would be a
+    /// quiet lie in the first line the model reads.
+    #[serde(default)]
+    model: String,
+}
+
+#[async_trait]
+impl Plugin for CodingPersonaPlugin {
+    fn name(&self) -> &'static str {
+        "persona-atomcode"
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        // The tool catalog decides what the persona may promise: it describes
+        // `todowrite` and `ask_user` only when they are actually mounted.
+        &["tools", "system-prompt"]
+    }
+    fn description(&self) -> &'static str {
+        "coding's own persona, in place of the harness's generic one"
+    }
+    async fn apply(&self, ctx: &Context, config: &serde_json::Value) -> Result<(), String> {
+        let row: PersonaRow = if config.is_null() {
+            PersonaRow::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        let tools = ctx.service::<atomcode_harness::seams::ToolsSvc>();
+        let has = |name: &str| tools.as_ref().is_some_and(|t| t.get(name).is_some());
+        let text = crate::persona::coding_persona(&row.model, has("todowrite"), has("ask_user"));
+        let Some(prompts) = ctx.service::<atomcode_harness::seams::SystemPromptSvc>() else {
+            return Ok(());
+        };
+        // Rank 0 and the generic row's id: the identity line goes first, and
+        // there is only ever one of it.
+        prompts.contribute("persona-coding", 0, text);
         Ok(())
     }
 }

@@ -3529,3 +3529,118 @@ async fn an_always_covers_the_scope_not_just_the_one_call() {
         let _ = std::fs::remove_file(outside.join(name));
     }
 }
+
+// ---- `/model` as a patch ------------------------------------------------
+//
+// The claim these two make, which a test COUNT cannot: a model switch on the
+// harness replaces the provider behind the `llm` seam and leaves everything
+// else — the agent, its handle, the conversation — exactly where it was.
+//
+// Before this, `/model` on the harness engine silently fell through to the
+// chain: it rebuilt a chain agent from `parts` and swapped the handle, so the
+// rest of the session ran on the engine the switch was supposed to leave. The
+// runtime's own tests passed either way, which is why these are here.
+
+#[tokio::test]
+async fn a_model_switch_puts_a_different_provider_behind_the_seam() {
+    let dir = scratch("swap-provider");
+    // Two providers that answer to different names, so which one is behind the
+    // seam is directly observable.
+    let first = Script::text(&["ok"]).as_model("model-before");
+    let second = Script::text(&["ok"]).as_model("model-after");
+
+    let quiet = quiet_rows(&dir);
+    let (handle, mut app, slots) = atomcode_coding::on_harness::mount_swappable(
+        &dir,
+        atomcode_coding::on_harness::Presence::Attended,
+        first,
+        &[quiet.as_str()],
+    )
+    .await
+    .expect("mount");
+
+    let seam_model = |app: &atomcode_plexus::App| {
+        app.context()
+            .service::<atomcode_harness::seams::LlmSvc>()
+            .map(|p| p.model_name().to_string())
+            .unwrap_or_default()
+    };
+    assert_eq!(seam_model(&app), "model-before");
+
+    let before = drive_answering(handle, say("who are you"), &[], None, allow()).await;
+    assert!(
+        before.iter().any(|s| s.kind == "TurnComplete"),
+        "the first turn must finish{}",
+        render(&before, &before)
+    );
+
+    // The swap itself: a patch, not a rebuild.
+    atomcode_coding::on_harness::swap_provider(&mut app, slots.as_ref(), second, "model-after")
+        .await
+        .expect("the provider swap must apply");
+
+    assert_eq!(
+        seam_model(&app),
+        "model-after",
+        "the `llm` seam still answers to the old provider — the patch did not take"
+    );
+    // And the agent is still the one that ran the first turn. `ui-handle` hands
+    // its handle out ONCE; a second one would mean the row remounted, which
+    // would mean the patch tore down the agent it was supposed to leave alone.
+    assert!(
+        app.context()
+            .service::<atomcode_harness::seams::AgentHandleSvc>()
+            .and_then(|h| h.take())
+            .is_none(),
+        "the tree handed out a second handle: the agent was rebuilt, not patched"
+    );
+    app.stop();
+}
+
+#[tokio::test]
+async fn a_model_switch_renames_the_persona_too() {
+    // The persona bakes the model into its identity line, so a swap that moved
+    // only the `llm` row would leave the model reading a first line that names
+    // the model it used to be. `swap_provider` patches both rows in one layer.
+    //
+    // Found the hard way: this assertion failed after the `llm` row alone was
+    // patched, and again after the model name was read from the PROVIDER rather
+    // than from the config — a provider factory is free to hand back something
+    // whose self-reported name is not what was asked for, and the test ones do.
+    let dir = scratch("swap-persona");
+    let quiet = quiet_rows(&dir);
+    let (handle, mut app, slots) = atomcode_coding::on_harness::mount_swappable(
+        &dir,
+        atomcode_coding::on_harness::Presence::Attended,
+        Script::text(&["ok"]),
+        &[quiet.as_str()],
+    )
+    .await
+    .expect("mount");
+    drop(handle);
+
+    atomcode_coding::on_harness::swap_provider(
+        &mut app,
+        slots.as_ref(),
+        Script::text(&["ok"]),
+        "a-brand-new-model",
+    )
+    .await
+    .expect("swap");
+
+    let prompt = app
+        .context()
+        .service::<atomcode_harness::seams::SystemPromptSvc>()
+        .expect("system-prompt")
+        .render();
+    assert!(
+        prompt.contains("You are AtomCode"),
+        "coding's own persona must be the one mounted, not the harness's generic \
+         line — this is the gap the swap exposed:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("a-brand-new-model"),
+        "the identity line must name the model that was just switched to:\n{prompt}"
+    );
+    app.stop();
+}

@@ -808,8 +808,11 @@ struct RuntimeResources {
     /// `ControlSvc::patch` will be reached through.
     ///
     /// Never read ON PURPOSE — it is held for its `Drop`, not its value.
-    #[allow(dead_code)]
     harness_app: Option<atomcode_plexus::App>,
+    /// The provider table the `llm` row reads by id. Holding it is what makes a
+    /// `/model` switch a patch rather than a rebuild — see
+    /// `on_harness::ProviderSlots`.
+    harness_providers: Option<Arc<crate::on_harness::ProviderSlots>>,
     wakeup_tx: mpsc::UnboundedSender<WakeupRequest>,
     loop_active: Arc<std::sync::atomic::AtomicBool>,
     image_preprocessor: Option<Arc<dyn ImagePreprocessor>>,
@@ -2031,6 +2034,7 @@ impl CodingRuntime {
         // `RuntimeResources` with `parts` because it is the same kind of thing —
         // what a respawn must not lose.
         let mut harness_app: Option<atomcode_plexus::App> = None;
+        let mut harness_providers: Option<Arc<crate::on_harness::ProviderSlots>> = None;
         let engine = Engine::from_env();
         let (kernel_agent, unavailable_reason) = match bootstrap {
             ProviderBootstrap::Unavailable(reason) => (None, Some(reason)),
@@ -2050,7 +2054,7 @@ impl CodingRuntime {
                                 } else {
                                     crate::on_harness::Presence::Headless
                                 };
-                                let (handle, app) = crate::on_harness::mount(
+                                let (handle, app, providers) = crate::on_harness::mount_swappable(
                                     &agent.working_dir,
                                     presence,
                                     provider,
@@ -2061,6 +2065,7 @@ impl CodingRuntime {
                                     RuntimeStartError::Assemble(std::io::Error::other(e))
                                 })?;
                                 harness_app = Some(app);
+                                harness_providers = Some(providers);
                                 handle
                             }
                         }),
@@ -2109,6 +2114,7 @@ impl CodingRuntime {
                 plugin_hooks,
                 parts,
                 harness_app,
+                harness_providers,
                 wakeup_tx,
                 loop_active,
                 image_preprocessor,
@@ -4416,6 +4422,116 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                         };
 
+                        // On the harness, a `/model` switch is a patch, not a
+                        // rebuild.
+                        //
+                        // Everything below this branch — stop the agent, verify
+                        // its terminal, fail-close pending requests, reassemble,
+                        // restore the snapshot — exists because the CHAIN has to
+                        // replace one `AgentHandle` with another. Here the handle
+                        // does not change: the provider lives behind the `llm`
+                        // seam, `agent-loop` resolves that seam per turn, and
+                        // `App::patch` remounts only the row whose config moved.
+                        // Rows are sibling fibers under `ROOT_FIBER` and
+                        // `Fibers::unload` cascades to children rather than to
+                        // consumers, so `agent-loop` and `ui-handle` keep running
+                        // across it.
+                        //
+                        // What is NOT skipped is the contract with whoever asked.
+                        // A first attempt at this branch dropped all of it on the
+                        // theory that it belonged to the rebuild; the runtime's
+                        // own tests named every piece, one failure at a time:
+                        // the generation is the RECEIPT `reassemble_provider`
+                        // returns, `controls.state` is what `status()` reads, the
+                        // driver renders four events in order, and a sessionless
+                        // run still has a snapshot to keep.
+                        if Engine::from_env() == Engine::Harness {
+                            if let (Some(app), Some(slots)) = (
+                                runtime.harness_app.as_mut(),
+                                runtime.harness_providers.clone(),
+                            ) {
+                                controls.state.store(
+                                    runtime_phase_state(
+                                        generation,
+                                        RuntimePhase::Reconfiguring,
+                                    ),
+                                    Ordering::Release,
+                                );
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::Reconfiguring {
+                                        operation: ReconfigureKind::Provider,
+                                    },
+                                );
+                                if let Err(error) = crate::on_harness::swap_provider(
+                                    app,
+                                    slots.as_ref(),
+                                    candidate_provider,
+                                    &next.model,
+                                )
+                                .await
+                                {
+                                    // The tree is unchanged on a failed patch, so
+                                    // the old provider is still behind the seam and
+                                    // the session carries on with the model it had.
+                                    controls.state.store(
+                                        runtime_phase_state(
+                                            generation,
+                                            RuntimePhase::Ready,
+                                        ),
+                                        Ordering::Release,
+                                    );
+                                    resources = Some(runtime);
+                                    let _ = done
+                                        .send(Err(RuntimeError::ReconfigureFailed(error)));
+                                    continue;
+                                }
+                                if let Some(config) = refresh_routing {
+                                    crate::provider_factory::refresh_subagent_tiers(
+                                        runtime.provider_factory.clone(),
+                                        &next,
+                                        config.as_ref(),
+                                    );
+                                }
+                                runtime.config = next;
+                                let provider = runtime.config.provider_name.clone();
+                                let model = runtime.config.model.clone();
+                                let reasoning_effort =
+                                    runtime.config.chat_options.reasoning_effort;
+                                let reasoning_effort_applicable =
+                                    runtime.config.supports_reasoning_effort;
+                                resources = Some(runtime);
+                                generation = generation.wrapping_add(1);
+                                event_generation.store(generation, Ordering::Release);
+                                pending_steer_acknowledgements.clear();
+                                if active_turn.is_none() {
+                                    controls.state.store(
+                                        runtime_phase_state(generation, RuntimePhase::Ready),
+                                        Ordering::Release,
+                                    );
+                                }
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::ProviderChanged {
+                                        provider: provider.clone(),
+                                        model,
+                                    },
+                                );
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::ReasoningEffortChanged {
+                                        provider,
+                                        effort: reasoning_effort,
+                                        applicable: reasoning_effort_applicable,
+                                    },
+                                );
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::Reconfigured {
+                                        operation: ReconfigureKind::Provider,
+                                    },
+                                );
+                                let _ = done.send(Ok(RuntimeGeneration(generation)));
+                                continue;
+                            }
+                        }
+
                         if let Some(task) = next_prompt_task.take() {
                             task.abort();
                         }
@@ -4895,6 +5011,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                 // of the escape hatch is measuring what the
                                 // harness carries, and a silent fallback would
                                 // make every later reading a lie.
+                                harness_providers: None,
                                 harness_app: {
                                     if Engine::from_env() == Engine::Harness {
                                         eprintln!(
@@ -9124,6 +9241,7 @@ mod tests {
             plugin_hooks,
             parts,
             harness_app: None,
+            harness_providers: None,
             wakeup_tx: wakeup_tx.clone(),
             loop_active: loop_active.clone(),
             image_preprocessor: None,
@@ -9226,6 +9344,7 @@ mod tests {
             plugin_hooks: start.plugin_hooks,
             parts,
             harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -9375,6 +9494,7 @@ mod tests {
             plugin_hooks: start.plugin_hooks,
             parts,
             harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active,
             image_preprocessor: None,
@@ -9466,6 +9586,7 @@ mod tests {
             plugin_hooks: start.plugin_hooks,
             parts,
             harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -12082,6 +12203,7 @@ mod tests {
             plugin_hooks,
             parts,
             harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -12267,6 +12389,7 @@ mod tests {
             plugin_hooks,
             parts,
             harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: pp,
@@ -12673,6 +12796,7 @@ mod tests {
             plugin_hooks,
             parts,
             harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -12769,6 +12893,7 @@ mod tests {
             plugin_hooks,
             parts,
             harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -12833,6 +12958,7 @@ mod tests {
             plugin_hooks,
             parts,
             harness_app: None,
+            harness_providers: None,
             wakeup_tx: wakeup_tx.clone(),
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -12956,6 +13082,7 @@ mod tests {
             plugin_hooks,
             parts,
             harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -13066,6 +13193,7 @@ mod tests {
             plugin_hooks,
             parts,
             harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -13135,6 +13263,7 @@ mod tests {
             plugin_hooks,
             parts,
             harness_app: None,
+            harness_providers: None,
             wakeup_tx: wakeup_tx.clone(),
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -13238,6 +13367,7 @@ mod tests {
             plugin_hooks,
             parts,
             harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -13337,6 +13467,7 @@ mod tests {
             plugin_hooks: start.plugin_hooks,
             parts,
             harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -13517,6 +13648,7 @@ mod tests {
             plugin_hooks: start.plugin_hooks,
             parts,
             harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor: None,
@@ -15075,6 +15207,7 @@ mod tests {
             plugin_hooks,
             parts,
             harness_app: None,
+            harness_providers: None,
             wakeup_tx,
             loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             image_preprocessor,
