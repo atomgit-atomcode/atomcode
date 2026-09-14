@@ -631,9 +631,10 @@ async fn reference_until(
 // driver passes `Enabled`: with it off, the criterion agreed that neither engine
 // had `task`, which is the exact question a person had to ask by hand.
 //
-// `review` is the same shape as `web` and is still off: it is the last gate that
-// hides a difference rather than avoiding one, because the row list has no
-// `code_review` yet. Turning it on is how that gets found, not how it gets fixed.
+// `review` was the last gate that hid a difference rather than avoiding one —
+// the row list had no `code_review`. It has one now (`tool-code-review`), so the
+// gate is open here too and the criterion covers it. Building the tool performs
+// no I/O; running a review does, and no scenario runs one.
 
 async fn production_agent(
     script: Arc<Script>,
@@ -643,7 +644,7 @@ async fn production_agent(
     let opts = atomcode_coding::parts::PrepareOptions {
         mcp: false,
         web: true,
-        review: false,
+        review: true,
         memory: false,
         subagents: atomcode_coding::SubagentPolicy::Enabled,
         skill_dirs: Some(Vec::new()),

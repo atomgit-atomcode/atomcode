@@ -70,6 +70,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(capabilities::CodeIntelPlugin))
         .register(Arc::new(capabilities::CodeGraphPlugin))
         .register(Arc::new(capabilities::WebPlugin))
+        .register(Arc::new(capabilities::ReviewToolPlugin))
         .register(Arc::new(capabilities::MemoryPlugin))
         .register(Arc::new(capabilities::McpPlugin))
         .register(Arc::new(findings::FindingsPlugin))

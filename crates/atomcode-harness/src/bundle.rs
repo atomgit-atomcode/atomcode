@@ -243,6 +243,13 @@ disabled = true
 name = "tool-web"
 disabled = true
 
+# A reviewer is another agent's worth of model calls inside one tool call, so a
+# generic tree opts into it. `config = { model = "…" }` names what the child is
+# told it runs; unset, it is whatever `llm` answers at mount.
+[[insert]]
+name = "tool-code-review"
+disabled = true
+
 [[insert]]
 name = "memory"
 

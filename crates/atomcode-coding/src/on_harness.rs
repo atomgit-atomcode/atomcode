@@ -135,6 +135,17 @@ name = "code-graph"
 [[insert]]
 name = "tool-web"
 
+# Reviewing the current changes in-session. On, because the chain has had
+# `review: true` in `PrepareOptions::default()` from the start and every shipped
+# driver leaves it on — `/review` is a product feature, not an extra.
+#
+# `model` is patched by `swap_provider` beside the persona: this row holds the
+# provider it was given at mount, and `App::patch` remounts only rows whose own
+# entry changed. Without that patch the reviewer would keep talking to the model
+# the person just switched away from.
+[[insert]]
+name = "tool-code-review"
+
 [[insert]]
 name = "memory"
 
@@ -461,12 +472,22 @@ pub async fn swap_provider(
     model: &str,
 ) -> Result<(), String> {
     let id = slots.insert(next);
-    // Both rows, one patch. The persona bakes the model into its identity line,
-    // so a swap that moved only `llm` would leave the model reading a first
-    // line that names the model it used to be.
+    // Three rows, one patch, and the two extras are there for the same reason:
+    // `App::patch` remounts only rows whose OWN entry changed, so a row that
+    // captured something from the `llm` seam keeps what it captured.
+    //
+    //   persona-atomcode  bakes the model into its identity line — a swap that
+    //                     moved only `llm` leaves the model reading a first line
+    //                     that names the model it used to be.
+    //   tool-code-review  holds the provider it hands the child reviewer — so
+    //                     `/model` would move the conversation and leave the
+    //                     reviewer on the old model, and `/logout` would leave
+    //                     it holding the credentials. The logout criterion in
+    //                     the differential fails the moment this line is gone.
     let layer = Layer::from_toml(&format!(
         "[[patch]]\nid = \"llm\"\nconfig = {{ provider_id = {id:?} }}\n\n\
-         [[patch]]\nid = \"persona-atomcode\"\nconfig = {{ model = {model:?} }}\n"
+         [[patch]]\nid = \"persona-atomcode\"\nconfig = {{ model = {model:?} }}\n\n\
+         [[patch]]\nid = \"tool-code-review\"\nconfig = {{ model = {model:?} }}\n"
     ))
     .map_err(|e| e.to_string())?;
     app.patch(&layer).await.map_err(|e| e.to_string())

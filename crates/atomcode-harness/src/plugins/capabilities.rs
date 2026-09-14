@@ -21,6 +21,7 @@ use atomcode_capabilities::skills::{
 use atomcode_capabilities::tools::{WebFetchTool, WebSearchTool};
 use atomcode_kernel::tool::Tool;
 use atomcode_plexus::{Context, Plugin};
+use atomcode_review::{ReviewTool, ReviewToolConfig, SharedReviewProvider};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -244,11 +245,7 @@ impl Plugin for WebPlugin {
         "web search and fetch"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
-        let row: WebRow = if config.is_null() {
-            WebRow::default()
-        } else {
-            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
-        };
+        let row: WebRow = parse(config)?;
         // Told the process is offline, this row mounts nothing. The tools
         // themselves do not refuse — they would try, fail, and tell the model
         // the internet is broken — and a persona that has already said there is
@@ -291,6 +288,86 @@ impl Plugin for WebPlugin {
                  the catalog.",
                 backend = provider.as_deref().unwrap_or("the default"),
             ),
+        );
+        Ok(())
+    }
+}
+
+// ---- review, as a capability of the agent --------------------------------
+
+#[derive(Debug, Deserialize, Default)]
+struct ReviewRow {
+    /// What the child reviewer is told it is running.
+    ///
+    /// Config rather than "just read the seam", and that is the whole design of
+    /// this row: `App::patch` remounts only rows whose OWN entry changed, and
+    /// `Fibers::unload` cascades to children rather than to consumers — so a
+    /// tree that swaps `llm` would leave this row holding the provider it was
+    /// given at mount. A tree that swaps models patches this row's `model` in
+    /// the same layer (the coding tree does, beside its persona), and the
+    /// remount picks up the new provider with the new name. Left unset it is
+    /// whatever the `llm` seam answers at mount.
+    #[serde(default)]
+    model: Option<String>,
+    /// Unset ⇒ the provider's own window, else the tool's default.
+    #[serde(default)]
+    context_window: Option<u32>,
+    /// Per-language review rules. Unset ⇒ the built-in ones only.
+    #[serde(default)]
+    rules_dir: Option<String>,
+}
+
+/// The `code_review` tool: a read-only child reviewer over the current changes.
+///
+/// Not a second agent product — the reviewer is one tool inside THIS agent, the
+/// way `task` is. It reuses the host's provider on purpose: a reviewer that
+/// built its own would miss a signing gateway and fail where the conversation
+/// around it works.
+pub struct ReviewToolPlugin;
+
+#[async_trait]
+impl Plugin for ReviewToolPlugin {
+    fn name(&self) -> &'static str {
+        "tool-code-review"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools", "llm"]
+    }
+    fn description(&self) -> &'static str {
+        "the `code_review` tool: a read-only reviewer over the current changes, \
+         running its own rounds on the host's provider"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: ReviewRow = parse(config)?;
+        let provider = ctx
+            .service::<crate::seams::LlmSvc>()
+            .ok_or("the `llm` seam must be filled before `tool-code-review`")?;
+        let defaults = ReviewToolConfig::default();
+        let cfg = ReviewToolConfig {
+            model: row
+                .model
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| provider.model_name().to_string()),
+            context_window: row
+                .context_window
+                .or_else(|| Some(provider.context_window()))
+                .filter(|w| *w > 0)
+                .unwrap_or(defaults.context_window),
+            rules_dir: row.rules_dir.map(PathBuf::from),
+            ..defaults
+        };
+        let slot: SharedReviewProvider = Arc::new(std::sync::RwLock::new(Some(provider)));
+        mount(
+            ctx,
+            vec![Arc::new(ReviewTool::new(slot, cfg)) as Arc<dyn Tool>],
+        )?;
+        contribute_prompt(
+            ctx,
+            "tool-code-review",
+            58,
+            "`code_review` runs a reviewer over the current changes and reports what it \
+             finds. It reads; it never edits. Use it before handing work back — not \
+             instead of running the tests.",
         );
         Ok(())
     }
