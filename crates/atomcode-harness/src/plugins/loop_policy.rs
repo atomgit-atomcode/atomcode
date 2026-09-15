@@ -35,6 +35,18 @@ fn parse<T: for<'de> Deserialize<'de> + Default>(config: &Value) -> Result<T, St
 
 #[derive(Debug, Deserialize)]
 struct RoundCapRow {
+    /// Rounds allowed in one turn. **`0` means no limit**, which is the
+    /// convention the coding engine already uses for the same knob
+    /// (`parts.rs` / `assemble.rs`: `if cfg.max_rounds != 0 { builder.max_rounds(…) }`)
+    /// — so a caller mapping its own config onto this row does not have to
+    /// remember to translate, and a session that was unlimited before is still
+    /// unlimited after.
+    ///
+    /// This matters more than it looks. `rounds` counts *completed* steps and the
+    /// check is `rounds >= max_rounds`, so a literal reading of `0` stops the
+    /// turn before its first request — a session that can do nothing at all. An
+    /// unlimited engine assembled onto this row without the special case would
+    /// be bricked, not merely capped.
     #[serde(default = "default_rounds")]
     max_rounds: u32,
     /// Stop the turn after this many seconds. `0` disables the deadline.
@@ -63,7 +75,11 @@ struct RoundCap {
 #[async_trait]
 impl Listener<TurnStopping> for RoundCap {
     async fn call(&self, progress: &TurnProgress) -> Option<StopReason> {
-        if progress.rounds >= self.max_rounds {
+        // `0` is "no limit", not "stop now" — see `RoundCapRow::max_rounds`.
+        // Spelled as a guard rather than by never mounting the listener, so the
+        // row can still carry a deadline (`max_seconds`) with the round budget
+        // switched off.
+        if self.max_rounds > 0 && progress.rounds >= self.max_rounds {
             return Some(StopReason::MaxRounds);
         }
         if self.max_seconds > 0 && progress.elapsed.as_secs() >= self.max_seconds {
@@ -800,6 +816,79 @@ mod retry_backoff_tests {
         assert_eq!(
             retry_backoff(1, BASE, CAP, Some(Duration::from_secs(6000))),
             Duration::from_secs(60)
+        );
+    }
+}
+
+/// 轮次预算的语义。单独一个模块，因为 `retry_backoff_tests` 只 import 了它自己
+/// 那一件东西，而这个判据要 `RoundCap` 与 `TurnProgress`。
+#[cfg(test)]
+mod round_budget_tests {
+    use super::{RoundCap, TurnProgress, TurnStopping};
+    use crate::seams::StopReason;
+    use atomcode_plexus::Listener;
+    use std::time::Duration;
+
+    /// **`0` 是「不限」，不是「立刻停」。**
+    ///
+    /// coding 引擎对同一个旋钮就是这么定义的（`parts.rs` / `assemble.rs`:
+    /// `if cfg.max_rounds != 0 { builder.max_rounds(…) }`）。而这里的判断是
+    /// `rounds >= max_rounds`，`rounds` 数的是**已完成**的步数 —— 所以照字面读
+    /// `0` 会在回合的第一个请求之前就把它停掉：一个什么也做不了的会话。
+    ///
+    /// 这不是理论风险，是把「原引擎不限轮次」的配置映射过来时的必经之路：忘了
+    /// 特判就把会话废掉，而不是仅仅收紧上限。所以判据钉住两个方向：`0` 必须**永
+    /// 不**因轮次而停，正数必须在**恰好**那么多轮时停（不能因为加了 `> 0` 而把
+    /// 正数路径也改宽）。
+    #[tokio::test]
+    async fn zero_rounds_means_unlimited_and_a_positive_cap_still_fires() {
+        let at = |rounds: u32| TurnProgress {
+            turn: 1,
+            rounds,
+            tool_calls: 0,
+            used_tokens: 0,
+            elapsed: Duration::ZERO,
+        };
+        let unlimited = RoundCap {
+            max_rounds: 0,
+            max_seconds: 0,
+        };
+        // Swept rather than checked at one value: "stopped at round 0" and
+        // "stopped at round 10 000" are the two ways an unlimited budget can
+        // still be wrong, and only one of them is near the boundary.
+        for rounds in [0u32, 1, 2, 24, 25, 10_000] {
+            assert_eq!(
+                unlimited.call(&at(rounds)).await,
+                None,
+                "`max_rounds = 0` must never stop a turn for its round count, \
+                 but it did at {rounds} rounds"
+            );
+        }
+
+        let capped = RoundCap {
+            max_rounds: 5,
+            max_seconds: 0,
+        };
+        assert_eq!(capped.call(&at(4)).await, None, "one under the budget");
+        assert_eq!(
+            capped.call(&at(5)).await,
+            Some(StopReason::MaxRounds),
+            "the budget is inclusive: the sixth round must not start"
+        );
+
+        // And a deadline still works with the round budget switched off — the
+        // pair is why this is a guard in `call` rather than a row that is simply
+        // not mounted when `0`.
+        let deadline_only = RoundCap {
+            max_rounds: 0,
+            max_seconds: 30,
+        };
+        let mut late = at(3);
+        late.elapsed = Duration::from_secs(31);
+        assert_eq!(
+            deadline_only.call(&late).await,
+            Some(StopReason::StoppedByPolicy),
+            "an unlimited round budget must not disable the deadline"
         );
     }
 }
