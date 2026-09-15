@@ -2105,6 +2105,29 @@ async fn the_prompt_teaches_each_product_tool_once(engine: &str) {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// A model that can see is shown the picture it reads; one that cannot is not.
+async fn a_picture_read_reaches_a_model_that_can_see_it(engine: &str) {
+    select(engine);
+    for vision in [true, false] {
+        let env = env();
+        std::fs::write(
+            env.project.path().join("cover.jpg"),
+            [
+                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00,
+            ],
+        )
+        .unwrap();
+        let recorder = Arc::new(Recorder::default());
+        let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+        config.agent.supports_vision = vision;
+        let mut runtime = CodingRuntime::start(config).await.unwrap();
+        turn(&mut runtime, "read cover.jpg").await;
+        let shown = recorder.last_request().iter().any(|m| !m.images.is_empty());
+        assert_eq!(shown, vision, "[{engine}] vision = {vision}");
+        runtime.handle.shutdown().await.unwrap();
+    }
+}
+
 // ---- what the model is offered ---------------------------------------------
 
 /// The start a production driver makes: every capability the chain turns on
@@ -2311,4 +2334,5 @@ on_both_engines!(
     a_silent_stream_times_the_turn_out,
     a_requested_compaction_is_summarized_by_the_model_about_the_focus,
     the_prompt_teaches_each_product_tool_once,
+    a_picture_read_reaches_a_model_that_can_see_it,
 );
