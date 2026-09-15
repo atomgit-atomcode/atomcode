@@ -896,6 +896,18 @@ pub async fn mount_swappable(
 pub struct HostState {
     pub session: crate::host_rows::SessionSeed,
     pub hooks: Option<Arc<crate::host_rows::HostHooks>>,
+    /// The person's live switches, and the session grants plan mode keeps for
+    /// MCP tools. Absent for a host with no switches: the tree keeps the
+    /// harness's mount-time rows.
+    pub modes: Option<HostModes>,
+}
+
+/// The switches `set_mode` writes, handed to the rows that obey them.
+pub struct HostModes {
+    pub modes: atomcode_harness::seams::Modes,
+    pub plan_mcp_grants: Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    /// Every other "always allow", in the store the approval seam remembers into.
+    pub approval_grants: Arc<dyn atomcode_capabilities::tools::PermissionStore>,
 }
 
 /// As [`mount_swappable`], carrying the runtime's own state into the tree.
@@ -959,8 +971,19 @@ pub async fn mount_hosted(
     // The session is the runtime's: its id, and its stored conversation as the
     // seed. The harness's own `session` row would mint an id and, asked to
     // resume, replay the JSONL journal — which is the follower, not the master.
+    // With live switches, plan mode is the product's and is always mounted — it
+    // decides per call whether it is on. Patched in place so it keeps
+    // `plan-mode`'s position, ahead of the approval gates: a write plan mode
+    // refuses must not first be asked about.
+    let modes_rows = if host.modes.is_some() {
+        "[[patch]]\nid = \"plan-mode\"\nname = \"plan-mode-live\"\ndisabled = false\n\n\
+         [[insert]]\nname = \"modes-host\"\n\n\
+         [[insert]]\nname = \"grants-host\"\n\n"
+    } else {
+        ""
+    };
     let hosted = format!(
-        "[[patch]]\nid = \"session\"\nname = \"session-native\"\n\n{}",
+        "[[patch]]\nid = \"session\"\nname = \"session-native\"\n\n{modes_rows}{}",
         host.hooks
             .as_ref()
             .map(|hooks| hooks.rows())
@@ -990,6 +1013,15 @@ pub async fn mount_hosted(
     registry.register(Arc::new(crate::host_rows::KernelHooksPlugin(
         host.hooks.unwrap_or_default(),
     )));
+    if let Some(modes) = host.modes {
+        registry.register(Arc::new(crate::host_rows::ModesHostPlugin(modes.modes)));
+        registry.register(Arc::new(crate::host_rows::PlanModeLivePlugin(
+            modes.plan_mcp_grants,
+        )));
+        registry.register(Arc::new(crate::host_rows::GrantsHostPlugin(
+            modes.approval_grants,
+        )));
+    }
     if let Some(host) = models {
         registry.register(Arc::new(InjectModels(Arc::new(CodingModels {
             host,

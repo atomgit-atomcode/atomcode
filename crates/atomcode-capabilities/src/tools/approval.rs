@@ -170,6 +170,12 @@ impl ApprovalMiddleware {
     pub fn in_memory() -> Self {
         Self::new(Arc::new(InMemoryPermissionStore::new()))
     }
+    /// The grant store this gate remembers "always" answers in. Shared so a host
+    /// that answers the same questions through another shell (a harness tree's
+    /// approval seam) remembers into the same set — the key shape is the same.
+    pub fn store(&self) -> Arc<dyn PermissionStore> {
+        Arc::clone(&self.store)
+    }
     /// Override the round-trip request `kind`.
     pub fn with_kind(mut self, kind: impl Into<String>) -> Self {
         self.kind = kind.into();

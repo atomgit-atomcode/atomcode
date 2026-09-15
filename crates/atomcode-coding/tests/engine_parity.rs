@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use atomcode_capabilities::session::SessionManager;
 use atomcode_coding::{
     CodingAgentConfig, CodingProviderFactory, CodingRuntime, CodingRuntimeEvent,
-    CodingRuntimeStart, PrepareOptions, ProviderBuildError, RewindScope, SessionMode,
+    CodingRuntimeStart, PrepareOptions, ProviderBuildError, RewindScope, RuntimeMode, SessionMode,
     StaticPluginHookSource, SubagentPolicy, UserInput,
 };
 use atomcode_kernel::message::{Message, Role, SessionSnapshot};
@@ -62,13 +62,24 @@ impl LlmProvider for RecordingProvider {
         let n = self.0.count.fetch_add(1, Ordering::SeqCst) + 1;
         // A prompt that names a file to read asks for it once; the result comes
         // back as the next request's last message, and is echoed.
-        let last = messages.last();
+        // A request tail (a plan-mode reminder, a skill nudge) rides after the
+        // message being answered; answer that message.
+        let last = messages.iter().rev().find(|m| !m.synthetic);
         let first = match last {
             Some(m) if m.role == Role::User && m.text.starts_with("read ") => {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
                     name: "read_file".into(),
                     arguments: serde_json::json!({ "file_path": &m.text[5..] }).to_string(),
+                })
+            }
+            Some(m) if m.role == Role::User && m.text.starts_with("write ") => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "write_file".into(),
+                    arguments:
+                        serde_json::json!({ "file_path": &m.text[6..], "content": "written\n" })
+                            .to_string(),
                 })
             }
             Some(m) if m.role == Role::Tool => StreamEvent::TextDelta(format!("saw: {}", m.text)),
@@ -96,6 +107,18 @@ impl CodingProviderFactory for RecordingFactory {
     ) -> Result<Arc<dyn LlmProvider>, ProviderBuildError> {
         Ok(Arc::new(RecordingProvider(self.0.clone())))
     }
+}
+
+/// As [`start`], with a person attending: questions are asked rather than
+/// refused, which is the shape a switch like accept-edits exists for.
+fn start_attended(
+    project: &std::path::Path,
+    recorder: &Arc<Recorder>,
+    session: SessionMode,
+) -> CodingRuntimeStart {
+    let mut start = start(project, recorder, session);
+    start.agent.interactive = true;
+    start
 }
 
 fn start(
@@ -127,16 +150,50 @@ fn start(
 }
 
 async fn turn(runtime: &mut CodingRuntime, text: &str) {
+    let asked = turn_answering(runtime, text, None).await;
+    assert_eq!(
+        asked, 0,
+        "a turn that was not expected to ask asked {asked} time(s)"
+    );
+}
+
+/// Run a turn, answering every question the runtime puts to the person with
+/// `answer` (a refusal when `None`). Returns how many questions were asked.
+async fn turn_answering(
+    runtime: &mut CodingRuntime,
+    text: &str,
+    answer: Option<serde_json::Value>,
+) -> usize {
     runtime.handle.submit(UserInput::from(text)).await.unwrap();
+    let mut asked = 0;
     loop {
         let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
             .await
             .expect("turn did not finish")
             .expect("runtime event stream closed");
-        if matches!(event.event, CodingRuntimeEvent::TurnFinished(_)) {
-            return;
+        match event.event {
+            CodingRuntimeEvent::TurnFinished(_) => return asked,
+            CodingRuntimeEvent::Request(request) => {
+                asked += 1;
+                let value = answer
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({ "decision": "deny" }));
+                runtime.handle.respond(request.id, value).await.unwrap();
+            }
+            _ => {}
         }
     }
+}
+
+/// A directory that is neither the workspace nor a temp root, so a write there
+/// is one the write gate asks about. Under the build's `target/`, the same
+/// place `permission_grants.rs` uses.
+fn outside_dir() -> tempfile::TempDir {
+    let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    tempfile::tempdir_in(target).unwrap()
 }
 
 fn user_texts(messages: &[Message]) -> Vec<String> {
@@ -419,6 +476,126 @@ async fn a_restored_snapshot_is_what_the_model_sees(engine: &str) {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// Plan mode, switched on mid-session: a write is refused and the model is
+/// told it is planning.
+async fn plan_mode_refuses_a_write_and_says_so(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(start_attended(
+        env.project.path(),
+        &recorder,
+        SessionMode::Fresh,
+    ))
+    .await
+    .unwrap();
+
+    turn(&mut runtime, "hello").await;
+    runtime.handle.set_mode(RuntimeMode::Plan).await.unwrap();
+    turn(&mut runtime, "write planned.txt").await;
+
+    assert!(
+        !env.project.path().join("planned.txt").exists(),
+        "[{engine}] plan mode let a write through"
+    );
+    assert!(
+        recorder
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .any(|m| m.text.contains("PLAN MODE is active")),
+        "[{engine}] the model was not told it is planning"
+    );
+    // The refusal is what the model reads back, whether or not the turn went
+    // on after it: look for it in the next request.
+    turn(&mut runtime, "what happened?").await;
+    let result = recorder
+        .last_request()
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Tool)
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        result.contains("plan mode"),
+        "[{engine}] the refusal: {result}"
+    );
+
+    // And switched off again, the same write goes through.
+    runtime.handle.set_mode(RuntimeMode::Build).await.unwrap();
+    turn(&mut runtime, "write planned.txt").await;
+    assert!(
+        env.project.path().join("planned.txt").exists(),
+        "[{engine}]"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// Accept-edits, switched on mid-session: a write the gate would ask about is
+/// applied without asking.
+async fn accept_edits_applies_a_write_without_asking(engine: &str) {
+    select(engine);
+    let env = env();
+    let outside = outside_dir();
+    let target = outside.path().join("accepted.txt");
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(start_attended(
+        env.project.path(),
+        &recorder,
+        SessionMode::Fresh,
+    ))
+    .await
+    .unwrap();
+
+    runtime
+        .handle
+        .set_mode(RuntimeMode::AcceptEdits)
+        .await
+        .unwrap();
+    let asked = turn_answering(&mut runtime, &format!("write {}", target.display()), None).await;
+
+    assert_eq!(asked, 0, "[{engine}] accept-edits still asked");
+    assert!(target.exists(), "[{engine}] the write did not happen");
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// "Always allow" is remembered for the session — including across a rebuild of
+/// the agent, which an undo is.
+async fn an_always_allow_survives_an_undo(engine: &str) {
+    select(engine);
+    let env = env();
+    let outside = outside_dir();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(start_attended(
+        env.project.path(),
+        &recorder,
+        SessionMode::Fresh,
+    ))
+    .await
+    .unwrap();
+
+    let first = outside.path().join("one.txt");
+    let asked = turn_answering(
+        &mut runtime,
+        &format!("write {}", first.display()),
+        Some(serde_json::json!({ "decision": "allow_always" })),
+    )
+    .await;
+    assert_eq!(asked, 1, "[{engine}] the first write should be asked about");
+    assert!(first.exists(), "[{engine}]");
+
+    turn(&mut runtime, "something else").await;
+    runtime.handle.undo_to_prompt(None).await.unwrap();
+
+    let second = outside.path().join("two.txt");
+    let asked = turn_answering(&mut runtime, &format!("write {}", second.display()), None).await;
+    assert_eq!(asked, 0, "[{engine}] the grant was forgotten");
+    assert!(second.exists(), "[{engine}]");
+    runtime.handle.shutdown().await.unwrap();
+}
+
 macro_rules! on_both_engines {
     ($($scenario:ident),* $(,)?) => {
         mod chain {
@@ -451,4 +628,7 @@ on_both_engines!(
     a_changed_directory_is_where_tools_run,
     a_rewound_conversation_is_gone_from_what_the_model_sees,
     a_restored_snapshot_is_what_the_model_sees,
+    plan_mode_refuses_a_write_and_says_so,
+    accept_edits_applies_a_write_without_asking,
+    an_always_allow_survives_an_undo,
 );

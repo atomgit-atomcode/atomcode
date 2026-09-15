@@ -56,6 +56,8 @@ plexus_service!(SubagentsSvc => dyn Subagents, "subagents", Seam, "Delegating wo
 plexus_service!(AgentLoopSvc => dyn AgentLoop, "agent-loop", Seam, "The turn driver");
 plexus_service!(ApprovalSvc => dyn ApprovalPolicy, "approval", Seam, "Whether a tool call may run");
 plexus_service!(AgentHandleSvc => dyn AgentHandleSource, "agent-handle", Seam, "A driver-protocol handle on this harness");
+plexus_service!(ModesSvc => Modes, "modes", Core, "Switches a person flips mid-session — plan mode, accept edits — read live by the rows they govern");
+plexus_service!(GrantsSvc => dyn atomcode_capabilities::tools::PermissionStore, "grants", Core, "The session's remembered always-allow answers, kept by a host that outlives the tree");
 
 /// The live tool catalog.
 ///
@@ -283,6 +285,21 @@ pub struct SessionDefaults {
     /// over `resume`, the same precedence [`crate::agent::CreateAgent`] already
     /// gives an explicit seed.
     pub seed: Vec<crate::session::LoggedEvent>,
+}
+
+/// Switches a person flips while a session runs.
+///
+/// Live rather than row config because flipping one must not remount anything:
+/// a remount is a new row instance, and a gate that holds a session grant would
+/// lose it on every toggle. The host that owns the switches provides this; a
+/// row it governs reads the flag at the moment it decides, and a tree with no
+/// host reads its own row config instead.
+#[derive(Clone, Debug, Default)]
+pub struct Modes {
+    /// Read-only exploration.
+    pub plan: Arc<std::sync::atomic::AtomicBool>,
+    /// Edits inside the workspace are applied without asking.
+    pub accept_edits: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One stored session, as a list would show it.

@@ -504,7 +504,14 @@ impl ApprovalPolicy for Asker {
         let scope = tool.always_grant_scope(&call.arguments);
         let grantable = scope != crate::seams::NEVER_GRANT;
         let key = format!("{}::{scope}", tool.name());
-        if grantable && self.granted.lock().expect("grants poisoned").contains(&key) {
+        // A host that keeps the session's grants past this tree (the coding
+        // runtime rebuilds it on undo) provides them; otherwise they live here.
+        let kept = self.ctx.service::<crate::seams::GrantsSvc>();
+        let remembered = match &kept {
+            Some(store) => store.is_granted(&key),
+            None => self.granted.lock().expect("grants poisoned").contains(&key),
+        };
+        if grantable && remembered {
             return Decision::Allow;
         }
         let question = crate::seams::Question::approval(
@@ -554,7 +561,12 @@ impl ApprovalPolicy for Asker {
                 // simply not remembered, which is the whole meaning of
                 // `NEVER_GRANT`.
                 if grantable {
-                    self.granted.lock().expect("grants poisoned").insert(key);
+                    match &kept {
+                        Some(store) => store.grant(&key),
+                        None => {
+                            self.granted.lock().expect("grants poisoned").insert(key);
+                        }
+                    }
                 }
                 Decision::Allow
             }
@@ -1109,7 +1121,14 @@ impl Plugin for AgentHandlePlugin {
     fn uses(&self) -> &'static [&'static str] {
         // `approval` because the gate resolves the policy per call rather than
         // capturing it — the same reason the static approval row declares it.
-        &["tools", "llm", "compaction", "approval", "session-defaults"]
+        &[
+            "tools",
+            "llm",
+            "compaction",
+            "approval",
+            "session-defaults",
+            "grants",
+        ]
     }
     fn provides(&self) -> &'static [&'static str] {
         // A driver renders prompts and answers them, so it fills the asking

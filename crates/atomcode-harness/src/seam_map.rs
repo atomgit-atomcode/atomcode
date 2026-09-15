@@ -58,9 +58,10 @@ macro_rules! seam_catalog {
 
 use crate::seams::{
     AgentHandleSvc, AgentLoopSvc, AgentsSvc, ApprovalSvc, CodeIndexSvc, CompactionSvc, ControlSvc,
-    FindingsSvc, FsSvc, LlmSvc, LlmUtilitySvc, McpSvc, ModelsSvc, OpenerSvc, OperationsSvc,
-    SessionDefaultsSvc, SessionPersistenceSvc, SessionProjectionsSvc, SessionSvc, SessionTitleSvc,
-    ShellSvc, SkillsSvc, SubagentsSvc, SystemPromptSvc, ToolsSvc, UiSvc, UserQuestionsSvc,
+    FindingsSvc, FsSvc, GrantsSvc, LlmSvc, LlmUtilitySvc, McpSvc, ModelsSvc, ModesSvc, OpenerSvc,
+    OperationsSvc, SessionDefaultsSvc, SessionPersistenceSvc, SessionProjectionsSvc, SessionSvc,
+    SessionTitleSvc, ShellSvc, SkillsSvc, SubagentsSvc, SystemPromptSvc, ToolsSvc, UiSvc,
+    UserQuestionsSvc,
 };
 
 seam_catalog!(
@@ -91,6 +92,8 @@ seam_catalog!(
     UiSvc,
     ControlSvc,
     AgentHandleSvc,
+    ModesSvc,
+    GrantsSvc,
 );
 
 /// Slots the host fills itself.
@@ -104,7 +107,15 @@ seam_catalog!(
 /// copy of the host's provider factory — and the rows that read this seam
 /// (`model-catalog`, `llm-utility-selected`, `task`, `team`) are careful to
 /// treat its absence as "there is no choice here", not as an error.
-pub const HOST_PROVIDED: &[&str] = &["control", "models"];
+///
+/// `modes`: the switches belong to whoever the person flips them through — the
+/// coding runtime's `set_mode`. A row inventing its own would be a second switch
+/// that the person's toggle never reaches.
+///
+/// `grants`: "always allow" is a statement about the session, and a host that
+/// rebuilds the tree mid-session (an undo, a restore) must not forget it. Only
+/// the host outlives the tree.
+pub const HOST_PROVIDED: &[&str] = &["control", "models", "modes", "grants"];
 
 /// Slots no row fills because they belong to an agent, not to the tree: the
 /// agent registry provides each agent's own log into its realm when the agent

@@ -361,3 +361,209 @@ impl Listener<TurnFinishing> for Bridge {
         None
     }
 }
+
+// ---- the person's switches ------------------------------------------------
+
+/// `modes-host`: the runtime's live switches, as the tree's `modes` service.
+///
+/// The same `Arc`s `set_mode` writes, so a toggle reaches every row that reads
+/// them at its next decision — nothing remounts.
+pub(crate) struct ModesHostPlugin(pub(crate) atomcode_harness::seams::Modes);
+
+#[async_trait]
+impl Plugin for ModesHostPlugin {
+    fn name(&self) -> &'static str {
+        "modes-host"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["modes"]
+    }
+    fn description(&self) -> &'static str {
+        "the coding runtime's plan and accept-edits switches, read live"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_harness::seams::ModesSvc>(Arc::new(self.0.clone()))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// `grants-host`: the session's "always allow" answers, kept by the runtime.
+///
+/// A tree's approval seam remembers grants in itself, and a tree is rebuilt on
+/// undo and restore — so a person who said "always" would be asked again after
+/// every undo. The runtime's store lives as long as the session's decisions do:
+/// kept across undo and restore, carried across a config reload, fresh for a new
+/// session — the lifetime the chain's approval middleware already gives it.
+pub(crate) struct GrantsHostPlugin(
+    pub(crate) Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+);
+
+#[async_trait]
+impl Plugin for GrantsHostPlugin {
+    fn name(&self) -> &'static str {
+        "grants-host"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["grants"]
+    }
+    fn description(&self) -> &'static str {
+        "the coding runtime's session grants, so a rebuilt tree remembers what the person allowed"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_harness::seams::GrantsSvc>(self.0.clone())
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// `plan-mode-live`: plan mode as the coding product has it, switched live.
+///
+/// The harness's own `plan-mode` row is a different policy — every tool without
+/// a read-only hint refused, and the instruction in the system prompt — and it
+/// is mount-time. This one asks [`crate::plan_mode::plan_verdict`], the judgement
+/// the kernel middleware asks: built-in mutating tools refused, read-only MCP
+/// tools run, other MCP tools asked about with a session grant. The reminder
+/// rides as a request tail, so toggling plan mode never rewrites the cached
+/// prompt prefix.
+pub(crate) struct PlanModeLivePlugin(
+    pub(crate) Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+);
+
+struct PlanModeLive {
+    ctx: Context,
+    mcp_grants: Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+}
+
+impl PlanModeLive {
+    fn active(&self) -> bool {
+        self.ctx
+            .service::<atomcode_harness::seams::ModesSvc>()
+            .is_some_and(|modes| modes.plan.load(Ordering::Relaxed))
+    }
+}
+
+#[async_trait]
+impl Waterfall<atomcode_harness::events::ToolsExecute> for PlanModeLive {
+    async fn handle(
+        &self,
+        exec: &mut atomcode_harness::events::ToolExec,
+        next: Next<'_, atomcode_harness::events::ToolsExecute>,
+    ) -> atomcode_kernel::tool::ToolResult {
+        use crate::plan_mode::{plan_mcp_denied, plan_verdict, PlanVerdict};
+        let Some(tool) = self
+            .ctx
+            .service::<atomcode_harness::seams::ToolsSvc>()
+            .and_then(|tools| tools.get(&exec.call.name))
+        else {
+            return next.run(exec).await;
+        };
+        let refuse = |call_id: String, content: String| atomcode_kernel::tool::ToolResult {
+            call_id,
+            content,
+            is_error: true,
+            images: vec![],
+        };
+        match plan_verdict(self.active(), &exec.call, &tool, self.mcp_grants.as_ref()) {
+            PlanVerdict::Proceed => next.run(exec).await,
+            PlanVerdict::Blocked(message) => refuse(exec.call.id.clone(), message),
+            PlanVerdict::Granted => {
+                exec.pre_approved = true;
+                next.run(exec).await
+            }
+            PlanVerdict::AskMcp => {
+                let Some(policy) = self.ctx.service::<atomcode_harness::seams::ApprovalSvc>()
+                else {
+                    // Nobody to ask: a forced question that silently became a
+                    // yes would let plan mode write.
+                    return refuse(exec.call.id.clone(), plan_mcp_denied(&exec.call.name));
+                };
+                let asking: Arc<dyn atomcode_kernel::tool::Tool> = Arc::new(McpInPlanMode(tool));
+                match policy.decide(&exec.call, &asking).await {
+                    atomcode_harness::seams::Decision::Allow => {
+                        exec.pre_approved = true;
+                        next.run(exec).await
+                    }
+                    atomcode_harness::seams::Decision::Deny(_) => {
+                        refuse(exec.call.id.clone(), plan_mcp_denied(&exec.call.name))
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Waterfall<AgentRequest> for PlanModeLive {
+    async fn handle(
+        &self,
+        req: &mut ModelRequest,
+        next: Next<'_, AgentRequest>,
+    ) -> Result<ModelResponse, RequestError> {
+        if self.active() {
+            req.messages
+                .push(atomcode_capabilities::reminder::synthetic_system_reminder(
+                    crate::plan_mode::PLAN_MODE_REMINDER_BODY,
+                ));
+        }
+        next.run(req).await
+    }
+}
+
+/// A mutating MCP tool, as plan mode asks about it: risky whatever the server
+/// claims, and granted per tool for the session.
+struct McpInPlanMode(Arc<dyn atomcode_kernel::tool::Tool>);
+
+#[async_trait]
+impl atomcode_kernel::tool::Tool for McpInPlanMode {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn description(&self) -> &str {
+        self.0.description()
+    }
+    fn parameters_schema(&self) -> Value {
+        self.0.parameters_schema()
+    }
+    fn risk(&self, _args: &str) -> atomcode_kernel::tool::RiskLevel {
+        atomcode_kernel::tool::RiskLevel::Risky
+    }
+    fn always_grant_scope(&self, _args: &str) -> String {
+        // The whole tool, for the session: the chain grants by tool name.
+        self.0.name().to_string()
+    }
+    async fn execute(
+        &self,
+        args: &str,
+        ctx: &atomcode_kernel::tool::ToolContext,
+    ) -> atomcode_kernel::tool::ToolResult {
+        self.0.execute(args, ctx).await
+    }
+}
+
+#[async_trait]
+impl Plugin for PlanModeLivePlugin {
+    fn name(&self) -> &'static str {
+        "plan-mode-live"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools"]
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["modes", "approval"]
+    }
+    fn description(&self) -> &'static str {
+        "plan mode switched live: mutating tools refused, MCP tools asked about, a request-tail reminder"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let live = Arc::new(PlanModeLive {
+            ctx: ctx.clone(),
+            mcp_grants: self.0.clone(),
+        });
+        let _ = ctx.on_waterfall::<atomcode_harness::events::ToolsExecute>(live.clone(), true);
+        let _ = ctx.on_waterfall::<AgentRequest>(live, false);
+        Ok(())
+    }
+}

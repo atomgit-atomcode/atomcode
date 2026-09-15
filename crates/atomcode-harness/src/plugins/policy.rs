@@ -731,11 +731,22 @@ impl Waterfall<ToolsExecute> for WriteApproval {
         if exec.pre_approved {
             return next.run(exec).await;
         }
+        // The row's own setting, or the person's live switch when a host
+        // provides one: either is a yes.
+        let accept_edits = self.accept_edits
+            || self
+                .ctx
+                .service::<crate::seams::ModesSvc>()
+                .is_some_and(|modes| {
+                    modes
+                        .accept_edits
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                });
         let verdict = write_verdict(
             &exec.call.name,
             &exec.call.arguments,
             Some(self.working_dir.as_path()),
-            self.accept_edits,
+            accept_edits,
         )
         .await;
         let (grantable, scope) = match verdict {
@@ -787,9 +798,8 @@ impl Waterfall<ToolsExecute> for WriteApproval {
 #[serde(default)]
 struct WriteApprovalRow {
     working_dir: Option<String>,
-    /// Auto-approve non-sensitive edits. Coding carries this as a live flag the
-    /// person toggles mid-session; here it is mount-time, like the other rows'
-    /// working dir. Making it live is a later, visible change — not silent drift.
+    /// Auto-approve non-sensitive edits, from mount. A host that lets the person
+    /// toggle this mid-session provides the `modes` service, which is read live.
     accept_edits: bool,
 }
 
@@ -804,7 +814,7 @@ impl Plugin for WriteApprovalPlugin {
         &["tools"]
     }
     fn uses(&self) -> &'static [&'static str] {
-        &["approval"]
+        &["approval", "modes"]
     }
     fn description(&self) -> &'static str {
         "a write outside the workspace is asked about; a sensitive one, every time"

@@ -7424,6 +7424,14 @@ fn harness_host_state(
     Ok(crate::on_harness::HostState {
         session,
         hooks: Some(hooks),
+        modes: Some(crate::on_harness::HostModes {
+            modes: atomcode_harness::seams::Modes {
+                plan: Arc::clone(&parts.plan_mode),
+                accept_edits: Arc::clone(&parts.accept_edits),
+            },
+            plan_mcp_grants: Arc::clone(&parts.mcp_plan_grants),
+            approval_grants: parts.approval.store(),
+        }),
     })
 }
 
