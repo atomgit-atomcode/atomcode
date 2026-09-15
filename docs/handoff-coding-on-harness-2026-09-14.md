@@ -601,7 +601,27 @@ fs2 文件锁，锁基线文件本身。
 | `GitPushLabelMiddleware` | — | 够不着,在 `atomgit` feature 后面,开它要拉 reqwest+auth |
 | `PermissionRuleGate` | — | 不用搬,harness `permissions` 行已自实现 |
 
-0. **🔴 `Injected` 投影缺口（2026-09-15 发现，未修，用户说"先记下来，等会再修"）。**
+0. ~~**🔴 `Injected` 投影缺口**~~ —— **已修（`5ec3316c`）**。下面这段保留,
+   因为它记的是这一类 bug 长什么样,以及修它时那条不能碰的线。
+
+   修法与当初补 `SessionEvent::ToolStarted` 同形:`AgentEvent` 加
+   `ContextAdded { text, source }`(`ContextSource` 类型化,不是标签),
+   `handle.rs` 的投影发它,tuix 画成 `UiLine::Muted`(**不是 `UiLine::User`**),
+   headless `-v` 打一行。**JSONL 故意没加**——那是别的程序读的版本化契约,
+   本会话已为"`serde(tag=…)` 读端遇到不认识的 kind 会整份文件失败"付过学费。
+
+   **链式一行没动。** 第一版把 kernel `agent.rs` 九个注入点都改了,用户:
+   「不能影响原有引擎的功能哈」,整个文件撤回。kernel 只剩 `event.rs` 的加法,
+   而 `AgentEvent` 是 `#[non_exhaustive]`、链式无人发它。这句有判据兜着:
+   `only_the_row_list_says_what_it_injected` 要求**链式一条都不发**。
+
+   差分台因此多了一条明规则 `ONE_SIDED_BY_DESIGN = ["ContextAdded"]`:
+   `normalise` 仍保留该事件(报告里看得见),只是不计入分歧数——省事的修法
+   (让链式也发)写过又撤了,而洞由上面那条判据钉死。
+
+   意外收获:memory 注入一直也是看不见的,同一个洞,一起修好了。
+
+   **原始记录（发现经过）:**
 
    `crates/atomcode-harness/src/plugins/handle.rs:326`:
 
