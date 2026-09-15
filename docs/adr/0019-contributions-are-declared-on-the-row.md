@@ -208,9 +208,41 @@ that disappears with its plugin」(`harness/plugins/tools.rs`),harness 的 `team
 接缝(不碰进程级 env,避免与 runtime 测试互踩)。harness 312 / coding 543 / tui 499 全绿,
 `fmt --check` 退 0。
 
-未做:**没有「提示词不得提名未挂载工具」的通用棘轮**。本轮只断言了具名的那几个,
-`change_dir` 那条也只管它自己一个名字。上面 `request_user_input` 正是从这个缺口漏出去的,
-下次换个名字照样漏。
+### 更正:上面那条「真幽灵」不成立(2026-09-15 当日实测)
+
+写那段时我没有把渲染结果打出来看,是从「`coding_persona_rows` 给
+`request_user_input` 位传了 `false`」推的。实测推翻了它:把 `tui` profile 真实装配后
+`SystemPromptSvc::render()` 落盘,`request_user_input` 出现 **0 次**,`## ASKING THE USER`
+一段也没进去;`single`/`multiple`/`questions` 三个词一个没有,唯一相关的是 `tool-ask`
+行贡献的那句 `use `ask_user` rather than picking for them`。
+
+**错的不是结论的方向,是它当时没有证据。**「persona 教了错名字」和「persona 那段压根
+没进去」是两回事,后者才是我当时该查的。
+
+按同一条治法(`memory` 的做法)把那个位从硬编码 `false` 换成问运行树
+(`mounted("request_user_input")`),语义等价但不再靠硬编码:哪天真有一行挂了
+`request_user_input`,那段会自己回来。`coding_persona_rows` 现在收一个
+`&dyn Fn(&str) -> bool`,两个位都由它回答。
+
+### 通用棘轮
+
+这一条是原计划里明确记为「未做」的缺口,现在补上。不再只手钉具名的那几个名字,而是用
+**两个引擎互为参照**:`differential.rs::neither_prompt_names_a_tool_only_the_other_engine_mounts`
+取两边的工具目录与 system prompt,断言任一提示词都不得提及「只有另一边挂」的工具名
+(反引号形式,避免普通散文误伤),`PROMPT_MAY_NAME_A_PHANTOM` 是空的逃生口且必须被用到。
+
+它不需要维护一张「全仓所有工具」的清单——这正是关键:手钉的写法只能断言**有人记得写下来
+的那个名字**(`change_dir` 那条就是如此,一个名字、手工列举),而下一个漏出去的
+`request_user_input` 恰好证明了这一点。交叉对照能覆盖两个引擎知道的每一个工具。
+
+已验证零误报(当下两边 prompt 都不提对方独有的名字),阴性对照已实做:把 persona 的门
+改回硬编码 `true`,立刻红在「the row list names `request_user_input`, and only the other
+engine mounts `request_user_input`」。
+
+**已知盲区(明确留给后人,不假装覆盖)**:两边**都不挂**的工具名它看不见——
+`change_dir` 正是这一类,只能靠那条手写的单测(`persona_does_not_advertise_the_unmounted_change_dir_tool`)。
+试过用「扫全仓 `fn name()` 字面量」作全集来补这个盲区,实测需要一张 41 条的白名单
+(`adjust_layout`、`tell_parent`、mcp 工具等都只在别的树里挂),策展成本高于收益,故不做。
 
 同一条缝在 atui 侧也补了闸门(`tui/tests/product.rs` 的
 `the_prompt_a_row_contributes_leaves_with_the_row_on_this_profile_too`)。理由:`differential.rs`

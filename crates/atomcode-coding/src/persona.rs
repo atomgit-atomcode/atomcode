@@ -194,20 +194,27 @@ pub fn coding_persona_with_language(
 /// arrives and leaves with the tool. This module used to hand the row-list persona the CHAIN
 /// assembly's paragraphs as well.
 ///
-/// `## MEMORY` is different and stays here, with one change: `memory` registers the tool without
-/// contributing a paragraph, so dropping the text would drop the guidance entirely rather than
-/// move it. What was wrong was the GATE — an `ATOMCODE_MEMORY_TOOL` env read inside
-/// `coding_persona`, which cannot see a row list that failed to mount the tool. `memory_mounted`
-/// is that question asked of the running tree (`has("memory")`) instead.
+/// Two sections stay here and are gated on the running tree instead of on anything read before
+/// it exists:
+///
+/// - `## MEMORY`: the `memory` row registers the tool without contributing a paragraph, so
+///   dropping the text would drop the guidance entirely rather than move it. The GATE was what
+///   was wrong — an `ATOMCODE_MEMORY_TOOL` env read inside `coding_persona`, which cannot see a
+///   row list that failed to mount the tool.
+/// - `## ASKING THE USER`: it teaches `request_user_input`, and the row list mounts `ask_user`
+///   instead — a different tool, with `question`/`options` where that one takes
+///   `single`/`multiple`/`questions`, and with its own paragraph contributed by `tool-ask`. So
+///   this section is off here, and it is off because `mounted` was asked rather than answered on
+///   the section's behalf: a row that ever does mount `request_user_input` gets the section back
+///   without an edit in this function.
 ///
 /// Why the chain's copies were wrong HERE, specifically: the losing answer is whichever the
 /// model reads second, and the chain's named a `wait` action the row list's `team` does not
-/// have, a `subagent_type` its `task` does not take, and `request_user_input` when the mounted
-/// tool is `ask_user`.
+/// have and a `subagent_type` its `task` does not take.
 pub(crate) fn coding_persona_rows(
     model: &str,
     preferred_language: Option<atomcode_config::locale::Locale>,
-    memory_mounted: bool,
+    mounted: &dyn Fn(&str) -> bool,
 ) -> String {
     let full = coding_persona_gated(
         model,
@@ -215,11 +222,11 @@ pub(crate) fn coding_persona_rows(
         // `todo`/`review` are still passed on: they are what put the two paragraphs there for
         // the removals below to take out. Nothing else about the chain text changes.
         true,
-        false,
+        mounted("request_user_input"),
         true,
         false,
         false,
-        memory_mounted,
+        mounted("memory"),
     );
     // One removal per owner, and each is asserted gone by the row-list gate rather than trusted
     // to a future edit of the block above.
@@ -1895,7 +1902,8 @@ mod tests {
         // locked by the row-list gate too (`differential.rs`), but this pins the seam itself:
         // the removals are the function's whole reason to exist, and a future edit of the chain
         // text above can silently put a section back.
-        let p = coding_persona_rows("glm-5.2", None, true);
+        let mounted = |_: &str| true;
+        let p = coding_persona_rows("glm-5.2", None, &mounted);
         for owned_by_a_row in [
             "## DELEGATING WITH `task`",
             "## TEAM AGENT:",
@@ -1917,13 +1925,16 @@ mod tests {
     }
 
     #[test]
-    fn the_memory_paragraph_follows_the_mounted_tool_not_the_env() {
-        // The chain reads `ATOMCODE_MEMORY_TOOL`; the row list asks the tree. The difference is
-        // observable exactly where the old gate was wrong — a tree that has the tool while the
-        // env says otherwise — and testing it that way keeps this off the process-global env
-        // (which runtime tests race on; see the note above the delegation tests).
-        let mounted = coding_persona_rows("glm-5.2", None, true);
-        let absent = coding_persona_rows("glm-5.2", None, false);
+    fn the_persona_paragraphs_that_stay_follow_the_mounted_tool_not_the_env() {
+        // The chain reads `ATOMCODE_MEMORY_TOOL` / `ATOMCODE_REQUEST_USER_INPUT`; the row list
+        // asks the tree. The difference is observable exactly where the old gate was wrong — a
+        // tree that has the tool while the env says otherwise — and testing it that way keeps
+        // this off the process-global env (which runtime tests race on; see the note above the
+        // delegation tests).
+        let yes = |_: &str| true;
+        let no = |_: &str| false;
+        let mounted = coding_persona_rows("glm-5.2", None, &yes);
+        let absent = coding_persona_rows("glm-5.2", None, &no);
         assert!(
             mounted.contains("## MEMORY"),
             "the tool is mounted, so the guidance must be there"
@@ -1931,6 +1942,17 @@ mod tests {
         assert!(
             !absent.contains("## MEMORY"),
             "no tool, no guidance — this is the phantom-call case the gate exists for"
+        );
+        // Same question, second section. `## ASKING THE USER` teaches `request_user_input`, and
+        // the row list mounts `ask_user` — so on the real tree this is the section that must be
+        // ABSENT, and a row that ever mounts that name gets it back.
+        assert!(
+            mounted.contains("## ASKING THE USER"),
+            "the name is mounted here, so the section follows it"
+        );
+        assert!(
+            !absent.contains("## ASKING THE USER"),
+            "and an unmounted `request_user_input` must not be advertised"
         );
         // And nothing else moved with it: the gate must not silently drop other sections.
         for section in ["## SKILLS:", "## DOING TASKS", "## WHEN COMMANDS FAIL"] {

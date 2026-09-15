@@ -147,6 +147,25 @@ impl Script {
             .collect::<Vec<_>>()
             .join("\n")
     }
+
+    /// Only the system messages — the part of the request a row composed.
+    ///
+    /// `seen()` is the right thing for "did the model ever learn this", and the
+    /// wrong thing for "does the assembly NAME something it did not mount":
+    /// user turns and tool results legitimately quote tool names (a person
+    /// pasting a diff, a `grep` result mentioning `describe_self`), and a gate
+    /// that read them would redden on its own fixtures.
+    fn system_prompt(&self) -> String {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .flatten()
+            .filter(|m| matches!(m.role, atomcode_kernel::message::Role::System))
+            .map(|m| m.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 #[async_trait]
@@ -4020,6 +4039,92 @@ async fn both_engines_offer_the_model_the_same_tools() {
             on_chain, on_rows,
             "`{name}` is recorded as a known difference ({why}) but both engines \
              now agree about it — drop the entry rather than leaving a stale reason"
+        );
+    }
+}
+
+/// Names a prompt is ALLOWED to use even though the engine it is rendered on
+/// does not mount the tool. The escape hatch for a mention that is deliberate —
+/// and, like `KNOWN_TOOL_DIFFERENCES`, it has to stay real.
+const PROMPT_MAY_NAME_A_PHANTOM: &[(&str, &str)] = &[];
+
+/// Neither prompt may name a tool that only the OTHER engine mounts.
+///
+/// A phantom name is worse than a missing one: the model is told to call
+/// something that is not there and either gets "unknown or unmounted tool", or —
+/// for the pair this gate was written for, `ask_user` and `request_user_input` —
+/// calls the tool it DOES have with the other one's parameters, because they are
+/// different tools (`question`/`options` vs `single`/`multiple`/`questions`) and
+/// not two spellings of one.
+///
+/// The reason this needs no curated list of every tool in the repo: the two
+/// engines are each other's oracle. A name only one of them mounts is, from the
+/// other's point of view, a name that reached the prompt with no tool behind it.
+/// That covers every tool either engine knows about without enumerating them,
+/// and it is why this belongs here rather than in a persona unit test — a unit
+/// test can only assert the names somebody remembered to write down, which is
+/// exactly the failure this replaces (the persona's own `change_dir` assertion
+/// is one name, hand-listed, and `request_user_input` was the next one).
+#[tokio::test]
+async fn neither_prompt_names_a_tool_only_the_other_engine_mounts() {
+    let dir = scratch("prompt-phantom");
+    seed(&dir);
+    let chain_script = Script::text(&["ok"]);
+    let _ = reference_production(chain_script.clone(), &dir, say("hi")).await;
+    let rows_script = Script::text(&["ok"]);
+    let (handle, mut app) = on_harness_handle(rows_script.clone(), &dir).await;
+    let _ = drive_answering(handle, say("hi"), &[], None, allow()).await;
+    app.stop();
+
+    let chain_tools = chain_script.tools();
+    let rows_tools = rows_script.tools();
+    let chain_prompt = chain_script.system_prompt();
+    let rows_prompt = rows_script.system_prompt();
+    // A tree whose prompt is empty would pass every assertion below in silence.
+    for (whose, prompt) in [("chain", &chain_prompt), ("row list", &rows_prompt)] {
+        assert!(
+            prompt.contains("You are AtomCode"),
+            "the {whose} prompt must be the composed system prompt, not an empty \
+             string that would make this gate vacuous"
+        );
+    }
+
+    let allowed = |name: &str| PROMPT_MAY_NAME_A_PHANTOM.iter().any(|(n, _)| *n == name);
+    let mut offenders: Vec<String> = Vec::new();
+    for (whose, prompt, ours, theirs) in [
+        ("the row list", &rows_prompt, &rows_tools, &chain_tools),
+        ("the chain", &chain_prompt, &chain_tools, &rows_tools),
+    ] {
+        for name in theirs.iter().filter(|n| !ours.contains(n)) {
+            if allowed(name) {
+                continue;
+            }
+            // Backticked, because that is how a prompt names a tool. A bare
+            // substring would redden on ordinary prose.
+            let quoted = format!("`{name}`");
+            if prompt.contains(&quoted) {
+                offenders.push(format!(
+                    "{whose} names {quoted}, and only the other engine mounts `{name}`"
+                ));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a prompt names a tool that is not in this tree's catalog — the model will \
+         call it and there is nothing behind it:\n  {}\n\
+         row-list tools: {rows_tools:?}\nchain tools: {chain_tools:?}",
+        offenders.join("\n  ")
+    );
+
+    // And each recorded allowance has to be exercised, so one that stopped
+    // being true gets dropped rather than explaining nothing.
+    for (name, why) in PROMPT_MAY_NAME_A_PHANTOM {
+        let quoted = format!("`{name}`");
+        assert!(
+            chain_prompt.contains(&quoted) || rows_prompt.contains(&quoted),
+            "`{name}` is recorded as a deliberate mention ({why}) but no prompt \
+             names it — drop the entry rather than leaving a stale reason"
         );
     }
 }

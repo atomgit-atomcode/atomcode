@@ -1745,10 +1745,11 @@ impl Plugin for CodingPersonaPlugin {
         // Three kinds of thing used to be decided here and are not any more: the two delegation
         // paragraphs (`team-in-process`, `subagent-in-process`), `## TASK TRACKING` (`tool-todo`)
         // and `## CODE REVIEW` (`tool-code-review`) are each contributed by the row that mounts
-        // the tool and leave with it. `## MEMORY` stays here — the `memory` row registers the
-        // tool but contributes no paragraph — so it is asked of the running tree instead of the
-        // `ATOMCODE_MEMORY_TOOL` env the chain reads. See `coding_persona_rows`.
-        let text = crate::persona::coding_persona_rows(&model, None, has("memory"));
+        // the tool and leave with it. What stays in the persona is asked of the running tree
+        // rather than of the `ATOMCODE_MEMORY_TOOL` / `ATOMCODE_REQUEST_USER_INPUT` envs the
+        // chain reads, which cannot see a tree that failed to mount the tool. See
+        // `coding_persona_rows`.
+        let text = crate::persona::coding_persona_rows(&model, None, &has);
         let Some(prompts) = ctx.service::<atomcode_harness::seams::SystemPromptSvc>() else {
             return Ok(());
         };
