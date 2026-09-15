@@ -20,7 +20,7 @@
 //!
 //! ```text
 //! infra                 (the harness machine: registries, session log, loop)
-//! tui-app               CODING_DEFAULTS + the three patches below
+//! tui-app               CODING_DEFAULTS + the two patches below
 //!                       + CODING_ROWS, with the working dir substituted in
 //! repl-app              the harness's interactive-terminal assembly
 //! tui-panels            this crate's surface and panels
@@ -155,8 +155,9 @@ pub fn assembly() -> Assembly {
     }
 }
 
-/// Coding's rows, plus the three patches that are about this host rather than
-/// about coding.
+/// Coding's rows, plus the two patches that are about this host rather than
+/// about coding: the working directory `agent-loop` must be told, and the round
+/// budget (see [`ROUNDS`]).
 ///
 /// `CODING_DEFAULTS` and `CODING_ROWS` are taken whole from `atomcode-coding`:
 /// they are that crate's product decision, stated once, and a second copy here
