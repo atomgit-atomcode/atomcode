@@ -142,6 +142,13 @@ impl LlmProvider for RecordingProvider {
                     StreamEvent::Done { truncated: true },
                 ])));
             }
+            // An answer from a provider that reports no token usage at all.
+            Some(m) if m.role == Role::User && m.text == "quietly" => {
+                return Ok(Box::pin(futures::stream::iter(vec![
+                    StreamEvent::TextDelta("hushed".into()),
+                    StreamEvent::Done { truncated: false },
+                ])));
+            }
             // A request that never answers: the only way out is a cancel.
             Some(m) if m.role == Role::User && m.text == "hang" => {
                 return Ok(Box::pin(futures::stream::pending()));
@@ -2128,6 +2135,34 @@ async fn a_picture_read_reaches_a_model_that_can_see_it(engine: &str) {
     }
 }
 
+/// Every model round is reported to the driver, whether or not the provider said
+/// how many tokens it used: a driver that starts a new message per round (ACP)
+/// has nothing else to count by.
+async fn every_model_round_is_reported_even_without_usage(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    let seen = turn_collecting(&mut runtime, "quietly").await;
+    let rounds = seen
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::Usage(_))
+            )
+        })
+        .count();
+    assert_eq!(
+        rounds, 1,
+        "[{engine}] one model round, reported {rounds} times"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 // ---- what the model is offered ---------------------------------------------
 
 /// The start a production driver makes: every capability the chain turns on
@@ -2335,4 +2370,5 @@ on_both_engines!(
     a_requested_compaction_is_summarized_by_the_model_about_the_focus,
     the_prompt_teaches_each_product_tool_once,
     a_picture_read_reaches_a_model_that_can_see_it,
+    every_model_round_is_reported_even_without_usage,
 );

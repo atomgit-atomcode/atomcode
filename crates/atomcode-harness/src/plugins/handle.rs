@@ -83,6 +83,10 @@ struct Projector {
     /// How many user messages this turn has taken. The second and later ones
     /// are steering.
     said_this_turn: u32,
+    /// The last round a `Usage` was reported for. A round the provider reported
+    /// no usage for is still a round, and a driver counting rounds by `Usage`
+    /// must hear of it.
+    usage_round: Option<(u64, u32)>,
     /// A `/compact` is committing its own compaction, and reports it itself —
     /// with the trigger it had, the numbers it measured and the snapshot. The
     /// fold's generic report of the same commit would be a second, auto-labelled
@@ -135,6 +139,25 @@ impl Projector {
                 ..
             } => {
                 let mut out = Vec::new();
+                // The provider said nothing about tokens this round. The round
+                // happened all the same: report it, with what is known — no
+                // counts, and the context as last measured.
+                if self.usage_round != Some((*turn, *round)) {
+                    self.usage_round = Some((*turn, *round));
+                    out.push(AgentEvent::Usage(MessageMeta {
+                        ctx_window: self.ctx_window,
+                        used_tokens: self.last_prompt_tokens,
+                        utilization: if self.ctx_window == 0 {
+                            0.0
+                        } else {
+                            self.last_prompt_tokens as f32 / self.ctx_window as f32
+                        },
+                        round: *round,
+                        turn_id: *turn,
+                        request_id: *round as u64,
+                        ..Default::default()
+                    }));
+                }
                 if tool_calls.len() >= 2 {
                     let id = format!("batch-{turn}-{round}");
                     out.push(AgentEvent::ToolBatchStarted {
@@ -204,6 +227,7 @@ impl Projector {
 
             SessionEvent::Usage { turn, round, usage } => {
                 self.last_prompt_tokens = usage.prompt;
+                self.usage_round = Some((*turn, *round));
                 vec![AgentEvent::Usage(MessageMeta {
                     tokens: *usage,
                     ctx_window: self.ctx_window,
@@ -1175,6 +1199,7 @@ pub async fn spawn(
         batch: None,
         last_prompt_tokens: 0,
         said_this_turn: 0,
+        usage_round: None,
         manual_compaction: manual_compaction.clone(),
     }));
 
@@ -1358,6 +1383,7 @@ pub fn replay(events: &[SessionEvent], ctx_window: u32) -> Vec<AgentEvent> {
         batch: None,
         last_prompt_tokens: 0,
         said_this_turn: 0,
+        usage_round: None,
         manual_compaction: Default::default(),
     };
     events

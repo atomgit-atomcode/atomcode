@@ -819,6 +819,11 @@ fn the_projection_is_a_pure_fold_over_the_log() {
             "TurnStarted",
             "TextDelta",
             "TextDelta",
+            // The log holds no `Usage` for this round — the fixture's provider
+            // reported none — and the round happened all the same. A driver
+            // that counts rounds by `Usage` (ACP starts a message per round)
+            // must hear of it, so the fold reports one with what it knows.
+            "Usage",
             "ToolBatchStarted",
             "ToolStarted",
             "ToolStarted",
@@ -884,7 +889,9 @@ fn a_call_that_never_ran_never_reads_as_started() {
         1000,
     );
 
-    assert_eq!(names(&events), vec!["ToolResult"]);
+    // `Usage` because the round is reported whether or not the provider counted
+    // tokens; what this scenario is about is the absent `ToolStarted`.
+    assert_eq!(names(&events), vec!["Usage", "ToolResult"]);
 }
 
 #[test]
