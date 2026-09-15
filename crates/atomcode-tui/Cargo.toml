@@ -13,6 +13,13 @@ path = "src/bin/atui.rs"
 # The plugin runtime and the agent assembly this UI is a front end for.
 atomcode-plexus = { path = "../atomcode-plexus" }
 atomcode-harness = { path = "../atomcode-harness" }
+# The agent this screen is a front end FOR. The edge points this way on purpose:
+# `atomcode-coding` mounts this crate's rows nowhere, and the product decision
+# ("a coding agent, with panels in front of it") is stated once, in
+# `atomcode-coding::on_harness`, rather than restated here. Only the row list,
+# the persona and the discipline rows are used — the runtime, the hand-written
+# chain and the provider factory are not reached from this crate.
+atomcode-coding = { path = "../atomcode-coding" }
 # Value types only: SessionEvent carries kernel messages and tool calls.
 atomcode-kernel = { path = "../atomcode-kernel" }
 # The `tools` feature only, and only for the todo fold: the panel must derive the

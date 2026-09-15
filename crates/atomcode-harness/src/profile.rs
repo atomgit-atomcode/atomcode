@@ -35,6 +35,17 @@ pub struct Profile {
     /// The profile's own patch layer, as TOML.
     #[serde(default)]
     pub patch: Option<String>,
+    /// A layer that addresses rows an earlier layer already inserted, applied
+    /// after the named bundles and before this profile's own patch.
+    ///
+    /// It exists because `Op::Insert` REPLACES a row with the same id, so a
+    /// layer that restates rows a bundle owns silently reverts whatever the
+    /// layers below did to them. A profile that is a product's edit of a
+    /// shipped assembly therefore states that edit here — where the user's home
+    /// patch, this profile's patch and every `--patch` overlay still come after
+    /// it — rather than restating rows in a bundle stacked ahead of them.
+    #[serde(default)]
+    pub adjust: Option<String>,
     /// One line for `--list-profiles`.
     #[serde(default)]
     pub description: String,
@@ -71,6 +82,7 @@ impl Profiles {
                     name: (*name).to_string(),
                     bundles: bundles_list.iter().map(|b| (*b).to_string()).collect(),
                     patch: patch.map(|p| p.to_string()),
+                    adjust: None,
                     description: (*description).to_string(),
                 },
             );
@@ -86,6 +98,19 @@ impl Profiles {
     /// its profiles somewhere other than `$ATOMCODE_HOME`.
     pub fn rooted_at(mut self, home: impl Into<PathBuf>) -> Self {
         self.home = home.into();
+        self
+    }
+
+    /// Add bundles this build does not ship — the catalog another crate's
+    /// product contributes, so its profiles (and a user's) can name them.
+    ///
+    /// Owned strings rather than `&'static str`, because a product's bundle is
+    /// usually composed from parts that only exist at runtime (`rows::SCREEN`
+    /// beside a few edits) and a duplicated fact diverges.
+    pub fn with_bundles(mut self, bundles: &[(String, String)]) -> Self {
+        for (name, source) in bundles {
+            self.bundles.insert(name.clone(), source.clone());
+        }
         self
     }
 
@@ -118,6 +143,33 @@ impl Profiles {
                 Err(e) => eprintln!("profile `{name}` is malformed: {e}"),
             }
         }
+        self
+    }
+
+    /// Register a profile this build does not ship.
+    ///
+    /// Same act as dropping a file in `<home>/profiles/`, minus the file: it is
+    /// how a product ships an assembly that names its own bundles without
+    /// teaching this crate what a product is. A shipped or on-disk name given
+    /// here is overridden, which is deliberate — the caller registering it is
+    /// closer to the person than the shipped catalog is.
+    pub fn with_profile(
+        mut self,
+        name: &str,
+        bundles: Vec<String>,
+        adjust: Option<String>,
+        description: &str,
+    ) -> Self {
+        self.profiles.insert(
+            name.to_string(),
+            Profile {
+                name: name.to_string(),
+                bundles,
+                patch: None,
+                adjust,
+                description: description.to_string(),
+            },
+        );
         self
     }
 
@@ -157,6 +209,9 @@ impl Profiles {
             })?;
             layers.push(Layer::from_toml(source)?);
         }
+        if let Some(adjust) = &profile.adjust {
+            layers.push(Layer::from_toml(adjust)?);
+        }
         if let Some(patch) = &profile.patch {
             layers.push(Layer::from_toml(patch)?);
         }
@@ -179,12 +234,20 @@ impl Profiles {
         for bundle in &profile.bundles {
             out.push_str(&format!("  1. bundle `{bundle}`\n"));
         }
+        out.push_str(&format!(
+            "  2. this profile's own edits{}\n",
+            if profile.adjust.is_some() {
+                ""
+            } else {
+                " (none)"
+            }
+        ));
         if profile.patch.is_some() {
-            out.push_str("  2. the profile's own patch\n");
+            out.push_str("  3. the profile's own patch\n");
         }
         let home = self.home_patch_path();
         out.push_str(&format!(
-            "  3. {} {}\n",
+            "  4. {} {}\n",
             home.display(),
             if home.exists() {
                 "(present)"
@@ -192,7 +255,7 @@ impl Profiles {
                 "(absent)"
             }
         ));
-        out.push_str("  4. any --patch overlay, in the order given\n");
+        out.push_str("  5. any --patch overlay, in the order given\n");
         out
     }
 }

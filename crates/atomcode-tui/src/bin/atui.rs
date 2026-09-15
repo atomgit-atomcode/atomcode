@@ -1,12 +1,12 @@
 //! `atui` — the launcher for the plugin-composed TUI.
 //!
-//! It adds three rows to the harness catalog and hands over. It knows nothing
-//! about panels, keys, streams or layout: those all arrive as config. The
-//! flags every launcher takes come from `atomcode_harness::launch`; only the
-//! ones that need a screen are parsed here.
+//! It brings two things the harness does not: this crate's rows (a surface and
+//! one row per panel) and coding's. Which of them run is the config's call —
+//! `atomcode_tui::product` is the module that decides, and this file only
+//! handles the flags that need a screen.
 //!
 //! ```text
-//! atui                              # a session, on the model your config names
+//! atui                              # the product: a coding agent, on a screen
 //! atui "fix the build"              # …starting with this prompt
 //! atui --offline                    # a scripted model, no network
 //! atui --mascot                     # bring the cat
@@ -15,68 +15,16 @@
 //! ```
 
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use atomcode_harness::launch::{value, Flag, Launch, HELP_SHARED};
-use atomcode_harness::plugins;
-use atomcode_harness::profile::Profiles;
-use atomcode_plexus::PluginRegistry;
-use atomcode_tui::plugin::{HeadlessSurfacePlugin, TerminalSurfacePlugin, TuiUiPlugin};
-use atomcode_tui::rows;
+use atomcode_tui::product;
 
-/// The shipped catalog plus this crate's rows.
-fn catalog() -> PluginRegistry {
-    let mut c = plugins::catalog();
-    c.register(Arc::new(TuiUiPlugin))
-        .register(Arc::new(TerminalSurfacePlugin))
-        .register(Arc::new(HeadlessSurfacePlugin));
-    for row in rows::catalog() {
-        c.register(row);
-    }
-    c
-}
-
-/// The overlay that swaps the shipped front end for this one.
-const TUI2: &str = r#"
-[[insert]]
-id = "surface"
-name = "surface-terminal"
-
-[[patch]]
-id = "ui"
-name = "ui-tui2"
-# Explicit and empty. A patch that names a new plugin keeps the old one's
-# config, so without this the `repl` profile's `banner`/`prompt` — knobs that
-# belong to the line-based REPL — arrive at a row that has no knobs at all.
-config = {}
-
-
-# The screen is the output; nothing else may write to it.
-[[patch]]
-id = "trace"
-config = { stream = false, tools = false, summary = false }
-
-# This front end owns the screen, so it is the one that asks — and the
-# standalone asker must stand down, because two rows filling one slot is an
-# error rather than a preference.
-[[patch]]
-id = "user-questions-unattended"
-disabled = true
-
-# Ask before a risky call rather than refusing it outright. That is the whole
-# point of having a person there.
-[[patch]]
-id = "approval"
-disabled = true
-
-[[patch]]
-id = "approval-interactive"
-disabled = false
-"#;
-
-/// Paint into memory. Auditing a composition, dumping it, or running under
-/// CI must not require a screen — a check that needs a tty is a check that
-/// cannot run where it matters most.
+/// The overlay that swaps the launcher's own defaults in.
+///
+/// One row, and only for `--headless`: `product::Assembly` has already laid
+/// down every other layer, including the profile's own edits, and an overlay
+/// runs last — after the user's home patch — so it is the right place for a
+/// flag and the wrong place for an assembly.
 const HEADLESS: &str = r#"
 [[patch]]
 id = "surface"
@@ -93,7 +41,8 @@ disabled = false
 async fn main() -> ExitCode {
     let help = format!("{HELP_HEAD}\n\n{HELP_SHARED}\n\n{HELP_KEYS}");
     let mut demo = false;
-    let parsed = Launch::new("repl", vec![TUI2.to_string(), rows::SCREEN.to_string()]).parse(
+    let assembly = product::assembly();
+    let parsed = Launch::new(product::PROFILE, vec![]).parse(
         std::env::args().skip(1),
         &help,
         |flag, args, launch| match flag {
@@ -159,8 +108,8 @@ async fn main() -> ExitCode {
         Err(code) => return code,
     };
 
-    let profiles = Profiles::builtin().with_home();
-    let catalog = catalog();
+    let profiles = assembly.profiles().with_home();
+    let catalog = assembly.catalog();
     if let Some(code) = launch.preflight(&profiles, &catalog) {
         return code;
     }

@@ -76,7 +76,13 @@ pub enum Presence {
 ///
 /// Read it against `parts::PrepareOptions`, which is where the hand-written
 /// chain says the same things in Rust.
-const CODING_DEFAULTS: &str = r#"
+///
+/// Public because this is the product decision, stated once. [`mount_swappable`]
+/// stacks it for a host that drives the agent through `ui-handle`; a host that
+/// brings its own front end (the full-screen TUI) stacks the same const rather
+/// than keeping a second copy of this list, which is how two products come to
+/// disagree about what a coding agent can do.
+pub const CODING_DEFAULTS: &str = r#"
 # --- what the model can do to the repository ------------------------------
 # All routed through the execution world (`fs`/`shell`), so the fence and the
 # approval seam apply to every one of them rather than to whoever remembered.
@@ -291,7 +297,10 @@ disabled = true
 ///
 /// `{working_dir}`, `{artifacts}` and `{force_verify}` are substituted by
 /// [`coding_overlay`].
-const CODING_ROWS: &str = r#"
+///
+/// Public for the same reason [`CODING_DEFAULTS`] is: a host with its own front
+/// end stacks this list instead of restating it.
+pub const CODING_ROWS: &str = r#"
 # Approval gates that the hand-written chain mounts as kernel `ToolMiddleware`s.
 # Same judgements — each row calls the same L1 function the middleware does —
 # reached through the `approval` seam instead of a private `PermissionStore`.
@@ -731,6 +740,36 @@ impl Plugin for InjectProvider {
     }
 }
 
+/// Every row this crate owns, for a host that is assembling a coding product.
+///
+/// Separate from [`mount_swappable`] because the two hosts differ in exactly
+/// two ways and this is neither of them: which front end drives the agent, and
+/// where the provider comes from. Both mount `CODING_DEFAULTS` and `CODING_ROWS`
+/// and both need these five rows to instantiate them — a row list naming a
+/// plugin nobody registered fails to mount, which is the failure this function
+/// exists to keep out of a second host's assembly.
+///
+/// The two rows at the end are registered and NOT in [`CODING_ROWS`], which is
+/// deliberate and documented there: for them, mounting is enabling. `datalog`
+/// writes a full transcript of every request to the user's disk; `cc-hooks`
+/// runs the person's own external commands. Both are inert until a host inserts
+/// the row.
+///
+/// `InjectProvider` and `InjectModels` are absent on purpose: they carry
+/// per-mount state (the provider table one host built), so they belong to
+/// whoever mounts rather than to the catalog.
+pub fn plugins() -> Vec<Arc<dyn Plugin>> {
+    vec![
+        Arc::new(VerifyCadencePlugin),
+        Arc::new(CodingPersonaPlugin),
+        Arc::new(ExecutionPolicyPlugin),
+        Arc::new(SkillCatalogPlugin),
+        Arc::new(SkillFirstPlugin),
+        Arc::new(DatalogPlugin),
+        Arc::new(CcHooksPlugin),
+    ]
+}
+
 /// Mount a coding assembly on the harness and take its driver handle.
 ///
 /// Returns the handle AND the `App`, because the tree must outlive the handle:
@@ -818,21 +857,9 @@ pub async fn mount_swappable(
     //
     // What IS registered here is what this crate owns: the coding discipline.
     let mut registry = atomcode_harness::plugins::catalog();
-    registry.register(Arc::new(VerifyCadencePlugin));
-    registry.register(Arc::new(CodingPersonaPlugin));
-    registry.register(Arc::new(ExecutionPolicyPlugin));
-    registry.register(Arc::new(SkillCatalogPlugin));
-    registry.register(Arc::new(SkillFirstPlugin));
-    // Registered but NOT in `CODING_ROWS`, and that is the whole design: for
-    // this row, mounting IS enabling, and the datalog writes a full transcript
-    // of every request to the user's disk. `datalog.enabled` defaults to false
-    // in config.toml for the same reason. A host that wants it inserts the row.
-    registry.register(Arc::new(DatalogPlugin));
-    // Also registered but NOT in `CODING_ROWS`: this one runs the person's own
-    // external commands. The row is inert without a `hooks.json`, but "inert"
-    // is not the same as "mounted by default" — a host that wants CC hooks
-    // inserts it, the way the chain mounts the engine only when one exists.
-    registry.register(Arc::new(CcHooksPlugin));
+    for row in plugins() {
+        registry.register(row);
+    }
     registry.register(Arc::new(InjectProvider(providers.clone())));
     if let Some(host) = models {
         registry.register(Arc::new(InjectModels(Arc::new(CodingModels {
@@ -1700,7 +1727,21 @@ impl Plugin for CodingPersonaPlugin {
         };
         let tools = ctx.service::<atomcode_harness::seams::ToolsSvc>();
         let has = |name: &str| tools.as_ref().is_some_and(|t| t.get(name).is_some());
-        let text = crate::persona::coding_persona(&row.model, has("todowrite"), has("ask_user"));
+        // Empty means "ask the running tree". A host whose provider is built by
+        // a config row rather than by the host itself (`llm-atomcode-config`)
+        // cannot know the model name before the tree is up, which is when the
+        // row config is written — and it can be changed afterwards with
+        // `--model`. Reading the seam is what the row's own documentation
+        // already said it was protecting: a persona naming the previous model
+        // is a quiet lie in the first line the model reads.
+        let model = if row.model.is_empty() {
+            ctx.service::<atomcode_harness::seams::LlmSvc>()
+                .map(|llm| llm.model_name().to_string())
+                .unwrap_or_default()
+        } else {
+            row.model.clone()
+        };
+        let text = crate::persona::coding_persona(&model, has("todowrite"), has("ask_user"));
         let Some(prompts) = ctx.service::<atomcode_harness::seams::SystemPromptSvc>() else {
             return Ok(());
         };
