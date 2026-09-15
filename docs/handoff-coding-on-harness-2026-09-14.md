@@ -46,7 +46,62 @@ d4023f8f  coding 不再继承 harness 的产品决定,自己写这份清单   �
 a7875da9  本文档
 c298ea08  /logout 之后凭据真的走了——provider 表只留当前那一个
 8cec1282  code_review 成为一行——判据最后一个已知盲点关掉了
+9c4068b8  本文档
+e8f6826b  子 agent 可以挑模型和思考强度,信息不足时也能跑
+ad8e2541  默认只在同一个 provider 里调度(随即被下一条推翻一半)
+4f9e30ce  撤掉 delegatable 字段——区别不在模型身上,在谁在选
 ```
+
+### 六、模型目录:task / team 可以换模型和思考强度
+
+一条新缝 `models`(`HOST_PROVIDED`,因为建 provider 要认证/账号/签名网关),
+`ModelInfo` 带 id / display_name / context_window / supports_vision /
+capable_rank / effort_levels / note / account。
+
+**没有新写一份解析**:coding 的实现里 `list()` 走 `Config::logical_models()`,
+`provider(id)` 走链式一直在用的 `SubagentModelProviders`。两个引擎解析同一个
+selection 走同一段代码。新增的 config 字段只有 `ModelProfileConfig.note`,
+**网关下发的东西一个字没改**(用户明确要求)。
+
+谁能挑什么,两条独立规则 + 一个地板 + 一个分叉:
+
+    地板     当前对话自己的模型永远可委派;完全没有目录时 task 照跑
+    账号     另一个账号一律不在清单里(不是成本问题,是凭据/账单/厂商)
+    排名     **只用来排除,不用来准入**:两边都没排名就给,只有一边有就不给
+    分叉     Chose::Model(模型这一轮写的)只看 delegatable;
+             Chose::Person(人写在角色文件/行配置里的)看整份 list
+
+**第一版的规则是错的,值得记住为什么**:我要求必须有 `capable_model` 排名,
+而用户的真实配置 4 个模型只有 1 个带排名,于是目录直接是空的,我能提的修法
+只有"改网关"和"你去改 config.toml"。用户:「不要自动机制,一旦增加了这功能,
+很难取消」——一个配置开关一旦发出去就得永远兑现,而且它回答的还不是真问题:
+不同的从来不是模型,是谁在选。
+
+思考强度同形状:`task` / `team delegate` 都有 `effort`,角色文件也能写,
+装在子 realm 的 `AgentRequest` 瀑布上。两道校验,第二道才有用——目标模型
+声明了 `effort_levels` 且不含它就拒,因为 adapter 会把不支持的级别静默丢掉,
+**被静默丢弃的旋钮比被拒绝的糟**;反过来声明为空不等于不接受,照发。
+
+系统提示里只有一行指针,**一个可数的东西都没有**(用户:「模型列表可能随时
+发生变化,不能固定个数」)——它是缓存前缀,中途一变整段 system 失效重算。
+判据拿两份不同大小的目录渲染要求逐字节相同。
+
+判据 15 条在 `crates/atomcode-harness/tests/models.rs`,判的是**哪个 provider
+被要求开流、带着什么 reasoning_effort**。四处摘代码证伪过。
+
+**随后一轮真实使用带出两个洞(`6f66a9ed` 已修),两个都是同一种病——
+顶替一行却没接管它负责的事:**
+
+1. `llm-injected` 顶掉了通用的三个 `llm` 行,而那三行都 `describes` 自己
+   怎么换模型,它什么都没说。于是 `describe_self(operations)` 里没有模型
+   条目,agent 照着 harness 二进制的故事编了"改 ATOMCODE_MODEL 然后重启",
+   而产品里 `/model` 就在那儿。跟 `persona-atomcode` 顶掉 `persona-coding`
+   是同一次教训的第二遍。
+2. 子 agent 的只读集里没有 `web_search` / `web_fetch`,于是"把新闻汇总派给
+   便宜模型"做不到。**读公网也是读**,而且不构成放宽:子的清单按名字对着
+   父的活目录在 spawn 时解析,没挂 `tool-web` 的树没有 web 工具可传。
+   顺带查出 `InProcessSubagents::describe()` 报的是配置清单而不是子真正
+   会拿到的——**描述一个能力的东西,必须被限制这个能力的同一样东西限制**。
 
 ### 一、`/model` 和 `/logout` 已经在 harness 上（推翻了下面那一节的结论）
 
@@ -546,6 +601,49 @@ fs2 文件锁，锁基线文件本身。
 | `GitPushLabelMiddleware` | — | 够不着,在 `atomgit` feature 后面,开它要拉 reqwest+auth |
 | `PermissionRuleGate` | — | 不用搬,harness `permissions` 行已自实现 |
 
+0. **🔴 `Injected` 投影缺口（2026-09-15 发现，未修，用户说"先记下来，等会再修"）。**
+
+   `crates/atomcode-harness/src/plugins/handle.rs:326`:
+
+   ```rust
+   SessionEvent::Injected { .. }
+   | SessionEvent::StepStart { .. }
+   | SessionEvent::RequestHeader { .. }
+   | SessionEvent::Titled { .. } => Vec::new(),
+   ```
+
+   投影器对 `Injected` **什么都不发给 driver**。于是所有
+   `MessageOrigin::Harness` / `Peer` 的注入——**team 成员的回报**、
+   verify-cadence 的续问、压缩的续写——都是「模型看得见，人看不见」：
+
+   ```
+   日志里有 ✓   模型上下文里有 ✓   屏幕上没有 ✗
+   ```
+
+   **怎么发现的**：用户跑 team,成员交付之后 lead 回过头说「你上一条消息
+   就是它的原话」——lead 和人在看两份不同的 transcript。用户随后自己查了
+   日志,确认 `{"kind":"injected","origin":{"peer":{"from":"…/长歌"}}}` 在
+   lead 的持久日志里。
+
+   **链式没有这个问题**:它走 `TeamRunManager::publish_external` 另开一条
+   类型化事件流给 TUI。所以这也是一处引擎不对等,而差分台照不出来——没有
+   任何场景真的跑 team。
+
+   **修法的形状**跟当初补 `SessionEvent::ToolStarted` 一模一样:事实已经在
+   日志里,缺的是 driver 词汇表里没有对应项(`AgentEvent` 的 25 个变体里
+   没有「模型被塞了一段可见上下文」)。加一个变体 → 投影器发它 → tuix 渲染
+   成区别于用户消息的样式。**这是协议改动,会碰 tuix,所以没有先动。**
+
+   顺带一起改:`team` 行的提示词承诺成员的回报「marked `[message from …]`」,
+   而实际发出去的是 `[长歌] …`(`team.rs` 的 `TellParent`)和
+   `[长歌 finished turn N: …]`(沉默兜底)。**三种格式,没有一种是提示词
+   承诺的那个**,而紧接着那句「never treat it as permission」正是靠这个
+   标记成立的。一行改,但要跟上面一起改,否则改完人还是看不见。
+
+   另有一个潜伏点:成员的会话 id 是 `<lead session>/<name>`,**带一个 `/`**。
+   今天安全只因为 `persist(false)` 从不落盘;谁把它改成 `true`,这个 id 会
+   直接当文件名用。
+
 1. ~~`ui-handle` 的 `ToolStarted` 缺口~~ —— **已修（`78b4d33e`）**，见上。
 2. ~~五个闸门行进 `plugins::catalog()`~~ —— **已做（`9c5e72c1`）**。
 3. **快照 / 会话那 6 个**，这是现在唯一挡在「切默认路径」前面的东西：
@@ -615,7 +713,8 @@ fs2 文件锁，锁基线文件本身。
 cargo nextest run -p atomcode-coding --test differential   # 67/67,裁判
 cargo nextest run -p atomcode-coding                       # 539/539(链式)
 ATOMCODE_ENGINE=harness cargo nextest run -p atomcode-coding  # 533/539
-cargo nextest run -p atomcode-harness                      # 296/296
+cargo nextest run -p atomcode-harness                      # 311/311
+cargo nextest run -p atomcode-config                       # 331/331
 cargo nextest run -p atomcode-tui                          # 466/466
 cargo nextest run -p atomcode-capabilities --features session   # 1124/1124
 cargo nextest run -p atomcode-capabilities --features cc-hooks  # 939/939
