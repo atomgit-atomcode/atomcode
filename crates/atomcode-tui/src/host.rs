@@ -768,7 +768,7 @@ impl Host {
         let now = self.moment.read().expect("moment poisoned").clone();
         let held = width > 0 && now.scroll.0 > 0;
         let before = if held {
-            self.stream_height(width, &now)
+            self.stream_height(size, &now)
         } else {
             0
         };
@@ -799,7 +799,7 @@ impl Host {
         }
 
         if held {
-            let after = self.stream_height(width, &now);
+            let after = self.stream_height(size, &now);
             self.pin(before, after, size, &now);
         }
     }
@@ -852,14 +852,14 @@ impl Host {
     /// the plan called out as the bug — the pin has to be one thing, or the
     /// routes drift apart and only some of them hold.
     pub fn repin(&self, before: &Moment) {
-        let Some((size, width, now)) = self.pin_baseline() else {
+        let Some((size, _width, now)) = self.pin_baseline() else {
             return;
         };
         // `before.scroll` and `now.scroll` are the same reading: the pin is
         // adjusting the offset *for* a content change, not reacting to a scroll
         // the person made. What is compared is the height, taken either side.
-        let before_h = self.stream_height(width, before);
-        let after_h = self.stream_height(width, &now);
+        let before_h = self.stream_height(size, before);
+        let after_h = self.stream_height(size, &now);
         self.pin(before_h, after_h, size, &now);
     }
 
@@ -1072,6 +1072,40 @@ impl Host {
         out
     }
 
+    /// The tail, with its total held below the pane it has to fit in.
+    ///
+    /// The geometry hands each module its **visible** height and lets it lay
+    /// itself out. That is right when the tail is smaller than the pane and
+    /// wrong when it is not: a module taller than the pane is asked for the
+    /// whole pane at several different offsets and draws the same picture every
+    /// time, so the reader turns the wheel and the screen does not move while
+    /// the badge counts up. Capping the total leaves at least one row for the
+    /// conversation, which is what makes every scroll position distinct.
+    ///
+    /// The cap is here rather than inside the renderers because it has to be the
+    /// *same* number in the geometry and in `stream_height`: two caps that
+    /// disagreed would put the tail's own rows out of reach at the bottom of the
+    /// scroll, which is the failure `stream_height` goes to lengths to avoid.
+    ///
+    /// Rationed bottom-up, so the module against the bottom edge — the newest
+    /// thing — is the last to lose a row.
+    fn cap_tail(mut heights: Vec<(String, u16)>, pane_h: u16) -> Vec<(String, u16)> {
+        // One row for the conversation, at least. A pane of one row cannot hold
+        // a tail and a conversation both, and the conversation is what the
+        // screen is for.
+        let budget = pane_h.saturating_sub(1);
+        let mut total: u16 = heights.iter().map(|(_, h)| *h).sum();
+        for (_, h) in heights.iter_mut().rev() {
+            if total <= budget {
+                break;
+            }
+            let take = total.saturating_sub(budget).min(*h);
+            *h -= take;
+            total -= take;
+        }
+        heights
+    }
+
     /// The pane a `Stream` was given, split between the conversation and the
     /// view modules riding at its tail.
     ///
@@ -1092,6 +1126,10 @@ impl Host {
     /// `tail` is empty for every layout that declares none, and then this is the
     /// identity: the whole pane is the block rect and `block_scroll == scroll`.
     fn pane_geometry(pane: Rect, scroll: usize, heights: &[(String, u16)]) -> Pane {
+        Self::pane_geometry_capped(pane, scroll, &Self::cap_tail(heights.to_vec(), pane.h))
+    }
+
+    fn pane_geometry_capped(pane: Rect, scroll: usize, heights: &[(String, u16)]) -> Pane {
         // Everything below is in "distance from the bottom of the pane", which
         // is the coordinate `scroll` is already measured in: `d = 0` is the last
         // row of content. The window shows `[scroll, scroll + h)`.
@@ -1374,7 +1412,13 @@ impl Host {
                     };
                     *self.last_width.lock().expect("width poisoned") = rect.w;
                     *self.last_size.lock().expect("size poisoned") = (w, h);
-                    stream_rect = Some(rect);
+                    // The **blocks'** rect, not the pane's. The badge reports
+                    // how much conversation is out of view, so it belongs on the
+                    // conversation's bottom edge; anchored to the pane it would
+                    // sit over the tail and cover the right half of its last
+                    // row — and the tail is the one thing a reader scrolled back
+                    // is *not* looking at.
+                    stream_rect = Some(pane.block_rect);
                     frame.place("stream", pane.block_rect, lines);
                     // A tail module is placed under **its own id**, not a
                     // path: `named_twice` already refuses a tree that names one
@@ -1535,7 +1579,7 @@ impl Host {
     /// The moment is an argument, not a field read: the caller is holding the
     /// write lock on it when it asks, and a `RwLock` does not forgive that.
     pub fn scroll_limit(&self, size: (u16, u16), moment: &Moment) -> usize {
-        self.stream_height(size.0, moment)
+        self.stream_height(size, moment)
             .saturating_sub(self.stream_rows(size, moment) as usize)
     }
 
@@ -1556,8 +1600,8 @@ impl Host {
     /// this walks the whole conversation in arithmetic rather than in markdown.
     /// It is called per chunk while the reader is scrolled back, which is the
     /// one time the whole conversation is in the sum.
-    pub fn stream_height(&self, width: u16, moment: &Moment) -> usize {
-        self.stream_height_split(width, moment).0
+    pub fn stream_height(&self, size: (u16, u16), moment: &Moment) -> usize {
+        self.stream_height_split(size, moment).0
     }
 
     /// The same sum, and the rows the tail contributes to it.
@@ -1566,7 +1610,8 @@ impl Host {
     /// the tail's share is what decides where the conversation ends and the tail
     /// begins. Two functions would be two walks of the conversation that agree
     /// until one of them changes.
-    fn stream_height_split(&self, width: u16, moment: &Moment) -> (usize, usize) {
+    fn stream_height_split(&self, size: (u16, u16), moment: &Moment) -> (usize, usize) {
+        let (width, _height) = size;
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         let mut total = 0usize;
@@ -1613,8 +1658,12 @@ impl Host {
         // leaving it out would put its own rows out of reach at the bottom of
         // the scroll, which is exactly the failure the block walk goes to such
         // lengths to avoid one paragraph up.
-        let tail: usize = self
-            .tail_heights(width, moment)
+        // The same cap the geometry uses. It takes the pane's height, which is
+        // the whole screen minus whatever the other regions hold — and this is
+        // the one place that would otherwise count rows the frame declined to
+        // draw, putting them out of reach at the bottom of the scroll.
+        let tail_room = self.stream_rows(size, moment);
+        let tail: usize = Self::cap_tail(self.tail_heights(width, moment), tail_room)
             .iter()
             .map(|(_, h)| *h as usize)
             .sum();
@@ -2005,7 +2054,7 @@ mod tests {
         let orders = std::sync::atomic::Ordering::SeqCst;
 
         asked.store(0, orders);
-        let first = h.stream_height(80, &h.moment.read().unwrap().clone());
+        let first = h.stream_height((80, 24), &h.moment.read().unwrap().clone());
         assert!(first > 0);
         let measured = asked.load(orders);
         assert!(
@@ -2015,7 +2064,7 @@ mod tests {
 
         asked.store(0, orders);
         for _ in 0..5 {
-            let _ = h.stream_height(80, &h.moment.read().unwrap().clone());
+            let _ = h.stream_height((80, 24), &h.moment.read().unwrap().clone());
         }
         assert_eq!(
             asked.load(orders),
@@ -2043,9 +2092,9 @@ mod tests {
         // First, at the bottom, the instrument itself: it is the thing whose
         // height moves, and if it cannot move this test judges nothing.
         let _ = h.compose(size);
-        let rest = h.stream_height(80, &h.moment.read().unwrap().clone());
+        let rest = h.stream_height((80, 24), &h.moment.read().unwrap().clone());
         h.set_activity(crate::moment::Activity::Working);
-        let working = h.stream_height(80, &h.moment.read().unwrap().clone());
+        let working = h.stream_height((80, 24), &h.moment.read().unwrap().clone());
         assert_eq!(
             working,
             rest + PEER_ROWS as usize,
@@ -2146,6 +2195,38 @@ mod tests {
 
     fn pane_heights() -> Vec<(String, u16)> {
         vec![("todo".to_string(), 4), ("live".to_string(), 2)]
+    }
+
+    #[test]
+    fn a_tail_taller_than_the_pane_still_scrolls() {
+        // Handing the module its visible height means a module taller than the
+        // pane is asked for the whole pane at several different offsets, and
+        // lays itself out identically each time: the reader turns the wheel and
+        // the picture does not move, while the badge counts up. That is the
+        // shape of a frozen screen, and the cap is what stops it.
+        let pane = Rect::sized(80, 19);
+        // A plan far taller than the pane it has to fit in.
+        let heights = vec![("todo".to_string(), 40u16), ("live".to_string(), 2)];
+
+        let capped = Host::cap_tail(heights.clone(), pane.h);
+        let total: u16 = capped.iter().map(|(_, h)| *h).sum();
+        assert!(
+            total < pane.h,
+            "the tail took {total} rows of a {}-row pane, so nothing scrolls",
+            pane.h
+        );
+
+        // And the scroll really does move the picture, one row per row.
+        let mut previous: Option<u16> = None;
+        for scroll in 0..total as usize {
+            let p = Host::pane_geometry(pane, scroll, &capped);
+            let drawn: u16 = p.tail.iter().map(|(_, r)| r.h).sum();
+            assert!(
+                previous.is_none_or(|before| drawn < before),
+                "scroll {scroll} drew {drawn} tail rows, the same as before — frozen"
+            );
+            previous = Some(drawn);
+        }
     }
 
     #[test]
@@ -2299,7 +2380,7 @@ mod tests {
             } else {
                 pane(Vec::new())
             });
-            h.stream_height_split(80, &moment)
+            h.stream_height_split((80, 24), &moment)
         };
 
         let without = declared(false);
@@ -2316,7 +2397,7 @@ mod tests {
             "the tail's rows are in the sum, not only beside it"
         );
         assert_eq!(
-            h.stream_height(80, &moment),
+            h.stream_height((80, 24), &moment),
             with.0,
             "`stream_height` is the total, tail included"
         );
@@ -2971,13 +3052,13 @@ mod tests {
              eight a 40-cell measure gives it"
         );
         assert_eq!(
-            h.stream_height(40, &Moment::default()),
+            h.stream_height((40, 24), &Moment::default()),
             drawn,
             "the sum says there are {} rows to read and the frame drew {drawn}: \
              the reply was measured at the full 40 cells instead of the 38 it \
              is set in by, and the rows that difference makes are the rows at \
              the top of it that cannot be scrolled to",
-            h.stream_height(40, &Moment::default()),
+            h.stream_height((40, 24), &Moment::default()),
         );
 
         // And the consequence, rather than only the arithmetic: scrolled as far
@@ -3624,7 +3705,7 @@ mod tests {
         assert!(limit > 0, "the conversation does not fit in 12 rows");
         assert_eq!(
             limit,
-            h.stream_height(80, &m) - h.stream_rows(size, &m) as usize,
+            h.stream_height(size, &m) - h.stream_rows(size, &m) as usize,
             "what there is to read, minus what is already on screen"
         );
 
