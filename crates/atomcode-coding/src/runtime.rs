@@ -7545,6 +7545,7 @@ fn harness_host_state(
         mcp,
         rate_limit_source: parts.rate_limit_source().cloned(),
         compaction_checkpoint: parts.snapshot_hook(),
+        summary_provider: Some(parts.side_provider_slot()),
         rows: harness_option_rows(parts, config, prepare) + &permission_rows,
         datalog: config.datalog.enabled.then(|| config.datalog.clone()),
         modes: Some(crate::on_harness::HostModes {

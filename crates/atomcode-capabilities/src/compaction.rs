@@ -175,7 +175,7 @@ const MAX_SUMMARY_TOKENS: u32 = 16_000;
 /// 180s (up from 120s): gives a slow model more room now that the summary INPUT is bounded
 /// (tool outputs truncated — see `SUMMARY_TOOL_OUTPUT_MAX_CHARS`), so a legit slow-but-
 /// progressing summary isn't cut early, while still bounding a genuinely hung call.
-const SUMMARY_TIMEOUT: Duration = Duration::from_secs(180);
+pub const SUMMARY_TIMEOUT: Duration = Duration::from_secs(180);
 /// Surfaced (as a `resume_note` → synthetic user message) when the summary times out and we
 /// fall back to stub compaction, so the user understands why they got a lighter compaction.
 const SUMMARY_TIMEOUT_NOTE: &str =
@@ -403,6 +403,23 @@ impl OverflowCompaction {
     /// `focus` (from `/compact <focus>`) steers the summary toward a topic when present.
     async fn summarize(&self, span: &[Message], focus: Option<&str>) -> Option<String> {
         let provider = self.summary_provider.as_ref()?;
+        summarize_span(provider.as_ref(), span, focus).await
+    }
+}
+
+/// Summarize a span of conversation with `provider`, the way a manual `/compact`
+/// does: the prior summary (if the span holds one) is the base being updated,
+/// the rest is folded in, `focus` steers it, and the result is framed so the next
+/// compaction recognizes it. `None` when the call fails or says nothing.
+///
+/// No timeout of its own — callers bound it with [`SUMMARY_TIMEOUT`] and fall
+/// back to something model-free.
+pub async fn summarize_span(
+    provider: &dyn LlmProvider,
+    span: &[Message],
+    focus: Option<&str>,
+) -> Option<String> {
+    {
         // Split: the prior anchor (if any) is the UPDATE base; everything else is the new
         // transcript to fold in. The anchor is NEVER re-rendered as transcript (erosion fix).
         let previous_anchor = find_prior_anchor(span);

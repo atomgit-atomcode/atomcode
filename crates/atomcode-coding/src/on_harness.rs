@@ -1088,6 +1088,8 @@ pub struct HostState {
     pub rows: String,
     /// The runtime's MCP registry, published into the tree by `mcp-host`.
     pub(crate) mcp: Option<crate::host_rows::McpPublication>,
+    /// The provider a requested compaction's summary is written with.
+    pub summary_provider: Option<atomcode_review::SharedReviewProvider>,
     /// The native snapshot writer a committed compaction is stored through.
     pub compaction_checkpoint: Option<Arc<atomcode_capabilities::session::SnapshotHook>>,
     /// Where CodingPlan usage windows come from, when this host has an account.
@@ -1205,10 +1207,11 @@ pub async fn mount_hosted(
             )
         })
         .unwrap_or_default();
-    let checkpoint_rows = if host.compaction_checkpoint.is_some() {
-        "[[insert]]\nname = \"native-compaction-checkpoint\"\n\n"
-    } else {
-        ""
+    let checkpoint_rows = match (host.compaction_checkpoint.is_some(), host.summary_provider.is_some()) {
+        (true, true) => "[[insert]]\nname = \"native-compaction-checkpoint\"\n\n[[patch]]\nid = \"compaction-tail\"\nname = \"compaction-coding\"\n\n",
+        (true, false) => "[[insert]]\nname = \"native-compaction-checkpoint\"\n\n",
+        (false, true) => "[[patch]]\nid = \"compaction-tail\"\nname = \"compaction-coding\"\n\n",
+        (false, false) => "",
     };
     let mcp_rows = if host.mcp.is_some() {
         "[[patch]]\nid = \"mcp\"\nname = \"mcp-host\"\ndisabled = false\n\n"
@@ -1268,6 +1271,9 @@ pub async fn mount_hosted(
     registry.register(Arc::new(crate::host_rows::KernelMiddlewarePlugin(
         host.middleware.unwrap_or_default(),
     )));
+    if let Some(slot) = host.summary_provider {
+        registry.register(Arc::new(crate::host_rows::CompactionCodingPlugin(slot)));
+    }
     if let Some(hook) = host.compaction_checkpoint {
         registry.register(Arc::new(
             crate::host_rows::NativeCompactionCheckpointPlugin(hook),

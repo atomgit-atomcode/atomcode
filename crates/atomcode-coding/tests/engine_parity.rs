@@ -2000,6 +2000,79 @@ async fn a_silent_stream_times_the_turn_out(engine: &str) {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// A `/compact` the person asks for is written by the conversation's model,
+/// steered by the focus they gave, billed to the session — and what the model
+/// sees afterwards is that summary.
+async fn a_requested_compaction_is_summarized_by_the_model_about_the_focus(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+    for n in 0..6 {
+        turn(
+            &mut runtime,
+            &format!("prompt {n} {}", "context ".repeat(500)),
+        )
+        .await;
+    }
+    let asked_before = recorder.requests.lock().unwrap().len();
+
+    runtime
+        .handle
+        .compact(Some("the zebra parser".to_string()))
+        .unwrap();
+    let completion = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("compaction did not finish")
+            .expect("runtime event stream closed");
+        if let CodingRuntimeEvent::CompactionFinished { completion } = event.event {
+            break completion;
+        }
+    };
+    let atomcode_coding::runtime::CompactionCompletion::Completed(outcome) = completion else {
+        panic!("[{engine}] {completion:?}");
+    };
+    assert!(outcome.committed, "[{engine}] the compaction was refused");
+
+    let summary_call = recorder.requests.lock().unwrap()[asked_before..]
+        .iter()
+        .any(|request| request.iter().any(|m| m.text.contains("the zebra parser")));
+    assert!(
+        summary_call,
+        "[{engine}] no model was asked to summarize with the focus"
+    );
+    let meta = SessionManager::for_project(env.project.path())
+        .read_meta(&id)
+        .unwrap();
+    let billed: u64 = meta
+        .detached_model_usage
+        .iter()
+        .map(|stat| stat.tokens.total())
+        .sum();
+    assert!(billed > 0, "[{engine}] the summary was billed to nobody");
+
+    turn(&mut runtime, "after").await;
+    let written = recorder
+        .last_request()
+        .iter()
+        .any(|m| m.text.contains("answer ") && m.role != Role::Assistant);
+    assert!(
+        written,
+        "[{engine}] the model never saw the written summary: {:?}",
+        recorder
+            .last_request()
+            .iter()
+            .map(|m| (m.role.clone(), m.text.chars().take(80).collect::<String>()))
+            .collect::<Vec<_>>()
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 // ---- what the model is offered ---------------------------------------------
 
 /// The start a production driver makes: every capability the chain turns on
@@ -2204,4 +2277,5 @@ on_both_engines!(
     a_turn_left_cut_off_says_so,
     a_cut_off_turn_asks_before_giving_up,
     a_silent_stream_times_the_turn_out,
+    a_requested_compaction_is_summarized_by_the_model_about_the_focus,
 );

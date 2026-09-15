@@ -1333,3 +1333,119 @@ impl Plugin for NativeCompactionCheckpointPlugin {
         Ok(())
     }
 }
+
+// ---- compaction, as the product writes it ---------------------------------
+
+/// `compaction-coding`: stands where `compaction-tail` stands.
+///
+/// Pressure-triggered compaction stays the tree's model-free list — a compactor
+/// that needs a model call cannot run when the provider is what is failing. A
+/// `/compact` the person asks for is the chain's: the conversation's own model
+/// writes the summary, updating the last one, steered by the focus they gave,
+/// billed to the session through the side provider. Anything short of a written
+/// summary falls back to the list.
+pub(crate) struct CompactionCodingPlugin(pub(crate) atomcode_review::SharedReviewProvider);
+
+#[derive(serde::Deserialize)]
+struct CompactionCodingRow {
+    #[serde(default = "default_compaction_threshold")]
+    threshold: f32,
+    #[serde(default = "default_keep_turns")]
+    keep_turns: u64,
+}
+
+fn default_compaction_threshold() -> f32 {
+    0.75
+}
+
+fn default_keep_turns() -> u64 {
+    2
+}
+
+struct CodingCompaction {
+    provider: atomcode_review::SharedReviewProvider,
+    keep_turns: u64,
+}
+
+#[async_trait]
+impl atomcode_harness::seams::Compaction for CodingCompaction {
+    fn describe(&self) -> String {
+        format!(
+            "keep the last {} turn(s); list the rest, or have the model summarize them on request",
+            self.keep_turns
+        )
+    }
+
+    async fn compact(
+        &self,
+        log: &atomcode_harness::session::SessionLog,
+    ) -> Option<atomcode_harness::seams::CompactionDecision> {
+        use atomcode_harness::plugins::loop_policy;
+        let span = loop_policy::settled_span(log, self.keep_turns)?;
+        Some(atomcode_harness::seams::CompactionDecision {
+            through: span.through,
+            summary: loop_policy::listed_summary(&span),
+        })
+    }
+
+    async fn compact_requested(
+        &self,
+        log: &atomcode_harness::session::SessionLog,
+        focus: Option<&str>,
+    ) -> Option<atomcode_harness::seams::CompactionDecision> {
+        use atomcode_capabilities::compaction::{summarize_span, SUMMARY_TIMEOUT};
+        use atomcode_harness::plugins::loop_policy;
+        let span = loop_policy::settled_span(log, self.keep_turns)?;
+        let provider = self.provider.read().ok().and_then(|slot| slot.clone());
+        let written = match provider {
+            Some(provider) => {
+                let events: Vec<_> = log
+                    .events()
+                    .into_iter()
+                    .filter(|logged| logged.seq <= span.through)
+                    .collect();
+                let messages = atomcode_harness::session::derive_messages(&events);
+                tokio::time::timeout(
+                    SUMMARY_TIMEOUT,
+                    summarize_span(provider.as_ref(), &messages, focus),
+                )
+                .await
+                .ok()
+                .flatten()
+            }
+            None => None,
+        };
+        Some(atomcode_harness::seams::CompactionDecision {
+            through: span.through,
+            summary: written.unwrap_or_else(|| loop_policy::listed_summary(&span)),
+        })
+    }
+}
+
+#[async_trait]
+impl Plugin for CompactionCodingPlugin {
+    fn name(&self) -> &'static str {
+        "compaction-coding"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["compaction"]
+    }
+    fn description(&self) -> &'static str {
+        "history compaction: a model-free list under pressure, the conversation model's summary on request"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: CompactionCodingRow = if config.is_null() {
+            serde_json::from_value(serde_json::json!({})).map_err(|e| e.to_string())?
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        let _ = ctx
+            .provide::<atomcode_harness::seams::CompactionSvc>(Arc::new(CodingCompaction {
+                provider: self.0.clone(),
+                keep_turns: row.keep_turns,
+            }))
+            .map_err(|e| e.to_string())?;
+        atomcode_harness::plugins::loop_policy::mount_compaction_trigger(ctx, row.threshold);
+        Ok(())
+    }
+}

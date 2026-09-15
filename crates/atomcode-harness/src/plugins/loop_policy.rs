@@ -403,20 +403,27 @@ fn default_keep() -> u64 {
 /// *what* is compacted and on the material a summary is built from — the
 /// boundary is a policy decision, and a second copy of it would be a second
 /// answer to the same question.
-pub(crate) struct CompactedSpan {
-    pub(crate) through: crate::session::SeqNo,
+pub struct CompactedSpan {
+    pub through: crate::session::SeqNo,
     /// What was asked, one line each, and the tools that were used. No header
     /// and no closing instruction: each strategy wraps it in its own words.
-    pub(crate) digest: String,
+    pub digest: String,
+}
+
+/// The model-free summary of a span: what was asked, and the tools used. The
+/// floor every strategy falls back to.
+pub fn listed_summary(span: &CompactedSpan) -> String {
+    format!(
+        "=== EARLIER IN THIS SESSION ===\nThese turns were compacted. What was asked:\n{}\
+         Ask again for any detail you need from before this point rather than assuming it.\n",
+        span.digest
+    )
 }
 
 /// The span a compaction would fold away at this depth. `None` when every turn
 /// still fits inside `keep_turns`, or when nothing was asked in the ones that do
 /// not — there is nothing worth summarizing then.
-pub(crate) fn settled_span(
-    log: &crate::session::SessionLog,
-    keep_turns: u64,
-) -> Option<CompactedSpan> {
+pub fn settled_span(log: &crate::session::SessionLog, keep_turns: u64) -> Option<CompactedSpan> {
     let events = log.events();
     let current = log.current_turn();
     let cutoff = current.saturating_sub(keep_turns);
@@ -480,16 +487,9 @@ impl Compaction for TailCompaction {
 
     async fn compact(&self, log: &crate::session::SessionLog) -> Option<CompactionDecision> {
         let span = settled_span(log, self.keep_turns)?;
-        let mut summary = String::from(
-            "=== EARLIER IN THIS SESSION ===\nThese turns were compacted. What was asked:\n",
-        );
-        summary.push_str(&span.digest);
-        summary.push_str(
-            "Ask again for any detail you need from before this point rather than assuming it.\n",
-        );
         Some(CompactionDecision {
             through: span.through,
-            summary,
+            summary: listed_summary(&span),
         })
     }
 }
@@ -606,7 +606,7 @@ impl Plugin for CompactionPlugin {
 /// strategy: a deployment that swaps the strategy for a model-written one still
 /// wants compaction to fire at the same pressure. Both rows call this, and a
 /// replacement strategy that forgot to would be a strategy that never runs.
-pub(crate) fn mount_compaction_trigger(ctx: &Context, threshold: f32) {
+pub fn mount_compaction_trigger(ctx: &Context, threshold: f32) {
     let _ = ctx.on_waterfall::<AgentRequest>(
         Arc::new(CompactBeforeRequest {
             ctx: ctx.clone(),

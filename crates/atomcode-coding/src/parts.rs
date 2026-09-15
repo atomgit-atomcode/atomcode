@@ -420,6 +420,9 @@ pub struct CodingParts {
     /// [`CodingAgentConfig`].
     /// `None` when the driver policy or `ATOMCODE_SUBAGENT` override disables it.
     pub subagent_provider: Option<SharedReviewProvider>,
+    /// The provider for model calls made outside a round — summaries — recorded
+    /// and metered; filled with the others by [`wire_side_providers`].
+    side_provider: SharedReviewProvider,
     /// Child-agent assembly prepared from the same live tier-provider cells and
     /// execution policy as `task`. The `team` tool is mounted in the next phase.
     pub team_runner: Option<crate::team::TeamRunnerFactory>,
@@ -1132,6 +1135,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         mcp_registry,
         review_provider,
         subagent_provider,
+        side_provider: Arc::new(std::sync::RwLock::new(None)),
         team_runner,
         team_manager,
         cc_external_hooks: cc_external,
@@ -1230,6 +1234,12 @@ impl CodingParts {
             publication_enabled: Arc::clone(&self.mcp_publication_enabled),
             catalog_ready: self.mcp_catalog_ready.clone(),
         })
+    }
+
+    /// Where the provider for out-of-round model calls lives, refilled on every
+    /// model change.
+    pub(crate) fn side_provider_slot(&self) -> SharedReviewProvider {
+        Arc::clone(&self.side_provider)
     }
 
     /// Tools a tree takes from this capability graph as the objects prepare built:
@@ -1782,6 +1792,9 @@ pub(crate) fn wire_side_providers(
         models.set_telemetry_provider_factory(telemetry_factory);
     }
 
+    if let Ok(mut slot) = parts.side_provider.write() {
+        *slot = Some(metered_provider.clone());
+    }
     metered_provider
 }
 

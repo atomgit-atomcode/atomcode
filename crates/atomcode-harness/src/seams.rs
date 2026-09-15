@@ -330,6 +330,16 @@ pub trait Compaction: Send + Sync {
     fn describe(&self) -> String;
     /// `None` means "nothing worth compacting yet".
     async fn compact(&self, log: &crate::session::SessionLog) -> Option<CompactionDecision>;
+    /// A compaction the person asked for, steered toward `focus` when they gave
+    /// one. A strategy with nothing to do with a topic compacts as it always does.
+    async fn compact_requested(
+        &self,
+        log: &crate::session::SessionLog,
+        focus: Option<&str>,
+    ) -> Option<CompactionDecision> {
+        let _ = focus;
+        self.compact(log).await
+    }
 }
 
 /// Reconfiguring the tree while it runs.

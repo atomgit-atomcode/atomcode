@@ -978,7 +978,7 @@ async fn compact(
         )
     };
     let (count_before, bytes_before) = measure(&log.derive_messages());
-    let decision = compaction.compact(&log).await;
+    let decision = compaction.compact_requested(&log, focus.as_deref()).await;
     let committed = match decision {
         Some(decision) => {
             reporting.store(true, std::sync::atomic::Ordering::SeqCst);
