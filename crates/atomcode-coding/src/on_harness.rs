@@ -523,10 +523,17 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> String {
         ));
     }
     // A turn's own round budget; `0` is unbounded, which `CODING_DEFAULTS` states.
+    // With the checkpoint, a front end that draws the question is asked before
+    // a turn is cut off by its budget or ends with its answer cut off.
+    if cfg.round_cap_checkpoint {
+        out.push_str(
+            "[[patch]]\nid = \"truncation-recovery\"\nconfig = { max_continuations = 4, checkpoint = true }\n\n",
+        );
+    }
     if cfg.max_rounds != 0 {
         out.push_str(&format!(
-            "[[patch]]\nid = \"round-cap\"\nconfig = {{ max_rounds = {}, max_seconds = 0 }}\n\n",
-            cfg.max_rounds
+            "[[patch]]\nid = \"round-cap\"\nconfig = {{ max_rounds = {}, max_seconds = 0, checkpoint = {} }}\n\n",
+            cfg.max_rounds, cfg.round_cap_checkpoint
         ));
     }
     // The exact-repeat guard. `None` is the person turning it off.

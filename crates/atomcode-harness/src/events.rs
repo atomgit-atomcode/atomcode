@@ -247,6 +247,10 @@ pub struct TurnProgress {
     pub used_tokens: u32,
     /// Wall-clock since the turn opened.
     pub elapsed: std::time::Duration,
+    /// Whether the turn would take another round: tools ran, the answer was cut
+    /// off, or work is waiting. A budget stops a turn that wants more; a turn
+    /// ending on its own at the budget has finished, not been cut off.
+    pub continuing: bool,
 }
 
 #[derive(Clone, Debug)]

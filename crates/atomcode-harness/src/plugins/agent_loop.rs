@@ -626,6 +626,7 @@ impl PluginAgentLoop {
                 break;
             }
 
+            let owes_a_request = tool_count > 0 || response.truncated;
             if let Some(stop) = self
                 .ctx
                 .serial::<TurnStopping>(&TurnProgress {
@@ -634,6 +635,7 @@ impl PluginAgentLoop {
                     tool_calls: outcome.tool_calls,
                     used_tokens,
                     elapsed: started_at.elapsed(),
+                    continuing: owes_a_request || agent.inbox().has_waking_input(),
                 })
                 .await
             {
@@ -652,7 +654,6 @@ impl PluginAgentLoop {
             // sentence. That row still owns the *policy* — when it stops
             // nudging it clears the flag, and this condition goes false — so the
             // continuation cap stays in one place.
-            let owes_a_request = tool_count > 0 || response.truncated;
             if !owes_a_request && !agent.inbox().has_waking_input() {
                 outcome.stop = StopReason::Stopped;
                 break;

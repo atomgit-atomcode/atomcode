@@ -52,6 +52,12 @@ struct RoundCapRow {
     /// Stop the turn after this many seconds. `0` disables the deadline.
     #[serde(default)]
     max_seconds: u64,
+    /// Ask the person before the budget cuts a turn off: going on grants another
+    /// `max_rounds`, anything else — a stop, no answer, nobody to ask — ends it
+    /// at the cap. For a front end that draws the question; off, the budget is a
+    /// fuse.
+    #[serde(default)]
+    checkpoint: bool,
 }
 
 impl Default for RoundCapRow {
@@ -59,6 +65,7 @@ impl Default for RoundCapRow {
         Self {
             max_rounds: default_rounds(),
             max_seconds: 0,
+            checkpoint: false,
         }
     }
 }
@@ -70,17 +77,117 @@ fn default_rounds() -> u32 {
 struct RoundCap {
     max_rounds: u32,
     max_seconds: u64,
+    /// Where the person is asked, when the row asks at all.
+    checkpoint: Option<Context>,
+    /// Rounds granted past the budget, per session, for the turn they were
+    /// granted in.
+    granted: Mutex<HashMap<String, (u64, u32)>>,
+}
+
+impl RoundCap {
+    fn fuse(max_rounds: u32, max_seconds: u64) -> Self {
+        Self {
+            max_rounds,
+            max_seconds,
+            checkpoint: None,
+            granted: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Put the budget to the person driving this agent. `Some` is the verdict;
+    /// `None` means go on.
+    async fn ask(&self, ctx: &Context, progress: &TurnProgress, cap: u32) -> Option<StopReason> {
+        let scoped = crate::agent::scoped(ctx);
+        let Some(log) = scoped.service::<SessionSvc>() else {
+            return Some(StopReason::MaxRounds);
+        };
+        // A delegated child has nobody to ask, and a budget nobody can extend
+        // is a fuse.
+        let Some(requester) = ctx
+            .service::<crate::seams::ToolDriverSvc>()
+            .and_then(|driver| driver.requester(log.id()))
+        else {
+            return Some(StopReason::MaxRounds);
+        };
+        let answer = requester
+            .request(
+                atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND,
+                serde_json::json!({
+                    "round": progress.rounds,
+                    "cap": cap,
+                    // What going on grants, so the front end can say "N more".
+                    "base": self.max_rounds,
+                }),
+            )
+            .await;
+        if answer.get("continue").and_then(Value::as_bool) == Some(true) {
+            let mut granted = self.granted.lock().expect("round grants poisoned");
+            let entry = granted
+                .entry(log.id().to_string())
+                .or_insert((progress.turn, 0));
+            entry.1 = entry.1.saturating_add(self.max_rounds);
+            return None;
+        }
+        // No answer because the person pressed stop: the turn was cancelled,
+        // not cut off.
+        let cancelled = ctx
+            .service::<crate::seams::AgentsSvc>()
+            .and_then(|agents| agents.by_session(log.id()))
+            .is_some_and(|agent| agent.cancelled());
+        Some(if cancelled {
+            StopReason::Cancelled
+        } else {
+            StopReason::MaxRounds
+        })
+    }
+
+    /// This session's budget for this turn: the configured one plus whatever
+    /// the person granted during it.
+    fn cap_for(&self, ctx: &Context, turn: u64) -> u32 {
+        let Some(log) = crate::agent::scoped(ctx).service::<SessionSvc>() else {
+            return self.max_rounds;
+        };
+        let mut granted = self.granted.lock().expect("round grants poisoned");
+        match granted.get(log.id()) {
+            Some((granted_turn, extra)) if *granted_turn == turn => {
+                self.max_rounds.saturating_add(*extra)
+            }
+            Some(_) => {
+                granted.remove(log.id());
+                self.max_rounds
+            }
+            None => self.max_rounds,
+        }
+    }
 }
 
 #[async_trait]
 impl Listener<TurnStopping> for RoundCap {
     async fn call(&self, progress: &TurnProgress) -> Option<StopReason> {
+        // A turn ending on its own is not cut off by a budget it happened to
+        // reach on its last round.
+        if !progress.continuing {
+            return None;
+        }
         // `0` is "no limit", not "stop now" — see `RoundCapRow::max_rounds`.
         // Spelled as a guard rather than by never mounting the listener, so the
         // row can still carry a deadline (`max_seconds`) with the round budget
         // switched off.
-        if self.max_rounds > 0 && progress.rounds >= self.max_rounds {
-            return Some(StopReason::MaxRounds);
+        if self.max_rounds > 0 {
+            let cap = match &self.checkpoint {
+                Some(ctx) => self.cap_for(ctx, progress.turn),
+                None => self.max_rounds,
+            };
+            if progress.rounds >= cap {
+                match &self.checkpoint {
+                    Some(ctx) => {
+                        if let Some(stop) = self.ask(ctx, progress, cap).await {
+                            return Some(stop);
+                        }
+                    }
+                    None => return Some(StopReason::MaxRounds),
+                }
+            }
         }
         if self.max_seconds > 0 && progress.elapsed.as_secs() >= self.max_seconds {
             return Some(StopReason::StoppedByPolicy);
@@ -96,15 +203,21 @@ impl Plugin for RoundCapPlugin {
     fn name(&self) -> &'static str {
         "round-cap"
     }
+    fn uses(&self) -> &'static [&'static str] {
+        // Only with `checkpoint`, and only to ask: whoever drives the agent, and
+        // whether it was that person who stopped the turn.
+        &["tool-driver", "agents"]
+    }
     fn description(&self) -> &'static str {
         "end a turn after a round budget or a wall-clock deadline"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
         let row: RoundCapRow = parse(config)?;
-        let _ = ctx.on_serial::<TurnStopping>(Arc::new(RoundCap {
-            max_rounds: row.max_rounds,
-            max_seconds: row.max_seconds,
-        }));
+        let mut cap = RoundCap::fuse(row.max_rounds, row.max_seconds);
+        if row.checkpoint {
+            cap.checkpoint = Some(ctx.clone());
+        }
+        let _ = ctx.on_serial::<TurnStopping>(Arc::new(cap));
         Ok(())
     }
 }
@@ -848,11 +961,9 @@ mod round_budget_tests {
             tool_calls: 0,
             used_tokens: 0,
             elapsed: Duration::ZERO,
+            continuing: true,
         };
-        let unlimited = RoundCap {
-            max_rounds: 0,
-            max_seconds: 0,
-        };
+        let unlimited = RoundCap::fuse(0, 0);
         // Swept rather than checked at one value: "stopped at round 0" and
         // "stopped at round 10 000" are the two ways an unlimited budget can
         // still be wrong, and only one of them is near the boundary.
@@ -865,10 +976,7 @@ mod round_budget_tests {
             );
         }
 
-        let capped = RoundCap {
-            max_rounds: 5,
-            max_seconds: 0,
-        };
+        let capped = RoundCap::fuse(5, 0);
         assert_eq!(capped.call(&at(4)).await, None, "one under the budget");
         assert_eq!(
             capped.call(&at(5)).await,
@@ -879,10 +987,7 @@ mod round_budget_tests {
         // And a deadline still works with the round budget switched off — the
         // pair is why this is a guard in `call` rather than a row that is simply
         // not mounted when `0`.
-        let deadline_only = RoundCap {
-            max_rounds: 0,
-            max_seconds: 30,
-        };
+        let deadline_only = RoundCap::fuse(0, 30);
         let mut late = at(3);
         late.elapsed = Duration::from_secs(31);
         assert_eq!(

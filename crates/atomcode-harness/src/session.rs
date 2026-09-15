@@ -78,6 +78,9 @@ pub enum NoticeKind {
     ProviderRetry,
     /// The answer hit the output-token limit; the model was asked to resume.
     OutputTruncated,
+    /// The turn is ending with its answer still cut off: resuming stopped
+    /// working, and the person has half of something.
+    OutputLeftCutOff,
 }
 
 /// One durable fact about a session.
@@ -363,8 +366,8 @@ impl SessionEvent {
 /// supposed to be able to redraw.
 ///
 /// **4** — added [`SessionEvent::PolicyIntervention`], `PolicyDenied` as a way a
-/// turn ends, [`SessionEvent::Interrupted`], and [`SessionEvent::RateLimitPaused`]
-/// with `RateLimited` as a way a turn ends. Same shape again: a hard
+/// turn ends, [`SessionEvent::Interrupted`], [`SessionEvent::RateLimitPaused`]
+/// with `RateLimited` as a way a turn ends, and [`NoticeKind::OutputLeftCutOff`]. Same shape again: a hard
 /// boundary's recovery choice, and what a person's cancel does to the history,
 /// were kernel behaviour the log never saw.
 pub const SESSION_FORMAT_VERSION: u32 = 4;

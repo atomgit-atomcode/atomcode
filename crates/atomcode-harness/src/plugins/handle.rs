@@ -283,6 +283,11 @@ impl Projector {
                     crate::session::NoticeKind::OverflowCompacted => {
                         AgentEvent::Warning(detail.clone())
                     }
+                    // A warning in the kernel protocol too: nothing is being
+                    // recovered, the person is being told to ask for the rest.
+                    crate::session::NoticeKind::OutputLeftCutOff => {
+                        AgentEvent::Warning(detail.clone())
+                    }
                 }]
             }
 

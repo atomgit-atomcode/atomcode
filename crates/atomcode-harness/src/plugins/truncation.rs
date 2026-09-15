@@ -48,15 +48,25 @@ struct Row {
     /// nudging itself becomes the loop.
     #[serde(default = "default_max")]
     max_continuations: u32,
+    /// Ask the person before giving up on a cut-off answer: going on resumes it
+    /// once more, anything else ends the turn on what it has. For a front end
+    /// that draws the question; off, giving up says so as a warning.
+    #[serde(default)]
+    checkpoint: bool,
 }
 
 impl Default for Row {
     fn default() -> Self {
         Self {
             max_continuations: default_max(),
+            checkpoint: false,
         }
     }
 }
+
+/// What the person is told when a turn ends with its answer still cut off.
+const LEFT_CUT_OFF: &str =
+    "模型这次回复达到了长度上限，内容可能没写完。可以让它「继续」，会接着把剩下的部分补完。";
 
 fn default_max() -> u32 {
     4
@@ -87,6 +97,7 @@ pub(crate) fn truncation_is_redump(prev: &str, curr: &str) -> bool {
 struct OnTruncation {
     ctx: Context,
     max_continuations: u32,
+    checkpoint: bool,
     /// Continuations spent in the current turn.
     seen: std::sync::atomic::AtomicU32,
     /// Text of the last truncated round this turn, to catch a re-dump.
@@ -100,6 +111,62 @@ impl OnTruncation {
     fn reset(&self) {
         self.seen.store(0, std::sync::atomic::Ordering::SeqCst);
         *self.last.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Resuming has stopped working. Decide what the response becomes: `true`
+    /// keeps it cut off, so the loop asks once more; `false` lets the turn end
+    /// on what it has.
+    ///
+    /// With the checkpoint, the person decides, and whatever they decide they
+    /// already saw — no warning follows. Without it, the turn ends and says so.
+    async fn give_up(&self, attempts: u32) -> bool {
+        let scoped = crate::agent::scoped(&self.ctx);
+        let Some(session) = scoped.service::<SessionSvc>() else {
+            return false;
+        };
+        if self.checkpoint {
+            let requester = self
+                .ctx
+                .service::<crate::seams::ToolDriverSvc>()
+                .and_then(|driver| driver.requester(session.id()));
+            let answer = match requester {
+                Some(requester) => {
+                    requester
+                        .request(
+                            atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND,
+                            serde_json::json!({
+                                "attempts": attempts,
+                                "max_attempts": self.max_continuations,
+                            }),
+                        )
+                        .await
+                }
+                None => Value::Null,
+            };
+            let go_on = answer.get("continue").and_then(Value::as_bool) == Some(true);
+            if go_on {
+                crate::session::commit(
+                    &self.ctx,
+                    &session,
+                    SessionEvent::Injected {
+                        turn: session.current_turn(),
+                        text: RESUME_NUDGE.to_string(),
+                        origin: InjectionOrigin::Continuation,
+                    },
+                );
+            }
+            return go_on;
+        }
+        crate::session::commit(
+            &self.ctx,
+            &session,
+            SessionEvent::Notice {
+                turn: session.current_turn(),
+                notice: crate::session::NoticeKind::OutputLeftCutOff,
+                detail: LEFT_CUT_OFF.to_string(),
+            },
+        );
+        false
     }
 }
 
@@ -127,7 +194,11 @@ impl Waterfall<AgentRequest> for OnTruncation {
             redump
         };
         if redump {
-            response.truncated = false;
+            let attempts = self
+                .seen
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .min(self.max_continuations);
+            response.truncated = self.give_up(attempts).await;
             return Ok(response);
         }
 
@@ -141,7 +212,7 @@ impl Waterfall<AgentRequest> for OnTruncation {
             // asking" and "this response is final" are the same statement. The
             // cap therefore lives here, once, rather than being re-derived by
             // whoever reads `truncated` next.
-            response.truncated = false;
+            response.truncated = self.give_up(self.max_continuations).await;
             return Ok(response);
         }
 
@@ -284,6 +355,10 @@ impl Plugin for TruncationPlugin {
     fn name(&self) -> &'static str {
         "truncation-recovery"
     }
+    fn uses(&self) -> &'static [&'static str] {
+        // Only with `checkpoint`: whoever drives the agent is asked.
+        &["tool-driver"]
+    }
     fn description(&self) -> &'static str {
         "resume after an output-limit cut (unless the model just re-dumped the same text), and refuse a call whose arguments were cut"
     }
@@ -296,6 +371,7 @@ impl Plugin for TruncationPlugin {
         let on_truncation = Arc::new(OnTruncation {
             ctx: ctx.clone(),
             max_continuations: row.max_continuations,
+            checkpoint: row.checkpoint,
             seen: std::sync::atomic::AtomicU32::new(0),
             last: std::sync::Mutex::new(None),
         });

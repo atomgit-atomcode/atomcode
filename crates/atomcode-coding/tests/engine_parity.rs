@@ -50,6 +50,10 @@ impl Recorder {
     }
 }
 
+/// Long enough that a second copy reads as a re-dump rather than a coincidence.
+const CUT_OFF: &str = "Section 1: overview. The player picks a face and a skin tone; \
+    Section 2: levels. Thirty seconds each, three misses and it is over. Section 3: art.";
+
 struct RecordingProvider(Arc<Recorder>);
 
 #[async_trait::async_trait]
@@ -126,6 +130,17 @@ impl LlmProvider for RecordingProvider {
                     code: None,
                     retry_after_secs: Some(1),
                 });
+            }
+            // An answer cut off at the output limit, the same text every time: the
+            // first nudge to resume is answered by starting over.
+            Some(m)
+                if (m.role == Role::User && m.text == "cut me off")
+                    || (m.role == Role::Assistant && m.text == CUT_OFF) =>
+            {
+                return Ok(Box::pin(futures::stream::iter(vec![
+                    StreamEvent::TextDelta(CUT_OFF.to_string()),
+                    StreamEvent::Done { truncated: true },
+                ])));
             }
             // A request that never answers: the only way out is a cancel.
             Some(m) if m.role == Role::User && m.text == "hang" => {
@@ -1774,6 +1789,192 @@ async fn a_logout_leaves_no_signed_in_provider_alive() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// Run a turn answering every question with `answer`; the kinds asked, and why
+/// the turn ended.
+async fn turn_asked(
+    runtime: &mut CodingRuntime,
+    text: &str,
+    answer: serde_json::Value,
+) -> (Vec<String>, atomcode_kernel::event::StopReason) {
+    runtime.handle.submit(UserInput::from(text)).await.unwrap();
+    let mut kinds = Vec::new();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("turn did not finish")
+            .expect("runtime event stream closed");
+        match event.event {
+            CodingRuntimeEvent::TurnFinished(
+                atomcode_coding::runtime::TurnCompletion::Completed { reason, .. },
+            ) => return (kinds, reason),
+            CodingRuntimeEvent::TurnFinished(other) => panic!("turn did not complete: {other:?}"),
+            CodingRuntimeEvent::Request(request) => {
+                kinds.push(request.kind.clone());
+                runtime
+                    .handle
+                    .respond(request.id, answer.clone())
+                    .await
+                    .unwrap();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A turn allowed N rounds that ends on its Nth has finished; it was not cut off.
+async fn a_turn_ending_on_its_last_allowed_round_is_not_cut_off(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+    config.agent.max_rounds = 1;
+    let mut runtime = CodingRuntime::start(config).await.unwrap();
+    let (asked, reason) = turn_asked(&mut runtime, "hello", serde_json::Value::Null).await;
+    assert!(asked.is_empty(), "[{engine}] asked {asked:?}");
+    assert_eq!(
+        reason,
+        atomcode_kernel::event::StopReason::Stopped,
+        "[{engine}]"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// With the checkpoint on, a turn at its round budget asks before it is cut off:
+/// going on buys another budget, stopping ends it at the cap.
+async fn the_round_budget_asks_before_it_cuts_a_turn_off(engine: &str) {
+    select(engine);
+    let env = env();
+    std::fs::write(env.project.path().join("marker.txt"), "marked\n").unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut config = start_attended(env.project.path(), &recorder, SessionMode::Fresh);
+    config.agent.max_rounds = 1;
+    config.agent.round_cap_checkpoint = true;
+    let mut runtime = CodingRuntime::start(config).await.unwrap();
+    let checkpoint = atomcode_kernel::ROUND_CAP_CHECKPOINT_KIND.to_string();
+
+    let (asked, reason) = turn_asked(
+        &mut runtime,
+        "read marker.txt",
+        serde_json::json!({ "continue": true }),
+    )
+    .await;
+    assert_eq!(asked, vec![checkpoint.clone()], "[{engine}] going on");
+    assert_eq!(
+        reason,
+        atomcode_kernel::event::StopReason::Stopped,
+        "[{engine}] going on"
+    );
+    let went_on = recorder
+        .last_request()
+        .iter()
+        .any(|m| m.role == Role::Tool && m.text.contains("marked"));
+    assert!(
+        went_on,
+        "[{engine}] the round after the checkpoint never ran"
+    );
+
+    let before = recorder.requests.lock().unwrap().len();
+    let (asked, reason) = turn_asked(
+        &mut runtime,
+        "read marker.txt",
+        serde_json::json!({ "continue": false }),
+    )
+    .await;
+    assert_eq!(asked, vec![checkpoint], "[{engine}] stopping");
+    assert_eq!(
+        reason,
+        atomcode_kernel::event::StopReason::MaxRounds,
+        "[{engine}] stopping"
+    );
+    assert_eq!(
+        recorder.requests.lock().unwrap().len(),
+        before + 1,
+        "[{engine}] a round ran past a stop"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+fn warned_of_cut_off(seen: &[CodingRuntimeEvent]) -> bool {
+    seen.iter().any(|event| {
+        matches!(
+            event,
+            CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::Warning(text))
+                if text.contains("长度上限")
+        )
+    })
+}
+
+/// A turn that ends with its answer still cut off says so: the person has half
+/// of something and should know to ask for the rest.
+async fn a_turn_left_cut_off_says_so(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    let seen = turn_collecting(&mut runtime, "cut me off").await;
+    assert!(
+        warned_of_cut_off(&seen),
+        "[{engine}] the turn ended cut off without a word"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// With the checkpoint on, a turn about to end cut off asks first: going on
+/// resumes it, stopping ends it without a second warning.
+async fn a_cut_off_turn_asks_before_giving_up(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut config = start_attended(env.project.path(), &recorder, SessionMode::Fresh);
+    config.agent.round_cap_checkpoint = true;
+    let mut runtime = CodingRuntime::start(config).await.unwrap();
+    let checkpoint = atomcode_kernel::OUTPUT_TRUNCATION_CHECKPOINT_KIND.to_string();
+
+    runtime
+        .handle
+        .submit(UserInput::from("cut me off"))
+        .await
+        .unwrap();
+    let mut asked = Vec::new();
+    let mut requests_at_ask = Vec::new();
+    let mut seen = Vec::new();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("turn did not finish")
+            .expect("runtime event stream closed");
+        match event.event {
+            CodingRuntimeEvent::TurnFinished(_) => break,
+            CodingRuntimeEvent::Request(request) => {
+                asked.push(request.kind.clone());
+                requests_at_ask.push(recorder.requests.lock().unwrap().len());
+                // Go on once, then stop.
+                let go_on = asked.len() == 1;
+                runtime
+                    .handle
+                    .respond(request.id, serde_json::json!({ "continue": go_on }))
+                    .await
+                    .unwrap();
+            }
+            other => seen.push(other),
+        }
+    }
+    assert_eq!(asked, vec![checkpoint.clone(), checkpoint], "[{engine}]");
+    assert_eq!(
+        requests_at_ask[1],
+        requests_at_ask[0] + 1,
+        "[{engine}] going on did not resume the answer exactly once"
+    );
+    assert!(
+        !warned_of_cut_off(&seen),
+        "[{engine}] the person chose to stop and was warned anyway"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 // ---- what the model is offered ---------------------------------------------
 
 /// The start a production driver makes: every capability the chain turns on
@@ -1973,4 +2174,8 @@ on_both_engines!(
     a_tools_question_reaches_the_person_and_the_answer_comes_back,
     a_delegated_subtask_is_reported_narrated_and_billed,
     a_team_run_reaches_the_team_panel,
+    a_turn_ending_on_its_last_allowed_round_is_not_cut_off,
+    the_round_budget_asks_before_it_cuts_a_turn_off,
+    a_turn_left_cut_off_says_so,
+    a_cut_off_turn_asks_before_giving_up,
 );
