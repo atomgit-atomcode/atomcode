@@ -133,6 +133,73 @@ impl Introspect {
         }
     }
 
+    /// What can be delegated to, read at the moment of asking.
+    ///
+    /// Never cached and never counted anywhere else: a login, a `/model` or an
+    /// edited config changes this list mid-session. That is also why the system
+    /// prompt says nothing countable about it — a fragment that moved with the
+    /// catalog would invalidate the cached prefix every time the catalog did.
+    fn models(&self) -> String {
+        let Some(models) = self.ctx.service::<crate::seams::ModelsSvc>() else {
+            return "This tree has no model catalog: `task` and `team` run on the \
+                    conversation's own model, and a `model` argument is refused."
+                .into();
+        };
+        let current = models.current();
+        let offered = crate::seams::delegatable(models.as_ref());
+        if offered.is_empty() {
+            return "This tree has a catalog but nothing in it to delegate to — not even \
+                    this conversation's own model, which means the catalog does not \
+                    contain it. `task` and `team` run here regardless; they simply take \
+                    no `model`."
+                .into();
+        }
+        let ranked = offered.iter().any(|m| m.capable_rank.is_some());
+        let rows = offered
+            .iter()
+            .map(|m| {
+                format!(
+                    "  {id}{here} — {name}, ctx {ctx}{vision}{effort}{note}",
+                    id = m.id,
+                    here = if current.as_deref() == Some(m.id.as_str()) {
+                        " (this conversation)"
+                    } else {
+                        ""
+                    },
+                    name = m.display_name,
+                    ctx = m.context_window,
+                    vision = if m.supports_vision { ", vision" } else { "" },
+                    effort = if m.effort_levels.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", effort {}", m.effort_levels.join("/"))
+                    },
+                    note = match &m.note {
+                        Some(note) => format!("\n      {note}"),
+                        None => String::new(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "Models `task` and `team` may be delegated to. Pass one of these ids as \
+             `model`; omit it to keep the conversation's own model.\n\n\
+             {rows}\n\n\
+             {why}",
+            why = if ranked {
+                "Ordered weakest first where the deployment says so. Anything more capable \
+             than this conversation is deliberately absent: choosing to spend more is \
+             the person's decision, made when they picked this model."
+            } else {
+                "This deployment has not said which of these is more capable, so they are \
+             not ordered and none is known to be cheaper. Pick on the facts above — \
+             context window, vision, and whatever note the deployment wrote — not on \
+             the name."
+            }
+        )
+    }
+
     fn settings(&self) -> String {
         // Rendered from the same catalog the config system edits through, so a
         // setting that is added, renamed or retired changes this answer without
@@ -229,8 +296,8 @@ impl Tool for DescribeSelf {
             "properties": {
                 "aspect": {
                     "type": "string",
-                    "enum": ["session", "services", "tools", "operations", "settings", "all"],
-                    "description": "session = which session this is and where its log is; services = what is mounted; tools = the live catalog; operations = how to change things (model, memory, plugins, layout); settings = the user-settings catalog including language. Defaults to everything but settings."
+                    "enum": ["session", "services", "tools", "models", "operations", "settings", "all"],
+                    "description": "session = which session this is and where its log is; services = what is mounted; tools = the live catalog; models = what `task` and `team` may be delegated to, read live; operations = how to change things (model, memory, plugins, layout); settings = the user-settings catalog including language. Defaults to everything but settings."
                 }
             }
         })
@@ -257,6 +324,7 @@ impl Tool for DescribeSelf {
             "session" => self.inner.session(),
             "services" => self.inner.services(),
             "tools" => self.inner.tools(),
+            "models" => self.inner.models(),
             "operations" => self.inner.operations(),
             "settings" => self.inner.settings(),
             // `all` deliberately omits `settings`: it is a 26-row table that

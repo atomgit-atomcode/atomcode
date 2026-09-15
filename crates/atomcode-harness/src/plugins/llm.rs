@@ -303,6 +303,96 @@ struct UtilityRow {
     supports_reasoning_effort: bool,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct UtilitySelectedRow {
+    /// A selection id from the `models` catalog. Unset picks the weakest model
+    /// the catalog offers, which is what a side call wants by definition.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// The side-call model, chosen from the host's catalog rather than configured.
+///
+/// The difference from [`LlmUtilityOpenAiCompatPlugin`] is where the provider
+/// comes from: that row BUILDS one from an endpoint and a key, which is right
+/// for a deployment that has its own gateway and wrong for a host that already
+/// holds correctly-built providers (authenticated, account-bound, possibly
+/// signing). This row asks the host for one by id.
+///
+/// Unset means "the weakest on offer". A side call is a title, a summary, a
+/// suggestion — a program reads the answer, not a person — so the cheapest
+/// model that can do it is the right default, and which one that is changes
+/// with the deployment rather than with this code.
+pub struct LlmUtilitySelectedPlugin;
+
+#[async_trait]
+impl Plugin for LlmUtilitySelectedPlugin {
+    fn name(&self) -> &'static str {
+        "llm-utility-selected"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["models"]
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["llm-utility"]
+    }
+    fn description(&self) -> &'static str {
+        "the side-call model, picked from the host's catalog by id"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: UtilitySelectedRow = if config.is_null() {
+            UtilitySelectedRow::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        let models = ctx
+            .service::<crate::seams::ModelsSvc>()
+            .ok_or("the `models` seam must be filled")?;
+        let offered = crate::seams::delegatable(models.as_ref());
+        let id = match &row.model {
+            Some(id) => {
+                let id = id.trim();
+                if !offered.iter().any(|m| m.id == id) {
+                    return Err(format!(
+                        "`{id}` is not on offer; the catalog has: {}",
+                        offered
+                            .iter()
+                            .map(|m| m.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                id.to_string()
+            }
+            // The cheapest model that can be SHOWN to be cheap. With no ranks
+            // anywhere this is `None`, and leaving the slot empty is the right
+            // answer: side calls then run on the conversation's model, exactly
+            // as they did before this row existed. Picking "probably that one"
+            // out of an unordered catalog would be inferring cost from a name.
+            None => match crate::seams::cheapest(models.as_ref()) {
+                Some(weakest) => weakest.id.clone(),
+                None => return Ok(()),
+            },
+        };
+        let provider = models.provider(&id).await?;
+        let _ = ctx
+            .provide::<LlmUtilitySvc>(provider)
+            .map_err(|e| e.to_string())?;
+        crate::plugins::self_knowledge::describes(
+            ctx,
+            "llm-utility",
+            12,
+            format!(
+                "SIDE-CALL MODEL — `{id}`, chosen from the model catalog. Side calls are \
+                 titles, summaries and the simple team roles. Set this row's `model` to a \
+                 different selection id, or leave it unset for the weakest model on offer. \
+                 `describe_self(aspect=\"models\")` lists them."
+            ),
+        );
+        Ok(())
+    }
+}
+
 pub struct LlmUtilityOpenAiCompatPlugin;
 
 #[async_trait]

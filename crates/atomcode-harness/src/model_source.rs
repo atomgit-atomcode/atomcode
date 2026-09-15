@@ -13,6 +13,9 @@
 //! deployment that wants a different one replaces the slot.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use atomcode_kernel::provider::LlmProvider;
 
 use atomcode_config::config::provider::ResolvedModelConfig;
 
@@ -45,6 +48,134 @@ pub enum Want<'a> {
         api_key_env: Option<&'a str>,
         model: &'a str,
     },
+}
+
+/// One model a host can build a provider for, as the tree sees it.
+///
+/// Deliberately not `ResolvedModelConfig`: that one carries the api key and the
+/// wire details, which are the host's business. This is what a ROW may know —
+/// enough to choose, and nothing that would be bad to print.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelInfo {
+    /// What a `model` argument names. The host's selection id, not the wire
+    /// model name: a deployment may expose the same wire model twice under
+    /// different settings.
+    pub id: String,
+    pub display_name: String,
+    pub context_window: usize,
+    pub supports_vision: bool,
+    /// Higher is more capable. `None` means this model does not participate in
+    /// capability ordering, which is also how the delegation ceiling reads it:
+    /// unranked models are never offered to a subagent, because nothing is
+    /// known about what delegating to them costs.
+    pub capable_rank: Option<i64>,
+    /// Reasoning levels this model accepts. Empty means no effort switching.
+    pub effort_levels: Vec<String>,
+    /// Free text from the host: what this model is good for. Never inferred
+    /// from the name.
+    pub note: Option<String>,
+}
+
+/// The models this host can build a provider for.
+///
+/// A seam, not a function, for the same reason the rest of this module is one:
+/// building a provider needs auth, an account, a gateway — the host's business.
+/// A row that wants to run a child on a different model names an id and asks.
+///
+/// Optional by design. A tree with one `llm` row and no catalog simply has no
+/// choice to offer, and the rows that read this seam say so rather than
+/// pretending: `task` and `team` keep running on the conversation's model.
+#[async_trait::async_trait]
+pub trait Models: Send + Sync {
+    /// Everything the host knows about, unfiltered. Read live: a login or a
+    /// `/model` can change it mid-session, so no caller may cache it.
+    fn list(&self) -> Vec<ModelInfo>;
+    /// The selection id the conversation itself is running on, when it is one
+    /// of the above.
+    fn current(&self) -> Option<String>;
+    /// Build (or reuse) the provider for one id.
+    async fn provider(&self, id: &str) -> Result<Arc<dyn LlmProvider>, String>;
+}
+
+/// What a subagent may be delegated to, given who is asking.
+///
+/// **A rank is evidence to EXCLUDE, never a requirement to be included.** The
+/// first version of this had it backwards — it demanded a `capable_rank` on the
+/// conversation's model and on every candidate, and returned nothing when
+/// either was missing. That is correct in the sense that nothing can be ordered
+/// without ranks, and useless in practice: the shipped config has a rank on one
+/// model out of four, so the feature was dead on arrival for the deployment it
+/// was written for, and the only fixes on offer were "change what the gateway
+/// sends" and "make the person edit config.toml". Neither is a fix.
+///
+/// So the rule is stated as a filter with a floor:
+///
+/// * **the conversation's own model is always on the list.** Delegating to it
+///   spends exactly what the person already chose, so there is nothing to
+///   decide and nothing to guard. This is the floor the whole feature degrades
+///   to, and with no catalog at all `task` and `team` still run here.
+/// * **both ranked** ⇒ the ceiling applies: no stronger than the conversation.
+/// * **neither ranked** ⇒ offered. Two models nobody ordered are siblings; there
+///   is no evidence one costs more than the other, and refusing on no evidence
+///   is how the feature died the first time.
+/// * **only the candidate ranked** ⇒ withheld. A rank exists precisely to mark a
+///   capability tier, and one marked against an unmarked conversation cannot be
+///   placed below it.
+/// * **only the conversation ranked** ⇒ the candidate is withheld for the mirror
+///   reason: it cannot be shown to be at or below the ceiling.
+///
+/// Sorted weakest-known-first, with the unordered ones after them — so
+/// [`cheapest`] can mean something even when most of the catalog says nothing.
+pub fn delegatable(models: &dyn Models) -> Vec<ModelInfo> {
+    let all = models.list();
+    // No idea what this conversation runs on ⇒ no floor to stand on and no
+    // ceiling to measure against, so nothing is offered. `task` and `team` are
+    // unaffected: they take no `model` and run where they already were.
+    let Some(current) = models.current() else {
+        return Vec::new();
+    };
+    let current = Some(current);
+    let here = |m: &ModelInfo| current.as_deref() == Some(m.id.as_str());
+    let host_rank = all.iter().find(|m| here(m)).and_then(|m| m.capable_rank);
+
+    let mut out: Vec<ModelInfo> = all
+        .into_iter()
+        .filter(|m| {
+            here(m)
+                || match (host_rank, m.capable_rank) {
+                    (Some(ceiling), Some(rank)) => rank <= ceiling,
+                    (None, None) => true,
+                    _ => false,
+                }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.capable_rank
+            .is_none()
+            .cmp(&b.capable_rank.is_none())
+            .then_with(|| a.capable_rank.cmp(&b.capable_rank))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    out
+}
+
+/// The cheapest model that can be SHOWN to be cheap, or `None`.
+///
+/// For the side-call slot, which wants the weakest thing that can write a title.
+/// `None` when nothing in the catalog carries a rank — and `None` means the slot
+/// stays empty and side calls run on the conversation's model, which is what
+/// they did before any of this existed. Guessing "probably that one" from a
+/// context window or a name would be the same mistake as inferring cost from a
+/// model's name.
+pub fn cheapest(models: &dyn Models) -> Option<ModelInfo> {
+    delegatable(models)
+        .into_iter()
+        .filter(|m| m.capable_rank.is_some())
+        .min_by(|a, b| {
+            a.capable_rank
+                .cmp(&b.capable_rank)
+                .then_with(|| a.id.cmp(&b.id))
+        })
 }
 
 /// What every caller gets back, whatever the source: one shape, so no caller has

@@ -17,12 +17,14 @@ use atomcode_kernel::tool::{Tool, ToolDef};
 use atomcode_plexus::{plexus_service, Context};
 
 use crate::agent::{Agent, Agents};
+pub use crate::model_source::{cheapest, delegatable, ModelInfo, Models};
 use crate::session::{LoggedEvent, SessionLog, SessionProjections};
 pub use atomcode_capabilities::tools::Opener;
 pub use atomcode_capabilities::world::{FileSystem, Shell};
 
 plexus_service!(LlmSvc => dyn LlmProvider, "llm", Seam, "Model adapter");
 plexus_service!(LlmUtilitySvc => dyn LlmProvider, "llm-utility", Seam, "The model for side calls whose result a program consumes — titles, summaries, suggestions — not the conversation");
+plexus_service!(ModelsSvc => dyn Models, "models", Seam, "Every model this host can build a provider for, so a row can run a child on a different one");
 plexus_service!(ToolsSvc => ToolBox, "tools", Core, "The live tool catalog");
 plexus_service!(SystemPromptSvc => PromptRegistry, "system-prompt", Core, "Ordered prompt fragments");
 // Reuses `PromptRegistry` because the shape is identical — ranked fragments
@@ -517,13 +519,38 @@ pub trait Findings: Send + Sync {
     fn take(&self) -> Vec<atomcode_capabilities::tools::Finding>;
 }
 
+/// One delegated job, as asked for.
+///
+/// A struct rather than a growing argument list: what a delegation may state
+/// grows with what a deployment turns out to need — a model, then an effort —
+/// and each addition as a positional argument is a silent change of meaning at
+/// every call site.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Delegation<'a> {
+    /// What the child should accomplish.
+    pub task: &'a str,
+    /// Standing instructions for the child.
+    pub instructions: &'a str,
+    /// A selection id from the [`Models`] seam, or `None` to run the child on
+    /// the conversation's own model. An id the catalog does not offer is an
+    /// error, never a silent fallback: a subagent quietly running on a different
+    /// model than was asked for is the one outcome nobody could spot.
+    pub model: Option<&'a str>,
+    /// How hard the child should think, for a model that accepts the knob.
+    /// `None` leaves whatever the tree already decided (the `reasoning-effort`
+    /// row) in charge — the right default, and the wrong thing to be stuck with
+    /// when the delegated job is a five-minute survey and the conversation is
+    /// set to `max`.
+    pub effort: Option<&'a str>,
+}
+
 /// Delegation. A seam because "a child agent in this process", "a fork of this
 /// session" and "another product entirely" are all legitimate answers behind
 /// one interface.
 #[async_trait]
 pub trait Subagents: Send + Sync {
     fn describe(&self) -> String;
-    async fn spawn(&self, task: &str, instructions: &str) -> SubagentOutcome;
+    async fn spawn(&self, work: Delegation<'_>) -> SubagentOutcome;
 }
 
 /// The turn driver. A seam like any other: the shipped loop is one row in the

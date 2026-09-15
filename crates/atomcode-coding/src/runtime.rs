@@ -2063,10 +2063,25 @@ impl CodingRuntime {
                                 } else {
                                     vec![from_config.as_str()]
                                 };
+                                // The model catalog, when this host has one.
+                                // Both halves come from what `install_subagent_tiers`
+                                // already put on the config a few lines above, so the
+                                // tree and the chain resolve a selection through the
+                                // same resolver — including its reset on `/model`.
+                                let models = agent
+                                    .subagent_config
+                                    .clone()
+                                    .zip(agent.subagent_model_providers.clone())
+                                    .map(|(config, providers)| crate::on_harness::HostModels {
+                                        config,
+                                        providers,
+                                        current: agent.provider_name.clone(),
+                                    });
                                 let (handle, app, providers) = crate::on_harness::mount_swappable(
                                     &agent.working_dir,
                                     presence,
                                     provider,
+                                    models,
                                     &extra,
                                 )
                                 .await

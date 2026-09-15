@@ -154,6 +154,7 @@ pub fn provision_openrouter(
                 },
                 max_tokens: None,
                 capable_model: None,
+                note: None,
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,

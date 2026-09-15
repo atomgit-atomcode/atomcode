@@ -58,7 +58,7 @@ macro_rules! seam_catalog {
 
 use crate::seams::{
     AgentHandleSvc, AgentLoopSvc, AgentsSvc, ApprovalSvc, CodeIndexSvc, CompactionSvc, ControlSvc,
-    FindingsSvc, FsSvc, LlmSvc, LlmUtilitySvc, McpSvc, OpenerSvc, OperationsSvc,
+    FindingsSvc, FsSvc, LlmSvc, LlmUtilitySvc, McpSvc, ModelsSvc, OpenerSvc, OperationsSvc,
     SessionDefaultsSvc, SessionPersistenceSvc, SessionProjectionsSvc, SessionSvc, SessionTitleSvc,
     ShellSvc, SkillsSvc, SubagentsSvc, SystemPromptSvc, ToolsSvc, UiSvc, UserQuestionsSvc,
 };
@@ -68,6 +68,7 @@ seam_catalog!(
     OperationsSvc,
     LlmSvc,
     LlmUtilitySvc,
+    ModelsSvc,
     ToolsSvc,
     SystemPromptSvc,
     SessionSvc,
@@ -92,15 +93,18 @@ seam_catalog!(
     AgentHandleSvc,
 );
 
-/// Slots the host reads directly rather than through a plugin. `run_turn` calls
-/// `agent-loop`; the launcher prints titles and audits the tree.
+/// Slots the host fills itself.
 ///
-/// Public because the audit needs the same list: a slot the binary itself calls
-/// is consumed, and reporting it as dead weight would bury the slots that
-/// really are.
-/// Slots the host fills itself. Only the launcher owns the `App`, so only it
-/// can offer reconfiguration of the running tree.
-pub const HOST_PROVIDED: &[&str] = &["control"];
+/// `control`: only the launcher owns the `App`, so only it can offer
+/// reconfiguration of the running tree.
+///
+/// `models`: which models exist is the person's `config.toml` plus whatever
+/// their login wrote into it, and BUILDING one needs credentials, an account
+/// and possibly a signing gateway. A row that tried would be a second, worse
+/// copy of the host's provider factory — and the rows that read this seam
+/// (`model-catalog`, `llm-utility-selected`, `task`, `team`) are careful to
+/// treat its absence as "there is no choice here", not as an error.
+pub const HOST_PROVIDED: &[&str] = &["control", "models"];
 
 /// Slots no row fills because they belong to an agent, not to the tree: the
 /// agent registry provides each agent's own log into its realm when the agent
@@ -108,6 +112,12 @@ pub const HOST_PROVIDED: &[&str] = &["control"];
 /// them, and so the "every seam has a provider" rule knows they are not orphans.
 pub const AGENT_PROVIDED: &[&str] = &["sessions"];
 
+/// Slots the host reads directly rather than through a plugin. `run_turn` calls
+/// `agent-loop`; the launcher prints titles and audits the tree.
+///
+/// Public because the audit needs the same list: a slot the binary itself calls
+/// is consumed, and reporting it as dead weight would bury the slots that
+/// really are.
 pub const HOST_CONSUMED: &[&str] = &[
     // The launcher resolves `ui` and hands over; `run_turn` and friends reach
     // for the rest.

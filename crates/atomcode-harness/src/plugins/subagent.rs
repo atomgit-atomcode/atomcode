@@ -25,7 +25,12 @@ use atomcode_plexus::{Context, Plugin};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::events::{TurnProgress, TurnStopping};
+use atomcode_kernel::provider::ReasoningEffort;
+use atomcode_plexus::{Next, Waterfall};
+
+use crate::events::{
+    AgentRequest, ModelRequest, ModelResponse, RequestError, TurnProgress, TurnStopping,
+};
 use crate::seams::{
     AgentLoopSvc, AgentsSvc, SessionSvc, StopReason, SubagentOutcome, Subagents, SubagentsSvc,
     SystemPromptSvc, ToolBox, ToolsSvc,
@@ -43,6 +48,122 @@ impl atomcode_plexus::Listener<TurnStopping> for ChildRoundCap {
     async fn call(&self, progress: &TurnProgress) -> Option<StopReason> {
         (progress.rounds >= self.max_steps).then_some(StopReason::MaxRounds)
     }
+}
+
+/// The provider a delegated child should run on, or `None` for "inherit".
+///
+/// One place, because `task` and `team` must answer this identically — two
+/// resolutions of "which model" is how a fleet ends up half on the model the
+/// person picked and half on something else.
+///
+/// Every failure names what IS on offer. A model that guessed an id gets the
+/// list back and can pick again; a model that guessed and was silently given
+/// the default would never learn.
+pub(crate) async fn resolve_child_model(
+    ctx: &Context,
+    model: Option<&str>,
+) -> Result<Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>, String> {
+    let Some(id) = model.map(str::trim).filter(|m| !m.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(models) = ctx.service::<crate::seams::ModelsSvc>() else {
+        return Err(
+            "this tree has no model catalog, so `model` cannot be honoured; omit it to run \
+             on this conversation's model"
+                .into(),
+        );
+    };
+    let offered = crate::seams::delegatable(models.as_ref());
+    if !offered.iter().any(|m| m.id == id) {
+        let names = offered
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(if names.is_empty() {
+            format!("`{id}` is not available to delegate to, and neither is anything else")
+        } else {
+            format!("`{id}` is not available to delegate to; you may use: {names}")
+        });
+    }
+    models.provider(&id).await.map(Some)
+}
+
+/// The thinking level one delegated child runs at, on its own realm.
+///
+/// Scoped to the child for the same reason its tools are: the level is a fact
+/// about the job that child was given, so two children delegated at different
+/// levels must not share an answer. Registered with `prepend`, because this is
+/// more specific than the session's `reasoning-effort` row — which still fills
+/// in for any child that asks for nothing.
+/// Writes one role's thinking tier onto every request that member makes.
+///
+/// Deliberately narrow: it sets the level and touches nothing else, so the
+/// session-wide row, the provider's own `thinking_type`, and every other
+/// per-call option keep working underneath it. Registered on the member's realm
+/// with `prepend`, because a role that names a tier knows better than the
+/// session default it would otherwise inherit.
+pub(crate) struct RoleEffort {
+    pub(crate) effort: ReasoningEffort,
+}
+
+#[async_trait]
+impl Waterfall<AgentRequest> for RoleEffort {
+    async fn handle(
+        &self,
+        req: &mut ModelRequest,
+        next: Next<'_, AgentRequest>,
+    ) -> Result<ModelResponse, RequestError> {
+        req.options.reasoning_effort = Some(self.effort);
+        next.run(req).await
+    }
+}
+
+/// The thinking level a delegated child should run at, validated against what
+/// the model it will run on actually accepts.
+///
+/// Two checks, and the second is the one worth having: `max` is a real level
+/// and a model that only advertises `low`/`high` will drop it on the floor at
+/// the adapter. A knob that is silently discarded is worse than one that is
+/// refused, because the person reads the transcript and concludes the level did
+/// not help.
+pub(crate) fn resolve_child_effort(
+    models: Option<&std::sync::Arc<dyn crate::seams::Models>>,
+    on: Option<&str>,
+    effort: Option<&str>,
+) -> Result<Option<atomcode_kernel::provider::ReasoningEffort>, String> {
+    let Some(asked) = effort.map(str::trim).filter(|e| !e.is_empty()) else {
+        return Ok(None);
+    };
+    let level =
+        atomcode_kernel::provider::ReasoningEffort::from_config(Some(asked)).ok_or_else(|| {
+            format!(
+                "`{asked}` is not a thinking level; use one of: {}",
+                crate::REASONING_EFFORT_LEVELS.join(", ")
+            )
+        })?;
+    // Which model this will run on: the one named, else the conversation's.
+    let target = on
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .or_else(|| models.and_then(|m| m.current()));
+    if let (Some(models), Some(target)) = (models, target) {
+        if let Some(info) = models.list().into_iter().find(|m| m.id == target) {
+            // An empty list means the deployment said nothing, not that the
+            // model accepts nothing — the same "silence is not a no" rule the
+            // rest of this catalog runs on.
+            if !info.effort_levels.is_empty()
+                && !info.effort_levels.iter().any(|l| l == level.as_str())
+            {
+                return Err(format!(
+                    "`{target}` does not take `{asked}`; it accepts: {}",
+                    info.effort_levels.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(Some(level))
 }
 
 /// Runs a child agent in an isolated realm of the same process.
@@ -63,7 +184,20 @@ impl Subagents for InProcessSubagents {
         )
     }
 
-    async fn spawn(&self, task: &str, instructions: &str) -> SubagentOutcome {
+    async fn spawn(&self, work: crate::seams::Delegation<'_>) -> SubagentOutcome {
+        // Both resolved before the child exists: a bad id, or a level this model
+        // will not honour, must fail the tool call — not leave a half-created
+        // agent behind, and certainly not run anyway at a level nobody asked for.
+        let catalog = self.ctx.service::<crate::seams::ModelsSvc>();
+        let effort = match resolve_child_effort(catalog.as_ref(), work.model, work.effort) {
+            Ok(effort) => effort,
+            Err(e) => return SubagentOutcome::failed(e),
+        };
+        let model = match resolve_child_model(&self.ctx, work.model).await {
+            Ok(model) => model,
+            Err(e) => return SubagentOutcome::failed(e),
+        };
+        let (task, instructions) = (work.task, work.instructions);
         let (Some(agents), Some(driver), Some(parent_tools)) = (
             self.ctx.service::<AgentsSvc>(),
             self.ctx.service::<AgentLoopSvc>(),
@@ -96,14 +230,30 @@ impl Subagents for InProcessSubagents {
             .id(format!("sub-{}", crate::agent::mint_session_id()))
             .persist(false)
             .setup(Box::new(move |realm: &Context| {
-                Ok(vec![
+                let mut held = vec![
                     realm
                         .provide::<ToolsSvc>(restricted)
                         .map_err(|e| e.to_string())?,
                     realm
                         .provide::<SystemPromptSvc>(prompts)
                         .map_err(|e| e.to_string())?,
-                ])
+                ];
+                // The child's own `llm`, on its own realm: lookup walks up, so
+                // the parent keeps the model it had and a sibling delegated
+                // elsewhere is unaffected.
+                if let Some(model) = model.clone() {
+                    held.push(
+                        realm
+                            .provide::<crate::seams::LlmSvc>(model)
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+                if let Some(effort) = effort {
+                    held.push(
+                        realm.on_waterfall::<AgentRequest>(Arc::new(RoleEffort { effort }), true),
+                    );
+                }
+                Ok(held)
             }));
         if let Some(parent) = parent {
             req = req.parent(parent);
@@ -147,6 +297,12 @@ struct TaskArgs {
     /// Optional extra standing instructions for the child.
     #[serde(default)]
     instructions: Option<String>,
+    /// A selection id from the model catalog. Absent ⇒ this conversation's model.
+    #[serde(default)]
+    model: Option<String>,
+    /// How hard the child should think. Absent ⇒ whatever the tree is set to.
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 const DEFAULT_INSTRUCTIONS: &str = "\
@@ -175,7 +331,9 @@ impl Tool for TaskTool {
             "type": "object",
             "properties": {
                 "task": { "type": "string", "description": "The complete task, stated so it needs no follow-up" },
-                "instructions": { "type": "string", "description": "Extra standing instructions for the subagent" }
+                "instructions": { "type": "string", "description": "Extra standing instructions for the subagent" },
+                "model": { "type": "string", "description": "Run this subagent on a different model: a selection id from `describe_self(aspect=\"models\")`. Omit to use this conversation's model." },
+                "effort": { "type": "string", "description": "How hard the subagent should think, for a model that takes the knob — the levels each model accepts are in `describe_self(aspect=\"models\")`. Omit to leave this conversation's setting in charge." }
             },
             "required": ["task"]
         })
@@ -210,7 +368,14 @@ impl Tool for TaskTool {
             };
         };
         let instructions = args.instructions.as_deref().unwrap_or(DEFAULT_INSTRUCTIONS);
-        let outcome = subagents.spawn(&args.task, instructions).await;
+        let outcome = subagents
+            .spawn(crate::seams::Delegation {
+                task: &args.task,
+                instructions,
+                model: args.model.as_deref(),
+                effort: args.effort.as_deref(),
+            })
+            .await;
         ToolResult {
             call_id: String::new(),
             content: outcome.report(),
@@ -305,6 +470,64 @@ impl Plugin for SubagentPlugin {
                 row.allowed_tools.join(", ")
             ),
         );
+        Ok(())
+    }
+}
+
+// ---- telling the model the catalog exists --------------------------------
+
+/// One line in the system prompt, and not one word more.
+///
+/// The catalog itself is answered on demand (`describe_self(aspect="models")`)
+/// rather than inlined, for two reasons that point the same way:
+///
+/// 1. **it changes**. A login, a `/model`, an edited config — the list is not a
+///    fact about the build, it is a fact about right now. Inlined, it would be
+///    stale between the moment it was rendered and the moment it was read.
+/// 2. **the prompt is a cache prefix**. A fragment that moved with the catalog
+///    would invalidate the cached system prefix every time a model was added or
+///    a plan changed. This one carries no count, no names, no ordering —
+///    nothing that can move — so the prefix survives a catalog that does not.
+///
+/// Which is why there is a criterion in `tests/subagent.rs` asserting this
+/// fragment renders byte-identically against two different catalogs. A number
+/// in this string is the easiest possible regression and the hardest to notice.
+const CATALOG_POINTER: &str = "Work can be delegated to a model other than this one: `task` and `team` both take a `model` id. Call `describe_self(aspect=\"models\")` for what is on offer right now — the list changes with logins and model switches, so read it when you need it rather than assuming.";
+
+pub struct ModelCatalogPlugin;
+
+#[async_trait]
+impl Plugin for ModelCatalogPlugin {
+    fn name(&self) -> &'static str {
+        "model-catalog"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["system-prompt"]
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        // Not `inject`: a tree with no catalog is a tree with nothing to say
+        // here, and this row falling silent is the right answer rather than a
+        // reason to wait forever.
+        &["models"]
+    }
+    fn description(&self) -> &'static str {
+        "tells the model that delegation can pick a model, without naming any"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let Some(models) = ctx.service::<crate::seams::ModelsSvc>() else {
+            return Ok(());
+        };
+        // The conversation's own model is always delegatable, so a catalog that
+        // offers only it offers no CHOICE — and telling the model to go look
+        // would send it to a tool call that can only answer "the one you are
+        // already on". One entry is the same as none, as far as this line goes.
+        //
+        // Note what this does and does not depend on: whether an alternative
+        // exists, not how many there are. The string itself never moves.
+        if crate::seams::delegatable(models.as_ref()).len() < 2 {
+            return Ok(());
+        }
+        contribute_prompt(ctx, "model-catalog", 56, CATALOG_POINTER);
         Ok(())
     }
 }

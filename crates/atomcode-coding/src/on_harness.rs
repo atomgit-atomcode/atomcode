@@ -135,6 +135,30 @@ name = "code-graph"
 [[insert]]
 name = "tool-web"
 
+# The model catalog, and the two rows that only make sense with one.
+#
+# Off in the list and switched on by `mount_swappable` when the host actually
+# hands one over — a tree mounted without a catalog (the differential's plain
+# `mount`, an embedder that only has one provider) would otherwise wait forever
+# for a seam nobody fills. They are here rather than inserted from Rust because
+# this list is meant to be the whole answer: a reader should see that this
+# product has a catalog, and that the side-call model comes out of it.
+[[insert]]
+name = "models-host"
+disabled = true
+
+# The side-call model: titles, summaries, the `simple` team roles. Unset picks
+# the weakest model on offer, which is what a side call wants by definition.
+[[insert]]
+name = "llm-utility-selected"
+disabled = true
+
+# One line telling the model that `task` and `team` take a `model` id, and where
+# to look. It says nothing countable on purpose — see the row's own docs.
+# Harmless without a catalog: it reads the seam rather than waiting on it.
+[[insert]]
+name = "model-catalog"
+
 # Reviewing the current changes in-session. On, because the chain has had
 # `review: true` in `PrepareOptions::default()` from the start and every shipped
 # driver leaves it on — `/review` is a product feature, not an extra.
@@ -446,12 +470,121 @@ impl ProviderSlots {
         id
     }
 
+    /// The one provider this table holds: what the `llm` row is serving now.
+    ///
+    /// Well-defined precisely because [`Self::insert`] keeps exactly one entry.
+    pub fn current(&self) -> Option<Arc<dyn LlmProvider>> {
+        self.slots
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .next()
+            .cloned()
+    }
+
     fn get(&self, id: &str) -> Option<Arc<dyn LlmProvider>> {
         self.slots
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
             .cloned()
+    }
+}
+
+/// What the host knows about models, handed to the tree at mount.
+///
+/// Three things the tree cannot work out for itself: which models exist (the
+/// person's `config.toml` plus whatever the gateway wrote there at login), how
+/// to BUILD one (auth, account, signing — the host's provider factory), and
+/// which one this conversation is on.
+///
+/// Deliberately the ingredients rather than a finished `Models`: the catalog
+/// also needs the live `ProviderSlots`, which does not exist until the mount is
+/// under way.
+pub struct HostModels {
+    pub config: Arc<atomcode_config::config::Config>,
+    pub providers: Arc<crate::SubagentModelProviders>,
+    /// The selection id this conversation runs on.
+    pub current: String,
+}
+
+/// The `models` seam, answered from what the host already had.
+///
+/// Note how little is new here: `logical_models()` is the catalog the settings
+/// UI and `/model` already read, and `SubagentModelProviders` is the lazily
+/// building, telemetry-wrapping resolver the hand-written chain has used for
+/// `task` since before this tree existed — including being reset on `/model` by
+/// `refresh_subagent_tiers`. **Both engines resolve a model selection through
+/// the same code**, which is the only way the two stay honest about it.
+struct CodingModels {
+    host: HostModels,
+    slots: Arc<ProviderSlots>,
+}
+
+#[async_trait]
+impl atomcode_harness::seams::Models for CodingModels {
+    fn list(&self) -> Vec<atomcode_harness::seams::ModelInfo> {
+        self.host
+            .config
+            .logical_models()
+            .into_iter()
+            .map(|(id, m)| atomcode_harness::seams::ModelInfo {
+                display_name: m.display_name.clone().unwrap_or_else(|| m.model.clone()),
+                context_window: m.context_window,
+                // Same rule `ProviderConfig::accepts_images` applies: an explicit
+                // value wins, else the name heuristic. Reading it any other way
+                // here would make the catalog disagree with what the provider
+                // actually does.
+                supports_vision: m
+                    .supports_vision
+                    .unwrap_or_else(|| atomcode_config::util::model_name_suggests_vision(&m.model)),
+                capable_rank: m.capable_model,
+                effort_levels: m.reasoning_effort_levels.clone().unwrap_or_default(),
+                note: m.note.clone(),
+                id,
+            })
+            .collect()
+    }
+
+    fn current(&self) -> Option<String> {
+        Some(self.host.current.clone())
+    }
+
+    async fn provider(&self, id: &str) -> Result<Arc<dyn LlmProvider>, String> {
+        // `get` answers `Ok(None)` for "that is the host's own model" — the
+        // collapse path the chain uses too. Serving the live slot rather than
+        // building a second provider for the same endpoint keeps one set of
+        // credentials in the process, which is what `/logout` relies on.
+        if id != self.host.current {
+            if let Some(built) = self.host.providers.get(id)? {
+                return Ok(built);
+            }
+        }
+        self.slots
+            .current()
+            .ok_or_else(|| "no provider is behind the `llm` seam".to_string())
+    }
+}
+
+/// Hands the tree the host's catalog.
+struct InjectModels(Arc<dyn atomcode_harness::seams::Models>);
+
+#[async_trait]
+impl Plugin for InjectModels {
+    fn name(&self) -> &'static str {
+        "models-host"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["models"]
+    }
+    fn description(&self) -> &'static str {
+        "the models this host can build a provider for"
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_harness::seams::ModelsSvc>(self.0.clone())
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 }
 
@@ -586,7 +719,8 @@ pub async fn mount(
     provider: Arc<dyn LlmProvider>,
     extra_layers: &[&str],
 ) -> Result<(AgentHandle, App), String> {
-    let (handle, app, _) = mount_swappable(working_dir, presence, provider, extra_layers).await?;
+    let (handle, app, _) =
+        mount_swappable(working_dir, presence, provider, None, extra_layers).await?;
     Ok((handle, app))
 }
 
@@ -599,6 +733,7 @@ pub async fn mount_swappable(
     working_dir: &Path,
     presence: Presence,
     provider: Arc<dyn LlmProvider>,
+    models: Option<HostModels>,
     extra_layers: &[&str],
 ) -> Result<(AgentHandle, App, Arc<ProviderSlots>), String> {
     let model = provider.model_name().to_string();
@@ -620,8 +755,17 @@ pub async fn mount_swappable(
             wd = working_dir.to_string_lossy(),
         ),
     };
+    // With a catalog, the two rows that need one come on; without, they stay
+    // down and `task`/`team` run on the conversation's model, which is what they
+    // did before the seam existed.
+    let catalog = if models.is_some() {
+        "[[patch]]\nid = \"models-host\"\ndisabled = false\n\n\
+         [[patch]]\nid = \"llm-utility-selected\"\ndisabled = false\n"
+    } else {
+        ""
+    };
     let scoped = format!(
-        "{boundary}\n\
+        "{catalog}{boundary}\n\
          [[patch]]\nid = \"agent-loop\"\nconfig = {{ working_dir = {wd:?} }}\n\n\
          [[patch]]\nid = \"llm\"\nname = \"llm-injected\"\nconfig = {{ provider_id = {pid:?} }}\n",
         wd = working_dir.to_string_lossy(),
@@ -667,6 +811,12 @@ pub async fn mount_swappable(
     // inserts it, the way the chain mounts the engine only when one exists.
     registry.register(Arc::new(CcHooksPlugin));
     registry.register(Arc::new(InjectProvider(providers.clone())));
+    if let Some(host) = models {
+        registry.register(Arc::new(InjectModels(Arc::new(CodingModels {
+            host,
+            slots: providers.clone(),
+        }))));
+    }
 
     let mut app = App::new(registry, tree);
     app.start().await.map_err(|e| e.to_string())?;

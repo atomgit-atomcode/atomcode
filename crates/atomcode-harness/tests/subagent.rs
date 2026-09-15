@@ -340,7 +340,11 @@ config = { script = [
         .context()
         .service::<SubagentsSvc>()
         .unwrap()
-        .spawn("read a.txt", "do the task")
+        .spawn(atomcode_harness::seams::Delegation {
+            task: "read a.txt",
+            instructions: "do the task",
+            ..Default::default()
+        })
         .await;
     assert_eq!(outcome.stop, StopReason::Stopped);
     assert_eq!(

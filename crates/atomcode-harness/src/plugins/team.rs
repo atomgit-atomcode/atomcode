@@ -26,14 +26,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use atomcode_kernel::provider::ReasoningEffort;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
-use atomcode_plexus::{Context, Next, Plugin, Waterfall};
+use atomcode_plexus::{Context, Plugin};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::agent::{Agent, AgentId, CreateAgent, MessageOrigin};
-use crate::events::{
-    AgentRequest, ModelRequest, ModelResponse, RequestError, SessionEventCommitted, TurnStopping,
-};
+use crate::events::{AgentRequest, SessionEventCommitted, TurnStopping};
 use crate::seams::{
     AgentsSvc, FsSvc, LlmSvc, LlmUtilitySvc, SessionSvc, ShellSvc, ToolBox, ToolsSvc,
 };
@@ -41,7 +39,7 @@ use crate::session::{Committed, SessionEvent};
 use crate::REASONING_EFFORT_LEVELS;
 
 use super::agent_loop::{keep_driven, Driving};
-use super::subagent::ChildRoundCap;
+use super::subagent::{ChildRoundCap, RoleEffort};
 use super::tools::{contribute_prompt, mount};
 
 // ---- roles ----------------------------------------------------------------
@@ -75,6 +73,13 @@ struct Role {
     when: String,
     /// An explicit tool list, instead of the permission's default set.
     tools: Option<Vec<String>>,
+    /// A selection id this role should run on, overriding `difficulty`.
+    ///
+    /// `difficulty` says "cheap or the conversation's", which is all a generic
+    /// two-tier setup can say. This says WHICH — for a project that knows one
+    /// of its models is the good reviewer. A `delegate` call may still override
+    /// it per member.
+    model: Option<String>,
     /// How hard this member should think, when the role says. `None` leaves the
     /// session's own setting (the `reasoning-effort` row) in charge.
     ///
@@ -100,6 +105,10 @@ fn built_in(
         persona: persona.into(),
         when: when.into(),
         tools: None,
+        // Built-in roles name no model: which models exist is a fact about the
+        // deployment, and a shipped default naming one would be wrong everywhere
+        // but where it was written.
+        model: None,
         effort: Some(effort),
     }
 }
@@ -170,6 +179,7 @@ fn built_in_roles() -> Vec<Role> {
 /// permission: explore        # or worker
 /// difficulty: simple         # or hard
 /// effort: low                # optional; how hard this member thinks
+/// model: glm-4.6             # optional; a selection id, overriding difficulty
 /// when: cataloguing what exists
 /// tools: read_file, grep     # optional; replaces the permission's default set
 /// ---
@@ -194,6 +204,7 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
     let mut effort = None;
     let mut when = String::new();
     let mut tools = None;
+    let mut model = None;
     let mut body = String::new();
     let mut in_front = true;
     for line in lines {
@@ -251,6 +262,10 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
                     })?)
                 }
                 "when" => when = value.to_string(),
+                // Not validated here: the catalog is a runtime fact and this
+                // file is read at mount. An id that is not on offer fails at
+                // `delegate`, with the list of what is.
+                "model" => model = Some(value.to_string()).filter(|m: &String| !m.is_empty()),
                 "tools" => {
                     tools = Some(
                         value
@@ -287,6 +302,7 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
         persona,
         when,
         tools,
+        model,
         effort,
     })
 }
@@ -459,6 +475,12 @@ struct TeamArgs {
     text: Option<String>,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    /// A selection id for this member, overriding whatever the role says.
+    #[serde(default)]
+    model: Option<String>,
+    /// How hard this member should think, overriding the role's `effort`.
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 impl TeamTool {
@@ -553,13 +575,48 @@ impl TeamTool {
                 }
             ),
         );
-        let utility = match role.difficulty {
-            Difficulty::Simple => self.ctx.service::<LlmUtilitySvc>(),
-            Difficulty::Hard => None,
+        // Which model this member runs on, most specific first:
+        //
+        //   1. what this `delegate` call named — the person's hint, relayed;
+        //   2. what the role file named — a project's standing choice;
+        //   3. `difficulty: simple` ⇒ the `llm-utility` seam, when one is mounted;
+        //   4. nothing ⇒ inherit the conversation's, by realm lookup.
+        //
+        // A named id that is not on offer FAILS here rather than falling through
+        // to the next rule: silently demoting a member the person asked to run on
+        // a specific model is the failure nobody would see.
+        let named = args
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .or_else(|| role.model.clone());
+        // Same order as the model, for the same reason: what this call said,
+        // else what the role standing behind it said, else nothing — and
+        // "nothing" leaves the session's `reasoning-effort` row in charge.
+        // Validated against the model it will actually run on, so a level that
+        // model would silently drop is refused here instead.
+        let asked_effort = args
+            .effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(str::to_string);
+        let effort_override = super::subagent::resolve_child_effort(
+            self.ctx.service::<crate::seams::ModelsSvc>().as_ref(),
+            named.as_deref(),
+            asked_effort.as_deref(),
+        )?;
+        let chosen = super::subagent::resolve_child_model(&self.ctx, named.as_deref()).await?;
+        let utility = match (chosen, role.difficulty) {
+            (Some(model), _) => Some(model),
+            (None, Difficulty::Simple) => self.ctx.service::<LlmUtilitySvc>(),
+            (None, Difficulty::Hard) => None,
         };
         // Captured out of `role` before the realm closure takes `tools_for_realm`
         // and friends; the closure is `move` and `role` is not otherwise kept.
-        let role_effort = role.effort;
+        let role_effort = effort_override.or(role.effort);
         let member_id = format!("{lead_session}/{name}");
         let lead_id = lead.id();
         let member_name = name.clone();
@@ -646,9 +703,13 @@ impl TeamTool {
             );
         child.send_from(task, MessageOrigin::Peer(lead_id));
         Ok(format!(
-            "delegated to `{name}` ({}){}. It will report through `tell_parent`; use `wait` \
+            "delegated to `{name}` ({}{}){}. It will report through `tell_parent`; use `wait` \
              to block on it or `status` to look.",
             role.id,
+            match &named {
+                Some(model) => format!(" on {model}"),
+                None => String::new(),
+            },
             match &worktree {
                 Some((dir, branch)) => format!(
                     ", working in its own checkout {} on branch `{branch}`",
@@ -933,6 +994,8 @@ impl Tool for TeamTool {
                     "description": "delegate needs name, role, task; tell needs name, text; wait needs name (timeout_secs optional); stop takes name or none for all; status takes nothing"
                 },
                 "name": { "type": "string", "description": "The member's name (delegate, tell, wait, stop)" },
+                "model": { "type": "string", "description": "Run this member on a different model: a selection id from `describe_self(aspect=\"models\")`. Omit to use the role's own choice, or this conversation's model." },
+                "effort": { "type": "string", "description": "How hard this member should think, overriding the role's own level. The levels each model accepts are in `describe_self(aspect=\"models\")`." },
                 "role": {
                     "type": "string",
                     "enum": self.roles.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
@@ -1042,29 +1105,6 @@ impl Default for TeamRow {
             worktrees: false,
             worktrees_dir: None,
         }
-    }
-}
-
-/// Writes one role's thinking tier onto every request that member makes.
-///
-/// Deliberately narrow: it sets the level and touches nothing else, so the
-/// session-wide row, the provider's own `thinking_type`, and every other
-/// per-call option keep working underneath it. Registered on the member's realm
-/// with `prepend`, because a role that names a tier knows better than the
-/// session default it would otherwise inherit.
-struct RoleEffort {
-    effort: ReasoningEffort,
-}
-
-#[async_trait]
-impl Waterfall<AgentRequest> for RoleEffort {
-    async fn handle(
-        &self,
-        req: &mut ModelRequest,
-        next: Next<'_, AgentRequest>,
-    ) -> Result<ModelResponse, RequestError> {
-        req.options.reasoning_effort = Some(self.effort);
-        next.run(req).await
     }
 }
 

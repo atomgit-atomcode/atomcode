@@ -1187,6 +1187,21 @@ async fn several_rounds() {
     }
 }
 
+/// What a cancel may cost, and why it is not 380ms.
+///
+/// The measurement is not "how long the cancel took" — it is how long the RIG
+/// took, and the rig keeps listening for `GRACE` (250ms) after the turn ends so
+/// that anything trailing the turn is still compared. So a perfectly prompt
+/// cancel reads ≈ 60ms (the wait before sending it) + 250ms ≈ 310ms, and a 380ms
+/// budget left 70ms of headroom for scheduling on a loaded machine. It duly
+/// failed on one.
+///
+/// The teeth are unaffected by loosening it: an engine that waits out the
+/// in-flight round reads 60 + 400 + 250 ≈ 710ms, which is nowhere near this.
+/// A budget has to discriminate between the two outcomes, not sit as close to
+/// one of them as the machine will allow.
+const CANCEL_BUDGET: std::time::Duration = std::time::Duration::from_millis(520);
+
 #[tokio::test]
 async fn a_cancel_lands() {
     // Cancellation is the one command whose whole value is timing. What must
@@ -1223,7 +1238,7 @@ async fn a_cancel_lands() {
 
     for (who, took) in [("参考", took_reference), ("候选", took_candidate)] {
         assert!(
-            took < std::time::Duration::from_millis(380),
+            took < CANCEL_BUDGET,
             "{who}: 取消用了 {took:?} —— 那一轮本来就要 400ms，说明它在等回合跑完\
              而不是中断它{report}"
         );
@@ -2579,7 +2594,7 @@ async fn a_cancel_lands_on_the_harness() {
 
     for (who, took) in [("链式", took_chain), ("行式", took_rows)] {
         assert!(
-            took < std::time::Duration::from_millis(380),
+            took < CANCEL_BUDGET,
             "{who}: 取消用了 {took:?} —— 那一轮本来就要 400ms，说明它在等回合跑完\
              而不是中断它{report}"
         );
@@ -3583,6 +3598,7 @@ async fn a_model_switch_puts_a_different_provider_behind_the_seam() {
         &dir,
         atomcode_coding::on_harness::Presence::Attended,
         first,
+        None,
         &[quiet.as_str()],
     )
     .await
@@ -3642,6 +3658,7 @@ async fn a_model_switch_renames_the_persona_too() {
         &dir,
         atomcode_coding::on_harness::Presence::Attended,
         Script::text(&["ok"]),
+        None,
         &[quiet.as_str()],
     )
     .await
@@ -3697,6 +3714,7 @@ async fn a_logout_takes_the_credentials_and_leaves_the_agent() {
         &dir,
         atomcode_coding::on_harness::Presence::Attended,
         Script::text(&["ok"]).as_model("signed-in-model"),
+        None,
         &[quiet.as_str()],
     )
     .await
@@ -3766,6 +3784,7 @@ async fn a_logout_drops_the_provider_object_and_not_only_the_seam() {
         &dir,
         atomcode_coding::on_harness::Presence::Attended,
         signed_in.clone(),
+        None,
         &[quiet.as_str()],
     )
     .await

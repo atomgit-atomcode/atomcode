@@ -282,6 +282,15 @@ name = "tool-ask"
 name = "subagent-in-process"
 disabled = true
 
+# NOTE: `model-catalog` and `llm-utility-selected` are deliberately NOT here.
+# Both name the `models` seam, and nothing in this crate fills it — the catalog
+# is the HOST's (which models exist, and how to build one, needs auth and an
+# account). Base carrying a row whose seam no registered plugin can provide is
+# exactly what `the_shipped_tree_audits_clean` refuses, and it is right to:
+# the same rule already keeps `opener` and `user-questions` out of base and in
+# the app bundles that fill them. A product with a catalog inserts both rows
+# beside its own `models` provider; `atomcode-coding` does.
+
 # External MCP servers are other people's processes: opt in.
 [[insert]]
 name = "mcp"

@@ -155,6 +155,12 @@ pub struct ModelProfileConfig {
     /// (design §14.2). Higher = more capable; unset ⇒ does not participate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capable_model: Option<i64>,
+    /// What this model is good for, in the deployment's own words. Shown when
+    /// the agent asks what it may delegate to, so a person can write "fast,
+    /// weak at Rust" once instead of watching the model guess from the name.
+    /// Never inferred: an absent note is shown as absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
