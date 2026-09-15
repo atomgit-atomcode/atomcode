@@ -3722,6 +3722,111 @@ async fn a_model_switch_renames_the_persona_too() {
 }
 
 #[tokio::test]
+async fn the_delegation_guidance_comes_from_the_rows_that_own_the_tools() {
+    // One tool, one row, one paragraph about it — and the paragraph leaves with the row,
+    // because `contribute_prompt` ties them together. This engine's `team` and `task` are the
+    // harness rows', so the harness rows are what describes them.
+    //
+    // It did not use to be. The coding persona appended the CHAIN assembly's guidance for both
+    // tools (`## TEAM AGENT:` for the run-id `team`, `## DELEGATING WITH \`task\`` for the
+    // `subagent_type`/`difficulty` `task`), gated on `ATOMCODE_SUBAGENT` rather than on what was
+    // mounted. On this engine that is a second answer to a question already answered, and the
+    // wrong one wins half the time: it named a `wait` action this `team` does not have — action
+    // set is delegate/tell/status/stop — and a `subagent_type` this `task` does not take. A
+    // mounted-tool check is what this gate is, and it is the thing the persona's own comment
+    // asked for ("gate on the SAME condition as the mount decision") but could not express from
+    // the other engine.
+    let dir = scratch("rows-own-their-words");
+    let quiet = quiet_rows(&dir);
+    let (handle, mut app, _) = atomcode_coding::on_harness::mount_swappable(
+        &dir,
+        atomcode_coding::on_harness::Presence::Attended,
+        Script::text(&["ok"]).as_model("rows-own-their-words"),
+        None,
+        &[quiet.as_str()],
+    )
+    .await
+    .expect("mount");
+    drop(handle);
+    let prompt = app
+        .context()
+        .service::<atomcode_harness::seams::SystemPromptSvc>()
+        .expect("system-prompt")
+        .render();
+
+    // Each row's own words about its own tool.
+    assert!(
+        prompt.contains("delegates a self-contained job"),
+        "the `task` row must describe its own tool:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("runs named child agents that stay around"),
+        "the `team` row must describe its own tool too:\n{prompt}"
+    );
+    // Including the judgment the parameter list cannot carry. It lived only in the persona, so
+    // deleting the persona's copy would have dropped it silently — that is why it moved here
+    // rather than being removed.
+    assert!(
+        prompt.contains("Not for a single read or grep"),
+        "the when-NOT-to-delegate rule must survive the move:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("non-overlapping scopes"),
+        "and so must the rule for running several at once:\n{prompt}"
+    );
+    // Same move, same reason, for the two other rows whose guidance used to be a persona
+    // paragraph: `tool-todo` (was `## TASK TRACKING`) and `tool-code-review` (was
+    // `## CODE REVIEW`). Each carries its own copy now, and the row-list persona carries none.
+    assert!(
+        prompt.contains("not only the next action"),
+        "the todo row must carry the planning rules, not just the one-line pointer:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("never batch-completing several at the end"),
+        "…all the way to the rule that made the persona's copy worth keeping:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("pass the requested scope and path filters straight to it"),
+        "the code-review row must carry the review routing rule:\n{prompt}"
+    );
+
+    // And the other engine's copy of any of it, nowhere. This is the regression itself.
+    assert!(
+        !prompt.contains("## TEAM AGENT:"),
+        "the chain assembly's `team` guidance must not reach this engine:\n{prompt}"
+    );
+    assert!(
+        !prompt.contains("## DELEGATING WITH `task`"),
+        "nor its `task` guidance:\n{prompt}"
+    );
+    assert!(
+        !prompt.contains("subagent_type"),
+        "this `task` has no `subagent_type` parameter, and saying otherwise is a phantom \
+         call the model has no way to know is phantom:\n{prompt}"
+    );
+    for section in ["## TASK TRACKING:", "## CODE REVIEW:"] {
+        assert_eq!(
+            prompt.matches(section).count(),
+            0,
+            "`{section}` belongs to the row that mounts the tool now — its presence here means \
+             the persona paragraph came back as a second answer:\n{prompt}"
+        );
+    }
+    // `## MEMORY` is the exception and stays in the persona, because the `memory` row registers
+    // the tool without contributing a paragraph. What moved is the GATE — the row list asks
+    // `has("memory")` instead of the `ATOMCODE_MEMORY_TOOL` env, which cannot see a tree that
+    // failed to mount the tool. The harness mounts `memory`, so the guidance must be here.
+    // (The gate itself is locked by `persona_rows.rs`' unit test, which drives the parameter
+    // directly rather than depending on the ambient env this test would have to mutate.)
+    assert!(
+        prompt.contains("## MEMORY"),
+        "the memory guidance is the persona's to give on this engine — the row contributes no \
+         paragraph, so `has(\"memory\")` must be what puts it here:\n{prompt}"
+    );
+    app.stop();
+}
+
+#[tokio::test]
 async fn a_logout_takes_the_credentials_and_leaves_the_agent() {
     // What `/logout` must do on this engine, and what it must NOT do.
     //

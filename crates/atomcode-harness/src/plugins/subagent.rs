@@ -482,6 +482,11 @@ impl Plugin for SubagentPlugin {
             ctx,
             vec![Arc::new(TaskTool { ctx: ctx.clone() }) as Arc<dyn Tool>],
         )?;
+        // This row's guidance for this row's tool, and nothing else: the rules a parameter list
+        // cannot carry — when NOT to delegate, and how to run several at once without them
+        // colliding. It used to sit in the coding persona, which described the chain assembly's
+        // `task` (`subagent_type`/`difficulty`) in the same breath, so the model was told about
+        // a tool with different parameters than the one it actually had.
         contribute_prompt(
             ctx,
             "subagent",
@@ -489,7 +494,12 @@ impl Plugin for SubagentPlugin {
             &format!(
                 "`task` delegates a self-contained job to a subagent with a reduced tool set \
                  (the ones this tree actually mounts, out of: {}). Use it for work whose \
-                 intermediate output you do not need to see.",
+                 intermediate output you do not need to see — a broad read-only sweep, or \
+                 several independent subtasks at once. Not for a single read or grep you can do \
+                 here in one call: a lone subagent costs a slow extra model round for no gain. \
+                 State each task completely, and when several run at once give them \
+                 non-overlapping scopes — two of them editing one file collide. What comes back \
+                 is a claim: weigh it, verify what matters.",
                 row.allowed_tools.join(", ")
             ),
         );

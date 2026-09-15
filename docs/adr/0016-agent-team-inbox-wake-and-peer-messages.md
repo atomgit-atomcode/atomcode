@@ -38,7 +38,7 @@ inbox 与 steering(父到子)、`findings` 缝(结构化结果)、`CreateAgent.s
 
 ## team 行(`plugins/team.rs`,Agent 能力行)
 
-`team` 工具:delegate(name、role、task)/ tell / status / wait / stop。成员按
+`team` 工具:delegate(name、role、task)/ tell / status / stop(`wait` 已删,见文末补节)。成员按
 `<lead session>/<name>` 命名、`persist = false`、`keep_driven` 驱动、round cap 独立。
 角色表五个(explorer、reviewer、implementer、tester、docs_writer),每个定
 permission(Explore 只读 / Worker 可写文件,永远没有 bash)和 difficulty(Simple
@@ -52,7 +52,7 @@ permission(Explore 只读 / Worker 可写文件,永远没有 bash)和 difficulty
 `tests/agent.rs`:没人 drive 的 agent 被 send 后自己跑回合、注入不起回合、句柄后的
 agent 被直接 send 也跑。`tests/team.rs`:成员在旁路模型上跑、任务以 lead 的 Peer
 消息到达、报告以成员的 Peer 消息进 lead 日志且模型看到「[message from」;沉默的
-成员被代报;status / wait / tell / stop 只有 lead 能调且 stop 撤销 agent;成员的
+成员被代报;status / tell / stop 只有 lead 能调且 stop 撤销 agent;成员的
 工具集只有 `tell_parent`、没有 `team`、没有 bash、explorer 没有写。
 harness + tui 481 全绿,差分基线未动,clippy 干净。
 
@@ -74,6 +74,64 @@ harness + tui 481 全绿,差分基线未动,clippy 干净。
 
 一条不借:按型号名选模型。它能这么做是因为型号表固定且自己控制;私有化部署的
 型号表每家不同,档的抽象更稳。
+
+## 补:wait 已于 2026-09-15 删除
+
+`team` 的 `wait` 动作(lead 阻塞到成员空闲再取回最后一句)已移除,动作集现为
+delegate / tell / status / stop。理由:同步委派本就有 `task` 这一行——它一次把子
+agent 跑到终态并交回报告,且天然并行(一个回合里发几个就并行几个)。`team` 的定位
+是**异步、跨回合长驻**的成员,报告经 `tell_parent` 推回 lead(机制一/二),lead 不需
+要也不应该把回合堵在某个成员上。`wait` 把这条分工线糊掉了。
+
+另外它和工具的自我描述互相矛盾:描述写「delegate, then carry on or end your turn;
+you do not have to wait」,而 delegate 的返回值写「use `wait` to block on it」——
+返回值是刚落地到上下文里的最新文本,离决策点更近,实测 lead 会照后者做,于是连串
+wait 把回合锁死,用户在此期间无法插话。
+
+闸门 `tests/team.rs` 随之改名 `status_tell_and_stop_are_the_leads_to_call`,原先用
+`wait` 做同步的三处断言改为测试自己的 `until_idle` + 读成员日志的 `last_said`;
+「不存在的成员」的 Refusal 文案断言从 `wait` 转发到 `tell`。harness 312 全绿。
+
+注意:`atomcode-coding/src/team/tool.rs` 里另有一个 `team` 工具(动作含
+delegate / wait / result,参数是 `run_id`),那是 coding 侧独立的一套,本次未动。
+
+## 补:提示词随工具走,team 与 task 两处割裂已合(2026-09-15,同日)
+
+上节删 `wait` 只修了工具,没修「谁描述这个工具」。两套同名工具让**同一个缝被割在两处**:
+
+| 缝的一半 | owner | 在场取决于 |
+| --- | --- | --- |
+| `team` 工具 + 短描述 | 行 `team-in-process`(`team.rs:1145` 挂工具,`team.rs:1198` contribute) | **行清单** |
+| `team` 长指导(`## TEAM AGENT:`) | 行 `persona-atomcode` → `persona.rs:279` 拼 `TEAM_DELEGATION` | **env `ATOMCODE_SUBAGENT`** |
+
+后半段描述的是 Chain 那套 run-id `team`。`task` 同病:`## DELEGATING WITH \`task\``
+教模型传 `subagent_type`/`explore`/`worker`/`hard`,全仓只有它自己提这些词——Chain 挂的
+`capabilities/tools/task.rs` 才有这些参数。Rows 挂的 `task` 参数是
+`task`/`instructions`/`model`/`effort`(见 `harness/plugins/subagent.rs`)。serde 忽略未知
+字段,于是模型以为派了个只读子 agent,实际按默认跑,不报错也不生效。
+
+harness 这边本来就是对的:`contribute_prompt` 的契约就是「Contribute a prompt fragment
+that disappears with its plugin」(`harness/plugins/tools.rs:43`),每一行给自己挂的工具
+带话。错的是 Rows 的 persona 行调了 Chain 的 legacy 包装 `coding_persona`——`persona.rs:52`
+自己标注它用 env-only 判据,而 `persona.rs:272` 那段注释要求「MUST stay gated on the SAME
+condition as the mount decision」。env 判不出挂的是哪一套 team。
+
+改法(Chain 引擎一行未动):`on_harness.rs:1744` 改调 `coding_persona_with_capabilities`
+并把 delegation 两位传 `false`,身份行与纪律保留、两段委派文案不再注入;原先只在 persona
+里的**判断类**指导(别为一次 read/grep 起子 agent、并行要 scope 不重叠、回报是主张要核)
+移进 `subagent-in-process` 行自己的片段,不是删掉。persona.rs 的 `TEAM_DELEGATION` /
+`SUBAGENT_DELEGATION` 两个常量及其 env 门断言原样保留——Chain 侧挂的确实带
+`subagent_type`,那段文案在那边是对的。
+
+闸门:`differential.rs` 新增 `the_delegation_guidance_comes_from_the_rows_that_own_the_tools`,
+在 `mount_swappable` 后的渲染提示上断言四件在(两行各自的描述 + 两条判断类规则)、三件不在
+(`## TEAM AGENT:`、`## DELEGATING WITH \`task\``、`subagent_type`)。已验阴性对照:退回
+`coding_persona` 即红在「chain 的 team 文案不得进这棵树」。harness 312 / coding 541
+(8 skipped)/ tui 499,`fmt --check` 退 0。
+
+注意:本节只合了 Rows 这条路径。Chain 仍由 `parts.rs:746` 挂它自己的 `team`、由
+`capabilities` 挂带 `subagent_type` 的 `task`,`persona.rs` 的静态文案在那边与工具一致;
+两条引擎并存是 `runtime.rs:857-859` 记明的现状,不在本次范围。
 
 ## 未做
 

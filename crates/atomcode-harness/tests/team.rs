@@ -137,6 +137,20 @@ async fn until_idle(agent: &Agent) {
     panic!("member never went idle");
 }
 
+/// The member's last words, from its own log — what a `wait` used to hand back.
+fn last_said(agent: &Agent) -> Option<String> {
+    agent
+        .session()
+        .events()
+        .into_iter()
+        .rev()
+        .filter_map(|e| match e.event {
+            SessionEvent::AssistantMessage { text, .. } if !text.trim().is_empty() => Some(text),
+            _ => None,
+        })
+        .next()
+}
+
 const DELEGATE: &str = r#"{ text = "delegating", calls = [ { name = "team", args = { action = "delegate", name = "scout", role = "explorer", task = "find where sessions are created" } } ] }"#;
 
 #[tokio::test]
@@ -247,7 +261,7 @@ async fn a_member_that_finishes_silently_is_reported_on() {
 }
 
 #[tokio::test]
-async fn status_wait_tell_and_stop_are_the_leads_to_call() {
+async fn status_tell_and_stop_are_the_leads_to_call() {
     let dir = scratch("lifecycle");
     let app = start(tree(
         &dir,
@@ -261,9 +275,10 @@ async fn status_wait_tell_and_stop_are_the_leads_to_call() {
     let scout_session = format!("{}/scout", lead.session_id());
     let scout = agents.by_session(&scout_session).unwrap();
 
-    let waited = as_lead(&app, &lead, r#"{"action":"wait","name":"scout"}"#).await;
-    assert!(!waited.is_error, "{}", waited.content);
-    assert_eq!(waited.content, "first answer");
+    // There is no `wait`: the member's answer is read from its own log, and
+    // what reaches the lead does so as a message rather than a return value.
+    until_idle(&scout).await;
+    assert_eq!(last_said(&scout).as_deref(), Some("first answer"));
 
     let status = as_lead(&app, &lead, r#"{"action":"status"}"#).await;
     assert!(
@@ -280,8 +295,7 @@ async fn status_wait_tell_and_stop_are_the_leads_to_call() {
     .await;
     assert!(!told.is_error, "{}", told.content);
     until_idle(&scout).await;
-    let waited = as_lead(&app, &lead, r#"{"action":"wait","name":"scout"}"#).await;
-    assert_eq!(waited.content, "second answer");
+    assert_eq!(last_said(&scout).as_deref(), Some("second answer"));
     assert_eq!(
         peers(&scout).len(),
         2,
@@ -311,7 +325,12 @@ async fn status_wait_tell_and_stop_are_the_leads_to_call() {
         as_lead(&app, &lead, r#"{"action":"status"}"#).await.content,
         "no members"
     );
-    let gone = as_lead(&app, &lead, r#"{"action":"wait","name":"scout"}"#).await;
+    let gone = as_lead(
+        &app,
+        &lead,
+        r#"{"action":"tell","name":"scout","text":"hi"}"#,
+    )
+    .await;
     assert!(
         gone.content.contains("do not survive a restart"),
         "{}",

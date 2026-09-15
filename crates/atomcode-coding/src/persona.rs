@@ -186,6 +186,70 @@ pub fn coding_persona_with_language(
     )
 }
 
+/// The same discipline for the row-list assembly (`on_harness`), where two of the guidance
+/// paragraphs belong to rows instead of to this module.
+///
+/// `## TASK TRACKING` and `## CODE REVIEW` are contributed by the rows that mount `todowrite`
+/// and `code_review` — `contribute_prompt` ties each paragraph to the row that owns it, so it
+/// arrives and leaves with the tool. This module used to hand the row-list persona the CHAIN
+/// assembly's paragraphs as well.
+///
+/// `## MEMORY` is different and stays here, with one change: `memory` registers the tool without
+/// contributing a paragraph, so dropping the text would drop the guidance entirely rather than
+/// move it. What was wrong was the GATE — an `ATOMCODE_MEMORY_TOOL` env read inside
+/// `coding_persona`, which cannot see a row list that failed to mount the tool. `memory_mounted`
+/// is that question asked of the running tree (`has("memory")`) instead.
+///
+/// Why the chain's copies were wrong HERE, specifically: the losing answer is whichever the
+/// model reads second, and the chain's named a `wait` action the row list's `team` does not
+/// have, a `subagent_type` its `task` does not take, and `request_user_input` when the mounted
+/// tool is `ask_user`.
+pub(crate) fn coding_persona_rows(
+    model: &str,
+    preferred_language: Option<atomcode_config::locale::Locale>,
+    memory_mounted: bool,
+) -> String {
+    let full = coding_persona_gated(
+        model,
+        preferred_language,
+        // `todo`/`review` are still passed on: they are what put the two paragraphs there for
+        // the removals below to take out. Nothing else about the chain text changes.
+        true,
+        false,
+        true,
+        false,
+        false,
+        memory_mounted,
+    );
+    // One removal per owner, and each is asserted gone by the row-list gate rather than trusted
+    // to a future edit of the block above.
+    let mut p = full;
+    for owned_by_a_row in ["\n\n## TASK TRACKING:", "\n\n## CODE REVIEW:"] {
+        p = remove_section(&p, owned_by_a_row);
+    }
+    p
+}
+
+/// Drop the `## SECTION` starting at `heading` up to the next `## ` heading (or the end).
+///
+/// The row list composes its prompt from fragments joined by `\n\n`, so a top-level `## ` at the
+/// start of a line is the boundary. Returning the input unchanged when the heading is absent is
+/// deliberate: a missing section must be loud in the gate, not silent here.
+fn remove_section(text: &str, heading: &str) -> String {
+    let Some(start) = text.find(heading) else {
+        return text.to_string();
+    };
+    let body = &text[start + heading.len()..];
+    let end = body
+        .find("\n## ")
+        .map(|i| start + heading.len() + i)
+        .unwrap_or(text.len());
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..start]);
+    out.push_str(&text[end..]);
+    out
+}
+
 pub(crate) fn coding_persona_with_capabilities(
     model: &str,
     preferred_language: Option<atomcode_config::locale::Locale>,
@@ -194,6 +258,31 @@ pub(crate) fn coding_persona_with_capabilities(
     review_enabled: bool,
     subagents_enabled: bool,
     external_subagents_enabled: bool,
+) -> String {
+    // The chain asks the env, which is how it has always decided. The row list asks the running
+    // tree — see `coding_persona_rows`.
+    coding_persona_gated(
+        model,
+        preferred_language,
+        todo_enabled,
+        request_user_input_enabled,
+        review_enabled,
+        subagents_enabled,
+        external_subagents_enabled,
+        memory_tool_enabled(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn coding_persona_gated(
+    model: &str,
+    preferred_language: Option<atomcode_config::locale::Locale>,
+    todo_enabled: bool,
+    request_user_input_enabled: bool,
+    review_enabled: bool,
+    subagents_enabled: bool,
+    external_subagents_enabled: bool,
+    memory_enabled: bool,
 ) -> String {
     let commit_language = commit_language_guidance(preferred_language);
     #[allow(unused_mut)] // `mut` is only used under `cfg(windows)` below.
@@ -266,7 +355,7 @@ Skip the trailer for `git commit --amend` and `git revert`. Only commit when the
     }
     #[cfg(feature = "atomgit")]
     p.push_str(ATOMGIT_TOOL_USAGE);
-    if memory_tool_enabled() {
+    if memory_enabled {
         p.push_str(MEMORY_USAGE);
     }
     // Delegation guidance for the `task` subagent tool — surfaced in the system prompt (not
@@ -1798,6 +1887,55 @@ mod tests {
             coding_persona_with_capabilities("glm-5.2", None, true, false, false, true, false);
         assert!(!persona.contains("## CODE REVIEW:"));
         assert!(!persona.contains("`code_review` tool is available"));
+    }
+
+    #[test]
+    fn the_row_list_persona_leaves_the_rows_own_paragraphs_to_the_rows() {
+        // The row-list entry point must not carry what a row contributes. Each of these is
+        // locked by the row-list gate too (`differential.rs`), but this pins the seam itself:
+        // the removals are the function's whole reason to exist, and a future edit of the chain
+        // text above can silently put a section back.
+        let p = coding_persona_rows("glm-5.2", None, true);
+        for owned_by_a_row in [
+            "## DELEGATING WITH `task`",
+            "## TEAM AGENT:",
+            "## TASK TRACKING:",
+        ] {
+            assert!(
+                !p.contains(owned_by_a_row),
+                "`{owned_by_a_row}` belongs to the row that mounts the tool, not to the persona"
+            );
+        }
+        // What stays: the identity line, the discipline, and the sections no row writes.
+        assert!(p.starts_with("You are AtomCode"));
+        assert!(p.contains("## DOING TASKS"));
+        assert!(p.contains("## SKILLS:"));
+        assert!(
+            p.contains("## WHEN COMMANDS FAIL"),
+            "the discipline must survive"
+        );
+    }
+
+    #[test]
+    fn the_memory_paragraph_follows_the_mounted_tool_not_the_env() {
+        // The chain reads `ATOMCODE_MEMORY_TOOL`; the row list asks the tree. The difference is
+        // observable exactly where the old gate was wrong — a tree that has the tool while the
+        // env says otherwise — and testing it that way keeps this off the process-global env
+        // (which runtime tests race on; see the note above the delegation tests).
+        let mounted = coding_persona_rows("glm-5.2", None, true);
+        let absent = coding_persona_rows("glm-5.2", None, false);
+        assert!(
+            mounted.contains("## MEMORY"),
+            "the tool is mounted, so the guidance must be there"
+        );
+        assert!(
+            !absent.contains("## MEMORY"),
+            "no tool, no guidance — this is the phantom-call case the gate exists for"
+        );
+        // And nothing else moved with it: the gate must not silently drop other sections.
+        for section in ["## SKILLS:", "## DOING TASKS", "## WHEN COMMANDS FAIL"] {
+            assert!(mounted.contains(section) && absent.contains(section));
+        }
     }
 
     #[test]

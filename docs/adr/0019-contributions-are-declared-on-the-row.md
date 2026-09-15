@@ -173,6 +173,45 @@ pub(super) fn contribute_prompt(ctx: &Context, id: &str, rank: i32, text: &str) 
 - 上游未定:ADR 0018 的 L1(协议中立化)与本设计正交,谁先做都可以;但
   `tui-layout` 拆行会让 UI crate 多一个行——**如果 L1 也做,那行应当写在中立侧**。
 
+## 补:提示词片段按这个原则收了一轮(2026-09-15)
+
+本页的原则原本只被部分执行:`contribute_prompt` 的契约是「Contribute a prompt fragment
+that disappears with its plugin」(`harness/plugins/tools.rs`),harness 的 `team.rs` /
+`subagent.rs` / `policy_rows.rs` / `capabilities.rs` 每一行都照做了。漏的是 coding 的
+**静态 persona**:`persona.rs` 里同一件事又写了一遍,判据不是挂载实况而是 env 或硬编码,
+于是行式装配下出现「第二个答案」,而模型读到的是后一个。
+
+同一刀口割出来的是两类,不是一类:
+
+| 段 | persona 侧门控 | 工具 owner | 后果 |
+| --- | --- | --- | --- |
+| `## TEAM AGENT:` / `## DELEGATING WITH \`task\`` | env `ATOMCODE_SUBAGENT` | `team-in-process` / `subagent-in-process`(各已自述) | 描述的是**另一套**工具:run-id `team` 与带 `subagent_type` 的 `task` |
+| `## TASK TRACKING` / `## CODE REVIEW` | 硬编码 `true` | `tool-todo` / `tool-code-review` | 同一件事两个答案;行被 patch 掉后文案仍在 |
+| `## MEMORY` | env `ATOMCODE_MEMORY_TOOL` | `memory`(只注册工具,**不贡献段落**) | 门看不见「行没挂上」 |
+
+第三行是**门错**而非**归属错**:`memory` 行没有自己的段落,把人写的段落删掉就是丢内容。
+所以它留在 persona,只把门从 env 换成行式实况 `has("memory")`。
+
+做法:加 `coding_persona_rows`(`persona.rs`)——row 式装配的专用入口,由它调用 Chain 的
+正文再去掉属于行的两段。**Chain 的 `coding_persona*` 与 `parts.rs` 一字未动**,两段静态
+文案在那里与工具严格对应(`capabilities/tools/task.rs` 确有 `subagent_type`/`difficulty`)。
+`memory` 走 `coding_persona_gated` 多带一个位:Chain 传 `memory_tool_enabled()`,row 式传
+`has("memory")`,默认行为不变。
+
+顺带查出一个**真幽灵**:persona 的 `## ASKING THE USER` 教模型调 `request_user_input`
+(还带 `single`/`multiple`/`questions`),而行式挂的是 `ask_user`(参数 `question` +
+`options`)。名字差早已登记在 `differential.rs` 的 `KNOWN_TOOL_DIFFERENCES` 里,理由写着
+「persona 和命名它的提示词得跟着搬」——**工具侧有闸门盯着,提示词那一半没人盯**。
+
+闸门:`differential.rs::the_delegation_guidance_comes_from_the_rows_that_own_the_tools`
+验行式渲染提示里「该在的在、该不在的不在」;`persona.rs` 两条单测直接驱动参数锁住这两条
+接缝(不碰进程级 env,避免与 runtime 测试互踩)。harness 312 / coding 543 / tui 499 全绿,
+`fmt --check` 退 0。
+
+未做:**没有「提示词不得提名未挂载工具」的通用棘轮**。本轮只断言了具名的那几个,
+`change_dir` 那条也只管它自己一个名字。上面 `request_user_input` 正是从这个缺口漏出去的,
+下次换个名字照样漏。
+
 ## §5 为什么作废了「容器收集贡献」
 
 先前那版设计的核心是「插件声明贡献值,容器折叠成聚合体」。查 dsh 后作废,三条:

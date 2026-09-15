@@ -45,12 +45,30 @@ impl Plugin for TodoPlugin {
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         mount(ctx, vec![Arc::new(TodoTool::new()) as Arc<dyn Tool>])?;
+        // This row's guidance for this row's tool — including the judgment a parameter list
+        // cannot carry. It lived in the coding persona as `## TASK TRACKING`, which meant it
+        // described `todowrite` on BOTH assemblies and could not leave with this row when the
+        // tool was patched out.
         contribute_prompt(
             ctx,
             "tool-todo",
             53,
             "Use `todowrite` to plan multi-step work: add one todo per concrete step before you \
-             start, and mark each completed as soon as it is done.",
+             start, and mark each completed as soon as it is done. Call it FIRST when a task has \
+             multiple requests, phases, files, dependencies, ambiguity, or needs investigation \
+             followed by changes, and make the initial list cover the WHOLE request — \
+             investigation, design, implementation, verification — not only the next action. \
+             Each item names a concrete outcome a later turn can execute without re-planning \
+             (`add retry to fetch_user`, not `fix networking`; never `task 1` or `step 2`). Then \
+             keep it current ONE item at a time rather than resending the list: \
+             `todowrite {\"action\":\"update\",\"id\":N,\"status\":\"in_progress\"}` when you \
+             start #N, and `completed` the moment it is actually verified — never on intent, and \
+             never batch-completing several at the end. Keep exactly one item in_progress. \
+             Unless you need approval, hit the stop-when-stuck limit, or the request is \
+             ambiguous, do not declare done or hand back while any item is still open. If the \
+             user pivots to unrelated multi-step work, call it with the new full list to REPLACE \
+             the old one instead of carrying stale items forward. Not for a single quick edit, a \
+             one-off command, or a purely informational reply.",
         );
         Ok(())
     }

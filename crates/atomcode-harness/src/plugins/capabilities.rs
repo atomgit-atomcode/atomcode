@@ -361,13 +361,21 @@ impl Plugin for ReviewToolPlugin {
             ctx,
             vec![Arc::new(ReviewTool::new(slot, cfg)) as Arc<dyn Tool>],
         )?;
+        // This row's guidance for this row's tool. It lived in the coding persona as
+        // `## CODE REVIEW`, which described the tool on BOTH assemblies — and stayed describing
+        // it after this row was patched out of the tree.
         contribute_prompt(
             ctx,
             "tool-code-review",
             58,
             "`code_review` runs a reviewer over the current changes and reports what it \
              finds. It reads; it never edits. Use it before handing work back — not \
-             instead of running the tests.",
+             instead of running the tests. When the person asks to review code, a diff, staged \
+             changes, a commit, or a branch range, call it before writing the review and pass \
+             the requested scope and path filters straight to it rather than pre-reading the \
+             diff with ordinary read/search tools, which is what the scoped reviewer is for. It \
+             may report findings you did not find; weigh them. Do not claim it fixed files or \
+             posted comments — it does neither.",
         );
         Ok(())
     }

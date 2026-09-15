@@ -1712,9 +1712,10 @@ impl Plugin for CodingPersonaPlugin {
         "persona-atomcode"
     }
     fn uses(&self) -> &'static [&'static str] {
-        // The tool catalog decides what the persona may promise: it describes
-        // `todowrite` and `ask_user` only when they are actually mounted.
-        &["tools", "system-prompt"]
+        // `system-prompt` only. It used to read the tool catalog to decide whether to describe
+        // `todowrite` / `ask_user`; those decisions now belong to the rows that mount them,
+        // which is what makes the description leave when the tool does.
+        &["system-prompt"]
     }
     fn description(&self) -> &'static str {
         "coding's own persona, in place of the harness's generic one"
@@ -1741,7 +1742,13 @@ impl Plugin for CodingPersonaPlugin {
         } else {
             row.model.clone()
         };
-        let text = crate::persona::coding_persona(&model, has("todowrite"), has("ask_user"));
+        // Three kinds of thing used to be decided here and are not any more: the two delegation
+        // paragraphs (`team-in-process`, `subagent-in-process`), `## TASK TRACKING` (`tool-todo`)
+        // and `## CODE REVIEW` (`tool-code-review`) are each contributed by the row that mounts
+        // the tool and leave with it. `## MEMORY` stays here — the `memory` row registers the
+        // tool but contributes no paragraph — so it is asked of the running tree instead of the
+        // `ATOMCODE_MEMORY_TOOL` env the chain reads. See `coding_persona_rows`.
+        let text = crate::persona::coding_persona_rows(&model, None, has("memory"));
         let Some(prompts) = ctx.service::<atomcode_harness::seams::SystemPromptSvc>() else {
             return Ok(());
         };
