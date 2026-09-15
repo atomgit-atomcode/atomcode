@@ -728,11 +728,11 @@ impl BashWorkspaceGate {
         rt: &RequestCtx,
     ) -> BeforeOutcome {
         match self.prompt(call, tool, rt).await {
-            PermissionDecision::AllowOnce | PermissionDecision::AllowAlways => {
-                BeforeOutcome::Allow {
-                    reason: Some("destructive bash approved (not remembered)".into()),
-                }
-            }
+            PermissionDecision::AllowOnce
+            | PermissionDecision::AllowAlways
+            | PermissionDecision::AllowAlwaysAll => BeforeOutcome::Allow {
+                reason: Some("destructive bash approved (not remembered)".into()),
+            },
             PermissionDecision::Deny => BeforeOutcome::deny(
                 "a destructive bash command needs approval and was denied".to_string(),
             ),
@@ -774,7 +774,7 @@ impl BashWorkspaceGate {
             PermissionDecision::AllowOnce => BeforeOutcome::Allow {
                 reason: Some("destructive bash approved (this call)".into()),
             },
-            PermissionDecision::AllowAlways => {
+            PermissionDecision::AllowAlways | PermissionDecision::AllowAlwaysAll => {
                 self.store.grant(&key);
                 BeforeOutcome::Allow {
                     reason: Some("destructive bash approved for this session".into()),
@@ -899,7 +899,7 @@ impl ToolMiddleware for BashWorkspaceGate {
             PermissionDecision::AllowOnce => BeforeOutcome::Allow {
                 reason: Some("approved once".into()),
             },
-            PermissionDecision::AllowAlways => {
+            PermissionDecision::AllowAlways | PermissionDecision::AllowAlwaysAll => {
                 for k in &out_keys {
                     self.store.grant(k);
                 }

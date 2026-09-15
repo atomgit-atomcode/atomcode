@@ -355,7 +355,7 @@ impl ToolMiddleware for SensitivePathGate {
         .unwrap_or(serde_json::Value::Null);
         match PermissionDecision::from_value(&rt.request(&self.kind, payload).await) {
             PermissionDecision::AllowOnce => BeforeOutcome::Proceed,
-            PermissionDecision::AllowAlways => {
+            PermissionDecision::AllowAlways | PermissionDecision::AllowAlwaysAll => {
                 self.store.grant(&key);
                 BeforeOutcome::Proceed
             }

@@ -260,11 +260,11 @@ impl WriteApprovalGate {
         rt: &RequestCtx,
     ) -> BeforeOutcome {
         match self.prompt(call, tool, rt).await {
-            PermissionDecision::AllowOnce | PermissionDecision::AllowAlways => {
-                BeforeOutcome::Allow {
-                    reason: Some("sensitive write approved (not remembered)".into()),
-                }
-            }
+            PermissionDecision::AllowOnce
+            | PermissionDecision::AllowAlways
+            | PermissionDecision::AllowAlwaysAll => BeforeOutcome::Allow {
+                reason: Some("sensitive write approved (not remembered)".into()),
+            },
             PermissionDecision::Deny => BeforeOutcome::deny(format!(
                 "writing a sensitive path needs approval and was denied: {}",
                 tool.name()
@@ -369,7 +369,7 @@ impl ToolMiddleware for WriteApprovalGate {
             PermissionDecision::AllowOnce => BeforeOutcome::Allow {
                 reason: Some("approved once".into()),
             },
-            PermissionDecision::AllowAlways => {
+            PermissionDecision::AllowAlways | PermissionDecision::AllowAlwaysAll => {
                 self.store.grant(&key);
                 BeforeOutcome::Allow {
                     reason: Some("approved always (this folder)".into()),

@@ -72,6 +72,10 @@ impl ApprovalResponse {
     }
 }
 
+/// Sentinel key for the session-scoped "allow all Bash (incl. destructive)" grant,
+/// stored in the shared allow-all `PermissionStore` and checked by both Bash gates.
+pub const BASH_ALLOW_ALL_KEY: &str = "bash::*";
+
 /// The decision a driver returns for an approval round-trip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionDecision {
@@ -80,6 +84,10 @@ pub enum PermissionDecision {
     /// Allow AND remember — the store caches the grant so the identical call is not
     /// asked again this session.
     AllowAlways,
+    /// Allow AND remember for ALL Bash this session (the explicit "allow all Bash,
+    /// incl. destructive" option). Recorded in the shared allow-all store under
+    /// [`BASH_ALLOW_ALL_KEY`]; honored by both BashWorkspaceGate and ApprovalMiddleware.
+    AllowAlwaysAll,
     /// Deny — the middleware blocks the call with `Err`.
     Deny,
 }
@@ -91,7 +99,9 @@ impl PermissionDecision {
     pub fn from_value(v: &serde_json::Value) -> Self {
         let decision = v.get("decision").and_then(|x| x.as_str()).unwrap_or("deny");
         let remember = v.get("remember").and_then(|x| x.as_bool()).unwrap_or(false);
+        let scope = v.get("grant_scope").and_then(|x| x.as_str()).unwrap_or("");
         match decision {
+            "allow" if remember && scope == "all" => PermissionDecision::AllowAlwaysAll,
             "allow_always" => PermissionDecision::AllowAlways,
             "allow" if remember => PermissionDecision::AllowAlways,
             "allow" => PermissionDecision::AllowOnce,
@@ -256,6 +266,10 @@ impl ToolMiddleware for ApprovalMiddleware {
             Err(degraded) => degraded, // Null → fail closed (channel failure, not a user deny).
             Ok(PermissionDecision::AllowOnce) => BeforeOutcome::Proceed,
             Ok(PermissionDecision::AllowAlways) => {
+                self.store.grant(&key);
+                BeforeOutcome::Proceed
+            }
+            Ok(PermissionDecision::AllowAlwaysAll) => {
                 self.store.grant(&key);
                 BeforeOutcome::Proceed
             }
@@ -443,6 +457,31 @@ mod tests {
         assert!(
             reason.contains("internal channel failure") && reason.contains("not a user"),
             "a degraded (Null) round-trip must be distinguishable from a user deny: {reason}"
+        );
+    }
+
+    #[test]
+    fn from_value_maps_grant_scope_all_to_allow_always_all() {
+        use serde_json::json;
+        // New: allow + remember + grant_scope:"all" → AllowAlwaysAll.
+        assert_eq!(
+            PermissionDecision::from_value(&json!({"decision":"allow","remember":true,"grant_scope":"all"})),
+            PermissionDecision::AllowAlwaysAll
+        );
+        // Back-compat: remember without scope stays AllowAlways.
+        assert_eq!(
+            PermissionDecision::from_value(&json!({"decision":"allow","remember":true})),
+            PermissionDecision::AllowAlways
+        );
+        // Unknown scope → AllowAlways (not AllowAlwaysAll).
+        assert_eq!(
+            PermissionDecision::from_value(&json!({"decision":"allow","remember":true,"grant_scope":"tool"})),
+            PermissionDecision::AllowAlways
+        );
+        // grant_scope only upgrades an allow: deny stays deny.
+        assert_eq!(
+            PermissionDecision::from_value(&json!({"decision":"deny","grant_scope":"all"})),
+            PermissionDecision::Deny
         );
     }
 

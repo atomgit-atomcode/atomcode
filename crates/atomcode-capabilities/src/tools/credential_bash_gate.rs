@@ -503,7 +503,7 @@ impl CredentialBashGate {
         .unwrap_or(serde_json::Value::Null);
         match PermissionDecision::from_value(&rt.request(APPROVAL_KIND, payload).await) {
             PermissionDecision::AllowOnce => BeforeOutcome::Proceed,
-            PermissionDecision::AllowAlways => {
+            PermissionDecision::AllowAlways | PermissionDecision::AllowAlwaysAll => {
                 store.grant(&key);
                 BeforeOutcome::Proceed
             }
