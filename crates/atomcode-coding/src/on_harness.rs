@@ -314,6 +314,15 @@ disabled = true
 name = "plan-mode"
 disabled = true
 
+# The person's own `hooks.json`. Here, disabled, only to hold its place: after
+# the hard boundaries, ahead of the gates that auto-approve — so a PreToolUse
+# hook sees a write before a convenience gate waves it through, the position
+# the chain gives it. Mounting it is enabling it (it runs the person's
+# commands), so a host that found hooks patches it on.
+[[insert]]
+name = "cc-hooks"
+disabled = true
+
 # On in base because the harness binary has no other front end. Off here, and
 # not as a nicety: with a driver rendering, this row printed every assistant
 # token a SECOND time, and a headless run answered "pongpong".
@@ -900,6 +909,22 @@ pub struct HostState {
     /// MCP tools. Absent for a host with no switches: the tree keeps the
     /// harness's mount-time rows.
     pub modes: Option<HostModes>,
+    /// Tool middleware the host built (telemetry, the AtomGit push label).
+    pub middleware: Option<Arc<crate::host_rows::HostMiddleware>>,
+    /// The person's `hooks.json` engine, as the host loaded it — plugin hooks,
+    /// session id and transcript path included. `None` when there are no hooks.
+    pub cc_hooks: Option<Arc<atomcode_capabilities::cc_hooks::CCExternalHooks>>,
+    /// Where the datalog writes, when the person turned it on.
+    pub datalog: Option<atomcode_config::config::DatalogConfig>,
+    /// The session context block, and the system prompt a continued session
+    /// was stored with (its git section is kept).
+    pub session_context: Option<HostContext>,
+}
+
+/// See [`crate::host_rows::SessionContextPlugin`].
+pub struct HostContext {
+    pub hook: Arc<atomcode_capabilities::session::SessionContextHook>,
+    pub stored: Option<String>,
 }
 
 /// The switches `set_mode` writes, handed to the rows that obey them.
@@ -982,11 +1007,40 @@ pub async fn mount_hosted(
     } else {
         ""
     };
+    let cc_rows = if host.cc_hooks.is_some() {
+        "[[patch]]\nid = \"cc-hooks\"\nname = \"cc-hooks-host\"\ndisabled = false\n\n"
+    } else {
+        ""
+    };
+    let context_rows = if host.session_context.is_some() {
+        "[[patch]]\nid = \"project-instructions\"\nname = \"session-context\"\n\n"
+    } else {
+        ""
+    };
+    let datalog_rows = host
+        .datalog
+        .as_ref()
+        .map(|datalog| {
+            let dir = datalog
+                .dir
+                .as_deref()
+                .map(|dir| format!(", dir = {}", atomcode_harness::bundle::toml_string(dir)))
+                .unwrap_or_default();
+            format!(
+                "[[insert]]\nname = \"datalog\"\nconfig = {{ working_dir = {}{dir} }}\n\n",
+                atomcode_harness::bundle::toml_string(&working_dir.to_string_lossy()),
+            )
+        })
+        .unwrap_or_default();
     let hosted = format!(
-        "[[patch]]\nid = \"session\"\nname = \"session-native\"\n\n{modes_rows}{}",
+        "[[patch]]\nid = \"session\"\nname = \"session-native\"\n\n{modes_rows}{cc_rows}{context_rows}{datalog_rows}{}{}",
         host.hooks
             .as_ref()
             .map(|hooks| hooks.rows())
+            .unwrap_or_default(),
+        host.middleware
+            .as_ref()
+            .map(|middleware| middleware.rows())
             .unwrap_or_default()
     );
     layers.push(Layer::from_toml(&hosted).map_err(|e| e.to_string())?);
@@ -1013,6 +1067,18 @@ pub async fn mount_hosted(
     registry.register(Arc::new(crate::host_rows::KernelHooksPlugin(
         host.hooks.unwrap_or_default(),
     )));
+    registry.register(Arc::new(crate::host_rows::KernelMiddlewarePlugin(
+        host.middleware.unwrap_or_default(),
+    )));
+    if let Some(engine) = host.cc_hooks {
+        registry.register(Arc::new(crate::host_rows::CcHooksHostPlugin(engine)));
+    }
+    if let Some(context) = host.session_context {
+        registry.register(Arc::new(crate::host_rows::SessionContextPlugin {
+            hook: context.hook,
+            stored: context.stored,
+        }));
+    }
     if let Some(modes) = host.modes {
         registry.register(Arc::new(crate::host_rows::ModesHostPlugin(modes.modes)));
         registry.register(Arc::new(crate::host_rows::PlanModeLivePlugin(
@@ -1793,46 +1859,58 @@ impl Plugin for CcHooksPlugin {
         if engine.is_empty() {
             return Ok(());
         }
-        let hooks = Arc::new(CcHooks {
-            ctx: ctx.clone(),
-            engine: Arc::new(engine),
-            started: std::sync::atomic::AtomicBool::new(false),
-        });
-        let _ = ctx.on_waterfall::<atomcode_harness::events::PreStep>(hooks.clone(), false);
-        // Prepended: the person's own hook decides before any built-in gate gets
-        // to auto-approve the call out from under it. The chain registers it in
-        // the same position, ahead of the workspace and approval gates.
-        let _ = ctx.on_waterfall::<atomcode_harness::events::ToolsExecute>(hooks.clone(), true);
-        let ended = hooks.clone();
-        let _ = ctx.on_emit::<atomcode_harness::events::TurnEnd>(
-            move |outcome: &atomcode_harness::seams::TurnOutcome| {
-                use atomcode_harness::seams::StopReason as Harness;
-                // The one branch CC actually reads off this value is Stop vs
-                // StopFailure, and `stop_is_failure` keys on a provider/stream
-                // failure — so that is the distinction worth carrying across two
-                // enums neither crate owns.
-                let reason = match outcome.stop {
-                    Harness::ProviderError => atomcode_kernel::event::StopReason::ProviderError,
-                    _ => atomcode_kernel::event::StopReason::Stopped,
-                };
-                let engine = ended.engine.clone();
-                // Spawned, and faithfully so: `turn_complete` is documented
-                // "observation only — fire all matching hooks and ignore output",
-                // so nothing downstream is waiting on the answer.
-                tokio::spawn(async move {
-                    use atomcode_kernel::hook::LifecycleHooks;
-                    engine
-                        .turn_complete(
-                            &atomcode_kernel::message::Conversation::new(),
-                            &reason,
-                            &atomcode_kernel::hook::TurnCtx::default(),
-                        )
-                        .await;
-                });
-            },
-        );
+        mount_cc_hooks(ctx, Arc::new(engine));
         Ok(())
     }
+}
+
+/// Mount a loaded `hooks.json` engine at the Claude-Code-compatible moments.
+///
+/// Shared by `cc-hooks` (which loads the file itself) and `cc-hooks-host` (which
+/// mounts the engine the runtime loaded, plugin hooks included), so the two
+/// cannot disagree about when a person's hook runs.
+pub(crate) fn mount_cc_hooks(
+    ctx: &Context,
+    engine: Arc<atomcode_capabilities::cc_hooks::CCExternalHooks>,
+) {
+    let hooks = Arc::new(CcHooks {
+        ctx: ctx.clone(),
+        engine,
+        started: std::sync::atomic::AtomicBool::new(false),
+    });
+    let _ = ctx.on_waterfall::<atomcode_harness::events::PreStep>(hooks.clone(), false);
+    // Prepended: the person's own hook decides before any built-in gate gets
+    // to auto-approve the call out from under it. The chain registers it in
+    // the same position, ahead of the workspace and approval gates.
+    let _ = ctx.on_waterfall::<atomcode_harness::events::ToolsExecute>(hooks.clone(), true);
+    let ended = hooks.clone();
+    let _ = ctx.on_emit::<atomcode_harness::events::TurnEnd>(
+        move |outcome: &atomcode_harness::seams::TurnOutcome| {
+            use atomcode_harness::seams::StopReason as Harness;
+            // The one branch CC actually reads off this value is Stop vs
+            // StopFailure, and `stop_is_failure` keys on a provider/stream
+            // failure — so that is the distinction worth carrying across two
+            // enums neither crate owns.
+            let reason = match outcome.stop {
+                Harness::ProviderError => atomcode_kernel::event::StopReason::ProviderError,
+                _ => atomcode_kernel::event::StopReason::Stopped,
+            };
+            let engine = ended.engine.clone();
+            // Spawned, and faithfully so: `turn_complete` is documented
+            // "observation only — fire all matching hooks and ignore output",
+            // so nothing downstream is waiting on the answer.
+            tokio::spawn(async move {
+                use atomcode_kernel::hook::LifecycleHooks;
+                engine
+                    .turn_complete(
+                        &atomcode_kernel::message::Conversation::new(),
+                        &reason,
+                        &atomcode_kernel::hook::TurnCtx::default(),
+                    )
+                    .await;
+            });
+        },
+    );
 }
 
 // ---- the persona --------------------------------------------------------

@@ -596,6 +596,235 @@ async fn an_always_allow_survives_an_undo(engine: &str) {
     runtime.handle.shutdown().await.unwrap();
 }
 
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn system_text(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .filter(|m| m.role == Role::System)
+        .map(|m| m.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The model is told where it is working, and a resumed session keeps the git
+/// snapshot it started with — rewriting it would break the cached prefix of the
+/// whole resumed conversation.
+async fn the_session_context_is_shown_and_its_git_snapshot_survives_a_resume(engine: &str) {
+    select(engine);
+    let env = env();
+    let project = env.project.path();
+    git(project, &["init", "-q"]);
+    git(project, &["config", "user.email", "t@t"]);
+    git(project, &["config", "user.name", "t"]);
+    std::fs::write(project.join("a.txt"), "a").unwrap();
+    git(project, &["add", "."]);
+    git(project, &["commit", "-qm", "first commit"]);
+    let first_head = git(project, &["log", "-1", "--format=%h"]);
+
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(start(project, &recorder, SessionMode::Fresh))
+        .await
+        .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+    turn(&mut runtime, "hello").await;
+    let shown = system_text(&recorder.last_request());
+    assert!(
+        shown.contains("=== SESSION CONTEXT ==="),
+        "[{engine}] {shown}"
+    );
+    assert!(shown.contains("Working directory:"), "[{engine}]");
+    assert!(shown.contains(&first_head), "[{engine}] {shown}");
+    runtime.handle.shutdown().await.unwrap();
+    let _ = runtime.task.await;
+
+    std::fs::write(project.join("b.txt"), "b").unwrap();
+    git(project, &["add", "."]);
+    git(project, &["commit", "-qm", "second commit"]);
+    let second_head = git(project, &["log", "-1", "--format=%h"]);
+
+    let mut resumed = CodingRuntime::start(start(project, &recorder, SessionMode::Resume(id)))
+        .await
+        .unwrap();
+    turn(&mut resumed, "again").await;
+    let shown = system_text(&recorder.last_request());
+    assert_eq!(
+        shown.matches("=== SESSION CONTEXT ===").count(),
+        1,
+        "[{engine}] one context block: {shown}"
+    );
+    assert!(
+        shown.contains(&first_head),
+        "[{engine}] the frozen HEAD: {shown}"
+    );
+    assert!(
+        !shown.contains(&second_head),
+        "[{engine}] the git section was rewritten: {shown}"
+    );
+    resumed.handle.shutdown().await.unwrap();
+}
+
+/// A turn leaves its transcript on disk and its cost in telemetry.
+async fn a_turn_is_transcribed_and_metered(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let (telemetry, captured) = atomcode_telemetry::Telemetry::in_memory("test".into());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.agent.telemetry = Some(telemetry);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    let id = runtime.session.clone().unwrap().id;
+
+    turn(&mut runtime, "hello").await;
+
+    let transcript = SessionManager::for_project(env.project.path())
+        .jsonl_path(&id)
+        .unwrap();
+    let text = std::fs::read_to_string(&transcript).unwrap_or_default();
+    assert!(
+        text.contains("hello"),
+        "[{engine}] transcript at {transcript:?}: {text}"
+    );
+
+    let mut chats = 0;
+    for _ in 0..100 {
+        chats = captured
+            .lock()
+            .await
+            .iter()
+            .filter(|record| matches!(record.event, atomcode_telemetry::Event::LlmChat { .. }))
+            .count();
+        if chats > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(chats > 0, "[{engine}] no model call was metered");
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// The person's `hooks.json` runs, and so does a hook a plugin contributed.
+async fn a_persons_hooks_and_a_plugins_hooks_both_run(engine: &str) {
+    select(engine);
+    let env = env();
+    let project = env.project.path();
+    let from_file = project.join("from-file.marker");
+    let from_plugin = project.join("from-plugin.marker");
+    std::fs::write(
+        project.join(".hooks.json"),
+        serde_json::json!({
+            "hooks": {
+                "mark": {
+                    "event": "UserPromptSubmit",
+                    "command": format!("touch {}", from_file.display()),
+                },
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(project, &recorder, SessionMode::Fresh);
+    start.plugin_hooks = Arc::new(StaticPluginHookSource::new(vec![
+        atomcode_capabilities::cc_hooks::HookConfig {
+            event: atomcode_capabilities::cc_hooks::HookEvent::UserPromptSubmit,
+            matcher: None,
+            command: format!("touch {}", from_plugin.display()),
+            timeout_ms: 5_000,
+            plugin_root: None,
+        },
+    ]));
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    turn(&mut runtime, "hello").await;
+
+    assert!(
+        from_file.exists(),
+        "[{engine}] the hooks.json hook did not run"
+    );
+    assert!(
+        from_plugin.exists(),
+        "[{engine}] the plugin's hook did not run"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// With the datalog on, a turn is written to it.
+async fn the_datalog_is_written_when_it_is_on(engine: &str) {
+    select(engine);
+    let env = env();
+    let logs = tempfile::tempdir().unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.agent.datalog = atomcode_config::config::DatalogConfig {
+        enabled: true,
+        dir: Some(logs.path().to_string_lossy().into_owned()),
+    };
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    turn(&mut runtime, "hello").await;
+
+    fn files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    let mut written = Vec::new();
+    for _ in 0..100 {
+        written.clear();
+        files(logs.path(), &mut written);
+        if written.iter().any(|p| {
+            std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .contains("hello")
+        }) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        written.iter().any(|p| std::fs::read_to_string(p)
+            .unwrap_or_default()
+            .contains("hello")),
+        "[{engine}] datalog files: {written:?}"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A new task is steered to plan with todos when the person asked for that.
+async fn an_eager_todo_reminder_rides_the_first_request(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.agent.todo.eager = atomcode_config::config::TodoEagerness::Always;
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    turn(&mut runtime, "build the feature").await;
+
+    let first = recorder.requests.lock().unwrap().first().cloned().unwrap();
+    assert!(
+        first
+            .last()
+            .is_some_and(|m| m.synthetic && m.text.contains("todowrite")),
+        "[{engine}] the first request's tail: {:?}",
+        first.last()
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 macro_rules! on_both_engines {
     ($($scenario:ident),* $(,)?) => {
         mod chain {
@@ -631,4 +860,9 @@ on_both_engines!(
     plan_mode_refuses_a_write_and_says_so,
     accept_edits_applies_a_write_without_asking,
     an_always_allow_survives_an_undo,
+    the_session_context_is_shown_and_its_git_snapshot_survives_a_resume,
+    a_turn_is_transcribed_and_metered,
+    a_persons_hooks_and_a_plugins_hooks_both_run,
+    the_datalog_is_written_when_it_is_on,
+    an_eager_todo_reminder_rides_the_first_request,
 );

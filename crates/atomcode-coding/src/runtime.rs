@@ -7402,6 +7402,7 @@ fn build_goal_evaluator_provider(
 /// runtime kept in memory.
 fn harness_host_state(
     parts: &crate::CodingParts,
+    config: &CodingAgentConfig,
 ) -> Result<crate::on_harness::HostState, std::io::Error> {
     let session = match &parts.session {
         Some(binding) => crate::host_rows::SessionSeed {
@@ -7417,13 +7418,80 @@ fn harness_host_state(
             snapshot: parts.runtime_resume_snapshot(),
         },
     };
+    // The system prompt a continued session was stored with: its leading
+    // system messages, whichever engine wrote them.
+    let stored_prompt = session.snapshot.as_ref().map(|snapshot| {
+        snapshot
+            .messages
+            .iter()
+            .take_while(|m| m.role == atomcode_kernel::message::Role::System && !m.synthetic)
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    });
+    let session_id = parts.session.as_ref().map(|binding| binding.id.as_str());
+
+    // Everything the chain's `prepare` + `assemble` hang on the kernel agent that
+    // the rows do not already carry, as the same objects.
     let hooks = crate::host_rows::HostHooks::new();
     if let Some(snapshot) = parts.snapshot_hook() {
         hooks.insert("native-snapshot", snapshot);
     }
+    if let Some(transcript) = parts.transcript_hook() {
+        hooks.insert("transcript", transcript);
+    }
+    let middleware = crate::host_rows::HostMiddleware::new();
+    if let Some(telemetry) = &config.telemetry {
+        hooks.insert(
+            "telemetry",
+            Arc::new(crate::telemetry::TelemetryHook::new(
+                telemetry.clone(),
+                config.provider_type.as_str(),
+                &config.base_url,
+                &config.model,
+                session_id,
+            )),
+        );
+        middleware.insert(
+            "tool-telemetry",
+            Arc::new(crate::telemetry::ToolTelemetryMiddleware::new(
+                telemetry.clone(),
+                config.provider_type.as_str(),
+                &config.base_url,
+                &config.model,
+                session_id,
+            )),
+        );
+    }
+    if parts.todo_enabled() {
+        hooks.insert(
+            "todo-eager",
+            Arc::new(crate::todo::TodoEagerHook::new(
+                &config.model,
+                &config.provider_type,
+                config.todo.eager,
+            )),
+        );
+    }
+    #[cfg(feature = "atomgit")]
+    middleware.insert(
+        "git-push-label",
+        Arc::new(atomcode_capabilities::tools::GitPushLabelMiddleware::new(
+            config.working_dir.clone(),
+        )),
+    );
     Ok(crate::on_harness::HostState {
+        session_context: Some(crate::on_harness::HostContext {
+            hook: Arc::new(atomcode_capabilities::session::SessionContextHook::new(
+                &config.working_dir,
+            )),
+            stored: stored_prompt,
+        }),
         session,
         hooks: Some(hooks),
+        middleware: Some(middleware),
+        cc_hooks: parts.cc_external_hooks.clone(),
+        datalog: config.datalog.enabled.then(|| config.datalog.clone()),
         modes: Some(crate::on_harness::HostModes {
             modes: atomcode_harness::seams::Modes {
                 plan: Arc::clone(&parts.plan_mode),
@@ -7480,7 +7548,7 @@ async fn mount_harness(
             providers,
             current: config.provider_name.clone(),
         });
-    let host = harness_host_state(parts).map_err(|error| error.to_string())?;
+    let host = harness_host_state(parts, config).map_err(|error| error.to_string())?;
     // Turns on this tree are billed to the model it was built for. The chain
     // stamps the same attribution inside `assemble`.
     if let Some(snapshot) = parts.snapshot_hook() {

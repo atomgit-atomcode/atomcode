@@ -26,17 +26,26 @@
 //! | `session_start` | first `agent/pre-step`; messages it appends ride as reminders |
 //! | `user_prompt_submit` | `agent/pre-step`, first step of a turn; `Err` rejects the input |
 //! | `turn_start` | `agent/request`, first request of a turn, after the prompt is logged |
+//! | `pre_request` | `agent/request`, before delegating; only what it APPENDS is kept, as an ephemeral tail |
 //! | `pre_request_options`, `on_request` | `agent/request`, before delegating |
 //! | `on_model_response` | `agent/request`, after a successful response |
 //! | `offer_continuation` | `agent/request`, after a response that ends the round; queued as a harness message |
 //! | `on_error` | `agent/request`, after a failed request |
 //! | `turn_complete` | `turn/finishing` — awaited, before the driver learns the turn ended |
 //!
-//! Not bridged, and why: `pre_request` rewrites the request after the log was
-//! checked, which would put content in front of the model that the log cannot
-//! explain; `on_text_delta` / `on_reasoning_delta` mutate a stream the harness
+//! Not bridged, and why: a `pre_request` that rewrites existing messages would
+//! put content in front of the model that the log cannot explain (its edits are
+//! dropped); `on_text_delta` / `on_reasoning_delta` mutate a stream the harness
 //! commits verbatim; `on_rate_limit` belongs to the retry policy; `session_end`
 //! has no harness moment. A hook that needs one of these gets a row of its own.
+//!
+//! # `kernel-middleware`
+//!
+//! The same, for a host-built [`ToolMiddleware`](atomcode_kernel::middleware::ToolMiddleware)
+//! on `tools/execute`: `before` → Proceed runs the call, Allow runs it marked
+//! pre-approved, Deny refuses it; `after` → Block appends the reason to the
+//! result. Only observers and deciders that never ask are bridged — the kernel's
+//! round-trip context here has nobody on the other end, so an `Ask` fails closed.
 //!
 //! Only the conversation's own agent is served. A delegated child runs its turns
 //! through the same events, and a snapshot writer that heard them would file the
@@ -292,6 +301,17 @@ impl Waterfall<AgentRequest> for Bridge {
             self.hook.turn_start(&mut convo).await;
         }
         let ctx = self.turn_ctx(&agent, req.turn, req.round);
+        // `pre_request` may only ADD to the end. What a hook appends is an
+        // ephemeral tail for this request — a reminder, a nudge — and rides the
+        // same way the harness's own tails do: past the log check, never logged.
+        // A hook that rewrote the history instead would be putting words in
+        // front of the model that no log can explain, so its edits are dropped.
+        let mut proposed = req.messages.clone();
+        let before = proposed.len();
+        self.hook.pre_request(&mut proposed, &ctx).await;
+        if proposed.len() > before && proposed[..before] == req.messages[..] {
+            req.messages.extend(proposed.drain(before..));
+        }
         self.hook
             .pre_request_options(&req.messages, &mut req.options, &ctx)
             .await;
@@ -564,6 +584,226 @@ impl Plugin for PlanModeLivePlugin {
         });
         let _ = ctx.on_waterfall::<atomcode_harness::events::ToolsExecute>(live.clone(), true);
         let _ = ctx.on_waterfall::<AgentRequest>(live, false);
+        Ok(())
+    }
+}
+
+// ---- host-built tool middleware -------------------------------------------
+
+/// Host-built tool middleware, by the name a `kernel-middleware` row asks for.
+#[derive(Default)]
+pub struct HostMiddleware {
+    entries: RwLock<BTreeMap<String, Arc<dyn atomcode_kernel::middleware::ToolMiddleware>>>,
+}
+
+impl HostMiddleware {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn insert(
+        &self,
+        name: impl Into<String>,
+        middleware: Arc<dyn atomcode_kernel::middleware::ToolMiddleware>,
+    ) {
+        self.entries
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.into(), middleware);
+    }
+
+    fn get(&self, name: &str) -> Option<Arc<dyn atomcode_kernel::middleware::ToolMiddleware>> {
+        self.entries
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
+    }
+
+    /// The row layer that mounts every middleware this table holds.
+    pub(crate) fn rows(&self) -> String {
+        self.entries
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .map(|name| {
+                format!(
+                    "[[insert]]\nid = {}\nname = \"kernel-middleware\"\nconfig = {{ middleware = {} }}\n\n",
+                    atomcode_harness::bundle::toml_string(&format!("kernel-middleware-{name}")),
+                    atomcode_harness::bundle::toml_string(name),
+                )
+            })
+            .collect()
+    }
+}
+
+/// `kernel-middleware`: one host-built tool middleware on `tools/execute`.
+pub(crate) struct KernelMiddlewarePlugin(pub(crate) Arc<HostMiddleware>);
+
+#[derive(serde::Deserialize)]
+struct KernelMiddlewareRow {
+    middleware: String,
+}
+
+struct MiddlewareBridge {
+    ctx: Context,
+    middleware: Arc<dyn atomcode_kernel::middleware::ToolMiddleware>,
+}
+
+#[async_trait]
+impl Waterfall<atomcode_harness::events::ToolsExecute> for MiddlewareBridge {
+    async fn handle(
+        &self,
+        exec: &mut atomcode_harness::events::ToolExec,
+        next: Next<'_, atomcode_harness::events::ToolsExecute>,
+    ) -> atomcode_kernel::tool::ToolResult {
+        use atomcode_kernel::middleware::{AfterOutcome, BeforeOutcome};
+        let tool = self
+            .ctx
+            .service::<atomcode_harness::seams::ToolsSvc>()
+            .and_then(|tools| tools.get(&exec.call.name));
+        if let Some(tool) = &tool {
+            // Nobody answers on this channel: a middleware that asks gets the
+            // closed-channel answer, which every kernel gate reads as a refusal.
+            let (events, _nobody) = tokio::sync::mpsc::unbounded_channel();
+            let rt =
+                atomcode_kernel::request::RequestCtx::new(events, Some(std::time::Duration::ZERO));
+            match self.middleware.before(&mut exec.call, tool, &rt).await {
+                BeforeOutcome::Proceed => {}
+                BeforeOutcome::Allow { .. } => exec.pre_approved = true,
+                BeforeOutcome::Ask { reason } => {
+                    return atomcode_kernel::tool::ToolResult {
+                        call_id: exec.call.id.clone(),
+                        content: reason.unwrap_or_else(|| {
+                            format!("`{}` needs approval nobody can give here", exec.call.name)
+                        }),
+                        is_error: true,
+                        images: vec![],
+                    }
+                }
+                BeforeOutcome::Deny { reason }
+                | BeforeOutcome::DenyTurn { reason }
+                | BeforeOutcome::DenyTurnWithIntervention { reason, .. } => {
+                    return atomcode_kernel::tool::ToolResult {
+                        call_id: exec.call.id.clone(),
+                        content: reason,
+                        is_error: true,
+                        images: vec![],
+                    }
+                }
+            }
+        }
+        let mut result = next.run(exec).await;
+        if let AfterOutcome::Block { reason } =
+            self.middleware.after(&mut result, tool.as_ref()).await
+        {
+            result.content.push_str("\n\n");
+            result.content.push_str(&reason);
+            result.is_error = true;
+        }
+        result
+    }
+}
+
+#[async_trait]
+impl Plugin for KernelMiddlewarePlugin {
+    fn name(&self) -> &'static str {
+        "kernel-middleware"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools"]
+    }
+    fn description(&self) -> &'static str {
+        "a tool middleware the coding runtime built, on tools/execute"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: KernelMiddlewareRow =
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?;
+        let middleware = self.0.get(&row.middleware).ok_or_else(|| {
+            format!(
+                "the host registered no middleware named `{}`",
+                row.middleware
+            )
+        })?;
+        // Innermost: an observer records the call that actually runs, after every
+        // gate has had its say — the chain registers these after the gates too.
+        let _ = ctx.on_waterfall::<atomcode_harness::events::ToolsExecute>(
+            Arc::new(MiddlewareBridge {
+                ctx: ctx.clone(),
+                middleware,
+            }),
+            false,
+        );
+        Ok(())
+    }
+}
+
+// ---- the person's own hooks, as the runtime loaded them -------------------
+
+/// `cc-hooks-host`: the `hooks.json` engine the runtime already built.
+///
+/// The harness's `cc-hooks` row loads `hooks.json` itself, which misses what only
+/// the host knows: hooks a plugin contributed, and the transcript path a Stop
+/// hook opens. The runtime's engine has both; this row mounts it at the same
+/// moments `cc-hooks` would.
+pub(crate) struct CcHooksHostPlugin(
+    pub(crate) Arc<atomcode_capabilities::cc_hooks::CCExternalHooks>,
+);
+
+#[async_trait]
+impl Plugin for CcHooksHostPlugin {
+    fn name(&self) -> &'static str {
+        "cc-hooks-host"
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["approval", "tools"]
+    }
+    fn description(&self) -> &'static str {
+        "run the hooks.json engine the coding runtime loaded, plugin hooks included"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        crate::on_harness::mount_cc_hooks(ctx, self.0.clone());
+        Ok(())
+    }
+}
+
+// ---- the session context block --------------------------------------------
+
+/// `session-context`: environment, project instructions and a git snapshot,
+/// contributed to the system prompt once per tree.
+///
+/// The chain inserts this block as a leading system message at session start.
+/// A tree has no conversation to insert into — its system prompt is the prompt
+/// registry — so the block is a fragment, under the id the harness's
+/// `project-instructions` row uses: this block already carries the instructions,
+/// and two copies of AGENTS.md is worse than either. A continued session keeps
+/// the git section it started with (see
+/// [`SessionContextHook::block`](atomcode_capabilities::session::SessionContextHook::block)).
+pub(crate) struct SessionContextPlugin {
+    pub(crate) hook: Arc<atomcode_capabilities::session::SessionContextHook>,
+    /// The system prompt the continued session was stored with, if any.
+    pub(crate) stored: Option<String>,
+}
+
+#[async_trait]
+impl Plugin for SessionContextPlugin {
+    fn name(&self) -> &'static str {
+        "session-context"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["system-prompt"]
+    }
+    fn description(&self) -> &'static str {
+        "environment, project instructions and a session-start git snapshot, in the system prompt"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let block = self.hook.block(self.stored.as_deref());
+        let Some(prompts) = ctx.service::<SystemPromptSvc>() else {
+            return Ok(());
+        };
+        // Withdrawn with the row, like every other fragment.
+        prompts.contribute("project-instructions", 1, block);
+        let _ = ctx.effect(move || prompts.remove("project-instructions"));
         Ok(())
     }
 }

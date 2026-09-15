@@ -364,6 +364,7 @@ pub struct CodingParts {
     /// Concrete handle retained so provider-only reassembly can update the
     /// per-turn cost attribution without rebuilding session-owned hooks.
     snapshot_hook: Option<Arc<SnapshotHook>>,
+    transcript_hook: Option<Arc<TranscriptHook>>,
     snapshot_persistence_status: Option<SnapshotPersistenceStatus>,
     pub session: Option<SessionBinding>,
     /// Runtime-owned resume for sessionless drivers during an in-process reassembly.
@@ -916,6 +917,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     let mut hooks: Vec<Arc<dyn LifecycleHooks>> = Vec::new();
     let mut compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>> = None;
     let mut snapshot_hook_handle = None;
+    let mut transcript_hook_handle = None;
     let mut snapshot_persistence_status = None;
     // Env / project-instructions / git context — unconditional (v1 parity: always present).
     hooks.push(session_context_hook);
@@ -946,10 +948,12 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         compaction_checkpoint = Some(snapshot_hook.clone());
         snapshot_hook_handle = Some(snapshot_hook.clone());
         hooks.push(snapshot_hook.clone());
-        hooks.push(Arc::new(
+        let transcript_hook = Arc::new(
             TranscriptHook::new(b.manager.clone(), &b.id)
                 .with_persistence_status(snapshot_hook.persistence_status()),
-        ));
+        );
+        transcript_hook_handle = Some(transcript_hook.clone());
+        hooks.push(transcript_hook);
     }
     // Date awareness comes from the frozen date anchor in the persona system prompt (cache-stable,
     // present on EVERY round including round 1), so recall's relative-date resolution has a current
@@ -1090,6 +1094,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         hooks,
         compaction_checkpoint,
         snapshot_hook: snapshot_hook_handle,
+        transcript_hook: transcript_hook_handle,
         snapshot_persistence_status,
         session,
         runtime_resume: None,
@@ -1168,6 +1173,14 @@ impl CodingParts {
 
     pub(crate) fn snapshot_hook(&self) -> Option<Arc<SnapshotHook>> {
         self.snapshot_hook.clone()
+    }
+
+    pub(crate) fn transcript_hook(&self) -> Option<Arc<TranscriptHook>> {
+        self.transcript_hook.clone()
+    }
+
+    pub(crate) fn todo_enabled(&self) -> bool {
+        self.todo_enabled
     }
 
     #[cfg(test)]
