@@ -191,9 +191,22 @@ struct InProcessSubagents {
 #[async_trait]
 impl Subagents for InProcessSubagents {
     fn describe(&self) -> String {
+        // Resolved against the LIVE catalog, exactly as `spawn` resolves it.
+        // Reporting the configured list instead named tools the tree does not
+        // have — `web_search` in a tree with no `tool-web` row — and this string
+        // is what `describe_self` hands the model when it asks what delegating
+        // would buy it. A description of a capability has to be filtered by the
+        // same thing the capability is.
+        let mounted = self.ctx.service::<ToolsSvc>();
+        let available: Vec<&str> = self
+            .allowed_tools
+            .iter()
+            .filter(|name| mounted.as_ref().is_some_and(|t| t.get(name).is_some()))
+            .map(String::as_str)
+            .collect();
         format!(
             "in-process, isolated realm, tools: {}",
-            self.allowed_tools.join(", ")
+            available.join(", ")
         )
     }
 
@@ -422,17 +435,10 @@ impl Default for SubagentRow {
 }
 
 fn default_tools() -> Vec<String> {
-    [
-        "read_file",
-        "list_directory",
-        "grep",
-        "glob",
-        "list_symbols",
-        "read_symbol",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+    crate::plugins::team::EXPLORE_TOOLS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 fn default_rounds() -> u32 {
@@ -482,7 +488,8 @@ impl Plugin for SubagentPlugin {
             57,
             &format!(
                 "`task` delegates a self-contained job to a subagent with a reduced tool set \
-                 ({}). Use it for work whose intermediate output you do not need to see.",
+                 (the ones this tree actually mounts, out of: {}). Use it for work whose \
+                 intermediate output you do not need to see.",
                 row.allowed_tools.join(", ")
             ),
         );

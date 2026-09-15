@@ -361,3 +361,53 @@ config = { script = [
         "and the file it could not read never reached the parent either"
     );
 }
+
+/// **A child reaches exactly as far as its parent was allowed to — no further,
+/// and no less.**
+///
+/// Reading the public internet is still reading, so `web_search` / `web_fetch`
+/// are in the explore set. Leaving them out made "delegate the news roundup to
+/// the cheap model" impossible for no reason anyone could state — which is how
+/// it was found, by a person trying exactly that.
+///
+/// The judge is both halves. The set is resolved BY NAME against the parent's
+/// live catalog at spawn, so the same list yields web tools in a tree that
+/// mounted `tool-web` and nothing at all in one that did not. Only asserting
+/// the first half would pass against a child that ignores its parent entirely.
+#[tokio::test]
+async fn a_child_gets_the_web_tools_only_where_its_parent_has_them() {
+    let script = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [ { text = "nothing to do" } ] }
+"#;
+    let on = "[[patch]]\nid = \"subagent-in-process\"\ndisabled = false";
+    let web = "[[patch]]\nid = \"tool-web\"\ndisabled = false";
+
+    let with_web = start(tree(&scratch("web-on"), script, &[YOLO, on, web])).await;
+    let said = with_web
+        .context()
+        .service::<SubagentsSvc>()
+        .unwrap()
+        .describe();
+    assert!(
+        said.contains("web_search") && said.contains("web_fetch"),
+        "the parent mounted the web tools, so a delegated child may use them:\n{said}"
+    );
+
+    let without = start(tree(&scratch("web-off"), script, &[YOLO, on])).await;
+    let said = without
+        .context()
+        .service::<SubagentsSvc>()
+        .unwrap()
+        .describe();
+    assert!(
+        !said.contains("web_search") && !said.contains("web_fetch"),
+        "and a tree that never mounted them has none to hand down — naming a tool \
+         in the child list is not the same as conjuring it:\n{said}"
+    );
+    // Local reading is unaffected either way, or the assertions above could be
+    // passing because the child got no tools at all.
+    assert!(said.contains("read_file"), "{said}");
+}

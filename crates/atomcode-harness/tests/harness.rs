@@ -386,11 +386,15 @@ async fn the_log_reaches_the_disk_in_the_order_it_was_committed() {
     for _ in 0..200 {
         let mut seen = Vec::new();
         walk(&root, &mut seen);
-        if seen.iter().any(|p| {
+        // EVERY file, not any: breaking as soon as one session had drained left
+        // a second one mid-write, and the assertions below read them all. It
+        // still flakes rarely under a full parallel run when read as `any`.
+        let settled = |p: &PathBuf| {
             std::fs::read_to_string(p)
                 .map(|t| t.lines().filter(|l| l.contains("turn_end")).count() >= 2)
                 .unwrap_or(false)
-        }) {
+        };
+        if !seen.is_empty() && seen.iter().all(settled) {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;

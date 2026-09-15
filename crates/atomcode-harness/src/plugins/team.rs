@@ -336,13 +336,29 @@ fn load_roles(dirs: &[PathBuf]) -> Result<Vec<Role>, String> {
     Ok(roles)
 }
 
-const EXPLORE_TOOLS: &[&str] = &[
+/// What "look, do not touch" means for a delegated child.
+///
+/// The last two are the reason this list is worth a comment. Reading the public
+/// internet is still reading: `web_search` and `web_fetch` change nothing, and
+/// a broad search is the exact shape `task` exists for — work that would
+/// otherwise flood the parent's conversation with intermediate output. Leaving
+/// them out made "delegate the news roundup to the cheap model" impossible for
+/// no reason anyone could state.
+///
+/// It is not a widening in a tree that did not ask for it: this list is
+/// resolved BY NAME against the parent's live catalog at spawn, so a tree
+/// without the `tool-web` row — which is off in `bundle::DEFAULTS`, and mounts
+/// nothing at all in offline mode — simply has no web tool to hand down. The
+/// child can reach exactly as far as its parent was allowed to.
+pub(crate) const EXPLORE_TOOLS: &[&str] = &[
     "read_file",
     "list_directory",
     "grep",
     "glob",
     "list_symbols",
     "read_symbol",
+    "web_search",
+    "web_fetch",
 ];
 const WORKER_TOOLS: &[&str] = &["edit_file", "write_file"];
 

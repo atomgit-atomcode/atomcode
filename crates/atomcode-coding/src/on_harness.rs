@@ -702,6 +702,28 @@ impl Plugin for InjectProvider {
             .0
             .get(&row.provider_id)
             .ok_or_else(|| format!("no provider registered as `{}`", row.provider_id))?;
+        // What replacing a row costs: the generic `llm` rows describe how a
+        // model gets switched in THEIR product (an env var and a restart, or a
+        // `--patch` file). This row displaced them and said nothing, so
+        // `describe_self` had no entry for the one question people actually ask
+        // — and the agent filled the gap by repeating the harness binary's
+        // story, telling a user to edit config and restart when `/model` was
+        // right there. Same failure as the persona: displacing a row means
+        // inheriting what it was responsible for.
+        let model = provider.model_name().to_string();
+        atomcode_harness::plugins::self_knowledge::describes(
+            ctx,
+            "model",
+            5,
+            format!(
+                "MODEL — this conversation runs `{model}`. The person switches it with \
+                 `/model` (or `--model` at launch); it takes effect on the next turn and \
+                 does NOT restart the session or lose the conversation. You cannot switch \
+                 it yourself, and you do not need to in order to use another model: \
+                 `task` and `team` each take a `model` id per delegation. \
+                 `describe_self(aspect=\"models\")` lists what is available."
+            ),
+        );
         let _ = ctx
             .provide::<atomcode_harness::seams::LlmSvc>(provider)
             .map_err(|e| e.to_string())?;
