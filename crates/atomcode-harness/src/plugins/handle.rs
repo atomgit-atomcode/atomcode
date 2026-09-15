@@ -412,6 +412,7 @@ pub fn stop_reason(stop: crate::seams::StopReason) -> atomcode_kernel::event::St
         In::InputRejected => Out::PromptRejected,
         In::PolicyDenied => Out::PolicyDenied,
         In::RateLimited => Out::RateLimited,
+        In::Timeout => Out::Timeout,
     }
 }
 

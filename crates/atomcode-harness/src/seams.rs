@@ -723,6 +723,9 @@ pub enum StopReason {
     /// A rate limit paused the turn — not a failure: already-produced work is
     /// kept, and the pause committed with it says when the limit resets.
     RateLimited,
+    /// The model's stream went silent past the liveness bound, and retrying did
+    /// not bring it back.
+    Timeout,
 }
 
 /// What a running tool can reach of the front end driving its agent.

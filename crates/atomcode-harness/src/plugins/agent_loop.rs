@@ -56,6 +56,12 @@ struct LoopRow {
     /// them, with a cancelled result for any call that never ran.
     #[serde(default)]
     undo_cancelled: bool,
+    /// How long a stream may go without an event — first token included —
+    /// before the request is abandoned as stalled. `0` waits as long as the
+    /// provider does. A stall is retryable: what happens next is the retry
+    /// policy's, and a turn that runs out of retries ends as timed out.
+    #[serde(default)]
+    stream_idle_ms: u64,
 }
 
 impl Default for LoopRow {
@@ -65,9 +71,14 @@ impl Default for LoopRow {
             working_dir: None,
             verify_log_invariant: true,
             undo_cancelled: false,
+            stream_idle_ms: 0,
         }
     }
 }
+
+/// The code a stalled stream's error carries, so the loop can tell a turn that
+/// timed out from one the provider failed.
+pub const STREAM_IDLE_CODE: &str = "stream_idle_timeout";
 
 fn default_max_rounds() -> u32 {
     100
@@ -85,6 +96,7 @@ struct PluginAgentLoop {
     max_rounds: u32,
     verify_log_invariant: bool,
     undo_cancelled: bool,
+    stream_idle: Option<std::time::Duration>,
 }
 
 impl PluginAgentLoop {
@@ -145,9 +157,10 @@ impl PluginAgentLoop {
                 let messages = req.messages.clone();
                 let tools = req.tools.clone();
                 let options = req.options.clone();
+                let idle = self.stream_idle;
                 Box::pin(async move {
                     stream_once(
-                        &*provider, &ctx, &session, turn, round, messages, tools, options,
+                        &*provider, &ctx, &session, turn, round, messages, tools, options, idle,
                     )
                     .await
                 }) as BoxFuture<'_, Result<ModelResponse, RequestError>>
@@ -240,13 +253,34 @@ async fn stream_once(
     messages: Vec<Message>,
     tools: Vec<ToolDef>,
     options: ChatOptions,
+    idle: Option<std::time::Duration>,
 ) -> Result<ModelResponse, RequestError> {
     let mut stream = provider
         .chat_stream(&messages, &tools, &options)
         .await
         .map_err(|e| RequestError::from_provider(&e))?;
     let mut out = ModelResponse::default();
-    while let Some(event) = stream.next().await {
+    loop {
+        let next = match idle {
+            Some(bound) => match tokio::time::timeout(bound, stream.next()).await {
+                Ok(next) => next,
+                // Silence is not an answer. Retryable, and carrying what already
+                // streamed, so recovery can keep it.
+                Err(_) => {
+                    return Err(RequestError {
+                        retryable: true,
+                        code: Some(STREAM_IDLE_CODE.to_string()),
+                        ..RequestError::message(format!(
+                            "stream idle timeout: no event for {}ms",
+                            bound.as_millis()
+                        ))
+                    }
+                    .with_partial(out))
+                }
+            },
+            None => stream.next().await,
+        };
+        let Some(event) = next else { break };
         match event {
             StreamEvent::TextDelta(text) => {
                 // Through the one write path like every other fact. A chunk
@@ -531,7 +565,11 @@ impl PluginAgentLoop {
                         outcome.stop = StopReason::RateLimited;
                         break;
                     }
-                    outcome.stop = StopReason::ProviderError;
+                    outcome.stop = if error.code.as_deref() == Some(STREAM_IDLE_CODE) {
+                        StopReason::Timeout
+                    } else {
+                        StopReason::ProviderError
+                    };
                     outcome.error = Some(error.to_string());
                     break;
                 }
@@ -866,6 +904,8 @@ impl Plugin for AgentLoopPlugin {
             max_rounds: row.max_rounds,
             verify_log_invariant: row.verify_log_invariant,
             undo_cancelled: row.undo_cancelled,
+            stream_idle: (row.stream_idle_ms > 0)
+                .then(|| std::time::Duration::from_millis(row.stream_idle_ms)),
         };
         let _ = ctx
             .provide::<AgentLoopSvc>(Arc::new(driver))

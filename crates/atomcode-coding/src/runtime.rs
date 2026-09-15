@@ -7710,8 +7710,9 @@ fn harness_option_rows(
     // Ctrl-C semantics: by default a cancelled turn is undone — its prompt and
     // partial work leave what the model sees next, as the chain rolls them back.
     rows.push_str(&format!(
-        "[[patch]]\nid = \"agent-loop\"\nconfig = {{ working_dir = {wd}, undo_cancelled = {} }}\n\n",
-        !config.keep_interrupted_context
+        "[[patch]]\nid = \"agent-loop\"\nconfig = {{ working_dir = {wd}, undo_cancelled = {}, stream_idle_ms = {} }}\n\n",
+        !config.keep_interrupted_context,
+        config.stream_timeout.as_millis()
     ));
     rows
 }

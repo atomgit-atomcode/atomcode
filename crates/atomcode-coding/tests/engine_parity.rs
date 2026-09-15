@@ -146,6 +146,10 @@ impl LlmProvider for RecordingProvider {
             Some(m) if m.role == Role::User && m.text == "hang" => {
                 return Ok(Box::pin(futures::stream::pending()));
             }
+            // A stream that opens and then says nothing, every time it is asked.
+            Some(m) if m.role == Role::User && m.text == "stall" => {
+                return Ok(Box::pin(futures::stream::pending()));
+            }
             Some(m) if m.role == Role::User && m.text == "mcp echo" => {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
@@ -1975,6 +1979,27 @@ async fn a_cut_off_turn_asks_before_giving_up(engine: &str) {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// A stream that goes silent ends the turn as timed out once the liveness bound
+/// passes, rather than holding it open until someone presses stop.
+async fn a_silent_stream_times_the_turn_out(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+    config.agent.stream_timeout = std::time::Duration::from_millis(100);
+    // No provider-level retries, so what is measured is the liveness bound.
+    config.agent.retry_max_attempts = Some(0);
+    let mut runtime = CodingRuntime::start(config).await.unwrap();
+    let (asked, reason) = turn_asked(&mut runtime, "stall", serde_json::Value::Null).await;
+    assert!(asked.is_empty(), "[{engine}] asked {asked:?}");
+    assert_eq!(
+        reason,
+        atomcode_kernel::event::StopReason::Timeout,
+        "[{engine}]"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 // ---- what the model is offered ---------------------------------------------
 
 /// The start a production driver makes: every capability the chain turns on
@@ -2178,4 +2203,5 @@ on_both_engines!(
     the_round_budget_asks_before_it_cuts_a_turn_off,
     a_turn_left_cut_off_says_so,
     a_cut_off_turn_asks_before_giving_up,
+    a_silent_stream_times_the_turn_out,
 );

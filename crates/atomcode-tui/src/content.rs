@@ -1016,6 +1016,8 @@ fn turn_end_note(stop: StopReason) -> (Glyph, String, Style) {
         ),
         // A pause, not a failure: the reset time is on the notice above it.
         RateLimited => (Glyph::Interrupted, "已暂停 · 触发限流".to_string(), warn),
+        // A failure: the stream went silent and retrying did not bring it back.
+        Timeout => (Glyph::Fail, "已中断 · 模型长时间没有回应".to_string(), bad()),
         // A failure, with the provider's own sentence folded in below.
         ProviderError => (Glyph::Fail, "已中断".to_string(), bad()),
         // Not a failed request: the log cannot explain what reached the model,
