@@ -842,16 +842,16 @@ pub struct RuntimeSessionInfo {
 
 /// Which engine runs the turns.
 ///
-/// The hand-written chain is the default and stays the default until the
-/// harness carries everything the runtime asks of it — which it does not yet:
-/// `/model`, `/cd`, plan mode, accept-edits and the MCP controls all reach into
-/// `CodingParts` handles that a mounted tree does not hand back. See
-/// `docs/handoff-coding-on-harness-2026-09-14.md`.
+/// **The harness is the default.** It carries what the runtime asks of it: the
+/// session (native snapshot, resume, undo, rewind, restore), the mode switches,
+/// the approval grants, MCP, the delegation tools, the rate-limit policy, the
+/// round and truncation checkpoints — each pinned by a scenario in
+/// `tests/engine_parity.rs` that ran on both engines before this line moved.
 ///
-/// `ATOMCODE_ENGINE=harness` opts one process in. Deliberately an env var
-/// rather than config: this is a development escape hatch for measuring how
-/// much of the runtime the harness can already carry, not a product setting,
-/// and it should be awkward to leave on.
+/// `ATOMCODE_ENGINE=chain` puts the hand-written chain back, and exists only for
+/// the length of this commit: the next one deletes the chain and this enum with
+/// it. It is not a product setting — nothing reads it but this function, and no
+/// documentation offers it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
     /// `parts::assemble` — the chain this crate has always shipped.
@@ -864,8 +864,8 @@ impl Engine {
     /// Read once per runtime start, so a turn cannot change engines midway.
     pub fn from_env() -> Self {
         match std::env::var("ATOMCODE_ENGINE").as_deref() {
-            Ok("harness") => Self::Harness,
-            _ => Self::Chain,
+            Ok("chain") => Self::Chain,
+            _ => Self::Harness,
         }
     }
 }

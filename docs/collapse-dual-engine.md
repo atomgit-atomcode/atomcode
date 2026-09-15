@@ -129,7 +129,8 @@ undo / restore / reprepare 家族今天是「停 agent → 写原生 → 重装�
 | 8 装配缺口(二) | `8a582120` `e412c194` `2c38ab96` | ✅ 取消即撤销(`SessionEvent::Interrupted`)、CodingPlan 窗口限流(`rate-limit-coding`,`RateLimitPaused`)、手动 compact 落盘即时 + 只汇报一次 |
 | 8 装配缺口(三) | `2ad275ed` `b857e241` `b89818ff` `631e33ca` `16914c71` `d5d5b277` `9d950b7e` | ✅ `tool-driver` 缝(工具进度 + 提问);树里挂产品自己的 `request_user_input` / `task` / `team` / `code_review` / `recall`(`parts::wire_side_providers` 两引擎共用：分层、会话 id、detached 用量记账、带 surface 计量;logout 清槽);Team 事件同源;`TurnProgress.continuing` + 轮次/截断检查点;`stream_idle_ms` → `Timeout`;`/compact <focus>` 由对话模型写摘要(`compaction-coding`);工具契约判据从名字升到描述+参数 |
 | 9 team 事件 | `b857e241` | ✅ 随产品 `task`/`team` 进树，事件由 `parts.team_manager` 发 |
-| 10 差分录 golden | 本 commit | ✅ `tests/golden/differential/*.json` 56 份，由链式录(`ATOMCODE_RECORD_GOLDEN=1`);回放下基线不变;篡改一份 → 棘轮红 |
+| 10 差分录 golden | `666adcf0` | ✅ `tests/golden/differential/*.json` 56 份，由链式录(`ATOMCODE_RECORD_GOLDEN=1`);回放下基线不变;篡改一份 → 棘轮红 |
+| 11 翻默认 | 本 commit | ✅ 默认 harness,`ATOMCODE_ENGINE=chain` 只活到删链那一个 commit。翻之前先把 tuix/cli/daemon 在 harness 下跑了一遍，抓到一条真回归:provider 不报用量的回合 harness 一条 `Usage` 都不发，ACP 按它换 messageId,两轮并成一条消息(`6e3ff220` 修 + 判据) |
 
 ### 装配缺口的做法(8)
 
@@ -143,6 +144,11 @@ undo / restore / reprepare 家族今天是「停 agent → 写原生 → 重装�
 ### 已知的偶发
 `atomcode-harness::harness the_log_reaches_the_disk_in_the_order_it_was_committed` 全量并行下偶发红，
 单跑与重复 10 次均绿;测试注释自认此事。
+
+### 与本线无关的既有红(翻默认前后都红)
+- `atomcode-daemon webui::tests::serves_embedded_index` / `unknown_path_falls_back_to_index`
+  (内嵌前端资源没构建)
+- `atomcode-tuix modals::config_panel::tests::retry_setting_is_searchable_in_both_languages`
 
 ## 判据(`tests/engine_parity.rs`)
 

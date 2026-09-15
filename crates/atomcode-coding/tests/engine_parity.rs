@@ -343,7 +343,7 @@ fn user_texts(messages: &[Message]) -> Vec<String> {
 }
 
 fn select(engine: &str) {
-    if engine == "chain" {
+    if engine == "harness" {
         std::env::remove_var("ATOMCODE_ENGINE");
     } else {
         std::env::set_var("ATOMCODE_ENGINE", engine);
