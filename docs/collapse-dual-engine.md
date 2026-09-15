@@ -122,10 +122,11 @@ undo / restore / reprepare 家族今天是「停 agent → 写原生 → 重装�
 |---|---|---|
 | 1-4 会话与重建 | `b884f74c` `da2c0767` `03130ee8` | ✅ 日志带 meta/reasoning_blocks;`SessionDefaults.seed`;`turn/finishing`;`native_log` 往返;`session-native` + `kernel-hooks` 行;`mount_harness` / `build_agent` 统一建树(残留树随之消失)。判据 `tests/engine_parity.rs` 8 场景 |
 | 5a 模式与授权 | `e51b7d16` | ✅ `modes` / `grants` 服务;`plan-mode-live`;`plan_verdict` 中立函数。判据 +3 场景 |
-| 5b 策略干预、schedule_wakeup | | 待做 |
+| 5b 策略干预、schedule_wakeup | `b07416c4` `67a332ec` | ✅ `SessionEvent::PolicyIntervention` + `StopReason::PolicyDenied`(会话格式 → 4);`host-tools`(schedule_wakeup) |
+| 7 配置桥接 | `c840386c` `4f7ad139` | ✅ 工具清单两引擎一致(明单三条)、能力开关、`skills-host`、memory `inject`、`chat-options`、`swap_provider_for`、权限规则、回合上限/循环保护/压缩/重试/提问超时 |
+| 8 装配缺口(一) | `85b392bb` | ✅ 上下文块、transcript、遥测、hooks.json + 插件钩子、datalog、todo 提醒;`kernel-middleware` 桥 |
 | 6 MCP | | 待做 |
-| 7 配置桥接 | | 待做 |
-| 8 装配缺口 | | 进行中 |
+| 8 装配缺口(二) | | 待做:CodingPlan 窗口限流、中断即撤销(keep_interrupted_context)、手动 compact 保真、用量记账、stream_timeout、team 事件 |
 
 ### 装配缺口的做法(8)
 
