@@ -46,6 +46,7 @@ use serde::Deserialize;
 
 use super::approval::{
     ApprovalRequest, InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
+    BASH_ALLOW_ALL_KEY,
 };
 use super::resolve_path;
 use super::sensitive_path::{path_is_sensitive, references_sensitive_path};
@@ -670,6 +671,10 @@ pub(crate) fn scan_destructive_bash(command: &str) -> BashScan {
 /// cwd handle).
 pub struct BashWorkspaceGate {
     store: Arc<dyn PermissionStore>,
+    /// Shared session-scoped "allow all Bash" store. If `BASH_ALLOW_ALL_KEY` is granted here,
+    /// any non-sensitive destructive bash is allowed without a round-trip. Sensitive targets
+    /// bypass this check and always go through `prompt_unremembered`.
+    allow_all: Arc<dyn PermissionStore>,
     /// LIVE working dir — the same handle the kernel reads per call, so a `/cd` moves the
     /// in-workspace boundary with it. Grant keys are canonicalized to ABSOLUTE paths, so a
     /// remembered out-of-workspace grant survives a `/cd`.
@@ -680,8 +685,10 @@ pub struct BashWorkspaceGate {
 impl BashWorkspaceGate {
     /// Gate over the LIVE (mutable) working dir handle.
     pub fn new(cwd: Arc<RwLock<PathBuf>>) -> Self {
+        let store: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
         Self {
-            store: Arc::new(InMemoryPermissionStore::new()),
+            allow_all: Arc::new(InMemoryPermissionStore::new()),
+            store,
             cwd,
             kind: APPROVAL_KIND.to_string(),
         }
@@ -695,6 +702,23 @@ impl BashWorkspaceGate {
     /// Use a caller-supplied grant store (tests).
     pub fn with_store(cwd: Arc<RwLock<PathBuf>>, store: Arc<dyn PermissionStore>) -> Self {
         Self {
+            allow_all: Arc::new(InMemoryPermissionStore::new()),
+            store,
+            cwd,
+            kind: APPROVAL_KIND.to_string(),
+        }
+    }
+
+    /// Use a caller-supplied per-target store AND a shared session-scoped allow-all store.
+    /// When the allow-all store holds [`BASH_ALLOW_ALL_KEY`], any non-sensitive out-of-workspace
+    /// destructive bash is allowed without a round-trip.
+    pub fn with_allow_all_store(
+        cwd: Arc<RwLock<PathBuf>>,
+        store: Arc<dyn PermissionStore>,
+        allow_all: Arc<dyn PermissionStore>,
+    ) -> Self {
+        Self {
+            allow_all,
             store,
             cwd,
             kind: APPROVAL_KIND.to_string(),
@@ -709,26 +733,39 @@ impl BashWorkspaceGate {
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
     ) -> PermissionDecision {
+        self.prompt_with_reason(call, tool, rt, Some("此命令写到工作区外 — 已允许常规 Bash,此类操作仍需单独确认。".into())).await
+    }
+
+    /// Round-trip the driver with an explicit reason string.
+    async fn prompt_with_reason(
+        &self,
+        call: &ToolCall,
+        tool: &Arc<dyn Tool>,
+        rt: &RequestCtx,
+        reason: Option<String>,
+    ) -> PermissionDecision {
         let payload = serde_json::to_value(ApprovalRequest {
             call_id: call.id.clone(),
             tool: tool.name().to_string(),
             args: call.arguments.clone(),
-            reason: None,
+            reason,
         })
         .unwrap_or(serde_json::Value::Null);
         PermissionDecision::from_value(&rt.request(&self.kind, payload).await)
     }
 
     /// Prompt and NEVER remember it — every call re-prompts. Reserved for SENSITIVE targets:
-    /// no answer to one prompt may pre-approve a later secret access. Both allow-once and
-    /// allow-always proceed without storing.
+    /// no answer to one prompt may pre-approve a later secret access. Both allow-once,
+    /// allow-always, and allow-always-all proceed without storing — the sensitive floor must
+    /// NEVER be weakened to blanket-allow, so AllowAlwaysAll is treated like AllowOnce here.
     async fn prompt_unremembered(
         &self,
         call: &ToolCall,
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
     ) -> BeforeOutcome {
-        match self.prompt(call, tool, rt).await {
+        let reason = Some("此命令触及敏感路径 — 每次都需确认(不会记住)。".into());
+        match self.prompt_with_reason(call, tool, rt, reason).await {
             PermissionDecision::AllowOnce
             | PermissionDecision::AllowAlways
             | PermissionDecision::AllowAlwaysAll => BeforeOutcome::Allow {
@@ -753,6 +790,9 @@ impl BashWorkspaceGate {
     /// The grant key is [`Tool::always_grant_scope`], the SAME scope the approval panel renders
     /// its label from, so "Always" means one thing everywhere. Sensitive arguments are routed to
     /// the unremembered prompt above before we get here — that floor is unchanged.
+    ///
+    /// On `AllowAlwaysAll`, ALSO records the shared session sentinel so the allow-all bypass
+    /// fires on future calls.
     async fn prompt_unresolvable(
         &self,
         call: &ToolCall,
@@ -771,12 +811,20 @@ impl BashWorkspaceGate {
                 reason: Some("destructive bash previously approved for this session".into()),
             };
         }
-        match self.prompt(call, tool, rt).await {
+        let reason = Some("此命令目标无法确定是否在工作区内 — 仍需单独确认。".into());
+        match self.prompt_with_reason(call, tool, rt, reason).await {
             PermissionDecision::AllowOnce => BeforeOutcome::Allow {
                 reason: Some("destructive bash approved (this call)".into()),
             },
-            PermissionDecision::AllowAlways | PermissionDecision::AllowAlwaysAll => {
+            PermissionDecision::AllowAlways => {
                 self.store.grant(&key);
+                BeforeOutcome::Allow {
+                    reason: Some("destructive bash approved for this session".into()),
+                }
+            }
+            PermissionDecision::AllowAlwaysAll => {
+                self.store.grant(&key);
+                self.allow_all.grant(BASH_ALLOW_ALL_KEY);
                 BeforeOutcome::Allow {
                     reason: Some("destructive bash approved for this session".into()),
                 }
@@ -826,11 +874,22 @@ impl ToolMiddleware for BashWorkspaceGate {
         // Sensitive TARGET → prompt EVERY time, never remembered (mirror WriteApprovalGate).
         // Classified on the resolved target (not a substring of the whole command) so a benign
         // command that merely MENTIONS a secret name (`echo id_rsa >> ./notes.txt`) isn't blocked.
+        // This check runs BEFORE the allow-all bypass: sensitive targets are NEVER covered by the
+        // session-wide allow-all grant — the sensitive floor must not be weakened.
         if targets
             .iter()
             .any(|t| path_is_sensitive(&resolve_path(t, &cwd)))
         {
             return self.prompt_unremembered(call, tool, rt).await;
+        }
+
+        // Session-scoped allow-all bypass: if the user previously approved "allow all Bash
+        // (incl. destructive)" for this session, short-circuit without a round-trip. Sensitive
+        // targets are excluded above; unresolvable commands are handled before we reach here.
+        if self.allow_all.is_granted(BASH_ALLOW_ALL_KEY) {
+            return BeforeOutcome::Allow {
+                reason: Some("previously approved all bash this session".into()),
+            };
         }
 
         // Classification canonicalizes paths (filesystem I/O) — run OFF the async worker, bounded,
@@ -900,10 +959,19 @@ impl ToolMiddleware for BashWorkspaceGate {
             PermissionDecision::AllowOnce => BeforeOutcome::Allow {
                 reason: Some("approved once".into()),
             },
-            PermissionDecision::AllowAlways | PermissionDecision::AllowAlwaysAll => {
+            PermissionDecision::AllowAlways => {
                 for k in &out_keys {
                     self.store.grant(k);
                 }
+                BeforeOutcome::Allow {
+                    reason: Some("approved always (this folder)".into()),
+                }
+            }
+            PermissionDecision::AllowAlwaysAll => {
+                for k in &out_keys {
+                    self.store.grant(k);
+                }
+                self.allow_all.grant(BASH_ALLOW_ALL_KEY);
                 BeforeOutcome::Allow {
                     reason: Some("approved always (this folder)".into()),
                 }
@@ -1612,6 +1680,54 @@ mod tests {
         assert!(
             out.is_deny(),
             "a target that escapes /tmp via .. must still prompt, got {out:?}"
+        );
+    }
+
+    // ---- allow-all bypass tests -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn allow_all_grant_bypasses_out_of_workspace_prompt() {
+        // A pre-granted BASH_ALLOW_ALL_KEY must short-circuit the gate WITHOUT a round-trip:
+        // an out-of-workspace rm must Allow immediately (silent driver never consulted).
+        let ws = tempfile::tempdir().unwrap();
+        let allow_all: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
+        allow_all.grant(BASH_ALLOW_ALL_KEY);
+        let gate = BashWorkspaceGate::with_allow_all_store(
+            Arc::new(RwLock::new(ws.path().to_path_buf())),
+            Arc::new(InMemoryPermissionStore::new()),
+            allow_all,
+        );
+        let tool = bash_tool();
+        let mut call = bash_call("rm /atomcode-test-allow-all/x.txt");
+        let out = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(
+            matches!(out, BeforeOutcome::Allow { .. }),
+            "allow-all grant must bypass the out-of-workspace prompt, got {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sensitive_target_not_bypassed_by_allow_all_grant() {
+        // Even with BASH_ALLOW_ALL_KEY pre-granted, a sensitive target must still prompt
+        // (fail closed with silent driver) — the sensitive floor must NEVER be weakened.
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("id_rsa");
+        std::fs::write(&secret, "k").unwrap();
+
+        let allow_all: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
+        allow_all.grant(BASH_ALLOW_ALL_KEY);
+        let gate = BashWorkspaceGate::with_allow_all_store(
+            Arc::new(RwLock::new(ws.path().to_path_buf())),
+            Arc::new(InMemoryPermissionStore::new()),
+            allow_all,
+        );
+        let tool = bash_tool();
+        let mut call = bash_call(&format!("rm {}", secret.to_str().unwrap()));
+        let out = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(
+            out.is_deny(),
+            "sensitive delete must still prompt even with allow-all grant (fail closed when silent), got {out:?}"
         );
     }
 }
