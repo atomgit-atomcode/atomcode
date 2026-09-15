@@ -154,6 +154,8 @@ impl Models for TestCatalog {
     }
 }
 
+/// A model on the one account everything in these tests shares, unless a test
+/// says otherwise.
 fn model(id: &str, rank: i64) -> ModelInfo {
     ModelInfo {
         id: id.into(),
@@ -163,6 +165,17 @@ fn model(id: &str, rank: i64) -> ModelInfo {
         capable_rank: Some(rank),
         effort_levels: Vec::new(),
         note: None,
+        account: "here".into(),
+        cross_account: false,
+    }
+}
+
+/// The same model, billed to somebody else.
+fn elsewhere(id: &str, rank: i64, opted_in: bool) -> ModelInfo {
+    ModelInfo {
+        account: "over-there".into(),
+        cross_account: opted_in,
+        ..model(id, rank)
     }
 }
 
@@ -599,6 +612,108 @@ async fn naming_a_model_with_no_catalog_says_so() {
     assert!(
         said.contains("not available to delegate to"),
         "the model has to learn that this id is not a thing here:\n{said}"
+    );
+    drop(app);
+}
+
+// ---- whose money, whose vendor -------------------------------------------
+
+/// **An account boundary is not a cost question, and cheapness does not cross
+/// it.**
+///
+/// The rank rules are about spending more of what the person already committed
+/// to. This one is about spending somebody else's, on somebody else's gateway,
+/// with this repository's contents in the request — and no rank, however low,
+/// makes that the model's decision.
+#[test]
+fn another_account_is_off_the_list_until_that_model_says_otherwise() {
+    struct Fixed(Vec<ModelInfo>, Option<String>);
+    #[async_trait]
+    impl Models for Fixed {
+        fn list(&self) -> Vec<ModelInfo> {
+            self.0.clone()
+        }
+        fn current(&self) -> Option<String> {
+            self.1.clone()
+        }
+        async fn provider(&self, _id: &str) -> Result<Arc<dyn LlmProvider>, String> {
+            Err("not needed".into())
+        }
+    }
+    let ids = |ms: Vec<ModelInfo>| ms.into_iter().map(|m| m.id).collect::<Vec<_>>();
+
+    // Cheaper, and still not offered: the flag is the only thing that crosses.
+    let shut = vec![
+        model("mine-cheap", 10),
+        model("mine", 30),
+        elsewhere("theirs-cheap", 5, false),
+    ];
+    assert_eq!(
+        ids(delegatable(&Fixed(shut, Some("mine".into())))),
+        vec!["mine-cheap", "mine"],
+        "a model on another account is not on the list, however cheap it is"
+    );
+
+    // The same model, opted in by the deployment.
+    let opened = vec![
+        model("mine-cheap", 10),
+        model("mine", 30),
+        elsewhere("theirs-cheap", 5, true),
+    ];
+    assert_eq!(
+        ids(delegatable(&Fixed(opened, Some("mine".into())))),
+        vec!["theirs-cheap", "mine-cheap", "mine"],
+        "opted in, it takes its place by rank like anything else"
+    );
+
+    // …and the opt-in does not buy it past the ceiling. Two independent rules,
+    // both of which must hold.
+    let strong = vec![model("mine", 30), elsewhere("theirs-strong", 99, true)];
+    assert_eq!(
+        ids(delegatable(&Fixed(strong, Some("mine".into())))),
+        vec!["mine"],
+        "`delegatable = true` is permission to cross an account, not permission \
+         to spend more than the person chose"
+    );
+
+    // Same account, no flag, nothing ranked: the ordinary case, and it works
+    // without anyone configuring anything.
+    let mut a = model("a", 0);
+    let mut b = model("b", 0);
+    a.capable_rank = None;
+    b.capable_rank = None;
+    assert_eq!(
+        ids(delegatable(&Fixed(vec![a, b], Some("a".into())))),
+        vec!["a", "b"],
+        "within one account, silence is still not a refusal"
+    );
+}
+
+/// And the tool refuses it the same way it refuses a typo — by name, with the
+/// list of what may be used instead.
+#[tokio::test]
+async fn naming_a_model_on_another_account_is_refused() {
+    let (app, calls) = delegate_with(
+        "other-account",
+        r#"{"task":"look around","model":"theirs"}"#,
+        vec![
+            model("cheap", 10),
+            model("lead-model", 30),
+            elsewhere("theirs", 5, false),
+        ],
+        Some("lead-model"),
+    )
+    .await;
+
+    assert!(
+        !who(&calls).iter().any(|c| c == "theirs"),
+        "nothing on the other account may be reached: {:?}",
+        calls.lock().expect("calls poisoned")
+    );
+    let said = transcript(&app);
+    assert!(
+        said.contains("not available to delegate to") && said.contains("cheap"),
+        "and the refusal names what IS available:\n{said}"
     );
     drop(app);
 }

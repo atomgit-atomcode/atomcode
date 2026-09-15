@@ -74,6 +74,12 @@ pub struct ModelInfo {
     /// Free text from the host: what this model is good for. Never inferred
     /// from the name.
     pub note: Option<String>,
+    /// Which set of credentials and which bill this model runs on. Two models
+    /// with the same account are the same person's money and the same vendor.
+    pub account: String,
+    /// The host says this model may be delegated to from ANOTHER account.
+    /// Meaningless within one account, where delegation needs no permission.
+    pub cross_account: bool,
 }
 
 /// The models this host can build a provider for.
@@ -124,6 +130,16 @@ pub trait Models: Send + Sync {
 /// * **only the conversation ranked** ⇒ the candidate is withheld for the mirror
 ///   reason: it cannot be shown to be at or below the ceiling.
 ///
+/// **Across accounts, none of that applies until someone says so.** Everything
+/// above is about spending more of the money the person already committed to.
+/// Another account is a different set of credentials, a different bill and
+/// usually a different vendor, so a model belonging to one is off the list
+/// entirely unless it carries `cross_account` — a per-model opt-in the
+/// deployment writes down. Being cheaper does not help: handing this repository
+/// to a second company at a discount is still not the model's call. Same
+/// account needs no flag, because choosing the account is exactly what the
+/// person did when they picked the conversation's model.
+///
 /// Sorted weakest-known-first, with the unordered ones after them — so
 /// [`cheapest`] can mean something even when most of the catalog says nothing.
 pub fn delegatable(models: &dyn Models) -> Vec<ModelInfo> {
@@ -136,17 +152,31 @@ pub fn delegatable(models: &dyn Models) -> Vec<ModelInfo> {
     };
     let current = Some(current);
     let here = |m: &ModelInfo| current.as_deref() == Some(m.id.as_str());
-    let host_rank = all.iter().find(|m| here(m)).and_then(|m| m.capable_rank);
+    let host = all.iter().find(|m| here(m));
+    let host_rank = host.and_then(|m| m.capable_rank);
+    // `None` when the catalog does not contain the conversation's own model —
+    // then nothing can be shown to share an account with it, and the gate below
+    // withholds everything that has not opted in.
+    let host_account = host.map(|m| m.account.clone());
 
     let mut out: Vec<ModelInfo> = all
         .into_iter()
         .filter(|m| {
-            here(m)
-                || match (host_rank, m.capable_rank) {
-                    (Some(ceiling), Some(rank)) => rank <= ceiling,
-                    (None, None) => true,
-                    _ => false,
-                }
+            if here(m) {
+                return true;
+            }
+            // The account gate runs FIRST, and it is not a cost question: a
+            // model on another account is off the list whatever its rank says.
+            let same_account = host_account.as_deref() == Some(m.account.as_str());
+            if !same_account && !m.cross_account {
+                return false;
+            }
+
+            match (host_rank, m.capable_rank) {
+                (Some(ceiling), Some(rank)) => rank <= ceiling,
+                (None, None) => true,
+                _ => false,
+            }
         })
         .collect();
     out.sort_by(|a, b| {

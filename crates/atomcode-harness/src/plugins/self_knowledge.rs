@@ -186,7 +186,11 @@ impl Introspect {
             "Models `task` and `team` may be delegated to. Pass one of these ids as \
              `model`; omit it to keep the conversation's own model.\n\n\
              {rows}\n\n\
-             {why}",
+             {why}\n\n\
+             Models billed to another account are not here unless that model was \
+             marked shareable. That is a decision about credentials and vendors, \
+             not about cost, so a cheaper model on another account is still \
+             absent.",
             why = if ranked {
                 "Ordered weakest first where the deployment says so. Anything more capable \
              than this conversation is deliberately absent: choosing to spend more is \
