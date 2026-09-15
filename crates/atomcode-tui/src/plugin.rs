@@ -913,14 +913,19 @@ impl Tui {
                 // and the line you clicked is the first thing to leave. Moving
                 // the view back by exactly what it gained keeps that line where
                 // it was, and what appears, appears *below* it.
-                // `m` was dropped above, so the pin can take the moment it needs
-                // without the caller's write lock in the way. One call, not a
-                // fourth copy of the arithmetic: folding a block changes how many
-                // rows there are to read, which is the same event the other
-                // routes pin against.
-                let before = self.host.moment.read().expect("moment poisoned").clone();
-                self.host.toggle_block(id, kind);
-                self.host.repin(&before);
+                // `m` was dropped above, so the pin can take the moment it
+                // needs without the caller's write lock in the way. Not a
+                // fourth copy of the arithmetic: folding a block changes how
+                // many rows there are to read, which is what every other route
+                // pins against.
+                //
+                // Held **whether or not the reader is at the bottom**, unlike
+                // the routes that fold a fact. The person pointed at this row;
+                // unfolding grows the block upward and its header is the first
+                // thing to leave, so the row they pointed at has to stay where
+                // they pointed — and pointing at a row while at the bottom is
+                // the common case, not the exception.
+                self.host.held_while(|| self.host.toggle_block(id, kind));
                 return false;
             }
             // Handing the mouse back is the answer to "I cannot select text

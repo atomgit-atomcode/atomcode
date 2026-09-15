@@ -691,16 +691,25 @@ pub struct Host {
     painted: Mutex<u64>,
     /// What was on screen last, so a click can be answered from it.
     hits: Mutex<Hits>,
-    /// The width the stream was last laid out at. New content arrives between
-    /// frames and has to be measured in the same terms the frame used.
-    last_width: Mutex<u16>,
-    /// The whole screen the last frame was composed at.
+    /// The box the conversation had in the last frame.
     ///
-    /// Beside `last_width` and for the same reason: `absorb` runs between
-    /// frames, and the scroll it adjusts has to be clamped against the screen
-    /// that was actually drawn — `stream_rows` is what says how much of the pane
-    /// is on it, and that is a question about both dimensions.
-    last_size: Mutex<(u16, u16)>,
+    /// Both dimensions, and **the stream's own**, not the screen's: a block is
+    /// measured at the width it is drawn at, and under a layout that does not
+    /// give the stream the whole screen (`wide`) the two are not the same. The
+    /// height is what the tail has to share with the conversation.
+    ///
+    /// Kept because `absorb` runs between frames and has to measure in the same
+    /// terms the frame did.
+    last_room: Mutex<Rect>,
+    /// Serialises "hold the reading still while this changes".
+    ///
+    /// The facts arrive on the emitter's thread and the activity on the event
+    /// loop's, so a turn ending can commit a fact and flip the activity at the
+    /// same moment. Both change how much there is to read and both compensate
+    /// for it, and two compensations for one change is a screen that jumps by
+    /// the difference. One gate, held across measure-change-measure, is what
+    /// makes the pair add up to one.
+    pin_gate: Mutex<()>,
 }
 
 impl Host {
@@ -722,8 +731,8 @@ impl Host {
             presentation: RwLock::new(Presentation::default_folds()),
             painted: Mutex::new(0),
             hits: Mutex::new(Hits::default()),
-            last_width: Mutex::new(0),
-            last_size: Mutex::new((0, 0)),
+            last_room: Mutex::new(Rect::default()),
+            pin_gate: Mutex::new(()),
         }
     }
 
@@ -748,31 +757,18 @@ impl Host {
             _ => {}
         }
 
-        // Pinned reading. The scroll offset is measured from the bottom of the
-        // conversation, and the model puts new output *at* that bottom — so a
-        // reader who has scrolled up to study something would watch it slide
-        // away by exactly as much as arrived, which is the screen refusing to
-        // hold still. Moving the offset by what grew keeps the same lines under
-        // the same eyes.
-        //
-        // Only while held back: at the bottom the whole point is to follow, and
-        // measuring is O(the conversation), so it is not paid for nothing.
-        //
-        // Read as a snapshot, because the reading has to be comparable before
-        // and after the fold below, and because `stream_height` now needs the
-        // moment: it is an argument, not a field read, so that a caller holding
-        // the write lock (plugin.rs) can hand its own guard over instead of
-        // deadlocking against it.
-        let width = *self.last_width.lock().expect("width poisoned");
-        let size = *self.last_size.lock().expect("size poisoned");
-        let now = self.moment.read().expect("moment poisoned").clone();
-        let held = width > 0 && now.scroll.0 > 0;
-        let before = if held {
-            self.stream_height(size, &now)
-        } else {
-            0
-        };
+        // Pinned while the reader is holding a position: what the fact does to
+        // the conversation is what moves the reading, and the reading has to
+        // move with it or the same words slide out from under the same eyes.
+        self.pinned(true, || self.fold(fact));
+    }
 
+    /// Fold one fact into every module, and into the few things the host keeps
+    /// beside them.
+    ///
+    /// Split out of [`Host::absorb`] so that the pin can wrap it: the pin is
+    /// "measure, change, measure again", and the change is this.
+    fn fold(&self, fact: &SessionEvent) {
         {
             let mut stream = self.stream.write().expect("stream poisoned");
             for p in self.modules.producers() {
@@ -797,11 +793,6 @@ impl Host {
                 m.history.push(text.clone());
             }
         }
-
-        if held {
-            let after = self.stream_height(size, &now);
-            self.pin(before, after, size, &now);
-        }
     }
 
     /// Tell the status line what the agent is doing.
@@ -817,68 +808,86 @@ impl Host {
     /// `true` when it changed what the line would draw — the caller's business,
     /// because a frame for the same picture is a frame nobody needed.
     pub fn set_activity(&self, activity: crate::moment::Activity) -> bool {
-        let before = {
-            let mut m = self.moment.write().expect("moment poisoned");
-            if m.activity == activity {
-                return false;
-            }
-            // Cloned *before* the write, because the reading to be held still is
-            // the one the reader is looking at, which is the one with the old
-            // activity in it.
-            let before = m.clone();
-            m.activity = activity;
-            before
-        };
-        self.repin(&before);
+        if self.moment.read().expect("moment poisoned").activity == activity {
+            return false;
+        }
+        self.pinned(true, || {
+            self.moment.write().expect("moment poisoned").activity = activity;
+        });
         true
     }
 
-    /// The size and moment to measure a pin against, and whether to pin at all.
+    /// Run `change` with the reader's place held, unconditionally.
     ///
-    /// Only while held back: at the bottom the whole point is to follow, and
-    /// measuring is O(the conversation), so it is not paid for nothing.
-    fn pin_baseline(&self) -> Option<((u16, u16), u16, Moment)> {
-        let width = *self.last_width.lock().expect("width poisoned");
-        let size = *self.last_size.lock().expect("size poisoned");
-        let now = self.moment.read().expect("moment poisoned").clone();
-        (width > 0 && now.scroll.0 > 0).then_some((size, width, now))
+    /// For a change the person made by pointing at something: the row they
+    /// pointed at stays where it was, whether or not they are at the bottom.
+    /// See [`Host::pinned`].
+    pub fn held_while<F: FnOnce()>(&self, change: F) {
+        self.pinned(false, change)
     }
 
-    /// Hold the reading still across a change to what is on screen.
+    /// Run `change`, keeping the reader's place across whatever it did.
     ///
-    /// Called from both routes that can move the sum: a fact ([`Host::absorb`])
-    /// and the activity the event loop writes ([`Host::set_activity`]), plus
-    /// the click that folds a block. Three copies of this arithmetic is what
-    /// the plan called out as the bug — the pin has to be one thing, or the
-    /// routes drift apart and only some of them hold.
-    pub fn repin(&self, before: &Moment) {
-        let Some((size, _width, now)) = self.pin_baseline() else {
+    /// **Measure, change, measure again** — one shape, because the arithmetic is
+    /// the same on every route and there are three of them: a fact folded in
+    /// ([`Host::absorb`]), the activity the event loop writes
+    /// ([`Host::set_activity`]), and a click that folds a block. Three copies
+    /// would drift, and the drift is invisible until someone is reading history
+    /// while it happens.
+    ///
+    /// What it holds still is the *reading*: the offset is measured from the
+    /// bottom of the conversation and the newest content lands at that bottom,
+    /// so a reader who scrolled up to study something would watch it slide away
+    /// by exactly as much as arrived. Moving the offset by what grew keeps the
+    /// same lines under the same eyes.
+    ///
+    /// `only_when_held`: true for the routes where "at the bottom" means follow
+    /// the output (the whole point there is to keep up, and the walk is
+    /// O(conversation)). **False for a click**, which is different: the person
+    /// pointed at a row, and the row has to stay where they pointed. A block
+    /// that unfolds grows *upward* — its header is the first thing to leave —
+    /// and that is exactly the most common case, done at the bottom.
+    ///
+    /// The gate is what makes the routes add up. A turn ending parts a fact on
+    /// the emitter's thread and an activity on the event loop's, and if both
+    /// measure the same change and both compensate for it, the offset moves
+    /// twice for one screenful.
+    fn pinned(&self, only_when_held: bool, change: impl FnOnce()) {
+        let _gate = self.pin_gate.lock().expect("pin gate poisoned");
+        let room = *self.last_room.lock().expect("room poisoned");
+        if room.is_empty() {
+            // No frame has been composed yet, so there is no "where the reader
+            // is" to hold and nothing to measure against.
+            change();
             return;
+        }
+        let before = self.moment.read().expect("moment poisoned").clone();
+        let held = !only_when_held || before.scroll.0 > 0;
+        let before_h = if held {
+            self.stream_height_in(room, &before).0
+        } else {
+            0
         };
-        // `before.scroll` and `now.scroll` are the same reading: the pin is
-        // adjusting the offset *for* a content change, not reacting to a scroll
-        // the person made. What is compared is the height, taken either side.
-        let before_h = self.stream_height(size, before);
-        let after_h = self.stream_height(size, &now);
-        self.pin(before_h, after_h, size, &now);
-    }
 
-    /// Move the offset by the change in what there is to read, clamped to what
-    /// is now reachable.
-    ///
-    /// **Signed**, and not `if grew > 0` as it was. A block only ever grows, so
-    /// one direction was enough while the stream was blocks and nothing else;
-    /// the tail is not like that. The live line appears and disappears with the
-    /// activity, and a plan can lose items — either shrinks the sum without a
-    /// thing scrolling, and a reader compensated one way only gets a screen
-    /// that jumps down whenever it happens.
-    fn pin(&self, before: usize, after: usize, size: (u16, u16), now: &Moment) {
-        let grew = after as i64 - before as i64;
+        change();
+
+        if !held {
+            return;
+        }
+        // Measured again *after* the change, and against the moment as it is
+        // now — a fresh read, not the snapshot. The snapshot is what the
+        // *before* height was taken at, and reusing it here would measure the
+        // same world twice and find no difference at all: this is exactly the
+        // hole the click route fell through when the fold lived somewhere the
+        // snapshot could not see it.
+        let after = self.moment.read().expect("moment poisoned").clone();
+        let after_h = self.stream_height_in(room, &after).0;
+        let grew = after_h as i64 - before_h as i64;
         if grew == 0 {
             return;
         }
         let mut m = self.moment.write().expect("moment poisoned");
-        let max = self.scroll_limit(size, now) as i64;
+        let max = self.scroll_limit((room.w, room.h), &after) as i64;
         m.scroll = crate::moment::ScrollPos((m.scroll.0 as i64 + grew).clamp(0, max) as usize);
     }
 
@@ -1087,15 +1096,23 @@ impl Host {
     /// disagreed would put the tail's own rows out of reach at the bottom of the
     /// scroll, which is the failure `stream_height` goes to lengths to avoid.
     ///
-    /// Rationed bottom-up, so the module against the bottom edge — the newest
-    /// thing — is the last to lose a row.
+    /// Rationed **top-down**: the first id gives up its rows first, so the one
+    /// against the bottom edge — the newest thing, and the one that answers "is
+    /// it stuck?" — keeps its rows longest.
+    ///
+    /// This was written backwards once: the comment said the bottom kept its
+    /// rows and the loop took them from the bottom first. On a long plan in a
+    /// short terminal that meant the live line was the first thing to go, which
+    /// is the worst of the two to lose — the task list has a `window` for
+    /// running out of room, and the live line has nothing to fall back on.
     fn cap_tail(mut heights: Vec<(String, u16)>, pane_h: u16) -> Vec<(String, u16)> {
         // One row for the conversation, at least. A pane of one row cannot hold
         // a tail and a conversation both, and the conversation is what the
         // screen is for.
         let budget = pane_h.saturating_sub(1);
         let mut total: u16 = heights.iter().map(|(_, h)| *h).sum();
-        for (_, h) in heights.iter_mut().rev() {
+        // Forward, not reversed: `heights` is in layout order, top to bottom.
+        for (_, h) in heights.iter_mut() {
             if total <= budget {
                 break;
             }
@@ -1394,14 +1411,14 @@ impl Host {
                 continue;
             }
             match region {
-                Region::Stream { .. } => {
+                Region::Stream { tail } => {
                     // The pane is split before anything is drawn: the modules
                     // riding the tail take their rows off the bottom, and what
                     // is left is the conversation's. With no tail declared this
                     // is the identity — one rect, the offset unchanged — which
                     // is why every layout in this build still composes the same
                     // frame it did before the split existed.
-                    let heights = self.tail_heights(rect.w, &moment);
+                    let heights = self.tail_heights_of(&tail, rect.w, &moment);
                     let pane = Self::pane_geometry(rect, moment.scroll.0, &heights);
                     let (lines, owners) = self.stream_lines(pane.block_rect, pane.block_scroll);
                     *self.hits.lock().expect("hits poisoned") = Hits {
@@ -1410,8 +1427,7 @@ impl Host {
                         jump: None,
                         field: None,
                     };
-                    *self.last_width.lock().expect("width poisoned") = rect.w;
-                    *self.last_size.lock().expect("size poisoned") = (w, h);
+                    *self.last_room.lock().expect("room poisoned") = rect;
                     // The **blocks'** rect, not the pane's. The badge reports
                     // how much conversation is out of view, so it belongs on the
                     // conversation's bottom edge; anchored to the pane it would
@@ -1563,6 +1579,22 @@ impl Host {
     /// term the stream scrolls off its own top and the region goes blank, which
     /// reads as the conversation having been lost.
     pub fn stream_rows(&self, size: (u16, u16), moment: &Moment) -> u16 {
+        self.stream_room(size, moment).h
+    }
+
+    /// The box the conversation gets on a screen of `size`.
+    ///
+    /// **The only place a stream's size is worked out**, and it is a `Rect`
+    /// rather than a pair of numbers because both dimensions matter and they
+    /// are used for different things: the width is what every block is
+    /// *measured* at, and the height is what the tail has to share with it.
+    ///
+    /// Taking the width from the screen instead is the mistake this exists to
+    /// stop. Under `wide` the conversation is 65% of the screen, so a block
+    /// measured at the full width wraps into fewer rows than the frame draws —
+    /// and a reader scrolled back drifts by the difference, one chunk at a
+    /// time.
+    fn stream_room(&self, size: (u16, u16), moment: &Moment) -> Rect {
         let (w, h) = size;
         let modules = self.modules.clone();
         let pruned = self.layout.tree().prune(&|id| modules.has_view(id));
@@ -1570,8 +1602,8 @@ impl Host {
         pruned
             .layout_with(Rect::sized(w, h), &asked)
             .into_iter()
-            .find_map(|(region, rect)| matches!(region, Region::Stream { .. }).then_some(rect.h))
-            .unwrap_or(h)
+            .find_map(|(region, rect)| matches!(region, Region::Stream { .. }).then_some(rect))
+            .unwrap_or_else(|| Rect::sized(w, h))
     }
 
     /// How far back the stream can be scrolled, in rendered lines. Zero when
@@ -1601,17 +1633,23 @@ impl Host {
     /// It is called per chunk while the reader is scrolled back, which is the
     /// one time the whole conversation is in the sum.
     pub fn stream_height(&self, size: (u16, u16), moment: &Moment) -> usize {
-        self.stream_height_split(size, moment).0
+        self.stream_height_in(self.stream_room(size, moment), moment)
+            .0
     }
 
-    /// The same sum, and the rows the tail contributes to it.
+    /// [`Host::stream_height`] for a caller that already knows the box.
     ///
-    /// Split out because the frame needs both: the total bounds the scroll, and
-    /// the tail's share is what decides where the conversation ends and the tail
-    /// begins. Two functions would be two walks of the conversation that agree
-    /// until one of them changes.
-    fn stream_height_split(&self, size: (u16, u16), moment: &Moment) -> (usize, usize) {
-        let (width, _height) = size;
+    /// The frame worked it out to lay the regions out, and the pin is holding
+    /// the one from the frame it is pinning against; asking again would be a
+    /// second answer to a question both of them already have — and the two
+    /// would disagree on the frame where the layout changed under them.
+    ///
+    /// Returns the total and the tail's share together, because the frame needs
+    /// both: the total bounds the scroll, and the tail's share is what decides
+    /// where the conversation ends and the tail begins. Two walks would agree
+    /// until one of them changed.
+    fn stream_height_in(&self, room: Rect, moment: &Moment) -> (usize, usize) {
+        let width = room.w;
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         let mut total = 0usize;
@@ -1658,12 +1696,11 @@ impl Host {
         // leaving it out would put its own rows out of reach at the bottom of
         // the scroll, which is exactly the failure the block walk goes to such
         // lengths to avoid one paragraph up.
-        // The same cap the geometry uses. It takes the pane's height, which is
-        // the whole screen minus whatever the other regions hold — and this is
-        // the one place that would otherwise count rows the frame declined to
-        // draw, putting them out of reach at the bottom of the scroll.
-        let tail_room = self.stream_rows(size, moment);
-        let tail: usize = Self::cap_tail(self.tail_heights(width, moment), tail_room)
+        // The same cap the geometry uses, and the same height it uses it at.
+        // This is the one place that would otherwise count rows the frame
+        // declined to draw, putting them out of reach at the bottom of the
+        // scroll.
+        let tail: usize = Self::cap_tail(self.tail_heights(width, moment), room.h)
             .iter()
             .map(|(_, h)| *h as usize)
             .sum();
@@ -1682,9 +1719,20 @@ impl Host {
     /// tail costs an arithmetic call per frame, not a second render of itself.
     fn tail_heights(&self, width: u16, moment: &Moment) -> Vec<(String, u16)> {
         let ids = self.layout.tree().tail().to_vec();
+        self.tail_heights_of(&ids, width, moment)
+    }
+
+    /// [`Host::tail_heights`] for a caller that already holds the ids.
+    ///
+    /// The frame has them — they came out of the `Region::Stream` it is
+    /// composing. Reading the tree again would be a second answer, and the two
+    /// can differ: `adjust_layout` runs on another thread, so a preset switched
+    /// between the layout and the compose would have this frame draw the old
+    /// arrangement's tail while the flex above placed the new one's.
+    fn tail_heights_of(&self, ids: &[String], width: u16, moment: &Moment) -> Vec<(String, u16)> {
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            let Some(view) = self.modules.view(&id) else {
+            let Some(view) = self.modules.view(id) else {
                 // Not mounted: `prune` would have taken it off the tree, and a
                 // tail id that is not mounted is not a row of anything.
                 continue;
@@ -1693,7 +1741,7 @@ impl Host {
                 Height::Fixed(n) | Height::Hug(n) => n,
                 Height::Fill => 1,
             };
-            out.push((id, h));
+            out.push((id.clone(), h));
         }
         out
     }
@@ -2203,6 +2251,126 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_call_leaves_the_row_that_was_clicked_where_it_was() {
+        // **At the bottom**, which is the common case and the one the old code
+        // skipped: it only pinned while the reader was scrolled back.
+        //
+        // A tool call arrives folded (`Presentation::default_folds`), so the
+        // click *opens* it — and opening grows the block **upward**, which
+        // pushes its own header off the top. The person pointed at that row; it
+        // is the one that has to stay.
+        let h = host_with_a_long_call();
+        let size = (80, 24);
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos::BOTTOM;
+        let _ = h.compose(size);
+
+        let frame = h.compose(size);
+        let y_before = anchor_row(&frame, "read_file(anchor-line)");
+        let (id, kind) = h
+            .block_at(10, y_before)
+            .expect("the call's header is a fold target");
+        assert_eq!(
+            h.moment.read().unwrap().scroll.0,
+            0,
+            "the reader has to be at the bottom for this to be the case it is about"
+        );
+        let folded_h = h.stream_height(size, &h.moment.read().unwrap().clone());
+
+        // The click, held.
+        h.held_while(|| {
+            h.toggle_block(id, kind);
+        });
+
+        let after = h.compose(size);
+        let opened_h = h.stream_height(size, &h.moment.read().unwrap().clone());
+        assert!(
+            opened_h > folded_h,
+            "the click did not open it ({folded_h} rows before, {opened_h} after), so \
+             there is nothing for the pin to hold"
+        );
+        assert_ne!(
+            h.moment.read().unwrap().scroll.0,
+            0,
+            "nothing was pinned: the reading never moved, so the row had to"
+        );
+        assert_eq!(
+            anchor_row(&after, "read_file(anchor-line)"),
+            y_before,
+            "the row that was clicked moved, so the pin did not hold it"
+        );
+    }
+
+    /// The screen row the call's own header is drawn on.
+    ///
+    /// The header, not its result rows: the header is the row a click folds, so
+    /// it is the row that has to stay put.
+    fn anchor_row(frame: &Frame, needle: &str) -> u16 {
+        let stream = frame.part("stream").expect("the conversation");
+        for (i, line) in stream.lines.iter().enumerate() {
+            if line.plain().contains(needle) {
+                return stream.rect.y + i as u16;
+            }
+        }
+        panic!(
+            "no line containing {needle:?} on screen: {:#?}",
+            stream.lines.iter().map(|l| l.plain()).collect::<Vec<_>>()
+        )
+    }
+
+    /// A host whose conversation is short, with one foldable tool call in it.
+    ///
+    /// Short on purpose: the block that gets folded has to be on screen in the
+    /// frame *before* the fold, or there is no row to hold in place and the
+    /// judgement is about nothing.
+    fn host_with_a_long_call() -> Host {
+        let h = host();
+        // Enough above it to scroll through: with a conversation that fits the
+        // pane there is nowhere to scroll *to*, and the pin would be clamping
+        // to a limit of zero — which is a correct answer and a pointless test.
+        for i in 0..30 {
+            h.absorb(&SessionEvent::AssistantMessage {
+                turn: 1,
+                round: i,
+                text: format!("lead-in {i}"),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+            });
+        }
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 30,
+            text: "before the call".into(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+        });
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 31,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({ "path": "anchor-line" }).to_string(),
+            }],
+        });
+        // Unfolded, the call draws several rows: the header, then its result.
+        // Folding it back to one line is what moves everything below it.
+        h.absorb(&SessionEvent::ToolResultLogged {
+            turn: 1,
+            round: 31,
+            call_id: "c1".into(),
+            content: (0..6)
+                .map(|n| format!("result row {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            is_error: false,
+            images: Vec::new(),
+        });
+        h
+    }
+
+    #[test]
     fn the_frame_holds_still_while_the_conversation_scrolls() {
         // The line ADR 0020 draws, from the other side: the tail is what moves,
         // and the frame is what must not. `tip` and `input` are the reason that
@@ -2623,6 +2791,51 @@ mod tests {
     }
 
     #[test]
+    fn a_capped_tail_keeps_the_live_line_and_cuts_the_plan() {
+        // **Who** gives up the rows, not just how many. `cap_tail` rations from
+        // the top, so the plan loses rows and the line against the bottom keeps
+        // its two — which is the right way round: the task list has a `window`
+        // for running out of room (`+N 更多`), and the live line has nothing to
+        // fall back on. It is the row that answers "is it stuck?".
+        //
+        // The loop used to go the other way while the comment said this, so a
+        // long plan in a short terminal emptied the live line first.
+        let pane_h = 19u16;
+        let capped = Host::cap_tail(
+            vec![("todo".to_string(), 40), ("live".to_string(), 2)],
+            pane_h,
+        );
+        assert_eq!(
+            capped[1].1, 2,
+            "the live line was cut: {capped:?} — a turn in flight would have no row"
+        );
+        assert!(
+            capped[0].1 + capped[1].1 < pane_h,
+            "the cap left no room for the conversation: {capped:?}"
+        );
+
+        // Rationing is top-down and it stops as soon as it is under budget: the
+        // module nearest the top gives up everything it has before the one below
+        // it is touched. `todo` is the topmost, so with a plan that is enormous
+        // and a third module declared below the live line, the plan absorbs the
+        // whole cut and the other two keep every row.
+        let three = Host::cap_tail(
+            vec![
+                ("todo".to_string(), 40),
+                ("live".to_string(), 2),
+                ("extra".to_string(), 8),
+            ],
+            pane_h,
+        );
+        assert_eq!(three[1].1, 2, "the live line was cut: {three:?}");
+        assert_eq!(
+            three[2].1, 8,
+            "a module *below* the live line was cut before the live line was: {three:?}"
+        );
+        assert_eq!(three[0].1, 8, "the plan took the whole cut: {three:?}");
+    }
+
+    #[test]
     fn a_tail_taller_than_the_pane_still_scrolls() {
         // Handing the module its visible height means a module taller than the
         // pane is asked for the whole pane at several different offsets, and
@@ -2672,10 +2885,13 @@ mod tests {
     }
 
     #[test]
-    fn the_tail_goes_first_and_the_blocks_do_not_move_until_it_has() {
+    fn the_tail_is_what_scrolls_away_first() {
         // The point of the whole exercise: scrolling back eats the tail off the
-        // bottom before it touches the conversation. Six tail rows, so scroll 0
-        // to 6 leaves the blocks exactly where they were.
+        // bottom before it touches the conversation's *offset*. Six tail rows,
+        // so scroll 0 to 6 leaves `block_scroll` at zero — the blocks are not
+        // moving up through the content, though they do move down the screen as
+        // the rect they sit in grows (see the ADR: those are two different
+        // statements and only one of them is true).
         let pane = Rect::sized(80, 21);
         for scroll in 0..=6usize {
             let p = Host::pane_geometry(pane, scroll, &pane_heights());
@@ -2805,7 +3021,7 @@ mod tests {
             } else {
                 pane(Vec::new())
             });
-            h.stream_height_split((80, 24), &moment)
+            h.stream_height_in(h.stream_room((80, 24), &moment), &moment)
         };
 
         let without = declared(false);
@@ -3101,7 +3317,7 @@ mod tests {
         h.absorb(&call(1, "c1"));
         h.absorb(&SessionEvent::ToolResultLogged {
             turn: 1,
-            round: 1,
+            round: 31,
             call_id: "c1".into(),
             content: "a.rs".into(),
             is_error: false,

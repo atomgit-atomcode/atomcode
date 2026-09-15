@@ -17,16 +17,16 @@
 |---|---|
 | branch | `feat/plexus-plugin-architecture` |
 | 开工时 SHA | `72b9e431` |
-| **当前 HEAD** | `4247ed59` |
-| 判据基线 | `gates/tui-test-count.baseline` = **493**(开工时 468),棘轮**只能升** |
+| **当前 HEAD** | `fdbbe5d9` + 本轮评审修复 |
+| 判据基线 | `gates/tui-test-count.baseline` = **495**(开工时 468),棘轮**只能升** |
 | worktree | 只剩 `Cargo.lock`(见下)与未跟踪的 `docs/atomcode-crate-deps.html` |
 
 **已提交:**
 
 | commit | 内容 |
 |---|---|
-| `c6ef4656` | ADR 0020 + 本计划 + `tui-composability.md` 索引 |
-| `5a3feced` | 接缝 S1–S4 折回本计划 |
+| `875a7465` | ADR 0020 + 本计划 + `tui-composability.md` 索引(rebase 前是 `c6ef4656`) |
+| `0868f2c6` | 接缝 S1–S4 折回本计划(rebase 前是 `5a3feced`) |
 | `1e35d91c` | 对比度下限抬高(`theme.rs` / `markdown/mod.rs`,另一件事,已单独提交) |
 | `25a09e40` | **Step 1**:`El::Stream { tail }`,行为不变 |
 | `9b47cb0b` | **Step 2**:pane 几何与签名,行为不变 |
@@ -35,6 +35,7 @@
 | `c94a301a` | **Step 3**:`todo` 进 tail,三个构造点收成唯一入口 |
 | `2b9580b2` | **Step 4**:`live` 进 tail,删掉让位判据 |
 | `4247ed59` | **Step 5**:框架不动 / 封顶一致 / wide 下列宽 —— 三条判据 |
+| `fdbbe5d9` | 本计划进度同步 |
 
 **Step 3–5 已完成,ADR 0020 落地。** 剩下的都不是本次范围:
 
@@ -131,7 +132,7 @@ rect」,而是「宿主写死它属于可滚动尾部」。
 |---|---|---|
 | `Hide{todo}` | 先查 `on_screen.contains(module)`(`:216`) | tail id 必须进 `modules()` —— 即 S2 ✅ |
 | `Show{todo}` | 已在屏上时返回 `AlreadyOnScreen`(`:201`) | todo 在 tail 里时被正确拒绝 ✅ |
-| `Swap{Target::Stream}` | `matches()` 只认叶子模式(`:288`) | pattern 改 `Region::Stream{..}`,语义不变 ✅ |
+| `Swap{Target::Stream}` | `matches()` 只认叶子模式 | ⚠️ **这条原来写"语义不变 ✅"是错的** —— `swap` 当时按 `Target` 重建节点,tail 会丢;已由 `b7fb3829` 改成找到原节点整体克隆,并拒绝以 tail id 为目标。见下面"已修的地基缺陷"第 ② 条 |
 
 **既存别扭(不是本次引入):** `/hide todo` 之后 `/show todo`,它作为**浮动兄弟
 节点**插回来(`Region::split`,`size` 默认 1 行),**不会回到 tail**。今天也一样:
@@ -141,7 +142,7 @@ rect」,而是「宿主写死它属于可滚动尾部」。
 
 ---
 
-## Step 1 — `el.rs`:`Stream` 带 `tail`(行为不变)
+## Step 1 — `el.rs`:`Stream` 带 `tail`(行为不变) —— 已落地 `25a09e40`
 
 ```rust
 // el.rs:127 现状
@@ -167,7 +168,13 @@ Stream { tail: Vec<String> },
 
 ---
 
-## Step 2 — `host.rs`:几何与签名(行为不变)
+## Step 2 — `host.rs`:几何与签名(行为不变) —— 已落地 `9b47cb0b`
+
+> **下面的代码片段是当时的计划,不是现在的代码。** 签名此后变过两次
+> (`stream_height` 从 `width` 到 `size` 再到 `room: Rect`;`last_width`/`last_size`
+> 并成 `last_room`)。要读实现请读文件:几何在 `Host::pane_geometry` 与
+> `Host::cap_tail`,补偿在 `Host::pinned`。这一节留着的价值是**为什么**,
+> 不是**怎么写**。
 
 ### 2a. 尾部几何
 
@@ -292,7 +299,7 @@ if held {
 
 ---
 
-## Step 3 — 先接 `todo`
+## Step 3 — 先接 `todo` —— 已落地 `c94a301a`
 
 **三个构造点,一个入口。** 尾部要在三处出现:`host::default_layout()`(`host.rs:1517`)、
 `layout.rs` 的 `focus`(`:144`)与 `wide`(`:157`)两个 preset。**漏掉一个,那个 preset
@@ -302,7 +309,7 @@ if held {
 
 ```rust
 // el.rs 或 host.rs，一处定义
-pub fn stream_with_tail() -> Region { Region::stream().with_tail(["todo", "live"]) }
+pub fn scroll_region() -> Region { Region::stream().with_tail(TAIL) }   // 实际落地是这个
 ```
 
 判据改成 **「每棵出厂的树里 todo 和 live 恰好出现一次」**,而不是「没有出现两次」。
@@ -328,7 +335,7 @@ pub fn stream_with_tail() -> Region { Region::stream().with_tail(["todo", "live"
 
 ---
 
-## Step 4 — 接 `live`,删让位
+## Step 4 — 接 `live`,删让位 —— 已落地 `2b9580b2`
 
 - `tail: vec!["todo".into(), "live".into()]`
 - `modules/live.rs`:**删** `showing()` 里的 `if !moment.scroll.is_at_bottom() { return None }`
@@ -342,7 +349,7 @@ pub fn stream_with_tail() -> Region { Region::stream().with_tail(["todo", "live"
 
 ---
 
-## Step 5 — 补齐无兜底的风险
+## Step 5 — 补齐无兜底的风险 —— 已落地 `4247ed59`
 
 **夹具先要真的挂上尾部。** `host.rs` 的 `host()` 只挂了 `transcript`/`status`/`input`,
 没挂 todo/live,也不声明 tail —— 用它写尾部判据会**恒真**:`tail_heights` 返回空,
@@ -409,9 +416,11 @@ cargo fmt --all && cargo fmt --all -- --check
 | 尾部绕过 `window_into` → 整块物化 | ✅ `host.rs:1686` `COPIED_ROWS == drawn`(不并入缓冲区时天然成立) |
 | 滚回时渲染量随会话增长 | ✅ `host.rs:1614` |
 | `height` 与实画行数失衡 | ✅ `host.rs:2294` + Step 5.3 |
-| pin 单边补偿 → 抖动 | ❌ 无,Step 3 / 5.1 **新增** |
-| `stream_height` 内部读锁 → 死锁 | ⚠️ 会挂而非静默,盯 2d / 2e |
-| **同一模块同时在 tail 与树中 → 画两遍** | ❌ 无,Step 5.4 **新增**(S2 的不变量) |
+| pin 单边补偿 → 抖动 | ✅ `b7fb3829` 的 activity 翻转判据已覆盖 |
+| `stream_height` 内部读锁 → 死锁 | ⚠️ 会挂而非静默;`stream_height` 收 `&Moment`,调用方传守卫 |
+| **同一模块同时在 tail 与树中 → 画两遍** | ✅ `named_twice` + `Layout::apply` 拒绝 + `every_shipped_tree_rides_the_tail_exactly_once` |
+| **一条路径补偿、另一条不补** | ✅ `b7fb3829` 收成 `Host::pinned`,四条路径共走;`opening_a_call_leaves_the_row_that_was_clicked_where_it_was` 钉住点击那条(底部也钉) |
+| **封顶时先扣掉 live** | ✅ `b453eb4e` 反向 + `a_capped_tail_keeps_the_live_line_and_cuts_the_plan` |
 | 尾部每帧小量渲染 | 可忽略(`scroll == 0` 时与现状相同;滚过之后反而被算术跳过,不再渲染) |
 
 ---
