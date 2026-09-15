@@ -970,6 +970,13 @@ pub fn stream_stalled_for(
 /// the spinner blurs at token rate. See [`UiState::tick_spinner_at`].
 pub const SPINNER_MIN_ADVANCE: std::time::Duration = std::time::Duration::from_millis(80);
 
+/// The FIRST thinking phase of every turn shows this fixed, unambiguous word
+/// instead of a random playful verb. The post-submit wait is exactly where a
+/// reasoning-heavy model (streaming minutes of hidden reasoning) looks "hung", so
+/// the initial spinner states plainly what it's doing; later thinking phases keep
+/// the playful [`THINKING_LABELS`]. English (no i18n) to match that pool.
+pub const FIRST_THINKING_LABEL: &str = "Thinking";
+
 /// Rotating pool of "thinking" labels — CC-style playful verbs.
 /// Advances once per turn so consecutive turns vary.
 pub const THINKING_LABELS: &[&str] = &[
@@ -1232,6 +1239,15 @@ pub struct UiState {
     pub round_cap_panel: Option<RoundCapPanel>,
     /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
     pub thinking_idx: usize,
+    /// True from turn start until the first `on_thinking` consumes it — gates the
+    /// once-per-turn [`FIRST_THINKING_LABEL`] treatment.
+    pub(crate) turn_first_thinking_pending: bool,
+    /// Whether the CURRENTLY displayed thinking phase is the turn's first one.
+    /// Display-only: `display_spinner_label` swaps the shown word to
+    /// `FIRST_THINKING_LABEL` (masking both a playful THINKING_LABEL and any tool
+    /// label the first phase spawns). The STORED `spinner_label` is never changed,
+    /// so stall detection + phase-clock logic are untouched. Reset at turn end.
+    pub(crate) showing_first_thinking: bool,
     /// When the current turn started. Set by on_submit, cleared on
     /// turn-complete / turn-cancelled. Used to surface the
     /// total wall-clock duration in the TurnComplete event payload.
@@ -1562,6 +1578,8 @@ impl UiState {
             user_input_batch: None,
             round_cap_panel: None,
             thinking_idx: 0,
+            turn_first_thinking_pending: false,
+            showing_first_thinking: false,
             turn_started_at: None,
             phase_started_at: None,
             last_stream_activity: None,
@@ -1866,9 +1884,17 @@ impl UiState {
     /// `Waiting approval`, …) passes through unchanged. Display-only: the stored
     /// `spinner_label` and all phase-clock timing logic are untouched.
     pub(crate) fn display_spinner_label(&self) -> &str {
-        if self.spinner_label.starts_with("Running ")
-            || self.spinner_label.starts_with("Preparing ")
+        let is_tool_label = self.spinner_label.starts_with("Running ")
+            || self.spinner_label.starts_with("Preparing ");
+        // The turn's first thinking phase says plainly "Thinking" — and stays
+        // "Thinking" through any tool it spawns, so the footer word never flips
+        // mid-phase (tool labels already map to the turn word, not the tool name).
+        // Other labels (approval / sub-agent) pass through unchanged.
+        if self.showing_first_thinking
+            && (is_tool_label || THINKING_LABELS.contains(&self.spinner_label.as_str()))
         {
+            FIRST_THINKING_LABEL
+        } else if is_tool_label {
             self.active_thinking_word()
         } else {
             &self.spinner_label
@@ -1881,6 +1907,10 @@ impl UiState {
         self.spinner_label = self.current_thinking().to_string();
         self.spinner_frame = 0;
         self.thinking_idx = self.thinking_idx.wrapping_add(1);
+        // Fresh turn: the first thinking phase (the post-submit wait) shows the fixed
+        // `FIRST_THINKING_LABEL`; arm it here and from the very first frame.
+        self.turn_first_thinking_pending = true;
+        self.showing_first_thinking = true;
         // A fresh turn hasn't dispatched team work yet.
         self.team_dispatched_this_turn = false;
         let now = std::time::Instant::now();
@@ -1939,6 +1969,11 @@ impl UiState {
         self.turn_output_chars = 0;
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
+        // Disarm the first-thinking latch so a later `/goal` continuation (which
+        // re-enters `on_thinking` WITHOUT an `on_submit`) can't inherit a stale
+        // "first phase" and mislabel its spinner "Thinking".
+        self.turn_first_thinking_pending = false;
+        self.showing_first_thinking = false;
         // Turn finished normally — no need to offer resubmit of the
         // message any more. (On cancel, the streaming-key handler
         // already took() the Option before the TurnCancelled event
@@ -1983,6 +2018,9 @@ impl UiState {
         self.turn_output_chars = 0;
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
+        // Disarm the first-thinking latch (see `on_turn_complete`).
+        self.turn_first_thinking_pending = false;
+        self.showing_first_thinking = false;
         self.subagent_activity = None;
         self.active_subtasks = None;
         // A cancelled turn tears down any still-"running" Team members; the
@@ -2125,6 +2163,10 @@ impl UiState {
         // on submit, one rotation per turn not per state transition).
         let idx = self.thinking_idx.saturating_sub(1) % THINKING_LABELS.len();
         self.spinner_label = THINKING_LABELS[idx].to_string();
+        // First thinking phase of the turn keeps `FIRST_THINKING_LABEL`; subsequent
+        // phases fall back to the playful pool. Consume the once-per-turn latch.
+        self.showing_first_thinking = self.turn_first_thinking_pending;
+        self.turn_first_thinking_pending = false;
         // New LLM round-trip → new phase clock. Without this reset the
         // displayed time keeps growing across consecutive thinks/tools
         // and ends up showing "Noodling… 1301s" mid-turn.
@@ -2897,6 +2939,42 @@ mod tests {
         assert_eq!(s.phase, UiPhase::Streaming);
         // Label is one of the rotating pool entries.
         assert!(THINKING_LABELS.contains(&s.spinner_label.as_str()));
+    }
+
+    #[test]
+    fn first_thinking_phase_shows_thinking_then_playful_verbs() {
+        let mut s = UiState::new();
+        s.on_submit();
+        s.on_thinking();
+        // The turn's FIRST thinking phase (the post-submit wait) shows the fixed word.
+        assert_eq!(s.display_spinner_label(), FIRST_THINKING_LABEL);
+
+        // A later thinking phase (e.g. the model thinks again after a tool ran) falls
+        // back to a playful verb — NOT the fixed word.
+        s.on_thinking();
+        let later = s.display_spinner_label().to_string();
+        assert_ne!(later, FIRST_THINKING_LABEL);
+        assert!(THINKING_LABELS.contains(&later.as_str()), "got {later:?}");
+
+        // The next turn re-arms the first-phase label.
+        s.on_submit();
+        s.on_thinking();
+        assert_eq!(s.display_spinner_label(), FIRST_THINKING_LABEL);
+    }
+
+    #[test]
+    fn turn_end_disarms_first_thinking_latch() {
+        let mut s = UiState::new();
+        s.on_submit();
+        // Turn ends WITHOUT ever entering a thinking phase (e.g. straight to a tool,
+        // then complete). The latch must be disarmed so a later `on_thinking` — a
+        // `/goal` continuation that re-enters WITHOUT an `on_submit` — does not
+        // inherit a stale "first phase" and mislabel its spinner "Thinking".
+        s.on_turn_complete();
+        s.on_thinking();
+        let label = s.display_spinner_label().to_string();
+        assert_ne!(label, FIRST_THINKING_LABEL, "stale first-thinking leaked: {label:?}");
+        assert!(THINKING_LABELS.contains(&label.as_str()), "got {label:?}");
     }
 
     #[test]

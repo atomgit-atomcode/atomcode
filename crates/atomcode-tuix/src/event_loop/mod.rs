@@ -5681,6 +5681,23 @@ mod buffer_tests {
             active.contains("(0s \u{b7} \u{2191} 12.40K tokens)"),
             "expected `(0s · ↑ 12.40K tokens)`, got {active:?}"
         );
+        // Under 1s elapsed, no throughput is shown (avoids div-by-zero / wild rates).
+        assert!(!active.contains("tok/s"), "no rate under 1s, got {active:?}");
+    }
+
+    #[test]
+    fn spinner_shows_tok_per_sec_once_a_second_elapses() {
+        let mut s = UiState::new();
+        s.on_submit();
+        // Backdate the turn start so `turn_elapsed >= 1s`; 40_000 chars ≈ 10K tokens
+        // over 10s → 1000 tok/s.
+        s.turn_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        s.turn_output_chars = 40_000;
+        let active = format_spinner_label(&s, 0, None);
+        assert!(
+            active.contains("tok/s"),
+            "expected a `tok/s` throughput, got {active:?}"
+        );
     }
 
     #[test]
@@ -29427,8 +29444,21 @@ fn format_spinner_label(
         let elapsed = fmt_elapsed(d.as_millis() as u64);
         let tokens = state.turn_output_token_estimate();
         if tokens > 0 {
+            // Live throughput as a "still moving, not hung" signal: the turn's token
+            // total over turn elapsed — a turn AVERAGE (numerator/denominator both
+            // whole-turn, so it's the rate of the `↑ N tokens` count shown). If the
+            // stream hangs it decays toward 0 as elapsed grows. NOTE it is not the
+            // same window as the displayed `phase_elapsed` clock, so on a multi-phase
+            // turn the shown seconds and this rate won't reconcile. Omitted under 1s
+            // to avoid a divide-by-zero and wild early numbers.
+            let rate = state
+                .turn_elapsed()
+                .map(|d| d.as_secs())
+                .filter(|secs| *secs >= 1)
+                .map(|secs| format!(" · {} tok/s", tokens / secs as usize))
+                .unwrap_or_default();
             out.push_str(&format!(
-                " ({elapsed} · \u{2191} {} tokens)",
+                " ({elapsed} · \u{2191} {} tokens{rate})",
                 crate::i18n::fmt_tokens(tokens)
             ));
         } else {
