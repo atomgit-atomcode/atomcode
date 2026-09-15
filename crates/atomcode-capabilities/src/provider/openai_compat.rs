@@ -1411,7 +1411,7 @@ pub(crate) fn extract_error_detail(text: &str) -> String {
 
 /// Format an OpenAI-compatible error OBJECT (`{"message","type","code"}`) as a readable
 /// "[type/code] message" one-liner carrying BOTH the error CODE and the REASON.
-fn parse_error_obj(err: &serde_json::Value) -> String {
+pub(crate) fn parse_error_obj(err: &serde_json::Value) -> String {
     let msg = err
         .get("message")
         .and_then(|m| m.as_str())
@@ -1446,7 +1446,7 @@ fn error_code_value(code: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn error_code(err: &serde_json::Value) -> Option<String> {
+pub(crate) fn error_code(err: &serde_json::Value) -> Option<String> {
     err.get("code").and_then(error_code_value).or_else(|| {
         err.get("type")
             .and_then(|t| t.as_str())
@@ -1471,7 +1471,7 @@ fn provider_error_code(envelope: &serde_json::Value) -> Option<String> {
 /// the upstream HTTP status. Only treat it as one when it is a plausible HTTP status
 /// (100–599), so vendor-specific numeric codes (e.g. billing `1113`) are not
 /// mislabeled. Returns `None` for string codes that are not pure HTTP status numbers.
-fn inband_error_http_status(err: &serde_json::Value) -> Option<u16> {
+pub(crate) fn inband_error_http_status(err: &serde_json::Value) -> Option<u16> {
     let n = match err.get("code")? {
         serde_json::Value::Number(n) => n.as_u64()?,
         serde_json::Value::String(s) => s.trim().parse::<u64>().ok()?,

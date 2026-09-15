@@ -250,12 +250,30 @@ fn function_call_item(tc: &ToolCall) -> Value {
     // whole request 400s with "data did not match any variant of untagged
     // enum ResponseInput". Same value for both, mirroring the prism converter
     // contract (`id` = `call_id` = the kernel ToolCall id).
+    //
+    // `arguments` must be VALID JSON on the wire — a strict `/v1/responses` 400s the
+    // ENTIRE request (every resumed turn) on malformed history. Empty ⇒ `{}`; valid ⇒
+    // verbatim (prefix-cache stable); else repair, then wrap-as-`{"input":…}` if still
+    // unsalvageable. Mirrors the chat/completions arguments guard.
+    let raw = tc.arguments.trim();
+    let arguments = if raw.is_empty() {
+        "{}".to_string()
+    } else if serde_json::from_str::<Value>(raw).is_ok() {
+        tc.arguments.clone()
+    } else {
+        let repaired = crate::tools::repair::repair_tool_args(&tc.name, &tc.arguments);
+        if serde_json::from_str::<Value>(&repaired).is_ok() {
+            repaired
+        } else {
+            json!({ "input": tc.arguments }).to_string()
+        }
+    };
     json!({
         "type": "function_call",
         "id": tc.id,
         "call_id": tc.id,
         "name": tc.name,
-        "arguments": tc.arguments,
+        "arguments": arguments,
     })
 }
 
@@ -281,6 +299,11 @@ fn effort_str(e: ReasoningEffort) -> &'static str {
 // SSE decoding (Responses event family)
 // ---------------------------------------------------------------------------
 
+/// Absurd upper bound on concurrent tool-call slots in one turn. The accumulator
+/// grows lazily to whatever `output_index` the gateway names, so cap it to refuse a
+/// pathological index (an OOM guard on the hot delta path).
+const MAX_TOOL_SLOTS: usize = 4096;
+
 /// Stateful decoder for the Responses `event: response.*` SSE family.
 ///
 /// Unlike chat/completions (single anonymous `data:` channel), Responses names
@@ -299,14 +322,11 @@ struct ResponsesSseDecoder {
     /// emitted as whole `ToolCall`s when the item completes — the kernel contract
     /// has no partial-tool-call variant.
     tool_calls: Vec<(String, String, String)>,
-    /// Index of the tool call currently accumulating (by output_index).
-    active_tool: Option<u32>,
     last_usage: Option<TokenUsage>,
     truncated: bool,
     done: bool,
     response_id_seen: bool,
     response_model_seen: bool,
-    usage_seen: bool,
 }
 
 impl ResponsesSseDecoder {
@@ -315,14 +335,34 @@ impl ResponsesSseDecoder {
             buf: Vec::new(),
             current_event: None,
             tool_calls: Vec::new(),
-            active_tool: None,
             last_usage: None,
             truncated: false,
             done: false,
             response_id_seen: false,
             response_model_seen: false,
-            usage_seen: false,
         }
+    }
+
+    /// Grow the tool-call accumulator so slot `idx` exists, then return `true`.
+    /// Returns `false` (allocating nothing) for a pathological `output_index` so a
+    /// buggy/hostile gateway can't OOM us. Shared by every event that addresses a
+    /// slot by `output_index` (added / arguments.delta / arguments.done / item.done),
+    /// so a delta that arrives before its `output_item.added` still accumulates
+    /// instead of being silently dropped.
+    fn ensure_tool_slot(&mut self, idx: usize) -> bool {
+        if idx >= MAX_TOOL_SLOTS {
+            // Never silently drop: a refused (pathological) output_index is traced so a
+            // broken/hostile gateway is diagnosable, not an invisible lost tool call.
+            tracing::warn!(
+                "responses: refusing tool slot at pathological output_index {idx} (>= {MAX_TOOL_SLOTS})"
+            );
+            return false;
+        }
+        while self.tool_calls.len() <= idx {
+            self.tool_calls
+                .push((String::new(), String::new(), String::new()));
+        }
+        true
     }
 
     /// Feed a chunk of raw bytes; return any complete `StreamEvent`s produced.
@@ -369,7 +409,9 @@ impl ResponsesSseDecoder {
                 out.push(StreamEvent::ToolCall(ToolCall {
                     id,
                     name,
-                    arguments: args,
+                    // A no-arg call streams no argument bytes; emit `{}` so the kernel
+                    // (and the resumed-turn wire) always carries valid JSON, never "".
+                    arguments: if args.trim().is_empty() { "{}".into() } else { args },
                 }));
             }
         }
@@ -407,14 +449,16 @@ impl ResponsesSseDecoder {
         // Mid-stream error envelope: `event: error` with `{"code","message",…}`.
         if event == "error" || payload.get("error").is_some() {
             let err = payload.get("error").unwrap_or(payload);
+            // Reuse the chat/completions error helpers so a Responses in-band error is
+            // classified identically: recover the embedded HTTP status (a proxy relaying
+            // an upstream 429 as `{"error":{"code":429}}`) so the kernel's rate-limit path
+            // can act, and read the code from `code` OR `type`. `parse_error_obj` reads the
+            // Value directly (no serialize→re-parse round-trip).
             out.push(StreamEvent::Error(ProviderError {
                 retryable: false,
-                message: format!(
-                    "provider error: {}",
-                    super::openai_compat::extract_error_detail(&payload.to_string())
-                ),
-                http_status: None,
-                code: err.get("code").and_then(|c| c.as_str()).map(String::from),
+                message: format!("provider error: {}", super::openai_compat::parse_error_obj(err)),
+                http_status: super::openai_compat::inband_error_http_status(err),
+                code: super::openai_compat::error_code(err),
                 retry_after_secs: None,
             }));
             self.done = true;
@@ -449,34 +493,35 @@ impl ResponsesSseDecoder {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 match item_type {
+                    // Explicit (not a match guard) so a refused slot doesn't fall through
+                    // to the `_` arm and mislabel a `function_call` as an "unsupported"
+                    // type; `ensure_tool_slot` already traces the refusal.
                     "function_call" => {
-                        // Open the accumulator slot for this output_index.
-                        while self.tool_calls.len() <= idx {
-                            self.tool_calls
-                                .push((String::new(), String::new(), String::new()));
+                        if self.ensure_tool_slot(idx) {
+                            let entry = &mut self.tool_calls[idx];
+                            if let Some(id) =
+                                payload.pointer("/item/call_id").and_then(|v| v.as_str())
+                            {
+                                entry.0 = id.to_string();
+                            }
+                            if let Some(name) =
+                                payload.pointer("/item/name").and_then(|v| v.as_str())
+                            {
+                                entry.1 = name.to_string();
+                            }
+                            out.push(StreamEvent::ToolCallDelta {
+                                index: idx as u32,
+                                id: payload
+                                    .pointer("/item/call_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from),
+                                name: payload
+                                    .pointer("/item/name")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from),
+                                arguments: String::new(),
+                            });
                         }
-                        let entry = &mut self.tool_calls[idx];
-                        if let Some(id) = payload.pointer("/item/call_id").and_then(|v| v.as_str())
-                        {
-                            entry.0 = id.to_string();
-                        }
-                        if let Some(name) = payload.pointer("/item/name").and_then(|v| v.as_str())
-                        {
-                            entry.1 = name.to_string();
-                        }
-                        self.active_tool = Some(idx as u32);
-                        out.push(StreamEvent::ToolCallDelta {
-                            index: idx as u32,
-                            id: payload
-                                .pointer("/item/call_id")
-                                .and_then(|v| v.as_str())
-                                .map(String::from),
-                            name: payload
-                                .pointer("/item/name")
-                                .and_then(|v| v.as_str())
-                                .map(String::from),
-                            arguments: String::new(),
-                        });
                     }
                     "message" | "reasoning" => {
                         // Full items arrive via delta events; nothing to open here.
@@ -522,7 +567,7 @@ impl ResponsesSseDecoder {
                     .get("output_index")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as usize;
-                if idx < self.tool_calls.len() {
+                if self.ensure_tool_slot(idx) {
                     if let Some(delta) = payload.get("delta").and_then(|v| v.as_str()) {
                         self.tool_calls[idx].2.push_str(delta);
                         if !delta.is_empty() {
@@ -544,7 +589,7 @@ impl ResponsesSseDecoder {
                     .get("output_index")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as usize;
-                if idx < self.tool_calls.len() {
+                if self.ensure_tool_slot(idx) {
                     if let Some(args) = payload.get("arguments").and_then(|v| v.as_str()) {
                         self.tool_calls[idx].2 = args.to_string();
                     }
@@ -559,7 +604,7 @@ impl ResponsesSseDecoder {
                     .pointer("/item/type")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if item_type == "function_call" && idx < self.tool_calls.len() {
+                if item_type == "function_call" && self.ensure_tool_slot(idx) {
                     // The completed item is authoritative — reconcile id/name/args.
                     let entry = &mut self.tool_calls[idx];
                     if let Some(id) = payload.pointer("/item/call_id").and_then(|v| v.as_str()) {
@@ -576,16 +621,12 @@ impl ResponsesSseDecoder {
                     {
                         entry.2 = args.to_string();
                     }
-                    if self.active_tool == Some(idx as u32) {
-                        self.active_tool = None;
-                    }
                 }
             }
             "response.completed" => {
                 if let Some(resp) = payload.get("response") {
                     if let Some(u) = resp.get("usage") {
                         self.last_usage = Some(map_responses_usage(u));
-                        self.usage_seen = true;
                     }
                     if let Some(status) = resp.get("status").and_then(|v| v.as_str()) {
                         if status == "incomplete" {
@@ -944,6 +985,45 @@ mod tests {
     }
 
     #[test]
+    fn malformed_and_empty_tool_args_are_repaired_on_the_wire() {
+        // A strict /v1/responses 400s the ENTIRE request on non-JSON `arguments`.
+        // Empty ⇒ `{}`; an unescaped Windows path (invalid JSON) is repaired/wrapped.
+        let msgs = vec![
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "c_empty".into(),
+                    name: "noop".into(),
+                    arguments: "".into(),
+                }],
+            ),
+            Message::tool_result("c_empty", "ok", false),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "c_bad".into(),
+                    name: "read_file".into(),
+                    // `\U` is not a legal JSON escape ⇒ invalid JSON in history.
+                    arguments: "{\"path\":\"C:\\Users\\a\"}".into(),
+                }],
+            ),
+            Message::tool_result("c_bad", "ok", false),
+        ];
+        let body = build_request_body("m", &msgs, &[], &ChatOptions::default(), &test_cfg());
+        for item in body["input"].as_array().unwrap() {
+            if item["type"] == "function_call" {
+                let args = item["arguments"].as_str().unwrap();
+                assert!(
+                    serde_json::from_str::<serde_json::Value>(args).is_ok(),
+                    "function_call arguments must be valid JSON on the wire, got: {args}"
+                );
+            }
+        }
+        // The empty-args call specifically normalizes to `{}`.
+        assert_eq!(body["input"][0]["arguments"], "{}");
+    }
+
+    #[test]
     fn max_tokens_maps_to_max_output_tokens() {
         let opts = ChatOptions {
             max_tokens: Some(1024),
@@ -1116,6 +1196,40 @@ mod tests {
     }
 
     #[test]
+    fn inband_error_recovers_http_status_and_type_code() {
+        // A proxy relaying an upstream 429 as an in-band `{"error":{"code":429}}`
+        // must surface http_status=429 (so the kernel's rate-limit path can act) and
+        // read the code from `type` when `code` is absent.
+        let mut dec = ResponsesSseDecoder::new();
+        let evs = feed_all(
+            &mut dec,
+            "event: error\n\
+             data: {\"error\":{\"type\":\"rate_limit\",\"code\":429,\"message\":\"slow down\"}}\n\n",
+        );
+        assert!(matches!(&evs[0], StreamEvent::Error(e)
+            if e.http_status == Some(429) && e.code.as_deref() == Some("429")));
+    }
+
+    #[test]
+    fn response_failed_terminal_surfaces_error_after_partial_text() {
+        // The `response.failed` terminal (distinct from `event: error`) must surface a
+        // StreamEvent::Error, not be swallowed — even after some text streamed.
+        let mut dec = ResponsesSseDecoder::new();
+        let evs = feed_all(
+            &mut dec,
+            "event: response.output_text.delta\n\
+             data: {\"delta\":\"partial\"}\n\n\
+             event: response.failed\n\
+             data: {\"response\":{\"status\":\"failed\"}}\n\n",
+        );
+        assert!(matches!(&evs[0], StreamEvent::TextDelta(t) if t == "partial"));
+        assert!(
+            matches!(evs.last(), Some(StreamEvent::Error(e)) if e.message.contains("failed")),
+            "response.failed must surface an Error: {evs:?}"
+        );
+    }
+
+    #[test]
     fn server_side_items_do_not_crash() {
         let mut dec = ResponsesSseDecoder::new();
         let mut evs = feed_all(
@@ -1172,6 +1286,78 @@ mod tests {
         assert!(matches!(evs.last(), Some(StreamEvent::Done { truncated: false })));
     }
 
+    #[test]
+    fn crlf_line_endings_decode_byte_split() {
+        // OpenAI's SSE uses CRLF; feed one byte at a time to prove the line splitter
+        // tolerates \r\n across arbitrary chunk boundaries.
+        let wire = "event: response.output_text.delta\r\n\
+                    data: {\"delta\":\"hi\"}\r\n\r\n\
+                    event: response.completed\r\n\
+                    data: {\"response\":{\"status\":\"completed\"}}\r\n\r\n";
+        let mut dec = ResponsesSseDecoder::new();
+        let mut evs = Vec::new();
+        for b in wire.as_bytes() {
+            evs.extend(dec.feed(&[*b]));
+        }
+        evs.extend(dec.finish());
+        assert!(evs.iter().any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "hi")));
+        assert!(matches!(evs.last(), Some(StreamEvent::Done { truncated: false })));
+    }
+
+    #[test]
+    fn emitted_content_events_are_replay_sensitive() {
+        // The #1 streaming-loop invariant: once a content event is emitted, the reopen
+        // gate must block a transparent reopen (else double-output / re-run tools). Prove
+        // the events THIS decoder emits for content are classified sensitive by the shared
+        // gate, so the loop's `emitted_replay_sensitive |= is_replay_sensitive_event(..)`
+        // trips and reopen is forbidden after any text/tool content.
+        let mut dec = ResponsesSseDecoder::new();
+        let evs = feed_all(
+            &mut dec,
+            "event: response.output_text.delta\n\
+             data: {\"delta\":\"hi\"}\n\n\
+             event: response.output_item.added\n\
+             data: {\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"f\"}}\n\n",
+        );
+        assert!(
+            evs.iter().any(|e| matches!(e, StreamEvent::TextDelta(_)))
+                && evs.iter().any(|e| matches!(e, StreamEvent::ToolCallDelta { .. })),
+            "decoder must emit text + tool-call content: {evs:?}"
+        );
+        assert!(
+            evs.iter()
+                .filter(|e| matches!(
+                    e,
+                    StreamEvent::TextDelta(_) | StreamEvent::ToolCallDelta { .. }
+                ))
+                .all(retry::is_replay_sensitive_event),
+            "every content event must gate reopen (is_replay_sensitive_event): {evs:?}"
+        );
+    }
+
+    #[test]
+    fn arguments_delta_before_item_added_still_accumulates() {
+        // Defensive: if a gateway sends `function_call_arguments.delta` for an index
+        // whose `output_item.added` hasn't arrived, the slot is grown (not dropped), so
+        // the arguments are not silently lost; a later `output_item.done` fills id/name.
+        let mut dec = ResponsesSseDecoder::new();
+        let mut evs = feed_all(
+            &mut dec,
+            "event: response.function_call_arguments.delta\n\
+             data: {\"output_index\":0,\"delta\":\"{\\\"a\\\":1}\"}\n\n\
+             event: response.output_item.done\n\
+             data: {\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c9\",\"name\":\"f\"}}\n\n",
+        );
+        evs.extend(dec.finish());
+        let tc = evs.iter().find_map(|e| match e {
+            StreamEvent::ToolCall(tc) => Some(tc),
+            _ => None,
+        });
+        let tc = tc.expect("a ToolCall must be emitted from the recovered slot");
+        assert_eq!(tc.id, "c9");
+        assert_eq!(tc.arguments, "{\"a\":1}");
+    }
+
     // ----- provider end-to-end (wiremock) -----
 
     #[tokio::test]
@@ -1203,6 +1389,71 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, StreamEvent::ResponseId(id) if id == "resp_9")));
         assert!(events.iter().any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "hi there")));
         assert!(matches!(events.last(), Some(StreamEvent::Done { truncated: false })));
+    }
+
+    #[tokio::test]
+    async fn request_body_shape_is_asserted_on_the_wire() {
+        // Guard the ACTUAL bytes sent (not just that a 200 decodes): system→instructions,
+        // stateless store:false, flat tool shape, and function_call carrying id+call_id.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "event: response.completed\r\n\
+                 data: {\"response\":{\"status\":\"completed\"}}\r\n\r\n",
+            ))
+            .mount(&server)
+            .await;
+
+        let tools = vec![ToolDef {
+            name: "get_weather".into(),
+            description: "w".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }];
+        let msgs = vec![
+            Message::system("be terse"),
+            Message::user("weather?"),
+            Message::assistant(
+                "",
+                vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "get_weather".into(),
+                    arguments: "{}".into(),
+                }],
+            ),
+            Message::tool_result("call_1", "{}", false),
+        ];
+        let cfg = OpenAiCompatConfig::new("k", format!("{}/v1", server.uri()), "gpt-test");
+        let provider = ResponsesProvider::new(cfg).unwrap();
+        let _ = provider
+            .chat_stream(&msgs, &tools, &ChatOptions::default())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "exactly one request should hit the wire");
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(body["instructions"], "be terse", "system lifts to instructions");
+        assert_eq!(body["store"], false, "stateless: store:false");
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "get_weather");
+        assert!(
+            body["tools"][0].get("function").is_none(),
+            "flat tool shape, no chat-completions wrapper"
+        );
+        let fc = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "function_call")
+            .expect("a function_call item on the wire");
+        assert_eq!(fc["id"], "call_1", "function_call carries item id");
+        assert_eq!(fc["call_id"], "call_1", "and the call_id correlation key");
     }
 
     #[test]

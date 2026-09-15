@@ -355,7 +355,11 @@ fn discovery_url(base_url: &str, provider_type: &str) -> anyhow::Result<reqwest:
 
 fn discovery_protocol(provider_type: &str) -> Option<&'static str> {
     match provider_type.trim().to_ascii_lowercase().as_str() {
-        "openai" | "openai-compat" | "openai_compat" => Some("openai"),
+        // The Responses adapter targets an OpenAI-shaped endpoint, so model
+        // discovery uses the SAME `/models` transport as the chat/completions
+        // ("openai") provider — without this arm a Responses account resolves to
+        // None and the add-model / discovery flow silently rejects it.
+        "openai" | "openai-compat" | "openai_compat" | "responses" => Some("openai"),
         "ollama" => Some("ollama"),
         _ => None,
     }
