@@ -1005,6 +1005,123 @@ async fn memory_is_shown_only_when_switched_on(engine: &str) {
     }
 }
 
+/// The request options the person configured reach the provider — and follow a
+/// model switch to the new model's options.
+async fn configured_request_options_reach_the_provider_and_follow_a_model_switch(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.agent.chat_options.max_tokens = Some(1234);
+    start.agent.chat_options.temperature = Some(0.25);
+    start.agent.chat_options.reasoning_effort =
+        Some(atomcode_kernel::provider::ReasoningEffort::High);
+    let mut next = start.agent.clone();
+    next.model = "recorder-two".into();
+    next.chat_options.max_tokens = Some(99);
+    next.chat_options.reasoning_effort = Some(atomcode_kernel::provider::ReasoningEffort::Low);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    turn(&mut runtime, "hello").await;
+    let first = recorder.options.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(first.max_tokens, Some(1234), "[{engine}]");
+    assert_eq!(first.temperature, Some(0.25), "[{engine}]");
+    assert_eq!(
+        first.reasoning_effort,
+        Some(atomcode_kernel::provider::ReasoningEffort::High),
+        "[{engine}]"
+    );
+
+    runtime.handle.reassemble_provider(next).await.unwrap();
+    turn(&mut runtime, "again").await;
+    let after = recorder.options.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(after.max_tokens, Some(99), "[{engine}] after /model");
+    assert_eq!(
+        after.reasoning_effort,
+        Some(atomcode_kernel::provider::ReasoningEffort::Low),
+        "[{engine}] after /model"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A preferred language reaches the persona.
+async fn the_preferred_language_reaches_the_persona(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.agent.preferred_language = Some(atomcode_config::locale::Locale::ZhCn);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    turn(&mut runtime, "hello").await;
+
+    let guidance =
+        atomcode_coding::commit_language_guidance(Some(atomcode_config::locale::Locale::ZhCn));
+    let shown = system_text(&recorder.last_request());
+    assert!(shown.contains(guidance), "[{engine}] {shown}");
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A `[permissions]` deny rule refuses the call it names, without asking.
+async fn a_permission_rule_refuses_what_it_denies(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start_attended(env.project.path(), &recorder, SessionMode::Fresh);
+    let (rules, invalid) =
+        atomcode_capabilities::tools::PermissionRules::parse(&[], &["write_file".to_string()]);
+    assert!(invalid.is_empty());
+    start.agent.permission_rules = Arc::new(rules);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    turn(&mut runtime, "write denied.txt").await;
+    turn(&mut runtime, "what happened?").await;
+
+    assert!(
+        !env.project.path().join("denied.txt").exists(),
+        "[{engine}] the rule let the write through"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A round budget ends the turn when it runs out.
+async fn a_round_budget_ends_the_turn(engine: &str) {
+    select(engine);
+    let env = env();
+    std::fs::write(env.project.path().join("marker.txt"), "x").unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.agent.max_rounds = 1;
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    runtime
+        .handle
+        .submit(UserInput::from("read marker.txt"))
+        .await
+        .unwrap();
+    let reason = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("turn did not finish")
+            .expect("runtime event stream closed");
+        match event.event {
+            CodingRuntimeEvent::TurnFinished(atomcode_coding::TurnCompletion::Completed {
+                reason,
+                ..
+            }) => break Some(reason),
+            CodingRuntimeEvent::TurnFinished(_) => break None,
+            _ => {}
+        }
+    };
+    assert_eq!(
+        reason,
+        Some(atomcode_kernel::event::StopReason::MaxRounds),
+        "[{engine}]"
+    );
+    assert_eq!(recorder.requests.lock().unwrap().len(), 1, "[{engine}]");
+    runtime.handle.shutdown().await.unwrap();
+}
+
 // ---- what the model is offered ---------------------------------------------
 
 /// The start a production driver makes: every capability the chain turns on
@@ -1176,4 +1293,8 @@ on_both_engines!(
     a_strict_credential_refusal_ends_the_turn_with_a_choice,
     the_catalog_is_the_skills_the_driver_named,
     memory_is_shown_only_when_switched_on,
+    configured_request_options_reach_the_provider_and_follow_a_model_switch,
+    the_preferred_language_reaches_the_persona,
+    a_permission_rule_refuses_what_it_denies,
+    a_round_budget_ends_the_turn,
 );

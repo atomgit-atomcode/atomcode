@@ -738,6 +738,10 @@ pub(crate) struct KernelMiddlewarePlugin(pub(crate) Arc<HostMiddleware>);
 #[derive(serde::Deserialize)]
 struct KernelMiddlewareRow {
     middleware: String,
+    /// Among the gates rather than after them — for a middleware that decides,
+    /// placed by patching the row whose position it takes.
+    #[serde(default)]
+    prepend: bool,
 }
 
 struct MiddlewareBridge {
@@ -820,14 +824,15 @@ impl Plugin for KernelMiddlewarePlugin {
                 row.middleware
             )
         })?;
-        // Innermost: an observer records the call that actually runs, after every
-        // gate has had its say — the chain registers these after the gates too.
+        // Innermost by default: an observer records the call that actually runs,
+        // after every gate has had its say — the chain registers these after the
+        // gates too. A decider asks to sit among the gates instead.
         let _ = ctx.on_waterfall::<atomcode_harness::events::ToolsExecute>(
             Arc::new(MiddlewareBridge {
                 ctx: ctx.clone(),
                 middleware,
             }),
-            false,
+            row.prepend,
         );
         Ok(())
     }

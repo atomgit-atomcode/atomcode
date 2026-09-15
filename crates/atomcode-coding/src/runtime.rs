@@ -4462,11 +4462,12 @@ fn spawn_runtime_owner_with_optional_agent(
                                         operation: ReconfigureKind::Provider,
                                     },
                                 );
-                                if let Err(error) = crate::on_harness::swap_provider(
+                                if let Err(error) = crate::on_harness::swap_provider_for(
                                     app,
                                     slots.as_ref(),
                                     candidate_provider,
                                     &next.model,
+                                    Some(&next),
                                 )
                                 .await
                                 {
@@ -7476,6 +7477,21 @@ fn harness_host_state(
             )),
         );
     }
+    // The person's `[permissions]` rules decide among the gates, at the position
+    // the `permissions` row holds: after the hard boundaries, before the
+    // convenience gates and the approval prompt — the chain's placement.
+    let permission_rows = if config.permission_rules.is_empty() {
+        String::new()
+    } else {
+        middleware.insert(
+            "permission-rules",
+            Arc::new(atomcode_capabilities::tools::PermissionRuleGate::new(
+                config.permission_rules.clone(),
+                parts.shared_cwd.clone(),
+            )),
+        );
+        "[[patch]]\nid = \"permissions\"\nname = \"kernel-middleware\"\nconfig = { middleware = \"permission-rules\", prepend = true }\n\n".to_string()
+    };
     #[cfg(feature = "atomgit")]
     middleware.insert(
         "git-push-label",
@@ -7500,7 +7516,7 @@ fn harness_host_state(
             .chain(parts.host_only_tools())
             .collect(),
         skills: parts.skill_registry(),
-        rows: harness_option_rows(parts, config, prepare),
+        rows: harness_option_rows(parts, config, prepare) + &permission_rows,
         datalog: config.datalog.enabled.then(|| config.datalog.clone()),
         modes: Some(crate::on_harness::HostModes {
             modes: atomcode_harness::seams::Modes {

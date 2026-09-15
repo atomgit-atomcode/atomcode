@@ -48,14 +48,26 @@ impl Plugin for FsWorldToolsPlugin {
     fn description(&self) -> &'static str {
         "read/write/edit/list, routed through the `fs` seam"
     }
-    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        #[derive(serde::Deserialize, Default)]
+        struct Row {
+            /// Whether `read_file` may hand an image back as a picture — the
+            /// running model's capability, so a model switch patches it.
+            #[serde(default)]
+            vision: bool,
+        }
+        let row: Row = if config.is_null() {
+            Row::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
         let fs = ctx.require::<FsSvc>().map_err(|e| e.to_string())?;
         // The SAME implementations `tool-fs` mounts, handed a world instead of
         // the local disk. There is no second copy of `read_file` any more: this
         // row and that one differ by one argument, which is the whole claim the
         // `fs` seam was built to make.
         let tools: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(ReadFileTool::with_world(false, fs.clone())),
+            Arc::new(ReadFileTool::with_world(row.vision, fs.clone())),
             Arc::new(WriteFileTool::with_world(fs.clone())),
             Arc::new(EditFileTool::with_world(fs.clone())),
             Arc::new(ListDirTool::with_world(fs.clone())),

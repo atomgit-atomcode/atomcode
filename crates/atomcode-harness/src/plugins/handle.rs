@@ -483,7 +483,14 @@ impl Asker {
             self.pending.lock().expect("pending poisoned").remove(&id);
             return None;
         }
-        match tokio::time::timeout(self.timeout, rx).await {
+        // Zero is "wait for the answer": a person at the terminal is not auto-denied
+        // for stepping away, which is what a host with nobody bounded asks for.
+        let answered = if self.timeout.is_zero() {
+            Ok(rx.await)
+        } else {
+            tokio::time::timeout(self.timeout, rx).await
+        };
+        match answered {
             Ok(Ok(value)) => Some(value),
             _ => {
                 self.pending.lock().expect("pending poisoned").remove(&id);

@@ -430,6 +430,12 @@ config = { model = {model} }
 name = "verify-cadence"
 config = { working_dir = {working_dir}, force = {force_verify} }
 
+# Request options the person configured (max tokens, temperature, reasoning
+# effort), on every request that does not state its own. Empty config says
+# nothing, so a default config sends what it always sent.
+[[insert]]
+name = "chat-options"
+
 # The driver protocol: this is what `CodingRuntimeHandle` drives.
 [[insert]]
 name = "ui-handle"
@@ -449,8 +455,107 @@ name = "ui-handle"
 /// that the row had no way to be told which backend to use — the person's
 /// `[web_search] provider = "duckduckgo"` would have been read by the chain and
 /// silently dropped by the tree.
+/// The `persona-atomcode` row's config for a model and a language.
+fn persona_config(model: &str, language: Option<atomcode_config::locale::Locale>) -> String {
+    match language
+        .and_then(|l| serde_json::to_value(l).ok())
+        .and_then(|v| v.as_str().map(str::to_string))
+    {
+        Some(language) => format!(
+            "{{ model = {}, language = {} }}",
+            atomcode_harness::bundle::toml_string(model),
+            atomcode_harness::bundle::toml_string(&language)
+        ),
+        None => format!(
+            "{{ model = {} }}",
+            atomcode_harness::bundle::toml_string(model)
+        ),
+    }
+}
+
+/// Rows whose config follows the running model — patched at mount and again on
+/// every model switch, because each one is a fact about the model.
+fn model_rows(cfg: &crate::CodingAgentConfig) -> String {
+    let mut out = format!(
+        "[[patch]]\nid = \"tool-fs-world\"\nconfig = {{ vision = {} }}\n\n",
+        cfg.supports_vision
+    );
+    let options = &cfg.chat_options;
+    let mut fields = Vec::new();
+    if let Some(level) = options
+        .reasoning_effort
+        .and_then(|l| serde_json::to_value(l).ok())
+        .and_then(|v| v.as_str().map(str::to_string))
+    {
+        fields.push(format!(
+            "reasoning_effort = {}",
+            atomcode_harness::bundle::toml_string(&level)
+        ));
+    }
+    if let Some(max_tokens) = options.max_tokens {
+        fields.push(format!("max_tokens = {max_tokens}"));
+    }
+    if let Some(temperature) = options.temperature {
+        fields.push(format!("temperature = {temperature:?}"));
+    }
+    out.push_str(&format!(
+        "[[patch]]\nid = \"chat-options\"\nconfig = {{ {} }}\n\n",
+        fields.join(", ")
+    ));
+    out
+}
+
 pub fn config_rows(cfg: &crate::CodingAgentConfig) -> String {
-    let mut out = String::new();
+    let mut out = model_rows(cfg);
+    if cfg.preferred_language.is_some() {
+        out.push_str(&format!(
+            "[[patch]]\nid = \"persona-atomcode\"\nconfig = {}\n\n",
+            persona_config(&cfg.model, cfg.preferred_language)
+        ));
+    }
+    // A turn's own round budget; `0` is unbounded, which `CODING_DEFAULTS` states.
+    if cfg.max_rounds != 0 {
+        out.push_str(&format!(
+            "[[patch]]\nid = \"round-cap\"\nconfig = {{ max_rounds = {}, max_seconds = 0 }}\n\n",
+            cfg.max_rounds
+        ));
+    }
+    // The exact-repeat guard. `None` is the person turning it off.
+    match cfg.tool_loop_policy {
+        Some(policy) => out.push_str(&format!(
+            "[[patch]]\nid = \"tool-loop-guard\"\nconfig = {{ warn_after = {}, stop_after = {} }}\n\n",
+            policy.warning_threshold(),
+            policy.stop_threshold()
+        )),
+        None => out.push_str("[[patch]]\nid = \"tool-loop-guard\"\ndisabled = true\n\n"),
+    }
+    out.push_str(&format!(
+        "[[patch]]\nid = \"compaction-tail\"\nconfig = {{ threshold = {:?}, keep_turns = 2 }}\n\n",
+        cfg.compact_threshold
+    ));
+    // Retries. An explicit upstream budget is the visible tier and wins; an
+    // explicit per-model adapter budget otherwise switches the outer tier off,
+    // the coupling the chain applies. Attempts count the first request.
+    let attempts = match (cfg.upstream_retry_max_attempts, cfg.retry_max_attempts) {
+        (Some(n), _) => Some(n.saturating_add(1)),
+        (None, Some(_)) => Some(1),
+        (None, None) => None,
+    };
+    if let Some(attempts) = attempts {
+        out.push_str(&format!(
+            "[[patch]]\nid = \"llm-retry\"\nconfig = {{ attempts = {attempts}, backoff_ms = 3000, cap_ms = 30000 }}\n\n"
+        ));
+    }
+    if let Some(waits) = cfg.retry_max_attempts {
+        out.push_str(&format!(
+            "[[patch]]\nid = \"llm-rate-limit\"\nconfig = {{ max_waits = {waits}, max_wait_secs = 120, fallback_secs = 5 }}\n\n"
+        ));
+    }
+    // How long a question to the person waits. `None` parks until answered.
+    let ask = cfg.request_timeout.map(|d| d.as_secs().max(1)).unwrap_or(0);
+    out.push_str(&format!(
+        "[[patch]]\nid = \"ui-handle\"\nconfig = {{ ask_timeout_secs = {ask} }}\n\n"
+    ));
     // `[tools] credential_shell = "off" | "prompt" | "strict"`. The row's own
     // default is `prompt`, the same as the L1 default, so only a person who
     // chose otherwise changes the tree.
@@ -718,6 +823,20 @@ pub async fn swap_provider(
     next: Arc<dyn LlmProvider>,
     model: &str,
 ) -> Result<(), String> {
+    swap_provider_for(app, slots, next, model, None).await
+}
+
+/// As [`swap_provider`], carrying everything else that follows the model: the
+/// persona's language, whether `read_file` may return pictures, and the request
+/// options (reasoning effort, max tokens, temperature) the chain reads off the
+/// new config when it reassembles.
+pub async fn swap_provider_for(
+    app: &mut App,
+    slots: &ProviderSlots,
+    next: Arc<dyn LlmProvider>,
+    model: &str,
+    config: Option<&crate::CodingAgentConfig>,
+) -> Result<(), String> {
     let id = slots.insert(next);
     // Three rows, one patch, and the two extras are there for the same reason:
     // `App::patch` remounts only rows whose OWN entry changed, so a row that
@@ -731,12 +850,16 @@ pub async fn swap_provider(
     //                     reviewer on the old model, and `/logout` would leave
     //                     it holding the credentials. The logout criterion in
     //                     the differential fails the moment this line is gone.
-    let layer = Layer::from_toml(&format!(
+    let persona = persona_config(model, config.and_then(|c| c.preferred_language));
+    let mut layer_text = format!(
         "[[patch]]\nid = \"llm\"\nconfig = {{ provider_id = {id:?} }}\n\n\
-         [[patch]]\nid = \"persona-atomcode\"\nconfig = {{ model = {model:?} }}\n\n\
-         [[patch]]\nid = \"tool-code-review\"\nconfig = {{ model = {model:?} }}\n"
-    ))
-    .map_err(|e| e.to_string())?;
+         [[patch]]\nid = \"persona-atomcode\"\nconfig = {persona}\n\n\
+         [[patch]]\nid = \"tool-code-review\"\nconfig = {{ model = {model:?} }}\n\n"
+    );
+    if let Some(config) = config {
+        layer_text.push_str(&model_rows(config));
+    }
+    let layer = Layer::from_toml(&layer_text).map_err(|e| e.to_string())?;
     app.patch(&layer).await.map_err(|e| e.to_string())
 }
 
@@ -871,6 +994,7 @@ pub fn plugins() -> Vec<Arc<dyn Plugin>> {
         Arc::new(SkillFirstPlugin),
         Arc::new(DatalogPlugin),
         Arc::new(CcHooksPlugin),
+        Arc::new(ChatOptionsPlugin),
     ]
 }
 
@@ -1990,6 +2114,10 @@ struct PersonaRow {
     /// quiet lie in the first line the model reads.
     #[serde(default)]
     model: String,
+    /// The language commit messages and the like are written in, when the
+    /// person chose one.
+    #[serde(default)]
+    language: Option<atomcode_config::locale::Locale>,
 }
 
 #[async_trait]
@@ -2040,13 +2168,89 @@ impl Plugin for CodingPersonaPlugin {
         // rather than of the `ATOMCODE_MEMORY_TOOL` / `ATOMCODE_REQUEST_USER_INPUT` envs the
         // chain reads, which cannot see a tree that failed to mount the tool. See
         // `coding_persona_rows`.
-        let text = crate::persona::coding_persona_rows(&model, None, &has);
+        let text = crate::persona::coding_persona_rows(&model, row.language, &has);
         let Some(prompts) = ctx.service::<atomcode_harness::seams::SystemPromptSvc>() else {
             return Ok(());
         };
         // Rank 0 and the generic row's id: the identity line goes first, and
         // there is only ever one of it.
         prompts.contribute("persona-coding", 0, text);
+        Ok(())
+    }
+}
+
+// ---- request options ----------------------------------------------------
+
+/// The person's request options, on requests that state none of their own.
+pub struct ChatOptionsPlugin;
+
+#[derive(serde::Deserialize, Default)]
+struct ChatOptionsRow {
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f32>,
+}
+
+struct ChatOptions {
+    reasoning_effort: Option<atomcode_kernel::provider::ReasoningEffort>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+}
+
+#[async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for ChatOptions {
+    async fn handle(
+        &self,
+        req: &mut atomcode_harness::events::ModelRequest,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::AgentRequest>,
+    ) -> Result<atomcode_harness::events::ModelResponse, atomcode_harness::events::RequestError>
+    {
+        let options = &mut req.options;
+        if options.reasoning_effort.is_none() {
+            options.reasoning_effort = self.reasoning_effort;
+        }
+        if options.max_tokens.is_none() {
+            options.max_tokens = self.max_tokens;
+        }
+        if options.temperature.is_none() {
+            options.temperature = self.temperature;
+        }
+        next.run(req).await
+    }
+}
+
+#[async_trait]
+impl Plugin for ChatOptionsPlugin {
+    fn name(&self) -> &'static str {
+        "chat-options"
+    }
+    fn description(&self) -> &'static str {
+        "the person's reasoning effort, max tokens and temperature on every request"
+    }
+    async fn apply(&self, ctx: &Context, config: &serde_json::Value) -> Result<(), String> {
+        let row: ChatOptionsRow = if config.is_null() {
+            ChatOptionsRow::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        let options = ChatOptions {
+            reasoning_effort: atomcode_kernel::provider::ReasoningEffort::from_config(
+                row.reasoning_effort.as_deref(),
+            ),
+            max_tokens: row.max_tokens,
+            temperature: row.temperature,
+        };
+        if options.reasoning_effort.is_none()
+            && options.max_tokens.is_none()
+            && options.temperature.is_none()
+        {
+            return Ok(());
+        }
+        // Outermost, so a request a later row retries or trims still carries them.
+        let _ = ctx.on_waterfall::<atomcode_harness::events::AgentRequest>(Arc::new(options), true);
         Ok(())
     }
 }
