@@ -860,3 +860,119 @@ fn a_failure_never_projects_as_a_clean_stop() {
         })
     ));
 }
+
+/// The `handle` profile, but with a store and a session that can be resumed.
+fn resumable(
+    home: &std::path::Path,
+    root: &std::path::Path,
+    id: &str,
+    resume: bool,
+    script: &str,
+) -> ConfigTree {
+    let empty_home = root.join("__no_user_skills__");
+    let _ = std::fs::create_dir_all(&empty_home);
+    let sessions = home.join("sessions");
+    let _ = std::fs::create_dir_all(&sessions);
+    let base = format!(
+        "[[patch]]\nid = \"mcp\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"tool-web\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ root = {sessions:?} }}\n\n\
+         [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 10, working_dir = {root:?} }}\n\n\
+         [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
+         [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {root:?} }}\n\n\
+         [[patch]]\nid = \"fs\"\nconfig = {{ root = {root:?} }}\n\n\
+         [[patch]]\nid = \"session\"\nconfig = {{ id = {id:?}, resume = {resume} }}\n",
+        root = root.to_string_lossy(),
+        home = empty_home.to_string_lossy()
+    );
+    Profiles::builtin()
+        .resolve("handle", &[base.as_str(), script])
+        .unwrap_or_else(|e| panic!("handle: {e}"))
+}
+
+async fn persisted(app: &App, id: &str, want: usize) {
+    let store = app
+        .context()
+        .service::<atomcode_harness::seams::SessionPersistenceSvc>()
+        .expect("the persistence row is mounted");
+    for _ in 0..100 {
+        if store.load(id).await.map(|e| e.len()).unwrap_or(0) >= want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the log never reached {want} facts on disk");
+}
+
+#[tokio::test]
+async fn a_resume_is_silent_for_a_driver_and_the_log_is_where_history_comes_from() {
+    // **Not a bug, and this is the test that says so.** `session/resume` is
+    // specified as a silent restore — see `atomcode-cli/tests/acp_end_to_end.rs`,
+    // "resume: silent restore, `{}` … (no replay, per v1)" — so a driver that
+    // attaches to a session that already exists is told *nothing* about the
+    // facts already in it. Whichever front end needs the history replays it
+    // itself, from the log: `atomcode-tuix` does it through `replay_on_start`,
+    // and `atomcode-tui` folds the log into its screen (`plugin.rs`'s `Facts`).
+    //
+    // Pinned because the empty answer here looks exactly like the bug fixed next
+    // door on the same day — `atui --resume` drew a blank screen for the same
+    // reason (nobody folded the restored prefix) — and the two are one keystroke
+    // apart: making this replay would turn a documented protocol into an
+    // undocumented one, and a driver that keeps its own copy would render the
+    // conversation twice.
+    let home = scratch("resume-home");
+    let root = scratch("resume-work");
+    let id = "fixed-id";
+
+    {
+        let app = start(resumable(
+            &home,
+            &root,
+            id,
+            false,
+            &replay(r#"{ text = "It is 42." }"#),
+        ))
+        .await;
+        let mut handle = handle_of(&app);
+        handle
+            .commands
+            .send(AgentCommand::SendMessage {
+                text: "remember the number 42".into(),
+                images: vec![],
+            })
+            .unwrap();
+        let _ = drain_turn(&mut handle).await;
+        persisted(&app, id, 6).await;
+        drop(handle);
+        drop(app);
+    }
+
+    let app = start(resumable(
+        &home,
+        &root,
+        id,
+        true,
+        &replay(r#"{ text = "still 42." }"#),
+    ))
+    .await;
+    let mut handle = handle_of(&app);
+
+    let mut seen: Vec<AgentEvent> = Vec::new();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_secs(3), handle.events.recv()).await
+    {
+        let terminal = matches!(event, AgentEvent::TurnComplete { .. });
+        seen.push(event);
+        if terminal {
+            break;
+        }
+    }
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta(t) if t.contains("42"))),
+        "the resumed turn's own answer must not be replayed to a driver by the \
+         handle — history is the log's to give, not this stream's: {:#?}",
+        names(&seen)
+    );
+}

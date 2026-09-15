@@ -11,7 +11,7 @@ use atomcode_harness::agent::{Agent, CreateAgent};
 use atomcode_harness::events::SessionEventCommitted;
 use atomcode_harness::plugins::handle::{spawn as spawn_driver, wire, Driven};
 use atomcode_harness::seams::{LlmSvc, UiSvc, UserInterface, UserQuestionsSvc};
-use atomcode_harness::session::Committed;
+use atomcode_harness::session::{Committed, LoggedEvent, SeqNo};
 use atomcode_kernel::agent::AgentHandle;
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_plexus::{plexus_service, Context, Plugin};
@@ -138,6 +138,108 @@ enum Wake {
 #[serde(deny_unknown_fields)]
 struct Row {}
 
+/// The screen's subscription to its own session's log.
+///
+/// The rule is one line — every committed fact of OUR session reaches the
+/// modules here and nowhere else — but the startup case is the whole reason
+/// this is a type rather than a closure. A resumed process finds the log
+/// already full: [`SessionLog::restore`] puts the history back **silently**,
+/// and silently on purpose (the facts were broadcast once, in the process
+/// that wrote them, and broadcasting them again would have every listener
+/// treat them as news — persistence would append them a second time). So a
+/// listener registered at startup hears only what happens *next*, and a
+/// screen built that way comes back to an empty conversation with the whole
+/// session sitting in the file. Measured: `atui --resume <id>` drew the
+/// composer and the status line and nothing else.
+///
+/// [`SessionLog::restore`]: atomcode_harness::session::SessionLog::restore
+struct Facts {
+    host: Arc<Host>,
+    state: Mutex<Feed>,
+}
+
+/// Whether the history has been folded yet, and how far.
+enum Feed {
+    /// Registered but not yet caught up. Facts queue rather than fold: the
+    /// history is folded from the log in log order, and draining this after
+    /// it is what keeps a fact that arrived mid-catch-up *behind* the
+    /// history it follows. Folding it first would hand a module a tool
+    /// result before the call that produced it.
+    CatchingUp(Vec<Committed>),
+    /// Caught up. Carries the highest seq folded, which is what makes the
+    /// join with the queued facts exact — anything already in the history
+    /// is skipped rather than folded twice.
+    Live(SeqNo),
+}
+
+impl Facts {
+    fn new(host: Arc<Host>) -> Self {
+        Self {
+            host,
+            state: Mutex::new(Feed::CatchingUp(Vec::new())),
+        }
+    }
+
+    /// Fold `c` now, or hold it for the catch-up. `true` when it reached the
+    /// modules, which is the caller's cue that a frame is owed.
+    ///
+    /// The `seq` comparison is not belt-and-braces: the same fact can reach
+    /// both paths, because reading the log and registering this listener are
+    /// two steps and a commit can land between them. Whichever path folds it
+    /// first wins; the other sees `seq <= high` and does nothing.
+    fn deliver(&self, c: &Committed) -> bool {
+        let mut state = self.state.lock().expect("fact feed poisoned");
+        match &mut *state {
+            Feed::CatchingUp(queue) => {
+                queue.push(c.clone());
+                false
+            }
+            Feed::Live(high) => {
+                if c.seq <= *high {
+                    return false;
+                }
+                *high = c.seq;
+                self.host.absorb(&c.event);
+                true
+            }
+        }
+    }
+
+    /// Fold the facts this process did not watch being committed, then let
+    /// facts through as they arrive. `true` if anything was folded.
+    ///
+    /// The lock is held across the whole thing, which is what serialises it
+    /// against `deliver` — so the modules see the history in log order and
+    /// then the live facts in commit order, with no interleaving and no
+    /// gap. The window is one startup, so holding it costs nothing.
+    fn catch_up(&self, history: Vec<LoggedEvent>) -> bool {
+        let mut state = self.state.lock().expect("fact feed poisoned");
+        let queued = match std::mem::replace(&mut *state, Feed::Live(0)) {
+            Feed::CatchingUp(queued) => queued,
+            live @ Feed::Live(_) => {
+                *state = live;
+                return false;
+            }
+        };
+        let mut high: SeqNo = 0;
+        let mut folded = false;
+        for (seq, event) in history
+            .iter()
+            .map(|l| (l.seq, &l.event))
+            .chain(queued.iter().map(|c| (c.seq, &c.event)))
+        {
+            if seq <= high {
+                continue;
+            }
+            high = seq;
+            self.host.absorb(event);
+            folded = true;
+        }
+        *state = Feed::Live(high);
+        folded
+    }
+}
+
 /// The assembled UI. Public so a test can drive exactly what ships.
 pub struct Tui {
     /// The agent, driven through the handle protocol. Opened when the row
@@ -243,13 +345,29 @@ impl UserInterface for Tui {
         let facts = wake_tx.clone();
         let mine = client.session().id().to_string();
         let ours = mine.clone();
+        let feed = Arc::new(Facts::new(host));
+        let subscribed = feed.clone();
         let stream = ctx.on_emit::<SessionEventCommitted>(move |c: &Committed| {
             if c.session != ours {
                 return;
             }
-            host.absorb(&c.event);
+            if !subscribed.deliver(c) {
+                return;
+            }
             let _ = facts.send(Wake::Fact);
         });
+
+        // The history this process did not watch being committed.
+        //
+        // Registered before it is read, and folded through `Facts` rather than
+        // straight from the log, so a fact committed in between is neither lost
+        // (the listener has it) nor folded twice (the seq says who went first).
+        // Without this a resumed session draws an empty conversation: a restored
+        // log is put back silently, so nothing here ever heard about it.
+        let history = client.session().events();
+        if feed.catch_up(history) {
+            let _ = wake_tx.send(Wake::Fact);
+        }
 
         // Input comes from the surface when it has its own — that is what a
         // headless run is — and from the terminal otherwise.

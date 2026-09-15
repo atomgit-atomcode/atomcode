@@ -82,6 +82,75 @@ fn replay(steps: &str) -> String {
     format!("[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [ {steps} ] }}\n")
 }
 
+/// The same screen as [`tree`], but with a session that persists and can be
+/// resumed — pointed at a private `home` so one test cannot see (or be seen by)
+/// any session on the machine.
+///
+/// `tree` disables the persistence row outright, which is right for the fifty
+/// tests that have nothing to say about resuming and wrong for the one that
+/// does: without a store there is no history to come back to.
+fn tree_resumable(
+    root: &std::path::Path,
+    home: &std::path::Path,
+    id: &str,
+    resume: bool,
+    script: &str,
+    extra: &[&str],
+) -> ConfigTree {
+    let empty = root.join("__no_skills__");
+    let _ = std::fs::create_dir_all(&empty);
+    let sessions = home.join("sessions");
+    let _ = std::fs::create_dir_all(&sessions);
+    let base = format!(
+        "[[patch]]\nid = \"trace\"\nconfig = {{ stream = false, tools = false, summary = false }}\n\n\
+         [[patch]]\nid = \"mcp\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"tool-web\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ root = {sessions:?} }}\n\n\
+         [[patch]]\nid = \"approval\"\ndisabled = false\nconfig = {{ mode = \"yolo\" }}\n\n\
+         [[patch]]\nid = \"approval-interactive\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"user-questions-unattended\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 8, working_dir = {root:?} }}\n\n\
+         [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
+         [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {root:?} }}\n\n\
+         [[patch]]\nid = \"fs\"\nconfig = {{ root = {root:?} }}\n\n\
+         [[patch]]\nid = \"session\"\nconfig = {{ id = {id:?}, resume = {resume} }}\n\n\
+         [[insert]]\nid = \"surface\"\nname = \"surface-headless\"\nconfig = {{ width = 80, height = 24 }}\n\n\
+         [[patch]]\nid = \"ui\"\nname = \"ui-tui2\"\n",
+        root = root.to_string_lossy(),
+        home = empty.to_string_lossy()
+    );
+    let mut layers = vec![
+        atomcode_harness::bundle::base().unwrap(),
+        Layer::from_toml(atomcode_harness::bundle::ONESHOT_APP).unwrap(),
+        Layer::from_toml(&base).unwrap(),
+        Layer::from_toml(atomcode_tui::rows::SCREEN).unwrap(),
+        Layer::from_toml(script).unwrap(),
+    ];
+    for e in extra {
+        layers.push(Layer::from_toml(e).unwrap());
+    }
+    ConfigTree::from_layers(layers).unwrap()
+}
+
+/// Wait for the fire-and-forget persistence writer to land `want` facts.
+///
+/// The writer is deliberately off the turn's path (a queue behind one task), so
+/// "the turn finished" and "the file has it" are different moments. A resume
+/// test that skipped this would be racing its own fixture.
+async fn persisted(s: &Session, id: &str, want: usize) {
+    let store = s
+        .app
+        .service::<atomcode_harness::seams::SessionPersistenceSvc>()
+        .expect("the persistence row is mounted");
+    for _ in 0..100 {
+        if store.load(id).await.map(|e| e.len()).unwrap_or(0) >= want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the log never reached {want} facts on disk");
+}
+
 /// The same scripted model, plus an answer to "can you see pictures?".
 fn replay_vision(steps: &str, vision: bool) -> String {
     format!(
@@ -2497,6 +2566,61 @@ async fn a_move_that_was_asked_for_says_nothing_again() {
          is being repeated per event, and the terminal is paying per cell"
     );
 
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn a_resumed_session_redraws_the_conversation_it_left_behind() {
+    // What `atui --resume` is for. The log IS the snapshot (there is no other
+    // format), so a resumed screen has to be rebuilt by folding the log the new
+    // process just loaded — and the fold that runs while a session is live only
+    // sees facts committed *after* it started. Measured before it was fixed:
+    // resume came back to a blank screen with the whole conversation sitting in
+    // the file, which is the one outcome a resume cannot have.
+    let home = scratch("resume-home");
+    let root = scratch("resume-work");
+    let id = "fixed-id";
+
+    {
+        let s = start(tree_resumable(
+            &root,
+            &home,
+            id,
+            false,
+            &replay(r#"{ text = "It is 42." }"#),
+            &[],
+        ))
+        .await;
+        let task = s.open().await;
+        s.term.type_line("remember the number 42");
+        s.quiet().await;
+        // The writer is behind its own queue, so the turn being over is not the
+        // same moment as the file having it.
+        persisted(&s, id, 6).await;
+        s.term.press(KeyPress::ctrl('d'));
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    let s = start(tree_resumable(
+        &root,
+        &home,
+        id,
+        true,
+        &replay(r#"{ text = "still 42." }"#),
+        &[],
+    ))
+    .await;
+    let task = s.open().await;
+    let screen = s.screen();
+    assert!(
+        screen.contains("remember the number 42"),
+        "the resumed screen must show what was said before it:\n{screen}"
+    );
+    assert!(
+        screen.contains("It is 42."),
+        "…and what was answered:\n{screen}"
+    );
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
