@@ -177,7 +177,7 @@ USAGE
     atui [FLAGS] [PROMPT]
 
 SCREEN
-    -p, --profile <name>   which composition to mount (default: repl)
+    -p, --profile <name>   which composition to mount (default: tui)
         --mascot           show the cat
         --theme <t>        auto (ask the terminal), dark or light
         --no-mouse         leave the pointer to the terminal

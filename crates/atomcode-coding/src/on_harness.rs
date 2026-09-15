@@ -1730,10 +1730,15 @@ impl Plugin for CodingPersonaPlugin {
         "persona-atomcode"
     }
     fn uses(&self) -> &'static [&'static str] {
-        // `system-prompt` only. It used to read the tool catalog to decide whether to describe
-        // `todowrite` / `ask_user`; those decisions now belong to the rows that mount them,
-        // which is what makes the description leave when the tool does.
-        &["system-prompt"]
+        // `system-prompt` is what it writes; `tools` and `llm` are what it reads
+        // to decide what to write. It used to read the tool catalog to decide
+        // whether to describe `todowrite` / `ask_user` — those decisions now
+        // belong to the rows that mount them, which is what makes the
+        // description leave when the tool does — but `has("memory")` still asks
+        // the catalog, and `model = ""` (the default here) asks the `llm` seam
+        // for the running model. Undeclared reads are invisible: `/audit` cannot
+        // report a row that is absent when the consumer never said it wanted it.
+        &["system-prompt", "tools", "llm"]
     }
     fn description(&self) -> &'static str {
         "coding's own persona, in place of the harness's generic one"
