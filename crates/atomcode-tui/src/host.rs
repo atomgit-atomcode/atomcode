@@ -1781,7 +1781,7 @@ fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16
 /// scrolling back for. What does not is the frame — the input box, the tip row,
 /// the status line: those say where the session *is*, have no history, and must
 /// not move out from under a hand reaching for them. See `docs/adr/0020`.
-pub const TAIL: &[&str] = &[crate::modules::todo::ID];
+pub const TAIL: &[&str] = &[crate::modules::todo::ID, crate::modules::live::ID];
 
 /// The conversation, with [`TAIL`] riding at its foot.
 ///
@@ -1822,7 +1822,6 @@ pub fn composer() -> Region {
     Region::flex(
         Dir::Vertical,
         vec![
-            Item::hug(Region::view(crate::modules::live::ID)),
             Item::hug(Region::view(crate::modules::tip::ID)),
             Item::grow(Region::view(crate::modules::input::ID)),
         ],
@@ -3372,10 +3371,15 @@ mod tests {
     }
 
     #[test]
-    fn a_scrolled_up_reader_is_not_shown_the_live_line() {
-        // The rows go back to the conversation rather than to the composer, and
-        // the field below does not move: the line is the only thing that stops
-        // being asked for.
+    fn a_scrolled_up_reader_watches_the_live_line_leave_like_content() {
+        // This used to assert that the line *vanished* the moment the reader
+        // left the bottom — a module reading `moment.scroll` and withdrawing.
+        // It rides the stream's tail now, so what happens is what happens to
+        // any content: scrolling moves it up, and one screen takes it away.
+        //
+        // The half that must NOT change is the second one here: the field does
+        // not move. That is the `tip`/`input` invariant, and it is why neither
+        // of those is in `TAIL`.
         use crate::modules::live;
         let mods = Arc::new(Modules::new());
         mods.add_producer(transcript::Transcript::new()).unwrap();
@@ -3393,26 +3397,43 @@ mod tests {
             m.activity = crate::moment::Activity::Working;
             m.now = crate::moment::Timestamp::millis(4_000);
         }
-        let at_bottom = h.compose((60, 12));
-        assert!(
-            at_bottom.part("live").is_some(),
-            "the line is up while the reader is at the bottom"
-        );
+        let size = (60, 12);
+        let at_bottom = h.compose(size);
+        let line = at_bottom
+            .part("live")
+            .expect("the line is up while the reader is at the bottom")
+            .rect;
         let field = at_bottom.part("input").expect("the field").rect;
+        assert_eq!(line.h, 2, "the words and their blank row");
 
+        // One row back and it is *shorter*, not gone: it is still on screen,
+        // just clipped at the bottom edge like any other content at the fold.
         h.moment.write().unwrap().scroll = crate::moment::ScrollPos(1);
-        let scrolled = h.compose((60, 12));
-        assert!(
-            scrolled.part("live").is_none(),
-            "reading history is not looking at the foot of the conversation"
-        );
+        let one_back = h.compose(size);
         assert_eq!(
-            scrolled.part("input").expect("the field").rect,
+            one_back.part("live").expect("still up").rect.h,
+            1,
+            "reading one row back does not delete the line"
+        );
+
+        // Past its own height and it has scrolled away — because the content
+        // moved, not because the line decided to withdraw.
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(2);
+        let past = h.compose(size);
+        assert!(
+            past.part("live").is_none(),
+            "scrolled past it, so it is off the screen"
+        );
+
+        // And the frame held still throughout, which is the point of keeping
+        // these two out of the tail.
+        assert_eq!(
+            past.part("input").expect("the field").rect,
             field,
             "the box does not move for it"
         );
         assert_eq!(
-            scrolled.part("stream").expect("the conversation").rect.h,
+            past.part("stream").expect("the conversation").rect.h,
             at_bottom.part("stream").expect("the conversation").rect.h + 2,
             "and the line and its blank row are the words' again"
         );
