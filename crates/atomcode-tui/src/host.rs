@@ -572,6 +572,26 @@ fn run_around(
     members.into_iter().map(|m| slots[m].block().id).collect()
 }
 
+/// One frame's split of a `Stream` region: the conversation's own rect, the
+/// offset it is drawn at, and where each tail module landed.
+///
+/// The pane a `Stream` is given covers more than the blocks: the view modules
+/// riding its tail draw inside it too, at the bottom, and the conversation's
+/// rect is what is left once they have taken their rows. See
+/// [`Host::pane_geometry`].
+struct Pane {
+    /// What the blocks are drawn into — the pane minus whatever tail rows the
+    /// window still covers.
+    block_rect: Rect,
+    /// The offset `block_rect` is drawn at, which is `scroll` *less* the rows
+    /// the tail took. Zero while any of the tail is still on screen.
+    block_scroll: usize,
+    /// `(id, rect)` per tail module that is at least partly visible, top to
+    /// bottom. A module wholly above the fold is absent, which is what makes
+    /// `part("stream.tail.live")` mean "on screen" rather than "declared".
+    tail: Vec<(String, Rect)>,
+}
+
 /// Which block each row of the stream came from, and where the stream was.
 ///
 /// Composing is where this is known and clicking is where it is needed, so the
@@ -674,6 +694,13 @@ pub struct Host {
     /// The width the stream was last laid out at. New content arrives between
     /// frames and has to be measured in the same terms the frame used.
     last_width: Mutex<u16>,
+    /// The whole screen the last frame was composed at.
+    ///
+    /// Beside `last_width` and for the same reason: `absorb` runs between
+    /// frames, and the scroll it adjusts has to be clamped against the screen
+    /// that was actually drawn — `stream_rows` is what says how much of the pane
+    /// is on it, and that is a question about both dimensions.
+    last_size: Mutex<(u16, u16)>,
 }
 
 impl Host {
@@ -696,6 +723,7 @@ impl Host {
             painted: Mutex::new(0),
             hits: Mutex::new(Hits::default()),
             last_width: Mutex::new(0),
+            last_size: Mutex::new((0, 0)),
         }
     }
 
@@ -724,14 +752,26 @@ impl Host {
         // conversation, and the model puts new output *at* that bottom — so a
         // reader who has scrolled up to study something would watch it slide
         // away by exactly as much as arrived, which is the screen refusing to
-        // hold still. Growing the offset by what grew keeps the same lines
-        // under the same eyes.
+        // hold still. Moving the offset by what grew keeps the same lines under
+        // the same eyes.
         //
         // Only while held back: at the bottom the whole point is to follow, and
         // measuring is O(the conversation), so it is not paid for nothing.
+        //
+        // Read as a snapshot, because the reading has to be comparable before
+        // and after the fold below, and because `stream_height` now needs the
+        // moment: it is an argument, not a field read, so that a caller holding
+        // the write lock (plugin.rs) can hand its own guard over instead of
+        // deadlocking against it.
         let width = *self.last_width.lock().expect("width poisoned");
-        let held = width > 0 && self.moment.read().expect("moment poisoned").scroll.0 > 0;
-        let before = if held { self.stream_height(width) } else { 0 };
+        let size = *self.last_size.lock().expect("size poisoned");
+        let now = self.moment.read().expect("moment poisoned").clone();
+        let held = width > 0 && now.scroll.0 > 0;
+        let before = if held {
+            self.stream_height(width, &now)
+        } else {
+            0
+        };
 
         {
             let mut stream = self.stream.write().expect("stream poisoned");
@@ -759,10 +799,19 @@ impl Host {
         }
 
         if held {
-            let grew = self.stream_height(width).saturating_sub(before);
-            if grew > 0 {
+            let after = self.stream_height(width, &now);
+            // **Signed**, and not `if grew > 0` as it was. A block only ever
+            // grows, so one direction was enough while the stream was blocks
+            // alone; the tail is not like that. `activity` flips between idle
+            // and working, and a plan can lose items — either shrinks the sum
+            // without a thing scrolling, and a reader compensated one way only
+            // gets a screen that jumps down whenever it happens.
+            let grew = after as i64 - before as i64;
+            if grew != 0 {
                 let mut m = self.moment.write().expect("moment poisoned");
-                m.scroll = crate::moment::ScrollPos(m.scroll.0 + grew);
+                let max = self.scroll_limit(size, &now) as i64;
+                m.scroll =
+                    crate::moment::ScrollPos((m.scroll.0 as i64 + grew).clamp(0, max) as usize);
             }
         }
     }
@@ -957,12 +1006,77 @@ impl Host {
         out
     }
 
+    /// The pane a `Stream` was given, split between the conversation and the
+    /// view modules riding at its tail.
+    ///
+    /// `scroll` is measured from the **bottom of the whole pane**, which is what
+    /// makes the tail get out of the way first: its rows are the newest content
+    /// there is, so they are what a reader scrolling back has already read. Only
+    /// once the tail is gone does `block_scroll` leave zero and the conversation
+    /// start moving.
+    ///
+    /// The arithmetic, with `B` block rows and `T` tail rows in a pane of `H`:
+    ///
+    /// ```text
+    /// visible_tail = (T - scroll).clamp(0, H)
+    /// block_scroll = (scroll - T).max(0)
+    /// scroll_limit = (B + T) - H
+    /// ```
+    ///
+    /// `tail` is empty for every layout that declares none, and then this is the
+    /// identity: the whole pane is the block rect and `block_scroll == scroll`.
+    fn pane_geometry(pane: Rect, scroll: usize, heights: &[(String, u16)]) -> Pane {
+        // Everything below is in "distance from the bottom of the pane", which
+        // is the coordinate `scroll` is already measured in: `d = 0` is the last
+        // row of content. The window shows `[scroll, scroll + h)`.
+        let top = scroll.saturating_add(pane.h as usize);
+        let tail_full: usize = heights.iter().map(|(_, h)| *h as usize).sum();
+        let visible_tail = tail_full.saturating_sub(scroll).min(pane.h as usize) as u16;
+
+        // Walking bottom-up: the ids arrive top-to-bottom, so the last one is
+        // the lowest on screen — the newest thing where the eye already is.
+        let mut offset = 0usize;
+        let mut tail: Vec<(String, Rect)> = Vec::new();
+        for (id, h) in heights.iter().rev() {
+            let (lo, hi) = (offset, offset + *h as usize);
+            // The part of this module the window still covers. A module wholly
+            // above the fold contributes nothing and is not placed; one caught
+            // half-way keeps its visible rows and the rect is that much shorter,
+            // which is the whole reason the module is asked for its own height
+            // rather than for the band it would have had.
+            let vis_lo = lo.max(scroll);
+            let vis_hi = hi.min(top);
+            if vis_hi > vis_lo {
+                // `d = scroll` is the pane's bottom row, so a module ending at
+                // `vis_hi` starts `vis_hi - scroll` rows above that bottom edge.
+                let y = pane.y + pane.h - (vis_hi - scroll) as u16;
+                tail.push((
+                    id.clone(),
+                    Rect::new(pane.x, y, pane.w, (vis_hi - vis_lo) as u16),
+                ));
+            }
+            offset += *h as usize;
+        }
+        tail.reverse();
+
+        Pane {
+            block_rect: Rect::new(pane.x, pane.y, pane.w, pane.h.saturating_sub(visible_tail)),
+            block_scroll: scroll.saturating_sub(tail_full),
+            tail,
+        }
+    }
+
     /// Render the stream's tail into `rect`.
     ///
     /// Bottom-anchored: what a person is reading is the newest thing. Blocks
     /// are rendered newest-first until the rect is full, then reversed — so the
     /// cost is O(what fits), not O(the conversation).
-    fn stream_lines(&self, rect: Rect) -> (Vec<Line>, Vec<RowOwner>) {
+    ///
+    /// `scroll` is passed rather than read: the caller is the one that knows how
+    /// the pane was split (`pane_geometry` above gives it the blocks' own
+    /// share), and a second read of `moment.scroll` here would be a second
+    /// answer to a question someone already answered.
+    fn stream_lines(&self, rect: Rect, scroll: usize) -> (Vec<Line>, Vec<RowOwner>) {
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         let mut out: Vec<Line> = Vec::new();
@@ -998,7 +1112,6 @@ impl Host {
                 }
             }
         }
-        let scroll = self.moment.read().expect("moment poisoned").scroll.0;
         let mut skipped = 0usize;
         let _ = &skipped;
 
@@ -1178,16 +1291,40 @@ impl Host {
             }
             match region {
                 Region::Stream { .. } => {
-                    let (lines, owners) = self.stream_lines(rect);
+                    // The pane is split before anything is drawn: the modules
+                    // riding the tail take their rows off the bottom, and what
+                    // is left is the conversation's. With no tail declared this
+                    // is the identity — one rect, the offset unchanged — which
+                    // is why every layout in this build still composes the same
+                    // frame it did before the split existed.
+                    let heights = self.tail_heights(rect.w, &moment);
+                    let pane = Self::pane_geometry(rect, moment.scroll.0, &heights);
+                    let (lines, owners) = self.stream_lines(pane.block_rect, pane.block_scroll);
                     *self.hits.lock().expect("hits poisoned") = Hits {
-                        rect,
+                        rect: pane.block_rect,
                         rows: owners,
                         jump: None,
                         field: None,
                     };
                     *self.last_width.lock().expect("width poisoned") = rect.w;
+                    *self.last_size.lock().expect("size poisoned") = (w, h);
                     stream_rect = Some(rect);
-                    frame.place("stream", rect, lines);
+                    frame.place("stream", pane.block_rect, lines);
+                    // Each tail module is its own part, named for where it is,
+                    // so a test can still ask for it by name and the
+                    // containment check still sees whose row is whose. The
+                    // rect is what the window covers — a module half scrolled
+                    // out is asked for its visible height and lays itself out
+                    // in it, rather than being sliced.
+                    for (id, tail_rect) in &pane.tail {
+                        let Some(view) = modules.view(id) else {
+                            continue;
+                        };
+                        let vp = crate::moment::Viewport::new(*tail_rect, &moment);
+                        let mut lines = view.render(&vp);
+                        lines.truncate(tail_rect.h as usize);
+                        frame.place(format!("stream.tail.{id}"), *tail_rect, lines);
+                    }
                 }
                 Region::Module(id) => {
                     let Some(view) = modules.view(&id) else {
@@ -1329,7 +1466,7 @@ impl Host {
     /// The moment is an argument, not a field read: the caller is holding the
     /// write lock on it when it asks, and a `RwLock` does not forgive that.
     pub fn scroll_limit(&self, size: (u16, u16), moment: &Moment) -> usize {
-        self.stream_height(size.0)
+        self.stream_height(size.0, moment)
             .saturating_sub(self.stream_rows(size, moment) as usize)
     }
 
@@ -1350,7 +1487,17 @@ impl Host {
     /// this walks the whole conversation in arithmetic rather than in markdown.
     /// It is called per chunk while the reader is scrolled back, which is the
     /// one time the whole conversation is in the sum.
-    pub fn stream_height(&self, width: u16) -> usize {
+    pub fn stream_height(&self, width: u16, moment: &Moment) -> usize {
+        self.stream_height_split(width, moment).0
+    }
+
+    /// The same sum, and the rows the tail contributes to it.
+    ///
+    /// Split out because the frame needs both: the total bounds the scroll, and
+    /// the tail's share is what decides where the conversation ends and the tail
+    /// begins. Two functions would be two walks of the conversation that agree
+    /// until one of them changes.
+    fn stream_height_split(&self, width: u16, moment: &Moment) -> (usize, usize) {
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         let mut total = 0usize;
@@ -1393,7 +1540,44 @@ impl Host {
             above = Some(b.kind());
             total += n;
         }
-        total
+        // The tail is content too, so it counts towards what there is to read:
+        // leaving it out would put its own rows out of reach at the bottom of
+        // the scroll, which is exactly the failure the block walk goes to such
+        // lengths to avoid one paragraph up.
+        let tail: usize = self
+            .tail_heights(width, moment)
+            .iter()
+            .map(|(_, h)| *h as usize)
+            .sum();
+        (total + tail, tail)
+    }
+
+    /// The view modules riding the stream's tail, with the height each asks for
+    /// at this width — the declaration order of the layout, top to bottom.
+    ///
+    /// Empty when the layout declares no tail, which is every layout in this
+    /// build until ADR 0020's Step 3: the pane is then the blocks' alone and the
+    /// geometry is the identity.
+    ///
+    /// The height comes from [`ViewObject::height`](crate::module::ViewObject::height),
+    /// which is a number the module computes rather than a render it does — a
+    /// tail costs an arithmetic call per frame, not a second render of itself.
+    fn tail_heights(&self, width: u16, moment: &Moment) -> Vec<(String, u16)> {
+        let ids = self.layout.tree().tail().to_vec();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(view) = self.modules.view(&id) else {
+                // Not mounted: `prune` would have taken it off the tree, and a
+                // tail id that is not mounted is not a row of anything.
+                continue;
+            };
+            let h = match view.height(moment, width) {
+                Height::Fixed(n) | Height::Hug(n) => n,
+                Height::Fill => 1,
+            };
+            out.push((id, h));
+        }
+        out
     }
 
     /// The block under a point on the last painted frame, if it is one that
@@ -1686,7 +1870,7 @@ mod tests {
         let orders = std::sync::atomic::Ordering::SeqCst;
 
         asked.store(0, orders);
-        let first = h.stream_height(80);
+        let first = h.stream_height(80, &h.moment.read().unwrap().clone());
         assert!(first > 0);
         let measured = asked.load(orders);
         assert!(
@@ -1696,12 +1880,198 @@ mod tests {
 
         asked.store(0, orders);
         for _ in 0..5 {
-            let _ = h.stream_height(80);
+            let _ = h.stream_height(80, &h.moment.read().unwrap().clone());
         }
         assert_eq!(
             asked.load(orders),
             0,
             "asking again how tall settled blocks are rendered them again"
+        );
+    }
+
+    // ---- the pane's split between the conversation and its tail ----------
+    //
+    // `pane_geometry` has no caller with a non-empty tail until ADR 0020's
+    // Step 3, so these are the only thing standing between the arithmetic and
+    // the day it is switched on. They are written against the numbers in the
+    // plan, which were worked out on a 21-row pane: 100 rows of blocks, a 4-row
+    // todo, a 2-row live line.
+
+    fn pane_heights() -> Vec<(String, u16)> {
+        vec![("todo".to_string(), 4), ("live".to_string(), 2)]
+    }
+
+    #[test]
+    fn with_no_tail_the_split_is_the_identity() {
+        // Every layout this build ships. If this stopped holding, nothing would
+        // compose the way it did before the split existed — which is the whole
+        // reason Step 2 is allowed to be behaviour-preserving.
+        let pane = Rect::sized(80, 21);
+        for scroll in [0usize, 1, 7, 1000] {
+            let p = Host::pane_geometry(pane, scroll, &[]);
+            assert_eq!(
+                p.block_rect, pane,
+                "scroll {scroll}: the pane is the blocks'"
+            );
+            assert_eq!(p.block_scroll, scroll, "scroll {scroll}: nothing took rows");
+            assert!(p.tail.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_tail_goes_first_and_the_blocks_do_not_move_until_it_has() {
+        // The point of the whole exercise: scrolling back eats the tail off the
+        // bottom before it touches the conversation. Six tail rows, so scroll 0
+        // to 6 leaves the blocks exactly where they were.
+        let pane = Rect::sized(80, 21);
+        for scroll in 0..=6usize {
+            let p = Host::pane_geometry(pane, scroll, &pane_heights());
+            assert_eq!(p.block_scroll, 0, "scroll {scroll} moved the conversation");
+            assert_eq!(
+                p.block_rect.h,
+                15 + scroll as u16,
+                "scroll {scroll}: the rows the tail gave back did not go to the conversation"
+            );
+            assert_eq!(
+                p.block_rect.h as usize + 6 - scroll,
+                21,
+                "scroll {scroll}: the pane stopped adding up"
+            );
+        }
+        // And only then do the blocks start to move.
+        let p = Host::pane_geometry(pane, 7, &pane_heights());
+        assert_eq!(p.block_scroll, 1, "past the tail, the conversation scrolls");
+        assert_eq!(
+            p.block_rect.h, 21,
+            "with the tail gone it has the whole pane"
+        );
+        assert!(p.tail.is_empty());
+    }
+
+    #[test]
+    fn a_tail_module_scrolls_out_one_row_at_a_time() {
+        // Not "disappears": four rows of todo lose a row at a time, and what is
+        // left keeps its place against the bottom. This is what the live line's
+        // whole-or-nothing `showing()` could not do.
+        let pane = Rect::sized(80, 21);
+        let h = |scroll: usize, id: &str| -> Option<Rect> {
+            Host::pane_geometry(pane, scroll, &pane_heights())
+                .tail
+                .into_iter()
+                .find(|(i, _)| i == id)
+                .map(|(_, r)| r)
+        };
+
+        // At rest both are up, the last id lowest: live sits under todo.
+        let todo = h(0, "todo").expect("todo is up");
+        let live = h(0, "live").expect("live is up");
+        assert_eq!(todo, Rect::new(0, 15, 80, 4), "todo, above the live line");
+        assert_eq!(live, Rect::new(0, 19, 80, 2), "live, against the bottom");
+        assert_eq!(live.bottom(), 21, "the newest thing is at the foot");
+
+        // Scroll 1 takes the bottom row off `live` — and takes it off the
+        // bottom *edge*, so what is left of live is the row still at y=20, not
+        // a shrunken box floating above it. Which row of live that is does not
+        // matter to the geometry: the module is handed a one-row rect and lays
+        // itself out in it, which is why live keeps saying what it is doing
+        // instead of going blank the moment it is clipped.
+        assert_eq!(h(1, "live"), Some(Rect::new(0, 20, 80, 1)));
+        assert_eq!(h(2, "live"), None, "two rows of live, two rows of scroll");
+
+        // Then todo starts to go, from its bottom row up.
+        assert_eq!(h(3, "todo"), Some(Rect::new(0, 18, 80, 3)), "one row gone");
+        assert_eq!(h(6, "todo"), None, "and the rest with it");
+    }
+
+    #[test]
+    fn a_tail_module_is_asked_for_the_rows_it_has_left() {
+        // The rect handed to the module is its *visible* height, not its full
+        // height clipped: `todo::window` and `live::render` both lay themselves
+        // out differently when they have less room, and cutting a full-height
+        // render is what would take away the row each of them keeps first.
+        let pane = Rect::sized(80, 21);
+        let p = Host::pane_geometry(pane, 3, &pane_heights());
+        let todo = p.tail.iter().find(|(i, _)| i == "todo").expect("todo");
+        assert_eq!(todo.1.h, 3, "asked for three rows, not given four and cut");
+    }
+
+    #[test]
+    fn the_tail_counts_towards_what_there_is_to_read() {
+        // Not counted, its own rows would be out of reach at the bottom of the
+        // scroll — the same failure the block walk goes to lengths to avoid for
+        // a reply that wraps wider than it is measured.
+        //
+        // The layout is swapped for one that really declares a tail, because
+        // every layout this build ships declares none: the sum's tail term has
+        // no other way to be exercised before Step 3 turns one on.
+        let h = host();
+        let moment = Moment::default();
+        // Mounted, or `tail_heights` skips it: an id nobody answers for is not a
+        // row of anything.
+        h.modules
+            .add_view(Arc::new(
+                crate::module::Mounted::<crate::modules::todo::Todo>::new(),
+            ))
+            .unwrap();
+        // A plan of two items, folded the way the real thing arrives: an
+        // assistant message carrying the call. `todo` is a view module with no
+        // producer, so this is what puts rows in it — not a block emit.
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: "t1".into(),
+                name: "todowrite".into(),
+                arguments: serde_json::json!({
+                    "todos": [
+                        { "content": "first", "status": "in_progress" },
+                        { "content": "second", "status": "pending" },
+                    ]
+                })
+                .to_string(),
+            }],
+        });
+
+        // The same state, measured twice: only the declaration differs, so the
+        // difference is the tail's own rows and nothing else. Comparing across
+        // the `absorb` above would have compared two different conversations —
+        // the message it folds is itself a block.
+        let declared = |with_tail: bool| {
+            let pane = |tail: Vec<&str>| {
+                Region::split(
+                    crate::region::Dir::Vertical,
+                    crate::region::Constraint::Fill,
+                    Region::stream().with_tail(tail),
+                    Region::view(crate::modules::status::ID),
+                )
+            };
+            h.layout.set(if with_tail {
+                pane(vec!["todo"])
+            } else {
+                pane(Vec::new())
+            });
+            h.stream_height_split(80, &moment)
+        };
+
+        let without = declared(false);
+        assert_eq!(without.1, 0, "nothing declared, so nothing is added");
+
+        let with = declared(true);
+        assert_eq!(
+            with.1, 3,
+            "a plan of two items is a header and two rows, and it counts"
+        );
+        assert_eq!(
+            with.0,
+            without.0 + 3,
+            "the tail's rows are in the sum, not only beside it"
+        );
+        assert_eq!(
+            h.stream_height(80, &moment),
+            with.0,
+            "`stream_height` is the total, tail included"
         );
     }
 
@@ -2354,13 +2724,13 @@ mod tests {
              eight a 40-cell measure gives it"
         );
         assert_eq!(
-            h.stream_height(40),
+            h.stream_height(40, &Moment::default()),
             drawn,
             "the sum says there are {} rows to read and the frame drew {drawn}: \
              the reply was measured at the full 40 cells instead of the 38 it \
              is set in by, and the rows that difference makes are the rows at \
              the top of it that cannot be scrolled to",
-            h.stream_height(40),
+            h.stream_height(40, &Moment::default()),
         );
 
         // And the consequence, rather than only the arithmetic: scrolled as far
@@ -3007,7 +3377,7 @@ mod tests {
         assert!(limit > 0, "the conversation does not fit in 12 rows");
         assert_eq!(
             limit,
-            h.stream_height(80) - h.stream_rows(size, &m) as usize,
+            h.stream_height(80, &m) - h.stream_rows(size, &m) as usize,
             "what there is to read, minus what is already on screen"
         );
 

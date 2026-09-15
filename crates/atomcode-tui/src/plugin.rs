@@ -908,9 +908,15 @@ impl Tui {
                 // the view back by exactly what it gained keeps that line where
                 // it was, and what appears, appears *below* it.
                 let size = self.surface.size();
-                let before = self.host.stream_height(size.0);
+                // Without the moment's write lock: `m` was dropped above, and
+                // `stream_height` takes the moment as an argument precisely so
+                // a caller that *is* holding it can pass its own guard rather
+                // than deadlocking. Read here, before the fold, because the
+                // fold is what the two readings are compared across.
+                let now = self.host.moment.read().expect("moment poisoned").clone();
+                let before = self.host.stream_height(size.0, &now);
                 self.host.toggle_block(id, kind);
-                let grew = self.host.stream_height(size.0) as i64 - before as i64;
+                let grew = self.host.stream_height(size.0, &now) as i64 - before as i64;
                 let mut m = self.host.moment.write().expect("moment poisoned");
                 let max = self.host.scroll_limit(size, &m) as i64;
                 m.scroll =
