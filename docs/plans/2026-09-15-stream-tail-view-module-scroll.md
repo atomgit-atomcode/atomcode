@@ -17,8 +17,8 @@
 |---|---|
 | branch | `feat/plexus-plugin-architecture` |
 | 开工时 SHA | `72b9e431` |
-| **当前 HEAD** | `b453eb4e` |
-| 判据基线 | `gates/tui-test-count.baseline` = **486**(开工时 468),棘轮**只能升** |
+| **当前 HEAD** | `4247ed59` |
+| 判据基线 | `gates/tui-test-count.baseline` = **493**(开工时 468),棘轮**只能升** |
 | worktree | 只剩 `Cargo.lock`(见下)与未跟踪的 `docs/atomcode-crate-deps.html` |
 
 **已提交:**
@@ -32,6 +32,16 @@
 | `9b47cb0b` | **Step 2**:pane 几何与签名,行为不变 |
 | `b7fb3829` | 评审修复 #1(pin 只走一半)+ #2(swap 丢 tail / resize 假成功) |
 | `b453eb4e` | 评审修复 #4(徽标锚点)+ #5(tail 总高封顶) |
+| `c94a301a` | **Step 3**:`todo` 进 tail,三个构造点收成唯一入口 |
+| `2b9580b2` | **Step 4**:`live` 进 tail,删掉让位判据 |
+| `4247ed59` | **Step 5**:框架不动 / 封顶一致 / wide 下列宽 —— 三条判据 |
+
+**Step 3–5 已完成,ADR 0020 落地。** 剩下的都不是本次范围:
+
+- 评审 #7 的宽度不一致(`scroll_limit` 按整屏宽量、画时用 stream 的 `rect.w`)
+  仍在,`wide` 下最明显。计划 Step 5 一节记了它。
+- `wide` 的侧栏 `findings` 从不挂载、`team` 没有成员时不占位 —— 这两件都是既有
+  行为,写进 `the_wide_layout_puts_the_tail_in_the_conversations_column` 的注释了。
 
 **约束:** `Cargo.lock` 不得提交 —— 本机 `crates/atomcode-codingplan-crypto/`
 是私有覆盖(skip-worktree + gitignore),那份 lock 差异是 `hkdf`/`hmac`/`subtle`/
