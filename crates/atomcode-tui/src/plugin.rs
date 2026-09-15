@@ -658,11 +658,14 @@ impl Tui {
 
     /// Tell the status line what the agent is doing. `false` when it already
     /// said so: the frame would be the one already up.
+    ///
+    /// The host's, not this front end's: writing `activity` moves the live line,
+    /// and the live line is a row of the scrollable content now — so whoever
+    /// writes it has to hold the reading still across the change. That is
+    /// [`Host::set_activity`]'s job, and keeping it there is what stops this
+    /// route and the fact route from pinning separately.
     fn set_activity(&self, activity: crate::moment::Activity) -> bool {
-        let mut m = self.host.moment.write().expect("moment poisoned");
-        let changed = m.activity != activity;
-        m.activity = activity;
-        changed
+        self.host.set_activity(activity)
     }
 
     fn say_refused(&self, text: &str) {
@@ -864,8 +867,11 @@ impl Tui {
                 m.caret = at + inserted.len();
             }
             Action::Cancel => {
-                m.activity = crate::moment::Activity::Stopping;
+                // Through the host, so the live line's appearance is pinned the
+                // same way a turn's start is: this is the third route that moves
+                // that row, and a pin on two of three jumps on the third.
                 drop(m);
+                self.host.set_activity(crate::moment::Activity::Stopping);
                 client.cancel();
                 return false;
             }
@@ -907,20 +913,14 @@ impl Tui {
                 // and the line you clicked is the first thing to leave. Moving
                 // the view back by exactly what it gained keeps that line where
                 // it was, and what appears, appears *below* it.
-                let size = self.surface.size();
-                // Without the moment's write lock: `m` was dropped above, and
-                // `stream_height` takes the moment as an argument precisely so
-                // a caller that *is* holding it can pass its own guard rather
-                // than deadlocking. Read here, before the fold, because the
-                // fold is what the two readings are compared across.
-                let now = self.host.moment.read().expect("moment poisoned").clone();
-                let before = self.host.stream_height(size.0, &now);
+                // `m` was dropped above, so the pin can take the moment it needs
+                // without the caller's write lock in the way. One call, not a
+                // fourth copy of the arithmetic: folding a block changes how many
+                // rows there are to read, which is the same event the other
+                // routes pin against.
+                let before = self.host.moment.read().expect("moment poisoned").clone();
                 self.host.toggle_block(id, kind);
-                let grew = self.host.stream_height(size.0, &now) as i64 - before as i64;
-                let mut m = self.host.moment.write().expect("moment poisoned");
-                let max = self.host.scroll_limit(size, &m) as i64;
-                m.scroll =
-                    crate::moment::ScrollPos((m.scroll.0 as i64 + grew).clamp(0, max) as usize);
+                self.host.repin(&before);
                 return false;
             }
             // Handing the mouse back is the answer to "I cannot select text
@@ -981,8 +981,8 @@ impl Tui {
                     m.caret = 0;
                     return false;
                 }
-                m.activity = crate::moment::Activity::Stopping;
                 drop(m);
+                self.host.set_activity(crate::moment::Activity::Stopping);
                 client.cancel();
                 return false;
             }

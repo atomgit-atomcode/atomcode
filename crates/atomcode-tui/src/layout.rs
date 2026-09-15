@@ -88,6 +88,10 @@ pub enum LayoutError {
     /// One module named both as a tail id and as a leaf of its own, which would
     /// draw it twice. See [`El::named_twice`](crate::el::El::named_twice).
     NamedTwice(String),
+    /// The target is a module riding the stream's tail, which has no box of its
+    /// own to move or resize. Move it out first (`/hide`, then `/show`) and aim
+    /// at it there.
+    TailIsNotATarget(String),
     NothingToUndo,
 }
 
@@ -105,6 +109,10 @@ impl std::fmt::Display for LayoutError {
             LayoutError::NamedTwice(m) => {
                 write!(f, "`{m}` 被写了两遍:既在流尾部、又是独立面板,会被画两次")
             }
+            LayoutError::TailIsNotATarget(m) => write!(
+                f,
+                "`{m}` 骑在对话的尾部,没有自己的位置可换或可改;先 `/hide {m}` 再 `/show` 它"
+            ),
             LayoutError::NothingToUndo => write!(f, "没有可撤销的布局改动"),
         }
     }
@@ -196,6 +204,19 @@ impl Layout {
         let current = self.tree();
         let on_screen: Vec<String> = current.modules();
 
+        // A module riding the tail has no leaf of its own, so an op that aims
+        // at one has nothing to move or resize. Refused up front rather than
+        // left to fall through: `swap todo stream` used to replace the *stream*
+        // node with `view("todo")` — deleting the conversation — and answer
+        // `Ok("换位")`.
+        for t in targets(op) {
+            if let Target::Module(m) = t {
+                if current.tail().contains(m) {
+                    return Err(LayoutError::TailIsNotATarget(m.clone()));
+                }
+            }
+        }
+
         let next = match op {
             LayoutOp::Undo => {
                 let previous = self
@@ -244,7 +265,10 @@ impl Layout {
                 }
                 swap(&current, a, b)
             }
-            LayoutOp::Resize { target, size } => resize(&current, target, *size),
+            LayoutOp::Resize { target, size } => match resize(&current, target, *size) {
+                (next, true) => next,
+                (_, false) => return Err(LayoutError::NotOnScreen(target_label(target))),
+            },
             LayoutOp::Preset { name } => preset(name).ok_or_else(|| LayoutError::NoSuchPreset {
                 name: name.clone(),
                 available: presets().iter().map(|(n, _)| n.to_string()).collect(),
@@ -306,6 +330,24 @@ fn describe(op: &LayoutOp) -> String {
     }
 }
 
+/// The targets an op aims at, so the tail check has one place to look.
+fn targets(op: &LayoutOp) -> Vec<&Target> {
+    match op {
+        LayoutOp::Swap { a, b } => vec![a, b],
+        LayoutOp::Resize { target, .. } => vec![target],
+        _ => Vec::new(),
+    }
+}
+
+/// What to call a target in a message. `Target::Stream` is not a module, so it
+/// has no name of its own to report.
+fn target_label(target: &Target) -> String {
+    match target {
+        Target::Stream => "对话".to_string(),
+        Target::Module(m) => m.clone(),
+    }
+}
+
 fn matches(region: &Region, target: &Target) -> bool {
     match (region, target) {
         (Region::Stream { .. }, Target::Stream) => true,
@@ -314,16 +356,25 @@ fn matches(region: &Region, target: &Target) -> bool {
     }
 }
 
-fn swap(region: &Region, a: &Target, b: &Target) -> Region {
+/// Swap what two targets are.
+///
+/// Each side is replaced by the node the **other** target actually matched,
+/// cloned whole — not rebuilt from the `Target`. Rebuilding is what lost a
+/// stream's tail: `Target::Stream` says "the conversation" and a rebuilt
+/// `Region::stream()` is a conversation with nothing riding it, so swapping the
+/// stream with anything quietly dropped every tail id.
+fn swap(root: &Region, a: &Target, b: &Target) -> Region {
+    swap_in(root, root, a, b)
+}
+
+fn swap_in(region: &Region, root: &Region, a: &Target, b: &Target) -> Region {
     match region {
-        r if matches(r, a) => match b {
-            Target::Stream => Region::stream(),
-            Target::Module(m) => Region::view(m.clone()),
-        },
-        r if matches(r, b) => match a {
-            Target::Stream => Region::stream(),
-            Target::Module(m) => Region::view(m.clone()),
-        },
+        // Both sides come from `root`, not from the subtree being walked: the
+        // two things being swapped are usually in different branches, and a
+        // lookup that only saw the current branch would find neither and leave
+        // the tree half-swapped.
+        r if matches(r, a) => find(root, b).unwrap_or_else(|| r.clone()),
+        r if matches(r, b) => find(root, a).unwrap_or_else(|| r.clone()),
         Region::Flex { dir, items, gap } => Region::Flex {
             dir: *dir,
             gap: *gap,
@@ -332,12 +383,26 @@ fn swap(region: &Region, a: &Target, b: &Target) -> Region {
                 .map(|it| Item {
                     basis: it.basis,
                     grow: it.grow,
-                    el: swap(&it.el, a, b),
+                    el: swap_in(&it.el, root, a, b),
                 })
                 .collect(),
         },
-        Region::Stack(c) => Region::Stack(c.iter().map(|r| swap(r, a, b)).collect()),
+        Region::Stack(c) => Region::Stack(c.iter().map(|r| swap_in(r, root, a, b)).collect()),
         other => other.clone(),
+    }
+}
+
+/// The node a target names, whole and as it stands.
+///
+/// The point is that it is *found* rather than reconstructed: a
+/// `Region::stream()` built from `Target::Stream` would be a conversation with
+/// no tail riding it, and a stream's tail is not expressible in the target.
+fn find(region: &Region, target: &Target) -> Option<Region> {
+    match region {
+        r if matches(r, target) => Some(r.clone()),
+        Region::Flex { items, .. } => items.iter().find_map(|it| find(&it.el, target)),
+        Region::Stack(children) => children.iter().find_map(|c| find(c, target)),
+        _ => None,
     }
 }
 
@@ -348,7 +413,14 @@ fn swap(region: &Region, a: &Target, b: &Target) -> Region {
 /// second at whatever it asked for — so `/resize input 5` on a second child
 /// silently did nothing. With children in a list, the one that was named is the
 /// one that changes, whichever position it holds.
-fn resize(region: &Region, target: &Target, size: u16) -> Region {
+/// Give `target` an explicit size where it sits, and say whether anything
+/// matched.
+///
+/// The `bool` is not decoration: a resize that matched nothing must not come
+/// back as success. `apply` promises never to silently do nothing, and the tree
+/// this returns for a miss is the tree it was handed — indistinguishable, to a
+/// caller, from a resize that worked.
+fn resize(region: &Region, target: &Target, size: u16) -> (Region, bool) {
     match region {
         Region::Flex { dir, items, gap } => {
             let hit = items.iter().position(|it| matches(&it.el, target));
@@ -365,28 +437,53 @@ fn resize(region: &Region, target: &Target, size: u16) -> Region {
                             items[other].grow = 1;
                         }
                     }
-                    Region::Flex {
-                        dir: *dir,
-                        gap: *gap,
-                        items,
-                    }
+                    (
+                        Region::Flex {
+                            dir: *dir,
+                            gap: *gap,
+                            items,
+                        },
+                        true,
+                    )
                 }
-                None => Region::Flex {
-                    dir: *dir,
-                    gap: *gap,
-                    items: items
+                None => {
+                    let mut found = false;
+                    let items = items
                         .iter()
-                        .map(|it| Item {
-                            basis: it.basis,
-                            grow: it.grow,
-                            el: resize(&it.el, target, size),
+                        .map(|it| {
+                            let (el, hit) = resize(&it.el, target, size);
+                            found |= hit;
+                            Item {
+                                basis: it.basis,
+                                grow: it.grow,
+                                el,
+                            }
                         })
-                        .collect(),
-                },
+                        .collect();
+                    (
+                        Region::Flex {
+                            dir: *dir,
+                            gap: *gap,
+                            items,
+                        },
+                        found,
+                    )
+                }
             }
         }
-        Region::Stack(c) => Region::Stack(c.iter().map(|r| resize(r, target, size)).collect()),
-        other => other.clone(),
+        Region::Stack(c) => {
+            let mut found = false;
+            let children = c
+                .iter()
+                .map(|r| {
+                    let (el, hit) = resize(r, target, size);
+                    found |= hit;
+                    el
+                })
+                .collect();
+            (Region::Stack(children), found)
+        }
+        other => (other.clone(), false),
     }
 }
 
@@ -546,6 +643,138 @@ mod tests {
         assert_ne!(l.tree(), before);
         l.apply(&op, &known()).unwrap();
         assert_eq!(l.tree(), before, "swap is its own inverse");
+    }
+
+    /// The shape ADR 0020's Step 3 produces, built by hand.
+    ///
+    /// A tail is only a tree that declares one, and this build ships none yet —
+    /// so there is nothing shipped to borrow here. It has to be the *shape* of
+    /// the real thing rather than `default_layout()` with a tail bolted on: in
+    /// that layout `todo` and `live` are still leaves of the composer, and a
+    /// tree naming them both ways is the one thing `named_twice` refuses.
+    fn layout_with_tail() -> Layout {
+        let frame = Region::flex(
+            Dir::Vertical,
+            vec![
+                Item::hug(Region::view("tip")),
+                Item::grow(Region::view(crate::modules::input::ID)),
+            ],
+        );
+        let below = Region::split(
+            Dir::Vertical,
+            Constraint::Fill,
+            frame,
+            Region::view(crate::modules::status::ID),
+        );
+        Layout::new(Region::split(
+            Dir::Vertical,
+            Constraint::Fill,
+            Region::stream().with_tail(["todo", "live"]),
+            below,
+        ))
+    }
+
+    #[test]
+    fn a_tail_survives_a_swap() {
+        // `swap` used to rebuild the node it matched from the `Target` alone,
+        // so `Target::Stream` produced a bare `Region::stream()` and the tail
+        // went with it — todo and live simply vanished from the tree, on a
+        // command the model can reach through `adjust_layout`.
+        let l = layout_with_tail();
+        let before = l.tree().tail().to_vec();
+        assert_eq!(before, ["todo", "live"], "the fixture has a tail to lose");
+
+        // `status` and `input` are the two leaves the shipped layout really
+        // has, so this swaps the conversation with one of them — the case that
+        // used to rebuild the stream and drop its tail.
+        let before_tree = l.tree();
+        l.apply(
+            &LayoutOp::Swap {
+                a: Target::Stream,
+                b: Target::Module("status".into()),
+            },
+            &known(),
+        )
+        .unwrap();
+
+        let mut after = l.tree().tail().to_vec();
+        after.sort();
+        assert_eq!(after, ["live", "todo"], "the tail went with the node");
+        assert!(
+            l.tree().has_stream(),
+            "and swapping is a move, not a way to delete the conversation"
+        );
+
+        // Its own inverse, which is the other thing rebuilding broke: it put
+        // back a bare stream, so the second swap could not restore the first.
+        l.apply(
+            &LayoutOp::Swap {
+                a: Target::Stream,
+                b: Target::Module("status".into()),
+            },
+            &known(),
+        )
+        .unwrap();
+        assert_eq!(l.tree(), before_tree, "swap is still its own inverse");
+    }
+
+    #[test]
+    fn a_tail_id_is_not_a_valid_target() {
+        // A module riding the tail has no leaf of its own, so an op that aims
+        // at one has nothing to aim at. `swap todo stream` used to replace the
+        // *stream* node with `view("todo")`, which deletes the conversation and
+        // still answers `Ok("换位")`.
+        let l = layout_with_tail();
+        let before = l.tree();
+
+        let err = l
+            .apply(
+                &LayoutOp::Swap {
+                    a: Target::Module("todo".into()),
+                    b: Target::Stream,
+                },
+                &known(),
+            )
+            .expect_err("aiming at a tail id has to be refused, not guessed at");
+        assert!(
+            matches!(&err, LayoutError::TailIsNotATarget(m) if m == "todo"),
+            "{err:?}"
+        );
+        assert_eq!(l.tree(), before, "and the tree is left alone");
+
+        let err = l
+            .apply(
+                &LayoutOp::Resize {
+                    target: Target::Module("live".into()),
+                    size: 5,
+                },
+                &known(),
+            )
+            .expect_err("a tail id has no box to resize");
+        assert!(
+            matches!(&err, LayoutError::TailIsNotATarget(m) if m == "live"),
+            "{err:?}"
+        );
+        assert_eq!(l.tree(), before);
+    }
+
+    #[test]
+    fn an_op_that_changes_nothing_is_not_reported_as_success() {
+        // `apply` promises never to silently do nothing. `resize` on a target
+        // that is not there walks the whole tree, finds no flex child, and
+        // returns the tree it was given along with `Ok("改成 5")` — the caller
+        // has no way to tell that from a resize that worked.
+        let l = layout();
+        let err = l
+            .apply(
+                &LayoutOp::Resize {
+                    target: Target::Module("findings".into()),
+                    size: 5,
+                },
+                &known(),
+            )
+            .expect_err("nothing was resized, so nothing succeeded");
+        assert!(matches!(err, LayoutError::NotOnScreen(_)), "{err:?}");
     }
 
     #[test]

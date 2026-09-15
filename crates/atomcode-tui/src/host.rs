@@ -800,20 +800,86 @@ impl Host {
 
         if held {
             let after = self.stream_height(width, &now);
-            // **Signed**, and not `if grew > 0` as it was. A block only ever
-            // grows, so one direction was enough while the stream was blocks
-            // alone; the tail is not like that. `activity` flips between idle
-            // and working, and a plan can lose items — either shrinks the sum
-            // without a thing scrolling, and a reader compensated one way only
-            // gets a screen that jumps down whenever it happens.
-            let grew = after as i64 - before as i64;
-            if grew != 0 {
-                let mut m = self.moment.write().expect("moment poisoned");
-                let max = self.scroll_limit(size, &now) as i64;
-                m.scroll =
-                    crate::moment::ScrollPos((m.scroll.0 as i64 + grew).clamp(0, max) as usize);
-            }
+            self.pin(before, after, size, &now);
         }
+    }
+
+    /// Tell the status line what the agent is doing.
+    ///
+    /// **Also pins the reading**, and that is the point of it living here
+    /// rather than in the front end: `activity` is half of what the live line
+    /// draws, and the other half is the turn — a fact that arrives through
+    /// [`Host::absorb`]. Whichever of the two lands second is what changes the
+    /// height, and which one that is is not settled anywhere. A pin in only one
+    /// of the two routes would hold for half the moves, which is worse than not
+    /// holding at all: the screen jumps on some turns and not others.
+    ///
+    /// `true` when it changed what the line would draw — the caller's business,
+    /// because a frame for the same picture is a frame nobody needed.
+    pub fn set_activity(&self, activity: crate::moment::Activity) -> bool {
+        let before = {
+            let mut m = self.moment.write().expect("moment poisoned");
+            if m.activity == activity {
+                return false;
+            }
+            // Cloned *before* the write, because the reading to be held still is
+            // the one the reader is looking at, which is the one with the old
+            // activity in it.
+            let before = m.clone();
+            m.activity = activity;
+            before
+        };
+        self.repin(&before);
+        true
+    }
+
+    /// The size and moment to measure a pin against, and whether to pin at all.
+    ///
+    /// Only while held back: at the bottom the whole point is to follow, and
+    /// measuring is O(the conversation), so it is not paid for nothing.
+    fn pin_baseline(&self) -> Option<((u16, u16), u16, Moment)> {
+        let width = *self.last_width.lock().expect("width poisoned");
+        let size = *self.last_size.lock().expect("size poisoned");
+        let now = self.moment.read().expect("moment poisoned").clone();
+        (width > 0 && now.scroll.0 > 0).then_some((size, width, now))
+    }
+
+    /// Hold the reading still across a change to what is on screen.
+    ///
+    /// Called from both routes that can move the sum: a fact ([`Host::absorb`])
+    /// and the activity the event loop writes ([`Host::set_activity`]), plus
+    /// the click that folds a block. Three copies of this arithmetic is what
+    /// the plan called out as the bug — the pin has to be one thing, or the
+    /// routes drift apart and only some of them hold.
+    pub fn repin(&self, before: &Moment) {
+        let Some((size, width, now)) = self.pin_baseline() else {
+            return;
+        };
+        // `before.scroll` and `now.scroll` are the same reading: the pin is
+        // adjusting the offset *for* a content change, not reacting to a scroll
+        // the person made. What is compared is the height, taken either side.
+        let before_h = self.stream_height(width, before);
+        let after_h = self.stream_height(width, &now);
+        self.pin(before_h, after_h, size, &now);
+    }
+
+    /// Move the offset by the change in what there is to read, clamped to what
+    /// is now reachable.
+    ///
+    /// **Signed**, and not `if grew > 0` as it was. A block only ever grows, so
+    /// one direction was enough while the stream was blocks and nothing else;
+    /// the tail is not like that. The live line appears and disappears with the
+    /// activity, and a plan can lose items — either shrinks the sum without a
+    /// thing scrolling, and a reader compensated one way only gets a screen
+    /// that jumps down whenever it happens.
+    fn pin(&self, before: usize, after: usize, size: (u16, u16), now: &Moment) {
+        let grew = after as i64 - before as i64;
+        if grew == 0 {
+            return;
+        }
+        let mut m = self.moment.write().expect("moment poisoned");
+        let max = self.scroll_limit(size, now) as i64;
+        m.scroll = crate::moment::ScrollPos((m.scroll.0 as i64 + grew).clamp(0, max) as usize);
     }
 
     pub fn painted(&self) -> u64 {
@@ -1310,12 +1376,15 @@ impl Host {
                     *self.last_size.lock().expect("size poisoned") = (w, h);
                     stream_rect = Some(rect);
                     frame.place("stream", pane.block_rect, lines);
-                    // Each tail module is its own part, named for where it is,
-                    // so a test can still ask for it by name and the
-                    // containment check still sees whose row is whose. The
-                    // rect is what the window covers — a module half scrolled
-                    // out is asked for its visible height and lays itself out
-                    // in it, rather than being sliced.
+                    // A tail module is placed under **its own id**, not a
+                    // path: `named_twice` already refuses a tree that names one
+                    // both as a tail id and as a leaf, so an id is unique in a
+                    // frame and everything that finds a module by name —
+                    // `part("live")`, the click handler, the tests — keeps
+                    // working without knowing where the module sits. The rect is
+                    // what the window covers: a module half scrolled out is
+                    // asked for its visible height and lays itself out in it,
+                    // rather than being sliced.
                     for (id, tail_rect) in &pane.tail {
                         let Some(view) = modules.view(id) else {
                             continue;
@@ -1323,7 +1392,7 @@ impl Host {
                         let vp = crate::moment::Viewport::new(*tail_rect, &moment);
                         let mut lines = view.render(&vp);
                         lines.truncate(tail_rect.h as usize);
-                        frame.place(format!("stream.tail.{id}"), *tail_rect, lines);
+                        frame.place(id.clone(), *tail_rect, lines);
                     }
                 }
                 Region::Module(id) => {
@@ -1730,6 +1799,72 @@ mod tests {
         Host::new(mods, default_layout())
     }
 
+    /// A tail module whose height follows `Moment::activity` and nothing else.
+    ///
+    /// The live line is the module this is really about, but it does not answer
+    /// the question yet: `live::showing` still returns nothing while the reader
+    /// is scrolled back, so its height does not move and a judgement about the
+    /// activity route would pass against machinery that never ran. This is the
+    /// instrument for the mechanism, and it keeps meaning something after the
+    /// live line joins in (ADR 0020 Step 4).
+    pub struct Peek;
+
+    impl crate::module::View for Peek {
+        type State = ();
+        fn id() -> &'static str {
+            "peek"
+        }
+        fn absorb(_: &mut (), _: &SessionEvent) {}
+        fn render(_: &(), vp: &crate::moment::Viewport<'_>) -> Vec<Line> {
+            (0..vp.rect.h).map(|_| Line::raw("peek")).collect()
+        }
+        fn height(_: &(), moment: &Moment, _: u16) -> Height {
+            match moment.activity {
+                crate::moment::Activity::Idle => Height::Hug(0),
+                _ => Height::Hug(PEER_ROWS),
+            }
+        }
+    }
+
+    const PEER_ROWS: u16 = 2;
+
+    /// A host whose tail is that module, with enough in the conversation to
+    /// scroll back through.
+    fn host_with_peek_tail() -> Host {
+        let mods = Arc::new(Modules::new());
+        mods.add_producer(transcript::Transcript::new()).unwrap();
+        mods.add_view(Arc::new(Mounted::<Peek>::new())).unwrap();
+        mods.add_view(Arc::new(Mounted::<crate::modules::status::Status>::new()))
+            .unwrap();
+        Host::new(
+            mods,
+            Region::split(
+                crate::region::Dir::Vertical,
+                crate::region::Constraint::Fill,
+                Region::stream().with_tail(["peek"]),
+                Region::split(
+                    crate::region::Dir::Vertical,
+                    crate::region::Constraint::Fill,
+                    Region::view(crate::modules::input::ID),
+                    Region::view(crate::modules::status::ID),
+                ),
+            ),
+        )
+    }
+
+    /// A conversation long enough to scroll back from the bottom.
+    fn fed_and_scrollable(h: &Host) {
+        for i in 0..30 {
+            h.absorb(&SessionEvent::AssistantMessage {
+                turn: 1,
+                round: i,
+                text: format!("row {i}"),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+            });
+        }
+    }
+
     fn fed() -> Host {
         let h = host();
         for f in conformance::facts() {
@@ -1886,6 +2021,118 @@ mod tests {
             asked.load(orders),
             0,
             "asking again how tall settled blocks are rendered them again"
+        );
+    }
+
+    // ---- pinning, when the thing that grew is a module rather than a block
+
+    #[test]
+    fn a_shift_in_what_the_tail_draws_is_pinned_too() {
+        // The tail's height has more than one source, and they arrive by
+        // different routes: a fact goes through `absorb`, while
+        // `Moment::activity` is written by the event loop and never through
+        // `absorb` at all. Which of the two lands first is not settled anywhere,
+        // so a pin inside `absorb` alone holds for half the moves — the screen
+        // jumps on some turns and not others, which is worse than not holding.
+        //
+        // This drives the route that does not go through `absorb`.
+        let h = host_with_peek_tail();
+        let size = (80, 24);
+        fed_and_scrollable(&h);
+
+        // First, at the bottom, the instrument itself: it is the thing whose
+        // height moves, and if it cannot move this test judges nothing.
+        let _ = h.compose(size);
+        let rest = h.stream_height(80, &h.moment.read().unwrap().clone());
+        h.set_activity(crate::moment::Activity::Working);
+        let working = h.stream_height(80, &h.moment.read().unwrap().clone());
+        assert_eq!(
+            working,
+            rest + PEER_ROWS as usize,
+            "the instrument does not change the sum, so nothing here is being judged"
+        );
+        assert!(
+            h.compose(size).part("peek").is_some(),
+            "and it does not reach the screen"
+        );
+
+        // Now the claim: a reader holding a position is not moved by it. The
+        // scroll is measured from the bottom of the pane, so the two new rows
+        // have to be added to it or the same conversation slides down under
+        // the same eyes.
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(5);
+        let before = h.compose(size);
+        let rows_before: Vec<String> = lines_of(&before, "stream");
+
+        h.set_activity(crate::moment::Activity::Idle);
+        let after = h.compose(size);
+
+        assert_eq!(
+            h.moment.read().unwrap().scroll.0,
+            5 - PEER_ROWS as usize,
+            "the tail went away and the reading was not moved to match"
+        );
+        assert_eq!(
+            lines_of(&after, "stream"),
+            rows_before,
+            "the same rows have to stay under the same eyes"
+        );
+
+        // And back the other way, which is the half a one-directional pin
+        // misses: the offset has to come *down* when the tail leaves.
+        let back = h.compose(size);
+        let rows_at_rest: Vec<String> = lines_of(&back, "stream");
+        h.set_activity(crate::moment::Activity::Working);
+        let grown = h.compose(size);
+        assert_eq!(
+            h.moment.read().unwrap().scroll.0,
+            5 - PEER_ROWS as usize + PEER_ROWS as usize,
+            "the tail came back without the reading being moved"
+        );
+        assert_eq!(
+            lines_of(&grown, "stream"),
+            rows_at_rest,
+            "and the rows under the eyes are the ones that were there"
+        );
+    }
+
+    fn lines_of(frame: &Frame, part: &str) -> Vec<String> {
+        frame
+            .part(part)
+            .unwrap_or_else(|| panic!("no `{part}` in the frame"))
+            .lines
+            .iter()
+            .map(|l| l.plain())
+            .collect()
+    }
+
+    #[test]
+    fn a_pin_that_would_leave_the_top_empty_is_pulled_back() {
+        // The other side of the same coin: pinned past the new limit, the
+        // scroll would sit above the oldest line — which reads as the
+        // conversation having been lost, the failure `scroll_limit` exists to
+        // prevent.
+        let h = host_with_peek_tail();
+        let size = (80, 24);
+        fed_and_scrollable(&h);
+        let _ = h.compose(size);
+
+        // Right at the top, where there is no room left to give.
+        let limit = h.scroll_limit(size, &h.moment.read().unwrap().clone());
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(limit);
+        let _ = h.compose(size);
+
+        // A tail arrives, which adds rows there is to read — this is the
+        // direction that would push the offset past the top if nothing clamped
+        // it.
+        h.set_activity(crate::moment::Activity::Working);
+
+        let now = h.moment.read().unwrap().clone();
+        assert!(
+            now.scroll.0 <= h.scroll_limit(size, &now),
+            "scrolled to {} with only {} to read",
+            now.scroll.0,
+            h.scroll_limit(size, &now)
         );
     }
 
