@@ -148,6 +148,78 @@ fn the_persons_own_patch_still_wins() {
 }
 
 #[tokio::test]
+async fn the_prompt_a_row_contributes_leaves_with_the_row_on_this_profile_too() {
+    // `differential.rs` locks this on `mount_swappable`; the product reaches the
+    // same rows through a different path (`Profiles` + bundles), and it is the
+    // path `atui` actually ships. What the model reads must be one answer per
+    // tool, contributed by the row that mounts it — the failure this catches is
+    // the coding persona describing the CHAIN assembly's tools again, which is
+    // what made "the composition ships a capability it names but does not
+    // mount" visible to the model rather than only to `--audit`.
+    let assembly = product::assembly();
+    let mut app = App::new(assembly.catalog(), assembled(&scratch("prompt"), &[]));
+    app.start().await.unwrap_or_else(|e| panic!("mount: {e}"));
+    let prompt = app
+        .context()
+        .service::<atomcode_harness::seams::SystemPromptSvc>()
+        .expect("the prompt registry is mounted")
+        .render();
+
+    // Each row's own words about its own tool, including the judgment a
+    // parameter list cannot carry.
+    for (fragment, why) in [
+        (
+            "delegates a self-contained job",
+            "the `task` row describes its own tool",
+        ),
+        (
+            "runs named child agents that stay around",
+            "so does the `team` row",
+        ),
+        (
+            "Not for a single read or grep",
+            "the when-NOT-to-delegate rule survives on this path",
+        ),
+        (
+            "not only the next action",
+            "the `tool-todo` row carries the planning rules, not just a pointer",
+        ),
+        (
+            "pass the requested scope and path filters straight to it",
+            "the `tool-code-review` row carries the review routing rule",
+        ),
+        (
+            "## MEMORY",
+            "`memory` contributes no paragraph, so the persona keeps this one — \
+             gated on `has(\"memory\")`, not on the env",
+        ),
+    ] {
+        assert!(prompt.contains(fragment), "{why}:\n{prompt}");
+    }
+
+    // And the other engine's copy of any of it, nowhere: this product mounts the
+    // harness rows, whose `team` has no `wait` and whose `task` takes no
+    // `subagent_type`.
+    for fragment in [
+        "## TEAM AGENT:",
+        "## DELEGATING WITH `task`",
+        "subagent_type",
+    ] {
+        assert!(
+            !prompt.contains(fragment),
+            "`{fragment}` describes the chain assembly's tools, which this tree does not mount:\n{prompt}"
+        );
+    }
+    for section in ["## TASK TRACKING:", "## CODE REVIEW:"] {
+        assert_eq!(
+            prompt.matches(section).count(),
+            0,
+            "`{section}` belongs to the row that mounts the tool now:\n{prompt}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_product_mounts_and_audits_clean() {
     // Mounting is the only way to catch a row that names a plugin nobody
     // registered: the tree resolves happily, and the row is simply not there.

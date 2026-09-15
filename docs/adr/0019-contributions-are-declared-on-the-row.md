@@ -212,6 +212,14 @@ that disappears with its plugin」(`harness/plugins/tools.rs`),harness 的 `team
 `change_dir` 那条也只管它自己一个名字。上面 `request_user_input` 正是从这个缺口漏出去的,
 下次换个名字照样漏。
 
+同一条缝在 atui 侧也补了闸门(`tui/tests/product.rs` 的
+`the_prompt_a_row_contributes_leaves_with_the_row_on_this_profile_too`)。理由:`differential.rs`
+锁的是 `mount_swappable` 那条路径,而 atui 走的是 `Profiles` + bundles,行从另一处进树——
+`product.rs` 的文件头本来就写着「这一层唯一的失效模式是 coding 加了行、这里没跟上」,提示词
+是同一个问题的可见面:组合里少挂的能力,模型比 `--audit` 先看见。断言与 `differential.rs`
+同形(六件在、三件不在、两段计数为 0),已验阴性对照:把 `on_harness.rs` 退回调用
+`coding_persona` 即红在「`## TEAM AGENT:` 不得进这棵树」。
+
 ## §5 为什么作废了「容器收集贡献」
 
 先前那版设计的核心是「插件声明贡献值,容器折叠成聚合体」。查 dsh 后作废,三条:
