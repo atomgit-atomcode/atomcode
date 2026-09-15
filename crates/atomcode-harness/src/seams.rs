@@ -17,7 +17,7 @@ use atomcode_kernel::tool::{Tool, ToolDef};
 use atomcode_plexus::{plexus_service, Context};
 
 use crate::agent::{Agent, Agents};
-pub use crate::model_source::{cheapest, delegatable, ModelInfo, Models};
+pub use crate::model_source::{cheapest, choices, delegatable, Chose, ModelInfo, Models};
 use crate::session::{LoggedEvent, SessionLog, SessionProjections};
 pub use atomcode_capabilities::tools::Opener;
 pub use atomcode_capabilities::world::{FileSystem, Shell};

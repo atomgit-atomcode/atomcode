@@ -77,9 +77,6 @@ pub struct ModelInfo {
     /// Which set of credentials and which bill this model runs on. Two models
     /// with the same account are the same person's money and the same vendor.
     pub account: String,
-    /// The host says this model may be delegated to from ANOTHER account.
-    /// Meaningless within one account, where delegation needs no permission.
-    pub cross_account: bool,
 }
 
 /// The models this host can build a provider for.
@@ -130,15 +127,22 @@ pub trait Models: Send + Sync {
 /// * **only the conversation ranked** ⇒ the candidate is withheld for the mirror
 ///   reason: it cannot be shown to be at or below the ceiling.
 ///
-/// **Across accounts, none of that applies until someone says so.** Everything
-/// above is about spending more of the money the person already committed to.
-/// Another account is a different set of credentials, a different bill and
-/// usually a different vendor, so a model belonging to one is off the list
-/// entirely unless it carries `cross_account` — a per-model opt-in the
-/// deployment writes down. Being cheaper does not help: handing this repository
-/// to a second company at a discount is still not the model's call. Same
-/// account needs no flag, because choosing the account is exactly what the
-/// person did when they picked the conversation's model.
+/// **Another account is never on this list.** Everything above is about
+/// spending more of the money the person already committed to. An account is a
+/// different set of credentials, a different bill and usually a different
+/// vendor, so crossing one is not a cost decision the model gets to make, and
+/// being cheaper does not help: handing this repository to a second company at
+/// a discount is still not its call. Same account needs no permission, because
+/// choosing the account is exactly what the person did when they picked the
+/// conversation's model.
+///
+/// There is deliberately no opt-in flag for the crossing. A flag would be a
+/// mechanism that, once shipped, has to be honoured forever and constrains
+/// every later decision about accounts — and it would be answering the wrong
+/// question, because the thing that differs is not the MODEL but **who is
+/// choosing**. A person who writes a model id into a team role or a row's
+/// config is naming it on purpose and is not restricted by any of this; see
+/// [`Chose`]. This list is only ever what the model may pick unprompted.
 ///
 /// Sorted weakest-known-first, with the unordered ones after them — so
 /// [`cheapest`] can mean something even when most of the catalog says nothing.
@@ -167,8 +171,7 @@ pub fn delegatable(models: &dyn Models) -> Vec<ModelInfo> {
             }
             // The account gate runs FIRST, and it is not a cost question: a
             // model on another account is off the list whatever its rank says.
-            let same_account = host_account.as_deref() == Some(m.account.as_str());
-            if !same_account && !m.cross_account {
+            if host_account.as_deref() != Some(m.account.as_str()) {
                 return false;
             }
 
@@ -187,6 +190,31 @@ pub fn delegatable(models: &dyn Models) -> Vec<ModelInfo> {
             .then_with(|| a.id.cmp(&b.id))
     });
     out
+}
+
+/// Who named a model, which is the only thing that decides what may be named.
+///
+/// The same string means two different things depending on where it came from,
+/// and collapsing them is how a product ends up either unable to use its own
+/// configuration or letting a model wander onto someone else's bill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chose {
+    /// The model, in a tool call it wrote this turn. Restricted to
+    /// [`delegatable`]: same account, no stronger than this conversation.
+    Model,
+    /// A person, in a file they wrote before the run — a team role's `model:`,
+    /// a row's config. Restricted to nothing but the catalog existing: they are
+    /// allowed to point their own agent at their own second account, and a
+    /// product that refused would be refusing its own configuration.
+    Person,
+}
+
+/// What `who` may name, given this catalog.
+pub fn choices(models: &dyn Models, who: Chose) -> Vec<ModelInfo> {
+    match who {
+        Chose::Model => delegatable(models),
+        Chose::Person => models.list(),
+    }
 }
 
 /// The cheapest model that can be SHOWN to be cheap, or `None`.

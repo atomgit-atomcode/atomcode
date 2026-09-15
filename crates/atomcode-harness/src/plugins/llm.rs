@@ -348,13 +348,16 @@ impl Plugin for LlmUtilitySelectedPlugin {
         let models = ctx
             .service::<crate::seams::ModelsSvc>()
             .ok_or("the `models` seam must be filled")?;
-        let offered = crate::seams::delegatable(models.as_ref());
+        // A person wrote this row, so they may name anything the host can build
+        // — their second account included. What the MODEL may reach for on its
+        // own is a different and narrower question; see `Chose`.
+        let offered = crate::seams::choices(models.as_ref(), crate::seams::Chose::Person);
         let id = match &row.model {
             Some(id) => {
                 let id = id.trim();
                 if !offered.iter().any(|m| m.id == id) {
                     return Err(format!(
-                        "`{id}` is not on offer; the catalog has: {}",
+                        "`{id}` is not a model this host knows about; it has: {}",
                         offered
                             .iter()
                             .map(|m| m.id.as_str())

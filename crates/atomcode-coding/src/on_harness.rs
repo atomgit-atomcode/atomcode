@@ -542,7 +542,6 @@ impl atomcode_harness::seams::Models for CodingModels {
                 effort_levels: m.reasoning_effort_levels.clone().unwrap_or_default(),
                 note: m.note.clone(),
                 account: m.account.clone(),
-                cross_account: m.delegatable,
                 id,
             })
             .collect()

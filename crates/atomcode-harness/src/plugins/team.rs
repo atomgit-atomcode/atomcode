@@ -79,6 +79,10 @@ struct Role {
     /// two-tier setup can say. This says WHICH — for a project that knows one
     /// of its models is the good reviewer. A `delegate` call may still override
     /// it per member.
+    ///
+    /// Written by a person in a file, so it may name ANY model the host can
+    /// build, including one on a second account. The lead asking for a model
+    /// mid-turn may not; that asymmetry is the whole of `Chose`.
     model: Option<String>,
     /// How hard this member should think, when the role says. `None` leaves the
     /// session's own setting (the `reasoning-effort` row) in charge.
@@ -585,13 +589,19 @@ impl TeamTool {
         // A named id that is not on offer FAILS here rather than falling through
         // to the next rule: silently demoting a member the person asked to run on
         // a specific model is the failure nobody would see.
-        let named = args
+        // Two sources, two rules, and the difference is who wrote the string.
+        // `args.model` the model produced this turn; `role.model` a person wrote
+        // into `.atomcode/agents/<role>.md` before the run and is theirs to
+        // point wherever they like — including at their own second account.
+        let (named, chose) = match args
             .model
             .as_deref()
             .map(str::trim)
             .filter(|m| !m.is_empty())
-            .map(str::to_string)
-            .or_else(|| role.model.clone());
+        {
+            Some(asked) => (Some(asked.to_string()), crate::seams::Chose::Model),
+            None => (role.model.clone(), crate::seams::Chose::Person),
+        };
         // Same order as the model, for the same reason: what this call said,
         // else what the role standing behind it said, else nothing — and
         // "nothing" leaves the session's `reasoning-effort` row in charge.
@@ -608,7 +618,8 @@ impl TeamTool {
             named.as_deref(),
             asked_effort.as_deref(),
         )?;
-        let chosen = super::subagent::resolve_child_model(&self.ctx, named.as_deref()).await?;
+        let chosen =
+            super::subagent::resolve_child_model(&self.ctx, named.as_deref(), chose).await?;
         let utility = match (chosen, role.difficulty) {
             (Some(model), _) => Some(model),
             (None, Difficulty::Simple) => self.ctx.service::<LlmUtilitySvc>(),

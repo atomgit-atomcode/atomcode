@@ -62,6 +62,7 @@ impl atomcode_plexus::Listener<TurnStopping> for ChildRoundCap {
 pub(crate) async fn resolve_child_model(
     ctx: &Context,
     model: Option<&str>,
+    who: crate::seams::Chose,
 ) -> Result<Option<Arc<dyn atomcode_kernel::provider::LlmProvider>>, String> {
     let Some(id) = model.map(str::trim).filter(|m| !m.is_empty()) else {
         return Ok(None);
@@ -73,17 +74,29 @@ pub(crate) async fn resolve_child_model(
                 .into(),
         );
     };
-    let offered = crate::seams::delegatable(models.as_ref());
+    let offered = crate::seams::choices(models.as_ref(), who);
     if !offered.iter().any(|m| m.id == id) {
         let names = offered
             .iter()
             .map(|m| m.id.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        return Err(if names.is_empty() {
-            format!("`{id}` is not available to delegate to, and neither is anything else")
-        } else {
-            format!("`{id}` is not available to delegate to; you may use: {names}")
+        return Err(match (who, names.is_empty()) {
+            // Written in a file by a person: the only thing that can be wrong
+            // is that no such model exists, so say that rather than lecturing
+            // them about accounts they own.
+            (crate::seams::Chose::Person, true) => {
+                format!("`{id}` is not a model this host knows about, and neither is anything else")
+            }
+            (crate::seams::Chose::Person, false) => {
+                format!("`{id}` is not a model this host knows about; it has: {names}")
+            }
+            (crate::seams::Chose::Model, true) => {
+                format!("`{id}` is not available to delegate to, and neither is anything else")
+            }
+            (crate::seams::Chose::Model, false) => {
+                format!("`{id}` is not available to delegate to; you may use: {names}")
+            }
         });
     }
     models.provider(&id).await.map(Some)
@@ -193,10 +206,13 @@ impl Subagents for InProcessSubagents {
             Ok(effort) => effort,
             Err(e) => return SubagentOutcome::failed(e),
         };
-        let model = match resolve_child_model(&self.ctx, work.model).await {
-            Ok(model) => model,
-            Err(e) => return SubagentOutcome::failed(e),
-        };
+        // The model wrote this argument this turn, so it is held to what it may
+        // pick unprompted. A person naming one goes through `team`'s role files.
+        let model =
+            match resolve_child_model(&self.ctx, work.model, crate::seams::Chose::Model).await {
+                Ok(model) => model,
+                Err(e) => return SubagentOutcome::failed(e),
+            };
         let (task, instructions) = (work.task, work.instructions);
         let (Some(agents), Some(driver), Some(parent_tools)) = (
             self.ctx.service::<AgentsSvc>(),

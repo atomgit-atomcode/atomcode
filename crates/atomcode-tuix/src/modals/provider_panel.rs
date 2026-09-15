@@ -1400,7 +1400,6 @@ impl ProviderPanel {
                             max_tokens: None,
                             capable_model: None,
                             note: None,
-                            delegatable: false,
                             retry_max_attempts: None,
                             thinking_type: None,
                             thinking_keep: None,

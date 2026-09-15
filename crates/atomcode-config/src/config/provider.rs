@@ -161,22 +161,6 @@ pub struct ModelProfileConfig {
     /// Never inferred: an absent note is shown as absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    /// May a subagent be delegated to this model from a conversation running on
-    /// a DIFFERENT account?
-    ///
-    /// Off by default, and the default is the point. An account is a set of
-    /// credentials, a bill, and usually a vendor; a subagent that quietly
-    /// crossed to another one would spend money the person did not authorise on
-    /// that account and hand this repository's contents to a second company —
-    /// neither of which the model is in any position to decide. Same-account
-    /// delegation needs no flag, because the person already chose that account
-    /// when they picked the conversation's model.
-    ///
-    /// Set it per model, not per account: the decision is "this specific model
-    /// is fine to hand work to", and a whole-account switch would opt in models
-    /// nobody considered.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub delegatable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

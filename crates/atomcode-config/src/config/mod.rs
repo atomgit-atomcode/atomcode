@@ -1500,7 +1500,6 @@ fn project_legacy_model(account_id: &str, p: &ProviderConfig) -> ModelProfileCon
         // A legacy `[providers.*]` entry has nowhere to write one; the new-schema
         // `[models.*]` form does.
         note: None,
-        delegatable: false,
         thinking_type: p.thinking_type.clone(),
         thinking_keep: p.thinking_keep.clone(),
         reasoning_history: p.reasoning_history.clone(),
@@ -3981,7 +3980,6 @@ capable_model = 5
                 max_tokens: None,
                 capable_model: None,
                 note: None,
-                delegatable: false,
                 retry_max_attempts: None,
                 thinking_type: None,
                 thinking_keep: None,
@@ -4033,7 +4031,6 @@ capable_model = 5
                 max_tokens: None,
                 capable_model: None,
                 note: None,
-                delegatable: false,
                 retry_max_attempts: None,
                 thinking_type: None,
                 thinking_keep: None,

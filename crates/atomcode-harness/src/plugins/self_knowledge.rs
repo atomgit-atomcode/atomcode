@@ -187,10 +187,10 @@ impl Introspect {
              `model`; omit it to keep the conversation's own model.\n\n\
              {rows}\n\n\
              {why}\n\n\
-             Models billed to another account are not here unless that model was \
-             marked shareable. That is a decision about credentials and vendors, \
-             not about cost, so a cheaper model on another account is still \
-             absent.",
+             Models billed to another account are never here. That is a decision \
+             about credentials and vendors rather than cost, so a cheaper model \
+             on another account is still absent — and it is the person's to make: \
+             they can point a team role or a row's config at one, and you cannot.",
             why = if ranked {
                 "Ordered weakest first where the deployment says so. Anything more capable \
              than this conversation is deliberately absent: choosing to spend more is \

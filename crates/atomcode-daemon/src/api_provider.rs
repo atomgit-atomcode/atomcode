@@ -528,7 +528,6 @@ fn insert_account_models(
                 // Discovery gives a name and a window, never prose about what
                 // the model is for. A person writes that one, or nobody does.
                 note: None,
-                delegatable: false,
                 thinking_type: None,
                 thinking_keep: None,
                 reasoning_history: None,

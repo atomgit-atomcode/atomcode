@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use atomcode_harness::seams::{
-    cheapest, delegatable, ModelInfo, Models, ModelsSvc, SystemPromptSvc,
+    cheapest, choices, delegatable, Chose, ModelInfo, Models, ModelsSvc, SystemPromptSvc,
 };
 use atomcode_harness::{bundle, plugins};
 use atomcode_kernel::message::Message;
@@ -156,6 +156,22 @@ impl Models for TestCatalog {
 
 /// A model on the one account everything in these tests shares, unless a test
 /// says otherwise.
+/// A catalog stated outright, for the rules that are about the rules.
+struct Fixed(Vec<ModelInfo>, Option<String>);
+
+#[async_trait]
+impl Models for Fixed {
+    fn list(&self) -> Vec<ModelInfo> {
+        self.0.clone()
+    }
+    fn current(&self) -> Option<String> {
+        self.1.clone()
+    }
+    async fn provider(&self, _id: &str) -> Result<Arc<dyn LlmProvider>, String> {
+        Err("not needed".into())
+    }
+}
+
 fn model(id: &str, rank: i64) -> ModelInfo {
     ModelInfo {
         id: id.into(),
@@ -166,15 +182,13 @@ fn model(id: &str, rank: i64) -> ModelInfo {
         effort_levels: Vec::new(),
         note: None,
         account: "here".into(),
-        cross_account: false,
     }
 }
 
 /// The same model, billed to somebody else.
-fn elsewhere(id: &str, rank: i64, opted_in: bool) -> ModelInfo {
+fn elsewhere(id: &str, rank: i64) -> ModelInfo {
     ModelInfo {
         account: "over-there".into(),
-        cross_account: opted_in,
         ..model(id, rank)
     }
 }
@@ -383,19 +397,6 @@ async fn nothing_stronger_than_this_conversation_is_on_offer() {
 /// degrade looks like from the outside.
 #[test]
 fn what_is_offered_when_the_deployment_has_not_said_much() {
-    struct Fixed(Vec<ModelInfo>, Option<String>);
-    #[async_trait]
-    impl Models for Fixed {
-        fn list(&self) -> Vec<ModelInfo> {
-            self.0.clone()
-        }
-        fn current(&self) -> Option<String> {
-            self.1.clone()
-        }
-        async fn provider(&self, _id: &str) -> Result<Arc<dyn LlmProvider>, String> {
-            Err("not needed".into())
-        }
-    }
     let ids = |ms: Vec<ModelInfo>| ms.into_iter().map(|m| m.id).collect::<Vec<_>>();
     let unranked = |id: &str| {
         let mut m = model(id, 0);
@@ -618,66 +619,33 @@ async fn naming_a_model_with_no_catalog_says_so() {
 
 // ---- whose money, whose vendor -------------------------------------------
 
-/// **An account boundary is not a cost question, and cheapness does not cross
-/// it.**
+/// **An account boundary is not a cost question, and nothing the model says
+/// crosses it.**
 ///
 /// The rank rules are about spending more of what the person already committed
 /// to. This one is about spending somebody else's, on somebody else's gateway,
 /// with this repository's contents in the request — and no rank, however low,
 /// makes that the model's decision.
+///
+/// There is deliberately no flag that changes this. What changes is **who is
+/// choosing**: see `a_person_may_name_a_model_the_model_may_not`.
 #[test]
-fn another_account_is_off_the_list_until_that_model_says_otherwise() {
-    struct Fixed(Vec<ModelInfo>, Option<String>);
-    #[async_trait]
-    impl Models for Fixed {
-        fn list(&self) -> Vec<ModelInfo> {
-            self.0.clone()
-        }
-        fn current(&self) -> Option<String> {
-            self.1.clone()
-        }
-        async fn provider(&self, _id: &str) -> Result<Arc<dyn LlmProvider>, String> {
-            Err("not needed".into())
-        }
-    }
+fn another_account_is_never_what_the_model_may_pick() {
     let ids = |ms: Vec<ModelInfo>| ms.into_iter().map(|m| m.id).collect::<Vec<_>>();
 
-    // Cheaper, and still not offered: the flag is the only thing that crosses.
-    let shut = vec![
+    // Cheaper, and still not offered.
+    let mixed = vec![
         model("mine-cheap", 10),
         model("mine", 30),
-        elsewhere("theirs-cheap", 5, false),
+        elsewhere("theirs-cheap", 5),
     ];
     assert_eq!(
-        ids(delegatable(&Fixed(shut, Some("mine".into())))),
+        ids(delegatable(&Fixed(mixed, Some("mine".into())))),
         vec!["mine-cheap", "mine"],
         "a model on another account is not on the list, however cheap it is"
     );
 
-    // The same model, opted in by the deployment.
-    let opened = vec![
-        model("mine-cheap", 10),
-        model("mine", 30),
-        elsewhere("theirs-cheap", 5, true),
-    ];
-    assert_eq!(
-        ids(delegatable(&Fixed(opened, Some("mine".into())))),
-        vec!["theirs-cheap", "mine-cheap", "mine"],
-        "opted in, it takes its place by rank like anything else"
-    );
-
-    // …and the opt-in does not buy it past the ceiling. Two independent rules,
-    // both of which must hold.
-    let strong = vec![model("mine", 30), elsewhere("theirs-strong", 99, true)];
-    assert_eq!(
-        ids(delegatable(&Fixed(strong, Some("mine".into())))),
-        vec!["mine"],
-        "`delegatable = true` is permission to cross an account, not permission \
-         to spend more than the person chose"
-    );
-
-    // Same account, no flag, nothing ranked: the ordinary case, and it works
-    // without anyone configuring anything.
+    // Same account, no ranks: the ordinary case, working with nothing configured.
     let mut a = model("a", 0);
     let mut b = model("b", 0);
     a.capable_rank = None;
@@ -689,8 +657,35 @@ fn another_account_is_off_the_list_until_that_model_says_otherwise() {
     );
 }
 
-/// And the tool refuses it the same way it refuses a typo — by name, with the
-/// list of what may be used instead.
+/// The asymmetry, on its own: **a person may name what the model may not.**
+///
+/// A team role file and a row's config are written before the run by somebody
+/// who owns both accounts. A product that refused them would be refusing its
+/// own configuration; one that let the model reach the same place would be
+/// letting it pick a vendor. Same catalog, two answers, and the only input is
+/// who is asking.
+#[test]
+fn a_person_may_name_a_model_the_model_may_not() {
+    let all = vec![model("mine", 30), elsewhere("theirs", 5)];
+    let catalog = Fixed(all, Some("mine".into()));
+    let ids = |ms: Vec<ModelInfo>| ms.into_iter().map(|m| m.id).collect::<Vec<_>>();
+
+    assert_eq!(
+        ids(choices(&catalog, Chose::Model)),
+        vec!["mine"],
+        "unprompted, the model stays on the account the person picked"
+    );
+    let mut theirs = ids(choices(&catalog, Chose::Person));
+    theirs.sort();
+    assert_eq!(
+        theirs,
+        vec!["mine", "theirs"],
+        "a person writing an id in a file may name anything this host can build"
+    );
+}
+
+/// And the tool refuses the model's attempt the same way it refuses a typo — by
+/// name, with the list of what may be used instead.
 #[tokio::test]
 async fn naming_a_model_on_another_account_is_refused() {
     let (app, calls) = delegate_with(
@@ -699,7 +694,7 @@ async fn naming_a_model_on_another_account_is_refused() {
         vec![
             model("cheap", 10),
             model("lead-model", 30),
-            elsewhere("theirs", 5, false),
+            elsewhere("theirs", 5),
         ],
         Some("lead-model"),
     )
