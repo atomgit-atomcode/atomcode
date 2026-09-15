@@ -113,6 +113,33 @@ async fn main() -> ExitCode {
     if let Some(code) = launch.preflight(&profiles, &catalog) {
         return code;
     }
+
+    // **A `-p` this front end cannot draw on, said in words a person can act on.**
+    //
+    // `atui` ships one composition. `-p plan`, `-p full` and `-p repl` name the
+    // harness's own assemblies, none of which contains this product's
+    // `tui-panels` bundle — so there is no `surface` row, and every one of this
+    // launcher's own flags (`--headless`, `--audit`, `--demo`, `--theme`,
+    // `--no-mouse`, `--mascot`) is a patch *to* that row. The loader's own
+    // complaint is `patch targets row `surface`, which no earlier layer
+    // inserted` — true, and about a row the person never wrote and has no way to
+    // place.
+    //
+    // Checked before mounting rather than after: the failure is not "this
+    // profile is missing something", it is "this launcher does not offer that
+    // composition", and the sentence should be about the latter.
+    if !product::can_draw(&profiles, &launch.profile) {
+        eprintln!(
+            "`atui` mounts the `{}` profile — it is the composition with a screen in \
+                 front of it.\n`{}` is one of the harness's own assemblies and has no \
+                 `surface` row, so this launcher's flags have nothing to patch.\nUse the \
+                 `harness` binary for `-p {}`, or drop `-p` for the screen.",
+            product::PROFILE,
+            launch.profile,
+            launch.profile
+        );
+        return ExitCode::from(2);
+    }
     let mounted = match launch.mount(catalog, &profiles).await {
         Ok(mounted) => mounted,
         Err(code) => return code,

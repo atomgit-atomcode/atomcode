@@ -504,3 +504,46 @@ fn a_deployment_can_still_cap_rounds() {
         "a later layer must still win over this product's default"
     );
 }
+
+/// `-p` 只能指向这个前端画得出屏幕的组合。
+///
+/// 这条判据的前身是一次实测:`atui -p plan`(以及 `full`、`repl`)全部
+/// **exit=2**,报的是加载器的
+/// ``patch targets row `surface`, which no earlier layer inserted``——
+/// 是真的,但那是一个用户从没写过、也无从放置的行:本启动器的每一个旗标
+/// (`--headless`、`--audit`、`--demo`、`--theme`、`--no-mouse`、`--mascot`)
+/// 都是**对 `surface` 那个行的 patch**,而那些组合里没有它。
+///
+/// 判据落在**判据本身**上而不是退出码上:能画与否由 bundle 决定,不由名字决定,
+/// 所以名字白名单既会漏掉用户的 profile,也会误拒。
+#[test]
+fn only_a_profile_with_the_products_screen_is_drawable() {
+    let assembly = product::assembly();
+    let profiles = assembly.profiles();
+
+    assert!(
+        product::can_draw(&profiles, product::PROFILE),
+        "the product's own profile must draw — everything else here is measured \
+         against it"
+    );
+
+    // The harness's assemblies. Named one by one rather than looped over
+    // `names()`, so that a profile disappearing shows up as a missing name
+    // rather than as a shorter loop.
+    for name in ["plan", "full", "repl", "oneshot", "web"] {
+        if profiles.get(name).is_none() {
+            continue; // a build that does not ship it — nothing to judge
+        }
+        assert!(
+            !product::can_draw(&profiles, name),
+            "`{name}` has no `{}` bundle, so this launcher cannot put a screen on \
+             it — and saying otherwise is how `-p {name}` came to fail inside the \
+             loader with an error about a row nobody wrote",
+            product::PANELS_BUNDLE
+        );
+    }
+
+    // A name nobody registered is not drawable either — the caller gets to say
+    // "no such profile" rather than mounting an empty tree.
+    assert!(!product::can_draw(&profiles, "definitely-not-a-profile"));
+}

@@ -78,7 +78,9 @@ use crate::rows;
 const APP_BUNDLE: &str = "tui-app";
 
 /// The bundle that is this front end: a surface, and one row per panel.
-const PANELS_BUNDLE: &str = "tui-panels";
+/// The bundle that carries this product's screen. Public so the launcher can
+/// tell whether a `-p` profile is one this front end can actually draw on.
+pub const PANELS_BUNDLE: &str = "tui-panels";
 
 /// The profile a person names: `atui -p tui` is the default and the only one
 /// that is a product.
@@ -135,6 +137,24 @@ impl Assembly {
                 "the full-screen TUI: a coding agent with panels in front of it",
             )
     }
+}
+
+/// Whether `name` is a composition this front end can put a screen on.
+///
+/// True for [`PROFILE`] and for a deployment's own `~/.atomcode/profiles/*.toml`
+/// that stacks [`PANELS_BUNDLE`] — a person writing their own composition of
+/// this product is exactly what the bundle list is for. False for the harness's
+/// assemblies (`plan`, `full`, `repl`), which have no `surface` row: every flag
+/// this launcher accepts patches *that* row, so there is nothing to patch and
+/// the loader's error names a row nobody wrote.
+///
+/// A predicate rather than a `vec![PROFILE]` allow-list on purpose: what makes a
+/// composition drawable is the bundle, not the name, and a name check would
+/// refuse the user's own profile for no reason.
+pub fn can_draw(profiles: &Profiles, name: &str) -> bool {
+    profiles
+        .get(name)
+        .is_some_and(|p| p.bundles.iter().any(|b| b == PANELS_BUNDLE))
 }
 
 /// Build the product assembly for `working_dir`.
