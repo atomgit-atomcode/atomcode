@@ -272,8 +272,8 @@ impl ToolMiddleware for ApprovalMiddleware {
             return BeforeOutcome::Proceed;
         }
         // Shared allow-all short-circuit: if the user has granted "allow all Bash" this
-        // session, skip the round-trip entirely for any bash call.
-        if call.name == "bash" && self.allow_all.is_granted(BASH_ALLOW_ALL_KEY) {
+        // session, skip the round-trip entirely for any command-shell tool (bash / bash_start).
+        if crate::tools::is_command_shell_tool(&call.name) && self.allow_all.is_granted(BASH_ALLOW_ALL_KEY) {
             return BeforeOutcome::Proceed;
         }
         // Session grant cache: an identical risky call already approved-always.
@@ -494,6 +494,33 @@ mod tests {
         let (tx, _rx) = unbounded_channel();
         let rt = RequestCtx::new(tx, Some(Duration::from_millis(1)));
         assert!(matches!(mw.before(&mut call, &tool, &rt).await, BeforeOutcome::Proceed));
+    }
+
+    /// BUG 1 regression: `bash_start` (background shell) must be covered by the allow-all
+    /// bypass — `is_command_shell_tool` returns true for both "bash" and "bash_start".
+    #[tokio::test]
+    async fn approval_allows_all_bash_start_after_allow_all_grant() {
+        let allow_all = std::sync::Arc::new(InMemoryPermissionStore::new());
+        allow_all.grant(BASH_ALLOW_ALL_KEY);
+        let mw = ApprovalMiddleware::with_allow_all_store(
+            std::sync::Arc::new(InMemoryPermissionStore::new()),
+            allow_all.clone(),
+            APPROVAL_KIND.to_string(),
+        );
+        // A risky bash_start call is allowed WITHOUT any round-trip (rt would time out → Deny
+        // if the bypass did NOT fire — asserting Proceed proves the bypass covers bash_start).
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::bash::BashStartTool);
+        let mut call = ToolCall {
+            id: "2".into(),
+            name: "bash_start".into(),
+            arguments: r#"{"command":"rm -rf /tmp/danger"}"#.into(),
+        };
+        let (tx, _rx) = unbounded_channel();
+        let rt = RequestCtx::new(tx, Some(Duration::from_millis(1)));
+        assert!(
+            matches!(mw.before(&mut call, &tool, &rt).await, BeforeOutcome::Proceed),
+            "allow-all grant must bypass risky bash_start just like bash"
+        );
     }
 
     #[test]

@@ -733,7 +733,7 @@ impl BashWorkspaceGate {
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
     ) -> PermissionDecision {
-        self.prompt_with_reason(call, tool, rt, Some("此命令写到工作区外 — 已允许常规 Bash,此类操作仍需单独确认。".into())).await
+        self.prompt_with_reason(call, tool, rt, Some("此命令会写到工作区外 — 需要单独确认。".into())).await
     }
 
     /// Round-trip the driver with an explicit reason string.
@@ -801,6 +801,15 @@ impl BashWorkspaceGate {
     ) -> BeforeOutcome {
         if references_sensitive_path(&call.arguments) {
             return self.prompt_unremembered(call, tool, rt).await;
+        }
+        // Session-scoped allow-all bypass: if the user already approved "allow all Bash" this
+        // session, an unresolvable-target command is also covered (modulo the sensitive floor
+        // above which MUST remain first). We cannot verify the target is in-workspace, but the
+        // user explicitly opted in to session-wide trust for all destructive bash.
+        if self.allow_all.is_granted(BASH_ALLOW_ALL_KEY) {
+            return BeforeOutcome::Allow {
+                reason: Some("previously approved all bash this session".into()),
+            };
         }
         let key = format!(
             "bash-unresolvable::{}",
@@ -1728,6 +1737,57 @@ mod tests {
         assert!(
             out.is_deny(),
             "sensitive delete must still prompt even with allow-all grant (fail closed when silent), got {out:?}"
+        );
+    }
+
+    /// BUG 2 regression: a pre-granted allow-all sentinel must bypass an UNRESOLVABLE-target
+    /// bash (e.g. `rm $(...)`, `cd /x && rm ./y`) without a round-trip.
+    #[tokio::test]
+    async fn allow_all_grant_bypasses_unresolvable_bash() {
+        let ws = tempfile::tempdir().unwrap();
+        let allow_all: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
+        allow_all.grant(BASH_ALLOW_ALL_KEY);
+        let gate = BashWorkspaceGate::with_allow_all_store(
+            Arc::new(RwLock::new(ws.path().to_path_buf())),
+            Arc::new(InMemoryPermissionStore::new()),
+            allow_all,
+        );
+        let tool = bash_tool();
+        // Both classic unresolvable forms: cd-then-relative and command-substitution target.
+        let mut call = bash_call("cd /somewhere/else && rm data.bin");
+        let out = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(
+            matches!(out, BeforeOutcome::Allow { .. }),
+            "allow-all grant must bypass unresolvable bash without a round-trip, got {out:?}"
+        );
+        let mut call2 = bash_call("rm $(cat list.txt)");
+        let out2 = gate.before(&mut call2, &tool, &silent_rt()).await;
+        assert!(
+            matches!(out2, BeforeOutcome::Allow { .. }),
+            "allow-all grant must bypass command-substitution unresolvable bash, got {out2:?}"
+        );
+    }
+
+    /// BUG 2 regression (sensitive floor): a SENSITIVE unresolvable target must still prompt
+    /// even with the allow-all sentinel granted — the sensitive floor MUST remain first.
+    #[tokio::test]
+    async fn allow_all_grant_does_not_bypass_sensitive_unresolvable_bash() {
+        let ws = tempfile::tempdir().unwrap();
+        let allow_all: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
+        allow_all.grant(BASH_ALLOW_ALL_KEY);
+        let gate = BashWorkspaceGate::with_allow_all_store(
+            Arc::new(RwLock::new(ws.path().to_path_buf())),
+            Arc::new(InMemoryPermissionStore::new()),
+            allow_all,
+        );
+        let tool = bash_tool();
+        // A command referencing a sensitive path is still unresolvable (dynamic token), but the
+        // sensitive floor fires first: it must still prompt (fail closed with silent driver).
+        let mut call = bash_call("cat ~/.ssh/id_rsa > $OUTFILE");
+        let out = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(
+            out.is_deny(),
+            "sensitive unresolvable bash must still prompt even with allow-all grant, got {out:?}"
         );
     }
 }

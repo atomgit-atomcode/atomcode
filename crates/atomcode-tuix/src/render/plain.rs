@@ -556,6 +556,12 @@ impl<W: Write + Send> Renderer for PlainRenderer<W> {
                                     detail: &scrub_controls(&panel.detail),
                                 })
                             );
+                            // "Why is this being asked" context line — rendered BEFORE
+                            // the advisory note, mirroring the retained backend order:
+                            // header → reason → note → options.
+                            if let Some(reason) = panel.reason.as_deref() {
+                                let _ = writeln!(self.out, "{}", scrub_controls(reason));
+                            }
                             // The advisory (e.g. credential-exposure warning) must not
                             // vanish on a plain/dumb terminal.
                             if let Some(note) = panel.note.as_deref() {
@@ -1129,6 +1135,58 @@ mod tests {
             approval_pos < chev_pos,
             "approval guidance must precede the chevron. got: {:?}",
             s
+        );
+    }
+
+    /// BUG 2b regression: `panel.reason` must appear in the plain backend output so
+    /// the "why is this being asked" transparency line is visible on dumb-TTY / IDE
+    /// / ATOMCODE_PLAIN backends — mirroring the retained backend's header→reason→note order.
+    #[test]
+    fn approval_panel_reason_rendered_in_plain_output() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let mut buf = Vec::new();
+        let mut r = PlainRenderer::with_writer_caps_and_interactive(
+            &mut buf,
+            caps_jediterm_ish(),
+            true, // interactive
+        );
+        let status = crate::render::StatusLine {
+            approval: Some(crate::render::ApprovalPanelView {
+                tool: "bash".to_string(),
+                detail: "rm /outside/x".to_string(),
+                options: vec![],
+                selected: 0,
+                note: Some("advisory note".to_string()),
+                reason: Some("此命令会写到工作区外 — 需要单独确认。".to_string()),
+            }),
+            ..Default::default()
+        };
+        r.render(UiLine::InputPrompt {
+            buf: "".into(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush();
+        let s = String::from_utf8(buf).unwrap();
+        // reason must appear
+        assert!(
+            s.contains("此命令会写到工作区外"),
+            "plain backend must render panel.reason; got: {s:?}"
+        );
+        // note must also appear
+        assert!(
+            s.contains("advisory note"),
+            "plain backend must still render panel.note; got: {s:?}"
+        );
+        // reason must precede note (mirrors retained backend order)
+        let reason_pos = s.find("此命令会写到工作区外").expect("reason must be present");
+        let note_pos = s.find("advisory note").expect("note must be present");
+        assert!(
+            reason_pos < note_pos,
+            "reason must precede note in plain output; got: {s:?}"
         );
     }
 
