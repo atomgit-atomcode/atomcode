@@ -60,8 +60,8 @@ use crate::seams::{
     AgentHandleSvc, AgentLoopSvc, AgentsSvc, ApprovalSvc, CodeIndexSvc, CompactionSvc, ControlSvc,
     FindingsSvc, FsSvc, GrantsSvc, LlmSvc, LlmUtilitySvc, McpSvc, ModelsSvc, ModesSvc, OpenerSvc,
     OperationsSvc, SessionDefaultsSvc, SessionPersistenceSvc, SessionProjectionsSvc, SessionSvc,
-    SessionTitleSvc, ShellSvc, SkillsSvc, SubagentsSvc, SystemPromptSvc, ToolsSvc, UiSvc,
-    UserQuestionsSvc,
+    SessionTitleSvc, ShellSvc, SkillsSvc, SubagentsSvc, SystemPromptSvc, ToolDriverSvc, ToolsSvc,
+    UiSvc, UserQuestionsSvc,
 };
 
 seam_catalog!(
@@ -94,6 +94,7 @@ seam_catalog!(
     AgentHandleSvc,
     ModesSvc,
     GrantsSvc,
+    ToolDriverSvc,
 );
 
 /// Slots the host fills itself.

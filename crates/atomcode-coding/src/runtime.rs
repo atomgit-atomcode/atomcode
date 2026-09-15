@@ -7670,9 +7670,10 @@ fn harness_option_rows(
         disable("tool-todo");
         disable("todo-reminder");
     }
-    if !parts.request_user_input_enabled() {
-        disable("tool-ask");
-    }
+    // The runtime's own `request_user_input` asks the person, when it is on; the
+    // tree's `ask_user` is a narrower contract for the same capability, and two
+    // question tools is one too many either way.
+    disable("tool-ask");
     // Rows whose directory defaults to the process's cwd, pointed at this
     // session's working directory instead. `[[patch]]` replaces a row's whole
     // config, so each carries every field the row is given elsewhere.

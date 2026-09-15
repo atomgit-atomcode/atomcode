@@ -455,6 +455,13 @@ impl Asker {
         }
     }
 
+    /// Send the driver an event outside any round trip, while it is connected.
+    fn emit(&self, event: AgentEvent) {
+        if let Some(events) = self.events.lock().expect("events poisoned").as_ref() {
+            let _ = events.send(event);
+        }
+    }
+
     /// Deliver an answer. `false` means nobody was waiting for it.
     fn answer(&self, id: RequestId, value: Value) -> bool {
         let waiting = self.pending.lock().expect("pending poisoned").remove(&id);
@@ -1000,6 +1007,51 @@ async fn compact(
     });
 }
 
+// ---- what a running tool reaches ------------------------------------------
+
+/// The driven agent's tools talk to its driver: progress as `ToolProgress`, a
+/// question as a `Request` answered like any other.
+///
+/// Both go through the asker, never through a sender of its own: the asker gives
+/// its sender up when the pump stops, and a service holding another one would
+/// keep the driver's event stream open for as long as the tree lives.
+struct HandleToolDriver {
+    session: String,
+    asker: Arc<Asker>,
+}
+
+impl crate::seams::ToolDriver for HandleToolDriver {
+    fn progress(&self, session: &str, call_id: &str) -> atomcode_kernel::tool::ProgressSink {
+        if session != self.session {
+            return atomcode_kernel::tool::ProgressSink::noop();
+        }
+        let asker = self.asker.clone();
+        let id = call_id.to_string();
+        atomcode_kernel::tool::ProgressSink::with_source_id(
+            call_id.to_string(),
+            Arc::new(move |message| {
+                asker.emit(AgentEvent::ToolProgress {
+                    call_id: id.clone(),
+                    message,
+                });
+            }),
+        )
+    }
+
+    fn requester(&self, session: &str) -> Option<atomcode_kernel::request::Requester> {
+        if session != self.session {
+            return None;
+        }
+        let asker = self.asker.clone();
+        Some(atomcode_kernel::request::Requester::from_fn(Arc::new(
+            move |kind, payload| {
+                let asker = asker.clone();
+                Box::pin(async move { asker.request(&kind, payload).await.unwrap_or(Value::Null) })
+            },
+        )))
+    }
+}
+
 // ---- the row ------------------------------------------------------------
 
 struct HandleFrontEnd {
@@ -1214,7 +1266,13 @@ impl Plugin for AgentHandlePlugin {
         // A driver renders prompts and answers them, so it fills the asking
         // seams too — and the standalone rows that would otherwise claim them
         // must stand down.
-        &["ui", "agent-handle", "user-questions", "approval"]
+        &[
+            "ui",
+            "agent-handle",
+            "user-questions",
+            "approval",
+            "tool-driver",
+        ]
     }
     fn description(&self) -> &'static str {
         "drive this harness through the AgentHandle protocol the shipped UIs speak"
@@ -1251,8 +1309,23 @@ impl Plugin for AgentHandlePlugin {
         );
 
         let initial = wire.commands.clone();
-        let Driven { handle, done, .. } =
-            spawn(ctx, wire, asker, crate::agent::CreateAgent::root(ctx)).await?;
+        let Driven {
+            handle,
+            done,
+            agent,
+        } = spawn(
+            ctx,
+            wire,
+            asker.clone(),
+            crate::agent::CreateAgent::root(ctx),
+        )
+        .await?;
+        let _ = ctx
+            .provide::<crate::seams::ToolDriverSvc>(Arc::new(HandleToolDriver {
+                session: agent.session_id().to_string(),
+                asker,
+            }))
+            .map_err(|e| e.to_string())?;
 
         let front = Arc::new(HandleFrontEnd {
             handle: Mutex::new(Some(handle)),

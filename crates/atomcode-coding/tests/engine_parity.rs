@@ -134,6 +134,19 @@ impl LlmProvider for RecordingProvider {
                     arguments: serde_json::json!({ "message": "hi" }).to_string(),
                 })
             }
+            Some(m) if m.role == Role::User && m.text == "ask me" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "request_user_input".into(),
+                    arguments: serde_json::json!({
+                        "header": "Flavour",
+                        "question": "Which one?",
+                        "mode": "single",
+                        "options": [{ "label": "vanilla" }, { "label": "pistachio" }],
+                    })
+                    .to_string(),
+                })
+            }
             Some(m) if m.role == Role::User && m.text == "tick" => {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
@@ -1539,6 +1552,59 @@ async fn a_committed_compaction_is_stored_at_once_and_reported_truthfully(engine
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// A question a tool puts to the person reaches the driver, and the person's
+/// answer reaches the tool — and through it, the model.
+async fn a_tools_question_reaches_the_person_and_the_answer_comes_back(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(start_attended(
+        env.project.path(),
+        &recorder,
+        SessionMode::Fresh,
+    ))
+    .await
+    .unwrap();
+    runtime
+        .handle
+        .submit(UserInput::from("ask me"))
+        .await
+        .unwrap();
+    let mut kinds = Vec::new();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("turn did not finish")
+            .expect("runtime event stream closed");
+        match event.event {
+            CodingRuntimeEvent::TurnFinished(_) => break,
+            CodingRuntimeEvent::Request(request) => {
+                kinds.push(request.kind.clone());
+                runtime
+                    .handle
+                    .respond(
+                        request.id,
+                        serde_json::json!({ "declined": false, "selected": ["pistachio"] }),
+                    )
+                    .await
+                    .unwrap();
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(kinds, vec!["request_user_input".to_string()], "[{engine}]");
+    let answered = recorder
+        .last_request()
+        .iter()
+        .any(|m| m.role == Role::Tool && m.text.contains("pistachio"));
+    assert!(
+        answered,
+        "[{engine}] the answer never reached the model: {:?}",
+        recorder.last_request()
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 // ---- what the model is offered ---------------------------------------------
 
 /// The start a production driver makes: every capability the chain turns on
@@ -1585,16 +1651,6 @@ async fn offered_tools(
 /// Names only one engine offers, and why. Every other tool must be offered by
 /// both — and every entry here must still differ, or it is stale.
 const KNOWN_TOOL_DIFFERENCES: &[(&str, &str)] = &[
-    // The harness asks through its own `ask_user`; the chain's structured
-    // `request_user_input` is the same capability under the kernel's name.
-    (
-        "request_user_input",
-        "chain: structured question tool; harness offers ask_user",
-    ),
-    (
-        "ask_user",
-        "harness: the question tool behind the user-questions seam",
-    ),
     // Self-knowledge is a harness row with no chain counterpart.
     ("describe_self", "harness: describes the running tree"),
 ];
@@ -1721,4 +1777,5 @@ on_both_engines!(
     an_exhausted_plan_window_pauses_until_its_reset,
     a_brief_rate_limit_is_waited_out,
     a_committed_compaction_is_stored_at_once_and_reported_truthfully,
+    a_tools_question_reaches_the_person_and_the_answer_comes_back,
 );

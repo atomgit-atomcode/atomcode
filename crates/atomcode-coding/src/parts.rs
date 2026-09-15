@@ -466,8 +466,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
 ) -> io::Result<CodingParts> {
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
-    // Tools the chain mounts from here that no harness row provides: handed to a
-    // tree as they are (see `CodingParts::host_only_tools`).
+    // Tools a tree takes from here as they are (see `CodingParts::host_only_tools`):
+    // no harness row provides them, or the product's own version is the one that
+    // ships and the row's is a different contract under the same capability.
     let mut host_only_tools: Vec<String> = Vec::new();
     let turn_execution_policy = Arc::new(TurnExecutionPolicy::new());
 
@@ -498,6 +499,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     }
     if !request_user_input_enabled {
         names.retain(|name| name != "request_user_input");
+    } else {
+        // The product's structured question — single, multiple, free text, a batch
+        // of up to four — in place of the tree's `ask_user`, which offers a choice
+        // and nothing else.
+        host_only_tools.push("request_user_input".into());
     }
     if opts.tools {
         register_codeintel_tools(&mut registry);
@@ -1222,13 +1228,10 @@ impl CodingParts {
         })
     }
 
-    pub(crate) fn request_user_input_enabled(&self) -> bool {
-        self.request_user_input_enabled
-    }
-
-    /// Tools this capability graph mounted that no harness row provides —
-    /// `list_sessions` over the native catalog, `lsp`, external-agent subagents,
-    /// the AtomGit tools — as the objects prepare built.
+    /// Tools a tree takes from this capability graph as the objects prepare built:
+    /// the ones no harness row provides — `list_sessions` over the native catalog,
+    /// `lsp`, external-agent subagents, the AtomGit tools — and the ones whose
+    /// product contract a row does not match, like `request_user_input`.
     pub(crate) fn host_only_tools(&self) -> Vec<Arc<dyn atomcode_kernel::tool::Tool>> {
         self.host_only_tools
             .iter()

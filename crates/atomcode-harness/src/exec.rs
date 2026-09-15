@@ -53,11 +53,23 @@ pub async fn execute_one(
                 // The agent's own token, not a fresh one: a long-running tool
                 // that polls `ctx.cancel` has to actually see a stop, or a
                 // cancel only takes effect after it finishes.
+                //
+                // Progress and questions reach the person through whoever drives
+                // this agent, if anyone does.
+                let session = crate::agent::scoped(&ctx).service::<crate::seams::SessionSvc>();
+                let (progress, requester) =
+                    match (ctx.service::<crate::seams::ToolDriverSvc>(), &session) {
+                        (Some(driver), Some(log)) => (
+                            driver.progress(log.id(), &call.id),
+                            driver.requester(log.id()),
+                        ),
+                        _ => (ProgressSink::noop(), None),
+                    };
                 let tool_ctx = ToolContext {
                     working_dir,
                     cancel,
-                    progress: ProgressSink::noop(),
-                    requester: None,
+                    progress,
+                    requester,
                 };
                 // The one moment "this call is running" becomes true: every
                 // waterfall listener delegated, so no gate refused it and no
@@ -68,9 +80,7 @@ pub async fn execute_one(
                 // After the unknown-tool check above, so a tool nobody mounted
                 // never announces a start it cannot have — the guard a driver
                 // used to keep for itself.
-                if let Some(session) =
-                    crate::agent::scoped(&ctx).service::<crate::seams::SessionSvc>()
-                {
+                if let Some(session) = session {
                     crate::session::commit(
                         &ctx,
                         &session,

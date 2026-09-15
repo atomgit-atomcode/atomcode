@@ -96,7 +96,7 @@ impl RequestCtx {
     /// A request-only handle for tools (see [`Requester`]).
     pub fn requester(&self) -> Requester {
         Requester {
-            inner: self.clone(),
+            inner: RequesterInner::Kernel(self.clone()),
         }
     }
 }
@@ -106,12 +106,36 @@ impl RequestCtx {
 /// question and await the answer.
 #[derive(Clone)]
 pub struct Requester {
-    inner: RequestCtx,
+    inner: RequesterInner,
+}
+
+/// A round trip someone else brokers: `(kind, payload)` in, the driver's answer
+/// out, `Null` for no answer.
+pub type RequestFn =
+    Arc<dyn Fn(String, Value) -> futures::future::BoxFuture<'static, Value> + Send + Sync>;
+
+#[derive(Clone)]
+enum RequesterInner {
+    Kernel(RequestCtx),
+    Host(RequestFn),
 }
 
 impl Requester {
+    /// A requester whose round trip a host brokers — an agent loop that is not
+    /// the kernel's, speaking the same driver protocol. The tool cannot tell the
+    /// difference, which is the point: `request_user_input` asks the same way
+    /// whoever runs it.
+    pub fn from_fn(f: RequestFn) -> Self {
+        Self {
+            inner: RequesterInner::Host(f),
+        }
+    }
+
     pub async fn request(&self, kind: &str, payload: Value) -> Value {
-        self.inner.request(kind, payload).await
+        match &self.inner {
+            RequesterInner::Kernel(ctx) => ctx.request(kind, payload).await,
+            RequesterInner::Host(f) => f(kind.to_string(), payload).await,
+        }
     }
 }
 

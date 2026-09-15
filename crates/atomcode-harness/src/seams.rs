@@ -57,6 +57,7 @@ plexus_service!(AgentLoopSvc => dyn AgentLoop, "agent-loop", Seam, "The turn dri
 plexus_service!(ApprovalSvc => dyn ApprovalPolicy, "approval", Seam, "Whether a tool call may run");
 plexus_service!(AgentHandleSvc => dyn AgentHandleSource, "agent-handle", Seam, "A driver-protocol handle on this harness");
 plexus_service!(ModesSvc => Modes, "modes", Core, "Switches a person flips mid-session — plan mode, accept edits — read live by the rows they govern");
+plexus_service!(ToolDriverSvc => dyn ToolDriver, "tool-driver", Seam, "What a running tool reaches of the person's front end: a progress line, a structured question");
 plexus_service!(GrantsSvc => dyn atomcode_capabilities::tools::PermissionStore, "grants", Core, "The session's remembered always-allow answers, kept by a host that outlives the tree");
 
 /// The live tool catalog.
@@ -722,4 +723,22 @@ pub enum StopReason {
     /// A rate limit paused the turn — not a failure: already-produced work is
     /// kept, and the pause committed with it says when the limit resets.
     RateLimited,
+}
+
+/// What a running tool can reach of the front end driving its agent.
+///
+/// A kernel agent hands every tool a progress sink tagged with the call's id and
+/// a requester for structured questions. A tool written against that context —
+/// `task` narrating its subtasks, `request_user_input` asking a choice — works
+/// the same on this loop only if something here hands it the same two things.
+/// The front end is that something: it owns the channel both travel on.
+///
+/// Keyed by session, because the answer depends on whose tool it is. A delegated
+/// child's call has no line to the person; only the agent the front end drives
+/// does.
+pub trait ToolDriver: Send + Sync {
+    /// Where this call's progress goes. `noop` when nobody is listening.
+    fn progress(&self, session: &str, call_id: &str) -> atomcode_kernel::tool::ProgressSink;
+    /// A round trip to the person, or `None` when this session has nobody to ask.
+    fn requester(&self, session: &str) -> Option<atomcode_kernel::request::Requester>;
 }

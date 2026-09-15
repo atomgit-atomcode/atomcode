@@ -838,8 +838,9 @@ impl Plugin for AgentLoopPlugin {
     }
     fn uses(&self) -> &'static [&'static str] {
         // Resolved per round, and the turn runs without them: no system message
-        // when there is no registry, no folded state when nothing projects.
-        &["system-prompt", "session-projections"]
+        // when there is no registry, no folded state when nothing projects, no
+        // progress line or question for a tool when no front end drives it.
+        &["system-prompt", "session-projections", "tool-driver"]
     }
     fn provides(&self) -> &'static [&'static str] {
         &["agent-loop"]
