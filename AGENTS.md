@@ -115,6 +115,24 @@ wire DTO 展开：
 
 - 修改过程中运行最小相关测试；一个逻辑单元完成后运行受影响 crate 的测试。
 
+### 提交前必须核 `Cargo.lock`（本机会反复污染它）
+
+**本机每跑一次 `cargo build`，`Cargo.lock` 都会被写进一批公开仓库不该有的私有依赖。**
+
+成因：`crates/atomcode-codingplan-crypto/` 在公开仓库里是**只有签名没有实现的 stub**，而本机放的是**实现版**——它的 `Cargo.toml` 声明了 `hmac`/`sha2`/`hkdf`/`zeroize`/`subtle`。根 `Cargo.toml` 的 `workspace.members = ["crates/*"]` 是 glob，把这个目录包了进来，于是 cargo 认为这些依赖属于本 workspace，解析后写进 lock。
+
+证据链（2026-09-15 实测）：`6504f4ca` 删掉那 41 行 → `8fb2eaf9` 又加回来 42 行（同一批 + 1 行合法的 `atomcode-coding`）→ 手工剔干净后跑一次 `cargo build -p atomcode-tui --lib`，`Cargo.lock` 的 md5 立刻变回含私有依赖的版本。
+
+**所以「剔掉那几行再提交」是一次性的，不是修好了。** push 前必须核：
+
+```bash
+grep -c 'name = "hkdf"\|name = "hmac"\|name = "zeroize_derive"' Cargo.lock   # 必须是 0
+```
+
+非 0 就用干净基线重来（`git show <干净 commit>:Cargo.lock > Cargo.lock`，再把该提交之后**合法的**依赖变化补回，例如 `atomcode-tui` 新增的 `atomcode-coding`），确认 `git diff Cargo.lock` 只剩你要删的那些行。**不要**用 `cargo update` 或 `cargo generate-lockfile` 去「修」它——它们只会把私有依赖写回来。
+
+这是个已知的反复成本，不是可以一次解决的 bug：`[workspace.exclude]` 看着对症，但 `atomcode-auth` 用 path 依赖引它，排除会打断公开侧的 feature 门。真要根治得先想清楚私有 overlay 该以什么身份进入 workspace。
+
 ### 测试与构建命令（2026-09-13 实测定标，勿凭直觉推翻）
 
 - 跑测试用 `cargo nextest run -p <crate>`，不用 `cargo test`。`cargo test` 一个 test binary 跑完才跑下一个，nextest 跨 binary 进程级并行。配置在 `.config/nextest.toml`。
