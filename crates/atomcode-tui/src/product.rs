@@ -179,12 +179,15 @@ pub fn assembly() -> Assembly {
 /// `ui-handle` comes along in `CODING_ROWS` and the profile's own layer disables
 /// it — see the module docs.
 fn app_bundle(working_dir: &Path, artifacts: &Path) -> String {
-    let wd = working_dir.to_string_lossy();
+    // `toml_string`, not `{:?}` — see `atomcode_harness::bundle::toml_string`.
+    // A working directory is whatever the user made, and `{:?}` writes a control
+    // character as `\u{7f}`, which TOML does not accept.
     format!(
         "{CODING_DEFAULTS}\n\
-         [[patch]]\nid = \"agent-loop\"\nconfig = {{ working_dir = {wd:?} }}\n\n\
+         [[patch]]\nid = \"agent-loop\"\nconfig = {{ working_dir = {} }}\n\n\
          [[patch]]\nid = \"round-cap\"\nconfig = {{ max_rounds = {ROUNDS} }}\n\n\
          {rows}\n",
+        atomcode_harness::bundle::toml_string(&working_dir.to_string_lossy()),
         rows = coding_overlay(working_dir, artifacts, Presence::Attended, ""),
     )
 }

@@ -405,9 +405,24 @@ pub fn coding_overlay(
     presence: Presence,
     model: &str,
 ) -> String {
+    // The placeholders sit **inside quotes** in `CODING_ROWS`, so what goes in
+    // is the escaped *content*, not another quoted literal — hence
+    // [`toml_string`] with its quotes trimmed rather than `{:?}`. See
+    // `atomcode_harness::bundle::toml_string` for why `{:?}` is not the same
+    // escaping language.
+    let escape_in_place = |v: &str| {
+        let quoted = atomcode_harness::bundle::toml_string(v);
+        quoted[1..quoted.len() - 1].to_string()
+    };
     CODING_ROWS
-        .replace("{working_dir}", &working_dir.to_string_lossy())
-        .replace("{artifacts}", &artifacts.to_string_lossy())
+        .replace(
+            "{working_dir}",
+            &escape_in_place(&working_dir.to_string_lossy()),
+        )
+        .replace(
+            "{artifacts}",
+            &escape_in_place(&artifacts.to_string_lossy()),
+        )
         .replace("{model}", model)
         .replace(
             "{force_verify}",
@@ -813,8 +828,8 @@ pub async fn mount_swappable(
     let boundary = match presence {
         Presence::Attended => "[[patch]]\nid = \"fs\"\nconfig = {}\n".to_string(),
         Presence::Headless => format!(
-            "[[patch]]\nid = \"fs\"\nconfig = {{ root = {wd:?} }}\n",
-            wd = working_dir.to_string_lossy(),
+            "[[patch]]\nid = \"fs\"\nconfig = {{ root = {} }}\n",
+            atomcode_harness::bundle::toml_string(&working_dir.to_string_lossy()),
         ),
     };
     // With a catalog, the two rows that need one come on; without, they stay
@@ -826,12 +841,15 @@ pub async fn mount_swappable(
     } else {
         ""
     };
+    // `toml_string`, not `{:?}`: a working directory is whatever the user made,
+    // and `{:?}` writes a control character as `\u{7f}` — which is not TOML.
+    // See `atomcode_harness::bundle::toml_string`.
     let scoped = format!(
         "{catalog}{boundary}\n\
-         [[patch]]\nid = \"agent-loop\"\nconfig = {{ working_dir = {wd:?} }}\n\n\
-         [[patch]]\nid = \"llm\"\nname = \"llm-injected\"\nconfig = {{ provider_id = {pid:?} }}\n",
-        wd = working_dir.to_string_lossy(),
-        pid = provider_id,
+         [[patch]]\nid = \"agent-loop\"\nconfig = {{ working_dir = {} }}\n\n\
+         [[patch]]\nid = \"llm\"\nname = \"llm-injected\"\nconfig = {{ provider_id = {} }}\n",
+        atomcode_harness::bundle::toml_string(&working_dir.to_string_lossy()),
+        atomcode_harness::bundle::toml_string(&provider_id),
     );
     // `infra`, not `base`: the machine is the harness's, the product decisions
     // are this crate's. See [`CODING_DEFAULTS`] for why that is not the same as

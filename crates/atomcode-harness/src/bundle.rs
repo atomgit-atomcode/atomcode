@@ -453,12 +453,45 @@ id = "user-questions-unattended"
 disabled = false
 "#;
 
+/// A Rust string as a TOML **basic string** literal, quotes and all.
+///
+/// Use this — not `{value:?}` — for anything that goes into a config layer.
+/// `Debug` and TOML are two different escaping languages and they disagree in
+/// exactly the place that is hard to notice: `{:?}` writes a control character
+/// as `\u{7f}`, and TOML's `\u` takes **four hex digits with no braces**, so
+/// the layer fails to parse. Measured 2026-09-15 against `tomllib`:
+///
+/// ```text
+/// path contains     {:?} gives        TOML
+/// '                 ' (not escaped)   OK
+/// "                 \"                 OK
+/// \                 \\                OK
+/// U+007F            \u{7f}            **FAIL** — "Invalid hex value"
+/// ```
+///
+/// So the usual suspects are fine and the unusual one is not — which is the
+/// wrong way round for a bug to hide. A working directory is whatever the user
+/// made; `--dump-config` in such a directory is where this shows up, and the
+/// error names a column in a layer nobody wrote by hand.
+///
+/// Quotes are added here rather than left to the caller so a value can never be
+/// spliced in unquoted, which is the other half of the same mistake.
+pub fn toml_string(value: &str) -> String {
+    // `toml` is already a dependency of this crate for exactly this kind of
+    // thing, and a serializer cannot be wrong about its own format the way a
+    // hand-rolled `escape_default` can.
+    toml::Value::String(value.to_string()).to_string()
+}
+
 /// Continue an existing session instead of starting a new one.
 ///
 /// Takes the id, because "which conversation" is not something a harness should
 /// guess. `--continue` resolves the most recent one and produces this.
 pub fn resume_overlay(id: &str) -> String {
-    format!("[[patch]]\nid = \"session\"\nconfig = {{ id = {id:?}, resume = true }}\n")
+    format!(
+        "[[patch]]\nid = \"session\"\nconfig = {{ id = {}, resume = true }}\n",
+        toml_string(id)
+    )
 }
 
 /// Allow everything. For a sandbox, a container, or an eval where the whole
@@ -868,3 +901,62 @@ pub fn ui_overlay(name: &str) -> String {
 
 /// Front ends `--ui` accepts.
 pub const UI_NAMES: &[&str] = &["oneshot", "repl", "web", "sdk", "handle", "quiet"];
+
+#[cfg(test)]
+mod toml_string_tests {
+    use super::toml_string;
+
+    /// **Round-trip, not spelling.** A test that asserted `\\u007f` would be
+    /// testing the serializer's taste; parsing the layer back and comparing is
+    /// testing the only property that matters — that laying a value into a
+    /// config layer and reading it out gives the value back.
+    ///
+    /// The set is the interesting axis of the disagreement between Rust's
+    /// `{:?}` and TOML, measured against `tomllib` on 2026-09-15: the three
+    /// characters that look dangerous (quote, backslash, apostrophe) are fine
+    /// in both, and the one that looks harmless — a control character, which a
+    /// filesystem will happily let a directory name contain — is the one
+    /// `{:?}` gets wrong.
+    #[test]
+    fn every_value_survives_the_trip_through_a_config_layer() {
+        let awkward = [
+            ("a plain path", "/Users/someone/project"),
+            ("an apostrophe", "/tmp/it's-here"),
+            ("a double quote", "/tmp/a\"b"),
+            ("a backslash", "/tmp/back\\slash"),
+            ("a newline", "/tmp/two\nlines"),
+            ("a tab", "/tmp/tab\there"),
+            ("the character {:?} writes as \\u{7f}", "/tmp/ctrl\u{7f}x"),
+            ("a DEL at the end", "/tmp/end\u{7f}"),
+            ("CJK", "/tmp/中文目录"),
+            ("an empty string", ""),
+        ];
+        for (what, value) in awkward {
+            let layer = format!(
+                "[[patch]]\nid = \"fs\"\nconfig = {{ root = {} }}\n",
+                toml_string(value)
+            );
+            let parsed: toml::Value = toml::from_str(&layer)
+                .unwrap_or_else(|e| panic!("{what}: the layer does not parse: {e}\n{layer}"));
+            let got = parsed["patch"][0]["config"]["root"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{what}: root is not a string\n{layer}"));
+            assert_eq!(
+                got, value,
+                "{what}: the value came back changed\n  in : {value:?}\n  out: {got:?}\n\
+                 layer: {layer}"
+            );
+        }
+    }
+
+    /// And the shape the callers actually use: a whole overlay a tree can load.
+    #[test]
+    fn an_overlay_built_from_an_awkward_id_still_loads() {
+        let id = "session\u{7f}it's";
+        let layer = super::resume_overlay(id);
+        let parsed: toml::Value = toml::from_str(&layer)
+            .unwrap_or_else(|e| panic!("resume_overlay produced unparseable TOML: {e}\n{layer}"));
+        assert_eq!(parsed["patch"][0]["config"]["id"].as_str(), Some(id));
+        assert_eq!(parsed["patch"][0]["config"]["resume"].as_bool(), Some(true));
+    }
+}
