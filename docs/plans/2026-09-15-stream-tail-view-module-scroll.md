@@ -9,6 +9,12 @@
 (不可逆、`Live → Settled`、`content_hash` 冻结);不改布局树持久化
 (布局树不落盘,`SessionEvent` 里没有 layout 变体 —— 已核实)。
 
+> **这是一份记录,不是说明书。** Step 1–5 都已落地(见下面的进度表),本文里的
+> `file:line` 全部是**写下它们那一刻**的行号,此后代码改动过多次,现在大多已经
+> 不对了(抽查 6 处只有 1 处还凑巧落在原处)。要读实现请看文件与函数名
+> ——`Host::pane_geometry`、`Host::cap_tail`、`Host::pinned`、`Host::stream_room`
+> ——而不是这里的行号。留着本文是因为**为什么这么做**比**当时改哪一行**活得久。
+
 ---
 
 ## 进度与基线(2026-09-15 更新)
@@ -37,12 +43,18 @@
 | `4247ed59` | **Step 5**:框架不动 / 封顶一致 / wide 下列宽 —— 三条判据 |
 | `fdbbe5d9` | 本计划进度同步 |
 
-**Step 3–5 已完成,ADR 0020 落地。** 剩下的都不是本次范围:
+**Step 1–5 已完成,ADR 0020 落地,第二轮评审的 11 条也已修完。** 现在只剩:
 
-- 评审 #7 的宽度不一致(`scroll_limit` 按整屏宽量、画时用 stream 的 `rect.w`)
-  仍在,`wide` 下最明显。计划 Step 5 一节记了它。
 - `wide` 的侧栏 `findings` 从不挂载、`team` 没有成员时不占位 —— 这两件都是既有
   行为,写进 `the_wide_layout_puts_the_tail_in_the_conversations_column` 的注释了。
+- 与本次无关的一处既有 flaky:`gates/tui.sh` 的「宿主 harness 未被弄坏」那一步里,
+  `harness/tests/harness.rs` 的 `the_log_reaches_the_disk_in_the_order_it_was_committed`
+  在完整套件里约 4 次红 1 次(单独跑永远绿;multi_thread + 300ms 等队列排空,
+  负载高时不够)。`a645cd87` 引入,本次没碰 harness。
+
+**评审第 7 条的宽度问题已在 `67c7afde` 一并解决**(原记在下面 Step 5 一节,
+当时的判断是"既有缺陷、本次不修" —— 那条判断在 `stream_height` 收 `room: Rect`
+之后不再成立)。
 
 **约束:** `Cargo.lock` 不得提交 —— 本机 `crates/atomcode-codingplan-crypto/`
 是私有覆盖(skip-worktree + gitignore),那份 lock 差异是 `hkdf`/`hmac`/`subtle`/
@@ -375,14 +387,23 @@ pub fn scroll_region() -> Region { Region::stream().with_tail(TAIL) }   // 实�
   多露出一行更旧的。ADR 里「块纹丝不动」那句说的是偏移,不是屏幕坐标,已改。
   要断言的「不动」是:`scroll` 跟着 tail 的高度变化一起调整,使得**同几行字**仍在
   视野里(这正是 `b7fb3829` 的判据在做的事)。
-- **`stream_height` 现在收 `size` 不是 `width`**(`b453eb4e` 改的)。尾部封顶要用
-  pane 高度,而 pane 高度是 `stream_rows(size, moment)` 算的。
+- **`stream_height` 收的是 `room: Rect`,不是 `width` 也不是 `size`**。签名变过
+  两次(`b453eb4e` 改成 `size` 以便算封顶;`67c7afde` 改成 `Rect` 以便按 stream
+  自己的宽度量块高)。要读实现请读 `Host::stream_room` 与 `Host::stream_height_in`。
 
-**已知的宽度不一致(评审第 7 条,本次不修):** `scroll_limit(size, …)` 内部按
-`size.0`(整屏宽)量块高,而画的时候用的是 stream 自己的 `rect.w`。`wide` preset 下
-两者是 65% 和 100%,所以滚动上界可能比实际少算。`plugin.rs:911/915` 有同一个问题。
-这是**既有**缺陷,与本次改动无关,记在这里以免被当成新引入的。修的时机是有人真的
-在 `wide` 下滚到顶发现末尾够不着的时候。
+**宽度不一致(评审第 7 条)—— 已修,`67c7afde`。**
+
+原来 `scroll_limit(size, …)` 按 `size.0`(整屏宽)量块高,而画的时候用 stream
+自己的 `rect.w`;`wide` 下是 65% 对 100%,滚动上界因此可能少算。
+
+这条被 `absorb` 的回归(评审第 2 条)一起解决了,因为两者是同一个问题:**「stream
+有多大」有两个答案**。现在只有一个 —— `Host::stream_room(size, moment) -> Rect`:
+宽度给块量行数,高度给尾部算封顶。`stream_height` 收 `room: Rect`,`scroll_limit`
+与 pin 都从这里出发,几何和画用同一个数。
+
+值得记下判断是怎么变的:上一轮我把它归成"既有缺陷、与本次改动无关",这是对的
+—— 但下一轮同一个东西以「吸收路径按错宽度」的形式回来了。**同一个根因的两种
+表现,分两次到达,第二次才被认出来是同一件事。**
 
 ---
 
