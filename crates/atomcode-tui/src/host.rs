@@ -681,6 +681,13 @@ pub struct Hits {
     jump: Option<Rect>,
     /// Where the composer was drawn, so a click in it can find a caret.
     field: Option<Rect>,
+    /// Where the question panel was drawn, so a click on it can find an answer.
+    ///
+    /// The panel's own rect and not a per-row table: the rows inside it are the
+    /// answers plus the prompt's wrapped lines, and which screen row is which
+    /// answer is a fact about how the prompt wrapped — the panel already knows,
+    /// and a second copy here would be a second wrapping.
+    ask: Option<Rect>,
 }
 
 impl Hits {
@@ -696,6 +703,11 @@ impl Hits {
     /// row of the stream, and the thing on top is the thing that was clicked.
     pub fn on_jump(&self, x: u16, y: u16) -> bool {
         self.jump.is_some_and(|r| r.contains(x, y))
+    }
+
+    /// Where the question panel was put, when it was up.
+    pub fn ask_rect(&self) -> Option<Rect> {
+        self.ask
     }
 }
 
@@ -1105,6 +1117,104 @@ impl Host {
         true
     }
 
+    /// Whether a question is drawn as a panel riding the tail.
+    ///
+    /// One predicate, read by the two places that have to agree about it: where
+    /// the question is drawn (the tail, or the foot of the stream) and what the
+    /// composer does about it (steps aside, or stays). A second copy of this
+    /// answer is a screen that hides the field for a panel that is not there.
+    fn ask_panel_mounted(&self) -> bool {
+        self.modules.view(crate::modules::ask::ID).is_some()
+    }
+
+    /// Bring `Moment::asking` in step with the queue, keeping the pointed-at row.
+    ///
+    /// The queue is the truth about whether a question is waiting; the moment is
+    /// what a module renders from. They are two copies of one fact on purpose —
+    /// a view module may not reach into the host — so this is where they are
+    /// reconciled, and it is the only place that writes `asking`.
+    ///
+    /// The cursor survives the rewrite while the question is the same one: the
+    /// loop syncs on every wake, and rebuilding the `Ask` from scratch each time
+    /// would put the highlight back on the first answer under a pointer that had
+    /// moved it.
+    ///
+    /// **True when a frame is owed.**
+    pub fn sync_asking(&self) -> bool {
+        // Only when the panel is mounted. Unmounted, there is no panel to draw
+        // the question and no panel for the composer to step aside for: the
+        // question goes to the foot of the stream the way it did before there was
+        // a panel, and the composer stays exactly where it was. Gating here rather
+        // than in each of the four places that read `asking` is what keeps them
+        // from disagreeing about whether a question is on screen.
+        let waiting = self
+            .ask_panel_mounted()
+            .then(|| self.asks.peek().map(|(_, q)| q))
+            .flatten();
+        let mut m = self.moment.write().expect("moment poisoned");
+        match waiting {
+            None => m.asking.take().is_some(),
+            Some(question) => {
+                let cursor = match &m.asking {
+                    Some(had) if had.question == question => had.cursor,
+                    _ => 0,
+                };
+                let same = m
+                    .asking
+                    .as_ref()
+                    .is_some_and(|had| had.question == question && had.cursor == cursor);
+                if same {
+                    return false;
+                }
+                m.asking = Some(crate::moment::Ask { question, cursor });
+                true
+            }
+        }
+    }
+
+    /// Move the highlight to an answer, by index. True when it moved.
+    pub fn point_ask_at(&self, row: usize) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        m.asking.as_mut().is_some_and(|a| a.point_at(row))
+    }
+
+    /// Move the highlight by `delta` answers, clamped to the ones there are.
+    ///
+    /// Clamped, not wrapped: a highlight that jumps from the last answer to the
+    /// first reads as a slip, and there is nowhere to fall off to at either end.
+    pub fn move_ask_by(&self, delta: i32) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let Some(ask) = m.asking.as_ref() else {
+            return false;
+        };
+        let last = ask.question.options.len().saturating_sub(1);
+        let cur = ask.cursor as i32;
+        let row = (cur + delta).clamp(0, last as i32) as usize;
+        m.asking.as_mut().is_some_and(|a| a.point_at(row))
+    }
+
+    /// Which answer a screen row belongs to, when it belongs to one.
+    ///
+    /// Read off the rect the panel was **drawn** in, so a click and the drawn
+    /// highlight cannot disagree. The row is converted to an answer index here
+    /// rather than by the caller for the same reason `menu::Menu::click` computes
+    /// it from `Menu::rect`: two formulas for one layout is a panel whose rows
+    /// answer to the wrong one.
+    ///
+    /// `None` means the point is not on an answer — beside the panel, on its
+    /// prompt, above the first row — and the caller decides what that means.
+    pub fn answer_row_at(&self, x: u16, y: u16) -> Option<usize> {
+        let rect = *self.hits.lock().expect("hits poisoned").ask.as_ref()?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        let ask = m.asking.as_ref()?;
+        let vp = crate::moment::Viewport::new(rect, &m);
+        let geom = crate::modules::ask::geometry(&ask.question, &vp);
+        geom.answer_at((y - rect.y) as usize)
+    }
+
     /// Run `change`, keeping the reader's place across whatever it did.
     ///
     /// **Measure, change, measure again** — one shape, because the arithmetic is
@@ -1485,30 +1595,37 @@ impl Host {
         let mut owner: Vec<RowOwner> = Vec::new();
         let want = rect.h as usize;
 
-        // A question in flight sits at the foot of the stream. It is not in the
-        // stream itself: it has no answer yet, and a block whose content is
-        // still to be decided has not settled — putting it in would mean
-        // amending a settled block the moment it is answered.
+        // A question in flight *used* to be drawn here, unconditionally. It is a
+        // module riding the tail now ([`crate::modules::ask`]), which is where it
+        // belongs for the same reason the live line and the steering bars are: it
+        // is the newest thing on screen, it has no answer yet so it is not a
+        // block, and it should take its room from the pane in the one place that
+        // knows how to split one.
         //
-        // Unless a row is drawing it as a modal: then the modal is where it is
-        // being answered, and a second copy here would be the same question
-        // asked twice on one screen.
-        if let Some((_, question)) = self.asks.peek().filter(|_| !self.overlays.is_open()) {
-            let pending = crate::content::ChoiceBlock {
-                question: crate::ask::recorded(&question),
-                options: question
-                    .options
-                    .iter()
-                    .map(|a| crate::ask::answer_label(&a.value, &a.label))
-                    .collect(),
-                answer: None,
-            };
-            let mut lines = crate::block::Content::lines(&pending, rect.w);
-            lines.reverse();
-            for line in lines {
-                if out.len() < want {
-                    out.push(line);
-                    owner.push(None); // a question is not a block yet
+        // Drawn here **only when that panel is not mounted** — `Moment::asking` is
+        // what says so, and the tail places nothing for a module that is not
+        // there. So this is now the fallback rather than a second copy: the plain
+        // lines every screen can draw, for the screen that removed the row. That
+        // is what makes the row a product's decision instead of a dependency of
+        // the front end.
+        if !self.ask_panel_mounted() {
+            if let Some((_, question)) = self.asks.peek() {
+                let pending = crate::content::ChoiceBlock {
+                    question: crate::ask::recorded(&question),
+                    options: question
+                        .options
+                        .iter()
+                        .map(|a| crate::ask::answer_label(&a.value, &a.label))
+                        .collect(),
+                    answer: None,
+                };
+                let mut lines = crate::block::Content::lines(&pending, rect.w);
+                lines.reverse();
+                for line in lines {
+                    if out.len() < want {
+                        out.push(line);
+                        owner.push(None); // a question is not a block yet
+                    }
                 }
             }
         }
@@ -1730,6 +1847,7 @@ impl Host {
                         rows: owners,
                         jump: None,
                         field: None,
+                        ask: None,
                     };
                     *self.last_room.lock().expect("room poisoned") = rect;
                     // The **blocks'** rect, not the pane's. The badge reports
@@ -1756,6 +1874,15 @@ impl Host {
                         let vp = crate::moment::Viewport::new(*tail_rect, &moment);
                         let mut lines = view.render(&vp);
                         lines.truncate(tail_rect.h as usize);
+                        // A click inside the question panel has to find the
+                        // answer it landed on, and only the host knows where the
+                        // panel was put. Recorded for the same reason the
+                        // composer's rect is: the press is answered from the
+                        // frame that is on screen, not from a formula that would
+                        // have to reproduce the tail's split.
+                        if id == crate::modules::ask::ID {
+                            self.hits.lock().expect("hits poisoned").ask = Some(*tail_rect);
+                        }
                         frame.place(id.clone(), *tail_rect, lines);
                     }
                 }
@@ -2104,7 +2231,27 @@ impl Host {
             .iter()
             .map(|(_, h)| *h as usize)
             .sum();
-        (total + tail, tail)
+        // The question drawn at the foot of the stream when no panel is mounted —
+        // see `stream_lines`. Counted here for the reason the tail is: a row the
+        // frame drew and this did not would be out of reach at the bottom of the
+        // scroll, which is the whole failure `row_index` exists to prevent.
+        let pending = match self.ask_panel_mounted() {
+            false => self.asks.peek().map(|(_, q)| q),
+            true => None,
+        };
+        let question = pending.map_or(0, |q| {
+            let block = crate::content::ChoiceBlock {
+                question: crate::ask::recorded(&q),
+                options: q
+                    .options
+                    .iter()
+                    .map(|a| crate::ask::answer_label(&a.value, &a.label))
+                    .collect(),
+                answer: None,
+            };
+            crate::block::Content::lines(&block, width).len()
+        });
+        (total + tail + question, tail)
     }
 
     /// The view modules riding the stream's tail, with the height each asks for
@@ -2206,14 +2353,43 @@ impl Host {
 /// What one module asks for, vertically. Shared by `compose` and
 /// [`Host::stream_rows`] so the rows a scroll is measured against are the same
 /// rows that get painted.
+/// The modules the composer is made of, and the ones a question displaces.
+///
+/// [`composer`] builds its tree from this list, so "what the composer is" and
+/// "what a question makes room for" are one answer rather than two that agree
+/// until a row is added to one of them. `live` is deliberately not a member: it
+/// rides the tail and steps aside in its own `height`, where its own visibility
+/// already lives.
+pub const COMPOSER: &[&str] = &[crate::modules::tip::ID, crate::modules::input::ID];
+
 fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16 {
-    modules
+    let asked = modules
         .view(id)
         .map(|v| match v.height(moment, width) {
             Height::Fixed(n) | Height::Hug(n) => n,
             Height::Fill => 1,
         })
-        .unwrap_or(1)
+        .unwrap_or(1);
+
+    // A question waiting takes the composer's place, and the composer gives it
+    // up here rather than in its own `height`.
+    //
+    // `height` is a question about the *module* — how many rows does this prompt
+    // field need for the text in it — and the field needs the same rows whether
+    // or not a question is waiting. What changes is what the screen does with
+    // them, and that is arbitration: the host's, by the same rule that clips a
+    // module asking for too much. A module that returned zero here because
+    // something else on screen is asking would be a module whose own size
+    // depends on a sibling, which is the thing the tail's `Hug` contract exists
+    // to keep out.
+    //
+    // The composer as a whole, not just the field: `tip`'s reserved row is part
+    // of it, and a blank row left above a panel is the shadow of a box that is
+    // not there.
+    if moment.asking.is_some() && COMPOSER.contains(&id) {
+        return 0;
+    }
+    asked
 }
 
 /// The view modules whose rows ride at the foot of the conversation.
@@ -2234,9 +2410,17 @@ fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16
 /// screen (words typed seconds ago, not yet sent) and the tail is laid out from
 /// the bottom up, so last means closest to the composer the person just typed
 /// into.
+///
+/// **`ask` sits between the live line and the steering bars**, and it is the one
+/// member that is not about what the turn is doing: it is about what the turn is
+/// waiting for. Below the live line, because "still moving" is context for the
+/// answer; above the steering bars, because a question is what has to be dealt
+/// with and words not yet sent are what happens next. While it is there it is
+/// also the only thing on the tail that takes keys.
 pub const TAIL: &[&str] = &[
     crate::modules::todo::ID,
     crate::modules::live::ID,
+    crate::modules::ask::ID,
     crate::modules::steering::ID,
 ];
 
@@ -2265,6 +2449,12 @@ pub fn scroll_region() -> Region {
 /// it would move the field, and the field is what a hand is already reaching
 /// for.
 ///
+/// **A question takes the composer's place.** While one is waiting there is
+/// nothing to type beside it, so `tip` and `input` ask for no rows and the panel
+/// riding the tail is what fills this space. Both are asked for by
+/// `asked_height`, which is the one place that decides; the fields are unchanged
+/// because the fields are what a screen has, not what a question does to it.
+///
 /// Written into the tree rather than claimed by each row's own `LayoutOp::Show`
 /// the way the mascot claims its strip: `Show` has two sides, above the
 /// conversation and below the status line, and both are the wrong side of the
@@ -2272,17 +2462,22 @@ pub fn scroll_region() -> Region {
 ///
 /// The tip row is the deliberate exception to `Hug`-ness — it asks for its row
 /// always, which is why a tip can never move the box out from under a hand
-/// reaching for it. See `modules::tip`.
+/// reaching for it. See `modules::tip`. The one exception to that exception is a
+/// question, where no hand is reaching for the box.
 pub fn composer() -> Region {
     use crate::el::Item;
     use crate::region::Dir;
-    Region::flex(
-        Dir::Vertical,
-        vec![
-            Item::hug(Region::view(crate::modules::tip::ID)),
-            Item::grow(Region::view(crate::modules::input::ID)),
-        ],
-    )
+    // From [`COMPOSER`], because the arbitration that gives these rows up for a
+    // question reads the same list: two lists would agree until a row was added
+    // to one of them, and the symptom would be a blank row left above a panel.
+    let items = COMPOSER
+        .iter()
+        .map(|id| match *id {
+            crate::modules::input::ID => Item::grow(Region::view(*id)),
+            _ => Item::hug(Region::view(*id)),
+        })
+        .collect();
+    Region::flex(Dir::Vertical, items)
 }
 
 /// The shipped layout: the conversation, a status bar, a prompt.
@@ -2352,6 +2547,106 @@ mod tests {
     }
 
     const PEER_ROWS: u16 = 2;
+
+    /// A question takes the field's rows without touching what is in it.
+    ///
+    /// The composer steps aside while a question is up (`asked_height`), and the
+    /// half of that which is easy to get wrong is the other half: hiding a box is
+    /// not clearing it. A person who had typed half a sentence and was interrupted
+    /// by a question must find it still there afterwards.
+    #[test]
+    fn a_question_hides_the_field_without_losing_what_was_typed() {
+        let h = host();
+        {
+            let mut m = h.moment.write().unwrap();
+            m.input = "half a sentence".into();
+            m.caret = m.input.len();
+        }
+        // No panel row in this tree, so nothing is expected to step aside.
+        h.asks.push(atomcode_harness::seams::Question::plain(
+            "Allow?",
+            &["yes", "no"],
+        ));
+        h.sync_asking();
+        assert!(
+            h.moment.read().unwrap().asking.is_none(),
+            "with no panel mounted the question belongs to the stream, not the moment"
+        );
+        assert_eq!(
+            h.moment.read().unwrap().input,
+            "half a sentence",
+            "and the draft is where it was"
+        );
+
+        // With the row mounted, the question reaches the moment — and the draft
+        // still survives it.
+        h.modules
+            .add_view(Arc::new(Mounted::<crate::modules::ask::Ask>::new()))
+            .unwrap();
+        assert!(h.sync_asking(), "the question arrives on the moment");
+        assert!(h.moment.read().unwrap().asking.is_some());
+        assert_eq!(
+            h.moment.read().unwrap().input,
+            "half a sentence",
+            "stepping aside is not clearing"
+        );
+
+        // Answer it: the panel goes, and the draft is handed back with it.
+        h.asks.take().unwrap().answer(Some("yes".into()));
+        assert!(h.sync_asking(), "the question leaving is a change too");
+        assert!(h.moment.read().unwrap().asking.is_none());
+        assert_eq!(
+            h.moment.read().unwrap().input,
+            "half a sentence",
+            "and it is handed back, not lost"
+        );
+    }
+
+    /// A question drawn at the foot of the stream is counted in the scroll.
+    ///
+    /// The fallback path: with no `tui-panel-ask` row mounted the question is
+    /// plain lines below the conversation (`stream_lines`), and a row the painter
+    /// draws but `stream_height_in` does not count is a row out of reach at the
+    /// bottom of the scroll — the last thing the question has to be is unreachable.
+    ///
+    /// Checked as a *delta*: the same host, the same size, the only difference
+    /// being that a question is waiting. An absolute number here would be a
+    /// second copy of the block's height, and it would keep passing if the
+    /// question stopped being counted and the fixture changed.
+    #[test]
+    fn a_question_at_the_foot_of_the_stream_is_counted_in_the_scroll() {
+        let h = host();
+        let size = (80u16, 24u16);
+        let before = h.stream_height(size, &h.moment.read().unwrap().clone());
+
+        // `pub(crate)`, and dropped on purpose: this asks what a *waiting*
+        // question does to the geometry, not who is waiting on the answer.
+        drop(h.asks.push(atomcode_harness::seams::Question::plain(
+            "Allow?",
+            &["yes", "no"],
+        )));
+        h.sync_asking();
+        let after = h.stream_height(size, &h.moment.read().unwrap().clone());
+
+        assert!(
+            after > before,
+            "the question is drawn but not counted: {before} -> {after}, so its rows \
+             are out of reach at the bottom of the scroll"
+        );
+
+        // And it is reachable: what the scroll can reach plus what the window
+        // shows must cover every row there is. Written as `>=` and not `==`: a
+        // conversation shorter than its pane has no scroll at all, so the limit
+        // saturates at zero and the sum exceeds the content — which is correct,
+        // and exactly the case an equality here got wrong.
+        let limit = h.scroll_limit(size, &h.moment.read().unwrap().clone());
+        let rows = h.stream_rows(size, &h.moment.read().unwrap().clone()) as usize;
+        assert!(
+            after <= limit + rows,
+            "the scroll cannot reach the last row of the question: {after} rows of \
+             content, a window of {rows} and a limit of {limit}"
+        );
+    }
 
     /// A host whose tail is that module, with enough in the conversation to
     /// scroll back through.

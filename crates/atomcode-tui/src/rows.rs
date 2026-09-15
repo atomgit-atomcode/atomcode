@@ -34,7 +34,7 @@ use serde_json::Value;
 use crate::command::Commands;
 use crate::layout::{LayoutOp, Side};
 use crate::module::{Modules, Mounted, Producer};
-use crate::modules::{input, live, status, steering, team, tip, todo, transcript};
+use crate::modules::{ask, input, live, status, steering, team, tip, todo, transcript};
 use crate::plugin::{CommandsSvc, LayoutSvc, ModulesSvc};
 
 /// The screen, panel by panel — the one place that says what a full UI is made
@@ -78,8 +78,8 @@ name = "tui-panel-todo"
 
 # On by default: it takes no room until the person types during a turn, and the
 # gap it fills is otherwise blank on every screen — words already sent, not yet
-# in the log, and no longer in the field. Rides the stream's tail with `todo`
-# and `live`.
+# in the log, and no longer in the field. Rides the stream's tail with `todo`,
+# `live` and `ask`.
 [[insert]]
 name = "tui-panel-steering"
 
@@ -99,7 +99,7 @@ disabled = true
 # answer and still record — as plain lines at the foot of the stream. That is
 # the fallback this row improves on, not a branch it replaces.
 [[insert]]
-name = "tui-ask-card"
+name = "tui-panel-ask"
 
 [[insert]]
 name = "tui-commands-screen"
@@ -132,7 +132,7 @@ pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
         Arc::new(TeamPanel),
         Arc::new(TodoPanel),
         Arc::new(SteeringPanel),
-        Arc::new(AskCardRow),
+        Arc::new(AskPanel),
         Arc::new(ScreenCommandsRow),
         Arc::new(SessionCommandsRow),
         Arc::new(TreeCommandsRow),
@@ -415,30 +415,36 @@ impl Plugin for SteeringPanel {
     }
 }
 
-/// The approval card: the modal a question is put in.
+/// The question panel: where a question is put, on the stream's tail.
 ///
-/// Not a panel — it takes no room until something asks — and not a branch in
-/// the host either. The host hands the question to whoever fills
-/// `tui-ask-view`; this row is who that is by default, and a product with a
-/// different idea of what an approval should look like replaces the row rather
-/// than patching the loop.
-pub struct AskCardRow;
+/// Mount only, like the task list and the steering bars beside it: its place is
+/// `host::TAIL`, which no `Show` op names.
+///
+/// A panel and not a modal any more. The modal was opened by the event loop out
+/// of a seam (`tui-ask-view`); now a question is a module riding the tail — the
+/// host was always asked for its height, so the question takes its rows the way
+/// every other panel does, and there is no second rendering to keep in step with
+/// it.
+pub struct AskPanel;
 
 #[async_trait]
-impl Plugin for AskCardRow {
+impl Plugin for AskPanel {
     fn name(&self) -> &'static str {
-        "tui-ask-card"
+        "tui-panel-ask"
     }
-    fn provides(&self) -> &'static [&'static str] {
-        &["tui-ask-view"]
+    fn inject(&self) -> &'static [&'static str] {
+        &["tui-modules"]
     }
     fn description(&self) -> &'static str {
-        "draw a question as a card: who is asking, what the call does, what each answer means"
+        "the question on screen: who is asking, what the call does, what each answer means"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
-        let _ = ctx
-            .provide::<crate::plugin::AskViewSvc>(Arc::new(crate::ask::Card))
-            .map_err(|e| e.to_string())?;
+        let mods = ctx.require::<ModulesSvc>().map_err(|e| e.to_string())?;
+        let view = Arc::new(Mounted::<ask::Ask>::new());
+        let id = <ask::Ask as crate::module::View>::id();
+        mods.add_view(view)?;
+        let m: Arc<Modules> = mods.clone();
+        let _ = ctx.effect(move || m.remove_view(id));
         Ok(())
     }
 }

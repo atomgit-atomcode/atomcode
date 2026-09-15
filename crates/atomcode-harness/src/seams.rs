@@ -429,7 +429,7 @@ pub struct AboutCall {
 /// person cannot answer honestly. So everything a front end needs to lay a
 /// question out is here, and everything it gets to decide — wording, colour,
 /// which key means which answer — is not.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Question {
     /// The ask, phrased, for a front end that renders nothing else.
     pub prompt: String,

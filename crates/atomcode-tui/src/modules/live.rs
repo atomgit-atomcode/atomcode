@@ -233,6 +233,19 @@ impl View for Live {
     /// rows are the host's to count against the offset. So the line steps aside
     /// and comes back, instead of following content it does not own.
     fn height(state: &State, moment: &Moment, _width: u16) -> Height {
+        // A question on screen is what the person is dealing with, and this line
+        // is a claim about what the agent is doing — context for an answer, not
+        // an answer. It steps aside rather than sharing the foot of the screen
+        // with the panel: two things talking about the same turn, one of them
+        // asking to be read, is a screen with no obvious place to look.
+        //
+        // Asked here and not in the host's arbitration because this line's whole
+        // visibility already lives in this function: `showing` decides it from
+        // the turn and the activity, and a second opinion elsewhere would be a
+        // second answer to "is this line up".
+        if moment.asking.is_some() {
+            return Height::Hug(0);
+        }
         match showing(state, moment) {
             Some(_) => Height::Hug(ROWS),
             None => Height::Hug(0),

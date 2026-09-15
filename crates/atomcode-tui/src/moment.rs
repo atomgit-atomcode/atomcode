@@ -7,6 +7,8 @@
 //! non-derivable state from growing quietly: adding a field here is a visible
 //! act, and every one of them has to be settable by a test.
 
+use atomcode_harness::seams::Question;
+
 use crate::frame::Rect;
 
 /// Injected time. Never `Instant::now()` inside a render — see `docs/adr/0008`.
@@ -228,6 +230,61 @@ pub struct Moment {
     /// appends on submit and clears on `AgentEvent::Steered`; see
     /// `modules::steering`.
     pub steering: String,
+    /// The question on screen, if one is waiting, and which of its answers is
+    /// pointed at.
+    ///
+    /// Here for the reason [`Moment::steering`] is: a question is not a fact
+    /// until it is answered — the log records the answer, not the asking — and
+    /// a module that folded "is a question waiting?" from facts would be folding
+    /// something that is not in them. See `modules::ask`.
+    pub asking: Option<Ask>,
+}
+
+/// A question on screen, with the row that is pointed at.
+///
+/// The cursor lives here rather than in the module's folded state because the
+/// highlight has exactly one owner: the row the up/down arrows are on and the
+/// row the pointer is over are the same row. Kept in two places, a panel ends
+/// up pointing at two rows at once — and the row a click would take has to be
+/// the row that is lit, or the light is a lie.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ask {
+    pub question: Question,
+    /// Which answer is pointed at, as an index into `question.options`.
+    pub cursor: usize,
+}
+
+impl Ask {
+    /// A question with its first answer pointed at.
+    pub fn new(question: Question) -> Self {
+        Self {
+            question,
+            cursor: 0,
+        }
+    }
+
+    /// Point at `row`, clamped to the answers there are.
+    ///
+    /// Clamped rather than rejected: a pointer on the panel's last row of
+    /// padding, or an arrow pressed past the end of a two-answer question, means
+    /// the nearest answer, not nothing.
+    pub fn point_at(&mut self, row: usize) -> bool {
+        let last = self.question.options.len().saturating_sub(1);
+        let row = row.min(last);
+        if row == self.cursor {
+            return false;
+        }
+        self.cursor = row;
+        true
+    }
+
+    /// The value a confirm would return, if there is one to return.
+    pub fn picked(&self) -> Option<String> {
+        self.question
+            .options
+            .get(self.cursor)
+            .map(|a| a.value.clone())
+    }
 }
 
 impl Moment {

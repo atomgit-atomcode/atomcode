@@ -35,9 +35,6 @@ plexus_service!(ModulesSvc => Modules, "tui-modules", Core, "Mounted stream prod
 plexus_service!(LayoutSvc => crate::layout::Layout, "tui-layout", Core, "The region tree on screen");
 plexus_service!(CommandsSvc => crate::command::Commands, "tui-commands", Core, "Slash commands contributed by rows");
 plexus_service!(AgentClientSvc => AgentClient, "tui-agent-client", Core, "The command channel to the agent this screen drives");
-// How a question is drawn. A seam rather than a branch: the foot-of-the-stream
-// lines are the fallback every screen has, and anything better is a row.
-plexus_service!(AskViewSvc => dyn crate::ask::AskView, "tui-ask-view", Seam, "How a question is put on screen");
 
 /// The session's clock, and the only place this crate reads one.
 ///
@@ -410,19 +407,30 @@ impl UserInterface for Tui {
             // foot of the loop because the pointer paths `continue` past
             // anything down there.
             //
+            // Two things follow the pointer, and either one is a reason for the
+            // terminal to report every cell it crosses: the composer's menu, and
+            // a question on screen — where the row under the pointer is the row a
+            // click would take, so a panel that did not follow would point at its
+            // first answer while the hand is on its third.
+            //
             // This is a request to the terminal, not a redraw: it changes what
             // the terminal *sends*, not what is on the screen, which is why it
             // is not folded into `stale`.
-            self.surface.set_motion(self.host.context_menu_open());
+            self.surface
+                .set_motion(self.host.context_menu_open() || self.host.asks.is_waiting());
             if stale && (coalesced >= COALESCE_LIMIT || wake.is_empty()) {
                 // The reading the frame about to be painted is drawn from. Facts
                 // absorb against whatever the last one was — a frame at most out
                 // of date, and the only reading available between commits.
                 self.host.moment.write().expect("moment poisoned").now = clock.reading();
                 self.refresh_members(ctx, &mine);
-                // A question that arrived while the loop was asleep gets its
-                // modal here, before the frame it appears in is composed.
-                self.open_question();
+                // A question that arrived while the loop was asleep is brought
+                // onto the moment here, before the frame it appears in is
+                // composed. The question panel renders from the moment, and the
+                // queue is the truth about whether one is waiting, so this is
+                // where the two are reconciled — in one place, before any frame
+                // can be drawn from a disagreement.
+                self.host.sync_asking();
                 self.paint();
                 stale = false;
                 coalesced = 0;
@@ -497,7 +505,14 @@ impl UserInterface for Tui {
                 //
                 // Not a query: see `Surface::heal_mouse` for why asking is not
                 // an option here.
-                Wake::Input(Input::Mouse(Click::Hover, ..)) if !self.host.context_menu_open() => {
+                // A hover that arrives while a question is up is the answer to our
+                // own request to the terminal, not a terminal that took the mouse
+                // back — see where `set_motion` is asked for. Treating it as the
+                // latter would say so on the tip row, and hand the pointer back
+                // the moment the question is answered.
+                Wake::Input(Input::Mouse(Click::Hover, ..))
+                    if !self.host.context_menu_open() && !self.host.asks.is_waiting() =>
+                {
                     self.surface.heal_mouse();
                     self.host.say(
                         "鼠标被终端收回了,已自动要回;若再次发生,ctrl-o 可手动切换",
@@ -544,6 +559,19 @@ impl UserInterface for Tui {
                         Click::WheelDown => Some(Action::Scroll(WHEEL_LINES)),
                         Click::Press => {
                             *self.pressed_at.lock().expect("press poisoned") = Some((x, y));
+                            // A press on an answer is the answer. It is not the
+                            // start of a text selection and not a fold: the
+                            // panel is a choice, and waiting for the release
+                            // would let a press-and-drag over one answer land on
+                            // another one's row.
+                            if self.host.asks.is_waiting() {
+                                if let Some(row) = self.host.answer_row_at(x, y) {
+                                    let _ = self.host.point_ask_at(row);
+                                    quit = self.confirm_question();
+                                    stale = true;
+                                    continue;
+                                }
+                            }
                             Some(Action::SelectFrom(x, y))
                         }
                         Click::Drag => Some(Action::SelectTo(x, y)),
@@ -569,6 +597,19 @@ impl UserInterface for Tui {
                         Click::Hover => {
                             if self.host.context_menu_open() {
                                 stale |= self.host.context_menu_hover(x, y, self.surface.size());
+                            }
+                            // A question is the other thing on screen that follows
+                            // a pointer, and for the same reason: the row under
+                            // the pointer is the row a click would take, and a
+                            // highlight somewhere else while the pointer is
+                            // somewhere is the panel lying about its own state.
+                            //
+                            // Free when no question is up — `asking` is a field
+                            // read, not a size ioctl.
+                            if self.host.asks.is_waiting() {
+                                if let Some(row) = self.host.answer_row_at(x, y) {
+                                    stale |= self.host.point_ask_at(row);
+                                }
                             }
                             continue;
                         }
@@ -602,9 +643,10 @@ impl UserInterface for Tui {
                     }
                     stale = true;
                 }
-                // A question on screen gets first refusal on every key. Focus is
-                // arbitration, not composition: exactly one thing can hold it,
-                // and the host decides which.
+                // A question on screen gets first refusal on every key. It is a
+                // panel riding the tail now, not a modal, so this is the only
+                // place its keys are routed — and focus is still arbitration,
+                // not composition: exactly one thing can hold it.
                 Wake::Input(Input::Key(press)) if self.host.asks.is_waiting() => {
                     quit = self.answer_question(press);
                     stale = true;
@@ -1199,40 +1241,58 @@ impl Tui {
 
     /// Route one key to the question on screen. Returns `true` to quit.
     ///
-    /// The fallback path: this is how a question is answered when no row draws
-    /// it. With `tui-ask-card` mounted the modal holds the keyboard and this is
-    /// never reached — the loop gives an open overlay the key first.
+    /// A question is a panel riding the stream's tail, not a modal, so the keys come
+    /// here directly — there is no overlay that holds the keyboard first. What has
+    /// not changed is the rule: while a question is waiting, every key is the
+    /// question's. Exactly one thing can hold focus, and this is what holds it.
+    ///
+    /// **Every answer is reachable by one key.** Up/down walk the list, which is what
+    /// a highlighted row is for; enter takes the row that is lit; a digit or a first
+    /// letter goes straight to an answer, which is faster once the list is known; esc
+    /// declines. The moves and the picks both live in [`crate::ask::Pending`], so the
+    /// keys the panel shows and the keys the fallback answers are one implementation
+    /// rather than two that agree until one changes.
     fn answer_question(&self, press: crate::surface::KeyPress) -> bool {
         use crate::surface::{Key, Mods};
         let Some((_, question)) = self.host.asks.peek() else {
             return false;
         };
-        let value_at = |n: usize| {
-            question
-                .options
-                .get(n.wrapping_sub(1))
-                .map(|a| a.value.clone())
-        };
         let chosen = match (press.key, press.mods) {
-            // Esc and ctrl-c decline. Declining is an answer; it is never
-            // consent, and it must always be one keystroke away.
+            (Key::Up, _) | (Key::Char('k'), Mods::CTRL) => {
+                let _ = self.host.move_ask_by(-1);
+                None
+            }
+            (Key::Down, _) | (Key::Char('j'), Mods::CTRL) => {
+                let _ = self.host.move_ask_by(1);
+                None
+            }
+            // Esc and ctrl-c decline. Declining is an answer; it is never consent,
+            // and it must always be one keystroke away.
             (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => Some(None),
             (Key::Char('d'), Mods::CTRL) => return true,
             (Key::Char(c), _) if c.is_ascii_digit() => {
-                value_at(c.to_digit(10).unwrap_or(0) as usize).map(Some)
+                crate::ask::nth(&question, c.to_digit(10).unwrap_or(0) as usize).map(Some)
             }
-            (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) => question
-                .options
-                .iter()
-                .find(|a| a.value.to_lowercase().starts_with(c.to_ascii_lowercase()))
-                .map(|a| Some(a.value.clone())),
-            // Enter takes the first option only when there is exactly one, so a
-            // stray return can never approve a two-way choice.
-            (Key::Enter, _) if question.options.len() == 1 => Some(value_at(1)),
+            // A letter picks the answer that starts with it. It does *not* fall back
+            // to typing: a question's answers are what there is to choose between, and
+            // a stray character is not one of them.
+            (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) => {
+                crate::ask::by_prefix(&question, c).map(Some)
+            }
+            // Enter takes the row that is pointed at. With several answers that is
+            // the highlighted one — which is what the highlight is *for*, and why it
+            // starts on the first: a stray return takes what the screen shows it
+            // would take, never a hidden default.
+            //
+            // Unmounted, there is no highlight to trust: the fallback at the foot of
+            // the stream marks nothing, so enter keeps the rule it had there and
+            // takes an answer only when there is exactly one to take.
+            (Key::Enter, _) if self.panel_mounted() => Some(self.pointed_at()),
+            (Key::Enter, _) if question.options.len() == 1 => Some(self.pointed_at()),
             _ => None,
         };
         let Some(answer) = chosen else {
-            return false; // an unrecognised key changes nothing
+            return false; // a move, or an unrecognised key: nothing to deliver
         };
         if let Some(p) = self.host.asks.take() {
             record_answer(&self.host, &question, &answer);
@@ -1241,58 +1301,52 @@ impl Tui {
         false
     }
 
-    /// Hand the waiting question to whoever draws questions.
+    /// Whether a question is being drawn as a panel rather than at the foot of the
+    /// stream.
     ///
-    /// Nothing happens when no row fills `tui-ask-view`: the question stays at
-    /// the foot of the stream and the keyboard answers it there. That is the
-    /// point of the seam — the fallback is a working screen, not a broken one.
-    fn open_question(&self) {
-        // A question refused out from under its card — a cancel, a shutdown —
-        // leaves a modal asking about something nobody is waiting for. Take it
-        // down rather than let a person answer a question that is already over.
-        if !self.host.asks.is_waiting() {
-            if self
-                .host
-                .overlays
-                .current()
-                .is_some_and(|o| o.id() == crate::ask::CARD)
-            {
-                self.host.overlays.close_all();
-            }
-            return;
-        }
-        if self.host.overlays.is_open() {
-            return;
-        }
-        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
-            return;
-        };
-        let Some(view) = ctx.service::<AskViewSvc>() else {
-            return;
-        };
-        let Some((_, question)) = self.host.asks.peek() else {
-            return;
-        };
-        let overlay = view.overlay(&question);
-        let host = self.host.clone();
-        let wake = self.wake.lock().expect("wake poisoned").clone();
-        self.host.overlays.open(
-            overlay,
-            Box::new(move |chosen| {
-                // A modal that closes with nothing closed with a refusal:
-                // `Pending::answer(None)` is a deny, never a default yes.
-                if let Some(p) = host.asks.take() {
-                    record_answer(&host, &question, &chosen);
-                    p.answer(chosen);
-                }
-                if let Some(k) = wake {
-                    let _ = k.send(Wake::Fact);
-                }
-            }),
-        );
+    /// Read off `Moment::asking`, which the host sets only for a mounted panel —
+    /// so this is the same question the renderer answered, not a second opinion
+    /// about it.
+    fn panel_mounted(&self) -> bool {
+        self.host
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .asking
+            .is_some()
     }
 
-    /// Keep the slash menu in step with what is typed.
+    /// The answer the panel has lit, as it would be delivered.
+    ///
+    /// One reader for both the return key and a click on a row, so a confirm and a
+    /// pick cannot disagree about what is pointed at. Nothing lit — the question
+    /// arrived this frame and has not been synced — is the first answer, because that
+    /// is the one the panel would have lit.
+    fn pointed_at(&self) -> Option<String> {
+        let m = self.host.moment.read().expect("moment poisoned");
+        match m.asking.as_ref() {
+            Some(ask) => ask.picked(),
+            None => self
+                .host
+                .asks
+                .peek()
+                .and_then(|(_, q)| q.options.first().map(|a| a.value.clone())),
+        }
+    }
+
+    /// Deliver whatever the panel is pointed at. `true` to quit, for the key path.
+    fn confirm_question(&self) -> bool {
+        let Some((_, question)) = self.host.asks.peek() else {
+            return false;
+        };
+        let answer = self.pointed_at();
+        if let Some(p) = self.host.asks.take() {
+            record_answer(&self.host, &question, &answer);
+            p.answer(answer);
+        }
+        false
+    }
+
     fn refresh_menu(&self) {
         let typed = self
             .host
@@ -1777,16 +1831,10 @@ impl Plugin for TuiUiPlugin {
     }
     fn uses(&self) -> &'static [&'static str] {
         // What the pump's projection reads, resolved live; where its own
-        // agent's session comes from; and who draws a question, when anyone
-        // does — this row asks either way, so the seam is a `uses`, not a
-        // dependency it cannot start without.
-        &[
-            "tools",
-            "llm",
-            "compaction",
-            "session-defaults",
-            "tui-ask-view",
-        ]
+        // agent's session comes from. **Not** who draws a question: a question
+        // is a module riding the tail now, so this row neither asks for a
+        // drawer nor depends on one being mounted.
+        &["tools", "llm", "compaction", "session-defaults"]
     }
     fn provides(&self) -> &'static [&'static str] {
         // It owns the screen, so it is the one that can ask. The registries it

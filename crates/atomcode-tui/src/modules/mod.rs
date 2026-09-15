@@ -1,5 +1,6 @@
 //! The modules this build ships. Which of them *run* is the layout's call.
 
+pub mod ask;
 pub mod input;
 pub mod live;
 pub mod status;

@@ -2306,14 +2306,15 @@ async fn an_approval_asked_for_by_a_member_says_which_member() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
-/// Take the card away and the screen still asks.
+/// Take the panel away and the screen still asks.
 ///
-/// The claim the seam makes: a row draws questions *better*, it is not what
-/// makes them answerable. Without it the question is plain lines at the foot
-/// of the stream and the keyboard answers them there — which is also the path
-/// every front end that never mounts a card takes.
+/// A question is drawn by a panel riding the stream's tail (`tui-panel-ask`), and
+/// that row is a product's decision — not what makes a question answerable.
+/// Without it the question is plain lines at the foot of the stream and the
+/// keyboard answers them there, which is the path every front end that never
+/// mounts the panel takes.
 #[tokio::test]
-async fn with_no_card_row_the_question_is_still_asked_and_still_answered() {
+async fn with_no_panel_row_the_question_is_still_asked_and_still_answered() {
     let dir = scratch("no-card");
     let script = replay(
         r#"{ text = "Writing.", calls = [ { name = "write_file", args = { file_path = "out.txt", content = "plain" } } ] },
@@ -2325,7 +2326,7 @@ async fn with_no_card_row_the_question_is_still_asked_and_still_answered() {
         &[
             "[[patch]]\nid = \"approval\"\ndisabled = true\n",
             "[[patch]]\nid = \"approval-interactive\"\ndisabled = false\n",
-            "[[remove]]\nid = \"tui-ask-card\"\n",
+            "[[remove]]\nid = \"tui-panel-ask\"\n",
         ],
     ))
     .await;
@@ -2334,10 +2335,19 @@ async fn with_no_card_row_the_question_is_still_asked_and_still_answered() {
     s.term.type_line("write it");
     until(&s, "write_file").await;
     let screen = s.screen();
-    assert!(!screen.contains("┌─ 审批"), "no row, no card:\n{screen}");
+    assert!(
+        !screen.contains("↑↓ 选择"),
+        "no row, no panel legend:\n{screen}"
+    );
     assert!(
         screen.contains("允许一次"),
         "but the answers are there:\n{screen}"
+    );
+    // The composer is still there: with no panel to take its place, nothing may
+    // have taken it away.
+    assert!(
+        screen.contains(caps_prompt()),
+        "and so is the field, since nothing came to take its place:\n{screen}"
     );
 
     s.term.press(KeyPress::ch('1'));
@@ -2351,6 +2361,221 @@ async fn with_no_card_row_the_question_is_still_asked_and_still_answered() {
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// The question panel rides the stream's tail, between the live line and the
+/// steering bars, and it takes the composer's place while it is there.
+///
+/// Three claims at once, because they are one arrangement: where the panel is,
+/// what is above it, and what is not on screen at all. Tested as geometry off the
+/// frame rather than by looking for words, so "the composer hid" cannot pass by
+/// the field merely being empty.
+#[tokio::test]
+async fn the_question_panel_rides_the_tail_and_takes_the_composer_s_place() {
+    let dir = scratch("ask-panel-tail");
+    let script = replay(
+        r#"{ text = "Writing.", calls = [ { name = "write_file", args = { file_path = "out.txt", content = "written" } } ] },
+           { text = "Done." }"#,
+    );
+    let s = start(asking(&dir, &script)).await;
+    let task = s.open().await;
+
+    s.term.type_line("write it");
+    until(&s, "↑↓ 选择").await;
+
+    let frame = s.term.last().expect("a frame");
+    let panel = frame
+        .part("ask")
+        .expect("the panel is placed under its own id")
+        .rect;
+    let stream = frame.part("stream").expect("the conversation").rect;
+    let live = frame.part("live").map(|p| p.rect);
+    let status = frame.part("status").expect("the status line").rect;
+
+    // Under the conversation, and under the live line when there is one.
+    assert!(
+        panel.y >= stream.y + stream.h,
+        "the panel is not below the conversation: panel {panel:?}, stream {stream:?}"
+    );
+    if let Some(live) = live {
+        assert!(
+            live.y + live.h <= panel.y,
+            "the live line is not above the panel: live {live:?}, panel {panel:?}"
+        );
+    }
+    // And above the status line, because the whole tail is.
+    assert!(
+        panel.y + panel.h <= status.y,
+        "the panel ran into the status line: panel {panel:?}, status {status:?}"
+    );
+
+    // **The composer is gone.** Not empty — not placed: no field, no tip row.
+    assert!(
+        frame.part("input").is_none(),
+        "the field is still on screen under the panel:\n{}",
+        s.screen()
+    );
+    assert!(
+        frame.part("tip").is_none(),
+        "the tip row is still on screen:\n{}",
+        s.screen()
+    );
+    // Nothing scrolled away either: the field's rows went to the conversation.
+    assert!(
+        stream.h > 1,
+        "the conversation kept a row of its own: {stream:?}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// The arrow keys pick, enter confirms, and the pointer does both.
+///
+/// The claim a highlighted row makes is that the row which is *lit* is the row a
+/// confirm would take. Read off the drawn frame — the row whose background is the
+/// brighter panel — because "the panel tracks the keys" and "the panel paints the
+/// key's row" are two claims and only the second one is the feature.
+#[tokio::test]
+async fn the_question_panel_picks_by_key_and_by_pointer_and_confirms_the_lit_row() {
+    let dir = scratch("ask-panel-pick");
+    let script = replay(
+        r#"{ text = "Writing.", calls = [ { name = "write_file", args = { file_path = "out.txt", content = "written" } } ] },
+           { text = "Done." }"#,
+    );
+    let s = start(asking(&dir, &script)).await;
+    let task = s.open().await;
+
+    s.term.type_line("write it");
+    until(&s, "↑↓ 选择").await;
+
+    let bright = Some(atomcode_tui::Color::role(
+        atomcode_tui::theme::Role::PanelSelBg,
+    ));
+    // The screen row of the lit answer, read off the frame that is up.
+    let lit_row = |s: &Session| -> Option<u16> {
+        let part = s.term.last().expect("a frame").part("ask")?.clone();
+        (0..part.lines.len())
+            .find(|i| part.lines[*i].spans.iter().any(|sp| sp.style.bg == bright))
+            .map(|i| part.rect.y + i as u16)
+    };
+
+    let panel = s.term.last().expect("a frame").part("ask").unwrap().rect;
+    let first = lit_row(&s).expect("an answer starts lit");
+    assert!(
+        first >= panel.y && first < panel.y + panel.h,
+        "the lit row is inside the panel: {first} vs {panel:?}"
+    );
+
+    // Down: the highlight moves to the next answer, and stays inside the panel.
+    s.term.press(KeyPress::plain(Key::Down));
+    // Not `quiet`: the turn is deliberately stuck on this question, so the screen
+    // is never quiet until it is answered. Wait for the *move* instead — the one
+    // thing that changed, which `until` can only see as the old row going dark.
+    until_row(&s, first, false).await;
+    let second = lit_row(&s).expect("an answer is lit after moving down");
+    assert_ne!(
+        second,
+        first,
+        "down did not move the highlight:\n{}",
+        s.screen()
+    );
+    assert!(
+        second > first,
+        "down moved the highlight up: {first} -> {second}"
+    );
+
+    // Up: and back, so the arrows are a pair rather than one direction.
+    s.term.press(KeyPress::plain(Key::Up));
+    until_row(&s, first, true).await;
+    assert_eq!(lit_row(&s), Some(first), "up did not come back");
+
+    // The pointer takes over the same row. Hovering is enough: the row under the
+    // pointer is the row a click would take, and the panel must say so.
+    let last = panel.y + panel.h - 1;
+    let target = (panel.y..=last)
+        .rev()
+        .find(|y| {
+            let part = s.term.last().unwrap().part("ask").unwrap().clone();
+            let i = (y - part.rect.y) as usize;
+            part.lines
+                .get(i)
+                .is_some_and(|l| l.plain().contains("允许"))
+        })
+        .expect("an answer row to point at");
+    s.term
+        .pointer(atomcode_tui::surface::Click::Hover, panel.x + 2, target);
+    until_row(&s, target, true).await;
+    assert_eq!(
+        lit_row(&s),
+        Some(target),
+        "the row the pointer is over is not the row drawn brighter:\n{}",
+        s.screen()
+    );
+
+    // And the row that is lit is the row a click takes — not the first one, which
+    // is what a click that ignored the pointer would have taken.
+    s.term
+        .pointer(atomcode_tui::surface::Click::Press, panel.x + 2, target);
+    s.term
+        .pointer(atomcode_tui::surface::Click::Release, panel.x + 2, target);
+    s.quiet().await;
+    assert!(
+        !s.screen().contains("↑↓ 选择"),
+        "the question is still up after a click on an answer:\n{}",
+        s.screen()
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+        "written",
+        "the answer the pointer picked is what was delivered:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// Wait for the lit answer row to reach `row`, or for it to leave it.
+///
+/// `quiet` cannot be used while a question is up: the turn is deliberately stuck
+/// on it, so the screen never settles. What is waited for instead is the one thing
+/// that changes — which row carries the panel's highlight.
+async fn until_row(s: &Session, row: u16, lit: bool) {
+    let bright = Some(atomcode_tui::Color::role(
+        atomcode_tui::theme::Role::PanelSelBg,
+    ));
+    let is_lit = |s: &Session| -> bool {
+        let frame = match s.term.last() {
+            Some(f) => f,
+            None => return false,
+        };
+        let Some(part) = frame.part("ask") else {
+            return false;
+        };
+        let Some(i) = row.checked_sub(part.rect.y).map(|i| i as usize) else {
+            return false;
+        };
+        part.lines
+            .get(i)
+            .is_some_and(|l| l.spans.iter().any(|sp| sp.style.bg == bright))
+    };
+    for _ in 0..400 {
+        if is_lit(s) == lit {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!(
+        "row {row} never {} lit; last frame:\n{}",
+        if lit { "became" } else { "stopped being" },
+        s.screen()
+    );
+}
+
+/// The prompt marker this terminal draws.
+fn caps_prompt() -> &'static str {
+    atomcode_tui::caps::Caps::default().g(atomcode_tui::caps::Glyph::Prompt)
 }
 
 /// A model's answer arrives a delta at a time — a word here — and every delta
