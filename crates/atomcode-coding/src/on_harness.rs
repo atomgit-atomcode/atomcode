@@ -919,6 +919,8 @@ pub struct HostState {
     /// The session context block, and the system prompt a continued session
     /// was stored with (its git section is kept).
     pub session_context: Option<HostContext>,
+    /// Tools the runtime built around its own controllers.
+    pub tools: Vec<Arc<dyn atomcode_kernel::tool::Tool>>,
 }
 
 /// See [`crate::host_rows::SessionContextPlugin`].
@@ -1032,8 +1034,13 @@ pub async fn mount_hosted(
             )
         })
         .unwrap_or_default();
+    let tools_rows = if host.tools.is_empty() {
+        ""
+    } else {
+        "[[insert]]\nname = \"host-tools\"\n\n"
+    };
     let hosted = format!(
-        "[[patch]]\nid = \"session\"\nname = \"session-native\"\n\n{modes_rows}{cc_rows}{context_rows}{datalog_rows}{}{}",
+        "[[patch]]\nid = \"session\"\nname = \"session-native\"\n\n{modes_rows}{cc_rows}{context_rows}{datalog_rows}{tools_rows}{}{}",
         host.hooks
             .as_ref()
             .map(|hooks| hooks.rows())
@@ -1070,6 +1077,9 @@ pub async fn mount_hosted(
     registry.register(Arc::new(crate::host_rows::KernelMiddlewarePlugin(
         host.middleware.unwrap_or_default(),
     )));
+    if !host.tools.is_empty() {
+        registry.register(Arc::new(crate::host_rows::HostToolsPlugin(host.tools)));
+    }
     if let Some(engine) = host.cc_hooks {
         registry.register(Arc::new(crate::host_rows::CcHooksHostPlugin(engine)));
     }

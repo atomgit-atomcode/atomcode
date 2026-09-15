@@ -82,6 +82,18 @@ impl LlmProvider for RecordingProvider {
                             .to_string(),
                 })
             }
+            Some(m) if m.role == Role::User && m.text == "tick" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "schedule_wakeup".into(),
+                    arguments: serde_json::json!({
+                        "delay_seconds": 60,
+                        "reason": "check again",
+                        "prompt": "tick",
+                    })
+                    .to_string(),
+                })
+            }
             Some(m) if m.role == Role::Tool => StreamEvent::TextDelta(format!("saw: {}", m.text)),
             _ => StreamEvent::TextDelta(format!("answer {n}")),
         };
@@ -825,6 +837,45 @@ async fn an_eager_todo_reminder_rides_the_first_request(engine: &str) {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// Inside a `/loop`, the model can schedule its next pass — the loop stays
+/// alive instead of finishing after the first turn.
+async fn a_loop_turn_can_schedule_its_next_pass(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+
+    runtime.handle.start_loop("watch").await.unwrap();
+    runtime
+        .handle
+        .submit(UserInput::from("tick"))
+        .await
+        .unwrap();
+    // The loop turn is held open while a wakeup is pending, so there is no
+    // `TurnFinished` to wait for: the scheduled pass is the observable fact.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(deadline, runtime.events.recv())
+            .await
+            .unwrap_or_else(|_| panic!("[{engine}] the loop never scheduled a next pass"))
+            .expect("runtime event stream closed");
+        if let CodingRuntimeEvent::LoopChanged(progress) = event.event {
+            if progress
+                .last_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("scheduled in"))
+            {
+                break;
+            }
+        }
+    }
+    let _ = runtime.handle.stop_loop().await;
+    runtime.handle.shutdown().await.unwrap();
+}
+
 macro_rules! on_both_engines {
     ($($scenario:ident),* $(,)?) => {
         mod chain {
@@ -865,4 +916,5 @@ on_both_engines!(
     a_persons_hooks_and_a_plugins_hooks_both_run,
     the_datalog_is_written_when_it_is_on,
     an_eager_todo_reminder_rides_the_first_request,
+    a_loop_turn_can_schedule_its_next_pass,
 );

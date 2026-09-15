@@ -7491,6 +7491,7 @@ fn harness_host_state(
         hooks: Some(hooks),
         middleware: Some(middleware),
         cc_hooks: parts.cc_external_hooks.clone(),
+        tools: parts.extra_tools(),
         datalog: config.datalog.enabled.then(|| config.datalog.clone()),
         modes: Some(crate::on_harness::HostModes {
             modes: atomcode_harness::seams::Modes {

@@ -365,6 +365,7 @@ pub struct CodingParts {
     /// per-turn cost attribution without rebuilding session-owned hooks.
     snapshot_hook: Option<Arc<SnapshotHook>>,
     transcript_hook: Option<Arc<TranscriptHook>>,
+    extra_tools: Vec<Arc<dyn atomcode_kernel::tool::Tool>>,
     snapshot_persistence_status: Option<SnapshotPersistenceStatus>,
     pub session: Option<SessionBinding>,
     /// Runtime-owned resume for sessionless drivers during an in-process reassembly.
@@ -1095,6 +1096,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         compaction_checkpoint,
         snapshot_hook: snapshot_hook_handle,
         transcript_hook: transcript_hook_handle,
+        extra_tools: Vec::new(),
         snapshot_persistence_status,
         session,
         runtime_resume: None,
@@ -1397,9 +1399,17 @@ impl CodingParts {
     pub fn register_extra_tool(&mut self, tool: Arc<dyn atomcode_kernel::tool::Tool>) {
         let name = tool.name().to_string();
         if !self.tool_names.iter().any(|n| n == &name) {
-            self.tool_names.push(name);
+            self.tool_names.push(name.clone());
         }
+        self.extra_tools.retain(|existing| existing.name() != name);
+        self.extra_tools.push(tool.clone());
         self.registry.register(tool);
+    }
+
+    /// Tools the runtime added on top of the capability graph (`schedule_wakeup`),
+    /// latest registration per name.
+    pub(crate) fn extra_tools(&self) -> Vec<Arc<dyn atomcode_kernel::tool::Tool>> {
+        self.extra_tools.clone()
     }
 }
 

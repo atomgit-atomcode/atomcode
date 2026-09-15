@@ -588,6 +588,40 @@ impl Plugin for PlanModeLivePlugin {
     }
 }
 
+// ---- tools the runtime adds -----------------------------------------------
+
+/// `host-tools`: tools the runtime built around its own state.
+///
+/// `schedule_wakeup` is the one today: calling it hands a wakeup to the runtime's
+/// `/loop` controller over a channel the runtime owns. No row can build it,
+/// because no row has that channel.
+pub(crate) struct HostToolsPlugin(pub(crate) Vec<Arc<dyn atomcode_kernel::tool::Tool>>);
+
+#[async_trait]
+impl Plugin for HostToolsPlugin {
+    fn name(&self) -> &'static str {
+        "host-tools"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools"]
+    }
+    fn description(&self) -> &'static str {
+        "tools the coding runtime built around its own controllers (schedule_wakeup)"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let toolbox = ctx
+            .require::<atomcode_harness::seams::ToolsSvc>()
+            .map_err(|e| e.to_string())?;
+        for tool in &self.0 {
+            let name = tool.name().to_string();
+            toolbox.register(tool.clone())?;
+            let toolbox = toolbox.clone();
+            let _ = ctx.effect(move || toolbox.unregister(&name));
+        }
+        Ok(())
+    }
+}
+
 // ---- host-built tool middleware -------------------------------------------
 
 /// Host-built tool middleware, by the name a `kernel-middleware` row asks for.
