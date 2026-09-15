@@ -131,8 +131,8 @@ undo / restore / reprepare 家族今天是「停 agent → 写原生 → 重装�
 | 9 team 事件 | `b857e241` | ✅ 随产品 `task`/`team` 进树，事件由 `parts.team_manager` 发 |
 | 10 差分录 golden | `666adcf0` | ✅ `tests/golden/differential/*.json` 56 份，由链式录(`ATOMCODE_RECORD_GOLDEN=1`);回放下基线不变;篡改一份 → 棘轮红 |
 | 11 翻默认 | `c81218a4` | ✅ 默认 harness,`ATOMCODE_ENGINE=chain` 只活到删链那一个 commit。翻之前先把 tuix/cli/daemon 在 harness 下跑了一遍，抓到一条真回归:provider 不报用量的回合 harness 一条 `Usage` 都不发，ACP 按它换 messageId,两轮并成一条消息(`6e3ff220` 修 + 判据) |
-
-| 12 删链 | 本 commit | ✅ `Engine`/`ATOMCODE_ENGINE`、`assemble.rs`、`parts::assemble`、`VerifyCadenceHook`/`SkillFirstHook`/`TodoHook` 的钩子外壳全部删除;`runtime::mount` 成为公开装配入口;12 个链式测试文件改挂树(`tests/support/mod.rs`),差分台只剩树对 golden |
+| 12 删链 | `f3a7f048` | ✅ `Engine`/`ATOMCODE_ENGINE`、`assemble.rs`、`parts::assemble`、`VerifyCadenceHook`/`SkillFirstHook`/`TodoHook` 的钩子外壳全部删除;`runtime::mount` 成为公开装配入口;12 个链式测试文件改挂树(`tests/support/mod.rs`),差分台只剩树对 golden |
+| 13 真模型冒烟 | 不产生 commit | ✅ 纯文本 / 带工具 / resume / undo 四项在真网关上过(见下) |
 
 ### 删链时测试抓到的真问题(各自已修)
 
@@ -170,11 +170,41 @@ undo / restore / reprepare 家族今天是「停 agent → 写原生 → 重装�
   (内嵌前端资源没构建)
 - `atomcode-tuix modals::config_panel::tests::retry_setting_is_searchable_in_both_languages`
 
+## 真模型冒烟(步骤 13)
+
+跑的是 `target/debug/atomcode`(默认装配 = 树),隔离 home,真网关 `AtomGit-glm5.3-flash-pro`。
+四项都是端到端经二进制，不碰测试替身:
+
+| 项 | 怎么跑 | 结果 |
+|---|---|---|
+| 纯文本 | `atomcode -p "Reply with exactly the word: pineapple"` | 回 `pineapple`，退出 0，打印 resume 提示 |
+| 带工具 | `-y -v -p "用 write 工具建 note.txt…"` | `[tool→ write_file]` → `[tool← ok]`,文件内容对;`turns=2 tool_calls=1`;两轮各报一次用量(`6e3ff220` 修的那条),第二轮 `cached=18752` 说明前缀缓存命中 |
+| resume | `--resume <id> -p "不用工具，回答你刚建的文件名和那一行"` | 答 `note.txt` / `hello-from-harness`,即原生快照种子进树成功 |
+| undo | ACP stdio(`atomcode -y acp`),两轮各建一个文件后发 `/undo`,再问「你这段对话里建过哪些文件」 | 答 `alpha.txt`;**反证**:同样三轮不发 `/undo`,答 `alpha.txt, beta.txt` |
+
+`/undo` 只回滚对话不回滚文件(两次跑完 `beta.txt` 都还在),这是 `undo_to_prompt` 的契约 ——
+文件回滚是 `rewind(RewindScope)` 的事，不是缺陷。
+
+顺带在真跑里看到了会话的两个写者各写各的:
+
+```
+sessions/<bucket>/<id>.jsonl          {"v":N,...}          ← 原生 transcript(主)
+sessions/harness/<bucket>/<id>.jsonl  {"header":{...}}/seq ← harness 日志(从)
+```
+
+两种格式、两个 root,任何一方都没写进对方的文件 —— 判据
+`the_session_transcript_has_one_writer` 在真跑上的样子。
+
+> 网关要签名，签名 crate(`atomcode-codingplan-crypto`)是闭源 overlay,不在公共仓。
+> 冒烟时从主仓工作区临时拷进来编译，跑完 `git checkout HEAD -- crates/atomcode-codingplan-crypto/ Cargo.lock`
+> 还原 + 删掉 overlay 文件 + `cargo clean -p atomcode-codingplan-crypto` 重编，
+> 本分支不含它的任何一行，Cargo.lock 也没被它污染。
+
 ## 判据(`tests/runtime_criteria.rs`)
 
 运行时判据，只经 `CodingRuntime` 公开面。每条都在两个引擎上写过、并摘掉被测代码证伪过
-一次(反证记在各自 commit 里),删链后原样留下来当 harness 判据。44 个场景 + 能力开关、
-transcript 单一写者、logout 不留凭据三条。
+一次(反证记在各自 commit 里),删链后原样留下来当 harness 判据。43 个场景 + 能力开关、
+transcript 单一写者、logout 不留凭据三条，共 46 条。
 
 ## 已知差异(决定保留，删链后照此为准)
 
