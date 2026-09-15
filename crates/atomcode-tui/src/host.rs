@@ -58,7 +58,6 @@ fn hideable(kind: &str) -> bool {
 
 /// Which blocks are shown how. Kept here, keyed by kind, rather than on the
 /// block — which is what makes "folding does not change content" structural.
-#[derive(Default)]
 pub struct Presentation {
     /// How each kind is shown right now. A kind nobody has touched is `Open`.
     by_kind: Vec<(&'static str, Showing)>,
@@ -70,6 +69,12 @@ pub struct Presentation {
     /// and it already has a key (ctrl-t) — a click that did it would be a click
     /// that changed six other things the person was looking at.
     by_block: std::collections::HashMap<BlockId, bool>,
+    /// Bumped by every change above. See `host::row_index` for why the row
+    /// count keys on this rather than being invalidated by hand: folding a
+    /// kind, folding one block and hiding a kind all change what the frame
+    /// counts, and a caller that forgot one of them would keep a count of a
+    /// screen nobody is looking at.
+    revision: u64,
 }
 
 impl Presentation {
@@ -102,7 +107,23 @@ impl Presentation {
         Self {
             by_kind,
             by_block: std::collections::HashMap::new(),
+            revision: 0,
         }
+    }
+
+    /// Every change that alters what a frame would count goes through this.
+    ///
+    /// One place rather than a bump at each writer: the writers are `set`,
+    /// `set_block`, `toggle` and `toggle_many`, and the last two call the first
+    /// two — so bumping here covers every route by construction, including the
+    /// next one somebody adds.
+    fn bump(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// What the row count keys on. See `host::row_index`.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// How this kind is shown now.
@@ -119,6 +140,7 @@ impl Presentation {
             Some(entry) => entry.1 = to,
             None => self.by_kind.push((kind, to)),
         }
+        self.bump();
     }
 
     pub fn is_folded(&self, kind: &str) -> bool {
@@ -189,6 +211,7 @@ impl Presentation {
     /// block's *run* is before it can mean anything — see `Host::toggle_block`.
     pub fn set_block(&mut self, id: BlockId, folded: bool) {
         self.by_block.insert(id, folded);
+        self.bump();
     }
 }
 
@@ -346,6 +369,13 @@ fn blank_row(line: &Line) -> bool {
 thread_local! {
     static COPIED_ROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+
+/// 关掉 `stream_lines` 的二分跳转，退回从最新一块逐格走动。
+///
+/// 等价性棘轮的两条腿之一 —— 见 `host::tests::the_jump_draws_what_the_walk_draws`。
+#[cfg(test)]
+pub(crate) static NO_JUMP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Put the rows of a block that can land on the screen into the frame.
 ///
@@ -519,6 +549,50 @@ fn lids(slots: &[crate::block::Slot], pres: &Presentation) -> Lids {
         i = next;
     }
     Lids { runs }
+}
+
+/// How many rows slot `i` contributes, in the terms the frame counts.
+///
+/// `None` when it draws nothing at all — off-screen by kind, behind a lid that
+/// is not its last member, or an empty block. The distinction matters to the
+/// walk as well as to the sum: a slot that draws no rows is not a neighbour
+/// either, so the blank rows around it stay where they were.
+fn lid_row(
+    lids: &Lids,
+    slots: &[crate::block::Slot],
+    i: usize,
+    room: u16,
+    b: &crate::block::Block,
+    pres: &Presentation,
+) -> Option<SlotRows> {
+    let kind = b.kind();
+    if pres.is_hidden(kind) {
+        return None;
+    }
+    match lids.at(i) {
+        // The last member of a merged run draws the lid, which stands for the
+        // whole run.
+        Some(run) => Some(SlotRows {
+            rows: lid_lines(slots, i, run.count, room).len(),
+            kind,
+            lid: Some(run.count),
+            folded: false,
+        }),
+        // An earlier member of a run: the lid at the end of it already drew.
+        None if lids.covers(i) => None,
+        None if !b.content.always_open() && pres.is_block_folded(b.id, kind) => Some(SlotRows {
+            rows: 1,
+            kind,
+            lid: None,
+            folded: true,
+        }),
+        None => Some(SlotRows {
+            rows: slots[i].rows_at(room).0,
+            kind,
+            lid: None,
+            folded: false,
+        }),
+    }
 }
 
 /// The one lid a merged run is drawn as, from its last call.
@@ -710,6 +784,157 @@ pub struct Host {
     /// the difference. One gate, held across measure-change-measure, is what
     /// makes the pair add up to one.
     pin_gate: Mutex<()>,
+    /// Rows per slot, and how many have been laid down before each one.
+    ///
+    /// **This is the frame's row sum, asked once.** Two walks need it —
+    /// `stream_height_in`, which bounds the scroll, and `stream_lines`, which
+    /// fills the viewport — and both used to rebuild it from scratch on every
+    /// call, which is why one wheel notch cost 17.7ms on a 1330-slot session
+    /// (measured, debug, 2026-09-15): `scroll_limit` 4.1ms + `compose` 13.7ms,
+    /// both O(slots) and both re-deriving the same arithmetic.
+    ///
+    /// Keyed on `(stream revision, presentation revision, width)` rather than
+    /// invalidated by hand. Those three are the whole of what a row count
+    /// depends on, so "when is this stale" is a question the type answers
+    /// instead of one somebody has to remember — and the two revisions are
+    /// bumped by every writer, not by the call sites that happen to exist today.
+    row_index: Mutex<RowIndex>,
+}
+
+/// The cached layout of the stream's rows, top to bottom.
+///
+/// Per slot, in slot order, with `None` for a slot that draws no rows. What
+/// each entry holds is what a walk needs and what a walk would otherwise
+/// recompute: how many rows the slot contributes, whether it is covered by a
+/// merged lid (both the *last* slot of a run, which draws the lid, and its
+/// earlier members, which draw nothing), and whether a blank row separates it
+/// from the slot above.
+struct RowIndex {
+    /// What the measurements below were taken under. A different width, or a
+    /// different idea of which blocks are folded, changes the answer for
+    /// *every* slot — so those invalidate the lot.
+    width: u16,
+    presentation: u64,
+    /// One entry per slot measured so far, in slot order. May be shorter than
+    /// the stream while entries are being added at the end.
+    measured: Vec<Measured>,
+    /// `rows[i]` — see [`SlotRows`], `None` for a slot that draws nothing.
+    rows: Vec<Option<SlotRows>>,
+    /// How much a newest-first walk has accumulated once it has passed every
+    /// slot from the end down to `i` — in **the walk's own terms**, seams and
+    /// all: `rows_j` plus the seam `j` owns (the one between it and the next
+    /// drawn slot newer).
+    ///
+    /// A suffix sum rather than a prefix sum, and that is the point. A prefix sum
+    /// can say what is *above* a slot; only this can say what the walk will have
+    /// in `skipped` when it gets there — and those two differ by exactly one
+    /// seam per boundary, because the two walks disagree about which side of a
+    /// seam owns it. Deriving the value from a prefix sum got that off by one and
+    /// scrolled the first thing said off the top; storing the walk's own number
+    /// cannot be off, because no second conversion is involved.
+    ///
+    /// Length `slots.len() + 1`, so `skip_from[n] == 0` is the reader at the
+    /// bottom with nothing passed yet.
+    skip_from: Vec<usize>,
+    /// The sum over the whole stream, which is `before.last()` plus the last
+    /// slot's own rows.
+    total: usize,
+}
+
+/// One slot's measurement, and what it was measured for.
+///
+/// The tag is what makes the index incremental, which is the difference between
+/// this helping and this hurting. A streamed answer commits a fact per token,
+/// and each of those settles nothing and changes one slot — so a rebuild that
+/// re-measured all 1330 slots would cost more than the walk it replaced. With
+/// the tag, a rebuild re-measures the slot that changed and reuses the rest.
+struct Measured {
+    /// The block this was measured for, so a slot reused for a different block
+    /// is not mistaken for the same one.
+    id: crate::block::BlockId,
+    /// Whether the block was settled when it was measured. A settled block's
+    /// content cannot change, so its row count holds; a live one can grow, so
+    /// it is measured again every time.
+    settled: bool,
+}
+
+/// What one slot contributes to the row count — and everything the painter
+/// would otherwise have to ask the block for.
+///
+/// The `kind`, `lid` and `folded` fields are not part of the sum. They are here
+/// because the walk that fills the viewport asks the block the same questions
+/// this table already asked while building it: what kind it is, whether a lid
+/// covers it, whether it is drawn folded. Asking the block again per slot per
+/// frame is four virtual calls and several string comparisons each — 1488 times
+/// a frame — and on this session that was most of the 21ms `compose` cost at
+/// the top of the scroll (measured, debug, 2026-09-15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlotRows {
+    /// Rows this slot draws. Zero means it is not a row of the transcript at
+    /// all — hidden, or empty — and it is not a neighbour of anything either.
+    rows: usize,
+    /// The block's kind, kept so the walk does not call `kind()` again.
+    kind: &'static str,
+    /// The run this slot draws a lid for — its member count — or `None`.
+    lid: Option<usize>,
+    /// Whether it is drawn as a one-row summary.
+    folded: bool,
+}
+
+impl RowIndex {
+    /// Where a newest-first walk may start, and the state it should start in.
+    ///
+    /// Returns `(start, skipped, below)`: the index to begin at, the rows a walk
+    /// would have skipped by the time it got there, and the kind of the block
+    /// below the window it would be carrying.
+    ///
+    /// **The arithmetic.** `total - before[i]` is the rows at or after slot `i`,
+    /// which falls as `i` rises — so it is sorted, and the boundary between
+    /// "wholly below the window" and "at least partly in it" is a partition
+    /// point. A slot `i` with `total - before[i] <= scroll` is *certainly*
+    /// skipped by the walk: its own rows plus everything newer already fits in
+    /// the scrolled-past region. That makes `m`, the first such index, a safe
+    /// place to stop skipping — so the walk can begin one slot earlier and let
+    /// the ordinary loop decide the boundary exactly.
+    ///
+    /// What this buys: the walk used to reach the viewport one slot at a time
+    /// from the newest block. On a 1570-slot session that was 5.25 of the 5.37ms
+    /// a frame cost at the top of the scroll (release; 20 of 20.4ms in debug),
+    /// for a window 24 rows tall.
+    fn jump_to(&self, scroll: usize) -> (usize, usize, Option<&'static str>) {
+        let n = self.rows.len();
+        if n == 0 {
+            return (0, 0, None);
+        }
+        // `skip_from` falls as the index rises, so "what a walk has passed by the
+        // time it reaches here" is sorted and the boundary is a partition point:
+        // the first slot a walk has already covered `scroll` rows before.
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.skip_from[mid] <= scroll {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        // One slot earlier than the first certainly-covered one, so the ordinary
+        // loop decides the boundary exactly rather than this function guessing it.
+        let start = lo.saturating_sub(1);
+        let skipped = self.skip_from.get(start + 1).copied().unwrap_or(0);
+        // What the walk would carry in `below`: the nearest slot above the
+        // starting one that drew rows. A slot that draws nothing is not a
+        // neighbour, so it is not an answer.
+        let below = (start + 1..n).find_map(|i| {
+            self.rows
+                .get(i)
+                .copied()
+                .flatten()
+                .filter(|e| e.rows > 0)
+                .map(|e| e.kind)
+        });
+        (start, skipped, below)
+    }
 }
 
 impl Host {
@@ -733,6 +958,14 @@ impl Host {
             hits: Mutex::new(Hits::default()),
             last_room: Mutex::new(Rect::default()),
             pin_gate: Mutex::new(()),
+            row_index: Mutex::new(RowIndex {
+                width: 0,
+                presentation: 0,
+                measured: Vec::new(),
+                rows: Vec::new(),
+                skip_from: Vec::new(),
+                total: 0,
+            }),
         }
     }
 
@@ -1279,37 +1512,57 @@ impl Host {
                 }
             }
         }
-        let mut skipped = 0usize;
-        let _ = &skipped;
+        // The same table `stream_height` summed, so the two cannot disagree
+        // about how tall anything is. It carries the run table too, so the walk
+        // below never builds `lids` of its own — that fold is O(slots) and the
+        // index already paid for it.
+        let index = self.row_index(rect.w, stream.slots(), &pres);
 
-        // The kind of the block whose rows went in last, which — iterating
-        // newest-first — is the one *below* the block being rendered now. Only
-        // blocks that drew something count: a block that renders no rows is not
-        // a neighbour, whatever its kind says.
-        let mut below: Option<&'static str> = None;
+        // **Start where the window starts.** Everything newer than this is
+        // wholly inside the rows the reader has scrolled past, so stepping
+        // through it one slot at a time only buys iterations: on a 1570-slot
+        // session that was 5.25 of a 5.37ms frame at the top of the scroll
+        // (release, 2026-09-15) for a window 24 rows tall. `jump_to` is a
+        // partition point over the prefix sum the index already keeps.
+        #[cfg(test)]
+        let no_jump = crate::host::NO_JUMP.load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let no_jump = false;
+        let (start, mut skipped, mut below) = if no_jump {
+            (
+                stream.slots().len().saturating_sub(1),
+                0usize,
+                None::<&'static str>,
+            )
+        } else {
+            index.jump_to(scroll)
+        };
+        // Skipped only in the sense of "not walked": `start` is the slot the
+        // window begins in, and the loop below decides the exact boundary from
+        // here the same way it always did.
+        let walked = stream.slots().len().saturating_sub(start + 1);
 
-        let lids = lids(stream.slots(), &pres);
-
-        for (i, slot) in stream.slots().iter().enumerate().rev() {
-            // The earlier calls of a merged run were drawn by the lid at the end
-            // of it, which this backwards walk reached first.
-            if lids.covers(i) {
+        for (i, slot) in stream.slots().iter().enumerate().rev().skip(walked) {
+            // Everything this walk needs to decide *whether* to draw came out of
+            // the index while it was built: a `None` is a slot the frame draws
+            // nothing for — off-screen by kind, empty, or an earlier member of a
+            // merged run whose lid the walk below reached first. Asking the
+            // block again here was four virtual calls and several string
+            // comparisons per slot per frame.
+            let Some(entry) = index.rows.get(i).copied().flatten() else {
                 continue;
-            }
+            };
             let block = slot.block();
-            let kind = block.kind();
-            // A kind the reader has taken off the screen draws nothing at all —
-            // not even the blank row, because it is not a neighbour of anything
-            // either. Asked before the `below` bookkeeping, so a hidden block
-            // leaves the seam between its visible neighbours the way it was.
-            if pres.is_hidden(kind) {
-                continue;
-            }
-            let lid = lids.at(i);
+            let kind = entry.kind;
+            let lid = entry.lid;
             // Two different questions. Reasoning and tool calls both fold — that
             // is what ctrl-r and ctrl-t are — but what a click may fold is
             // narrower than what folds: prose is out, because it is what the
             // transcript is for and most of the screen is things the model said.
+            // Whether it *can* fold — a property of the content, not of whether
+            // it happens to be folded right now. Conflating the two made an
+            // already-folded block refuse a click that had just folded it: the
+            // click worked once and then the row stopped answering.
             let foldable = !block.content.always_open();
             let mut own = (foldable && CLICKABLE.contains(&kind)).then_some((block.id, kind));
             // The column this block leaves on the left, and the width that is
@@ -1319,22 +1572,27 @@ impl Host {
             // cells.
             let pad = inset(kind);
             let room = rect.w.saturating_sub(pad);
-            let lines: Arc<Vec<Line>> = if let Some(run) = lid {
+            let lines: Arc<Vec<Line>> = if let Some(count) = lid {
                 // A run of folded calls behind one lid. Its rows are owned by
                 // the last call, so a click anywhere on the lid folds the run
                 // that drew it — which is the only thing that click could mean.
                 own = Some((block.id, kind));
-                Arc::new(lid_lines(stream.slots(), i, run.count, room))
-            } else if foldable && pres.is_block_folded(block.id, kind) {
+                Arc::new(lid_lines(stream.slots(), i, count, room))
+            } else if entry.folded {
                 Arc::new(vec![block.content.summary(room)])
             } else {
-                // The one place a block is rendered for the screen. Its row count
-                // comes first, because a settled block already knows it: a block
-                // that lies entirely above the reader is then skipped in
-                // arithmetic instead of being rendered and thrown away, which is
-                // what makes scrolling back through a long conversation cost the
-                // screen rather than the session.
-                let (n, rendered) = slot.rows_at(room);
+                // The count comes from the index — the same number
+                // `stream_height` summed — rather than from a second measurement
+                // behind the block's own write lock. That second measurement was
+                // one lock acquisition per slot per frame, and on a 1458-slot
+                // session it was most of the 13.7ms this path cost per wheel
+                // notch (measured, debug, 2026-09-15).
+                //
+                // With the count in hand, a block entirely above the reader is
+                // skipped in arithmetic instead of being rendered and thrown
+                // away, which is what makes scrolling back through a long
+                // conversation cost the screen rather than the session.
+                let n = entry.rows;
                 // Not a neighbour if it draws nothing — same as the draw path
                 // below, which leaves `below` alone for an empty block.
                 if n == 0 {
@@ -1356,11 +1614,11 @@ impl Host {
                     below = Some(kind);
                     continue;
                 }
-                // A hit hands back the rows it measured with — the block's own,
-                // shared rather than copied, since a frame wants a screenful of
-                // them at most. A miss is rendered now, for the same reason the
-                // count came first: this is a block the reader can see.
-                match rendered {
+                // Rendered only now, because the count above proved the reader
+                // can see this block — and rendering is the one part of this walk
+                // that cannot come from a table. Still through `rows_at`, so a
+                // growing answer extends its live cache in place.
+                match slot.rows_at(room).1 {
                     Some(lines) => lines,
                     None => Arc::new(block.content.lines(room)),
                 }
@@ -1683,6 +1941,135 @@ impl Host {
             .0
     }
 
+    /// Throw the index away, so the next ask rebuilds it from the stream.
+    ///
+    /// Test-only, and the whole point of the ratchet beside it: the property
+    /// that needs proving is that the incrementally-kept index says exactly what
+    /// a from-scratch one would. Without a way to force the rebuild there is
+    /// nothing to compare the reuse against.
+    #[cfg(test)]
+    fn forget_row_index(&self) {
+        self.row_index.lock().expect("row index poisoned").width = 0;
+    }
+
+    /// The direct walk, kept as the ratchet's reference.
+    ///
+    /// This is what the frame used to do per call: for every slot, ask the
+    /// presentation whether it is hidden, ask the run table whether a lid covers
+    /// it, and measure the block. It is correct and it is O(slots) of locks and
+    /// folds — which is why it cost 17.7ms a wheel notch on a 1330-slot session.
+    ///
+    /// Test-only rather than deleted, because "the index agrees with the walk"
+    /// is the only statement that makes the index safe to trust, and a copy of
+    /// the walk kept anywhere else would be a second answer rather than a
+    /// yardstick.
+    #[cfg(test)]
+    fn rows_by_walk(
+        &self,
+        width: u16,
+        slots: &[crate::block::Slot],
+        pres: &Presentation,
+    ) -> Vec<Option<SlotRows>> {
+        let lids = lids(slots, pres);
+        (0..slots.len())
+            .map(|i| {
+                let b = slots[i].block();
+                let room = width.saturating_sub(inset(b.kind()));
+                lid_row(&lids, slots, i, room, b, pres)
+            })
+            .collect()
+    }
+
+    /// Build or extend the row index, and hand it back.
+    ///
+    /// **One row sum for the whole host.** `stream_height_in` bounds the scroll
+    /// with it and `stream_lines` fills the viewport from it, so the two cannot
+    /// disagree about how tall anything is — the failure the old duplicate walks
+    /// could only avoid by being kept identical by hand.
+    ///
+    /// Incremental in the two directions that matter, which are different
+    /// cadences:
+    ///
+    /// * **A scroll** changes neither revision, so this returns what it built
+    ///   last frame and the walks below cost an array read per slot instead of a
+    ///   lock, a hashmap and a fold lookup.
+    /// * **A streamed chunk** amends the trailing live block without touching the
+    ///   stream revision (`amend` is deliberately not a bump — see `Stream`), so
+    ///   only that one slot is re-measured. Everything settled keeps the count it
+    ///   settled with, which is the promise settling makes.
+    ///
+    /// A different width or a different idea of what is folded changes the
+    /// answer for every slot, so those start over. Both are revisions rather
+    /// than arguments somebody passes correctly: see `Presentation::revision`.
+    fn row_index<'a>(
+        &'a self,
+        width: u16,
+        slots: &[crate::block::Slot],
+        pres: &Presentation,
+    ) -> std::sync::MutexGuard<'a, RowIndex> {
+        let mut idx = self.row_index.lock().expect("row index poisoned");
+        if idx.width != width || idx.presentation != pres.revision() {
+            idx.measured.clear();
+            idx.rows.clear();
+            idx.width = width;
+            idx.presentation = pres.revision();
+        }
+        let lids = lids(slots, pres);
+        for i in 0..slots.len() {
+            let slot = &slots[i];
+            let b = slot.block();
+            let settled = slot.is_settled();
+            // Reuse only what settling froze at this exact width. A live block
+            // can have grown since, and that is the whole reason it is not
+            // cached.
+            let reusable = settled
+                && idx
+                    .measured
+                    .get(i)
+                    .is_some_and(|m| m.settled && m.id == b.id);
+            if reusable {
+                continue;
+            }
+            // The same width the painter will use: a row count is only the
+            // painter's if it was measured at the width the painter draws at,
+            // and a block that is set in draws two cells narrower.
+            let room = width.saturating_sub(inset(b.kind()));
+            // Kept as `Option`, not folded to zero. A slot that draws nothing is
+            // not a row AND not a neighbour — the seams around it stay where
+            // they were — and collapsing the two made a hidden block add itself
+            // to the running kind, which moved every blank below it. The ratchet
+            // beside this caught exactly that on its first run.
+            let entry = lid_row(&lids, slots, i, room, b, pres);
+            let m = Measured { id: b.id, settled };
+            if idx.measured.len() <= i {
+                idx.measured.push(m);
+                idx.rows.push(entry);
+            } else {
+                idx.measured[i] = m;
+                idx.rows[i] = entry;
+            }
+        }
+        // The suffix sum, in the walk's terms — see `skip_from`. Backwards, so
+        // the slot seen last is the one *below* the current one, which is the
+        // seam the newest-first walk charges to this slot.
+        let mut below: Option<&'static str> = None;
+        let mut acc = 0usize;
+        idx.skip_from.clear();
+        idx.skip_from.resize(slots.len() + 1, 0);
+        for i in (0..slots.len()).rev() {
+            if let Some(entry) = idx.rows.get(i).copied().flatten() {
+                if entry.rows > 0 {
+                    let seam = below.is_some_and(|b| blank_between(entry.kind, b));
+                    acc += entry.rows + usize::from(seam);
+                    below = Some(entry.kind);
+                }
+            }
+            idx.skip_from[i] = acc;
+        }
+        idx.total = acc;
+        idx
+    }
+
     /// [`Host::stream_height`] for a caller that already knows the box.
     ///
     /// The frame worked it out to lay the regions out, and the pin is holding
@@ -1698,50 +2085,17 @@ impl Host {
         let width = room.w;
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
-        let mut total = 0usize;
-        // Walking forwards, so the block seen last is the one *above* the
-        // current one — `blank_between` takes (upper, lower).
-        let mut above: Option<&'static str> = None;
-        let lids = lids(stream.slots(), &pres);
-        for (i, slot) in stream.slots().iter().enumerate() {
-            // A merged run is one row-block: its earlier members were drawn by
-            // the lid at the end of it, so they are not rows and not neighbours.
-            if lids.covers(i) {
-                continue;
-            }
-            let b = slot.block();
-            // What is not drawn is not a row of the transcript — and by the same
-            // token it is not a neighbour, so the blanks around it stay put.
-            if pres.is_hidden(b.kind()) {
-                continue;
-            }
-            // The same width the painter will use, and for the same reason it
-            // exists: a row count is only the painter's if it was measured at
-            // the width the painter draws at, and a block that is set in draws
-            // two cells narrower. Measuring here at the full width would count
-            // the wraps of a *wider* column than the one on screen, so a long
-            // reply would come out shorter in the sum than it is in the frame —
-            // and the last rows of it would be exactly that many rows out of
-            // reach at the bottom of the scroll.
-            let room = width.saturating_sub(inset(b.kind()));
-            let n = match lids.at(i) {
-                Some(run) => lid_lines(stream.slots(), i, run.count, room).len(),
-                None if !b.content.always_open() && pres.is_block_folded(b.id, b.kind()) => 1,
-                None => slot.rows_at(room).0,
-            };
-            if n == 0 {
-                continue;
-            }
-            if above.is_some_and(|k| blank_between(k, b.kind())) {
-                total += 1;
-            }
-            above = Some(b.kind());
-            total += n;
-        }
+        // The sum, from the one place both this and the painter read it — see
+        // [`Host::row_index`]. This used to walk every slot itself: a second
+        // answer to a question the frame had already asked. On a 1458-slot
+        // session the two walks cost 4.1ms here and 13.7ms in `stream_lines`,
+        // per wheel notch (measured, debug, 2026-09-15).
+        let total = self.row_index(width, stream.slots(), &pres).total;
         // The tail is content too, so it counts towards what there is to read:
         // leaving it out would put its own rows out of reach at the bottom of
         // the scroll, which is exactly the failure the block walk goes to such
         // lengths to avoid one paragraph up.
+        //
         // The same cap the geometry uses, and the same height it uses it at.
         // This is the one place that would otherwise count rows the frame
         // declined to draw, putting them out of reach at the bottom of the
@@ -1955,6 +2309,7 @@ pub fn default_layout() -> Region {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::conformance;
     use crate::module::Mounted;
     use crate::modules::{input, status, transcript};
@@ -2686,6 +3041,276 @@ mod tests {
         );
     }
 
+    /// 计时/等价性用的块，kind 可控。
+    #[derive(Debug)]
+    struct Kinded {
+        kind: &'static str,
+        lines: Vec<String>,
+    }
+
+    impl crate::block::Content for Kinded {
+        fn kind(&self) -> &'static str {
+            self.kind
+        }
+        fn content_hash(&self) -> crate::block::ContentHash {
+            crate::block::hash_of(&self.lines.iter().map(|l| l.as_str()).collect::<Vec<_>>())
+        }
+        fn lines(&self, _w: u16) -> Vec<crate::frame::Line> {
+            self.lines
+                .iter()
+                .map(|l| crate::frame::Line::raw(l.as_str()))
+                .collect()
+        }
+    }
+
+    /// **索引必须说出走动说出的话。**
+    ///
+    /// The row index is only safe to trust because of this test. It replaces a
+    /// direct walk that computed, per slot, three things — is it hidden, does a
+    /// lid cover it, how many rows does it measure — with a table kept across
+    /// frames and re-used whenever it *looks* like nothing changed. "Looks like"
+    /// is where a cache earns its reputation: the failure mode is not a wrong
+    /// answer for the slot that changed, it is a stale answer for the slots
+    /// around it, and it shows up as a scroll that cannot reach the bottom or a
+    /// row that stopped being drawn.
+    ///
+    /// Two comparisons, because they fail differently:
+    ///
+    /// * **against the walk** — the arithmetic, which catches a `lid_row` that
+    ///   drifted from the loop it replaced.
+    /// * **against a forced rebuild** — the reuse, which catches an index that
+    ///   kept a measurement the stream had since invalidated. This is the one a
+    ///   walk comparison alone cannot see, because both sides would be the same
+    ///   stale table.
+    ///
+    /// Driven through every change that can move a row count, because the
+    /// revisions are only worth having if the mutations actually reach them:
+    /// a streamed chunk, a settle, a kind folded, a kind hidden, one block
+    /// folded by hand, and a resize.
+    #[test]
+    fn the_row_index_says_what_the_walk_says() {
+        let h = host();
+        let width = 80u16;
+        let check = |label: &str| {
+            let stream = h.stream.read().unwrap();
+            let pres = h.presentation.read().unwrap();
+            let slots = stream.slots();
+            let walk = h.rows_by_walk(width, slots, &pres);
+            let kept = h.row_index(width, slots, &pres).rows.clone();
+            h.forget_row_index();
+            let fresh = h.row_index(width, slots, &pres).rows.clone();
+            assert_eq!(
+                kept, walk,
+                "{label}: the kept index disagrees with a fresh walk — a reuse \
+                 survived something that changed it"
+            );
+            assert_eq!(
+                fresh, walk,
+                "{label}: a from-scratch index disagrees with the walk — the \
+                 arithmetic drifted from the loop it replaced"
+            );
+        };
+
+        // A block of each kind the fold table has an opinion about, plus two
+        // prose blocks so there is a seam to keep.
+        {
+            let mut s = h.stream.write().unwrap();
+            let mut w = s.writer("bench");
+            for (i, kind) in ["assistant", "reasoning", "tool_call", "assistant"]
+                .into_iter()
+                .enumerate()
+            {
+                w.emit(
+                    crate::block::Coord::default(),
+                    Arc::new(Kinded {
+                        kind,
+                        lines: vec![format!("{kind} {i}"), "second row".into()],
+                    }),
+                );
+            }
+        }
+        check("initial");
+
+        // A block still arriving: the count for this slot is not cacheable.
+        let live = {
+            let mut s = h.stream.write().unwrap();
+            let mut w = s.writer("bench");
+            w.open(
+                crate::block::Coord::default(),
+                Arc::new(Kinded {
+                    kind: "assistant",
+                    lines: vec!["growing".into()],
+                }),
+            )
+        };
+        check("open");
+
+        // …amended, which is what a streamed chunk does — and which must NOT
+        // invalidate the whole table, since it happens per token.
+        {
+            let mut s = h.stream.write().unwrap();
+            let mut w = s.writer("bench");
+            let widened: Vec<String> = (0..5).map(|i| format!("grown row {i}")).collect();
+            assert!(w.amend(
+                live,
+                Arc::new(Kinded {
+                    kind: "assistant",
+                    lines: widened,
+                })
+            ));
+        }
+        check("amended");
+
+        {
+            let mut s = h.stream.write().unwrap();
+            let mut w = s.writer("bench");
+            assert!(w.settle(live));
+        }
+        check("settled");
+
+        // The three presentation routes, each its own revision.
+        h.presentation.write().unwrap().toggle("assistant");
+        check("kind folded");
+        h.presentation.write().unwrap().toggle("reasoning");
+        check("kind unfolded");
+        h.presentation.write().unwrap().set_block(live, true);
+        check("block folded");
+
+        // A different width answers a different question for every slot.
+        let stream = h.stream.read().unwrap();
+        let pres = h.presentation.read().unwrap();
+        let narrow = 40u16;
+        let walk = h.rows_by_walk(narrow, stream.slots(), &pres);
+        let kept = h.row_index(narrow, stream.slots(), &pres).rows.clone();
+        assert_eq!(kept, walk, "resize: the index was not re-measured");
+    }
+
+    #[test]
+    fn zz_measure_after_index() {
+        use std::time::Instant;
+        let Ok(path) = std::env::var("ATOMCODE_PERF_LOG") else {
+            return;
+        };
+        let h = host();
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(std::fs::File::open(&path).unwrap()).lines() {
+            let Ok(line) = line else { continue };
+            if line.trim().is_empty() || line.contains("\"header\"") {
+                continue;
+            }
+            let Ok(rec) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let Some(ev) = rec.get("event") else { continue };
+            let Ok(fact) = serde_json::from_value::<SessionEvent>(ev.clone()) else {
+                continue;
+            };
+            h.absorb(&fact);
+        }
+        let size = (80u16, 24u16);
+        let m = h.moment.read().unwrap().clone();
+        let t = Instant::now();
+        let limit = h.scroll_limit(size, &m);
+        let cold = t.elapsed().as_secs_f64() * 1000.0;
+        let t = Instant::now();
+        for _ in 0..10 {
+            h.scroll_limit(size, &m);
+        }
+        let warm = t.elapsed().as_secs_f64() * 1000.0 / 10.0;
+        println!(
+            "\n槽位 {} / scroll_limit 冷 {cold:.3}ms 热 {warm:.3}ms",
+            h.stream.read().unwrap().slots().len()
+        );
+        for (label, scroll) in [("底部", 0usize), ("中部", limit / 2), ("顶部", limit)] {
+            h.moment.write().unwrap().scroll = crate::moment::ScrollPos(scroll);
+            let _ = h.compose(size);
+            let t = Instant::now();
+            for _ in 0..10 {
+                let _ = h.compose(size);
+            }
+            println!(
+                "  compose @{label:<4} {:.3}ms/帧",
+                t.elapsed().as_secs_f64() * 1000.0 / 10.0
+            );
+        }
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(limit);
+        let t = Instant::now();
+        for i in 0..10 {
+            let mm = h.moment.read().unwrap().clone();
+            let max = h.scroll_limit(size, &mm);
+            h.moment.write().unwrap().scroll = crate::moment::ScrollPos(max.saturating_sub(i));
+            let _ = h.compose(size);
+        }
+        println!(
+            "  一格滚轮 {:.3}ms",
+            t.elapsed().as_secs_f64() * 1000.0 / 10.0
+        );
+    }
+
+    /// 真实日志下的帧成本。`ATOMCODE_PERF_LOG` 不给就跳过，所以它不是门，
+    /// 是一把尺子 —— 只在有人要量的时候量。
+    #[test]
+    fn zz_measure_real_session() {
+        use std::time::Instant;
+        let Ok(path) = std::env::var("ATOMCODE_PERF_LOG") else {
+            return;
+        };
+        let h = host();
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(std::fs::File::open(&path).unwrap()).lines() {
+            let Ok(line) = line else { continue };
+            if line.trim().is_empty() || line.contains("\"header\"") {
+                continue;
+            }
+            let Ok(rec) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let Some(ev) = rec.get("event") else { continue };
+            let Ok(fact) = serde_json::from_value::<SessionEvent>(ev.clone()) else {
+                continue;
+            };
+            h.absorb(&fact);
+        }
+        let size = (80u16, 24u16);
+        let m = h.moment.read().unwrap().clone();
+        let t = Instant::now();
+        let limit = h.scroll_limit(size, &m);
+        let cold = t.elapsed().as_secs_f64() * 1000.0;
+        let t = Instant::now();
+        for _ in 0..20 {
+            h.scroll_limit(size, &m);
+        }
+        let warm = t.elapsed().as_secs_f64() * 1000.0 / 20.0;
+        println!(
+            "\n槽位 {} / scroll_limit: 冷 {cold:.3}ms, 热 {warm:.3}ms",
+            h.stream.read().unwrap().slots().len()
+        );
+        for (label, scroll) in [("底部", 0usize), ("中部", limit / 2), ("顶部", limit)] {
+            h.moment.write().unwrap().scroll = crate::moment::ScrollPos(scroll);
+            let _ = h.compose(size);
+            let t = Instant::now();
+            for _ in 0..20 {
+                let _ = h.compose(size);
+            }
+            println!(
+                "  compose @{label:<4} {:.3}ms/帧",
+                t.elapsed().as_secs_f64() * 1000.0 / 20.0
+            );
+        }
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(limit);
+        let t = Instant::now();
+        for i in 0..20 {
+            let mm = h.moment.read().unwrap().clone();
+            let max = h.scroll_limit(size, &mm);
+            h.moment.write().unwrap().scroll = crate::moment::ScrollPos(max.saturating_sub(i));
+            let _ = h.compose(size);
+        }
+        println!(
+            "  一格滚轮 {:.3}ms",
+            t.elapsed().as_secs_f64() * 1000.0 / 20.0
+        );
+    }
+
     /// **一把尺子，不是一道闸门。** 给它 `ATOMCODE_PERF_LOG=<真实会话的 jsonl>`
     /// 就把那份会话折进一个 host，量一格滚轮的真实成本；不给就立刻返回。
     ///
@@ -2714,19 +3339,51 @@ mod tests {
     /// （`assistant_chunk` 累积成一块），所以 427MB 的会话和 30MB 的会话在帧
     /// 成本上几乎一样。看日志大小估帧成本会估错一个数量级。
     ///
-    /// ## 还没做的：让一帧不必走完整个会话
+    /// ## 两处优化，都在树里
     ///
-    /// 这两条路都是 O(槽位)，而窗口只有 24 行：
+    /// **一、行数索引。** 「两条走动各自把整段会话的每块行数重算一遍」是对的猜
+    /// 想。按 `(stream 版本, 呈现版本, 宽度)` 键控的前缀/后缀和，两条走动共读：
     ///
-    /// * `stream_height_in` 每次调用都把整段会话的每块行数重算一遍。实测
-    ///   `scroll_limit` 一次 **2.04ms**（release）—— 而 `pinned` 在读者往回滚
-    ///   着看历史时**每个 chunk 调它两次**。
-    /// * `stream_lines` 从最新一块**倒着走到视口**：1570 个槽位时为了一屏 24 行
-    ///   要迭代 1546 次，占掉 `compose` 5.37ms 里的 5.25ms（release）。
+    /// ```text
+    ///                接线前     接线后
+    /// scroll_limit    2.04ms →  0.12ms    ← 17 倍
+    /// compose@顶部     5.33ms →  5.37ms    ← 无差异，它慢在别处
+    /// ```
     ///
-    /// 两条都有现成的把手：每块的行数是可缓存的（settling 就是「内容不再变」的
-    /// 承诺），而倒着走的那条有前缀和就能二分跳到视口所在块。
+    /// 收益最大的一处不在滚轮上：`pinned` 在读者往回滚着看历史时**每个 chunk 调
+    /// 两次** `stream_height_in`，所以「边跑边回看大段历史」是 4.1ms → 0.24ms
+    /// 每 chunk。
     ///
+    /// 换来 2 处真回归（隐藏槽位被压成 0、已折叠块拒绝响应点击），都被既有测试
+    /// 与棘轮 `the_row_index_says_what_the_walk_says` 抓到并修好。
+    ///
+    /// **二、`stream_lines` 的二分跳转。** 真正的成本在这里：它从最新一块**倒着
+    /// 走到视口**，是 O(槽位)，1570 个槽位时为了一屏 24 行要迭代 1546 次。索引
+    /// 里的后缀和（`RowIndex::skip_from`）让边界成了一个 partition point。
+    ///
+    /// ```text
+    ///             索引后    跳转后     降幅
+    /// 一格滚轮     5.54ms →  0.273ms   20×   （release）
+    /// 一格滚轮    20.7ms  →  0.720ms   29×   （debug）
+    /// compose@顶部 5.37ms →  0.144ms   37×
+    /// ```
+    ///
+    /// 跳转必须自己算对两样东西：走动能累积多少（`skipped`）和它手里握着哪一块
+    /// 的 kind（`below`）。**第一版在第二样上错了** —— 用前缀和反推，差一个空
+    /// 行，视口低一行、最开始那句话被顶出屏幕。所以索引存的是**走动自己的那个
+    /// 数**（后缀和），而不是让人再换算一次。棘轮
+    /// `the_jump_draws_what_the_walk_draws` 把每个滚动位置都比一遍。
+    ///
+    /// ## 量这个必须核对对照物本身
+    ///
+    /// 第一次量「索引有没有用」时，我把「接线前」的备份和「接线后」相比，得出
+    /// 「release 下收益为零」并据此撤掉了这份改动 —— 而**那个备份里已经带着接
+    /// 线**，等于同一版本跟自己比。教训：性能对照要么干净重建，要么先确认两份
+    /// 代码真的不同。
+    ///
+    /// 另外，**构建必须说清**：同一条路径 debug 比 release 慢约 4 倍，所以
+    /// 「20ms 卡顿」在 release 下可能只是 5ms。用户报 CPU 99% 时跑的是
+    /// `./target/debug/atui`。
     #[test]
     fn measure_the_frame_cost_of_a_real_session() {
         use std::time::Instant;
@@ -2800,6 +3457,92 @@ mod tests {
             "  一格滚轮 {:.3}ms",
             t.elapsed().as_secs_f64() * 1000.0 / 20.0
         );
+    }
+
+    /// **跳转画出来的，必须和逐格走动画出来的一模一样。**
+    ///
+    /// `stream_lines` 从最新一块倒着走到视口。二分跳转让它直接落到视口所在
+    /// 槽位 —— release 下把一帧从 5.37ms 压到 0.145ms，debug 下从 20.4ms 压到
+    /// 0.39ms，1570 个槽位。省掉的正是那 1546 次「确定要跳过的槽位」的迭代。
+    ///
+    /// 代价是跳转必须自己算对两样东西：走动能累积多少（`skipped`），以及它手
+    /// 里握着的是哪一块的 kind（`below`，块与块之间的空行归谁看它）。**第一版
+    /// 就在第二样上错了** —— 用前缀和反推，差了一个空行，视口低一行、最开始那
+    /// 句话被顶出屏幕。既有测试抓到了，但只有一条，覆盖的是一个位置。
+    ///
+    /// 所以这条棘轮把**每一个滚动位置**都比一遍：两个腿跑同一个 host，逐行比
+    /// 对，连归属（`owner`，决定点击折叠哪一块）一起比。跳转只在某些位置生效
+    /// 正是危险所在 —— 差异会藏在「恰好没被覆盖的那几个 scroll 值」上。
+    #[test]
+    fn the_jump_draws_what_the_walk_draws() {
+        use std::sync::atomic::Ordering as O;
+        // A stream with everything the jump has to reason about: prose (seams
+        // between blocks), reasoning (hidden by default → draws nothing and is
+        // not a neighbour), tool calls (merged behind lids), and a kind folded to
+        // one row.
+        let h = host();
+        {
+            let mut s = h.stream.write().unwrap();
+            let mut w = s.writer("bench");
+            // Long enough to scroll well past a screenful, and mixed enough that
+            // the jump has to reason about all three of its cases: prose (seams),
+            // a kind that draws nothing, and tool calls merged behind lids.
+            for i in 0..60usize {
+                let kind = ["assistant", "reasoning", "tool_call", "assistant"][i % 4];
+                let title = if kind == "tool_call" {
+                    "read_file"
+                } else {
+                    "note"
+                };
+                w.emit(
+                    crate::block::Coord::default(),
+                    Arc::new(Kinded {
+                        kind,
+                        lines: (0..(2 + i % 4))
+                            .map(|r| format!("{title} {i} row {r} 内容"))
+                            .collect(),
+                    }),
+                );
+            }
+        }
+        let size = (80u16, 24u16);
+        let limit = h.scroll_limit(size, &h.moment.read().unwrap().clone());
+        assert!(
+            limit > 4,
+            "the fixture must be scrollable, got limit {limit}"
+        );
+
+        // The whole frame, and the per-row attribution a click reads. The second
+        // is not redundant: `below` is what the jump has to reconstruct, and it
+        // decides both the seams on screen and which block a click on a row
+        // folds — a jump that got the rows right and the neighbours wrong would
+        // pass on the first and fail on the second.
+        let snapshot = |scroll: usize| {
+            h.moment.write().unwrap().scroll = crate::moment::ScrollPos(scroll);
+            let frame = h.compose(size);
+            let rows = h.hits.lock().unwrap().rows.clone();
+            (frame, rows)
+        };
+
+        // Both legs, every position — and a few past the limit, because the front
+        // end clamps but the walk should not care either way.
+        for scroll in 0..=limit + 3 {
+            crate::host::NO_JUMP.store(true, O::SeqCst);
+            let walked = snapshot(scroll);
+            crate::host::NO_JUMP.store(false, O::SeqCst);
+            let jumped = snapshot(scroll);
+            assert_eq!(
+                walked.0, jumped.0,
+                "at scroll {scroll} the jump drew a different screen than the \
+                 walk — same host, so this is the jump's arithmetic and not the \
+                 content's"
+            );
+            assert_eq!(
+                walked.1, jumped.1,
+                "at scroll {scroll} the jump attributed the rows differently, so \
+                 a click would fold a different block"
+            );
+        }
     }
 
     #[test]
