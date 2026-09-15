@@ -93,6 +93,165 @@ fn every_row_coding_names_is_addressable_in_this_product() {
          stacks it gets every row or the alignment is a story.",
         missing.len()
     );
+
+    // **Being addressable is not the same as being mounted.**
+    //
+    // Every id above can be present in the tree and the row still switched off
+    // (`disabled = true`) or handed a different configuration by a layer that
+    // runs later — which is exactly how this product silently acquired a
+    // 24-round cap: `infra` ships `round-cap` at 24, coding never mentions it,
+    // and "the id is in the tree" said nothing.
+    //
+    // So each row coding configures is checked against what coding asked for.
+    // Names coding only *names* (a `[[remove]]`, say) have nothing to compare
+    // and are skipped.
+    let mut wrong: Vec<String> = Vec::new();
+    // **The comparison is against the tree, and the tree includes this
+    // product's own layers.** `CODING_ROWS` is the first word on a row, not the
+    // last: `tui-app`/`repl-app` patch `approval-interactive` on afterwards
+    // (`bundle.rs`), so reading only coding's string answers with a value the
+    // product has already overruled — which is how this check first reported a
+    // row `--dump-config` calls `Active`. What is compared, then, is what
+    // coding asked for against what the tree ended up with, and the product's
+    // own edits are edits like any other: declared, or a failure.
+    for (id, want_disabled, want_config) in ids_and_config(&coding) {
+        let Some(mine) = tree.entries.iter().find(|e| e.id == id) else {
+            continue; // already reported above
+        };
+        // Declared in [`DELIBERATE_DIVERGENCES`] and must stay listed there.
+        if deliberate(&id, &want_config, mine) {
+            continue;
+        }
+        // `disabled` first: a row the product switched off is a different agent
+        // no matter what config it carries.
+        if let Some(want) = want_disabled {
+            if mine.disabled != want {
+                wrong.push(format!(
+                    "`{id}` — coding sets disabled = {want}, this product has {}",
+                    mine.disabled
+                ));
+            }
+        }
+        // Then only the keys coding actually set, so a row with extra options
+        // the product adds on purpose is not called a mismatch.
+        if let Some(want) = want_config.as_object() {
+            for (k, v) in want {
+                let got = mine.config.get(k);
+                if got != Some(v) {
+                    wrong.push(format!(
+                        "`{id}` — coding sets {k} = {v}, this product has {got:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "coding's rows are in the tree but not as coding asked for them:\n  {}\n\
+         A row that is present, off, or reconfigured is a different agent, and \
+         no id-level check can see it. If the change is deliberate, add it to \
+         DELIBERATE_DIVERGENCES with its reason.",
+        wrong.join("\n  ")
+    );
+}
+
+/// Divergences from coding's own list that this product makes **on purpose**.
+///
+/// The list is the point, in both directions. Without it, every deliberate
+/// difference reads as a regression and the check gets switched off the first
+/// time it is inconvenient — which is how the id-level version of this test
+/// came to exist. With it, an *undeclared* difference is the only thing that
+/// fails, and a declared one that stops being true is caught by the negative
+/// check below.
+///
+/// Each entry: the row, what this product does to it, and why.
+const DELIBERATE_DIVERGENCES: &[(&str, &str)] = &[
+    (
+        "approval-interactive",
+        "on: this product stacks `tui-app`/`repl-app`, which patch it on, and \
+         `Presence::Attended` is precisely the mode whose out-of-workspace calls \
+         are meant to arrive as questions rather than refusals (product.rs docs)",
+    ),
+    ("persona-atomcode", "model stays empty"),
+    (
+        "ui",
+        "the row is filled by `ui-tui2` instead of the line-based REPL",
+    ),
+    (
+        "ui-handle",
+        "off: this product's agent is driven by the pump inside `ui-tui2`, and \\
+         both rows fill `ui`",
+    ),
+    (
+        "user-questions-unattended",
+        "off: `ui-tui2` fills `user-questions`, and two rows in one slot is an error",
+    ),
+    (
+        "trace",
+        "silenced: the screen is the output, so nothing else may write to it",
+    ),
+];
+
+/// Whether this row's difference is one the product declares.
+///
+/// Deliberately coarse — it matches on the row id alone. A finer check ("is it
+/// still the *same* divergence") would have to restate each reason in code, and
+/// the reasons are prose. What it does buy is that a divergence must be written
+/// down before it can pass, which is the whole of the property worth having.
+fn deliberate(id: &str, _want: &serde_json::Value, _mine: &atomcode_plexus::Entry) -> bool {
+    DELIBERATE_DIVERGENCES.iter().any(|(row, _)| *row == id)
+}
+
+/// Every `(id, disabled, config)` the layer ends up asking for.
+///
+/// `ids_named_by` above answers "is it addressed at all"; this answers "with
+/// what **in the end**". The distinction is not pedantry: a layer may name the
+/// same id twice — `CODING_ROWS` inserts `approval-interactive` disabled and a
+/// later patch turns it on — and the loader's rule is that the later one wins.
+/// A reader that collects every mention answers with the *first*, which is how
+/// this check first reported a row that `--dump-config` calls `Active`.
+///
+/// `disabled` accumulates the way the loader resolves it: an explicit `Some`
+/// sets it, a patch that says nothing about `disabled` leaves the earlier
+/// answer standing.
+fn ids_and_config(src: &str) -> Vec<(String, Option<bool>, serde_json::Value)> {
+    let layer = Layer::from_toml(src).expect("layer parses");
+    let mut out: Vec<(String, Option<bool>, serde_json::Value)> = Vec::new();
+    let mut put = |id: &str, disabled: Option<bool>, config: Option<&serde_json::Value>| match out
+        .iter_mut()
+        .find(|(seen, _, _)| seen == id)
+    {
+        Some(slot) => {
+            if disabled.is_some() {
+                slot.1 = disabled;
+            }
+            if let Some(c) = config {
+                slot.2 = c.clone();
+            }
+        }
+        None => out.push((
+            id.to_string(),
+            disabled,
+            config.cloned().unwrap_or(serde_json::Value::Null),
+        )),
+    };
+    for op in &layer.ops {
+        match op {
+            Op::Insert(entries) => {
+                for e in entries {
+                    put(&e.id.clone(), e.disabled.then_some(true), Some(&e.config));
+                }
+            }
+            Op::Patch {
+                id,
+                config,
+                disabled,
+                ..
+            } => put(id, *disabled, config.as_ref()),
+            Op::Remove { .. } => {}
+        }
+    }
+    out
 }
 
 #[test]
@@ -244,5 +403,65 @@ async fn the_product_mounts_and_audits_clean() {
             .service::<atomcode_tui::plugin::AgentClientSvc>()
             .is_some(),
         "`ui-tui2` provides the command channel to its agent"
+    );
+}
+
+/// The round budget is the engine's, not `infra`'s.
+///
+/// `infra` ships `round-cap` at `max_rounds = 24`, and this product inherited
+/// that by saying nothing — so a session the coding engine would have run
+/// unbounded was cut off after 24 rounds. The engine's own default for the
+/// equivalent knob is `0` meaning *unbounded*
+/// (`atomcode-coding/src/config.rs`: `default_turn_max_rounds` → `0`, honored by
+/// `if cfg.max_rounds != 0 { builder.max_rounds(…) }`).
+///
+/// **Why this needs its own test.** The id-level check above cannot see it and
+/// neither can the config-level version: `round-cap` comes from `infra` and
+/// coding never names it, so "coding's rows, as coding asked" has nothing to
+/// say about a row coding does not know exists. A row can be silently
+/// reconfigured by the *absence* of a patch, and only a test that names the row
+/// catches that.
+#[test]
+fn the_round_budget_is_the_engines_default_not_the_infras() {
+    let tree = assembled(&scratch("rounds"), &[]);
+    let row = tree
+        .entries
+        .iter()
+        .find(|e| e.id == "round-cap")
+        .expect("`infra` ships `round-cap`, so it is in this tree");
+    assert!(
+        !row.disabled,
+        "`round-cap` must be mounted — an unmounted row is not a budget, it is \
+         a missing fuse that looks like an unlimited one"
+    );
+    assert_eq!(
+        row.config.get("max_rounds"),
+        Some(&serde_json::json!(0)),
+        "this product must not cap rounds where the engine does not: `0` is the \
+         engine's own default and it means unbounded. Got {:?}",
+        row.config.get("max_rounds")
+    );
+}
+
+/// And a deployment that wants a fuse can still set one.
+///
+/// The mapping above is a *default*, not a policy: `--patch` and
+/// `harness.patch.toml` both land after the product's layer, so the escape
+/// hatch has to keep working or the fix trades one wrong answer for another.
+#[test]
+fn a_deployment_can_still_cap_rounds() {
+    let tree = assembled(
+        &scratch("rounds-patch"),
+        &["[[patch]]\nid = \"round-cap\"\nconfig = { max_rounds = 12 }\n"],
+    );
+    let row = tree
+        .entries
+        .iter()
+        .find(|e| e.id == "round-cap")
+        .expect("the row is there");
+    assert_eq!(
+        row.config.get("max_rounds"),
+        Some(&serde_json::json!(12)),
+        "a later layer must still win over this product's default"
     );
 }

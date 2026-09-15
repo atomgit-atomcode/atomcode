@@ -183,10 +183,34 @@ fn app_bundle(working_dir: &Path, artifacts: &Path) -> String {
     format!(
         "{CODING_DEFAULTS}\n\
          [[patch]]\nid = \"agent-loop\"\nconfig = {{ working_dir = {wd:?} }}\n\n\
+         [[patch]]\nid = \"round-cap\"\nconfig = {{ max_rounds = {ROUNDS} }}\n\n\
          {rows}\n",
         rows = coding_overlay(working_dir, artifacts, Presence::Attended, ""),
     )
 }
+
+/// The turn's round budget, in the unit `round-cap` counts.
+///
+/// **Zero, and that is a translation rather than a whim.** `infra` ships
+/// `round-cap` with `max_rounds = 24`, which this product inherited by simply
+/// not saying anything — so a session that the coding engine would have run
+/// unbounded was cut off after 24 rounds. The engine's own default for the
+/// equivalent knob is `0` with the meaning *unbounded*
+/// (`atomcode-coding/src/config.rs`: `default_turn_max_rounds` → `0`,
+/// documented on `CodingAgentConfig::max_rounds` as "`0` = unbounded", and
+/// honored by `if cfg.max_rounds != 0 { builder.max_rounds(…) }` in both
+/// `parts.rs` and `assemble.rs`).
+///
+/// The two sides agree that `0` means unlimited — `RoundCap::call` guards with
+/// `max_rounds > 0` for exactly this reason — so passing it through is the
+/// honest mapping. The alternative, leaving the row alone and documenting
+/// "24", would make this product a different agent from the one the same
+/// codebase runs everywhere else.
+///
+/// A deployment that WANTS a fuse still has one: `[[patch]] id = "round-cap"`
+/// in a `--patch` file or in `harness.patch.toml`, which both land after this
+/// layer.
+const ROUNDS: u32 = 0;
 
 /// The surface, and one row per panel.
 ///
