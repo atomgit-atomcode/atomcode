@@ -474,6 +474,22 @@ pub fn web_search_provider() -> Option<String> {
     env("ATOMCODE_WEB_SEARCH_PROVIDER")
 }
 
+/// Where to append a diagnostic line per assembled request, when someone asked
+/// for one. `None` — the normal case — means no instrumentation at all.
+///
+/// Here for the reason [`web_search_provider`] gives, one step further out: this
+/// variable names a *file*, and the loop that would otherwise read it is the
+/// turn driver. A driver reaching into the environment to decide where to write
+/// is the same shape as a row resolving its own gateway, so the name and the
+/// resolution live here and the driver only consumes.
+///
+/// Deliberately not configuration anybody sets in a config file: it is a
+/// debugging aid, it must not be discoverable as a product knob, and the code
+/// that writes the dump says what it is for.
+pub fn request_dump_path() -> Option<PathBuf> {
+    env("ATOMCODE_DUMP_REQUEST").map(PathBuf::from)
+}
+
 /// One key variable, for a caller that states its own endpoint and only needs
 /// the credential.
 fn api_key_from_env(key_env: &str) -> Result<String, String> {

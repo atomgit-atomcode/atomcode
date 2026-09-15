@@ -113,6 +113,7 @@ impl PluginAgentLoop {
             .service::<ToolsSvc>()
             .map(|t| t.defs())
             .unwrap_or_default();
+        dump_request(session, &messages, &tools);
         (messages, tools)
     }
 
@@ -660,6 +661,75 @@ fn failed(message: &str) -> TurnOutcome {
         stop: StopReason::ProviderError,
         error: Some(message.to_string()),
         ..Default::default()
+    }
+}
+
+/// Append this request's shape to `$ATOMCODE_DUMP_REQUEST`, one JSON line per
+/// call. Off unless that variable is set, so nothing changes for anyone else.
+///
+/// It exists to answer one question the log cannot: **what did the resumed
+/// process actually send?** The request is `system prompt + derive_messages`,
+/// and both halves are visible here — the second is a pure function of the log,
+/// so a resumed request that differs from the live one can only differ because
+/// the *log the process holds* differs. The `events`/`max_seq` fields say which
+/// log that was; the per-message hashes say what came out of it. Comparing two
+/// dumps finds the first message that changed.
+///
+/// Deliberately a side channel rather than a log fact: it is a debugging
+/// instrument, it must not enter the session, and a `build_request_body` that
+/// grew a diagnostic would be a wire change.
+fn dump_request(session: &SessionLog, messages: &[Message], tools: &[ToolDef]) {
+    // The name and the resolution live in `model_source`; this only consumes.
+    let Some(path) = crate::model_source::request_dump_path() else {
+        return;
+    };
+    use std::hash::{Hash, Hasher};
+    let digest = |s: &str| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        s.hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    let events = session.events();
+    let max_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    let mut out = format!(
+        "{{\"ts\":{ms},\"session\":{:?},\"events\":{},\"max_seq\":{},\"n_msgs\":{},\"total_chars\":{},\
+         \"tool_defs\":{},\"msgs\":[",
+        session.id(),
+        events.len(),
+        max_seq,
+        messages.len(),
+        messages.iter().map(|m| m.text.len()).sum::<usize>(),
+        tools.len(),
+    );
+    for (i, m) in messages.iter().enumerate() {
+        let r = m.reasoning.as_deref().unwrap_or("");
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"i\":{i},\"role\":{:?},\"len\":{},\"h\":\"{}\",\"rlen\":{},\"rh\":\"{}\",\"calls\":{}}}",
+            format!("{:?}", m.role),
+            m.text.len(),
+            digest(&m.text),
+            r.len(),
+            digest(r),
+            m.tool_calls.len(),
+        ));
+    }
+    out.push_str("]}\n");
+
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let _ = f.write_all(out.as_bytes());
     }
 }
 
