@@ -1177,7 +1177,7 @@ impl Host {
                 continue;
             }
             match region {
-                Region::Stream => {
+                Region::Stream { .. } => {
                     let (lines, owners) = self.stream_lines(rect);
                     *self.hits.lock().expect("hits poisoned") = Hits {
                         rect,
@@ -1320,7 +1320,7 @@ impl Host {
         pruned
             .layout_with(Rect::sized(w, h), &asked)
             .into_iter()
-            .find_map(|(region, rect)| matches!(region, Region::Stream).then_some(rect.h))
+            .find_map(|(region, rect)| matches!(region, Region::Stream { .. }).then_some(rect.h))
             .unwrap_or(h)
     }
 
@@ -1519,7 +1519,7 @@ pub fn default_layout() -> Region {
     Region::split(
         Dir::Vertical,
         Constraint::Fill,
-        Region::Stream,
+        Region::stream(),
         Region::split(
             Dir::Vertical,
             Constraint::Fill,
@@ -1552,6 +1552,29 @@ mod tests {
             h.absorb(&f);
         }
         h
+    }
+
+    #[test]
+    fn the_layout_this_build_ships_names_no_module_twice() {
+        // `default_layout()` and every preset are trees that never pass through
+        // `Layout::apply`, which is where a tail id that is also a leaf gets
+        // refused. A shipped tree that named one twice would draw it twice on
+        // every frame, and nothing else in the suite would notice — `compose`
+        // would simply place it in both regions.
+        let mut trees = vec![("default".to_string(), default_layout())];
+        for (name, _) in crate::layout::presets() {
+            trees.push((
+                name.to_string(),
+                crate::layout::preset_for_test(name).expect("every listed preset resolves"),
+            ));
+        }
+        for (name, tree) in trees {
+            assert_eq!(
+                tree.named_twice(),
+                None,
+                "the {name} layout names one twice"
+            );
+        }
     }
 
     /// Content that counts how many times it was asked to render.

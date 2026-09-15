@@ -123,8 +123,22 @@ pub enum El {
     /// mounted rows *for a realm*, so the tree says where and the realm says
     /// which.
     Module(String),
-    /// 块级：the irreversible stream.
-    Stream,
+    /// 块级：the irreversible stream, and the view modules whose rows ride at
+    /// its tail.
+    ///
+    /// Still a **leaf**: [`El::place_into`] hands it one rect and stops. The
+    /// `tail` is a list of ids rather than child nodes on purpose — a child
+    /// would get a rect of its own from the flex above, which means *all of it
+    /// is always visible*, and the one thing a tail must do is scroll partly
+    /// out of view. Keeping the engine ignorant of scrolling is what makes the
+    /// tail an id list: the host, which owns `moment.scroll`, is what splits
+    /// the pane. See `docs/adr/0020`.
+    ///
+    /// The ids must not also appear as [`El::Module`] leaves in the same tree,
+    /// or the module is drawn twice — the host would place it from the flex
+    /// *and* lay its rows into the stream. [`El::prune`] filters the list, and
+    /// `Layout::apply` refuses a tree that names one both ways.
+    Stream { tail: Vec<String> },
     /// 块级：any number of children dividing an area — flexbox.
     ///
     /// The web's model, minus the parts a terminal should not have. `basis`
@@ -191,6 +205,33 @@ impl El {
     /// 块级：name a module. The registry resolves it at compose time.
     pub fn view(id: impl Into<String>) -> El {
         El::Module(id.into())
+    }
+
+    /// 块级：the conversation, with no view modules riding at its tail.
+    ///
+    /// The common case in tests and in every layout that has no tail. The tail
+    /// is set through [`El::with_tail`], because a bare `Stream` that happens
+    /// to carry a tail would be a second way to write the same tree.
+    pub fn stream() -> El {
+        El::Stream { tail: Vec::new() }
+    }
+
+    /// Ride these view modules' rows at the tail of the stream.
+    ///
+    /// Order is top-to-bottom inside the tail — the last id is the one against
+    /// the bottom edge of the pane, which is where the newest thing belongs.
+    /// A no-op on anything but a stream: a layout is data a user can write, and
+    /// wrapping the wrong node must not take the screen down.
+    pub fn with_tail(self, tail: impl IntoIterator<Item = impl Into<String>>) -> El {
+        match self {
+            El::Stream { tail: existing } => El::Stream {
+                tail: existing
+                    .into_iter()
+                    .chain(tail.into_iter().map(Into::into))
+                    .collect(),
+            },
+            other => other,
+        }
     }
 
     /// 块级：divide an area between two children — the two-child special case
@@ -291,17 +332,21 @@ impl El {
     pub fn stream_over(below: El, rows: u16) -> El {
         El::flex(
             Dir::Vertical,
-            vec![Item::grow(El::Stream), Item::fixed(rows, below)],
+            vec![Item::grow(El::stream()), Item::fixed(rows, below)],
         )
     }
 
     /// Every module id this tree names, in tree order.
+    ///
+    /// The tail counts: a module riding the stream is on screen, so `/hide` it
+    /// must be accepted and `/show` it must be refused as already there. Both
+    /// questions are asked of this list (`Layout::apply`).
     pub fn modules(&self) -> Vec<String> {
         let mut out = Vec::new();
-        self.walk(&mut |r| {
-            if let El::Module(id) = r {
-                out.push(id.clone());
-            }
+        self.walk(&mut |r| match r {
+            El::Module(id) => out.push(id.clone()),
+            El::Stream { tail } => out.extend(tail.iter().cloned()),
+            _ => {}
         });
         out
     }
@@ -309,11 +354,58 @@ impl El {
     pub fn has_stream(&self) -> bool {
         let mut found = false;
         self.walk(&mut |r| {
-            if matches!(r, El::Stream) {
+            if matches!(r, El::Stream { .. }) {
                 found = true;
             }
         });
         found
+    }
+
+    /// A module named **both** as a tail id and as a leaf of its own, if any.
+    ///
+    /// Such a tree draws the module twice: the flex above places it, and the
+    /// host lays its rows into the stream as well. Nothing about that is a
+    /// judgement call, so it is refused rather than resolved — silently
+    /// dropping one of the two would pick for the person who wrote the layout.
+    ///
+    /// `None` for the ordinary case, which is every tree that has no tail.
+    pub fn named_twice(&self) -> Option<String> {
+        let tail = self.tail();
+        if tail.is_empty() {
+            return None;
+        }
+        let mut twice = None;
+        self.walk(&mut |r| {
+            if let El::Module(id) = r {
+                if twice.is_none() && tail.iter().any(|t| t == id) {
+                    twice = Some(id.clone());
+                }
+            }
+        });
+        twice
+    }
+
+    /// The modules the stream's tail names, in order, if there is a stream.
+    ///
+    /// Asked by the host when it splits the pane, and by the check that refuses
+    /// a module named both as a tail id and as a leaf of its own. Written as a
+    /// match rather than through [`El::walk`] so the borrow of `self` survives
+    /// — a closure handed to `walk` is higher-ranked and cannot hand one back.
+    pub fn tail(&self) -> &[String] {
+        match self {
+            El::Stream { tail } => tail,
+            El::Flex { items, .. } => items
+                .iter()
+                .map(|it| it.el.tail())
+                .find(|t| !t.is_empty())
+                .unwrap_or(&[]),
+            El::Stack(children) => children
+                .iter()
+                .map(|c| c.tail())
+                .find(|t| !t.is_empty())
+                .unwrap_or(&[]),
+            _ => &[],
+        }
     }
 
     fn walk(&self, f: &mut impl FnMut(&El)) {
@@ -334,6 +426,12 @@ impl El {
     pub fn prune(&self, mounted: &dyn Fn(&str) -> bool) -> El {
         match self {
             El::Module(id) if !mounted(id) => El::Empty,
+            // The tail is filtered rather than collapsed: an unmounted module
+            // riding the stream takes its rows away and leaves the stream, the
+            // way `[[remove]] id = "tui-panel-todo"` is supposed to read.
+            El::Stream { tail } => El::Stream {
+                tail: tail.iter().filter(|id| mounted(id)).cloned().collect(),
+            },
             El::Flex { dir, items, gap } => {
                 let kept: Vec<Item> = items
                     .iter()
@@ -398,7 +496,7 @@ impl El {
             // Leaves of the block pass. An inline subtree sitting directly in
             // a split is a leaf too: it gets an area, and the host lays it at
             // that area's width.
-            El::Stream
+            El::Stream { .. }
             | El::Module(_)
             | El::Text(_)
             | El::Row(_)
@@ -502,7 +600,7 @@ impl El {
     fn wanted(&self, dir: Dir, wants: &dyn Fn(&str) -> u16) -> u16 {
         match self {
             El::Empty => 0,
-            El::Stream => 1,
+            El::Stream { .. } => 1,
             // No `.max(1)`: `Height::Hug(0)` is a module saying it has nothing
             // to say, and `Hug` is documented as "at most this many, fewer if
             // it has less". Forcing a row would leave a blank line of chrome
@@ -560,7 +658,7 @@ impl El {
             // use — `place` takes them and hands their leaves to the host —
             // and empty rather than a panic, because a layout is data a user
             // can write and bad data must not take the screen down.
-            El::Module(_) | El::Stream | El::Flex { .. } | El::Stack(_) => Vec::new(),
+            El::Module(_) | El::Stream { .. } | El::Flex { .. } | El::Stack(_) => Vec::new(),
             El::Text(line) => vec![line.truncate(w as usize)],
             El::Col(children) => children.iter().flat_map(|c| c.lay(w)).collect(),
             El::Row(children) => lay_row(children, w),
@@ -893,7 +991,7 @@ mod tests {
     fn ids(v: &[(El, Rect)]) -> Vec<String> {
         v.iter()
             .map(|(r, _)| match r {
-                El::Stream => "stream".to_string(),
+                El::Stream { .. } => "stream".to_string(),
                 El::Module(id) => id.clone(),
                 _ => "?".into(),
             })
@@ -920,7 +1018,7 @@ mod tests {
         let tree = El::split(
             Dir::Vertical,
             Constraint::Fill,
-            El::Stream,
+            El::stream(),
             El::split(
                 Dir::Vertical,
                 Constraint::Cells(1),
@@ -939,11 +1037,11 @@ mod tests {
         let tree = El::split(
             Dir::Horizontal,
             Constraint::Percent(70),
-            El::Stream,
+            El::stream(),
             El::view("findings"),
         );
         let pruned = tree.prune(&|id| id != "findings");
-        assert_eq!(pruned, El::Stream, "the split collapses to what is left");
+        assert_eq!(pruned, El::stream(), "the split collapses to what is left");
         let out = pruned.layout(Rect::sized(30, 5));
         assert_eq!(out[0].1, Rect::sized(30, 5), "the survivor takes the space");
     }
@@ -953,7 +1051,7 @@ mod tests {
         let tree = El::split(
             Dir::Vertical,
             Constraint::Fill,
-            El::Stream,
+            El::stream(),
             El::split(
                 Dir::Horizontal,
                 Constraint::Percent(30),
@@ -969,6 +1067,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- the stream's tail ----------------------------------------------
+
+    #[test]
+    fn a_tail_id_is_a_module_the_tree_names() {
+        // What `/hide todo` and `/show todo` are decided against. A module
+        // riding the stream is on screen, so leaving it out of this list would
+        // make `/hide` refuse a panel the person can see.
+        let tree = El::split(
+            Dir::Vertical,
+            Constraint::Fill,
+            El::stream().with_tail(["todo"]),
+            El::view("status"),
+        );
+        assert_eq!(tree.modules(), vec!["todo", "status"]);
+        assert_eq!(tree.tail(), ["todo"]);
+        assert!(tree.has_stream());
+    }
+
+    #[test]
+    fn the_tail_of_a_tree_without_one_is_empty() {
+        assert_eq!(El::view("status").tail(), [] as [String; 0]);
+        assert_eq!(El::stream().tail(), [] as [String; 0]);
+        assert_eq!(El::stream().named_twice(), None);
+    }
+
+    #[test]
+    fn a_module_mounted_nowhere_rides_nowhere() {
+        // `[[remove]] id = "tui-panel-todo"`: the tail loses the id and the
+        // stream stays, rather than the whole region collapsing.
+        let tree = El::stream().with_tail(["todo", "live"]);
+        let pruned = tree.prune(&|id| id != "todo");
+        assert_eq!(pruned, El::stream().with_tail(["live"]));
+        assert!(pruned.has_stream(), "the conversation did not go with it");
+    }
+
+    #[test]
+    fn a_module_named_twice_is_reported_rather_than_picked_between() {
+        // Both halves draw it: the flex places the leaf, and the host lays the
+        // tail's rows into the stream. Resolving it quietly would pick for
+        // whoever wrote the layout.
+        let tree = El::split(
+            Dir::Vertical,
+            Constraint::Fill,
+            El::stream().with_tail(["todo"]),
+            El::view("todo"),
+        );
+        assert_eq!(tree.named_twice().as_deref(), Some("todo"));
+
+        // The same module mounted as a plain leaf is fine — the fault is only
+        // being named twice, not being mounted.
+        let ok = El::split(
+            Dir::Vertical,
+            Constraint::Fill,
+            El::stream().with_tail(["todo"]),
+            El::view("status"),
+        );
+        assert_eq!(ok.named_twice(), None);
+    }
+
+    #[test]
+    fn a_tail_survives_pruning_a_neighbour() {
+        // The flex collapses to one child when its neighbour is unmounted —
+        // and a stream carrying a tail is that child, with the tail intact.
+        let tree = El::split(
+            Dir::Horizontal,
+            Constraint::Percent(70),
+            El::stream().with_tail(["todo"]),
+            El::view("findings"),
+        );
+        let pruned = tree.prune(&|id| id != "findings");
+        assert_eq!(pruned, El::stream().with_tail(["todo"]));
     }
 
     #[test]
@@ -991,7 +1162,7 @@ mod tests {
         let el = El::split(
             Dir::Vertical,
             Constraint::Fill,
-            El::Stream,
+            El::stream(),
             El::view("empty"),
         );
         let drawn = |id: &str| id != "empty";
@@ -1011,7 +1182,7 @@ mod tests {
         // than being left blank.
         let stream = out
             .iter()
-            .find_map(|(e, r)| matches!(e, El::Stream).then_some(r.h))
+            .find_map(|(e, r)| matches!(e, El::Stream { .. }).then_some(r.h))
             .expect("the stream is placed");
         assert_eq!(stream, 10, "the whole area, since nothing else wants it");
     }
@@ -1021,7 +1192,7 @@ mod tests {
             .into_iter()
             .filter_map(|(e, r)| match e {
                 El::Module(id) => Some((id, r)),
-                El::Stream => Some(("stream".to_string(), r)),
+                El::Stream { .. } => Some(("stream".to_string(), r)),
                 _ => None,
             })
             .collect()
@@ -1070,7 +1241,7 @@ mod tests {
             Dir::Vertical,
             vec![
                 Item::fixed(1, El::view("status")),
-                Item::grow(El::Stream),
+                Item::grow(El::stream()),
                 Item::fixed(3, El::view("input")),
             ],
         );
@@ -1130,7 +1301,7 @@ mod tests {
             Dir::Horizontal,
             vec![
                 Item::fixed(3, El::view("a")),
-                Item::grow(El::Stream),
+                Item::grow(El::stream()),
                 Item {
                     basis: Constraint::Percent(30),
                     grow: 0,

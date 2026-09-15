@@ -85,6 +85,9 @@ pub enum LayoutError {
         name: String,
         available: Vec<String>,
     },
+    /// One module named both as a tail id and as a leaf of its own, which would
+    /// draw it twice. See [`El::named_twice`](crate::el::El::named_twice).
+    NamedTwice(String),
     NothingToUndo,
 }
 
@@ -98,6 +101,9 @@ impl std::fmt::Display for LayoutError {
             LayoutError::AlreadyOnScreen(m) => write!(f, "`{m}` 已经在屏幕上了"),
             LayoutError::NoSuchPreset { name, available } => {
                 write!(f, "没有叫 `{name}` 的布局;有的是:{}", available.join(" "))
+            }
+            LayoutError::NamedTwice(m) => {
+                write!(f, "`{m}` 被写了两遍:既在流尾部、又是独立面板,会被画两次")
             }
             LayoutError::NothingToUndo => write!(f, "没有可撤销的布局改动"),
         }
@@ -113,6 +119,16 @@ pub fn presets() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// The tree a named preset resolves to, for tests that need to inspect one.
+///
+/// The op path reaches `preset` through `Layout::apply`; this exists so a test
+/// can hold the tree itself — a shipped arrangement is a tree that never passes
+/// that check, and what it names is worth asserting directly.
+#[cfg(test)]
+pub(crate) fn preset_for_test(name: &str) -> Option<Region> {
+    preset(name)
+}
+
 fn preset(name: &str) -> Option<Region> {
     let base = crate::host::default_layout();
     // Whatever arrangement is chosen, the input box keeps the live line above
@@ -125,7 +141,7 @@ fn preset(name: &str) -> Option<Region> {
         "focus" => Some(Region::split(
             Dir::Vertical,
             Constraint::Fill,
-            Region::Stream,
+            Region::stream(),
             composer,
         )),
         "wide" => Some(Region::split(
@@ -138,7 +154,7 @@ fn preset(name: &str) -> Option<Region> {
                 Region::split(
                     Dir::Horizontal,
                     Constraint::Percent(65),
-                    Region::Stream,
+                    Region::stream(),
                     Region::view("findings"),
                 ),
                 composer,
@@ -235,6 +251,13 @@ impl Layout {
             })?,
         };
 
+        // Checked on the tree that would be installed, not on the op: the op is
+        // only one of the ways a tree arrives (a preset is another, and the
+        // default layout is a third), and the fault is a property of the tree.
+        if let Some(id) = next.named_twice() {
+            return Err(LayoutError::NamedTwice(id));
+        }
+
         self.history.write().expect("layout poisoned").push(current);
         *self.tree.write().expect("layout poisoned") = next;
         Ok(describe(op))
@@ -285,7 +308,7 @@ fn describe(op: &LayoutOp) -> String {
 
 fn matches(region: &Region, target: &Target) -> bool {
     match (region, target) {
-        (Region::Stream, Target::Stream) => true,
+        (Region::Stream { .. }, Target::Stream) => true,
         (Region::Module(id), Target::Module(m)) => id == m,
         _ => false,
     }
@@ -294,11 +317,11 @@ fn matches(region: &Region, target: &Target) -> bool {
 fn swap(region: &Region, a: &Target, b: &Target) -> Region {
     match region {
         r if matches(r, a) => match b {
-            Target::Stream => Region::Stream,
+            Target::Stream => Region::stream(),
             Target::Module(m) => Region::view(m.clone()),
         },
         r if matches(r, b) => match a {
-            Target::Stream => Region::Stream,
+            Target::Stream => Region::stream(),
             Target::Module(m) => Region::view(m.clone()),
         },
         Region::Flex { dir, items, gap } => Region::Flex {
