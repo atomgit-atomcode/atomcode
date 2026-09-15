@@ -743,11 +743,13 @@ impl CCExternalHooks {
     async fn resolve_ask(&self, call: &ToolCall, rt: &RequestCtx) -> BeforeOutcome {
         match request_approval_decision(rt, APPROVAL_KIND, call, &call.name).await {
             Err(degraded) => degraded, // Null → fail closed (shared channel-failure deny).
-            Ok(PermissionDecision::AllowOnce | PermissionDecision::AllowAlways) => {
-                BeforeOutcome::Allow {
-                    reason: Some("approved (hook ask)".into()),
-                }
-            }
+            Ok(
+                PermissionDecision::AllowOnce
+                | PermissionDecision::AllowAlways
+                | PermissionDecision::AllowAlwaysAll,
+            ) => BeforeOutcome::Allow {
+                reason: Some("approved (hook ask)".into()),
+            },
             Ok(PermissionDecision::Deny) => BeforeOutcome::deny(format!(
                 "denied by approval prompt (hook ask): {}",
                 call.name

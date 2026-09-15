@@ -246,6 +246,7 @@ impl WriteApprovalGate {
             call_id: call.id.clone(),
             tool: tool.name().to_string(),
             args: call.arguments.clone(),
+            reason: None,
         })
         .unwrap_or(serde_json::Value::Null);
         PermissionDecision::from_value(&rt.request(&self.kind, payload).await)

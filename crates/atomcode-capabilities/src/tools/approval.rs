@@ -39,6 +39,11 @@ pub struct ApprovalRequest {
     pub tool: String,
     /// The EXACT argument bytes that will execute (approve-what-runs contract).
     pub args: String,
+    /// Human-readable "why is this being asked" line shown above the options.
+    /// `None` for a plain approval; set by gates that re-confirm despite a session
+    /// grant (destructive / out-of-workspace / sensitive path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// The driver's answer. `decision` is `"allow"` / `"allow_always"` / `"deny"`
@@ -236,6 +241,7 @@ pub async fn request_approval_decision(
         call_id: call.id.clone(),
         tool: tool_name.to_string(),
         args: call.arguments.clone(),
+        reason: None,
     })
     .unwrap_or(serde_json::Value::Null);
     let response = rt.request(kind, payload).await;
@@ -461,6 +467,16 @@ mod tests {
     }
 
     #[test]
+    fn approval_request_serializes_reason_only_when_present() {
+        let mut req = ApprovalRequest { call_id: "c".into(), tool: "bash".into(), args: "{}".into(), reason: None };
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(v.get("reason").is_none(), "reason omitted when None: {v}");
+        req.reason = Some("此命令写到工作区外".into());
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v.get("reason").and_then(|r| r.as_str()), Some("此命令写到工作区外"));
+    }
+
+    #[test]
     fn from_value_maps_grant_scope_all_to_allow_always_all() {
         use serde_json::json;
         // New: allow + remember + grant_scope:"all" → AllowAlwaysAll.
@@ -494,6 +510,7 @@ mod tests {
             call_id: "call_1".into(),
             tool: "bash".into(),
             args: "{\"cmd\":\"ls\"}".into(),
+            reason: None,
         })
         .unwrap();
         assert_eq!(

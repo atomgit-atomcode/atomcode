@@ -499,6 +499,7 @@ impl CredentialBashGate {
             call_id: call.id.clone(),
             tool: tool.name().to_string(),
             args: call.arguments.clone(),
+            reason: None,
         })
         .unwrap_or(serde_json::Value::Null);
         match PermissionDecision::from_value(&rt.request(APPROVAL_KIND, payload).await) {
