@@ -542,7 +542,10 @@ const KEYWORDS: &[&str] = &[
 fn highlight(line: &str, _lang: &str) -> Vec<Span> {
     let kw = Style::new().fg(Color::role(Role::Brand));
     let string = Style::new().fg(Color::role(Role::Success));
-    let comment = Style::new().fg(Color::role(Role::Border)).italic();
+    // Comments are prose someone will read, not chrome: `Border` was the
+    // dimmest role at the time, and that is the trouble — dimness was never
+    // the job here. `Muted` keeps the recede but holds its own floor.
+    let comment = Style::new().fg(Color::role(Role::Muted)).italic();
     let number = Style::new().fg(Color::role(Role::Warning));
     let plain = code();
 
