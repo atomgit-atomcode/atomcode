@@ -19407,18 +19407,35 @@ fn pause_active_goal(ctx: &LoopCtx) -> bool {
 enum ApprovalChoice {
     Allow,
     AllowAlways,
+    /// Session-wide "allow ALL Bash" — produces
+    /// `{"decision":"allow","remember":true,"grant_scope":"all"}`.
+    AllowAlwaysAll,
     Deny,
 }
 
 fn deliver_approval(ctx: &mut LoopCtx, choice: ApprovalChoice) {
     if let Some(id) = ctx.pending_runtime_request_id.take() {
         use atomcode_capabilities::tools::ApprovalResponse;
-        let response = match choice {
-            ApprovalChoice::Allow => ApprovalResponse::allow(),
-            ApprovalChoice::AllowAlways => ApprovalResponse::allow_always(),
-            ApprovalChoice::Deny => ApprovalResponse::deny(),
+        let value = match choice {
+            ApprovalChoice::AllowAlwaysAll => {
+                // `PermissionDecision::from_value` requires
+                // `{"decision":"allow","remember":true,"grant_scope":"all"}`.
+                serde_json::json!({
+                    "decision": "allow",
+                    "remember": true,
+                    "grant_scope": "all"
+                })
+            }
+            other => {
+                let response = match other {
+                    ApprovalChoice::Allow => ApprovalResponse::allow(),
+                    ApprovalChoice::AllowAlways => ApprovalResponse::allow_always(),
+                    ApprovalChoice::Deny => ApprovalResponse::deny(),
+                    ApprovalChoice::AllowAlwaysAll => unreachable!(),
+                };
+                serde_json::to_value(response).unwrap_or(serde_json::Value::Null)
+            }
         };
-        let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
         if ctx.live_binding.is_some() {
             if let Err(error) = atomcode_daemon::native_live::respond(id, value) {
                 crate::tuix_trace!("LIVE", "approval response failed: {error:?}");
@@ -19551,6 +19568,7 @@ fn approval_choice_to_decision(
     match choice {
         ApprovalChoice::Allow => PermissionDecision::AllowOnce,
         ApprovalChoice::AllowAlways => PermissionDecision::AllowAlways,
+        ApprovalChoice::AllowAlwaysAll => PermissionDecision::AllowAlwaysAll,
         ApprovalChoice::Deny => PermissionDecision::Deny,
     }
 }
@@ -19600,7 +19618,12 @@ pub(crate) fn build_approval_options(tool: &str, args: &str) -> Vec<crate::state
     } else {
         crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool }).into_owned()
     };
-    vec![
+    // Determine whether this is a Bash call (either wire name or display name).
+    let is_bash = matches!(
+        tool.to_ascii_lowercase().replace('_', "").as_str(),
+        "bash" | "bashstart"
+    );
+    let mut opts = vec![
         ApprovalOption {
             label: crate::i18n::t(crate::i18n::Msg::ApprovalAllowOnce).into_owned(),
             kind: ApprovalKind::AllowOnce,
@@ -19611,12 +19634,21 @@ pub(crate) fn build_approval_options(tool: &str, args: &str) -> Vec<crate::state
             kind: ApprovalKind::AlwaysAllow,
             accel: 'a',
         },
-        ApprovalOption {
-            label: crate::i18n::t(crate::i18n::Msg::ApprovalDeny).into_owned(),
-            kind: ApprovalKind::Deny,
-            accel: 'n',
-        },
-    ]
+    ];
+    // For Bash only: add a danger "allow ALL Bash" option between AlwaysAllow and Deny.
+    if is_bash {
+        opts.push(ApprovalOption {
+            label: crate::i18n::t(crate::i18n::Msg::ApprovalAllowAllBash).into_owned(),
+            kind: ApprovalKind::AllowAlwaysAll,
+            accel: '!',
+        });
+    }
+    opts.push(ApprovalOption {
+        label: crate::i18n::t(crate::i18n::Msg::ApprovalDeny).into_owned(),
+        kind: ApprovalKind::Deny,
+        accel: 'n',
+    });
+    opts
 }
 
 /// The `AgentCommand` for a chosen approval option kind. Pure seam so the
@@ -19626,6 +19658,7 @@ fn approval_kind_to_choice(kind: crate::state::ApprovalKind) -> ApprovalChoice {
     match kind {
         ApprovalKind::AllowOnce => ApprovalChoice::Allow,
         ApprovalKind::AlwaysAllow => ApprovalChoice::AllowAlways,
+        ApprovalKind::AllowAlwaysAll => ApprovalChoice::AllowAlwaysAll,
         ApprovalKind::Deny => ApprovalChoice::Deny,
     }
 }
@@ -19691,6 +19724,10 @@ mod bypass_approval_tests {
             PermissionDecision::AllowAlways
         ));
         assert!(matches!(
+            approval_choice_to_decision(ApprovalChoice::AllowAlwaysAll),
+            PermissionDecision::AllowAlwaysAll
+        ));
+        assert!(matches!(
             approval_choice_to_decision(ApprovalChoice::Deny),
             PermissionDecision::Deny
         ));
@@ -19707,7 +19744,8 @@ mod bypass_approval_tests {
         // never the wire name — assert on both so the label can't silently regress again.
         for name in ["Bash", "bash"] {
             let opts = super::build_approval_options(name, &bash_args("rm -rf victim"));
-            assert_eq!(opts.len(), 3);
+            // Bash gets 4 options: AllowOnce / AlwaysAllow / AllowAlwaysAll (danger) / Deny.
+            assert_eq!(opts.len(), 4, "bash must have 4 options ({name})");
             assert_eq!(
                 (opts[0].kind, opts[0].accel),
                 (ApprovalKind::AllowOnce, 'y')
@@ -19721,7 +19759,16 @@ mod bypass_approval_tests {
                 crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool: name }).into_owned(),
                 "an ordinary bash grant is session-wide, so the label names the tool ({name})"
             );
-            assert_eq!((opts[2].kind, opts[2].accel), (ApprovalKind::Deny, 'n'));
+            assert_eq!(
+                (opts[2].kind, opts[2].accel),
+                (ApprovalKind::AllowAlwaysAll, '!')
+            );
+            assert_eq!(
+                opts[2].label,
+                crate::i18n::t(crate::i18n::Msg::ApprovalAllowAllBash).into_owned(),
+                "allow-all-bash option must carry the danger label ({name})"
+            );
+            assert_eq!((opts[3].kind, opts[3].accel), (ApprovalKind::Deny, 'n'));
         }
     }
 
@@ -19837,9 +19884,62 @@ mod bypass_approval_tests {
             ApprovalChoice::AllowAlways
         ));
         assert!(matches!(
+            super::approval_kind_to_choice(ApprovalKind::AllowAlwaysAll),
+            ApprovalChoice::AllowAlwaysAll
+        ));
+        assert!(matches!(
             super::approval_kind_to_choice(ApprovalKind::Deny),
             ApprovalChoice::Deny
         ));
+    }
+
+    /// Bash MUST offer an `AllowAlwaysAll` option whose payload round-trips through
+    /// `PermissionDecision::from_value` as `AllowAlwaysAll`. Non-bash tools MUST NOT
+    /// get this option.
+    #[test]
+    fn bash_approval_offers_allow_all_danger_option() {
+        use crate::state::ApprovalKind;
+        use atomcode_capabilities::tools::approval::PermissionDecision;
+
+        let bash_cmd = bash_args("rm -rf /tmp/x");
+
+        // Bash (both wire and display name spellings) must include AllowAlwaysAll.
+        for name in ["Bash", "bash"] {
+            let opts = super::build_approval_options(name, &bash_cmd);
+            let allow_all_opt = opts
+                .iter()
+                .find(|o| o.kind == ApprovalKind::AllowAlwaysAll)
+                .unwrap_or_else(|| panic!("bash ({name}) must have an AllowAlwaysAll option"));
+
+            // The response payload must parse to AllowAlwaysAll.
+            let payload = serde_json::json!({
+                "decision": "allow",
+                "remember": true,
+                "grant_scope": "all"
+            });
+            assert_eq!(
+                PermissionDecision::from_value(&payload),
+                PermissionDecision::AllowAlwaysAll,
+                "allow-all payload must parse to AllowAlwaysAll"
+            );
+
+            // The choice produced by the kind must map to AllowAlwaysAll decision.
+            let choice = super::approval_kind_to_choice(allow_all_opt.kind);
+            assert_eq!(
+                approval_choice_to_decision(choice),
+                PermissionDecision::AllowAlwaysAll,
+                "AllowAlwaysAll kind → choice → decision must round-trip ({name})"
+            );
+        }
+
+        // Non-bash tools MUST NOT get this option.
+        for tool in ["ReadFile", "WriteFile", "EditFile", "SearchReplace", "read_file"] {
+            let opts = super::build_approval_options(tool, "{}");
+            assert!(
+                opts.iter().all(|o| o.kind != ApprovalKind::AllowAlwaysAll),
+                "{tool} must NOT have an AllowAlwaysAll option"
+            );
+        }
     }
 }
 
@@ -23899,7 +23999,7 @@ fn handle_runtime_event(
                     handle_agent_event(
                         AgentEvent::ApprovalNeeded {
                             tool_name: approval.tool.clone(),
-                            reason: "Requires approval".into(),
+                            reason: approval.reason,
                             call: atomcode_kernel::tool::ToolCall {
                                 id: approval.call_id,
                                 name: approval.tool,
@@ -26871,9 +26971,9 @@ fn handle_agent_event(
         }
         AgentEvent::ApprovalNeeded {
             tool_name,
+            reason: approval_reason,
             call,
             snapshot,
-            ..
         } => {
             // No driver-side grant lookup: a gate that already granted this call never asks
             // again (it checks its own store before round-tripping), so reaching here means
@@ -26977,6 +27077,7 @@ fn handle_agent_event(
                 options: build_approval_options(&display, &call.arguments),
                 selected: 0,
                 note,
+                reason: approval_reason,
             });
             renderer.flush();
             atomcode_capabilities::notify::notify(
@@ -29084,6 +29185,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             options: p.options.iter().map(|o| o.label.clone()).collect(),
             selected: p.selected,
             note: p.note.clone(),
+            reason: p.reason.clone(),
         });
     // A pending batch takes precedence over a single panel (mutually exclusive in
     // practice). The view carries the CURRENT question's fields plus batch navigator

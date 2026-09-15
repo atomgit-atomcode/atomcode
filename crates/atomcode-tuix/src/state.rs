@@ -64,6 +64,9 @@ pub enum UiPhase {
 pub enum ApprovalKind {
     AllowOnce,
     AlwaysAllow,
+    /// Session-wide "allow ALL Bash (incl. destructive)" — sends
+    /// `{"decision":"allow","remember":true,"grant_scope":"all"}`. Only offered for Bash.
+    AllowAlwaysAll,
     Deny,
 }
 
@@ -87,6 +90,10 @@ pub struct ApprovalPanel {
     /// Optional advisory line rendered under the header (e.g. a credential-exposure
     /// warning). `None` for ordinary approvals.
     pub note: Option<String>,
+    /// Optional "why is this being asked" line from `ApprovalRequest.reason` — shown
+    /// above the options in a muted style so the user knows the context for re-approval.
+    /// `None` for first-time approvals where no gate added a reason.
+    pub reason: Option<String>,
 }
 
 impl ApprovalPanel {
@@ -3441,6 +3448,7 @@ mod tests {
             ],
             selected: 0,
             note: None,
+            reason: None,
         };
         p.move_up();
         assert_eq!(p.selected, 2, "up from 0 wraps to last");

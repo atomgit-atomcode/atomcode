@@ -739,6 +739,9 @@ pub struct ApprovalPanelView {
     pub selected: usize,
     /// Optional advisory line rendered under the header (e.g. a credential warning).
     pub note: Option<String>,
+    /// Optional "why is this being asked" line from `ApprovalRequest.reason`. Shown
+    /// above the options in a muted style; `None` for ordinary first-time approvals.
+    pub reason: Option<String>,
 }
 
 /// Renderer-facing snapshot of the `request_user_input` panel (mirrors

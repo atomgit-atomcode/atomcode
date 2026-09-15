@@ -480,6 +480,9 @@ pub enum Msg<'a> {
     /// "Always" for `bash`, whose grant is scoped to THIS COMMAND (not the whole
     /// tool) — so the label says "this command", not "Always allow bash".
     ApprovalAlwaysAllowCommand,
+    /// Danger option shown ONLY for Bash: allow ALL Bash commands for this session,
+    /// including destructive ones. Emits `{"decision":"allow","remember":true,"grant_scope":"all"}`.
+    ApprovalAllowAllBash,
     ApprovalDeny,
     ApprovalHint,
     /// Header line above the interactive approval options, naming what is being

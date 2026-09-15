@@ -3915,10 +3915,13 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// the header/detail/hint: the command is already shown in the `▸ Tool(detail)`
     /// body row above, so the panel is just the selectable choices.
     fn approval_panel_row_count(&self, panel: &crate::render::ApprovalPanelView) -> usize {
-        // 1 header row ("Allow Tool(detail)?") + optional advisory note + N option
-        // rows + 1 hint row. MUST track `build_approval_rows` exactly or the footer
-        // height under-counts and the panel overlaps the body.
-        panel.options.len() + 2 + usize::from(panel.note.is_some())
+        // 1 header row ("Allow Tool(detail)?") + optional reason line + optional advisory
+        // note + N option rows + 1 hint row. MUST track `build_approval_rows` exactly or
+        // the footer height under-counts and the panel overlaps the body.
+        panel.options.len()
+            + 2
+            + usize::from(panel.note.is_some())
+            + usize::from(panel.reason.is_some())
     }
 
     /// Build the compact footer approval panel: numbered selectable options
@@ -3964,6 +3967,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ", &style);
             push_str_cells(&mut row, &header_trunc, &style);
+            out.push(row);
+        }
+
+        // Reason row: "why is this being asked" context from `ApprovalRequest.reason`.
+        // Shown between the header and the advisory note in a muted style.
+        if let Some(reason) = panel.reason.as_deref() {
+            let reason = crate::glyph::downgrade_glyphs(reason, unicode);
+            let reason = crate::width::truncate_with_ellipsis(
+                &scrub_controls(&reason),
+                rule_width.saturating_sub(2),
+            );
+            let style = self.style_for(Role::Muted);
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "  ", &style);
+            push_str_cells(&mut row, &reason, &style);
             out.push(row);
         }
 
@@ -20345,6 +20363,7 @@ mod tests {
             options: vec!["Allow".into(), "Deny".into()],
             selected: 0,
             note: None,
+            reason: None,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -20378,6 +20397,7 @@ mod tests {
             ],
             selected: 0,
             note: None,
+            reason: None,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -20429,6 +20449,7 @@ mod tests {
             options: vec!["Allow once".into(), "Deny".into()],
             selected: 0,
             note: Some("may send credentials to the provider".into()),
+            reason: None,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -20443,6 +20464,65 @@ mod tests {
         assert!(
             vterm.any_row(|r| r.contains("may send credentials to the provider")),
             "advisory note must render\n{dump}"
+        );
+    }
+
+    /// When `ApprovalRequest.reason` is `Some`, the approval panel must render that
+    /// text above the options (between the header and any advisory note).
+    #[test]
+    fn approval_panel_renders_reason_line_when_present() {
+        let (mut r, buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let mut status = status_basic();
+        status.approval = Some(crate::render::ApprovalPanelView {
+            tool: "Bash".into(),
+            detail: "rm -rf /outside/dir".into(),
+            options: vec!["Allow once".into(), "Deny".into()],
+            selected: 0,
+            note: None,
+            reason: Some("此命令写到工作区外".into()),
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let dump = vterm.dump();
+        // Wide CJK characters are rendered two cells wide; row_text() may
+        // interleave padding spaces — check for the first character instead of
+        // the full concatenated string.
+        assert!(
+            vterm.any_row(|r| r.contains("此")),
+            "reason line must render in the approval panel\n{dump}"
+        );
+        // reason adds one row to the panel height
+        let panel_with_reason = crate::render::ApprovalPanelView {
+            tool: "Bash".into(),
+            detail: "cmd".into(),
+            options: vec!["Allow once".into(), "Deny".into()],
+            selected: 0,
+            note: None,
+            reason: Some("reason text".into()),
+        };
+        let panel_without = crate::render::ApprovalPanelView {
+            reason: None,
+            ..panel_with_reason.clone()
+        };
+        assert_eq!(
+            r.approval_panel_row_count(&panel_with_reason),
+            r.approval_panel_row_count(&panel_without) + 1,
+            "reason must add exactly one row to the panel height"
+        );
+        // Verify row count tracks build_approval_rows exactly.
+        assert_eq!(
+            r.approval_panel_row_count(&panel_with_reason),
+            r.build_approval_rows(&panel_with_reason, 60, 80).len(),
+            "row count must match rendered rows when reason is present"
         );
     }
 
@@ -21164,6 +21244,7 @@ mod tests {
             ],
             selected: 0,
             note: None,
+            reason: None,
         };
         status.approval = Some(panel.clone());
         r.render(UiLine::InputPrompt {
@@ -21269,6 +21350,7 @@ mod tests {
             ],
             selected: 0,
             note: None,
+            reason: None,
         };
         // Digit routing: index = (c as usize) - ('1' as usize).
         // '1' → idx 0 → AllowOnce
@@ -25833,6 +25915,7 @@ mod tests {
             ],
             selected: 0,
             note: None,
+            reason: None,
         });
 
         r.render(UiLine::InputPrompt {
@@ -26048,6 +26131,7 @@ mod tests {
             options: vec!["Allow once".into(), "Always allow".into(), "Deny".into()],
             selected: 0,
             note: None,
+            reason: None,
         });
 
         r.render(UiLine::InputPrompt {

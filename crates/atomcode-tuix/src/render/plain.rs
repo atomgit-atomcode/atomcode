@@ -1096,6 +1096,7 @@ mod tests {
                 options: vec![],
                 selected: 0,
                 note: None,
+                reason: None,
             }),
             ..Default::default()
         };
@@ -1199,6 +1200,7 @@ mod tests {
                 options: vec![],
                 selected: 0,
                 note: None,
+                reason: None,
             }),
             ..Default::default()
         };
