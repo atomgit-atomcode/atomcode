@@ -1464,6 +1464,11 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         )
         .into(),
         Msg::StreamRecoverySucceeded => "✓ recovered from the interrupted stream".into(),
+        Msg::ContextFromPeer => "said to the agent by".into(),
+        Msg::ContextFromMemory => "from memory".into(),
+        Msg::ContextFromReminder => "runtime note".into(),
+        Msg::ContextFromContinuation => "the engine asked for another round".into(),
+        Msg::ContextFromCompaction => "summary of folded history".into(),
         Msg::OutputTruncationRunning { attempt, max_attempts } =>
             format!("Output limit reached; automatically continuing ({attempt}/{max_attempts})").into(),
         Msg::OutputTruncationHeader => "Output limit reached".into(),

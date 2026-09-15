@@ -323,8 +323,26 @@ impl Projector {
                     }]
                 }
             }
-            SessionEvent::Injected { .. }
-            | SessionEvent::StepStart { .. }
+            // Model-visible context the person did not type. Dropping it here
+            // was the bug this variant exists to fix: the fact reached the log
+            // and the model's request and stopped, so a team member's report was
+            // invisible to the person it was being reported to.
+            SessionEvent::Injected { text, origin, .. } => {
+                use crate::session::InjectionOrigin as In;
+                use atomcode_kernel::event::ContextSource as Out;
+                vec![AgentEvent::ContextAdded {
+                    text: text.clone(),
+                    source: match origin {
+                        In::Peer { from } => Out::Peer { from: from.clone() },
+                        In::Memory => Out::Memory,
+                        In::Reminder => Out::Reminder,
+                        In::Continuation => Out::Continuation,
+                        In::CompactionSummary => Out::CompactionSummary,
+                    },
+                }]
+            }
+
+            SessionEvent::StepStart { .. }
             | SessionEvent::RequestHeader { .. }
             | SessionEvent::Titled { .. } => Vec::new(),
         }

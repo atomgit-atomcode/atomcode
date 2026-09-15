@@ -3110,6 +3110,23 @@ pub(crate) async fn run_native_headless(
                     );
                 }
             }
+            // Model-visible context the person did not type — a delegated
+            // agent's report, a continuation the engine asked for. Shown under
+            // `-v` for the same reason the TUI draws it: without it the model
+            // and the person are reading two different conversations.
+            //
+            // Deliberately NOT added to the JSONL schema here. That stream is a
+            // versioned contract read by other programs, and this session has
+            // already paid for the lesson that a `serde(tag=…)` reader fails
+            // the whole file on a kind it does not know (`SESSION_FORMAT_VERSION`
+            // 1 → 2). Putting it there is a schema decision with a version bump,
+            // not a line added in passing.
+            CodingRuntimeEvent::Agent(KernelEvent::ContextAdded { text, source }) => {
+                if !jsonl && verbose {
+                    close_native_thinking(&mut thinking_line_open);
+                    eprintln!("[context {source:?}] {}", truncate_log_line(&text, 200));
+                }
+            }
             CodingRuntimeEvent::Agent(KernelEvent::ToolResult { result }) => {
                 close_native_thinking(&mut thinking_line_open);
                 if jsonl {

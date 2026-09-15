@@ -1424,6 +1424,11 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         )
         .into(),
         Msg::StreamRecoverySucceeded => "✓ 已从流中断处恢复".into(),
+        Msg::ContextFromPeer => "对 agent 说".into(),
+        Msg::ContextFromMemory => "来自记忆".into(),
+        Msg::ContextFromReminder => "运行时提示".into(),
+        Msg::ContextFromContinuation => "引擎追问了一轮".into(),
+        Msg::ContextFromCompaction => "折叠历史的摘要".into(),
         Msg::OutputTruncationRunning { attempt, max_attempts } =>
             format!("输出达到上限，正在自动续写（{attempt}/{max_attempts}）").into(),
         Msg::OutputTruncationHeader => "输出达到上限".into(),

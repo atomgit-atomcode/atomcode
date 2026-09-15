@@ -23195,6 +23195,7 @@ fn project_kernel_event(
             snapshot: atomcode_kernel::message::SessionSnapshot::new(Vec::new()),
         }),
         Kernel::Warning(message) => Some(AgentEvent::Warning(message)),
+        Kernel::ContextAdded { text, source } => Some(AgentEvent::ContextAdded { text, source }),
         Kernel::ProviderRetry {
             attempt,
             max_attempts,
@@ -27458,6 +27459,42 @@ fn handle_agent_event(
             // a terminal. Native kernel diagnostics currently carry an empty
             // snapshot, so this is normally a no-op.
             persist_current_session(ctx, snapshot, renderer);
+        }
+        AgentEvent::ContextAdded { text, source } => {
+            // Model-visible context the person did not type: a delegated
+            // agent's report, a continuation the engine asked for, a memory
+            // block. Muted and labelled, because the ONE thing it must not look
+            // like is the user speaking — that confusion is why the event
+            // exists. Before it, a lead told its own user "your previous
+            // message was actually the subagent's words": the report had
+            // reached the model and nothing else.
+            use atomcode_kernel::event::ContextSource as Src;
+            let label = match &source {
+                Src::Peer { from } => format!(
+                    "{} {from}",
+                    crate::i18n::t(crate::i18n::Msg::ContextFromPeer)
+                ),
+                Src::Memory => crate::i18n::t(crate::i18n::Msg::ContextFromMemory).into_owned(),
+                Src::Reminder => crate::i18n::t(crate::i18n::Msg::ContextFromReminder).into_owned(),
+                Src::Continuation => {
+                    crate::i18n::t(crate::i18n::Msg::ContextFromContinuation).into_owned()
+                }
+                Src::CompactionSummary => {
+                    crate::i18n::t(crate::i18n::Msg::ContextFromCompaction).into_owned()
+                }
+                // `ContextSource` is `#[non_exhaustive]`: a source this build
+                // does not know still gets drawn, unlabelled, rather than
+                // silently dropped. Dropping it is the bug.
+                _ => String::new(),
+            };
+            for line in text.lines() {
+                renderer.render(UiLine::Muted(if label.is_empty() {
+                    format!("↳ {line}")
+                } else {
+                    format!("↳ {label} · {line}")
+                }));
+            }
+            renderer.flush();
         }
         AgentEvent::Warning(w) => {
             // Non-fatal — flush a yellow advisory line and let the turn

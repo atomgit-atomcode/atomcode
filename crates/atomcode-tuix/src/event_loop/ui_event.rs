@@ -11,6 +11,14 @@ use atomcode_kernel::tool::ToolCall;
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     TextDelta(String),
+    /// Model-visible context the person did not type: a delegated agent's
+    /// report, a continuation the engine asked for, a memory block. Carried as
+    /// its own presentation event so it can be drawn as evidence rather than as
+    /// the user speaking — the confusion that made it necessary.
+    ContextAdded {
+        text: String,
+        source: atomcode_kernel::event::ContextSource,
+    },
     ReasoningDelta(String),
     ToolCallStreaming {
         name: String,

@@ -182,6 +182,29 @@ pub struct ToolBatchCall {
     pub parallel_safe: bool,
 }
 
+/// Where a piece of model-visible context came from, when it was not typed by
+/// the person.
+///
+/// Typed rather than a label, for the reason the recovery events are typed: a
+/// driver that has to parse prose to decide how to draw something is a driver
+/// that is wrong in every language nobody tested.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSource {
+    /// Another agent — a team member reporting to its lead, a lead steering a
+    /// member. `from` is the sender's session id, which outlives both of them.
+    Peer { from: String },
+    /// A persistent memory store.
+    Memory,
+    /// A runtime note the engine adds to the request.
+    Reminder,
+    /// The engine asked for another round on its own.
+    Continuation,
+    /// A summary standing in for history that was dropped.
+    CompactionSummary,
+}
+
 /// Agent → driver. Serializable for the same reason. The id-correlated
 /// Request/Respond pair replaces any in-process oneshot, so the round-trip
 /// works identically in-process and over the wire.
@@ -191,6 +214,24 @@ pub enum AgentEvent {
     /// A turn began (perception granularity).
     TurnStarted,
     TextDelta(String),
+    /// **Model-visible context the person did not type.**
+    ///
+    /// A team member's report, a continuation the engine asked for, a memory
+    /// block, a compaction summary. It is in the model's request and in the
+    /// session log; without this event it is in neither the screen nor anything
+    /// a driver could render, and the person and the model end up reading two
+    /// different conversations. That is not hypothetical — it shipped: a lead
+    /// answered its user with "your previous message was actually the
+    /// subagent's words", because the report had reached the model and nothing
+    /// else.
+    ///
+    /// A driver MUST NOT draw this as the user speaking. It is evidence the
+    /// agent was handed, and the difference matters most exactly when the text
+    /// reads like an instruction.
+    ContextAdded {
+        text: String,
+        source: ContextSource,
+    },
     /// A STREAMING fragment of a tool call the model is still emitting — live display of
     /// the tool name / arguments as they arrive. `index` groups fragments of the same
     /// call. Purely observational: the tool is EXECUTED later (see `ToolStarted` + the

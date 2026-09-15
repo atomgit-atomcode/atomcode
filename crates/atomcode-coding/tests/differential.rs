@@ -250,6 +250,9 @@ fn normalise(event: &AgentEvent) -> Option<Step> {
     let step = |kind, detail: String| Some(Step { kind, detail });
     match event {
         AgentEvent::TurnStarted => step("TurnStarted", String::new()),
+        // Kept, so it shows in every rendered report and the criteria can read
+        // it — but EXCLUDED from the divergence count; see `ONE_SIDED_BY_DESIGN`.
+        AgentEvent::ContextAdded { text, .. } => step("ContextAdded", text.clone()),
         // Deltas are chunking, not meaning: one engine may split a sentence
         // where the other does not. The assembled text arrives in TurnComplete.
         AgentEvent::TextDelta(_) => None,
@@ -886,10 +889,37 @@ fn render(a: &[Step], b: &[Step]) -> String {
 }
 
 /// How many events are unmatched — one insertion counts once.
+/// The one event kind allowed to appear on one side only.
+///
+/// `ContextAdded` is model-visible context the person did not type — a team
+/// member's report, a continuation the engine asked for. **Both engines have
+/// always injected such text; only the row list says so**, and that is the
+/// point of the row-side fix rather than an accident: before it, a lead
+/// answered its own user with "your previous message was actually the
+/// subagent's words", because the report had reached the model and nothing
+/// else.
+///
+/// Making the chain emit it too was written, and then reverted. That is the
+/// engine people are running today, and adding an event to it for the benefit
+/// of a comparison is not a trade this rig gets to make.
+///
+/// So the asymmetry is excluded here and measured where it can be seen, by
+/// `only_the_row_list_says_what_it_injected`. It still renders in every report,
+/// so nobody reading one is misled about what the two sides did.
+const ONE_SIDED_BY_DESIGN: &[&str] = &["ContextAdded"];
+
 fn divergences(a: &[Step], b: &[Step]) -> usize {
     align(a, b)
         .into_iter()
         .filter(|(l, r)| l.is_none() || r.is_none())
+        .filter(|(l, r)| {
+            let kind = l
+                .as_ref()
+                .or(r.as_ref())
+                .map(|s| s.kind)
+                .unwrap_or_default();
+            !ONE_SIDED_BY_DESIGN.contains(&kind)
+        })
         .count()
 }
 
@@ -3933,4 +3963,48 @@ async fn offline_takes_the_web_tools_off_both_engines() {
             "{who}: 在线时两个 web 工具都该在 —— 否则上面那条断言什么也没证明{names:?}"
         );
     }
+}
+
+/// The one place the `ContextAdded` asymmetry is allowed to be visible.
+///
+/// `divergences` excludes the kind so it cannot inflate every scenario that
+/// happens to inject something. That is a hole, and this is what stops it being
+/// a silent one: the asymmetry has to stay exactly as described — the row list
+/// says what it injected, the chain does not — and the day somebody makes the
+/// chain emit it too, this fails and `ONE_SIDED_BY_DESIGN` must go with it.
+#[tokio::test]
+async fn only_the_row_list_says_what_it_injected() {
+    let dir = scratch("context-added");
+    seed(&dir);
+
+    let injections = |steps: Vec<Step>| -> Vec<String> {
+        steps
+            .into_iter()
+            .filter(|s| s.kind == "ContextAdded")
+            .map(|s| s.detail)
+            .collect()
+    };
+    // A turn that carries context: both engines put the rider in front of the
+    // message, so both have something to say — if they were both saying it.
+    let cmds = || {
+        vec![AgentCommand::SendMessageWithContext {
+            text: "go".into(),
+            context: "the file changed under you".into(),
+            images: Vec::new(),
+        }]
+    };
+
+    let chain = injections(reference(Script::text(&["ok"]), &dir, cmds()).await);
+    let rows = injections(candidate(Script::text(&["ok"]), &dir, cmds()).await);
+
+    assert!(
+        rows.iter().any(|t| t.contains("changed under you")),
+        "the row list must tell the driver what the model was handed: {rows:?}"
+    );
+    assert!(
+        chain.is_empty(),
+        "the chain has started emitting `ContextAdded` — good, but then it is no \
+         longer an asymmetry, and `ONE_SIDED_BY_DESIGN` must stop excluding it: \
+         {chain:?}"
+    );
 }

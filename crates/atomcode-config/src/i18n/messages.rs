@@ -1968,6 +1968,14 @@ pub enum Msg<'a> {
         max_attempts: u32,
     },
     StreamRecoverySucceeded,
+    /// Labels for model-visible context the person did not type. The line they
+    /// prefix is drawn muted, because the one thing it must never look like is
+    /// the person speaking.
+    ContextFromPeer,
+    ContextFromMemory,
+    ContextFromReminder,
+    ContextFromContinuation,
+    ContextFromCompaction,
     OutputTruncationRunning {
         attempt: u32,
         max_attempts: u32,
