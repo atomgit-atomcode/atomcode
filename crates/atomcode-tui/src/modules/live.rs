@@ -282,10 +282,16 @@ const ROWS: u16 = 1 + MARGIN;
 /// function rather than a condition written twice: the two disagreeing is either
 /// a blank row of chrome above the composer or a line drawn where nothing was
 /// asked for.
+/// What the line says, or nothing.
+///
+/// **One question, and it is not about the screen.** This used to ask a second
+/// one — whether the reader was at the bottom — and hand the row back while they
+/// were not. That was a module deciding where it goes, which is the host's
+/// business, and it is why the live line had a rule the task list beside it did
+/// not. The row rides the stream's tail now: scrolling takes it away because it
+/// is *content*, and content moves, rather than because the line looked at
+/// `moment.scroll` and withdrew. See `docs/adr/0020`.
 fn showing(state: &State, moment: &Moment) -> Option<String> {
-    if !moment.scroll.is_at_bottom() {
-        return None;
-    }
     doing(state, moment)
 }
 
@@ -564,57 +570,60 @@ mod tests {
     }
 
     #[test]
-    fn the_line_gets_out_of_the_way_while_the_reader_is_scrolled_up() {
-        // The one case where a claim about *now* is worth less than the rows it
-        // costs: somebody reading further back. It leaves with the words it
-        // belongs to — the margin too — and asks for nothing while it is gone, so
-        // the conversation keeps both rows.
+    fn where_the_reader_is_scrolled_to_is_not_this_modules_business() {
+        // The line used to withdraw when the reader left the bottom — a module
+        // reading `moment.scroll` to decide whether it exists. It rides the
+        // stream's tail now, so the scrolling is the host's, and the module has
+        // one question left: is there anything to say.
+        //
+        // Asserted by holding everything *but* the scroll still and sweeping it.
+        // A module that peeked at the offset would show up as a height that
+        // changed with it.
         let state = fold(&a_turn());
         let mut moment = Moment::default().working().at_tick(0);
         moment.now = Timestamp::millis(3_000);
         moment.turn_started = Some(Timestamp::millis(0));
 
+        let at_bottom = Live::height(&state, &moment, 80);
         assert_eq!(
-            Live::height(&state, &moment, 80),
+            at_bottom,
             Height::Hug(ROWS),
-            "up while the reader is at the bottom"
+            "a turn in flight has something to say"
         );
 
-        // One line up is enough. The row is a claim about the foot of the
-        // conversation, and the foot is not on screen any more.
-        moment.scroll = crate::moment::ScrollPos(1);
-        assert!(
-            draw(&state, &moment, 80, ROWS).is_empty(),
-            "no words, and no blank row where they were"
-        );
-        assert_eq!(
-            Live::height(&state, &moment, 80),
-            Height::Hug(0),
-            "and it says so, which is how the rows get handed back"
-        );
+        for offset in [1usize, 2, 7, 1_000] {
+            moment.scroll = crate::moment::ScrollPos(offset);
+            assert_eq!(
+                Live::height(&state, &moment, 80),
+                at_bottom,
+                "scroll {offset} changed what this line asks for — it is reading \
+                 the offset again"
+            );
+            assert_eq!(
+                draw(&state, &moment, 80, ROWS).len(),
+                ROWS as usize,
+                "scroll {offset}: and it still draws the rows it asked for"
+            );
+        }
 
-        // Height and render are one predicate, so they cannot disagree: the row
-        // asked for is the row filled, at either answer.
-        let asked = match Live::height(&state, &moment, 80) {
-            Height::Hug(n) => n,
-            other => panic!("the row is asked for as a hug, not {other:?}"),
-        };
-        assert_eq!(draw(&state, &moment, 80, asked).len(), asked as usize);
-
-        // Back at the bottom is back on screen — the same reading that hid it is
-        // the one that shows it again.
-        moment.scroll = crate::moment::ScrollPos::BOTTOM;
-        assert_eq!(
-            Live::height(&state, &moment, 80),
-            Height::Hug(ROWS),
-            "scrolling back down brings it back"
-        );
-        assert!(
-            draw(&state, &moment, 80, ROWS)
-                .iter()
-                .any(|l| l.contains("正在等待模型")),
-            "with what it was saying"
-        );
+        // Between turns there is nothing to say, at any offset.
+        let idle = fold(&[
+            SessionEvent::TurnStart { turn: 1 },
+            SessionEvent::TurnEnd {
+                turn: 1,
+                stop: StopReason::Stopped,
+                error: None,
+            },
+        ]);
+        for offset in [0usize, 1, 3, 500] {
+            let mut m = moment.clone();
+            m.scroll = crate::moment::ScrollPos(offset);
+            assert_eq!(
+                Live::height(&idle, &m, 80),
+                Height::Hug(0),
+                "no turn, no row — regardless of where the reader is ({offset})"
+            );
+        }
     }
 
     #[test]

@@ -98,11 +98,85 @@ pub const MOUSE_OFF: &str = "\x1b[?1003l\x1b[?1006l\x1b[?1002l";
 /// clicks. It is a switch of its own rather than part of [`MOUSE_ON`] because
 /// the price is per cell: with it on, every cell the pointer crosses is an
 /// event, and the pointer crosses cells all day. Whoever turns it on owes the
-/// terminal a [`MOUSE_MOTION_OFF`] — [`MOUSE_OFF`] covers the case where that
+/// terminal [`Pointer::Buttons`] — [`MOUSE_OFF`] covers the case where that
 /// debt is still outstanding when the mouse is handed back.
 pub const MOUSE_MOTION_ON: &str = "\x1b[?1003h";
-/// The exact inverse of [`MOUSE_MOTION_ON`].
-pub const MOUSE_MOTION_OFF: &str = "\x1b[?1003l";
+
+/// Which setting the terminal's mouse tracker is on.
+///
+/// One type because the terminal has one tracker, not three. The DECSET numbers
+/// 1000/1002/1003 read like three independent flags and are not — they are three
+/// settings of the same thing, and clearing any one of them clears it:
+///
+/// - xterm: all three reach `really_set_mousemode`, which does
+///   `send_mouse_pos = enabled ? mode : MOUSE_OFF` (`charproc.c`);
+/// - iTerm2: they write one `mouseMode`, and clearing writes
+///   `MOUSE_REPORTING_NONE` (`sources/VT100/VT100Terminal.m`, `case 1003`);
+/// - kitty: one `mouse_tracking_mode`, and clearing writes `0`;
+/// - Alacritty spells it with bits but lands in the same place — setting one
+///   clears the others ("Mouse protocols are mutually exclusive"), while
+///   clearing removes only its own.
+///
+/// That is why the UI never models this as two booleans. Stopping the hover is
+/// not "back to buttons": it is "no mouse at all" unless the buttons are asked
+/// for again. Saying which state the terminal should be *in* is the whole of
+/// what this type is for, and the only state whose escape mentions `1003l` is
+/// [`Pointer::Terminal`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pointer {
+    /// The terminal has it: click-drag selects text, nothing is reported.
+    Terminal,
+    /// Ours, reporting presses and drags — what a click that folds a tool call
+    /// needs.
+    Buttons,
+    /// Ours, and reporting the pointer crossing cells as well — what the
+    /// composer's menu needs to light the row under the pointer.
+    ButtonsAndHover,
+}
+
+impl Pointer {
+    /// The escape that puts the terminal's mouse in this state.
+    ///
+    /// Always the whole state, never a delta. A tracker with three mutually
+    /// exclusive settings cannot be moved by saying what you no longer want:
+    /// `1003l` to stop the hover took button reporting with it, so the
+    /// composer's menu closing handed the pointer back for the rest of the
+    /// session — and `ctrl-o` then needed two presses to return it, the first
+    /// having turned off what was already off.
+    pub const fn escape(self) -> &'static str {
+        match self {
+            Pointer::Terminal => MOUSE_OFF,
+            Pointer::Buttons => MOUSE_ON,
+            Pointer::ButtonsAndHover => MOUSE_MOTION_ON,
+        }
+    }
+
+    /// What to write to move the terminal from `before` to here — `None` when
+    /// it is already here.
+    ///
+    /// This is the whole of "should bytes go out": the loop asks for the menu's
+    /// hover state on every iteration, and re-announcing an unchanged mouse
+    /// mode every frame is a waste.
+    pub fn escape_from(self, before: Pointer) -> Option<&'static str> {
+        (self != before).then(|| self.escape())
+    }
+
+    /// The state the terminal should be in, from the UI's two intents.
+    ///
+    /// `grab` — the pointer is ours at all. `hover` — the context menu is up
+    /// and following it. Hover without the grab is not a state a terminal can
+    /// be in: with the pointer handed back there is nothing to report to, so it
+    /// is [`Pointer::Terminal`] either way.
+    pub const fn from_intents(grab: bool, hover: bool) -> Self {
+        if !grab {
+            Pointer::Terminal
+        } else if hover {
+            Pointer::ButtonsAndHover
+        } else {
+            Pointer::Buttons
+        }
+    }
+}
 
 /// Put text on the system clipboard, through the terminal (OSC 52).
 ///
@@ -741,7 +815,42 @@ mod tests {
             "free motion comes on only for the thing that follows the pointer"
         );
         assert_eq!(MOUSE_MOTION_ON, "\x1b[?1003h");
-        assert_eq!(MOUSE_MOTION_OFF, "\x1b[?1003l");
+        // One tracker, three settings, and each state names its own escape —
+        // never a delta. This is the pair that matters: stopping the hover is
+        // `Pointer::Buttons`, whose escape asks for button reporting outright,
+        // because `1003l` alone clears the tracker instead of lowering it.
+        assert_eq!(Pointer::Terminal.escape(), MOUSE_OFF);
+        assert_eq!(Pointer::Buttons.escape(), MOUSE_ON);
+        assert_eq!(Pointer::ButtonsAndHover.escape(), MOUSE_MOTION_ON);
+        assert!(
+            Pointer::ButtonsAndHover.escape().contains("?1003h"),
+            "the hover is the only state that reports motion"
+        );
+        assert!(
+            !Pointer::Buttons.escape().contains("?1003"),
+            "and the button state must not ask for motion"
+        );
+        // Leaving the hover while the pointer is still ours asks for the
+        // buttons back. Sending `1003l` here is the bug that cost two presses of
+        // `ctrl-o`, and this is where it would come back.
+        assert_eq!(
+            Pointer::Buttons.escape_from(Pointer::ButtonsAndHover),
+            Some(MOUSE_ON)
+        );
+        assert!(Pointer::Buttons.escape().contains("?1002h"));
+        // Nothing goes out when the state is already right: the loop asks for
+        // the menu's state on every iteration.
+        assert_eq!(Pointer::Buttons.escape_from(Pointer::Buttons), None);
+        assert_eq!(
+            Pointer::Terminal.escape_from(Pointer::Buttons),
+            Some(MOUSE_OFF)
+        );
+        // Hover without the grab is not a state a terminal can be in — with the
+        // pointer handed back there is nothing to report to.
+        assert_eq!(Pointer::from_intents(false, true), Pointer::Terminal);
+        assert_eq!(Pointer::from_intents(false, false), Pointer::Terminal);
+        assert_eq!(Pointer::from_intents(true, false), Pointer::Buttons);
+        assert_eq!(Pointer::from_intents(true, true), Pointer::ButtonsAndHover);
         // Handing the mouse back has to take free motion with it, whichever
         // order the two were asked for in: a shell left in 1003 gets an event
         // per cell and prints it.

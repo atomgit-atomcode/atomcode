@@ -308,23 +308,34 @@ fn lift(base: Rgb, bg: Rgb, need: f32) -> Rgb {
 
 /// The contrast a role must clear against the background.
 ///
-/// 4.5 is WCAG AA for body text and applies to anything carrying meaning — an
-/// error that cannot be read is worse than no error, and so is the line that
-/// says which model is running. Chrome sits at 3.0, AA for large text: a border
-/// that shouted would be a border competing with the words.
+/// The floors were raised in response to exactly the complaint "the palette is
+/// correct and still hard to read": the resolver is designed to *stop at* the
+/// floor — [`quietest`] picks the dimmest ink that qualifies, [`lift`] halts the
+/// moment the ratio clears — so a floor set at the legal minimum produces a
+/// palette that sits on the legal minimum everywhere, all at once. WCAG AA
+/// (4.5) is a threshold below which text is *faulty*, not a target at which
+/// text is comfortable; terminals render small monospace glyphs through video
+/// compression and antialiasing that a printed page never meets, so the target
+/// here is the AAA band (7.0) for anything carrying meaning — an error, a diff
+/// half, the line that says which model is running.
 ///
-/// **`Muted` used to be the exception, at 2.5, and that was the bug.** The
-/// theory was that metadata should be less contrast than the prose it
-/// annotates; the effect was a status line, a tool's `· 6 行` and a folded
-/// thought that a person could not read without leaning in — and, because a slot
-/// is not a colour, one that measured 4.7:1 in xterm's numbers while the
-/// terminal painted it nearer 3:1. Hierarchy comes from muted being *quieter
-/// than the prose*, which is true at 4.5 against a foreground sitting at 13:1.
-/// It does not come from starving the contrast.
+/// - **7.0** — meaning-carrying ink: errors, diffs, warnings, success, the
+///   brand and accent marks.
+/// - **6.0** — [`Role::Muted`]. It must stay below the prose (its hierarchy
+///   test asserts that against the loudest ink), and 7.0 on black leaves
+///   almost no room between it and plain text; 6.0 is still a solid jump from
+///   the 4.5 that read as washed out.
+/// - **4.5** — [`Role::Mode`]. A badge sits on a filled ground it does not
+///   control; AA there, bold weight does the rest.
+/// - **3.0** — [`Role::Border`] alone. Lines are chrome, not prose: a border
+///   that shouted would be a border competing with the words, and its
+///   legibility is carried by shape (a rule, a box edge), not by colour.
 fn floor(role: Role) -> f32 {
     match role {
-        Role::Border | Role::Mode => 3.0,
-        _ => 4.5,
+        Role::Border => 3.0,
+        Role::Mode => 4.5,
+        Role::Muted => 6.0,
+        _ => 7.0,
     }
 }
 
@@ -768,23 +779,55 @@ mod tests {
 
     #[test]
     fn the_users_own_scheme_is_preferred_over_a_colour_of_ours() {
-        // Synthesis is the fallback, not the default: for a role that carries
-        // meaning as a hue, an ordinary terminal should land on one of its own
-        // named slots, so the UI sits inside the scheme the person chose.
+        // Synthesis is the fallback, not the default: when the scheme's slot
+        // measurably reads, an ordinary terminal lands on one of its own named
+        // slots, so the UI sits inside the scheme the person chose.
         //
         // `Muted` is deliberately absent from this list — see the tests below.
-        // Its whole complaint was that a slot number is not a colour, and it is
-        // the role where believing an unanswered slot does the most damage,
-        // because slot 8's job in almost every scheme is to be the dimmest grey
-        // there is.
+        // So is `Error`: xterm's assumed red reads 5.25:1 on black, which
+        // cannot clear the 7.0 a meaning-carrying colour now owes, and an
+        // *assumed* slot is not a scheme the person chose anyway — overriding
+        // it is what
+        // `a_scheme_whose_slots_do_not_read_is_overridden_rather_than_obeyed`
+        // already prescribes; the raised floor merely moved to where that
+        // override starts to bite.
         for bg in [(0, 0, 0), (255, 255, 255)] {
             let caps = caps_on(bg);
-            for role in [Role::Accent, Role::Border, Role::Error] {
+            for role in [Role::Accent, Role::Border] {
                 assert!(
                     matches!(resolve(role, caps), Some(Color::Ansi(_))),
                     "{role:?} on {bg:?} reached for a colour of its own"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_stock_dark_profile_carries_meaning_at_the_new_floors() {
+        // The report this raise answers: nothing measured, xterm's own numbers
+        // — a terminal nobody customised. Every meaning-carrying role must
+        // land at its floor against black, not at the 4.5 that measured as
+        // passing and still read as washed out.
+        let caps = caps_on((0, 0, 0));
+        for role in ROLES {
+            if matches!(
+                role,
+                Role::Secondary | Role::ToolName | Role::PanelBg | Role::PanelSelBg
+            ) {
+                continue; // no ink of their own, or not a contrast question
+            }
+            let Some(c) = seen(role, caps) else { continue };
+            let against = match role {
+                // Panel ink reads against the panel, as on any ground.
+                Role::PanelFg => seen(Role::PanelBg, caps).unwrap(),
+                _ => (0, 0, 0),
+            };
+            let ratio = contrast(c, against);
+            let need = floor(role);
+            assert!(
+                ratio >= need,
+                "{role:?} on black is only {ratio:.2}:1 (floor {need:.1})"
+            );
         }
     }
 

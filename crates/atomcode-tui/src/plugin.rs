@@ -319,6 +319,30 @@ impl UserInterface for Tui {
                 None => wake.recv().await.unwrap_or(Wake::Closed),
             };
             coalesced += 1;
+            // The pointer's own vocabulary, needed in the patterns below rather
+            // than only inside an arm body.
+            use crate::surface::Click;
+            // Say the mouse mode again on the wakes that can follow a terminal
+            // putting its own tracker back without telling us — every tick, and
+            // every keystroke. Idempotent by construction (a DECSET for a mode
+            // already set changes nothing), so the cost is bytes and no state.
+            //
+            // Deliberately *not* on mouse events, which is the tempting case to
+            // include and the one that would cost the most: an arriving mouse
+            // event is itself proof that the tracker is on, so repeating the
+            // mode there buys nothing. While the menu is up it is worse than
+            // nothing — free motion reports every cell the pointer crosses, so
+            // healing on each of those is exactly the packet-per-cell price
+            // `ansi::MOUSE_MOTION_ON` exists to avoid, paid for information the
+            // event already carries. The one mouse event worth acting on is the
+            // one that should not have arrived at all; see the `Hover` arm below.
+            //
+            // Here rather than at the top of the loop because `woke` is what
+            // says which of these it was, and before the `match` because the
+            // pointer arms `continue` past anything below.
+            if matches!(&woke, Wake::Tick | Wake::Input(Input::Key(_))) {
+                self.surface.heal_mouse();
+            }
             match woke {
                 Wake::Closed => quit = true,
                 // The fact was folded into the stream by the listener that sent
@@ -340,6 +364,27 @@ impl UserInterface for Tui {
                 Wake::Tick => {
                     let mut m = self.host.moment.write().expect("moment poisoned");
                     m.tick = m.tick.wrapping_add(1);
+                    stale = true;
+                }
+                // A move is the one event the tracker sends for a reason we did
+                // not ask for: `Moved` arrives only while free motion is
+                // reporting, and free motion is asked for exactly while the
+                // menu is up. Seeing one with the menu down is the one piece of
+                // evidence available that the terminal's tracker is not where
+                // this side left it — which is what a session restore, a tab
+                // switch or a stray reset from anything else holding the tty
+                // does to it. Say the mode again, and say so, because the
+                // pointer was in the terminal's hands until the next click
+                // brought it back.
+                //
+                // Not a query: see `Surface::heal_mouse` for why asking is not
+                // an option here.
+                Wake::Input(Input::Mouse(Click::Hover, ..)) if !self.host.context_menu_open() => {
+                    self.surface.heal_mouse();
+                    self.host.say(
+                        "鼠标被终端收回了,已自动要回;若再次发生,ctrl-o 可手动切换",
+                        false,
+                    );
                     stale = true;
                 }
                 Wake::Input(Input::Resize(..)) => {
@@ -613,11 +658,14 @@ impl Tui {
 
     /// Tell the status line what the agent is doing. `false` when it already
     /// said so: the frame would be the one already up.
+    ///
+    /// The host's, not this front end's: writing `activity` moves the live line,
+    /// and the live line is a row of the scrollable content now — so whoever
+    /// writes it has to hold the reading still across the change. That is
+    /// [`Host::set_activity`]'s job, and keeping it there is what stops this
+    /// route and the fact route from pinning separately.
     fn set_activity(&self, activity: crate::moment::Activity) -> bool {
-        let mut m = self.host.moment.write().expect("moment poisoned");
-        let changed = m.activity != activity;
-        m.activity = activity;
-        changed
+        self.host.set_activity(activity)
     }
 
     fn say_refused(&self, text: &str) {
@@ -819,8 +867,11 @@ impl Tui {
                 m.caret = at + inserted.len();
             }
             Action::Cancel => {
-                m.activity = crate::moment::Activity::Stopping;
+                // Through the host, so the live line's appearance is pinned the
+                // same way a turn's start is: this is the third route that moves
+                // that row, and a pin on two of three jumps on the third.
                 drop(m);
+                self.host.set_activity(crate::moment::Activity::Stopping);
                 client.cancel();
                 return false;
             }
@@ -862,14 +913,19 @@ impl Tui {
                 // and the line you clicked is the first thing to leave. Moving
                 // the view back by exactly what it gained keeps that line where
                 // it was, and what appears, appears *below* it.
-                let size = self.surface.size();
-                let before = self.host.stream_height(size.0);
-                self.host.toggle_block(id, kind);
-                let grew = self.host.stream_height(size.0) as i64 - before as i64;
-                let mut m = self.host.moment.write().expect("moment poisoned");
-                let max = self.host.scroll_limit(size, &m) as i64;
-                m.scroll =
-                    crate::moment::ScrollPos((m.scroll.0 as i64 + grew).clamp(0, max) as usize);
+                // `m` was dropped above, so the pin can take the moment it
+                // needs without the caller's write lock in the way. Not a
+                // fourth copy of the arithmetic: folding a block changes how
+                // many rows there are to read, which is what every other route
+                // pins against.
+                //
+                // Held **whether or not the reader is at the bottom**, unlike
+                // the routes that fold a fact. The person pointed at this row;
+                // unfolding grows the block upward and its header is the first
+                // thing to leave, so the row they pointed at has to stay where
+                // they pointed — and pointing at a row while at the bottom is
+                // the common case, not the exception.
+                self.host.held_while(|| self.host.toggle_block(id, kind));
                 return false;
             }
             // Handing the mouse back is the answer to "I cannot select text
@@ -930,8 +986,8 @@ impl Tui {
                     m.caret = 0;
                     return false;
                 }
-                m.activity = crate::moment::Activity::Stopping;
                 drop(m);
+                self.host.set_activity(crate::moment::Activity::Stopping);
                 client.cancel();
                 return false;
             }

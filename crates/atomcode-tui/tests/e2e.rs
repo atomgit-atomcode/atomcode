@@ -1474,6 +1474,29 @@ async fn the_menu_asks_the_terminal_for_the_pointer_only_while_it_is_open() {
         "the menu closed but the terminal is still reporting every cell"
     );
 
+    // …and what is handed back is the *hover*, not the pointer. One tracker,
+    // three mutually exclusive settings: the `1003l` that stops free motion
+    // stops the clicks with it, so closing the menu has to leave the terminal in
+    // button reporting. Asserted as the state rather than as the bytes, because
+    // the bug was that the two were thought to be the same thing — the old pair
+    // of flags said "no hover" and could not say "and still no buttons", so the
+    // pointer was gone for the rest of the session and `ctrl-o` needed two
+    // presses to return it: the first turned off what was already off.
+    assert_eq!(
+        s.term.pointer_mode(),
+        atomcode_tui::ansi::Pointer::Buttons,
+        "closing the menu gave the clicks away with the hover"
+    );
+    // The bytes agree with the state, which is what a real terminal reads. Named
+    // as the constant rather than through `Pointer::escape` on purpose: asking
+    // the function under test what it produced is not an oracle, and this
+    // assertion is the one that notices the escape going back to a bare `1003l`.
+    assert_eq!(
+        s.term.escapes().last().map(String::as_str),
+        Some(atomcode_tui::ansi::MOUSE_ON),
+        "and that is what went out on the wire"
+    );
+
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
@@ -2300,6 +2323,118 @@ async fn the_effort_command_moves_the_row_while_the_screen_runs() {
         level_now(&app).await.as_deref(),
         Some("high"),
         "a refused value must not disturb the row"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn a_hover_with_nothing_following_the_pointer_says_the_mode_again_and_says_so() {
+    // The terminal can put its own tracker back without telling us — a session
+    // restore, a tab switch, a reset from anything else holding the tty. There
+    // is no way to ask (see `Surface::heal_mouse`: the `$y` reply never drains
+    // out of crossterm's parser), so the signal is behavioural: a plain move
+    // arrives *only* while free motion is reporting, and free motion is asked
+    // for exactly while the menu is up. A move with no menu is the one piece of
+    // evidence available that the tracker is not where this side left it.
+    let dir = scratch("heal-hover");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    let before = s.term.escapes().len();
+    assert!(
+        !s.screen().contains("鼠标被终端收回"),
+        "nothing said before anything happened:\n{}",
+        s.screen()
+    );
+
+    // A move, with no menu open. Nothing asked for it.
+    let field = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("input")
+        .expect("the composer")
+        .rect;
+    s.term
+        .pointer(atomcode_tui::surface::Click::Hover, field.x + 2, field.y);
+    s.quiet().await;
+
+    // Said again, as the whole mode — so a terminal that dropped the grab is
+    // back in button reporting. The state does not change (this side never
+    // thought it had changed), which is exactly why the tip is owed.
+    let sent = s.term.escapes();
+    assert!(sent.len() > before, "the mode was not said again: {sent:?}");
+    assert_eq!(
+        sent.last().map(String::as_str),
+        Some(atomcode_tui::ansi::MOUSE_ON),
+        "and it is the whole mode, not a delta"
+    );
+    assert_eq!(
+        s.term.pointer_mode(),
+        atomcode_tui::ansi::Pointer::Buttons,
+        "still in button reporting — healing is not a state change"
+    );
+
+    // And the person is told, on the reserved row, because the click they were
+    // about to make would have gone to the terminal instead.
+    assert!(
+        s.screen().contains("鼠标被终端收回"),
+        "the person was not told:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn a_move_that_was_asked_for_says_nothing_again() {
+    // The other half of the healing rule, and the half with a cost attached: an
+    // arriving mouse event is itself proof that the tracker is on, so repeating
+    // the mode on one buys nothing. While the menu is up it is worse than
+    // nothing — free motion reports every cell the pointer crosses, so healing
+    // per event would hand the terminal a packet per cell, which is the exact
+    // price `MOUSE_MOTION_ON` is written to avoid paying.
+    //
+    // Counted as a burst rather than one event, so a tick landing in the window
+    // cannot be read as the per-event healing this is about: ticks heal (that is
+    // the other half of the rule), and at 110ms a short burst has room for very
+    // few of them.
+    let dir = scratch("heal-no-op");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+
+    right_click_composer(&s);
+    s.quiet().await;
+    assert!(s.screen().contains("复制全文"), "the menu is up");
+
+    let hovered = 24usize;
+    let before = s.term.escapes().len();
+    let field = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("input")
+        .expect("the composer")
+        .rect;
+    for i in 0..hovered {
+        s.term.pointer(
+            atomcode_tui::surface::Click::Hover,
+            field.x + (i as u16 % 4),
+            field.y,
+        );
+    }
+    s.quiet().await;
+    let grew = s.term.escapes().len() - before;
+
+    assert!(
+        grew * 2 < hovered,
+        "{hovered} moves the menu asked for produced {grew} escapes — the mode \
+         is being repeated per event, and the terminal is paying per cell"
     );
 
     s.term.press(KeyPress::ctrl('d'));
