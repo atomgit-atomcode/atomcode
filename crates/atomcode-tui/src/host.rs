@@ -826,6 +826,52 @@ impl Host {
         self.pinned(false, change)
     }
 
+    /// Note words the person said that the model has not been handed yet.
+    ///
+    /// Called by the front end when a line is submitted during a turn. Goes
+    /// through [`Host::set_steering`], so the row this adds is pinned against
+    /// the reader's scroll like any other tail row — it takes a line off the
+    /// conversation, and a reader studying history must not watch it slide.
+    pub fn add_steering(&self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let mut next = self
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .steering
+            .clone();
+        if !next.is_empty() {
+            next.push('\n');
+        }
+        next.push_str(text);
+        self.set_steering(next);
+    }
+
+    /// The model has been handed everything waiting, so nothing is waiting.
+    ///
+    /// The whole point of the panel: it is up exactly while the person has said
+    /// something and the model has not seen it. `AgentEvent::Steered` is that
+    /// moment — it is emitted at the round boundary the inputs were folded at,
+    /// which is when the transcript starts drawing them too. Clearing at the end
+    /// of the turn instead would show every steering line twice.
+    pub fn clear_steering(&self) {
+        self.set_steering(String::new());
+    }
+
+    /// Replace what is waiting, pinned. `false` when it did not change.
+    fn set_steering(&self, text: String) -> bool {
+        if self.moment.read().expect("moment poisoned").steering == text {
+            return false;
+        }
+        self.pinned(true, || {
+            self.moment.write().expect("moment poisoned").steering = text;
+        });
+        true
+    }
+
     /// Run `change`, keeping the reader's place across whatever it did.
     ///
     /// **Measure, change, measure again** — one shape, because the arithmetic is
@@ -1829,7 +1875,16 @@ fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16
 /// scrolling back for. What does not is the frame — the input box, the tip row,
 /// the status line: those say where the session *is*, have no history, and must
 /// not move out from under a hand reaching for them. See `docs/adr/0020`.
-pub const TAIL: &[&str] = &[crate::modules::todo::ID, crate::modules::live::ID];
+///
+/// The steering panel is last, under the live line: it is the newest thing on
+/// screen (words typed seconds ago, not yet sent) and the tail is laid out from
+/// the bottom up, so last means closest to the composer the person just typed
+/// into.
+pub const TAIL: &[&str] = &[
+    crate::modules::todo::ID,
+    crate::modules::live::ID,
+    crate::modules::steering::ID,
+];
 
 /// The conversation, with [`TAIL`] riding at its foot.
 ///
@@ -3029,12 +3084,12 @@ mod tests {
 
         let with = declared(true);
         assert_eq!(
-            with.1, 3,
-            "a plan of two items is a header and two rows, and it counts"
+            with.1, 4,
+            "a plan of two items is a margin, a header and two rows, and it counts"
         );
         assert_eq!(
             with.0,
-            without.0 + 3,
+            without.0 + 4,
             "the tail's rows are in the sum, not only beside it"
         );
         assert_eq!(

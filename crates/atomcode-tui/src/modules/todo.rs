@@ -155,7 +155,15 @@ impl View for Todo {
             return Vec::new();
         }
 
-        let rows = window(items, vp.rect.h as usize);
+        let margin = if vp.rect.h >= ROWS {
+            MARGIN as usize
+        } else {
+            0
+        };
+        // The window is told what is left once the margin has been taken off the
+        // rect — it counts the header itself, so handing it the full height
+        // would push one item below the fold to make room for a blank row.
+        let rows = window(items, (vp.rect.h as usize).saturating_sub(margin));
         let (completed, in_progress, total) = todo_counts(items);
         let open = total.saturating_sub(completed + in_progress);
         let unicode = vp.moment.caps.unicode;
@@ -168,14 +176,28 @@ impl View for Todo {
         let done = theme::fg(Role::Muted);
         let plain = theme::fg(Role::Secondary);
 
-        let mut out = El::row(vec![
-            El::styled("任务 ", label),
-            El::styled(
-                format!("({completed} 已完成, {in_progress} 进行中, {open} 待办)"),
-                counts,
-            ),
-        ])
-        .lay(w);
+        // The margin, only when the rect can seat it as well as the header —
+        // the same bargain `live` strikes, and for the same reason: the host
+        // clips to `height`, so emitting a blank row it would keep in place of
+        // the header is the one way this could draw a plan panel that says
+        // nothing. Above the header only: below the last item is the
+        // conversation's own edge, and a margin there would be a second row of
+        // nothing between the panel and whatever the reader scrolled to.
+        let mut out: Vec<Line> = Vec::with_capacity(ROWS as usize);
+        for _ in 0..margin {
+            out.push(Line::empty());
+        }
+
+        out.extend(
+            El::row(vec![
+                El::styled("任务 ", label),
+                El::styled(
+                    format!("({completed} 已完成, {in_progress} 进行中, {open} 待办)"),
+                    counts,
+                ),
+            ])
+            .lay(w),
+        );
 
         for row in rows {
             match row {
@@ -215,17 +237,36 @@ impl View for Todo {
         out
     }
 
-    /// A header plus a line each, content-sized: the host caps it, so a plan
-    /// that outgrows the screen loses the fold, not the panel.
+    /// The header, the margin above it, and a line each. Content-sized: the
+    /// host caps it, so a plan that outgrows the screen loses the fold, not the
+    /// panel.
+    ///
+    /// The margin is counted here because this is where the row is *asked for*:
+    /// a `gap` in the layout would be counted whether or not the panel is up,
+    /// leaving a blank row of chrome over the conversation between plans. Asked
+    /// for here, it arrives and leaves with the panel, from the same predicate
+    /// `render` draws from. See `live.rs` for the same bargain.
     fn height(state: &State, _: &Moment, _: u16) -> Height {
         let items = state.items.len();
         Height::Hug(if items == 0 {
             0
         } else {
-            (items + 1).min(u16::MAX as usize) as u16
+            (items + 1 + MARGIN as usize).min(u16::MAX as usize) as u16
         })
     }
 }
+
+/// The blank row above the header — the padding that keeps the plan off the
+/// conversation, which is the thing it sits directly under.
+///
+/// Above only. Under the last item is the stream's own bottom edge, and the tail
+/// is laid out from the bottom up (ADR 0020), so a margin below would be a row
+/// of nothing claimed from the conversation to say the same thing twice.
+const MARGIN: u16 = 1;
+
+/// What the panel asks for when it is up: the margin, the header, and at least
+/// one item. The threshold `render` uses to decide whether the margin fits.
+const ROWS: u16 = 1 + MARGIN;
 
 /// One line of the body, after the fold and before the styles.
 enum Row {
@@ -358,26 +399,30 @@ mod tests {
             r#"{"todos":[{"content":"读代码","status":"completed"},{"content":"写面板","status":"in_progress"},{"content":"跑测试","status":"pending"}]}"#,
         )]);
         let lines = drew(&state, 60, 10);
-        assert_eq!(lines.len(), 4, "{lines:#?}");
-        assert!(lines[0].contains("1 已完成"), "{:?}", lines[0]);
-        assert!(lines[0].contains("1 进行中"), "{:?}", lines[0]);
-        assert!(lines[0].contains("1 待办"), "{:?}", lines[0]);
+        assert_eq!(lines.len(), 5, "{lines:#?}");
+        // The margin first, blank — the row that keeps the plan off the words it
+        // sits directly under. It is the module's own row, asked for in
+        // `height`, so it arrives and leaves with the panel.
+        assert_eq!(lines[0], "", "{lines:#?}");
+        assert!(lines[1].contains("1 已完成"), "{:?}", lines[1]);
+        assert!(lines[1].contains("1 进行中"), "{:?}", lines[1]);
+        assert!(lines[1].contains("1 待办"), "{:?}", lines[1]);
         assert!(
-            lines[1].contains("#1") && lines[1].contains("读代码"),
-            "{:?}",
-            lines[1]
-        );
-        assert!(
-            lines[2].contains("#2") && lines[2].contains("写面板"),
+            lines[2].contains("#1") && lines[2].contains("读代码"),
             "{:?}",
             lines[2]
         );
         assert!(
-            lines[3].contains("#3") && lines[3].contains("跑测试"),
+            lines[3].contains("#2") && lines[3].contains("写面板"),
             "{:?}",
             lines[3]
         );
-        assert_eq!(asks(&state), Height::Hug(4));
+        assert!(
+            lines[4].contains("#3") && lines[4].contains("跑测试"),
+            "{:?}",
+            lines[4]
+        );
+        assert_eq!(asks(&state), Height::Hug(5));
     }
 
     #[test]
@@ -410,9 +455,9 @@ mod tests {
 
         // Partly finished is not finished: the panel is there, and it says so.
         let partial = fold(&[two(), finish(1)]);
-        assert_eq!(asks(&partial), Height::Hug(3));
+        assert_eq!(asks(&partial), Height::Hug(4));
         assert!(
-            drew(&partial, 60, 10)[0].contains("1 已完成"),
+            drew(&partial, 60, 10)[1].contains("1 已完成"),
             "the count still has something to report"
         );
 
@@ -438,13 +483,13 @@ mod tests {
             call("c3", "todowrite", r#"{"action":"add","content":"c"}"#),
         ]);
         let lines = drew(&state, 60, 10);
-        assert_eq!(lines.len(), 4, "{lines:#?}");
+        assert_eq!(lines.len(), 5, "{lines:#?}");
         assert!(
-            lines[2].starts_with("[•]") && lines[2].contains("b"),
+            lines[3].starts_with("[•]") && lines[3].contains("b"),
             "{:?}",
-            lines[2]
+            lines[3]
         );
-        assert!(lines[3].contains("c"), "{:?}", lines[3]);
+        assert!(lines[4].contains("c"), "{:?}", lines[4]);
     }
 
     #[test]
@@ -460,11 +505,11 @@ mod tests {
             result("c2", true),
         ]);
         let lines = drew(&state, 60, 10);
-        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert_eq!(lines.len(), 3, "{lines:#?}");
         assert!(
-            lines[1].contains("a") && !lines[1].contains("b"),
+            lines[2].contains("a") && !lines[2].contains("b"),
             "{:?}",
-            lines[1]
+            lines[2]
         );
     }
 
@@ -505,8 +550,8 @@ mod tests {
             &plan(r#"{"todos":[{"content":"b","status":"pending"}]}"#),
         );
         let lines = drew(&state, 60, 10);
-        assert_eq!(lines.len(), 2, "{lines:#?}");
-        assert!(lines[1].contains("b"), "{:?}", lines[1]);
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(lines[2].contains("b"), "{:?}", lines[2]);
     }
 
     #[test]
@@ -550,21 +595,25 @@ mod tests {
 
         // The frontier is the *first* item: the tail cannot hold it, so the
         // window is pulled back to the front and the rows it gives up say so.
+        // The margin costs one of the eight rows, which is one item fewer than
+        // the panel without a margin would show — the trade the margin is.
         let state = fold(&[plan(&build(0))]);
         let lines = drew(&state, 60, 8);
         assert_eq!(lines.len(), 8, "{lines:#?}");
         assert!(
-            lines[1].contains("#1") && lines[1].contains("task 0"),
+            lines[2].contains("#1") && lines[2].contains("task 0"),
             "{lines:#?}"
         );
-        assert!(lines[7].contains("+6 更多"), "{:?}", lines[7]);
+        assert!(lines[7].contains("+7 更多"), "{:?}", lines[7]);
 
         // Nothing is claimed to be missing when everything fits.
         let all = drew(&state, 60, 40);
-        assert_eq!(all.len(), 13, "{all:#?}");
+        assert_eq!(all.len(), 14, "{all:#?}");
         assert!(!all.iter().any(|l| l.contains("更多")), "{all:#?}");
 
-        // Header only, when that is all there is room for.
+        // Header only, when that is all there is room for. One row cannot seat
+        // the margin as well, so the margin stands down and the header keeps the
+        // row: at a height that cannot hold both, the words win.
         let one = drew(&state, 60, 1);
         assert_eq!(one.len(), 1, "{one:#?}");
         assert!(one[0].contains("11 待办"), "{:?}", one[0]);

@@ -417,6 +417,66 @@ async fn typing_during_a_turn_is_folded_into_it_rather_than_queued() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+#[tokio::test]
+async fn a_line_typed_mid_turn_is_shown_until_the_model_is_handed_it() {
+    // The gap this panel exists for, and it is only visible from the outside:
+    // a message typed during a turn goes to the agent's inbox and is folded in
+    // at the next ROUND boundary, so between the two there is no `UserMessage`
+    // fact for the transcript to fold and the words are nowhere on screen —
+    // already sent, no longer in the field, not yet in the conversation.
+    //
+    // The slow tool is what holds that window open. Measured here rather than
+    // assumed: the words land at the round boundary, NOT at the end of the turn,
+    // so a panel that stayed until `TurnComplete` would draw the same sentence
+    // twice for as long as the rest of the turn took.
+    let dir = scratch("steering-panel");
+    let script = replay(
+        r#"{ text = "one", calls = [ { name = "bash", args = { command = "sleep 3" } } ] },
+           { text = "two", calls = [ { name = "bash", args = { command = "sleep 5" } } ] },
+           { text = "three" }"#,
+    );
+    let s = start(tree(&dir, &script, &[])).await;
+    let task = s.open().await;
+
+    s.term.type_line("first");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    s.term.type_line("STEER-ME");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let waiting = s.screen();
+    assert!(
+        waiting.contains("STEER-ME"),
+        "the person's own words must be on screen while they are in flight:\n{waiting}"
+    );
+    assert!(
+        waiting.contains("运行中"),
+        "…and this is the mid-turn window, not the end of it:\n{waiting}"
+    );
+
+    // Past the round boundary: `sleep 3` is done, the fold has happened, the
+    // model has the words, and the next step has opened its own long sleep.
+    tokio::time::sleep(Duration::from_millis(2900)).await;
+    let folded = s.screen();
+    assert!(
+        folded.contains("STEER-ME"),
+        "the transcript owns the words from here on:\n{folded}"
+    );
+    assert!(
+        folded.contains("运行中"),
+        "still inside the turn, so this is the handover and not the end:\n{folded}"
+    );
+    // One copy, not two. This is the assertion the `Steered`-timed clear exists
+    // for: the panel leaves as the block arrives.
+    assert_eq!(
+        folded.matches("STEER-ME").count(),
+        1,
+        "the panel must be gone by the time the transcript draws the words:\n{folded}"
+    );
+
+    s.quiet().await;
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 // Multi-threaded on purpose. The driver commits the turn's last fact and
 // marks the agent idle in one synchronous stretch; on the single-threaded test
 // runtime the UI task cannot run between the two, so the race this test exists

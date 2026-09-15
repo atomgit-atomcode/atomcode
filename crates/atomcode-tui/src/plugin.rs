@@ -637,7 +637,22 @@ impl Tui {
         match event {
             AgentEvent::TurnStarted => self.set_activity(Activity::Working),
             AgentEvent::TurnComplete { .. } | AgentEvent::Cancelled => {
+                // A cancel or a failure can end the turn with words still in the
+                // inbox — nothing folded them, and no `Steered` is coming. The
+                // panel is a claim about the model's inbox, so it goes with the
+                // turn rather than lying about work that will not happen.
+                self.host.clear_steering();
                 self.set_activity(Activity::Idle)
+            }
+            AgentEvent::Steered { .. } => {
+                // The model has been handed what was waiting. This is the moment
+                // the transcript starts drawing it too, so the panel leaves as it
+                // arrives rather than showing the same sentence twice. The `true`
+                // is the panel leaving — the transcript's half of the exchange
+                // comes to the screen as the fact itself, which needs no frame
+                // from here.
+                self.host.clear_steering();
+                true
             }
             AgentEvent::Compacted { committed, .. } => {
                 if committed {
@@ -739,7 +754,18 @@ impl Tui {
                 }
                 // One command. Whether it starts a turn or folds into the one
                 // running is the pump's call, not the screen's.
-                client.send(text, images);
+                //
+                // What the screen does know is whether a turn is *already*
+                // running, and only then is this steering. Said between turns it
+                // opens a new turn and reaches the model immediately — there is
+                // no gap to fill, and `Steered` will never come to close a panel
+                // that was opened for it.
+                let steering = self.host.moment.read().expect("moment poisoned").activity
+                    != crate::moment::Activity::Idle;
+                client.send(text.clone(), images);
+                if steering {
+                    self.host.add_steering(&text);
+                }
                 return false;
             }
             Action::Insert(c) => {

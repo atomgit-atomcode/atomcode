@@ -34,7 +34,7 @@ use serde_json::Value;
 use crate::command::Commands;
 use crate::layout::{LayoutOp, Side};
 use crate::module::{Modules, Mounted, Producer};
-use crate::modules::{input, live, status, team, tip, todo, transcript};
+use crate::modules::{input, live, status, steering, team, tip, todo, transcript};
 use crate::plugin::{CommandsSvc, LayoutSvc, ModulesSvc};
 
 /// The screen, panel by panel — the one place that says what a full UI is made
@@ -75,6 +75,13 @@ name = "tui-panel-input"
 # off the screen.
 [[insert]]
 name = "tui-panel-todo"
+
+# On by default: it takes no room until the person types during a turn, and the
+# gap it fills is otherwise blank on every screen — words already sent, not yet
+# in the log, and no longer in the field. Rides the stream's tail with `todo`
+# and `live`.
+[[insert]]
+name = "tui-panel-steering"
 
 # Off by default, on with `--mascot`. A row, not a boolean on the UI row.
 [[insert]]
@@ -124,6 +131,7 @@ pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
         Arc::new(MascotPanel),
         Arc::new(TeamPanel),
         Arc::new(TodoPanel),
+        Arc::new(SteeringPanel),
         Arc::new(AskCardRow),
         Arc::new(ScreenCommandsRow),
         Arc::new(SessionCommandsRow),
@@ -369,6 +377,38 @@ impl Plugin for TodoPanel {
         mods.add_view(view)?;
         // Mount only. Where it goes is the composer's to write — `LayoutOp::Show`
         // has no side that means "above the field".
+        let m: Arc<Modules> = mods.clone();
+        let _ = ctx.effect(move || m.remove_view(id));
+        Ok(())
+    }
+}
+
+/// The panel for words typed while a turn was running and not yet handed to the
+/// model.
+///
+/// Mount only, like the task list beside it: its place is the stream's tail
+/// (`host::TAIL`), which no `Show` op names. Its rows come and go with
+/// `Moment::steering` rather than with anything folded from the log — the log
+/// has no such fact until the next round boundary — so there is no state to
+/// keep and nothing to remove.
+pub struct SteeringPanel;
+
+#[async_trait]
+impl Plugin for SteeringPanel {
+    fn name(&self) -> &'static str {
+        "tui-panel-steering"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tui-modules"]
+    }
+    fn description(&self) -> &'static str {
+        "what you said while the model was working, until the model is handed it"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let mods = ctx.require::<ModulesSvc>().map_err(|e| e.to_string())?;
+        let view = Arc::new(Mounted::<steering::Steering>::new());
+        let id = <steering::Steering as crate::module::View>::id();
+        mods.add_view(view)?;
         let m: Arc<Modules> = mods.clone();
         let _ = ctx.effect(move || m.remove_view(id));
         Ok(())

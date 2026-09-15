@@ -218,6 +218,16 @@ pub struct Moment {
     /// in the log is a tip, and copying text to the clipboard commits nothing.
     /// It carries its own expiry so the module draws it without a clock.
     pub notice: Option<Notice>,
+    /// What the person has said while a turn was running, and the model has not
+    /// been handed yet — oldest first, joined by newlines.
+    ///
+    /// Not in the log, and that is not an implementation detail: a message typed
+    /// mid-turn is folded in at the next *round* boundary, so until then no
+    /// `UserMessage` fact exists to fold. The words are in the agent's inbox and
+    /// nowhere else, which is exactly what this struct is for. The front end
+    /// appends on submit and clears on `AgentEvent::Steered`; see
+    /// `modules::steering`.
+    pub steering: String,
 }
 
 impl Moment {
