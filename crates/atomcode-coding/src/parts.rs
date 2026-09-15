@@ -34,8 +34,8 @@ use atomcode_capabilities::skills::{
     register_skill_tools, runtime_skill_dirs, SkillCatalogHook, SkillRegistry,
 };
 use atomcode_capabilities::tools::{
-    register_coding_tools_with_vision, ApprovalMiddleware, ArtifactMiddleware, ArtifactStore,
-    BashWorkspaceGate, FetchOutputTool, OpenFileWorkspaceGate, ReadFileTool,
+    register_coding_tools_with_vision, APPROVAL_KIND, ApprovalMiddleware, ArtifactMiddleware,
+    ArtifactStore, BashWorkspaceGate, FetchOutputTool, OpenFileWorkspaceGate, ReadFileTool,
     RepairToolArgsMiddleware, SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
 };
 use atomcode_kernel::agent::Agent;
@@ -1098,7 +1098,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         approval: Arc::new(ApprovalMiddleware::with_allow_all_store(
             Arc::new(atomcode_capabilities::tools::InMemoryPermissionStore::new()),
             bash_allow_all.clone(),
-            "approval".to_string(),
+            APPROVAL_KIND.to_string(),
         )),
         hooks,
         compaction_checkpoint,
@@ -1226,6 +1226,7 @@ impl CodingParts {
         self.bash_workspace_grants = Arc::clone(&previous.bash_workspace_grants);
         self.sensitive_path_grants = Arc::clone(&previous.sensitive_path_grants);
         self.credential_shell_grants = Arc::clone(&previous.credential_shell_grants);
+        self.bash_allow_all_grants = Arc::clone(&previous.bash_allow_all_grants);
     }
 
     /// Preserve the exact current conversation across a sessionless provider reassembly.
@@ -3016,6 +3017,10 @@ mod tests {
         assert!(Arc::ptr_eq(
             &candidate.credential_shell_grants,
             &previous.credential_shell_grants,
+        ));
+        assert!(Arc::ptr_eq(
+            &candidate.bash_allow_all_grants,
+            &previous.bash_allow_all_grants,
         ));
         assert!(candidate
             .plan_mode
