@@ -229,6 +229,22 @@ impl Palette {
         self.slots[i].unwrap_or(XTERM[i])
     }
 
+    /// What the terminal renders for any index, above the scheme's own sixteen
+    /// included.
+    ///
+    /// Slots 0..15 are the person's scheme and only the terminal can say what
+    /// they are; 16 and up are the standard cube and ramp, which every
+    /// 256-colour terminal renders identically. That asymmetry is the whole
+    /// reason a computed surface can be placed at all on a terminal that never
+    /// answered — see [`cube`].
+    pub fn rendered(&self, n: u8) -> Rgb {
+        if n < 16 {
+            self.slot(n)
+        } else {
+            cube(n)
+        }
+    }
+
     /// Which way the background leans.
     pub fn theme(&self) -> Theme {
         if luminance(self.bg) > 0.18 {
@@ -422,11 +438,10 @@ fn panel_ground(p: &Palette, reach: f32) -> Rgb {
 /// The single resolution point. Everything above states a role.
 pub fn resolve(role: Role, caps: Caps) -> Option<Color> {
     let p = &caps.palette;
-    let truecolor = caps.colors == Colors::True;
     match role {
         Role::Secondary | Role::ToolName => None,
-        Role::PanelBg => Some(exact(panel_bg(p), truecolor, p)),
-        Role::PanelSelBg => Some(exact(panel_ground(p, PANEL_SEL_REACH), truecolor, p)),
+        Role::PanelBg => Some(exact(panel_bg(p), caps.colors, p)),
+        Role::PanelSelBg => Some(exact(panel_ground(p, PANEL_SEL_REACH), caps.colors, p)),
         Role::PanelFg => {
             // Read against the panel, not against the screen behind it.
             let on = panel_bg(p);
@@ -435,7 +450,7 @@ pub fn resolve(role: Role, caps: Caps) -> Option<Color> {
             } else {
                 (0, 0, 0)
             };
-            Some(exact(ink, truecolor, p))
+            Some(exact(ink, caps.colors, p))
         }
         Role::Muted => {
             let need = floor(role);
@@ -461,7 +476,7 @@ pub fn resolve(role: Role, caps: Caps) -> Option<Color> {
             // the nearest slot, which is the honest answer when slots are the
             // only vocabulary it has.
             if let Some(ink) = muted_ink(p, need) {
-                return Some(exact(ink, truecolor, p));
+                return Some(exact(ink, caps.colors, p));
             }
             // Nobody answered: synthesise from the standard candidate and stop
             // just above the floor. Taking an assumed slot here instead is what
@@ -553,17 +568,59 @@ fn from_slots(role: Role, caps: Caps) -> Option<Color> {
     synthesise(role, caps)
 }
 
-/// An exact colour when the terminal has one, and the nearest slot when it does
+/// The colour xterm's index table renders for index `n`, 16 and up.
+///
+/// 16..231 is the 6×6×6 cube, 232..255 the 24-step grey ramp. Both are part of
+/// the *standard*, not of anybody's scheme: unlike slots 0..15 — which a person
+/// redefines in their profile, so assuming one is assuming someone else's
+/// colours — every 256-colour terminal draws these the same. That is what makes
+/// them usable on a terminal that answered nothing at all, which is the state
+/// every Windows terminal is in (the palette query needs a tty descriptor;
+/// see `surface::query_terminal`).
+fn cube(n: u8) -> Rgb {
+    match n {
+        0..=15 => XTERM[n as usize],
+        16..=231 => {
+            const LEVELS: [u8; 6] = [0, 0x5f, 0x87, 0xaf, 0xd7, 0xff];
+            let i = n as usize - 16;
+            (LEVELS[i / 36 % 6], LEVELS[i / 6 % 6], LEVELS[i % 6])
+        }
+        // 8, 18, ... 238 — xterm's ramp starts at eight, not zero, so the first
+        // step is a grey that is *not* the black it would otherwise equal.
+        232..=255 => {
+            let g = 8 + 10 * (n - 232);
+            (g, g, g)
+        }
+    }
+}
+
+/// An exact colour when the terminal has one, and the nearest index when it does
 /// not — a panel is a background, and a wrong background is worse than a plain
 /// one.
-fn exact(rgb: Rgb, truecolor: bool, p: &Palette) -> Color {
-    if truecolor {
+///
+/// The search runs over all 256 indices on a 256-colour terminal, not just the
+/// scheme's sixteen. Sixteen was the bug: the surfaces this resolves are the
+/// background moved a *little* (12% and 24% of the way to white), and on a black
+/// ground the nearest of the sixteen to `#1f1f1f` is slot 0 — black — so the
+/// raised panel came out identical to the screen and the pointed-at row
+/// identical to the panel. The cube has an index for every hexstep and the ramp
+/// steps by ten, so both land on something that is actually a step away. Ties go
+/// to the lower index, so a slot the person's own scheme defines still wins
+/// whenever it is exactly as close as a cube entry.
+///
+/// Sixteen colours have no such vocabulary — there, any answer that is not the
+/// ground is also not a colour the person chose — so an [`Colors::Ansi16`]
+/// terminal keeps the old behaviour and its panels stay flat. Inventing a slot
+/// there is the guess this module refuses everywhere else.
+fn exact(rgb: Rgb, colors: Colors, p: &Palette) -> Color {
+    if colors == Colors::True {
         return Color::rgb(rgb);
     }
-    let best = (0u8..16)
+    let last = if colors == Colors::Ansi256 { 255 } else { 15 };
+    let best = (0u8..=last)
         .min_by(|&a, &b| {
-            distance(p.slot(a), rgb)
-                .partial_cmp(&distance(p.slot(b), rgb))
+            distance(p.rendered(a), rgb)
+                .partial_cmp(&distance(p.rendered(b), rgb))
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .unwrap_or(7);
@@ -591,8 +648,8 @@ pub fn explain(caps: Caps) -> Vec<String> {
     let hex = |(r, g, b): Rgb| format!("#{r:02x}{g:02x}{b:02x}");
     let rgb_of = |c: Option<Color>| match c {
         Some(Color::Ansi(n)) => Some((
-            format!("slot {n:<3} {}", hex(caps.palette.slot(n))),
-            caps.palette.slot(n),
+            format!("slot {n:<3} {}", hex(caps.palette.rendered(n))),
+            caps.palette.rendered(n),
         )),
         Some(Color::Rgb(r, g, b)) => Some((format!("exact    {}", hex((r, g, b))), (r, g, b))),
         _ => None,
@@ -673,7 +730,7 @@ mod tests {
     fn seen(role: Role, caps: Caps) -> Option<Rgb> {
         match resolve(role, caps)? {
             Color::Rgb(r, g, b) => Some((r, g, b)),
-            Color::Ansi(n) => Some(caps.palette.slot(n)),
+            Color::Ansi(n) => Some(caps.palette.rendered(n)),
             Color::Role(_) => unreachable!("resolution does not produce a role"),
         }
     }
@@ -773,6 +830,62 @@ mod tests {
             assert!(
                 contrast(pointed, bg) > contrast(panel, bg),
                 "and the step has to be *away* from the ground: {pointed:?} over {bg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_raised_panel_is_visible_without_truecolor_too() {
+        // The Windows case, and every other terminal that will not report
+        // itself: nothing measured and no truecolor, so `exact` has only the
+        // index table to answer from. It searched the first sixteen and stopped
+        // — and the panel it computed for a black ground, `#1f1f1f`, twelve
+        // percent of the way to white, is nearest to slot 0, which *is* the
+        // ground. The raised surface and the pointed-at row both sank into the
+        // screen behind them, on the terminals least able to report it back.
+        for theme in [Theme::Dark, Theme::Light] {
+            let caps = Caps {
+                palette: Palette::assumed(theme),
+                colors: Colors::Ansi256,
+                ..Caps::default()
+            };
+            let bg = caps.palette.background();
+            let panel = seen(Role::PanelBg, caps).unwrap();
+            let pointed = seen(Role::PanelSelBg, caps).unwrap();
+            assert_ne!(panel, bg, "the panel is the ground it sits on ({theme:?})");
+            assert_ne!(
+                pointed, panel,
+                "the pointed-at row is its panel ({theme:?})"
+            );
+            assert!(
+                contrast(pointed, bg) > contrast(panel, bg),
+                "the step has to be *away* from the ground: {panel:?} / {pointed:?} over {bg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sixteen_colour_terminal_is_not_sent_to_the_cube() {
+        // The boundary of the fix above, and the reason `exact` takes a
+        // `Colors` rather than a `bool`: the cube and the ramp are the one part
+        // of the index table every 256-colour terminal draws the same, and a
+        // terminal that has only sixteen of them does not draw them *at all* —
+        // it maps the index back into its own sixteen, so a computed surface
+        // would land on whatever approximation the terminal chose rather than
+        // on the step we asked for. Sixteen colours therefore keep the flat
+        // panel: no colour is better than a colour we cannot predict.
+        let caps = Caps {
+            palette: Palette::assumed(Theme::Dark),
+            colors: Colors::Ansi16,
+            ..Caps::default()
+        };
+        for role in [Role::PanelBg, Role::PanelSelBg] {
+            let Some(Color::Ansi(n)) = resolve(role, caps) else {
+                panic!("{role:?} did not resolve to an index");
+            };
+            assert!(
+                n < 16,
+                "{role:?} reached for index {n} on a 16-colour terminal"
             );
         }
     }

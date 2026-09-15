@@ -44,7 +44,7 @@
 
 use atomcode_harness::session::SessionEvent;
 
-use crate::caps::{Glyph, SPINNER};
+use crate::caps::Glyph;
 use crate::el::El;
 use crate::frame::{Line, Style};
 use crate::module::{Height, View};
@@ -172,7 +172,7 @@ impl View for Live {
         };
 
         let muted = theme::fg(Role::Muted);
-        let frame = SPINNER[(vp.moment.tick as usize) % SPINNER.len()];
+        let frame = vp.moment.caps.spinner(vp.moment.tick);
         let sep = format!(" {} ", vp.moment.caps.g(Glyph::Separator));
 
         let head = format!("{frame} {words}");

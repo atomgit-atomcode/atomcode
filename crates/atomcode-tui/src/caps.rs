@@ -326,9 +326,37 @@ pub enum Glyph {
 /// glyph for one ASCII cell, and there is no one-cell ASCII spinner that reads
 /// as motion. These are one column everywhere, which is the property that
 /// matters — a frame two cells wide would move the text beside it every tick.
+///
+/// Which is why the set is chosen by terminal rather than rewritten afterwards:
+/// a column of tofu is not a spinner, and [`Caps::spinner`] is the only way to
+/// take a frame. See [`ASCII_SPINNER`].
 pub const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
+/// The spinner for a terminal with no Unicode: the oldest one there is.
+///
+/// `- \ | /` rather than braille blanks or ASCII digits: motion is the whole
+/// job of this row, and it is the only property that has to survive the swap.
+/// All four are ASCII, one column, and unambiguous in every font — including
+/// the legacy Windows console, which draws the first set of eight as eight
+/// tofu boxes.
+pub const ASCII_SPINNER: [&str; 4] = ["-", "\\", "|", "/"];
+
 impl Caps {
+    /// The spinner frame for this tick, in a set this terminal can draw.
+    ///
+    /// The one way to take a frame. A module that indexed [`SPINNER`] itself
+    /// would draw braille on a terminal that has already been told to stay
+    /// inside ASCII, and the tofu would arrive on the one row that is *all*
+    /// motion — the downgrade table cannot rescue it (see [`SPINNER`]), so the
+    /// set has to change instead.
+    pub fn spinner(&self, tick: u64) -> &'static str {
+        if self.unicode {
+            SPINNER[(tick as usize) % SPINNER.len()]
+        } else {
+            ASCII_SPINNER[(tick as usize) % ASCII_SPINNER.len()]
+        }
+    }
+
     pub fn g(&self, glyph: Glyph) -> &'static str {
         use Glyph::*;
         if self.unicode {
@@ -538,6 +566,43 @@ mod tests {
             );
             assert_eq!(downgrade(frame, false), frame, "chrome is never rewritten");
         }
+    }
+
+    #[test]
+    fn a_terminal_without_unicode_is_handed_a_spinner_it_can_draw() {
+        // The braille set is deliberately absent from the downgrade table — it
+        // trades one column for one column, and there is no one-cell ASCII
+        // stand-in that reads as motion. So the *set* has to follow the
+        // terminal, or the shield that exists to stop tofu draws eight of them,
+        // on exactly the terminals it was written for (legacy Windows conhost,
+        // `LANG=C` in a container).
+        let plain = Caps::plain();
+        for tick in 0..24 {
+            let frame = plain.spinner(tick);
+            assert!(
+                frame.is_ascii(),
+                "tick {tick} drew {frame:?} on a terminal with no unicode"
+            );
+            assert_eq!(
+                crate::width::str_width(frame),
+                1,
+                "tick {tick} drew {frame:?}, which is not one cell"
+            );
+        }
+        // Anything that is not an outright no keeps the good set. Stated as an
+        // explicit capability rather than `Caps::detect()`: detection is the
+        // environment's answer, and the test runner sets `TERM=dumb` to keep its
+        // own output stable — asserting the runner's answer would be a test of
+        // nextest, not of this table.
+        let capable = Caps {
+            unicode: true,
+            ..Caps::default()
+        };
+        assert_eq!(
+            capable.spinner(3),
+            SPINNER[3],
+            "a terminal that can draw braille did not get it"
+        );
     }
 
     #[test]

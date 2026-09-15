@@ -4,8 +4,7 @@ use atomcode_harness::session::SessionEvent;
 
 // One frame per tick, shared with the live line above the composer: two panels
 // cycling two different sets, or the same set out of phase, is two front ends
-// on one screen.
-use crate::caps::SPINNER;
+// on one screen. Which set is the terminal's answer, so it comes from `caps`.
 use crate::frame::{Color, Line, Style};
 use crate::module::{Height, View};
 use crate::moment::{Activity, Moment, Viewport};
@@ -97,10 +96,7 @@ impl View for Status {
             Activity::Working => {
                 row.push(sep());
                 row.push(El::styled(
-                    format!(
-                        "{} 运行中",
-                        SPINNER[(vp.moment.tick as usize) % SPINNER.len()]
-                    ),
+                    format!("{} 运行中", vp.moment.caps.spinner(vp.moment.tick)),
                     theme::fg(Role::Warning),
                 ));
             }

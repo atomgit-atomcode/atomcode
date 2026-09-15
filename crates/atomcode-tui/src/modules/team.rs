@@ -62,9 +62,6 @@ enum Pending {
     Stop { name: Option<String> },
 }
 
-/// One frame per tick, as in the status line.
-const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
-
 /// How wide a name or a role column may get before it is cut.
 const NAME_CAP: usize = 14;
 const ROLE_CAP: usize = 12;
@@ -219,7 +216,7 @@ impl View for Team {
         for row in &rows {
             let (mark, mark_style) = match row.state {
                 Shown::Working => (
-                    SPINNER[(vp.moment.tick as usize) % SPINNER.len()].to_string(),
+                    caps.spinner(vp.moment.tick).to_string(),
                     theme::fg(Role::Warning),
                 ),
                 Shown::Idle => (caps.g(Glyph::Ok).to_string(), theme::fg(Role::Success)),
