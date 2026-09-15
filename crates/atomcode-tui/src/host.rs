@@ -2686,6 +2686,122 @@ mod tests {
         );
     }
 
+    /// **一把尺子，不是一道闸门。** 给它 `ATOMCODE_PERF_LOG=<真实会话的 jsonl>`
+    /// 就把那份会话折进一个 host，量一格滚轮的真实成本；不给就立刻返回。
+    ///
+    /// 它存在的理由：这份 host 里其他每一条判断都是「画了什么」——而「一帧花了
+    /// 多久」在画面上看不出来，同样的行两种做法都画得出来。`COPIED_ROWS` 与
+    /// `block::LIVE_RESUMES` 是同一种东西，只是那两个数**调用次数**，这个数
+    /// **时间**。
+    ///
+    /// ## 2026-09-15 的实测（用户报「滚动卡、CPU 99%」）
+    ///
+    /// 会话 1570 个槽位。**一格滚轮 = `scroll_limit` + `compose`**：
+    ///
+    /// ```text
+    ///              debug    release
+    /// 一格滚轮      20.7ms    5.5ms      ← 差 4 倍
+    /// compose@顶部  20.4ms    5.3ms      ← 最坏：视口在最旧的内容处
+    /// compose@底部   1.0ms    0.2ms
+    /// scroll_limit   4.1ms    0.11ms
+    /// ```
+    ///
+    /// **结论：那是构建配置，不是算法。** 用户跑的是 `./target/debug/atui`；
+    /// 换 release 即缓解。所以量这里的东西必须说清用哪个构建，否则会把 debug
+    /// 的放大倍数当成算法问题。
+    ///
+    /// 成本随**槽位数**走，不随日志大小走 —— 381774 个事件只折出 1570 个块
+    /// （`assistant_chunk` 累积成一块），所以 427MB 的会话和 30MB 的会话在帧
+    /// 成本上几乎一样。看日志大小估帧成本会估错一个数量级。
+    ///
+    /// ## 还没做的：让一帧不必走完整个会话
+    ///
+    /// 这两条路都是 O(槽位)，而窗口只有 24 行：
+    ///
+    /// * `stream_height_in` 每次调用都把整段会话的每块行数重算一遍。实测
+    ///   `scroll_limit` 一次 **2.04ms**（release）—— 而 `pinned` 在读者往回滚
+    ///   着看历史时**每个 chunk 调它两次**。
+    /// * `stream_lines` 从最新一块**倒着走到视口**：1570 个槽位时为了一屏 24 行
+    ///   要迭代 1546 次，占掉 `compose` 5.37ms 里的 5.25ms（release）。
+    ///
+    /// 两条都有现成的把手：每块的行数是可缓存的（settling 就是「内容不再变」的
+    /// 承诺），而倒着走的那条有前缀和就能二分跳到视口所在块。
+    ///
+    #[test]
+    fn measure_the_frame_cost_of_a_real_session() {
+        use std::time::Instant;
+        let Ok(path) = std::env::var("ATOMCODE_PERF_LOG") else {
+            // The normal case. A ruler nobody picked up says nothing and must
+            // not fail — see the doc above for why this is not a gate.
+            return;
+        };
+        let h = host();
+        use std::io::BufRead;
+        for line in
+            std::io::BufReader::new(std::fs::File::open(&path).expect("open the log")).lines()
+        {
+            let Ok(line) = line else { continue };
+            if line.trim().is_empty() || line.contains("\"header\"") {
+                continue;
+            }
+            let Ok(rec) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let Some(ev) = rec.get("event") else { continue };
+            let Ok(fact) = serde_json::from_value::<SessionEvent>(ev.clone()) else {
+                continue;
+            };
+            h.absorb(&fact);
+        }
+        // A fixture that loaded nothing would print a flattering number.
+        let slots = h.stream.read().unwrap().slots().len();
+        assert!(
+            slots > 0,
+            "{path} folded into no blocks at all, so every figure below would be \
+             the cost of an empty screen"
+        );
+
+        let size = (80u16, 24u16);
+        let m = h.moment.read().unwrap().clone();
+        let t = Instant::now();
+        let limit = h.scroll_limit(size, &m);
+        let cold = t.elapsed().as_secs_f64() * 1000.0;
+        let t = Instant::now();
+        for _ in 0..20 {
+            h.scroll_limit(size, &m);
+        }
+        let warm = t.elapsed().as_secs_f64() * 1000.0 / 20.0;
+        println!("\n槽位 {slots} / scroll_limit: 冷 {cold:.3}ms, 热 {warm:.3}ms");
+
+        for (label, scroll) in [("底部", 0usize), ("中部", limit / 2), ("顶部", limit)] {
+            h.moment.write().unwrap().scroll = crate::moment::ScrollPos(scroll);
+            let _ = h.compose(size);
+            let t = Instant::now();
+            for _ in 0..20 {
+                let _ = h.compose(size);
+            }
+            println!(
+                "  compose @{label:<4} {:.3}ms/帧",
+                t.elapsed().as_secs_f64() * 1000.0 / 20.0
+            );
+        }
+
+        // One wheel notch, as the front end actually pays for it: bound the
+        // scroll, then paint.
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(limit);
+        let t = Instant::now();
+        for i in 0..20 {
+            let mm = h.moment.read().unwrap().clone();
+            let max = h.scroll_limit(size, &mm);
+            h.moment.write().unwrap().scroll = crate::moment::ScrollPos(max.saturating_sub(i));
+            let _ = h.compose(size);
+        }
+        println!(
+            "  一格滚轮 {:.3}ms",
+            t.elapsed().as_secs_f64() * 1000.0 / 20.0
+        );
+    }
+
     #[test]
     fn a_settled_block_is_measured_once_per_width_not_once_per_call() {
         // The cheaper half of the same property, without scrolling: working out
