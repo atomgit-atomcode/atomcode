@@ -1474,6 +1474,71 @@ async fn a_brief_rate_limit_is_waited_out(engine: &str) {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// A committed `/compact` is already in the native store when the driver hears
+/// of it, and the count it reports removed is the conversation's net shrink.
+async fn a_committed_compaction_is_stored_at_once_and_reported_truthfully(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+    // Long enough that a summary is a net win, which both engines require
+    // before they commit one.
+    for n in 0..6 {
+        turn(
+            &mut runtime,
+            &format!("prompt {n} {}", "context ".repeat(500)),
+        )
+        .await;
+    }
+    let manager = SessionManager::for_project(env.project.path());
+    let before = manager.load_native_session(&id).unwrap().snapshot.messages;
+
+    runtime.handle.compact(None).unwrap();
+    let completion = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("compaction did not finish")
+            .expect("runtime event stream closed");
+        if let CodingRuntimeEvent::CompactionFinished { completion } = event.event {
+            break completion;
+        }
+    };
+    // Read before anything else can write: the claim is about the moment the
+    // driver is told.
+    let stored = manager.load_native_session(&id).unwrap().snapshot.messages;
+    let atomcode_coding::runtime::CompactionCompletion::Completed(outcome) = completion else {
+        panic!("[{engine}] {completion:?}");
+    };
+    assert!(outcome.committed, "[{engine}] the compaction was refused");
+    let committed = outcome
+        .committed_snapshot
+        .clone()
+        .expect("a committed compaction carries its snapshot");
+    let shape = |messages: &[Message]| {
+        messages
+            .iter()
+            .map(|m| (m.role.clone(), m.text.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        shape(&stored),
+        shape(&committed.messages),
+        "[{engine}] the store has not caught up with the compaction"
+    );
+    assert_eq!(
+        outcome.removed_messages,
+        before.len() - committed.messages.len(),
+        "[{engine}] {} messages became {}",
+        before.len(),
+        committed.messages.len()
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 // ---- what the model is offered ---------------------------------------------
 
 /// The start a production driver makes: every capability the chain turns on
@@ -1655,4 +1720,5 @@ on_both_engines!(
     a_distant_rate_limit_pauses_the_turn,
     an_exhausted_plan_window_pauses_until_its_reset,
     a_brief_rate_limit_is_waited_out,
+    a_committed_compaction_is_stored_at_once_and_reported_truthfully,
 );

@@ -1255,3 +1255,62 @@ impl Plugin for RateLimitCodingPlugin {
         Ok(())
     }
 }
+
+// ---- a compaction, stored when it commits -------------------------------------
+
+/// `native-compaction-checkpoint`: a committed compaction reaches the native
+/// store at once.
+///
+/// The chain hands the snapshot writer to the kernel as its compaction
+/// checkpoint, so a compaction is durable before anyone is told it happened. A
+/// tree commits a compaction as a log fact, and the native store otherwise hears
+/// about it only when the turn ends — or never, for a `/compact` issued between
+/// turns and followed by a quit. Written from the same commit, synchronously, so
+/// the driver's `Compacted` arrives after the store has it.
+pub(crate) struct NativeCompactionCheckpointPlugin(
+    pub(crate) Arc<atomcode_capabilities::session::SnapshotHook>,
+);
+
+#[async_trait]
+impl Plugin for NativeCompactionCheckpointPlugin {
+    fn name(&self) -> &'static str {
+        "native-compaction-checkpoint"
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["agents", "system-prompt"]
+    }
+    fn description(&self) -> &'static str {
+        "write a committed compaction to the coding runtime's native session store"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let hook = self.0.clone();
+        let listener_ctx = ctx.clone();
+        let _ = ctx.on_emit::<atomcode_harness::events::SessionEventCommitted>(
+            move |committed: &atomcode_harness::session::Committed| {
+                if !matches!(committed.event, SessionEvent::Compacted { .. }) {
+                    return;
+                }
+                let Some(agent) = listener_ctx
+                    .service::<AgentsSvc>()
+                    .and_then(|agents| agents.by_session(&committed.session))
+                else {
+                    return;
+                };
+                if agent.parent().is_some() {
+                    return;
+                }
+                let system = listener_ctx
+                    .service::<SystemPromptSvc>()
+                    .map(|prompts| prompts.render());
+                let convo =
+                    crate::native_log::conversation_from_log(system, &agent.session().events());
+                let snapshot = SessionSnapshot::from_conversation(&convo);
+                use atomcode_kernel::checkpoint::CompactionCheckpoint;
+                if let Err(error) = hook.save(&snapshot) {
+                    eprintln!("[native-compaction-checkpoint] {error}");
+                }
+            },
+        );
+        Ok(())
+    }
+}

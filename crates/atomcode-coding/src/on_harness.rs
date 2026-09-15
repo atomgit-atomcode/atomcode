@@ -1075,6 +1075,8 @@ pub struct HostState {
     pub rows: String,
     /// The runtime's MCP registry, published into the tree by `mcp-host`.
     pub(crate) mcp: Option<crate::host_rows::McpPublication>,
+    /// The native snapshot writer a committed compaction is stored through.
+    pub compaction_checkpoint: Option<Arc<atomcode_capabilities::session::SnapshotHook>>,
     /// Where CodingPlan usage windows come from, when this host has an account.
     pub rate_limit_source: Option<Arc<dyn crate::rate_limit::RateLimitWindowSource>>,
 }
@@ -1190,6 +1192,11 @@ pub async fn mount_hosted(
             )
         })
         .unwrap_or_default();
+    let checkpoint_rows = if host.compaction_checkpoint.is_some() {
+        "[[insert]]\nname = \"native-compaction-checkpoint\"\n\n"
+    } else {
+        ""
+    };
     let mcp_rows = if host.mcp.is_some() {
         "[[patch]]\nid = \"mcp\"\nname = \"mcp-host\"\ndisabled = false\n\n"
     } else {
@@ -1207,7 +1214,7 @@ pub async fn mount_hosted(
         "[[insert]]\nname = \"host-tools\"\n\n"
     };
     let hosted = format!(
-        "[[patch]]\nid = \"session\"\nname = \"session-native\"\n\n{modes_rows}{cc_rows}{context_rows}{datalog_rows}{tools_rows}{skills_rows}{mcp_rows}{}{}{}",
+        "[[patch]]\nid = \"session\"\nname = \"session-native\"\n\n{modes_rows}{cc_rows}{context_rows}{datalog_rows}{tools_rows}{skills_rows}{mcp_rows}{checkpoint_rows}{}{}{}",
         host.hooks
             .as_ref()
             .map(|hooks| hooks.rows())
@@ -1248,6 +1255,11 @@ pub async fn mount_hosted(
     registry.register(Arc::new(crate::host_rows::KernelMiddlewarePlugin(
         host.middleware.unwrap_or_default(),
     )));
+    if let Some(hook) = host.compaction_checkpoint {
+        registry.register(Arc::new(
+            crate::host_rows::NativeCompactionCheckpointPlugin(hook),
+        ));
+    }
     if let Some(publication) = host.mcp {
         registry.register(Arc::new(crate::host_rows::McpHostPlugin::new(publication)));
     }

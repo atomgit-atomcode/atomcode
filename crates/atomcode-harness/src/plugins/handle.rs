@@ -83,6 +83,11 @@ struct Projector {
     /// How many user messages this turn has taken. The second and later ones
     /// are steering.
     said_this_turn: u32,
+    /// A `/compact` is committing its own compaction, and reports it itself —
+    /// with the trigger it had, the numbers it measured and the snapshot. The
+    /// fold's generic report of the same commit would be a second, auto-labelled
+    /// one.
+    manual_compaction: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Projector {
@@ -215,6 +220,13 @@ impl Projector {
                 })]
             }
 
+            SessionEvent::Compacted { .. }
+                if self
+                    .manual_compaction
+                    .load(std::sync::atomic::Ordering::SeqCst) =>
+            {
+                Vec::new()
+            }
             SessionEvent::Compacted { summary, .. } => vec![AgentEvent::Compacted {
                 trigger: CompactTrigger::Auto {
                     utilization: if self.ctx_window == 0 {
@@ -751,6 +763,7 @@ async fn pump(
     asker: Arc<dyn Answers>,
     events: mpsc::UnboundedSender<AgentEvent>,
     mut commands: mpsc::UnboundedReceiver<AgentCommand>,
+    manual_compaction: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let Ok(driver) = ctx.require::<AgentLoopSvc>() else {
         let _ = events.send(AgentEvent::Error {
@@ -803,7 +816,7 @@ async fn pump(
             Woke::TurnDone => {
                 turn = None;
                 for focus in std::mem::take(&mut compactions_waiting) {
-                    compact(&ctx, &events, focus).await;
+                    compact(&ctx, &events, focus, &manual_compaction).await;
                 }
                 for _ in 0..std::mem::take(&mut snapshots_waiting) {
                     send_snapshot(&ctx, &events);
@@ -885,7 +898,7 @@ async fn pump(
                 if turn.is_some() {
                     compactions_waiting.push(focus);
                 } else {
-                    compact(&ctx, &events, focus).await;
+                    compact(&ctx, &events, focus, &manual_compaction).await;
                 }
                 continue;
             }
@@ -914,7 +927,12 @@ async fn pump(
     }
 }
 
-async fn compact(ctx: &Context, events: &mpsc::UnboundedSender<AgentEvent>, focus: Option<String>) {
+async fn compact(
+    ctx: &Context,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+    focus: Option<String>,
+    reporting: &std::sync::atomic::AtomicBool,
+) {
     let trigger = CompactTrigger::Manual {
         focus: focus.clone(),
     };
@@ -937,23 +955,48 @@ async fn compact(ctx: &Context, events: &mpsc::UnboundedSender<AgentEvent>, focu
         });
         return;
     };
-    let before = log.len();
+    // Measured on what the model sees, which is what a driver reports and what
+    // its token estimate is computed from — not on the log, which compaction
+    // never shrinks.
+    let measure = |messages: &[atomcode_kernel::message::Message]| {
+        (
+            messages.len(),
+            messages.iter().map(|m| m.text.len()).sum::<usize>(),
+        )
+    };
+    let (count_before, bytes_before) = measure(&log.derive_messages());
     let decision = compaction.compact(&log).await;
     let committed = match decision {
         Some(decision) => {
+            reporting.store(true, std::sync::atomic::Ordering::SeqCst);
             crate::session::apply_compaction(ctx, &log, decision);
+            reporting.store(false, std::sync::atomic::Ordering::SeqCst);
             true
         }
         None => false,
     };
+    let after = log.derive_messages();
+    let (count_after, bytes_after) = measure(&after);
     let _ = events.send(AgentEvent::Compacted {
         trigger,
         epoch: 0,
-        removed: if committed { before } else { 0 },
-        bytes_before: before,
-        bytes_after: log.len(),
+        removed: count_before.saturating_sub(count_after),
+        bytes_before,
+        bytes_after,
         committed,
-        snapshot: committed.then(|| SessionSnapshot::new(log.derive_messages())),
+        // The conversation as a snapshot holds it: with the system prompt at its
+        // head, the way `send_snapshot` answers.
+        snapshot: committed.then(|| {
+            let mut messages = Vec::new();
+            if let Some(prompts) = ctx.service::<crate::seams::SystemPromptSvc>() {
+                let system = prompts.render();
+                if !system.is_empty() {
+                    messages.push(atomcode_kernel::message::Message::system(system));
+                }
+            }
+            messages.extend(after);
+            SessionSnapshot::new(messages)
+        }),
     });
 }
 
@@ -1064,6 +1107,7 @@ pub async fn spawn(
     let agents = ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
     let agent = agents.create(ctx, req).await?;
     let session_id = agent.session_id().to_string();
+    let manual_compaction = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let projector = Arc::new(Mutex::new(Projector {
         tools: ctx.service::<ToolsSvc>(),
         ctx_window: ctx
@@ -1073,6 +1117,7 @@ pub async fn spawn(
         batch: None,
         last_prompt_tokens: 0,
         said_this_turn: 0,
+        manual_compaction: manual_compaction.clone(),
     }));
 
     let out = events.clone();
@@ -1096,7 +1141,15 @@ pub async fn spawn(
     let pump_ctx = ctx.clone();
     let pump_agent = agent.clone();
     let task = tokio::spawn(async move {
-        pump(pump_ctx, pump_agent, answers, events, command_rx).await;
+        pump(
+            pump_ctx,
+            pump_agent,
+            answers,
+            events,
+            command_rx,
+            manual_compaction,
+        )
+        .await;
         // The listener holds a clone of the sender; revoking it is what
         // lets the event channel close, so a driver reading to the end sees
         // the end. Dropping only the local handles would hang it forever.
@@ -1226,6 +1279,7 @@ pub fn replay(events: &[SessionEvent], ctx_window: u32) -> Vec<AgentEvent> {
         batch: None,
         last_prompt_tokens: 0,
         said_this_turn: 0,
+        manual_compaction: Default::default(),
     };
     events
         .iter()
