@@ -169,6 +169,9 @@ impl PermissionStore for InMemoryPermissionStore {
 /// The generic approval gate. Clone-cheap (Arc-backed store).
 pub struct ApprovalMiddleware {
     store: Arc<dyn PermissionStore>,
+    /// Shared session-scoped allow-all store — checked before the per-call store for `bash`.
+    /// Defaults to the same instance as `store` when not explicitly injected.
+    allow_all: Arc<dyn PermissionStore>,
     kind: String,
 }
 
@@ -177,6 +180,7 @@ impl ApprovalMiddleware {
     /// matches `AgentEvent::Request.kind` on it).
     pub fn new(store: Arc<dyn PermissionStore>) -> Self {
         Self {
+            allow_all: store.clone(),
             store,
             kind: APPROVAL_KIND.to_string(),
         }
@@ -184,6 +188,10 @@ impl ApprovalMiddleware {
     /// Convenience: gate with a fresh in-memory store.
     pub fn in_memory() -> Self {
         Self::new(Arc::new(InMemoryPermissionStore::new()))
+    }
+    /// Like [`new`] but with a shared allow-all store consulted for `bash` calls.
+    pub fn with_allow_all_store(store: Arc<dyn PermissionStore>, allow_all: Arc<dyn PermissionStore>, kind: String) -> Self {
+        Self { store, allow_all, kind }
     }
     /// Override the round-trip request `kind`.
     pub fn with_kind(mut self, kind: impl Into<String>) -> Self {
@@ -263,6 +271,11 @@ impl ToolMiddleware for ApprovalMiddleware {
         if tool.risk(&call.arguments) == RiskLevel::Safe {
             return BeforeOutcome::Proceed;
         }
+        // Shared allow-all short-circuit: if the user has granted "allow all Bash" this
+        // session, skip the round-trip entirely for any bash call.
+        if call.name == "bash" && self.allow_all.is_granted(BASH_ALLOW_ALL_KEY) {
+            return BeforeOutcome::Proceed;
+        }
         // Session grant cache: an identical risky call already approved-always.
         let key = Self::grant_key(call, tool.as_ref());
         if self.store.is_granted(&key) {
@@ -276,7 +289,7 @@ impl ToolMiddleware for ApprovalMiddleware {
                 BeforeOutcome::Proceed
             }
             Ok(PermissionDecision::AllowAlwaysAll) => {
-                self.store.grant(&key);
+                self.allow_all.grant(BASH_ALLOW_ALL_KEY);
                 BeforeOutcome::Proceed
             }
             Ok(PermissionDecision::Deny) => {
@@ -464,6 +477,23 @@ mod tests {
             reason.contains("internal channel failure") && reason.contains("not a user"),
             "a degraded (Null) round-trip must be distinguishable from a user deny: {reason}"
         );
+    }
+
+    #[tokio::test]
+    async fn approval_allows_all_bash_after_allow_all_grant() {
+        let allow_all = std::sync::Arc::new(InMemoryPermissionStore::new());
+        allow_all.grant(BASH_ALLOW_ALL_KEY);
+        let mw = ApprovalMiddleware::with_allow_all_store(
+            std::sync::Arc::new(InMemoryPermissionStore::new()),
+            allow_all.clone(),
+            APPROVAL_KIND.to_string(),
+        );
+        // A risky bash call is allowed WITHOUT any round-trip (rt would panic if used).
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::bash::BashTool::default());
+        let mut call = ToolCall { id: "1".into(), name: "bash".into(), arguments: r#"{"command":"git push --force origin main"}"#.into() };
+        let (tx, _rx) = unbounded_channel();
+        let rt = RequestCtx::new(tx, Some(Duration::from_millis(1)));
+        assert!(matches!(mw.before(&mut call, &tool, &rt).await, BeforeOutcome::Proceed));
     }
 
     #[test]
