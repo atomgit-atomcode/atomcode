@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use atomcode_kernel::message::{ImageContent, Message};
+use atomcode_kernel::message::{ImageContent, Message, MessageMeta, ReasoningBlock};
 use atomcode_kernel::stream::TokenUsage;
 use atomcode_kernel::tool::ToolCall;
 use serde::{Deserialize, Serialize};
@@ -132,6 +132,19 @@ pub enum SessionEvent {
         reasoning: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
+        /// Opaque thinking blocks a provider requires echoed back verbatim
+        /// (Anthropic `signature` and kin). Model-visible on the wire, so logged:
+        /// a resumed thinking session that lost them is rejected by the provider.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reasoning_blocks: Vec<ReasoningBlock>,
+        /// What this response cost and where it sat: tokens, timing, the
+        /// correlation ids. A sidecar — never rendered into the request — kept
+        /// because a store that persists messages rather than events (the native
+        /// snapshot) needs it back, and a fact the log dropped cannot be
+        /// recovered by any projection of it. Additive on disk: absent reads as
+        /// `None`, and an older reader ignores the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        meta: Option<MessageMeta>,
     },
     /// A call got past every gate and is about to run.
     ///
@@ -521,9 +534,55 @@ impl SessionLog {
     }
 }
 
+/// Give a run of events new sequence numbers starting at `first`, keeping their
+/// order and the references between them.
+///
+/// The one reference an event makes to another is a compaction's `through`, so
+/// that moves with the events it points at; a boundary that pointed below the run
+/// keeps pointing below it. For a host that hands a tree a seed for a session the
+/// store already holds events under: the store's numbering must stay monotonic,
+/// or a compaction boundary written later means a different cut on replay.
+pub fn renumber(events: Vec<LoggedEvent>, first: SeqNo) -> Vec<LoggedEvent> {
+    let Some(old_first) = events.first().map(|e| e.seq) else {
+        return events;
+    };
+    let map = |seq: SeqNo| {
+        if seq < old_first {
+            seq
+        } else {
+            seq - old_first + first
+        }
+    };
+    events
+        .into_iter()
+        .map(|mut logged| {
+            logged.seq = map(logged.seq);
+            if let SessionEvent::Compacted { through, .. } = &mut logged.event {
+                *through = map(*through);
+            }
+            logged
+        })
+        .collect()
+}
+
 /// The projection, as a free function so it can be tested against a literal log
 /// and reused by a persistence layer replaying someone else's events.
 pub fn derive_messages(events: &[LoggedEvent]) -> Vec<Message> {
+    project(events, false)
+}
+
+/// [`derive_messages`], with each assistant message's logged `meta` attached.
+///
+/// Same projection, one more field. The model's request is built from
+/// [`derive_messages`] so that nothing about it changes; this is for a consumer
+/// that persists messages and needs the stats back — the native snapshot store.
+/// One function behind both, so the two views cannot drift on which events
+/// become which messages.
+pub fn derive_messages_with_meta(events: &[LoggedEvent]) -> Vec<Message> {
+    project(events, true)
+}
+
+fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
     // A compaction boundary replaces everything at or below it. Find the last
     // one first: replaying then discarding would be wasted work and, worse,
     // would let a dropped tool result pair with a surviving call.
@@ -595,11 +654,17 @@ pub fn derive_messages(events: &[LoggedEvent]) -> Vec<Message> {
                 text,
                 reasoning,
                 tool_calls,
+                reasoning_blocks,
+                meta,
                 ..
             } => {
                 let mut message = Message::assistant(text, tool_calls.clone());
                 if !reasoning.is_empty() {
                     message.reasoning = Some(reasoning.clone());
+                }
+                message.reasoning_blocks = reasoning_blocks.clone();
+                if with_meta {
+                    message.meta = meta.clone();
                 }
                 messages.push(message);
             }

@@ -352,6 +352,8 @@ mod tests {
                     r#"{{"action":"delegate","name":"{name}","role":"{role}","task":"go"}}"#
                 ),
             }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
         }
     }
 

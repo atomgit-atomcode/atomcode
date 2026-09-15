@@ -2046,48 +2046,10 @@ impl CodingRuntime {
                                 .map_err(RuntimeStartError::Assemble)?
                                 .spawn(),
                             Engine::Harness => {
-                                // Presence follows the same rule the overlay
-                                // uses: a person who can answer means asking,
-                                // nobody means fencing.
-                                let presence = if agent.is_attended() {
-                                    crate::on_harness::Presence::Attended
-                                } else {
-                                    crate::on_harness::Presence::Headless
-                                };
-                                // What the person wrote in `config.toml` and
-                                // the chain reads off this struct. Empty for a
-                                // default config, so the tree is unchanged.
-                                let from_config = crate::on_harness::config_rows(&agent);
-                                let extra: Vec<&str> = if from_config.is_empty() {
-                                    Vec::new()
-                                } else {
-                                    vec![from_config.as_str()]
-                                };
-                                // The model catalog, when this host has one.
-                                // Both halves come from what `install_subagent_tiers`
-                                // already put on the config a few lines above, so the
-                                // tree and the chain resolve a selection through the
-                                // same resolver — including its reset on `/model`.
-                                let models = agent
-                                    .subagent_config
-                                    .clone()
-                                    .zip(agent.subagent_model_providers.clone())
-                                    .map(|(config, providers)| crate::on_harness::HostModels {
-                                        config,
-                                        providers,
-                                        current: agent.provider_name.clone(),
-                                    });
-                                let (handle, app, providers) = crate::on_harness::mount_swappable(
-                                    &agent.working_dir,
-                                    presence,
-                                    provider,
-                                    models,
-                                    &extra,
-                                )
-                                .await
-                                .map_err(|e| {
-                                    RuntimeStartError::Assemble(std::io::Error::other(e))
-                                })?;
+                                let (handle, app, providers) =
+                                    mount_harness(&parts, &agent, provider).await.map_err(|e| {
+                                        RuntimeStartError::Assemble(std::io::Error::other(e))
+                                    })?;
                                 harness_app = Some(app);
                                 harness_providers = Some(providers);
                                 handle
@@ -4528,6 +4490,12 @@ fn spawn_runtime_owner_with_optional_agent(
                                         config.as_ref(),
                                     );
                                 }
+                                // Turns from here on are billed to the new model.
+                                // The chain says the same thing from `assemble`,
+                                // which only runs once the swap has succeeded.
+                                if let Some(snapshot) = runtime.parts.snapshot_hook() {
+                                    snapshot.set_model_attribution(&next.provider_name, &next.model);
+                                }
                                 runtime.config = next;
                                 let provider = runtime.config.provider_name.clone();
                                 let model = runtime.config.model.clone();
@@ -4670,7 +4638,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         preserve_sessionless_snapshot(&mut runtime, &stop_report);
 
                         let old_config = runtime.config.clone();
-                        match assemble(&mut runtime.parts, &next, candidate_provider) {
+                        match build_agent(&mut runtime, &next, candidate_provider).await {
                             Ok(candidate) => {
                                 if let Some(config) = refresh_routing {
                                     crate::provider_factory::refresh_subagent_tiers(
@@ -4680,7 +4648,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     );
                                 }
                                 runtime.config = next;
-                                agent = Some(candidate.spawn());
+                                agent = Some(candidate);
                                 generation = generation.wrapping_add(1);
                                 event_generation.store(generation, Ordering::Release);
                                 pending_steer_acknowledgements.clear();
@@ -4741,10 +4709,12 @@ fn spawn_runtime_owner_with_optional_agent(
                             }
                             Err(candidate_error) => {
                                 runtime.config = old_config;
-                                match had_active_agent
-                                    .then(|| assemble_runtime_resources(&mut runtime))
-                                    .transpose()
-                                {
+                                let rollback = if had_active_agent {
+                                    Some(assemble_runtime_resources(&mut runtime).await)
+                                } else {
+                                    None
+                                };
+                                match rollback.transpose() {
                                     Ok(None) => {
                                         agent = None;
                                         agent_available = false;
@@ -5171,26 +5141,10 @@ fn spawn_runtime_owner_with_optional_agent(
                                 provider_factory: runtime.provider_factory.clone(),
                                 plugin_hooks: runtime.plugin_hooks.clone(),
                                 parts,
-                                // Chain-only path. `reprepare` rebuilds the
-                                // agent from `parts`, which is the hand-written
-                                // chain — so on the harness engine a /model swap
-                                // or a /cd drops back to the chain for the rest
-                                // of the session. Saying so out loud beats
-                                // discovering it from behaviour: the whole point
-                                // of the escape hatch is measuring what the
-                                // harness carries, and a silent fallback would
-                                // make every later reading a lie.
+                                // Filled by `assemble_runtime_resources` below,
+                                // on whichever engine this runtime runs.
                                 harness_providers: None,
-                                harness_app: {
-                                    if Engine::from_env() == Engine::Harness {
-                                        eprintln!(
-                                            "ATOMCODE_ENGINE=harness: reassembly is not on the \
-                                             harness engine yet — this session continues on the \
-                                             hand-written chain"
-                                        );
-                                    }
-                                    None
-                                },
+                                harness_app: None,
                                 wakeup_tx: runtime.wakeup_tx.clone(),
                                 loop_active: Arc::clone(&runtime.loop_active),
                                 // Preserve the injected VL hook across reprepare
@@ -5229,7 +5183,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         // current agent. A failed fresh/resume/cd transition must leave the
                         // previous runtime executable; rebuilding it as a rollback can fail for
                         // reasons (notably authentication) unrelated to the accepted operation.
-                        let replacement = match assemble_runtime_resources(&mut candidate) {
+                        let replacement = match assemble_runtime_resources(&mut candidate).await {
                             Ok(replacement) => replacement,
                             Err(candidate_error) => {
                                 let cleanup_error =
@@ -5511,7 +5465,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(error));
                             continue;
                         }
-                        match assemble_runtime_resources(&mut runtime) {
+                        match assemble_runtime_resources(&mut runtime).await {
                             Ok(replacement) => {
                                 agent = Some(replacement);
                                 generation = generation.wrapping_add(1);
@@ -5569,7 +5523,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                         },
                                     ));
                                 } else {
-                                    match assemble_runtime_resources(&mut runtime) {
+                                    match assemble_runtime_resources(&mut runtime).await {
                                         Ok(rollback) => {
                                             agent = Some(rollback);
                                             agent_available = true;
@@ -5695,6 +5649,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         );
                         let candidate = match persisted.as_ref() {
                             Ok(_) => assemble_runtime_resources(&mut runtime)
+                                .await
                                 .map_err(NativePersistenceError::certain),
                             Err(error) => Err(error.clone()),
                         };
@@ -5769,7 +5724,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                         },
                                     ));
                                 } else {
-                                    match assemble_runtime_resources(&mut runtime) {
+                                    match assemble_runtime_resources(&mut runtime).await {
                                         Ok(rollback) => {
                                             agent = Some(rollback);
                                             agent_available = true;
@@ -7439,7 +7394,131 @@ fn build_goal_evaluator_provider(
     factory.build(host, session_id)
 }
 
-fn assemble_runtime_resources(runtime: &mut RuntimeResources) -> Result<AgentHandle, String> {
+/// What a tree needs from the runtime's own state to continue this session.
+///
+/// The same two sources the chain's `assemble` reads: a session-bound runtime
+/// reloads the canonical native aggregate (absent only for a fresh session not
+/// yet published), and a sessionless one continues from the snapshot the
+/// runtime kept in memory.
+fn harness_host_state(
+    parts: &crate::CodingParts,
+) -> Result<crate::on_harness::HostState, std::io::Error> {
+    let session = match &parts.session {
+        Some(binding) => crate::host_rows::SessionSeed {
+            id: Some(binding.id.clone()),
+            snapshot: match binding.manager.load_native_session(&binding.id) {
+                Ok(loaded) => Some(loaded.snapshot),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            },
+        },
+        None => crate::host_rows::SessionSeed {
+            id: None,
+            snapshot: parts.runtime_resume_snapshot(),
+        },
+    };
+    let hooks = crate::host_rows::HostHooks::new();
+    if let Some(snapshot) = parts.snapshot_hook() {
+        hooks.insert("native-snapshot", snapshot);
+    }
+    Ok(crate::on_harness::HostState {
+        session,
+        hooks: Some(hooks),
+    })
+}
+
+/// Mount a harness tree that continues this runtime's session.
+///
+/// The one place a tree is built from runtime state — at start, and on every
+/// rebuild (undo, restore, reprepare, a provider coming back) — so the session,
+/// the hooks and the rows cannot differ between the first agent and the next.
+async fn mount_harness(
+    parts: &crate::CodingParts,
+    config: &CodingAgentConfig,
+    provider: Arc<dyn atomcode_kernel::provider::LlmProvider>,
+) -> Result<
+    (
+        AgentHandle,
+        atomcode_plexus::App,
+        Arc<crate::on_harness::ProviderSlots>,
+    ),
+    String,
+> {
+    // Presence follows the same rule the overlay uses: a person who can answer
+    // means asking, nobody means fencing.
+    let presence = if config.is_attended() {
+        crate::on_harness::Presence::Attended
+    } else {
+        crate::on_harness::Presence::Headless
+    };
+    // What the person wrote in `config.toml` and the chain reads off this
+    // struct. Empty for a default config, so the tree is unchanged.
+    let from_config = crate::on_harness::config_rows(config);
+    let extra: Vec<&str> = if from_config.is_empty() {
+        Vec::new()
+    } else {
+        vec![from_config.as_str()]
+    };
+    // The model catalog, when this host has one. Both halves come from what
+    // `install_subagent_tiers` already put on the config, so the tree and the
+    // chain resolve a selection through the same resolver — including its reset
+    // on `/model`.
+    let models = config
+        .subagent_config
+        .clone()
+        .zip(config.subagent_model_providers.clone())
+        .map(|(model_config, providers)| crate::on_harness::HostModels {
+            config: model_config,
+            providers,
+            current: config.provider_name.clone(),
+        });
+    let host = harness_host_state(parts).map_err(|error| error.to_string())?;
+    // Turns on this tree are billed to the model it was built for. The chain
+    // stamps the same attribution inside `assemble`.
+    if let Some(snapshot) = parts.snapshot_hook() {
+        snapshot.set_model_attribution(&config.provider_name, &config.model);
+    }
+    crate::on_harness::mount_hosted(
+        &config.working_dir,
+        presence,
+        provider,
+        models,
+        host,
+        &extra,
+    )
+    .await
+}
+
+/// Build the agent for `config` on this runtime's engine, replacing whatever
+/// tree the runtime held.
+///
+/// Replacing is the point: a rebuilt agent that left the previous tree in
+/// `harness_app` would have a later `/model` patch a tree whose driver loop had
+/// already exited, and a later `/logout` leave the credentials in the agent that
+/// is actually running.
+async fn build_agent(
+    runtime: &mut RuntimeResources,
+    config: &CodingAgentConfig,
+    provider: Arc<dyn atomcode_kernel::provider::LlmProvider>,
+) -> Result<AgentHandle, String> {
+    match Engine::from_env() {
+        Engine::Chain => {
+            runtime.harness_app = None;
+            runtime.harness_providers = None;
+            assemble(&mut runtime.parts, config, provider)
+                .map(|agent| agent.spawn())
+                .map_err(|error| error.to_string())
+        }
+        Engine::Harness => {
+            let (handle, app, providers) = mount_harness(&runtime.parts, config, provider).await?;
+            runtime.harness_app = Some(app);
+            runtime.harness_providers = Some(providers);
+            Ok(handle)
+        }
+    }
+}
+
+async fn assemble_runtime_resources(runtime: &mut RuntimeResources) -> Result<AgentHandle, String> {
     runtime
         .parts
         .register_extra_tool(Arc::new(ScheduleWakeupTool::new(
@@ -7455,9 +7534,8 @@ fn assemble_runtime_resources(runtime: &mut RuntimeResources) -> Result<AgentHan
         .provider_factory
         .build(&runtime.config, session_id)
         .map_err(|error| error.to_string())?;
-    assemble(&mut runtime.parts, &runtime.config, provider)
-        .map(|agent| agent.spawn())
-        .map_err(|error| error.to_string())
+    let config = runtime.config.clone();
+    build_agent(runtime, &config, provider).await
 }
 
 fn preserve_sessionless_snapshot(runtime: &mut RuntimeResources, report: &StopReport) {

@@ -71,6 +71,8 @@ pub fn facts() -> Vec<SessionEvent> {
                 call("c1", "read_file", r#"{"file_path":"a.rs"}"#),
                 call("c2", "read_file", r#"{"file_path":"b.rs"}"#),
             ],
+            reasoning_blocks: Vec::new(),
+            meta: None,
         },
         SessionEvent::ToolResultLogged {
             turn: 1,
@@ -129,6 +131,8 @@ pub fn facts() -> Vec<SessionEvent> {
             text: "Fixed it. 中文也要能画 🙂".into(),
             reasoning: String::new(),
             tool_calls: Vec::new(),
+            reasoning_blocks: Vec::new(),
+            meta: None,
         },
         SessionEvent::TurnEnd {
             turn: 1,
@@ -165,6 +169,8 @@ pub fn facts() -> Vec<SessionEvent> {
                 "bash",
                 r#"{"command":"cd /Users/我的项目/前端/源码 && echo 这条命令足够长而且结尾整段都是中文没有任何半角字符"}"#,
             )],
+            reasoning_blocks: Vec::new(),
+            meta: None,
         },
         SessionEvent::ToolResultLogged {
             turn: 2,

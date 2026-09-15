@@ -252,6 +252,21 @@ plexus_event!(
     SessionEventCommitted, "session/event", Emit, Committed
 );
 plexus_event!(TurnStart, "turn/start", Emit, TurnStarted);
+plexus_event!(
+    /// The turn is over and not yet recorded as over — awaited.
+    ///
+    /// `turn/end` fires after `TurnEnd` is committed, and committing it is what
+    /// tells a driver the turn finished. A listener whose work must be done
+    /// before anyone acts on that — a store writing the turn durably, so that an
+    /// undo issued the moment the driver sees the end reads the new state, or a
+    /// fail-closed check that looks for a failed write — has no moment there:
+    /// `turn/end` is synchronous, and a spawned write races the driver.
+    ///
+    /// Every listener runs, concurrently, and the turn waits for all of them.
+    /// Nothing here can change the outcome; it is the last await before the
+    /// boundary is committed.
+    TurnFinishing, "turn/finishing", Parallel, TurnOutcome
+);
 plexus_event!(TurnEnd, "turn/end", Emit, TurnOutcome);
 plexus_event!(AssistantChunk, "assistant/chunk", Emit, Chunk);
 plexus_event!(AssistantMessage, "assistant/message", Emit, Message);

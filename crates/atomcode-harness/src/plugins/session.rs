@@ -58,6 +58,7 @@ impl Plugin for SessionPlugin {
             .provide::<SessionDefaultsSvc>(Arc::new(SessionDefaults {
                 id: row.id,
                 resume: row.resume,
+                seed: Vec::new(),
             }))
             .map_err(|e| e.to_string())?;
         Ok(())

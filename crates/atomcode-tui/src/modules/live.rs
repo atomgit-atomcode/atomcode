@@ -486,6 +486,8 @@ mod tests {
                 text: "Looking.".into(),
                 reasoning: "hmm".into(),
                 tool_calls: vec![call("c1"), call("c2")],
+                reasoning_blocks: Vec::new(),
+                meta: None,
             },
             SessionEvent::Usage {
                 turn: 1,

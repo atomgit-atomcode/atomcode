@@ -877,6 +877,36 @@ pub async fn mount_swappable(
     models: Option<HostModels>,
     extra_layers: &[&str],
 ) -> Result<(AgentHandle, App, Arc<ProviderSlots>), String> {
+    mount_hosted(
+        working_dir,
+        presence,
+        provider,
+        models,
+        HostState::default(),
+        extra_layers,
+    )
+    .await
+}
+
+/// What the coding runtime hands a tree beyond its provider: the session it
+/// continues, and the lifecycle hooks it already built against that session.
+///
+/// See [`crate::host_rows`] for how each becomes a row.
+#[derive(Default)]
+pub struct HostState {
+    pub session: crate::host_rows::SessionSeed,
+    pub hooks: Option<Arc<crate::host_rows::HostHooks>>,
+}
+
+/// As [`mount_swappable`], carrying the runtime's own state into the tree.
+pub async fn mount_hosted(
+    working_dir: &Path,
+    presence: Presence,
+    provider: Arc<dyn LlmProvider>,
+    models: Option<HostModels>,
+    host: HostState,
+    extra_layers: &[&str],
+) -> Result<(AgentHandle, App, Arc<ProviderSlots>), String> {
     let model = provider.model_name().to_string();
     let (providers, provider_id) = ProviderSlots::new(provider);
     let artifacts = working_dir.join(".atomcode").join("artifacts");
@@ -926,6 +956,17 @@ pub async fn mount_swappable(
     ] {
         layers.push(Layer::from_toml(src).map_err(|e| e.to_string())?);
     }
+    // The session is the runtime's: its id, and its stored conversation as the
+    // seed. The harness's own `session` row would mint an id and, asked to
+    // resume, replay the JSONL journal — which is the follower, not the master.
+    let hosted = format!(
+        "[[patch]]\nid = \"session\"\nname = \"session-native\"\n\n{}",
+        host.hooks
+            .as_ref()
+            .map(|hooks| hooks.rows())
+            .unwrap_or_default()
+    );
+    layers.push(Layer::from_toml(&hosted).map_err(|e| e.to_string())?);
     for src in extra_layers {
         layers.push(Layer::from_toml(src).map_err(|e| e.to_string())?);
     }
@@ -943,6 +984,12 @@ pub async fn mount_swappable(
         registry.register(row);
     }
     registry.register(Arc::new(InjectProvider(providers.clone())));
+    registry.register(Arc::new(crate::host_rows::SessionNativePlugin(Arc::new(
+        host.session,
+    ))));
+    registry.register(Arc::new(crate::host_rows::KernelHooksPlugin(
+        host.hooks.unwrap_or_default(),
+    )));
     if let Some(host) = models {
         registry.register(Arc::new(InjectModels(Arc::new(CodingModels {
             host,

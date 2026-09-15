@@ -68,6 +68,8 @@ fn the_projection_is_the_only_path_from_facts_to_a_prompt() {
                 name: "bash".into(),
                 arguments: "{}".into(),
             }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
         },
         SessionEvent::ToolResultLogged {
             turn: 1,
@@ -131,6 +133,8 @@ fn raw_chunks_stay_in_the_log_so_a_replay_is_faithful() {
             text: "hello".into(),
             reasoning: String::new(),
             tool_calls: vec![],
+            reasoning_blocks: Vec::new(),
+            meta: None,
         },
     ]);
     let replayed: String = log
@@ -163,6 +167,8 @@ fn a_compaction_boundary_replaces_history_without_erasing_it() {
         text: "old answer".into(),
         reasoning: String::new(),
         tool_calls: vec![],
+        reasoning_blocks: Vec::new(),
+        meta: None,
     });
     log.append(SessionEvent::Compacted {
         turn: 2,

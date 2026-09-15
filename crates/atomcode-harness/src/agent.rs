@@ -277,9 +277,16 @@ impl CreateAgent {
     /// resume, so `--resume <id>` keeps meaning what it meant.
     pub fn root(ctx: &Context) -> Self {
         let defaults = ctx.service::<SessionDefaultsSvc>();
+        let seed = defaults
+            .as_ref()
+            .map(|d| d.seed.clone())
+            .unwrap_or_default();
+        let seed_len = seed.len();
         Self {
             id: defaults.as_ref().and_then(|d| d.id.clone()),
             resume: defaults.map(|d| d.resume).unwrap_or(false),
+            seed,
+            seed_len,
             ..Self::new()
         }
     }
@@ -701,6 +708,18 @@ impl Agents {
         header.parent = req.parent.clone();
         if req.parent.is_some() {
             header.inherited = seed_len;
+        }
+        // A seed for a session the store already holds events under continues
+        // the store's numbering. Without this, the events this agent commits are
+        // appended with sequence numbers the file already used, and a
+        // compaction boundary written later cuts a different place on replay.
+        if !seed.is_empty() && req.persist && req.parent.is_none() {
+            if let Some(store) = ctx.service::<SessionPersistenceSvc>() {
+                let stored = store.load(&session_id).await.unwrap_or_default();
+                if let Some(max) = stored.iter().map(|e| e.seq).max() {
+                    seed = crate::session::renumber(seed, max + 1);
+                }
+            }
         }
         if req.resume && seed.is_empty() {
             let store = ctx

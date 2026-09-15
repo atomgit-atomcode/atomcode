@@ -518,6 +518,8 @@ impl Waterfall<AgentRequest> for StreamRecovery {
                         // model must re-issue it rather than have the harness
                         // guess. The nudge says so.
                         tool_calls: Vec::new(),
+                        reasoning_blocks: Vec::new(),
+                        meta: None,
                     },
                 );
                 crate::session::commit(

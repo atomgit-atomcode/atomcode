@@ -363,7 +363,10 @@ impl Projector {
 /// `InvariantViolated` has no counterpart at all — it rides out as a failure
 /// with the real cause in the `Error` that precedes it, because the one thing a
 /// driver must never do is read it as a clean stop.
-fn stop_reason(stop: crate::seams::StopReason) -> atomcode_kernel::event::StopReason {
+/// The kernel protocol's name for why a turn ended. Public so a host that runs
+/// kernel-shaped hooks at the harness's moments says the same thing the driver
+/// is told.
+pub fn stop_reason(stop: crate::seams::StopReason) -> atomcode_kernel::event::StopReason {
     use crate::seams::StopReason as In;
     use atomcode_kernel::event::StopReason as Out;
     match stop {

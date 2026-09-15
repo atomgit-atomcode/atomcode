@@ -29,8 +29,8 @@ use crate::agent::{Agent, MessageOrigin};
 use crate::events::{
     AgentInfo, AgentRequest, AssistantChunk, AssistantMessage, Chunk, InboxInserted, ModelRequest,
     ModelResponse, PreStep, RequestError, SessionEventCommitted, StepDecision, ToolBatch, ToolExec,
-    ToolResultEvent, ToolsExecuteBatch, TurnEnd, TurnProgress, TurnStart, TurnStarted,
-    TurnStopping,
+    ToolResultEvent, ToolsExecuteBatch, TurnEnd, TurnFinishing, TurnProgress, TurnStart,
+    TurnStarted, TurnStopping,
 };
 use crate::seams::{
     AgentLoop, AgentLoopSvc, LlmSvc, SessionProjectionsSvc, StopReason, SystemPromptSvc, ToolsSvc,
@@ -506,6 +506,7 @@ impl PluginAgentLoop {
                 },
             );
             let cancel = agent.cancel_token();
+            let request_started = std::time::Instant::now();
             let response = match tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
@@ -533,6 +534,14 @@ impl PluginAgentLoop {
                     },
                 );
             }
+            let meta = response_meta(
+                &session,
+                provider.as_ref(),
+                &response,
+                turn,
+                step,
+                request_started.elapsed(),
+            );
             self.commit(
                 &session,
                 SessionEvent::AssistantMessage {
@@ -541,6 +550,8 @@ impl PluginAgentLoop {
                     text: response.text.clone(),
                     reasoning: response.reasoning.clone(),
                     tool_calls: response.tool_calls.clone(),
+                    reasoning_blocks: Vec::new(),
+                    meta: Some(meta),
                 },
             );
             self.ctx.emit::<AssistantMessage>(&Message::assistant(
@@ -639,6 +650,7 @@ impl PluginAgentLoop {
             }
         }
 
+        self.ctx.parallel::<TurnFinishing>(&outcome).await;
         self.commit(
             &session,
             SessionEvent::TurnEnd {
@@ -653,6 +665,60 @@ impl PluginAgentLoop {
         // one every later turn ends before its first request.
         agent.end_turn();
         outcome
+    }
+}
+
+/// The stats a stored message carries about the response that produced it.
+///
+/// `request_id` continues the session's own sequence — one past the highest id
+/// any logged response already holds — rather than restarting per process, so a
+/// session resumed from a store that kept those ids does not mint duplicates.
+fn response_meta(
+    session: &SessionLog,
+    provider: &dyn LlmProvider,
+    response: &ModelResponse,
+    turn: u64,
+    round: u32,
+    elapsed: std::time::Duration,
+) -> atomcode_kernel::message::MessageMeta {
+    let request_id = session
+        .events()
+        .iter()
+        .filter_map(|logged| match &logged.event {
+            SessionEvent::AssistantMessage {
+                meta: Some(meta), ..
+            } => Some(meta.request_id),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let tokens = response.usage.unwrap_or_default();
+    let ctx_window = provider.context_window();
+    let used_tokens = tokens.prompt;
+    atomcode_kernel::message::MessageMeta {
+        tokens,
+        elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        ctx_window,
+        used_tokens,
+        utilization: if ctx_window == 0 {
+            0.0
+        } else {
+            used_tokens as f32 / ctx_window as f32
+        },
+        round,
+        turn_id: turn,
+        request_id,
+        session_id: Some(session.id().to_string()),
+        finish_reason: if !response.tool_calls.is_empty() {
+            "tool_calls"
+        } else if response.truncated {
+            "length"
+        } else {
+            "stop"
+        }
+        .to_string(),
+        ..Default::default()
     }
 }
 

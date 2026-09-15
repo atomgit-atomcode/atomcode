@@ -766,6 +766,8 @@ fn the_projection_is_a_pure_fold_over_the_log() {
                 text: "Hello".into(),
                 reasoning: String::new(),
                 tool_calls: vec![call("a", "read_file"), call("b", "read_file")],
+                reasoning_blocks: Vec::new(),
+                meta: None,
             },
             // Both calls got past the gates, so both are recorded as started.
             // The assistant message above says only that the model ASKED — a
@@ -867,6 +869,8 @@ fn a_call_that_never_ran_never_reads_as_started() {
                     name: "bash".into(),
                     arguments: "{}".into(),
                 }],
+                reasoning_blocks: Vec::new(),
+                meta: None,
             },
             Fact::ToolResultLogged {
                 turn: 1,

@@ -274,6 +274,15 @@ pub trait SessionPersistence: Send + Sync {
 pub struct SessionDefaults {
     pub id: Option<String>,
     pub resume: bool,
+    /// The conversation to start from, when the host keeps sessions somewhere
+    /// the `session-persistence` seam does not read.
+    ///
+    /// A host whose durable store is not this tree's (the coding runtime keeps
+    /// native snapshots) cannot say "resume" — that would replay whatever the
+    /// seam holds — so it hands the events over instead. A non-empty seed wins
+    /// over `resume`, the same precedence [`crate::agent::CreateAgent`] already
+    /// gives an explicit seed.
+    pub seed: Vec<crate::session::LoggedEvent>,
 }
 
 /// One stored session, as a list would show it.

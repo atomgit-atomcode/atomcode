@@ -354,6 +354,8 @@ mod tests {
                 name: name.into(),
                 arguments: args.into(),
             }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
         }
     }
 

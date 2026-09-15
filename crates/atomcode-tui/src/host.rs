@@ -2681,6 +2681,8 @@ mod tests {
                 text: format!("row {i}"),
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
+                reasoning_blocks: Vec::new(),
+                meta: None,
             });
         }
     }
@@ -2764,6 +2766,8 @@ mod tests {
                 text: format!("row {i}"),
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
+                reasoning_blocks: Vec::new(),
+                meta: None,
             });
         }
         h.absorb(&SessionEvent::AssistantMessage {
@@ -2779,6 +2783,8 @@ mod tests {
                 })
                 .to_string(),
             }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
         });
         let size = (80, 24);
 
@@ -2932,6 +2938,8 @@ mod tests {
                 })
                 .to_string(),
             }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
         });
 
         let size = (100, 24);
@@ -3039,6 +3047,8 @@ mod tests {
                 text: format!("lead-in {i}"),
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
+                reasoning_blocks: Vec::new(),
+                meta: None,
             });
         }
         h.absorb(&SessionEvent::AssistantMessage {
@@ -3047,6 +3057,8 @@ mod tests {
             text: "before the call".into(),
             reasoning: String::new(),
             tool_calls: Vec::new(),
+            reasoning_blocks: Vec::new(),
+            meta: None,
         });
         h.absorb(&SessionEvent::AssistantMessage {
             turn: 1,
@@ -3058,6 +3070,8 @@ mod tests {
                 name: "read_file".into(),
                 arguments: serde_json::json!({ "path": "anchor-line" }).to_string(),
             }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
         });
         // Unfolded, the call draws several rows: the header, then its result.
         // Folding it back to one line is what moves everything below it.
@@ -3094,6 +3108,8 @@ mod tests {
                 text: format!("row {i}"),
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
+                reasoning_blocks: Vec::new(),
+                meta: None,
             });
         }
         let size = (80, 24);
@@ -3151,6 +3167,8 @@ mod tests {
                 text: format!("row {i}"),
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
+                reasoning_blocks: Vec::new(),
+                meta: None,
             });
         }
         // A plan **taller than the pane**, so the cap is actually in force.
@@ -3173,6 +3191,8 @@ mod tests {
                 })
                 .to_string(),
             }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
         });
 
         let size = (80, 24);
@@ -4210,6 +4230,8 @@ mod tests {
                 })
                 .to_string(),
             }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
         });
 
         // The same state, measured twice: only the declaration differs, so the
@@ -4522,6 +4544,8 @@ mod tests {
                 name: "bash".into(),
                 arguments: r#"{"command":"ls"}"#.into(),
             }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
         };
         h.absorb(&call(1, "c1"));
         h.absorb(&SessionEvent::ToolResultLogged {
@@ -4785,6 +4809,8 @@ mod tests {
             text: "第一行很长很长很长很长很长很长很长很长\n第二行".into(),
             reasoning: String::new(),
             tool_calls: Vec::new(),
+            reasoning_blocks: Vec::new(),
+            meta: None,
         });
         let rows = stream_rows(&h, (40, 20));
         let mark = format!("{} ", Caps::default().g(Glyph::ToolMark));
@@ -4845,6 +4871,8 @@ mod tests {
             text: text.clone(),
             reasoning: String::new(),
             tool_calls: Vec::new(),
+            reasoning_blocks: Vec::new(),
+            meta: None,
         });
         let drawn: String = stream_rows(&h, (W, 20))
             .iter()
@@ -4896,6 +4924,8 @@ mod tests {
             text: long,
             reasoning: String::new(),
             tool_calls: Vec::new(),
+            reasoning_blocks: Vec::new(),
+            meta: None,
         });
         // What the painter actually draws, counted off a screen tall enough to
         // hold the whole reply — so this is the frame's number, not the sum's.
@@ -5425,6 +5455,8 @@ mod tests {
             text: answer,
             reasoning: String::new(),
             tool_calls: Vec::new(),
+            reasoning_blocks: Vec::new(),
+            meta: None,
         });
         let open = h.compose((80, 40)).rows().join("\n");
         assert!(open.contains("第 8 行"), "the whole answer is up:\n{open}");
@@ -5620,6 +5652,8 @@ mod tests {
                 text: format!("marker-{i}"),
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
+                reasoning_blocks: Vec::new(),
+                meta: None,
             });
         }
         h.absorb(&SessionEvent::AssistantMessage {
@@ -5638,6 +5672,8 @@ mod tests {
                 })
                 .to_string(),
             }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
         });
 
         let size = (80, 16);
@@ -6143,6 +6179,8 @@ mod demo {
             text: answer,
             reasoning: String::new(),
             tool_calls: Vec::new(),
+            reasoning_blocks: Vec::new(),
+            meta: None,
         });
         // A turn in flight, so the live line is in the picture: three seconds
         // and one tool call into the next thing the model was asked to do.
@@ -6158,6 +6196,8 @@ mod demo {
                 name: "bash".into(),
                 arguments: r#"{"command":"cargo test -p atomcode-tui"}"#.into(),
             }],
+            reasoning_blocks: Vec::new(),
+            meta: None,
         });
         // A real reading off the wire, so the figures in the frame are the shape
         // they take on a long turn: a context of tens of thousands of tokens
