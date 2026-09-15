@@ -456,6 +456,12 @@ impl PluginAgentLoop {
                     },
                 );
             }
+            // A round answering a nudge the harness wrote may legitimately have
+            // nothing to add: the model read the note, did not need a tool, and
+            // has already answered the person. An ordinary round with no content
+            // is a provider that failed; this one is a turn that is finished.
+            let answering_a_nudge =
+                matches!(decision.origin, MessageOrigin::Internal) && decision.message.is_some();
             if let Some(text) = &decision.message {
                 // The same wake, two provenances. A continuation the harness
                 // scheduled is model-visible like anything else and is logged
@@ -471,6 +477,11 @@ impl PluginAgentLoop {
                         turn,
                         text: text.clone(),
                         origin: InjectionOrigin::Continuation,
+                    },
+                    MessageOrigin::Internal => SessionEvent::Injected {
+                        turn,
+                        text: text.clone(),
+                        origin: InjectionOrigin::InternalNudge,
                     },
                     // Logged under the sender's session id, not its registry
                     // id: the log outlives both agents.
@@ -544,6 +555,7 @@ impl PluginAgentLoop {
                     options: ChatOptions::default(),
                     turn,
                     round: step,
+                    answering_a_nudge,
                 },
             );
             let cancel = agent.cancel_token();
@@ -557,6 +569,12 @@ impl PluginAgentLoop {
                 answered = asked => answered,
             } {
                 Ok(response) => response,
+                Err(error) if error.empty_response && answering_a_nudge => {
+                    // Nothing to add to a note nobody asked for: the turn ends
+                    // where it already was.
+                    outcome.stop = StopReason::Stopped;
+                    break;
+                }
                 Err(error) => {
                     if let Some(pause) = error.rate_limit_pause.clone() {
                         // Not a failure: the turn stops cleanly and says when to

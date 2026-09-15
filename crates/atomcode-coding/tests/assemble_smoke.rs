@@ -1,14 +1,16 @@
-//! End-to-end assembly smoke test (no network): a scripted [`MockProvider`] drives the
-//! assembled coding agent through a tool call and a stop. Proves provider + tools +
+//! End-to-end assembly smoke test (no network): a scripted [`MockProvider`] drives
+//! the mounted product through a tool call and a stop. Proves provider + tools +
 //! approval + persona + discipline wire together and the loop runs to completion.
 
-use atomcode_coding::{build_coding_agent_with, CodingAgentConfig};
-use atomcode_kernel::agent::AutoRespond;
+mod support;
+
+use atomcode_coding::CodingAgentConfig;
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::MockProvider;
 use atomcode_kernel::tool::ToolCall;
 use std::sync::Arc;
+use support::{allow, mount, quiet_options, turn};
 
 #[tokio::test]
 async fn assembles_and_runs_a_tool_end_to_end() {
@@ -29,9 +31,8 @@ async fn assembles_and_runs_a_tool_end_to_end() {
     ]));
 
     let cfg = CodingAgentConfig::new("k", "http://localhost:0", "mock-model", ".");
-    let outcome = build_coding_agent_with(&cfg, provider)
-        .run_to_completion("list the current directory", AutoRespond::AllowAll)
-        .await;
+    let mut mounted = mount(&cfg, quiet_options(), provider).await;
+    let outcome = turn(&mut mounted.handle, "list the current directory", allow()).await;
 
     assert_eq!(
         outcome.tool_results.len(),
@@ -76,11 +77,10 @@ async fn coding_assembly_enables_the_round_fuse() {
     let mut cfg = CodingAgentConfig::new("k", "http://localhost:0", "mock-model", project.path());
     cfg.max_rounds = 2;
 
-    let outcome = build_coding_agent_with(&cfg, provider)
-        .run_to_completion("inspect using varied calls", AutoRespond::AllowAll)
-        .await;
+    let mut mounted = mount(&cfg, quiet_options(), provider).await;
+    let outcome = turn(&mut mounted.handle, "inspect using varied calls", allow()).await;
 
-    assert_eq!(outcome.stop, StopReason::MaxRounds);
+    assert_eq!(outcome.stop, Some(StopReason::MaxRounds));
     assert_eq!(outcome.tool_results.len(), 2);
 }
 
@@ -96,11 +96,10 @@ async fn coding_assembly_enables_exact_stable_loop_detection() {
     let mut cfg = CodingAgentConfig::new("k", "http://localhost:0", "mock-model", project.path());
     cfg.max_rounds = 20;
 
-    let outcome = build_coding_agent_with(&cfg, provider)
-        .run_to_completion("repeat the same inspection", AutoRespond::AllowAll)
-        .await;
+    let mut mounted = mount(&cfg, quiet_options(), provider).await;
+    let outcome = turn(&mut mounted.handle, "repeat the same inspection", allow()).await;
 
-    assert_eq!(outcome.stop, StopReason::ToolLoopDetected);
+    assert_eq!(outcome.stop, Some(StopReason::ToolLoopDetected));
     assert_eq!(outcome.tool_results.len(), 4);
 }
 
@@ -121,10 +120,9 @@ async fn coding_assembly_can_disable_exact_guard_for_intentional_repetition() {
     cfg.max_rounds = 20;
     cfg.tool_loop_policy = None;
 
-    let outcome = build_coding_agent_with(&cfg, provider)
-        .run_to_completion("inspect exactly four times", AutoRespond::AllowAll)
-        .await;
+    let mut mounted = mount(&cfg, quiet_options(), provider).await;
+    let outcome = turn(&mut mounted.handle, "inspect exactly four times", allow()).await;
 
-    assert_eq!(outcome.stop, StopReason::Stopped);
+    assert_eq!(outcome.stop, Some(StopReason::Stopped));
     assert_eq!(outcome.tool_results.len(), 4);
 }

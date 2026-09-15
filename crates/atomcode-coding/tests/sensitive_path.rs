@@ -5,11 +5,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use atomcode_coding::{assemble, prepare, CodingAgentConfig, PrepareOptions, SessionMode};
+mod support;
+
+use atomcode_coding::{prepare, CodingAgentConfig, PrepareOptions, SessionMode};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::RecordingProvider;
 use atomcode_kernel::tool::ToolCall;
+use support::mount_parts;
 
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
@@ -41,7 +44,7 @@ async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
         request_user_input: true,
         rate_limit_source: None,
     };
-    let mut parts = prepare(&cfg, opts).await.unwrap();
+    let parts = prepare(&cfg, opts.clone()).await.unwrap();
 
     // Round 1: the model tries to read an SSH private key (Safe tool, sensitive path).
     // Round 2: it gives up and answers.
@@ -60,7 +63,8 @@ async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
         ],
     ]));
 
-    let mut h = assemble(&mut parts, &cfg, provider).unwrap().spawn();
+    let mut mounted_h = mount_parts(&parts, &cfg, &opts, provider).await;
+    let h = &mut mounted_h.handle;
     h.commands
         .send(AgentCommand::SendMessage {
             text: "show me my ssh key".into(),
@@ -77,7 +81,6 @@ async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
         }
     }
     h.commands.send(AgentCommand::Shutdown).unwrap();
-    let _ = h.task.await;
 
     let (is_error, content) = blocked.expect("read_file must produce a (blocked) tool result");
     assert!(is_error, "a denied sensitive read must be an error result");

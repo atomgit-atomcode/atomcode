@@ -11,12 +11,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use atomcode_coding::{assemble, prepare, CodingAgentConfig, PrepareOptions, SessionMode};
+mod support;
+
+use atomcode_coding::{prepare, CodingAgentConfig, PrepareOptions, SessionMode};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::message::{Message, Role};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::RecordingProvider;
 use atomcode_kernel::tool::ToolDef;
+use support::mount_parts;
 
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
@@ -128,7 +131,7 @@ async fn full_assembly_wire_prefix_is_cacheable_across_turns() {
         request_user_input: true,
         rate_limit_source: None,
     };
-    let mut parts = prepare(&cfg, opts).await.unwrap();
+    let parts = prepare(&cfg, opts.clone()).await.unwrap();
 
     // Two text-only turns → one recorded provider call each.
     let provider = Arc::new(RecordingProvider::new(vec![
@@ -136,11 +139,11 @@ async fn full_assembly_wire_prefix_is_cacheable_across_turns() {
         text_turn("answer two"),
     ]));
     let calls = provider.calls();
-    let mut h = assemble(&mut parts, &cfg, provider).unwrap().spawn();
+    let mounted_h = mount_parts(&parts, &cfg, &opts, provider).await;
+    let mut h = mounted_h.handle;
     drive(&mut h, "first task").await;
     drive(&mut h, "second task").await;
     h.commands.send(AgentCommand::Shutdown).unwrap();
-    let _ = h.task.await;
 
     let calls = calls.lock().unwrap();
     assert!(
@@ -224,13 +227,13 @@ async fn tool_block_and_system_are_deterministic_across_independent_assemblies()
     };
 
     async fn first_call(cfg: &CodingAgentConfig, opts: PrepareOptions) -> (String, String) {
-        let mut parts = prepare(cfg, opts).await.unwrap();
+        let parts = prepare(cfg, opts.clone()).await.unwrap();
         let provider = Arc::new(RecordingProvider::new(vec![text_turn("ok")]));
         let calls = provider.calls();
-        let mut h = assemble(&mut parts, cfg, provider).unwrap().spawn();
+        let mounted_h = mount_parts(&parts, cfg, &opts, provider).await;
+        let mut h = mounted_h.handle;
         drive(&mut h, "task").await;
         h.commands.send(AgentCommand::Shutdown).unwrap();
-        let _ = h.task.await;
         let calls = calls.lock().unwrap();
         (
             tool_block_repr(&calls[0].1),

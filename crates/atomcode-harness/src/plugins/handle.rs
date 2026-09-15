@@ -83,6 +83,10 @@ struct Projector {
     /// How many user messages this turn has taken. The second and later ones
     /// are steering.
     said_this_turn: u32,
+    /// The round now running answers a nudge the harness wrote. What the model
+    /// says back is not shown: it is answering a note the person never sent. What
+    /// it DOES still is — the calls it makes and their results project as always.
+    answering_a_nudge: bool,
     /// The last round a `Usage` was reported for. A round the provider reported
     /// no usage for is still a round, and a driver counting rounds by `Usage`
     /// must hear of it.
@@ -122,7 +126,12 @@ impl Projector {
             SessionEvent::AssistantChunk {
                 delta, reasoning, ..
             } => {
-                if *reasoning {
+                // Answering a nudge nobody wrote: the words are not the person's
+                // business, the actions are. Logged all the same — this decides
+                // what is SHOWN, never what is kept.
+                if self.answering_a_nudge {
+                    Vec::new()
+                } else if *reasoning {
                     vec![AgentEvent::Reasoning(delta.clone())]
                 } else {
                     vec![AgentEvent::TextDelta(delta.clone())]
@@ -215,15 +224,19 @@ impl Projector {
                 }]
             }
 
-            SessionEvent::StepEnd { .. } => match self.batch.take() {
-                Some(batch) => vec![AgentEvent::ToolBatchCompleted {
-                    batch_id: batch.id,
-                    ok: batch.ok,
-                    total: batch.total,
-                    elapsed_ms: batch.started.elapsed().as_millis() as u64,
-                }],
-                None => Vec::new(),
-            },
+            SessionEvent::StepEnd { .. } => {
+                // Whatever the next round says, it is the model's own again.
+                self.answering_a_nudge = false;
+                match self.batch.take() {
+                    Some(batch) => vec![AgentEvent::ToolBatchCompleted {
+                        batch_id: batch.id,
+                        ok: batch.ok,
+                        total: batch.total,
+                        elapsed_ms: batch.started.elapsed().as_millis() as u64,
+                    }],
+                    None => Vec::new(),
+                }
+            }
 
             SessionEvent::Usage { turn, round, usage } => {
                 self.last_prompt_tokens = usage.prompt;
@@ -243,7 +256,6 @@ impl Projector {
                     ..Default::default()
                 })]
             }
-
             SessionEvent::Compacted { .. }
                 if self
                     .manual_compaction
@@ -382,6 +394,8 @@ impl Projector {
             // and the model's request and stopped, so a team member's report was
             // invisible to the person it was being reported to.
             SessionEvent::Injected { text, origin, .. } => {
+                self.answering_a_nudge =
+                    matches!(origin, crate::session::InjectionOrigin::InternalNudge);
                 use crate::session::InjectionOrigin as In;
                 use atomcode_kernel::event::ContextSource as Out;
                 vec![AgentEvent::ContextAdded {
@@ -391,6 +405,7 @@ impl Projector {
                         In::Memory => Out::Memory,
                         In::Reminder => Out::Reminder,
                         In::Continuation => Out::Continuation,
+                        In::InternalNudge => Out::Continuation,
                         In::CompactionSummary => Out::CompactionSummary,
                     },
                 }]
@@ -399,6 +414,9 @@ impl Projector {
             SessionEvent::StepStart { .. }
             | SessionEvent::RequestHeader { .. }
             | SessionEvent::Titled { .. }
+            // The ladder that stubs says so itself, as a notice; the fact is for
+            // the log and the next request, not for the screen.
+            | SessionEvent::ToolResultsStubbed { .. }
             // A question was put, and answered: a card in the log, drawn by the
             // front end that asked for it out of the same fold as every other
             // block. The kernel protocol has no vocabulary for a question, and
@@ -1199,6 +1217,7 @@ pub async fn spawn(
         batch: None,
         last_prompt_tokens: 0,
         said_this_turn: 0,
+        answering_a_nudge: false,
         usage_round: None,
         manual_compaction: manual_compaction.clone(),
     }));
@@ -1383,6 +1402,7 @@ pub fn replay(events: &[SessionEvent], ctx_window: u32) -> Vec<AgentEvent> {
         batch: None,
         last_prompt_tokens: 0,
         said_this_turn: 0,
+        answering_a_nudge: false,
         usage_round: None,
         manual_compaction: Default::default(),
     };

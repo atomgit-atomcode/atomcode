@@ -325,40 +325,28 @@ impl<'de> serde::Deserialize<'de> for Step {
 
 // ---- the chain, recorded ------------------------------------------------
 //
-// The hand-written chain is being deleted. What it did in each scenario that is
-// compared against it is kept as a golden file, recorded from the chain itself
-// while it still existed, and the comparison runs against that record under the
-// same ratchet.
+// The hand-written chain is gone. What it did in each scenario compared against
+// it was recorded, from the chain itself, in the commit before it was deleted;
+// these files are that record, and the comparison runs the row list against them
+// under the same ratchet.
 //
-// `ATOMCODE_RECORD_GOLDEN=1` runs the chain and rewrites the record. Without it
-// the record is read and the chain is never run — the expression is not awaited.
+// A golden cannot be re-recorded: there is nothing left to record it from. A
+// scenario whose record no longer describes the product is a decision to make in
+// the open — edit the file and say why in the commit — not something to
+// regenerate.
 
 macro_rules! golden {
-    ($key:expr, $chain:expr) => {
-        golden_value($key, async { $chain }).await
+    ($key:expr) => {
+        golden_value($key).await
     };
 }
 
-async fn golden_value<T, F>(key: &str, chain: F) -> T
-where
-    T: serde::Serialize + serde::de::DeserializeOwned,
-    F: std::future::Future<Output = T>,
-{
+async fn golden_value<T: serde::de::DeserializeOwned>(key: &str) -> T {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/differential")
         .join(format!("{key}.json"));
-    if std::env::var_os("ATOMCODE_RECORD_GOLDEN").is_some() {
-        let value = chain.await;
-        std::fs::create_dir_all(path.parent().expect("golden dir")).expect("golden dir");
-        std::fs::write(
-            &path,
-            serde_json::to_string_pretty(&value).expect("golden serializes") + "\n",
-        )
-        .expect("golden written");
-        return value;
-    }
     let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
-        panic!("golden `{key}` is missing ({error}): it was recorded from the chain with ATOMCODE_RECORD_GOLDEN=1")
+        panic!("golden `{key}` is missing ({error}); it was recorded from the hand-written chain, which no longer exists to record it again")
     });
     serde_json::from_str(&text)
         .unwrap_or_else(|error| panic!("golden `{key}` is unreadable: {error}"))
@@ -425,17 +413,6 @@ fn normalise(event: &AgentEvent) -> Option<Step> {
         // on the floor by whichever engine does not emit it.
         other => step("UNKNOWN", format!("{other:?}")),
     }
-}
-
-/// As [`drive`], but keep listening past the turn's end until every `also` kind
-/// has been seen.
-///
-/// The first version always stopped at the terminal event, which meant a reply
-/// that legitimately arrives after it — a `Snapshot` answer — was cut off by the
-/// rig rather than missing from the engine. A measurement that reports its own
-/// harness's behaviour is worse than no measurement.
-async fn drive_until(handle: AgentHandle, commands: Vec<AgentCommand>, also: &[&str]) -> Vec<Step> {
-    drive_with(handle, commands, also, None).await
 }
 
 /// As above, but send `late` once the turn has actually started.
@@ -685,41 +662,6 @@ fn scratch(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-/// The reference: `atomcode-coding`'s own assembly.
-async fn reference(
-    script: Arc<Script>,
-    dir: &std::path::Path,
-    commands: Vec<AgentCommand>,
-) -> Vec<Step> {
-    reference_until(script, dir, commands, &[]).await
-}
-
-fn coding_agent(script: Arc<Script>, dir: &std::path::Path) -> atomcode_kernel::agent::Agent {
-    let cfg = atomcode_coding::CodingAgentConfig::new("k", "http://unused.test/v1", "script", dir);
-    atomcode_coding::build_coding_agent_with(&cfg, script)
-}
-
-/// A second message, sent once the turn is genuinely under way.
-async fn reference_late(
-    script: Arc<Script>,
-    dir: &std::path::Path,
-    commands: Vec<AgentCommand>,
-    late: AgentCommand,
-) -> Vec<Step> {
-    drive_with(coding_agent(script, dir).spawn(), commands, &[], Some(late)).await
-}
-
-async fn reference_until(
-    script: Arc<Script>,
-    dir: &std::path::Path,
-    commands: Vec<AgentCommand>,
-    also: &[&str],
-) -> Vec<Step> {
-    let cfg = atomcode_coding::CodingAgentConfig::new("k", "http://unused.test/v1", "script", dir);
-    let agent = atomcode_coding::build_coding_agent_with(&cfg, script);
-    drive_until(agent.spawn(), commands, also).await
-}
-
 // ---- the production reference -------------------------------------------
 //
 // `build_coding_agent_with` above is, by its own doc comment, the "MINIMAL sync
@@ -756,35 +698,6 @@ async fn reference_until(
 // the row list had no `code_review`. It has one now (`tool-code-review`), so the
 // gate is open here too and the criterion covers it. Building the tool performs
 // no I/O; running a review does, and no scenario runs one.
-
-async fn production_agent(
-    script: Arc<Script>,
-    dir: &std::path::Path,
-) -> atomcode_kernel::agent::Agent {
-    let cfg = atomcode_coding::CodingAgentConfig::new("k", "http://unused.test/v1", "script", dir);
-    let opts = atomcode_coding::parts::PrepareOptions {
-        mcp: false,
-        web: true,
-        review: true,
-        memory: false,
-        subagents: atomcode_coding::SubagentPolicy::Enabled,
-        skill_dirs: Some(Vec::new()),
-        ..Default::default()
-    };
-    let mut parts = atomcode_coding::parts::prepare(&cfg, opts)
-        .await
-        .expect("the production prepare must succeed in the rig");
-    atomcode_coding::parts::assemble(&mut parts, &cfg, script)
-        .expect("the production assemble must succeed in the rig")
-}
-
-async fn reference_production(
-    script: Arc<Script>,
-    dir: &std::path::Path,
-    commands: Vec<AgentCommand>,
-) -> Vec<Step> {
-    drive_until(production_agent(script, dir).await.spawn(), commands, &[]).await
-}
 
 /// The candidate: a plexus tree providing `agent-handle`.
 async fn candidate(
@@ -1132,10 +1045,7 @@ async fn a_plain_turn() {
             images: Vec::new(),
         }]
     };
-    let a = golden!(
-        "plain_turn",
-        reference(Script::text(&["hello"]), &dir, cmds()).await
-    );
+    let a: Vec<Step> = golden!("plain_turn");
     let b = candidate(Script::text(&["hello"]), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("plain_turn", divergences(&a, &b), &report);
@@ -1180,7 +1090,7 @@ async fn one_tool_call() {
             images: Vec::new(),
         }]
     };
-    let a = golden!("one_tool_call", reference(script(), &dir, cmds()).await);
+    let a: Vec<Step> = golden!("one_tool_call");
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("one_tool_call", divergences(&a, &b), &report);
@@ -1225,7 +1135,7 @@ async fn two_tool_calls_at_once() {
             images: Vec::new(),
         }]
     };
-    let a = golden!("two_tool_calls", reference(script(), &dir, cmds()).await);
+    let a: Vec<Step> = golden!("two_tool_calls");
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("two_tool_calls", divergences(&a, &b), &report);
@@ -1258,7 +1168,7 @@ async fn a_tool_that_does_not_exist() {
             images: Vec::new(),
         }]
     };
-    let a = golden!("unknown_tool", reference(script(), &dir, cmds()).await);
+    let a: Vec<Step> = golden!("unknown_tool");
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("unknown_tool", divergences(&a, &b), &report);
@@ -1281,7 +1191,7 @@ async fn the_provider_fails_mid_stream() {
             images: Vec::new(),
         }]
     };
-    let a = golden!("provider_error", reference(script(), &dir, cmds()).await);
+    let a: Vec<Step> = golden!("provider_error");
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("provider_error", divergences(&a, &b), &report);
@@ -1319,7 +1229,7 @@ async fn several_rounds() {
             images: Vec::new(),
         }]
     };
-    let a = golden!("several_rounds", reference(script(), &dir, cmds()).await);
+    let a: Vec<Step> = golden!("several_rounds");
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("several_rounds", divergences(&a, &b), &report);
@@ -1374,16 +1284,7 @@ async fn a_cancel_lands() {
     // is not the thing being measured, it is not bounded, and under a loaded
     // suite it is easily tens of milliseconds — a budget that includes it is a
     // budget that reports the machine's load as a cancellation bug.
-    let a = golden!(
-        "cancel",
-        drive_with(
-            coding_agent(script(), &dir).spawn(),
-            cmds(),
-            &[],
-            Some(AgentCommand::Cancel)
-        )
-        .await
-    );
+    let a: Vec<Step> = golden!("cancel");
     let (candidate, mut app) = candidate_handle(script(), &dir).await;
 
     let started = std::time::Instant::now();
@@ -1560,7 +1461,7 @@ async fn the_provider_fails_while_a_tool_call_is_outstanding() {
             images: Vec::new(),
         }]
     };
-    let a = golden!("dangling_call", reference(script(), &dir, cmds()).await);
+    let a: Vec<Step> = golden!("dangling_call");
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("dangling_call", divergences(&a, &b), &report);
@@ -1602,7 +1503,7 @@ async fn one_of_two_parallel_tools_fails() {
             images: Vec::new(),
         }]
     };
-    let a = golden!("mixed_batch", reference(script(), &dir, cmds()).await);
+    let a: Vec<Step> = golden!("mixed_batch");
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("mixed_batch", divergences(&a, &b), &report);
@@ -1637,14 +1538,7 @@ async fn a_second_turn_sees_the_first() {
     // nothing the person said earlier counts.
     let dir = scratch("two-turns");
     let script = || Script::text(&["first answer", "second answer"]);
-    let a = golden!(
-        "two_turns",
-        drive_turns(
-            coding_agent(script(), &dir).spawn(),
-            &["remember the number 41", "what number?"],
-        )
-        .await
-    );
+    let a: Vec<Step> = golden!("two_turns");
     let (handle, _app) = candidate_handle(script(), &dir).await;
     let b = drive_turns(handle, &["remember the number 41", "what number?"]).await;
     let report = render(&a, &b);
@@ -1677,12 +1571,10 @@ async fn the_context_a_message_carries_actually_reaches_the_model() {
             context: "the build fails on line 41".into(),
         }]
     };
-    let seen_reference =
-        transcript(coding_agent(Script::text(&["ok"]), &dir).spawn(), cmds()).await;
     let (handle, _app) = candidate_handle(Script::text(&["ok"]), &dir).await;
     let seen_candidate = transcript(handle, cmds()).await;
 
-    for (who, seen) in [("参考", &seen_reference), ("候选", &seen_candidate)] {
+    for (who, seen) in [("候选", &seen_candidate)] {
         assert!(
             seen.contains("the build fails on line 41"),
             "{who}: 上下文没到模型面前：\n{seen}"
@@ -1706,7 +1598,7 @@ async fn a_truncated_response() {
             images: Vec::new(),
         }]
     };
-    let a = golden!("truncated", reference(script(), &dir, cmds()).await);
+    let a: Vec<Step> = golden!("truncated");
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     // Known and benign: both engines run the recovery round and both report the
@@ -1743,7 +1635,7 @@ async fn a_truncation_the_model_answers_by_redumping() {
             images: Vec::new(),
         }]
     };
-    let a = golden!("truncated_redump", reference(script(), &dir, cmds()).await);
+    let a: Vec<Step> = golden!("truncated_redump");
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("truncated_redump", divergences(&a, &b), &report);
@@ -1780,7 +1672,7 @@ async fn a_transient_open_failure_with_a_retry_after() {
             images: Vec::new(),
         }]
     };
-    let a = golden!("retry_after", reference(script(), &dir, cmds()).await);
+    let a: Vec<Step> = golden!("retry_after");
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("retry_after", divergences(&a, &b), &report);
@@ -1809,10 +1701,7 @@ async fn a_manual_compaction() {
             AgentCommand::Compact { focus: None },
         ]
     };
-    let a = golden!(
-        "compact",
-        reference_until(Script::text(&["ok"]), &dir, cmds(), &[]).await
-    );
+    let a: Vec<Step> = golden!("compact");
     let b = candidate_until(Script::text(&["ok"]), &dir, cmds(), &[]).await;
     let report = render(&a, &b);
     // Known and benign: the candidate emits `CompactionStarted` where the
@@ -1847,10 +1736,7 @@ async fn a_second_message_steers_the_running_turn() {
         text: "and also this".into(),
         images: Vec::new(),
     };
-    let a = golden!(
-        "steering",
-        reference_late(script(), &dir, cmds(), later()).await
-    );
+    let a: Vec<Step> = golden!("steering");
     let b = candidate_late(script(), &dir, cmds(), later()).await;
     let report = render(&a, &b);
     ratchet("steering", divergences(&a, &b), &report);
@@ -1876,10 +1762,7 @@ async fn a_message_carrying_context() {
             context: "the build is broken".into(),
         }]
     };
-    let a = golden!(
-        "with_context",
-        reference(Script::text(&["fix it"]), &dir, cmds()).await
-    );
+    let a: Vec<Step> = golden!("with_context");
     let b = candidate(Script::text(&["fix it"]), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("with_context", divergences(&a, &b), &report);
@@ -1903,10 +1786,7 @@ async fn a_synthetic_message() {
             text: "keep going".into(),
         }]
     };
-    let a = golden!(
-        "synthetic",
-        reference(Script::text(&["carrying on"]), &dir, cmds()).await
-    );
+    let a: Vec<Step> = golden!("synthetic");
     let b = candidate(Script::text(&["carrying on"]), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("synthetic", divergences(&a, &b), &report);
@@ -1934,10 +1814,7 @@ async fn a_snapshot_round_trip() {
             AgentCommand::Snapshot,
         ]
     };
-    let a = golden!(
-        "snapshot",
-        reference_until(Script::text(&["ok"]), &dir, cmds(), &["Snapshot"]).await
-    );
+    let a: Vec<Step> = golden!("snapshot");
     let b = candidate_until(Script::text(&["ok"]), &dir, cmds(), &["Snapshot"]).await;
     let report = render(&a, &b);
     ratchet("snapshot", divergences(&a, &b), &report);
@@ -1956,7 +1833,7 @@ async fn prod_vs_candidate(
     script: impl Fn() -> Arc<Script>,
     cmds: impl Fn() -> Vec<AgentCommand>,
 ) -> (Vec<Step>, Vec<Step>, String) {
-    let a = golden!(key, reference_production(script(), dir, cmds()).await);
+    let a: Vec<Step> = golden!(key);
     let b = candidate(script(), dir, cmds()).await;
     let report = render(&a, &b);
     ratchet(key, divergences(&a, &b), &report);
@@ -2199,30 +2076,6 @@ async fn on_harness_late(
 // below could only be run against one of the two engines — which is not a
 // differential at all.
 
-async fn reference_production_until(
-    script: Arc<Script>,
-    dir: &std::path::Path,
-    commands: Vec<AgentCommand>,
-    also: &[&str],
-) -> Vec<Step> {
-    drive_until(production_agent(script, dir).await.spawn(), commands, also).await
-}
-
-async fn reference_production_late(
-    script: Arc<Script>,
-    dir: &std::path::Path,
-    commands: Vec<AgentCommand>,
-    late: AgentCommand,
-) -> Vec<Step> {
-    drive_with(
-        production_agent(script, dir).await.spawn(),
-        commands,
-        &[],
-        Some(late),
-    )
-    .await
-}
-
 /// Render and ratchet a pair of runs the caller drove itself.
 ///
 /// `chain_vs_rows` covers the scenarios whose two sides are driven identically;
@@ -2241,7 +2094,7 @@ async fn chain_vs_rows(
     script: impl Fn() -> Arc<Script>,
     cmds: impl Fn() -> Vec<AgentCommand>,
 ) -> (Vec<Step>, Vec<Step>, String) {
-    let a = golden!(key, reference_production(script(), dir, cmds()).await);
+    let a: Vec<Step> = golden!(key);
     let b = on_harness(script(), dir, cmds()).await;
     let report = render(&a, &b);
     ratchet(key, divergences(&a, &b), &report);
@@ -2327,16 +2180,6 @@ async fn several_rounds_on_the_harness() {
 // different insides, one observable: `AgentEvent::Request`, answered with
 // `AgentCommand::Respond`.
 
-async fn reference_production_answering(
-    script: Arc<Script>,
-    dir: &std::path::Path,
-    commands: Vec<AgentCommand>,
-    answer: serde_json::Value,
-) -> Vec<Step> {
-    let agent = production_agent(script, dir).await;
-    drive_answering(agent.spawn(), commands, &[], None, answer).await
-}
-
 /// The same tree, with the driver answering approvals.
 ///
 /// Disabling the `approval` row is what ENABLES asking here, which reads
@@ -2369,10 +2212,7 @@ async fn ask_chain_vs_rows(
     cmds: impl Fn() -> Vec<AgentCommand>,
     answer: serde_json::Value,
 ) -> (Vec<Step>, Vec<Step>, String) {
-    let a = golden!(
-        key,
-        reference_production_answering(script(), dir, cmds(), answer.clone()).await
-    );
+    let a: Vec<Step> = golden!(key);
     let b = on_harness_answering(script(), dir, cmds(), answer).await;
     let report = render(&a, &b);
     ratchet(key, divergences(&a, &b), &report);
@@ -2758,16 +2598,7 @@ async fn a_cancel_lands_on_the_harness() {
     // setup step — it read 416ms for a 400ms round and blamed the cancel. It
     // would also have been unfair the other way: mounting a plexus tree is not
     // free either, and neither cost is what this scenario is about.
-    let a = golden!(
-        "cancel_rows",
-        drive_with(
-            production_agent(script(), &dir).await.spawn(),
-            say("go"),
-            &[],
-            Some(AgentCommand::Cancel)
-        )
-        .await
-    );
+    let a: Vec<Step> = golden!("cancel_rows");
 
     let (handle, mut app) = on_harness_handle(script(), &dir).await;
     let started = std::time::Instant::now();
@@ -2810,10 +2641,7 @@ async fn a_second_message_steers_the_running_turn_on_the_harness() {
         text: "and also this".into(),
         images: Vec::new(),
     };
-    let a = golden!(
-        "steering_rows",
-        reference_production_late(script(), &dir, say("start"), later()).await
-    );
+    let a: Vec<Step> = golden!("steering_rows");
     let b = on_harness_late(script(), &dir, say("start"), later()).await;
     let report = judge("steering_rows", &a, &b);
 
@@ -2915,10 +2743,7 @@ async fn a_manual_compaction_on_the_harness() {
             AgentCommand::Compact { focus: None },
         ]
     };
-    let a = golden!(
-        "compact_rows",
-        reference_production_until(Script::text(&["ok"]), &dir, cmds(), &[]).await
-    );
+    let a: Vec<Step> = golden!("compact_rows");
     let b = on_harness_until(Script::text(&["ok"]), &dir, cmds(), &[]).await;
     // Frozen at 1, the same as the minimal path: the row list emits
     // `CompactionStarted` where the chain goes straight to `Compacted`. That
@@ -2950,10 +2775,7 @@ async fn a_snapshot_round_trip_on_the_harness() {
             AgentCommand::Snapshot,
         ]
     };
-    let a = golden!(
-        "snapshot_rows",
-        reference_production_until(Script::text(&["ok"]), &dir, cmds(), &["Snapshot"]).await
-    );
+    let a: Vec<Step> = golden!("snapshot_rows");
     let b = on_harness_until(Script::text(&["ok"]), &dir, cmds(), &["Snapshot"]).await;
     let report = judge("snapshot_rows", &a, &b);
 
@@ -2975,10 +2797,7 @@ async fn a_message_carrying_context_on_the_harness() {
             context: "the build is broken".into(),
         }]
     };
-    let a = golden!(
-        "with_context_rows",
-        reference_production(Script::text(&["fix it"]), &dir, cmds()).await
-    );
+    let a: Vec<Step> = golden!("with_context_rows");
     let b = on_harness(Script::text(&["fix it"]), &dir, cmds()).await;
     let report = judge("with_context_rows", &a, &b);
 
@@ -2999,10 +2818,7 @@ async fn a_synthetic_message_on_the_harness() {
             text: "keep going".into(),
         }]
     };
-    let a = golden!(
-        "synthetic_rows",
-        reference_production(Script::text(&["carrying on"]), &dir, cmds()).await
-    );
+    let a: Vec<Step> = golden!("synthetic_rows");
     let b = on_harness(Script::text(&["carrying on"]), &dir, cmds()).await;
     let report = judge("synthetic_rows", &a, &b);
 
@@ -3023,10 +2839,7 @@ async fn a_second_turn_sees_the_first_on_the_harness() {
     let script = || Script::text(&["first answer", "second answer"]);
     let asked = ["remember the number 41", "what number?"];
 
-    let a = golden!(
-        "two_turns_rows",
-        drive_turns(production_agent(script(), &dir).await.spawn(), &asked).await
-    );
+    let a: Vec<Step> = golden!("two_turns_rows");
     let (handle, mut app) = on_harness_handle(script(), &dir).await;
     let b = drive_turns(handle, &asked).await;
     app.stop();
@@ -3059,16 +2872,11 @@ async fn the_context_a_message_carries_reaches_the_model_on_the_harness() {
             context: "the build fails on line 41".into(),
         }]
     };
-    let seen_chain = transcript(
-        production_agent(Script::text(&["ok"]), &dir).await.spawn(),
-        cmds(),
-    )
-    .await;
     let (handle, mut app) = on_harness_handle(Script::text(&["ok"]), &dir).await;
     let seen_rows = transcript(handle, cmds()).await;
     app.stop();
 
-    for (who, seen) in [("链式", &seen_chain), ("行式", &seen_rows)] {
+    for (who, seen) in [("行式", &seen_rows)] {
         assert!(
             seen.contains("the build fails on line 41"),
             "{who}: 上下文没到模型面前：\n{seen}"
@@ -3135,10 +2943,7 @@ fn model_calls(steps: &[Step]) -> usize {
 async fn an_edit_that_was_never_verified_is_asked_about_on_both_engines() {
     let dir = scratch("verify-cadence-onharness");
     seed(&dir);
-    let a = golden!(
-        "verify_cadence_rows",
-        reference_production(edits_and_stops(), &dir, say("fix a.rs")).await
-    );
+    let a: Vec<Step> = golden!("verify_cadence_rows");
     let (handle, mut app) = on_harness_headless(edits_and_stops(), &dir).await;
     let b = drive_answering(handle, say("fix a.rs"), &[], None, allow()).await;
     app.stop();
@@ -3169,27 +2974,12 @@ async fn an_attended_run_does_not_force_the_check() {
     // spends a round on something they were about to decide themselves.
     let dir = scratch("verify-cadence-attended");
     seed(&dir);
-    let mut cfg =
-        atomcode_coding::CodingAgentConfig::new("k", "http://unused.test/v1", "script", &dir);
-    cfg.interactive = true;
-    let opts = atomcode_coding::parts::PrepareOptions {
-        mcp: false,
-        web: false,
-        review: false,
-        memory: false,
-        skill_dirs: Some(Vec::new()),
-        ..Default::default()
-    };
-    let mut parts = atomcode_coding::parts::prepare(&cfg, opts)
-        .await
-        .expect("prepare");
-    let chain =
-        atomcode_coding::parts::assemble(&mut parts, &cfg, edits_and_stops()).expect("assemble");
-    let a = drive_until(chain.spawn(), say("fix a.rs"), &[]).await;
+    // A property, not a comparison: what matters is the number of model calls,
+    // and no record of the chain's is needed to count the tree's.
     let b = on_harness(edits_and_stops(), &dir, say("fix a.rs")).await;
-    let report = judge("verify_cadence_attended_rows", &a, &b);
+    let report = render(&b, &b);
 
-    for (who, steps) in [("链式", &a), ("行式", &b)] {
+    for (who, steps) in [("行式", &b)] {
         assert_eq!(
             model_calls(steps),
             2,
@@ -3210,10 +3000,7 @@ async fn a_user_who_forbade_the_shell_is_not_nudged_into_using_it() {
     let dir = scratch("verify-cadence-forbidden");
     seed(&dir);
     let asked = || say("fix a.rs, and do not run any command");
-    let a = golden!(
-        "verify_cadence_forbidden_rows",
-        reference_production(edits_and_stops(), &dir, asked()).await
-    );
+    let a: Vec<Step> = golden!("verify_cadence_forbidden_rows");
     let (handle, mut app) = on_harness_headless(edits_and_stops(), &dir).await;
     let b = drive_answering(handle, asked(), &[], None, allow()).await;
     app.stop();
@@ -3250,10 +3037,7 @@ async fn a_command_the_user_forbade_is_refused_on_both_engines() {
         ])
     };
     let asked = || say("check the build, and do not run any command");
-    let a = golden!(
-        "exec_policy_rows",
-        reference_production(script(), &dir, asked()).await
-    );
+    let a: Vec<Step> = golden!("exec_policy_rows");
     let (handle, mut app) = on_harness_headless(script(), &dir).await;
     let b = drive_answering(handle, asked(), &[], None, allow()).await;
     app.stop();
@@ -3300,10 +3084,7 @@ async fn a_refused_call_is_never_announced_as_started() {
             Reply::Text("stopped"),
         ])
     };
-    let a = golden!(
-        "refused_call_started_rows",
-        reference_production_answering(script(), &dir, say("clean it"), deny()).await
-    );
+    let a: Vec<Step> = golden!("refused_call_started_rows");
     let b = on_harness_answering(script(), &dir, say("clean it"), deny()).await;
     let report = judge("refused_call_started_rows", &a, &b);
 
@@ -3343,33 +3124,6 @@ fn seed_skill(dir: &std::path::Path) {
     .expect("skill");
 }
 
-/// The production assembly, told it is a model that needs firm steering, with
-/// skills actually loaded.
-async fn reference_production_as(
-    script: Arc<Script>,
-    dir: &std::path::Path,
-    model: &str,
-    commands: Vec<AgentCommand>,
-) -> Vec<Step> {
-    let cfg = atomcode_coding::CodingAgentConfig::new("k", "http://unused.test/v1", model, dir);
-    let opts = atomcode_coding::parts::PrepareOptions {
-        mcp: false,
-        web: false,
-        review: false,
-        memory: false,
-        // NOT `Some(vec![])` here, unlike every other scenario: this one is
-        // about the skill catalog, and an empty catalog makes the behaviour a
-        // no-op by design on both engines.
-        skill_dirs: None,
-        ..Default::default()
-    };
-    let mut parts = atomcode_coding::parts::prepare(&cfg, opts)
-        .await
-        .expect("prepare");
-    let agent = atomcode_coding::parts::assemble(&mut parts, &cfg, script).expect("assemble");
-    drive_until(agent.spawn(), commands, &[]).await
-}
-
 #[tokio::test]
 async fn a_weak_model_is_told_to_check_the_skills_first_on_both_engines() {
     // DeepSeek and Qwen under-weight the soft `## SKILLS:` guidance and open by
@@ -3385,22 +3139,13 @@ async fn a_weak_model_is_told_to_check_the_skills_first_on_both_engines() {
     seed(&dir);
     seed_skill(&dir);
 
-    let chain_script = Script::text(&["ok"]).as_model("deepseek-chat");
-    let _ = reference_production_as(
-        chain_script.clone(),
-        &dir,
-        "deepseek-chat",
-        say("tidy the imports in a.rs"),
-    )
-    .await;
-
     let rows_script = Script::text(&["ok"]).as_model("deepseek-chat");
     let (handle, mut app) = on_harness_handle(rows_script.clone(), &dir).await;
     let _ = drive_answering(handle, say("tidy the imports in a.rs"), &[], None, allow()).await;
     app.stop();
 
     const DIRECTIVE: &str = "you MUST call `use_skill`";
-    for (who, seen) in [("链式", chain_script.seen()), ("行式", rows_script.seen())] {
+    for (who, seen) in [("行式", rows_script.seen())] {
         assert!(
             seen.contains("tidy-imports"),
             "{who}: 连技能目录都没到模型面前,这条场景就没在测它该测的东西:\n{seen}"
@@ -3429,21 +3174,12 @@ async fn a_strong_model_is_not_nudged_and_the_pointer_is_not_doubled() {
     seed(&dir);
     seed_skill(&dir);
 
-    let chain_script = Script::text(&["ok"]).as_model("claude-opus-5");
-    let _ = reference_production_as(
-        chain_script.clone(),
-        &dir,
-        "claude-opus-5",
-        say("tidy the imports in a.rs"),
-    )
-    .await;
-
     let rows_script = Script::text(&["ok"]).as_model("claude-opus-5");
     let (handle, mut app) = on_harness_handle(rows_script.clone(), &dir).await;
     let _ = drive_answering(handle, say("tidy the imports in a.rs"), &[], None, allow()).await;
     app.stop();
 
-    for (who, seen) in [("链式", chain_script.seen()), ("行式", rows_script.seen())] {
+    for (who, seen) in [("行式", rows_script.seen())] {
         assert!(
             seen.contains("tidy-imports"),
             "{who}: 目录还是要在,只是不该被催{seen}"
@@ -3508,28 +3244,6 @@ async fn the_datalog_records_the_same_turn_on_both_engines() {
         ])
     };
 
-    // The chain: `datalog.enabled` is false by default, so the scenario turns it
-    // on the way a user would.
-    let mut cfg =
-        atomcode_coding::CodingAgentConfig::new("k", "http://unused.test/v1", "script", &dir);
-    cfg.datalog = atomcode_config::config::DatalogConfig {
-        enabled: true,
-        dir: Some(logs.join("chain").to_string_lossy().into_owned()),
-    };
-    let opts = atomcode_coding::parts::PrepareOptions {
-        mcp: false,
-        web: false,
-        review: false,
-        memory: false,
-        skill_dirs: Some(Vec::new()),
-        ..Default::default()
-    };
-    let mut parts = atomcode_coding::parts::prepare(&cfg, opts)
-        .await
-        .expect("prepare");
-    let chain = atomcode_coding::parts::assemble(&mut parts, &cfg, script()).expect("assemble");
-    let _ = drive_until(chain.spawn(), say("read a.rs"), &[]).await;
-
     // The rows: an extra layer inserting the row, because for this one mounting
     // IS enabling — it is deliberately absent from `CODING_ROWS`.
     let quiet = quiet_rows(&dir);
@@ -3554,7 +3268,7 @@ async fn the_datalog_records_the_same_turn_on_both_engines() {
     // asserting on a race.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    for (who, root) in [("链式", logs.join("chain")), ("行式", logs.join("rows"))] {
+    for (who, root) in [("行式", logs.join("rows"))] {
         let (markdown, jsonl) = datalog_files(&root);
         assert!(
             !markdown.is_empty() && !jsonl.is_empty(),
@@ -3640,10 +3354,7 @@ async fn a_users_hook_can_refuse_a_tool_on_both_engines() {
         ])
     };
 
-    let a = golden!(
-        "cc_hooks_deny_rows",
-        reference_production(script(), &dir, say("read a.rs")).await
-    );
+    let a: Vec<Step> = golden!("cc_hooks_deny_rows");
 
     let quiet = quiet_rows(&dir);
     let insert = format!(
@@ -3699,10 +3410,7 @@ async fn without_a_hooks_file_nothing_is_mounted_and_nothing_changes() {
         ])
     };
 
-    let a = golden!(
-        "cc_hooks_absent_rows",
-        reference_production(script(), &dir, say("read a.rs")).await
-    );
+    let a: Vec<Step> = golden!("cc_hooks_absent_rows");
 
     let quiet = quiet_rows(&dir);
     let insert = format!(
@@ -4144,11 +3852,7 @@ async fn a_logout_drops_the_provider_object_and_not_only_the_seam() {
 
 /// The tool names each engine offers the model for the same turn.
 async fn catalogs(key: &str, dir: &std::path::Path) -> (Vec<String>, Vec<String>) {
-    let chain_tools: Vec<String> = golden!(key, {
-        let chain = Script::text(&["ok"]);
-        let _ = reference_production(chain.clone(), dir, say("hi")).await;
-        chain.tools()
-    });
+    let chain_tools: Vec<String> = golden!(key);
     let rows = Script::text(&["ok"]);
     let (handle, mut app) = on_harness_handle(rows.clone(), dir).await;
     let _ = drive_answering(handle, say("hi"), &[], None, allow()).await;
@@ -4243,15 +3947,7 @@ const PROMPT_MAY_NAME_A_PHANTOM: &[(&str, &str)] = &[];
 async fn neither_prompt_names_a_tool_only_the_other_engine_mounts() {
     let dir = scratch("prompt-phantom");
     seed(&dir);
-    let (chain_tools, chain_prompt): (Vec<String>, String) = golden!("prompt_phantom", {
-        let chain_script = Script::text(&["ok"]);
-        let _ = reference_production(chain_script.clone(), &dir, say("hi")).await;
-        // The scratch path is this run's, not the chain's; the record keeps neither.
-        let prompt = chain_script
-            .system_prompt()
-            .replace(&*dir.to_string_lossy(), "<scratch>");
-        (chain_script.tools(), prompt)
-    });
+    let (chain_tools, chain_prompt): (Vec<String>, String) = golden!("prompt_phantom");
     let rows_script = Script::text(&["ok"]);
     let (handle, mut app) = on_harness_handle(rows_script.clone(), &dir).await;
     let _ = drive_answering(handle, say("hi"), &[], None, allow()).await;
@@ -4383,10 +4079,8 @@ async fn only_the_row_list_says_what_it_injected() {
         }]
     };
 
-    let chain = injections(golden!(
-        "context_added",
-        reference(Script::text(&["ok"]), &dir, cmds()).await
-    ));
+    let recorded: Vec<Step> = golden!("context_added");
+    let chain = injections(recorded);
     let rows = injections(candidate(Script::text(&["ok"]), &dir, cmds()).await);
 
     assert!(
@@ -4445,21 +4139,14 @@ async fn a_finished_turns_reasoning_survives_into_the_next_turns_request() {
     };
 
     let mut shapes = Vec::new();
-    for whose in ["the row list", "the chain"] {
+    for whose in ["the row list"] {
         let s = script();
-        let requests = match whose {
-            "the row list" => {
-                let (mut handle, mut app) = on_harness_handle(s.clone(), &dir).await;
-                rows_turn(&mut handle, "first").await;
-                rows_turn(&mut handle, "second").await;
-                app.stop();
-                s.requests()
-            }
-            _ => {
-                let handle = production_agent(s.clone(), &dir).await.spawn();
-                let _ = drive_turns(handle, &["first", "second"]).await;
-                s.requests()
-            }
+        let requests = {
+            let (mut handle, mut app) = on_harness_handle(s.clone(), &dir).await;
+            rows_turn(&mut handle, "first").await;
+            rows_turn(&mut handle, "second").await;
+            app.stop();
+            s.requests()
         };
         assert!(
             requests.len() >= 3,

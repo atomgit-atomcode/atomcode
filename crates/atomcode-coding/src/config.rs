@@ -7,8 +7,8 @@ use std::time::Duration;
 use atomcode_config::locale::Locale;
 use atomcode_kernel::agent::ToolLoopPolicy;
 
-/// Everything [`build_coding_agent`](crate::build_coding_agent) needs: provider
-/// credentials, the working directory the tools are scoped to, and liveness bounds.
+/// Everything an assembly needs: provider credentials, the working directory the
+/// tools are scoped to, and liveness bounds.
 ///
 /// Timeouts default to sane non-infinite values — the kernel itself defaults to
 /// unbounded, and the assembly map flagged "L2 MUST set stream/request timeouts" so a

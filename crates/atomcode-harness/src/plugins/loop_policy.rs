@@ -310,7 +310,13 @@ impl Waterfall<AgentRequest> for Retry {
                     // The provider already classified this. Deciding again from
                     // the message text is how a handler ends up retrying an
                     // auth failure or giving up on a transient one.
+                    // An empty answer to a nudge the harness wrote is an answer:
+                    // the model read the note and had nothing to add. It arrives
+                    // marked retryable like any empty response, and retrying it
+                    // spends the budget on a round that was already finished.
+                    let nothing_to_add = error.empty_response && req.answering_a_nudge;
                     let worth_retrying = !error.is_fatal()
+                        && !nothing_to_add
                         && (error.retryable || error.empty_response)
                         // A rate limit and an overflow each have a dedicated
                         // handler that knows how to make the next attempt

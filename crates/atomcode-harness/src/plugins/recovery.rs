@@ -218,6 +218,34 @@ impl Waterfall<AgentRequest> for OverflowLadder {
             match next.run(req).await {
                 Ok(response) => return Ok(response),
                 Err(error) if error.context_overflow && attempt < self.max_attempts => {
+                    // First rung: show the long tool results as stubs. A turn
+                    // that overflowed on its own output has nothing *settled*
+                    // for a fold to take — its own results are what filled the
+                    // window — and this is the cheapest thing that shrinks a
+                    // request without losing what was asked or decided.
+                    if let Some(session) = crate::agent::scoped(&self.ctx).service::<SessionSvc>() {
+                        if let Some(through) = stubbable(&session) {
+                            crate::session::commit(
+                                &self.ctx,
+                                &session,
+                                SessionEvent::ToolResultsStubbed {
+                                    turn: session.current_turn(),
+                                    through,
+                                },
+                            );
+                            reproject(req, &session);
+                            attempt += 1;
+                            notice(
+                                &self.ctx,
+                                NoticeKind::OverflowCompacted,
+                                format!(
+                                    "context overflow; earlier tool output shown as summaries, retrying ({attempt}/{})",
+                                    self.max_attempts
+                                ),
+                            );
+                            continue;
+                        }
+                    }
                     let (Some(session), Some(compaction)) = (
                         crate::agent::scoped(&self.ctx).service::<SessionSvc>(),
                         self.ctx.service::<CompactionSvc>(),
@@ -242,18 +270,7 @@ impl Waterfall<AgentRequest> for OverflowLadder {
                         });
                     };
                     crate::session::apply_compaction(&self.ctx, &session, decision);
-                    // Re-project: the retry has to carry the compacted history,
-                    // and it still has to be exactly what the log says.
-                    let mut messages: Vec<Message> = req
-                        .messages
-                        .iter()
-                        .take_while(|m| {
-                            m.role == atomcode_kernel::message::Role::System && !m.synthetic
-                        })
-                        .cloned()
-                        .collect();
-                    messages.extend(session.derive_messages());
-                    req.messages = messages;
+                    reproject(req, &session);
                     attempt += 1;
                     notice(
                         &self.ctx,
@@ -268,6 +285,49 @@ impl Waterfall<AgentRequest> for OverflowLadder {
             }
         }
     }
+}
+
+/// The last tool result that is worth stubbing: one that is long enough to be
+/// worth it and has not been stubbed already.
+///
+/// `None` means stubbing would change nothing — every result is already a stub,
+/// short enough to leave alone, or there are none.
+fn stubbable(session: &crate::session::SessionLog) -> Option<crate::session::SeqNo> {
+    /// Results at or below this are left alone; a produced stub is far under it,
+    /// which is what keeps the rewrite monotonic.
+    const WORTH_STUBBING: usize = 500;
+    let events = session.events();
+    let already = events
+        .iter()
+        .filter_map(|logged| match logged.event {
+            SessionEvent::ToolResultsStubbed { through, .. } => Some(through),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    events
+        .iter()
+        .filter(|logged| logged.seq > already)
+        .filter_map(|logged| match &logged.event {
+            SessionEvent::ToolResultLogged { content, .. } if content.len() > WORTH_STUBBING => {
+                Some(logged.seq)
+            }
+            _ => None,
+        })
+        .max()
+}
+
+/// The request carries what the log now says, and nothing else: the system
+/// prompt it opened with, then the conversation as projected.
+fn reproject(req: &mut ModelRequest, session: &crate::session::SessionLog) {
+    let mut messages: Vec<Message> = req
+        .messages
+        .iter()
+        .take_while(|m| m.role == atomcode_kernel::message::Role::System && !m.synthetic)
+        .cloned()
+        .collect();
+    messages.extend(session.derive_messages());
+    req.messages = messages;
 }
 
 pub struct OverflowPlugin;

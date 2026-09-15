@@ -4,11 +4,14 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use atomcode_coding::{assemble, prepare, CodingAgentConfig, PrepareOptions, SessionMode};
+mod support;
+
+use atomcode_coding::{prepare, CodingAgentConfig, PrepareOptions, SessionMode};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::RecordingProvider;
 use atomcode_kernel::tool::ToolCall;
+use support::mount_parts;
 
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
@@ -16,7 +19,7 @@ fn _isolate_atomcode_home() {
 }
 
 #[tokio::test]
-async fn plan_mode_blocks_a_write_tool_through_full_assembly() {
+async fn plan_mode_blocks_a_write_tool_through_the_assembly() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -40,7 +43,7 @@ async fn plan_mode_blocks_a_write_tool_through_full_assembly() {
         rate_limit_source: None,
     };
 
-    let mut parts = prepare(&cfg, opts).await.unwrap();
+    let parts = prepare(&cfg, opts.clone()).await.unwrap();
     // Activate plan mode before the turn, matching CodingRuntime::set_mode.
     parts.plan_mode.store(true, Ordering::Relaxed);
 
@@ -60,7 +63,8 @@ async fn plan_mode_blocks_a_write_tool_through_full_assembly() {
         ],
     ]));
 
-    let mut h = assemble(&mut parts, &cfg, provider).unwrap().spawn();
+    let mut mounted = mount_parts(&parts, &cfg, &opts, provider).await;
+    let h = &mut mounted.handle;
     h.commands
         .send(AgentCommand::SendMessage {
             text: "add a file".into(),
@@ -79,7 +83,6 @@ async fn plan_mode_blocks_a_write_tool_through_full_assembly() {
         }
     }
     h.commands.send(AgentCommand::Shutdown).unwrap();
-    let _ = h.task.await;
 
     let (is_error, content) =
         blocked_content.expect("write_file should have produced a tool result");

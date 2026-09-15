@@ -42,7 +42,7 @@ use crate::controllers::{
 use crate::parts::prepare_with_plugin_hook_source_reusing_lease;
 #[cfg(test)]
 use crate::prepare_with_plugin_hook_source;
-use crate::{assemble, CodingAgentConfig, CodingProviderFactory, PluginHookSource, PrepareOptions};
+use crate::{CodingAgentConfig, CodingProviderFactory, PluginHookSource, PrepareOptions};
 
 /// Runtime facts emitted by the coding engine without depending on the legacy
 /// `atomcode-core` driver protocol.
@@ -838,36 +838,6 @@ pub struct CodingRuntime {
 pub struct RuntimeSessionInfo {
     pub id: String,
     pub resumed: bool,
-}
-
-/// Which engine runs the turns.
-///
-/// **The harness is the default.** It carries what the runtime asks of it: the
-/// session (native snapshot, resume, undo, rewind, restore), the mode switches,
-/// the approval grants, MCP, the delegation tools, the rate-limit policy, the
-/// round and truncation checkpoints — each pinned by a scenario in
-/// `tests/engine_parity.rs` that ran on both engines before this line moved.
-///
-/// `ATOMCODE_ENGINE=chain` puts the hand-written chain back, and exists only for
-/// the length of this commit: the next one deletes the chain and this enum with
-/// it. It is not a product setting — nothing reads it but this function, and no
-/// documentation offers it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Engine {
-    /// `parts::assemble` — the chain this crate has always shipped.
-    Chain,
-    /// `on_harness::mount` — the same product as a row list.
-    Harness,
-}
-
-impl Engine {
-    /// Read once per runtime start, so a turn cannot change engines midway.
-    pub fn from_env() -> Self {
-        match std::env::var("ATOMCODE_ENGINE").as_deref() {
-            Ok("chain") => Self::Chain,
-            _ => Self::Harness,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -2035,47 +2005,40 @@ impl CodingRuntime {
         // what a respawn must not lose.
         let mut harness_app: Option<atomcode_plexus::App> = None;
         let mut harness_providers: Option<Arc<crate::on_harness::ProviderSlots>> = None;
-        let engine = Engine::from_env();
-        let (kernel_agent, unavailable_reason) = match bootstrap {
-            ProviderBootstrap::Unavailable(reason) => (None, Some(reason)),
-            ProviderBootstrap::Required | ProviderBootstrap::RecoverAuthentication => {
-                match provider_factory.build(&agent, session_id) {
-                    Ok(provider) => (
-                        Some(match engine {
-                            Engine::Chain => assemble(&mut parts, &agent, provider)
-                                .map_err(RuntimeStartError::Assemble)?
-                                .spawn(),
-                            Engine::Harness => {
-                                let (handle, app, providers) =
-                                    mount_harness(&parts, &agent, &prepare, provider)
-                                        .await
-                                        .map_err(|e| {
-                                            RuntimeStartError::Assemble(std::io::Error::other(e))
-                                        })?;
-                                harness_app = Some(app);
-                                harness_providers = Some(providers);
-                                handle
-                            }
-                        }),
-                        None,
-                    ),
-                    Err(crate::ProviderBuildError::Authentication(_))
-                        if bootstrap == ProviderBootstrap::RecoverAuthentication =>
-                    {
-                        (
+        let (kernel_agent, unavailable_reason) =
+            match bootstrap {
+                ProviderBootstrap::Unavailable(reason) => (None, Some(reason)),
+                ProviderBootstrap::Required | ProviderBootstrap::RecoverAuthentication => {
+                    match provider_factory.build(&agent, session_id) {
+                        Ok(provider) => (
+                            Some({
+                                let mounted =
+                                    mount(&parts, &agent, &prepare, provider).await.map_err(
+                                        |e| RuntimeStartError::Assemble(std::io::Error::other(e)),
+                                    )?;
+                                harness_app = Some(mounted.app);
+                                harness_providers = Some(mounted.providers);
+                                mounted.handle
+                            }),
                             None,
-                            Some(ProviderUnavailableReason::AuthenticationRequired),
-                        )
+                        ),
+                        Err(crate::ProviderBuildError::Authentication(_))
+                            if bootstrap == ProviderBootstrap::RecoverAuthentication =>
+                        {
+                            (
+                                None,
+                                Some(ProviderUnavailableReason::AuthenticationRequired),
+                            )
+                        }
+                        Err(crate::ProviderBuildError::SourceBuildGatewayUnsupported {
+                            ..
+                        }) if bootstrap == ProviderBootstrap::RecoverAuthentication => {
+                            (None, Some(ProviderUnavailableReason::UnsupportedBuild))
+                        }
+                        Err(error) => return Err(RuntimeStartError::Provider(error)),
                     }
-                    Err(crate::ProviderBuildError::SourceBuildGatewayUnsupported { .. })
-                        if bootstrap == ProviderBootstrap::RecoverAuthentication =>
-                    {
-                        (None, Some(ProviderUnavailableReason::UnsupportedBuild))
-                    }
-                    Err(error) => return Err(RuntimeStartError::Provider(error)),
                 }
-            }
-        };
+            };
         parts
             .publish_staged_session()
             .map_err(runtime_start_prepare_error)?;
@@ -4445,7 +4408,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         // `/logout` → `/login` and then refused every turn with
                         // `ProviderUnavailable`: the provider had been swapped
                         // behind a seam nobody was reading.
-                        if Engine::from_env() == Engine::Harness && agent.is_some() {
+                        if agent.is_some() {
                             if let (Some(app), Some(slots)) = (
                                 runtime.harness_app.as_mut(),
                                 runtime.harness_providers.clone(),
@@ -4844,8 +4807,7 @@ fn spawn_runtime_owner_with_optional_agent(
                         // rebuild — and therefore what keeps a `/logout` →
                         // `/login` from quietly moving the session back onto the
                         // chain for the rest of its life.
-                        let harness_logout = Engine::from_env() == Engine::Harness
-                            && agent.is_some()
+                        let harness_logout = agent.is_some()
                             && resources
                                 .as_ref()
                                 .is_some_and(|r| r.harness_providers.is_some());
@@ -7427,7 +7389,17 @@ fn harness_host_state(
             id: Some(binding.id.clone()),
             snapshot: match binding.manager.load_native_session(&binding.id) {
                 Ok(loaded) => Some(loaded.snapshot),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                // A fresh session that has not been published yet has nothing on
+                // disk, and that is the ONE reason a file may be missing here. Any
+                // other absence is half a session, and continuing on half a
+                // session hands the model a conversation the store cannot explain
+                // — the person's history, silently gone.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && binding.is_staged_fresh() =>
+                {
+                    None
+                }
                 Err(error) => return Err(error.into()),
             },
         },
@@ -7546,6 +7518,7 @@ fn harness_host_state(
         rate_limit_source: parts.rate_limit_source().cloned(),
         compaction_checkpoint: parts.snapshot_hook(),
         summary_provider: Some(parts.side_provider_slot()),
+        model: Some(config.model.clone()),
         rows: harness_option_rows(parts, config, prepare) + &permission_rows,
         datalog: config.datalog.enabled.then(|| config.datalog.clone()),
         modes: Some(crate::on_harness::HostModes {
@@ -7559,24 +7532,31 @@ fn harness_host_state(
     })
 }
 
-/// Mount a harness tree that continues this runtime's session.
+/// A mounted product tree: the handle a driver speaks to, the tree behind it,
+/// and the table its provider lives in.
 ///
-/// The one place a tree is built from runtime state — at start, and on every
-/// rebuild (undo, restore, reprepare, a provider coming back) — so the session,
-/// the hooks and the rows cannot differ between the first agent and the next.
-async fn mount_harness(
+/// The tree must outlive the handle. Dropping the `App` unloads every row, and
+/// the next command would reach a conversation whose services are gone.
+pub struct Mounted {
+    pub handle: AgentHandle,
+    pub app: atomcode_plexus::App,
+    pub providers: Arc<crate::on_harness::ProviderSlots>,
+}
+
+/// Mount the product as a tree, continuing `parts`' session.
+///
+/// The one place a tree is built from prepared parts — the runtime does it at
+/// start and on every rebuild (undo, restore, reprepare, a provider coming
+/// back), so the session, the hooks and the rows cannot differ between the first
+/// agent and the next. Public because that assembly IS the product: a test or an
+/// embedder that wants what ships asks for it here rather than rebuilding a
+/// second version of it.
+pub async fn mount(
     parts: &crate::CodingParts,
     config: &CodingAgentConfig,
     prepare: &PrepareOptions,
     provider: Arc<dyn atomcode_kernel::provider::LlmProvider>,
-) -> Result<
-    (
-        AgentHandle,
-        atomcode_plexus::App,
-        Arc<crate::on_harness::ProviderSlots>,
-    ),
-    String,
-> {
+) -> Result<Mounted, String> {
     // Presence follows the same rule the overlay uses: a person who can answer
     // means asking, nobody means fencing.
     let presence = if config.is_attended() {
@@ -7615,7 +7595,7 @@ async fn mount_harness(
     if let Some(snapshot) = parts.snapshot_hook() {
         snapshot.set_model_attribution(&config.provider_name, &config.model);
     }
-    crate::on_harness::mount_hosted(
+    let (handle, app, providers) = crate::on_harness::mount_hosted(
         &config.working_dir,
         presence,
         provider,
@@ -7623,11 +7603,15 @@ async fn mount_harness(
         host,
         &extra,
     )
-    .await
+    .await?;
+    Ok(Mounted {
+        handle,
+        app,
+        providers,
+    })
 }
 
-/// Build the agent for `config` on this runtime's engine, replacing whatever
-/// tree the runtime held.
+/// Build the agent for `config`, replacing whatever tree the runtime held.
 ///
 /// Replacing is the point: a rebuilt agent that left the previous tree in
 /// `harness_app` would have a later `/model` patch a tree whose driver loop had
@@ -7638,22 +7622,10 @@ async fn build_agent(
     config: &CodingAgentConfig,
     provider: Arc<dyn atomcode_kernel::provider::LlmProvider>,
 ) -> Result<AgentHandle, String> {
-    match Engine::from_env() {
-        Engine::Chain => {
-            runtime.harness_app = None;
-            runtime.harness_providers = None;
-            assemble(&mut runtime.parts, config, provider)
-                .map(|agent| agent.spawn())
-                .map_err(|error| error.to_string())
-        }
-        Engine::Harness => {
-            let (handle, app, providers) =
-                mount_harness(&runtime.parts, config, &runtime.prepare, provider).await?;
-            runtime.harness_app = Some(app);
-            runtime.harness_providers = Some(providers);
-            Ok(handle)
-        }
-    }
+    let mounted = mount(&runtime.parts, config, &runtime.prepare, provider).await?;
+    runtime.harness_app = Some(mounted.app);
+    runtime.harness_providers = Some(mounted.providers);
+    Ok(mounted.handle)
 }
 
 /// Row edits for what this runtime's options switched off, and for the
@@ -7705,8 +7677,23 @@ fn harness_option_rows(
             prepare.memory
         ));
     }
+    // The tree's own log, kept and written — but NOT where the native store keeps
+    // this session's transcript. Both name a file `<bucket>/<id>.jsonl` under
+    // `<home>/sessions`, and two writers with two schemas in one file is a file
+    // neither can read: the runtime's transcript is what `recall` and the session
+    // catalog read, so the follower gets a root of its own.
+    //
+    // `resume = false` for the same reason the decision records: the native
+    // snapshot is what a session is rebuilt from here, and a replay of this log
+    // would be a second, divergent answer to the same question.
+    let follower = atomcode_harness::bundle::toml_string(
+        &atomcode_harness::home()
+            .join("sessions")
+            .join("harness")
+            .to_string_lossy(),
+    );
     rows.push_str(&format!(
-        "[[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ resume = false, project_root = {wd} }}\n\n"
+        "[[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ resume = false, root = {follower}, project_root = {wd} }}\n\n"
     ));
     // Ctrl-C semantics: by default a cancelled turn is undone — its prompt and
     // partial work leave what the model sees next, as the chain rolls them back.
@@ -12609,7 +12596,7 @@ mod tests {
     /// submits after recovering and insists the turn starts.
     #[tokio::test]
     async fn a_recovered_runtime_can_actually_run_a_turn() {
-        let mut runtime = CodingRuntime::start(native_start(false)).await.unwrap();
+        let runtime = CodingRuntime::start(native_start(false)).await.unwrap();
         runtime
             .handle
             .deactivate_provider(ProviderUnavailableReason::AuthenticationRequired)

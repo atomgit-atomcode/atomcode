@@ -9,11 +9,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atomcode_capabilities::tools::PermissionRules;
-use atomcode_coding::{assemble, prepare, CodingAgentConfig, PrepareOptions, SessionMode};
+mod support;
+
+use atomcode_coding::{prepare, CodingAgentConfig, PrepareOptions, SessionMode};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::RecordingProvider;
 use atomcode_kernel::tool::ToolCall;
+use support::mount_parts;
 
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
@@ -70,10 +73,9 @@ async fn run_turn(project: &std::path::Path, command: &str, rules: PermissionRul
     cfg.request_timeout = Some(Duration::from_secs(5));
     cfg.permission_rules = Arc::new(rules);
 
-    let mut parts = prepare(&cfg, prepare_options()).await.unwrap();
-    let mut h = assemble(&mut parts, &cfg, bash_provider(command))
-        .unwrap()
-        .spawn();
+    let parts = prepare(&cfg, prepare_options()).await.unwrap();
+    let mut mounted = mount_parts(&parts, &cfg, &prepare_options(), bash_provider(command)).await;
+    let h = &mut mounted.handle;
     h.commands
         .send(AgentCommand::SendMessage {
             text: "run it".into(),
@@ -99,7 +101,6 @@ async fn run_turn(project: &std::path::Path, command: &str, rules: PermissionRul
         }
     }
     h.commands.send(AgentCommand::Shutdown).unwrap();
-    let _ = h.task.await;
     Outcome { prompted, denied }
 }
 

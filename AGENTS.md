@@ -38,6 +38,8 @@ CLI / TUI / daemon / background / ACP / clix code
 - `atomcode-kernel`、`atomcode-capabilities`、`atomcode-coding` 的生产依赖必须保持 core-free；尤其禁止 capabilities 反向依赖 core、L2 或前端。
 - native `SessionManager/SessionMeta/SessionSnapshot/PresentationFile` 是唯一 session 持久化模型；core session 模块与持久化 API 已退役。历史 core JSON 只允许由 daemon 私有 DTO 单向导入，禁止恢复 legacy writer、core 磁盘投影或双向持久化转换。
 - `atomcode-core` crate 已从 workspace 删除；生产代码不得重新依赖或重建同名兼容层。历史 core JSON 只由 daemon 私有 DTO 单向导入。
+- coding 的装配只有一套：`parts::prepare` 建能力图，`runtime::mount` 挂成 plexus 行清单（`on_harness` + `host_rows`）。手写的 kernel 中间件/钩子链(`parts::assemble` / `build_coding_agent`)与 `ATOMCODE_ENGINE` 开关已删除，不得重建第二套装配或引擎选择开关。链式当年的事件流录在 `crates/atomcode-coding/tests/golden/differential/`，差分台对着它回归；那些 golden 不可重录（录它的引擎已经没了），要改就改文件本身并在 commit 里说明理由。
+- coding runtime 里 **原生快照是主、harness JSONL 是从**：resume / undo / rewind / restore / 会话目录 / 租约 / 落盘失败 fail-close 只认 `SessionManager`。`session-persistence-jsonl` 行继续写，但 `resume = false`，并且写在自己的 root(`<home>/sessions/harness`)——它和原生 transcript 不共用一个文件，任何一方都不得读对方的文件当权威。
 - daemon/TUI 的 live/provider/UI 投影必须直接使用 kernel/coding 中立类型；持久化读取必须先得到严格 native 聚合。不得借转换层恢复旧 engine 命令、第二 runtime owner、core session 磁盘模型或静默 fallback。
 
 ## 架构方向

@@ -1,23 +1,21 @@
-//! Coding, assembled on the harness.
+//! Coding, as a row list.
 //!
-//! The other assembly in this crate (`parts::prepare` → `parts::assemble`) wires
-//! L1 capabilities into a kernel [`Agent`] with hand-written Rust: a fixed chain,
-//! in a fixed order, decided at compile time. This one mounts a plexus tree
-//! instead — the same capabilities, named as rows in a config tree.
+//! This is the product's assembly: the capabilities named as rows in a config
+//! tree, mounted as a plexus app. It replaced a hand-written chain — the same
+//! capabilities wired into a kernel `Agent` in a fixed order, decided at compile
+//! time — and the reason for the change is what a list can do that Rust cannot:
+//! a chain is changed by editing Rust and rebuilding, a list by editing the list.
+//! That is what "one engine, several products" needs.
 //!
-//! Nothing above changes. `CodingRuntimeHandle` talks to its engine through
-//! exactly one channel pair (8 `AgentCommand`s in, 25 `AgentEvent`s out), and the
-//! harness's `agent-handle` row hands out the very same
-//! [`atomcode_kernel::agent::AgentHandle`] that `Agent::spawn()` does. The swap is
-//! a swap, not an adaptation.
+//! Nothing above it changed in the swap. `CodingRuntimeHandle` talks to its engine
+//! through exactly one channel pair (8 `AgentCommand`s in, 25 `AgentEvent`s out),
+//! and the harness's `agent-handle` row hands out the very same
+//! [`atomcode_kernel::agent::AgentHandle`] `Agent::spawn()` did.
 //!
-//! Why bother, when the chain already works: a chain written in Rust can only be
-//! changed by editing Rust. A row list can be changed by editing the list — which
-//! is what "one engine, several products" needs, and what this crate's assembly
-//! cannot offer today.
-//!
-//! Status: the tree mounts and is driven by the differential rig beside the
-//! hand-written chain. It is NOT yet what `build_coding_agent` returns.
+//! What the chain did in each scenario is kept: `tests/golden/differential/*.json`
+//! records its event streams, and `tests/differential.rs` runs this tree against
+//! that record under a ratchet. `tests/runtime_criteria.rs` holds the promises
+//! measured across turns, each one falsified once before it was kept.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -367,7 +365,7 @@ disabled = true
 /// Public for the same reason [`CODING_DEFAULTS`] is: a host with its own front
 /// end stacks this list instead of restating it.
 pub const CODING_ROWS: &str = r#"
-# Approval gates that the hand-written chain mounts as kernel `ToolMiddleware`s.
+# Approval gates that the chain mounted as kernel `ToolMiddleware`s.
 # Same judgements — each row calls the same L1 function the middleware does —
 # reached through the `approval` seam instead of a private `PermissionStore`.
 [[insert]]
@@ -741,7 +739,7 @@ pub struct HostModels {
 ///
 /// Note how little is new here: `logical_models()` is the catalog the settings
 /// UI and `/model` already read, and `SubagentModelProviders` is the lazily
-/// building, telemetry-wrapping resolver the hand-written chain has used for
+/// building, telemetry-wrapping resolver the chain used for
 /// `task` since before this tree existed — including being reset on `/model` by
 /// `refresh_subagent_tiers`. **Both engines resolve a model selection through
 /// the same code**, which is the only way the two stay honest about it.
@@ -1088,6 +1086,14 @@ pub struct HostState {
     pub rows: String,
     /// The runtime's MCP registry, published into the tree by `mcp-host`.
     pub(crate) mcp: Option<crate::host_rows::McpPublication>,
+    /// What the person chose this conversation to run, when the host knows it.
+    ///
+    /// Not `provider.model_name()`: a provider may report something other than
+    /// what was asked for — a gateway alias, a test double — and the identity
+    /// line, the model catalog entry and `describe_self` should say what the
+    /// person picked. `swap_provider_for` has always passed the configured name
+    /// for the same reason; this is the other half of it, at mount.
+    pub model: Option<String>,
     /// The provider a requested compaction's summary is written with.
     pub summary_provider: Option<atomcode_review::SharedReviewProvider>,
     /// The native snapshot writer a committed compaction is stored through.
@@ -1119,7 +1125,10 @@ pub async fn mount_hosted(
     host: HostState,
     extra_layers: &[&str],
 ) -> Result<(AgentHandle, App, Arc<ProviderSlots>), String> {
-    let model = provider.model_name().to_string();
+    let model = host
+        .model
+        .clone()
+        .unwrap_or_else(|| provider.model_name().to_string());
     let (providers, provider_id) = ProviderSlots::new(provider);
     let artifacts = working_dir.join(".atomcode").join("artifacts");
     // The two halves of one rule. Attended: no `root`, so the fs world is not
@@ -1202,8 +1211,9 @@ pub async fn mount_hosted(
                 .map(|dir| format!(", dir = {}", atomcode_harness::bundle::toml_string(dir)))
                 .unwrap_or_default();
             format!(
-                "[[insert]]\nname = \"datalog\"\nconfig = {{ working_dir = {}{dir} }}\n\n",
+                "[[insert]]\nname = \"datalog\"\nconfig = {{ working_dir = {}, model = {}{dir} }}\n\n",
                 atomcode_harness::bundle::toml_string(&working_dir.to_string_lossy()),
+                atomcode_harness::bundle::toml_string(&model),
             )
         })
         .unwrap_or_default();
@@ -1330,7 +1340,7 @@ pub async fn mount_hosted(
 // ---- the verify cadence, as a row ---------------------------------------
 //
 // One of the three things this crate says it owns (lib.rs: assembly, persona,
-// discipline). In the hand-written chain it is `VerifyCadenceHook`, sitting on
+// discipline). In the chain it was `VerifyCadenceHook`, sitting on
 // the kernel's `offer_continuation`. The harness has no such hook — but it has
 // the two halves the discipline actually needs, and they are already how the
 // `truncation-recovery` row keeps a turn alive:
@@ -1410,7 +1420,7 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Veri
         // the difference between a note and a continuation.
         agent.inbox().send_from(
             crate::discipline::NUDGE,
-            atomcode_harness::agent::MessageOrigin::Harness,
+            atomcode_harness::agent::MessageOrigin::Internal,
         );
         Ok(response)
     }
@@ -1799,6 +1809,10 @@ struct DatalogRow {
     /// `datalog.dir` in config.toml, including `~` and the relative form.
     #[serde(default)]
     dir: Option<String>,
+    /// What to record this session's rounds under. Empty asks the provider,
+    /// which may answer with something other than what the person chose.
+    #[serde(default)]
+    model: String,
 }
 
 #[async_trait]
@@ -1823,10 +1837,16 @@ impl Plugin for DatalogPlugin {
             dir: row.dir,
         };
         let llm = ctx.service::<atomcode_harness::seams::LlmSvc>();
-        let model = llm
-            .as_ref()
-            .map(|l| l.model_name().to_string())
-            .unwrap_or_default();
+        // The name the person chose when the host knows it: a record of what ran
+        // is worth little if it says "canned" because that is what the adapter
+        // calls itself.
+        let model = if row.model.is_empty() {
+            llm.as_ref()
+                .map(|l| l.model_name().to_string())
+                .unwrap_or_default()
+        } else {
+            row.model.clone()
+        };
         let context_window = llm.as_ref().map(|l| l.context_window()).unwrap_or(0);
         let Some(sink) = atomcode_capabilities::datalog::DatalogHook::new(
             std::path::PathBuf::from(row.working_dir),

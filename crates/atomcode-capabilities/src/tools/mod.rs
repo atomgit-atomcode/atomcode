@@ -861,7 +861,7 @@ mod tests {
         );
     }
 
-    /// A `/model` swap re-registers `read_file` (see `coding::parts::assemble`) to refresh
+    /// A `/model` swap re-mounts the row that offers `read_file`, to refresh
     /// its vision flag. This guards the mechanism that fix relies on: re-registering with a
     /// new `vision` value OVERWRITES the prior `read_file`, so a model swap from text→vision
     /// (or vision→text) actually changes how it treats an image — it does not go stale.

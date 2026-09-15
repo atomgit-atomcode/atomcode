@@ -11,19 +11,6 @@
 //!   to start a new conversation / clear history. Without this, GLM/DeepSeek proactively
 //!   suggest "开启新对话" around ~80% context, which reads as a product defect.
 
-/// Build the coding system prompt for `model`. The identity line carries the model name
-/// so the agent self-identifies correctly; the rest is the language-agnostic coding
-/// discipline (workflow / tool-parallelism / doing-tasks / verification / output).
-/// The single source of truth for the todo switch across every production
-/// `coding_persona` call site (assemble, parts, model-swap reconcile) AND the
-/// `todowrite` tool/hook gate: `ATOMCODE_TODO` env (0/false/off) overrides the
-/// default-on config. Keeping ALL call sites on this one helper guarantees the
-/// system-prompt guidance and the mounted tool never disagree.
-#[cfg(test)]
-pub(crate) fn todo_switch_enabled() -> bool {
-    todo_switch_enabled_for(true)
-}
-
 pub(crate) fn todo_switch_enabled_for(configured: bool) -> bool {
     atomcode_config::config::todo_enabled_from_env(
         std::env::var("ATOMCODE_TODO").ok().as_deref(),

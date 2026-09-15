@@ -39,6 +39,10 @@ pub struct ModelRequest {
     pub turn: u64,
     /// 1-based index of this call within the turn.
     pub round: u32,
+    /// This round answers a nudge the harness wrote rather than anything the
+    /// person sent. A recovery policy reads it to know that "no content" is an
+    /// answer here — the model has nothing to add — and not a provider failing.
+    pub answering_a_nudge: bool,
 }
 
 /// Why a model request failed, with the structure a recovery policy needs.

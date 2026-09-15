@@ -13,11 +13,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use atomcode_coding::{assemble, prepare, CodingAgentConfig, PrepareOptions, SessionMode};
+mod support;
+
+use atomcode_coding::{prepare, CodingAgentConfig, PrepareOptions, SessionMode};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::RecordingProvider;
 use atomcode_kernel::tool::ToolCall;
+use support::mount_parts;
 
 #[ctor::ctor]
 fn _isolate_atomcode_home() {
@@ -72,18 +75,19 @@ async fn prompts_when_always_allowing(project: &std::path::Path, commands: &[&st
     cfg.stream_timeout = Duration::from_secs(5);
     cfg.request_timeout = Some(Duration::from_secs(5));
 
-    let mut parts = prepare(&cfg, prepare_options()).await.unwrap();
-    drive(&mut parts, &cfg, commands).await
+    let parts = prepare(&cfg, prepare_options()).await.unwrap();
+    drive(&parts, &cfg, commands).await
 }
 
 /// One turn against a fresh assembly built from EXISTING parts, answering every approval with
 /// "always". Returns the command text of each call that prompted.
 async fn drive(
-    parts: &mut atomcode_coding::CodingParts,
+    parts: &atomcode_coding::CodingParts,
     cfg: &CodingAgentConfig,
     commands: &[&str],
 ) -> Vec<String> {
-    let mut h = assemble(parts, cfg, scripted(commands)).unwrap().spawn();
+    let mounted_h = mount_parts(parts, cfg, &prepare_options(), scripted(commands)).await;
+    let mut h = mounted_h.handle;
     h.commands
         .send(AgentCommand::SendMessage {
             text: "go".into(),
@@ -119,7 +123,6 @@ async fn drive(
         }
     }
     h.commands.send(AgentCommand::Shutdown).unwrap();
-    let _ = h.task.await;
     prompted
 }
 
@@ -140,14 +143,14 @@ async fn always_allow_survives_reassembly_without_a_driver_cache() {
     let mut cfg = CodingAgentConfig::new("k", "http://unused", "test-model", project.path());
     cfg.stream_timeout = Duration::from_secs(5);
     cfg.request_timeout = Some(Duration::from_secs(5));
-    let mut parts = prepare(&cfg, prepare_options()).await.unwrap();
+    let parts = prepare(&cfg, prepare_options()).await.unwrap();
 
     // Turn 1 on the first assembly: prompt once, answer "always".
-    let first = drive(&mut parts, &cfg, &["rm -rf v1"]).await;
+    let first = drive(&parts, &cfg, &["rm -rf v1"]).await;
     assert_eq!(first.len(), 1, "the first destructive bash must prompt");
 
     // Re-assemble (what a `/model` swap does) and issue a DIFFERENT destructive command.
-    let second = drive(&mut parts, &cfg, &["rm -rf v2"]).await;
+    let second = drive(&parts, &cfg, &["rm -rf v2"]).await;
     assert!(
         second.is_empty(),
         "the session grant must survive re-assembly on its own; got {second:?}"

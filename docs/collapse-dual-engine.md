@@ -120,7 +120,7 @@ undo / restore / reprepare 家族今天是「停 agent → 写原生 → 重装�
 
 | 步 | commit | 状态 |
 |---|---|---|
-| 1-4 会话与重建 | `b884f74c` `da2c0767` `03130ee8` | ✅ 日志带 meta/reasoning_blocks;`SessionDefaults.seed`;`turn/finishing`;`native_log` 往返;`session-native` + `kernel-hooks` 行;`mount_harness` / `build_agent` 统一建树(残留树随之消失)。判据 `tests/engine_parity.rs` 8 场景 |
+| 1-4 会话与重建 | `b884f74c` `da2c0767` `03130ee8` | ✅ 日志带 meta/reasoning_blocks;`SessionDefaults.seed`;`turn/finishing`;`native_log` 往返;`session-native` + `kernel-hooks` 行;`mount_harness` / `build_agent` 统一建树(残留树随之消失)。判据 `tests/runtime_criteria.rs` 8 场景 |
 | 5a 模式与授权 | `e51b7d16` | ✅ `modes` / `grants` 服务;`plan-mode-live`;`plan_verdict` 中立函数。判据 +3 场景 |
 | 5b 策略干预、schedule_wakeup | `b07416c4` `67a332ec` | ✅ `SessionEvent::PolicyIntervention` + `StopReason::PolicyDenied`(会话格式 → 4);`host-tools`(schedule_wakeup) |
 | 7 配置桥接 | `c840386c` `4f7ad139` | ✅ 工具清单两引擎一致(明单三条)、能力开关、`skills-host`、memory `inject`、`chat-options`、`swap_provider_for`、权限规则、回合上限/循环保护/压缩/重试/提问超时 |
@@ -130,7 +130,27 @@ undo / restore / reprepare 家族今天是「停 agent → 写原生 → 重装�
 | 8 装配缺口(三) | `2ad275ed` `b857e241` `b89818ff` `631e33ca` `16914c71` `d5d5b277` `9d950b7e` | ✅ `tool-driver` 缝(工具进度 + 提问);树里挂产品自己的 `request_user_input` / `task` / `team` / `code_review` / `recall`(`parts::wire_side_providers` 两引擎共用：分层、会话 id、detached 用量记账、带 surface 计量;logout 清槽);Team 事件同源;`TurnProgress.continuing` + 轮次/截断检查点;`stream_idle_ms` → `Timeout`;`/compact <focus>` 由对话模型写摘要(`compaction-coding`);工具契约判据从名字升到描述+参数 |
 | 9 team 事件 | `b857e241` | ✅ 随产品 `task`/`team` 进树，事件由 `parts.team_manager` 发 |
 | 10 差分录 golden | `666adcf0` | ✅ `tests/golden/differential/*.json` 56 份，由链式录(`ATOMCODE_RECORD_GOLDEN=1`);回放下基线不变;篡改一份 → 棘轮红 |
-| 11 翻默认 | 本 commit | ✅ 默认 harness,`ATOMCODE_ENGINE=chain` 只活到删链那一个 commit。翻之前先把 tuix/cli/daemon 在 harness 下跑了一遍，抓到一条真回归:provider 不报用量的回合 harness 一条 `Usage` 都不发，ACP 按它换 messageId,两轮并成一条消息(`6e3ff220` 修 + 判据) |
+| 11 翻默认 | `c81218a4` | ✅ 默认 harness,`ATOMCODE_ENGINE=chain` 只活到删链那一个 commit。翻之前先把 tuix/cli/daemon 在 harness 下跑了一遍，抓到一条真回归:provider 不报用量的回合 harness 一条 `Usage` 都不发，ACP 按它换 messageId,两轮并成一条消息(`6e3ff220` 修 + 判据) |
+
+| 12 删链 | 本 commit | ✅ `Engine`/`ATOMCODE_ENGINE`、`assemble.rs`、`parts::assemble`、`VerifyCadenceHook`/`SkillFirstHook`/`TodoHook` 的钩子外壳全部删除;`runtime::mount` 成为公开装配入口;12 个链式测试文件改挂树(`tests/support/mod.rs`),差分台只剩树对 golden |
+
+### 删链时测试抓到的真问题(各自已修)
+
+链式测试改挂树的过程本身是判据 —— 12 个文件里有 6 个第一次跑就红，每一条都是真差异:
+
+- **transcript 两个写者**:runtime 的 transcript 与树的 `session-persistence-jsonl`
+  都写 `<bucket>/<id>.jsonl`,两种格式混在一个文件里(`recall`/会话目录读它)。从此
+  follower 写自己的 root;判据 `the_session_transcript_has_one_writer`。
+- **不完整聚合没 fail-close**:mount 把任何 NotFound 都当「还没存过」,少了 presentation
+  文件的会话会静默从空开始。改成只有 staged fresh 才容忍。
+- **溢出无法恢复**:树的压缩按回合折叠，第一回合自己的工具输出撑爆窗口时没有可折的东西。
+  给日志加 `ToolResultsStubbed` 事实 + 溢出阶梯第一级把长工具结果显示成摘要。
+- **内部提醒的回话外露**:链式把 verify 提醒的「纯说话」回复藏起来;树直接播了出去。
+  加 `MessageOrigin::Internal` / `InjectionOrigin::InternalNudge`,投影不播它的文字(照样入日志),
+  空回复也不当 provider 失败重试。
+- **人设/datalog 的模型名**:mount 用 provider 自报的名字，不是人选的那个。`HostState.model`。
+- **resume 后重复提醒**:「这条编辑已经提醒过」原来在钩子的内存状态里;挪进 `unverified_edit`
+  判断本身(连同「用户禁止跑命令就别催」),这样 resume 也认。
 
 ### 装配缺口的做法(8)
 
@@ -150,11 +170,11 @@ undo / restore / reprepare 家族今天是「停 agent → 写原生 → 重装�
   (内嵌前端资源没构建)
 - `atomcode-tuix modals::config_panel::tests::retry_setting_is_searchable_in_both_languages`
 
-## 判据(`tests/engine_parity.rs`)
+## 判据(`tests/runtime_criteria.rs`)
 
-两引擎各跑一遍的运行时判据，只经 `CodingRuntime` 公开面，删链后原样留作 harness 判据。
-每条先摘掉被测代码证伪一次(commit message 里记了反证)。截至步骤 10 共 44 个场景 + 3 个
-清单/凭据判据。
+运行时判据，只经 `CodingRuntime` 公开面。每条都在两个引擎上写过、并摘掉被测代码证伪过
+一次(反证记在各自 commit 里),删链后原样留下来当 harness 判据。44 个场景 + 能力开关、
+transcript 单一写者、logout 不留凭据三条。
 
 ## 已知差异(决定保留，删链后照此为准)
 

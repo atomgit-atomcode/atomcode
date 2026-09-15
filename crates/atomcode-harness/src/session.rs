@@ -57,6 +57,9 @@ pub enum InjectionOrigin {
     Reminder,
     /// A continuation the harness itself asked for.
     Continuation,
+    /// A nudge the harness asked for, whose talking-only answer is not shown.
+    /// See [`crate::agent::MessageOrigin::Internal`].
+    InternalNudge,
     /// A compaction summary standing in for dropped history.
     CompactionSummary,
 }
@@ -243,6 +246,19 @@ pub enum SessionEvent {
         round: u32,
         usage: TokenUsage,
     },
+    /// Tool results at or below `through` are shown to the model as a one-line
+    /// stub from here on.
+    ///
+    /// The other half of compaction, and the half a fold cannot do: a long turn
+    /// that no longer fits has nothing *settled* to fold away, and what fills
+    /// the window is almost always tool output nobody needs in full any more.
+    /// Committed as a fact rather than re-derived per render, so what the model
+    /// saw stays what the log says — and so the rewrite is monotonic: a stub is
+    /// never re-stubbed, and the prefix cache is invalidated once.
+    ToolResultsStubbed {
+        turn: u64,
+        through: SeqNo,
+    },
     /// Something the harness did that a person should know about and the model
     /// should not.
     ///
@@ -322,6 +338,7 @@ impl SessionEvent {
             | Self::Asked { turn, .. }
             | Self::Answered { turn, .. }
             | Self::Compacted { turn, .. }
+            | Self::ToolResultsStubbed { turn, .. }
             | Self::Usage { turn, .. }
             | Self::Notice { turn, .. }
             | Self::Titled { turn, .. }
@@ -342,6 +359,7 @@ impl SessionEvent {
                 | Self::ToolResultLogged { .. }
                 | Self::Injected { .. }
                 | Self::Compacted { .. }
+                | Self::ToolResultsStubbed { .. }
                 | Self::Interrupted { .. }
         )
     }
@@ -367,7 +385,8 @@ impl SessionEvent {
 ///
 /// **4** — added [`SessionEvent::PolicyIntervention`], `PolicyDenied` as a way a
 /// turn ends, [`SessionEvent::Interrupted`], [`SessionEvent::RateLimitPaused`]
-/// with `RateLimited` as a way a turn ends, and [`NoticeKind::OutputLeftCutOff`]. Same shape again: a hard
+/// with `RateLimited` as a way a turn ends, [`NoticeKind::OutputLeftCutOff`],
+/// [`SessionEvent::ToolResultsStubbed`] and [`InjectionOrigin::InternalNudge`]. Same shape again: a hard
 /// boundary's recovery choice, and what a person's cancel does to the history,
 /// were kernel behaviour the log never saw.
 pub const SESSION_FORMAT_VERSION: u32 = 4;
@@ -600,8 +619,10 @@ pub fn renumber(events: Vec<LoggedEvent>, first: SeqNo) -> Vec<LoggedEvent> {
         .into_iter()
         .map(|mut logged| {
             logged.seq = map(logged.seq);
-            if let SessionEvent::Compacted { through, .. } = &mut logged.event {
-                *through = map(*through);
+            match &mut logged.event {
+                SessionEvent::Compacted { through, .. }
+                | SessionEvent::ToolResultsStubbed { through, .. } => *through = map(*through),
+                _ => {}
             }
             logged
         })
@@ -631,17 +652,36 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
     // would let a dropped tool result pair with a surviving call.
     let mut floor: SeqNo = 0;
     let mut summary: Option<&str> = None;
+    // How far the stubbing has reached, for the same reason: a result is shown
+    // stubbed because a later fact says so.
+    let mut stubbed_through: SeqNo = 0;
     for logged in events {
-        if let SessionEvent::Compacted {
-            through,
-            summary: s,
-            ..
-        } = &logged.event
-        {
-            floor = *through;
-            summary = Some(s);
+        match &logged.event {
+            SessionEvent::Compacted {
+                through,
+                summary: s,
+                ..
+            } => {
+                floor = *through;
+                summary = Some(s);
+            }
+            SessionEvent::ToolResultsStubbed { through, .. } => {
+                stubbed_through = (*through).max(stubbed_through);
+            }
+            _ => {}
         }
     }
+    // Which tool a result came back from, for the stub's first line. The call is
+    // logged with the assistant message that asked for it.
+    let tool_names: std::collections::HashMap<&str, &str> = events
+        .iter()
+        .filter_map(|logged| match &logged.event {
+            SessionEvent::AssistantMessage { tool_calls, .. } => Some(tool_calls),
+            _ => None,
+        })
+        .flatten()
+        .map(|call| (call.id.as_str(), call.name.as_str()))
+        .collect();
 
     // Turns the person interrupted and asked to have undone: their own work
     // leaves the projection. Memory and a compaction summary are not the turn's
@@ -713,7 +753,12 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
                 let mut message = match origin {
                     // A continuation speaks as the user, because it is a
                     // prompt; the rest ride as a note the model reads in place.
-                    InjectionOrigin::Continuation => Message::user(text),
+                    // A nudge is a prompt too — the harness asking for a check it
+                    // is owed; what differs is only whether a talking-only answer
+                    // is shown (see `crate::agent::MessageOrigin::Internal`).
+                    InjectionOrigin::Continuation | InjectionOrigin::InternalNudge => {
+                        Message::user(text)
+                    }
                     // A peer's message is something to act on, not a note in
                     // the margin — but it is a report from another agent, not
                     // the person's word, and it says so. Claude Code frames
@@ -768,7 +813,16 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
                 images,
                 ..
             } => {
-                messages.push(Message::tool_result(call_id, content, *is_error));
+                let shown = if logged.seq <= stubbed_through {
+                    std::borrow::Cow::Owned(atomcode_capabilities::compaction::build_compact_stub(
+                        tool_names.get(call_id.as_str()).copied().unwrap_or("tool"),
+                        content,
+                        !*is_error,
+                    ))
+                } else {
+                    std::borrow::Cow::Borrowed(content.as_str())
+                };
+                messages.push(Message::tool_result(call_id, shown.as_ref(), *is_error));
                 // A provider serializes images on a user message and rejects
                 // them on a tool one, so the picture rides in immediately
                 // after the result it belongs to.

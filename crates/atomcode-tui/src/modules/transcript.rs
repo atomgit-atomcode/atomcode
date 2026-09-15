@@ -85,6 +85,7 @@ fn origin_label(origin: &InjectionOrigin) -> String {
         InjectionOrigin::Memory => "memory".into(),
         InjectionOrigin::Reminder => "reminder".into(),
         InjectionOrigin::Continuation => "continuation".into(),
+        InjectionOrigin::InternalNudge => "nudge".into(),
         InjectionOrigin::CompactionSummary => "compaction summary".into(),
     }
 }
@@ -104,6 +105,7 @@ pub(crate) fn origin_kind(origin: &InjectionOrigin) -> &'static str {
         InjectionOrigin::Memory => "injected:memory",
         InjectionOrigin::Reminder => "injected:reminder",
         InjectionOrigin::Continuation => "injected:continuation",
+        InjectionOrigin::InternalNudge => "injected:nudge",
         InjectionOrigin::CompactionSummary => "injected:compaction",
     }
 }

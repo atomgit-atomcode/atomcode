@@ -347,6 +347,12 @@ pub enum MessageOrigin {
     User,
     /// The harness itself: a continuation, a scheduled goal, a resumed plan.
     Harness,
+    /// The harness nudging the model to finish something it started — a check it
+    /// owes, a list it left open. The nudge is logged like any other injection;
+    /// what is different is the ANSWER: a reply that only talks (no tool call) is
+    /// the model arguing with a note the person never wrote, and a driver does
+    /// not show it. One that acts is shown by its actions, as usual.
+    Internal,
     /// Another agent, by registry id. Logged with the sender's session id.
     Peer(AgentId),
 }

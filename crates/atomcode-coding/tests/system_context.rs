@@ -1,12 +1,14 @@
 //! e2e: the SessionContextHook block (env + project instructions + git snapshot) actually
 //! reaches the provider as a leading system message when a coding agent is assembled.
 
-use atomcode_coding::{build_coding_agent_with, CodingAgentConfig};
-use atomcode_kernel::agent::AutoRespond;
+mod support;
+
+use atomcode_coding::CodingAgentConfig;
 use atomcode_kernel::message::Role;
 use atomcode_kernel::stream::StreamEvent;
 use atomcode_kernel::testkit::RecordingProvider;
 use std::sync::Arc;
+use support::{allow, mount, quiet_options, turn};
 
 #[tokio::test]
 async fn session_context_block_reaches_the_provider() {
@@ -34,10 +36,8 @@ async fn session_context_block_reaches_the_provider() {
     let calls = provider.calls(); // capture the shared handle before moving the provider
 
     let cfg = CodingAgentConfig::new("k", "http://localhost", "test-model", d.path());
-    let agent = build_coding_agent_with(&cfg, provider);
-    let _ = agent
-        .run_to_completion("hello", AutoRespond::AllowAll)
-        .await;
+    let mut mounted = mount(&cfg, quiet_options(), provider).await;
+    let _ = turn(&mut mounted.handle, "hello", allow()).await;
 
     let recorded = calls.lock().unwrap();
     assert!(!recorded.is_empty(), "the provider must have been called");
