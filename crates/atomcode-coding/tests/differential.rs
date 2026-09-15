@@ -56,6 +56,19 @@ enum Reply {
     OpenFail(&'static str, Option<u64>),
     /// Cut off by `finish_reason=length`.
     Truncated(&'static str),
+    /// Reasoning, then text. A thinking model on a plain round.
+    ///
+    /// Needed to exercise `ReasoningPolicy` at all: every other variant is a
+    /// non-thinking round, so a rig built only from them cannot tell whether
+    /// prior-turn reasoning is echoed back — which is the axis the biggest
+    /// open question about prefix caching runs along.
+    ThinkText(&'static str, &'static str),
+    /// Reasoning, a tool call, and optional text.
+    ThinkCalls(
+        &'static str,
+        &'static str,
+        Vec<(&'static str, &'static str, &'static str)>,
+    ),
     /// A round that takes time to answer.
     ///
     /// Needed to measure cancellation at all: with an instant provider, whether
@@ -134,6 +147,15 @@ impl Script {
         let mut names = self.tools.lock().unwrap_or_else(|e| e.into_inner()).clone();
         names.sort();
         names
+    }
+
+    /// Every request, verbatim — the same list `seen` flattens.
+    ///
+    /// For a judgement about what did and did not make it onto the wire:
+    /// `seen()` renders text, and what a provider echo decision changes is a
+    /// *field* (`Message::reasoning`) that never appears in `text`.
+    fn requests(&self) -> Vec<Vec<Message>> {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Everything the model was shown, request by request, flattened to text.
@@ -220,6 +242,25 @@ impl LlmProvider for Script {
             }
             Reply::Text(t) => events.push(StreamEvent::TextDelta(t.into())),
             Reply::Calls(t, calls) => {
+                if !t.is_empty() {
+                    events.push(StreamEvent::TextDelta(t.into()));
+                }
+                for (id, name, args) in calls {
+                    events.push(StreamEvent::ToolCall(atomcode_kernel::tool::ToolCall {
+                        id: id.into(),
+                        name: name.into(),
+                        arguments: args.into(),
+                    }));
+                }
+            }
+            Reply::ThinkText(reasoning, t) => {
+                events.push(StreamEvent::Reasoning(reasoning.into()));
+                if !t.is_empty() {
+                    events.push(StreamEvent::TextDelta(t.into()));
+                }
+            }
+            Reply::ThinkCalls(reasoning, t, calls) => {
+                events.push(StreamEvent::Reasoning(reasoning.into()));
                 if !t.is_empty() {
                     events.push(StreamEvent::TextDelta(t.into()));
                 }
@@ -4217,4 +4258,137 @@ async fn only_the_row_list_says_what_it_injected() {
          longer an asymmetry, and `ONE_SIDED_BY_DESIGN` must stop excluding it: \
          {chain:?}"
     );
+}
+
+/// Does a finished turn's reasoning reach the NEXT turn's first request?
+///
+/// This is the question a session log cannot answer. `derive_messages` is a pure
+/// function of the log, and the log keeps every turn's reasoning in full — so if
+/// the two engines disagree here, the difference is in how each projects the log
+/// onto the wire, and nowhere else.
+///
+/// **What this pins, exactly:** the reasoning a finished turn wrote is still in
+/// the next turn's request, on both engines. It is not a claim about prefix
+/// caching — that measurement lives in the session log, not here.
+///
+/// The reason it exists at all: until this test, **no fixture in this rig could
+/// produce reasoning**. Every `Reply` was a non-thinking round, so the whole
+/// reasoning axis — the echo policy, what a resumed request carries, what the
+/// next turn sees — was untested, and the `ThinkText`/`ThinkCalls` variants
+/// added alongside it are what make it testable.
+///
+/// How this started, recorded because the first reading was wrong: a single
+/// session (2026-09-15) showed each new turn's first request reporting fewer
+/// prompt tokens than the previous turn's last one, and the step down tracked
+/// the previous turn's reasoning — `-24535` against 101261 chars, `-29533`
+/// against 122884, `-4368` against 22866. That correlation does NOT generalize:
+/// across 80 sessions and 395 turn boundaries the same ratio held for 4 of the
+/// 128 large step-downs, because compaction rewrites explain most of the rest.
+/// So the table is not evidence of anything, and this test does not assume it.
+#[tokio::test]
+async fn a_finished_turns_reasoning_survives_into_the_next_turns_request() {
+    let dir = scratch("reasoning-echo");
+    seed(&dir);
+    // Turn 1 has two rounds, both thinking, the first calling a tool — the shape
+    // every real turn with reasoning has. Turn 2 is one round.
+    let script = || {
+        Script::new(&[
+            Reply::ThinkCalls(
+                "TURN1-ROUND1-REASONING",
+                "",
+                vec![("c1", "read_file", r#"{"file_path":"a.rs"}"#)],
+            ),
+            Reply::ThinkText("TURN1-ROUND2-REASONING", "Turn one answer."),
+            Reply::ThinkText("TURN2-REASONING", "Turn two answer."),
+        ])
+    };
+
+    let mut shapes = Vec::new();
+    for whose in ["the row list", "the chain"] {
+        let s = script();
+        let requests = match whose {
+            "the row list" => {
+                let (mut handle, mut app) = on_harness_handle(s.clone(), &dir).await;
+                rows_turn(&mut handle, "first").await;
+                rows_turn(&mut handle, "second").await;
+                app.stop();
+                s.requests()
+            }
+            _ => {
+                let handle = production_agent(s.clone(), &dir).await.spawn();
+                let _ = drive_turns(handle, &["first", "second"]).await;
+                s.requests()
+            }
+        };
+        assert!(
+            requests.len() >= 3,
+            "{whose}: expected a request per round (two thinking rounds, then \
+             one), got {}",
+            requests.len()
+        );
+        let last_of_turn1 = &requests[requests.len() - 2];
+        let first_of_turn2 = &requests[requests.len() - 1];
+        let carried = |req: &Vec<Message>, needle: &str| {
+            req.iter()
+                .any(|m| m.reasoning.as_deref().is_some_and(|r| r.contains(needle)))
+        };
+        // The rig has to actually exercise reasoning, or every assertion below
+        // passes against a scenario that never produced any.
+        assert!(
+            carried(last_of_turn1, "TURN1-ROUND1-REASONING"),
+            "{whose}: the fixture produced no reasoning to follow — the test \
+             would say nothing:\n{}",
+            shape(last_of_turn1)
+        );
+        shapes.push(format!("{whose}: turn1 last  {}", shape(last_of_turn1)));
+        shapes.push(format!("{whose}: turn2 first {}", shape(first_of_turn2)));
+        assert!(
+            carried(first_of_turn2, "TURN1-ROUND1-REASONING"),
+            "{whose}: a finished turn's reasoning is gone from the next turn's \
+             first request — the two engines must not disagree about this:\n{}",
+            shapes.join("\n")
+        );
+    }
+}
+
+/// The role/len/reasoning shape of a request, for a failure message that says
+/// which message changed rather than only that something did.
+fn shape(req: &[Message]) -> String {
+    req.iter()
+        .map(|m| {
+            format!(
+                "{:?}(text={},reason={})",
+                m.role,
+                m.text.len(),
+                m.reasoning.as_deref().unwrap_or("").len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Send a message and wait for the turn to end, answering approvals.
+async fn rows_turn(handle: &mut AgentHandle, text: &str) {
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: text.into(),
+            images: Vec::new(),
+        })
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!left.is_zero(), "`{text}`: the turn never finished");
+        match tokio::time::timeout(left, handle.events.recv()).await {
+            Ok(Some(AgentEvent::TurnComplete { .. })) => return,
+            Ok(Some(AgentEvent::Request { id, .. })) => {
+                let _ = handle
+                    .commands
+                    .send(AgentCommand::Respond { id, value: allow() });
+            }
+            Ok(Some(_)) => continue,
+            other => panic!("`{text}`: the turn never finished: {other:?}"),
+        }
+    }
 }
