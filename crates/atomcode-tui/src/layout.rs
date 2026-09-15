@@ -149,7 +149,7 @@ fn preset(name: &str) -> Option<Region> {
         "focus" => Some(Region::split(
             Dir::Vertical,
             Constraint::Fill,
-            Region::stream(),
+            crate::host::scroll_region(),
             composer,
         )),
         "wide" => Some(Region::split(
@@ -162,7 +162,7 @@ fn preset(name: &str) -> Option<Region> {
                 Region::split(
                     Dir::Horizontal,
                     Constraint::Percent(65),
-                    Region::stream(),
+                    crate::host::scroll_region(),
                     Region::view("findings"),
                 ),
                 composer,

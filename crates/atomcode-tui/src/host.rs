@@ -1768,41 +1768,60 @@ fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16
         .unwrap_or(1)
 }
 
-/// The composer: the task list, the live line, and the reserved tip row above
-/// the field.
+/// The view modules whose rows ride at the foot of the conversation.
+///
+/// **One list, in one place.** Three trees have to agree about it — the shipped
+/// [`default_layout`] and the `focus` and `wide` presets — and a tree that
+/// forgot one would not be caught by the check that refuses a module named
+/// twice: naming it *nowhere* is not naming it twice. Everything that builds a
+/// scroll region goes through [`scroll_region`], so the list is added to once
+/// or not at all.
+///
+/// What belongs here is "what this turn is working through", which is worth
+/// scrolling back for. What does not is the frame — the input box, the tip row,
+/// the status line: those say where the session *is*, have no history, and must
+/// not move out from under a hand reaching for them. See `docs/adr/0020`.
+pub const TAIL: &[&str] = &[crate::modules::todo::ID];
+
+/// The conversation, with [`TAIL`] riding at its foot.
+///
+/// The only way a stream with a tail is built. `El::Stream`'s tail is a list
+/// rather than child nodes because the engine must stay ignorant of scrolling
+/// (ADR 0020), which leaves the host to split the pane — so this is the host's
+/// notion of "the scrollable region", and the trees name it rather than each
+/// writing `Region::stream().with_tail(...)` for themselves.
+pub fn scroll_region() -> Region {
+    Region::stream().with_tail(TAIL.iter().copied())
+}
+
+/// The frame: the live line, the reserved tip row, and the field.
 ///
 /// One definition, because every arrangement that has an input has this above
 /// it — the input box is where a person's eyes are, and the one thing that
 /// answers "is it stuck?" belongs against it rather than in a panel beside the
-/// conversation. The task list is here for the same reason: it is what the
-/// current turn is working through, and it reads as part of the working rather
-/// than as a panel about it.
+/// conversation.
+///
+/// **None of these scroll.** The task list used to be a member here and is not
+/// any more; it moved to [`TAIL`], where it scrolls with the conversation
+/// instead of standing at the foot of the screen while a reader looks at
+/// history. What is left is the part of the screen that is about *now*: moving
+/// it would move the field, and the field is what a hand is already reaching
+/// for.
 ///
 /// Written into the tree rather than claimed by each row's own `LayoutOp::Show`
 /// the way the mascot claims its strip: `Show` has two sides, above the
 /// conversation and below the status line, and both are the wrong side of the
-/// input box. That is why the todo list — which used to place itself at the
-/// bottom, under the field — is a member here instead.
+/// input box.
 ///
-/// All three are `Hug`-ish: the live line and the task list ask for no rows
-/// between turns and no panel until the model has planned something, so the
-/// composer closes up around the field instead of standing on blank rows. The
-/// tip row beneath is the deliberate exception — it asks for its row always,
-/// which is why a tip can never move the box out from under a hand reaching for
-/// it. See `modules::tip`.
-///
-/// The blank row above the live line is the line's own for that same reason: a
-/// `gap` on this flex is counted between the children whether or not the line is
-/// mounted, so the margin would outlive the thing it spaces out. It is above
-/// only — under the line sits the reserved row, which is not a margin and is
-/// drawn whether or not there is a line to space off.
+/// The tip row is the deliberate exception to `Hug`-ness — it asks for its row
+/// always, which is why a tip can never move the box out from under a hand
+/// reaching for it. See `modules::tip`.
 pub fn composer() -> Region {
     use crate::el::Item;
     use crate::region::Dir;
     Region::flex(
         Dir::Vertical,
         vec![
-            Item::hug(Region::view(crate::modules::todo::ID)),
             Item::hug(Region::view(crate::modules::live::ID)),
             Item::hug(Region::view(crate::modules::tip::ID)),
             Item::grow(Region::view(crate::modules::input::ID)),
@@ -1821,7 +1840,7 @@ pub fn default_layout() -> Region {
     Region::split(
         Dir::Vertical,
         Constraint::Fill,
-        Region::stream(),
+        scroll_region(),
         Region::split(
             Dir::Vertical,
             Constraint::Fill,
@@ -1922,13 +1941,8 @@ mod tests {
         h
     }
 
-    #[test]
-    fn the_layout_this_build_ships_names_no_module_twice() {
-        // `default_layout()` and every preset are trees that never pass through
-        // `Layout::apply`, which is where a tail id that is also a leaf gets
-        // refused. A shipped tree that named one twice would draw it twice on
-        // every frame, and nothing else in the suite would notice — `compose`
-        // would simply place it in both regions.
+    /// Every tree this build ships, by name.
+    fn shipped_trees() -> Vec<(String, Region)> {
         let mut trees = vec![("default".to_string(), default_layout())];
         for (name, _) in crate::layout::presets() {
             trees.push((
@@ -1936,12 +1950,164 @@ mod tests {
                 crate::layout::preset_for_test(name).expect("every listed preset resolves"),
             ));
         }
-        for (name, tree) in trees {
+        trees
+    }
+
+    #[test]
+    fn the_layout_this_build_ships_names_no_module_twice() {
+        // `default_layout()` and every preset are trees that never pass through
+        // `Layout::apply`, which is where a tail id that is also a leaf gets
+        // refused. A shipped tree that named one twice would draw it twice on
+        // every frame, and nothing else in the suite would notice — `compose`
+        // would simply place it in both regions.
+        for (name, tree) in shipped_trees() {
             assert_eq!(
                 tree.named_twice(),
                 None,
                 "the {name} layout names one twice"
             );
+        }
+    }
+
+    #[test]
+    fn every_shipped_tree_rides_the_tail_exactly_once() {
+        // The other direction, and the one `named_twice` cannot see: a tree that
+        // names a tail module **nowhere** is not naming it twice, so dropping
+        // the tail from one preset would leave that arrangement quietly missing
+        // its task list while every other check stayed green.
+        //
+        // "Exactly once" rather than "at least once" because the two faults are
+        // guarded in the same breath: too few is this, too many is
+        // `named_twice`, and a module named twice is also named once.
+        for (name, tree) in shipped_trees() {
+            let tail = tree.tail().to_vec();
+            for id in TAIL {
+                let rides = tail.iter().filter(|t| t == id).count();
+                let leaves = tree.modules().iter().filter(|m| m == id).count() - rides;
+                assert_eq!(
+                    leaves, 0,
+                    "`{id}` is a leaf of its own in the {name} layout as well as a tail id"
+                );
+                assert_eq!(
+                    rides, 1,
+                    "`{id}` rides the tail {rides} times in the {name} layout — every \
+                     shipped tree has to carry `TAIL` exactly once, or that arrangement \
+                     silently loses it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_planned_todo_list_scrolls_with_the_conversation() {
+        // The point of the whole change, and the one thing an assertion on
+        // `part("todo")` cannot tell: a panel that is *placed* is placed whether
+        // it is pinned to the foot of the screen or riding the conversation.
+        // What says which one it is, is whether scrolling takes it away.
+        let h = host_with_real_todo();
+        for i in 0..40 {
+            h.absorb(&SessionEvent::AssistantMessage {
+                turn: 1,
+                round: i,
+                text: format!("row {i}"),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+            });
+        }
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 40,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: "t1".into(),
+                name: "todowrite".into(),
+                arguments: serde_json::json!({
+                    "todos": [ { "content": "only", "status": "in_progress" } ]
+                })
+                .to_string(),
+            }],
+        });
+        let size = (80, 24);
+
+        let at_bottom = h.compose(size);
+        let todo = at_bottom
+            .part("todo")
+            .expect("the plan is up while the reader is at the bottom");
+        // Inside the conversation's region, and above the frame's first row —
+        // where the tail belongs. Which exact row is the tail's business, not
+        // this judgement's: what it has to establish is that the plan is part
+        // of the scrolling content rather than a band of its own.
+        let stream_rect = at_bottom.part("stream").expect("the words").rect;
+        assert!(
+            todo.rect.y + todo.rect.h <= size.1,
+            "the plan runs off the bottom of the screen: {todo:?}"
+        );
+        assert!(
+            todo.rect.y >= stream_rect.y,
+            "the plan is above the conversation rather than at its tail"
+        );
+
+        // Scrolled far enough back and it is gone — not moved, gone. A pinned
+        // panel would still have a rect here.
+        let plan_rows = todo.rect.h as usize;
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(plan_rows);
+        let scrolled = h.compose(size);
+        assert!(
+            scrolled.part("todo").is_none(),
+            "the plan is still on screen after scrolling past it: it is pinned, \
+             not riding the conversation"
+        );
+
+        // And what it gave back went to the conversation.
+        assert_eq!(
+            scrolled.part("stream").expect("the words").rect.h as usize,
+            at_bottom.part("stream").expect("the words").rect.h as usize + plan_rows,
+            "the rows the tail gave up are the conversation's again"
+        );
+    }
+
+    /// The shipped default layout, with the task list really mounted.
+    ///
+    /// `host()` has neither, and a tail judgement written against it is vacuous:
+    /// no tail id resolves, the geometry is the identity, and every assertion
+    /// passes against machinery that never ran. This is the fixture the tail
+    /// checks have to start from.
+    fn host_with_real_todo() -> Host {
+        let mods = Arc::new(Modules::new());
+        mods.add_producer(transcript::Transcript::new()).unwrap();
+        mods.add_view(Arc::new(Mounted::<crate::modules::todo::Todo>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<input::Input>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<status::Status>::new()))
+            .unwrap();
+        Host::new(mods, default_layout())
+    }
+
+    #[test]
+    fn the_tail_is_what_scrolls_and_the_frame_is_not() {
+        // The line ADR 0020 draws. A module whose rows ride the tail scrolls; a
+        // module in the frame has to stay where it is, because the frame holds
+        // the field and the field is what a hand is reaching for.
+        for (name, tree) in shipped_trees() {
+            let tail = tree.tail();
+            for frame_module in [
+                crate::modules::input::ID,
+                crate::modules::tip::ID,
+                crate::modules::status::ID,
+            ] {
+                assert!(
+                    !tail.contains(&frame_module.to_string()),
+                    "`{frame_module}` must not scroll, and the {name} layout puts it in the tail"
+                );
+            }
+            for riding in tail {
+                assert!(
+                    TAIL.contains(&riding.as_str()),
+                    "`{riding}` rides the tail of the {name} layout but is not declared in TAIL"
+                );
+            }
         }
     }
 
