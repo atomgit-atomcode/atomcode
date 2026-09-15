@@ -1220,6 +1220,7 @@ fn resolve_account_api_key(
         provider_preset::ProviderType::Anthropic => "ANTHROPIC_API_KEY",
         provider_preset::ProviderType::Ollama => "OLLAMA_API_KEY",
         provider_preset::ProviderType::OpenAi => "OPENAI_API_KEY",
+        provider_preset::ProviderType::Responses => "OPENAI_API_KEY",
     };
     for env in [preset.api_key_env, Some(wire_env), Some("ATOMCODE_API_KEY")]
         .into_iter()
@@ -1243,6 +1244,9 @@ fn legacy_provider_to_preset_id(provider_type: &str) -> &'static str {
     match provider_type {
         "claude" | "anthropic" => "anthropic",
         "ollama" => "ollama",
+        // OpenAI Responses API wire — distinct protocol from chat/completions,
+        // so it must resolve to the Responses preset, not the generic OpenAI one.
+        "responses" => "openai-responses",
         // Preserve the vendor preset for legacy OpenCode Zen entries. Falling
         // through to the generic OpenAI preset would resolve OPENAI_API_KEY
         // instead of OPENCODE_API_KEY even though the wire protocol is the same.
