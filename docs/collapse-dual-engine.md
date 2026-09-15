@@ -125,8 +125,11 @@ undo / restore / reprepare 家族今天是「停 agent → 写原生 → 重装�
 | 5b 策略干预、schedule_wakeup | `b07416c4` `67a332ec` | ✅ `SessionEvent::PolicyIntervention` + `StopReason::PolicyDenied`(会话格式 → 4);`host-tools`(schedule_wakeup) |
 | 7 配置桥接 | `c840386c` `4f7ad139` | ✅ 工具清单两引擎一致(明单三条)、能力开关、`skills-host`、memory `inject`、`chat-options`、`swap_provider_for`、权限规则、回合上限/循环保护/压缩/重试/提问超时 |
 | 8 装配缺口(一) | `85b392bb` | ✅ 上下文块、transcript、遥测、hooks.json + 插件钩子、datalog、todo 提醒;`kernel-middleware` 桥 |
-| 6 MCP | | 待做 |
-| 8 装配缺口(二) | | 待做:CodingPlan 窗口限流、中断即撤销(keep_interrupted_context)、手动 compact 保真、用量记账、stream_timeout、team 事件 |
+| 6 MCP | `34f46781` | ✅ runtime 的注册表是唯一 owner,`mcp-host` 发布进树 |
+| 8 装配缺口(二) | `8a582120` `e412c194` `2c38ab96` | ✅ 取消即撤销(`SessionEvent::Interrupted`)、CodingPlan 窗口限流(`rate-limit-coding`,`RateLimitPaused`)、手动 compact 落盘即时 + 只汇报一次 |
+| 8 装配缺口(三) | `2ad275ed` `b857e241` `b89818ff` `631e33ca` `16914c71` `d5d5b277` `9d950b7e` | ✅ `tool-driver` 缝(工具进度 + 提问);树里挂产品自己的 `request_user_input` / `task` / `team` / `code_review` / `recall`(`parts::wire_side_providers` 两引擎共用：分层、会话 id、detached 用量记账、带 surface 计量;logout 清槽);Team 事件同源;`TurnProgress.continuing` + 轮次/截断检查点;`stream_idle_ms` → `Timeout`;`/compact <focus>` 由对话模型写摘要(`compaction-coding`);工具契约判据从名字升到描述+参数 |
+| 9 team 事件 | `b857e241` | ✅ 随产品 `task`/`team` 进树，事件由 `parts.team_manager` 发 |
+| 10 差分录 golden | 本 commit | ✅ `tests/golden/differential/*.json` 56 份，由链式录(`ATOMCODE_RECORD_GOLDEN=1`);回放下基线不变;篡改一份 → 棘轮红 |
 
 ### 装配缺口的做法(8)
 
@@ -140,3 +143,26 @@ undo / restore / reprepare 家族今天是「停 agent → 写原生 → 重装�
 ### 已知的偶发
 `atomcode-harness::harness the_log_reaches_the_disk_in_the_order_it_was_committed` 全量并行下偶发红，
 单跑与重复 10 次均绿;测试注释自认此事。
+
+## 判据(`tests/engine_parity.rs`)
+
+两引擎各跑一遍的运行时判据，只经 `CodingRuntime` 公开面，删链后原样留作 harness 判据。
+每条先摘掉被测代码证伪一次(commit message 里记了反证)。截至步骤 10 共 44 个场景 + 3 个
+清单/凭据判据。
+
+## 已知差异(决定保留，删链后照此为准)
+
+- **压力触发的自动压缩**:链式是「超阈值把旧工具结果原地改成桩」(StubCompaction),溢出时
+  桩 → 截断 → 摘要;树是 `compaction-coding` 的免模型清单(保留最近 2 回合)。原地改写旧消息
+  在追加式日志里没有对应事实，要做得先给日志加事件，属日志模型的决定，不在本线。人要的
+  `/compact <focus>` 已对齐(对话模型写摘要，计费)。
+- **摘要的锚点**:链式下一次压缩认得上一次摘要(哨兵行)并在其上更新;树里上一次摘要投影成
+  合成 system 消息，下一次会把它当普通内容一起摘。
+- **边界**:链式按 token 预算留最近内容，树按回合数(2)。
+- **工具指引的归属**:树里 fs / shell / 搜索 / codeintel / web / todo / describe_self 的提示词
+  由各自的行写，措辞与链式人设里的段落不同;产品自有工具(`request_user_input` / `task` /
+  `team` / `code_review`)的段落由 host-tools 带入，与链式同文。
+- **`max_continuations`(offer_continuation 熔断，默认 50)**:树里的续写提醒(verify-cadence、
+  todo-reminder)各自一次性，没有需要熔断的循环，不桥接。
+- **流静默重连次数**:链式内核自带 5 次无内容重连;树里静默是可重试错误，次数归 `llm-retry`。
+- **链式 logout 不清审查/子 agent 槽位**:树里清(判据 `a_logout_leaves_no_signed_in_provider_alive`)。

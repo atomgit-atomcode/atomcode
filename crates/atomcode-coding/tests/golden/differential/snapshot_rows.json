@@ -1,0 +1,18 @@
+[
+  {
+    "kind": "TurnStarted",
+    "detail": ""
+  },
+  {
+    "kind": "Usage",
+    "detail": ""
+  },
+  {
+    "kind": "TurnComplete",
+    "detail": "Stopped"
+  },
+  {
+    "kind": "Snapshot",
+    "detail": "system,user,assistant"
+  }
+]

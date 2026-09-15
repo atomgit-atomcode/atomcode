@@ -1,0 +1,14 @@
+[
+  {
+    "kind": "TurnStarted",
+    "detail": ""
+  },
+  {
+    "kind": "Error",
+    "detail": "upstream exploded"
+  },
+  {
+    "kind": "TurnComplete",
+    "detail": "ProviderError"
+  }
+]

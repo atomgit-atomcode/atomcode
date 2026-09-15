@@ -1,0 +1,14 @@
+[
+  {
+    "kind": "TurnStarted",
+    "detail": ""
+  },
+  {
+    "kind": "Cancelled",
+    "detail": ""
+  },
+  {
+    "kind": "TurnComplete",
+    "detail": "Cancelled"
+  }
+]

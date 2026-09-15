@@ -300,10 +300,68 @@ impl LlmProvider for Script {
 /// Ids, durations and token counts legitimately differ between two engines
 /// running the same conversation; the *shape* of the stream must not. Comparing
 /// raw events would report a difference on every run and mean nothing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 struct Step {
     kind: &'static str,
     detail: String,
+}
+
+/// A recorded step. The kind comes back as the `&'static str` every comparison
+/// here is written against; the set is small and a test process is short.
+impl<'de> serde::Deserialize<'de> for Step {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Recorded {
+            kind: String,
+            detail: String,
+        }
+        let recorded = <Recorded as serde::Deserialize>::deserialize(d)?;
+        Ok(Step {
+            kind: Box::leak(recorded.kind.into_boxed_str()),
+            detail: recorded.detail,
+        })
+    }
+}
+
+// ---- the chain, recorded ------------------------------------------------
+//
+// The hand-written chain is being deleted. What it did in each scenario that is
+// compared against it is kept as a golden file, recorded from the chain itself
+// while it still existed, and the comparison runs against that record under the
+// same ratchet.
+//
+// `ATOMCODE_RECORD_GOLDEN=1` runs the chain and rewrites the record. Without it
+// the record is read and the chain is never run — the expression is not awaited.
+
+macro_rules! golden {
+    ($key:expr, $chain:expr) => {
+        golden_value($key, async { $chain }).await
+    };
+}
+
+async fn golden_value<T, F>(key: &str, chain: F) -> T
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+    F: std::future::Future<Output = T>,
+{
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/differential")
+        .join(format!("{key}.json"));
+    if std::env::var_os("ATOMCODE_RECORD_GOLDEN").is_some() {
+        let value = chain.await;
+        std::fs::create_dir_all(path.parent().expect("golden dir")).expect("golden dir");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&value).expect("golden serializes") + "\n",
+        )
+        .expect("golden written");
+        return value;
+    }
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!("golden `{key}` is missing ({error}): it was recorded from the chain with ATOMCODE_RECORD_GOLDEN=1")
+    });
+    serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("golden `{key}` is unreadable: {error}"))
 }
 
 fn normalise(event: &AgentEvent) -> Option<Step> {
@@ -1074,7 +1132,10 @@ async fn a_plain_turn() {
             images: Vec::new(),
         }]
     };
-    let a = reference(Script::text(&["hello"]), &dir, cmds()).await;
+    let a = golden!(
+        "plain_turn",
+        reference(Script::text(&["hello"]), &dir, cmds()).await
+    );
     let b = candidate(Script::text(&["hello"]), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("plain_turn", divergences(&a, &b), &report);
@@ -1119,7 +1180,7 @@ async fn one_tool_call() {
             images: Vec::new(),
         }]
     };
-    let a = reference(script(), &dir, cmds()).await;
+    let a = golden!("one_tool_call", reference(script(), &dir, cmds()).await);
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("one_tool_call", divergences(&a, &b), &report);
@@ -1164,7 +1225,7 @@ async fn two_tool_calls_at_once() {
             images: Vec::new(),
         }]
     };
-    let a = reference(script(), &dir, cmds()).await;
+    let a = golden!("two_tool_calls", reference(script(), &dir, cmds()).await);
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("two_tool_calls", divergences(&a, &b), &report);
@@ -1197,7 +1258,7 @@ async fn a_tool_that_does_not_exist() {
             images: Vec::new(),
         }]
     };
-    let a = reference(script(), &dir, cmds()).await;
+    let a = golden!("unknown_tool", reference(script(), &dir, cmds()).await);
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("unknown_tool", divergences(&a, &b), &report);
@@ -1220,7 +1281,7 @@ async fn the_provider_fails_mid_stream() {
             images: Vec::new(),
         }]
     };
-    let a = reference(script(), &dir, cmds()).await;
+    let a = golden!("provider_error", reference(script(), &dir, cmds()).await);
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("provider_error", divergences(&a, &b), &report);
@@ -1258,7 +1319,7 @@ async fn several_rounds() {
             images: Vec::new(),
         }]
     };
-    let a = reference(script(), &dir, cmds()).await;
+    let a = golden!("several_rounds", reference(script(), &dir, cmds()).await);
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("several_rounds", divergences(&a, &b), &report);
@@ -1313,12 +1374,18 @@ async fn a_cancel_lands() {
     // is not the thing being measured, it is not bounded, and under a loaded
     // suite it is easily tens of milliseconds — a budget that includes it is a
     // budget that reports the machine's load as a cancellation bug.
-    let reference = coding_agent(script(), &dir);
+    let a = golden!(
+        "cancel",
+        drive_with(
+            coding_agent(script(), &dir).spawn(),
+            cmds(),
+            &[],
+            Some(AgentCommand::Cancel)
+        )
+        .await
+    );
     let (candidate, mut app) = candidate_handle(script(), &dir).await;
 
-    let started = std::time::Instant::now();
-    let a = drive_with(reference.spawn(), cmds(), &[], Some(AgentCommand::Cancel)).await;
-    let took_reference = started.elapsed();
     let started = std::time::Instant::now();
     let b = drive_with(candidate, cmds(), &[], Some(AgentCommand::Cancel)).await;
     let took_candidate = started.elapsed();
@@ -1326,7 +1393,7 @@ async fn a_cancel_lands() {
     let report = render(&a, &b);
     ratchet("cancel", divergences(&a, &b), &report);
 
-    for (who, took) in [("参考", took_reference), ("候选", took_candidate)] {
+    for (who, took) in [("候选", took_candidate)] {
         assert!(
             took < CANCEL_BUDGET,
             "{who}: 取消用了 {took:?} —— 那一轮本来就要 400ms，说明它在等回合跑完\
@@ -1493,7 +1560,7 @@ async fn the_provider_fails_while_a_tool_call_is_outstanding() {
             images: Vec::new(),
         }]
     };
-    let a = reference(script(), &dir, cmds()).await;
+    let a = golden!("dangling_call", reference(script(), &dir, cmds()).await);
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("dangling_call", divergences(&a, &b), &report);
@@ -1535,7 +1602,7 @@ async fn one_of_two_parallel_tools_fails() {
             images: Vec::new(),
         }]
     };
-    let a = reference(script(), &dir, cmds()).await;
+    let a = golden!("mixed_batch", reference(script(), &dir, cmds()).await);
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("mixed_batch", divergences(&a, &b), &report);
@@ -1570,11 +1637,14 @@ async fn a_second_turn_sees_the_first() {
     // nothing the person said earlier counts.
     let dir = scratch("two-turns");
     let script = || Script::text(&["first answer", "second answer"]);
-    let a = drive_turns(
-        coding_agent(script(), &dir).spawn(),
-        &["remember the number 41", "what number?"],
-    )
-    .await;
+    let a = golden!(
+        "two_turns",
+        drive_turns(
+            coding_agent(script(), &dir).spawn(),
+            &["remember the number 41", "what number?"],
+        )
+        .await
+    );
     let (handle, _app) = candidate_handle(script(), &dir).await;
     let b = drive_turns(handle, &["remember the number 41", "what number?"]).await;
     let report = render(&a, &b);
@@ -1636,7 +1706,7 @@ async fn a_truncated_response() {
             images: Vec::new(),
         }]
     };
-    let a = reference(script(), &dir, cmds()).await;
+    let a = golden!("truncated", reference(script(), &dir, cmds()).await);
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     // Known and benign: both engines run the recovery round and both report the
@@ -1673,7 +1743,7 @@ async fn a_truncation_the_model_answers_by_redumping() {
             images: Vec::new(),
         }]
     };
-    let a = reference(script(), &dir, cmds()).await;
+    let a = golden!("truncated_redump", reference(script(), &dir, cmds()).await);
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("truncated_redump", divergences(&a, &b), &report);
@@ -1710,7 +1780,7 @@ async fn a_transient_open_failure_with_a_retry_after() {
             images: Vec::new(),
         }]
     };
-    let a = reference(script(), &dir, cmds()).await;
+    let a = golden!("retry_after", reference(script(), &dir, cmds()).await);
     let b = candidate(script(), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("retry_after", divergences(&a, &b), &report);
@@ -1739,7 +1809,10 @@ async fn a_manual_compaction() {
             AgentCommand::Compact { focus: None },
         ]
     };
-    let a = reference_until(Script::text(&["ok"]), &dir, cmds(), &[]).await;
+    let a = golden!(
+        "compact",
+        reference_until(Script::text(&["ok"]), &dir, cmds(), &[]).await
+    );
     let b = candidate_until(Script::text(&["ok"]), &dir, cmds(), &[]).await;
     let report = render(&a, &b);
     // Known and benign: the candidate emits `CompactionStarted` where the
@@ -1774,7 +1847,10 @@ async fn a_second_message_steers_the_running_turn() {
         text: "and also this".into(),
         images: Vec::new(),
     };
-    let a = reference_late(script(), &dir, cmds(), later()).await;
+    let a = golden!(
+        "steering",
+        reference_late(script(), &dir, cmds(), later()).await
+    );
     let b = candidate_late(script(), &dir, cmds(), later()).await;
     let report = render(&a, &b);
     ratchet("steering", divergences(&a, &b), &report);
@@ -1800,7 +1876,10 @@ async fn a_message_carrying_context() {
             context: "the build is broken".into(),
         }]
     };
-    let a = reference(Script::text(&["fix it"]), &dir, cmds()).await;
+    let a = golden!(
+        "with_context",
+        reference(Script::text(&["fix it"]), &dir, cmds()).await
+    );
     let b = candidate(Script::text(&["fix it"]), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("with_context", divergences(&a, &b), &report);
@@ -1824,7 +1903,10 @@ async fn a_synthetic_message() {
             text: "keep going".into(),
         }]
     };
-    let a = reference(Script::text(&["carrying on"]), &dir, cmds()).await;
+    let a = golden!(
+        "synthetic",
+        reference(Script::text(&["carrying on"]), &dir, cmds()).await
+    );
     let b = candidate(Script::text(&["carrying on"]), &dir, cmds()).await;
     let report = render(&a, &b);
     ratchet("synthetic", divergences(&a, &b), &report);
@@ -1852,7 +1934,10 @@ async fn a_snapshot_round_trip() {
             AgentCommand::Snapshot,
         ]
     };
-    let a = reference_until(Script::text(&["ok"]), &dir, cmds(), &["Snapshot"]).await;
+    let a = golden!(
+        "snapshot",
+        reference_until(Script::text(&["ok"]), &dir, cmds(), &["Snapshot"]).await
+    );
     let b = candidate_until(Script::text(&["ok"]), &dir, cmds(), &["Snapshot"]).await;
     let report = render(&a, &b);
     ratchet("snapshot", divergences(&a, &b), &report);
@@ -1871,7 +1956,7 @@ async fn prod_vs_candidate(
     script: impl Fn() -> Arc<Script>,
     cmds: impl Fn() -> Vec<AgentCommand>,
 ) -> (Vec<Step>, Vec<Step>, String) {
-    let a = reference_production(script(), dir, cmds()).await;
+    let a = golden!(key, reference_production(script(), dir, cmds()).await);
     let b = candidate(script(), dir, cmds()).await;
     let report = render(&a, &b);
     ratchet(key, divergences(&a, &b), &report);
@@ -2156,7 +2241,7 @@ async fn chain_vs_rows(
     script: impl Fn() -> Arc<Script>,
     cmds: impl Fn() -> Vec<AgentCommand>,
 ) -> (Vec<Step>, Vec<Step>, String) {
-    let a = reference_production(script(), dir, cmds()).await;
+    let a = golden!(key, reference_production(script(), dir, cmds()).await);
     let b = on_harness(script(), dir, cmds()).await;
     let report = render(&a, &b);
     ratchet(key, divergences(&a, &b), &report);
@@ -2284,7 +2369,10 @@ async fn ask_chain_vs_rows(
     cmds: impl Fn() -> Vec<AgentCommand>,
     answer: serde_json::Value,
 ) -> (Vec<Step>, Vec<Step>, String) {
-    let a = reference_production_answering(script(), dir, cmds(), answer.clone()).await;
+    let a = golden!(
+        key,
+        reference_production_answering(script(), dir, cmds(), answer.clone()).await
+    );
     let b = on_harness_answering(script(), dir, cmds(), answer).await;
     let report = render(&a, &b);
     ratchet(key, divergences(&a, &b), &report);
@@ -2670,10 +2758,16 @@ async fn a_cancel_lands_on_the_harness() {
     // setup step — it read 416ms for a 400ms round and blamed the cancel. It
     // would also have been unfair the other way: mounting a plexus tree is not
     // free either, and neither cost is what this scenario is about.
-    let chain = production_agent(script(), &dir).await;
-    let started = std::time::Instant::now();
-    let a = drive_with(chain.spawn(), say("go"), &[], Some(AgentCommand::Cancel)).await;
-    let took_chain = started.elapsed();
+    let a = golden!(
+        "cancel_rows",
+        drive_with(
+            production_agent(script(), &dir).await.spawn(),
+            say("go"),
+            &[],
+            Some(AgentCommand::Cancel)
+        )
+        .await
+    );
 
     let (handle, mut app) = on_harness_handle(script(), &dir).await;
     let started = std::time::Instant::now();
@@ -2682,7 +2776,7 @@ async fn a_cancel_lands_on_the_harness() {
     app.stop();
     let report = judge("cancel_rows", &a, &b);
 
-    for (who, took) in [("链式", took_chain), ("行式", took_rows)] {
+    for (who, took) in [("行式", took_rows)] {
         assert!(
             took < CANCEL_BUDGET,
             "{who}: 取消用了 {took:?} —— 那一轮本来就要 400ms，说明它在等回合跑完\
@@ -2716,7 +2810,10 @@ async fn a_second_message_steers_the_running_turn_on_the_harness() {
         text: "and also this".into(),
         images: Vec::new(),
     };
-    let a = reference_production_late(script(), &dir, say("start"), later()).await;
+    let a = golden!(
+        "steering_rows",
+        reference_production_late(script(), &dir, say("start"), later()).await
+    );
     let b = on_harness_late(script(), &dir, say("start"), later()).await;
     let report = judge("steering_rows", &a, &b);
 
@@ -2818,7 +2915,10 @@ async fn a_manual_compaction_on_the_harness() {
             AgentCommand::Compact { focus: None },
         ]
     };
-    let a = reference_production_until(Script::text(&["ok"]), &dir, cmds(), &[]).await;
+    let a = golden!(
+        "compact_rows",
+        reference_production_until(Script::text(&["ok"]), &dir, cmds(), &[]).await
+    );
     let b = on_harness_until(Script::text(&["ok"]), &dir, cmds(), &[]).await;
     // Frozen at 1, the same as the minimal path: the row list emits
     // `CompactionStarted` where the chain goes straight to `Compacted`. That
@@ -2850,7 +2950,10 @@ async fn a_snapshot_round_trip_on_the_harness() {
             AgentCommand::Snapshot,
         ]
     };
-    let a = reference_production_until(Script::text(&["ok"]), &dir, cmds(), &["Snapshot"]).await;
+    let a = golden!(
+        "snapshot_rows",
+        reference_production_until(Script::text(&["ok"]), &dir, cmds(), &["Snapshot"]).await
+    );
     let b = on_harness_until(Script::text(&["ok"]), &dir, cmds(), &["Snapshot"]).await;
     let report = judge("snapshot_rows", &a, &b);
 
@@ -2872,7 +2975,10 @@ async fn a_message_carrying_context_on_the_harness() {
             context: "the build is broken".into(),
         }]
     };
-    let a = reference_production(Script::text(&["fix it"]), &dir, cmds()).await;
+    let a = golden!(
+        "with_context_rows",
+        reference_production(Script::text(&["fix it"]), &dir, cmds()).await
+    );
     let b = on_harness(Script::text(&["fix it"]), &dir, cmds()).await;
     let report = judge("with_context_rows", &a, &b);
 
@@ -2893,7 +2999,10 @@ async fn a_synthetic_message_on_the_harness() {
             text: "keep going".into(),
         }]
     };
-    let a = reference_production(Script::text(&["carrying on"]), &dir, cmds()).await;
+    let a = golden!(
+        "synthetic_rows",
+        reference_production(Script::text(&["carrying on"]), &dir, cmds()).await
+    );
     let b = on_harness(Script::text(&["carrying on"]), &dir, cmds()).await;
     let report = judge("synthetic_rows", &a, &b);
 
@@ -2914,7 +3023,10 @@ async fn a_second_turn_sees_the_first_on_the_harness() {
     let script = || Script::text(&["first answer", "second answer"]);
     let asked = ["remember the number 41", "what number?"];
 
-    let a = drive_turns(production_agent(script(), &dir).await.spawn(), &asked).await;
+    let a = golden!(
+        "two_turns_rows",
+        drive_turns(production_agent(script(), &dir).await.spawn(), &asked).await
+    );
     let (handle, mut app) = on_harness_handle(script(), &dir).await;
     let b = drive_turns(handle, &asked).await;
     app.stop();
@@ -3023,7 +3135,10 @@ fn model_calls(steps: &[Step]) -> usize {
 async fn an_edit_that_was_never_verified_is_asked_about_on_both_engines() {
     let dir = scratch("verify-cadence-onharness");
     seed(&dir);
-    let a = reference_production(edits_and_stops(), &dir, say("fix a.rs")).await;
+    let a = golden!(
+        "verify_cadence_rows",
+        reference_production(edits_and_stops(), &dir, say("fix a.rs")).await
+    );
     let (handle, mut app) = on_harness_headless(edits_and_stops(), &dir).await;
     let b = drive_answering(handle, say("fix a.rs"), &[], None, allow()).await;
     app.stop();
@@ -3095,7 +3210,10 @@ async fn a_user_who_forbade_the_shell_is_not_nudged_into_using_it() {
     let dir = scratch("verify-cadence-forbidden");
     seed(&dir);
     let asked = || say("fix a.rs, and do not run any command");
-    let a = reference_production(edits_and_stops(), &dir, asked()).await;
+    let a = golden!(
+        "verify_cadence_forbidden_rows",
+        reference_production(edits_and_stops(), &dir, asked()).await
+    );
     let (handle, mut app) = on_harness_headless(edits_and_stops(), &dir).await;
     let b = drive_answering(handle, asked(), &[], None, allow()).await;
     app.stop();
@@ -3132,7 +3250,10 @@ async fn a_command_the_user_forbade_is_refused_on_both_engines() {
         ])
     };
     let asked = || say("check the build, and do not run any command");
-    let a = reference_production(script(), &dir, asked()).await;
+    let a = golden!(
+        "exec_policy_rows",
+        reference_production(script(), &dir, asked()).await
+    );
     let (handle, mut app) = on_harness_headless(script(), &dir).await;
     let b = drive_answering(handle, asked(), &[], None, allow()).await;
     app.stop();
@@ -3179,7 +3300,10 @@ async fn a_refused_call_is_never_announced_as_started() {
             Reply::Text("stopped"),
         ])
     };
-    let a = reference_production_answering(script(), &dir, say("clean it"), deny()).await;
+    let a = golden!(
+        "refused_call_started_rows",
+        reference_production_answering(script(), &dir, say("clean it"), deny()).await
+    );
     let b = on_harness_answering(script(), &dir, say("clean it"), deny()).await;
     let report = judge("refused_call_started_rows", &a, &b);
 
@@ -3516,7 +3640,10 @@ async fn a_users_hook_can_refuse_a_tool_on_both_engines() {
         ])
     };
 
-    let a = reference_production(script(), &dir, say("read a.rs")).await;
+    let a = golden!(
+        "cc_hooks_deny_rows",
+        reference_production(script(), &dir, say("read a.rs")).await
+    );
 
     let quiet = quiet_rows(&dir);
     let insert = format!(
@@ -3572,7 +3699,10 @@ async fn without_a_hooks_file_nothing_is_mounted_and_nothing_changes() {
         ])
     };
 
-    let a = reference_production(script(), &dir, say("read a.rs")).await;
+    let a = golden!(
+        "cc_hooks_absent_rows",
+        reference_production(script(), &dir, say("read a.rs")).await
+    );
 
     let quiet = quiet_rows(&dir);
     let insert = format!(
@@ -4013,14 +4143,17 @@ async fn a_logout_drops_the_provider_object_and_not_only_the_seam() {
 // is a subagent capability the chain has and the tree did not.
 
 /// The tool names each engine offers the model for the same turn.
-async fn catalogs(dir: &std::path::Path) -> (Vec<String>, Vec<String>) {
-    let chain = Script::text(&["ok"]);
-    let _ = reference_production(chain.clone(), dir, say("hi")).await;
+async fn catalogs(key: &str, dir: &std::path::Path) -> (Vec<String>, Vec<String>) {
+    let chain_tools: Vec<String> = golden!(key, {
+        let chain = Script::text(&["ok"]);
+        let _ = reference_production(chain.clone(), dir, say("hi")).await;
+        chain.tools()
+    });
     let rows = Script::text(&["ok"]);
     let (handle, mut app) = on_harness_handle(rows.clone(), dir).await;
     let _ = drive_answering(handle, say("hi"), &[], None, allow()).await;
     app.stop();
-    (chain.tools(), rows.tools())
+    (chain_tools, rows.tools())
 }
 
 /// Differences that are DECISIONS, each with its reason. Anything else is drift.
@@ -4052,7 +4185,7 @@ const KNOWN_TOOL_DIFFERENCES: &[(&str, &str)] = &[
 async fn both_engines_offer_the_model_the_same_tools() {
     let dir = scratch("tool-catalog");
     seed(&dir);
-    let (chain, rows) = catalogs(&dir).await;
+    let (chain, rows) = catalogs("catalog", &dir).await;
 
     let known = |name: &String| KNOWN_TOOL_DIFFERENCES.iter().any(|(n, _)| n == name);
     let missing: Vec<&String> = chain
@@ -4110,16 +4243,21 @@ const PROMPT_MAY_NAME_A_PHANTOM: &[(&str, &str)] = &[];
 async fn neither_prompt_names_a_tool_only_the_other_engine_mounts() {
     let dir = scratch("prompt-phantom");
     seed(&dir);
-    let chain_script = Script::text(&["ok"]);
-    let _ = reference_production(chain_script.clone(), &dir, say("hi")).await;
+    let (chain_tools, chain_prompt): (Vec<String>, String) = golden!("prompt_phantom", {
+        let chain_script = Script::text(&["ok"]);
+        let _ = reference_production(chain_script.clone(), &dir, say("hi")).await;
+        // The scratch path is this run's, not the chain's; the record keeps neither.
+        let prompt = chain_script
+            .system_prompt()
+            .replace(&*dir.to_string_lossy(), "<scratch>");
+        (chain_script.tools(), prompt)
+    });
     let rows_script = Script::text(&["ok"]);
     let (handle, mut app) = on_harness_handle(rows_script.clone(), &dir).await;
     let _ = drive_answering(handle, say("hi"), &[], None, allow()).await;
     app.stop();
 
-    let chain_tools = chain_script.tools();
     let rows_tools = rows_script.tools();
-    let chain_prompt = chain_script.system_prompt();
     let rows_prompt = rows_script.system_prompt();
     // A tree whose prompt is empty would pass every assertion below in silence.
     for (whose, prompt) in [("chain", &chain_prompt), ("row list", &rows_prompt)] {
@@ -4188,11 +4326,11 @@ async fn offline_takes_the_web_tools_off_both_engines() {
     seed(&dir);
 
     seed_offline_verdict(OfflineMode::On, None);
-    let offline = catalogs(&dir).await;
+    let offline = catalogs("catalog_offline", &dir).await;
     // Back to online BEFORE any assertion: a panic here must not leave the
     // process verdict flipped for whatever test shares it.
     seed_offline_verdict(OfflineMode::Off, None);
-    let online = catalogs(&dir).await;
+    let online = catalogs("catalog_online", &dir).await;
 
     let web = |names: &Vec<String>| {
         names
@@ -4245,7 +4383,10 @@ async fn only_the_row_list_says_what_it_injected() {
         }]
     };
 
-    let chain = injections(reference(Script::text(&["ok"]), &dir, cmds()).await);
+    let chain = injections(golden!(
+        "context_added",
+        reference(Script::text(&["ok"]), &dir, cmds()).await
+    ));
     let rows = injections(candidate(Script::text(&["ok"]), &dir, cmds()).await);
 
     assert!(
