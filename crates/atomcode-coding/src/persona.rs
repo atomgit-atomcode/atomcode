@@ -222,7 +222,9 @@ pub(crate) fn coding_persona_rows(
         // `todo`/`review` are still passed on: they are what put the two paragraphs there for
         // the removals below to take out. Nothing else about the chain text changes.
         true,
-        mounted("request_user_input"),
+        // Brought by the host with the tool (`host_tool_guidance`), not asked of the
+        // tree here: whether it is mounted yet depends on which row applied first.
+        false,
         true,
         false,
         false,
@@ -696,6 +698,7 @@ when its distinct capability is the point.";
 /// the words the chain has always used for it.
 pub(crate) fn host_tool_guidance(tool: &str) -> Option<(&'static str, &'static str)> {
     let (key, section) = match tool {
+        "request_user_input" => ("ask", REQUEST_USER_INPUT_USAGE),
         "task" => ("task", SUBAGENT_DELEGATION),
         "team" => ("team", TEAM_DELEGATION),
         "code_review" => ("code-review", CODE_REVIEW_USAGE),
@@ -1962,16 +1965,17 @@ mod tests {
             !absent.contains("## MEMORY"),
             "no tool, no guidance — this is the phantom-call case the gate exists for"
         );
-        // Same question, second section. `## ASKING THE USER` teaches `request_user_input`, and
-        // the row list mounts `ask_user` — so on the real tree this is the section that must be
-        // ABSENT, and a row that ever mounts that name gets it back.
+        // `## ASKING THE USER` is not the persona's to decide any more: the host mounts the
+        // product's `request_user_input` and brings the section with it, so whether it shows
+        // cannot depend on which row happened to apply first.
         assert!(
-            mounted.contains("## ASKING THE USER"),
-            "the name is mounted here, so the section follows it"
+            !mounted.contains("## ASKING THE USER") && !absent.contains("## ASKING THE USER"),
+            "the section travels with the host's tool, never in the persona"
         );
         assert!(
-            !absent.contains("## ASKING THE USER"),
-            "and an unmounted `request_user_input` must not be advertised"
+            super::host_tool_guidance("request_user_input")
+                .is_some_and(|(_, text)| text.starts_with("## ASKING THE USER")),
+            "and the host has it to bring"
         );
         // And nothing else moved with it: the gate must not silently drop other sections.
         for section in ["## SKILLS:", "## DOING TASKS", "## WHEN COMMANDS FAIL"] {

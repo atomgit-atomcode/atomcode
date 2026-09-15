@@ -689,7 +689,11 @@ impl Plugin for HostToolsPlugin {
                 if guided.insert(key) {
                     let id = format!("host-tool-{key}");
                     // Beside the rows that describe their own tools.
-                    let rank = if key == "code-review" { 58 } else { 57 };
+                    let rank = match key {
+                        "ask" => 56,
+                        "code-review" => 58,
+                        _ => 57,
+                    };
                     prompts.contribute(&id, rank, text);
                     let prompts = prompts.clone();
                     let _ = ctx.effect(move || prompts.remove(&id));

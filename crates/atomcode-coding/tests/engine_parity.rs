@@ -2073,6 +2073,38 @@ async fn a_requested_compaction_is_summarized_by_the_model_about_the_focus(engin
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// The product's guidance for the tools the host mounts is in the system prompt,
+/// once each, whatever order the tree happens to mount things in.
+async fn the_prompt_teaches_each_product_tool_once(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(production_start(env.project.path(), &recorder, |_| {}))
+        .await
+        .unwrap();
+    turn(&mut runtime, "hello").await;
+    let first = recorder.requests.lock().unwrap()[0].clone();
+    let system: String = first
+        .iter()
+        .filter(|m| m.role == Role::System && !m.synthetic)
+        .map(|m| m.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    for heading in [
+        "## ASKING THE USER:",
+        "## DELEGATING WITH `task`:",
+        "## TEAM AGENT:",
+        "## CODE REVIEW:",
+    ] {
+        assert_eq!(
+            system.matches(heading).count(),
+            1,
+            "[{engine}] `{heading}` should appear exactly once"
+        );
+    }
+    runtime.handle.shutdown().await.unwrap();
+}
+
 // ---- what the model is offered ---------------------------------------------
 
 /// The start a production driver makes: every capability the chain turns on
@@ -2278,4 +2310,5 @@ on_both_engines!(
     a_cut_off_turn_asks_before_giving_up,
     a_silent_stream_times_the_turn_out,
     a_requested_compaction_is_summarized_by_the_model_about_the_focus,
+    the_prompt_teaches_each_product_tool_once,
 );
