@@ -533,6 +533,9 @@ pub struct Agent {
     /// broken model. Opening a turn mints a fresh one; cancelling fires the one
     /// in flight.
     cancel: RwLock<CancellationToken>,
+    /// Set when the current turn was stopped by a person rather than by the
+    /// harness (a reconfigure, a shutdown). Read once, at the turn's end.
+    interrupted: std::sync::atomic::AtomicBool,
 }
 
 impl Agent {
@@ -611,6 +614,23 @@ impl Agent {
         self.cancel.read().expect("cancel token poisoned").cancel();
     }
 
+    /// Cancel on a person's behalf: the turn stops, and the history is told so.
+    /// [`Agent::cancel`] is the harness stopping a turn for its own reasons
+    /// (reconfiguring, shutting down), which abandons nothing.
+    pub fn interrupt(&self) {
+        if self.status() == AgentStatus::Working {
+            self.interrupted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.cancel();
+    }
+
+    /// Whether a person interrupted the turn now ending. Clears the mark.
+    pub fn take_interrupted(&self) -> bool {
+        self.interrupted
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn cancelled(&self) -> bool {
         self.cancel
             .read()
@@ -629,6 +649,8 @@ impl Agent {
     /// Every loop implementation calls this, because "which token is this turn
     /// running under" is the agent's fact, not the driver's.
     pub fn begin_turn(&self) -> CancellationToken {
+        self.interrupted
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let fresh = CancellationToken::new();
         *self.cancel.write().expect("cancel token poisoned") = fresh.clone();
         self.set_status(AgentStatus::Working);
@@ -780,6 +802,7 @@ impl Agents {
             world: Mutex::new(world),
             status: RwLock::new(AgentStatus::Idle),
             cancel: RwLock::new(CancellationToken::new()),
+            interrupted: std::sync::atomic::AtomicBool::new(false),
         });
         self.agents
             .write()

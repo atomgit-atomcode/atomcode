@@ -30,6 +30,84 @@ fn log_with(events: Vec<SessionEvent>) -> SessionLog {
     log
 }
 
+/// A turn the person interrupted: undone, its work is gone from the model's
+/// view and a note stands in; kept, its unanswered calls get a cancelled result
+/// so the next request still pairs every call with an answer.
+#[test]
+fn an_interrupted_turn_is_undone_or_kept_and_always_noted() {
+    let interrupted = |undone: bool| {
+        log_with(vec![
+            SessionEvent::TurnStart { turn: 1 },
+            SessionEvent::UserMessage {
+                turn: 1,
+                text: "first".into(),
+                images: vec![],
+            },
+            SessionEvent::AssistantMessage {
+                turn: 1,
+                round: 1,
+                text: "done".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            },
+            SessionEvent::TurnStart { turn: 2 },
+            SessionEvent::Injected {
+                turn: 2,
+                text: "remembered".into(),
+                origin: InjectionOrigin::Memory,
+            },
+            SessionEvent::UserMessage {
+                turn: 2,
+                text: "second".into(),
+                images: vec![],
+            },
+            SessionEvent::AssistantMessage {
+                turn: 2,
+                round: 1,
+                text: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            },
+            SessionEvent::Interrupted { turn: 2, undone },
+        ])
+    };
+
+    let undone = interrupted(true).derive_messages();
+    let texts: Vec<&str> = undone.iter().map(|m| m.text.as_str()).collect();
+    assert!(texts.contains(&"first"));
+    assert!(
+        !texts.contains(&"second"),
+        "the undone prompt is gone: {texts:?}"
+    );
+    assert!(
+        undone.iter().all(|m| m.tool_calls.is_empty()),
+        "and its calls"
+    );
+    assert!(
+        texts.contains(&"remembered"),
+        "memory is the session's, not the turn's"
+    );
+    assert!(undone.last().unwrap().is_user_interruption());
+
+    let kept = interrupted(false).derive_messages();
+    let texts: Vec<&str> = kept.iter().map(|m| m.text.as_str()).collect();
+    assert!(texts.contains(&"second"), "{texts:?}");
+    let answer = kept
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+        .expect("the unanswered call gets a result");
+    assert!(answer.is_error && answer.text == "(cancelled)");
+    assert!(kept.last().unwrap().is_user_interruption());
+}
+
 #[test]
 fn the_projection_is_the_only_path_from_facts_to_a_prompt() {
     let log = log_with(vec![

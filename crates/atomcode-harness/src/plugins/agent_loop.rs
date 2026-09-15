@@ -51,6 +51,11 @@ struct LoopRow {
     /// channel into the prompt) is invisible otherwise.
     #[serde(default = "default_true")]
     verify_log_invariant: bool,
+    /// When a person cancels a turn, take the turn's prompt and partial work out
+    /// of what the model sees next (a note of the interruption stays). Off keeps
+    /// them, with a cancelled result for any call that never ran.
+    #[serde(default)]
+    undo_cancelled: bool,
 }
 
 impl Default for LoopRow {
@@ -59,6 +64,7 @@ impl Default for LoopRow {
             max_rounds: default_max_rounds(),
             working_dir: None,
             verify_log_invariant: true,
+            undo_cancelled: false,
         }
     }
 }
@@ -78,6 +84,7 @@ struct PluginAgentLoop {
     working_dir: PathBuf,
     max_rounds: u32,
     verify_log_invariant: bool,
+    undo_cancelled: bool,
 }
 
 impl PluginAgentLoop {
@@ -650,6 +657,15 @@ impl PluginAgentLoop {
             }
         }
 
+        if outcome.stop == StopReason::Cancelled && agent.take_interrupted() {
+            self.commit(
+                &session,
+                SessionEvent::Interrupted {
+                    turn,
+                    undone: self.undo_cancelled,
+                },
+            );
+        }
         self.ctx.parallel::<TurnFinishing>(&outcome).await;
         self.commit(
             &session,
@@ -840,6 +856,7 @@ impl Plugin for AgentLoopPlugin {
             working_dir,
             max_rounds: row.max_rounds,
             verify_log_invariant: row.verify_log_invariant,
+            undo_cancelled: row.undo_cancelled,
         };
         let _ = ctx
             .provide::<AgentLoopSvc>(Arc::new(driver))

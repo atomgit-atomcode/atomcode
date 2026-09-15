@@ -262,6 +262,18 @@ pub enum SessionEvent {
         turn: u64,
         title: String,
     },
+    /// The person stopped this turn.
+    ///
+    /// Model-visible, because what the model is shown next depends on it: a note
+    /// that it was interrupted, and — when `undone` — none of the turn's own work.
+    /// The facts stay in the log; the projection leaves them out. Committed only
+    /// for a person's cancel, not for the harness stopping a turn to reconfigure
+    /// or shut down: those do not mean anyone abandoned the request.
+    Interrupted {
+        turn: u64,
+        /// The turn's prompt and partial work no longer reach the model.
+        undone: bool,
+    },
     /// A hard boundary ended the turn and the person has to choose how to go on.
     ///
     /// Screen-visible, so logged: the recovery choices ("complete it yourself",
@@ -303,6 +315,7 @@ impl SessionEvent {
             | Self::Notice { turn, .. }
             | Self::Titled { turn, .. }
             | Self::PolicyIntervention { turn, .. }
+            | Self::Interrupted { turn, .. }
             | Self::TurnEnd { turn, .. } => *turn,
         }
     }
@@ -317,6 +330,7 @@ impl SessionEvent {
                 | Self::ToolResultLogged { .. }
                 | Self::Injected { .. }
                 | Self::Compacted { .. }
+                | Self::Interrupted { .. }
         )
     }
 }
@@ -339,9 +353,10 @@ impl SessionEvent {
 /// exist only on the screen that asked, which is the one thing a log is
 /// supposed to be able to redraw.
 ///
-/// **4** — added [`SessionEvent::PolicyIntervention`], and `PolicyDenied` as a
-/// way a turn ends. Same shape again: a hard boundary's recovery choice was a
-/// kernel event the log never saw.
+/// **4** — added [`SessionEvent::PolicyIntervention`], `PolicyDenied` as a way a
+/// turn ends, and [`SessionEvent::Interrupted`]. Same shape again: a hard
+/// boundary's recovery choice, and what a person's cancel does to the history,
+/// were kernel behaviour the log never saw.
 pub const SESSION_FORMAT_VERSION: u32 = 4;
 
 fn now_ms() -> u64 {
@@ -615,6 +630,17 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
         }
     }
 
+    // Turns the person interrupted and asked to have undone: their own work
+    // leaves the projection. Memory and a compaction summary are not the turn's
+    // work — they stand for the session — so they stay.
+    let undone: std::collections::HashSet<u64> = events
+        .iter()
+        .filter_map(|logged| match logged.event {
+            SessionEvent::Interrupted { turn, undone: true } => Some(turn),
+            _ => None,
+        })
+        .collect();
+
     let mut messages = Vec::new();
     if let Some(summary) = summary {
         let mut message = Message::system(summary);
@@ -623,7 +649,46 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
     }
 
     for logged in events.iter().filter(|e| e.seq > floor) {
+        let session_wide = matches!(
+            &logged.event,
+            SessionEvent::Injected {
+                origin: InjectionOrigin::Memory | InjectionOrigin::CompactionSummary,
+                ..
+            } | SessionEvent::Interrupted { .. }
+        );
+        if !session_wide && undone.contains(&logged.event.turn()) {
+            continue;
+        }
         match &logged.event {
+            SessionEvent::Interrupted { turn, undone } => {
+                // Kept: every call the turn asked for has a result, or the next
+                // request pairs a call with nothing and a provider rejects it.
+                if !undone {
+                    let answered: std::collections::HashSet<&str> = events
+                        .iter()
+                        .filter_map(|e| match &e.event {
+                            SessionEvent::ToolResultLogged { call_id, .. } => {
+                                Some(call_id.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    for e in events.iter().filter(|e| e.event.turn() == *turn) {
+                        if let SessionEvent::AssistantMessage { tool_calls, .. } = &e.event {
+                            for call in tool_calls {
+                                if !answered.contains(call.id.as_str()) {
+                                    messages.push(Message::tool_result(
+                                        &call.id,
+                                        "(cancelled)",
+                                        true,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                messages.push(Message::user_interruption());
+            }
             SessionEvent::UserMessage { text, images, .. } => {
                 if images.is_empty() {
                     messages.push(Message::user(text));

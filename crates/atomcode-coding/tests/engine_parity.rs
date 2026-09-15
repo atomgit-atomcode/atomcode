@@ -98,6 +98,10 @@ impl LlmProvider for RecordingProvider {
                     .to_string(),
                 })
             }
+            // A request that never answers: the only way out is a cancel.
+            Some(m) if m.role == Role::User && m.text == "hang" => {
+                return Ok(Box::pin(futures::stream::pending()));
+            }
             Some(m) if m.role == Role::User && m.text == "mcp echo" => {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
@@ -1231,6 +1235,87 @@ async fn an_mcp_servers_tools_are_offered_and_run(engine: &str) {
     );
 }
 
+/// Cancel a turn that is waiting on the model, and wait for it to end.
+async fn cancel_hanging_turn(runtime: &mut CodingRuntime, recorder: &Recorder) {
+    let before = recorder.requests.lock().unwrap().len();
+    runtime
+        .handle
+        .submit(UserInput::from("hang"))
+        .await
+        .unwrap();
+    // Until the request is out there is nothing to interrupt.
+    for _ in 0..500 {
+        if recorder.requests.lock().unwrap().len() > before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    runtime.handle.cancel().await.unwrap();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("the cancelled turn did not finish")
+            .expect("runtime event stream closed");
+        if matches!(event.event, CodingRuntimeEvent::TurnFinished(_)) {
+            return;
+        }
+    }
+}
+
+/// By default a cancelled turn leaves no trace in what the model sees next —
+/// only a note that the person interrupted.
+async fn a_cancelled_turn_is_undone_by_default(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+
+    turn(&mut runtime, "first").await;
+    cancel_hanging_turn(&mut runtime, &recorder).await;
+    turn(&mut runtime, "third").await;
+
+    let seen = recorder.last_request();
+    assert_eq!(
+        user_texts(&seen),
+        vec!["first".to_string(), "third".to_string()],
+        "[{engine}] {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|m| m.is_user_interruption()),
+        "[{engine}] no interruption note: {seen:?}"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// With `keep_interrupted_context`, the cancelled prompt stays in the history.
+async fn a_cancelled_turn_is_kept_when_asked(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.agent.keep_interrupted_context = true;
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    turn(&mut runtime, "first").await;
+    cancel_hanging_turn(&mut runtime, &recorder).await;
+    turn(&mut runtime, "third").await;
+
+    let seen = recorder.last_request();
+    assert_eq!(
+        user_texts(&seen),
+        vec!["first".to_string(), "hang".to_string(), "third".to_string()],
+        "[{engine}] {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|m| m.is_user_interruption()),
+        "[{engine}] no interruption note: {seen:?}"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 // ---- what the model is offered ---------------------------------------------
 
 /// The start a production driver makes: every capability the chain turns on
@@ -1407,4 +1492,6 @@ on_both_engines!(
     a_permission_rule_refuses_what_it_denies,
     a_round_budget_ends_the_turn,
     an_mcp_servers_tools_are_offered_and_run,
+    a_cancelled_turn_is_undone_by_default,
+    a_cancelled_turn_is_kept_when_asked,
 );

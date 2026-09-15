@@ -357,7 +357,11 @@ impl Projector {
             // the answer the model sees travels its own way — as the tool's
             // result.
             | SessionEvent::Asked { .. }
-            | SessionEvent::Answered { .. } => Vec::new(),
+            | SessionEvent::Answered { .. }
+            // The driver already knows: it sent the cancel, and the turn's end
+            // says `Cancelled`. What changed is the model's view, which is the
+            // log's business.
+            | SessionEvent::Interrupted { .. } => Vec::new(),
         }
     }
 }
@@ -840,7 +844,8 @@ async fn pump(
                 continue;
             }
             AgentCommand::Cancel => {
-                agent.cancel();
+                // The driver's cancel is a person's: the turn's end records it.
+                agent.interrupt();
                 // And release anything parked on an answer. Cancelling is
                 // cooperative: a tool blocked on an approval nobody will now
                 // give never reaches a point where it can observe the token,

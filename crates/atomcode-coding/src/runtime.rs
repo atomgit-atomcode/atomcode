@@ -7686,6 +7686,12 @@ fn harness_option_rows(
     rows.push_str(&format!(
         "[[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ resume = false, project_root = {wd} }}\n\n"
     ));
+    // Ctrl-C semantics: by default a cancelled turn is undone — its prompt and
+    // partial work leave what the model sees next, as the chain rolls them back.
+    rows.push_str(&format!(
+        "[[patch]]\nid = \"agent-loop\"\nconfig = {{ working_dir = {wd}, undo_cancelled = {} }}\n\n",
+        !config.keep_interrupted_context
+    ));
     if parts.subagent_provider.is_some() {
         rows.push_str(&format!(
             "[[patch]]\nid = \"team-in-process\"\nconfig = {{ project_root = {wd}, max_members = 6, max_rounds = 24 }}\n\n"
