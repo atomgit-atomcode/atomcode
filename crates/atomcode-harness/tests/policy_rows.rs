@@ -1021,3 +1021,165 @@ async fn without_the_gate_rows_the_same_workspace_write_is_refused() {
          proves nothing about the gates"
     );
 }
+
+// ---- the card is a fact --------------------------------------------------
+//
+// Asking a person used to be the one thing on screen that was not in the log:
+// the question went out through `user-questions`, the answer came back as a
+// tool result, and what the person decided was written nowhere. So a remounted
+// panel lost the answer and a resumed session redrew an approved call with no
+// sign anyone had been asked. These hold the two halves of the fix — the fact
+// is committed, and it carries enough of the card to redraw it.
+
+/// Every question this session put, with what came back.
+///
+/// Both halves of the exchange, in log order: a client connecting midway needs
+/// the question to be there while it is still waiting, and the answer to say
+/// what was decided.
+fn logged_answers(app: &App) -> Vec<(Question, Option<String>, String)> {
+    use atomcode_harness::session::SessionEvent;
+    let mut out: Vec<(Question, Option<String>, String)> = Vec::new();
+    for logged in app.context().only_session().unwrap().events() {
+        match logged.event {
+            SessionEvent::Asked { question, .. } => out.push((question, None, String::new())),
+            SessionEvent::Answered { answer, by, .. } => {
+                if let Some(last) = out.last_mut() {
+                    last.1 = answer;
+                    last.2 = by;
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn an_approval_is_a_fact_the_log_can_redraw() {
+    let dir = scratch("approval-logged");
+    let target = dir.join("out.txt");
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = plugins::catalog();
+    registry.register(Arc::new(RecorderPlugin(asked.clone())));
+    let swap = "[[patch]]\nid = \"user-questions-unattended\"\nname = \"user-questions-recorder\"";
+    let tool = script_one(
+        "write_file",
+        &format!(
+            r#"{{ file_path = {:?}, content = "written" }}"#,
+            target.to_string_lossy()
+        ),
+    );
+    let mut app = App::new(registry, tree(&dir, &tool, &[bundle::INTERACTIVE, swap]));
+    app.start().await.unwrap();
+    run_turn(&app, "write it").await.unwrap();
+
+    let cards = logged_answers(&app);
+    assert_eq!(cards.len(), 1, "one answered question, one fact: {cards:?}");
+    let (question, answer, by) = &cards[0];
+    assert_eq!(
+        answer.as_deref(),
+        Some(ANSWER_ALLOW),
+        "the answer is the value the seam returned, verbatim — a screen \
+         translates it, a log records it"
+    );
+    assert_eq!(
+        by, "scripted human (records the card)",
+        "and which front end gave it: the record is worth less without it the \
+         moment two clients can answer one session"
+    );
+    // Everything a card needs to be drawn again: what was asked, the answers
+    // that were offered (a bare `allow` means nothing without them), and the
+    // call under review.
+    assert!(
+        question.prompt.contains("write_file"),
+        "the card names the tool: {question:?}"
+    );
+    assert_eq!(
+        question.values(),
+        vec![
+            ANSWER_ALLOW.to_string(),
+            ANSWER_ALWAYS.to_string(),
+            ANSWER_DENY.to_string()
+        ],
+        "and the options the person chose between"
+    );
+    let about = question
+        .about
+        .as_ref()
+        .expect("an approval is about a call");
+    assert_eq!(about.tool, "write_file");
+    assert!(
+        about.arguments.contains("out.txt"),
+        "the bytes that ran, not a paraphrase: {about:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_declined_question_is_logged_as_declined_and_not_as_absent() {
+    // The negative control, and the reason `answer` is an Option rather than
+    // just the value: "nobody answered" and "nobody was asked" are different
+    // things to a person reading back, and a log that folded them together
+    // would redraw a call nobody allowed as one that was never offered.
+    let dir = scratch("decline-logged");
+    let target = dir.join("out.txt");
+    let mut registry = plugins::catalog();
+    registry.register(Arc::new(DeclinesPlugin));
+    let swap = "[[patch]]\nid = \"user-questions-unattended\"\nname = \"user-questions-declines\"";
+    let tool = script_one(
+        "write_file",
+        &format!(
+            r#"{{ file_path = {:?}, content = "written" }}"#,
+            target.to_string_lossy()
+        ),
+    );
+    let mut app = App::new(registry, tree(&dir, &tool, &[bundle::INTERACTIVE, swap]));
+    app.start().await.unwrap();
+    run_turn(&app, "write it").await.unwrap();
+
+    assert!(!target.exists(), "a declined call does not run");
+    let cards = logged_answers(&app);
+    assert_eq!(cards.len(), 1, "asked and closed with nothing: {cards:?}");
+    assert_eq!(
+        cards[0].1, None,
+        "a refusal is recorded as the absence of an answer"
+    );
+    assert_eq!(
+        cards[0].2, "scripted human (declines)",
+        "and the client that closed it is named"
+    );
+    assert!(
+        cards[0].0.prompt.contains("write_file"),
+        "and the question is still there, so the card can say what was refused"
+    );
+}
+
+/// A person who says no, by returning nothing.
+struct Declines;
+
+#[async_trait]
+impl UserQuestions for Declines {
+    fn describe(&self) -> String {
+        "scripted human (declines)".into()
+    }
+    async fn ask(&self, _question: &Question) -> Option<String> {
+        None
+    }
+}
+
+struct DeclinesPlugin;
+
+#[async_trait]
+impl Plugin for DeclinesPlugin {
+    fn name(&self) -> &'static str {
+        "user-questions-declines"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["user-questions"]
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<UserQuestionsSvc>(Arc::new(Declines))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}

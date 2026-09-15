@@ -686,45 +686,6 @@ impl UserInterface for Tui {
     }
 }
 
-/// What was asked and what was said, as a settled fact of the conversation —
-/// the screen must be able to explain itself later. A free function because
-/// both paths write it: the keyboard at the foot of the stream, and the modal's
-/// callback, which outlives the borrow it was created from.
-fn record_answer(
-    host: &Host,
-    question: &atomcode_harness::seams::Question,
-    answer: &Option<String>,
-) {
-    let said = match answer {
-        Some(value) => crate::ask::answer_label(
-            value,
-            &question
-                .options
-                .iter()
-                .find(|a| &a.value == value)
-                .map(|a| a.label.clone())
-                .unwrap_or_else(|| value.clone()),
-        ),
-        // No answer is a refusal, and the record says so in the same words the
-        // card offered for it.
-        None => crate::ask::answer_label(atomcode_harness::seams::ANSWER_DENY, "declined"),
-    };
-    let mut stream = host.stream.write().expect("stream poisoned");
-    let mut w = stream.writer("questions");
-    w.emit(
-        crate::block::Coord::default(),
-        Arc::new(crate::content::ChoiceBlock {
-            question: crate::ask::recorded(question),
-            options: question
-                .options
-                .iter()
-                .map(|a| crate::ask::answer_label(&a.value, &a.label))
-                .collect(),
-            answer: Some(said),
-        }),
-    );
-}
-
 impl Tui {
     fn paint(&self) {
         let frame = self.host.compose(self.surface.size());
@@ -1301,7 +1262,6 @@ impl Tui {
             return false; // a move, or an unrecognised key: nothing to deliver
         };
         if let Some(p) = self.host.asks.take() {
-            record_answer(&self.host, &question, &answer);
             p.answer(answer);
         }
         false
@@ -1342,12 +1302,8 @@ impl Tui {
 
     /// Deliver whatever the panel is pointed at. `true` to quit, for the key path.
     fn confirm_question(&self) -> bool {
-        let Some((_, question)) = self.host.asks.peek() else {
-            return false;
-        };
         let answer = self.pointed_at();
         if let Some(p) = self.host.asks.take() {
-            record_answer(&self.host, &question, &answer);
             p.answer(answer);
         }
         false

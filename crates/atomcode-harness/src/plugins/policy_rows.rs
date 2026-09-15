@@ -329,40 +329,30 @@ impl crate::seams::ApprovalPolicy for AskingPolicy {
         {
             return Decision::Allow;
         }
-        let Some(questions) = self.ctx.service::<UserQuestionsSvc>() else {
+        // Refused before anything is asked, so a tree with nothing to ask
+        // through denies rather than quietly allowing.
+        if self.ctx.service::<UserQuestionsSvc>().is_none() {
             return Decision::Deny("no way to ask for approval".into());
-        };
+        }
         let asker = self.asker();
-        let question = crate::seams::Question {
-            prompt: match &asker {
-                Some(who) => format!("Allow `{}` to run, asked for by `{who}`?", tool.name()),
-                None => format!("Allow `{}` to run?", tool.name()),
-            },
-            options: {
-                let mut o = vec![crate::seams::Answer::labelled(
-                    crate::seams::ANSWER_ALLOW,
-                    "allow once",
-                )];
-                if grantable {
-                    o.push(crate::seams::Answer::labelled(
-                        crate::seams::ANSWER_ALWAYS,
-                        "always allow",
-                    ));
-                }
-                o.push(crate::seams::Answer::labelled(
-                    crate::seams::ANSWER_DENY,
-                    "deny",
-                ));
-                o
-            },
+        // One constructor with the driver's own approval path (`Asker::decide`
+        // in `handle.rs`), so the same call reads the same way wherever the
+        // question is asked and the log records one question rather than two
+        // dialects for it.
+        let question = crate::seams::Question::approval(
+            tool.name(),
+            &call.arguments,
+            grantable.then_some(scope.as_str()),
             asker,
-            about: Some(crate::seams::AboutCall {
-                tool: tool.name().to_string(),
-                arguments: call.arguments.clone(),
-                grant: grantable.then_some(scope),
-            }),
-        };
-        match questions.ask(&question).await.as_deref() {
+        );
+        // `ask_person`, not the seam directly: the question and its answer are
+        // one fact, and this is the row holding both. The transcript draws the
+        // card from that fact, the way it draws every other block — see
+        // [`SessionEvent::Answered`].
+        match crate::agent::ask_person(&self.ctx, question)
+            .await
+            .as_deref()
+        {
             Some(crate::seams::ANSWER_ALLOW) => Decision::Allow,
             Some(crate::seams::ANSWER_ALWAYS) => {
                 self.granted.lock().expect("grants poisoned").insert(grant);

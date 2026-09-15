@@ -2902,3 +2902,110 @@ async fn a_resumed_session_redraws_the_conversation_it_left_behind() {
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
+
+/// Every fact of a session that has reached the file so far.
+async fn persisted_facts(s: &Session, id: &str) -> Vec<atomcode_harness::session::SessionEvent> {
+    s.app
+        .service::<atomcode_harness::seams::SessionPersistenceSvc>()
+        .expect("the persistence row is mounted")
+        .load(id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.event)
+        .collect()
+}
+
+/// An approval survives a resume.
+///
+/// This was the one thing on screen that existed nowhere else. The question went
+/// out through the `user-questions` seam and the answer came back as the tool's
+/// result, so what a person decided was drawn on the transcript and written
+/// down by nobody: a resumed session redrew the call that was approved with no
+/// sign anyone had ever been asked, and a panel remounted mid-session lost the
+/// answer the same way. `session.rs` states the rule this broke — what the
+/// screen shows, the log records — so the fix is a fact, and this is the test
+/// that says so from a **second process's** picture. Nothing here can pass by
+/// the first screen still being on the wall.
+#[tokio::test]
+async fn a_resumed_session_shows_the_approval_it_was_given() {
+    use atomcode_harness::session::SessionEvent;
+
+    let home = scratch("approve-resume-home");
+    let root = scratch("approve-resume-work");
+    let id = "approved-id";
+    let script = replay(
+        r#"{ text = "Writing.", calls = [ { name = "write_file", args = { file_path = "out.txt", content = "written" } } ] },
+           { text = "Done." }"#,
+    );
+    // The resumable tree runs `yolo` by default: a resume test about approval
+    // has to turn the asking on first, or there is no question to lose.
+    let asking_here = [
+        "[[patch]]\nid = \"approval\"\ndisabled = true\n",
+        "[[patch]]\nid = \"approval-interactive\"\ndisabled = false\n",
+    ];
+
+    {
+        let s = start(tree_resumable(
+            &root,
+            &home,
+            id,
+            false,
+            &script,
+            &asking_here,
+        ))
+        .await;
+        let task = s.open().await;
+        s.term.type_line("write it");
+        // The turn is deliberately blocked on the answer, so this waits for the
+        // question rather than for quiet.
+        until(&s, "esc 拒绝").await;
+        s.term.press(KeyPress::ch('1'));
+        s.quiet().await;
+        assert_eq!(
+            std::fs::read_to_string(root.join("out.txt")).unwrap_or_default(),
+            "written",
+            "the allowed call ran"
+        );
+        // The writer is behind its own queue, so wait for the *fact* rather than
+        // for the turn: a resume test that skipped this would be racing its own
+        // fixture, and would sometimes pass on an empty file.
+        let mut landed = false;
+        for _ in 0..200 {
+            if persisted_facts(&s, id)
+                .await
+                .iter()
+                .any(|f| matches!(f, SessionEvent::Answered { .. }))
+            {
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(landed, "the answer was never written to the log");
+        s.term.press(KeyPress::ctrl('d'));
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    let s = start(tree_resumable(
+        &root,
+        &home,
+        id,
+        true,
+        &script,
+        &asking_here,
+    ))
+    .await;
+    let task = s.open().await;
+    let screen = s.screen();
+    assert!(
+        screen.contains("→ 允许一次"),
+        "the resumed screen must show the answer that was given:\n{screen}"
+    );
+    assert!(
+        screen.contains("write_file") && screen.contains("out.txt"),
+        "…about the call it was given for:\n{screen}"
+    );
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}

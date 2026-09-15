@@ -122,9 +122,13 @@ impl Tool for AskTool {
             ));
         }
 
-        let Some(questions) = self.ctx.service::<UserQuestionsSvc>() else {
+        // Through `ask_person` rather than the seam: the question and its answer
+        // become one fact, so the card a person answers is a block in the
+        // transcript like every other thing on screen — and it is still there
+        // after a remount or a resume. See [`SessionEvent::Answered`].
+        if self.ctx.service::<UserQuestionsSvc>().is_none() {
             return ok(NOBODY);
-        };
+        }
         let asked = Question {
             prompt: question,
             options: options.iter().map(Answer::new).collect(),
@@ -133,7 +137,7 @@ impl Tool for AskTool {
             asker: crate::agent::current_member_name(&self.ctx),
             about: None,
         };
-        match questions.ask(&asked).await {
+        match crate::agent::ask_person(&self.ctx, asked).await {
             Some(answer) => ok(format!("The person answered: {answer}")),
             None => ok(NOBODY),
         }

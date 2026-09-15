@@ -9,12 +9,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use atomcode_harness::seams::Question;
 use atomcode_harness::session::{InjectionOrigin, SessionEvent};
 
 use crate::block::{BlockId, Coord, StreamWriter};
 use crate::content::{
-    InjectedBlock, ModelSaid, ModelThought, NoticeBlock, Outcome, ToolCallBlock, TurnEndBlock,
-    TurnStats, UserSaid,
+    ChoiceBlock, InjectedBlock, ModelSaid, ModelThought, NoticeBlock, Outcome, ToolCallBlock,
+    TurnEndBlock, TurnStats, UserSaid,
 };
 use crate::module::Producer;
 
@@ -28,6 +29,10 @@ struct Open {
     thought: Option<(BlockId, String)>,
     /// Tool calls waiting for their result, by `call_id`.
     calls: HashMap<String, (BlockId, ToolCallBlock)>,
+    /// The question on the screen waiting for an answer, with the question
+    /// itself: the answer says `allow`, and only the question can say what was
+    /// being allowed. One at a time — a person answers one thing at a time.
+    asked: Option<(BlockId, Question)>,
     /// What the turn in flight has cost so far, folded from its own `Usage` and
     /// `StepEnd` facts and handed to the block that closes it.
     ///
@@ -42,6 +47,24 @@ struct Open {
 #[derive(Default)]
 pub struct Transcript {
     open: Mutex<Open>,
+}
+
+/// The card a question draws, before or after it is answered.
+///
+/// One function for both, because both are the same card: an amendment has to
+/// leave the question and the options exactly where they were, and two builders
+/// that agree until one changes is how a card ends up rewriting itself when it
+/// is answered.
+fn card_for(question: &Question, answer: Option<String>) -> ChoiceBlock {
+    ChoiceBlock {
+        question: crate::ask::recorded(question),
+        options: question
+            .options
+            .iter()
+            .map(|a| crate::ask::answer_label(&a.value, &a.label))
+            .collect(),
+        answer,
+    }
 }
 
 impl Transcript {
@@ -220,6 +243,65 @@ impl Producer for Transcript {
                 );
             }
 
+            // A question was put. Opened rather than settled, because it has no
+            // answer yet — the same shape as a tool call, and for the same
+            // reason: the card is what the person is deciding about, and it is
+            // already in the conversation rather than only in a panel that
+            // would have to be mounted to show it.
+            SessionEvent::Asked { question, .. } => {
+                let id = out.open(at, Arc::new(card_for(question, None)));
+                open.asked = Some((id, question.clone()));
+            }
+
+            // And it was closed — with an answer or without one. Amended in
+            // place, so the words the person was deciding between stay where
+            // they were and only the answer is filled in.
+            SessionEvent::Answered { answer, .. } => {
+                let said = match (answer, &open.asked) {
+                    // The label the asker gave the value it sent back, so the
+                    // word on the card is the word the card offered.
+                    (Some(value), Some((_, asked))) => crate::ask::answer_label(
+                        value,
+                        &asked
+                            .options
+                            .iter()
+                            .find(|a| &a.value == value)
+                            .map(|a| a.label.clone())
+                            .unwrap_or_else(|| value.clone()),
+                    ),
+                    (Some(value), None) => value.clone(),
+                    // No answer is a refusal. Written the same way whether a
+                    // person declined or the turn was cancelled out from under
+                    // the question: both are "nobody said yes".
+                    //
+                    // `by` is deliberately not drawn. It is in the log because a
+                    // record of who allowed what is worth having once two
+                    // clients can answer; a card that read "拒绝 · the person at
+                    // the terminal" would be the log leaking onto the screen.
+                    (None, _) => {
+                        crate::ask::answer_label(atomcode_harness::seams::ANSWER_DENY, "declined")
+                    }
+                };
+                match open.asked.take() {
+                    Some((id, asked)) => {
+                        out.amend(id, Arc::new(card_for(&asked, Some(said))));
+                        out.settle(id);
+                    }
+                    // An answer with no question in front of it: the log is out
+                    // of shape, but a person should still see what was decided.
+                    None => {
+                        out.emit(
+                            at,
+                            Arc::new(ChoiceBlock {
+                                question: "(unpaired)".into(),
+                                options: Vec::new(),
+                                answer: Some(said),
+                            }),
+                        );
+                    }
+                }
+            }
+
             SessionEvent::TurnEnd { stop, error, .. } => {
                 // Anything still open never got its answer. Saying so is the
                 // honest ending: a call that was cut is not a call that failed.
@@ -227,6 +309,23 @@ impl Producer for Transcript {
                     out.settle(id);
                 }
                 if let Some((id, _)) = open.thought.take() {
+                    out.settle(id);
+                }
+                // A question the turn ended on top of is a refusal by the seam's
+                // own contract — every caller reads a missing answer as one —
+                // so the card settles saying that rather than staying lit as
+                // though someone were still deciding.
+                if let Some((id, asked)) = open.asked.take() {
+                    out.amend(
+                        id,
+                        Arc::new(card_for(
+                            &asked,
+                            Some(crate::ask::answer_label(
+                                atomcode_harness::seams::ANSWER_DENY,
+                                "declined",
+                            )),
+                        )),
+                    );
                     out.settle(id);
                 }
                 for (_, (id, block)) in open.calls.drain() {
@@ -300,6 +399,64 @@ mod tests {
 
     fn kinds(s: &Stream) -> Vec<&'static str> {
         s.slots().iter().map(|x| x.block().kind()).collect()
+    }
+
+    #[test]
+    fn an_answered_question_is_one_settled_card_in_the_conversation() {
+        let s = fold(&conformance::facts());
+        // The whole card, not just its summary line: what was asked, the answers
+        // that were offered, and which one was taken. A card that lost its
+        // options would still read as an answer — with no way to tell what the
+        // person was choosing between.
+        let cards: Vec<String> = s
+            .slots()
+            .iter()
+            .filter(|x| x.block().kind() == "choice")
+            .map(|x| {
+                assert!(
+                    x.is_settled(),
+                    "a card is settled once it is closed: nothing about it is \
+                     still being decided"
+                );
+                crate::block::Content::lines(&*x.block().content, 80)
+                    .iter()
+                    .map(|l| l.plain())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect();
+        // Three ways a question ends, and all three are on the screen: answered,
+        // closed with nothing, and the turn ending on top of one. The third is
+        // the one a fold can get wrong without anyone noticing — it arrives
+        // with no answer of its own.
+        assert_eq!(cards.len(), 3, "one card per question: {cards:?}");
+        // What was asked, with the call's own subject. The screen used to compose
+        // this itself, out of the question it happened to be holding — which is
+        // exactly why a remount lost it.
+        assert!(
+            cards[0].contains("write_file") && cards[0].contains("notes.md"),
+            "the call under review is on the card:\n{}",
+            cards[0]
+        );
+        assert!(
+            cards[0].contains("允许一次"),
+            "and the answer that was taken, in the words the card offered it in:\n{}",
+            cards[0]
+        );
+        // Closed with no answer: a refusal, not silence and not consent.
+        assert!(
+            cards[1].contains("拒绝") && cards[1].contains("Allow `bash` to run?"),
+            "a question closed with nothing still says what it was:\n{}",
+            cards[1]
+        );
+        // And the one the turn ended on top of. It never got an answer of its
+        // own, and the seam's contract is that a missing answer is a refusal —
+        // so the card must not keep saying the person has not decided yet.
+        assert!(
+            cards[2].contains("拒绝") && cards[2].contains("telemetry"),
+            "a question a finished turn left behind settles as a refusal:\n{}",
+            cards[2]
+        );
     }
 
     crate::tui_conformance!(producer || Transcript::new() as Arc<dyn Producer>, as transcript_conformance);
@@ -467,6 +624,7 @@ mod tests {
             "reasoning",
             "tool_call",
             "notice",
+            "choice",
             "injected:reminder",
             "injected:peer",
             "turn_end",

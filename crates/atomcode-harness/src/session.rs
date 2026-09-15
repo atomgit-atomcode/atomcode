@@ -168,6 +168,52 @@ pub enum SessionEvent {
         text: String,
         origin: InjectionOrigin,
     },
+    /// A question was put to the person.
+    ///
+    /// Screen-visible is logged, and a question was the one thing a screen
+    /// showed that it did not get from here: asking went out through the
+    /// `user-questions` seam and the answer came back as the tool's return
+    /// value, so what the person decided was written on the screen and nowhere
+    /// else. That made an approval the single exception to "one screen, one
+    /// log" — a remounted panel lost the answer, and a resumed session redrew
+    /// the call that was approved with no sign anyone had ever been asked.
+    ///
+    /// Committed **before** the question is drawn rather than with its answer,
+    /// because a question that is waiting is a state a client has to be able to
+    /// see: one that connects midway folds the log and finds it, and a session
+    /// whose process died mid-question resumes with the question it was stuck
+    /// on rather than with a gap. The pair is [`SessionEvent::Answered`].
+    ///
+    /// Not model-visible, deliberately: what goes to the model is the answer,
+    /// and it travels its own way — as the tool's result. Putting the card in
+    /// the request would have the model read its own approval as news.
+    Asked {
+        turn: u64,
+        /// The question as it was asked, options and all: "allow once / always
+        /// allow / deny" is what makes a bare `deny` mean something.
+        question: crate::seams::Question,
+    },
+    /// That question is closed, with an answer or without one.
+    ///
+    /// Always committed when the asking returns, including when nobody
+    /// answered: [`SessionEvent::Asked`] with no answer after it is a question
+    /// still waiting, and one that was refused has to be distinguishable from
+    /// one nobody ever got to. `None` here is the refusal the seam's contract
+    /// promises every caller must read into it.
+    Answered {
+        turn: u64,
+        /// The answer's [`crate::seams::Answer::value`], or `None` for a
+        /// question that was closed without one — declined, cancelled, or
+        /// nobody there.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<String>,
+        /// Which front end answered, as it describes itself ("the person at the
+        /// terminal", "the connected driver"). A record of what was decided is
+        /// worth less without it the moment two clients can answer the same
+        /// session — a phone and a terminal are not interchangeable answerers,
+        /// and a log that cannot tell them apart cannot say who allowed what.
+        by: String,
+    },
     /// A compaction boundary: everything at or below `through` is replaced by
     /// `summary` for model purposes. The dropped events stay in the log —
     /// compaction changes the projection, not the history.
@@ -227,6 +273,8 @@ impl SessionEvent {
             | Self::ToolStarted { turn, .. }
             | Self::ToolResultLogged { turn, .. }
             | Self::Injected { turn, .. }
+            | Self::Asked { turn, .. }
+            | Self::Answered { turn, .. }
             | Self::Compacted { turn, .. }
             | Self::Usage { turn, .. }
             | Self::Notice { turn, .. }
@@ -261,7 +309,12 @@ impl SessionEvent {
 /// version is the same outcome stated honestly, which is what this constant is
 /// for. Making the reader skip what it does not understand would be a different
 /// trade — "guess" instead of "refuse" — and belongs to whoever owns that call.
-pub const SESSION_FORMAT_VERSION: u32 = 2;
+///
+/// **3** — added [`SessionEvent::Asked`] and [`SessionEvent::Answered`], the
+/// same shape of change for the same reason. What a person decided used to
+/// exist only on the screen that asked, which is the one thing a log is
+/// supposed to be able to redraw.
+pub const SESSION_FORMAT_VERSION: u32 = 3;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()

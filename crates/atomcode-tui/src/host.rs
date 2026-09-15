@@ -4664,7 +4664,14 @@ mod tests {
         // everything": the notice and the user's own bar stay flush left. A rule
         // applied by kind has to be checked on the kinds it excludes, or it is
         // indistinguishable from a rule applied to nothing.
-        let rows = stream_rows(&fed(), (64, 30));
+        // A window tall enough to hold the whole corpus. The assertion is that
+        // four kinds of row line up *with each other*, so it can only be made
+        // where all four are on screen at once — and the corpus is longer than
+        // a real terminal, because it is every awkward shape a module might
+        // fold. When the corpus outgrows this, the row that fell off the top is
+        // the user's bar and its `.expect` says so; the fix is a taller window,
+        // not a shorter corpus.
+        let rows = stream_rows(&fed(), (64, 120));
         let prose = rows
             .iter()
             .find(|r| r.contains("Fixed it"))

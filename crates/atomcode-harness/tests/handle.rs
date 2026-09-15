@@ -332,6 +332,53 @@ async fn a_risky_call_is_asked_about_with_the_bytes_that_will_run() {
         "written",
         "an approved call runs"
     );
+
+    // And the decision is a fact, not only a round-trip that happened. This is
+    // the path a daemon, an ACP session and every remote driver take — the
+    // question goes out as an `approval` request and the answer comes back on
+    // the agent's command stream — so a client that connects *later* has no way
+    // to learn what was allowed unless the log has it. The driver protocol is
+    // untouched: same request, same `{"decision": …}` response.
+    let logged: Vec<_> = app
+        .context()
+        .only_session()
+        .unwrap()
+        .events()
+        .into_iter()
+        .map(|e| e.event)
+        .collect();
+    let asked: Vec<_> = logged
+        .iter()
+        .filter_map(|e| match e {
+            atomcode_harness::session::SessionEvent::Asked { question, .. } => Some(question),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(asked.len(), 1, "the question reached the log: {logged:?}");
+    assert_eq!(
+        asked[0].about.as_ref().map(|a| a.tool.as_str()),
+        Some("write_file"),
+        "with the call it is about"
+    );
+    let answered: Vec<_> = logged
+        .iter()
+        .filter_map(|e| match e {
+            atomcode_harness::session::SessionEvent::Answered { answer, by, .. } => {
+                Some((answer, by))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(answered.len(), 1, "and so did the answer: {logged:?}");
+    assert_eq!(
+        answered[0].0.as_deref(),
+        Some(atomcode_harness::seams::ANSWER_ALLOW),
+        "as the value the person chose, not this row's `PermissionDecision`"
+    );
+    assert_eq!(
+        answered[0].1, "the connected driver",
+        "and which front end answered — the driver's own name for itself"
+    );
 }
 
 #[tokio::test]

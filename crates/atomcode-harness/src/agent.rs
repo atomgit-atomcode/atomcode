@@ -35,7 +35,7 @@ use atomcode_kernel::message::ImageContent;
 
 use crate::events::{AgentCreated, AgentInfo, InboxInserted};
 use crate::seams::{FsSvc, SessionDefaultsSvc, SessionPersistenceSvc, SessionSvc};
-use crate::session::{InjectionOrigin, LoggedEvent, SessionHeader, SessionLog};
+use crate::session::{InjectionOrigin, LoggedEvent, SessionEvent, SessionHeader, SessionLog};
 
 // ---- the agent whose turn this is -----------------------------------------
 
@@ -85,6 +85,111 @@ pub fn current_member_name(ctx: &Context) -> Option<String> {
     agent.parent()?;
     let id = agent.session_id();
     Some(id.rsplit('/').next().unwrap_or(id).to_string())
+}
+
+/// The log of the conversation the person is driving.
+///
+/// [`current_member_name`]'s counterpart, and here for the same reason: a
+/// question asked inside a member's turn is the member's turn, but it is the
+/// person's conversation that has to be able to redraw it afterwards. A
+/// member's own log is its parent's business — it is not even persisted (see
+/// the session-persistence row) — so a card written there would be written
+/// where nobody reads, and the screen would be back to showing something the
+/// log cannot explain.
+///
+/// With no turn running on this task — a front end asking on the person's
+/// behalf — the conversation is the root agent's, which is the same rule the
+/// registry uses to mean "not delegated".
+fn person_session(ctx: &Context) -> Option<Arc<SessionLog>> {
+    let agents = ctx.service::<crate::seams::AgentsSvc>()?;
+    if let Some(here) = current().and_then(|c| c.service::<SessionSvc>()) {
+        return match agents
+            .by_session(here.id())
+            .and_then(|a| a.parent().map(str::to_string))
+        {
+            Some(parent) => agents.by_session(&parent).map(|a| a.session()),
+            None => Some(here),
+        };
+    }
+    agents
+        .list()
+        .into_iter()
+        .find(|a| a.parent().is_none())
+        .map(|a| a.session())
+}
+
+/// Write down that a question was put, before it is answered.
+///
+/// Public because there are two ways to ask and both have to reach the log: the
+/// `user-questions` seam ([`ask_person`], which owns the whole exchange) and the
+/// handle's own `approval` round-trip, which speaks the driver's wire contract
+/// and calls this from the row that owns that request. A single funnel would
+/// have meant changing that wire shape, and a session a client can rejoin is
+/// not worth a new protocol for every front end.
+pub fn record_asked(ctx: &Context, question: &crate::seams::Question) {
+    let Some(log) = person_session(ctx) else {
+        return;
+    };
+    crate::session::commit(
+        &scoped(ctx),
+        &log,
+        SessionEvent::Asked {
+            turn: log.current_turn(),
+            question: question.clone(),
+        },
+    );
+}
+
+/// Write down the answer — or that there was none.
+///
+/// `answer` is a [`crate::seams::Answer::value`], not whatever a caller's own
+/// vocabulary calls the decision: the log holds what the person chose, and the
+/// policy that asked is free to read it however it likes.
+pub fn record_answered(ctx: &Context, answer: Option<String>) {
+    let Some(log) = person_session(ctx) else {
+        return;
+    };
+    // The front end's own name for itself. Read here rather than passed in,
+    // because it is a property of whoever filled the seam, and a caller that
+    // had to remember to thread it through is one that will eventually forget.
+    let by = ctx
+        .service::<crate::seams::UserQuestionsSvc>()
+        .map(|q| q.describe())
+        .unwrap_or_else(|| "nobody".to_string());
+    crate::session::commit(
+        &scoped(ctx),
+        &log,
+        SessionEvent::Answered {
+            turn: log.current_turn(),
+            answer,
+            by,
+        },
+    );
+}
+
+/// Ask the person, and write down both halves of the exchange.
+///
+/// The way through for every row that asks through `user-questions`, rather
+/// than calling the seam directly: the asking row is the only one holding both
+/// halves — the question as it was put and the answer that came back — and a
+/// front end sees them as two unrelated things. What it writes is a fact, so a
+/// panel can be remounted into an answered card and a resumed session can show
+/// what was decided.
+///
+/// **Asked first, then the answer.** A question that is waiting is itself a
+/// state a client has to be able to see: one that connects midway folds the log
+/// and finds the question it can answer, instead of a session that looks
+/// blocked for no reason. See [`SessionEvent::Asked`] and
+/// [`SessionEvent::Answered`].
+pub async fn ask_person(ctx: &Context, question: crate::seams::Question) -> Option<String> {
+    let questions = ctx.service::<crate::seams::UserQuestionsSvc>()?;
+    record_asked(ctx, &question);
+    // Asked of the *service that will answer*, after the fact is down: a
+    // front end that resolves the question by reading back the log would
+    // otherwise be racing the write that put it there.
+    let answer = questions.ask(&question).await;
+    record_answered(ctx, answer.clone());
+    answer
 }
 
 /// Run `f` as this agent's turn: everything it awaits resolves in the agent's

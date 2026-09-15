@@ -174,6 +174,71 @@ pub fn facts() -> Vec<SessionEvent> {
             is_error: false,
             images: Vec::new(),
         },
+        // A question that was put to a person — an approval, with the call's own
+        // arguments in it, because that is what makes the card readable
+        // (`write_file · notes.md`) and what a half-escaped path would break.
+        SessionEvent::Asked {
+            turn: 2,
+            question: atomcode_harness::seams::Question {
+                prompt: "Allow `write_file` to run?".into(),
+                options: vec![
+                    atomcode_harness::seams::Answer::labelled(
+                        atomcode_harness::seams::ANSWER_ALLOW,
+                        "allow once",
+                    ),
+                    atomcode_harness::seams::Answer::labelled(
+                        atomcode_harness::seams::ANSWER_ALWAYS,
+                        "always allow",
+                    ),
+                    atomcode_harness::seams::Answer::labelled(
+                        atomcode_harness::seams::ANSWER_DENY,
+                        "deny",
+                    ),
+                ],
+                asker: None,
+                about: Some(atomcode_harness::seams::AboutCall {
+                    tool: "write_file".into(),
+                    arguments: r#"{"file_path":"我的笔记/notes.md","content":"hello"}"#.into(),
+                    grant: Some(String::new()),
+                }),
+            },
+        },
+        SessionEvent::Answered {
+            turn: 2,
+            answer: Some(atomcode_harness::seams::ANSWER_ALLOW.into()),
+            by: "the person at the terminal".into(),
+        },
+        // And one closed with no answer at all — Esc, a cancel, nobody there.
+        // A refusal and a question that was never put are different things on a
+        // card, and a corpus with only the first would let the second draw as
+        // consent.
+        SessionEvent::Asked {
+            turn: 2,
+            question: atomcode_harness::seams::Question {
+                prompt: "Allow `bash` to run?".into(),
+                options: vec![atomcode_harness::seams::Answer::labelled(
+                    atomcode_harness::seams::ANSWER_ALLOW,
+                    "allow once",
+                )],
+                asker: Some("scribe".into()),
+                about: None,
+            },
+        },
+        SessionEvent::Answered {
+            turn: 2,
+            answer: None,
+            by: "the connected driver".into(),
+        },
+        // A question the turn ended on top of: asked, never closed. The card
+        // has to settle as a refusal rather than stay lit as though someone
+        // were still deciding — a turn that is over has nobody to answer it.
+        SessionEvent::Asked {
+            turn: 2,
+            question: atomcode_harness::seams::Question::plain(
+                "Add a [telemetry] section, or leave it off?",
+                &["add it", "leave it off"],
+            ),
+        },
         SessionEvent::TurnEnd {
             turn: 2,
             stop: atomcode_harness::seams::StopReason::Cancelled,

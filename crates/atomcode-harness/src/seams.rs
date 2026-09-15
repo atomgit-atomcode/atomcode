@@ -15,6 +15,7 @@ use atomcode_capabilities::skills::SkillRegistry;
 use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::tool::{Tool, ToolDef};
 use atomcode_plexus::{plexus_service, Context};
+use serde::{Deserialize, Serialize};
 
 use crate::agent::{Agent, Agents};
 pub use crate::model_source::{cheapest, choices, delegatable, Chose, ModelInfo, Models};
@@ -381,7 +382,11 @@ pub const ANSWER_ALWAYS: &str = "allow_always";
 pub const ANSWER_DENY: &str = "deny";
 
 /// One answer: what comes back, and what a plain front end prints.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Serialisable because an answered question is a fact of the session, and a
+/// fact is what the log writes down — the card a person answered is not
+/// reproducible from the answer alone, and the options are half of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
     /// Returned by [`UserQuestions::ask`] when this one is picked.
     pub value: String,
@@ -407,7 +412,7 @@ impl Answer {
 }
 
 /// The call an approval is about.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AboutCall {
     pub tool: String,
     /// The exact bytes that will run. A front end summarises them for the eye,
@@ -429,7 +434,10 @@ pub struct AboutCall {
 /// person cannot answer honestly. So everything a front end needs to lay a
 /// question out is here, and everything it gets to decide — wording, colour,
 /// which key means which answer — is not.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// Serialisable for the same reason: this is the record of what was asked, and
+/// the log is where a screen finds it again after a remount or a resume.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Question {
     /// The ask, phrased, for a front end that renders nothing else.
     pub prompt: String,
@@ -451,6 +459,48 @@ impl Question {
             ..Self::default()
         }
     }
+
+    /// The card an approval shows: the call under review, and the three answers
+    /// a risky call can have.
+    ///
+    /// One constructor for both asking seams, because they are the same card —
+    /// the `user-questions` one the interactive policy asks through, and the
+    /// handle's own `approval` one a driver round-trips. Two builders that agree
+    /// until one changes is how a person ends up with two products' worth of
+    /// wording for one decision, and how a log records two different questions
+    /// for the same call.
+    ///
+    /// `grant` is what an `allow_always` would cover, or `None` when the call
+    /// may never be remembered — then the option is not offered, because showing
+    /// "always allow" for a decision that will be asked again tells the person
+    /// something untrue about the permission they just gave. Empty means every
+    /// call of this tool.
+    pub fn approval(
+        tool: &str,
+        arguments: &str,
+        grant: Option<&str>,
+        asker: Option<String>,
+    ) -> Self {
+        let mut options = vec![Answer::labelled(ANSWER_ALLOW, "allow once")];
+        if grant.is_some() {
+            options.push(Answer::labelled(ANSWER_ALWAYS, "always allow"));
+        }
+        options.push(Answer::labelled(ANSWER_DENY, "deny"));
+        Self {
+            prompt: match &asker {
+                Some(who) => format!("Allow `{tool}` to run, asked for by `{who}`?"),
+                None => format!("Allow `{tool}` to run?"),
+            },
+            options,
+            asker,
+            about: Some(AboutCall {
+                tool: tool.to_string(),
+                arguments: arguments.to_string(),
+                grant: grant.map(str::to_string),
+            }),
+        }
+    }
+
     /// Just the values, for an asker that only echoes them.
     pub fn values(&self) -> Vec<String> {
         self.options.iter().map(|o| o.value.clone()).collect()

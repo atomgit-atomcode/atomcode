@@ -344,7 +344,14 @@ impl Projector {
 
             SessionEvent::StepStart { .. }
             | SessionEvent::RequestHeader { .. }
-            | SessionEvent::Titled { .. } => Vec::new(),
+            | SessionEvent::Titled { .. }
+            // A question was put, and answered: a card in the log, drawn by the
+            // front end that asked for it out of the same fold as every other
+            // block. The kernel protocol has no vocabulary for a question, and
+            // the answer the model sees travels its own way — as the tool's
+            // result.
+            | SessionEvent::Asked { .. }
+            | SessionEvent::Answered { .. } => Vec::new(),
         }
     }
 }
@@ -374,6 +381,11 @@ fn stop_reason(stop: crate::seams::StopReason) -> atomcode_kernel::event::StopRe
 /// The half that asks. Fills both the `approval` and `user-questions` seams,
 /// because a driver that can render a prompt can answer either.
 struct Asker {
+    /// The row's own realm. Held for the one thing the asking half does that is
+    /// not a round-trip: writing the question and its answer into the session's
+    /// log, so a driver that was not attached when it happened can still find
+    /// out what was decided.
+    ctx: Context,
     /// Dropped on shutdown. The asker outlives the pump — it is a service in
     /// the tree — so a sender it held forever would keep the event channel
     /// open forever, and a driver reading to the end would never reach one.
@@ -398,8 +410,9 @@ struct Asker {
 }
 
 impl Asker {
-    fn new(events: mpsc::UnboundedSender<AgentEvent>, timeout: Duration) -> Self {
+    fn new(ctx: Context, events: mpsc::UnboundedSender<AgentEvent>, timeout: Duration) -> Self {
         Self {
+            ctx,
             events: Mutex::new(Some(events)),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
@@ -491,6 +504,18 @@ impl ApprovalPolicy for Asker {
         if grantable && self.granted.lock().expect("grants poisoned").contains(&key) {
             return Decision::Allow;
         }
+        let question = crate::seams::Question::approval(
+            tool.name(),
+            &call.arguments,
+            grantable.then_some(scope.as_str()),
+            crate::agent::current_member_name(&self.ctx),
+        );
+        // Written down around the round-trip, not instead of it: what goes over
+        // the wire stays the driver's own `ApprovalRequest`/`PermissionDecision`
+        // contract — the one every shipped front end already speaks — and the
+        // question above is the record of it. A session a client can rejoin is
+        // the point; a new wire shape for it would be a different change.
+        crate::agent::record_asked(&self.ctx, &question);
         let request = ApprovalRequest {
             call_id: call.id.clone(),
             tool: call.name.clone(),
@@ -507,7 +532,18 @@ impl ApprovalPolicy for Asker {
             .await;
         // A missing answer parses as deny, which is the point: `from_value`
         // fails closed on `Null`.
-        match PermissionDecision::from_value(&answer.unwrap_or(Value::Null)) {
+        let decision = PermissionDecision::from_value(&answer.unwrap_or(Value::Null));
+        let value = match decision {
+            PermissionDecision::AllowOnce => crate::seams::ANSWER_ALLOW,
+            PermissionDecision::AllowAlways => crate::seams::ANSWER_ALWAYS,
+            PermissionDecision::Deny => crate::seams::ANSWER_DENY,
+        };
+        // The answer as a value the log can hold, not the decision: `allow` is
+        // what the person chose, and what the policy makes of it is this row's
+        // business. Logging the decision would write this row's vocabulary into
+        // a record that outlives it.
+        crate::agent::record_answered(&self.ctx, Some(value.to_string()));
+        match decision {
             PermissionDecision::AllowOnce => Decision::Allow,
             PermissionDecision::AllowAlways => {
                 // An "always" for something un-grantable is honoured as an
@@ -519,7 +555,9 @@ impl ApprovalPolicy for Asker {
                 }
                 Decision::Allow
             }
-            PermissionDecision::Deny => Decision::Deny(format!("`{}` was not approved", call.name)),
+            PermissionDecision::Deny => {
+                Decision::Deny(format!("`{}` was not approved", tool.name()))
+            }
         }
     }
 }
@@ -1089,6 +1127,7 @@ impl Plugin for AgentHandlePlugin {
 
         let wire = wire();
         let asker = Arc::new(Asker::new(
+            ctx.clone(),
             wire.events.clone(),
             Duration::from_secs(row.ask_timeout_secs),
         ));

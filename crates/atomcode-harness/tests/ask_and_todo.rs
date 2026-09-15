@@ -169,6 +169,41 @@ async fn the_agent_can_put_a_choice_to_the_person_and_hears_the_answer() {
         "the answer comes back as the tool's result: {results:?}"
     );
     assert_eq!(out.text, "Left it off, as asked.");
+
+    // And the exchange is a fact, not just a screen that scrolled by. Both
+    // halves have to be here: without the question a client connecting midway
+    // cannot see what is waiting, and without the answer nobody can tell it was
+    // ever decided.
+    let asked: Vec<_> = facts(&app)
+        .into_iter()
+        .filter_map(|f| match f {
+            SessionEvent::Asked { question, .. } => Some(question),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(asked.len(), 1, "asked once, logged once: {asked:?}");
+    assert_eq!(
+        asked[0].values(),
+        vec!["add it", "leave it off"],
+        "the options are on the card, not only in the seam's return value"
+    );
+    let answered: Vec<_> = facts(&app)
+        .into_iter()
+        .filter_map(|f| match f {
+            SessionEvent::Answered { answer, by, .. } => Some((answer, by)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(answered.len(), 1, "closed once: {answered:?}");
+    assert_eq!(
+        answered[0].0.as_deref(),
+        Some("leave it off"),
+        "and what the person picked"
+    );
+    assert_eq!(
+        answered[0].1, "scripted human (always picks `leave it off`)",
+        "with the front end's own name on it — who answered is part of the record"
+    );
 }
 
 #[tokio::test]
