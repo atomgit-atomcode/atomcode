@@ -675,6 +675,7 @@ Frame(我的模型)  ──surface──> ANSI 字节 ──vte 解析──> �
 | 全屏,流式由 `ui-repl` 那一行承担 | [ADR 0006](./adr/0006-tui-is-full-screen-not-inline.md) |
 | 布局是入日志的状态,三条入口一个 op 词汇表 | [ADR 0007](./adr/0007-tui-layout-is-logged-state-with-one-op-vocabulary.md) |
 | 时间由宿主注入,`render` 永不读系统时钟 | [ADR 0008](./adr/0008-animation-time-is-injected-not-read.md) |
+| 视图模块的行可以进入流的滚动尾部(仍是视图模块,只是行画在哪变了) | [ADR 0020](./adr/0020-view-module-rows-can-join-the-scroll-tail.md) |
 
 下表是本文档自身的演化,粒度比 ADR 细:
 
