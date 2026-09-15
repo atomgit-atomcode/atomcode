@@ -2084,6 +2084,266 @@ mod tests {
         Host::new(mods, default_layout())
     }
 
+    /// The shipped default layout with **everything `TAIL` names** mounted.
+    ///
+    /// Built from `TAIL` rather than listed by hand: a fixture that named the
+    /// modules itself would keep passing after `TAIL` grew, while the thing it
+    /// is supposed to exercise stopped being the shipped arrangement.
+    fn host_with_the_shipped_tail() -> Host {
+        let mods = Arc::new(Modules::new());
+        mods.add_producer(transcript::Transcript::new()).unwrap();
+        mods.add_view(Arc::new(Mounted::<crate::modules::todo::Todo>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<crate::modules::live::Live>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<input::Input>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<crate::modules::tip::Tip>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<status::Status>::new()))
+            .unwrap();
+        Host::new(mods, default_layout())
+    }
+
+    /// The same tree with one module id renamed, for exercising an arrangement
+    /// whose side panel is a module that is not mounted in this build.
+    fn replace_named(region: &Region, from: &str, to: &str) -> Region {
+        match region {
+            Region::Module(id) if id == from => Region::view(to),
+            Region::Module(_) => region.clone(),
+            Region::Stream { tail } => Region::Stream {
+                tail: tail
+                    .iter()
+                    .map(|t| if t == from { to.to_string() } else { t.clone() })
+                    .collect(),
+            },
+            Region::Flex { dir, items, gap } => Region::Flex {
+                dir: *dir,
+                gap: *gap,
+                items: items
+                    .iter()
+                    .map(|it| crate::el::Item {
+                        basis: it.basis,
+                        grow: it.grow,
+                        el: replace_named(&it.el, from, to),
+                    })
+                    .collect(),
+            },
+            Region::Stack(children) => Region::Stack(
+                children
+                    .iter()
+                    .map(|c| replace_named(c, from, to))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    #[test]
+    fn the_wide_layout_puts_the_tail_in_the_conversations_column() {
+        // `wide` splits the conversation off from `findings`, so the scroll
+        // region is 65% of the screen. The tail rides the *stream*, which means
+        // it shrinks into that column with it — a change from before ADR 0020,
+        // where the task list was a full-width band under the conversation.
+        //
+        // Pinned here because nothing else would notice: the panel is on screen
+        // and has the right rows either way, and only its width says which
+        // column it ended up in.
+        let mods = Arc::new(Modules::new());
+        mods.add_producer(transcript::Transcript::new()).unwrap();
+        mods.add_view(Arc::new(Mounted::<crate::modules::todo::Todo>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<input::Input>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<status::Status>::new()))
+            .unwrap();
+        // `team`, not `findings`: the latter is the layout's example of a name
+        // that is never mounted, so `prune` collapses it away and the wide
+        // arrangement becomes a single column — which would make this judgement
+        // about nothing. The tree still says what the real one says.
+        mods.add_view(Arc::new(Mounted::<crate::modules::team::Team>::new()))
+            .unwrap();
+        let mut wide = crate::layout::preset_for_test("wide").expect("the wide preset resolves");
+        wide = replace_named(&wide, "findings", crate::modules::team::ID);
+        let h = Host::new(mods, wide);
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 1,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: "t1".into(),
+                name: "todowrite".into(),
+                arguments: serde_json::json!({
+                    "todos": [ { "content": "only", "status": "in_progress" } ]
+                })
+                .to_string(),
+            }],
+        });
+
+        let size = (100, 24);
+        let frame = h.compose(size);
+        let todo = frame.part("todo").expect("the plan is up");
+        let stream = frame.part("stream").expect("the conversation").rect;
+        assert_eq!(
+            todo.rect.w, stream.w,
+            "the tail is in the conversation's column, not the whole screen"
+        );
+        assert_eq!(todo.rect.x, stream.x, "and against its left edge");
+        // 65% of 100, which is what `wide` splits the conversation off at. The
+        // number is stated rather than derived from `findings`' rect: the side
+        // panel is `Hug(0)` when it has nothing to show, so it is not on screen
+        // here and cannot be measured — which is an arrangement worth knowing
+        // about, not a detail to paper over.
+        assert_eq!(todo.rect.w, 65, "the column, not the screen");
+        assert!(
+            stream.right() <= size.0,
+            "and inside the screen: {stream:?}"
+        );
+    }
+
+    #[test]
+    fn the_frame_holds_still_while_the_conversation_scrolls() {
+        // The line ADR 0020 draws, from the other side: the tail is what moves,
+        // and the frame is what must not. `tip` and `input` are the reason that
+        // line exists at all — the field is where a hand is already reaching,
+        // and a row that pushed it down when a tip arrived would move it out
+        // from under that hand (`modules/tip.rs`).
+        //
+        // Swept across the whole range, including past the end, because the
+        // failure this guards is an off-by-one in the pane split rather than a
+        // gross error.
+        let h = host_with_the_shipped_tail();
+        for i in 0..40 {
+            h.absorb(&SessionEvent::AssistantMessage {
+                turn: 1,
+                round: i,
+                text: format!("row {i}"),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+            });
+        }
+        let size = (80, 24);
+        let _ = h.compose(size);
+
+        let resting = h.compose(size);
+        let frame: Vec<(String, Rect)> =
+            ["tip", crate::modules::input::ID, crate::modules::status::ID]
+                .iter()
+                .map(|id| {
+                    (
+                        id.to_string(),
+                        resting
+                            .part(id)
+                            .unwrap_or_else(|| panic!("`{id}` is not on screen"))
+                            .rect,
+                    )
+                })
+                .collect();
+
+        let limit = h.scroll_limit(size, &h.moment.read().unwrap().clone());
+        for scroll in 0..=limit + 5 {
+            h.moment.write().unwrap().scroll = crate::moment::ScrollPos(scroll);
+            let frame_now = h.compose(size);
+            for (id, want) in &frame {
+                let got = frame_now
+                    .part(id)
+                    .unwrap_or_else(|| panic!("`{id}` left the screen at scroll {scroll}"))
+                    .rect;
+                assert_eq!(
+                    got, *want,
+                    "`{id}` moved at scroll {scroll}: {:?} was {:?}",
+                    got, want
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_sum_of_what_there_is_to_read_is_what_gets_drawn() {
+        // The property the scroll bound rests on: `stream_height` has to agree
+        // with the frame, or the bottom rows of the conversation cannot be
+        // scrolled to. Now that the tail is part of the sum, "the frame" means
+        // the blocks *and* the tail rows — and the cap has to be the same in
+        // both, or the two disagree by whatever was capped away.
+        //
+        // Swept over scroll positions because the two are computed by different
+        // walks: the sum counts rows, the frame decides which ones fit, and an
+        // off-by-one shows up at the end of the range rather than the start.
+        let h = host_with_the_shipped_tail();
+        for i in 0..40 {
+            h.absorb(&SessionEvent::AssistantMessage {
+                turn: 1,
+                round: i,
+                text: format!("row {i}"),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+            });
+        }
+        // A plan **taller than the pane**, so the cap is actually in force.
+        // A two-item plan would leave it idle and this judgement would pass
+        // against a `stream_height` that had no cap at all — which is what the
+        // first version of it did.
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 40,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: "t1".into(),
+                name: "todowrite".into(),
+                arguments: serde_json::json!({
+                    "todos": (0..40).map(|i| serde_json::json!({
+                        "content": format!("item {i}"),
+                        "status": if i == 0 { "in_progress" } else { "pending" },
+                    })).collect::<Vec<_>>()
+                })
+                .to_string(),
+            }],
+        });
+
+        let size = (80, 24);
+        let height = h.stream_height(size, &h.moment.read().unwrap().clone());
+        let rows = h.stream_rows(size, &h.moment.read().unwrap().clone());
+        let limit = h.scroll_limit(size, &h.moment.read().unwrap().clone());
+        assert!(limit > 0, "the fixture has to be scrollable");
+
+        // The cap has to be biting, or this judgement is about a code path the
+        // fixture never reaches — which is how its first version passed against
+        // a `stream_height` that had no cap at all.
+        let uncapped: usize = h
+            .tail_heights(size.0, &h.moment.read().unwrap().clone())
+            .iter()
+            .map(|(_, h)| *h as usize)
+            .sum();
+        assert!(
+            uncapped > rows as usize,
+            "the tail asks for {uncapped} rows of a {rows}-row pane: the cap is idle \
+             here, so this judgement cannot see it"
+        );
+
+        // At the very bottom the frame draws the last `rows` of what there is:
+        // the count and the drawing have to agree about how much that is. If
+        // the sum counted rows the frame declined to draw, this is where the
+        // difference lands — the tail's own rows would be out of reach.
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(0);
+        let scrolled_to_top = {
+            h.moment.write().unwrap().scroll = crate::moment::ScrollPos(limit);
+            h.compose(size)
+        };
+        let drawn = scrolled_to_top
+            .parts
+            .iter()
+            .filter(|p| p.owner == "stream" || TAIL.contains(&p.owner.as_str()))
+            .map(|p| p.lines.len())
+            .sum::<usize>();
+        assert_eq!(
+            drawn,
+            rows as usize,
+            "the frame drew {drawn} rows of a {rows}-row pane, but the sum says there              are {height} rows to read: what is at the top of the scroll would not be              reachable"
+        );
+    }
+
     #[test]
     fn the_tail_is_what_scrolls_and_the_frame_is_not() {
         // The line ADR 0020 draws. A module whose rows ride the tail scrolls; a
@@ -3903,6 +4163,72 @@ mod tests {
         assert!(
             !text.trim().is_empty(),
             "scrolled to the top, not into nothing"
+        );
+    }
+
+    #[test]
+    fn a_tail_taller_than_the_pane_still_leaves_the_top_of_the_scroll_reachable() {
+        // The other half of the same property, now that the tail is part of the
+        // sum. The cap in `cap_tail` has to be the *same* number in
+        // `stream_height` and in the geometry: if the sum counted tail rows the
+        // pane never drew, the last rows of the conversation would sit exactly
+        // that far above the top of the scroll — reachable by the number and
+        // not by the wheel.
+        //
+        // `scrolling_stops_at_the_oldest_line_not_past_it` above states the
+        // arithmetic; this is what it looks like when it is wrong. The tail is
+        // deliberately taller than the pane so the cap is in force: with a
+        // short tail the two walks agree whether or not either caps.
+        let h = host_with_the_shipped_tail();
+        // One row per fact, so the oldest line is easy to name.
+        for i in 0..40 {
+            h.absorb(&SessionEvent::AssistantMessage {
+                turn: 1,
+                round: i,
+                text: format!("marker-{i}"),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+            });
+        }
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 40,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![atomcode_kernel::tool::ToolCall {
+                id: "t1".into(),
+                name: "todowrite".into(),
+                arguments: serde_json::json!({
+                    "todos": (0..40).map(|i| serde_json::json!({
+                        "content": format!("item {i}"),
+                        "status": if i == 0 { "in_progress" } else { "pending" },
+                    })).collect::<Vec<_>>()
+                })
+                .to_string(),
+            }],
+        });
+
+        let size = (80, 16);
+        let m = h.moment.read().unwrap().clone();
+        let rows = h.stream_rows(size, &m) as usize;
+        let uncapped: usize = h
+            .tail_heights(size.0, &m)
+            .iter()
+            .map(|(_, h)| *h as usize)
+            .sum();
+        assert!(
+            uncapped > rows,
+            "the tail asks for {uncapped} rows of a {rows}-row pane: the cap is idle \
+             and this judgement cannot see it"
+        );
+
+        let limit = h.scroll_limit(size, &m);
+        h.moment.write().unwrap().scroll = crate::moment::ScrollPos(limit);
+        let text = h.compose(size).rows().join("\n");
+        assert!(
+            text.contains("marker-0"),
+            "scrolled all the way back and the oldest line is not on screen — the \
+             scroll bound counts rows the frame never drew:\n{text}"
         );
     }
 
