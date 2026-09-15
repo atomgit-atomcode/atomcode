@@ -117,3 +117,25 @@ undo / restore / reprepare 家族今天是「停 agent → 写原生 → 重装�
 ## 进度
 
 (每步完成后在这里记 commit 与判据数字)
+
+| 步 | commit | 状态 |
+|---|---|---|
+| 1-4 会话与重建 | `b884f74c` `da2c0767` `03130ee8` | ✅ 日志带 meta/reasoning_blocks;`SessionDefaults.seed`;`turn/finishing`;`native_log` 往返;`session-native` + `kernel-hooks` 行;`mount_harness` / `build_agent` 统一建树(残留树随之消失)。判据 `tests/engine_parity.rs` 8 场景 |
+| 5a 模式与授权 | `e51b7d16` | ✅ `modes` / `grants` 服务;`plan-mode-live`;`plan_verdict` 中立函数。判据 +3 场景 |
+| 5b 策略干预、schedule_wakeup | | 待做 |
+| 6 MCP | | 待做 |
+| 7 配置桥接 | | 待做 |
+| 8 装配缺口 | | 进行中 |
+
+### 装配缺口的做法(8)
+
+链式 `assemble` 里还没对上的，按「能复用本体就复用」分三类:
+- **走 `kernel-hooks` 桥**(LifecycleHooks 本体照用):TelemetryHook(on_request/on_model_response/on_error/turn_complete)、
+  TodoEagerHook 与 StatusReminderHook(只往请求尾巴追加 → 桥要支持 pre_request「只许追加」)。
+- **已有行、要按配置条件插入**:`datalog`(cfg.datalog)、`cc-hooks`(hooks.json + PluginHookSource)。
+- **要单独写行**:SessionContextHook(环境与 git 快照进 system prompt,resume 冻结 git 段)、
+  RateLimitHook(on_rate_limit 属重试策略)、ToolTelemetryMiddleware / GitPushLabelMiddleware(工具中间件)。
+
+### 已知的偶发
+`atomcode-harness::harness the_log_reaches_the_disk_in_the_order_it_was_committed` 全量并行下偶发红，
+单跑与重复 10 次均绿;测试注释自认此事。
