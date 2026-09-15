@@ -11,18 +11,31 @@
 
 ---
 
-## 基线(开工前记录)
+## 进度与基线(2026-09-15 更新)
 
 | | |
 |---|---|
 | branch | `feat/plexus-plugin-architecture` |
-| SHA | `72b9e431` |
-| worktree | **dirty**,含与本次无关的改动:`crates/atomcode-tui/src/theme.rs`、`crates/atomcode-tui/src/markdown/mod.rs`(对比度调整,含 1 条新测试)、`Cargo.lock`、未跟踪的 `docs/atomcode-crate-deps.html` |
-| 判据基线 | `gates/tui-test-count.baseline` = **468**,棘轮**只能升** |
+| 开工时 SHA | `72b9e431` |
+| **当前 HEAD** | `b453eb4e` |
+| 判据基线 | `gates/tui-test-count.baseline` = **486**(开工时 468),棘轮**只能升** |
+| worktree | 只剩 `Cargo.lock`(见下)与未跟踪的 `docs/atomcode-crate-deps.html` |
 
-**约束:** dirty 的那三个文件是另一件事,不得混进本次提交。本次提交只含
-`el.rs` / `host.rs` / `layout.rs` / `modules/live.rs` / `modules/todo.rs`
-与相关测试、本计划与 ADR 0020。
+**已提交:**
+
+| commit | 内容 |
+|---|---|
+| `c6ef4656` | ADR 0020 + 本计划 + `tui-composability.md` 索引 |
+| `5a3feced` | 接缝 S1–S4 折回本计划 |
+| `1e35d91c` | 对比度下限抬高(`theme.rs` / `markdown/mod.rs`,另一件事,已单独提交) |
+| `25a09e40` | **Step 1**:`El::Stream { tail }`,行为不变 |
+| `9b47cb0b` | **Step 2**:pane 几何与签名,行为不变 |
+| `b7fb3829` | 评审修复 #1(pin 只走一半)+ #2(swap 丢 tail / resize 假成功) |
+| `b453eb4e` | 评审修复 #4(徽标锚点)+ #5(tail 总高封顶) |
+
+**约束:** `Cargo.lock` 不得提交 —— 本机 `crates/atomcode-codingplan-crypto/`
+是私有覆盖(skip-worktree + gitignore),那份 lock 差异是 `hkdf`/`hmac`/`subtle`/
+`zeroize` 这些私有 crate 的真依赖,而公开仓库的占位符并不声明它们。
 
 ---
 
@@ -226,24 +239,82 @@ if held {
 
 **注:** 空 tail 时 `grew` 的行为与今天等价,所以本步仍全绿。
 
-**完成判据:** 全绿,行为不变。
+**「行为不变」这句话与 2e 的符号化有张力,如实记下(评审第 6 条)。**
+`if grew > 0` 改成 `if grew != 0` 只有在「块高在一次 absorb 里不会减少」时才等价,
+而这一点当时**没有证明、也没有判据**。实测(一次性探针,非判据)把
+`conformance::facts()` 逐条 absorb、每步测高,没有任何一次下降 —— 证据倾向于等价,
+但 `Live → Settled` 换渲染器、工具调用合并折叠这些机制并没有被单独钉住。
+
+所以结论分两层:Step 2 **对每个装配出来的树**行为不变(`with_no_tail_the_split_is_the_identity`
+钉住的是切分,而这句说的是 pin);但「pin 从这个提交起就与从前等价」是一个当时
+**没有根据**的断言,`9b47cb0b` 的 message 里把它写成了事实。真正修掉这条的是
+`b7fb3829` —— 它把补偿收成一个方法并给了 activity 翻转的判据,那时符号化才有意义。
+
+**完成判据:** 全绿。
+
+---
+
+## 已修的地基缺陷(外部评审,2026-09-15)
+
+两条会在 Step 3/4 落地后发作为真 bug 的问题,已经在 Step 2 之后、Step 3 之前修掉
+(`b7fb3829` / `b453eb4e`)。它们的判据现在是地基的一部分:
+
+**① 补偿只挂在 `absorb` 上,而 tail 高度有一半不经过 `absorb`。**
+`state.turn` 走事实(absorb),`Moment::activity` 由事件循环写(从不经过 absorb)。
+先后无保证,所以读者回滚时每轮开始/结束屏幕会跳 tail 那两行。
+**修法**:补偿收成 `Host::pin` 一个方法,五条路径共走(`absorb` /
+`Host::set_activity` / Cancel ×2 / 点击折叠)。判据用 `set_activity` 触发 ——
+这正是 bug 的要害所在。
+
+**② `swap` 按 `Target` 重建节点,于是 tail 静默消失,`swap todo stream` 还会
+把对话整个删掉并返回 `Ok("换位")`;`resize` 命中不到时返回原树 + `Ok`。**
+**修法**:`swap` 改为找到并整体克隆命中的原节点;tail 里的 id 作目标直接拒绝
+(新 `LayoutError::TailIsNotATarget`);`resize` 返回 `(tree, found)`,未命中报
+`NotOnScreen`。
+
+**③ 徽标锚点**:`stream_rect` 锚 `pane.block_rect`,不是整个 pane —— 否则
+`0 < scroll ≤ T` 时它盖住尾部的最后一行右半截。
+
+**④ tail 总高封顶**:`Host::cap_tail` 把总高封在 `pane_h - 1`,自底向上分配。
+几何和 `stream_height` **必须用同一个封顶**,因此 `stream_height` 的签名是
+`size: (u16, u16)`。不封顶时 tail 高于 pane 会让屏幕在 `[0, T−H]` 冻住
+(实测 T=20/H=19 时 scroll 0 与 1 的 rect 完全相同)。
 
 ---
 
 ## Step 3 — 先接 `todo`
 
+**三个构造点,一个入口。** 尾部要在三处出现:`host::default_layout()`(`host.rs:1517`)、
+`layout.rs` 的 `focus`(`:144`)与 `wide`(`:157`)两个 preset。**漏掉一个,那个 preset
+里 todo 就悄悄消失**,而 `named_twice` 照样绿 —— 它只防「画两遍」,不防「一遍都没画」。
+
+所以抽一个**唯一入口**,三个构造点都走它:
+
+```rust
+// el.rs 或 host.rs，一处定义
+pub fn stream_with_tail() -> Region { Region::stream().with_tail(["todo", "live"]) }
+```
+
+判据改成 **「每棵出厂的树里 todo 和 live 恰好出现一次」**,而不是「没有出现两次」。
+后者对「一次都没有」是绿的,前者两边都拦。
+
+其余:
+
 - 拆 `host::composer()`(`host.rs:1497`):滚动部分(`todo`)与框架部分(`tip` + `input`)。
   **注意这时候 todo 不再是树的子节点**,所以它从 `composer()` 里移出不是「少一行」,
   而是「换个地方声明」(见 S3)
-- `default_layout()`(`host.rs:1517`)构造 `Stream { tail: vec!["todo".into()] }`
-- `layout.rs` 三个 preset(`:116-149`)同步:`default` / `focus` / `wide` 都经 `composer()`
-- **守住 S2 的不变量**:移走树里的 `El::Module("todo")` 与声明 `tail` 必须同时发生,
+- **守住 S2 的不变量**:移走树里的 `El::Module("todo")` 与声明 `tail` 必须同时发生，
   否则 todo 被渲染两次
-- 打开 2e 的符号对称 pin(首个非空 tail)
-- 新增判据:**pin 符号对称** — 读者 `scroll > 0` 时 `todo` 因计划变化缩短,读者正在看的那几行**不动**。反证:把 `grew != 0` 改回 `grew > 0` 必须红
+- 新增判据:**pin 符号对称** — 用 activity 翻转触发(`set_activity`),不用「todo 变短」
+  —— 后者走 absorb 路径,而 absorb 那条路在 `b7fb3829` 之前就已经有判据了,
+  盖不住 activity 那条
 
-**会红的测试:** 按 `part("todo")` 定位的用例改名 `part("stream.tail.todo")`
-(目前 `host.rs` 无 todo 专门测试,主要影响 `tests/e2e.rs` 里按 rect 定位的用例)。
+**`wide` 下 tail 会跟着 stream 缩进左边 65% 那一列**,今天是整宽。这是行为变化,
+不是回归,写在这里免得被当成 bug。
+
+**会红的测试:** `part("todo")` **不用改名** —— owner 就是裸 id(评审第 8 条,
+`b7fb3829` 已改)。受影响的只有那些断言 `stream` rect 高度的用例:现在流区分出去
+了尾部那几行。
 
 ---
 
@@ -263,15 +334,38 @@ if held {
 
 ## Step 5 — 补齐无兜底的风险
 
-1. **pin 符号对称**(Step 3 已列,此处确认为必做)
+**夹具先要真的挂上尾部。** `host.rs` 的 `host()` 只挂了 `transcript`/`status`/`input`,
+没挂 todo/live,也不声明 tail —— 用它写尾部判据会**恒真**:`tail_heights` 返回空,
+几何退化成恒等,断言什么都过。Step 2 已经为此建了 `host_with_peek_tail()`(带一个
+`Peek` 仪器模块,高度只跟 activity 走)。Step 3/4 需要一个挂**真** todo/live 的版本
+(即 Step 3 之后的 `default_layout()` 本身),判据从这里出发。
+
+1. **pin 符号对称** —— 已在 `b7fb3829` 落地(用 activity 翻转触发)。Step 3 接上真
+   模块后,判据应当仍走 `set_activity` 这条路,而不是靠「todo 变短」
 2. **框架模块不受 scroll 影响**:`status` / `input` / `tip` 的 rect 在任何 `scroll` 下不变
    — 守住「输入框永不移动」(`modules/tip.rs:10-22`)
 3. **`stream_height` 与实画一致**(把 `host.rs:2294` 的模式扩到尾部):
-   块区行数 + 各 tail 模块实际 place 的行数 == 该高度
+   块区行数 + 各 tail 模块实际 place 的行数 == 该高度(**都用封顶后的值**)
 4. **同一模块不得同时出现在 `tail` 和树中**(S2 的不变量)。
    判据:构造一棵**故意**同时含 `tail: ["todo"]` 与 `El::Module("todo")` 的树,
-   断言它被判红(或在 `prune`/装配期被拒绝)。这条比 S2 的「记得同时改」更硬 ——
-   否则下一个人改布局时会静默地把 todo 画两遍
+   断言它被判红。这条已经落地(`El::named_twice` + `Layout::apply` 拒绝 +
+   `the_layout_this_build_ships_names_no_module_twice`)
+
+**写判据时的两条陷阱(评审第 9、11 条):**
+
+- **别断言「块的行位置不变」。** `scroll` 在 `[0, T]` 区间里 `block_scroll` 确实是 0,
+  但 `block_rect.h` 每格长一行、内容底对齐 —— 块在屏幕上**每格下移一行**,顶上同时
+  多露出一行更旧的。ADR 里「块纹丝不动」那句说的是偏移,不是屏幕坐标,已改。
+  要断言的「不动」是:`scroll` 跟着 tail 的高度变化一起调整,使得**同几行字**仍在
+  视野里(这正是 `b7fb3829` 的判据在做的事)。
+- **`stream_height` 现在收 `size` 不是 `width`**(`b453eb4e` 改的)。尾部封顶要用
+  pane 高度,而 pane 高度是 `stream_rows(size, moment)` 算的。
+
+**已知的宽度不一致(评审第 7 条,本次不修):** `scroll_limit(size, …)` 内部按
+`size.0`(整屏宽)量块高,而画的时候用的是 stream 自己的 `rect.w`。`wide` preset 下
+两者是 65% 和 100%,所以滚动上界可能比实际少算。`plugin.rs:911/915` 有同一个问题。
+这是**既有**缺陷,与本次改动无关,记在这里以免被当成新引入的。修的时机是有人真的
+在 `wide` 下滚到顶发现末尾够不着的时候。
 
 ---
 
@@ -283,7 +377,7 @@ cargo nextest run -p atomcode-tui
 cargo test --doc -p atomcode-tui        # nextest 不跑 doctest(本 crate 可跑 0,确认没丢)
 
 # 每步收尾
-bash gates/tui-test-count.sh            # 判据数只能升(基线 468)
+bash gates/tui-test-count.sh            # 判据数只能升(当前 486)
 bash gates/tui.sh
 bash gates/tui-layers.sh
 bash gates/tui-string-slice.sh
