@@ -366,6 +366,10 @@ pub struct CodingParts {
     snapshot_hook: Option<Arc<SnapshotHook>>,
     transcript_hook: Option<Arc<TranscriptHook>>,
     extra_tools: Vec<Arc<dyn atomcode_kernel::tool::Tool>>,
+    host_only_tools: Vec<String>,
+    /// The skill catalog prepare loaded, and its prompt rendering (prioritizing
+    /// skills the project's instructions name). `None` without tools.
+    skill_registry: Option<(Arc<SkillRegistry>, Option<String>)>,
     snapshot_persistence_status: Option<SnapshotPersistenceStatus>,
     pub session: Option<SessionBinding>,
     /// Runtime-owned resume for sessionless drivers during an in-process reassembly.
@@ -460,6 +464,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
 ) -> io::Result<CodingParts> {
     let mut registry = ToolRegistry::new();
     let mut names: Vec<String> = Vec::new();
+    // Tools the chain mounts from here that no harness row provides: handed to a
+    // tree as they are (see `CodingParts::host_only_tools`).
+    let mut host_only_tools: Vec<String> = Vec::new();
     let turn_execution_policy = Arc::new(TurnExecutionPolicy::new());
 
     // Always-on core: neutral fs/bash toolset + codeintel. Vision gating: a VL model
@@ -499,6 +506,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         );
         if atomcode_capabilities::codeintel::register_lsp_tool(&mut registry, &cfg.lsp) {
             names.push("lsp".into());
+            host_only_tools.push("lsp".into());
         }
     }
 
@@ -512,14 +520,17 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             &opts.external_subagents,
         );
         let any = !mounted.is_empty();
+        host_only_tools.extend(mounted.iter().cloned());
         names.extend(mounted);
         any
     };
 
     #[cfg(feature = "atomgit")]
     if opts.tools {
+        let before = names.len();
         crate::assemble::register_atomgit_capabilities(&mut registry, &mut names)
             .map_err(|error| io::Error::other(format!("AtomGit tool setup failed: {error}")))?;
+        host_only_tools.extend(names[before..].iter().cloned());
     }
 
     if opts.tools && opts.web && !atomcode_config::config::offline::is_offline_active() {
@@ -783,6 +794,9 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // leading system message by SkillCatalogHook below (without it the model never
     // learns which skills exist — only the use_skill/list_skills tools were mounted).
     let skill_catalog = skills.render_catalog_prioritizing(&instruction_text);
+    let skill_registry = opts
+        .tools
+        .then(|| (Arc::clone(&skills), skill_catalog.clone()));
     if opts.tools {
         register_skill_tools(&mut registry, skills);
         names.extend(
@@ -896,6 +910,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             ListSessionsTool::new().with_sessions_dir(b.manager.root()),
         ));
         names.push("list_sessions".into());
+        host_only_tools.push("list_sessions".into());
     }
 
     // Hooks in the CANONICAL ORDER (registration order = HookChain execution order):
@@ -1097,6 +1112,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         snapshot_hook: snapshot_hook_handle,
         transcript_hook: transcript_hook_handle,
         extra_tools: Vec::new(),
+        host_only_tools,
+        skill_registry,
         snapshot_persistence_status,
         session,
         runtime_resume: None,
@@ -1183,6 +1200,24 @@ impl CodingParts {
 
     pub(crate) fn todo_enabled(&self) -> bool {
         self.todo_enabled
+    }
+
+    pub(crate) fn request_user_input_enabled(&self) -> bool {
+        self.request_user_input_enabled
+    }
+
+    /// Tools this capability graph mounted that no harness row provides —
+    /// `list_sessions` over the native catalog, `lsp`, external-agent subagents,
+    /// the AtomGit tools — as the objects prepare built.
+    pub(crate) fn host_only_tools(&self) -> Vec<Arc<dyn atomcode_kernel::tool::Tool>> {
+        self.host_only_tools
+            .iter()
+            .filter_map(|name| self.registry.mount(&[name.as_str()]).get(name))
+            .collect()
+    }
+
+    pub(crate) fn skill_registry(&self) -> Option<(Arc<SkillRegistry>, Option<String>)> {
+        self.skill_registry.clone()
     }
 
     #[cfg(test)]

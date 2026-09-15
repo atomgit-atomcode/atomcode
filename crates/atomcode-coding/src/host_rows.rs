@@ -588,6 +588,67 @@ impl Plugin for PlanModeLivePlugin {
     }
 }
 
+// ---- the skill catalog, as prepare loaded it --------------------------------
+
+/// `skills-host`: the skill registry the runtime's prepare loaded.
+///
+/// The harness's `skills` row loads the standard directories itself and can only
+/// ADD to them; a host that was told exactly which directories to use (or none)
+/// could not say so, and plugin skills — loaded under their plugin's namespace —
+/// had no way in at all. This row serves the registry prepare built, and puts its
+/// catalog in the prompt the way the chain does: rendered once, skills the
+/// project's instructions name first when the budget cuts.
+pub(crate) struct SkillsHostPlugin {
+    pub(crate) registry: Arc<atomcode_capabilities::skills::SkillRegistry>,
+    pub(crate) catalog: Option<String>,
+}
+
+#[async_trait]
+impl Plugin for SkillsHostPlugin {
+    fn name(&self) -> &'static str {
+        "skills-host"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools", "system-prompt"]
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["skills"]
+    }
+    fn description(&self) -> &'static str {
+        "the skill catalog the coding runtime loaded, plugin skills included"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_harness::seams::SkillsSvc>(self.registry.clone())
+            .map_err(|e| e.to_string())?;
+        let toolbox = ctx
+            .require::<atomcode_harness::seams::ToolsSvc>()
+            .map_err(|e| e.to_string())?;
+        for tool in [
+            Arc::new(atomcode_capabilities::skills::UseSkillTool::new(
+                self.registry.clone(),
+            )) as Arc<dyn atomcode_kernel::tool::Tool>,
+            Arc::new(atomcode_capabilities::skills::ListSkillsTool::new(
+                self.registry.clone(),
+            )),
+        ] {
+            let name = tool.name().to_string();
+            toolbox.register(tool)?;
+            let toolbox = toolbox.clone();
+            let _ = ctx.effect(move || toolbox.unregister(&name));
+        }
+        if let (Some(catalog), Some(prompts)) = (
+            self.catalog.as_ref().filter(|c| !c.trim().is_empty()),
+            ctx.service::<SystemPromptSvc>(),
+        ) {
+            let (id, rank) = crate::on_harness::SKILLS_FRAGMENT;
+            prompts.contribute(id, rank, catalog.clone());
+            let _ = ctx.effect(move || prompts.remove(id));
+        }
+        Ok(())
+    }
+}
+
 // ---- tools the runtime adds -----------------------------------------------
 
 /// `host-tools`: tools the runtime built around its own state.

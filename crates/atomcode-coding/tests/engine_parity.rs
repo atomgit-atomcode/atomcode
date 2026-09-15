@@ -30,6 +30,8 @@ use futures::stream::BoxStream;
 #[derive(Default)]
 struct Recorder {
     requests: Mutex<Vec<Vec<Message>>>,
+    tools: Mutex<Vec<Vec<String>>>,
+    options: Mutex<Vec<ChatOptions>>,
     count: AtomicUsize,
 }
 
@@ -55,10 +57,14 @@ impl LlmProvider for RecordingProvider {
     async fn chat_stream(
         &self,
         messages: &[Message],
-        _tools: &[ToolDef],
-        _options: &ChatOptions,
+        tools: &[ToolDef],
+        options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
         self.0.requests.lock().unwrap().push(messages.to_vec());
+        let mut names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+        names.sort();
+        self.0.tools.lock().unwrap().push(names);
+        self.0.options.lock().unwrap().push(options.clone());
         let n = self.0.count.fetch_add(1, Ordering::SeqCst) + 1;
         // A prompt that names a file to read asks for it once; the result comes
         // back as the next request's last message, and is echoed.
@@ -943,6 +949,189 @@ async fn a_strict_credential_refusal_ends_the_turn_with_a_choice(engine: &str) {
     runtime.handle.shutdown().await.unwrap();
 }
 
+fn write_skill(dir: &std::path::Path, name: &str, description: &str) {
+    let skill = dir.join(name);
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {description}\n---\nDo the thing.\n"),
+    )
+    .unwrap();
+}
+
+/// The skill catalog is exactly what the driver named — its directories, and a
+/// plugin's skills under the plugin's namespace — not whatever the invoking
+/// user happens to have installed.
+async fn the_catalog_is_the_skills_the_driver_named(engine: &str) {
+    select(engine);
+    let env = env();
+    let skills = tempfile::tempdir().unwrap();
+    write_skill(skills.path(), "demo-skill", "does demo things");
+    let plugin = tempfile::tempdir().unwrap();
+    write_skill(plugin.path(), "plug", "a plugin's skill");
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.prepare.skill_dirs = Some(vec![skills.path().to_path_buf()]);
+    start.prepare.plugin_skill_dirs = vec![(plugin.path().to_path_buf(), "myplugin".into())];
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    turn(&mut runtime, "hello").await;
+
+    let shown = system_text(&recorder.last_request());
+    assert!(shown.contains("demo-skill"), "[{engine}] {shown}");
+    assert!(shown.contains("myplugin:plug"), "[{engine}] {shown}");
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// Stored memory is put in front of the model only when the driver asked for it.
+async fn memory_is_shown_only_when_switched_on(engine: &str) {
+    select(engine);
+    for memory in [true, false] {
+        let env = env();
+        let file = env.project.path().join(".atomcode").join("memory.md");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "- the secret word is pineapple\n").unwrap();
+        let recorder = Arc::new(Recorder::default());
+        let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+        start.prepare.memory = memory;
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+        turn(&mut runtime, "hello").await;
+
+        let seen = recorder.last_request();
+        let shown = seen.iter().any(|m| m.text.contains("pineapple"));
+        assert_eq!(shown, memory, "[{engine}] memory={memory}: {seen:?}");
+        runtime.handle.shutdown().await.unwrap();
+    }
+}
+
+// ---- what the model is offered ---------------------------------------------
+
+/// The start a production driver makes: every capability the chain turns on
+/// by default, minus the two that reach outside the test (MCP servers, the
+/// person's real skill directories).
+fn production_start(
+    project: &std::path::Path,
+    recorder: &Arc<Recorder>,
+    configure: impl FnOnce(&mut CodingRuntimeStart),
+) -> CodingRuntimeStart {
+    let mut start = start(project, recorder, SessionMode::Fresh);
+    start.prepare.memory = true;
+    start.prepare.web = true;
+    start.prepare.review = true;
+    start.prepare.subagents = SubagentPolicy::Enabled;
+    configure(&mut start);
+    start
+}
+
+/// The tools the model is offered on its first request, under `engine`.
+async fn offered_tools(
+    engine: &str,
+    configure: impl FnOnce(&mut CodingRuntimeStart),
+) -> Vec<String> {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(production_start(env.project.path(), &recorder, configure))
+            .await
+            .unwrap();
+    turn(&mut runtime, "hello").await;
+    runtime.handle.shutdown().await.unwrap();
+    let tools = recorder
+        .tools
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .unwrap_or_default();
+    tools
+}
+
+/// Names only one engine offers, and why. Every other tool must be offered by
+/// both — and every entry here must still differ, or it is stale.
+const KNOWN_TOOL_DIFFERENCES: &[(&str, &str)] = &[
+    // The harness asks through its own `ask_user`; the chain's structured
+    // `request_user_input` is the same capability under the kernel's name.
+    (
+        "request_user_input",
+        "chain: structured question tool; harness offers ask_user",
+    ),
+    (
+        "ask_user",
+        "harness: the question tool behind the user-questions seam",
+    ),
+    // Self-knowledge is a harness row with no chain counterpart.
+    ("describe_self", "harness: describes the running tree"),
+];
+
+fn tool_difference(chain: &[String], harness: &[String]) -> (Vec<String>, Vec<String>) {
+    let only_chain = chain
+        .iter()
+        .filter(|name| !harness.contains(name))
+        .cloned()
+        .collect();
+    let only_harness = harness
+        .iter()
+        .filter(|name| !chain.contains(name))
+        .cloned()
+        .collect();
+    (only_chain, only_harness)
+}
+
+fn assert_same_tools(chain: &[String], harness: &[String], what: &str) {
+    let (only_chain, only_harness) = tool_difference(chain, harness);
+    let unexplained: Vec<&String> = only_chain
+        .iter()
+        .chain(&only_harness)
+        .filter(|name| {
+            !KNOWN_TOOL_DIFFERENCES
+                .iter()
+                .any(|(known, _)| known == name)
+        })
+        .collect();
+    assert!(
+        unexplained.is_empty(),
+        "{what}: only chain {only_chain:?}, only harness {only_harness:?}\n chain {chain:?}\n harness {harness:?}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(engine)]
+async fn the_model_is_offered_the_same_tools_on_both_engines() {
+    let chain = offered_tools("chain", |_| {}).await;
+    let harness = offered_tools("harness", |_| {}).await;
+    assert_same_tools(&chain, &harness, "production start");
+    // The list of known differences is itself checked: an entry that no longer
+    // differs is a claim nobody is making any more.
+    let (only_chain, only_harness) = tool_difference(&chain, &harness);
+    for (known, _) in KNOWN_TOOL_DIFFERENCES {
+        assert!(
+            only_chain
+                .iter()
+                .chain(&only_harness)
+                .any(|name| name == known),
+            "`{known}` is listed as a difference but both engines agree"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(engine)]
+async fn a_capability_switched_off_is_not_offered_on_either_engine() {
+    let off = |start: &mut CodingRuntimeStart| {
+        start.prepare.memory = false;
+        start.prepare.web = false;
+        start.prepare.review = false;
+        start.prepare.subagents = SubagentPolicy::Disabled;
+        start.prepare.request_user_input = false;
+        start.agent.todo.enabled = false;
+    };
+    let chain = offered_tools("chain", off).await;
+    let harness = offered_tools("harness", off).await;
+    assert_same_tools(&chain, &harness, "capabilities off");
+}
+
 macro_rules! on_both_engines {
     ($($scenario:ident),* $(,)?) => {
         mod chain {
@@ -985,4 +1174,6 @@ on_both_engines!(
     an_eager_todo_reminder_rides_the_first_request,
     a_loop_turn_can_schedule_its_next_pass,
     a_strict_credential_refusal_ends_the_turn_with_a_choice,
+    the_catalog_is_the_skills_the_driver_named,
+    memory_is_shown_only_when_switched_on,
 );

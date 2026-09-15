@@ -383,10 +383,29 @@ impl Plugin for ReviewToolPlugin {
 
 // ---- memory -------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 struct MemoryRow {
     #[serde(default)]
     project_root: Option<String>,
+    /// Put memory in front of the model on the first turn. Off leaves the
+    /// `memory` tool mounted — writing a memory and being shown the stored ones
+    /// are separate decisions, and a host that turns off the second (a one-shot
+    /// run that must not depend on someone's notes) still wants the first.
+    #[serde(default = "yes")]
+    inject: bool,
+}
+
+impl Default for MemoryRow {
+    fn default() -> Self {
+        Self {
+            project_root: None,
+            inject: true,
+        }
+    }
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// User memory, injected as a **logged fact** rather than a hidden prepend.
@@ -456,7 +475,7 @@ impl Plugin for MemoryPlugin {
             ),
         );
 
-        if merged.is_empty() {
+        if merged.is_empty() || !row.inject {
             return Ok(());
         }
 

@@ -937,6 +937,14 @@ pub struct HostState {
     pub session_context: Option<HostContext>,
     /// Tools the runtime built around its own controllers.
     pub tools: Vec<Arc<dyn atomcode_kernel::tool::Tool>>,
+    /// The skill registry the runtime loaded, and its prompt catalog.
+    pub skills: Option<(
+        Arc<atomcode_capabilities::skills::SkillRegistry>,
+        Option<String>,
+    )>,
+    /// Row edits the runtime's own options call for (a capability switched off,
+    /// a directory to resolve against), as a TOML layer.
+    pub rows: String,
 }
 
 /// See [`crate::host_rows::SessionContextPlugin`].
@@ -1050,13 +1058,19 @@ pub async fn mount_hosted(
             )
         })
         .unwrap_or_default();
+    let skills_rows = if host.skills.is_some() {
+        "[[patch]]\nid = \"skills\"\nname = \"skills-host\"\n\n\
+         [[patch]]\nid = \"skill-catalog-inline\"\ndisabled = true\n\n"
+    } else {
+        ""
+    };
     let tools_rows = if host.tools.is_empty() {
         ""
     } else {
         "[[insert]]\nname = \"host-tools\"\n\n"
     };
     let hosted = format!(
-        "[[patch]]\nid = \"session\"\nname = \"session-native\"\n\n{modes_rows}{cc_rows}{context_rows}{datalog_rows}{tools_rows}{}{}",
+        "[[patch]]\nid = \"session\"\nname = \"session-native\"\n\n{modes_rows}{cc_rows}{context_rows}{datalog_rows}{tools_rows}{skills_rows}{}{}{}",
         host.hooks
             .as_ref()
             .map(|hooks| hooks.rows())
@@ -1064,7 +1078,8 @@ pub async fn mount_hosted(
         host.middleware
             .as_ref()
             .map(|middleware| middleware.rows())
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        host.rows,
     );
     layers.push(Layer::from_toml(&hosted).map_err(|e| e.to_string())?);
     for src in extra_layers {
@@ -1093,6 +1108,12 @@ pub async fn mount_hosted(
     registry.register(Arc::new(crate::host_rows::KernelMiddlewarePlugin(
         host.middleware.unwrap_or_default(),
     )));
+    if let Some((skill_registry, catalog)) = host.skills {
+        registry.register(Arc::new(crate::host_rows::SkillsHostPlugin {
+            registry: skill_registry,
+            catalog,
+        }));
+    }
     if !host.tools.is_empty() {
         registry.register(Arc::new(crate::host_rows::HostToolsPlugin(host.tools)));
     }
@@ -1437,7 +1458,7 @@ impl Plugin for ExecutionPolicyPlugin {
 /// Fragment id and rank of the generic `skills` advertisement, which this
 /// replaces. Same id is the mechanism (`PromptRegistry::contribute` retains by
 /// id), and it is deliberate rather than incidental.
-const SKILLS_FRAGMENT: (&str, i32) = ("skills", 60);
+pub(crate) const SKILLS_FRAGMENT: (&str, i32) = ("skills", 60);
 
 /// Puts the full skill catalog in the system prompt.
 pub struct SkillCatalogPlugin;

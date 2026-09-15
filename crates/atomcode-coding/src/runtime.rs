@@ -2047,9 +2047,11 @@ impl CodingRuntime {
                                 .spawn(),
                             Engine::Harness => {
                                 let (handle, app, providers) =
-                                    mount_harness(&parts, &agent, provider).await.map_err(|e| {
-                                        RuntimeStartError::Assemble(std::io::Error::other(e))
-                                    })?;
+                                    mount_harness(&parts, &agent, &prepare, provider)
+                                        .await
+                                        .map_err(|e| {
+                                            RuntimeStartError::Assemble(std::io::Error::other(e))
+                                        })?;
                                 harness_app = Some(app);
                                 harness_providers = Some(providers);
                                 handle
@@ -7403,6 +7405,7 @@ fn build_goal_evaluator_provider(
 fn harness_host_state(
     parts: &crate::CodingParts,
     config: &CodingAgentConfig,
+    prepare: &PrepareOptions,
 ) -> Result<crate::on_harness::HostState, std::io::Error> {
     let session = match &parts.session {
         Some(binding) => crate::host_rows::SessionSeed {
@@ -7491,7 +7494,13 @@ fn harness_host_state(
         hooks: Some(hooks),
         middleware: Some(middleware),
         cc_hooks: parts.cc_external_hooks.clone(),
-        tools: parts.extra_tools(),
+        tools: parts
+            .extra_tools()
+            .into_iter()
+            .chain(parts.host_only_tools())
+            .collect(),
+        skills: parts.skill_registry(),
+        rows: harness_option_rows(parts, config, prepare),
         datalog: config.datalog.enabled.then(|| config.datalog.clone()),
         modes: Some(crate::on_harness::HostModes {
             modes: atomcode_harness::seams::Modes {
@@ -7512,6 +7521,7 @@ fn harness_host_state(
 async fn mount_harness(
     parts: &crate::CodingParts,
     config: &CodingAgentConfig,
+    prepare: &PrepareOptions,
     provider: Arc<dyn atomcode_kernel::provider::LlmProvider>,
 ) -> Result<
     (
@@ -7549,7 +7559,7 @@ async fn mount_harness(
             providers,
             current: config.provider_name.clone(),
         });
-    let host = harness_host_state(parts, config).map_err(|error| error.to_string())?;
+    let host = harness_host_state(parts, config, prepare).map_err(|error| error.to_string())?;
     // Turns on this tree are billed to the model it was built for. The chain
     // stamps the same attribution inside `assemble`.
     if let Some(snapshot) = parts.snapshot_hook() {
@@ -7587,12 +7597,72 @@ async fn build_agent(
                 .map_err(|error| error.to_string())
         }
         Engine::Harness => {
-            let (handle, app, providers) = mount_harness(&runtime.parts, config, provider).await?;
+            let (handle, app, providers) =
+                mount_harness(&runtime.parts, config, &runtime.prepare, provider).await?;
             runtime.harness_app = Some(app);
             runtime.harness_providers = Some(providers);
             Ok(handle)
         }
     }
+}
+
+/// Row edits for what this runtime's options switched off, and for the
+/// directory rows resolve against.
+///
+/// Read off what prepare DECIDED (a review provider exists or not, the todo
+/// switch after its environment override) rather than re-deriving it from the
+/// options, so the tree and the capability graph cannot disagree about whether a
+/// capability is on.
+fn harness_option_rows(
+    parts: &crate::CodingParts,
+    config: &CodingAgentConfig,
+    prepare: &PrepareOptions,
+) -> String {
+    let mut rows = String::new();
+    let mut disable = |id: &str| {
+        rows.push_str(&format!("[[patch]]\nid = \"{id}\"\ndisabled = true\n\n"));
+    };
+    if !prepare.tools {
+        disable("memory");
+    }
+    if !prepare.tools || !prepare.web {
+        disable("tool-web");
+    }
+    if parts.review_provider.is_none() {
+        disable("tool-code-review");
+    }
+    if parts.subagent_provider.is_none() {
+        disable("subagent-in-process");
+        disable("team-in-process");
+    }
+    if !parts.todo_enabled() {
+        disable("tool-todo");
+        disable("todo-reminder");
+    }
+    if !parts.request_user_input_enabled() {
+        disable("tool-ask");
+    }
+    // Rows whose directory defaults to the process's cwd, pointed at this
+    // session's working directory instead. `[[patch]]` replaces a row's whole
+    // config, so each carries every field the row is given elsewhere.
+    let wd = atomcode_harness::bundle::toml_string(&config.working_dir.to_string_lossy());
+    // The chain's `memory` switch is the injection alone; the `memory` tool is
+    // one of the core tools and stays either way.
+    if prepare.tools {
+        rows.push_str(&format!(
+            "[[patch]]\nid = \"memory\"\nconfig = {{ project_root = {wd}, inject = {} }}\n\n",
+            prepare.memory
+        ));
+    }
+    rows.push_str(&format!(
+        "[[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ resume = false, project_root = {wd} }}\n\n"
+    ));
+    if parts.subagent_provider.is_some() {
+        rows.push_str(&format!(
+            "[[patch]]\nid = \"team-in-process\"\nconfig = {{ project_root = {wd}, max_members = 6, max_rounds = 24 }}\n\n"
+        ));
+    }
+    rows
 }
 
 async fn assemble_runtime_resources(runtime: &mut RuntimeResources) -> Result<AgentHandle, String> {
