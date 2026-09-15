@@ -403,6 +403,10 @@ pub struct CodingParts {
     /// credential command survives a model swap / capability re-prepare (mirrors the
     /// sibling gates above); otherwise the user re-approves it every time.
     pub credential_shell_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    /// Shared allow-all store for both bash gates (workspace gate + generic approval
+    /// middleware). Allows the user to grant "always approve bash" across both gates
+    /// with a single decision, persisting across model swaps.
+    pub bash_allow_all_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
     /// Provider slot for the `code_review` sub-agent tool, FILLED by [`assemble`] (the tool
     /// is built in `prepare` before the provider exists). Shared so a respawn/model-swap
     /// updates the reviewer's provider too. `None` when `opts.review` was false.
@@ -1052,6 +1056,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         names.clear();
     }
 
+    // Shared allow-all store for both bash gates (workspace gate + generic approval middleware).
+    let bash_allow_all: Arc<dyn atomcode_capabilities::tools::PermissionStore> =
+        Arc::new(atomcode_capabilities::tools::InMemoryPermissionStore::new());
+
     Ok(CodingParts {
         shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
         plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1073,6 +1081,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         credential_shell_grants: std::sync::Arc::new(
             atomcode_capabilities::tools::InMemoryPermissionStore::new(),
         ),
+        bash_allow_all_grants: bash_allow_all.clone(),
         registry,
         tool_names: names,
         todo_enabled,
@@ -1086,7 +1095,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         mcp_publication_enabled,
         mcp_catalog_ready: tokio::sync::watch::channel(mcp_registry.is_none()).0,
         _mcp_work_guard: mcp_work_guard,
-        approval: Arc::new(ApprovalMiddleware::in_memory()),
+        approval: Arc::new(ApprovalMiddleware::with_allow_all_store(
+            Arc::new(atomcode_capabilities::tools::InMemoryPermissionStore::new()),
+            bash_allow_all.clone(),
+            "approval".to_string(),
+        )),
         hooks,
         compaction_checkpoint,
         snapshot_hook: snapshot_hook_handle,
@@ -1803,9 +1816,10 @@ pub fn assemble(
         // BEFORE the generic approval gate so its `Allow` short-circuits the prompt; reads the
         // SAME live cwd handle, so /cd moves the boundary. Mode-independent (accept-edits is for
         // edits only); full Auto bypasses it via the driver auto-answering.
-        .middleware(Arc::new(BashWorkspaceGate::with_store(
+        .middleware(Arc::new(BashWorkspaceGate::with_allow_all_store(
             parts.shared_cwd.clone(),
             parts.bash_workspace_grants.clone(),
+            parts.bash_allow_all_grants.clone(),
         )))
         // Approval AFTER the CC PreToolUse gate + the write/open auto-approve gates — every
         // arg-rewrite (CC `updatedInput`) has already applied, so the user approves the exact
