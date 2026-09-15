@@ -106,6 +106,12 @@ fn every_row_coding_names_is_addressable_in_this_product() {
     // Names coding only *names* (a `[[remove]]`, say) have nothing to compare
     // and are skipped.
     let mut wrong: Vec<String> = Vec::new();
+    // Which (row, field) pairs really do differ, declaration or not. Gathered so
+    // the declarations can be checked against reality at the end: one that
+    // stopped being true is a note explaining something that no longer happens,
+    // which is worse than no note — same rule as `KNOWN_TOOL_DIFFERENCES` in
+    // `differential.rs`.
+    let mut differing: Vec<(String, String)> = Vec::new();
     // **The comparison is against the tree, and the tree includes this
     // product's own layers.** `CODING_ROWS` is the first word on a row, not the
     // last: `tui-app`/`repl-app` patch `approval-interactive` on afterwards
@@ -118,18 +124,18 @@ fn every_row_coding_names_is_addressable_in_this_product() {
         let Some(mine) = tree.entries.iter().find(|e| e.id == id) else {
             continue; // already reported above
         };
-        // Declared in [`DELIBERATE_DIVERGENCES`] and must stay listed there.
-        if deliberate(&id, &want_config, mine) {
-            continue;
-        }
         // `disabled` first: a row the product switched off is a different agent
-        // no matter what config it carries.
+        // no matter what config it carries. **Per field**, so a declared
+        // divergence on one key of a row does not also excuse `disabled`.
         if let Some(want) = want_disabled {
             if mine.disabled != want {
-                wrong.push(format!(
-                    "`{id}` — coding sets disabled = {want}, this product has {}",
-                    mine.disabled
-                ));
+                differing.push((id.clone(), "disabled".to_string()));
+                if !deliberate(&id, "disabled") {
+                    wrong.push(format!(
+                        "`{id}` — coding sets disabled = {want}, this product has {}",
+                        mine.disabled
+                    ));
+                }
             }
         }
         // Then only the keys coding actually set, so a row with extra options
@@ -138,9 +144,12 @@ fn every_row_coding_names_is_addressable_in_this_product() {
             for (k, v) in want {
                 let got = mine.config.get(k);
                 if got != Some(v) {
-                    wrong.push(format!(
-                        "`{id}` — coding sets {k} = {v}, this product has {got:?}"
-                    ));
+                    differing.push((id.clone(), k.clone()));
+                    if !deliberate(&id, k) {
+                        wrong.push(format!(
+                            "`{id}` — coding sets {k} = {v}, this product has {got:?}"
+                        ));
+                    }
                 }
             }
         }
@@ -153,6 +162,22 @@ fn every_row_coding_names_is_addressable_in_this_product() {
          DELIBERATE_DIVERGENCES with its reason.",
         wrong.join("\n  ")
     );
+
+    // And every declaration has to be real. One that no longer differs is a
+    // reason kept for something that stopped happening — and, worse, an
+    // exemption still granting cover over a field the product no longer
+    // overrules.
+    let stale: Vec<&str> = DELIBERATE_DIVERGENCES
+        .iter()
+        .filter(|(row, field, _)| !differing.iter().any(|(r, f)| r == row && f == field))
+        .map(|(row, _, _)| *row)
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these rows are declared as deliberate divergences but no longer differ, \
+         so the declaration is stale: {stale:?} — drop the entry rather than \
+         leaving a reason for something that stopped happening"
+    );
 }
 
 /// Divergences from coding's own list that this product makes **on purpose**.
@@ -160,46 +185,54 @@ fn every_row_coding_names_is_addressable_in_this_product() {
 /// The list is the point, in both directions. Without it, every deliberate
 /// difference reads as a regression and the check gets switched off the first
 /// time it is inconvenient — which is how the id-level version of this test
-/// came to exist. With it, an *undeclared* difference is the only thing that
-/// fails, and a declared one that stops being true is caught by the negative
-/// check below.
+/// came to exist.
 ///
-/// Each entry: the row, what this product does to it, and why.
-const DELIBERATE_DIVERGENCES: &[(&str, &str)] = &[
+/// **Scoped to one field, and that scope is enforced.** An earlier version
+/// declared the whole row, so `triple`-style exemptions meant `persona-atomcode`
+/// could have its `disabled`, its `name` or anything else changed and still pass
+/// — a list of rows is a list of holes. Each entry names the one field this
+/// product overrules, and every other field of that row is still compared.
+///
+/// Each entry: the row, the field, and why.
+const DELIBERATE_DIVERGENCES: &[(&str, &str, &str)] = &[
     (
-        "approval-interactive",
-        "on: this product stacks `tui-app`/`repl-app`, which patch it on, and \
-         `Presence::Attended` is precisely the mode whose out-of-workspace calls \
-         are meant to arrive as questions rather than refusals (product.rs docs)",
-    ),
-    ("persona-atomcode", "model stays empty"),
-    (
-        "ui",
-        "the row is filled by `ui-tui2` instead of the line-based REPL",
-    ),
-    (
-        "ui-handle",
-        "off: this product's agent is driven by the pump inside `ui-tui2`, and \\
-         both rows fill `ui`",
-    ),
-    (
-        "user-questions-unattended",
-        "off: `ui-tui2` fills `user-questions`, and two rows in one slot is an error",
+        "persona-atomcode",
+        "model",
+        "left empty on purpose: an empty model means 'ask the running tree', \
+         because the provider here is built by the `llm` row and `--model` can \
+         change it after this layer was written (product.rs docs)",
     ),
     (
         "trace",
+        "stream",
         "silenced: the screen is the output, so nothing else may write to it",
+    ),
+    ("trace", "tools", "silenced, same reason as `stream`"),
+    ("trace", "summary", "silenced, same reason as `stream`"),
+    (
+        "ui-handle",
+        "disabled",
+        "off: this product's agent is driven by the pump inside `ui-tui2`, and \
+         both rows fill `ui`",
+    ),
+    (
+        "approval-interactive",
+        "disabled",
+        "on: this product stacks `tui-app`/`repl-app`, which patch it on, and \
+         `Presence::Attended` is exactly the mode whose out-of-workspace calls are \
+         meant to arrive as questions rather than refusals (product.rs docs)",
     ),
 ];
 
-/// Whether this row's difference is one the product declares.
+/// Whether this one field of this row is a difference the product declares.
 ///
-/// Deliberately coarse — it matches on the row id alone. A finer check ("is it
-/// still the *same* divergence") would have to restate each reason in code, and
-/// the reasons are prose. What it does buy is that a divergence must be written
-/// down before it can pass, which is the whole of the property worth having.
-fn deliberate(id: &str, _want: &serde_json::Value, _mine: &atomcode_plexus::Entry) -> bool {
-    DELIBERATE_DIVERGENCES.iter().any(|(row, _)| *row == id)
+/// Field-scoped rather than row-scoped: an exemption for a row is an exemption
+/// for everything about it, which is how a declared `model` divergence would
+/// silently cover a later `disabled` one.
+fn deliberate(row: &str, field: &str) -> bool {
+    DELIBERATE_DIVERGENCES
+        .iter()
+        .any(|(r, f, _)| *r == row && *f == field)
 }
 
 /// Every `(id, disabled, config)` the layer ends up asking for.
@@ -239,7 +272,13 @@ fn ids_and_config(src: &str) -> Vec<(String, Option<bool>, serde_json::Value)> {
         match op {
             Op::Insert(entries) => {
                 for e in entries {
-                    put(&e.id.clone(), e.disabled.then_some(true), Some(&e.config));
+                    // `Some(e.disabled)`, not `then_some(true)`: an insert that
+                    // ships a row **enabled** is stating `disabled = false`, and
+                    // `then_some(true)` turned that statement into "no opinion" —
+                    // so switching such a row off in this product compared
+                    // nothing at all. `verify-cadence` is one, which is how the
+                    // hole was found: disable it and the check stayed green.
+                    put(&e.id.clone(), Some(e.disabled), Some(&e.config));
                 }
             }
             Op::Patch {

@@ -83,6 +83,63 @@ pub enum Presence {
 /// than keeping a second copy of this list, which is how two products come to
 /// disagree about what a coding agent can do.
 pub const CODING_DEFAULTS: &str = r#"
+# --- how long a turn may run ----------------------------------------------
+#
+# `infra` ships `round-cap` at `max_rounds = 24`, so every tree that says
+# nothing inherits a 24-round turn. The engine this assembly stands in for does
+# not cap turns at all: its equivalent knob defaults to `0`, documented as
+# "`0` = unbounded" (`atomcode-coding/src/config.rs`,
+# `default_turn_max_rounds`), and honored by
+# `if cfg.max_rounds != 0 { builder.max_rounds(…) }` in `parts.rs` and
+# `assemble.rs` alike.
+#
+# So the mapping is not "pick a number" — it is stating the same policy the
+# engine states, in the unit this row counts. Leaving `infra`'s 24 in place made
+# this assembly a *different agent* from the one the same codebase runs
+# everywhere else, and the difference was invisible: a row can be reconfigured
+# by the **absence** of a patch.
+#
+# Here rather than in a host's own bundle, because both hosts stack this list —
+# `product.rs` (the full-screen TUI) and `mount_swappable` (a driver holding an
+# `AgentHandle`). Putting it in one of them is how the two came to disagree:
+# round 1 of this fix did exactly that, and the harness-side host kept stopping
+# at 24.
+#
+# `0` is written literally, so a deployment that wants a fuse sets it in a layer
+# of its own (`--patch`, or `harness.patch.toml`) — both land after this one.
+# `RoundCap::call` guards with `max_rounds > 0` so `0` means "no limit" rather
+# than "stop before the first request".
+#
+# NOT mapped, and worth knowing: `[coding].max_rounds` /
+# `ATOMCODE_TURN_MAX_ROUNDS` do not reach this row. Those are read where the
+# engine builds its loop (`config.rs`), which a config *layer* cannot do — a
+# layer is data. Bridging them means a plugin that reads the environment and
+# patches this row, which does not exist yet; until it does, a deployment that
+# sets them gets the engine's cap on the chain path and none here.
+#
+# ALSO NOT mapped, deliberately, and this one is a divergence rather than a gap:
+# `agent-loop` carries a second, coarser stop — `infra` sets
+# `config = { max_rounds = 100 }`, and `agent_loop.rs` ends the turn with
+# `StopReason::RunawayFuse` at that round. The engine's counterpart is
+# `cfg.max_rounds` → the kernel fuse, whose comment reads "`0` leaves the
+# neutral kernel fuse unwired" — i.e. the engine ships it **off** and relies on
+# the repetition guards, which is what this assembly's `tool-loop-guard` +
+# `repeat-fuse` rows are.
+#
+# Matching that here means setting the fuse to `0`, and that is two changes, not
+# one: `agent_loop.rs` compares `step >= self.max_rounds`, so a bare `0` stops
+# the turn before its first request (the same trap `round-cap` had), and
+# `Op::Patch` **replaces a row's whole config** — so a host that patches
+# `agent-loop` with just its `working_dir` (both hosts do) would drop the field
+# straight back to the default of 100. Doing it half-way would produce a fuse
+# that reads 0 in a `--dump-config` whose host has already reverted it.
+#
+# Left as is on purpose: the fuse is a safety net, removing one is its own
+# decision, and the divergence is documented here rather than silently made.
+[[patch]]
+id = "round-cap"
+config = { max_rounds = 0 }
+
 # --- what the model can do to the repository ------------------------------
 # All routed through the execution world (`fs`/`shell`), so the fence and the
 # approval seam apply to every one of them rather than to whoever remembered.
@@ -306,23 +363,23 @@ pub const CODING_ROWS: &str = r#"
 # reached through the `approval` seam instead of a private `PermissionStore`.
 [[insert]]
 name = "tool-open-file-workspace"
-config = { working_dir = "{working_dir}" }
+config = { working_dir = {working_dir} }
 
 [[insert]]
 name = "tool-credential-shell"
 
 [[insert]]
 name = "tool-write-approval"
-config = { working_dir = "{working_dir}" }
+config = { working_dir = {working_dir} }
 
 [[insert]]
 name = "tool-bash-workspace"
-config = { working_dir = "{working_dir}" }
+config = { working_dir = {working_dir} }
 
 # An oversized tool result is stored whole and shown head + tail.
 [[insert]]
 name = "tool-output-artifact"
-config = { dir = "{artifacts}" }
+config = { dir = {artifacts} }
 
 # How the model is told about skills. The generic `skills` row advertises a
 # count and a pointer; coding lists the catalog, because every other piece of
@@ -354,7 +411,7 @@ name = "tool-open-file"
 # rewritten by a `/model` patch so this row remounts with it.
 [[insert]]
 name = "persona-atomcode"
-config = { model = "{model}" }
+config = { model = {model} }
 
 # The self-correction loop: an in-workspace code edit the model walked away
 # from without checking gets one nudge. `force` follows presence, the same rule
@@ -362,7 +419,7 @@ config = { model = "{model}" }
 # is watching can ask for the check themselves.
 [[insert]]
 name = "verify-cadence"
-config = { working_dir = "{working_dir}", force = {force_verify} }
+config = { working_dir = {working_dir}, force = {force_verify} }
 
 # The driver protocol: this is what `CodingRuntimeHandle` drives.
 [[insert]]
@@ -405,25 +462,32 @@ pub fn coding_overlay(
     presence: Presence,
     model: &str,
 ) -> String {
-    // The placeholders sit **inside quotes** in `CODING_ROWS`, so what goes in
-    // is the escaped *content*, not another quoted literal — hence
-    // [`toml_string`] with its quotes trimmed rather than `{:?}`. See
-    // `atomcode_harness::bundle::toml_string` for why `{:?}` is not the same
-    // escaping language.
-    let escape_in_place = |v: &str| {
-        let quoted = atomcode_harness::bundle::toml_string(v);
-        quoted[1..quoted.len() - 1].to_string()
-    };
+    // Each placeholder stands **where its value goes**, not inside quotes of its
+    // own — so what is substituted is [`toml_string`]'s whole output, quotes and
+    // all.
+    //
+    // This was wrong once, in a way worth remembering: the placeholders used to
+    // sit inside `"…"` and the substitution trimmed `toml_string`'s quotes to
+    // fit. That works only by accident, because the serializer does not always
+    // choose double quotes — for a value containing `"` or a backslash and no
+    // `'`, it emits a **literal** string (`'/tmp/we"ird'`), and trimming that
+    // leaves raw text to be spliced into `"…"`, which is to say no escaping at
+    // all. The awkward paths stayed broken; only the values the serializer
+    // happens to double-quote were fixed. Hence: whole output, placeholder
+    // unquoted.
+    //
+    // `{force_verify}` below is the exception, and it is not a string: it is a
+    // TOML **boolean** (`true`/`false`), so it goes in bare.
     CODING_ROWS
         .replace(
             "{working_dir}",
-            &escape_in_place(&working_dir.to_string_lossy()),
+            &atomcode_harness::bundle::toml_string(&working_dir.to_string_lossy()),
         )
         .replace(
             "{artifacts}",
-            &escape_in_place(&artifacts.to_string_lossy()),
+            &atomcode_harness::bundle::toml_string(&artifacts.to_string_lossy()),
         )
-        .replace("{model}", model)
+        .replace("{model}", &atomcode_harness::bundle::toml_string(model))
         .replace(
             "{force_verify}",
             // Same rule as the fence above, read the other way round: with
