@@ -47,6 +47,18 @@ pub struct ModelRequest {
 /// status, a structured code, a real `Retry-After`. Flattening that to a string
 /// at the seam would force every recovery plugin to re-derive it by matching on
 /// message text, which is exactly how a rate-limit handler ends up mistaking a
+/// Why a rate-limited turn stopped rather than failed, and when to come back.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RateLimitPause {
+    pub reset_at_display: String,
+    pub reset_label: String,
+    #[serde(default)]
+    pub secs_until_reset: Option<u64>,
+    /// The provider's own reason, for a pause that is not a plan window.
+    #[serde(default)]
+    pub server_message: Option<String>,
+}
+
 /// 400 for a 429.
 #[derive(Clone, Debug)]
 pub struct RequestError {
@@ -65,6 +77,9 @@ pub struct RequestError {
     /// The provider answered with no content and no tool calls. Distinct from
     /// an error: nothing failed, the turn simply cannot proceed on it.
     pub empty_response: bool,
+    /// A rate-limit policy decided this 429 is a pause, not a failure: the turn
+    /// ends cleanly as rate-limited and the person is told when it resets.
+    pub rate_limit_pause: Option<RateLimitPause>,
     /// What the stream had already produced when it broke.
     ///
     /// A stream that fails after emitting real work is not the same failure as
@@ -84,6 +99,7 @@ impl RequestError {
             retry_after: None,
             context_overflow: false,
             empty_response: false,
+            rate_limit_pause: None,
             partial: None,
         }
     }
@@ -98,6 +114,7 @@ impl RequestError {
             retry_after: error.retry_after_secs.map(std::time::Duration::from_secs),
             context_overflow: error.is_context_overflow(),
             empty_response: false,
+            rate_limit_pause: None,
             partial: None,
         }
     }

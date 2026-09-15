@@ -32,6 +32,7 @@ struct Recorder {
     requests: Mutex<Vec<Vec<Message>>>,
     tools: Mutex<Vec<Vec<String>>>,
     options: Mutex<Vec<ChatOptions>>,
+    blipped: std::sync::atomic::AtomicBool,
     count: AtomicUsize,
 }
 
@@ -97,6 +98,30 @@ impl LlmProvider for RecordingProvider {
                     })
                     .to_string(),
                 })
+            }
+            // A limit that resets an hour from now.
+            Some(m) if m.role == Role::User && m.text == "throttle" => {
+                return Err(ProviderError {
+                    retryable: false,
+                    message: "HTTP 429: slow down".into(),
+                    http_status: Some(429),
+                    code: None,
+                    retry_after_secs: Some(3600),
+                });
+            }
+            // A limit that clears in a second, once.
+            Some(m)
+                if m.role == Role::User
+                    && m.text == "blip"
+                    && !self.0.blipped.swap(true, Ordering::SeqCst) =>
+            {
+                return Err(ProviderError {
+                    retryable: false,
+                    message: "HTTP 429: busy".into(),
+                    http_status: Some(429),
+                    code: None,
+                    retry_after_secs: Some(1),
+                });
             }
             // A request that never answers: the only way out is a cancel.
             Some(m) if m.role == Role::User && m.text == "hang" => {
@@ -1316,6 +1341,139 @@ async fn a_cancelled_turn_is_kept_when_asked(engine: &str) {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// A CodingPlan account whose 5-hour window is exhausted, resetting later.
+#[derive(Debug)]
+struct ExhaustedWindow;
+
+#[async_trait::async_trait]
+impl atomcode_coding::RateLimitWindowSource for ExhaustedWindow {
+    fn applies_to(&self, _base_url: &str) -> bool {
+        true
+    }
+    async fn fetch_windows(&self) -> Result<Vec<atomcode_coding::RateLimitWindow>, String> {
+        Ok(vec![atomcode_coding::RateLimitWindow {
+            window_size_seconds: 18_000,
+            quota_exhausted: true,
+            reset_at_display: "15:30".into(),
+            seconds_until_reset: 5_400,
+            reset_label: "5h".into(),
+            call_limit: 100,
+        }])
+    }
+}
+
+/// Run a turn to its end and return how it ended and the rate-limit notice the
+/// driver was given, if any.
+async fn turn_to_rate_limit(
+    runtime: &mut CodingRuntime,
+    text: &str,
+) -> (
+    Option<atomcode_kernel::event::StopReason>,
+    Vec<atomcode_kernel::event::AgentEvent>,
+) {
+    runtime.handle.submit(UserInput::from(text)).await.unwrap();
+    let mut notices = Vec::new();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("turn did not finish")
+            .expect("runtime event stream closed");
+        match event.event {
+            CodingRuntimeEvent::Agent(
+                notice @ atomcode_kernel::event::AgentEvent::RateLimited { .. },
+            ) => notices.push(notice),
+            CodingRuntimeEvent::TurnFinished(atomcode_coding::TurnCompletion::Completed {
+                reason,
+                ..
+            }) => return (Some(reason), notices),
+            CodingRuntimeEvent::TurnFinished(_) => return (None, notices),
+            _ => {}
+        }
+    }
+}
+
+/// A limit that resets far off pauses the turn — not a failure — and says why.
+async fn a_distant_rate_limit_pauses_the_turn(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+
+    let (reason, notices) = turn_to_rate_limit(&mut runtime, "throttle").await;
+
+    assert_eq!(
+        reason,
+        Some(atomcode_kernel::event::StopReason::RateLimited),
+        "[{engine}]"
+    );
+    assert!(
+        notices.iter().any(|notice| matches!(
+            notice,
+            atomcode_kernel::event::AgentEvent::RateLimited {
+                auto_resuming: false,
+                server_message: Some(message),
+                ..
+            } if message == "slow down"
+        )),
+        "[{engine}] {notices:?}"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// On the CodingPlan gateway the account's window says when it resets.
+async fn an_exhausted_plan_window_pauses_until_its_reset(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.prepare.rate_limit_source = Some(Arc::new(ExhaustedWindow));
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    let (reason, notices) = turn_to_rate_limit(&mut runtime, "throttle").await;
+
+    assert_eq!(
+        reason,
+        Some(atomcode_kernel::event::StopReason::RateLimited),
+        "[{engine}]"
+    );
+    assert!(
+        notices.iter().any(|notice| matches!(
+            notice,
+            atomcode_kernel::event::AgentEvent::RateLimited {
+                reset_at_display,
+                secs_until_reset: Some(5_400),
+                ..
+            } if reset_at_display == "15:30"
+        )),
+        "[{engine}] {notices:?}"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A limit that clears in a moment is waited out, and the turn goes on.
+async fn a_brief_rate_limit_is_waited_out(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+
+    let (reason, _) = turn_to_rate_limit(&mut runtime, "blip").await;
+
+    assert_eq!(
+        reason,
+        Some(atomcode_kernel::event::StopReason::Stopped),
+        "[{engine}]"
+    );
+    assert_eq!(recorder.requests.lock().unwrap().len(), 2, "[{engine}]");
+    runtime.handle.shutdown().await.unwrap();
+}
+
 // ---- what the model is offered ---------------------------------------------
 
 /// The start a production driver makes: every capability the chain turns on
@@ -1494,4 +1652,7 @@ on_both_engines!(
     an_mcp_servers_tools_are_offered_and_run,
     a_cancelled_turn_is_undone_by_default,
     a_cancelled_turn_is_kept_when_asked,
+    a_distant_rate_limit_pauses_the_turn,
+    an_exhausted_plan_window_pauses_until_its_reset,
+    a_brief_rate_limit_is_waited_out,
 );

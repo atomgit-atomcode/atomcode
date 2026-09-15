@@ -274,6 +274,13 @@ impl Projector {
                 }]
             }
 
+            SessionEvent::RateLimitPaused { pause, .. } => vec![AgentEvent::RateLimited {
+                reset_at_display: pause.reset_at_display.clone(),
+                reset_label: pause.reset_label.clone(),
+                secs_until_reset: pause.secs_until_reset,
+                auto_resuming: false,
+                server_message: pause.server_message.clone(),
+            }],
             SessionEvent::PolicyIntervention { intervention, .. } => {
                 vec![AgentEvent::PolicyIntervention {
                     intervention: intervention.clone(),
@@ -387,6 +394,7 @@ pub fn stop_reason(stop: crate::seams::StopReason) -> atomcode_kernel::event::St
         In::Cancelled => Out::Cancelled,
         In::InputRejected => Out::PromptRejected,
         In::PolicyDenied => Out::PolicyDenied,
+        In::RateLimited => Out::RateLimited,
     }
 }
 

@@ -451,7 +451,7 @@ fn parse_retry_after_secs(msg: &str) -> Option<u64> {
 /// real `Retry-After` response header (`ProviderError::retry_after_secs`, populated by the
 /// provider open path), falling back to the "try again in N seconds" text that some
 /// gateways (e.g. LiteLLM) embed only in the BODY when they send no header.
-fn effective_retry_after(e: &crate::stream::ProviderError) -> Option<u64> {
+pub(crate) fn effective_retry_after(e: &crate::stream::ProviderError) -> Option<u64> {
     e.retry_after_secs
         .or_else(|| parse_retry_after_secs(&e.message))
 }
@@ -462,7 +462,7 @@ fn effective_retry_after(e: &crate::stream::ProviderError) -> Option<u64> {
 /// pause instead of a bare "HTTP 429". `None` when the body is empty / only the
 /// prefix. Kept prefix-exact (the known status) rather than a loose match, and
 /// falls back to the whole message if the prefix isn't present (other providers).
-fn rate_limit_server_message(e: &crate::stream::ProviderError) -> Option<String> {
+pub(crate) fn rate_limit_server_message(e: &crate::stream::ProviderError) -> Option<String> {
     let status = e.http_status.unwrap_or(429);
     let prefix = format!("HTTP {status}: ");
     let detail = e
@@ -475,7 +475,7 @@ fn rate_limit_server_message(e: &crate::stream::ProviderError) -> Option<String>
 
 /// Distinguish account/billing exhaustion from transient RPM/TPM throttling.
 /// Keep this allow-list narrow: unknown 429s remain retryable.
-fn is_terminal_rate_limit(e: &crate::stream::ProviderError) -> bool {
+pub(crate) fn is_terminal_rate_limit(e: &crate::stream::ProviderError) -> bool {
     let code = e.code.as_deref().unwrap_or_default().to_ascii_lowercase();
     if matches!(
         code.as_str(),

@@ -262,6 +262,14 @@ pub enum SessionEvent {
         turn: u64,
         title: String,
     },
+    /// A rate limit paused the turn: it ended cleanly, and resets later.
+    ///
+    /// Screen-visible, so logged — the reset time is what a driver draws instead
+    /// of a red error, and a resumed session can still say why the turn stopped.
+    RateLimitPaused {
+        turn: u64,
+        pause: crate::events::RateLimitPause,
+    },
     /// The person stopped this turn.
     ///
     /// Model-visible, because what the model is shown next depends on it: a note
@@ -316,6 +324,7 @@ impl SessionEvent {
             | Self::Titled { turn, .. }
             | Self::PolicyIntervention { turn, .. }
             | Self::Interrupted { turn, .. }
+            | Self::RateLimitPaused { turn, .. }
             | Self::TurnEnd { turn, .. } => *turn,
         }
     }
@@ -354,7 +363,8 @@ impl SessionEvent {
 /// supposed to be able to redraw.
 ///
 /// **4** — added [`SessionEvent::PolicyIntervention`], `PolicyDenied` as a way a
-/// turn ends, and [`SessionEvent::Interrupted`]. Same shape again: a hard
+/// turn ends, [`SessionEvent::Interrupted`], and [`SessionEvent::RateLimitPaused`]
+/// with `RateLimited` as a way a turn ends. Same shape again: a hard
 /// boundary's recovery choice, and what a person's cancel does to the history,
 /// were kernel behaviour the log never saw.
 pub const SESSION_FORMAT_VERSION: u32 = 4;

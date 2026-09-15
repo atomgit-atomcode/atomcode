@@ -719,4 +719,7 @@ pub enum StopReason {
     /// choices are the [`crate::session::SessionEvent::PolicyIntervention`]
     /// committed with it.
     PolicyDenied,
+    /// A rate limit paused the turn — not a failure: already-produced work is
+    /// kept, and the pause committed with it says when the limit resets.
+    RateLimited,
 }

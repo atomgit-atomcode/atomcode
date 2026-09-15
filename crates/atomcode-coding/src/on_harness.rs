@@ -480,6 +480,15 @@ fn model_rows(cfg: &crate::CodingAgentConfig) -> String {
         "[[patch]]\nid = \"tool-fs-world\"\nconfig = {{ vision = {} }}\n\n",
         cfg.supports_vision
     );
+    // A 429 is judged against the endpoint the request went to: whether it is the
+    // CodingPlan gateway (whose windows say when to come back) follows the model.
+    out.push_str(&format!(
+        "[[patch]]\nid = \"llm-rate-limit\"\nname = \"rate-limit-coding\"\nconfig = {{ base_url = {}{} }}\n\n",
+        atomcode_harness::bundle::toml_string(&cfg.base_url),
+        cfg.retry_max_attempts
+            .map(|n| format!(", max_attempts = {n}"))
+            .unwrap_or_default()
+    ));
     let options = &cfg.chat_options;
     let mut fields = Vec::new();
     if let Some(level) = options
@@ -544,11 +553,6 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> String {
     if let Some(attempts) = attempts {
         out.push_str(&format!(
             "[[patch]]\nid = \"llm-retry\"\nconfig = {{ attempts = {attempts}, backoff_ms = 3000, cap_ms = 30000 }}\n\n"
-        ));
-    }
-    if let Some(waits) = cfg.retry_max_attempts {
-        out.push_str(&format!(
-            "[[patch]]\nid = \"llm-rate-limit\"\nconfig = {{ max_waits = {waits}, max_wait_secs = 120, fallback_secs = 5 }}\n\n"
         ));
     }
     // How long a question to the person waits. `None` parks until answered.
@@ -1071,6 +1075,8 @@ pub struct HostState {
     pub rows: String,
     /// The runtime's MCP registry, published into the tree by `mcp-host`.
     pub(crate) mcp: Option<crate::host_rows::McpPublication>,
+    /// Where CodingPlan usage windows come from, when this host has an account.
+    pub rate_limit_source: Option<Arc<dyn crate::rate_limit::RateLimitWindowSource>>,
 }
 
 /// See [`crate::host_rows::SessionContextPlugin`].
@@ -1235,6 +1241,9 @@ pub async fn mount_hosted(
     ))));
     registry.register(Arc::new(crate::host_rows::KernelHooksPlugin(
         host.hooks.unwrap_or_default(),
+    )));
+    registry.register(Arc::new(crate::host_rows::RateLimitCodingPlugin(
+        host.rate_limit_source.clone(),
     )));
     registry.register(Arc::new(crate::host_rows::KernelMiddlewarePlugin(
         host.middleware.unwrap_or_default(),

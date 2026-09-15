@@ -524,6 +524,13 @@ impl PluginAgentLoop {
             } {
                 Ok(response) => response,
                 Err(error) => {
+                    if let Some(pause) = error.rate_limit_pause.clone() {
+                        // Not a failure: the turn stops cleanly and says when to
+                        // come back.
+                        self.commit(&session, SessionEvent::RateLimitPaused { turn, pause });
+                        outcome.stop = StopReason::RateLimited;
+                        break;
+                    }
                     outcome.stop = StopReason::ProviderError;
                     outcome.error = Some(error.to_string());
                     break;

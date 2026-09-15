@@ -120,6 +120,26 @@ pub enum RateLimitDecision {
     },
 }
 
+impl RateLimitHint {
+    /// The hint the kernel builds for a 429, for a loop that is not the kernel's
+    /// but asks the same host hook: the real Retry-After (or the one a gateway
+    /// only wrote in the body), and whether the provider called it terminal.
+    pub fn from_provider_error(error: &crate::stream::ProviderError, attempt: u32) -> Self {
+        Self {
+            http_status: error.http_status,
+            retry_after_secs: crate::agent::effective_retry_after(error),
+            terminal: crate::agent::is_terminal_rate_limit(error),
+            attempt,
+        }
+    }
+
+    /// The provider's own 429 message, prefix stripped — what a driver shows on a
+    /// generic pause.
+    pub fn server_message(error: &crate::stream::ProviderError) -> Option<String> {
+        crate::agent::rate_limit_server_message(error)
+    }
+}
+
 impl RateLimitDecision {
     /// Conservative fallback when NO host hook supplies a verdict (non-CodingPlan,
     /// or usage data unavailable): wait only if the kernel's own hint says the

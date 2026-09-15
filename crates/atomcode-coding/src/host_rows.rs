@@ -1096,3 +1096,162 @@ impl Plugin for McpHostPlugin {
         Ok(())
     }
 }
+
+// ---- 429s, judged the way the chain judges them -----------------------------
+
+/// `rate-limit-coding`: stands where `llm-rate-limit` stands, and decides a 429
+/// with the same host hook the chain's kernel asks.
+///
+/// The harness's own row waits out a `Retry-After` and otherwise fails the turn.
+/// The product has more to go on: on the CodingPlan gateway the account's usage
+/// windows say whether the limit clears in seconds (wait and retry) or hours
+/// (pause, and tell the person when) — and a 429 from anywhere else still gets
+/// the kernel's default verdict, including its livelock fuse and its refusal to
+/// retry a stream that had already shown the person some output. A pause ends
+/// the turn as rate-limited, not as a failure.
+pub(crate) struct RateLimitCodingPlugin(
+    pub(crate) Option<Arc<dyn crate::rate_limit::RateLimitWindowSource>>,
+);
+
+#[derive(serde::Deserialize, Default)]
+struct RateLimitCodingRow {
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    max_attempts: Option<u32>,
+}
+
+/// The kernel's bound on consecutive waits for one 429 incident.
+const MAX_RATE_LIMIT_WAITS: u32 = 5;
+/// A first 429 with no hint recovers quietly after this, as the kernel does.
+const QUIET_FIRST_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+struct RateLimitCoding {
+    ctx: Context,
+    hook: crate::rate_limit::RateLimitHook,
+}
+
+impl RateLimitCoding {
+    fn notice(&self, detail: String) {
+        let scoped = atomcode_harness::agent::scoped(&self.ctx);
+        if let Some(log) = scoped.service::<SessionSvc>() {
+            atomcode_harness::session::commit(
+                &scoped,
+                &log,
+                SessionEvent::Notice {
+                    turn: log.current_turn(),
+                    notice: atomcode_harness::session::NoticeKind::RateLimited,
+                    detail,
+                },
+            );
+        }
+    }
+}
+
+#[async_trait]
+impl Waterfall<AgentRequest> for RateLimitCoding {
+    async fn handle(
+        &self,
+        req: &mut ModelRequest,
+        next: Next<'_, AgentRequest>,
+    ) -> Result<ModelResponse, RequestError> {
+        use atomcode_kernel::hook::{RateLimitDecision, RateLimitHint};
+        let mut waits = 0u32;
+        loop {
+            let error = match next.run(req).await {
+                Ok(response) => return Ok(response),
+                Err(error) if error.is_rate_limited() => error,
+                Err(error) => return Err(error),
+            };
+            let provider = atomcode_kernel::stream::ProviderError {
+                retryable: error.retryable,
+                message: error.message.clone(),
+                http_status: error.http_status,
+                code: error.code.clone(),
+                retry_after_secs: error.retry_after.map(|d| d.as_secs()),
+            };
+            let hint = RateLimitHint::from_provider_error(&provider, waits.saturating_add(1));
+            let server_message = RateLimitHint::server_message(&provider);
+            let verdict = if hint.terminal {
+                None
+            } else {
+                self.hook.on_rate_limit(&hint).await
+            };
+            let quiet_first =
+                verdict.is_none() && hint.retry_after_secs.is_none() && !hint.terminal;
+            let decision = verdict.unwrap_or_else(|| RateLimitDecision::from_hint(&hint));
+            let pause = |reset_at_display: String, reset_label: String, secs: Option<u64>| {
+                Err(RequestError {
+                    rate_limit_pause: Some(atomcode_harness::events::RateLimitPause {
+                        reset_at_display,
+                        reset_label,
+                        secs_until_reset: secs,
+                        server_message: server_message.clone(),
+                    }),
+                    ..error.clone()
+                })
+            };
+            match decision {
+                // A stream that already showed the person output cannot be
+                // re-issued without showing it twice.
+                RateLimitDecision::WaitAndRetry { secs } if error.partial.is_some() => {
+                    return pause(String::new(), String::new(), Some(secs));
+                }
+                RateLimitDecision::WaitAndRetry { .. } if waits >= MAX_RATE_LIMIT_WAITS => {
+                    return pause(String::new(), String::new(), None);
+                }
+                RateLimitDecision::WaitAndRetry { secs } => {
+                    waits += 1;
+                    let wait = if quiet_first && waits == 1 {
+                        QUIET_FIRST_RETRY
+                    } else {
+                        self.notice(format!("rate limited; retrying in {secs}s"));
+                        std::time::Duration::from_secs(secs)
+                    };
+                    // The loop races this request against the stop button, so a
+                    // cancel drops the sleep with it.
+                    tokio::time::sleep(wait).await;
+                }
+                RateLimitDecision::Pause {
+                    reset_at_display,
+                    reset_label,
+                    secs_until_reset,
+                } => return pause(reset_at_display, reset_label, secs_until_reset),
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Plugin for RateLimitCodingPlugin {
+    fn name(&self) -> &'static str {
+        "rate-limit-coding"
+    }
+    fn description(&self) -> &'static str {
+        "a 429 decided from the CodingPlan usage windows when on the gateway, the kernel's default otherwise"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: RateLimitCodingRow = if config.is_null() {
+            RateLimitCodingRow::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        let hook = match &self.0 {
+            Some(source) => {
+                crate::rate_limit::RateLimitHook::with_source(row.base_url, source.clone())
+            }
+            None => crate::rate_limit::RateLimitHook::new(row.base_url),
+        }
+        .with_max_attempts(row.max_attempts);
+        // Prepended, like the row it replaces: waiting has to happen outside every
+        // other recovery, or each burns an attempt against a limit still in force.
+        let _ = ctx.on_waterfall::<AgentRequest>(
+            Arc::new(RateLimitCoding {
+                ctx: ctx.clone(),
+                hook,
+            }),
+            true,
+        );
+        Ok(())
+    }
+}
