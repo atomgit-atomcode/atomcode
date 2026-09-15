@@ -46,6 +46,78 @@ frontier 并标 `+N 更多`,`live::render` 会在放不下 margin 时丢 margin 
 
 ---
 
+## 接缝(已核实,动手前定死)
+
+### S1. `tail` 必须是 id 列表,不是子节点
+
+`El::Stream{tail}` 仍是**叶子**:`place_into`(`el.rs:401`)照旧交出整个矩形就停。
+切 pane 的是 **host**:compose 的循环绑定了 `region` 本身(`host.rs:1179`),
+所以它可以从同一个值里读到 `tail`,自己算出 `block_rect` + N 个尾部矩形。
+
+**不能把尾部做成 `Stream` 的子节点。** 那样布局引擎会按 flex 给每个子节点一个
+矩形 —— 永远全部 N 个可见,而我们要的恰恰是「能被部分滚出视野」。滚动概念一旦进
+引擎,就得在引擎里重做一遍偏移算术。
+
+> 一句话:**引擎对滚动一无所知**,`tail` 只是一个 id 列表。
+
+### S2. 只有两个函数要真正理解 `tail`
+
+`El::Stream` 落在 `prune` 的 `other => other.clone()`(`el.rs:371`)—— 原样返回、
+不修剪;`modules()` 只递归 `Flex`/`Stack` 的子节点。所以新逻辑只在:
+
+| 函数 | 改法 |
+|---|---|
+| `modules()`(`el.rs:299`) | **要改** — 收集 `tail` 里的 id。否则 `/hide todo` 报 `NotOnScreen`(`layout.rs:216` 查的就是 `tree().modules()`) |
+| `prune()`(`el.rs:334`) | **要改** — 过滤 `tail` 列表(未挂载的剔除) |
+| `place_into`(`el.rs:401`) | **不动** — 仍交出一个 rect |
+| `wanted`(`el.rs:505`) | **不动** — 仍报 1,靠 `grow` 吃满 |
+
+```
+tail 声明了 todo,而树里仍有 El::Module("todo")  →  被渲染两次
+```
+
+**这是 Step 2/3 必须守住的不变量**:同一模块不得同时出现在 `tail` 和树中。
+(见 Step 5.4 的判据)
+
+### S3. tail 声明是「第三条路」,放在 `default_layout()`
+
+面板定位自己的位置今天有两种做法:
+
+| | 怎么定位 | `inject()` |
+|---|---|---|
+| `MascotPanel`(`rows.rs:249-266`) | **用 `LayoutOp::Show{side: Top}` 自己占位** | `["tui-modules","tui-layout"]` |
+| `TodoPanel`(`rows.rs:365-375`) | **什么都不做**,只 `add_view` | `["tui-modules"]` |
+
+`TodoPanel` 的注释就是 ADR 0020 的出发点:
+
+```rust
+// Mount only. Where it goes is the composer's to write — `LayoutOp::Show`
+// has no side that means "above the field".
+```
+
+所以 `composer()` 是「宿主替这类面板写位置」的**唯一**地方。tail 声明放在同一层
+(`default_layout()` 里构造 `Stream{tail}`),不是新机制,是那条既有约束的延伸。
+ADR 里应把它描述成第三条路:**不是**「用 op 自己占位」,**也不是**「宿主写死一个
+rect」,而是「宿主写死它属于可滚动尾部」。
+
+### S4. `/hide` `/show` `/swap`:无新缺口,但有一条既存别扭(不修)
+
+逐条核过 `Layout::apply`(`layout.rs:194-236`):
+
+| op | 行为 | 结论 |
+|---|---|---|
+| `Hide{todo}` | 先查 `on_screen.contains(module)`(`:216`) | tail id 必须进 `modules()` —— 即 S2 ✅ |
+| `Show{todo}` | 已在屏上时返回 `AlreadyOnScreen`(`:201`) | todo 在 tail 里时被正确拒绝 ✅ |
+| `Swap{Target::Stream}` | `matches()` 只认叶子模式(`:288`) | pattern 改 `Region::Stream{..}`,语义不变 ✅ |
+
+**既存别扭(不是本次引入):** `/hide todo` 之后 `/show todo`,它作为**浮动兄弟
+节点**插回来(`Region::split`,`size` 默认 1 行),**不会回到 tail**。今天也一样:
+`/hide todo` 从 `composer()` 的 flex 里剪掉它,`/show todo` 同样插成浮动兄弟。
+**不是回归**,可靠的回退路径一直是 `Undo`。**本次不碰**,写在这里免得下一个人
+以为自己弄坏了什么。
+
+---
+
 ## Step 1 — `el.rs`:`Stream` 带 `tail`(行为不变)
 
 ```rust
@@ -65,14 +137,8 @@ Stream { tail: Vec<String> },
 - `layout.rs`: 128、141(preset 构造)、288(`matches`)、297、301(`swap`)、548(测试)
 - `host.rs`: 1180(compose)、1323(`stream_rows`)、1522(`default_layout`)
 
-**四个函数要真正理解 `tail`:**
-
-| 函数 | 改法 |
-|---|---|
-| `place_into`(`el.rs:401`) | **语义不变** — Stream 仍是叶子、仍拿一个矩形(该矩形天然包含尾部) |
-| `wanted`(`el.rs:505`) | 不变(仍报 1,靠 `grow` 吃满) |
-| `modules()`(`el.rs:299`) | 收集 `tail` 里的 id — 否则 `/hide todo` 报 `NotOnScreen` |
-| `prune`(`el.rs:334`) | `tail` 中未挂载的 id 剔除 |
+新逻辑只落在 `modules()` 与 `prune()` 两个函数上(理由见 S2);`place_into` 与
+`wanted` **不动**。
 
 **完成判据:** `cargo nextest run -p atomcode-tui` 全绿 — tail 处处为空,行为不变。
 
@@ -166,9 +232,13 @@ if held {
 
 ## Step 3 — 先接 `todo`
 
-- 拆 `host::composer()`(`host.rs:1497`):滚动部分(`todo`)与框架部分(`tip` + `input`)
+- 拆 `host::composer()`(`host.rs:1497`):滚动部分(`todo`)与框架部分(`tip` + `input`)。
+  **注意这时候 todo 不再是树的子节点**,所以它从 `composer()` 里移出不是「少一行」,
+  而是「换个地方声明」(见 S3)
 - `default_layout()`(`host.rs:1517`)构造 `Stream { tail: vec!["todo".into()] }`
 - `layout.rs` 三个 preset(`:116-149`)同步:`default` / `focus` / `wide` 都经 `composer()`
+- **守住 S2 的不变量**:移走树里的 `El::Module("todo")` 与声明 `tail` 必须同时发生,
+  否则 todo 被渲染两次
 - 打开 2e 的符号对称 pin(首个非空 tail)
 - 新增判据:**pin 符号对称** — 读者 `scroll > 0` 时 `todo` 因计划变化缩短,读者正在看的那几行**不动**。反证:把 `grew != 0` 改回 `grew > 0` 必须红
 
@@ -198,6 +268,10 @@ if held {
    — 守住「输入框永不移动」(`modules/tip.rs:10-22`)
 3. **`stream_height` 与实画一致**(把 `host.rs:2294` 的模式扩到尾部):
    块区行数 + 各 tail 模块实际 place 的行数 == 该高度
+4. **同一模块不得同时出现在 `tail` 和树中**(S2 的不变量)。
+   判据:构造一棵**故意**同时含 `tail: ["todo"]` 与 `El::Module("todo")` 的树,
+   断言它被判红(或在 `prune`/装配期被拒绝)。这条比 S2 的「记得同时改」更硬 ——
+   否则下一个人改布局时会静默地把 todo 画两遍
 
 ---
 
@@ -233,6 +307,7 @@ cargo fmt --all && cargo fmt --all -- --check
 | `height` 与实画行数失衡 | ✅ `host.rs:2294` + Step 5.3 |
 | pin 单边补偿 → 抖动 | ❌ 无,Step 3 / 5.1 **新增** |
 | `stream_height` 内部读锁 → 死锁 | ⚠️ 会挂而非静默,盯 2d / 2e |
+| **同一模块同时在 tail 与树中 → 画两遍** | ❌ 无,Step 5.4 **新增**(S2 的不变量) |
 | 尾部每帧小量渲染 | 可忽略(`scroll == 0` 时与现状相同;滚过之后反而被算术跳过,不再渲染) |
 
 ---
