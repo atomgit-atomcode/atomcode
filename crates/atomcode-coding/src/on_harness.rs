@@ -451,6 +451,22 @@ name = "ui-handle"
 /// silently dropped by the tree.
 pub fn config_rows(cfg: &crate::CodingAgentConfig) -> String {
     let mut out = String::new();
+    // `[tools] credential_shell = "off" | "prompt" | "strict"`. The row's own
+    // default is `prompt`, the same as the L1 default, so only a person who
+    // chose otherwise changes the tree.
+    {
+        use atomcode_capabilities::tools::CredentialShellPolicy;
+        let policy = match cfg.credential_shell_policy {
+            CredentialShellPolicy::Off => Some("off"),
+            CredentialShellPolicy::Prompt => None,
+            CredentialShellPolicy::Strict => Some("strict"),
+        };
+        if let Some(policy) = policy {
+            out.push_str(&format!(
+                "[[patch]]\nid = \"tool-credential-shell\"\nconfig = {{ policy = \"{policy}\" }}\n\n"
+            ));
+        }
+    }
     if let Some(provider) = cfg
         .web_search_provider
         .as_deref()

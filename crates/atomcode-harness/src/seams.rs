@@ -713,4 +713,10 @@ pub enum StopReason {
     /// turn is stopped rather than continued: a prompt nobody can reconstruct
     /// makes resume, fork and compaction unsound from here on.
     InvariantViolated,
+    /// A hard policy boundary refused a call and ended the turn, because trying
+    /// another spelling of the same thing would be unsafe. The refusal is in the
+    /// log as the tool's result; what to do next is the person's, and the
+    /// choices are the [`crate::session::SessionEvent::PolicyIntervention`]
+    /// committed with it.
+    PolicyDenied,
 }

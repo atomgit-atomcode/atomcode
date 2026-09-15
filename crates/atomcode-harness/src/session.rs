@@ -262,6 +262,16 @@ pub enum SessionEvent {
         turn: u64,
         title: String,
     },
+    /// A hard boundary ended the turn and the person has to choose how to go on.
+    ///
+    /// Screen-visible, so logged: the recovery choices ("complete it yourself",
+    /// "skip this step") are what a driver draws, and a session resumed after the
+    /// process died owes the person the same choice rather than a silent stop.
+    /// Not model-visible — the model already read the refusal as the tool's result.
+    PolicyIntervention {
+        turn: u64,
+        intervention: atomcode_kernel::event::PolicyIntervention,
+    },
     TurnEnd {
         turn: u64,
         /// Why it ended. The reason itself, not a rendering of it: a consumer
@@ -292,6 +302,7 @@ impl SessionEvent {
             | Self::Usage { turn, .. }
             | Self::Notice { turn, .. }
             | Self::Titled { turn, .. }
+            | Self::PolicyIntervention { turn, .. }
             | Self::TurnEnd { turn, .. } => *turn,
         }
     }
@@ -327,7 +338,11 @@ impl SessionEvent {
 /// same shape of change for the same reason. What a person decided used to
 /// exist only on the screen that asked, which is the one thing a log is
 /// supposed to be able to redraw.
-pub const SESSION_FORMAT_VERSION: u32 = 3;
+///
+/// **4** — added [`SessionEvent::PolicyIntervention`], and `PolicyDenied` as a
+/// way a turn ends. Same shape again: a hard boundary's recovery choice was a
+/// kernel event the log never saw.
+pub const SESSION_FORMAT_VERSION: u32 = 4;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()

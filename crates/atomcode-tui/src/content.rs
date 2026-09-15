@@ -1008,6 +1008,12 @@ fn turn_end_note(stop: StopReason) -> (Glyph, String, Style) {
             warn,
         ),
         InputRejected => (Glyph::Interrupted, "已中断 · 输入被拒绝".to_string(), warn),
+        // A hard boundary refused a call; the refusal itself is the tool's result.
+        PolicyDenied => (
+            Glyph::Interrupted,
+            "已中断 · 安全策略拦下了这一步".to_string(),
+            warn,
+        ),
         // A failure, with the provider's own sentence folded in below.
         ProviderError => (Glyph::Fail, "已中断".to_string(), bad()),
         // Not a failed request: the log cannot explain what reached the model,

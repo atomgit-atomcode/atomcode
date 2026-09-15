@@ -628,12 +628,27 @@ impl Waterfall<ToolsExecute> for CredentialShell {
         };
         match verdict {
             CredentialShellVerdict::NotOurs => return next.run(exec).await,
-            // The turn-ending variant of `strict` is a kernel notion (it carries a
-            // `PolicyIntervention`); here the call is refused and the loop decides
-            // what to do with a refusal, which is the harness's own vocabulary.
-            CredentialShellVerdict::DenyTurn | CredentialShellVerdict::Deny => {
-                return refuse(CREDENTIAL_BASH_DENIAL_REASON)
+            // `strict`: refused, and the turn ends here — another spelling of
+            // the same command would be just as unsafe to try. The person gets
+            // the recovery choice as a logged fact; the loop's stopping
+            // question (below) reads it and ends the turn after this round.
+            CredentialShellVerdict::DenyTurn => {
+                let scoped = crate::agent::scoped(&self.ctx);
+                if let Some(log) = scoped.service::<crate::seams::SessionSvc>() {
+                    crate::session::commit(
+                        &scoped,
+                        &log,
+                        crate::session::SessionEvent::PolicyIntervention {
+                            turn: log.current_turn(),
+                            intervention:
+                                atomcode_kernel::event::PolicyIntervention::credential_shell_blocked(
+                                ),
+                        },
+                    );
+                }
+                return refuse(CREDENTIAL_BASH_DENIAL_REASON);
             }
+            CredentialShellVerdict::Deny => return refuse(CREDENTIAL_BASH_DENIAL_REASON),
             CredentialShellVerdict::Ask => {}
         }
         let (Some(policy), Some(toolbox)) = (policy, self.ctx.service::<ToolsSvc>()) else {
@@ -657,6 +672,34 @@ impl Waterfall<ToolsExecute> for CredentialShell {
             }
             Decision::Deny(why) => refuse(&format!("{CREDENTIAL_BASH_DENIAL_REASON} ({why})")),
         }
+    }
+}
+
+/// Ends the turn after a round that committed a policy intervention.
+struct StopOnIntervention {
+    ctx: Context,
+}
+
+#[async_trait]
+impl atomcode_plexus::Listener<crate::events::TurnStopping> for StopOnIntervention {
+    async fn call(
+        &self,
+        progress: &crate::events::TurnProgress,
+    ) -> Option<crate::seams::StopReason> {
+        let log = crate::agent::scoped(&self.ctx).service::<crate::seams::SessionSvc>()?;
+        log.events()
+            .iter()
+            .rev()
+            .take_while(|logged| {
+                !matches!(logged.event, crate::session::SessionEvent::TurnStart { .. })
+            })
+            .any(|logged| {
+                matches!(
+                    &logged.event,
+                    crate::session::SessionEvent::PolicyIntervention { turn, .. } if *turn == progress.turn
+                )
+            })
+            .then_some(crate::seams::StopReason::PolicyDenied)
     }
 }
 
@@ -707,6 +750,10 @@ impl Plugin for CredentialShellPlugin {
             }),
             true,
         );
+        // A turn whose round committed a policy intervention ends with that round.
+        let _ = ctx.on_serial::<crate::events::TurnStopping>(Arc::new(StopOnIntervention {
+            ctx: ctx.clone(),
+        }));
         Ok(())
     }
 }

@@ -274,6 +274,12 @@ impl Projector {
                 }]
             }
 
+            SessionEvent::PolicyIntervention { intervention, .. } => {
+                vec![AgentEvent::PolicyIntervention {
+                    intervention: intervention.clone(),
+                }]
+            }
+
             SessionEvent::TurnEnd { stop, error, .. } => {
                 let mut out = Vec::new();
                 if let Some(message) = error {
@@ -376,6 +382,7 @@ pub fn stop_reason(stop: crate::seams::StopReason) -> atomcode_kernel::event::St
         In::ToolLoopDetected => Out::ToolLoopDetected,
         In::Cancelled => Out::Cancelled,
         In::InputRejected => Out::PromptRejected,
+        In::PolicyDenied => Out::PolicyDenied,
     }
 }
 
