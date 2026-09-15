@@ -17,13 +17,13 @@ use std::sync::{Arc, Mutex};
 use atomcode_capabilities::session::SessionManager;
 use atomcode_coding::{
     CodingAgentConfig, CodingProviderFactory, CodingRuntime, CodingRuntimeEvent,
-    CodingRuntimeStart, PrepareOptions, ProviderBuildError, SessionMode, StaticPluginHookSource,
-    SubagentPolicy, UserInput,
+    CodingRuntimeStart, PrepareOptions, ProviderBuildError, RewindScope, SessionMode,
+    StaticPluginHookSource, SubagentPolicy, UserInput,
 };
-use atomcode_kernel::message::{Message, Role};
+use atomcode_kernel::message::{Message, Role, SessionSnapshot};
 use atomcode_kernel::provider::{ChatOptions, LlmProvider};
 use atomcode_kernel::stream::{ProviderError, StreamEvent, TokenUsage};
-use atomcode_kernel::tool::ToolDef;
+use atomcode_kernel::tool::{ToolCall, ToolDef};
 use futures::stream::BoxStream;
 
 /// Answers every request with `answer N` and keeps what each request showed.
@@ -60,8 +60,22 @@ impl LlmProvider for RecordingProvider {
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
         self.0.requests.lock().unwrap().push(messages.to_vec());
         let n = self.0.count.fetch_add(1, Ordering::SeqCst) + 1;
+        // A prompt that names a file to read asks for it once; the result comes
+        // back as the next request's last message, and is echoed.
+        let last = messages.last();
+        let first = match last {
+            Some(m) if m.role == Role::User && m.text.starts_with("read ") => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({ "file_path": &m.text[5..] }).to_string(),
+                })
+            }
+            Some(m) if m.role == Role::Tool => StreamEvent::TextDelta(format!("saw: {}", m.text)),
+            _ => StreamEvent::TextDelta(format!("answer {n}")),
+        };
         Ok(Box::pin(futures::stream::iter(vec![
-            StreamEvent::TextDelta(format!("answer {n}")),
+            first,
             StreamEvent::Usage(TokenUsage {
                 prompt: 10,
                 completion: 2,
@@ -275,6 +289,136 @@ async fn a_sessionless_undo_is_gone_from_what_the_model_sees(engine: &str) {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// A fresh session starts empty, and switching back resumes the first one —
+/// both without restarting the runtime.
+async fn switching_sessions_switches_what_the_model_sees(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    let first = runtime.session.clone().unwrap().id;
+
+    turn(&mut runtime, "apple").await;
+    let fresh = runtime.handle.fresh_session().await.unwrap();
+    assert_ne!(fresh.session_id.as_deref(), Some(first.as_str()));
+    turn(&mut runtime, "banana").await;
+    assert_eq!(
+        user_texts(&recorder.last_request()),
+        vec!["banana".to_string()],
+        "[{engine}] a fresh session"
+    );
+
+    let resumed = runtime.handle.resume_session(first.clone()).await.unwrap();
+    assert_eq!(resumed.session_id.as_deref(), Some(first.as_str()));
+    turn(&mut runtime, "which fruit?").await;
+    assert_eq!(
+        user_texts(&recorder.last_request()),
+        vec!["apple".to_string(), "which fruit?".to_string()],
+        "[{engine}] the resumed session"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// After `/cd`, tools resolve against the new directory.
+async fn a_changed_directory_is_where_tools_run(engine: &str) {
+    select(engine);
+    let env = env();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(elsewhere.path().join("marker.txt"), "from elsewhere\n").unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+
+    let changed = runtime
+        .handle
+        .change_directory(elsewhere.path().to_path_buf())
+        .await
+        .unwrap();
+    assert_eq!(
+        changed.working_dir.canonicalize().unwrap(),
+        elsewhere.path().canonicalize().unwrap()
+    );
+    turn(&mut runtime, "read marker.txt").await;
+
+    let seen = recorder.last_request();
+    let result = seen
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Tool)
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        result.contains("from elsewhere"),
+        "[{engine}] the tool read: {result}"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// Every completed turn is a rewind point, and rewinding the conversation takes
+/// the turns after it out of what the model sees.
+async fn a_rewound_conversation_is_gone_from_what_the_model_sees(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+
+    turn(&mut runtime, "first").await;
+    turn(&mut runtime, "second").await;
+    let catalog = runtime.handle.rewind_points().await.unwrap();
+    assert_eq!(catalog.points.len(), 2, "[{engine}] {:?}", catalog.points);
+    let second = catalog.points[1].turn_id;
+    runtime
+        .handle
+        .rewind(second, RewindScope::Conversation)
+        .await
+        .unwrap();
+    turn(&mut runtime, "third").await;
+
+    assert_eq!(
+        user_texts(&recorder.last_request()),
+        vec!["first".to_string(), "third".to_string()],
+        "[{engine}]"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A restored snapshot is the conversation the next turn continues.
+async fn a_restored_snapshot_is_what_the_model_sees(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+
+    turn(&mut runtime, "before").await;
+    runtime
+        .handle
+        .restore_snapshot(SessionSnapshot::new(vec![
+            Message::user("restored"),
+            Message::assistant("noted", vec![]),
+        ]))
+        .await
+        .unwrap();
+    turn(&mut runtime, "after").await;
+
+    assert_eq!(
+        user_texts(&recorder.last_request()),
+        vec!["restored".to_string(), "after".to_string()],
+        "[{engine}]"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 macro_rules! on_both_engines {
     ($($scenario:ident),* $(,)?) => {
         mod chain {
@@ -303,4 +447,8 @@ on_both_engines!(
     a_resumed_session_continues_the_stored_conversation,
     an_undone_turn_is_gone_from_what_the_model_sees,
     a_sessionless_undo_is_gone_from_what_the_model_sees,
+    switching_sessions_switches_what_the_model_sees,
+    a_changed_directory_is_where_tools_run,
+    a_rewound_conversation_is_gone_from_what_the_model_sees,
+    a_restored_snapshot_is_what_the_model_sees,
 );
