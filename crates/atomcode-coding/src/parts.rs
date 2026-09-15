@@ -584,6 +584,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             .with_tool_loop_policy(cfg.tool_loop_policy),
         ));
         names.push("code_review".into());
+        host_only_tools.push("code_review".into());
         Some(slot)
     } else {
         None
@@ -710,6 +711,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         }
         registry.register(Arc::new(task_tool));
         names.push("task".to_string());
+        host_only_tools.push("task".into());
         Some(slot)
     } else {
         None
@@ -770,6 +772,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             runner.model_factory(),
         )));
         names.push("team".to_string());
+        host_only_tools.push("team".into());
         runner
     });
 
@@ -914,6 +917,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             RecallTool::new().with_sessions_dir(b.manager.root()),
         ));
         names.push("recall".into());
+        host_only_tools.push("recall".into());
         registry.register(Arc::new(
             ListSessionsTool::new().with_sessions_dir(b.manager.root()),
         ));
@@ -1231,7 +1235,9 @@ impl CodingParts {
     /// Tools a tree takes from this capability graph as the objects prepare built:
     /// the ones no harness row provides — `list_sessions` over the native catalog,
     /// `lsp`, external-agent subagents, the AtomGit tools — and the ones whose
-    /// product contract a row does not match, like `request_user_input`.
+    /// product contract a row does not match: `request_user_input`, `task` and
+    /// `team` (tiers, worker scopes, the team panel), `code_review` (the product's
+    /// limits and provider), `recall` (over the native store, which is the master).
     pub(crate) fn host_only_tools(&self) -> Vec<Arc<dyn atomcode_kernel::tool::Tool>> {
         self.host_only_tools
             .iter()
@@ -1574,64 +1580,23 @@ async fn publish_connected_mcp_server(
     catalog_publisher.publish(&tool_registry, &refs);
 }
 
-/// Phase 2 — composition: parts + provider → a runnable [`Agent`].
+/// Fill the providers this capability graph's own sub-agents run on, for `cfg`'s
+/// model: the reviewer's and the subagent host tier's slots, the fast/capable tier
+/// cells and the named-model resolver — each billed to this session's detached
+/// usage and metered under its own telemetry surface.
 ///
-/// A session-bound assemble ALWAYS picks up the session's latest on-disk snapshot
-/// (the SnapshotHook persisted one every turn), so calling it again on the SAME
-/// parts with a new provider IS the respawn (B2 model swap / reload): approval
-/// grants, hook state, session identity, AND the conversation all carry over. A
-/// plain re-`assemble` can never rewind a live session — the one respawn footgun
-/// the design review flagged. Errors:
-/// - a snapshot that exists but can't be read or has an unsupported version
-///   (continuing would silently fresh-start the SAME session id and corrupt its
-///   transcript/snapshot — the exact "silent fresh start" the Resume contract
-///   forbids);
-/// - only an explicitly staged fresh session may have no aggregate yet; every
-///   resume/reassemble requires metadata, snapshot, and presentation together.
+/// Returns the provider for model calls the primary loop makes outside a round
+/// (the overflow summary), recorded and metered the same way.
 ///
-/// CONCURRENCY CONTRACT: at most ONE live agent per `CodingParts` — await the old
-/// `AgentHandle.task` (after `Shutdown`) before re-assembling. The session hooks
-/// hold per-turn state and write per-session files; two live agents on the same
-/// parts would interleave both.
-pub fn assemble(
-    parts: &mut CodingParts,
+/// Its own function because both assemblies need it: the chain's `assemble`, and a
+/// tree that mounts this graph's `task`, `team` and `code_review` as they are. A
+/// slot left empty is a tool that panics on first use; a slot filled with the bare
+/// provider is spend nobody is billed for.
+pub(crate) fn wire_side_providers(
+    parts: &CodingParts,
     cfg: &CodingAgentConfig,
-    provider: Arc<dyn LlmProvider>,
-) -> io::Result<Agent> {
-    // Model swap (e.g. `/model`) routes here via the runtime WITHOUT re-running `prepare`,
-    // so re-register `read_file` with the CURRENT model's vision capability — otherwise the
-    // PREPARE-time flag goes stale and a text-only model could receive a base64 image (or a
-    // VL model none). `register` overwrites by name, so this idempotently refreshes the one
-    // tool whose behavior depends on the model. Same model-swap-refresh pattern as the
-    // `review_provider` slot below.
-    parts
-        .registry
-        .register(Arc::new(ReadFileTool::new(cfg.supports_vision)));
-
-    // Session-bound: reload the complete canonical aggregate. Only a fresh
-    // runtime intentionally staged in memory is allowed to assemble before its
-    // first aggregate publication.
-    if let Some(b) = &mut parts.session {
-        match b.manager.load_native_session(&b.id) {
-            Ok(loaded) => {
-                let mut snap = loaded.snapshot;
-                check_snapshot_version(&snap)?;
-                reconcile_coding_persona(
-                    &mut snap,
-                    cfg,
-                    parts.todo_enabled,
-                    parts.request_user_input_enabled,
-                    parts.review_provider.is_some(),
-                    parts.subagent_provider.is_some(),
-                    parts.has_external_subagents,
-                );
-                b.resume = Some(snap);
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound && b.staged_fresh.is_some() => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-
+    provider: &Arc<dyn LlmProvider>,
+) -> Arc<dyn LlmProvider> {
     // A telemetry-metering decorator over the host provider. Calls made OUTSIDE the host
     // agent loop — the tier-2 overflow summary AND the `code_review` sub-agent's rounds —
     // never reach the turn-level TelemetryHook (which fires on this loop's on_request /
@@ -1716,9 +1681,169 @@ pub fn assemble(
         }
     }
 
-    // Tier-2 overflow summary uses the same metered provider so its summary LLM call is
-    // likewise counted.
-    let summary_provider = metered_provider;
+    if let Some(b) = &parts.session {
+        // Share the parent's `x-atomcode-session-id` with the subagent tier providers so a
+        // `task` fan-out's children run within the SAME gateway window as the main
+        // conversation — otherwise each session-less child is a distinct window and GLM-5.2's
+        // multi-window guard serializes the strong-tier subtasks. (Single-model users already
+        // reuse the host provider, which the kernel binds with this id, so they're unaffected.)
+        if let Some(cell) = &cfg.subagent_fast_provider {
+            cell.set_session_id(&b.id);
+        }
+        if let Some(cell) = &cfg.subagent_capable_provider {
+            cell.set_session_id(&b.id);
+        }
+        if let Some(models) = &cfg.subagent_model_providers {
+            models.set_session_id(&b.id);
+            let manager = b.manager.clone();
+            let session_id = b.id.clone();
+            let persistence_status = parts.snapshot_persistence_status();
+            models.set_usage_recorder_factory(Arc::new(move |selection, model| {
+                let mut recorder = atomcode_capabilities::session::DetachedUsageRecorder::new(
+                    manager.clone(),
+                    &session_id,
+                    selection,
+                    model,
+                );
+                if let Some(status) = persistence_status.clone() {
+                    recorder = recorder.with_persistence_status(status);
+                }
+                recorder
+            }));
+        }
+        if let Some(registry) = cfg.subagent_config.as_deref() {
+            if let Some((fast_key, capable_key)) =
+                crate::subagent_tiers::resolve_tier_keys(registry, &cfg.model)
+            {
+                let install_recorder = |cell: &Arc<crate::config::TierProvider>, key: &str| {
+                    // `key` is a model-selection id (design §14.2); resolve it the
+                    // same way the tier provider was built so usage attribution
+                    // uses the same model identity.
+                    if let Ok(resolved) = registry.resolve_model(Some(key)) {
+                        let mut recorder =
+                            atomcode_capabilities::session::DetachedUsageRecorder::new(
+                                b.manager.clone(),
+                                &b.id,
+                                key,
+                                &resolved.model,
+                            );
+                        if let Some(status) = parts.snapshot_persistence_status() {
+                            recorder = recorder.with_persistence_status(status);
+                        }
+                        cell.set_usage_recorder(recorder);
+                    }
+                };
+                if let Some(cell) = &cfg.subagent_fast_provider {
+                    install_recorder(cell, &fast_key);
+                }
+                if let Some(cell) = &cfg.subagent_capable_provider {
+                    install_recorder(cell, &capable_key);
+                }
+            }
+        }
+    }
+    if let Some(models) = cfg.subagent_model_providers.as_ref() {
+        let telemetry_factory = match (cfg.telemetry.as_ref(), cfg.subagent_config.as_ref()) {
+            (Some(telemetry), Some(model_config)) => {
+                let telemetry = telemetry.clone();
+                let model_config = model_config.clone();
+                let mut base_config = cfg.clone();
+                // The decorator is stored inside `subagent_model_providers`; do not
+                // capture that same Arc through the cloned runtime config.
+                base_config.subagent_fast_provider = None;
+                base_config.subagent_capable_provider = None;
+                base_config.subagent_model_providers = None;
+                base_config.subagent_config = None;
+                let session_id = parts.session.as_ref().map(|binding| binding.id.clone());
+                Some(Arc::new(move |selection: &str, provider| {
+                    let resolved = model_config
+                        .resolve_model(Some(selection))
+                        .map_err(|error| error.to_string())?;
+                    let tier = crate::provider_factory::derive_tier_config_from_resolved(
+                        &base_config,
+                        &resolved,
+                    );
+                    Ok(Arc::new(
+                        crate::telemetry::MeteredProvider::new(
+                            provider,
+                            telemetry.clone(),
+                            tier.provider_type.as_str(),
+                            &tier.base_url,
+                            &tier.model,
+                            session_id.as_deref(),
+                        )
+                        .with_surface("subagent"),
+                    ) as Arc<dyn LlmProvider>)
+                })
+                    as crate::config::SubagentTelemetryProviderFactory)
+            }
+            _ => None,
+        };
+        models.set_telemetry_provider_factory(telemetry_factory);
+    }
+
+    metered_provider
+}
+
+/// Phase 2 — composition: parts + provider → a runnable [`Agent`].
+///
+/// A session-bound assemble ALWAYS picks up the session's latest on-disk snapshot
+/// (the SnapshotHook persisted one every turn), so calling it again on the SAME
+/// parts with a new provider IS the respawn (B2 model swap / reload): approval
+/// grants, hook state, session identity, AND the conversation all carry over. A
+/// plain re-`assemble` can never rewind a live session — the one respawn footgun
+/// the design review flagged. Errors:
+/// - a snapshot that exists but can't be read or has an unsupported version
+///   (continuing would silently fresh-start the SAME session id and corrupt its
+///   transcript/snapshot — the exact "silent fresh start" the Resume contract
+///   forbids);
+/// - only an explicitly staged fresh session may have no aggregate yet; every
+///   resume/reassemble requires metadata, snapshot, and presentation together.
+///
+/// CONCURRENCY CONTRACT: at most ONE live agent per `CodingParts` — await the old
+/// `AgentHandle.task` (after `Shutdown`) before re-assembling. The session hooks
+/// hold per-turn state and write per-session files; two live agents on the same
+/// parts would interleave both.
+pub fn assemble(
+    parts: &mut CodingParts,
+    cfg: &CodingAgentConfig,
+    provider: Arc<dyn LlmProvider>,
+) -> io::Result<Agent> {
+    // Model swap (e.g. `/model`) routes here via the runtime WITHOUT re-running `prepare`,
+    // so re-register `read_file` with the CURRENT model's vision capability — otherwise the
+    // PREPARE-time flag goes stale and a text-only model could receive a base64 image (or a
+    // VL model none). `register` overwrites by name, so this idempotently refreshes the one
+    // tool whose behavior depends on the model. Same model-swap-refresh pattern as the
+    // `review_provider` slot below.
+    parts
+        .registry
+        .register(Arc::new(ReadFileTool::new(cfg.supports_vision)));
+
+    // Session-bound: reload the complete canonical aggregate. Only a fresh
+    // runtime intentionally staged in memory is allowed to assemble before its
+    // first aggregate publication.
+    if let Some(b) = &mut parts.session {
+        match b.manager.load_native_session(&b.id) {
+            Ok(loaded) => {
+                let mut snap = loaded.snapshot;
+                check_snapshot_version(&snap)?;
+                reconcile_coding_persona(
+                    &mut snap,
+                    cfg,
+                    parts.todo_enabled,
+                    parts.request_user_input_enabled,
+                    parts.review_provider.is_some(),
+                    parts.subagent_provider.is_some(),
+                    parts.has_external_subagents,
+                );
+                b.resume = Some(snap);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound && b.staged_fresh.is_some() => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    let summary_provider = wire_side_providers(parts, cfg, &provider);
 
     // When a session is present, wire the artifact store: register the fetch_output tool
     // so the model can retrieve large outputs, and prepare the middleware that intercepts
@@ -1967,65 +2092,6 @@ pub fn assemble(
     }
     if let Some(b) = &parts.session {
         builder = builder.session_id(&b.id);
-        // Share the parent's `x-atomcode-session-id` with the subagent tier providers so a
-        // `task` fan-out's children run within the SAME gateway window as the main
-        // conversation — otherwise each session-less child is a distinct window and GLM-5.2's
-        // multi-window guard serializes the strong-tier subtasks. (Single-model users already
-        // reuse the host provider, which the kernel binds with this id, so they're unaffected.)
-        if let Some(cell) = &cfg.subagent_fast_provider {
-            cell.set_session_id(&b.id);
-        }
-        if let Some(cell) = &cfg.subagent_capable_provider {
-            cell.set_session_id(&b.id);
-        }
-        if let Some(models) = &cfg.subagent_model_providers {
-            models.set_session_id(&b.id);
-            let manager = b.manager.clone();
-            let session_id = b.id.clone();
-            let persistence_status = parts.snapshot_persistence_status();
-            models.set_usage_recorder_factory(Arc::new(move |selection, model| {
-                let mut recorder = atomcode_capabilities::session::DetachedUsageRecorder::new(
-                    manager.clone(),
-                    &session_id,
-                    selection,
-                    model,
-                );
-                if let Some(status) = persistence_status.clone() {
-                    recorder = recorder.with_persistence_status(status);
-                }
-                recorder
-            }));
-        }
-        if let Some(registry) = cfg.subagent_config.as_deref() {
-            if let Some((fast_key, capable_key)) =
-                crate::subagent_tiers::resolve_tier_keys(registry, &cfg.model)
-            {
-                let install_recorder = |cell: &Arc<crate::config::TierProvider>, key: &str| {
-                    // `key` is a model-selection id (design §14.2); resolve it the
-                    // same way the tier provider was built so usage attribution
-                    // uses the same model identity.
-                    if let Ok(resolved) = registry.resolve_model(Some(key)) {
-                        let mut recorder =
-                            atomcode_capabilities::session::DetachedUsageRecorder::new(
-                                b.manager.clone(),
-                                &b.id,
-                                key,
-                                &resolved.model,
-                            );
-                        if let Some(status) = parts.snapshot_persistence_status() {
-                            recorder = recorder.with_persistence_status(status);
-                        }
-                        cell.set_usage_recorder(recorder);
-                    }
-                };
-                if let Some(cell) = &cfg.subagent_fast_provider {
-                    install_recorder(cell, &fast_key);
-                }
-                if let Some(cell) = &cfg.subagent_capable_provider {
-                    install_recorder(cell, &capable_key);
-                }
-            }
-        }
         if let Some(snap) = &b.resume {
             builder = builder.resume(snap.clone());
         }
@@ -2040,45 +2106,6 @@ pub fn assemble(
             parts.has_external_subagents,
         );
         builder = builder.resume(snapshot);
-    }
-    if let Some(models) = cfg.subagent_model_providers.as_ref() {
-        let telemetry_factory = match (cfg.telemetry.as_ref(), cfg.subagent_config.as_ref()) {
-            (Some(telemetry), Some(model_config)) => {
-                let telemetry = telemetry.clone();
-                let model_config = model_config.clone();
-                let mut base_config = cfg.clone();
-                // The decorator is stored inside `subagent_model_providers`; do not
-                // capture that same Arc through the cloned runtime config.
-                base_config.subagent_fast_provider = None;
-                base_config.subagent_capable_provider = None;
-                base_config.subagent_model_providers = None;
-                base_config.subagent_config = None;
-                let session_id = parts.session.as_ref().map(|binding| binding.id.clone());
-                Some(Arc::new(move |selection: &str, provider| {
-                    let resolved = model_config
-                        .resolve_model(Some(selection))
-                        .map_err(|error| error.to_string())?;
-                    let tier = crate::provider_factory::derive_tier_config_from_resolved(
-                        &base_config,
-                        &resolved,
-                    );
-                    Ok(Arc::new(
-                        crate::telemetry::MeteredProvider::new(
-                            provider,
-                            telemetry.clone(),
-                            tier.provider_type.as_str(),
-                            &tier.base_url,
-                            &tier.model,
-                            session_id.as_deref(),
-                        )
-                        .with_surface("subagent"),
-                    ) as Arc<dyn LlmProvider>)
-                })
-                    as crate::config::SubagentTelemetryProviderFactory)
-            }
-            _ => None,
-        };
-        models.set_telemetry_provider_factory(telemetry_factory);
     }
     // Ensure the repo's `atomcode` project label after a successful `git push` to a
     // gitcode/atomgit remote. THIS is the production mount: the terminal TUI, daemon, and

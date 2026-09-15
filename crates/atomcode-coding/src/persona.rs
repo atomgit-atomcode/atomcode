@@ -688,6 +688,25 @@ criteria). Treat the returned text as that agent's final answer and verify it yo
 relying on it. Prefer the in-project tools for ordinary work; reach for an external subagent only \
 when its distinct capability is the point.";
 
+/// The product's guidance for a tool the host hands a tree as it is.
+///
+/// The part of this persona that is about one tool rather than about the agent. A
+/// tree composes its prompt from fragments that come and go with the rows that
+/// own them; a tool the host mounts itself brings its fragment the same way, in
+/// the words the chain has always used for it.
+pub(crate) fn host_tool_guidance(tool: &str) -> Option<(&'static str, &'static str)> {
+    let (key, section) = match tool {
+        "task" => ("task", SUBAGENT_DELEGATION),
+        "team" => ("team", TEAM_DELEGATION),
+        "code_review" => ("code-review", CODE_REVIEW_USAGE),
+        name if name.starts_with("subagent_") => {
+            ("external-subagents", EXTERNAL_SUBAGENT_DELEGATION)
+        }
+        _ => return None,
+    };
+    Some((key, section.trim_start_matches('\n')))
+}
+
 /// Natural-language routing for the read-only review specialization. The tool description
 /// alone is not strong enough for every supported model: some otherwise answer a review
 /// request from a shallow `git diff` scan and never start the dedicated reviewer.

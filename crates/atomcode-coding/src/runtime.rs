@@ -4462,6 +4462,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                         operation: ReconfigureKind::Provider,
                                     },
                                 );
+                                let side_provider = candidate_provider.clone();
                                 if let Err(error) = crate::on_harness::swap_provider_for(
                                     app,
                                     slots.as_ref(),
@@ -4493,6 +4494,12 @@ fn spawn_runtime_owner_with_optional_agent(
                                         config.as_ref(),
                                     );
                                 }
+                                // The reviewer and the subagents follow the model.
+                                let _ = crate::parts::wire_side_providers(
+                                    &runtime.parts,
+                                    &next,
+                                    &side_provider,
+                                );
                                 // Turns from here on are billed to the new model.
                                 // The chain says the same thing from `assemble`,
                                 // which only runs once the swap has succeeded.
@@ -4885,6 +4892,13 @@ fn spawn_runtime_owner_with_optional_agent(
                                         continue;
                                     }
                                 }
+                                // The reviewer's and the subagents' slots held the
+                                // same credentials; they leave with the seam's.
+                                let _ = crate::parts::wire_side_providers(
+                                    &runtime.parts,
+                                    &runtime.config,
+                                    &crate::on_harness::signed_out_provider(),
+                                );
                                 preserve_sessionless_snapshot(runtime, &stop_report);
                                 if let Some(provider) =
                                     runtime.config.subagent_fast_provider.as_ref()
@@ -7590,6 +7604,10 @@ async fn mount_harness(
             providers,
             current: config.provider_name.clone(),
         });
+    // The capability graph's own sub-agents — the reviewer, `task`, `team` — run on
+    // this model, billed to the session and metered the way the chain's
+    // `assemble` wires them.
+    let _ = crate::parts::wire_side_providers(parts, config, &provider);
     let host = harness_host_state(parts, config, prepare).map_err(|error| error.to_string())?;
     // Turns on this tree are billed to the model it was built for. The chain
     // stamps the same attribution inside `assemble`.
@@ -7659,13 +7677,13 @@ fn harness_option_rows(
     if !prepare.tools || !prepare.web {
         disable("tool-web");
     }
-    if parts.review_provider.is_none() {
-        disable("tool-code-review");
-    }
-    if parts.subagent_provider.is_none() {
-        disable("subagent-in-process");
-        disable("team-in-process");
-    }
+    // The runtime mounts its own `code_review`, `task`, `team` and `recall` (see
+    // `CodingParts::host_only_tools`) whenever prepare built them; the rows'
+    // versions are different contracts under the same names.
+    disable("tool-code-review");
+    disable("subagent-in-process");
+    disable("team-in-process");
+    disable("recall");
     if !parts.todo_enabled() {
         disable("tool-todo");
         disable("todo-reminder");
@@ -7695,11 +7713,6 @@ fn harness_option_rows(
         "[[patch]]\nid = \"agent-loop\"\nconfig = {{ working_dir = {wd}, undo_cancelled = {} }}\n\n",
         !config.keep_interrupted_context
     ));
-    if parts.subagent_provider.is_some() {
-        rows.push_str(&format!(
-            "[[patch]]\nid = \"team-in-process\"\nconfig = {{ project_root = {wd}, max_members = 6, max_rounds = 24 }}\n\n"
-        ));
-    }
     rows
 }
 

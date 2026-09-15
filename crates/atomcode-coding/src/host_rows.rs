@@ -653,9 +653,11 @@ impl Plugin for SkillsHostPlugin {
 
 /// `host-tools`: tools the runtime built around its own state.
 ///
-/// `schedule_wakeup` is the one today: calling it hands a wakeup to the runtime's
-/// `/loop` controller over a channel the runtime owns. No row can build it,
-/// because no row has that channel.
+/// `schedule_wakeup` hands a wakeup to the runtime's `/loop` controller over a
+/// channel the runtime owns — no row can build it, because no row has that
+/// channel. The rest are the capability graph's own tools, whose contract a row
+/// does not match; each brings the persona's guidance for it as a fragment that
+/// leaves with it.
 pub(crate) struct HostToolsPlugin(pub(crate) Vec<Arc<dyn atomcode_kernel::tool::Tool>>);
 
 #[async_trait]
@@ -666,16 +668,33 @@ impl Plugin for HostToolsPlugin {
     fn inject(&self) -> &'static [&'static str] {
         &["tools"]
     }
+    fn uses(&self) -> &'static [&'static str] {
+        &["system-prompt"]
+    }
     fn description(&self) -> &'static str {
-        "tools the coding runtime built around its own controllers (schedule_wakeup)"
+        "tools the coding runtime built itself: its controllers' and its capability graph's"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let toolbox = ctx
             .require::<atomcode_harness::seams::ToolsSvc>()
             .map_err(|e| e.to_string())?;
+        let prompts = ctx.service::<SystemPromptSvc>();
+        let mut guided = std::collections::BTreeSet::new();
         for tool in &self.0 {
             let name = tool.name().to_string();
             toolbox.register(tool.clone())?;
+            if let (Some(prompts), Some((key, text))) =
+                (&prompts, crate::persona::host_tool_guidance(&name))
+            {
+                if guided.insert(key) {
+                    let id = format!("host-tool-{key}");
+                    // Beside the rows that describe their own tools.
+                    let rank = if key == "code-review" { 58 } else { 57 };
+                    prompts.contribute(&id, rank, text);
+                    let prompts = prompts.clone();
+                    let _ = ctx.effect(move || prompts.remove(&id));
+                }
+            }
             let toolbox = toolbox.clone();
             let _ = ctx.effect(move || toolbox.unregister(&name));
         }

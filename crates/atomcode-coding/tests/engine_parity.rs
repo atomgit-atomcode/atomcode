@@ -31,9 +31,12 @@ use futures::stream::BoxStream;
 struct Recorder {
     requests: Mutex<Vec<Vec<Message>>>,
     tools: Mutex<Vec<Vec<String>>>,
+    defs: Mutex<Vec<Vec<ToolDef>>>,
     options: Mutex<Vec<ChatOptions>>,
     blipped: std::sync::atomic::AtomicBool,
     count: AtomicUsize,
+    /// Every provider the factory handed out — the objects a credential lives in.
+    built: Mutex<Vec<std::sync::Weak<dyn LlmProvider>>>,
 }
 
 impl Recorder {
@@ -65,6 +68,7 @@ impl LlmProvider for RecordingProvider {
         let mut names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
         names.sort();
         self.0.tools.lock().unwrap().push(names);
+        self.0.defs.lock().unwrap().push(tools.to_vec());
         self.0.options.lock().unwrap().push(options.clone());
         let n = self.0.count.fetch_add(1, Ordering::SeqCst) + 1;
         // A prompt that names a file to read asks for it once; the result comes
@@ -147,6 +151,35 @@ impl LlmProvider for RecordingProvider {
                     .to_string(),
                 })
             }
+            Some(m) if m.role == Role::User && m.text == "delegate" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "task".into(),
+                    arguments: serde_json::json!({
+                        "tasks": [{
+                            "description": "look around",
+                            "prompt": "list what is here",
+                            "subagent_type": "explore",
+                        }],
+                    })
+                    .to_string(),
+                })
+            }
+            Some(m) if m.role == Role::User && m.text == "delegate a team" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "team".into(),
+                    arguments: serde_json::json!({
+                        "action": "delegate",
+                        "tasks": [{
+                            "description": "look around",
+                            "prompt": "list what is here",
+                            "role": "explorer",
+                        }],
+                    })
+                    .to_string(),
+                })
+            }
             Some(m) if m.role == Role::User && m.text == "tick" => {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
@@ -182,7 +215,9 @@ impl CodingProviderFactory for RecordingFactory {
         _config: &CodingAgentConfig,
         _session_id: Option<&str>,
     ) -> Result<Arc<dyn LlmProvider>, ProviderBuildError> {
-        Ok(Arc::new(RecordingProvider(self.0.clone())))
+        let provider: Arc<dyn LlmProvider> = Arc::new(RecordingProvider(self.0.clone()));
+        self.0.built.lock().unwrap().push(Arc::downgrade(&provider));
+        Ok(provider)
     }
 }
 
@@ -1605,6 +1640,140 @@ async fn a_tools_question_reaches_the_person_and_the_answer_comes_back(engine: &
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// Every event a turn produced, answering nothing.
+async fn turn_collecting(runtime: &mut CodingRuntime, text: &str) -> Vec<CodingRuntimeEvent> {
+    runtime.handle.submit(UserInput::from(text)).await.unwrap();
+    let mut seen = Vec::new();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("turn did not finish")
+            .expect("runtime event stream closed");
+        let finished = matches!(event.event, CodingRuntimeEvent::TurnFinished(_));
+        seen.push(event.event);
+        if finished {
+            return seen;
+        }
+    }
+}
+
+/// A `task` subtask is the product's: the driver hears it as a Team run and as
+/// live progress on the call, and what the child spends is billed to the session.
+async fn a_delegated_subtask_is_reported_narrated_and_billed(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(production_start(env.project.path(), &recorder, |_| {}))
+        .await
+        .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+    let seen = turn_collecting(&mut runtime, "delegate").await;
+
+    assert!(
+        seen.iter()
+            .any(|event| matches!(event, CodingRuntimeEvent::Team { .. })),
+        "[{engine}] the subtask never reached the driver as a Team run"
+    );
+    assert!(
+        seen.iter().any(|event| matches!(
+            event,
+            CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::ToolProgress { .. })
+        )),
+        "[{engine}] the subtask ran without a word of progress"
+    );
+    let reported = recorder
+        .last_request()
+        .iter()
+        .any(|m| m.role == Role::Tool && m.text.contains("answer"));
+    assert!(
+        reported,
+        "[{engine}] the child's report never reached the model: {:?}",
+        recorder.last_request()
+    );
+    let meta = SessionManager::for_project(env.project.path())
+        .read_meta(&id)
+        .unwrap();
+    let billed: u64 = meta
+        .detached_model_usage
+        .iter()
+        .map(|stat| stat.tokens.total())
+        .sum();
+    assert!(
+        billed > 0,
+        "[{engine}] the child's spend was billed to nobody"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A `team` run is the product's: the driver's team panel hears it.
+async fn a_team_run_reaches_the_team_panel(engine: &str) {
+    select(engine);
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(production_start(env.project.path(), &recorder, |_| {}))
+        .await
+        .unwrap();
+    let mut seen = turn_collecting(&mut runtime, "delegate a team").await;
+    // The run outlives the turn that started it; its events may trail it.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !seen
+        .iter()
+        .any(|event| matches!(event, CodingRuntimeEvent::Team { .. }))
+    {
+        match tokio::time::timeout_at(deadline, runtime.events.recv()).await {
+            Ok(Some(event)) => seen.push(event.event),
+            _ => break,
+        }
+    }
+    assert!(
+        seen.iter()
+            .any(|event| matches!(event, CodingRuntimeEvent::Team { .. })),
+        "[{engine}] the team run never reached the driver"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// After a logout no provider the runtime was handed is alive — not behind the
+/// seam, and not in the reviewer's or the subagents' slots either.
+///
+/// The harness only: the chain tears its agent down but leaves the same slots
+/// filled, which is one of the things deleting it ends.
+#[tokio::test]
+#[serial_test::serial(engine)]
+async fn a_logout_leaves_no_signed_in_provider_alive() {
+    select("harness");
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(production_start(env.project.path(), &recorder, |_| {}))
+        .await
+        .unwrap();
+    turn(&mut runtime, "hello").await;
+    let alive = |recorder: &Recorder| {
+        recorder
+            .built
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|weak| weak.upgrade().is_some())
+            .count()
+    };
+    assert!(
+        alive(&recorder) > 0,
+        "nothing holds a provider while signed in, so the check below proves nothing"
+    );
+    runtime
+        .handle
+        .deactivate_provider(atomcode_coding::ProviderUnavailableReason::AuthenticationRequired)
+        .await
+        .unwrap();
+    assert_eq!(
+        alive(&recorder),
+        0,
+        "a signed-in provider outlived the logout"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 // ---- what the model is offered ---------------------------------------------
 
 /// The start a production driver makes: every capability the chain turns on
@@ -1624,11 +1793,12 @@ fn production_start(
     start
 }
 
-/// The tools the model is offered on its first request, under `engine`.
+/// The tools the model is offered on its first request, under `engine`, as the
+/// model sees them: name, description and parameters.
 async fn offered_tools(
     engine: &str,
     configure: impl FnOnce(&mut CodingRuntimeStart),
-) -> Vec<String> {
+) -> Vec<ToolDef> {
     select(engine);
     let env = env();
     let recorder = Arc::new(Recorder::default());
@@ -1639,7 +1809,7 @@ async fn offered_tools(
     turn(&mut runtime, "hello").await;
     runtime.handle.shutdown().await.unwrap();
     let tools = recorder
-        .tools
+        .defs
         .lock()
         .unwrap()
         .first()
@@ -1649,13 +1819,16 @@ async fn offered_tools(
 }
 
 /// Names only one engine offers, and why. Every other tool must be offered by
-/// both — and every entry here must still differ, or it is stale.
+/// both, with the same contract — and every entry here must still differ, or it
+/// is stale.
 const KNOWN_TOOL_DIFFERENCES: &[(&str, &str)] = &[
     // Self-knowledge is a harness row with no chain counterpart.
     ("describe_self", "harness: describes the running tree"),
 ];
 
-fn tool_difference(chain: &[String], harness: &[String]) -> (Vec<String>, Vec<String>) {
+fn tool_difference(chain: &[ToolDef], harness: &[ToolDef]) -> (Vec<String>, Vec<String>) {
+    let names = |tools: &[ToolDef]| tools.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+    let (chain, harness) = (names(chain), names(harness));
     let only_chain = chain
         .iter()
         .filter(|name| !harness.contains(name))
@@ -1669,7 +1842,7 @@ fn tool_difference(chain: &[String], harness: &[String]) -> (Vec<String>, Vec<St
     (only_chain, only_harness)
 }
 
-fn assert_same_tools(chain: &[String], harness: &[String], what: &str) {
+fn assert_same_tools(chain: &[ToolDef], harness: &[ToolDef], what: &str) {
     let (only_chain, only_harness) = tool_difference(chain, harness);
     let unexplained: Vec<&String> = only_chain
         .iter()
@@ -1682,7 +1855,27 @@ fn assert_same_tools(chain: &[String], harness: &[String], what: &str) {
         .collect();
     assert!(
         unexplained.is_empty(),
-        "{what}: only chain {only_chain:?}, only harness {only_harness:?}\n chain {chain:?}\n harness {harness:?}"
+        "{what}: only chain {only_chain:?}, only harness {only_harness:?}"
+    );
+    // A tool both engines name is the same tool only if the model is told the
+    // same thing about it. Two `task`s with different parameters are two agents.
+    let differing: Vec<String> = chain
+        .iter()
+        .filter_map(|c| {
+            let h = harness.iter().find(|h| h.name == c.name)?;
+            let mut what = Vec::new();
+            if c.description != h.description {
+                what.push("description");
+            }
+            if c.parameters != h.parameters {
+                what.push("parameters");
+            }
+            (!what.is_empty()).then(|| format!("{} ({})", c.name, what.join(", ")))
+        })
+        .collect();
+    assert!(
+        differing.is_empty(),
+        "{what}: the same name, a different contract: {differing:?}"
     );
 }
 
@@ -1778,4 +1971,6 @@ on_both_engines!(
     a_brief_rate_limit_is_waited_out,
     a_committed_compaction_is_stored_at_once_and_reported_truthfully,
     a_tools_question_reaches_the_person_and_the_answer_comes_back,
+    a_delegated_subtask_is_reported_narrated_and_billed,
+    a_team_run_reaches_the_team_panel,
 );

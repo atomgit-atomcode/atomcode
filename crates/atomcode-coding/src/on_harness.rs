@@ -912,6 +912,12 @@ impl LlmProvider for NoProvider {
 /// The counterpart of [`swap_provider`], and the reason a logout does not have
 /// to end a session on this engine: the agent, its conversation and its handle
 /// all survive, and a later login is another swap.
+/// A provider holding nothing and refusing everything: what stands in any slot a
+/// logout empties.
+pub(crate) fn signed_out_provider() -> Arc<dyn LlmProvider> {
+    Arc::new(NoProvider)
+}
+
 pub async fn deactivate_provider(app: &mut App, slots: &ProviderSlots) -> Result<(), String> {
     swap_provider(app, slots, Arc::new(NoProvider), "(signed out)").await
 }
