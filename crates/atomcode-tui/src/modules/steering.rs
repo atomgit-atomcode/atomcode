@@ -20,6 +20,24 @@
 //! because the transcript draws the folded `UserMessage` from that same
 //! boundary onward.
 //!
+//! # Rendering is the settled rendering
+//!
+//! The words are drawn by [`UserSaid`] — the very block the transcript will draw
+//! a moment later — rather than by a look-alike built here. Two reasons, and the
+//! second is the one that decided it:
+//!
+//! * The person is looking at their own words. A provisional style would read as
+//!   "something is wrong with what I typed".
+//! * **It is the same code, so it cannot drift.** A hand-copied bar is a second
+//!   answer to "what does the user's line look like", and it would be right on
+//!   the day it was written and wrong the first time that block changed. What
+//!   this panel is doing is showing the block early; showing it *differently*
+//!   would be the bug.
+//!
+//! One bar per queued message, because that is what folding produces: each input
+//! becomes its own `UserMessage`, hence its own block. Joining them into one bar
+//! would draw a paragraph the transcript is never going to have.
+//!
 //! Where the text lives, and why not here: [`Moment::steering`]. Nothing in the
 //! log is a steering line — that is the whole reason this panel exists — so it
 //! is state about *now*, which is `Moment`'s job (the same reason `notice` and
@@ -31,12 +49,11 @@
 
 use atomcode_harness::session::SessionEvent;
 
-use crate::el::El;
+use crate::block::Content;
+use crate::content::UserSaid;
 use crate::frame::Line;
 use crate::module::{Height, View};
 use crate::moment::{Moment, Viewport};
-use crate::theme::{self, Role};
-use crate::width;
 
 pub const ID: &str = "steering";
 
@@ -59,120 +76,80 @@ impl View for Steering {
 
     fn absorb(_state: &mut State, _fact: &SessionEvent) {}
 
-    /// A margin, then the label and the words.
-    ///
-    /// The words are drawn in the *muted* role rather than the bar a settled
-    /// `UserSaid` wears, and that is the honest distinction rather than a
-    /// stylistic one: this has not been said into the conversation yet, and a
-    /// full-width bar is exactly how the transcript marks the messages that
-    /// have. When it is folded in, the block that appears a moment later wears
-    /// the bar — the change of appearance is the change of state.
+    /// A margin, then one settled bar per message waiting.
     fn render(_state: &State, vp: &Viewport<'_>) -> Vec<Line> {
         let w = vp.rect.w;
         if w == 0 || vp.rect.h == 0 {
             return Vec::new();
         }
-        let Some(words) = showing(vp.moment) else {
+        let mut body = bars(vp.moment, w);
+        if body.is_empty() {
             return Vec::new();
-        };
+        }
 
-        // The margin, only when the rect can seat it: the same bargain `live`
-        // and `todo` strike. Above only — under the words is the pane's own
-        // bottom edge, which the read-cursor badge is anchored to.
-        let margin = if vp.rect.h >= ROWS {
+        // The margin, only when the rect can seat it *as well as* the bars: the
+        // same bargain `live` and `todo` strike. Drawn first and dropped first,
+        // so at a height that cannot hold both the words win — a blank row in
+        // place of what the person typed is a panel that says nothing.
+        let margin = if vp.rect.h as usize >= body.len() + MARGIN as usize {
             MARGIN as usize
         } else {
             0
         };
-        let mut out: Vec<Line> = Vec::with_capacity(ROWS as usize);
+        let mut out: Vec<Line> = Vec::with_capacity(body.len() + margin);
         for _ in 0..margin {
             out.push(Line::empty());
         }
-
-        // One line per message, oldest first, and the last one is what the
-        // reader just sent — so the panel is read top-down like the conversation
-        // it is waiting to join. Wrapped, because a long sentence must not be
-        // quietly cut: this is the person's own words.
-        let label = theme::fg(Role::Muted);
-        for text in words.lines() {
-            let mut row: Vec<El> = vec![El::styled(
-                format!("{} ", vp.moment.caps.g(crate::caps::Glyph::Pending)),
-                label,
-            )];
-            for (i, piece) in wrapped(text, w as usize, 2).into_iter().enumerate() {
-                if i > 0 {
-                    out.extend(El::row(std::mem::take(&mut row)).lay(w));
-                }
-                row.push(El::styled(piece, theme::fg(Role::Secondary)));
-            }
-            out.extend(El::row(row).lay(w));
-        }
+        out.append(&mut body);
+        // The host clips to the rect anyway; doing it here keeps the returned
+        // lines inside the height this module was handed.
         out.truncate(vp.rect.h as usize);
         out
     }
 
-    /// The margin and the words, and nothing between turns.
-    fn height(_state: &State, moment: &Moment, _width: u16) -> Height {
-        match showing(moment) {
-            Some(text) => {
-                let lines = text.lines().count().max(1);
-                Height::Hug((lines + MARGIN as usize).min(u16::MAX as usize) as u16)
-            }
-            None => Height::Hug(0),
+    /// The margin and the bars, and nothing between turns.
+    ///
+    /// Counted by rendering at `width`, not by counting newlines: a bar wraps,
+    /// so how many rows it takes is a fact about the width it is given.
+    fn height(_state: &State, moment: &Moment, width: u16) -> Height {
+        let body = if width == 0 {
+            0
+        } else {
+            bars(moment, width).len()
+        };
+        if body == 0 {
+            return Height::Hug(0);
         }
+        Height::Hug((body + MARGIN as usize).min(u16::MAX as usize) as u16)
     }
 }
 
-/// What this row is showing, or `None` when there is nothing waiting.
+/// One [`UserSaid`] bar per message waiting, oldest first.
 ///
-/// One question, asked by both `render` and `height`: the two disagreeing is
-/// either a blank row of chrome above the composer or words drawn outside the
-/// rect nothing was asked for. Same shape as `live::showing`.
-fn showing(moment: &Moment) -> Option<&str> {
-    if moment.steering.is_empty() {
-        None
-    } else {
-        Some(moment.steering.as_str())
-    }
-}
-
-/// The blank row above the label — the padding that keeps the panel off the live
-/// line it sits under.
-///
-/// Above only, and asked for here for the reason the live line and the task
-/// list give: a `gap` in the layout is counted between its children whether or
-/// not this row is mounted, so between turns the composer would stand on a
-/// blank row. Asked for here, it arrives and leaves with the words.
-const MARGIN: u16 = 1;
-
-/// What the row asks for at least: the margin and one line of words.
-const ROWS: u16 = 1 + MARGIN;
-
-/// Split `text` into at most `width` cells per line, keeping the marker column.
-///
-/// Not `crate::content::wrapped`: that one carries a block's own lead and styles
-/// for the transcript, and this is a view module drawing its own two-column row.
-/// What it shares is the only part that matters — the width is counted in cells,
-/// not bytes, so a Chinese sentence wraps where it looks like it should.
-fn wrapped(text: &str, width: usize, indent: usize) -> Vec<String> {
-    let room = width.saturating_sub(indent).max(1);
-    let mut out: Vec<String> = Vec::new();
-    let mut line = String::new();
-    let mut used = 0usize;
-    for word in text.split_inclusive(' ') {
-        let w = width::str_width(word);
-        if used > 0 && used + w > room {
-            out.push(std::mem::take(&mut line));
-            used = 0;
+/// The blank lines between the bars that the conversation will have are not
+/// drawn: that spacing belongs to the seam between two blocks
+/// (`host::blank_between`), and these rows are not blocks. Nothing here decides
+/// it, so nothing here can disagree with it.
+fn bars(moment: &Moment, width: u16) -> Vec<Line> {
+    let mut out: Vec<Line> = Vec::new();
+    for message in moment.steering.lines() {
+        let message = message.trim();
+        if message.is_empty() {
+            continue;
         }
-        line.push_str(word);
-        used += w;
-    }
-    if !line.is_empty() || out.is_empty() {
-        out.push(line);
+        out.extend(UserSaid(message.to_string()).lines(width));
     }
     out
 }
+
+/// The blank row above the bars — the padding that keeps them off the live line
+/// they sit under.
+///
+/// Above only, and asked for here for the reason the live line and the task list
+/// give: a `gap` in the layout is counted between its children whether or not
+/// this row is mounted, so between turns the composer would stand on a blank
+/// row. Asked for here, it arrives and leaves with the words.
+const MARGIN: u16 = 1;
 
 #[cfg(test)]
 mod tests {
@@ -219,10 +196,29 @@ mod tests {
     }
 
     #[test]
-    fn words_waiting_draw_a_margin_then_the_line() {
-        // The margin is the module's own row — asked for in `height`, drawn in
-        // `render` — so it arrives and leaves with the words rather than being a
-        // permanent gap in the layout.
+    fn what_is_drawn_is_exactly_what_the_transcript_will_draw() {
+        // The point of going through `UserSaid` instead of a look-alike: this
+        // test would have to be rewritten if the panel built its own spans, and
+        // rewriting it is the moment somebody notices the two drifted. Compared
+        // against the block itself at the same width, styles included.
+        let text = "看看 crates/ 的结构";
+        let m = waiting(text);
+        let panel = draw_at(&m, 60, 6);
+        assert_eq!(panel.len(), 2, "margin, then one bar");
+        let settled = UserSaid(text.to_string()).lines(60);
+        assert_eq!(
+            panel[1].spans, settled[0].spans,
+            "the panel must draw the same row the transcript draws"
+        );
+        assert!(
+            panel[1].plain().contains("❯"),
+            "the prompt marker is part of that row: {:?}",
+            panel[1].plain()
+        );
+    }
+
+    #[test]
+    fn words_waiting_draw_a_margin_then_the_bar() {
         let m = waiting("and also this");
         let lines = draw(&m, 60, 6);
         assert_eq!(lines.len(), 2, "{lines:#?}");
@@ -246,10 +242,9 @@ mod tests {
     }
 
     #[test]
-    fn several_messages_are_all_shown_oldest_first() {
-        // `add_steering` joins them with newlines while the turn runs, so the
-        // panel is what says "both of these are on their way" rather than only
-        // the last one.
+    fn each_message_gets_its_own_bar_the_way_folding_will() {
+        // Folding turns each input into its own `UserMessage`, so joining them
+        // into one bar here would draw a paragraph the transcript never has.
         let m = waiting("first follow-up\nsecond follow-up");
         let lines = draw(&m, 60, 8);
         assert_eq!(lines.len(), 3, "{lines:#?}");
@@ -260,21 +255,20 @@ mod tests {
     }
 
     #[test]
-    fn it_is_muted_rather_than_drawn_as_a_settled_message() {
-        // The bar is how the transcript marks a message that HAS been said into
-        // the conversation. This has not been, so it must not wear it: the
-        // change of appearance when it lands is the signal that it landed.
-        let m = waiting("and also this");
-        let rows = draw_at(&m, 60, 6);
-        let words = rows
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .find(|s| s.text.contains("and also this"))
-            .expect("the words");
+    fn a_long_message_wraps_the_way_the_settled_one_does() {
+        // The height has to follow the wrapping, or a long sentence would be
+        // drawn into rows the host was never asked for.
+        let text = "a sentence long enough that it cannot possibly fit on one row of \
+                    a sixty column screen without wrapping somewhere";
+        let m = waiting(text);
+        let width = 60u16;
+        let rows = UserSaid(text.to_string()).lines(width).len();
+        assert!(rows > 1, "the fixture must actually wrap: {rows} rows");
+        let lines = draw(&m, width, 20);
+        assert_eq!(lines.len(), rows + 1, "margin plus the bar's own rows");
         assert_eq!(
-            words.style,
-            theme::fg(Role::Secondary),
-            "quiet ink, not the settled bar"
+            Steering::height(&State, &m, width),
+            Height::Hug((rows + 1) as u16)
         );
     }
 
