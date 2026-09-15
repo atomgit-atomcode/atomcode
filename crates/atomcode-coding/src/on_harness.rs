@@ -1069,6 +1069,8 @@ pub struct HostState {
     /// Row edits the runtime's own options call for (a capability switched off,
     /// a directory to resolve against), as a TOML layer.
     pub rows: String,
+    /// The runtime's MCP registry, published into the tree by `mcp-host`.
+    pub(crate) mcp: Option<crate::host_rows::McpPublication>,
 }
 
 /// See [`crate::host_rows::SessionContextPlugin`].
@@ -1182,6 +1184,11 @@ pub async fn mount_hosted(
             )
         })
         .unwrap_or_default();
+    let mcp_rows = if host.mcp.is_some() {
+        "[[patch]]\nid = \"mcp\"\nname = \"mcp-host\"\ndisabled = false\n\n"
+    } else {
+        ""
+    };
     let skills_rows = if host.skills.is_some() {
         "[[patch]]\nid = \"skills\"\nname = \"skills-host\"\n\n\
          [[patch]]\nid = \"skill-catalog-inline\"\ndisabled = true\n\n"
@@ -1194,7 +1201,7 @@ pub async fn mount_hosted(
         "[[insert]]\nname = \"host-tools\"\n\n"
     };
     let hosted = format!(
-        "[[patch]]\nid = \"session\"\nname = \"session-native\"\n\n{modes_rows}{cc_rows}{context_rows}{datalog_rows}{tools_rows}{skills_rows}{}{}{}",
+        "[[patch]]\nid = \"session\"\nname = \"session-native\"\n\n{modes_rows}{cc_rows}{context_rows}{datalog_rows}{tools_rows}{skills_rows}{mcp_rows}{}{}{}",
         host.hooks
             .as_ref()
             .map(|hooks| hooks.rows())
@@ -1232,6 +1239,9 @@ pub async fn mount_hosted(
     registry.register(Arc::new(crate::host_rows::KernelMiddlewarePlugin(
         host.middleware.unwrap_or_default(),
     )));
+    if let Some(publication) = host.mcp {
+        registry.register(Arc::new(crate::host_rows::McpHostPlugin::new(publication)));
+    }
     if let Some((skill_registry, catalog)) = host.skills {
         registry.register(Arc::new(crate::host_rows::SkillsHostPlugin {
             registry: skill_registry,

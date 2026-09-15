@@ -907,3 +907,192 @@ impl Plugin for SessionContextPlugin {
         Ok(())
     }
 }
+
+// ---- MCP, as the runtime connected it ---------------------------------------
+
+/// The runtime's MCP registry and the publication state its catalog shares.
+pub(crate) struct McpPublication {
+    pub(crate) registry: Arc<atomcode_capabilities::mcp::McpRegistry>,
+    pub(crate) connect_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<atomcode_capabilities::mcp::McpConnectEvent>>,
+    pub(crate) tool_names: Arc<RwLock<Vec<String>>>,
+    pub(crate) publish_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) publication_enabled: Arc<AtomicBool>,
+    pub(crate) catalog_ready: tokio::sync::watch::Sender<bool>,
+}
+
+/// `mcp-host`: the MCP servers the runtime connected, and their tools in the tree.
+///
+/// One owner: the registry the runtime's prepare built and connects in the
+/// background, which is what `mcp_status`, `wait_mcp_ready`, `withdraw_mcp_tools`
+/// and a capability reload already act on. The harness's own `mcp` row would
+/// connect the same servers a second time, from the tree. This row publishes
+/// the runtime's registry instead — each server's tools as it connects, a full
+/// reconciliation when the initial pass settles (that is what readiness means),
+/// and nothing once the registry is withdrawn.
+pub(crate) struct McpHostPlugin(pub(crate) Mutex<Option<McpPublication>>);
+
+impl McpHostPlugin {
+    pub(crate) fn new(publication: McpPublication) -> Self {
+        Self(Mutex::new(Some(publication)))
+    }
+}
+
+/// Replace the MCP tools this tree offers with `infos` (all of them) or add
+/// `infos` (one server's) to them, under the publication lock.
+async fn publish_mcp(
+    toolbox: &Arc<atomcode_harness::seams::ToolBox>,
+    registry: &Arc<atomcode_capabilities::mcp::McpRegistry>,
+    infos: Vec<atomcode_capabilities::mcp::McpToolInfo>,
+    publication: &McpShared,
+    replace: bool,
+) {
+    let _guard = publication.publish_lock.lock().await;
+    if !publication.publication_enabled.load(Ordering::Acquire) {
+        return;
+    }
+    let adapters: Vec<Arc<dyn atomcode_kernel::tool::Tool>> = infos
+        .into_iter()
+        .filter_map(|info| {
+            match atomcode_capabilities::mcp::McpToolAdapter::new(Arc::clone(registry), info) {
+                Ok(adapter) => Some(Arc::new(adapter) as Arc<dyn atomcode_kernel::tool::Tool>),
+                Err(error) => {
+                    eprintln!("[mcp] tool publication skipped: {error}");
+                    None
+                }
+            }
+        })
+        .collect();
+    let mut names = publication
+        .tool_names
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    if replace {
+        for name in names.drain(..) {
+            toolbox.unregister(&name);
+        }
+    }
+    for adapter in adapters {
+        let name = adapter.name().to_string();
+        toolbox.unregister(&name);
+        if toolbox.register(adapter).is_ok() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names.sort_unstable();
+}
+
+/// The publication state a publishing task shares with the runtime.
+#[derive(Clone)]
+struct McpShared {
+    tool_names: Arc<RwLock<Vec<String>>>,
+    publish_lock: Arc<tokio::sync::Mutex<()>>,
+    publication_enabled: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Plugin for McpHostPlugin {
+    fn name(&self) -> &'static str {
+        "mcp-host"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools"]
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["mcp"]
+    }
+    fn description(&self) -> &'static str {
+        "the MCP servers the coding runtime connected, their tools published as they come up"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let Some(publication) = self.0.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return Err("mcp-host mounted twice from one publication".into());
+        };
+        let McpPublication {
+            registry,
+            connect_rx,
+            tool_names,
+            publish_lock,
+            publication_enabled,
+            catalog_ready,
+        } = publication;
+        let _ = ctx
+            .provide::<atomcode_harness::seams::McpSvc>(Arc::clone(&registry))
+            .map_err(|e| e.to_string())?;
+        let toolbox = ctx
+            .require::<atomcode_harness::seams::ToolsSvc>()
+            .map_err(|e| e.to_string())?;
+        let shared = McpShared {
+            tool_names,
+            publish_lock,
+            publication_enabled,
+        };
+
+        let task = {
+            let toolbox = toolbox.clone();
+            let registry = Arc::clone(&registry);
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                // A tree mounted after the servers came up (a rebuild) starts from
+                // what is already connected.
+                let now = registry.list_all_tools().await;
+                publish_mcp(&toolbox, &registry, now, &shared, true).await;
+                let mut connect_rx = connect_rx;
+                let initial = {
+                    let registry = Arc::clone(&registry);
+                    async move { registry.wait_until_initial_connections_done().await }
+                };
+                tokio::pin!(initial);
+                let cancelled = {
+                    let registry = Arc::clone(&registry);
+                    async move { registry.wait_for_cancellation().await }
+                };
+                tokio::pin!(cancelled);
+                loop {
+                    let event = async {
+                        match connect_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! {
+                        _ = &mut cancelled => {
+                            // Withdrawn: late connections must not republish, and
+                            // what was published leaves the catalog.
+                            let _guard = shared.publish_lock.lock().await;
+                            let mut names =
+                                shared.tool_names.write().unwrap_or_else(|e| e.into_inner());
+                            for name in names.drain(..) {
+                                toolbox.unregister(&name);
+                            }
+                            break;
+                        }
+                        _ = &mut initial => {
+                            let all = registry.list_all_tools().await;
+                            publish_mcp(&toolbox, &registry, all, &shared, true).await;
+                            catalog_ready.send_replace(true);
+                            break;
+                        }
+                        event = event => match event {
+                            Some(atomcode_capabilities::mcp::McpConnectEvent::Connected { name }) => {
+                                let tools = registry.list_tools_for_server(&name).await;
+                                publish_mcp(&toolbox, &registry, tools, &shared, false).await;
+                            }
+                            Some(_) => {}
+                            None => connect_rx = None,
+                        },
+                    }
+                }
+            })
+        };
+        // The task and the tools leave with the row.
+        let _ = ctx.effect(move || {
+            task.abort();
+            let mut names = shared.tool_names.write().unwrap_or_else(|e| e.into_inner());
+            for name in names.drain(..) {
+                toolbox.unregister(&name);
+            }
+        });
+        Ok(())
+    }
+}

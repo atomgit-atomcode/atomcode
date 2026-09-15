@@ -346,7 +346,9 @@ pub struct CodingParts {
     mcp_tool_names: Arc<std::sync::RwLock<Vec<String>>>,
     mounted_tools: Option<MountedTools>,
     mounted_tools_publisher: Option<MountedToolsPublisher>,
-    mcp_connect_rx: Option<tokio::sync::mpsc::UnboundedReceiver<McpConnectEvent>>,
+    /// Connection events for whoever publishes this registry's tools: the chain's
+    /// catalog task, or a tree's `mcp-host` row. Taken once.
+    mcp_connect_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<McpConnectEvent>>>,
     mcp_publish_lock: Arc<tokio::sync::Mutex<()>>,
     mcp_publication_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// True only after the publisher has reconciled every initial connection into
@@ -1101,7 +1103,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         mcp_tool_names,
         mounted_tools: None,
         mounted_tools_publisher: None,
-        mcp_connect_rx,
+        mcp_connect_rx: std::sync::Mutex::new(mcp_connect_rx),
         mcp_publish_lock: Arc::new(tokio::sync::Mutex::new(())),
         mcp_publication_enabled,
         mcp_catalog_ready: tokio::sync::watch::channel(mcp_registry.is_none()).0,
@@ -1202,6 +1204,24 @@ impl CodingParts {
         self.todo_enabled
     }
 
+    /// Everything a tree needs to publish this registry's MCP tools the way the
+    /// chain's catalog task does, sharing its locks, switches and readiness.
+    pub(crate) fn mcp_publication(&self) -> Option<crate::host_rows::McpPublication> {
+        let registry = self.mcp_registry.clone()?;
+        Some(crate::host_rows::McpPublication {
+            registry,
+            connect_rx: self
+                .mcp_connect_rx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+            tool_names: Arc::clone(&self.mcp_tool_names),
+            publish_lock: Arc::clone(&self.mcp_publish_lock),
+            publication_enabled: Arc::clone(&self.mcp_publication_enabled),
+            catalog_ready: self.mcp_catalog_ready.clone(),
+        })
+    }
+
     pub(crate) fn request_user_input_enabled(&self) -> bool {
         self.request_user_input_enabled
     }
@@ -1288,9 +1308,13 @@ impl CodingParts {
         }
 
         let (mounted, publisher) = self.registry.mount_updatable(&refs);
-        if let (Some(mcp_registry), Some(mut connect_rx)) =
-            (self.mcp_registry.clone(), self.mcp_connect_rx.take())
-        {
+        if let (Some(mcp_registry), Some(mut connect_rx)) = (
+            self.mcp_registry.clone(),
+            self.mcp_connect_rx
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+        ) {
             let tool_registry = self.registry.clone();
             let base_names = self.tool_names.clone();
             let mcp_tool_names = Arc::clone(&self.mcp_tool_names);

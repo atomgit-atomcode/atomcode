@@ -7444,6 +7444,18 @@ fn harness_host_state(
     if let Some(transcript) = parts.transcript_hook() {
         hooks.insert("transcript", transcript);
     }
+    let mcp = parts.mcp_publication();
+    if let Some(publication) = &mcp {
+        // Server-scoped instructions for the MCP tools currently mounted, as an
+        // ephemeral request tail — the chain's projection, the same object.
+        hooks.insert(
+            "mcp-instructions",
+            Arc::new(crate::mcp_instructions::McpInstructionsHook::new(
+                Arc::clone(&publication.registry),
+                Arc::clone(&publication.tool_names),
+            )),
+        );
+    }
     let middleware = crate::host_rows::HostMiddleware::new();
     if let Some(telemetry) = &config.telemetry {
         hooks.insert(
@@ -7516,6 +7528,7 @@ fn harness_host_state(
             .chain(parts.host_only_tools())
             .collect(),
         skills: parts.skill_registry(),
+        mcp,
         rows: harness_option_rows(parts, config, prepare) + &permission_rows,
         datalog: config.datalog.enabled.then(|| config.datalog.clone()),
         modes: Some(crate::on_harness::HostModes {

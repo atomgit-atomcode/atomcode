@@ -98,6 +98,13 @@ impl LlmProvider for RecordingProvider {
                     .to_string(),
                 })
             }
+            Some(m) if m.role == Role::User && m.text == "mcp echo" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "mcp__t__echo".into(),
+                    arguments: serde_json::json!({ "message": "hi" }).to_string(),
+                })
+            }
             Some(m) if m.role == Role::User && m.text == "tick" => {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
@@ -1122,6 +1129,108 @@ async fn a_round_budget_ends_the_turn(engine: &str) {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// A minimal MCP server over stdio: one `echo` tool. A shell script rather than
+/// capabilities' test binary, which cargo only builds for that crate's tests.
+fn write_mcp_server(dir: &std::path::Path, calls: &std::path::Path) -> std::path::PathBuf {
+    let script = dir.join("server.sh");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+echo started >> "{spawns}"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2025-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"t","version":"0"}}}}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":[{{"name":"echo","description":"echo back","inputSchema":{{"type":"object","properties":{{"message":{{"type":"string"}}}},"required":["message"]}}}}]}}}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":"echo:from-server"}}]}}}}\n' "$id" ;;
+    *'"id":'*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id" ;;
+  esac
+done
+"#,
+            spawns = calls.display()
+        ),
+    )
+    .unwrap();
+    script
+}
+
+/// An MCP server's tools are offered to the model and run — connected once,
+/// by the runtime, whichever engine drives the turns.
+#[cfg(unix)]
+async fn an_mcp_servers_tools_are_offered_and_run(engine: &str) {
+    select(engine);
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let spawns = scratch.path().join("spawns.log");
+    let script = write_mcp_server(scratch.path(), &spawns);
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.prepare.mcp = true;
+    start.prepare.extra_mcp_servers = vec![atomcode_capabilities::mcp::McpServerConfig {
+        name: "t".into(),
+        disabled: false,
+        config: atomcode_capabilities::mcp::McpTransportConfig::Stdio {
+            command: "sh".into(),
+            args: vec![script.to_string_lossy().into_owned()],
+            env: Default::default(),
+            timeout_ms: Some(10_000),
+        },
+        source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
+        trust: true,
+        auto_approve: Vec::new(),
+    }];
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    turn(&mut runtime, "mcp echo").await;
+
+    let offered = recorder
+        .tools
+        .lock()
+        .unwrap()
+        .first()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        offered.iter().any(|name| name == "mcp__t__echo"),
+        "[{engine}] offered: {offered:?}"
+    );
+    let result = recorder
+        .last_request()
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Tool)
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        result.contains("echo:from-server"),
+        "[{engine}] result: {result}"
+    );
+    let listed = runtime.handle.mcp_tools("t".into()).await.unwrap();
+    assert!(
+        listed.tools.iter().any(|name| name.contains("echo")),
+        "[{engine}] mcp_tools: {:?}",
+        listed.tools
+    );
+    runtime.handle.shutdown().await.unwrap();
+    let started = std::fs::read_to_string(&spawns).unwrap_or_default();
+    assert_eq!(
+        started.lines().count(),
+        1,
+        "[{engine}] the server was started {} time(s)",
+        started.lines().count()
+    );
+}
+
 // ---- what the model is offered ---------------------------------------------
 
 /// The start a production driver makes: every capability the chain turns on
@@ -1297,4 +1406,5 @@ on_both_engines!(
     the_preferred_language_reaches_the_persona,
     a_permission_rule_refuses_what_it_denies,
     a_round_budget_ends_the_turn,
+    an_mcp_servers_tools_are_offered_and_run,
 );
