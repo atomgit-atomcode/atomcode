@@ -2573,6 +2573,59 @@ async fn until_row(s: &Session, row: u16, lit: bool) {
     );
 }
 
+/// While a question is up the terminal must report where the pointer is.
+///
+/// The panel lights the row the pointer is over, and a hover is DECSET 1003 —
+/// which the screen asks for only while something is following the pointer.
+/// Handed in as a recorded event like the menu's own test, this passes whether or
+/// not a real terminal would ever have sent one; asserted as the request, it does
+/// not.
+///
+/// It is also the reason the heal arm had to learn about questions: a hover that
+/// arrives while one is up is the answer to our own request, not a terminal that
+/// took the mouse back.
+#[tokio::test]
+async fn a_question_asks_the_terminal_for_the_pointer_only_while_it_is_up() {
+    let dir = scratch("ask-panel-motion");
+    let script = replay(
+        r#"{ text = "Writing.", calls = [ { name = "write_file", args = { file_path = "out.txt", content = "written" } } ] },
+           { text = "Done." }"#,
+    );
+    let s = start(asking(&dir, &script)).await;
+    let task = s.open().await;
+
+    s.quiet().await;
+    assert!(
+        !s.term.motion(),
+        "the screen asks for free motion with nothing following the pointer"
+    );
+
+    s.term.type_line("write it");
+    until(&s, "↑↓ 选择").await;
+    assert!(
+        s.term.motion(),
+        "the panel follows the pointer, so the terminal has to be reporting it"
+    );
+
+    // Answer it: the panel goes, and so does the request — a terminal left in
+    // 1003 sends an event for every cell the pointer crosses for the rest of the
+    // session, for nothing.
+    s.term.press(KeyPress::ch('2'));
+    s.quiet().await;
+    assert!(
+        !s.screen().contains("↑↓ 选择"),
+        "the question was answered:\n{}",
+        s.screen()
+    );
+    assert!(
+        !s.term.motion(),
+        "the panel closed but the terminal is still reporting every cell"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 /// The prompt marker this terminal draws.
 fn caps_prompt() -> &'static str {
     atomcode_tui::caps::Caps::default().g(atomcode_tui::caps::Glyph::Prompt)

@@ -407,11 +407,11 @@ impl UserInterface for Tui {
             // foot of the loop because the pointer paths `continue` past
             // anything down there.
             //
-            // Two things follow the pointer, and either one is a reason for the
-            // terminal to report every cell it crosses: the composer's menu, and
-            // a question on screen — where the row under the pointer is the row a
-            // click would take, so a panel that did not follow would point at its
-            // first answer while the hand is on its third.
+            // **Two** things follow the pointer, and either one is a reason for
+            // the terminal to report every cell it crosses: the composer's menu,
+            // and a question on screen — where the row under the pointer is the
+            // row a click would take, so a panel that did not follow would point
+            // at its first answer while the hand is on its third.
             //
             // This is a request to the terminal, not a redraw: it changes what
             // the terminal *sends*, not what is on the screen, which is why it
@@ -505,11 +505,17 @@ impl UserInterface for Tui {
                 //
                 // Not a query: see `Surface::heal_mouse` for why asking is not
                 // an option here.
-                // A hover that arrives while a question is up is the answer to our
-                // own request to the terminal, not a terminal that took the mouse
-                // back — see where `set_motion` is asked for. Treating it as the
-                // latter would say so on the tip row, and hand the pointer back
-                // the moment the question is answered.
+                // A hover-arrival is proof the mode is *on* only for the one case
+                // this arm was written for: free motion was not requested, so the
+                // terminal must be reporting it on its own.
+                //
+                // With a question on screen we have just asked for it (see
+                // `set_motion` below, and that is what starts this arm's one
+                // firing), so an arriving hover is exactly what was requested —
+                // treating it as a terminal that took the mouse back would say so
+                // on the tip row and, worse, hand the pointer back the next time
+                // the question is answered. The question's own hover is a
+                // request, same as the menu's.
                 Wake::Input(Input::Mouse(Click::Hover, ..))
                     if !self.host.context_menu_open() && !self.host.asks.is_waiting() =>
                 {
