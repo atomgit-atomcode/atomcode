@@ -167,6 +167,21 @@ pub trait HostControl: Send + Sync {
     fn subscribe(&self) -> mpsc::UnboundedReceiver<HostEvent>;
 }
 
+/// Everything a front end gets from a host: the handle protocol to what it runs
+/// and host control over it.
+///
+/// The pair outlives any one agent. When the host replaces the live session it
+/// rewires underneath: the front end keeps these channels, hears
+/// [`HostEvent::SessionChanged`], and subscribes to the new session
+/// (`docs/adr/0022` §2, §3).
+pub struct HostConnection {
+    /// The session live when the connection was made.
+    pub session: String,
+    pub commands: mpsc::UnboundedSender<crate::event::AgentCommand>,
+    pub events: mpsc::UnboundedReceiver<crate::event::AgentEvent>,
+    pub control: std::sync::Arc<dyn HostControl>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -31,6 +31,7 @@ pub mod control;
 pub mod events;
 pub mod exec;
 pub mod feed;
+pub mod host;
 pub mod launch;
 pub mod model_source;
 pub mod plugins;
