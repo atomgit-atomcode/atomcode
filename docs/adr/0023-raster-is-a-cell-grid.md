@@ -49,6 +49,31 @@ Tetris"的 demo 是这么画出来的**,不是像素协议。一条说明:`cells
 矩形**,否则"第几格"每一帧都在变。所以位图的矩形只能来自布局树
 (`Region::view(id)` 或 `LayoutOp::Show { side, size }`)。
 
+**位图内容经 `Moment` 到达模块,不经服务。** 这一条是初稿漏掉的,补它的过程值得
+记:`View::render(state, viewport)` **拿不到任何服务**——trait 的 doc 把这条说得很
+硬("a module therefore *cannot* capture a `Context`, a service handle, a channel
+or a clock — the signature makes the ... obligation unrepresentable rather than
+merely discouraged")。所以"位图住在视图模块里"还不够,必须回答"它怎么看见位图"。
+
+答案是仓库已有的那个形状:`Moment` 是"不是事实、但此刻为真"的那一半
+(`cwd`/`caps`/`members`/`notice` 都在里面),而 `refresh_members`(`plugin.rs:694`)
+正是"一个 row 读服务、把活数据写进 `Moment`"的先例。
+
+于是 `Moment` 多一个字段、宿主的 `compose` 每帧把快照放进去:
+
+```rust
+pub rasters: RastersView,      // 不可变快照;里面的 Raster 是 Arc<Raster>
+```
+
+**两条由这个选择推出的约束:**
+
+- **`Rasters::view()` 必须 O(1)**(把存着的 `Arc` 克隆一份)。重建整张表只发生在
+  `write` 上——热路径(每帧)免费、冷路径(写入)付费,与 `LiveCache`/`Settled`
+  同一取舍。
+- **位图模块的高度必须来自配置**(`Height::Fixed`),不能按位图内容算。因为
+  `View::height` 收的是**调用方手上那份** `Moment`(`stream_height` 等路径传来的
+  那份里 `rasters` 可能是空的),按内容算高度会让高度取决于"快照在不在"。
+
 **代价说清:视图模块的矩形是固定的,所以位图不随对话滚。** 这与我们为欢迎块那只
 猫做的选择(随对话滚动)不冲突——**它们是两个不同的东西**:
 
@@ -65,18 +90,40 @@ Tetris"的 demo 是这么画出来的**,不是像素协议。一条说明:`cells
 "一个模块画不出自己的矩形",而按任意 owner 写会直接废掉那条保证。代价是比 Mods
 弱一档,换来的是几何是真的、`--audit` 仍能看出"挂了没画"与"画了没挂"。
 
-**③ 字形必须宽度 1 且非 Ambiguous。braille 暂拒。** 这是本 ADR 与 Mods 唯一的
-推导分歧,而理由是**我们自己撞过**:
+**③ 字形的判据是「宽度 1」,不是「非 Ambiguous」。braille 可以用。**
 
-- `crates/atomcode-tuix/src/render/qr.rs:10-15` 实证:braille 是 **Unicode-
-  Ambiguous 宽度**,iTerm2 默认"把 ambiguous 当双宽"会把它横向拉成 2 格——tuix
-  为此把 Braille 版 QR 做成 opt-in。
-- 我们的 `width.rs` 以 `unicode-width` 为权威,它把 braille 算 **1 格**;
-  `caps.rs` 的判据 `every_spinner_frame_is_one_column` 也断言 `str_width == 1`。
+这一条**推翻了本 ADR 最初的写法**(原稿说"必须宽度 1 且非 Ambiguous,braille 暂拒"),
+理由是查证时发现的一件**既有的、全 UI 范围**的事实。先给权威数据
+(UAX #11 `EastAsianWidth.txt`):
 
-对 **spinner**(孤立一个字符)这是对的;**对位图(相邻密排的网格)是错的**——一格
-被画成 2 格,右边所有列错位,网格整体烂掉。所以 v1 拒收 ambiguous,拒因写明
-"终端可能画成 2 格"。开放的正解是加一个 caps 位并补偿,不是直接收下。
+| 码点 | EAW | |
+|---|---|---|
+| `2800..28FF` braille | **N** | **Neutral** |
+| `2580..258F` `█▀▄` | A | Ambiguous |
+| `2592..2595` `▒` | A | Ambiguous |
+| **`2500..254B` 全部框线** `─│┌┐└┘├┤┬┴┼` | **A** | **Ambiguous** |
+| `25C6` 品牌记号 `◆` | A | Ambiguous |
+
+`unicode-width` 的 `width`/`width_cjk` 正是这个分类的两种读法(它的 doc 明说
+`width` 把 Ambiguous 当 1 列),所以 **`width != width_cjk` 就是"Ambiguous"的判据**。
+
+**于是「非 Ambiguous」不能用**:它会拒掉 `█▀▄▒`,**以及这个 UI 已经在用的
+每一条框线**。而"Ambiguous 被终端当双宽"是一个**全 UI 范围的既有暴露**——开了
+那个设置的终端上,每一个面板边框、每一条表格横线**今天就已经错位**,与 Raster
+无关。在一个已经全是 Ambiguous 网格的 UI 里,单独拒收 Raster 里的 Ambiguous
+字符既不保护什么,又让 Raster 无字符可用。
+
+**判据因此回到这个 crate 既有的权威**:`width.rs` 的 `unicode-width::width(c) == 1`
+(窄约定),加上"可打印的 BMP 字符"。这与 UI 其余部分的假设**完全一致**。
+
+**braille 因此是安全的,而且是这批候选里最安全的一档**(Neutral);原稿把它当危险
+项是**反的**。顺带更正一处仓库注释:`crates/atomcode-tuix/src/render/qr.rs`
+说 braille 是 "Unicode-Ambiguous width"——按 UAX #11 它是 N,**那句注释是错的**
+(它把 Braille 版 QR 做成 opt-in 的理由因此不成立;不过 opt-in 本身无害)。
+
+**这一条不改 Raster 的设计,但改了一条既有隐患的记录**:ambiguous-as-wide 是
+UI 级暴露。真要防它,正解是给 `Caps` 加一位并在 `Caps::g` 里退回 ASCII 框线
+(`+ - |`),形状与既有降级机制完全一样——**那是独立的一件事**,不在本 ADR。
 
 **④ 能力门是必须的,因为位图**没有**降级退路。** `caps.rs:586-591` 已经为
 braille 写下这条理由:
@@ -149,10 +196,11 @@ cannot reach the scrollback**"。做到格级 = 放弃整行擦、改成只覆�
 **格级 diff(暂)。** 见决策⑤:先量化。这条不是"不做",是"没有数据不做",
 门槛写死在 ADR 里。
 
-**`blit` 这个名字。** 见决策⑦。
+**v1 收 braille。** 见决策③——而且**推翻**了本 ADR 最初"拒收 braille"的写法:
+按 UAX #11 它是 N(Neutral),是候选里最安全的一档;我们最初以为它 Ambiguous,
+来源是仓库里一条错的注释。
 
-**v1 收 braille。** 见决策③。我们与 Mods 在这一点上不同,而且我们是对的——理由
-是我们有 tuix 的实证,他们没有。
+**`blit` 这个名字。** 见决策⑦。
 
 ## 失效条件
 
@@ -161,9 +209,10 @@ cannot reach the scrollback**"。做到格级 = 放弃整行擦、改成只覆�
   不是加标志位。
 - **若行级重画的字节数成为实测瓶颈**:开格级,动 `encode_rows` 的先擦后画。
   前置是决策⑤那条量化,且要重新论证"erase 整行"与 scrollback 安全。
-- **若"Ambiguous 当双宽"在目标终端上成为常态**:加 caps 位并补偿,或彻底禁
-  ambiguous——**但那时 spinner 的 braille 要一起重看**(它的判据断言一列,而那在
-  双宽终端上可能是错的)。
+- **若"Ambiguous 当双宽"在目标终端上成为常态**:那是 **UI 级**问题(每个面板边框、
+  每条表格横线都会错位,不止位图),正解是给 `Caps` 加一位并在 `Caps::g` 里退回
+  ASCII 框线(`+ - |`)。**在 Raster 里单独处理它没有意义**——Raster 用的字符与
+  框线同类(都是 Ambiguous)。
 - **若出现第二个"外部往已挂载的东西写、模块每帧读"的场景**:`Asks` 与 `Rasters`
   会长成两种同形的东西,那时该抽一个共用的形状,而不是并排第三张表。
 - **若 `Caps` 探测升级到拿单元格像素尺寸**(`[16t`):Raster 是**字符格**的,
@@ -184,7 +233,11 @@ cannot reach the scrollback**"。做到格级 = 放弃整行擦、改成只覆�
   (尺子)、`encode_rows`(先擦后画的不变量)
 - `crates/atomcode-tui/src/caps.rs` —— `SPINNER` 与它的两条判据(braille 为什么
   不进降级表)
-- `crates/atomcode-tuix/src/render/qr.rs` —— braille 的 Ambiguous 宽度实证
+- `crates/atomcode-tuix/src/render/qr.rs` —— **它说 braille 是 Ambiguous,而按
+  UAX #11 是 N(Neutral)**;决策③更正了这一点
+- UAX #11 `EastAsianWidth.txt` —— 决策③那张表的权威来源
+- `crates/atomcode-tui/src/plugin.rs` 的 `refresh_members` —— "row 读服务、把活数据
+  写进 `Moment`" 的先例,位图内容正是走这条路进模块
 - `crates/atomcode-tui/src/ask.rs` 的 `Asks` —— 新表要照的形状
 - `crates/atomcode-tui/src/host.rs` 的 `context_menu_key` —— 键盘焦点那条缝的
   先例

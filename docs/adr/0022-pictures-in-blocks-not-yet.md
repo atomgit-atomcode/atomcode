@@ -199,11 +199,20 @@ kitty 规范那句"必须随文本一起滚"的实现）。但它是**终端侧*
 2. **欢迎块（`docs/plans/2026-09-15-session-welcome-block-design.md`）用字符**，
    精度靠"一格多像素"而不是图形协议：
    - `█` → 一格一像素（9×4）；
-   - `▀▄█` → 一格两像素（9×8），且这些字形是 **Unicode-Neutral 宽度**，
-     没有终端会把它们拉伸（tuix 的 `render/qr.rs` 已经踩过这条路）；
-   - Braille（U+2800–U+28FF）→ 一格 **2×4 个点**（9×16），但它是
-     **Ambiguous 宽度**：iTerm2 默认「ambiguous 当双宽」会把它横向拉 2 倍，
-     所以它必须是一个 caps 门，而不是默认。
+   - `▀▄█` → 一格两像素（9×8）。**（更正）** 本条早先说这些字形是
+     "Unicode-Neutral 宽度，没有终端会把它们拉伸"——按 UAX #11
+     `2580..258F` 是 **A（Ambiguous）**，不是 Neutral。它们与 UI 其余部分
+     同一假设：**全部框线** `2500..254B` 也是 Ambiguous，所以用它们并不比
+     画一个面板边框更危险。
+   - Braille（U+2800–28FF）→ 一格 **2×4 个点**（9×16）。
+     **一处更正（2026-09-15 查证）**：本条早先写「Braille 是 Ambiguous 宽度，
+     iTerm2 默认拉双宽，所以必须是一个 caps 门」——**那句是错的**，来源是
+     `crates/atomcode-tuix/src/render/qr.rs` 的一条错注释。按 UAX #11
+     `EastAsianWidth.txt`，`2800..28FF` 是 **N（Neutral）**；反倒是
+     `2580..258F`（`█▀▄`）与**全部框线** `2500..254B` 是 **A（Ambiguous）**。
+     所以 Braille **不需要**为宽度加 caps 门——它是候选里最安全的一档；
+     而 `▀▄█` 与 UI 其余部分同一假设（框线也是 Ambiguous）。详见
+     [`0023`](./0023-raster-is-a-cell-grid.md) 决策③。
    这三档全部落在 [`0021`](./0021-blocks-may-shape-by-terminal-capability.md)
    那条缝里——不碰 `Frame`、不碰 `for_screen`、不碰 diff、不碰滚动。
    **这与业界一致**：ratatui-image 自己的 `Halfblocks` 兜底也是这一档（它注明
@@ -293,7 +302,8 @@ ratatui 的类型。**能引的是它下面的编码器与探测配方，不是�
 - `crates/atomcode-tui/src/ansi.rs` 的 `encode_rows` —— 滚动是重画，不是滚动
 - `crates/atomcode-tui/src/text.rs` 的 `for_screen` —— 唯一挡住 ESC 的那道门
 - `crates/atomcode-tuix/src/render/qr.rs` —— 字符多像素的两个先例（`▀▄█` 与
-  Braille，含 Braille 的 ambiguous 宽度坑）
+  Braille）。**注意它的注释里有一条错的**：它说 Braille 是 Ambiguous 宽度，
+  按 UAX #11 是 N（Neutral）；见 [`0023`](./0023-raster-is-a-cell-grid.md) 决策③
 - `docs/plans/2026-09-15-session-welcome-block-design.md` §四 —— 猫的形状
 
 查证过的外部件（引用前先读本条"业界怎么做的"）：

@@ -149,7 +149,7 @@ Mods 的上限是 512 列 × 256 行。他们没说为什么，我们算一遍�
 这个数字是**建议值**，实现时可以调；重要的是它由算式得出，且判据里有一条钉住
 「超限被拒」。
 
-## 决策五：字形与宽度——**复用 braille 那次踩出来的结论**
+## 决策五：字形与宽度——宽度判据取 crate 既有权威，可画性靠整组换
 
 这是本设计里最容易埋暗雷的一处，而仓库里**已经有一半的答案**。
 
@@ -172,33 +172,44 @@ Mods 的上限是 512 列 × 256 行。他们没说为什么，我们算一遍�
 
 （`Caps::plain()` 与 `ATOMCODE_ASCII` 是这条门的两个触发点。）
 
-### 5.2 Ambiguous 宽度：一个 Mods 也有、而我们踩过的地方
+### 5.2 宽度：判据是「宽度 1」，**不是「非 Ambiguous」**
 
-Mods 的约束原文是：
+这一节推翻了本设计初稿的写法（初稿说「必须宽度 1 且非 Ambiguous，braille 暂拒」）。
+**查证推翻了它**，而且牵出一条既有的、全 UI 范围的事实。
 
-> A code point is one printable width-1 BMP character (**blocks, box drawing,
-> braille too**), or the tree is refused naming the cell's index.
+**权威数据**（UAX #11 `EastAsianWidth.txt`，本机实测 `unicode-width` 两个约定与它一致）：
 
-**「braille too」这半句是可疑的**，而我们在 tuix 里已经撞过：`render/qr.rs:10-15`
-写着 braille 是 **Unicode-Ambiguous 宽度**，iTerm2 默认
-「Treat ambiguous-width characters as double width」会把它横向拉成 2 格——他们
-为此把 Braille 版 QR 做成 **opt-in**。
+| 码点 | EAW |
+|---|---|
+| `2800..28FF` braille | **N**（Neutral） |
+| `2580..258F` `█▀▄` | A（Ambiguous） |
+| `2592..2595` `▒` | A |
+| **`2500..254B` 全部框线** `─│┌┐└┘├┤┬┴┼` | **A** |
+| `25C6` 品牌记号 `◆` | A |
 
-在我们这边，这件事会以**「量 1、画 2」**的形态出现：
+判据：`unicode-width` 的 `width()` 把 Ambiguous 当 **1** 列、`width_cjk()` 当 **2**
+（它的 doc 明说），所以 **`width != width_cjk` 就是「Ambiguous」**。
 
-- `width.rs` 以 `unicode-width` 为权威，它把 braille 算作 **1 格**；
-- `caps.rs` 的判据 `every_spinner_frame_is_one_column` 也断言 `str_width(braille)
-  == 1`（对**spinner 那个位置**而言这是对的：那一行里它旁边没有需要对齐的东西）；
-- 而**位图是网格**——一格被画成 2 格，右边所有列都错位，网格整体烂掉。这与
-  spinner 的情况不同：spinner 是孤立一个字符，位图是**相邻密排**的。
+**结论：`非 Ambiguous` 不能当判据。**
 
-**所以 v1 的校验要排除 Ambiguous 宽度字符**：只收 `unicode-width` 判为 **1** 且
-**不是 Ambiguous** 的码点（`█▀▄░▒`、box drawing 里的窄那几个、ASCII 都在内），
-braille 暂时**拒收**并说明理由。
+- 它会拒掉 `█▀▄▒`——**以及这个 UI 已经在用的每一条框线**。面板边框、表格横线、
+  `◆` 品牌记号全是 Ambiguous。
+- 而「Ambiguous 被终端当双宽」是**全 UI 范围的既有暴露**：开了那个设置的终端上，
+  每一个边框今天就已经错位，**与 Raster 无关**。
+- 在一个已经全是 Ambiguous 网格的 UI 里，单独拒收 Raster 里的 Ambiguous 字符
+  **既不保护什么，又让 Raster 无字符可用**。
 
-这是本设计**唯一一处与 Mods 不同**的推导——他们允许 braille，我们建议先禁，
-理由是我们有那次实证而他们没有。若将来要开放，正解是**加一个 caps 位**
-（「把 ambiguous 当双宽」）并在排格里补偿，而不是直接收下。
+**所以 v1 的校验回到这个 crate 既有的权威**：`unicode-width::width(c) == 1`
+（窄约定）+ 可打印 BMP 字符。**braille 因此可用，而且是这批候选里最安全的一档**
+（Neutral）——初稿把它当危险项是反的。
+
+（顺带更正一处仓库注释：`crates/atomcode-tuix/src/render/qr.rs` 说 braille 是
+"Unicode-Ambiguous width"——按 UAX #11 它是 **N**，那句注释是错的。它把 Braille
+版 QR 做成 opt-in 的理由因此不成立；opt-in 本身无害，不必动。）
+
+**真要防 ambiguous-as-wide，那是另一件事**：给 `Caps` 加一位，并在 `Caps::g` 里
+退回 ASCII 框线（`+ - |`）——形状与既有降级机制完全一样，收益是全 UI 的。
+本设计**不做**，但把它记进「相关」，因为它是这次查证的副产品。
 
 ## 新面
 
@@ -214,7 +225,7 @@ pub struct Raster {
 }
 
 pub struct Cell {
-    /// 一个**可打印、宽度 1、非 Ambiguous** 的 BMP 码点。
+    /// 一个**可打印、宽度 1** 的 BMP 码点（窄约定，见 5.2）。
     pub ch: char,
     /// `None` = 用终端默认色（对应 Mods 的 `0x01000000`）。
     pub fg: Option<Color>,
@@ -242,40 +253,106 @@ impl Raster {
 |---|---|
 | `BadBase64` | 载荷本身不是合法 base64 |
 | `BadLength { got, want }` | 解码后不是 `columns * rows * 12` 字节 |
-| `BadCell { index, why }` | 不可打印 / 不是 BMP / 宽度 ≠ 1 / **Ambiguous** |
+| `BadCell { index, why }` | 不可打印 / 不是 BMP / **宽度 ≠ 1**（宽字符、零宽、控制符）|
 | `TooLarge { columns, rows, max }` | 超上限——**拒绝而不是截断** |
 | `NotMounted { module, key }` | `write` 到一块没挂载过的位图——**不隐式挂载** |
 | `SizeMismatch { want, got }` | `write` 的尺寸与挂载时不符（换尺寸要先卸载再挂）|
 
-### `Rasters`（新的一格服务）
+### `Rasters`：内容**经 `Moment` 到达模块**（这一条是初稿漏掉的）
 
-照 `Asks` 的形状——外部可变、模块每帧读：
+初稿写「照 `Asks` 的形状——外部可变、模块每帧读」，**那是错的**，因为
+`View::render(state, viewport)` 拿不到任何服务。trait 的 doc 把这条说得很硬：
+
+> [`View::render`] takes `&State`, not `&self`. A module therefore *cannot* capture
+> a `Context`, a service handle, a channel or a clock — the signature makes the
+> "no side effects, no IO, not async" obligation unrepresentable rather than
+> merely discouraged.
+
+**所以位图不能由模块自己去表里取，必须由宿主送进来。** 仓库里已有的先例正是这个
+形状——`refresh_members`（`plugin.rs:694`）：
 
 ```rust
-pub struct Rasters {
-    /// `(模块 id, key)` → 当前位图。
-    mounted: Mutex<HashMap<(String, String), Raster>>,
-    /// 每次成功写入 +1，测试用来断言"下一帧真的换了"。
-    revision: AtomicU64,
+let mut members: Vec<MemberNow> = agents.list()...collect();
+if moment.members != members {
+    moment.members = members;        // 一个 row 读服务，把活数据写进 Moment
 }
 ```
 
-`blit` 的签名（**不叫 blit**，见下）：
+模块这边则从 `viewport.moment.members` 读。**`Moment` 就是「不是事实、但此刻为真」
+的那一半**（`cwd`、`caps`、`members`、`notice` 都在里面）。
+
+照办，于是三件事各有归属：
 
 ```rust
-impl Rasters {
-    /// 换掉一块已挂载位图的内容。
+// moment.rs —— 新增一个字段
+pub struct Moment {
+    ...
+    /// 已挂载的位图，**这一帧的那一份**。
     ///
-    /// 未挂载的 `(module, key)`、尺寸不符、校验不过——**都拒**，且拒因说明
-    /// 是哪一种。一个静默的 no-op 会让调用方以为画上了。
+    /// 快照而不是把手：里面的 `Raster` 是不可变的，所以同一个 `Moment` 渲染两次
+    /// 看到同一幅画面——与 `caps`、`cwd` 守的是同一个承诺。
+    pub rasters: RastersView,
+}
+```
+
+```rust
+// raster.rs —— 不可变快照 + 可变表
+/// 某一帧的位图集合。克隆是 N 次 Arc 计数，不是像素拷贝。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RastersView(Arc<HashMap<(String, String), Arc<Raster>>>);
+
+impl RastersView {
+    pub fn get(&self, module: &str, key: &str) -> Option<&Arc<Raster>>;
+    pub fn is_empty(&self) -> bool;
+}
+
+/// 写入方用的表。宿主持有一个，`RastersSvc` 交给能写的行。
+pub struct Rasters {
+    /// **每帧读的那条路必须是 O(1)**：`view()` 只是把存着的 `Arc` 克隆一份。
+    /// 重建整张表（O(N) 次 Arc 计数，无像素拷贝）只发生在 `write` 上——
+    /// 与 `LiveCache`/`Settled` 同一取舍：热路径免费，冷路径付费。
+    current: Mutex<Arc<HashMap<(String, String), Arc<Raster>>>>,
+    revision: AtomicU64,
+}
+
+impl Rasters {
+    pub fn view(&self) -> RastersView;                                   // O(1)
+    pub fn mount(&self, module: &str, key: &str, raster: Raster) -> Result<(), RasterError>;
     pub fn write(&self, module: &str, key: &str, cells: &str) -> Result<(), RasterError>;
 }
 ```
 
-**命名**：Mods 叫 `blit`（位块传送），那是图形学的说法，而这里没有位块、没有
-传送，只有「换掉一块字符格」。建议 `Rasters::write`。**这不是吹毛求疵**：
-`docs/adr/0021` 那条缝的存在理由正是「块的存在或形状取决于终端能力」，而
-「blit」这个词会让下一个读代码的人以为我们在往终端写像素。
+**宿主侧两处接线**（`host.rs`）：
+
+```rust
+// Host::new 里：自家造一个，无需改签名
+rasters: Arc::new(crate::raster::Rasters::new()),
+
+// compose：把这一帧的快照放进 moment —— 与 `moment.caps` 同一条路
+let mut moment = self.moment.read().expect("moment poisoned").clone();
+moment.rasters = self.rasters.view();
+```
+
+**为什么 `view()` 必须 O(1)**：`compose` 每帧调一次，`write` 是外部偶发。把重建
+放在 `write` 上，帧路径就只剩一次 `Arc` 克隆。
+
+**为什么位图模块的高度必须来自配置**：`View::height(state, moment, width)` 收的是
+调用方手上那份 `Moment`，而**不是** `compose` 造的那份——`stream_height` 等路径
+传来的 moment 里 `rasters` 可能是空的。所以位图模块**不能**按位图内容报高度，
+只能用 `Height::Fixed(n)`（配置给）。这一条避免了「高度取决于快照在不在」的
+不确定性。
+
+### `RastersSvc`（新的一格服务）
+
+照 `ModulesSvc` / `CommandsSvc` 的位置加在 `plugin.rs`：
+
+```rust
+plexus_service!(RastersSvc => crate::raster::Rasters, "tui-rasters", Core,
+    "Mounted cell-grid bitmaps, addressed by (module id, key)");
+```
+
+由 `TuiUiPlugin` 与其它 `tui-*` 服务一起 `provide`（`assemble(surface)` 造好
+`Host` 之后，`host.rasters.clone()`）。
 
 ## 交互：一半有路，一半是**硬缺口**
 
@@ -321,7 +398,7 @@ impl Rasters {
 | 超上限 | `TooLarge` 拒，说明上限与收到的尺寸 |
 | 载荷长度不符 | `BadLength { got, want }` |
 | 某一格非法 | `BadCell { index, why }`——**点名下标** |
-| Ambiguous 宽度码点 | `BadCell`，理由写明「终端可能画成 2 格」 |
+| 宽度 ≠ 1 的码点（如 `中` U+4E2D，或零宽的组合符） | `BadCell`，理由写明实测宽度 |
 | `write` 到未挂载的 `(module, key)` | 拒（`NotMounted`），不隐式挂载 |
 | `write` 的尺寸与挂载时不符 | 拒（`SizeMismatch`）——换尺寸要先卸载再挂 |
 | 模块被卸载而位图还在 | 模块的 `apply` 里 `ctx.effect` 撤销时一并清掉（照 `rows.rs` 里每个面板的 effect 形状）|
@@ -334,8 +411,11 @@ impl Rasters {
 
 1. **校验（逐变体）**：`TooLarge`、`BadLength`、`BadBase64`、`BadCell` 各一条；
    `BadCell` 那条断言**拒因里有点名下标**。阴性对照：一个合法最小位图（1×1）通过。
-2. **Ambiguous 被拒**：一个含 braille（`\u{2800}`）的位图被拒，理由提到 2 格。
-   阴性对照：`\u{2588}`（`█`，Neutral）通过。
+2. **宽度不是 1 的码点被拒，braille 通过**（这一对就是 5.2 那条更正的可执行版本）：
+   - `\u{4E2D}`（`中`，宽字符）被拒，理由提到实测宽度 2；
+   - `\u{2800}`（braille 空白）**通过**——它是 Neutral，是这批里最安全的一档；
+   - `\u{2588}`（`█`，Ambiguous）**通过**——与 UI 其余部分（框线也是 Ambiguous）
+     同一假设，拒它没有意义。
 3. **未变的行不许重编码**：一个已挂载且内容未变的位图，连画两帧，
    **`ROWS_ENCODED` 不增**（现成的尺子）。阴性对照：`write` 换掉一行之后，
    **只有那一行**重编码。
@@ -354,7 +434,9 @@ impl Rasters {
   不变量。见失效条件。
 - **不做键盘交互。** `Moment.focus` 那条缝是独立工作（见「交互」一节）。
 - **不做图形协议。** ADR 0022 已定，重开条件在那里。
-- **不做 braille。** v1 拒收，理由与开放方式写在 5.2。
+- **不做 ambiguous-as-wide 的防御。** 那是**全 UI 范围**的既有暴露（框线全是
+  Ambiguous），正解是给 `Caps` 加一位并在 `Caps::g` 里退回 ASCII 框线——
+  **独立的一件事**，见 5.2。
 - **不做「写进别人的矩形」。** 决策三。
 
 ## 失效条件
@@ -364,9 +446,10 @@ impl Rasters {
   它的核心），不是加个标志位。
 - **若行级重画的字节数成为实测瓶颈**：开格级，动 `encode_rows` 的先擦后画。
   前置是决策二里那条量化，且要重新论证「erase 整行」与 scrollback 安全。
-- **若「Ambiguous 当双宽」在目标终端上成为常态**：加 caps 位并补偿，或彻底
-  禁 ambiguous——**但那时 spinner 的 braille 也要一起重看**（现在是按终端选
-  整组，判据断言一列，而那个断言在双宽终端上可能是错的）。
+- **若「Ambiguous 当双宽」在目标终端上成为常态**：那是 **UI 级**问题（每个面板
+  边框、每条表格横线都会错位，不止位图），正解是给 `Caps` 加一位并在 `Caps::g`
+  里退回 ASCII 框线（`+ - |`）——**在 Raster 里单独处理它没有意义**。那时
+  Raster 不需要改：它用的字符与框线同类。
 - **若出现了第二个「外部往已挂载的东西写、模块每帧读」的场景**：`Asks` 与
   `Rasters` 会长成两种同形的东西，那时该抽一个共用的形状，而不是并列第三张表。
 - **若 `Caps` 能力探测升级**（比如真的去探 `[16t` 拿单元格像素尺寸）：
@@ -385,7 +468,9 @@ impl Rasters {
   `encode_rows`
 - `crates/atomcode-tui/src/frame.rs` 的 `Placed` / `Frame::place` / `Style`
 - `crates/atomcode-tui/src/caps.rs` 的 `SPINNER` 与其两条判据（braille 不进降级表）
-- `crates/atomcode-tuix/src/render/qr.rs` —— braille 的 Ambiguous 宽度实证
+- `crates/atomcode-tuix/src/render/qr.rs` —— **它说 braille 是 Ambiguous，按
+  UAX #11 是错的（N）**；这次的更正见 5.2
+- UAX #11 `EastAsianWidth.txt` —— 5.2 那张表的权威来源
 - `crates/atomcode-tui/src/ask.rs` 的 `Asks` —— 新表要照的形状
 - `crates/atomcode-tui/src/host.rs` 的 `context_menu_key` —— 键盘焦点那条缝的
   现成先例
