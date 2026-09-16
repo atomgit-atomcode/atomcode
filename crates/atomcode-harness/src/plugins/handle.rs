@@ -796,6 +796,12 @@ enum Woke {
 /// into the turn already running — is processed while the model is streaming.
 /// A pump that blocked on the turn could not deliver the one command whose
 /// entire purpose is to interrupt it.
+/// Sessions this handle streams facts for, each with the highest seq it has
+/// sent. Shared by the fact listener and the pump, and held across a
+/// subscription's catch-up, so history and live facts meet with no gap and no
+/// repeat.
+type Subscriptions = Arc<Mutex<HashMap<String, crate::session::SeqNo>>>;
+
 async fn pump(
     ctx: Context,
     agent: Arc<Agent>,
@@ -803,6 +809,7 @@ async fn pump(
     events: mpsc::UnboundedSender<AgentEvent>,
     mut commands: mpsc::UnboundedReceiver<AgentCommand>,
     manual_compaction: Arc<std::sync::atomic::AtomicBool>,
+    subscriptions: Subscriptions,
 ) {
     let Ok(driver) = ctx.require::<AgentLoopSvc>() else {
         let _ = events.send(AgentEvent::Error {
@@ -989,6 +996,47 @@ async fn pump(
                 } else {
                     compact(&ctx, &events, focus, &manual_compaction).await;
                 }
+                continue;
+            }
+            AgentCommand::Subscribe { session, from } => {
+                // Its own session, or one it can reach by id — a team member's.
+                let log = if session == agent.session_id() {
+                    Some(agent.session())
+                } else {
+                    ctx.service::<AgentsSvc>()
+                        .and_then(|agents| agents.by_session(&session))
+                        .map(|member| member.session())
+                };
+                match log {
+                    None => reject(atomcode_kernel::event::CommandError::NotFound),
+                    Some(log) => {
+                        accept(None);
+                        // Held while the history is read and sent: a fact
+                        // committed meanwhile waits in the listener and then
+                        // compares against the seq recorded here.
+                        let mut subscribed = subscriptions.lock().expect("subscriptions poisoned");
+                        let mut high = from.saturating_sub(1);
+                        for logged in log.events() {
+                            if logged.seq >= from {
+                                high = logged.seq;
+                                let _ = events.send(AgentEvent::Fact(Committed {
+                                    session: session.clone(),
+                                    seq: logged.seq,
+                                    event: logged.event,
+                                }));
+                            }
+                        }
+                        subscribed.insert(session, high);
+                    }
+                }
+                continue;
+            }
+            AgentCommand::Unsubscribe { session } => {
+                subscriptions
+                    .lock()
+                    .expect("subscriptions poisoned")
+                    .remove(&session);
+                accept(None);
                 continue;
             }
             AgentCommand::Shutdown => {
@@ -1265,7 +1313,19 @@ pub async fn spawn(
 
     let out = events.clone();
     let fold = projector.clone();
+    let subscriptions: Subscriptions = Arc::new(Mutex::new(HashMap::new()));
+    let subscribed = subscriptions.clone();
     let stream = ctx.on_emit::<SessionEventCommitted>(move |committed: &Committed| {
+        // Facts for whoever subscribed to this session — its own or a member's.
+        {
+            let mut sessions = subscribed.lock().expect("subscriptions poisoned");
+            if let Some(high) = sessions.get_mut(&committed.session) {
+                if committed.seq > *high {
+                    *high = committed.seq;
+                    let _ = out.send(AgentEvent::Fact(committed.clone()));
+                }
+            }
+        }
         // One handle, one conversation. A delegated child commits to its
         // own log and this listener is above both.
         if committed.session != session_id {
@@ -1291,6 +1351,7 @@ pub async fn spawn(
             events,
             command_rx,
             manual_compaction,
+            subscriptions,
         )
         .await;
         // The listener holds a clone of the sender; revoking it is what

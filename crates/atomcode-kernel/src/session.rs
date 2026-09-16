@@ -447,7 +447,7 @@ pub struct LoggedEvent {
 /// them, because that is what one-way realm visibility means. Without the id on
 /// the broadcast, a subagent's transcript arrives on the parent's screen and in
 /// the parent's file, and nothing downstream can tell it apart.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Committed {
     /// Which log this fact was appended to.
     pub session: String,

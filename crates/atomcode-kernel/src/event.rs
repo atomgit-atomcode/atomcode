@@ -218,6 +218,21 @@ pub enum AgentCommand {
         id: CommandId,
         command: Box<AgentCommand>,
     },
+    /// Start receiving a session's facts as [`AgentEvent::Fact`]: every fact
+    /// from `from` on that is already in its log, then each new one as it is
+    /// committed — in order, none twice, none skipped (`docs/adr/0022` §1).
+    ///
+    /// Any session this agent can reach by id: its own, or a team member's.
+    /// Content reaches a front end only this way; events carry status.
+    Subscribe {
+        session: String,
+        #[serde(default)]
+        from: crate::session::SeqNo,
+    },
+    /// Stop receiving a session's facts.
+    Unsubscribe {
+        session: String,
+    },
 }
 
 /// A driver's name for one command, echoed back on its receipt.
@@ -246,6 +261,8 @@ pub enum CommandError {
     Unavailable,
     /// Not now: something the agent is doing has to finish first.
     Busy { reason: String },
+    /// Nothing by that id is here — a session this agent cannot reach.
+    NotFound,
     /// A command this agent has no answer for.
     Unsupported,
 }
@@ -319,6 +336,10 @@ pub enum AgentEvent {
         command: CommandId,
         error: CommandError,
     },
+    /// One fact of a session this driver subscribed to
+    /// ([`AgentCommand::Subscribe`]). The session log is the content; a screen is
+    /// a fold over these (`docs/adr/0022` §1).
+    Fact(crate::session::Committed),
     TextDelta(String),
     /// **Model-visible context the person did not type.**
     ///

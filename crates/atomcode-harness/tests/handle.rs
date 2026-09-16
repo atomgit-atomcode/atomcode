@@ -1320,3 +1320,167 @@ async fn a_command_that_cannot_act_is_rejected_on_the_spot() {
         ]
     );
 }
+
+// ---- the session fact stream (docs/adr/0022 §1) --------------------------
+
+fn only_session(
+    app: &App,
+) -> (
+    String,
+    std::sync::Arc<atomcode_harness::session::SessionLog>,
+) {
+    let agents = app
+        .context()
+        .service::<atomcode_harness::seams::AgentsSvc>()
+        .expect("agents");
+    let agent = agents
+        .list()
+        .into_iter()
+        .next()
+        .expect("the handle's agent");
+    (agent.session_id().to_string(), agent.session())
+}
+
+fn fact_seqs(events: &[AgentEvent], session: &str) -> Vec<u64> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Fact(c) if c.session == session => Some(c.seq),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Read events until a fact with `seq` of `session` has arrived, the turn has
+/// ended, and nothing more is queued.
+async fn drain_turn_and_facts(handle: &mut AgentHandle) -> Vec<AgentEvent> {
+    let mut seen = drain_turn(handle).await;
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(200), handle.events.recv()).await
+    {
+        seen.push(event);
+    }
+    seen
+}
+
+#[tokio::test]
+async fn a_subscriber_gets_the_history_then_live_facts_with_no_gap_or_repeat() {
+    let dir = scratch("facts");
+    let app = start(tree(
+        &dir,
+        &replay(r#"{ text = "one" }, { text = "two" }"#),
+        &[],
+    ))
+    .await;
+    let mut handle = handle_of(&app);
+
+    handle.commands.send(message("first")).unwrap();
+    let before = drain_turn(&mut handle).await;
+    assert!(
+        fact_seqs(&before, "").is_empty()
+            && !before.iter().any(|e| matches!(e, AgentEvent::Fact(_))),
+        "no facts without a subscription: {before:#?}"
+    );
+
+    let (session, log) = only_session(&app);
+    handle
+        .commands
+        .send(AgentCommand::Subscribe {
+            session: session.clone(),
+            from: 0,
+        })
+        .unwrap();
+    handle.commands.send(message("second")).unwrap();
+    let after = drain_turn_and_facts(&mut handle).await;
+
+    let seqs = fact_seqs(&after, &session);
+    let expected: Vec<u64> = log.events().iter().map(|l| l.seq).collect();
+    assert!(!expected.is_empty());
+    assert_eq!(
+        seqs, expected,
+        "history then live, every fact once, in log order"
+    );
+}
+
+#[tokio::test]
+async fn subscribing_while_a_turn_runs_misses_and_repeats_nothing() {
+    let dir = scratch("facts-mid-turn");
+    let app = start(tree(&dir, &replay(r#"{ text = "one" }"#), &[])).await;
+    let mut handle = handle_of(&app);
+    let (session, log) = only_session(&app);
+    let _guard = app
+        .context()
+        .on_waterfall::<atomcode_harness::events::AgentRequest>(
+            std::sync::Arc::new(SendsThroughHandleMidTurn {
+                commands: handle.commands.clone(),
+                command: std::sync::Mutex::new(Some(AgentCommand::Subscribe {
+                    session: session.clone(),
+                    from: 0,
+                })),
+            }),
+            false,
+        );
+
+    handle.commands.send(message("go")).unwrap();
+    let events = drain_turn_and_facts(&mut handle).await;
+
+    let seqs = fact_seqs(&events, &session);
+    let expected: Vec<u64> = log.events().iter().map(|l| l.seq).collect();
+    assert_eq!(seqs, expected, "{events:#?}");
+}
+
+#[tokio::test]
+async fn a_subscription_starts_at_the_seq_it_asks_for() {
+    let dir = scratch("facts-from");
+    let app = start(tree(&dir, &replay(r#"{ text = "one" }"#), &[])).await;
+    let mut handle = handle_of(&app);
+    handle.commands.send(message("go")).unwrap();
+    drain_turn(&mut handle).await;
+    let (session, log) = only_session(&app);
+    let all: Vec<u64> = log.events().iter().map(|l| l.seq).collect();
+    let from = all[all.len() / 2];
+
+    handle
+        .commands
+        .send(AgentCommand::Subscribe {
+            session: session.clone(),
+            from,
+        })
+        .unwrap();
+    let mut facts = Vec::new();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(300), handle.events.recv()).await
+    {
+        facts.push(event);
+    }
+    let expected: Vec<u64> = all.into_iter().filter(|s| *s >= from).collect();
+    assert_eq!(fact_seqs(&facts, &session), expected);
+}
+
+#[tokio::test]
+async fn subscribing_to_a_session_nobody_has_is_not_found() {
+    let dir = scratch("facts-missing");
+    let app = start(tree(&dir, &replay(r#"{ text = "unused" }"#), &[])).await;
+    let mut handle = handle_of(&app);
+    handle
+        .commands
+        .send(tagged(
+            "s",
+            AgentCommand::Subscribe {
+                session: "no-such-session".into(),
+                from: 0,
+            },
+        ))
+        .unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), handle.events.recv()).await {
+            Ok(Some(AgentEvent::Rejected { command, error })) => {
+                assert_eq!(command, "s");
+                assert_eq!(error, atomcode_kernel::event::CommandError::NotFound);
+                break;
+            }
+            Ok(Some(_)) => continue,
+            other => panic!("no rejection: {other:?}"),
+        }
+    }
+}
