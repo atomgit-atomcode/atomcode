@@ -762,7 +762,7 @@ impl Tui {
     fn on_event(&self, event: AgentEvent) -> bool {
         use crate::moment::Activity;
         match event {
-            AgentEvent::TurnStarted => self.set_activity(Activity::Working),
+            AgentEvent::TurnStarted { .. } => self.set_activity(Activity::Working),
             AgentEvent::TurnComplete { .. } | AgentEvent::Cancelled => {
                 // A cancel or a failure can end the turn with words still in the
                 // inbox — nothing folded them, and no `Steered` is coming. The

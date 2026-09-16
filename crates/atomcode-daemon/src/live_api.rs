@@ -872,7 +872,7 @@ impl NativeLiveWireProjector {
                 }
             }
             crate::live_hub::LiveViewEvent::Runtime(Runtime::Agent(event)) => match event {
-                Kernel::TurnStarted => LiveWireEvent::State {
+                Kernel::TurnStarted { .. } => LiveWireEvent::State {
                     running: true,
                     stop_reason: None,
                     message: None,

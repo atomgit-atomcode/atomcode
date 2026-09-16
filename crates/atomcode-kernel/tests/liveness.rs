@@ -151,7 +151,7 @@ async fn partial_stream_timeout_continues_once_without_failing_the_turn() {
                     recovered,
                 }) => phases.push((attempt, max_attempts, recovered)),
                 Some(AgentEvent::Error { message, .. }) => errors.push(message),
-                Some(AgentEvent::TurnComplete { reason }) => break reason,
+                Some(AgentEvent::TurnComplete { reason, .. }) => break reason,
                 Some(_) => {}
                 None => panic!("event channel closed before terminal"),
             }
@@ -200,7 +200,7 @@ async fn partial_stream_tool_call_is_preserved_but_never_executed_or_replayed() 
     handle.commands.send(send("go")).unwrap();
     let reason = tokio::time::timeout(OUTER_GUARD, async {
         loop {
-            if let Some(AgentEvent::TurnComplete { reason }) = handle.events.recv().await {
+            if let Some(AgentEvent::TurnComplete { reason, .. }) = handle.events.recv().await {
                 break reason;
             }
         }
@@ -280,7 +280,7 @@ async fn second_partial_stream_timeout_stops_after_the_single_safe_continuation(
         loop {
             match handle.events.recv().await {
                 Some(AgentEvent::Error { message, .. }) => error = Some(message),
-                Some(AgentEvent::TurnComplete { reason }) => break (error, reason),
+                Some(AgentEvent::TurnComplete { reason, .. }) => break (error, reason),
                 Some(_) => {}
                 None => panic!("event channel closed before terminal"),
             }

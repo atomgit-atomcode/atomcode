@@ -367,6 +367,9 @@ pub enum InboxItem {
         /// Attachments that belong to this message. Model-visible, so they
         /// travel with it rather than being handed to the request separately.
         images: Vec<ImageContent>,
+        /// The driver's id for the command that sent this, when it asked for a
+        /// receipt. Never logged: it names a command, not a fact of the session.
+        receipt: Option<atomcode_kernel::event::CommandId>,
     },
     /// Model-visible context that rides along with the next message. Never
     /// wakes anything on its own.
@@ -387,6 +390,8 @@ pub struct Claimed {
     pub images: Vec<ImageContent>,
     /// Context that came along with it.
     pub injections: Vec<(String, InjectionOrigin)>,
+    /// The receipt the message's command asked for, if any.
+    pub receipt: Option<atomcode_kernel::event::CommandId>,
 }
 
 impl Claimed {
@@ -424,6 +429,18 @@ impl Inbox {
         origin: MessageOrigin,
         images: Vec<ImageContent>,
     ) {
+        self.send_receipted(text, origin, images, None);
+    }
+
+    /// Queue a message whose command wants a receipt: when a turn claims it,
+    /// [`crate::events::InputClaimed`] says which turn, carrying `receipt`.
+    pub fn send_receipted(
+        &self,
+        text: impl Into<String>,
+        origin: MessageOrigin,
+        images: Vec<ImageContent>,
+        receipt: Option<atomcode_kernel::event::CommandId>,
+    ) {
         self.queue
             .lock()
             .expect("inbox poisoned")
@@ -431,6 +448,7 @@ impl Inbox {
                 text: text.into(),
                 origin,
                 images,
+                receipt,
             });
     }
 
@@ -464,10 +482,12 @@ impl Inbox {
                     text,
                     origin,
                     images,
+                    receipt,
                 } => {
                     claimed.message = Some(text);
                     claimed.origin = origin;
                     claimed.images = images;
+                    claimed.receipt = receipt;
                     break;
                 }
             }
@@ -578,6 +598,18 @@ impl Agent {
         images: Vec<ImageContent>,
     ) {
         self.inbox.send_full(text, origin, images);
+        self.woke();
+    }
+
+    /// Queue a message with a receipt. See [`Inbox::send_receipted`].
+    pub fn send_receipted(
+        &self,
+        text: impl Into<String>,
+        origin: MessageOrigin,
+        images: Vec<ImageContent>,
+        receipt: Option<atomcode_kernel::event::CommandId>,
+    ) {
+        self.inbox.send_receipted(text, origin, images, receipt);
         self.woke();
     }
 

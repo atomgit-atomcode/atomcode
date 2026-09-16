@@ -859,7 +859,7 @@ impl LiveViewHub {
         };
         let mut replay = state.turn_active;
         match &event {
-            CodingRuntimeEvent::Agent(AgentEvent::TurnStarted) => {
+            CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { .. }) => {
                 // A new turn closes the prior driver-owned recovery window. A turn
                 // started outside `submit`/`submit_confirmed` (embedded TUI / sync
                 // mode drives the runtime handle directly, so those replay-clearing
@@ -1512,7 +1512,7 @@ mod tests {
                 SequencedRuntimeEvent {
                     generation: 1,
                     sequence: 1,
-                    event: CodingRuntimeEvent::Agent(AgentEvent::TurnStarted),
+                    event: CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { turn: None }),
                 },
             )
             .unwrap_err();
@@ -1523,7 +1523,7 @@ mod tests {
             SequencedRuntimeEvent {
                 generation: 1,
                 sequence: 2,
-                event: CodingRuntimeEvent::Agent(AgentEvent::TurnStarted),
+                event: CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { turn: None }),
             },
         )
         .unwrap();
@@ -1617,7 +1617,7 @@ mod tests {
             SequencedRuntimeEvent {
                 generation: 1,
                 sequence: 1,
-                event: CodingRuntimeEvent::Agent(AgentEvent::TurnStarted),
+                event: CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { turn: None }),
             },
         )
         .unwrap();
@@ -1654,7 +1654,7 @@ mod tests {
         assert!(after.replay.is_empty());
         assert!(matches!(
             during.replay[0].event,
-            LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(AgentEvent::TurnStarted))
+            LiveViewEvent::Runtime(CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { .. }))
         ));
     }
 
@@ -1669,7 +1669,10 @@ mod tests {
             atomcode_kernel::event::PolicyIntervention::credential_shell_blocked();
         intervention.id = 42;
         for (sequence, event) in [
-            (1, CodingRuntimeEvent::Agent(AgentEvent::TurnStarted)),
+            (
+                1,
+                CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { turn: None }),
+            ),
             (
                 2,
                 CodingRuntimeEvent::Agent(AgentEvent::PolicyIntervention { intervention }),
@@ -1738,7 +1741,10 @@ mod tests {
             atomcode_kernel::event::PolicyIntervention::credential_shell_blocked();
         intervention.id = 42;
         for (sequence, event) in [
-            (1, CodingRuntimeEvent::Agent(AgentEvent::TurnStarted)),
+            (
+                1,
+                CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { turn: None }),
+            ),
             (
                 2,
                 CodingRuntimeEvent::Agent(AgentEvent::PolicyIntervention { intervention }),
@@ -1817,7 +1823,10 @@ mod tests {
             .bind("session-1", PathBuf::from("/one"), snapshot("old"), control)
             .unwrap();
         for (sequence, event) in [
-            (1, CodingRuntimeEvent::Agent(AgentEvent::TurnStarted)),
+            (
+                1,
+                CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { turn: None }),
+            ),
             (
                 2,
                 CodingRuntimeEvent::Agent(AgentEvent::PolicyIntervention {
@@ -1853,7 +1862,7 @@ mod tests {
             SequencedRuntimeEvent {
                 generation: 1,
                 sequence: 4,
-                event: CodingRuntimeEvent::Agent(AgentEvent::TurnStarted),
+                event: CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { turn: None }),
             },
         )
         .unwrap();

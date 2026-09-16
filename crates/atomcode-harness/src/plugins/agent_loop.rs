@@ -393,6 +393,16 @@ impl PluginAgentLoop {
             // later passes this is what folds a mid-turn message into the turn
             // already running instead of making it wait for the next one.
             let claimed = agent.inbox().claim();
+            if let (Some(receipt), true) = (claimed.receipt.clone(), claimed.message.is_some()) {
+                agent
+                    .ctx()
+                    .emit::<crate::events::InputClaimed>(&crate::events::ClaimedInput {
+                        agent: agent.id(),
+                        receipt,
+                        turn,
+                        steered: step > 0,
+                    });
+            }
             let mut decision = StepDecision {
                 turn,
                 step: step + 1,

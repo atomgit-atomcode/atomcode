@@ -1124,7 +1124,7 @@ impl Agent {
                 AgentEvent::PolicyIntervention { intervention } => {
                     outcome.policy_intervention = Some(intervention);
                 }
-                AgentEvent::TurnComplete { reason } => {
+                AgentEvent::TurnComplete { reason, .. } => {
                     outcome.stop = reason;
                     let _ = handle.commands.send(AgentCommand::Shutdown);
                     break;
@@ -1467,10 +1467,14 @@ impl RunningAgent {
             std::collections::VecDeque::new();
         loop {
             let cmd = match cmd_rx.recv().await {
-                Some(c) => c,
+                // This engine sends no receipts: a tagged command is run as the
+                // command it carries (`AgentCommand::untagged`).
+                Some(c) => c.untagged(),
                 None => break,
             };
             match cmd {
+                // Unwrapped on receipt; nothing tagged reaches this match.
+                AgentCommand::Tagged { .. } => {}
                 AgentCommand::Shutdown => break,
                 // No turn is running at the top-level loop, but a Cancel that races in
                 // here (turn just returned) must still flush any orphaned parked request
@@ -1598,6 +1602,7 @@ impl RunningAgent {
                 retryable: None,
             });
             self.rt.emit(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::PromptRejected,
             });
             return false;
@@ -1661,7 +1666,9 @@ impl RunningAgent {
         loop {
             tokio::select! {
                 _ = &mut turn => break,
-                maybe = cmd_rx.recv() => match maybe {
+                maybe = cmd_rx.recv() => match maybe.map(AgentCommand::untagged) {
+                    // Unwrapped on receipt; nothing tagged reaches this match.
+                    Some(AgentCommand::Tagged { .. }) => {}
                     Some(AgentCommand::Respond { id, value }) => self.rt.resolve(id, value),
                     Some(AgentCommand::Shutdown) => {
                         // Shutdown during a live turn is a cooperative terminal, not
@@ -1851,7 +1858,8 @@ impl RunningAgent {
     /// a turn that ran — it keeps its bare event emit, no `turn_complete`.)
     async fn finish_turn(&self, convo: &Conversation, reason: StopReason, ctx: &TurnCtx) {
         self.hooks.turn_complete(convo, &reason, ctx).await;
-        self.rt.emit(AgentEvent::TurnComplete { reason });
+        self.rt
+            .emit(AgentEvent::TurnComplete { turn: None, reason });
     }
 
     /// Persist only the replay-safe, fully assembled portion of a failed stream.
@@ -1964,7 +1972,7 @@ impl RunningAgent {
         mut tool_loop_state: Option<&mut ToolLoopState>,
     ) {
         self.hooks.turn_start(convo).await;
-        self.rt.emit(AgentEvent::TurnStarted);
+        self.rt.emit(AgentEvent::TurnStarted { turn: None });
         // A turn must execute against the exact same tool set advertised to the
         // provider. Runtime catalog updates become visible on the next turn.
         let turn_tools = self.tools.snapshot();
@@ -2153,7 +2161,11 @@ impl RunningAgent {
                         images: input.images,
                     });
                 }
-                self.rt.emit(AgentEvent::Steered { count: n, inputs });
+                self.rt.emit(AgentEvent::Steered {
+                    turn: None,
+                    count: n,
+                    inputs,
+                });
             }
             let mut messages = convo.messages.clone();
             self.hooks.pre_request(&mut messages, &turn_ctx).await;
@@ -5546,7 +5558,7 @@ mod steer_buffer_tests {
         let mut steered = false;
         while let Some(ev) = handle.events.recv().await {
             match ev {
-                AgentEvent::TurnStarted => turn_started += 1,
+                AgentEvent::TurnStarted { .. } => turn_started += 1,
                 AgentEvent::ToolResult { .. } if !steered => {
                     steer_tx
                         .send(AgentCommand::SendMessage {
@@ -5621,7 +5633,7 @@ mod steer_buffer_tests {
         let mut turn_complete = 0u32;
         while let Some(ev) = handle.events.recv().await {
             match ev {
-                AgentEvent::TurnStarted => turn_started += 1,
+                AgentEvent::TurnStarted { .. } => turn_started += 1,
                 AgentEvent::TurnComplete { .. } => {
                     turn_complete += 1;
                     break;
@@ -5682,7 +5694,7 @@ mod steer_buffer_tests {
         let mut turn_started = 0u32;
         while let Some(ev) = handle.events.recv().await {
             match ev {
-                AgentEvent::TurnStarted => turn_started += 1,
+                AgentEvent::TurnStarted { .. } => turn_started += 1,
                 AgentEvent::TurnComplete { .. } => break,
                 _ => {}
             }
@@ -5746,7 +5758,7 @@ mod steer_buffer_tests {
         let mut steered_inputs = Vec::new();
         while let Some(ev) = handle.events.recv().await {
             match ev {
-                AgentEvent::Steered { count, inputs } => {
+                AgentEvent::Steered { count, inputs, .. } => {
                     assert_eq!(count, inputs.len());
                     steered_inputs.extend(inputs);
                 }

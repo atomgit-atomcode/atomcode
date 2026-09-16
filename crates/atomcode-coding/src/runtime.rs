@@ -6229,7 +6229,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     },
                                 ));
                             }
-                            AgentEvent::TurnComplete { reason } => {
+                            AgentEvent::TurnComplete { reason, .. } => {
                                 // The tree carries the real cause; this protocol's
                                 // drivers match on the folded set.
                                 let reason = reason.folded_for_runtime_drivers();
@@ -6710,7 +6710,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     );
                                 }
                             }
-                            AgentEvent::TurnStarted => {
+                            AgentEvent::TurnStarted { .. } => {
                                 if let Some(intervention) = pending_policy_intervention.take() {
                                     let _ = runtime_event_tx.send(
                                         CodingRuntimeEvent::PolicyInterventionCleared {
@@ -6724,7 +6724,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     Ordering::Release,
                                 );
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
-                                    AgentEvent::TurnStarted,
+                                    AgentEvent::TurnStarted { turn: None },
                                 ));
                             }
                             event @ AgentEvent::ToolStarted { .. } => {
@@ -6732,14 +6732,14 @@ fn spawn_runtime_owner_with_optional_agent(
                                     turn_stats.tool_call_count.saturating_add(1);
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(event));
                             }
-                            AgentEvent::Steered { count, inputs } => {
+                            AgentEvent::Steered { count, inputs, .. } => {
                                 let acknowledged = acknowledge_steered_inputs(
                                     &mut pending_steer_acknowledgements,
                                     generation,
                                     &inputs,
                                 );
                                 let _ = runtime_event_tx.send(CodingRuntimeEvent::Agent(
-                                    AgentEvent::Steered { count, inputs },
+                                    AgentEvent::Steered { turn: None, count, inputs },
                                 ));
                                 if !acknowledged.is_empty() {
                                     let _ = runtime_event_tx.send(
@@ -8279,7 +8279,7 @@ async fn quiesce_current_agent(
                         Some(AgentEvent::Usage(meta)) => {
                             *observed_tokens = Some(meta.used_tokens as usize);
                         }
-                        Some(AgentEvent::TurnComplete { reason }) => {
+                        Some(AgentEvent::TurnComplete { reason, .. }) => {
                             report.reason = Some(reason.folded_for_runtime_drivers());
                         }
                         Some(AgentEvent::Snapshot { snapshot }) => {
@@ -8360,7 +8360,7 @@ async fn stop_current_agent(
                         Some(AgentEvent::Usage(meta)) => {
                             *observed_tokens = Some(meta.used_tokens as usize);
                         }
-                        Some(AgentEvent::TurnComplete { reason }) => {
+                        Some(AgentEvent::TurnComplete { reason, .. }) => {
                             report.reason = Some(reason.folded_for_runtime_drivers());
                         }
                         Some(AgentEvent::Snapshot { snapshot }) => {
@@ -8387,7 +8387,7 @@ async fn stop_current_agent(
             Some(AgentEvent::Usage(meta)) => {
                 *observed_tokens = Some(meta.used_tokens as usize);
             }
-            Some(AgentEvent::TurnComplete { reason }) => {
+            Some(AgentEvent::TurnComplete { reason, .. }) => {
                 report.reason = Some(reason.folded_for_runtime_drivers())
             }
             Some(AgentEvent::Snapshot { snapshot }) => {
@@ -9930,6 +9930,7 @@ mod tests {
                     );
                     let event = match terminal {
                         ShutdownPersistenceTerminal::TurnComplete => AgentEvent::TurnComplete {
+                            turn: None,
                             reason: StopReason::Cancelled,
                         },
                         ShutdownPersistenceTerminal::CompactionFailed => {
@@ -10160,6 +10161,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -10312,6 +10314,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::MaxRounds,
             })
             .unwrap();
@@ -10567,6 +10570,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -10644,6 +10648,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -10741,6 +10746,7 @@ mod tests {
         // synthetic prompt. The runtime stores one bounded copy for recovery compact.
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::ProviderError,
             })
             .unwrap();
@@ -10770,6 +10776,7 @@ mod tests {
         for round in 2..=MAX_UNPRODUCTIVE {
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    turn: None,
                     reason: StopReason::ProviderError,
                 })
                 .unwrap();
@@ -10916,6 +10923,7 @@ mod tests {
         for attempt in 0..2 {
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    turn: None,
                     reason: StopReason::Stopped,
                 })
                 .unwrap();
@@ -11012,6 +11020,7 @@ mod tests {
             .expect("loop wakeup was not registered");
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    turn: None,
                     reason: StopReason::Stopped,
                 })
                 .unwrap();
@@ -11088,6 +11097,7 @@ mod tests {
         let _ = runtime_events.recv().await;
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -11146,6 +11156,7 @@ mod tests {
         drop(kernel_commands);
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -11206,6 +11217,7 @@ mod tests {
         drop(kernel_commands);
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -11268,6 +11280,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -11326,6 +11339,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::MaxRounds,
             })
             .unwrap();
@@ -11388,6 +11402,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::ToolLoopDetected,
             })
             .unwrap();
@@ -11491,6 +11506,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -12780,9 +12796,12 @@ mod tests {
             Some(AgentCommand::SendMessage { text, .. }) if text == "steer"
         ));
 
-        kernel_events.send(AgentEvent::TurnStarted).unwrap();
+        kernel_events
+            .send(AgentEvent::TurnStarted { turn: None })
+            .unwrap();
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -12792,7 +12811,7 @@ mod tests {
         ));
         assert!(matches!(
             runtime_events.recv().await,
-            Some(CodingRuntimeEvent::Agent(AgentEvent::TurnStarted))
+            Some(CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { .. }))
         ));
         assert!(runtime_events.try_recv().is_err());
 
@@ -12907,6 +12926,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -13329,6 +13349,7 @@ mod tests {
 
         kernel_events
             .send(AgentEvent::Steered {
+                turn: None,
                 count: 1,
                 inputs: vec![atomcode_kernel::event::SteeredInput {
                     text: "VL[before\n[Image #1]\nafter]".into(),
@@ -13491,6 +13512,7 @@ mod tests {
         let _ = kernel_commands.recv().await;
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::ProviderError,
             })
             .unwrap();
@@ -13583,6 +13605,7 @@ mod tests {
         let _ = kernel_commands.recv().await;
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Cancelled,
             })
             .unwrap();
@@ -13676,6 +13699,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -13786,6 +13810,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -13966,6 +13991,7 @@ mod tests {
         let _ = runtime_events.recv().await;
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -14283,6 +14309,7 @@ mod tests {
                 if matches!(command, AgentCommand::Shutdown) {
                     if emit_verified_terminal {
                         let _ = event_tx.send(AgentEvent::TurnComplete {
+                            turn: None,
                             reason: StopReason::Cancelled,
                         });
                         let _ = event_tx.send(AgentEvent::Snapshot {
@@ -16088,6 +16115,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -16165,6 +16193,7 @@ mod tests {
         for attempt in 0..2 {
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    turn: None,
                     reason: StopReason::Stopped,
                 })
                 .unwrap();
@@ -16262,6 +16291,7 @@ mod tests {
         for attempt in 0..2 {
             kernel_events
                 .send(AgentEvent::TurnComplete {
+                    turn: None,
                     reason: StopReason::Stopped,
                 })
                 .unwrap();
@@ -16380,6 +16410,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -16480,6 +16511,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -16568,6 +16600,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();
@@ -16651,6 +16684,7 @@ mod tests {
         ));
         kernel_events
             .send(AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             })
             .unwrap();

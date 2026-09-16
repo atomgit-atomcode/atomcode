@@ -4341,7 +4341,7 @@ impl ChatRuntimeProjector {
                 auto_resuming,
                 server_message,
             }],
-            Agent::TurnStarted
+            Agent::TurnStarted { .. }
             | Agent::ToolCallStreaming { .. }
             | Agent::ToolBatchCompleted { .. }
             | Agent::Request { .. }

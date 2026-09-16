@@ -118,9 +118,9 @@ impl Projector {
 
     fn project(&mut self, event: &SessionEvent) -> Vec<AgentEvent> {
         match event {
-            SessionEvent::TurnStart { .. } => {
+            SessionEvent::TurnStart { turn } => {
                 self.said_this_turn = 0;
-                vec![AgentEvent::TurnStarted]
+                vec![AgentEvent::TurnStarted { turn: Some(*turn) }]
             }
 
             SessionEvent::AssistantChunk {
@@ -340,7 +340,7 @@ impl Projector {
                 }]
             }
 
-            SessionEvent::TurnEnd { stop, error, .. } => {
+            SessionEvent::TurnEnd { turn, stop, error } => {
                 let mut out = Vec::new();
                 if let Some(message) = error {
                     out.push(AgentEvent::Error {
@@ -354,6 +354,7 @@ impl Projector {
                     out.push(AgentEvent::Cancelled);
                 }
                 out.push(AgentEvent::TurnComplete {
+                    turn: Some(*turn),
                     reason: *stop,
                 });
                 out
@@ -374,13 +375,14 @@ impl Projector {
             // driver was never told, so a UI could not say "your message was
             // folded into this turn". The reference engine announces it; a
             // differential run showed this as the only difference on that path.
-            SessionEvent::UserMessage { text, images, .. } => {
+            SessionEvent::UserMessage { turn, text, images } => {
                 if self.said_this_turn == 0 {
                     self.said_this_turn = 1;
                     Vec::new()
                 } else {
                     self.said_this_turn += 1;
                     vec![AgentEvent::Steered {
+                        turn: Some(*turn),
                         count: 1,
                         inputs: vec![atomcode_kernel::event::SteeredInput {
                             text: text.clone(),
@@ -535,7 +537,9 @@ impl Asker {
                 kind: kind.to_string(),
                 payload,
             }),
-            None => Err(mpsc::error::SendError(AgentEvent::TurnStarted)),
+            None => Err(mpsc::error::SendError(AgentEvent::TurnStarted {
+                turn: None,
+            })),
         };
         // Nobody on the other end: a refusal, not a wait.
         if sent.is_err() {
@@ -822,6 +826,20 @@ async fn pump(
             let _ = woke_tx.send(());
         }
     });
+    // A message a driver asked a receipt for is accepted when a turn claims it
+    // — not when it is queued, because only then is it known whether it starts
+    // a turn or joins the one running (`docs/adr/0021` §7).
+    let receipts = events.clone();
+    let claimed =
+        ctx.on_emit::<crate::events::InputClaimed>(move |input: &crate::events::ClaimedInput| {
+            if input.agent == me {
+                let _ = receipts.send(AgentEvent::Accepted {
+                    command: input.receipt.clone(),
+                    turn: Some(input.turn),
+                    steered: input.steered,
+                });
+            }
+        });
     // Anything that landed before the listener existed: this task is spawned
     // at mount and a message can reach the inbox before it runs. Listener
     // first, then the look — so nothing falls between them.
@@ -877,9 +895,34 @@ async fn pump(
             Woke::Command(Some(command)) => command,
         };
 
+        // A tagged command is the command it carries, plus an id the driver wants
+        // echoed on its receipt. Messages are receipted when a turn claims them;
+        // everything else is answered here, on the spot.
+        let (receipt, command) = match command {
+            AgentCommand::Tagged { id, command } => (Some(id), command.untagged()),
+            other => (None, other),
+        };
+        let accept = |turn: Option<u64>| {
+            if let Some(id) = &receipt {
+                let _ = events.send(AgentEvent::Accepted {
+                    command: id.clone(),
+                    turn,
+                    steered: false,
+                });
+            }
+        };
+        let reject = |error: atomcode_kernel::event::CommandError| {
+            if let Some(id) = &receipt {
+                let _ = events.send(AgentEvent::Rejected {
+                    command: id.clone(),
+                    error,
+                });
+            }
+        };
+
         match command {
             AgentCommand::SendMessage { text, images } => {
-                agent.send_full(text, MessageOrigin::User, images);
+                agent.send_receipted(text, MessageOrigin::User, images, receipt.clone());
             }
             // Context first, then the prompt: one command, one turn. The
             // context is model-visible and logged as the harness's, so a
@@ -890,16 +933,25 @@ async fn pump(
                 context,
             } => {
                 agent.inject(context, crate::session::InjectionOrigin::Continuation);
-                agent.send_full(text, MessageOrigin::User, images);
+                agent.send_receipted(text, MessageOrigin::User, images, receipt.clone());
             }
             AgentCommand::SendSyntheticMessage { text } => {
-                agent.send_from(text, MessageOrigin::Harness);
+                agent.send_receipted(text, MessageOrigin::Harness, Vec::new(), receipt.clone());
             }
             AgentCommand::Respond { id, value } => {
-                asker.answer(id, value);
+                if asker.answer(id, value) {
+                    accept(None);
+                } else {
+                    reject(atomcode_kernel::event::CommandError::StaleQuestion);
+                }
                 continue;
             }
             AgentCommand::Cancel => {
+                if turn.is_some() {
+                    accept(Some(agent.session().current_turn()));
+                } else {
+                    reject(atomcode_kernel::event::CommandError::NotRunning);
+                }
                 // The driver's cancel is a person's: the turn's end records it.
                 agent.interrupt();
                 // And release anything parked on an answer. Cancelling is
@@ -916,6 +968,7 @@ async fn pump(
                 continue;
             }
             AgentCommand::Snapshot => {
+                accept(None);
                 // Queued while a turn is in flight; answered the moment it
                 // ends. Answering now would describe a conversation that is
                 // still being written.
@@ -927,6 +980,7 @@ async fn pump(
                 continue;
             }
             AgentCommand::Compact { focus } => {
+                accept(None);
                 // Behind the turn, like a snapshot and for the same reason:
                 // rewriting the conversation while a round is mid-flight
                 // compacts a history the turn is still appending to.
@@ -937,10 +991,16 @@ async fn pump(
                 }
                 continue;
             }
-            AgentCommand::Shutdown => break,
+            AgentCommand::Shutdown => {
+                accept(None);
+                break;
+            }
             // `#[non_exhaustive]`: a command this harness has no answer for is
-            // ignored rather than guessed at.
-            _ => continue,
+            // refused rather than guessed at.
+            _ => {
+                reject(atomcode_kernel::event::CommandError::Unsupported);
+                continue;
+            }
         }
 
         // Everything that falls through here queued work. A turn already
@@ -957,6 +1017,7 @@ async fn pump(
     agent.cancel();
     asker.close();
     wake.dispose();
+    claimed.dispose();
     if let Some(handle) = turn.take() {
         let _ = handle.await;
     }

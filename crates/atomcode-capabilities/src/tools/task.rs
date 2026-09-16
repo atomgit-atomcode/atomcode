@@ -1614,7 +1614,7 @@ async fn run_child_to_completion(
             AgentEvent::PolicyIntervention { intervention } => {
                 outcome.policy_intervention = Some(intervention);
             }
-            AgentEvent::TurnComplete { reason } => {
+            AgentEvent::TurnComplete { reason, .. } => {
                 outcome.stop = reason;
                 let _ = handle.commands.send(AgentCommand::Shutdown);
                 break;

@@ -161,7 +161,7 @@ pub async fn turn(handle: &mut AgentHandle, text: &str, answer: Option<serde_jso
                     .unwrap_or(serde_json::json!({ "decision": "deny" }));
                 let _ = handle.commands.send(AgentCommand::Respond { id, value });
             }
-            Ok(Some(AgentEvent::TurnComplete { reason })) => {
+            Ok(Some(AgentEvent::TurnComplete { reason, .. })) => {
                 out.stop = Some(reason);
                 return out;
             }

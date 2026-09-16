@@ -357,6 +357,27 @@ plexus_event!(
     AgentCreated, "agent/created", Emit, AgentInfo
 );
 
+/// A message whose command asked for a receipt was taken by a turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimedInput {
+    pub agent: crate::agent::AgentId,
+    /// The driver's id for the command that sent the message.
+    pub receipt: atomcode_kernel::event::CommandId,
+    /// The turn that answers it.
+    pub turn: u64,
+    /// It joined that turn while it was running, rather than starting it.
+    pub steered: bool,
+}
+
+plexus_event!(
+    /// A turn took a message a driver wants a receipt for (`docs/adr/0021` §7).
+    ///
+    /// Emitted the moment the message is claimed, because that is the first
+    /// moment anyone knows whether it starts a turn or joins the one running.
+    /// Emitted on the agent's own context, like [`InboxInserted`].
+    InputClaimed, "agent/inbox/claimed", Emit, ClaimedInput
+);
+
 plexus_event!(
     /// Something reached an agent's inbox.
     ///

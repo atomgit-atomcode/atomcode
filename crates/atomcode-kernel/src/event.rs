@@ -207,6 +207,47 @@ pub enum AgentCommand {
     },
     Cancel,
     Shutdown,
+    /// Any command, carrying an id the driver chose, so the agent can answer
+    /// *this* command: [`AgentEvent::Accepted`] or [`AgentEvent::Rejected`] with
+    /// the same id (`docs/adr/0021` §7).
+    ///
+    /// An envelope rather than a field on every command, so a driver that does
+    /// not want receipts sends what it always sent. The id never reaches the
+    /// session log; an ACP JSON-RPC request id maps onto it directly.
+    Tagged {
+        id: CommandId,
+        command: Box<AgentCommand>,
+    },
+}
+
+/// A driver's name for one command, echoed back on its receipt.
+pub type CommandId = String;
+
+impl AgentCommand {
+    /// The command inside any [`AgentCommand::Tagged`] envelopes, for a loop that
+    /// sends no receipts and so has no use for the id.
+    pub fn untagged(self) -> Self {
+        match self {
+            Self::Tagged { command, .. } => command.untagged(),
+            other => other,
+        }
+    }
+}
+
+/// Why a tagged command was refused on the spot (`docs/adr/0021` §8).
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommandError {
+    /// The question being answered is no longer waiting for an answer.
+    StaleQuestion,
+    /// There is no turn running for this to act on.
+    NotRunning,
+    /// The agent cannot take commands now, or at all any more.
+    Unavailable,
+    /// Not now: something the agent is doing has to finish first.
+    Busy { reason: String },
+    /// A command this agent has no answer for.
+    Unsupported,
 }
 
 /// One call inside a `ToolBatchStarted` payload — everything the driver/UI
@@ -251,7 +292,33 @@ pub enum ContextSource {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AgentEvent {
     /// A turn began (perception granularity).
-    TurnStarted,
+    ///
+    /// `turn` is the session log's turn number when the agent keeps a log — the
+    /// same number as the [`Self::TurnComplete`] that closes it and the
+    /// [`Self::Accepted`] of every message it answered. `None` from a source that
+    /// numbers no turns.
+    TurnStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<u64>,
+    },
+    /// A tagged command was taken (`docs/adr/0021` §7).
+    ///
+    /// For a message: `turn` is the turn that answers it, and `steered` says it
+    /// was folded into that turn while it was already running rather than
+    /// starting it. Commands that belong to no turn (a compaction, a snapshot, an
+    /// answer) are accepted with `turn: None`.
+    Accepted {
+        command: CommandId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<u64>,
+        #[serde(default)]
+        steered: bool,
+    },
+    /// A tagged command was refused on the spot. Nothing it asked for happened.
+    Rejected {
+        command: CommandId,
+        error: CommandError,
+    },
     TextDelta(String),
     /// **Model-visible context the person did not type.**
     ///
@@ -340,7 +407,12 @@ pub enum AgentEvent {
     /// `MaxContinuations`/`RepeatLoop`/`ToolLoopDetected`/`Cancelled`/
     /// `PromptRejected`/`PolicyDenied`). A driver can no longer mistake a failed turn for an empty
     /// success.
+    ///
+    /// Exactly one per [`Self::TurnStarted`], with the same `turn` — cancelled,
+    /// failed and shut-down turns included.
     TurnComplete {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<u64>,
         reason: StopReason,
     },
     /// A failure (failed open / mid-stream / timeout / max-rounds / prompt-rejected /
@@ -421,6 +493,9 @@ pub enum AgentEvent {
     /// a round boundary. `count` folded this round. Drivers relabel their
     /// type-ahead indicator from "queued" to "folded into current turn".
     Steered {
+        /// The running turn the inputs were folded into.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<u64>,
         count: usize,
         /// Exact inputs folded at this boundary. Additive for wire
         /// compatibility: older events deserialize with an empty list.
@@ -467,6 +542,51 @@ pub enum AgentEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tagged command crosses the wire whole, and the events that answer it
+    /// read without the fields an older peer does not send (`docs/adr/0021` §7).
+    #[test]
+    fn receipts_and_turn_numbers_cross_the_wire() {
+        let command = AgentCommand::Tagged {
+            id: "req-7".into(),
+            command: Box::new(AgentCommand::SendMessage {
+                text: "hi".into(),
+                images: Vec::new(),
+            }),
+        };
+        let back: AgentCommand =
+            serde_json::from_str(&serde_json::to_string(&command).unwrap()).unwrap();
+        assert!(matches!(
+            back.clone(),
+            AgentCommand::Tagged { id, command } if id == "req-7"
+                && matches!(*command, AgentCommand::SendMessage { ref text, .. } if text == "hi")
+        ));
+        assert!(matches!(back.untagged(), AgentCommand::SendMessage { .. }));
+
+        let old: AgentEvent =
+            serde_json::from_str(r#"{"TurnComplete":{"reason":"Stopped"}}"#).unwrap();
+        assert!(matches!(
+            old,
+            AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Stopped
+            }
+        ));
+        let accepted = AgentEvent::Accepted {
+            command: "req-7".into(),
+            turn: Some(3),
+            steered: true,
+        };
+        let json = serde_json::to_string(&accepted).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<AgentEvent>(&json).unwrap(),
+            AgentEvent::Accepted {
+                turn: Some(3),
+                steered: true,
+                ..
+            }
+        ));
+    }
 
     /// The harness's own copy logged a refused input as `InputRejected`; the one
     /// enum still reads that name.
@@ -565,11 +685,11 @@ mod tests {
             old,
             AgentEvent::Steered {
                 count: 1,
-                inputs
-            } if inputs.is_empty()
+                inputs, .. } if inputs.is_empty()
         ));
 
         let event = AgentEvent::Steered {
+            turn: None,
             count: 1,
             inputs: vec![SteeredInput {
                 text: "follow up".into(),
@@ -582,8 +702,7 @@ mod tests {
             roundtrip,
             AgentEvent::Steered {
                 count: 1,
-                inputs
-            } if inputs == vec![SteeredInput {
+                inputs, .. } if inputs == vec![SteeredInput {
                 text: "follow up".into(),
                 images: Vec::new(),
             }]

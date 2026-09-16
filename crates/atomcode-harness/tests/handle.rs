@@ -133,7 +133,7 @@ fn names(events: &[AgentEvent]) -> Vec<&'static str> {
     events
         .iter()
         .map(|e| match e {
-            AgentEvent::TurnStarted => "TurnStarted",
+            AgentEvent::TurnStarted { .. } => "TurnStarted",
             AgentEvent::TextDelta(_) => "TextDelta",
             AgentEvent::Reasoning(_) => "Reasoning",
             AgentEvent::ToolBatchStarted { .. } => "ToolBatchStarted",
@@ -188,7 +188,8 @@ async fn a_message_produces_the_turn_a_driver_expects() {
         matches!(
             events.last(),
             Some(AgentEvent::TurnComplete {
-                reason: StopReason::Stopped
+                reason: StopReason::Stopped,
+                ..
             })
         ),
         "{seen:?}"
@@ -545,7 +546,8 @@ async fn a_cancelled_turn_ends_and_the_next_one_still_runs() {
         matches!(
             first.last(),
             Some(AgentEvent::TurnComplete {
-                reason: StopReason::Cancelled
+                reason: StopReason::Cancelled,
+                ..
             })
         ),
         "the turn must end because it was cancelled, not because it ran out: {:?}",
@@ -569,7 +571,8 @@ async fn a_cancelled_turn_ends_and_the_next_one_still_runs() {
         matches!(
             second.last(),
             Some(AgentEvent::TurnComplete {
-                reason: StopReason::Stopped
+                reason: StopReason::Stopped,
+                ..
             })
         ),
         "{:?}",
@@ -916,7 +919,8 @@ fn a_failure_never_projects_as_a_clean_stop() {
     assert!(matches!(
         events.last(),
         Some(AgentEvent::TurnComplete {
-            reason: StopReason::InvariantViolated
+            reason: StopReason::InvariantViolated,
+            ..
         })
     ));
 }
@@ -1064,10 +1068,255 @@ fn the_handle_reports_the_logged_stop_reason_unfolded() {
         let reported: Vec<StopReason> = events
             .iter()
             .filter_map(|event| match event {
-                AgentEvent::TurnComplete { reason } => Some(*reason),
+                AgentEvent::TurnComplete { reason, .. } => Some(*reason),
                 _ => None,
             })
             .collect();
         assert_eq!(reported, vec![stop], "{stop:?}: {events:?}");
     }
+}
+
+// ---- receipts and turn numbers (docs/adr/0021 §7) ------------------------
+
+/// Sends one command through the handle while the agent's first request is in
+/// flight — how a person types while the model is answering.
+struct SendsThroughHandleMidTurn {
+    commands: tokio::sync::mpsc::UnboundedSender<AgentCommand>,
+    command: std::sync::Mutex<Option<AgentCommand>>,
+}
+
+#[async_trait::async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest>
+    for SendsThroughHandleMidTurn
+{
+    async fn handle(
+        &self,
+        req: &mut atomcode_harness::events::ModelRequest,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::AgentRequest>,
+    ) -> Result<atomcode_harness::events::ModelResponse, atomcode_harness::events::RequestError>
+    {
+        let taken = self.command.lock().unwrap().take();
+        if let Some(command) = taken {
+            let _ = self.commands.send(command);
+            // Let the pump queue it before this step decides whether to go on.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        next.run(req).await
+    }
+}
+
+fn tagged(id: &str, command: AgentCommand) -> AgentCommand {
+    AgentCommand::Tagged {
+        id: id.into(),
+        command: Box::new(command),
+    }
+}
+
+fn message(text: &str) -> AgentCommand {
+    AgentCommand::SendMessage {
+        text: text.into(),
+        images: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn a_tagged_message_is_accepted_into_the_turn_that_answers_it() {
+    let dir = scratch("receipt");
+    let app = start(tree(&dir, &replay(r#"{ text = "Hello." }"#), &[])).await;
+    let mut handle = handle_of(&app);
+
+    handle.commands.send(tagged("a", message("hi"))).unwrap();
+    let events = drain_turn(&mut handle).await;
+
+    let started = events.iter().find_map(|e| match e {
+        AgentEvent::TurnStarted { turn } => Some(*turn),
+        _ => None,
+    });
+    let accepted = events.iter().find_map(|e| match e {
+        AgentEvent::Accepted {
+            command,
+            turn,
+            steered,
+        } if command == "a" => Some((*turn, *steered)),
+        _ => None,
+    });
+    let closed = events.iter().find_map(|e| match e {
+        AgentEvent::TurnComplete { turn, .. } => Some(*turn),
+        _ => None,
+    });
+    let turn = started
+        .flatten()
+        .expect("TurnStarted carries the log's turn number");
+    assert_eq!(accepted, Some((Some(turn), false)), "{events:#?}");
+    assert_eq!(closed, Some(Some(turn)), "{events:#?}");
+}
+
+/// The attribution a driver could not make before: a message typed while the
+/// model was answering was folded in, and only the order of events said which
+/// terminal answered it.
+#[tokio::test]
+async fn a_message_steered_into_a_running_turn_says_which_turn_answers_it() {
+    let dir = scratch("steer-receipt");
+    let app = start(tree(
+        &dir,
+        &replay(r#"{ text = "first" }, { text = "second" }"#),
+        &[],
+    ))
+    .await;
+    let mut handle = handle_of(&app);
+    let _guard = app
+        .context()
+        .on_waterfall::<atomcode_harness::events::AgentRequest>(
+            std::sync::Arc::new(SendsThroughHandleMidTurn {
+                commands: handle.commands.clone(),
+                command: std::sync::Mutex::new(Some(tagged("b", message("also this")))),
+            }),
+            false,
+        );
+
+    handle
+        .commands
+        .send(tagged("a", message("do this")))
+        .unwrap();
+    let events = drain_turn(&mut handle).await;
+
+    let accepted: Vec<(String, Option<u64>, bool)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Accepted {
+                command,
+                turn,
+                steered,
+            } => Some((command.clone(), *turn, *steered)),
+            _ => None,
+        })
+        .collect();
+    let closed: Vec<Option<u64>> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TurnComplete { turn, .. } => Some(*turn),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed.len(), 1, "one turn: {events:#?}");
+    let turn = closed[0];
+    assert!(turn.is_some(), "{events:#?}");
+    assert_eq!(
+        accepted,
+        vec![
+            ("a".to_string(), turn, false),
+            ("b".to_string(), turn, true)
+        ],
+        "{events:#?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Steered { turn: t, .. } if *t == turn)),
+        "{events:#?}"
+    );
+}
+
+/// Every turn a driver is told began is closed exactly once, under the same
+/// number — a cancelled one included.
+#[tokio::test]
+async fn every_turn_started_is_closed_once_under_its_number() {
+    let dir = scratch("turn-numbers");
+    let app = start(tree(
+        &dir,
+        &replay(r#"{ text = "one" }, { text = "two" }, { text = "three" }"#),
+        &[],
+    ))
+    .await;
+    let mut handle = handle_of(&app);
+
+    let mut all = Vec::new();
+    handle.commands.send(message("first")).unwrap();
+    all.extend(drain_turn(&mut handle).await);
+    handle.commands.send(message("second")).unwrap();
+    all.extend(drain_turn(&mut handle).await);
+    // A turn cancelled while its request is in flight.
+    let _guard = app
+        .context()
+        .on_waterfall::<atomcode_harness::events::AgentRequest>(
+            std::sync::Arc::new(SendsThroughHandleMidTurn {
+                commands: handle.commands.clone(),
+                command: std::sync::Mutex::new(Some(AgentCommand::Cancel)),
+            }),
+            false,
+        );
+    handle.commands.send(message("third")).unwrap();
+    all.extend(drain_turn(&mut handle).await);
+
+    let started: Vec<Option<u64>> = all
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TurnStarted { turn } => Some(*turn),
+            _ => None,
+        })
+        .collect();
+    let closed: Vec<Option<u64>> = all
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TurnComplete { turn, .. } => Some(*turn),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started.len(), 3, "{all:#?}");
+    assert!(started.iter().all(Option::is_some), "{started:?}");
+    assert_eq!(
+        started, closed,
+        "each start closed once, in order, same number"
+    );
+    let mut unique = started.clone();
+    unique.dedup();
+    assert_eq!(unique.len(), 3, "three different turns: {started:?}");
+}
+
+#[tokio::test]
+async fn a_command_that_cannot_act_is_rejected_on_the_spot() {
+    let dir = scratch("rejected");
+    let app = start(tree(&dir, &replay(r#"{ text = "unused" }"#), &[])).await;
+    let mut handle = handle_of(&app);
+
+    handle
+        .commands
+        .send(tagged("c", AgentCommand::Cancel))
+        .unwrap();
+    handle
+        .commands
+        .send(tagged(
+            "r",
+            AgentCommand::Respond {
+                id: 999,
+                value: serde_json::json!({ "decision": "allow" }),
+            },
+        ))
+        .unwrap();
+    handle
+        .commands
+        .send(tagged("k", AgentCommand::Compact { focus: None }))
+        .unwrap();
+
+    let mut receipts = Vec::new();
+    while receipts.len() < 3 {
+        match tokio::time::timeout(Duration::from_secs(5), handle.events.recv()).await {
+            Ok(Some(AgentEvent::Accepted { command, turn, .. })) => {
+                receipts.push(format!("{command}: accepted {turn:?}"))
+            }
+            Ok(Some(AgentEvent::Rejected { command, error })) => {
+                receipts.push(format!("{command}: rejected {error:?}"))
+            }
+            Ok(Some(_)) => continue,
+            other => panic!("receipts stopped at {receipts:?}: {other:?}"),
+        }
+    }
+    assert_eq!(
+        receipts,
+        vec![
+            "c: rejected NotRunning".to_string(),
+            "r: rejected StaleQuestion".to_string(),
+            "k: accepted None".to_string(),
+        ]
+    );
 }

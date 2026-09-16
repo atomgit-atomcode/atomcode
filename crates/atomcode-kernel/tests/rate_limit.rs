@@ -117,7 +117,8 @@ async fn rate_limit_pause_emits_ratelimited_not_error() {
         collected.iter().any(|e| matches!(
             e,
             AgentEvent::TurnComplete {
-                reason: StopReason::RateLimited
+                reason: StopReason::RateLimited,
+                ..
             }
         )),
         "TurnComplete must carry RateLimited reason: {collected:?}"
@@ -247,7 +248,8 @@ async fn mid_stream_429_after_output_pauses_without_replay() {
         collected.iter().any(|e| matches!(
             e,
             AgentEvent::TurnComplete {
-                reason: StopReason::RateLimited
+                reason: StopReason::RateLimited,
+                ..
             }
         )),
         "turn must pause after a mid-stream 429 with visible output: {collected:?}"
@@ -292,7 +294,7 @@ async fn empty_mid_stream_429_uses_one_turn_owned_fuse() {
     let mut events = handle.events;
     let mut terminal = None;
     while let Some(event) = events.recv().await {
-        if let AgentEvent::TurnComplete { reason } = event {
+        if let AgentEvent::TurnComplete { reason, .. } = event {
             terminal = Some(reason);
             break;
         }
@@ -352,7 +354,8 @@ async fn first_fallback_429_retries_silently_without_banner() {
         collected.iter().any(|e| matches!(
             e,
             AgentEvent::TurnComplete {
-                reason: StopReason::Stopped
+                reason: StopReason::Stopped,
+                ..
             }
         )),
         "turn must end Stopped after the silent retry: {collected:?}"
@@ -505,7 +508,8 @@ async fn rate_limit_wait_then_resumes_turn() {
         collected.iter().any(|e| matches!(
             e,
             AgentEvent::TurnComplete {
-                reason: StopReason::Stopped
+                reason: StopReason::Stopped,
+                ..
             }
         )),
         "turn must end with Stopped after successful retry: {collected:?}"

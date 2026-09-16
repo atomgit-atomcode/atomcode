@@ -95,7 +95,7 @@ async fn main() {
                 });
             }
             AgentEvent::Error { message, .. } => failure = Some(message),
-            AgentEvent::TurnComplete { reason } => {
+            AgentEvent::TurnComplete { reason, .. } => {
                 println!("\n--- outcome ---\nstop: {reason:?}\ntool calls: {tool_calls}\n\n{text}");
                 break;
             }
