@@ -83,13 +83,21 @@ pub struct SteeredInput {
 /// `Stopped` is the NORMAL terminal (the model emitted no tool calls and the
 /// `offer_continuation` hook did not continue), and is the `Default` so `Outcome::default()`
 /// still compiles.
+///
+/// **The only one.** The harness used to keep a second `StopReason` for the
+/// session log's `TurnEnd`, and its pump translated one into the other, folding
+/// three causes into `MaxRounds` / `ProviderError` on the way — so a front end
+/// read one reason in the log and another on the handle (`docs/adr/0021` §6).
+/// Serialized by variant name, which is also how the log stored the harness's
+/// copy; `InputRejected` is that copy's name for [`Self::PromptRejected`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum StopReason {
     /// Normal completion: model produced no tool calls and `offer_continuation` returned None.
     #[default]
     Stopped,
-    /// The `max_rounds` safety fuse tripped (too many LLM rounds this turn).
+    /// The round budget ran out: the `max_rounds` cap was reached and nobody
+    /// granted more (a person at a round-cap checkpoint, or no one to ask).
     MaxRounds,
     /// The `max_continuations` safety fuse tripped (a `offer_continuation` hook
     /// kept injecting continuations with no model agency to stop — a runaway loop).
@@ -108,7 +116,9 @@ pub enum StopReason {
     Timeout,
     /// The turn was cooperatively cancelled (`AgentCommand::Cancel`).
     Cancelled,
-    /// A `user_prompt_submit` hook rejected the prompt — no turn ran.
+    /// The input was refused before a step ran: a `user_prompt_submit` hook
+    /// rejected the prompt, or a pre-step listener rejected the claimed input.
+    #[serde(alias = "InputRejected")]
     PromptRejected,
     /// A tool middleware enforced a hard policy boundary. The blocked tool
     /// result was persisted before the turn terminated, so provider pairing is valid.
@@ -116,6 +126,35 @@ pub enum StopReason {
     /// The provider returned 429 and the host chose to PAUSE (reset too far to
     /// wait out). Not a failure — already-produced content is preserved.
     RateLimited,
+    /// A stopping policy other than the round budget ended the turn — a
+    /// deadline, a cost ceiling.
+    StoppedByPolicy,
+    /// The loop's own coarse runaway fuse. Not a policy: it exists so a loop with
+    /// no stopping policy at all still terminates.
+    RunawayFuse,
+    /// Something reached the model that the session log cannot explain. The turn
+    /// is stopped rather than continued: a prompt nobody can reconstruct makes
+    /// resume, fork and compaction unsound from here on.
+    InvariantViolated,
+}
+
+impl StopReason {
+    /// The reason as drivers of the coding runtime's own protocol have always
+    /// seen it: the three causes the harness pump used to fold away are folded
+    /// the same way here.
+    ///
+    /// Transitional. Those drivers (tuix, daemon, ACP, clix) and the lifecycle
+    /// hooks behind them match on the folded set; applying this where the runtime
+    /// takes a reason off the tree keeps their behaviour unchanged while the tree
+    /// and its new front end carry the real cause. Delete with the runtime's
+    /// driver protocol (`docs/tui-replaces-tuix-plan.md` M6).
+    pub fn folded_for_runtime_drivers(self) -> Self {
+        match self {
+            Self::StoppedByPolicy | Self::RunawayFuse => Self::MaxRounds,
+            Self::InvariantViolated => Self::ProviderError,
+            other => other,
+        }
+    }
 }
 
 /// Driver → agent. Serializable so it crosses process/network boundaries
@@ -428,6 +467,44 @@ pub enum AgentEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The harness's own copy logged a refused input as `InputRejected`; the one
+    /// enum still reads that name.
+    #[test]
+    fn a_stop_reason_logged_under_the_harness_name_still_reads() {
+        let reason: StopReason = serde_json::from_str("\"InputRejected\"").unwrap();
+        assert_eq!(reason, StopReason::PromptRejected);
+        assert_eq!(
+            serde_json::to_string(&StopReason::RunawayFuse).unwrap(),
+            "\"RunawayFuse\""
+        );
+    }
+
+    /// What the coding runtime's drivers are handed is exactly what the harness
+    /// pump used to hand them: the three causes it folded, folded the same way,
+    /// and every other reason untouched.
+    #[test]
+    fn runtime_drivers_see_the_causes_the_pump_used_to_fold_folded_the_same_way() {
+        use StopReason::*;
+        for (reason, seen) in [
+            (StoppedByPolicy, MaxRounds),
+            (RunawayFuse, MaxRounds),
+            (InvariantViolated, ProviderError),
+            (Stopped, Stopped),
+            (MaxRounds, MaxRounds),
+            (MaxContinuations, MaxContinuations),
+            (RepeatLoop, RepeatLoop),
+            (ToolLoopDetected, ToolLoopDetected),
+            (ProviderError, ProviderError),
+            (Timeout, Timeout),
+            (Cancelled, Cancelled),
+            (PromptRejected, PromptRejected),
+            (PolicyDenied, PolicyDenied),
+            (RateLimited, RateLimited),
+        ] {
+            assert_eq!(reason.folded_for_runtime_drivers(), seen, "{reason:?}");
+        }
+    }
 
     #[test]
     fn send_message_serde_is_additive_for_images() {

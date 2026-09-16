@@ -6230,6 +6230,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                 ));
                             }
                             AgentEvent::TurnComplete { reason } => {
+                                // The tree carries the real cause; this protocol's
+                                // drivers match on the folded set.
+                                let reason = reason.folded_for_runtime_drivers();
                                 pending_steer_acknowledgements.clear();
                                 let persistence_status = resources.as_ref().and_then(|runtime| {
                                     runtime.parts.snapshot_persistence_status()
@@ -8277,7 +8280,7 @@ async fn quiesce_current_agent(
                             *observed_tokens = Some(meta.used_tokens as usize);
                         }
                         Some(AgentEvent::TurnComplete { reason }) => {
-                            report.reason = Some(reason);
+                            report.reason = Some(reason.folded_for_runtime_drivers());
                         }
                         Some(AgentEvent::Snapshot { snapshot }) => {
                             report.snapshot = Some(snapshot);
@@ -8358,7 +8361,7 @@ async fn stop_current_agent(
                             *observed_tokens = Some(meta.used_tokens as usize);
                         }
                         Some(AgentEvent::TurnComplete { reason }) => {
-                            report.reason = Some(reason);
+                            report.reason = Some(reason.folded_for_runtime_drivers());
                         }
                         Some(AgentEvent::Snapshot { snapshot }) => {
                             report.snapshot = Some(snapshot);
@@ -8384,7 +8387,9 @@ async fn stop_current_agent(
             Some(AgentEvent::Usage(meta)) => {
                 *observed_tokens = Some(meta.used_tokens as usize);
             }
-            Some(AgentEvent::TurnComplete { reason }) => report.reason = Some(reason),
+            Some(AgentEvent::TurnComplete { reason }) => {
+                report.reason = Some(reason.folded_for_runtime_drivers())
+            }
             Some(AgentEvent::Snapshot { snapshot }) => {
                 report.snapshot = Some(snapshot);
                 report.snapshot_after_turn_terminal = report.reason.is_some();

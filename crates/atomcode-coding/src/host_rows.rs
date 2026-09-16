@@ -493,7 +493,7 @@ impl Listener<TurnFinishing> for Bridge {
             return None;
         }
         let convo = self.conversation(&agent);
-        let reason = atomcode_harness::plugins::handle::stop_reason(outcome.stop);
+        let reason = outcome.stop.folded_for_runtime_drivers();
         let ctx = self.turn_ctx(&agent, outcome.turn, outcome.rounds);
         self.hook.turn_complete(&convo, &reason, &ctx).await;
         None

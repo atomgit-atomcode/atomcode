@@ -354,7 +354,7 @@ impl Projector {
                     out.push(AgentEvent::Cancelled);
                 }
                 out.push(AgentEvent::TurnComplete {
-                    reason: stop_reason(*stop),
+                    reason: *stop,
                 });
                 out
             }
@@ -429,32 +429,6 @@ impl Projector {
             // log's business.
             | SessionEvent::Interrupted { .. } => Vec::new(),
         }
-    }
-}
-
-/// This harness's stop reasons, in the driver's vocabulary.
-///
-/// Where the two disagree the mapping is deliberate rather than clever:
-/// `StoppedByPolicy` and `RunawayFuse` are both budgets running out, and
-/// `InvariantViolated` has no counterpart at all — it rides out as a failure
-/// with the real cause in the `Error` that precedes it, because the one thing a
-/// driver must never do is read it as a clean stop.
-/// The kernel protocol's name for why a turn ended. Public so a host that runs
-/// kernel-shaped hooks at the harness's moments says the same thing the driver
-/// is told.
-pub fn stop_reason(stop: crate::seams::StopReason) -> atomcode_kernel::event::StopReason {
-    use crate::seams::StopReason as In;
-    use atomcode_kernel::event::StopReason as Out;
-    match stop {
-        In::Stopped => Out::Stopped,
-        In::MaxRounds | In::StoppedByPolicy | In::RunawayFuse => Out::MaxRounds,
-        In::ProviderError | In::InvariantViolated => Out::ProviderError,
-        In::ToolLoopDetected => Out::ToolLoopDetected,
-        In::Cancelled => Out::Cancelled,
-        In::InputRejected => Out::PromptRejected,
-        In::PolicyDenied => Out::PolicyDenied,
-        In::RateLimited => Out::RateLimited,
-        In::Timeout => Out::Timeout,
     }
 }
 

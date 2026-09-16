@@ -900,7 +900,9 @@ fn a_failure_never_projects_as_a_clean_stop() {
     use atomcode_harness::seams::StopReason as Harness;
     use atomcode_harness::session::SessionEvent as Fact;
 
-    // The one reason with no counterpart in the driver's vocabulary. It must
+    // Once the reason with no counterpart in the driver's vocabulary, folded into
+    // `ProviderError` on the way out. There is one `StopReason` now
+    // (`docs/adr/0021` §6), so the driver is told the cause itself — and it must
     // still be impossible to read as success.
     let events = project(
         &[Fact::TurnEnd {
@@ -914,7 +916,7 @@ fn a_failure_never_projects_as_a_clean_stop() {
     assert!(matches!(
         events.last(),
         Some(AgentEvent::TurnComplete {
-            reason: StopReason::ProviderError
+            reason: StopReason::InvariantViolated
         })
     ));
 }
@@ -1033,4 +1035,39 @@ async fn a_resume_is_silent_for_a_driver_and_the_log_is_where_history_comes_from
          handle — history is the log's to give, not this stream's: {:#?}",
         names(&seen)
     );
+}
+
+/// The handle says why a turn ended in the log's own words. The pump used to
+/// translate between two `StopReason`s and fold a runaway fuse, a stopping
+/// policy and a broken invariant into `MaxRounds` / `ProviderError`, so a front
+/// end read one reason in the log and another here (`docs/adr/0021` §6).
+#[test]
+fn the_handle_reports_the_logged_stop_reason_unfolded() {
+    use atomcode_harness::session::SessionEvent;
+    for stop in [
+        StopReason::RunawayFuse,
+        StopReason::StoppedByPolicy,
+        StopReason::InvariantViolated,
+        StopReason::MaxRounds,
+    ] {
+        let events = atomcode_harness::plugins::handle::replay(
+            &[
+                SessionEvent::TurnStart { turn: 1 },
+                SessionEvent::TurnEnd {
+                    turn: 1,
+                    stop,
+                    error: None,
+                },
+            ],
+            0,
+        );
+        let reported: Vec<StopReason> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::TurnComplete { reason } => Some(*reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reported, vec![stop], "{stop:?}: {events:?}");
+    }
 }

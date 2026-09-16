@@ -416,7 +416,7 @@ impl PluginAgentLoop {
                 if let Some(reason) = decision.rejected.clone() {
                     // The attempt is a fact even though nothing was sent: a
                     // turn that was refused must be visible in the log.
-                    outcome.stop = StopReason::InputRejected;
+                    outcome.stop = StopReason::PromptRejected;
                     outcome.error = Some(reason);
                     break;
                 }

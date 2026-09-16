@@ -351,7 +351,7 @@ async fn a_rejected_first_claim_closes_a_turn_with_no_step() {
         .on_waterfall::<PreStep>(Arc::new(RejectsInput), false);
 
     let outcome = run_turn(&app, "please do something").await.unwrap();
-    assert_eq!(outcome.stop, StopReason::InputRejected);
+    assert_eq!(outcome.stop, StopReason::PromptRejected);
     assert_eq!(outcome.steps, 0);
     assert_eq!(outcome.error.as_deref(), Some("not allowed to ask that"));
 

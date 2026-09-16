@@ -820,49 +820,10 @@ pub struct TurnOutcome {
     pub error: Option<String>,
 }
 
-/// Why a turn ended.
-///
-/// Serialized by variant name, which is what `format!("{:?}")` produced when
-/// the log stored a rendering of this instead of the value — so a session
-/// written before it was typed still loads.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum StopReason {
-    /// The model answered with no further tool calls.
-    #[default]
-    Stopped,
-    /// The round budget ran out.
-    MaxRounds,
-    /// The provider failed.
-    ProviderError,
-    /// A `agent/turn-stopping` listener asked for the turn to end — a round
-    /// budget, a deadline, a cost ceiling.
-    StoppedByPolicy,
-    /// The loop's own runaway fuse. Not a policy: the fuse exists so a tree with
-    /// no stopping policy at all still terminates.
-    RunawayFuse,
-    /// A tool-loop guard saw no progress and ended the turn.
-    ToolLoopDetected,
-    /// The agent was asked to stop.
-    Cancelled,
-    /// A `agent/pre-step` listener rejected the claimed input, so no step ran.
-    InputRejected,
-    /// Something reached the model that the session log cannot explain. The
-    /// turn is stopped rather than continued: a prompt nobody can reconstruct
-    /// makes resume, fork and compaction unsound from here on.
-    InvariantViolated,
-    /// A hard policy boundary refused a call and ended the turn, because trying
-    /// another spelling of the same thing would be unsafe. The refusal is in the
-    /// log as the tool's result; what to do next is the person's, and the
-    /// choices are the [`crate::session::SessionEvent::PolicyIntervention`]
-    /// committed with it.
-    PolicyDenied,
-    /// A rate limit paused the turn — not a failure: already-produced work is
-    /// kept, and the pause committed with it says when the limit resets.
-    RateLimited,
-    /// The model's stream went silent past the liveness bound, and retrying did
-    /// not bring it back.
-    Timeout,
-}
+/// Why a turn ended — the kernel's one enum, re-exported where the loop has
+/// always named it. There used to be a second copy here that the handle pump
+/// translated (`docs/adr/0021` §6).
+pub use atomcode_kernel::event::StopReason;
 
 /// What a running tool can reach of the front end driving its agent.
 ///
