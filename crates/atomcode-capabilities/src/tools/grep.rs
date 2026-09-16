@@ -5,6 +5,7 @@
 //! are dropped.
 
 use super::read::lenient_usize;
+use super::sensitive_path::is_credential_path;
 use super::{err, is_skip_dir, not_found_hint, ok, resolve_path};
 use crate::world::{FileSystem, LocalFs, SearchLine, SearchQuery};
 use async_trait::async_trait;
@@ -98,8 +99,8 @@ impl Tool for GrepTool {
         };
         let raw = a.path.clone().unwrap_or_else(|| ".".to_string());
         let root = resolve_path(&raw, &ctx.working_dir);
-        match self.world.info(&root).await {
-            Ok(m) if m.exists => {}
+        let walks_a_dir = match self.world.info(&root).await {
+            Ok(m) if m.exists => m.is_dir,
             // Denied is not missing — see the same note in `read`.
             Err(e) if e.is_denied() => return err(format!("grep: {e}")),
             _ => {
@@ -109,7 +110,7 @@ impl Tool for GrepTool {
                     not_found_hint(&root, &ctx.working_dir).await
                 ))
             }
-        }
+        };
         let max = a
             .max_results
             .unwrap_or(DEFAULT_MAX_RESULTS)
@@ -138,16 +139,28 @@ impl Tool for GrepTool {
             literal
         };
 
+        // A credential store in the AtomCode home (`config.toml` with its api keys,
+        // `auth.toml`, …) is searched only when the call names it — and then the
+        // sensitive-path gate has already asked. A walk that merely passes through
+        // the home must not read it: `grep api_key ~/.atomcode` would otherwise
+        // hand over what `read_file ~/.atomcode/config.toml` asks about. Resolved
+        // on the first file the walk meets, on the walker's own thread.
+        let credential_homes = std::sync::OnceLock::new();
         let query = SearchQuery {
             pattern,
             case_insensitive,
             context,
             max_matches: max,
             skip_dir: Arc::new(is_skip_dir),
-            skip_file: Arc::new(|path: &std::path::Path| {
+            skip_file: Arc::new(move |path: &std::path::Path| {
                 path.extension()
                     .map(|x| x.eq_ignore_ascii_case("log"))
                     .unwrap_or(false)
+                    || (walks_a_dir
+                        && credential_homes
+                            .get_or_init(home_spellings)
+                            .iter()
+                            .any(|home| is_credential_path(path, home)))
             }),
         };
         let base = ctx.working_dir.clone();
@@ -176,6 +189,14 @@ impl Tool for GrepTool {
             Err(e) => err(format!("grep: {e}")),
         }
     }
+}
+
+/// The AtomCode home as a walk may spell it: as configured, and canonical when
+/// that differs — a fenced world walks the canonical path.
+fn home_spellings() -> Vec<std::path::PathBuf> {
+    let home = crate::paths::config_dir();
+    let canonical = home.canonicalize().ok().filter(|real| *real != home);
+    std::iter::once(home).chain(canonical).collect()
 }
 
 /// `rel:num:content` for a match, `rel-num-content` for context, `--` between
@@ -469,5 +490,46 @@ mod tests {
             "target/ should be skipped: {}",
             r.content
         );
+    }
+
+    /// Walking the AtomCode home must not read its credential stores on the way past.
+    /// The sensitive-path gate asks before `read_file ~/.atomcode/config.toml`, and it
+    /// asks before a grep that names that file — but a grep rooted at the home names
+    /// only the directory, so without this every plain `api_key` in `config.toml` (and
+    /// in its hand-made backups) came back as a match line, unasked.
+    #[tokio::test]
+    async fn a_walk_through_the_home_skips_its_credential_stores() {
+        // The crate's `#[ctor]` points `$ATOMCODE_HOME` at a throwaway dir.
+        let home = crate::paths::config_dir();
+        std::fs::create_dir_all(&home).unwrap();
+        let needle = "sk-grep-walk-criterion";
+        let line = format!("api_key = \"{needle}\"\n");
+        // Not `mcp_auth.toml`: this home is shared with the OAuth store's own tests.
+        for store in ["config.toml", "config.toml.bak"] {
+            std::fs::write(home.join(store), &line).unwrap();
+        }
+        // Proof the walk reached the home at all: an ordinary file with the same line.
+        std::fs::write(home.join("grep-walk-criterion.md"), &line).unwrap();
+
+        let args = serde_json::json!({ "pattern": needle, "path": home }).to_string();
+        let r = GrepTool::default().execute(&args, &ctx(&home)).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            r.content.contains("grep-walk-criterion.md:1:"),
+            "the walk must still search the rest of the home: {}",
+            r.content
+        );
+        assert!(
+            !r.content.lines().any(|l| l.starts_with("config.toml")),
+            "config.toml and its copies must not be searched by a walk: {}",
+            r.content
+        );
+
+        // Named outright, the file is searched: asking about it is the gate's call,
+        // and a silent "no matches" after the person allowed it would be a lie.
+        let named = home.join("config.toml");
+        let args = serde_json::json!({ "pattern": needle, "path": named }).to_string();
+        let r = GrepTool::default().execute(&args, &ctx(&home)).await;
+        assert!(r.content.contains(needle), "{}", r.content);
     }
 }
