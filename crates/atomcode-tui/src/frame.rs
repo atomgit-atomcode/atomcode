@@ -147,12 +147,31 @@ pub enum Color {
     /// of them could get it wrong. Instead they state the role and
     /// [`crate::ansi::encode_with`] — which does know — resolves it.
     Role(crate::theme::Role),
+    /// A colour **the picture brings with it**, as a 256-index the art was baked
+    /// with — `atomcode-tuix`'s mascot (`mascot_color`).
+    ///
+    /// The third case beside "a colour the scheme chose" (`Role`) and "a measured
+    /// triple" (`Rgb`), and it exists because neither fits: a role can only say
+    /// what a colour *means*, and there is no role that means "orange", while an
+    /// index says exactly which orange the artist meant.
+    ///
+    /// Deliberately **not** `Ansi`: that one states a sequence and gets it
+    /// written out verbatim, which on a terminal without the cube is a colour
+    /// nobody chose. This says "the picture's colour 202", and the encoder — which
+    /// holds the capabilities — resolves it, passing 202 through where the cube
+    /// exists and taking the nearest real slot where it does not.
+    Picture(u8),
 }
 
 impl Color {
     /// Shorthand, because this is how nearly every colour should be written.
     pub const fn role(r: crate::theme::Role) -> Color {
         Color::Role(r)
+    }
+
+    /// A picture's own index. See [`Color::Picture`].
+    pub const fn picture(index: u8) -> Color {
+        Color::Picture(index)
     }
 
     /// An exact colour, from a measured triple. Only the palette resolver

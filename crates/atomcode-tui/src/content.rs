@@ -110,13 +110,21 @@ pub struct WelcomeBlock {
     pub tips: Vec<(String, String)>,
 }
 
-/// The mascot's source art, borrowed verbatim from `atomcode-tuix`
+/// The mascot's source art, **verbatim** from `atomcode-tuix`
 /// (`render/mascot.rs`).
 ///
 /// Four rows of 18 characters: nine cells, and each cell's two characters are its
 /// **upper and lower** half-pixels — tuix draws them as `▀` with the foreground
-/// above and the cell's background below. Legend: `.` transparent, `o` body,
-/// `e` eyebrow, `w` highlight, `k` pupil.
+/// above and the cell's background below. Legend: `.` transparent, `o` orange,
+/// `e` dark-orange eyebrow, `w` white, `k` black.
+///
+/// **It is coarse, and that is the art.** 18 × 8 pixels is enough for two ears, two
+/// eyes and a chin — and no whiskers, no nose, no tail. Rendered large it reads as
+/// a rounded blob with a face in it. That was checked before deciding to keep it:
+/// the alternative was redrawing a "better" cat, which would be a second mascot to
+/// keep in step with tuix's, and the two front ends disagreeing about what the
+/// product's cat looks like is a worse outcome than a small one. Kept verbatim on
+/// purpose; see the judgement below about its colours.
 const MASCOT_SOURCE: [&str; 4] = [
     "oooo.o.o.o.o.ooooo",
     "ooooooewekooewekoo",
@@ -127,31 +135,30 @@ const MASCOT_SOURCE: [&str; 4] = [
 /// How many cells wide the art is.
 const MASCOT_CELLS: usize = 9;
 
-/// Whether one cell's upper or lower half is body, and if so **in which ink**.
+/// A legend character as its 256-index colour, or `None` for transparent.
 ///
-/// The four legend characters are four colours, and that is not decoration: the
-/// art is 85% body, so its face is carried entirely by *which* body — a pupil, a
-/// highlight and an eyebrow in one ink are a filled rectangle with no cat in it.
-/// Tuix draws them with four literal colours for the same reason.
-///
-/// They become **roles**, never bare colours: a role is resolved against the
-/// measured palette at paint time, which is what keeps this legible on a light
-/// terminal and is what the layering gate enforces.
-fn mascot_ink(legend: char) -> Option<Role> {
+/// **The literal palette, exactly as tuix defines it** (`mascot_color`), and
+/// literal on purpose. I first wrote these as roles and it produced a magenta cat
+/// that read as a bug — the reason is worth keeping: `Role::Brand` resolves to
+/// xterm slot 13 *to mean "the brand"*, and this art is not asking for a meaning,
+/// it is a picture of an orange cat. There is no role in the vocabulary that means
+/// "orange", so the picture states its own colours and the gate below is what
+/// protects a terminal that cannot show them.
+fn mascot_colour(legend: char) -> Option<u8> {
     match legend {
-        'o' => Some(Role::Brand),
-        'e' => Some(Role::Muted),
-        'w' => Some(Role::Secondary),
-        'k' => Some(Role::PanelBg),
-        _ => None,
+        'o' => Some(202), // orange        #ff5f00
+        'e' => Some(166), // eyebrow       #d75f00
+        'w' => Some(231), // highlight     white
+        'k' => Some(232), // pupil         near-black
+        _ => None,        // '.' transparent
     }
 }
 
-fn mascot_cell(row: &str, cell: usize) -> (Option<Role>, Option<Role>) {
+fn mascot_cell(row: &str, cell: usize) -> (Option<u8>, Option<u8>) {
     let chars: Vec<char> = row.chars().collect();
     (
-        chars.get(cell * 2).copied().and_then(mascot_ink),
-        chars.get(cell * 2 + 1).copied().and_then(mascot_ink),
+        chars.get(cell * 2).copied().and_then(mascot_colour),
+        chars.get(cell * 2 + 1).copied().and_then(mascot_colour),
     )
 }
 
@@ -349,24 +356,32 @@ impl Content for WelcomeBlock {
 /// How far the block is set in from the rect it was given.
 const PAD: usize = 2;
 
-/// The mascot, as cells of two vertical pixels each.
+/// The mascot, as nine cells of two vertical pixels each.
 ///
 /// **With `cell_background`** the two pixels are the cell's foreground and
-/// background, which is what tuix does and what makes the art recognisable: `▀`
-/// for a cell whose upper half is body and lower half is not, `█` for both,
-/// `▄` for the lower one, a space for neither.
+/// background, which is what makes the cat recognisable: `▀` for a cell with an
+/// upper pixel only, `▀` (fg upper, bg lower) for both, `▄` for a lower pixel
+/// only, blank for neither — tuix's `mascot_cell`, unchanged.
 ///
-/// **Without it** the lower pixel would simply not paint — the terminal draws the
-/// glyph and drops the background — so the half-block set comes apart and the cat
-/// loses its chin. That is what tuix hit on bare ssh clients. The fallback draws
-/// one solid cell for either pixel, which is coarser and honest: `█` or nothing.
+/// **Without it** the gate below refuses to draw at all, and that is tuix's
+/// behaviour rather than a degradation this code invented. Its condition is
+/// `colors && unicode_symbols && (modern_emulator || jediterm)`, and the comment
+/// next to it says why: on a terminal that drops backgrounds the art **fragments**.
+/// A version of this that "coped" by filling both pixels with the upper colour
+/// drew a solid orange rectangle for weeks and looked like a loading placeholder.
+///
+/// My equivalents: `colors != None` for `colors`, `unicode` for
+/// `unicode_symbols`, and the measured `cell_background` for
+/// `modern_emulator || jediterm` — the same three facts, one of them measured
+/// rather than guessed from an environment variable.
 ///
 /// Cut to `content_w`, like every other row: art wider than the rect it was given
 /// is a row running into its neighbour.
 fn mascot(ctx: &RenderCtx, content_w: usize) -> Vec<Line> {
-    if !ctx.caps.unicode {
-        // No Unicode means no block glyphs at all, and `ascii_for` has no
-        // stand-in that reads as a picture. Nothing beats a rectangle of `#`.
+    let drawable = ctx.caps.colors != crate::caps::Colors::None
+        && ctx.caps.unicode
+        && ctx.caps.cell_background;
+    if !drawable {
         return Vec::new();
     }
     // The art needs PAD + nine cells. Showing a sliced cat is worse than showing
@@ -374,16 +389,24 @@ fn mascot(ctx: &RenderCtx, content_w: usize) -> Vec<Line> {
     if content_w < MASCOT_CELLS {
         return Vec::new();
     }
-    let ink = |role: Role| Style::new().fg(Color::role(role));
     MASCOT_SOURCE
         .iter()
         .map(|row| {
             let mut spans: Vec<Span> = vec![Span::raw(" ".repeat(PAD))];
             let mut run = String::new();
-            let mut run_style = ink(Role::Brand);
+            let mut run_style = Style::new();
             for cell in 0..MASCOT_CELLS {
                 let (top, bottom) = mascot_cell(row, cell);
-                let (glyph, style) = draw_cell(top, bottom, ctx.caps.cell_background);
+                // tuix's `mascot_cell`, decision for decision. `▄` where the TOP
+                // pixel is the transparent one, so the ears' empty half does not
+                // paint a default-foreground bar across them — the bug that line
+                // exists to prevent.
+                let (glyph, style) = match (top, bottom) {
+                    (None, None) => (" ", Style::new()),
+                    (Some(t), None) => ("\u{2580}", ink(t)),
+                    (None, Some(b)) => ("\u{2584}", ink(b)),
+                    (Some(t), Some(b)) => ("\u{2580}", ink(t).bg(Color::picture(b))),
+                };
                 if style == run_style {
                     run.push_str(glyph);
                 } else {
@@ -402,38 +425,13 @@ fn mascot(ctx: &RenderCtx, content_w: usize) -> Vec<Line> {
         .collect()
 }
 
-/// The glyph and style for one cell.
+/// `▀`'s foreground: one of the art's own 256-index colours.
 ///
-/// This is where a half block earns its keep: `▀` paints its cell's foreground in
-/// the upper half and its **background** in the lower, so one cell carries two
-/// colours — which is exactly what the art needs for an eye (a highlight above a
-/// pupil). `█` is one colour both halves, `▄` the lower half alone.
-///
-/// `cell_background` decides whether that is available at all. Without it the
-/// background never paints, so a two-colour `▀` would arrive as its top half and
-/// the cat would lose its chin — tuix hit this on bare ssh clients. The fallback
-/// draws one solid cell per pixel in a single ink: coarser, and honest.
-fn draw_cell(
-    top: Option<Role>,
-    bottom: Option<Role>,
-    cell_background: bool,
-) -> (&'static str, Style) {
-    let ink = |role: Role| Style::new().fg(Color::role(role));
-    if !cell_background {
-        // One ink for the whole cell, whichever half has something in it. The
-        // upper one wins where both do: it is the half a `▀` would have drawn.
-        return match (top, bottom) {
-            (Some(role), _) | (None, Some(role)) => ("█", ink(role)),
-            (None, None) => (" ", Style::new()),
-        };
-    }
-    match (top, bottom) {
-        (Some(t), Some(b)) if t == b => ("█", ink(t)),
-        (Some(t), Some(b)) => ("▀", ink(t).bg(Color::role(b))),
-        (Some(t), None) => ("▀", ink(t)),
-        (None, Some(b)) => ("▄", ink(b)),
-        (None, None) => (" ", Style::new()),
-    }
+/// [`Color::Picture`], not `Color::Ansi`: the index is *the picture's*, and the
+/// encoder — which is the only part of this that knows what the terminal can show
+/// — resolves it. Same promise [`Color::Role`] keeps for the scheme's colours.
+fn ink(index: u8) -> Style {
+    Style::new().fg(Color::picture(index))
 }
 
 impl Content for UserSaid {
@@ -1507,25 +1505,148 @@ mod tests {
     }
 
     #[test]
-    fn the_mascot_needs_two_pixels_per_cell_and_says_so() {
-        // The heart of the shape decision: with a cell background the art is the
-        // half-block set (`▀`/`▄`/`█`); without one the bottom half of every glyph
-        // would simply not paint, so it falls back to one solid cell per pixel.
-        let with = lines_of(&welcome(), 80, true).join("\n");
-        assert!(
-            with.contains('▀') || with.contains('▄') || with.contains('█'),
-            "no mascot at all:\n{with}"
-        );
+    fn the_mascot_is_the_same_cat_tuix_draws() {
+        // The art and its palette are tuix's, unchanged — a "close enough" redraw
+        // would be a second cat to keep in step. Checked against the constants
+        // rather than against a transcription of them.
+        for (i, row) in MASCOT_SOURCE.iter().enumerate() {
+            assert_eq!(
+                row.chars().count(),
+                MASCOT_CELLS * 2,
+                "row {i} is not {MASCOT_CELLS} cells of two pixels"
+            );
+            assert!(
+                row.chars()
+                    .all(|c| matches!(c, '.' | 'o' | 'e' | 'w' | 'k')),
+                "row {i} has a legend character nobody draws"
+            );
+        }
+        assert_eq!(mascot_colour('o'), Some(202), "orange, as tuix bakes it");
+        assert_eq!(mascot_colour('e'), Some(166), "dark-orange eyebrow");
+        assert_eq!(mascot_colour('w'), Some(231), "white highlight");
+        assert_eq!(mascot_colour('k'), Some(232), "black pupil");
+        assert_eq!(mascot_colour('.'), None, "transparent, not a colour");
 
-        let without = lines_of(&welcome(), 80, false).join("\n");
-        assert!(
-            !without.contains('▀') && !without.contains('▄'),
-            "half blocks must not be used where the background does not paint:\n{without}"
+        // tuix's own judgement on the art: one white highlight per eye, eyebrows
+        // above them. If the bytes are ever edited, this says what they must keep.
+        let eyes = MASCOT_SOURCE[1];
+        assert_eq!(eyes.matches('w').count(), 2, "one highlight per eye");
+        assert_eq!(
+            eyes.matches('e').count(),
+            4,
+            "an eyebrow per eye, 2 cells wide"
         );
+    }
+
+    #[test]
+    fn the_mascot_states_its_own_colours_rather_than_asking_for_a_role() {
+        // It is a picture of an orange cat, not a request for "the brand colour".
+        // Written with roles it came out magenta (Brand → xterm 13) and read as a
+        // bug: there is no role in the vocabulary that means "orange". So the art
+        // carries literal indices, and the gate below is what protects a terminal
+        // that cannot show them.
+        let lines = welcome().lines(&wctx(80, true));
+        // Both pixels, because which one a colour lands on is the art's business:
+        // the highlight sits *below* the eyebrow in the same cell (`ew`), so it
+        // arrives as a background. Collecting foregrounds only would report the
+        // white as missing when it is right there.
+        let mut colours: Vec<u8> = Vec::new();
+        let mut backgrounds = 0usize;
+        for span in lines.iter().flat_map(|line| &line.spans) {
+            let index = |c: Option<Color>| match c {
+                Some(Color::Picture(n)) => Some(n),
+                _ => None,
+            };
+            if let Some(n) = index(span.style.fg) {
+                colours.push(n);
+            }
+            if let Some(n) = index(span.style.bg) {
+                colours.push(n);
+                backgrounds += 1;
+            }
+        }
+        for want in [202u8, 166, 231, 232] {
+            assert!(
+                colours.contains(&want),
+                "the palette index {want} never reached a cell: {colours:?}"
+            );
+        }
         assert!(
-            without.contains('█'),
-            "the coarser fallback should still draw the cat:\n{without}"
+            backgrounds > 0,
+            "no cell carried a background pixel — two colours per cell is what makes \
+             this art possible"
         );
+        // Per **span**, not per line: the mascot shares its rows with the tips
+        // (two columns), and the tips are roles on purpose. So the claim is about
+        // the spans that actually carry block glyphs.
+        let glyph_spans: Vec<&Span> = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.text.contains('\u{2580}') || span.text.contains('\u{2584}'))
+            .collect();
+        assert!(!glyph_spans.is_empty(), "no mascot spans found");
+        assert!(
+            !glyph_spans
+                .iter()
+                .any(|s| matches!(s.style.fg, Some(Color::Role(_)))),
+            "the cat must not be drawn from roles"
+        );
+        // And they do carry the art's own indices.
+        assert!(
+            glyph_spans
+                .iter()
+                .all(|s| matches!(s.style.fg, Some(Color::Picture(_)))),
+            "every block glyph should carry the picture's index: {glyph_spans:?}"
+        );
+    }
+
+    #[test]
+    fn the_mascot_needs_a_background_and_says_so_by_not_drawing() {
+        // tuix's gate, kept exactly: `colors && unicode_symbols && (modern ||
+        // jediterm)`. Everything else **draws nothing**, because on a terminal that
+        // drops backgrounds the half-block art fragments — and a version that
+        // "coped" by filling both pixels with the upper colour drew a solid orange
+        // rectangle that looked like a loading placeholder.
+        let with = lines_of(&welcome(), 80, true).join("\n");
+        assert!(with.contains('▀'), "no mascot at all:\n{with}");
+
+        for (why, ctx) in [
+            (
+                "no cell background",
+                RenderCtx {
+                    width: 80,
+                    caps: crate::block::ShapeCaps {
+                        cell_background: false,
+                        ..wctx(80, true).caps
+                    },
+                },
+            ),
+            (
+                "no colour at all",
+                RenderCtx {
+                    width: 80,
+                    caps: crate::block::ShapeCaps {
+                        colors: crate::caps::Colors::None,
+                        ..wctx(80, true).caps
+                    },
+                },
+            ),
+        ] {
+            let all = welcome()
+                .lines(&ctx)
+                .iter()
+                .map(Line::plain)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !all.contains('▀') && !all.contains('▄'),
+                "half blocks were drawn with {why} — the art would fragment:\n{all}"
+            );
+            // And no solid-block stand-in either: that was the bug.
+            assert!(!all.contains('█'), "a rectangle is not a cat:\n{all}");
+            // The words are still there: only the art is withheld.
+            assert!(all.contains("AtomCode") && all.contains("~/proj"), "{all}");
+        }
     }
 
     #[test]
