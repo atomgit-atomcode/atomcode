@@ -79,20 +79,19 @@ ACP `session/load` 的历史重放是事实流的投影;cli 的 ACP 实现今天
 - **UI App** 持有 surface、面板、命令、布局,重建 agent 的 App 时不受影响。
 - **agent 的 App** 归宿主(过渡期是 runtime)。每重建一次,宿主重新接线:
   - 把句柄(命令、状态事件、事实流)交给 UI 的 `tui-agent-client`;
-  - 装 UI 对 agent 的贡献:`adjust_layout` 走 `HostState.tools`(`coding/on_harness.rs:1278`,
-    已有);`tui-layout` 提示词片段要新开入口;
+  - (UI 对 agent 的贡献——`adjust_layout` 工具与 `tui-layout` 提示词——随第 8 节去掉,宿主不再需要装。)
   - 把 App 里的事实转发出来:带着实例、每个新 App 都挂一份的行,先例是
     `native-compaction-checkpoint`(`host_rows.rs:1608`)。
 - **tui 直读的 agent 侧服务改走契约**:
   - `AgentsSvc` → 句柄协议里的 agent 与成员状态事件(带父子关系);
   - `LlmSvc` / `CompactionSvc` / `ToolsSvc` 的只读用途 → agent 自述(模型名、能否看图、
     有无压缩、工具列表),形状未决;
-  - `ControlSvc` → 配置树操作契约。进程外是否开放仍按 0013 未决;tui 在进程内。
+  - `ControlSvc`:见第 7 节,读写配置树的命令只留 `/effort`,改走宿主控制契约。
 - `ui-tui2` 不再自己起泵(`plugin.rs:1851`),不再 `inject` `agents` / `agent-loop`。
 
 `architecture-target.md` §6 当初列过翻成协议客户端的三笔代价,这里逐笔认:日志到协议的
-投影(第 1 节,SDK 反正要做);`adjust_layout` 这类 UI 工具的通道(第 3 节由宿主每个 App
-装一次);realm 隔离降为 session id 约定——tui 今天实际上已经按 session id 过滤
+投影(第 1 节,SDK 反正要做);`adjust_layout` 这类 UI 工具的通道(第 8 节把它去掉了,这笔
+不用付);realm 隔离降为 session id 约定——tui 今天实际上已经按 session id 过滤
 (`plugin.rs:343-349`),这笔已经付过。
 
 目标形态下 runtime 不再重建 App(0023),「活过重建」这个理由会消失;分两个 App 仍由
@@ -102,6 +101,59 @@ ACP `session/load` 的历史重放是事实流的投影;cli 的 ACP 实现今天
 
 第 2 节表里第二、三行落地之前,tui 只开放:发消息、回答提问、取消、压缩、新会话、resume。
 **不开放**:撤销、rewind、恢复快照、重载配置/skills、登出/登录。
+
+### 6. 每个会话一条流,切换是换显示哪一条
+
+ADR 0004 定了屏幕是不可逆块序列、块属于流;tui 的 Host 今天只有一条流
+(`tui/host.rs:748`);tui 的注释写着「一块屏幕一段对话」,把两段混进一条流就是两个 agent 抢着说话
+(`tui/plugin.rs:333-340`)。定为:
+
+- **每个会话一条流**,各自内部仍不可逆(0004 不受影响);切换不改任何已定下的块。
+- **新会话 / resume**:新建一条流;旧会话的 realm 已移除,它的流随之丢弃。
+- **团队成员**:第一次切过去时从事实流序号 0 补历史建流,之后留着,切回不重建。
+- **折叠状态与滚动位置按流分开**:0004 的 `Presentation` 按 `BlockId` 索引,改为按 `(会话, BlockId)`。
+- **切换时 tip 行提示一句**(复用现有的三秒 tip)。
+- 不在同一条流里画分隔后接着画:来回切几次,同一条流里就会反复出现不同的对话。
+
+### 7. 读写配置树的开发命令:只留 `/effort`
+
+`tui-commands-tree` 这一行(`tui/commands.rs:183-198`)有 `/rows`、`/rows-list`、`/tools-list`、
+`/audit`、`/effort`、`/patch`,全经 `ControlSvc` 直接改运行中的配置树;`/patch`、`/rows` 能在运行时
+关掉审批、敏感路径这类安全行,绕过 runtime 直接改还会让 runtime 的记账与树不一致。定为:
+
+- **只留 `/effort`**,改走宿主控制契约(「切推理强度」,0021 第 2 条)。
+- **`/rows`、`/rows-list`、`/tools-list`、`/audit`、`/patch` 删掉**,UI 不再需要配置树操作接口。
+- 因此 `Described` 里的工具名列表(第 5 节)没有消费方了,先不做。
+
+### 8. 可调布局整体去掉,等想清楚再说
+
+屏幕布局分三层:① 给模型的——系统提示里的布局描述(`tui/plugin.rs:1866-1873`,挂载时算一次,
+注释说「每次请求重新读取」而代码不是)与 `adjust_layout` 工具(`tui/layout_tool.rs`);② 给人的——
+`tui-commands-layout` 行的 `/layout`、`/show`、`/hide`、`/undo-layout`、`/layout-set`
+(`tui/commands.rs:340-356`),键 `ctrl-f`(专注预设)、`ctrl-z`(撤销布局)(`tui/keymap.rs:221-233`),
+`ctrl-n` 与 `/mascot`(手动显示 / 隐藏吉祥物,走同一套布局操作,`tui/plugin.rs:1594-1614`),
+以及为撤销和模型而记的布局操作日志(ADR 0007);③ 渲染本身——区域树决定面板画在哪。
+
+- **去掉 ① 与 ②**(含 `ctrl-n` 与 `/mascot`)。ADR 0007 作废。吉祥物显不显示只由 `--mascot` 决定——
+  它打开的是 `tui-panel-mascot` 这一行,不经布局操作。
+- **③ 保留。** 面板行挂载时自己用 `LayoutOp::Show` / `Hide` 把自己放上 / 撤下屏幕(如
+  `tui/rows.rs:240-290` 的吉祥物)——这是渲染装配,不是人或模型调布局。
+- `/effort` 之外的读写配置树命令同时去掉(第 7 节)。
+- 删测试会让 `gates/tui-test-count.baseline`(「判据只能增不能减」)变红;降基线在 commit 里写明是
+  随功能删除。
+
+### 5. agent 自述与状态:用事件推,不做查询
+
+状态栏的模型名已经从日志事实 `RequestHeader { model }` 读(`tui/modules/status.rs:41`)。要靠自述
+提供的是:能否看图(`tui/plugin.rs:1714`)、有无压缩(`commands.rs:141`)、工具列表
+(`commands.rs:216`)、agent 状态(`plugin.rs:708`)。`/model` 会在会话中途换模型,自述会变。
+
+- `AgentAdded { description }` / `AgentRemoved { session }`:团队成员列表。
+- `Described { description }`:订阅时发一次,变了再发。内容:session id、父会话 id、成员名与
+  角色;模型 id、能否看图、推理档;有无压缩;工具名列表(第 7 节删了 `/tools-list`,这一项先不做);**命令目录**(0021 第 10 条)。
+- `StatusChanged { session, status }`:空闲 / 工作中 / 停止中,变得频繁,单独拆出。
+
+位置在 `kernel::agent`(0021 第 6 条)。
 
 ## 权衡过、没做的
 
@@ -115,10 +167,10 @@ ACP `session/load` 的历史重放是事实流的投影;cli 的 ACP 实现今天
 ## 未决
 
 - ~~事实词汇放哪~~:已由 [`0024`](./0024-the-session-log-is-the-authority.md) 定,挪到 kernel。
-- 换会话在屏幕上怎么表现:清屏重画,还是在不可逆流里加一条分隔再画新会话(ADR 0004)。
+- ~~换会话在屏幕上怎么表现~~:定为第 6 节,每个会话一条流。
 - ~~resume 画面有损~~:已由 [`0024`](./0024-the-session-log-is-the-authority.md) 取消——会话权威改为 harness 日志,resume 即重放,不再从快照重建。
-- agent 自述在契约里的形状(位置已定:`kernel::agent`,0021 第 6 条)。
-- `tui-layout` 提示词片段的宿主入口。
+- ~~agent 自述在契约里的形状~~:定为第 5 节。
+- ~~`tui-layout` 提示词片段的宿主入口~~:取消,第 8 节把这个功能去掉了。
 
 ## 闸门
 

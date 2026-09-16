@@ -144,6 +144,73 @@ tui 替换 tuix(0012),第一个要回答的问题是 **tui 与 agent 之间认�
   [`0022`](./0022-tui-and-agent-in-separate-apps.md) 定:tui 与 agent 分两个 App,重建 App 对前端只以
   会话身份体现。
 
+### 7. 句柄协议补强的字段
+
+- 回合号今天就在日志事实里(`TurnStart { turn }`、`TurnEnd { turn, stop }`、`UserMessage { turn, … }`),
+  泵投影成事件时丢了(`harness/plugins/handle.rs:123`、`:356`、`:383`)。`SendMessage` 只是进
+  inbox(`:901-903`),开新回合还是被折进当前回合要到循环取走它、提交 `UserMessage` 时才知道。
+  `AgentEvent` 不落盘(落盘的是 `SessionEvent`),改形状只影响在线连接。
+- **命令带客户端自起的 `id`**:只跟着 inbox 里那一项走,不写进日志;ACP 的 JSON-RPC 请求 id
+  直接映射。
+- **新事件** `Accepted { command, turn: Option<u64>, steered }`(`UserMessage` 提交时发;压缩这类
+  没有回合的命令 `turn` 为空)、`Rejected { command, error }`(当场拒绝时发)。
+- **回合事件带回合号**:`TurnStarted { turn }`、`TurnComplete { turn, reason }`、`Steered { turn, … }`。
+  `TurnStarted` 由无字段变体变成带字段,JSON 形状变,因为不落盘而接受。
+- **不变式**:每个 `TurnStarted { turn }` 后恰好一个同号的 `TurnComplete`(含取消、出错、关闭);
+  每个 `Accepted` 里的回合都会等到它的 `TurnComplete`。
+
+### 8. 契约里的错误
+
+以 `RuntimeError` 的 15 种为起点:
+
+| 今天 | 去向 |
+|---|---|
+| `Busy` | 留,`Busy { reason }` |
+| `Cancelled` | 留 |
+| `SessionInUse { id }` | 留(租约) |
+| `StaleRequest { id }` | 改名 `StaleQuestion`,归句柄协议 |
+| `NoPendingPolicyIntervention`、`InvalidPolicyRecoveryAction` | 归策略干预能力行(第 3 条),不进宿主契约 |
+| `DeliveryFailed` | 并入 `Unavailable` |
+| `Unavailable` | 留 |
+| `ProviderUnavailable(reason)` | 留,原因改中立枚举 |
+| `SnapshotUnavailable(String)` | 删;恢复按 rewind 点 id,找不到归 `NotFound` |
+| `ReconfigureFailed(String)` | 改为 `Failed { message }` |
+| `InvalidWorkingDirectory` | 留 |
+| `UndoOutOfRange { requested, available }` | 留 |
+| `RewindPointUnavailable { turn_id }` | 改名 `RewindPointNotFound` |
+| `CodeRewindUnavailable` | 留 |
+| (新) | `Stale { current: SeqNo }`、`NotRunning`、`NotFound` |
+
+### 9. `generation` 的接替
+
+句柄方法在**调用那一刻**读当前 generation(如 `compact`,`coding/runtime.rs:1164-1175`),防的是
+「重配前发出、重配后才处理」的通道竞争;撤销另带 `expected_revision` 防「对话内容已变」。
+契约里不要 generation,用三样:
+
+- **按 session id 寻址**(0022):发给会话 A、处理时已换到 B 的命令被拒。同会话重建 App 在 M5
+  之后不存在,过渡期由 adapter 处理。
+- **依赖对话内容的宿主命令带 `based_on: SeqNo`**(客户端看到的最后一条事实的序号):撤销到第 N
+  个 prompt、rewind、恢复。其后提交过新的用户消息或回合边界就回 `Stale { current }`。
+- **回合内的命令带回合号或提问 id**:取消对不上回 `NotRunning`,回答对不上回 `StaleQuestion`。
+
+### 10. 能力行的命令:命令目录 + 一个通用调用
+
+agent 树里今天没有命令目录(`operations` 服务存的是 `describe_self` 的自述,`harness/seams.rs:35`);
+tui 的斜杠命令都是 UI 树里的 `CommandSet` 行;ACP 广播的可用命令来自 tuix 内置命令表里标了 `acp`
+的子集(`cli/src/acp/commands.rs:1-11`),tuix 删掉后这张表也没了。要被前端调用的能力行命令有 goal、
+loop、策略干预、本地上下文排队(第 3 条)与人停成员(0023 第 8 节)。定为:
+
+- **agent 树里加一个核心注册表 `commands`。** 能力行挂载时登记自己的命令:名字、参数写法、说明、
+  作用对象(会话,或某个 agent);行卸载时命令随之消失。
+- **目录经 `Described` 推给前端**(0022 第 5 节),变了再推。
+- **句柄协议只加一个通用命令** `Invoke { id, session, name, args }`;回执沿用 `Accepted` /
+  `Rejected`(第 7 条),结果用新事件 `Invoked { id, output }`。
+- **tui 把三类命令合进一个斜杠菜单**:UI 自己的(`/quit`、`/keys`、`/mouse`…)、宿主控制的
+  (`/effort`、`/resume`…)、目录里的。ACP 把目录投影成 `available_commands_update`。
+- 这些命令只由人从前端发起,不是给模型的工具。
+- **不取**:每个能力在 kernel 里加一个带类型的命令(如 `StartGoal`)——类型清楚,但每加一个能力行
+  都要改 kernel,违背「能力靠加行」。
+
 ## 权衡过、没做的
 
 - **驱动协议当契约。** 覆盖全、零迁移;不取的理由是背景里的四条。
@@ -154,10 +221,10 @@ tui 替换 tuix(0012),第一个要回答的问题是 **tui 与 agent 之间认�
 ## 未决
 
 - ~~宿主控制契约放哪~~:定为第 6 条,kernel 分模块、服务键由消费方声明、不建新 crate。
-- 句柄协议三条语义补强的具体字段。
-- 能力行的命令(goal / loop / 策略干预)怎么被前端发现与调用。
-- `RuntimeError` 里哪些进契约。
-- **`generation` 今天承担的「拦过期请求」由什么接替。** 契约里没有 generation,但它在
+- ~~句柄协议三条语义补强的具体字段~~:定为第 7 条。
+- ~~能力行的命令怎么被前端发现与调用~~:定为第 10 条,命令目录 + 通用调用。
+- ~~`RuntimeError` 里哪些进契约~~:定为第 8 条。
+- ~~**`generation` 今天承担的「拦过期请求」由什么接替**~~(定为第 9 条)。 契约里没有 generation,但它在
   runtime 里有实际用途:每个控制消息带上调用方看到的 generation,对不上就回 `Busy`
   (`runtime.rs` 里 26 处 `request_generation != generation`)。契约要用别的东西表达同一
   保证,候选是会话 id 加 turn id 或对话版本号(撤销今天已经另带 `expected_revision`)。

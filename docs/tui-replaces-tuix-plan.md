@@ -1,0 +1,173 @@
+# tui 接进 atomcode、替换 tuix:执行计划
+
+状态: 定稿(2026-09-17)。按 ADR [0021](adr/0021-front-end-contracts-split-by-layer.md)–
+[0024](adr/0024-the-session-log-is-the-authority.md) 排,取代讨论初期的「第 1–5 步」。四份 ADR 的
+「未决」已全部清空,本页不再有待定项;执行中发现新问题,先补 ADR 再改本页。入口统一那部分与
+[`assembly-and-host-plan.md`](assembly-and-host-plan.md) 的 W2-rest 重叠,以本页为准;那一页的
+W1(配置折树)与本页无依赖。
+
+## 一、目标
+
+`atomcode --tui` 驱动产品装配里的 agent——与 tuix 今天驱动的是同一个 agent、同一份会话——
+日用到不想切回 tuix;然后翻默认、删 tuix。
+
+## 二、已定的决定(索引)
+
+| ADR | 要点 |
+|---|---|
+| 0021 | 会话内走句柄协议,补回执(`Accepted` / `Rejected`,命令带客户端 id)、回合事件带回合号、每回合恰好一个终结;宿主控制单独一份中立契约;runtime 驱动协议只是过渡实现;undo 等进 SDK 面;契约类型放 kernel 分模块(`event` / `session` / `host` / `agent`,`agent.rs` 改目录模块保路径),服务键由消费方声明,两个 `StopReason` 合并,不建新 crate;错误表(第 8 条);不要 generation,改用 session id 寻址 + `based_on: SeqNo` + 回合号 / 提问 id;能力行命令走命令目录 + `Invoke` |
+| 0022 | tui 与 agent 分两个 App;会话事实流进句柄协议;重建 App 对前端只以会话身份体现;agent 自述与状态用事件推(`AgentAdded` / `AgentRemoved` / `Described` / `StatusChanged`);每个会话一条流;读写配置树的命令只留 `/effort`;可调布局整体去掉(给模型的、给人的,含 `ctrl-f` / `ctrl-z` / `ctrl-n` / `/mascot`),ADR 0007 作废 |
+| 0023 | 「树」= realm;产品 team / task 改用 harness realm 版本;成员面板是切换入口(竖排、「主」在首行、`Tab` 聚焦、方向键 + `Enter`、鼠标点击),切换后输入与流全换成该 agent 的;人可直接对成员说话、lead 知情不被叫醒;统一句柄泵;成员视图操作;取消级联 |
+| 0024 | 会话唯一权威是 harness 事件日志;`SessionManager` 改存事件日志、不设从;事件词汇挪 kernel;片段不落盘、取消时半截输出落盘并进上下文;旧会话读时转换;resume 带回团队;租约每个落盘 Agent 一份;成员参数进会话头、stop 是事实;事件日志取代 transcript、记录带时间;旧 journal 丢弃;格式版本与回滚不分叉;撤销 / rewind / 恢复统一为 `Rewound` 事实 |
+
+## 三、里程碑
+
+```
+M1 契约地基(kernel)
+ ├─> M2 tui 接上 atomcode(最小可用,开始自用)
+ └─> M3 会话日志成为权威          ← M2 与 M3 可并行
+          └─> M4 团队(4.3 依赖 M3)
+               └─> M5 同会话不重建 App + 功能补齐(依赖 M3)
+                    └─> M6 翻默认、迁移、删 tuix
+后续(不挡替换):换会话不重建 App、回合引擎改名
+```
+
+**为什么 M2 排在 M3 前面**:M2 只开放发消息、回答、取消、压缩、新会话、resume、`/effort`。其中只有
+新会话与 resume 会重建 App,而那是「换会话」,前端换一条流即可(0022 第 2、6 节),不依赖日志成为
+权威。先接上就能先自用,后面每一步都在真实使用里验证。
+
+### M1 契约地基(kernel)
+
+| # | 内容 | 出处 |
+|---|---|---|
+| 1.1 | `kernel/agent.rs` 改目录模块:现有内容挪 `agent/engine.rs`,`agent/mod.rs` 里 `pub use`,调用方不改 | 0021 §6 |
+| 1.2 | 两个 `StopReason` 合并进 kernel:先查泵(`harness/plugins/handle.rs`)今天怎么映射,再按含义合并、全仓替换 | 0021 §6 |
+| 1.3 | 会话词汇挪 `kernel::session`:`SessionEvent`、`LoggedEvent`、`SessionHeader`、`InjectionOrigin`、`HeaderReason`、`derive_messages*`、`renumber`,连带 `Question` / `Answer` / `AboutCall` / `RateLimitPause`。内存日志 `SessionLog` 留 harness;harness 过渡期 `pub use` 保旧路径 | 0024 §6 |
+| 1.4 | 句柄协议补强:命令带客户端 `id`;`Accepted { command, turn, steered }` / `Rejected { command, error }`;`TurnStarted { turn }` / `TurnComplete { turn, reason }` / `Steered { turn, … }`;每回合恰好一个终结。泵实现 | 0021 §7 |
+| 1.5 | 会话事实流进句柄协议:按 session id 订阅、从某序号补。泵实现 | 0022 §1 |
+| 1.6 | `kernel::agent` 契约:`AgentAdded` / `AgentRemoved` / `Described`(身份、模型 id 与能否看图与推理档、有无压缩、命令目录) / `StatusChanged` | 0022 §5 |
+| 1.7 | `kernel::host` 最小集:新会话、resume、切推理强度的命令 / 事件 / 错误 / trait;错误按 0021 §8,寻址与防过期按 0021 §9 | 0021 §2、§8、§9 |
+| 1.8 | 命令目录契约类型:命令描述、`Invoke { id, session, name, args }`、`Invoked { id, output }` | 0021 §10 |
+
+**判据**
+
+- kernel 不依赖 plexus(读 `Cargo.toml` 的守卫)。
+- 只有一个 `StopReason`。**今天红。**
+- 宿主控制契约每个变体 serde 往返一致。
+- 回合归属可判定:steer 进当前回合的消息只看事件流就知道由哪个回合号收尾。**今天红。**
+- 每个 `TurnStarted { turn }` 后恰好一个同号 `TurnComplete`(含取消、出错、关闭)。
+
+### M2 tui 接上 atomcode(最小可用)
+
+| # | 内容 | 出处 |
+|---|---|---|
+| 2.1 | 宿主侧 adapter:`kernel::host` 最小集 → `CodingRuntimeHandle` | 0021 §5 |
+| 2.2 | 事实转发行:每个 App 挂一份,把会话事实与 agent 状态、自述事件转发到宿主持有的流(先例 `native-compaction-checkpoint`,`coding/host_rows.rs:1608`) | 0022 §3 |
+| 2.3 | tui 拆成独立 UI App:`ui-tui2` 不再起泵、不 `inject` `agents` / `agent-loop`;`tui-agent-client` 接宿主给的句柄与事实流;6 处 agent 侧服务直读改走契约 | 0022 §3 |
+| 2.4 | 每个会话一条流:`Presentation` 按 `(会话, BlockId)`;新会话 / resume 建新流、丢旧流;切换时 tip 行提示 | 0022 §6 |
+| 2.5 | 删可调布局:`tui-layout` 提示词片段、`adjust_layout`(`layout_tool.rs`)、`tui-commands-layout` 行、`ctrl-f` / `ctrl-z` / `ctrl-n`、`/mascot`、布局操作日志与撤销;面板行挂载时的 `LayoutOp::Show` / `Hide` 保留 | 0022 §8 |
+| 2.6 | 删读写配置树的命令:`/rows`、`/rows-list`、`/tools-list`、`/audit`、`/patch`;`/effort` 改走宿主控制契约 | 0022 §7 |
+| 2.7 | 入口 `atomcode --tui`:cli 在 `main.rs:2427` 分支(默认仍 tuix);`atui` 的 flag 搬进 cli;删 `tui/src/product.rs` 自拼的 coding 装配,改挂 `runtime::mount` + UI overlay;删 `atui` 二进制;`gates/tui.sh:80` 改调新入口;`launch.rs` 的 `the_full_screen_front_end_is_not_a_row_here` 反向 | 0018 §5 |
+| 2.8 | 功能第一批:发消息、回答提问、取消、压缩、新会话、resume、`/effort` | 0022 §4 |
+
+**判据**
+
+- 装配入口唯一:`CODING_DEFAULTS` / `coding_overlay` / `CODING_ROWS` 的生产引用只在
+  `atomcode-coding` 内部。**今天红**(`tui/src/product.rs`)。
+- 会话互通:产品路径写下的会话,`atomcode --tui --resume` 之后屏幕上有历史。**今天红**
+  (`atui` 读 harness JSONL)。
+- tui 不依赖驱动协议(读源码守卫)。
+- UI 不直读 agent 侧服务(读源码守卫)。**今天红**(6 处)。
+- 屏幕跨会话切换不重不冻(headless 端到端)。
+- 可调布局已删:`crates/atomcode-tui/src` 里没有 `adjust_layout`、`LayoutOp::Undo`、`tui-commands-layout`;
+  键位表没有 `ctrl-f` / `ctrl-z` / `ctrl-n` 的绑定(读源码守卫)。
+- `gates/tui.sh` 全过。删测试导致 `gates/tui-test-count.baseline` 下降时,在同一个 commit 里写明是
+  随功能删除。
+- `gates/differential.baseline` 只降不升。
+
+**M2 完成后开始每天用 `atomcode --tui` 写这个仓库。**
+
+### M3 会话日志成为权威
+
+| # | 内容 | 出处 |
+|---|---|---|
+| 3.1 | 落盘记录外层加提交时间(注入时钟) | 0024 §14 |
+| 3.2 | `SessionManager` 存事件日志:`<id>.events` + `<id>.index`,追加复用 `append_jsonl_line`;租约每个落盘 Agent 一份,追加前校验;写失败即停;删 `session-journal` 行 | 0024 §5、§12、§16 |
+| 3.3 | 片段不落盘;人取消时半截输出合并成事实;投影带半截文本(只文本) | 0024 §7–9 |
+| 3.4 | resume = 重放事件日志,`session-native` 不再 `seed_from_snapshot` | 0024 §2 |
+| 3.5 | 读时转换旧原生会话:补旧 transcript 时间戳;旧文件加 `.migrated` 挪开(含 `.ui.json`) | 0024 §10、§14、§16 |
+| 3.6 | 返回 `SessionSnapshot` 的读接口改为事件投影(daemon / ACP 读路径不动) | 0024 §5 |
+| 3.7 | recall / worklog / `list_sessions` / 网页历史读事件;Claude Code hooks 的 `transcript_path` 指事件日志;删 `SnapshotHook` / `TranscriptHook` / presentation 写入 | 0024 §14、迁移写路径 |
+| 3.8 | 格式版本:读到更新版本列出并拒 resume;半截输出等新事件种类随版本升 | 0024 §16 |
+| 3.9 | 旧 `sessions/harness/` journal 不再写、不导入 | 0024 §15 |
+| 3.10 | `AGENTS.md` 第 39、42 行改写成新现状 | 0024 |
+
+**判据**:0024 闸门——只有一个权威、resume 无损(除片段外)、片段不落盘、半截输出进上下文、
+一个会话只有一个写者、新版本会话被拒而不拖垮目录、回滚不分叉、记录带时间、旧 journal 不被读、
+旧会话读时转换。
+
+**依赖与冲突面**:依赖 M1.3。与 M2 并行时,两边都会动 `coding/host_rows.rs`(M2 加转发行,
+M3 改 `session-native`),分 worktree 时先约定合并顺序。
+
+### M4 团队
+
+| # | 内容 | 出处 |
+|---|---|---|
+| 4.1 | 统一句柄泵:泵接管已存在的 agent;删 `keep_driven`;task 工具改为发任务 + 等终结;取消只拒该 agent 自己的提问 | 0023 §6 |
+| 4.2 | 产品改用 `team-in-process` / `subagent-in-process`:先把 coding team / task 的现有测试原样挂到 realm 版本上跑,逐条对齐差异;在产品树上立成员的安全判据;撤掉 coding 的 `task` / `team` host tool | 0023 §2 |
+| 4.3 | 成员落盘:会话头 `member` 字段、「已停止」事实、resume 带回没被 stop 的成员;权限按当前角色重算 | 0024 §11、§13 |
+| 4.4 | 命令目录:harness 加 `commands` 核心注册表;泵处理 `Invoke`;team 行登记 `stop`;tui 斜杠菜单合并 UI 自己的、宿主控制的、目录里的命令 | 0021 §10 |
+| 4.5 | 人对成员说话:`User` 来源;lead 注入(新来源「人对成员说」);人发起回合的汇报改注入;带 lead 消息的回合与 `tell_parent` 照旧叫醒 | 0023 §4、§7 |
+| 4.6 | 成员视图操作:lead 视图显示并回答成员提问;取消成员;人停成员(经 4.4);压缩成员 | 0023 §8 |
+| 4.7 | 取消级联:task 子 agent 级联;「全部停下」命令;lead 回合被撤回时停掉这一回合新 delegate 的成员 | 0023 §9 |
+| 4.8 | 成员面板改切换入口:竖排,「主」在首行;`Tab` 聚焦、`↑` / `↓` 移动、`Enter` 切换、`Esc` / 再按 `Tab` 回输入框;鼠标悬停高亮、点击切换;选中行一个状态键盘与指针共用;标出当前 agent、状态栏写名字;切换后输入与流全换成该 agent 的(成员流第一次切过去时从序号 0 补) | 0023 §3、0022 §6 |
+
+**判据**:0023 闸门全部,加 0024 的「成员落盘」「成员参数可恢复」。
+
+### M5 同会话不重建 App + 功能补齐
+
+| # | 内容 | 出处 |
+|---|---|---|
+| 5.1 | 重载配置 / skills 走 control patch | 0022 §2、0023 §1 |
+| 5.2 | 登出 / 登录只换模型行,不拆 agent | 同上 |
+| 5.3 | 撤销、rewind、恢复快照:`Rewound { to, scope }` 事实与投影规则;`Checkpointed { turn, id }`;todo 跟投影走;屏幕把被撤的块标成已撤销并加标记块 | 0024 §17 |
+| 5.4 | 宿主控制契约其余项 + adapter + tui 命令:撤销、rewind、恢复、切模型、MCP 状态与撤回、重载、登出 / 登录 | 0021 §2 |
+| 5.5 | goal / loop / 策略干预 / 本地上下文排队作为能力行,命令登记进命令目录;策略干预的两种错误归该行 | 0021 §3、§8、§10 |
+
+**判据**:同会话操作不重建 App(0022);撤销是投影的事、撤销后 todo 回退(0024);每个新命令的契约
+serde 往返 + adapter 行为判据。
+
+### M6 翻默认、迁移、删 tuix
+
+| # | 内容 |
+|---|---|
+| 6.1 | 自用到「不想切回 tuix」;真模型冒烟(codingplan-crypto 的临时拷贝流程,跑完还原,绝不提交) |
+| 6.2 | 翻默认:`atomcode` 默认进 tui,tuix 留逃生口 soak |
+| 6.3 | daemon / ACP / clix 迁到两份契约;ACP 的可用命令改由命令目录投影 |
+| 6.4 | 删 tuix:`cli/src/acp/commands.rs:21` 的 `CommandRegistry`、`cli/Cargo.toml:21` 的 `distro-pm` 转发、`main.rs` 的 tuix 分支、workspace 成员 |
+| 6.5 | 清点并删掉不再被挂载的代码:runtime 驱动协议、coding `team/`、capabilities `tools/task.rs` 的委派部分 |
+
+### 后续(不挡替换)
+
+- **换会话不重建 App**:每会话状态下沉到 realm——provider 的 session 绑定、hooks、按目录
+  解析的 MCP 与 skills(0023 §1 的目标形态)。
+- **回合引擎改名**,解决与 harness `Agent` 撞名(0021 §6)。
+- **可调布局**:想清楚再说(0022 §8)。
+
+## 四、每步交付前必过的门
+
+```sh
+cargo nextest run -p <受影响的 crate>      # 不用 cargo test、不用 --workspace(AGENTS.md)
+cargo fmt --all -- --check
+bash gates/tui.sh                          # 碰 tui 时
+gates/differential.baseline 只降不升        # golden 不可重录
+```
+
+新判据落地时先摘掉被测代码证伪一次,反证写进 commit。
+
+## 五、不做
+
+- 不读 tuix 定需求(0012)。
+- 不建 `atomcode-protocol` crate(`AGENTS.md:54`)。
+- 不重录差分 golden(`AGENTS.md:41`)。
+- 不给时间估算:工作量等 M1 与 M3 各做出第一版再估。
