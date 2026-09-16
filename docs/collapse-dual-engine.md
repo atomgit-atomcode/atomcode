@@ -309,5 +309,16 @@ A 那条对照特别值得留意:**`-y`（自动批准一切）也没能让它�
   > 只 commit 一条随下次请求带出去的提醒，不唤醒已结束的回合。当时拿它当 `TodoHook`
   > 的替身，于是没发现 `TodoHook` 整个掉了(见 `515a70c9`)。**「某某行顶替了它」这种
   > 判断得去看那行挂在哪个事件上，不能看名字。**
+- **默认配置下回合数其实被硬顶在 100，而且不问人**:`agent-loop` 行在 `bundle::INFRA`
+  里带 `max_rounds = 100`,而运行时用 `{ working_dir, undo_cancelled, stream_idle_ms }`
+  patch 它 —— `Op::Patch` 整块替换 config,`max_rounds` 掉回 serde 默认(也是 100)。
+  链式在 `cfg.max_rounds == 0`(默认)时**根本不接内核熔断**,回合数不封顶,只靠重复守卫。
+  `CODING_DEFAULTS` 里有整段注释论证过这件事、也点名了「宿主 patch 会把它打回去」,
+  所以是决定不是疏漏;判据 `no_row_silently_loses_a_configured_field` 的 INTENDED
+  清单里记着它。
+  > **但注释没权衡的一面(2026-09-16 补)**:这道熔断在 `TurnStopping` 之后直接 break,
+  > 不问任何人;而「切断前问一句要不要继续」只长在 `round-cap` 行上,默认 `max_rounds = 0`
+  > 时那条检查点被跳过。于是**显式设了回合上限的人会被问，没设的人在第 100 轮被闷头砍**,
+  > 理由还报成「回合用完」——正好是反的。要不要改属产品决定,记在这里而不是默默放着。
 - **流静默重连次数**:链式内核自带 5 次无内容重连;树里静默是可重试错误，次数归 `llm-retry`。
 - **链式 logout 不清审查/子 agent 槽位**:树里清(判据 `a_logout_leaves_no_signed_in_provider_alive`)。

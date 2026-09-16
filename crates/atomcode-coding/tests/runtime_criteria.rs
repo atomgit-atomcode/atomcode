@@ -2067,6 +2067,53 @@ async fn a_logout_with_no_live_agent_still_leaves_no_provider_alive() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// A `/model` the tree cannot apply fails loudly and leaves the session usable.
+///
+/// The tree is built by FORMATTING a TOML layer, and that can fail on values a
+/// person can actually write: `temperature = nan` is legal TOML, but `{:?}`
+/// renders it `NaN`, which TOML will not read back. (A model name carrying a
+/// control character is the same shape — `{:?}` renders `\u{7f}`, not a legal
+/// TOML escape.) The switch must then be a clean no-op, not a half-applied one.
+///
+/// **What this does NOT cover, and the omission is deliberate:** the provider
+/// SLOT is swapped before that fallible step, and it is the slot — not the tree
+/// — that `CodingModels::provider` serves to the `models` seam, i.e. what
+/// `task` / `team` / `code_review` get when they ask for "the model this
+/// conversation is on". `swap_provider_for` now restores it on failure, but this
+/// criterion passes with and without that restore: the conversation itself keeps
+/// working either way, because the `llm` row captured its provider at mount. A
+/// criterion for the slot needs the delegated child's provider to be
+/// distinguishable from the conversation's, which the recorder cannot do today.
+/// **A test that stays green with the fix removed is worse than no test**, so
+/// this one claims only what it proves, and the gap is written down here.
+async fn a_model_switch_that_cannot_be_applied_changes_nothing() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    let mut broken = start.agent.clone();
+    broken.model = "recorder-two".into();
+    // Legal TOML in `config.toml`, not legal once it has been through `{:?}`.
+    broken.chat_options.temperature = Some(f32::NAN);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    turn(&mut runtime, "hello").await;
+    let before = recorder.requests.lock().unwrap().len();
+
+    let failed = runtime.handle.reassemble_provider(broken).await;
+    assert!(
+        failed.is_err(),
+        "a layer that cannot be built must not report success"
+    );
+
+    // The turn still runs, on the model it already had.
+    turn(&mut runtime, "hello").await;
+    assert!(
+        recorder.requests.lock().unwrap().len() > before,
+        "the conversation stopped working after a failed /model"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// Run a turn answering every question with `answer`; the kinds asked, and why
 /// the turn ended.
 async fn turn_asked(
@@ -2580,6 +2627,7 @@ mod criteria {
         withdrawing_mcp_takes_the_tools_off_the_model,
         a_written_task_list_outlives_the_messages_it_came_from,
         the_retry_budget_follows_a_model_switch,
+        a_model_switch_that_cannot_be_applied_changes_nothing,
         a_cancelled_turn_is_undone_by_default,
         a_cancelled_turn_is_kept_when_asked,
         a_distant_rate_limit_pauses_the_turn,
