@@ -657,6 +657,9 @@ struct LoopGuardPatch {
 #[derive(serde::Serialize)]
 struct CompactionTailPatch {
     threshold: f32,
+    /// Carried because a patch replaces the whole config and base sets it. Only
+    /// the model-free row reads it: `compaction-coding`, which the product swaps
+    /// in, keeps recent turns by token budget.
     keep_turns: u32,
 }
 

@@ -84,6 +84,11 @@ pub enum NoticeKind {
     /// The turn is ending with its answer still cut off: resuming stopped
     /// working, and the person has half of something.
     OutputLeftCutOff,
+    /// A compaction that asks a model has started; the request waits on it.
+    Compacting,
+    /// A compaction did less than was asked — a summary that timed out fell
+    /// back to folding tool output — and the person should know why.
+    CompactionDegraded,
 }
 
 /// One durable fact about a session.
@@ -233,13 +238,19 @@ pub enum SessionEvent {
         /// and a log that cannot tell them apart cannot say who allowed what.
         by: String,
     },
-    /// A compaction boundary: everything at or below `through` is replaced by
-    /// `summary` for model purposes. The dropped events stay in the log —
+    /// A compaction boundary: everything above `from` and at or below `through`
+    /// is replaced by `summary` for model purposes. The dropped events stay in the log —
     /// compaction changes the projection, not the history.
     Compacted {
         turn: u64,
         through: SeqNo,
         summary: String,
+        /// Events at or below `from` are not folded by this compaction: the head
+        /// of the session it keeps — its first request, which every later summary
+        /// is measured against. `0` folds from the start. What an earlier
+        /// compaction folded stays folded.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        from: SeqNo,
     },
     Usage {
         turn: u64,
@@ -248,6 +259,9 @@ pub enum SessionEvent {
     },
     /// Tool results at or below `through` are shown to the model as a one-line
     /// stub from here on.
+    ///
+    /// No longer written: [`SessionEvent::MessagesRewritten`] carries the text
+    /// itself. Still projected, so a log that holds one replays as it ran.
     ///
     /// The other half of compaction, and the half a fold cannot do: a long turn
     /// that no longer fits has nothing *settled* to fold away, and what fills
@@ -258,6 +272,19 @@ pub enum SessionEvent {
     ToolResultsStubbed {
         turn: u64,
         through: SeqNo,
+    },
+    /// From here on the model sees `text` in place of what event `seq` said.
+    ///
+    /// The other half of compaction, and the half a fold cannot do: a long turn
+    /// that no longer fits has nothing *settled* to fold away, and what fills the
+    /// window is almost always tool output nobody needs in full any more — or a
+    /// single message too large to send at all. The replacement is committed
+    /// word for word rather than as a rule re-applied on replay, so a later
+    /// change to how a stub is written never changes what an old log projects,
+    /// and the rewrite is monotonic: the prefix cache is invalidated once.
+    MessagesRewritten {
+        turn: u64,
+        texts: Vec<RewrittenText>,
     },
     /// Something the harness did that a person should know about and the model
     /// should not.
@@ -339,6 +366,7 @@ impl SessionEvent {
             | Self::Answered { turn, .. }
             | Self::Compacted { turn, .. }
             | Self::ToolResultsStubbed { turn, .. }
+            | Self::MessagesRewritten { turn, .. }
             | Self::Usage { turn, .. }
             | Self::Notice { turn, .. }
             | Self::Titled { turn, .. }
@@ -360,6 +388,7 @@ impl SessionEvent {
                 | Self::Injected { .. }
                 | Self::Compacted { .. }
                 | Self::ToolResultsStubbed { .. }
+                | Self::MessagesRewritten { .. }
                 | Self::Interrupted { .. }
         )
     }
@@ -389,7 +418,25 @@ impl SessionEvent {
 /// [`SessionEvent::ToolResultsStubbed`] and [`InjectionOrigin::InternalNudge`]. Same shape again: a hard
 /// boundary's recovery choice, and what a person's cancel does to the history,
 /// were kernel behaviour the log never saw.
-pub const SESSION_FORMAT_VERSION: u32 = 4;
+///
+/// **5** — added [`SessionEvent::MessagesRewritten`], `from` on
+/// [`SessionEvent::Compacted`], and [`NoticeKind::Compacting`] /
+/// [`NoticeKind::CompactionDegraded`]: pressure-driven compaction folds tool
+/// output in place and keeps a session's first request, which a fold alone
+/// could not say.
+pub const SESSION_FORMAT_VERSION: u32 = 5;
+
+/// One replacement a [`SessionEvent::MessagesRewritten`] makes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewrittenText {
+    /// The event whose text the model sees replaced.
+    pub seq: SeqNo,
+    pub text: String,
+}
+
+fn is_zero(seq: &SeqNo) -> bool {
+    *seq == 0
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -620,8 +667,18 @@ pub fn renumber(events: Vec<LoggedEvent>, first: SeqNo) -> Vec<LoggedEvent> {
         .map(|mut logged| {
             logged.seq = map(logged.seq);
             match &mut logged.event {
-                SessionEvent::Compacted { through, .. }
-                | SessionEvent::ToolResultsStubbed { through, .. } => *through = map(*through),
+                SessionEvent::Compacted { through, from, .. } => {
+                    *through = map(*through);
+                    if *from != 0 {
+                        *from = map(*from);
+                    }
+                }
+                SessionEvent::ToolResultsStubbed { through, .. } => *through = map(*through),
+                SessionEvent::MessagesRewritten { texts, .. } => {
+                    for rewritten in texts {
+                        rewritten.seq = map(rewritten.seq);
+                    }
+                }
                 _ => {}
             }
             logged
@@ -632,6 +689,46 @@ pub fn renumber(events: Vec<LoggedEvent>, first: SeqNo) -> Vec<LoggedEvent> {
 /// The projection, as a free function so it can be tested against a literal log
 /// and reused by a persistence layer replaying someone else's events.
 pub fn derive_messages(events: &[LoggedEvent]) -> Vec<Message> {
+    project(events, false)
+        .into_iter()
+        .map(|traced| traced.message)
+        .collect()
+}
+
+/// What a projected message was made from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provenance {
+    /// The text of the event at this sequence number: the text a
+    /// [`SessionEvent::MessagesRewritten`] replaces.
+    Event(SeqNo),
+    /// A compaction summary: a `Compacted` event's, or one a resumed session was
+    /// seeded with.
+    Summary(SeqNo),
+    /// Written beside the event at this sequence number rather than taken from
+    /// it — a cancelled call's result, an interruption, a picture's carrier.
+    Derived(SeqNo),
+}
+
+impl Provenance {
+    pub fn seq(&self) -> SeqNo {
+        match self {
+            Self::Event(seq) | Self::Summary(seq) | Self::Derived(seq) => *seq,
+        }
+    }
+}
+
+/// One model-visible message, and what it was made from.
+#[derive(Clone, Debug)]
+pub struct TracedMessage {
+    pub message: Message,
+    pub source: Provenance,
+}
+
+/// [`derive_messages`], with each message traced to the event it came from.
+///
+/// For a compaction policy that measures and cuts the conversation as the model
+/// sees it, and has to say where it cut in terms of the log.
+pub fn derive_traced(events: &[LoggedEvent]) -> Vec<TracedMessage> {
     project(events, false)
 }
 
@@ -644,33 +741,46 @@ pub fn derive_messages(events: &[LoggedEvent]) -> Vec<Message> {
 /// become which messages.
 pub fn derive_messages_with_meta(events: &[LoggedEvent]) -> Vec<Message> {
     project(events, true)
+        .into_iter()
+        .map(|traced| traced.message)
+        .collect()
 }
 
-fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
-    // A compaction boundary replaces everything at or below it. Find the last
-    // one first: replaying then discarding would be wasted work and, worse,
-    // would let a dropped tool result pair with a surviving call.
-    let mut floor: SeqNo = 0;
-    let mut summary: Option<&str> = None;
+fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<TracedMessage> {
+    // Each compaction folds what lies between the head it keeps and its
+    // boundary, and what one folded stays folded. Collect them first: replaying
+    // then discarding would be wasted work and, worse, would let a dropped tool
+    // result pair with a surviving call. The last one's summary is the one shown.
+    let mut folded: Vec<(SeqNo, SeqNo)> = Vec::new();
+    let mut summary: Option<(SeqNo, &str)> = None;
     // How far the stubbing has reached, for the same reason: a result is shown
     // stubbed because a later fact says so.
     let mut stubbed_through: SeqNo = 0;
+    // What a later fact says the model sees instead. The last word wins.
+    let mut rewritten: std::collections::HashMap<SeqNo, &str> = std::collections::HashMap::new();
     for logged in events {
         match &logged.event {
             SessionEvent::Compacted {
                 through,
                 summary: s,
+                from,
                 ..
             } => {
-                floor = *through;
-                summary = Some(s);
+                folded.push((*from, *through));
+                summary = Some((logged.seq, s));
             }
             SessionEvent::ToolResultsStubbed { through, .. } => {
                 stubbed_through = (*through).max(stubbed_through);
             }
+            SessionEvent::MessagesRewritten { texts, .. } => {
+                for replaced in texts {
+                    rewritten.insert(replaced.seq, &replaced.text);
+                }
+            }
             _ => {}
         }
     }
+    let compacted_at = summary.map(|(seq, _)| seq).unwrap_or(0);
     // Which tool a result came back from, for the stub's first line. The call is
     // logged with the assistant message that asked for it.
     let tool_names: std::collections::HashMap<&str, &str> = events
@@ -695,13 +805,22 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
         .collect();
 
     let mut messages = Vec::new();
-    if let Some(summary) = summary {
+    let mut push = |message: Message, source: Provenance| {
+        messages.push(TracedMessage { message, source });
+    };
+    if let Some((seq, summary)) = summary {
         let mut message = Message::system(summary);
         message.synthetic = true;
-        messages.push(message);
+        push(message, Provenance::Summary(seq));
     }
 
-    for logged in events.iter().filter(|e| e.seq > floor) {
+    for logged in events.iter().filter(|e| {
+        !folded
+            .iter()
+            .any(|(from, through)| e.seq > *from && e.seq <= *through)
+    }) {
+        let seq = logged.seq;
+        let text_of = |own: &str| rewritten.get(&seq).copied().unwrap_or(own).to_string();
         let session_wide = matches!(
             &logged.event,
             SessionEvent::Injected {
@@ -730,25 +849,32 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
                         if let SessionEvent::AssistantMessage { tool_calls, .. } = &e.event {
                             for call in tool_calls {
                                 if !answered.contains(call.id.as_str()) {
-                                    messages.push(Message::tool_result(
-                                        &call.id,
-                                        "(cancelled)",
-                                        true,
-                                    ));
+                                    push(
+                                        Message::tool_result(&call.id, "(cancelled)", true),
+                                        Provenance::Derived(seq),
+                                    );
                                 }
                             }
                         }
                     }
                 }
-                messages.push(Message::user_interruption());
+                push(Message::user_interruption(), Provenance::Derived(seq));
             }
             SessionEvent::UserMessage { text, images, .. } => {
-                if images.is_empty() {
-                    messages.push(Message::user(text));
+                let text = text_of(text);
+                let message = if images.is_empty() {
+                    Message::user(text)
                 } else {
-                    messages.push(Message::user_with_images(text, images.clone()));
-                }
+                    Message::user_with_images(text, images.clone())
+                };
+                push(message, Provenance::Event(seq));
             }
+            // A summary a resumed session was seeded with stands for what came
+            // before it — until a later compaction's summary stands for that too.
+            SessionEvent::Injected {
+                origin: InjectionOrigin::CompactionSummary,
+                ..
+            } if seq < compacted_at => {}
             SessionEvent::Injected { text, origin, .. } => {
                 let mut message = match origin {
                     // A continuation speaks as the user, because it is a
@@ -786,7 +912,11 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
                     }
                 };
                 message.synthetic = true;
-                messages.push(message);
+                let source = match origin {
+                    InjectionOrigin::CompactionSummary => Provenance::Summary(seq),
+                    _ => Provenance::Derived(seq),
+                };
+                push(message, source);
             }
             SessionEvent::AssistantMessage {
                 text,
@@ -796,7 +926,7 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
                 meta,
                 ..
             } => {
-                let mut message = Message::assistant(text, tool_calls.clone());
+                let mut message = Message::assistant(text_of(text), tool_calls.clone());
                 if !reasoning.is_empty() {
                     message.reasoning = Some(reasoning.clone());
                 }
@@ -804,7 +934,7 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
                 if with_meta {
                     message.meta = meta.clone();
                 }
-                messages.push(message);
+                push(message, Provenance::Event(seq));
             }
             SessionEvent::ToolResultLogged {
                 call_id,
@@ -813,23 +943,28 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
                 images,
                 ..
             } => {
-                let shown = if logged.seq <= stubbed_through {
-                    std::borrow::Cow::Owned(atomcode_capabilities::compaction::build_compact_stub(
+                let shown = if let Some(text) = rewritten.get(&seq) {
+                    (*text).to_string()
+                } else if seq <= stubbed_through {
+                    atomcode_capabilities::compaction::build_compact_stub(
                         tool_names.get(call_id.as_str()).copied().unwrap_or("tool"),
                         content,
                         !*is_error,
-                    ))
+                    )
                 } else {
-                    std::borrow::Cow::Borrowed(content.as_str())
+                    content.clone()
                 };
-                messages.push(Message::tool_result(call_id, shown.as_ref(), *is_error));
+                push(
+                    Message::tool_result(call_id, &shown, *is_error),
+                    Provenance::Event(seq),
+                );
                 // A provider serializes images on a user message and rejects
                 // them on a tool one, so the picture rides in immediately
                 // after the result it belongs to.
                 if !images.is_empty() {
                     let mut carrier = Message::user_with_images("", images.clone());
                     carrier.synthetic = true;
-                    messages.push(carrier);
+                    push(carrier, Provenance::Derived(seq));
                 }
             }
             // Chunks, headers, usage and turn boundaries are facts about the
@@ -903,30 +1038,60 @@ pub fn commit(ctx: &atomcode_plexus::Context, log: &SessionLog, event: SessionEv
     seq
 }
 
-/// Apply a compaction decision: cut the history at `through`, and record what
-/// the model sees in place of what was cut.
+/// Apply a compaction decision: record what the model sees in other words, cut
+/// the history at `through`, and tell the person anything they should know.
 ///
 /// Four callers arrive at a decision by different routes — a usage threshold,
 /// an overflow retry, an `AgentHandle` request, a `/compact` command — and each
-/// has to turn it into the same fact. The
+/// has to turn it into the same facts. The
 /// [`Compaction`](crate::seams::Compaction) seam deliberately cannot do it for
 /// them: it takes a log and no context, so a policy stays a pure decision that
 /// can be tested off the tree. This is where that one translation lives, so
 /// there is no fifth spelling of it.
+///
+/// The rewrites land before the cut: a consumer that reacts to the cut (the
+/// native store) then sees both.
 pub fn apply_compaction(
     ctx: &atomcode_plexus::Context,
     log: &SessionLog,
     decision: crate::seams::CompactionDecision,
 ) -> SeqNo {
-    commit(
-        ctx,
-        log,
-        SessionEvent::Compacted {
-            turn: log.current_turn(),
-            through: decision.through,
-            summary: decision.summary,
-        },
-    )
+    let turn = log.current_turn();
+    let mut last = 0;
+    if !decision.rewrites.is_empty() {
+        last = commit(
+            ctx,
+            log,
+            SessionEvent::MessagesRewritten {
+                turn,
+                texts: decision.rewrites,
+            },
+        );
+    }
+    if decision.through != 0 {
+        last = commit(
+            ctx,
+            log,
+            SessionEvent::Compacted {
+                turn,
+                through: decision.through,
+                summary: decision.summary,
+                from: decision.from,
+            },
+        );
+    }
+    if let Some(note) = decision.note {
+        commit(
+            ctx,
+            log,
+            SessionEvent::Notice {
+                turn,
+                notice: NoticeKind::CompactionDegraded,
+                detail: note,
+            },
+        );
+    }
+    last
 }
 
 // ---- projections --------------------------------------------------------

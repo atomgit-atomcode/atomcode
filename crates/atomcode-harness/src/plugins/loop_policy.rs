@@ -20,7 +20,9 @@ use crate::events::{
     AgentRequest, ModelRequest, ModelResponse, RequestError, ToolBatch, ToolExec, ToolsExecute,
     ToolsExecuteBatch, TurnProgress, TurnStopping,
 };
-use crate::seams::{Compaction, CompactionDecision, CompactionSvc, SessionSvc, StopReason};
+use crate::seams::{
+    Compaction, CompactionAsk, CompactionDecision, CompactionSvc, SessionSvc, StopReason,
+};
 use crate::session::InjectionOrigin;
 use crate::session::SessionEvent;
 
@@ -425,6 +427,39 @@ pub struct CompactedSpan {
 }
 
 impl CompactedSpan {
+    /// A span measured on messages rather than on the log: the summaries in them
+    /// are carried, real prompts are listed, and the tools named.
+    pub fn from_messages(through: crate::session::SeqNo, messages: &[Message]) -> Self {
+        use atomcode_kernel::message::Role;
+        let mut span = Self {
+            through,
+            prior: Vec::new(),
+            prompts: Vec::new(),
+            tools: Vec::new(),
+        };
+        for message in messages {
+            match message.role {
+                Role::System | Role::User
+                    if message.synthetic
+                        && (message.role == Role::System
+                            || message.text.starts_with(
+                                atomcode_capabilities::compaction::ANCHOR_SENTINEL,
+                            )) =>
+                {
+                    span.prior.push(message.text.clone());
+                }
+                Role::User if !message.synthetic => span.prompts.push(truncate(&message.text, 200)),
+                Role::Assistant => span
+                    .tools
+                    .extend(message.tool_calls.iter().map(|c| c.name.clone())),
+                _ => {}
+            }
+        }
+        span.tools.sort();
+        span.tools.dedup();
+        span
+    }
+
     /// The span as plain text: the earlier summary, then what was asked and used
     /// since. No header and no closing instruction — each strategy wraps it in
     /// its own words.
@@ -624,12 +659,19 @@ impl Compaction for TailCompaction {
         )
     }
 
-    async fn compact(&self, log: &crate::session::SessionLog) -> Option<CompactionDecision> {
+    async fn compact(
+        &self,
+        log: &crate::session::SessionLog,
+        ask: &CompactionAsk,
+    ) -> Option<CompactionDecision> {
+        if let Some(stubbed) = super::compaction::stub_on_overflow(log, ask) {
+            return Some(stubbed);
+        }
         let span = settled_span(log, self.keep_turns)?;
-        Some(CompactionDecision {
-            through: span.through,
-            summary: listed_summary(&span),
-        })
+        Some(CompactionDecision::fold(
+            span.through,
+            listed_summary(&span),
+        ))
     }
 }
 
@@ -645,11 +687,31 @@ fn truncate(text: &str, max: usize) -> String {
 }
 
 /// Runs before the request goes out: if the last round's usage crossed the
-/// threshold, ask the compaction provider for a boundary and log it. The
+/// threshold, ask the compaction provider for a decision and log it. The
 /// resulting prompt is smaller *and* still fully derived from the log.
 struct CompactBeforeRequest {
     ctx: Context,
     threshold: f32,
+    /// The turn each session last tried a quick and a slow compaction in.
+    tried: Mutex<HashMap<String, (u64, [bool; 2])>>,
+}
+
+impl CompactBeforeRequest {
+    /// At most one attempt per stage — a quick one, one that calls a model — per
+    /// turn. The trigger runs before every request and pressure does not fall
+    /// between two rounds of one turn; a strategy that found nothing worth doing
+    /// at the first would be asked again at every round after it, and one that
+    /// calls a model would bill for it each time.
+    fn first_try(&self, session: &str, turn: u64, slow: bool) -> bool {
+        let mut tried = self.tried.lock().expect("compaction attempts poisoned");
+        let entry = tried
+            .entry(session.to_string())
+            .or_insert((turn, [false; 2]));
+        if entry.0 != turn {
+            *entry = (turn, [false; 2]);
+        }
+        !std::mem::replace(&mut entry.1[usize::from(slow)], true)
+    }
 }
 
 #[async_trait]
@@ -679,24 +741,48 @@ impl Waterfall<AgentRequest> for CompactBeforeRequest {
             return next.run(req).await;
         }
 
-        if let Some(decision) = compaction.compact(&session).await {
+        let ask = CompactionAsk {
+            trigger: atomcode_kernel::message::CompactTrigger::Auto {
+                utilization: used as f32 / window as f32,
+            },
+            window,
+            used_tokens: used,
+        };
+        let slow = compaction.calls_model(&session, &ask);
+        if !self.first_try(session.id(), session.current_turn(), slow) {
+            return next.run(req).await;
+        }
+        if slow {
+            super::recovery::notice(
+                &self.ctx,
+                crate::session::NoticeKind::Compacting,
+                "summarizing the earlier conversation".into(),
+            );
+        }
+        if let Some(decision) = compaction.compact(&session, &ask).await {
             crate::session::apply_compaction(&self.ctx, &session, decision);
             // Re-project: the request must carry the compacted history, and it
             // must still be exactly what the log says.
-            let mut messages: Vec<Message> = req
-                .messages
-                .iter()
-                .take_while(|m| m.role == atomcode_kernel::message::Role::System && !m.synthetic)
-                .cloned()
-                .collect();
-            messages.extend(session.derive_messages());
-            req.messages = messages;
+            reproject(req, &session);
         }
         next.run(req).await
     }
 }
 
-fn last_prompt_tokens(session: &crate::session::SessionLog) -> u32 {
+/// The request carries what the log now says, and nothing else: the system
+/// prompt it opened with, then the conversation as projected.
+pub(crate) fn reproject(req: &mut ModelRequest, session: &crate::session::SessionLog) {
+    let mut messages: Vec<Message> = req
+        .messages
+        .iter()
+        .take_while(|m| m.role == atomcode_kernel::message::Role::System && !m.synthetic)
+        .cloned()
+        .collect();
+    messages.extend(session.derive_messages());
+    req.messages = messages;
+}
+
+pub(crate) fn last_prompt_tokens(session: &crate::session::SessionLog) -> u32 {
     session
         .events()
         .iter()
@@ -750,6 +836,7 @@ pub fn mount_compaction_trigger(ctx: &Context, threshold: f32) {
         Arc::new(CompactBeforeRequest {
             ctx: ctx.clone(),
             threshold,
+            tried: Mutex::new(HashMap::new()),
         }),
         false,
     );

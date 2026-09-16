@@ -291,13 +291,26 @@ A 那条对照特别值得留意:**`-y`（自动批准一切）也没能让它�
 
 ## 已知差异(决定保留，删链后照此为准)
 
-- **压力触发的自动压缩**:链式是「超阈值把旧工具结果原地改成桩」(StubCompaction),溢出时
-  桩 → 截断 → 摘要;树是 `compaction-coding` 的免模型清单(保留最近 2 回合)。原地改写旧消息
-  在追加式日志里没有对应事实，要做得先给日志加事件，属日志模型的决定，不在本线。人要的
-  `/compact <focus>` 已对齐(对话模型写摘要，计费)。
-- **摘要的锚点**:链式下一次压缩认得上一次摘要(哨兵行)并在其上更新;树里上一次摘要投影成
-  合成 system 消息，下一次会把它当普通内容一起摘。
-- **边界**:链式按 token 预算留最近内容，树按回合数(2)。
+- ~~**压力触发的自动压缩**~~ / ~~**摘要的锚点**~~ / ~~**边界**~~ —— **2026-09-16 已对齐，不再是差异**
+  (分支 `fix/auto-compaction`)。原来这三条写的是：树只按回合数(2)留最近内容、不调模型地把
+  其余折成提问清单、下一次压缩认不出上一次摘要，并且说「原地改写旧消息在追加式日志里没有
+  对应事实，要先给日志加事件」。对齐之后：
+  - `compaction-coding` 直接跑链式那套 `OverflowCompaction` over `StubCompaction`,由
+    `harness::plugins::compaction::decide_with_strategy` 把内核计划翻译成日志事实，内核原来
+    守的不变量(保护首个请求、切点不留孤儿工具结果、净缩减守卫)在翻译层照守。
+  - 日志加了 `MessagesRewritten`(逐字记下替换文本，不是规则)和 `Compacted.from`(本次压缩
+    不折叠的头部;多次压缩各自隐藏 `(from, through]`,取并集，旧日志 `from=0` 投影不变)。
+    格式版本 4 → 5。
+  - 压力下：利用率 ≥ 阈值(0.7)折旧工具输出(`read_file` 豁免、活动回合不动);≥ 0.78 且
+    判断有用时由对话模型写锚定摘要，保留首个请求和约 1/4 窗口的最近回合，下一次在上一份
+    摘要上更新。每回合每档(快/调模型)最多试一次。
+  - 溢出：发送前估算超过可用上限、或 provider 拒绝为过长，都走 桩 → 截断 → 摘要(拆开超长
+    回合)三级;没事可做的一级不发请求。
+  - 调模型的压缩开始时驱动会收到 `CompactionStarted`,即使最后什么都没提交也会收到终态
+    (`compactions.is_active()` 会让 rewind 返回 Busy,所以开始必须有终态)。
+  - 判据：harness `tests/compaction_strategy.rs`(6)、`tests/session.rs` 投影 4 条、
+    `loop_policy.rs` 2 条 + 触发器 1 条、`recovery.rs` 发送前 1 条;coding
+    `runtime_criteria.rs` 端到端 3 条。每条都摘掉被测代码证伪过。
 - **工具指引的归属**:树里 fs / shell / 搜索 / codeintel / web / todo / describe_self 的提示词
   由各自的行写，措辞与链式人设里的段落不同;产品自有工具(`request_user_input` / `task` /
   `team` / `code_review`)的段落由 host-tools 带入，与链式同文。

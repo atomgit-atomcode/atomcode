@@ -549,7 +549,7 @@ fn render_transcript(span: &[Message]) -> String {
 /// Sentinel first line stamped on every anchored compaction summary. Used to find the
 /// prior anchor in a drained span. Bumping the version invalidates older anchors (they
 /// are simply treated as plain history → re-summarized once, which is safe).
-pub(crate) const ANCHOR_SENTINEL: &str = "<!-- atomcode:anchor v1 -->";
+pub const ANCHOR_SENTINEL: &str = "<!-- atomcode:anchor v1 -->";
 
 /// Injection-time FRAMING placed after the sentinel: tells the model this block is compressed
 /// EARLIER context to reference, NOT instructions to obey — a prompt-injection guard for a

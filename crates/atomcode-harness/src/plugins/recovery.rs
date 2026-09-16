@@ -18,13 +18,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use atomcode_kernel::message::Message;
+use atomcode_kernel::message::{CompactTrigger, Message};
 use atomcode_plexus::{Context, Next, Plugin, Waterfall};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::events::{AgentRequest, ModelRequest, ModelResponse, RequestError};
-use crate::seams::{CompactionSvc, SessionSvc};
+use crate::seams::{CompactionAsk, CompactionSvc, SessionSvc};
 use crate::session::{NoticeKind, SessionEvent};
 
 fn parse<T: for<'de> Deserialize<'de> + Default>(config: &Value) -> Result<T, String> {
@@ -197,13 +197,70 @@ fn default_attempts() -> u32 {
 
 /// Compact and retry when the history no longer fits.
 ///
-/// Distinct from the threshold-driven compaction, which acts on *predicted*
-/// pressure before a request. This one acts on the provider's own verdict after
-/// the fact, which is the only signal that is never wrong — and the only one
-/// available when the window is unknown or the token estimate was off.
+/// Distinct from the threshold-driven compaction, which acts on *measured*
+/// pressure from the last request. This one acts on the request about to go
+/// out: before sending, when its estimate is already past what the model can
+/// take — a gateway that answers an over-window request with an empty success
+/// never says it overflowed — and after, on the provider's own verdict, the
+/// only signal that is never wrong.
+///
+/// Each pass asks the compaction strategy at the next rung of its ladder. A rung
+/// with nothing to do costs an attempt and no request: resending unchanged
+/// history is guaranteed to fail the same way.
 struct OverflowLadder {
     ctx: Context,
     max_attempts: u32,
+}
+
+impl OverflowLadder {
+    /// Climb until a rung commits something, or say why nothing can.
+    async fn shrink(
+        &self,
+        req: &mut ModelRequest,
+        attempt: &mut u32,
+        what: &str,
+    ) -> Result<(), &'static str> {
+        let (Some(session), Some(compaction)) = (
+            crate::agent::scoped(&self.ctx).service::<SessionSvc>(),
+            self.ctx.service::<CompactionSvc>(),
+        ) else {
+            return Err("no compaction provider is mounted, so this cannot recover");
+        };
+        let window = self
+            .ctx
+            .service::<crate::seams::LlmSvc>()
+            .map(|p| p.context_window())
+            .unwrap_or(0);
+        let used_tokens = super::loop_policy::last_prompt_tokens(&session);
+        while *attempt < self.max_attempts {
+            let ask = CompactionAsk {
+                trigger: CompactTrigger::Overflow {
+                    attempt: u8::try_from(*attempt).unwrap_or(u8::MAX),
+                },
+                window,
+                used_tokens,
+            };
+            *attempt += 1;
+            if compaction.calls_model(&session, &ask) {
+                notice(
+                    &self.ctx,
+                    NoticeKind::Compacting,
+                    "summarizing the earlier conversation".into(),
+                );
+            }
+            if let Some(decision) = compaction.compact(&session, &ask).await {
+                crate::session::apply_compaction(&self.ctx, &session, decision);
+                super::loop_policy::reproject(req, &session);
+                notice(
+                    &self.ctx,
+                    NoticeKind::OverflowCompacted,
+                    format!("{what}; compacted ({}/{})", *attempt, self.max_attempts),
+                );
+                return Ok(());
+            }
+        }
+        Err("nothing further can be compacted")
+    }
 }
 
 #[async_trait]
@@ -213,73 +270,45 @@ impl Waterfall<AgentRequest> for OverflowLadder {
         req: &mut ModelRequest,
         next: Next<'_, AgentRequest>,
     ) -> Result<ModelResponse, RequestError> {
+        // Before sending: an estimate past the usable window is a request that
+        // fails, or worse, comes back empty. Only once something has been
+        // answered — a first prompt too large on its own is nothing a
+        // compaction can shrink.
+        let window = self
+            .ctx
+            .service::<crate::seams::LlmSvc>()
+            .map(|p| p.context_window())
+            .unwrap_or(0);
+        let answered = req
+            .messages
+            .iter()
+            .any(|m| m.role == atomcode_kernel::message::Role::Assistant);
+        if window > 0 && answered {
+            let limit =
+                atomcode_kernel::agent::effective_input_limit(window, req.options.max_tokens);
+            let mut attempt = 0;
+            while estimate(&req.messages) >= u64::from(limit) {
+                if self
+                    .shrink(req, &mut attempt, "the request would not fit")
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+
         let mut attempt = 0;
         loop {
             match next.run(req).await {
                 Ok(response) => return Ok(response),
                 Err(error) if error.context_overflow && attempt < self.max_attempts => {
-                    // First rung: show the long tool results as stubs. A turn
-                    // that overflowed on its own output has nothing *settled*
-                    // for a fold to take — its own results are what filled the
-                    // window — and this is the cheapest thing that shrinks a
-                    // request without losing what was asked or decided.
-                    if let Some(session) = crate::agent::scoped(&self.ctx).service::<SessionSvc>() {
-                        if let Some(through) = stubbable(&session) {
-                            crate::session::commit(
-                                &self.ctx,
-                                &session,
-                                SessionEvent::ToolResultsStubbed {
-                                    turn: session.current_turn(),
-                                    through,
-                                },
-                            );
-                            reproject(req, &session);
-                            attempt += 1;
-                            notice(
-                                &self.ctx,
-                                NoticeKind::OverflowCompacted,
-                                format!(
-                                    "context overflow; earlier tool output shown as summaries, retrying ({attempt}/{})",
-                                    self.max_attempts
-                                ),
-                            );
-                            continue;
-                        }
+                    if let Err(why) = self.shrink(req, &mut attempt, "context overflow").await {
+                        return Err(RequestError {
+                            message: format!("{} ({why})", error.message),
+                            ..error
+                        });
                     }
-                    let (Some(session), Some(compaction)) = (
-                        crate::agent::scoped(&self.ctx).service::<SessionSvc>(),
-                        self.ctx.service::<CompactionSvc>(),
-                    ) else {
-                        // Nothing can shrink the history, so retrying would
-                        // fail identically. Say why rather than spin.
-                        return Err(RequestError {
-                            message: format!(
-                                "{} (no compaction provider is mounted, so this cannot recover)",
-                                error.message
-                            ),
-                            ..error
-                        });
-                    };
-                    let Some(decision) = compaction.compact(&session).await else {
-                        return Err(RequestError {
-                            message: format!(
-                                "{} (nothing further can be compacted)",
-                                error.message
-                            ),
-                            ..error
-                        });
-                    };
-                    crate::session::apply_compaction(&self.ctx, &session, decision);
-                    reproject(req, &session);
-                    attempt += 1;
-                    notice(
-                        &self.ctx,
-                        NoticeKind::OverflowCompacted,
-                        format!(
-                            "context overflow; compacted and retrying ({attempt}/{})",
-                            self.max_attempts
-                        ),
-                    );
                 }
                 Err(error) => return Err(error),
             }
@@ -287,47 +316,11 @@ impl Waterfall<AgentRequest> for OverflowLadder {
     }
 }
 
-/// The last tool result that is worth stubbing: one that is long enough to be
-/// worth it and has not been stubbed already.
-///
-/// `None` means stubbing would change nothing — every result is already a stub,
-/// short enough to leave alone, or there are none.
-fn stubbable(session: &crate::session::SessionLog) -> Option<crate::session::SeqNo> {
-    /// Results at or below this are left alone; a produced stub is far under it,
-    /// which is what keeps the rewrite monotonic.
-    const WORTH_STUBBING: usize = 500;
-    let events = session.events();
-    let already = events
+fn estimate(messages: &[Message]) -> u64 {
+    messages
         .iter()
-        .filter_map(|logged| match logged.event {
-            SessionEvent::ToolResultsStubbed { through, .. } => Some(through),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0);
-    events
-        .iter()
-        .filter(|logged| logged.seq > already)
-        .filter_map(|logged| match &logged.event {
-            SessionEvent::ToolResultLogged { content, .. } if content.len() > WORTH_STUBBING => {
-                Some(logged.seq)
-            }
-            _ => None,
-        })
-        .max()
-}
-
-/// The request carries what the log now says, and nothing else: the system
-/// prompt it opened with, then the conversation as projected.
-fn reproject(req: &mut ModelRequest, session: &crate::session::SessionLog) {
-    let mut messages: Vec<Message> = req
-        .messages
-        .iter()
-        .take_while(|m| m.role == atomcode_kernel::message::Role::System && !m.synthetic)
-        .cloned()
-        .collect();
-    messages.extend(session.derive_messages());
-    req.messages = messages;
+        .map(|m| u64::from(m.estimate_tokens()))
+        .sum()
 }
 
 pub struct OverflowPlugin;
