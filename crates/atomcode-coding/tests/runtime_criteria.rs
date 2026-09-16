@@ -37,6 +37,8 @@ struct Recorder {
     count: AtomicUsize,
     /// Every provider the factory handed out — the objects a credential lives in.
     built: Mutex<Vec<std::sync::Weak<dyn LlmProvider>>>,
+    /// Flip to make every later `build` fail, the way expired credentials do.
+    build_fails: std::sync::atomic::AtomicBool,
 }
 
 impl Recorder {
@@ -265,6 +267,13 @@ impl CodingProviderFactory for RecordingFactory {
         _config: &CodingAgentConfig,
         _session_id: Option<&str>,
     ) -> Result<Arc<dyn LlmProvider>, ProviderBuildError> {
+        // Credentials that stopped working, which is the product's own error
+        // path and the reason a person reaches for `/logout` in the first place.
+        if self.0.build_fails.load(Ordering::SeqCst) {
+            return Err(ProviderBuildError::Authentication(
+                "credentials expired".into(),
+            ));
+        }
         let provider: Arc<dyn LlmProvider> = Arc::new(RecordingProvider(self.0.clone()));
         self.0.built.lock().unwrap().push(Arc::downgrade(&provider));
         Ok(provider)
@@ -1997,6 +2006,63 @@ async fn a_logout_leaves_no_signed_in_provider_alive() {
         alive(&recorder),
         0,
         "a signed-in provider outlived the logout"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// …and that holds when the logout is taken with no live agent, which is the
+/// state a person is actually in when they reach for it.
+///
+/// Credentials stop working, so the next rebuild — an undo, a `/cd`, a resume —
+/// fails while building the provider, and the runtime is left with no agent.
+/// THEN they log out. That takes a different branch, and it used to reset only
+/// the two lazy cells on the config while leaving `parts.review_provider` and
+/// `parts.subagent_provider` — which survive a rebuild by design — holding the
+/// provider they were signed in with.
+///
+/// The criterion above documents itself as "the harness only: the chain tears
+/// its agent down but leaves the same slots filled". That exemption died with
+/// the chain: this branch is not another engine, it is this one with no agent.
+///
+/// Negative control: leave `build_fails` alone and the undo succeeds, which is
+/// the criterion above — so a green here would prove nothing without it.
+#[tokio::test]
+#[serial_test::serial(engine)]
+async fn a_logout_with_no_live_agent_still_leaves_no_provider_alive() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(production_start(env.project.path(), &recorder, |_| {}))
+        .await
+        .unwrap();
+    turn(&mut runtime, "hello").await;
+    let alive = |recorder: &Recorder| {
+        recorder
+            .built
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|weak| weak.upgrade().is_some())
+            .count()
+    };
+    assert!(
+        alive(&recorder) > 0,
+        "nothing holds a provider while signed in, so the check below proves nothing"
+    );
+
+    // The credentials stop working, and the rebuild that discovers it cannot put
+    // an agent back.
+    recorder.build_fails.store(true, Ordering::SeqCst);
+    let _ = runtime.handle.undo_to_prompt(None).await;
+
+    runtime
+        .handle
+        .deactivate_provider(atomcode_coding::ProviderUnavailableReason::AuthenticationRequired)
+        .await
+        .unwrap();
+    assert_eq!(
+        alive(&recorder),
+        0,
+        "a logout taken with no live agent left the reviewer's and the subagents' slots signed in"
     );
     runtime.handle.shutdown().await.unwrap();
 }

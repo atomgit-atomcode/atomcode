@@ -4990,6 +4990,33 @@ fn spawn_runtime_owner_with_optional_agent(
                         }
                         if let Some(runtime) = resources.as_mut() {
                             preserve_sessionless_snapshot(runtime, &stop_report);
+                            // The reviewer's and the subagents' slots live on
+                            // `parts` and survive a rebuild on purpose, so losing
+                            // the agent does NOT empty them. A logout taken here
+                            // — which is the state expired credentials leave a
+                            // person in, and therefore the common one — has to
+                            // take the credentials out of them by hand, exactly
+                            // as the branch with a live agent does.
+                            let _ = crate::parts::wire_side_providers(
+                                &runtime.parts,
+                                &runtime.config,
+                                &crate::on_harness::signed_out_provider(),
+                            );
+                            // A tree can outlive the agent: an assemble that fails
+                            // after `mount` leaves the old one in `harness_app`,
+                            // and its `llm` row is still holding the provider it
+                            // captured. Nothing will drive it again, but "nothing
+                            // drives it" is not "the credentials are gone".
+                            if let (Some(app), Some(slots)) = (
+                                runtime.harness_app.as_mut(),
+                                runtime.harness_providers.clone(),
+                            ) {
+                                let _ = crate::on_harness::deactivate_provider(
+                                    app,
+                                    slots.as_ref(),
+                                )
+                                .await;
+                            }
                             if let Some(provider) = runtime.config.subagent_fast_provider.as_ref() {
                                 provider.reset(Arc::new(|| None));
                             }
