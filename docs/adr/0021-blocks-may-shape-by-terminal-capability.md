@@ -45,6 +45,12 @@
 pub struct ShapeCaps {
     pub unicode: bool,
     pub colors: crate::caps::Colors,
+    /// 这一位是那条"问一句"的规则的第一次真实使用,记在这里当范例。
+    ///
+    /// `cell_background`(终端画不画格的背景色)**决定形状**而不是颜色:半块靠
+    /// 背景色画下半像素,不画时"猫的下巴"整片消失。所以它进来,并跟着缓存键走
+    /// —— 换了终端就该重画,而不是沿用旧的形状。
+    pub cell_background: bool,
 }
 
 pub struct RenderCtx {

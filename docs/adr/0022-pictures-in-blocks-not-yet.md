@@ -277,7 +277,12 @@ ratatui 的类型。**能引的是它下面的编码器与探测配方，不是�
 **把 9×4 的字符猫当成"够用了"不再想这件事。** 本条明确留了口子：`▀▄█`
 （9×8）与 Braille（9×16）都是零风险的精度提升，且不依赖任何本条的结论。
 `▀▄█` 应当做；Braille 做成 caps 门。**而这两位之上还有一档**：半块 + 投影
-（opencode 的做法），只多需要「终端能画格背景」一位 caps。
+（opencode 的做法）。
+
+**（已落地，2026-09-15）** 这一档做了：`Caps::cell_background` 与
+`ShapeCaps::cell_background` 已加（见 [`0021`](./0021-blocks-may-shape-by-terminal-capability.md)
+的字段说明），欢迎块的猫用它画一格两像素的半身，缺这一位时退化成"一格一像素"的
+实心块。判断环境的方式照 tuix 原样搬（`WT_SESSION` / `TERM_PROGRAM` / `jediterm`）。
 
 ## 失效条件
 
