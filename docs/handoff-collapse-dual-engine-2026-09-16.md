@@ -5,7 +5,8 @@
 > 链没了，差分台现在对的是存档。
 >
 > 分支 `feat/collapse-dual-engine`（从 `feat/plexus-plugin-architecture@617a93fe` 分出），
-> **27 个 commit，全部本地，未 push**（用户明确要求不推）。
+> **34 个 commit，全部本地，未 push**（用户明确要求不推）。`feat/plexus-plugin-architecture`
+> 本身已与 origin 同步(0/0)，所以合回去是纯 fast-forward。
 
 ## 一句话结论
 
@@ -73,19 +74,43 @@ transcript 两个写者、mount 对不完整聚合 fail-open、第一回合溢�
 
 **这一条值得记住**：把旧测试原样挂到新装配上跑，比再写一批新测试更能抓 bug。
 
+## 删链之后又修了 6 条（2026-09-16）
+
+两个对抗性 review agent 查完，6 条发现全部成立、全部已修。**其中两条是安全性的，而且都
+不在「已知差异」清单里——不是有意保留，是漏掉了。** 逐条见
+`docs/collapse-dual-engine.md#删链之后的-review-与修复2026-09-16`。
+
+最该读的一条是 A：`ToolExec.pre_approved: bool` 换成了
+`Authorization`(`No`/`Presumed`/`ByPerson`)。一个 bool 同时承载「人对这一次点了头」和
+「有条配置说别问」，凭据边界分不出来只好都认，于是 `allow = ["Bash(curl *)"]` 让
+`credential_shell = "strict"` 形同虚设。
+
+**从这条里学到的、会影响你以后所有改动的一件事：**
+
+> plexus 的 `App::start` 写着 **"Order in the file is irrelevant"** ——
+> 行在清单里的位置**不决定执行顺序**（顺序 = 注册时机 = 挂载顺序），
+> `prepend` 是唯一的排序杠杆，而且只有「最前」「最后」两档。
+
+所以**不要用顺序来保证安全**。A 最初的修法就是「把行摆到正确位置」，做不到；改成让边界
+只认 `by_person()` 之后，权限闸门至今仍 prepend 在最前、行清单一个字没动，两条判据同时绿。
+
+C 和 E 两条**没有判据**，我没假装有：唯一能让 patch 失败的途径是某一行拒绝重挂，测试够
+不到。缺口写在 `finish_stopped_native_turn` 的文档里。**一条测试够不到的错误分支，等于
+从来没人跑过它** —— C 和 E 都是这么长出来的。
+
 ## 验证现状
 
 | 范围 | 结果 |
 |---|---|
-| `atomcode-coding` | 579 绿 |
-| `atomcode-harness` / `-tui` / `-kernel` / `-capabilities` | 3209 绿 |
-| `atomcode-tuix` / `-cli` / `-daemon` | 2666 跑，3 红 **且都是既有红**（daemon webui 内嵌资源 ×2、tuix 配置面板搜索），在链上也红 |
+| `atomcode-coding` | 586 绿 |
+| `atomcode-harness` / `-tui` / `-kernel` / `-capabilities` | 全绿 |
+| `atomcode-tuix` / `-cli` / `-daemon` | 3 红 **且都是既有红**（daemon webui 内嵌资源 ×2、tuix 配置面板搜索），在链上也红 |
 | `clix` | `cargo check` 过（按用户要求「不删，只保证能编译」） |
 | `cargo fmt --all -- --check` | 0 |
 | 差分棘轮 | 不变 |
 | 真模型冒烟 | 纯文本 / 带工具 / resume / undo 四项在真网关上过，undo 那条带反证 |
 
-判据在 `crates/atomcode-coding/tests/runtime_criteria.rs`（43 个场景 + 3 条独立判据 = 46 个测试，
+判据在 `crates/atomcode-coding/tests/runtime_criteria.rs`（48 个场景 + 3 条独立判据，
 只经 `CodingRuntime` 公开面）。**每条都摘掉被测代码证伪过一次**，反证记在各自 commit
 里 —— 这是用户反复要求的纪律，新加判据照办。
 
@@ -111,7 +136,8 @@ cargo clean -p atomcode-codingplan-crypto && cargo build -p atomcode
 
 ## 接着做什么
 
-1. **soak 再 push。** 27 个 commit 一次都没推过；用户要的是先在本地用一段时间。
+1. **soak 再 push。** 34 个 commit 一次都没推过；用户要的是先在本地用一段时间。
+   合回 `feat/plexus-plugin-architecture` 是纯 fast-forward（它已与 origin 同步）。
    push 之前把 `docs/collapse-dual-engine.md` 的「已知差异」那一节再读一遍 ——
    它列的是**决定保留**的差异（自动压缩策略、摘要锚点、边界按回合、工具指引归属、
    `max_continuations`、流重连次数、链式 logout 不清槽），不是待办。

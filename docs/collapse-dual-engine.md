@@ -200,11 +200,66 @@ sessions/harness/<bucket>/<id>.jsonl  {"header":{...}}/seq ← harness 日志(�
 > 还原 + 删掉 overlay 文件 + `cargo clean -p atomcode-codingplan-crypto` 重编，
 > 本分支不含它的任何一行，Cargo.lock 也没被它污染。
 
+## 删链之后的 review 与修复(2026-09-16)
+
+两个对抗性 review agent 各查一面(「链有树无的静默丢失」「重建路径的状态搬运」),
+报了 6 条,每条我都独立复核过:**6 条发现全部成立**。
+
+但**它们的修法建议不能照单全收**——A 那条 agent 给的方向是「把 `permissions` 行摆到
+正确位置」,而在 plexus 里位置根本不决定顺序(见下),照做会同时打破 allow 规则的另一半。
+发现靠证据,修法靠自己验。
+
+| | 缺陷 | commit | 判据 |
+|---|---|---|---|
+| A | `[permissions] allow` 规则能解开凭据 shell 硬边界 | `f6e0fbc1` | 2 条，互为反向 |
+| B | `withdraw_mcp_tools` 只销账不 unregister | `c4010968` | 1 条 |
+| C | 登出 patch 失败 → 被取消的回合永不收尾 | `00875b4d` | **测不到** |
+| D | `/model` 不重发 `llm-retry`，重试预算错配 | `d6c474c3` | 1 条 |
+| E | patch 失败 → 槽表与树不一致，子 agent 跑错 provider | `00875b4d` | **测不到** |
+| F | `TodoHook` 整个掉了(sidecar / 续写 / 每轮锚点) | `3ab4d947` | 1 条 |
+
+另加 `67fee7e8`:装配审计(`the_product_mounts_and_audits_clean`),精简与全功能各审一次。
+`atomcode-tui` 一直有这条,coding 直到行清单成为唯一装配才补上。
+
+### A 那条值得单独读:修的是字段语义，不是位置
+
+`ToolExec.pre_approved: bool` 换成了 `authorization: Authorization`
+(`No`/`Presumed`/`ByPerson`)。一个 bool 同时承载了「人对这一次调用点了头」和「有条配置
+说别问」,凭据闸门分不出来只好都认,于是一条图省事的 `allow = ["Bash(curl *)"]` 让
+`credential_shell = "strict"` 形同虚设。现在便利闸门问 `settled()`,安全边界问
+`by_person()`。
+
+**一开始的修法是错的**:想把 `permissions` 行摆到「硬边界之后、便利闸门之前」。
+做不到——`App::start` 的文档写着 **"Order in the file is irrelevant"**,行在清单里的
+位置不决定执行顺序(顺序 = 注册时机 = 挂载顺序),`prepend` 是唯一的排序杠杆而且只有
+两档。实测把行摆到凭据闸门之后,执行上它仍在最内层。
+
+**结论:安全性不该压在一个作者控制不了的性质上。** 改完之后权限闸门至今仍 prepend 在
+最前、行清单一个字没动,两条判据同时绿——这就是「与顺序无关」的实证。顺带,harness
+自带的那份 `PermissionGate` 有同样的洞(也 prepend),改字段一次把两份壳都修了。
+
+### C 和 E:一条测试够不到的错误分支，等于从来没人跑过它
+
+两条都在同一个形状上:**可失败的操作已经改了共享状态,中间没有回滚**。也都写不出判据
+——唯一能让 patch 失败的途径是某一行拒绝重挂,而测试够不到那个条件(layer 是固定字符串,
+碰的只有 `llm` 一行)。它们靠结构和注释守着,缺口记在 `finish_stopped_native_turn`
+的文档里,连同「一旦有了注入 patch 失败的办法,该写的判据是什么」。
+
+### 这一轮反复踩的坑：顺序靠读代码推，连错四次
+
+waterfall 的执行顺序我先后猜过「挂载轮次」「底座有重复行」「patch 会移位」「声明位置
+生效」,四次全错。打一次真实顺序就全清楚了——`tests/gate_order.rs` 留了这个探针
+(`dump_row_order`,`#[ignore]`)。**顺序是能打印的东西,不该靠推。**
+
+同一类错误还有一次:把 `todo-reminder` 当成 `TodoHook` 的替身,是看名字判断的;它其实是
+`on_emit::<SessionEventCommitted>` 观察者,既不唤醒已结束的回合也不写 sidecar。
+**「某某行顶替了它」要看那行挂在哪个事件上。**
+
 ## 判据(`tests/runtime_criteria.rs`)
 
 运行时判据，只经 `CodingRuntime` 公开面。每条都在两个引擎上写过、并摘掉被测代码证伪过
-一次(反证记在各自 commit 里),删链后原样留下来当 harness 判据。43 个场景 + 能力开关、
-transcript 单一写者、logout 不留凭据三条，共 46 条。
+一次(反证记在各自 commit 里),删链后原样留下来当 harness 判据。48 个场景 + 能力开关、transcript 单一写者、logout 不留凭据三条，共 51 条;
+另有 `tests/gate_order.rs` 的装配审计与「权限闸门只挂一次」两条。
 
 ## 已知差异(决定保留，删链后照此为准)
 
