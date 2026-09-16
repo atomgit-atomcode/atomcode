@@ -7474,6 +7474,20 @@ fn harness_host_state(
                 config.todo.eager,
             )),
         );
+        // The list itself, and the three things the `todo-reminder` row is not:
+        // the anchor + list on EVERY round (the mid-work drift backstop), the
+        // one-shot nudge when the model stops with items still open, and the
+        // `<id>.todos.json` sidecar that lets a compacted session still show its
+        // plan (issue #1503 — the transcript's `todowrite` calls are gone by
+        // then, and vscode's fallback derives from exactly those).
+        //
+        // `todo-reminder` is an observer: it commits a staleness note that rides
+        // the NEXT request. It never continues a turn, so it cannot stand in for
+        // `offer_continuation`, and it never writes the sidecar.
+        hooks.insert(
+            "todo",
+            Arc::new(crate::todo::TodoHook::new(config.working_dir.clone())),
+        );
     }
     // The person's `[permissions]` rules decide among the gates, and WHERE they
     // decide is the whole contract: after every hard boundary, before the

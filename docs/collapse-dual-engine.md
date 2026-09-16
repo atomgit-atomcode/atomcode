@@ -218,7 +218,13 @@ transcript 单一写者、logout 不留凭据三条，共 46 条。
 - **工具指引的归属**:树里 fs / shell / 搜索 / codeintel / web / todo / describe_self 的提示词
   由各自的行写，措辞与链式人设里的段落不同;产品自有工具(`request_user_input` / `task` /
   `team` / `code_review`)的段落由 host-tools 带入，与链式同文。
-- **`max_continuations`(offer_continuation 熔断，默认 50)**:树里的续写提醒(verify-cadence、
-  todo-reminder)各自一次性，没有需要熔断的循环，不桥接。
+- **`max_continuations`(offer_continuation 熔断，默认 50)**:树里会续写的两处
+  (verify-cadence 行、`kernel-hooks` 上的 `TodoHook::offer_continuation`)各自一次性,
+  没有需要熔断的循环，不桥接。
+  > 2026-09-16 更正:这条原先写的是「verify-cadence、todo-reminder 各自一次性」。
+  > `todo-reminder` **根本不是续写** —— 它是 `on_emit::<SessionEventCommitted>` 观察者,
+  > 只 commit 一条随下次请求带出去的提醒，不唤醒已结束的回合。当时拿它当 `TodoHook`
+  > 的替身，于是没发现 `TodoHook` 整个掉了(见 `515a70c9`)。**「某某行顶替了它」这种
+  > 判断得去看那行挂在哪个事件上，不能看名字。**
 - **流静默重连次数**:链式内核自带 5 次无内容重连;树里静默是可重试错误，次数归 `llm-retry`。
 - **链式 logout 不清审查/子 agent 槽位**:树里清(判据 `a_logout_leaves_no_signed_in_provider_alive`)。

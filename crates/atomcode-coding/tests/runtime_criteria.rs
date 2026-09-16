@@ -97,6 +97,20 @@ impl LlmProvider for RecordingProvider {
                             .to_string(),
                 })
             }
+            Some(m) if m.role == Role::User && m.text == "plan two things" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "todowrite".into(),
+                    arguments: serde_json::json!({
+                        "action": "set",
+                        "todos": [
+                            { "id": 1, "content": "the first thing", "status": "in_progress" },
+                            { "id": 2, "content": "the second thing", "status": "pending" },
+                        ],
+                    })
+                    .to_string(),
+                })
+            }
             Some(m) if m.role == Role::User && m.text == "leak the token" => {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
@@ -1372,6 +1386,39 @@ async fn an_mcp_servers_tools_are_offered_and_run() {
     );
 }
 
+/// A turn that wrote a task list leaves it in the session's todo sidecar.
+///
+/// The sidecar is what a compacted session has left: compaction drains the
+/// transcript's `todowrite` calls, and the panel that shows a person their plan
+/// derives from exactly those calls when there is no sidecar (issue #1503). So
+/// this is not a duplicate of "the list reached the model" — it is the copy that
+/// outlives the messages the list was made of.
+///
+/// Negative control: drop the `todo` hook from `harness_host_state` and no
+/// sidecar is written.
+async fn a_written_task_list_outlives_the_messages_it_came_from() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+
+    turn(&mut runtime, "plan two things").await;
+
+    let sidecar = SessionManager::for_project(env.project.path())
+        .read_todo_sidecar(&id)
+        .expect("reading the sidecar must not fail")
+        .expect("a turn that wrote a task list must leave a sidecar");
+    let titles: Vec<String> = sidecar.todos.iter().map(|t| t.content.clone()).collect();
+    assert!(
+        titles.iter().any(|t| t.contains("first")),
+        "sidecar: {titles:?}"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// Withdrawing MCP takes the tools away from the model, not just off the books.
 ///
 /// This is the fail-closed cutover every mutable-MCP-state command opens with —
@@ -2408,6 +2455,7 @@ mod criteria {
         a_round_budget_ends_the_turn,
         an_mcp_servers_tools_are_offered_and_run,
         withdrawing_mcp_takes_the_tools_off_the_model,
+        a_written_task_list_outlives_the_messages_it_came_from,
         a_cancelled_turn_is_undone_by_default,
         a_cancelled_turn_is_kept_when_asked,
         a_distant_rate_limit_pauses_the_turn,
