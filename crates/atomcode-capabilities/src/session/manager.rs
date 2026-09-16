@@ -944,6 +944,46 @@ impl MetaReadPause {
 }
 
 impl SessionManager {
+    /// The one directory under [`sessions_root`](Self::sessions_root) that is
+    /// not a project bucket: the coding runtime's event journal, kept beside
+    /// the native store and apart from its files so neither writer ever reads
+    /// the other's as its own. The catalog passes over it.
+    ///
+    /// Named here, and used by the runtime that writes it, so the directory and
+    /// the scanner that must not mistake it for a bucket cannot disagree.
+    pub const JOURNAL_DIR: &'static str = "harness";
+
+    /// Whether `path` is an event-journal file rather than one of this store's.
+    ///
+    /// Journals were not always kept under [`Self::JOURNAL_DIR`]: the coding
+    /// runtime before 2026-09-16, and the harness launchers (`harness`, `atui`),
+    /// wrote `<id>.jsonl` straight into project buckets. Hundreds of those are on
+    /// disk, and a reader of native files — `recall`, the catalog — must pass over
+    /// them rather than call its own file corrupt. Recognised by the first record,
+    /// which no native file shares: a journal header (`{"header":…}`), or, in
+    /// journals older than headers, a sequenced event (`{"seq":…,"event":…}`).
+    /// Not a regular file, or unreadable, is `false`: the caller's own checks
+    /// report those.
+    pub fn is_journal_file(path: &Path) -> bool {
+        let Ok(file) = open_read_file(path) else {
+            return false;
+        };
+        let mut first = Vec::new();
+        if BufReader::new(file)
+            .take(MAX_JSONL_LINE_BYTES as u64)
+            .read_until(b'\n', &mut first)
+            .is_err()
+        {
+            return false;
+        }
+        let Ok(serde_json::Value::Object(record)) = serde_json::from_slice(&first) else {
+            return false;
+        };
+        !record.contains_key("turn_id")
+            && (record.contains_key("header")
+                || (record.contains_key("event") && record.contains_key("seq")))
+    }
+
     pub fn sessions_root() -> PathBuf {
         super::config_dir().join("sessions")
     }
@@ -3344,6 +3384,9 @@ fn scan_catalog_root(sessions_root: &Path) -> CatalogScan {
         let bucket_path = bucket_entry.path();
         let bucket = match bucket_entry.file_name().into_string() {
             Ok(bucket) if valid_project_bucket(&bucket) => bucket,
+            // Another writer's directory, put here on purpose: not a bucket,
+            // and not a problem to report.
+            Ok(bucket) if bucket == SessionManager::JOURNAL_DIR => continue,
             Ok(bucket) => {
                 scan.diagnostics.push(CatalogDiagnostic {
                     project_bucket: Some(bucket),
@@ -3458,7 +3501,12 @@ fn scan_catalog_root(sessions_root: &Path) -> CatalogScan {
     }
 
     for (key, path) in native_sidecars {
-        if !native_meta_ids.contains(&key) {
+        // A journal written into the bucket is not half of a native session.
+        // Read only for orphans, so a healthy bucket costs no extra IO.
+        if !native_meta_ids.contains(&key)
+            && !(path.extension().is_some_and(|ext| ext == "jsonl")
+                && SessionManager::is_journal_file(&path))
+        {
             scan.diagnostics.push(CatalogDiagnostic {
                 project_bucket: Some(key.0),
                 path,
@@ -5770,6 +5818,54 @@ mod tests {
         let third = SessionManager::scan_catalog(root.path());
         assert_eq!(third.entries.len(), 2, "rescan must see the added session");
         assert!(third.entries.iter().any(|e| e.id == "b"));
+    }
+
+    #[test]
+    fn the_journal_directory_is_passed_over_and_a_stray_one_is_still_reported() {
+        // The runtime writes its journal to `<sessions>/harness/<bucket>/`. Every
+        // session-list refresh used to report that directory as a malformed
+        // bucket; a directory that really is stray must still be reported, or
+        // this would be silencing the scanner rather than teaching it.
+        let root = tempfile::tempdir().unwrap();
+        let journal = root
+            .path()
+            .join(SessionManager::JOURNAL_DIR)
+            .join("0123456789abcdef");
+        std::fs::create_dir_all(&journal).unwrap();
+        std::fs::write(journal.join("s.jsonl"), "{\"header\":{}}\n").unwrap();
+        let stray = root.path().join("not-a-bucket");
+        std::fs::create_dir_all(&stray).unwrap();
+
+        let scan = scan_catalog_root(root.path());
+        assert!(scan.entries.is_empty(), "a journal is not a session");
+        let reported: Vec<_> = scan.diagnostics.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(reported, vec![stray]);
+    }
+
+    #[test]
+    fn a_journal_file_inside_a_bucket_is_not_an_orphaned_sidecar() {
+        // Launchers wrote their journals straight into project buckets for months;
+        // each one was reported as half a native session on every list refresh. A
+        // transcript with no metadata is still reported — that one really is.
+        let root = tempfile::tempdir().unwrap();
+        let bucket = root.path().join("0123456789abcdef");
+        std::fs::create_dir_all(&bucket).unwrap();
+        std::fs::write(
+            bucket.join("1789296604064-38002.jsonl"),
+            "{\"header\":{\"id\":\"1789296604064-38002\",\"version\":1}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bucket.join("1789000000000-1.jsonl"),
+            "{\"seq\":1,\"event\":{\"kind\":\"turn_start\",\"turn\":1}}\n",
+        )
+        .unwrap();
+        let orphan = bucket.join("5b0e0b8e-0000-4000-8000-000000000000.jsonl");
+        std::fs::write(&orphan, "{\"v\":1,\"ts\":1,\"turn_id\":1}\n").unwrap();
+
+        let scan = scan_catalog_root(root.path());
+        let reported: Vec<_> = scan.diagnostics.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(reported, vec![orphan]);
     }
 
     /// Not a correctness gate — a manual throughput check. Run with:

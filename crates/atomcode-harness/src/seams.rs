@@ -28,13 +28,11 @@ plexus_service!(LlmUtilitySvc => dyn LlmProvider, "llm-utility", Seam, "The mode
 plexus_service!(ModelsSvc => dyn Models, "models", Seam, "Every model this host can build a provider for, so a row can run a child on a different one");
 plexus_service!(ToolsSvc => ToolBox, "tools", Core, "The live tool catalog");
 plexus_service!(SystemPromptSvc => PromptRegistry, "system-prompt", Core, "Ordered prompt fragments");
-// Reuses `PromptRegistry` because the shape is identical — ranked fragments
-// keyed by id, removed with their row — and a second implementation of "ordered
-// contributions" would be a second thing to keep correct. The *slot* is what
-// differs: this one is never sent to the model unprompted. It is answered when
-// asked, so a row can describe a knob in as much detail as the knob deserves
-// without that detail costing tokens on every single request.
-plexus_service!(OperationsSvc => PromptRegistry, "operations", Core, "How to work the running system, described by the rows that own each knob");
+// Never sent to the model unprompted. It is answered when asked, so a row can
+// describe a knob in as much detail as the knob deserves without that detail
+// costing tokens on every single request — and, unlike the system prompt, an
+// answer may depend on the session asking (see `Descriptions`).
+plexus_service!(OperationsSvc => Descriptions, "operations", Core, "What each row says about itself — how to work it, and its part of this session — answered when asked");
 plexus_service!(SessionSvc => SessionLog, "sessions", Core, "The append-only session log of the agent whose realm this is");
 plexus_service!(SessionDefaultsSvc => SessionDefaults, "session-defaults", Core, "What the front end's own agent is told about its session: an id, whether to resume it");
 plexus_service!(SessionProjectionsSvc => SessionProjections, "session-projections", Core, "Incremental folds over the log");
@@ -188,6 +186,134 @@ impl PromptRegistry {
             .expect("prompt registry poisoned")
             .iter()
             .map(|f| f.id.clone())
+            .collect()
+    }
+}
+
+/// Which question a description answers — the `aspect` a `describe_self` caller
+/// names. The tool owns this vocabulary; the rows own every answer in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Aspect {
+    /// This session: where it is kept, what it is called, how it is continued.
+    Session,
+    /// How to work the running system: the knobs, and who turns them.
+    Operations,
+    /// The settings file that configured this tree, and what in it is safe to
+    /// edit. Said by whatever read that file.
+    Settings,
+    /// The models work may be delegated to. Said by the row that tells the agent
+    /// a catalog exists; how a delegation names one is each tool's own
+    /// description.
+    Models,
+}
+
+/// A description computed when it is asked for, from the asking agent's
+/// context. `None` when the row has nothing to say about this particular asker.
+pub type LiveDescription = Arc<dyn Fn(&Context) -> Option<String> + Send + Sync>;
+
+enum Said {
+    Fixed(String),
+    Live(LiveDescription),
+}
+
+struct Description {
+    id: String,
+    aspect: Aspect,
+    rank: i32,
+    said: Said,
+}
+
+/// What each row says about itself, answered on request.
+///
+/// One registry for every domain, not one per domain. A row that keeps
+/// sessions, picks the model or holds memory describes its part here — as
+/// fixed text when the answer is settled at mount, or as a closure when it
+/// depends on who asks and when (this session's file, the model after a
+/// `/model`). `describe_self` renders; it knows no domain, so it cannot answer
+/// for a row that is not mounted or miss one that is.
+///
+/// Not a [`PromptRegistry`], on purpose: a description may be computed per
+/// session, and the system prompt must never be. Keeping the two types apart
+/// is what makes a per-session value in the prompt impossible rather than
+/// merely discouraged.
+#[derive(Default)]
+pub struct Descriptions {
+    entries: RwLock<Vec<Description>>,
+}
+
+impl Descriptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn insert(&self, id: String, aspect: Aspect, rank: i32, said: Said) {
+        let mut entries = self.entries.write().expect("descriptions poisoned");
+        entries.retain(|e| e.id != id);
+        entries.push(Description {
+            id,
+            aspect,
+            rank,
+            said,
+        });
+        entries.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.id.cmp(&b.id)));
+    }
+
+    pub fn contribute(
+        &self,
+        aspect: Aspect,
+        id: impl Into<String>,
+        rank: i32,
+        text: impl Into<String>,
+    ) {
+        self.insert(id.into(), aspect, rank, Said::Fixed(text.into()));
+    }
+
+    pub fn contribute_live(
+        &self,
+        aspect: Aspect,
+        id: impl Into<String>,
+        rank: i32,
+        describe: LiveDescription,
+    ) {
+        self.insert(id.into(), aspect, rank, Said::Live(describe));
+    }
+
+    pub fn remove(&self, id: &str) {
+        self.entries
+            .write()
+            .expect("descriptions poisoned")
+            .retain(|e| e.id != id);
+    }
+
+    /// Everything said under `aspect`, for the agent whose context is `asking`.
+    pub fn render(&self, aspect: Aspect, asking: &Context) -> Vec<String> {
+        // Taken out of the lock first: a live description reads live state, and
+        // must not do it while holding what a row unloading right now needs.
+        let said: Vec<Result<String, LiveDescription>> = self
+            .entries
+            .read()
+            .expect("descriptions poisoned")
+            .iter()
+            .filter(|e| e.aspect == aspect)
+            .map(|e| match &e.said {
+                Said::Fixed(text) => Ok(text.clone()),
+                Said::Live(describe) => Err(describe.clone()),
+            })
+            .collect();
+        said.into_iter()
+            .filter_map(|s| match s {
+                Ok(text) => Some(text),
+                Err(describe) => describe(asking),
+            })
+            .collect()
+    }
+
+    pub fn ids(&self) -> Vec<String> {
+        self.entries
+            .read()
+            .expect("descriptions poisoned")
+            .iter()
+            .map(|e| e.id.clone())
             .collect()
     }
 }

@@ -231,12 +231,40 @@ struct WebRow {
     provider: Option<String>,
 }
 
-pub struct WebPlugin;
+/// `tool-web`, and `tool-web-keyed` when a host has an Exa key to give it.
+///
+/// The key is a field of the plugin instance, never row config: a config tree is
+/// data that gets printed (`--dump-config` renders every row's config verbatim),
+/// and a credential in it is a credential on somebody's screen. A host that holds
+/// a key registers [`WebPlugin::with_api_key`] and swaps the row onto it; the
+/// row keeps its id, so a `provider` patch still lands.
+pub struct WebPlugin {
+    api_key: Option<String>,
+}
+
+impl WebPlugin {
+    /// The catalog's `tool-web`: the key, if any, comes from `EXA_API_KEY`.
+    pub const fn new() -> Self {
+        Self { api_key: None }
+    }
+
+    /// `tool-web-keyed`: a key the host read from somewhere a row cannot see.
+    /// `EXA_API_KEY` still wins when it is set.
+    pub fn with_api_key(api_key: String) -> Self {
+        Self {
+            api_key: Some(api_key),
+        }
+    }
+}
 
 #[async_trait]
 impl Plugin for WebPlugin {
     fn name(&self) -> &'static str {
-        "tool-web"
+        if self.api_key.is_some() {
+            "tool-web-keyed"
+        } else {
+            "tool-web"
+        }
     }
     fn inject(&self) -> &'static [&'static str] {
         &["tools"]
@@ -261,8 +289,8 @@ impl Plugin for WebPlugin {
             .filter(|p| !p.trim().is_empty())
             .or_else(crate::model_source::web_search_provider);
         let search = match &provider {
-            Some(name) => WebSearchTool::with_provider(name),
-            None => WebSearchTool::new(),
+            Some(name) => WebSearchTool::with_provider_and_key(name, self.api_key.clone()),
+            None => WebSearchTool::with_provider_and_key("exa", self.api_key.clone()),
         };
         mount(
             ctx,
@@ -281,11 +309,12 @@ impl Plugin for WebPlugin {
             61,
             format!(
                 "WEB — `web_search` and `web_fetch` reach the public internet. The search \
-                 backend is {backend}; set it with this row's `provider` config or the \
-                 `ATOMCODE_WEB_SEARCH_PROVIDER` environment variable, and an unknown name \
-                 falls back to the default rather than failing. When the process is in \
-                 offline mode this row mounts nothing at all, so neither tool appears in \
-                 the catalog.",
+                 backend is {backend}; when nothing configured this \
+                 row, the `ATOMCODE_WEB_SEARCH_PROVIDER` environment variable picks it, and \
+                 an unknown name falls back to the default rather than failing. An Exa key \
+                 comes from `EXA_API_KEY`, else from the host, else Exa runs keyless. \
+                 When the process is in offline mode this row mounts nothing at all, so \
+                 neither tool appears in the catalog.",
                 backend = provider.as_deref().unwrap_or("the default"),
             ),
         );

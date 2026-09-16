@@ -232,6 +232,14 @@ impl LlmProvider for RecordingProvider {
                     .to_string(),
                 })
             }
+            // What the agent is told about itself, the way the model asks for it.
+            Some(m) if m.role == Role::User && m.text.starts_with("describe ") => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "describe_self".into(),
+                    arguments: serde_json::json!({ "aspect": &m.text[9..] }).to_string(),
+                })
+            }
             Some(m) if m.role == Role::User && m.text == "tick" => {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
@@ -2504,6 +2512,282 @@ async fn the_session_transcript_has_one_writer() {
     }
 }
 
+/// The last tool result the model was shown.
+///
+/// Searched back through every request, not just the last: a runtime that names
+/// its session sends that side request after the turn, and it carries no tools.
+fn last_tool_result(recorder: &Recorder) -> String {
+    recorder
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|request| {
+            request
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::Tool)
+                .map(|m| m.text.clone())
+        })
+        .expect("the turn ran a tool and showed the model its result")
+}
+
+/// What the agent is told about its session is what this runtime does with it.
+///
+/// The judge is the store itself — the snapshot path `SessionManager` resumes
+/// from — not the wording. Before, the only session description in this
+/// assembly was the harness journal's, so an agent asked "where is this
+/// conversation kept" named a file nothing reads back, and asked "how do I
+/// resume" taught a `resume = true` patch nothing applies.
+async fn the_agent_is_told_where_its_session_really_is() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+    turn(&mut runtime, "describe session").await;
+    let session = last_tool_result(&recorder);
+    turn(&mut runtime, "describe operations").await;
+    let operations = last_tool_result(&recorder);
+    runtime.handle.shutdown().await.unwrap();
+
+    let store = SessionManager::for_project(env.project.path());
+    let snapshot = store.snapshot_path(&id).unwrap();
+    assert!(session.contains(&id), "{session}");
+    assert!(
+        session.contains(&format!("kept in: {}", snapshot.display())),
+        "the session must be placed where a resume reads it from:\n{session}"
+    );
+    assert!(
+        session
+            .lines()
+            .filter(|line| line.starts_with("kept in:"))
+            .all(|line| !line.contains("harness")),
+        "the journal is not where the session is kept:\n{session}"
+    );
+    assert!(
+        operations.contains(&store.root().display().to_string()),
+        "{operations}"
+    );
+    assert!(
+        operations.contains("rebuilds it from that file and from nothing else"),
+        "what a resume reads is the store's to say:\n{operations}"
+    );
+    // The product's contract for continuing a session, which every front end
+    // that replaces a current one keeps.
+    for how in ["/resume", "--resume", "--continue"] {
+        assert!(
+            operations.contains(how),
+            "`{how}` is how a person continues a session here:\n{operations}"
+        );
+    }
+    for taught in [
+        "resume = true",
+        "SESSION IDENTITY",
+        "stored events are the snapshot",
+        "the log IS the snapshot",
+        "[[patch]]",
+        "harness.patch.toml",
+    ] {
+        assert!(
+            !session.contains(taught) && !operations.contains(taught),
+            "`{taught}` describes a mechanism this runtime does not use:\n{session}\n\n{operations}"
+        );
+    }
+
+    // A runtime that keeps no session says so, rather than naming a store.
+    let recorder = Arc::new(Recorder::default());
+    let mut sessionless =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Disabled))
+            .await
+            .unwrap();
+    turn(&mut sessionless, "describe session").await;
+    let said = last_tool_result(&recorder);
+    sessionless.handle.shutdown().await.unwrap();
+    assert!(said.contains("cannot be resumed"), "{said}");
+    assert!(!said.contains(".snapshot"), "{said}");
+}
+
+/// A capability the runtime mounts in place of a harness row still describes
+/// itself — as this runtime does it.
+///
+/// The skill catalog and MCP are each a harness row that this runtime displaces
+/// with its own. The harness rows describe how a person adds to them; the
+/// replacements said nothing, so the agent had no SKILLS or MCP entry at all,
+/// and the harness versions it might have learned from describe row configs
+/// this runtime never reads. (A tool's own description already reaches the
+/// model on every request, so a tool needs no entry here.)
+#[cfg(unix)]
+async fn a_capability_the_runtime_mounts_itself_still_describes_itself() {
+    let env = env();
+    let skills = tempfile::tempdir().unwrap();
+    write_skill(skills.path(), "demo-skill", "does demo things");
+    let plugin = tempfile::tempdir().unwrap();
+    write_skill(plugin.path(), "plug", "a plugin's skill");
+    let scratch = tempfile::tempdir().unwrap();
+    let script = write_mcp_server(scratch.path(), &scratch.path().join("spawns.log"));
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.prepare.skill_dirs = Some(vec![skills.path().to_path_buf()]);
+    start.prepare.plugin_skill_dirs = vec![(plugin.path().to_path_buf(), "myplugin".into())];
+    start.prepare.mcp = true;
+    start.prepare.extra_mcp_servers = vec![atomcode_capabilities::mcp::McpServerConfig {
+        name: "t".into(),
+        disabled: false,
+        config: atomcode_capabilities::mcp::McpTransportConfig::Stdio {
+            command: "sh".into(),
+            args: vec![script.to_string_lossy().into_owned()],
+            env: Default::default(),
+            timeout_ms: Some(10_000),
+        },
+        source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
+        trust: true,
+        auto_approve: Vec::new(),
+    }];
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    turn(&mut runtime, "describe operations").await;
+    let operations = last_tool_result(&recorder);
+    runtime.handle.shutdown().await.unwrap();
+
+    assert!(operations.contains("SKILLS — 2 loaded"), "{operations}");
+    assert!(
+        operations.contains(&skills.path().display().to_string()),
+        "the directories named are the ones this runtime scanned:\n{operations}"
+    );
+    assert!(operations.contains("myplugin"), "{operations}");
+    assert!(operations.contains("MCP —"), "{operations}");
+    assert!(operations.contains(".mcp.json"), "{operations}");
+    // Enough to add a server for the person, not just to know servers exist.
+    assert!(operations.contains("\"mcpServers\""), "{operations}");
+    assert!(operations.contains("atomcode mcp add"), "{operations}");
+    assert!(operations.contains("/mcp trust"), "{operations}");
+    // And a skill: the file it is and what starts it.
+    assert!(operations.contains("SKILL.md"), "{operations}");
+    assert!(operations.contains("description:"), "{operations}");
+    assert!(
+        !operations.contains("To add a skill for the person"),
+        "the driver named its own directories, so where a new skill belongs is not \
+         this runtime's to say:\n{operations}"
+    );
+    for harness_only in ["`mcp` row's config", "row's `dirs` config"] {
+        assert!(
+            !operations.contains(harness_only),
+            "`{harness_only}` is a knob this runtime does not read:\n{operations}"
+        );
+    }
+
+    // With the standard directories, the agent is told where a new skill goes —
+    // the two directories that win a clash at their level.
+    let recorder = Arc::new(Recorder::default());
+    let mut standard_start = self::start(env.project.path(), &recorder, SessionMode::Disabled);
+    standard_start.prepare.skill_dirs = None;
+    let mut runtime = CodingRuntime::start(standard_start).await.unwrap();
+    turn(&mut runtime, "describe operations").await;
+    let standard = last_tool_result(&recorder);
+    runtime.handle.shutdown().await.unwrap();
+    let home = std::path::PathBuf::from(std::env::var_os("ATOMCODE_HOME").unwrap());
+    for place in [
+        env.project.path().join(".atomcode/skills"),
+        home.join("skills"),
+    ] {
+        assert!(
+            standard.contains(&format!("`{}`", place.display())),
+            "`{}` is where a new skill goes:\n{standard}",
+            place.display()
+        );
+    }
+}
+
+/// A runtime configured from `config.toml` describes that file — and a key in it
+/// actually reaches what it configures.
+///
+/// Built the way the CLI and the daemon build one, through
+/// `CodingRuntimeConfig::from_config`. `[web_search] provider` is the judge for
+/// "reaches": it was parsed and then read by nobody, so a person who set it got
+/// the default backend while the agent could have told them it was set.
+async fn a_runtime_configured_from_a_file_describes_the_file() {
+    let env = env();
+    std::env::remove_var("ATOMCODE_WEB_SEARCH_PROVIDER");
+    let mut file = atomcode_config::config::Config::default();
+    file.web_search.provider = "duckduckgo".into();
+    let from_file = atomcode_coding::CodingRuntimeConfig::from_config(
+        &file,
+        env.project.path(),
+        None,
+        None,
+        false,
+        true,
+    )
+    .agent_config();
+
+    let recorder = Arc::new(Recorder::default());
+    let mut configured = start(env.project.path(), &recorder, SessionMode::Disabled);
+    configured.agent = from_file;
+    configured.prepare.web = true;
+    let mut runtime = CodingRuntime::start(configured).await.unwrap();
+    turn(&mut runtime, "describe operations").await;
+    let operations = last_tool_result(&recorder);
+    turn(&mut runtime, "describe settings").await;
+    let settings = last_tool_result(&recorder);
+    runtime.handle.shutdown().await.unwrap();
+
+    assert!(
+        operations.contains("backend is duckduckgo"),
+        "`[web_search] provider` must reach the search tool:\n{operations}"
+    );
+    assert!(operations.contains("CONFIG FILE"), "{operations}");
+    // This product's `team` takes no `model`; nothing may say it does.
+    assert!(operations.contains("MODEL —"), "{operations}");
+    assert!(
+        !operations.contains("`team` each take") && !operations.contains("`team` both take"),
+        "a tool spoken for:\n{operations}"
+    );
+    for section in [
+        "[permissions]",
+        "[subagent]",
+        "[web_search]",
+        "default_model",
+    ] {
+        assert!(
+            operations.contains(section),
+            "`{section}` is read by this runtime:\n{operations}"
+        );
+    }
+    // The catalog is the judge, not a list this test keeps.
+    assert!(
+        settings.contains(&format!(
+            "{} of them are safely editable",
+            atomcode_config::settings::SETTINGS.len()
+        )),
+        "{settings}"
+    );
+    for spec in atomcode_config::settings::SETTINGS {
+        assert!(settings.contains(spec.id), "setting {} is missing", spec.id);
+    }
+    assert!(settings.contains("中文"), "aliases carry: {settings}");
+    assert!(settings.contains("deliberately absent"), "{settings}");
+
+    // No file configured this one, so nothing may send the agent to edit one.
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Disabled))
+            .await
+            .unwrap();
+    turn(&mut runtime, "describe settings").await;
+    let unconfigured = last_tool_result(&recorder);
+    turn(&mut runtime, "describe operations").await;
+    let unconfigured_ops = last_tool_result(&recorder);
+    runtime.handle.shutdown().await.unwrap();
+    assert!(!unconfigured.contains("config.toml"), "{unconfigured}");
+    assert!(
+        !unconfigured_ops.contains("CONFIG FILE"),
+        "{unconfigured_ops}"
+    );
+}
+
 // ---- what the model is offered ---------------------------------------------
 
 /// The start a production driver makes: every capability the chain turns on
@@ -2661,5 +2945,8 @@ mod criteria {
         the_prompt_teaches_each_product_tool_once,
         a_picture_read_reaches_a_model_that_can_see_it,
         every_model_round_is_reported_even_without_usage,
+        the_agent_is_told_where_its_session_really_is,
+        a_capability_the_runtime_mounts_itself_still_describes_itself,
+        a_runtime_configured_from_a_file_describes_the_file,
     );
 }

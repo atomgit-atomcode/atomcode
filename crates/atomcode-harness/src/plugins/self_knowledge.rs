@@ -31,7 +31,7 @@ use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
 use atomcode_plexus::{Context, Plugin};
 use serde_json::{json, Value};
 
-use crate::seams::{OperationsSvc, SessionPersistenceSvc, SessionSvc, ToolsSvc};
+use crate::seams::{Aspect, OperationsSvc, ToolsSvc};
 
 /// Describe a knob this row owns, and take the description away with the row.
 ///
@@ -44,7 +44,29 @@ pub fn describes(ctx: &Context, topic: &str, rank: i32, text: impl Into<String>)
     let Some(ops) = ctx.service::<OperationsSvc>() else {
         return;
     };
-    ops.contribute(topic, rank, text.into());
+    ops.contribute(Aspect::Operations, topic, rank, text.into());
+    let topic = topic.to_string();
+    let ops = ops.clone();
+    let _ = ctx.effect(move || ops.remove(&topic));
+}
+
+/// As [`describes`], for an answer that depends on who asks and when.
+///
+/// `describe` runs on every `describe_self` call with the asking agent's
+/// context — reach its session with [`OnlySession`](crate::agent::OnlySession).
+/// Use it for what a row can only say at call time: which file THIS session is
+/// in, what a model switch changed. Taken away with the row, like the rest.
+pub fn describes_live(
+    ctx: &Context,
+    aspect: Aspect,
+    topic: &str,
+    rank: i32,
+    describe: impl Fn(&Context) -> Option<String> + Send + Sync + 'static,
+) {
+    let Some(ops) = ctx.service::<OperationsSvc>() else {
+        return;
+    };
+    ops.contribute_live(aspect, topic, rank, Arc::new(describe));
     let topic = topic.to_string();
     let ops = ops.clone();
     let _ = ctx.effect(move || ops.remove(&topic));
@@ -59,48 +81,50 @@ struct Introspect {
 }
 
 impl Introspect {
+    /// The asking agent's context: inside a turn, the agent whose turn it is;
+    /// outside one — a driver asking on its own — the tree's.
+    fn asking(&self) -> Context {
+        crate::agent::scoped(&self.ctx)
+    }
+
+    /// What the rows say under `aspect`, for whoever is asking.
+    fn told(&self, aspect: Aspect) -> Vec<String> {
+        self.ctx
+            .service::<OperationsSvc>()
+            .map(|ops| ops.render(aspect, &self.asking()))
+            .unwrap_or_default()
+    }
+
     fn session(&self) -> String {
-        // Inside a turn, the agent whose turn it is; outside one — a driver
-        // asking on its own — the only agent there is.
-        let Some(log) = crate::agent::scoped(&self.ctx)
-            .service::<SessionSvc>()
-            .or_else(|| {
-                use crate::agent::OnlySession;
-                self.ctx.only_session()
-            })
-        else {
-            return "session: no session log is mounted in this tree.".into();
+        use crate::agent::OnlySession;
+        // Only what the agent's own log is the authority for. Where the session
+        // is kept, when it began and how it is continued belong to whichever
+        // rows keep and continue it — this row cannot know which those are, and
+        // the version that guessed (the persistence slot's file is the store; no
+        // store means memory only) was wrong in the first assembly that kept its
+        // sessions anywhere else.
+        let mut lines = match self.asking().only_session() {
+            Some(log) => {
+                let mut lines = vec![format!("session id: {}", log.id())];
+                if let Some(title) = log.title() {
+                    lines.push(format!("title: {title}"));
+                }
+                lines.push(format!("turn: {}", log.current_turn()));
+                lines.push(format!("events logged so far: {}", log.len()));
+                lines
+            }
+            None => vec!["session: no agent session is visible from here.".to_string()],
         };
-        let id = log.id().to_string();
-        let where_ = self
-            .ctx
-            .service::<SessionPersistenceSvc>()
-            .and_then(|store| store.location(&id))
-            .unwrap_or_else(|| {
-                "nowhere — no session-persistence row is mounted, so this \
-                 session is in memory only and ends when the process does"
-                    .into()
-            });
-        let header = log.header();
-        let mut lines = vec![
-            format!("session id: {id}"),
-            format!("created at: {} (unix ms)", header.created_at),
-        ];
-        if let Some(cwd) = &header.cwd {
-            lines.push(format!("working directory: {cwd}"));
+        let told = self.told(Aspect::Session);
+        if told.is_empty() {
+            lines.push(
+                "where it is kept: no mounted row says — which is not a statement \
+                 that it is unsaved. Do not tell the person it is saved, or that it \
+                 is not, on the strength of this."
+                    .into(),
+            );
         }
-        if let Some(parent) = &header.parent {
-            lines.push(format!(
-                "forked from: {parent} (the first {} events are inherited)",
-                header.inherited
-            ));
-        }
-        if let Some(title) = log.title() {
-            lines.push(format!("title: {title}"));
-        }
-        lines.push(format!("turn: {}", log.current_turn()));
-        lines.push(format!("events logged so far: {}", log.len()));
-        lines.push(format!("event log: {where_}"));
+        lines.extend(told);
         lines.join("\n")
     }
 
@@ -122,129 +146,46 @@ impl Introspect {
     }
 
     fn operations(&self) -> String {
-        match self.ctx.service::<OperationsSvc>() {
-            Some(ops) if !ops.ids().is_empty() => format!(
-                "How to work this system. Each entry was written by the row that \
-                 implements it, so nothing here describes a capability that is \
-                 not mounted.\n\n{}",
-                ops.render()
-            ),
-            _ => "No row has described a knob in this tree.".into(),
+        let told = self.told(Aspect::Operations);
+        if told.is_empty() {
+            return "No row has described a knob in this tree.".into();
         }
-    }
-
-    /// What can be delegated to, read at the moment of asking.
-    ///
-    /// Never cached and never counted anywhere else: a login, a `/model` or an
-    /// edited config changes this list mid-session. That is also why the system
-    /// prompt says nothing countable about it — a fragment that moved with the
-    /// catalog would invalidate the cached prefix every time the catalog did.
-    fn models(&self) -> String {
-        let Some(models) = self.ctx.service::<crate::seams::ModelsSvc>() else {
-            return "This tree has no model catalog: `task` and `team` run on the \
-                    conversation's own model, and a `model` argument is refused."
-                .into();
-        };
-        let current = models.current();
-        let offered = crate::seams::delegatable(models.as_ref());
-        if offered.is_empty() {
-            return "This tree has a catalog but nothing in it to delegate to — not even \
-                    this conversation's own model, which means the catalog does not \
-                    contain it. `task` and `team` run here regardless; they simply take \
-                    no `model`."
-                .into();
-        }
-        let ranked = offered.iter().any(|m| m.capable_rank.is_some());
-        let rows = offered
-            .iter()
-            .map(|m| {
-                format!(
-                    "  {id}{here} — {name}, ctx {ctx}{vision}{effort}{note}",
-                    id = m.id,
-                    here = if current.as_deref() == Some(m.id.as_str()) {
-                        " (this conversation)"
-                    } else {
-                        ""
-                    },
-                    name = m.display_name,
-                    ctx = m.context_window,
-                    vision = if m.supports_vision { ", vision" } else { "" },
-                    effort = if m.effort_levels.is_empty() {
-                        String::new()
-                    } else {
-                        format!(", effort {}", m.effort_levels.join("/"))
-                    },
-                    note = match &m.note {
-                        Some(note) => format!("\n      {note}"),
-                        None => String::new(),
-                    },
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
         format!(
-            "Models `task` and `team` may be delegated to. Pass one of these ids as \
-             `model`; omit it to keep the conversation's own model.\n\n\
-             {rows}\n\n\
-             {why}\n\n\
-             Models billed to another account are never here. That is a decision \
-             about credentials and vendors rather than cost, so a cheaper model \
-             on another account is still absent — and it is the person's to make: \
-             they can point a team role or a row's config at one, and you cannot.",
-            why = if ranked {
-                "Ordered weakest first where the deployment says so. Anything more capable \
-             than this conversation is deliberately absent: choosing to spend more is \
-             the person's decision, made when they picked this model."
-            } else {
-                "This deployment has not said which of these is more capable, so they are \
-             not ordered and none is known to be cheaper. Pick on the facts above — \
-             context window, vision, and whatever note the deployment wrote — not on \
-             the name."
-            }
+            "How to work this system. Each entry was written by the row that \
+             implements it, so nothing here describes a capability that is \
+             not mounted.\n\n{}",
+            told.join("\n\n")
         )
     }
 
-    fn settings(&self) -> String {
-        // Rendered from the same catalog the config system edits through, so a
-        // setting that is added, renamed or retired changes this answer without
-        // anyone remembering to.
-        let mut out = format!(
-            "User settings live in `{}`. {} of them are safely editable; each \
-             line is `id — label (aliases) : accepted values → when it takes \
-             effect`.\n\nNote what is deliberately absent: model, provider, \
-             account, endpoint and credentials are NOT in this catalog. Those \
-             are picked per row in the running tree — see the `operations` \
-             aspect for how this tree gets its model.\n",
-            atomcode_config::Config::default_path().display(),
-            atomcode_config::settings::SETTINGS.len(),
-        );
-        for spec in atomcode_config::settings::SETTINGS {
-            let values = match spec.kind {
-                atomcode_config::settings::SettingKind::Boolean => "true | false".to_string(),
-                atomcode_config::settings::SettingKind::OptionalBoolean => {
-                    "true | false | unset".to_string()
-                }
-                atomcode_config::settings::SettingKind::Integer { min, max } => {
-                    format!("{min}..={max}")
-                }
-                atomcode_config::settings::SettingKind::Choice(options) => options.join(" | "),
-                atomcode_config::settings::SettingKind::Text => "text".to_string(),
-            };
-            out.push_str(&format!(
-                "\n  {} — {} / {}{} : {} → {:?}",
-                spec.id,
-                spec.label_en,
-                spec.label_zh,
-                if spec.aliases.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", spec.aliases.join(", "))
-                },
-                values,
-                spec.apply,
-            ));
+    /// What can be delegated to, as the row that surfaces the catalog says.
+    ///
+    /// This used to render the catalog here and say `task` and `team` take its
+    /// ids — true of the harness's two delegation rows, false of an assembly
+    /// that mounts its own `team` with no `model` at all. Which tools take an id
+    /// is in their descriptions; the list is the catalog row's.
+    fn models(&self) -> String {
+        let told = self.told(Aspect::Models);
+        if told.is_empty() {
+            return "No mounted row describes models to delegate to, so work that is \
+                    delegated runs on this conversation's model unless a tool's own \
+                    description says otherwise."
+                .into();
         }
-        out
+        told.join("\n\n")
+    }
+
+    /// The settings file, as described by whatever read one to configure this
+    /// tree. The catalog used to be rendered here, which told every tree —
+    /// including ones no settings file ever configured — to edit `config.toml`.
+    fn settings(&self) -> String {
+        let told = self.told(Aspect::Settings);
+        if told.is_empty() {
+            return "No mounted row says this tree was configured from a settings file, \
+                    so there is none to point the person at."
+                .into();
+        }
+        told.join("\n\n")
     }
 
     fn tools(&self) -> String {
@@ -284,14 +225,16 @@ impl Tool for DescribeSelf {
 
     fn description(&self) -> &str {
         "Report how this agent is actually assembled and how to work it: the \
-         session id and where its event log is written, which service slots are \
-         filled, which tools are registered, how to change things (model, \
-         memory, plugins, layout — `aspect: operations`), and the user-settings \
-         catalog including language (`aspect: settings`). Read this instead of \
-         guessing or searching the repository whenever you are asked what you \
-         are, what you can do, how to change something, or where your own state \
-         is kept — every answer is generated from the running system, so none of \
-         it can be out of date."
+         session id and what the rows that keep this session say about it (where \
+         it is stored, how it is continued), which service slots are filled, which tools are registered, \
+         how to change things and add capabilities — model, memory, skills, MCP \
+         servers, plugins, layout — with the files and commands involved \
+         (`aspect: operations`), and the user-settings catalog including language \
+         (`aspect: settings`). Read this instead of guessing or searching the \
+         repository whenever you are asked what you are, what you can do, how to \
+         change or extend something, or where your own state is kept — and before \
+         helping someone install a skill or an MCP server. Every answer is \
+         generated from the running system, so none of it can be out of date."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -301,7 +244,7 @@ impl Tool for DescribeSelf {
                 "aspect": {
                     "type": "string",
                     "enum": ["session", "services", "tools", "models", "operations", "settings", "all"],
-                    "description": "session = which session this is and where its log is; services = what is mounted; tools = the live catalog; models = what `task` and `team` may be delegated to, read live; operations = how to change things (model, memory, plugins, layout); settings = the user-settings catalog including language. Defaults to everything but settings."
+                    "description": "session = which session this is, and what the rows that keep it say about where and how; services = what is mounted; tools = the live catalog; models = what `task` and `team` may be delegated to, read live; operations = how to change things and add capabilities (model, memory, skills, MCP servers, plugins, layout); settings = the user-settings catalog including language. Defaults to everything but settings."
                 }
             }
         })
@@ -368,7 +311,7 @@ impl Plugin for SelfKnowledgePlugin {
         // plain statement of absence, so none of it is a hard dependency. That
         // is what lets this row mount in an eval tree with no catalog and no
         // store and still be correct about having neither.
-        &["tools", "session-persistence", "operations"]
+        &["tools", "operations"]
     }
     fn description(&self) -> &'static str {
         "tell the model what it is assembled from, from the live tree"
@@ -399,11 +342,12 @@ is no fixed feature set — only the rows the running tree happens to have \
 mounted, which is why you cannot know what you are made of from anything you \
 were trained on.
 
-When you are asked what you are made of, what you can do, how to change \
-something about yourself — the model, memory, plugins, the layout, the \
-language, where a file lives — which session this is, or where your own state \
-is kept, call `describe_self` rather than guessing or searching the repository \
-for clues. Reading the source of a build is not the \
+When you are asked what you are made of, what you can do, how to change or \
+extend something about yourself — the model, memory, skills, MCP servers, \
+plugins, the layout, the language, where a file lives — which session this is, \
+or where your own state is kept, call `describe_self` rather than guessing or \
+searching the repository for clues; do the same before helping someone install \
+a skill or an MCP server. Reading the source of a build is not the \
 same as reading the tree that is running, and only the tool reports the tree \
 that is running.";
 
@@ -415,19 +359,18 @@ that is running.";
             ctx,
             "composition",
             1,
+            // Only what holds for every tree. Whether the person can change the
+            // rows, and with what, is the launcher's to say — this row used to
+            // teach `[[patch]]` files in an assembly that never reads one.
             "HOW THIS SYSTEM IS PUT TOGETHER. Every capability is a *row* in a \
              config tree — model adapter, each tool group, memory, recall, \
              approval policy, the UI. A row names a plugin from the build's \
-             catalog; the tree says which rows run and in what order.\n\
-             To add one: `[[insert]] name = \"<plugin>\"` (optionally with \
-             `config = {…}`). To retune one: `[[patch]] id = \"<row>\" \
-             config = {…}` — note this REPLACES that row's config rather than \
-             merging into it. To drop one: `[[remove]] id = \"<row>\"`, or \
-             `[[patch]] … disabled = true`.\n\
-             Third-party tools arrive as MCP servers rather than as compiled \
-             plugins — see the `mcp` entry if that row is mounted. Call \
-             `describe_self` with `aspect: services` for what is mounted right \
-             now.",
+             catalog; the tree says which rows run. Whether and how the rows \
+             can be changed is up to what launched this tree: if it says, its \
+             entry is here too; if nothing here says, do not tell the person \
+             they can.\n\
+             Call `describe_self` with `aspect: services` for what is mounted \
+             right now.",
         );
 
         // The tool half is optional so this row can mount in a tree with no

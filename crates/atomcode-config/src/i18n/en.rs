@@ -1030,7 +1030,7 @@ Msg::CmdDescInit => "Analyze the project and generate AGENTS.md".into(),
 Msg::CmdDescBg => "Background sessions: /bg, /bg list, /bg <N>, /bg drop <N>".into(),
 Msg::CmdDescBackground => "Run a one-shot task in an isolated background context (read-only-ish tool subset)".into(),
         Msg::CmdDescDiff => "Show git diff".into(),
-        Msg::CmdDescClear => "Clear screen".into(),
+        Msg::CmdDescClear => "Start a new conversation (clears context + screen)".into(),
         Msg::CmdDescSession => "Start a new session (clears conversation)".into(),
         Msg::CmdDescCost => "Show session token usage".into(),
         Msg::CmdDescUsage => "Show CodingPlan usage (tabs: current / overview / models)".into(),
@@ -1040,7 +1040,7 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
         Msg::CmdDescRemember => "Save a fact to memory (/remember --global for global)".into(),
         Msg::CmdDescForget => "Remove matching memories".into(),
         Msg::CmdDescMemory => "Show all saved memories".into(),
-        Msg::CmdDescMcp => "Show MCP server status (subcommand: reload)".into(),
+        Msg::CmdDescMcp => "Show MCP server status (subcommands: reload, tools, login, logout, trust, untrust)".into(),
         Msg::CmdDescUndo => "Undo: roll conversation memory back a turn (/undo or /undo N)".into(),
         Msg::CmdDescRewind => "Rewind: restore the conversation to an earlier checkpoint".into(),
         Msg::CmdDescWorktree => "Git worktree isolation (create/list/done/cleanup)".into(),
@@ -1240,10 +1240,12 @@ Msg::CmdDescBackground => "Run a one-shot task in an isolated background context
              \u{20}\u{20}/goal clear           stop the active goal (aliases: stop, off, reset, none, cancel)\n  \
              \u{20}\u{20}/goal help            this help\n  \
              Notes:\n  \
-             \u{20}\u{20}- A fast model evaluates each round; configure via [providers] +\n  \
-             \u{20}\u{20}\u{20}\u{20}evaluator_provider in ~/.atomcode/config.toml.\n  \
-             \u{20}\u{20}- No built-in round / time cap — express budgets in the condition\n  \
-             \u{20}\u{20}\u{20}\u{20}text itself (e.g. \"or stop after 20 turns\"). CC's /goal works the same way.\n  \
+             \u{20}\u{20}- A model evaluates each round; pick it with evaluator_provider (a [models]\n  \
+             \u{20}\u{20}\u{20}\u{20}id or [providers] name) in ~/.atomcode/config.toml.\n  \
+             \u{20}\u{20}- Round cap: 30% of your CodingPlan call limit (at least 50), else 300;\n  \
+             \u{20}\u{20}\u{20}\u{20}ATOMCODE_GOAL_MAX_ROUNDS overrides it. No time cap unless\n  \
+             \u{20}\u{20}\u{20}\u{20}ATOMCODE_GOAL_MAX_DURATION_SECS is set. At a cap the goal pauses —\n  \
+             \u{20}\u{20}\u{20}\u{20}send a message to keep going.\n  \
              \u{20}\u{20}- Esc / Ctrl+C stops the goal at any time.\n".into(),
         Msg::GoalStatus { condition, round, mins, secs } =>
             format!("  ◎ Goal: {}\n  Round: {}\n  Elapsed: {}m {}s\n", condition, round, mins, secs).into(),

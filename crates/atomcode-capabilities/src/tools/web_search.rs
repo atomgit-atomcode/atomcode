@@ -93,6 +93,14 @@ impl WebSearchTool {
             exa_api_key: env_exa_key(),
         }
     }
+    /// As [`Self::with_provider`], with an Exa key from configuration. `EXA_API_KEY`
+    /// still wins when it is set, which is what `[web_search] api_key` documents.
+    pub fn with_provider_and_key(provider: &str, api_key: Option<String>) -> Self {
+        Self {
+            provider: SearchProvider::from_str(provider),
+            exa_api_key: env_exa_key().or(api_key.filter(|key| !key.trim().is_empty())),
+        }
+    }
 }
 
 fn env_exa_key() -> Option<String> {
@@ -505,6 +513,21 @@ fn strip_html_tags(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn a_configured_key_is_used_unless_the_environment_has_one() {
+        std::env::remove_var("EXA_API_KEY");
+        let configured = WebSearchTool::with_provider_and_key("exa", Some("from-config".into()));
+        assert_eq!(configured.exa_api_key.as_deref(), Some("from-config"));
+        let blank = WebSearchTool::with_provider_and_key("exa", Some("  ".into()));
+        assert_eq!(blank.exa_api_key, None, "a blank key is no key");
+
+        std::env::set_var("EXA_API_KEY", "from-env");
+        let env_wins = WebSearchTool::with_provider_and_key("exa", Some("from-config".into()));
+        std::env::remove_var("EXA_API_KEY");
+        assert_eq!(env_wins.exa_api_key.as_deref(), Some("from-env"));
+    }
 
     #[test]
     fn default_is_exa() {

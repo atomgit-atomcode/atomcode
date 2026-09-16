@@ -138,6 +138,15 @@ pub const CODING_DEFAULTS: &str = r#"
 id = "round-cap"
 config = { max_rounds = 0 }
 
+# --- where the event journal goes ------------------------------------------
+# The harness row writes into `<home>/sessions/<bucket>/`, which in this product
+# is the native session store — every reader of native files then trips over
+# journals. This product's own row keeps the same format in the one directory
+# the native catalog passes over. See `session_journal`.
+[[patch]]
+id = "session-persistence-jsonl"
+name = "session-journal"
+
 # --- what the model can do to the repository ------------------------------
 # All routed through the execution world (`fs`/`shell`), so the fence and the
 # approval seam apply to every one of them rather than to whoever remembered.
@@ -661,6 +670,8 @@ struct CredentialShellPatch<'a> {
     policy: &'a str,
 }
 
+/// Never an `api_key`: row config is printable data. The key reaches the row as
+/// a plugin instance instead — see `HostState::web_search_api_key`.
 #[derive(serde::Serialize)]
 struct WebProviderPatch<'a> {
     provider: &'a str,
@@ -1157,8 +1168,9 @@ impl Plugin for InjectProvider {
                 "MODEL — this conversation runs `{model}`. The person switches it with \
                  `/model` (or `--model` at launch); it takes effect on the next turn and \
                  does NOT restart the session or lose the conversation. You cannot switch \
-                 it yourself, and you do not need to in order to use another model: \
-                 `task` and `team` each take a `model` id per delegation. \
+                 it yourself. To run delegated work on another model, a delegation tool \
+                 that takes a `model` id (its description says whether it does) can \
+                 name one; \
                  `describe_self(aspect=\"models\")` lists what is available."
             ),
         );
@@ -1197,6 +1209,7 @@ pub fn plugins() -> Vec<Arc<dyn Plugin>> {
         Arc::new(DatalogPlugin),
         Arc::new(CcHooksPlugin),
         Arc::new(ChatOptionsPlugin),
+        Arc::new(crate::session_journal::SessionJournalPlugin),
     ]
 }
 
@@ -1263,11 +1276,9 @@ pub struct HostState {
     pub session_context: Option<HostContext>,
     /// Tools the runtime built around its own controllers.
     pub tools: Vec<Arc<dyn atomcode_kernel::tool::Tool>>,
-    /// The skill registry the runtime loaded, and its prompt catalog.
-    pub skills: Option<(
-        Arc<atomcode_capabilities::skills::SkillRegistry>,
-        Option<String>,
-    )>,
+    /// The skill registry the runtime loaded, its prompt catalog, and where it
+    /// looked.
+    pub skills: Option<crate::host_rows::LoadedSkills>,
     /// Row edits the runtime's own options call for (a capability switched off,
     /// a directory to resolve against).
     pub rows: Layer,
@@ -1287,6 +1298,11 @@ pub struct HostState {
     pub compaction_checkpoint: Option<Arc<atomcode_capabilities::session::SnapshotHook>>,
     /// Where CodingPlan usage windows come from, when this host has an account.
     pub rate_limit_source: Option<Arc<dyn crate::rate_limit::RateLimitWindowSource>>,
+    /// The settings file this runtime was configured from, when it was.
+    pub config_file: Option<std::path::PathBuf>,
+    /// `[web_search] api_key`. Handed to `tool-web` as a plugin instance, never
+    /// as row config — a config tree is printed verbatim, a credential must not be.
+    pub web_search_api_key: Option<String>,
 }
 
 /// See [`crate::host_rows::SessionContextPlugin`].
@@ -1413,6 +1429,12 @@ pub async fn mount_hosted(
         })
         .when(host.summary_provider.is_some(), |layer| {
             layer.swap("compaction-tail", "compaction-coding")
+        })
+        .when(host.config_file.is_some(), |layer| {
+            layer.insert(Entry::named("config-file"))
+        })
+        .when(host.web_search_api_key.is_some(), |layer| {
+            layer.swap("tool-web", "tool-web-keyed")
         });
     if let Some(datalog) = host.datalog.as_ref() {
         hosted = hosted
@@ -1474,11 +1496,16 @@ pub async fn mount_hosted(
     if let Some(publication) = host.mcp {
         registry.register(Arc::new(crate::host_rows::McpHostPlugin::new(publication)));
     }
-    if let Some((skill_registry, catalog)) = host.skills {
-        registry.register(Arc::new(crate::host_rows::SkillsHostPlugin {
-            registry: skill_registry,
-            catalog,
-        }));
+    if let Some(skills) = host.skills {
+        registry.register(Arc::new(crate::host_rows::SkillsHostPlugin(skills)));
+    }
+    if let Some(file) = host.config_file {
+        registry.register(Arc::new(crate::host_rows::ConfigFilePlugin(file)));
+    }
+    if let Some(key) = host.web_search_api_key {
+        registry.register(Arc::new(
+            atomcode_harness::plugins::capabilities::WebPlugin::with_api_key(key),
+        ));
     }
     if !host.tools.is_empty() {
         registry.register(Arc::new(crate::host_rows::HostToolsPlugin(host.tools)));

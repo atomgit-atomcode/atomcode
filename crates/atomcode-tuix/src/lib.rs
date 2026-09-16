@@ -678,9 +678,9 @@ pub async fn run(
 
     let capability_scan_start = std::time::Instant::now();
     let custom_commands = crate::custom_commands::CustomCommandRegistry::load(&working_dir);
-    // Same Arc the agent loop holds — reload() calls there propagate
-    // here automatically, so the slash menu reflects newly-installed
-    // skills without re-plumbing.
+    // The TUI's own registry for the slash menu — NOT the runtime's, which loads
+    // its own in `prepare`. `/plugin reload` reloads both (this one directly, the
+    // runtime's through a capability rebuild).
     let foreground_runtime_id = event_loop::bg_runtime::RuntimeId::new(1);
     let skill_registry = std::sync::Arc::new(std::sync::RwLock::new(
         atomcode_capabilities::skills::SkillRegistry::new(),

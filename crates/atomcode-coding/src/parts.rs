@@ -372,14 +372,16 @@ pub struct CodingParts {
     extra_tools: Vec<Arc<dyn atomcode_kernel::tool::Tool>>,
     host_only_tools: Vec<String>,
     /// The skill catalog prepare loaded, and its prompt rendering (prioritizing
-    /// skills the project's instructions name). `None` without tools.
-    skill_registry: Option<(Arc<SkillRegistry>, Option<String>)>,
+    /// skills the project's instructions name), and where it looked. `None`
+    /// without tools.
+    skill_registry: Option<crate::host_rows::LoadedSkills>,
     snapshot_persistence_status: Option<SnapshotPersistenceStatus>,
     pub session: Option<SessionBinding>,
     /// Runtime-owned resume for sessionless drivers during an in-process reassembly.
     /// Persistent sessions reload their canonical snapshot through `SessionBinding` instead.
     runtime_resume: Option<SessionSnapshot>,
-    /// Connected MCP servers (None when `opts.mcp` was false or no config exists).
+    /// Connected MCP servers (None when `opts.tools` or `opts.mcp` was false; an empty
+    /// registry, not None, when MCP is on but nothing is configured).
     pub mcp_registry: Option<Arc<McpRegistry>>,
     /// The agent's tool working dir as a LIVE handle (kernel Seam 1b): the driver
     /// mutates it to implement `/cd` — tools resolve against the new dir from the
@@ -694,8 +696,8 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .expect("subagent provider slot filled at assemble before any turn")
         };
 
-        // `[subagent]` live knobs. `timeout_secs` remains parse-only compatibility:
-        // a productive child is never cancelled for total wall-clock age.
+        // `[subagent]` live knobs. There is no total wall-clock limit: a productive
+        // child is never cancelled for its age.
         let task_team_manager = team_manager.clone();
         let mut task_tool = TaskTool::new(
             make_fast,
@@ -812,9 +814,23 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // leading system message by SkillCatalogHook below (without it the model never
     // learns which skills exist — only the use_skill/list_skills tools were mounted).
     let skill_catalog = skills.render_catalog_prioritizing(&instruction_text);
-    let skill_registry = opts
-        .tools
-        .then(|| (Arc::clone(&skills), skill_catalog.clone()));
+    let skill_registry = opts.tools.then(|| crate::host_rows::LoadedSkills {
+        registry: Arc::clone(&skills),
+        catalog: skill_catalog.clone(),
+        dirs: skill_dirs.clone(),
+        // Only for the standard list: a driver that named its own directories
+        // decided where skills come from, and this runtime cannot say where a
+        // new one belongs in that.
+        install: opts.skill_dirs.is_none().then(|| {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            atomcode_capabilities::skills::runtime_skill_install_dirs(&home, &cfg.working_dir)
+        }),
+        plugins: opts
+            .plugin_skill_dirs
+            .iter()
+            .map(|(_, plugin)| plugin.clone())
+            .collect(),
+    });
     if opts.tools {
         register_skill_tools(&mut registry, skills);
         names.extend(
@@ -1167,7 +1183,7 @@ impl CodingParts {
             .collect()
     }
 
-    pub(crate) fn skill_registry(&self) -> Option<(Arc<SkillRegistry>, Option<String>)> {
+    pub(crate) fn skill_registry(&self) -> Option<crate::host_rows::LoadedSkills> {
         self.skill_registry.clone()
     }
 
@@ -1735,12 +1751,13 @@ mod tests {
     }
 
     #[test]
-    fn subagent_runtime_knobs_ignore_legacy_timeout_and_floor_concurrency() {
+    fn subagent_runtime_knobs_floor_concurrency() {
         use super::subagent_runtime_knobs;
         use atomcode_config::config::SubAgentConfig;
+        // The legacy `timeout_secs` this test once also ignored is gone from the
+        // schema; `legacy_dead_keys_still_parse` pins that a file carrying it loads.
         let cfg = SubAgentConfig {
             max_concurrent: 0,
-            timeout_secs: 5,
             ..SubAgentConfig::default()
         };
         let (mc, rounds) = subagent_runtime_knobs(&cfg, None);

@@ -505,6 +505,62 @@ async fn the_prompt_says_nothing_that_moves_when_the_catalog_does() {
 }
 
 #[tokio::test]
+async fn the_catalog_is_listed_by_its_row_and_no_tool_is_spoken_for() {
+    // `describe_self` used to render this list itself and say `task` and `team`
+    // take its ids — false in an assembly whose `team` takes no `model`. The list
+    // is the catalog row's; which tool takes an id is the tool's description.
+    async fn models_aspect(app: &App) -> String {
+        let tool = app
+            .context()
+            .service::<atomcode_harness::seams::ToolsSvc>()
+            .unwrap()
+            .get("describe_self")
+            .expect("describe_self");
+        let ctx = atomcode_kernel::tool::ToolContext {
+            working_dir: std::env::current_dir().unwrap(),
+            cancel: Default::default(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
+        tool.execute(r#"{"aspect":"models"}"#, &ctx).await.content
+    }
+
+    let (app, _) = delegate_with(
+        "listed",
+        r#"{"task":"look around"}"#,
+        vec![model("cheap", 10), model("lead-model", 30)],
+        Some("lead-model"),
+    )
+    .await;
+    let said = models_aspect(&app).await;
+    assert!(
+        said.contains("cheap") && said.contains("lead-model"),
+        "{said}"
+    );
+    for tool in ["`task`", "`team`"] {
+        assert!(!said.contains(tool), "`{tool}` spoken for:\n{said}");
+    }
+    let prompt = app.context().service::<SystemPromptSvc>().unwrap().render();
+    assert!(
+        !prompt.contains("`task` and `team` both take"),
+        "the prompt must not speak for them either:\n{prompt}"
+    );
+
+    // Unload the row that says it, and nothing is left saying it.
+    app.context()
+        .service::<atomcode_harness::seams::OperationsSvc>()
+        .unwrap()
+        .remove("model-catalog");
+    let unsaid = models_aspect(&app).await;
+    assert!(!unsaid.contains("cheap"), "{unsaid}");
+    assert!(
+        unsaid.contains("No mounted row describes models"),
+        "{unsaid}"
+    );
+    drop(app);
+}
+
+#[tokio::test]
 async fn with_no_catalog_the_prompt_says_nothing_at_all() {
     let (app, _) = delegate_with(
         "empty",

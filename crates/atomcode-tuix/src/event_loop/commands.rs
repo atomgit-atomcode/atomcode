@@ -4706,8 +4706,15 @@ fn parse_plugin_arg(s: &str) -> Option<PluginArg> {
 /// Parse a `--scope user|project|local` argument.
 /// Defaults to `User` if missing or unrecognized.
 fn parse_scope_arg(s: &str) -> atomcode_capabilities::plugin::InstallScope {
-    // Accept both `--scope user` and bare `user`.
-    let val = s.strip_prefix("--scope=").unwrap_or(s).trim();
+    // Accept `--scope project`, `--scope=project` and bare `project`. The caller
+    // hands over everything after the plugin name, so the spaced form arrives as
+    // one string — which the `--scope=`-only strip used to turn into user scope.
+    let s = s.trim();
+    let val = s
+        .strip_prefix("--scope=")
+        .or_else(|| s.strip_prefix("--scope").map(str::trim_start))
+        .unwrap_or(s)
+        .trim();
     match val.to_lowercase().as_str() {
         "project" => atomcode_capabilities::plugin::InstallScope::Project,
         "local" => atomcode_capabilities::plugin::InstallScope::Local,
@@ -9426,6 +9433,27 @@ mod mcp_subcommand_tests {
             ("b".to_string(), ServerStatus::Disconnected),
         ];
         assert_eq!(count_blocked_untrusted(&servers), 0);
+    }
+
+    #[test]
+    fn plugin_install_scope_reads_every_spelling_the_usage_offers() {
+        use atomcode_capabilities::plugin::InstallScope;
+        for arg in [
+            "--scope project",
+            "--scope=project",
+            "project",
+            "  --scope   project ",
+        ] {
+            assert!(
+                matches!(super::parse_scope_arg(arg), InstallScope::Project),
+                "`{arg}` must install at project scope"
+            );
+        }
+        assert!(matches!(
+            super::parse_scope_arg("--scope local"),
+            InstallScope::Local
+        ));
+        assert!(matches!(super::parse_scope_arg(""), InstallScope::User));
     }
 
     #[test]

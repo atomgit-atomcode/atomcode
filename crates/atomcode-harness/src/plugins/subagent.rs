@@ -525,7 +525,72 @@ impl Plugin for SubagentPlugin {
 /// Which is why there is a criterion in `tests/subagent.rs` asserting this
 /// fragment renders byte-identically against two different catalogs. A number
 /// in this string is the easiest possible regression and the hardest to notice.
-const CATALOG_POINTER: &str = "Work can be delegated to a model other than this one: `task` and `team` both take a `model` id. Call `describe_self(aspect=\"models\")` for what is on offer right now — the list changes with logins and model switches, so read it when you need it rather than assuming.";
+///
+/// It names no tool either: which delegation tools take a `model` id is in each
+/// tool's own description. This line once said `task` and `team` both did, and
+/// an assembly whose `team` takes none sent that to the model on every request.
+const CATALOG_POINTER: &str = "Work can be delegated to a model other than this one, where a delegation tool takes a `model` id. Call `describe_self(aspect=\"models\")` for what is on offer right now — the list changes with logins and model switches, so read it when you need it rather than assuming.";
+
+/// The catalog as the agent reads it, rendered at the moment of asking: a login,
+/// a `/model` or an edited config changes it mid-session.
+fn describe_catalog(models: &dyn crate::seams::Models) -> String {
+    let current = models.current();
+    let offered = crate::seams::delegatable(models);
+    if offered.is_empty() {
+        return "MODELS. There is a model catalog but nothing in it to delegate to — not \
+                even this conversation's own model, which means the catalog does not \
+                contain it. Delegated work runs on this conversation's model."
+            .into();
+    }
+    let ranked = offered.iter().any(|m| m.capable_rank.is_some());
+    let rows = offered
+        .iter()
+        .map(|m| {
+            format!(
+                "  {id}{here} — {name}, ctx {ctx}{vision}{effort}{note}",
+                id = m.id,
+                here = if current.as_deref() == Some(m.id.as_str()) {
+                    " (this conversation)"
+                } else {
+                    ""
+                },
+                name = m.display_name,
+                ctx = m.context_window,
+                vision = if m.supports_vision { ", vision" } else { "" },
+                effort = if m.effort_levels.is_empty() {
+                    String::new()
+                } else {
+                    format!(", effort {}", m.effort_levels.join("/"))
+                },
+                note = match &m.note {
+                    Some(note) => format!("\n      {note}"),
+                    None => String::new(),
+                },
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "MODELS. What delegated work may run on. A delegation tool whose description \
+         says it takes a `model` id takes one of these; leaving it out keeps the \
+         conversation's own model.\n\n\
+         {rows}\n\n\
+         {why}\n\n\
+         Models billed to another account are never here. That is a decision about \
+         credentials and vendors rather than cost, so a cheaper model on another \
+         account is still absent — and it is the person's to make, not yours.",
+        why = if ranked {
+            "Ordered weakest first where the deployment says so. Anything more capable \
+             than this conversation is deliberately absent: choosing to spend more is \
+             the person's decision, made when they picked this model."
+        } else {
+            "This deployment has not said which of these is more capable, so they are \
+             not ordered and none is known to be cheaper. Pick on the facts above — \
+             context window, vision, and whatever note the deployment wrote — not on \
+             the name."
+        }
+    )
+}
 
 pub struct ModelCatalogPlugin;
 
@@ -541,15 +606,29 @@ impl Plugin for ModelCatalogPlugin {
         // Not `inject`: a tree with no catalog is a tree with nothing to say
         // here, and this row falling silent is the right answer rather than a
         // reason to wait forever.
-        &["models"]
+        &["models", "operations"]
     }
     fn description(&self) -> &'static str {
-        "tells the model that delegation can pick a model, without naming any"
+        "tells the model that delegation can pick a model, and lists them when asked"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let Some(models) = ctx.service::<crate::seams::ModelsSvc>() else {
             return Ok(());
         };
+        // The list itself, on request — rendered from the live catalog each
+        // time, so it follows a login or a model switch.
+        let catalog = ctx.clone();
+        crate::plugins::self_knowledge::describes_live(
+            ctx,
+            crate::seams::Aspect::Models,
+            "model-catalog",
+            0,
+            move |_| {
+                catalog
+                    .service::<crate::seams::ModelsSvc>()
+                    .map(|models| describe_catalog(models.as_ref()))
+            },
+        );
         // The conversation's own model is always delegatable, so a catalog that
         // offers only it offers no CHOICE — and telling the model to go look
         // would send it to a tool call that can only answer "the one you are

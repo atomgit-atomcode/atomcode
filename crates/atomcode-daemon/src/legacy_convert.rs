@@ -1774,14 +1774,7 @@ fn validate_project_bucket(project_bucket: &str) -> anyhow::Result<()> {
 }
 
 fn report_catalog_diagnostics(diagnostics: &[atomcode_capabilities::session::CatalogDiagnostic]) {
-    for diagnostic in diagnostics {
-        tracing::warn!(
-            path = %diagnostic.path.display(),
-            kind = ?diagnostic.kind,
-            message = %diagnostic.message,
-            "session catalog entry was skipped"
-        );
-    }
+    crate::warn_catalog_diagnostics(diagnostics);
 }
 
 fn reject_matching_catalog_diagnostic(

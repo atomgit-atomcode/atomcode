@@ -25,7 +25,7 @@ use crate::bundle;
 use crate::control::AppControl;
 use crate::profile::Profiles;
 use crate::seam_map;
-use crate::seams::{ControlSvc, UiSvc};
+use crate::seams::{Aspect, ControlSvc, OperationsSvc, UiSvc};
 
 /// What the command line asked for, before anything is resolved.
 #[derive(Debug, Default)]
@@ -300,8 +300,47 @@ impl Launch {
             eprintln!("failed to mount: {e}");
             return Err(ExitCode::from(1));
         }
+        describe_launch(&app, &self.profile, profiles);
         Ok(Mounted { app, launch: self })
     }
+}
+
+/// What this launcher lets the person change, said by the launcher.
+///
+/// Patch layers and `--resume` are read here and nowhere else. A tree mounted
+/// some other way — the coding runtime mounts its own — reads neither, so the
+/// rows cannot be the ones to teach them: they did, and an agent in that
+/// assembly told people to edit a patch file nothing would ever read.
+fn describe_launch(app: &App, profile: &str, profiles: &Profiles) {
+    let Some(ops) = app.context().service::<OperationsSvc>() else {
+        return;
+    };
+    ops.contribute(
+        Aspect::Operations,
+        "launcher-layers",
+        2,
+        format!(
+            "CHANGING THE ROWS. This tree was launched from profile `{profile}`. \
+             Its rows come from layers stacked in this order, last wins: the \
+             profile's bundles, the profile's own patch, `{home}`, then every \
+             `--patch <file>` given at launch. A layer is read when the tree is \
+             launched. In one: `[[insert]] name = \"<plugin>\"` (optionally with \
+             `config = {{…}}`) adds a row; `[[patch]] id = \"<row>\" config = {{…}}` \
+             retunes one — this REPLACES that row's config rather than merging \
+             into it; `[[remove]] id = \"<row>\"`, or `[[patch]] … disabled = true`, \
+             drops one. Launch flags such as `--model`, `--read-only` and `--plan` \
+             are shorthand for a patch layer.",
+            home = profiles.home_patch_path().display(),
+        ),
+    );
+    ops.contribute(
+        Aspect::Operations,
+        "launcher-resume",
+        11,
+        "CONTINUING A SESSION. Launching with `--resume <session-id>` continues a \
+         stored session: it sets `id` and `resume = true` on the `session` row. \
+         This session's id is under `describe_self` with `aspect: session`.",
+    );
 }
 
 /// A mounted tree, waiting to be inspected or handed to its front end.

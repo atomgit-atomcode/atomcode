@@ -38,6 +38,17 @@ impl Mounted {
         self.app.stop();
     }
 
+    /// Everything `--dump-config` would print: every row's config, the fibers,
+    /// the services. For a criterion about what must never be printed.
+    pub fn dump(&self) -> String {
+        self.app.dump_runtime()
+    }
+
+    /// The tree's own context, to reach a service the way a row does.
+    pub fn context(&self) -> atomcode_plexus::Context {
+        self.app.context()
+    }
+
     /// The mounted tree, row by row, in the order it will run — what
     /// `--dump-config` shows. For a criterion about ordering, which is a
     /// product decision the row list is supposed to state out loud.

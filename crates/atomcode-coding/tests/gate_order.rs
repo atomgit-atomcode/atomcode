@@ -244,18 +244,38 @@ async fn the_session_rows_carry_what_the_runtime_sent() {
     let follower = configs
         .get("session-persistence-jsonl")
         .expect("the follower row is mounted");
-
-    let root = follower["root"]
-        .as_str()
-        .expect("the follower was given a root");
-    assert!(
-        root.ends_with("sessions/harness"),
-        "the follower must not share the native transcript's root: {root}"
-    );
     assert_eq!(
         follower["project_root"].as_str(),
         Some(project.path().to_string_lossy().as_ref()),
         "the follower buckets by the session's project, not the process cwd"
+    );
+
+    // Where it writes is the row's own decision now, so the judge is the path
+    // the store reports — not a config field that could say one thing while the
+    // row does another.
+    let store = mounted
+        .context()
+        .service::<atomcode_harness::seams::SessionPersistenceSvc>()
+        .expect("a store is mounted");
+    let written = std::path::PathBuf::from(store.location("1789000000000-1").unwrap());
+    let bucket = atomcode_capabilities::session::SessionManager::project_hash(project.path());
+    assert_eq!(
+        written,
+        home.path()
+            .join("sessions")
+            .join(atomcode_capabilities::session::SessionManager::JOURNAL_DIR)
+            .join(&bucket)
+            .join("1789000000000-1.jsonl"),
+        "the follower must not write into the native store's bucket"
+    );
+    assert!(
+        mounted
+            .rows()
+            .iter()
+            .any(|row| row.starts_with("session-persistence-jsonl")
+                && row.ends_with("session-journal")),
+        "this product's journal row is what mounted: {:?}",
+        mounted.rows()
     );
     mounted.stop();
 }

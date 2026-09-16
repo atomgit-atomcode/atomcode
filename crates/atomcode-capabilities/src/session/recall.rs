@@ -75,13 +75,38 @@ fn score_record(r: &TurnRecord, terms: &[String]) -> Score {
 
 #[derive(Debug, Deserialize)]
 struct RecallArgs {
+    /// Keywords. Optional: most of what people ask of recall is "yesterday",
+    /// "last time", "the first thing I asked" — questions with a time and no
+    /// topic. When it was required, models invented one (`"j"`, `"所有对话"`,
+    /// `"最近的对话"`), and an honest empty query found nothing even inside a
+    /// correct date window.
+    #[serde(default)]
     query: String,
     #[serde(default)]
     after: Option<String>,
     #[serde(default)]
     before: Option<String>,
+    /// One session: its id, or the leading characters recall and
+    /// `list_sessions` show.
+    #[serde(default)]
+    session: Option<String>,
+    /// Without keywords: `newest` (default) or `oldest` first.
+    #[serde(default)]
+    order: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+/// What one recall asks for.
+#[derive(Debug, Default)]
+pub struct RecallRequest<'a> {
+    pub query: &'a str,
+    pub after: Option<&'a str>,
+    pub before: Option<&'a str>,
+    pub session: Option<&'a str>,
+    /// Only without keywords, where there is no relevance to rank by.
+    pub oldest_first: bool,
+    pub limit: usize,
 }
 
 const DEFAULT_LIMIT: usize = 8;
@@ -138,21 +163,72 @@ impl RecallTool {
         before: Option<&str>,
         limit: usize,
     ) -> SessionResult<String> {
-        let after_ms = after.and_then(parse_date_bound);
-        let before_ms = before.and_then(parse_date_bound);
+        self.search(
+            sessions_dir,
+            &RecallRequest {
+                query,
+                after,
+                before,
+                limit,
+                ..RecallRequest::default()
+            },
+        )
+    }
+
+    /// As [`Self::search_dir`], with every filter: a session, and the order of a
+    /// search that has no keywords.
+    ///
+    /// Two modes, chosen by whether `query` holds any searchable term. With terms,
+    /// turns rank by relevance. Without, they come back by time — newest first
+    /// unless `oldest_first` — which is what "what did we do yesterday" and "what
+    /// was the first thing I asked" need, and what a required keyword could only
+    /// fake.
+    pub fn search(
+        &self,
+        sessions_dir: &Path,
+        request: &RecallRequest<'_>,
+    ) -> SessionResult<String> {
+        let after_ms = request.after.and_then(parse_date_bound);
+        let before_ms = request.before.and_then(parse_date_bound);
+        let session = request
+            .session
+            .map(str::trim)
+            .filter(|session| !session.is_empty());
 
         let records: Vec<TurnRecord> = load_records(sessions_dir)?
             .into_iter()
             .filter(|r| after_ms.is_none_or(|a| r.ts >= a))
             .filter(|r| before_ms.is_none_or(|b| r.ts < b))
+            .filter(|r| session.is_none_or(|s| r.session_id.starts_with(s)))
             .collect();
 
-        let q = RecallQuery {
-            terms: tokenize(query),
-            limit,
+        let terms = tokenize(request.query);
+        let mut out = if terms.is_empty() {
+            let mut by_time: Vec<&TurnRecord> = records.iter().collect();
+            if request.oldest_first {
+                by_time.sort_by_key(|r| r.ts);
+            } else {
+                by_time.sort_by_key(|r| std::cmp::Reverse(r.ts));
+            }
+            by_time.truncate(request.limit);
+            let order = if request.oldest_first {
+                "oldest first"
+            } else {
+                "newest first"
+            };
+            format_hits(
+                &by_time,
+                &format!("Recalled {{n}} turn(s) by time, {order} (no keywords given)"),
+                session,
+            )
+        } else {
+            let q = RecallQuery {
+                terms,
+                limit: request.limit,
+            };
+            let hits = self.index.search(&records, &q);
+            format_hits(&hits, "Recalled {n} matching turn(s)", session)
         };
-        let hits = self.index.search(&records, &q);
-        let mut out = format_hits(&hits);
         // Self-documenting fallback: point the model at the raw ground truth (prints the
         // REAL dir, so it never goes stale) and restate the freshness boundary right where
         // a confused "why is nothing here?" lands. Reading those `<id>.jsonl` files gives
@@ -174,26 +250,33 @@ impl Tool for RecallTool {
     }
 
     fn description(&self) -> &str {
-        "Search this project's COMPLETED conversation turns — across all sessions, \
-         including earlier turns of the CURRENT session — by topic and/or time. A turn is \
-         indexed only AFTER it finishes, so the in-progress turn (what is happening right \
-         now) is NOT here yet; for that, rely on your own context. Use it to recall a past \
-         decision, bug, or approach, even from another session. Resolve relative dates \
-         yourself (e.g. 'yesterday') into the `after`/`before` fields using the current \
-         date. Read-only — the result footer shows where the raw per-turn transcripts live \
-         if you need the exact, full text."
+        "Read this project's COMPLETED conversation turns — across all sessions, including \
+         earlier turns of the CURRENT session. Two ways to ask:\n\
+         - By topic: put the words you are looking for in `query` (a past decision, bug, \
+         approach).\n\
+         - By time or session: leave `query` OUT — do not invent one — and the turns come \
+         back by time, newest first. \"What did we do yesterday\": set `after`/`before`. \
+         \"What was our last conversation about\": no filters. \"What did I ask first\": \
+         `order: \"oldest\"`. To read one session (ids from `list_sessions` or an earlier \
+         recall result): `session`.\n\
+         Filters combine with `query` too. Resolve relative dates yourself (\"yesterday\") \
+         into `after`/`before` using the current date. A turn is indexed only AFTER it \
+         finishes, so the in-progress turn is not here; for that, rely on your own context. \
+         Read-only — the result footer shows where the raw per-turn transcripts live if you \
+         need the exact, full text."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "keywords / topic to recall" },
+                "query": { "type": "string", "description": "words to search for; leave out to list turns by time" },
                 "after": { "type": "string", "description": "optional lower bound, inclusive — ISO datetime or YYYY-MM-DD (local time)" },
                 "before": { "type": "string", "description": "optional upper bound, exclusive — ISO datetime or YYYY-MM-DD (local time)" },
+                "session": { "type": "string", "description": "only this session: its id, or the leading characters shown by list_sessions / recall" },
+                "order": { "type": "string", "enum": ["newest", "oldest"], "description": "without query: which end of time comes first (default newest)" },
                 "limit": { "type": "integer", "description": "max turns to return (default 8)" }
-            },
-            "required": ["query"]
+            }
         })
     }
 
@@ -219,12 +302,19 @@ impl Tool for RecallTool {
                 .root()
                 .to_path_buf(),
         };
-        let content = match self.search_dir(
+        let content = match self.search(
             &sessions_dir,
-            &a.query,
-            a.after.as_deref(),
-            a.before.as_deref(),
-            a.limit.unwrap_or(DEFAULT_LIMIT),
+            &RecallRequest {
+                query: &a.query,
+                after: a.after.as_deref(),
+                before: a.before.as_deref(),
+                session: a.session.as_deref(),
+                oldest_first: a
+                    .order
+                    .as_deref()
+                    .is_some_and(|order| order.trim().eq_ignore_ascii_case("oldest")),
+                limit: a.limit.unwrap_or(DEFAULT_LIMIT),
+            },
         ) {
             Ok(content) => content,
             Err(error) => {
@@ -269,6 +359,11 @@ fn load_records(dir: &Path) -> SessionResult<Vec<TurnRecord>> {
         })?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        // Another writer's journal left in the bucket is not a transcript, and
+        // not a corrupt one either: one of them used to fail every search.
+        if SessionManager::is_journal_file(&path) {
             continue;
         }
         let file_bytes = regular_file_len(&path)?;
@@ -364,13 +459,19 @@ fn parse_date_bound(s: &str) -> Option<i64> {
     )
 }
 
-fn format_hits(hits: &[&TurnRecord]) -> String {
+/// `heading` carries `{n}` for the count.
+fn format_hits(hits: &[&TurnRecord], heading: &str, session: Option<&str>) -> String {
     if hits.is_empty() {
-        return "No matching turns found in this project's history.".to_string();
+        return match session {
+            Some(session) => {
+                format!("No turns found for session {session:?} in this project's history.")
+            }
+            None => "No matching turns found in this project's history.".to_string(),
+        };
     }
     let mut out = format!(
-        "Recalled {} matching turn(s) (project-local):\n",
-        hits.len()
+        "{} (project-local):\n",
+        heading.replace("{n}", &hits.len().to_string())
     );
     for h in hits {
         // CHAR-safe truncation (mirrors `truncate` below): a byte slice `[..8]` would
@@ -724,13 +825,134 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_all_stopword_queries_degrade_to_no_match() {
+    fn no_keywords_lists_turns_by_time_instead_of_finding_nothing() {
+        // Taken from real transcripts: "我昨天都产生了哪些对话" got a correct date
+        // window and an empty query, and was told nothing happened that day.
         let dir = tempfile::tempdir().unwrap();
-        write_jsonl(dir.path(), "a.jsonl", &[rec("s", 1, "工作 任务", "你好")]);
+        write_jsonl(
+            dir.path(),
+            "a.jsonl",
+            &[
+                rec("s", 1_000, "工作 任务", "你好"),
+                rec("s", 3_000, "第三件事", "好"),
+                rec("s", 2_000, "第二件事", "行"),
+            ],
+        );
         let tool = RecallTool::new();
         for q in ["", "   ", "的 了 和"] {
             let out = tool.search_dir(dir.path(), q, None, None, 8).unwrap();
-            assert!(out.contains("No matching turns"), "query {q:?}: got {out}");
+            assert!(
+                out.contains("Recalled 3 turn(s) by time"),
+                "query {q:?}: got {out}"
+            );
+            let (third, first) = (out.find("第三件事").unwrap(), out.find("工作").unwrap());
+            assert!(third < first, "newest first by default: {out}");
         }
+
+        let oldest = tool
+            .search(
+                dir.path(),
+                &RecallRequest {
+                    oldest_first: true,
+                    limit: 1,
+                    ..RecallRequest::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            oldest.contains("工作 任务") && !oldest.contains("第二件事"),
+            "{oldest}"
+        );
+
+        // The date window alone, which is the case that used to come back empty.
+        let window = tool
+            .search(
+                dir.path(),
+                &RecallRequest {
+                    after: Some("1970-01-01T00:00:01.500Z"),
+                    before: Some("1970-01-01T00:00:02.500Z"),
+                    limit: 8,
+                    ..RecallRequest::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            window.contains("第二件事") && !window.contains("第三件事"),
+            "{window}"
+        );
+    }
+
+    #[test]
+    fn one_session_can_be_read_by_its_id_or_the_prefix_results_show() {
+        let dir = tempfile::tempdir().unwrap();
+        write_jsonl(
+            dir.path(),
+            "a.jsonl",
+            &[rec(
+                "0e300ebf-b604-4cd7-8c22-0a491456f89e",
+                1,
+                "这个会话的问题",
+                "答",
+            )],
+        );
+        write_jsonl(
+            dir.path(),
+            "b.jsonl",
+            &[rec(
+                "98333746-eb5c-4a98-aac2-a162c0699e3d",
+                2,
+                "别的会话",
+                "答",
+            )],
+        );
+        let tool = RecallTool::new();
+        for session in ["0e300ebf-b604-4cd7-8c22-0a491456f89e", "0e300ebf"] {
+            let out = tool
+                .search(
+                    dir.path(),
+                    &RecallRequest {
+                        session: Some(session),
+                        limit: 8,
+                        ..RecallRequest::default()
+                    },
+                )
+                .unwrap();
+            assert!(out.contains("这个会话的问题"), "{out}");
+            assert!(!out.contains("别的会话"), "{out}");
+        }
+        let unknown = tool
+            .search(
+                dir.path(),
+                &RecallRequest {
+                    session: Some("ffffffff"),
+                    limit: 8,
+                    ..RecallRequest::default()
+                },
+            )
+            .unwrap();
+        assert!(unknown.contains("No turns found for session"), "{unknown}");
+    }
+
+    #[test]
+    fn an_event_journal_left_in_the_bucket_is_passed_over_not_called_corrupt() {
+        // Both journal shapes on real disks: with a header line, and older ones that
+        // open straight on a sequenced event. Either used to fail every search.
+        let dir = tempfile::tempdir().unwrap();
+        write_jsonl(dir.path(), "a.jsonl", &[rec("s", 1, "真正的回合", "答")]);
+        std::fs::write(
+            dir.path().join("1789296604064-38002.jsonl"),
+            "{\"header\":{\"created_at\":1,\"id\":\"1789296604064-38002\",\"inherited\":0,\"version\":1}}\n\
+             {\"event\":{\"kind\":\"turn_start\",\"turn\":1},\"seq\":1}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("1789000000000-1.jsonl"),
+            "{\"event\":{\"kind\":\"turn_start\",\"turn\":1},\"seq\":1}\n",
+        )
+        .unwrap();
+        let out = RecallTool::new()
+            .search_dir(dir.path(), "真正", None, None, 8)
+            .unwrap();
+        assert!(out.contains("真正的回合"), "{out}");
     }
 }

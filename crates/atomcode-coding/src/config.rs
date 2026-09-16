@@ -131,6 +131,9 @@ pub struct CodingAgentConfig {
     /// /unknown ⇒ Exa. Mirrors v1's `[web_search] provider` config knob — without this the
     /// tool was hardwired to Exa with no way to opt into DDG.
     pub web_search_provider: Option<String>,
+    /// `[web_search] api_key`, for Exa. `None` leaves the tool to `EXA_API_KEY` or
+    /// the keyless tier.
+    pub web_search_api_key: Option<String>,
     /// Opt-in read-only LSP policy. The manager is created by this runtime's tool
     /// assembly, so provider/session reloads cannot create a second hidden owner.
     pub lsp: atomcode_capabilities::codeintel::LspSettings,
@@ -235,6 +238,9 @@ pub struct CodingRuntimeConfig {
     pub next_prompt_suggestions: bool,
     pub supports_vision: bool,
     pub lsp: atomcode_capabilities::codeintel::LspSettings,
+    /// `[web_search]`, see [`web_search_from_config`].
+    pub web_search_provider: Option<String>,
+    pub web_search_api_key: Option<String>,
 }
 
 pub fn lsp_settings_from_config(
@@ -276,6 +282,80 @@ pub fn permission_rules_from_config(
         );
     }
     rules
+}
+
+/// What this runtime takes from `config.toml`, for an agent asked how AtomCode is
+/// configured.
+///
+/// Here, beside [`CodingRuntimeConfig::from_config`] and the `*_from_config`
+/// helpers, because these are the functions that read each section: a key
+/// added or dropped there is a sentence to change a few lines away, not in a
+/// document somewhere else. Sections a front end reads (`[ui]`,
+/// `[notifications]`, the proxy) are the front end's to describe.
+pub fn describe_config_file(config_file: &std::path::Path) -> String {
+    format!(
+        "CONFIG FILE. This runtime was configured from `{file}` — the AtomCode home's \
+         `config.toml`, unless the front end was started with `--config <file>`. It read \
+         the file when it was built and does not watch it: an edit reaches a runtime \
+         built after the file is read again (a new session, or a restart). Switching the \
+         model is `/model`, not an edit.\n\
+         What this runtime takes from it:\n\
+         - Model: `default_model` names a `[models.<id>]` entry (`account`, `model`, and \
+         optional `context_window`, `max_tokens`, `supports_vision`, `reasoning_effort`, \
+         `capable_model`, `note`) whose `account` is a `[provider_accounts.<id>]` entry \
+         (`provider`, `api_key`, `base_url`). The legacy form is `default_provider` naming \
+         a `[providers.<name>]` entry (`type`, `model`, `api_key`, `base_url`, …); \
+         `default_model` wins. An `api_key` may be written `${{VAR}}`. `capable_model` \
+         ranks models for `task` and `team`: the lowest rank is the fast tier, the \
+         highest the capable one.\n\
+         - `evaluator_provider`: the model that judges whether a `/goal` is met.\n\
+         - `[permissions]` `allow` / `deny`: rules such as `Bash(git *)`, `Read(<path>)` or \
+         `mcp__<server>__<tool>`. `deny` wins, and `allow` never opens a sensitive path.\n\
+         - `[coding]` `max_rounds` (per turn; 0 = no cap; `ATOMCODE_TURN_MAX_ROUNDS` wins) \
+         and `shell_guard_policy`: a shell command that reaches for credentials is asked \
+         about (`prompt`, the default), refused and the turn ended (`strict`), or left to \
+         the ordinary approval rules (`off`).\n\
+         - `[loop_config]` `max_rounds`: how many passes a `/loop` may run (default 100; \
+         0 = no cap).\n\
+         - `[subagent]` `max_concurrent` (default 3) and `max_rounds` (default 200) for \
+         `task` and `team`; `codex` / `claude` = `off` | `read-only` | `accept-edits` | \
+         `auto`, and `[[subagent.external]]` entries (`name`, `kind` = `codex` | \
+         `claude-code`, `model`, `permission`, `timeout_secs`, `enabled`), add the Codex \
+         or Claude Code CLI as a delegate where the front end allows it.\n\
+         - `[tools.todo]` `enabled`, and `eager` = `auto` | `preferred` | `always`.\n\
+         - `[lsp]` `enabled`, `auto_detect`, and `[lsp.servers.<extension>]` = \
+         `{{ command, args, root_markers }}`.\n\
+         - `[web_search]` `provider` = `exa` | `duckduckgo`, and `api_key` for Exa; the \
+         `ATOMCODE_WEB_SEARCH_PROVIDER` and `EXA_API_KEY` environment variables win.\n\
+         - `keep_interrupted_context` (keep a cancelled turn's partial work; default \
+         true), `language` (`en` | `zh_CN`), `[network]` `upstream_retry_max_attempts`, \
+         and `[datalog]` `enabled` / `dir`.\n\
+         Sections not listed here are read by the front end, not by this runtime. \
+         `describe_self` with `aspect: settings` lists the settings that are safe to \
+         edit and when each takes effect.",
+        file = config_file.display(),
+    )
+}
+
+/// `[web_search]` as the `tool-web` row takes it: `(provider, api_key)`.
+///
+/// The environment keeps the last word it always had — `ATOMCODE_WEB_SEARCH_PROVIDER`
+/// over `provider`, `EXA_API_KEY` over `api_key` — by leaving the file's value out
+/// when the variable is set, so the row falls back to it. Before this the section
+/// was parsed and then read by nobody: a person's `provider = "duckduckgo"` did
+/// nothing at all.
+pub fn web_search_from_config(
+    web_search: &atomcode_config::config::WebSearchConfig,
+) -> (Option<String>, Option<String>) {
+    let set = |name: &str| std::env::var(name).is_ok_and(|value| !value.trim().is_empty());
+    let provider = (!set("ATOMCODE_WEB_SEARCH_PROVIDER"))
+        .then(|| web_search.provider.trim().to_string())
+        .filter(|provider| !provider.is_empty());
+    let api_key = (!set("EXA_API_KEY"))
+        .then(|| web_search.api_key.clone())
+        .flatten()
+        .filter(|key| !key.trim().is_empty());
+    (provider, api_key)
 }
 
 pub fn credential_shell_policy_from_config(
@@ -375,6 +455,8 @@ impl CodingRuntimeConfig {
             round_cap_checkpoint: false,
             next_prompt_suggestions: false,
             lsp: lsp_settings_from_config(&config.lsp),
+            web_search_provider: web_search_from_config(&config.web_search).0,
+            web_search_api_key: web_search_from_config(&config.web_search).1,
         }
     }
 
@@ -424,6 +506,8 @@ impl CodingRuntimeConfig {
         config.round_cap_checkpoint = self.round_cap_checkpoint;
         config.next_prompt_suggestions = self.next_prompt_suggestions;
         config.lsp = self.lsp.clone();
+        config.web_search_provider = self.web_search_provider.clone();
+        config.web_search_api_key = self.web_search_api_key.clone();
         config
     }
 }
@@ -848,6 +932,7 @@ impl CodingAgentConfig {
             thinking_keep: None,
             compact_threshold: 0.7,
             web_search_provider: None,
+            web_search_api_key: None,
             lsp: Default::default(),
             keep_interrupted_context: false,
             credential_shell_policy: Default::default(),

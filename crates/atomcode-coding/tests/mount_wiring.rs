@@ -171,3 +171,82 @@ async fn a_sessions_cost_is_recorded_per_model_across_a_switch() {
     assert_eq!(report.models[1].provider_id, "provider-b");
     assert_eq!(report.models[1].model_id, "model-b");
 }
+
+/// A credential read from `config.toml` reaches what it configures without
+/// entering the config tree, and nothing the agent can ask about itself says it.
+///
+/// A config tree is printable data — `--dump-config` renders every row's config
+/// verbatim — so a key carried as row config is a key on somebody's screen. The
+/// judge is the printed tree and every `describe_self` aspect, with a sentinel
+/// standing in for the key (never a real one).
+#[tokio::test]
+#[serial_test::serial(atomcode_home)]
+async fn a_configured_credential_never_enters_the_config_tree() {
+    const SENTINEL: &str = "sentinel-web-search-key-for-this-test";
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    std::env::remove_var("EXA_API_KEY");
+    let project = tempfile::tempdir().unwrap();
+    let mut file = atomcode_config::config::Config::default();
+    file.web_search.api_key = Some(SENTINEL.into());
+    let cfg = atomcode_coding::CodingRuntimeConfig::from_config(
+        &file,
+        project.path(),
+        None,
+        None,
+        false,
+        false,
+    )
+    .agent_config();
+    assert_eq!(
+        cfg.web_search_api_key.as_deref(),
+        Some(SENTINEL),
+        "the key was read, so the absences below are not passing by absence"
+    );
+
+    let opts = PrepareOptions {
+        web: true,
+        ..quiet_options()
+    };
+    let mounted = support::mount(&cfg, opts, Arc::new(CannedProvider)).await;
+    let dump = mounted.dump();
+    assert!(
+        dump.contains("tool-web-keyed"),
+        "the keyed web row is what mounted:\n{dump}"
+    );
+    assert!(
+        !dump.contains(SENTINEL),
+        "the key is in the printable config tree"
+    );
+
+    let describe = mounted
+        .context()
+        .service::<atomcode_harness::seams::ToolsSvc>()
+        .unwrap()
+        .get("describe_self")
+        .expect("describe_self is mounted");
+    let ctx = atomcode_kernel::tool::ToolContext {
+        working_dir: project.path().to_path_buf(),
+        cancel: Default::default(),
+        progress: atomcode_kernel::tool::ProgressSink::noop(),
+        requester: None,
+    };
+    for aspect in [
+        "all",
+        "session",
+        "services",
+        "tools",
+        "models",
+        "operations",
+        "settings",
+    ] {
+        let said = describe
+            .execute(&format!(r#"{{"aspect":"{aspect}"}}"#), &ctx)
+            .await;
+        assert!(
+            !said.content.contains(SENTINEL),
+            "`describe_self` aspect `{aspect}` says the key"
+        );
+    }
+    mounted.shutdown().await;
+}

@@ -169,29 +169,20 @@ impl Default for LoopConfig {
     }
 }
 
-/// `[subagent]` execution policy for the `task` subagent tool.
+/// `[subagent]` execution policy for the `task` and `team` tools.
 ///
-/// `max_concurrent` and `max_rounds` are the LIVE knobs: `coding::parts` reads them via
-/// `subagent_runtime_knobs` and wires them into `TaskTool`.
-/// The tool's master ON/OFF is the env gate `ATOMCODE_SUBAGENT`
-/// (default ON, opt out with `ATOMCODE_SUBAGENT=0`) — NOT `enabled` here; `enabled`,
-/// `initial_turns`, and `max_turns` are vestigial from the retired `parallel_edit` dispatch
-/// path and are not currently consulted.
+/// `max_concurrent` and `max_rounds` are the live knobs: `coding::parts` reads them
+/// and wires them into `TaskTool` and the team manager. Whether the tools are
+/// mounted at all is the driver's `SubagentPolicy` first, then the env gate
+/// `ATOMCODE_SUBAGENT` (`0`/`false`/`off` turns them off) — there is no config key
+/// for it. The old `enabled`, `initial_turns`, `max_turns` and `timeout_secs` keys
+/// were read by nothing and are gone; a file that still has them parses unchanged
+/// (see `legacy_dead_keys_still_parse`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SubAgentConfig {
-    /// Vestigial: the live master switch is the env gate `ATOMCODE_SUBAGENT` (default ON),
-    /// not this field. Kept for config back-compat.
-    pub enabled: bool,
-    /// Vestigial (retired resilience path); not currently read.
-    pub initial_turns: usize,
-    /// Vestigial (retired resilience path); not currently read.
-    pub max_turns: usize,
     /// Max parallel subagents the `task` tool runs at once (floored to 1). Default 3.
     pub max_concurrent: usize,
-    /// Deprecated compatibility field. Subtasks no longer have a total wall-clock limit;
-    /// provider idle timeouts, `max_rounds`, and explicit cancellation own liveness.
-    pub timeout_secs: u64,
     /// Per-subtask model-round high-water mark. Default 200; `0` means unbounded.
     /// Overridden by `ATOMCODE_SUBAGENT_MAX_ROUNDS` when set.
     pub max_rounds: u32,
@@ -220,12 +211,7 @@ fn default_subagent_level() -> String {
 impl Default for SubAgentConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            initial_turns: 4,
-            max_turns: 12,
             max_concurrent: 3,
-            // Retained only so existing config files continue to deserialize unchanged.
-            timeout_secs: 900,
             max_rounds: 200,
             codex: default_subagent_level(),
             claude: default_subagent_level(),
@@ -271,7 +257,10 @@ pub struct Config {
     /// Falls back to `default_provider` when not set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluator_provider: Option<String>,
-    /// Default working directory. Saved on /cd, restored on startup.
+    /// The daemon's default working directory: written by a `/cd` request that
+    /// asks for `set_default`, read when the daemon starts (a launch-time
+    /// directory, as `atomcode webui` passes, wins over it). The terminal UI
+    /// neither reads nor writes it.
     pub default_workdir: Option<String>,
     /// Legacy flattened providers. `#[serde(default)]` so a pure new-schema
     /// config (accounts + models only, no `[providers]`) loads (design §4).
@@ -322,10 +311,6 @@ pub struct Config {
     /// LSP integration configuration.
     #[serde(default)]
     pub lsp: LspConfig,
-    /// Automatically commit edited files after each agent turn completes.
-    /// Only applies when working inside a git repository.
-    #[serde(default)]
-    pub auto_commit: bool,
     /// `task` subagent tool policy. Missing from older configs uses the defaults in
     /// [`SubAgentConfig`], including a configurable 200-round high-water mark.
     #[serde(default)]
@@ -736,7 +721,6 @@ impl Default for Config {
             auto_update: true,
             telemetry: Default::default(),
             lsp: Default::default(),
-            auto_commit: false,
             subagent: Default::default(),
             loop_config: Default::default(),
             coding: CodingConfig::default(),
@@ -1949,14 +1933,16 @@ fn render_hooks_json_section() -> String {
     let mut out = String::new();
     out.push_str("\n# Lifecycle hooks — configure in separate JSON files:\n");
     out.push_str("#   ~/.atomcode/hooks.json       (global hooks)\n");
-    out.push_str("#   <project>/.hooks.json         (project hooks, override global by name)\n");
+    out.push_str("#   <project>/.hooks.json         (project hooks — loaded as well; both files' hooks run)\n");
     out.push_str("#\n");
     out.push_str("# Example hooks.json:\n");
     out.push_str("#   {\n");
     out.push_str("#     \"hooks\": {\n");
     out.push_str("#       \"audit-all\": {\n");
     out.push_str("#         \"event\": \"pre_tool_use\",\n");
-    out.push_str("#         \"command\": \"echo \\\"$(date) $ATOMCODE_TOOL_NAME\\\" >> ~/.atomcode/audit.log\"\n");
+    out.push_str(
+        "#         \"command\": \"jq -c '{tool_name, tool_input}' >> ~/.atomcode/audit.log\"\n",
+    );
     out.push_str("#       },\n");
     out.push_str("#       \"block-rm\": {\n");
     out.push_str("#         \"event\": \"pre_tool_use\",\n");
@@ -1967,9 +1953,18 @@ fn render_hooks_json_section() -> String {
     out.push_str("#     }\n");
     out.push_str("#   }\n");
     out.push_str("#\n");
-    out.push_str("# Events: pre_tool_use, post_tool_use, session_start, session_end\n");
-    out.push_str("# Env vars: ATOMCODE_HOOK_EVENT, ATOMCODE_TOOL_NAME, ATOMCODE_HOOK_CONTEXT\n");
-    out.push_str("# PreToolUse stdout: {\"action\":\"allow\"} or {\"action\":\"block\",\"reason\":\"...\"}\n");
+    out.push_str(
+        "# Events (PascalCase or snake_case): PreToolUse, PostToolUse, PostToolUseFailure,\n",
+    );
+    out.push_str("#   SessionStart, SessionEnd, UserPromptSubmit, Stop, StopFailure\n");
+    out.push_str("# matcher: tool names, `|`-separated, `*` as a wildcard (e.g. \"Edit|Write\", \"mcp__github__*\")\n");
+    out.push_str(
+        "# Input: a JSON object on stdin — hook_event_name, session_id, cwd, and tool_name /\n",
+    );
+    out.push_str("#   tool_input for tool events (Claude Code's hook payload)\n");
+    out.push_str("# PreToolUse stdout: {\"action\":\"allow\"} or {\"action\":\"block\",\"reason\":\"...\"},\n");
+    out.push_str("#   or Claude Code's {\"hookSpecificOutput\":{\"permissionDecision\":\"allow|deny|ask\"}};\n");
+    out.push_str("#   exiting with code 2 and a reason also blocks\n");
     out
 }
 
@@ -3273,7 +3268,6 @@ model = "missing-type"
             auto_update: true,
             telemetry: Default::default(),
             lsp: Default::default(),
-            auto_commit: false,
             subagent: Default::default(),
             loop_config: Default::default(),
             coding: CodingConfig::default(),
@@ -3814,6 +3808,27 @@ reflection_cadence = 7
 [providers]
 "#;
         let _cfg: Config = toml::from_str(toml_text).expect("legacy field ignored");
+    }
+
+    #[test]
+    fn legacy_dead_keys_still_parse() {
+        // Keys that were parsed and then read by nothing, removed from the schema.
+        // Files in the wild still carry them — config.example.toml shipped them —
+        // and the live values beside them must keep their meaning.
+        let toml_text = r#"
+auto_commit = true
+[providers]
+[subagent]
+enabled = false
+initial_turns = 4
+max_turns = 12
+timeout_secs = 900
+max_concurrent = 5
+max_rounds = 42
+"#;
+        let cfg: Config = toml::from_str(toml_text).expect("dead keys are ignored");
+        assert_eq!(cfg.subagent.max_concurrent, 5);
+        assert_eq!(cfg.subagent.max_rounds, 42);
     }
 
     #[test]

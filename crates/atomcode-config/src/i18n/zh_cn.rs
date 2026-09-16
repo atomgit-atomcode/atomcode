@@ -1000,7 +1000,7 @@ Msg::CmdDescInit => "分析项目并生成 AGENTS.md".into(),
 Msg::CmdDescBg => "后台会话：/bg、/bg list、/bg <N>、/bg drop <N>".into(),
 Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务（只读工具子集）".into(),
         Msg::CmdDescDiff => "显示 git diff".into(),
-        Msg::CmdDescClear => "清屏".into(),
+        Msg::CmdDescClear => "开始新对话（清空上下文和屏幕）".into(),
         Msg::CmdDescSession => "开始新会话（清除对话）".into(),
         Msg::CmdDescCost => "显示本会话 Token 用量".into(),
         Msg::CmdDescUsage => "显示 CodingPlan 用量（标签：当前窗口 / 总览 / 模型）".into(),
@@ -1010,7 +1010,7 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
         Msg::CmdDescRemember => "保存记忆（/remember --global 为全局）".into(),
         Msg::CmdDescForget => "删除匹配的记忆".into(),
         Msg::CmdDescMemory => "显示所有已保存的记忆".into(),
-        Msg::CmdDescMcp => "显示 MCP 服务器状态（子命令：reload）".into(),
+        Msg::CmdDescMcp => "显示 MCP 服务器状态（子命令：reload、tools、login、logout、trust、untrust）".into(),
         Msg::CmdDescUndo => "撤销：把对话记忆回退一轮（/undo 或 /undo N）".into(),
         Msg::CmdDescRewind => "回退：把对话恢复到更早的检查点".into(),
         Msg::CmdDescWorktree => "Git 工作树隔离（create/list/done/cleanup）".into(),
@@ -1205,10 +1205,11 @@ Msg::CmdDescBackground => "在隔离的后台上下文中运行一次性任务�
              \u{20}\u{20}/goal clear           停止当前目标（别名：stop、off、reset、none、cancel）\n  \
              \u{20}\u{20}/goal help            显示本帮助\n  \
              说明：\n  \
-             \u{20}\u{20}- 每轮由一个快速模型评估；通过 ~/.atomcode/config.toml 中的 [providers] +\n  \
-             \u{20}\u{20}\u{20}\u{20}evaluator_provider 配置。\n  \
-             \u{20}\u{20}- 没有内置的轮次 / 时间上限——请在条件文本中自行表达预算\n  \
-             \u{20}\u{20}\u{20}\u{20}（例如 \"或在 20 轮后停止\"）。Claude Code 的 /goal 也是这样工作的。\n  \
+             \u{20}\u{20}- 每轮由一个模型评估；在 ~/.atomcode/config.toml 里用 evaluator_provider\n  \
+             \u{20}\u{20}\u{20}\u{20}指定（[models] 的 id 或 [providers] 的名字）。\n  \
+             \u{20}\u{20}- 轮次上限：CodingPlan 调用额度的 30%（至少 50），没有套餐信息时为 300；\n  \
+             \u{20}\u{20}\u{20}\u{20}ATOMCODE_GOAL_MAX_ROUNDS 可覆盖。默认没有时间上限，除非设置了\n  \
+             \u{20}\u{20}\u{20}\u{20}ATOMCODE_GOAL_MAX_DURATION_SECS。达到上限后目标暂停——发一条消息即可继续。\n  \
              \u{20}\u{20}- 随时可用 Esc / Ctrl+C 停止目标。\n".into(),
         Msg::GoalStatus { condition, round, mins, secs } =>
             format!("  ◎ 目标：{}\n  轮次：{}\n  已用时：{}分 {}秒\n", condition, round, mins, secs).into(),

@@ -7451,10 +7451,12 @@ fn harness_host_state(
                 }
                 Err(error) => return Err(error.into()),
             },
+            store: Some(binding.manager.clone()),
         },
         None => crate::host_rows::SessionSeed {
             id: None,
             snapshot: parts.runtime_resume_snapshot(),
+            store: None,
         },
     };
     // The system prompt a continued session was stored with: its leading
@@ -7597,6 +7599,13 @@ fn harness_host_state(
         compaction_checkpoint: parts.snapshot_hook(),
         summary_provider: Some(parts.side_provider_slot()),
         model: Some(config.model.clone()),
+        // `from_config` is the one constructor that carries the parsed file along;
+        // a runtime built from a hand-made config was configured by no file.
+        config_file: config
+            .subagent_config
+            .is_some()
+            .then(atomcode_config::Config::default_path),
+        web_search_api_key: config.web_search_api_key.clone(),
         rows: harness_option_rows(parts, config, prepare)
             .map_err(std::io::Error::other)?
             .then(permission_rows),
@@ -7722,7 +7731,8 @@ struct MemoryPatch<'a> {
 }
 
 #[derive(serde::Serialize)]
-/// What `session-persistence-jsonl` actually reads.
+/// What the journal row (`session-journal`, on the `session-persistence-jsonl`
+/// row) actually reads: the project. Where it writes is the row's own decision.
 ///
 /// NOT `resume`: that is the `session` row's field, and the string this replaced
 /// had been sending it here — to a row that has never read it — since the
@@ -7730,7 +7740,6 @@ struct MemoryPatch<'a> {
 /// follower is replayed on resume is decided where it belongs, by
 /// `session-native`'s `SessionDefaults { resume: false }`.
 struct JsonlFollowerPatch<'a> {
-    root: std::path::PathBuf,
     project_root: &'a std::path::Path,
 }
 
@@ -7785,10 +7794,9 @@ fn harness_option_rows(
             .map_err(|e| e.to_string())?;
     }
     // The tree's own log, kept and written — but NOT where the native store keeps
-    // this session's transcript. Both name a file `<bucket>/<id>.jsonl` under
-    // `<home>/sessions`, and two writers with two schemas in one file is a file
-    // neither can read: the runtime's transcript is what `recall` and the session
-    // catalog read, so the follower gets a root of its own.
+    // this session's transcript. That is `session-journal`'s to decide
+    // (`CODING_DEFAULTS` swaps it in, for every host that stacks those rows); the
+    // runtime only says which project this session is.
     //
     // `resume = false` for the same reason the decision records: the native
     // snapshot is what a session is rebuilt from here, and a replay of this log
@@ -7796,10 +7804,7 @@ fn harness_option_rows(
     rows = rows
         .patch(
             "session-persistence-jsonl",
-            JsonlFollowerPatch {
-                root: atomcode_harness::home().join("sessions").join("harness"),
-                project_root: wd,
-            },
+            JsonlFollowerPatch { project_root: wd },
         )
         .map_err(|e| e.to_string())?;
     // Ctrl-C semantics: by default a cancelled turn is undone — its prompt and

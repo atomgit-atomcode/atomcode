@@ -276,8 +276,50 @@ pub fn runtime_skill_dirs(home: &Path, project: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Where a new skill should be written so [`runtime_skill_dirs`] finds it and it
+/// wins a name clash at its level: `(every project, this project)`.
+///
+/// Next to the list it indexes into, so the two cannot drift: the test
+/// `install_dirs_are_the_winning_dirs_of_the_runtime_list` pins it.
+pub fn runtime_skill_install_dirs(home: &Path, project: &Path) -> (PathBuf, PathBuf) {
+    let user = std::env::var_os("ATOMCODE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".atomcode"))
+        .join("skills");
+    (user, project.join(".atomcode/skills"))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[serial_test::serial]
+    fn install_dirs_are_the_winning_dirs_of_the_runtime_list() {
+        let home = Path::new("/home/u");
+        let project = Path::new("/proj");
+        for atomcode_home in [None, Some("/custom/atomcode")] {
+            match atomcode_home {
+                Some(dir) => std::env::set_var("ATOMCODE_HOME", dir),
+                None => std::env::remove_var("ATOMCODE_HOME"),
+            }
+            let dirs = runtime_skill_dirs(home, project);
+            let (user, this_project) = runtime_skill_install_dirs(home, project);
+            let at = |p: &PathBuf| dirs.iter().position(|d| d == p);
+            let user_at = at(&user).expect("the user install dir is scanned");
+            let project_at = at(&this_project).expect("the project install dir is scanned");
+            assert_eq!(
+                project_at,
+                dirs.len() - 1,
+                "the project dir wins every clash"
+            );
+            assert!(
+                dirs[user_at + 1..].iter().all(|d| d.starts_with(project)),
+                "the user dir wins every clash at the user level: {dirs:?}"
+            );
+        }
+        std::env::remove_var("ATOMCODE_HOME");
+    }
+
     use super::*;
 
     #[test]

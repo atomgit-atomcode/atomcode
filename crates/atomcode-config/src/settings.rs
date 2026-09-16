@@ -41,6 +41,46 @@ pub struct SettingSpec {
     pub apply: ApplyPolicy,
 }
 
+/// The catalog as an agent reads it: which file, what each setting accepts, and
+/// when a change takes effect.
+///
+/// Rendered from [`SETTINGS`] itself, next to it, so a setting that is added,
+/// renamed or retired changes this answer without anyone remembering to.
+pub fn describe_catalog(config_file: &std::path::Path) -> String {
+    let mut out = format!(
+        "User settings live in `{}`. {} of them are safely editable; each line is \
+         `id — label (aliases) : accepted values → when it takes effect`.\n\n\
+         Note what is deliberately absent: model, provider, account, endpoint and \
+         credentials are NOT in this catalog — see the `operations` aspect for how \
+         the model is chosen.\n",
+        config_file.display(),
+        SETTINGS.len(),
+    );
+    for spec in SETTINGS {
+        let values = match spec.kind {
+            SettingKind::Boolean => "true | false".to_string(),
+            SettingKind::OptionalBoolean => "true | false | unset".to_string(),
+            SettingKind::Integer { min, max } => format!("{min}..={max}"),
+            SettingKind::Choice(options) => options.join(" | "),
+            SettingKind::Text => "text".to_string(),
+        };
+        out.push_str(&format!(
+            "\n  {} — {} / {}{} : {} → {:?}",
+            spec.id,
+            spec.label_en,
+            spec.label_zh,
+            if spec.aliases.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", spec.aliases.join(", "))
+            },
+            values,
+            spec.apply,
+        ));
+    }
+    out
+}
+
 const TODO_EAGERNESS: &[&str] = &["auto", "preferred", "always"];
 const THEMES: &[&str] = &["auto", "dark", "light"];
 const LANGUAGES: &[&str] = &["auto", "en", "zh_CN"];

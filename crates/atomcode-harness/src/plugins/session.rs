@@ -54,6 +54,18 @@ impl Plugin for SessionPlugin {
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
         let row: SessionRow = parse(config)?;
+        // This row's own two knobs, and nothing about how they get set — a
+        // launcher that writes them says so itself.
+        crate::plugins::self_knowledge::describes(
+            ctx,
+            "session-identity",
+            10,
+            "SESSION IDENTITY. The tree's own agent takes its session from the \
+             `session` row: `id` names it (minted when absent), and `resume = true` \
+             continues that session by replaying the events `session-persistence` \
+             stored for it before the first turn. There is no separate snapshot \
+             format for this: the stored events are the snapshot.",
+        );
         let _ = ctx
             .provide::<SessionDefaultsSvc>(Arc::new(SessionDefaults {
                 id: row.id,
@@ -235,6 +247,21 @@ impl JsonlStore {
         Ok(Some(header))
     }
 
+    /// The header this store holds for `session_id`, read synchronously: what a
+    /// description reports as the session's recorded start, which is not the
+    /// in-memory log's when the log was seeded rather than resumed from here.
+    fn stored_header(&self, session_id: &str) -> Option<SessionHeader> {
+        use std::io::BufRead;
+        let path = match self.path(session_id) {
+            p if p.exists() => p,
+            _ => self.legacy_path(session_id),
+        };
+        let file = std::fs::File::open(&path).ok()?;
+        let mut first = String::new();
+        std::io::BufReader::new(file).read_line(&mut first).ok()?;
+        Self::parse_header(&path, &first).ok().flatten()
+    }
+
     /// Write the header line if the file does not exist yet. Synchronous and
     /// small on purpose: it must be on disk before the first event lands, and
     /// the first event is appended from a task this does not wait for.
@@ -385,19 +412,60 @@ impl Plugin for SessionPersistenceJsonlPlugin {
         // what a project is.
         let bucket = atomcode_config::util::stable_project_hash(&project);
         let store = Arc::new(JsonlStore { root, bucket });
+        // What this row does, and only that. It used to go on to explain resume
+        // and recall, which are other rows' — and in an assembly that keeps its
+        // sessions elsewhere and swaps both of those out, this entry was left
+        // telling the agent its journal was the session store.
         crate::plugins::self_knowledge::describes(
             ctx,
-            "sessions",
-            10,
+            "session-event-log",
+            12,
             format!(
-                "SESSIONS. Every committed fact of this session is appended to \n\
-                 `{}`. Sessions are bucketed per project, so the `recall` tool \n\
-                 searches this project's history and not the whole machine's.\n\
-                 To resume one: set `id = \"<session-id>\"` and `resume = true` \
-                 on the `session` row. There is no snapshot format — the log IS \
-                 the snapshot, so a resume is a replay.",
+                "SESSION EVENT LOG. Every committed fact of a session is appended \
+                 to `{}/<session-id>.jsonl`, one directory per project — this one \
+                 is this project's.",
                 store.dir().display()
             ),
+        );
+        let facts_store = store.clone();
+        let facts_ctx = ctx.clone();
+        crate::plugins::self_knowledge::describes_live(
+            ctx,
+            crate::seams::Aspect::Session,
+            "session-event-log/this-session",
+            12,
+            move |asking| {
+                use crate::agent::OnlySession;
+                let log = asking.only_session()?;
+                let persisted = facts_ctx
+                    .service::<crate::seams::AgentsSvc>()
+                    .and_then(|agents| agents.by_session(log.id()))
+                    .map(|agent| agent.persist())
+                    .unwrap_or(true);
+                if !persisted {
+                    return None;
+                }
+                let mut lines = vec![format!(
+                    "event log: {}",
+                    facts_store.path(log.id()).display()
+                )];
+                if let Some(header) = facts_store.stored_header(log.id()) {
+                    lines.push(format!(
+                        "  started at: {} (unix ms, as the log recorded it)",
+                        header.created_at
+                    ));
+                    if let Some(cwd) = &header.cwd {
+                        lines.push(format!("  working directory: {cwd}"));
+                    }
+                    if let Some(parent) = &header.parent {
+                        lines.push(format!(
+                            "  forked from: {parent} (the first {} events are inherited)",
+                            header.inherited
+                        ));
+                    }
+                }
+                Some(lines.join("\n"))
+            },
         );
         let _ = ctx
             .provide::<SessionPersistenceSvc>(store.clone())

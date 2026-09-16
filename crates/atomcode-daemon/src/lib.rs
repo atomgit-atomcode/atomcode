@@ -1470,7 +1470,27 @@ fn catalog_scan_in_root(
     root: &std::path::Path,
 ) -> std::io::Result<atomcode_capabilities::session::CatalogScan> {
     let scan = atomcode_capabilities::session::SessionManager::scan_catalog(root);
-    for diagnostic in &scan.diagnostics {
+    warn_catalog_diagnostics(&scan.diagnostics);
+    Ok(scan)
+}
+
+/// Each skipped catalog entry, logged once per process.
+///
+/// The web UI refreshes the session list every few seconds, and a stale file on
+/// disk is the same stale file on every refresh. Logging all of them each time
+/// put ~30,000 identical warnings into one minute of log, burying anything new.
+/// A problem not seen before is still reported the moment it appears.
+pub(crate) fn warn_catalog_diagnostics(
+    diagnostics: &[atomcode_capabilities::session::CatalogDiagnostic],
+) {
+    static REPORTED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(PathBuf, String)>>,
+    > = std::sync::OnceLock::new();
+    let mut reported = REPORTED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for diagnostic in first_reports(&mut reported, diagnostics) {
         tracing::warn!(
             path = %diagnostic.path.display(),
             kind = ?diagnostic.kind,
@@ -1478,7 +1498,49 @@ fn catalog_scan_in_root(
             "session catalog entry was skipped"
         );
     }
-    Ok(scan)
+}
+
+/// The diagnostics in `diagnostics` that `reported` has not seen, recording them.
+fn first_reports<'a>(
+    reported: &mut std::collections::HashSet<(PathBuf, String)>,
+    diagnostics: &'a [atomcode_capabilities::session::CatalogDiagnostic],
+) -> Vec<&'a atomcode_capabilities::session::CatalogDiagnostic> {
+    diagnostics
+        .iter()
+        .filter(|diagnostic| reported.insert((diagnostic.path.clone(), diagnostic.message.clone())))
+        .collect()
+}
+
+#[cfg(test)]
+mod catalog_diagnostic_log_tests {
+    use super::first_reports;
+    use atomcode_capabilities::session::{CatalogDiagnostic, CatalogDiagnosticKind};
+
+    fn diagnostic(path: &str, message: &str) -> CatalogDiagnostic {
+        CatalogDiagnostic {
+            project_bucket: None,
+            path: path.into(),
+            kind: CatalogDiagnosticKind::InvalidId,
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn a_refresh_repeats_nothing_already_reported_but_a_new_problem_still_is() {
+        let mut reported = Default::default();
+        let first = [diagnostic("/s/a", "bad"), diagnostic("/s/b", "bad")];
+        assert_eq!(first_reports(&mut reported, &first).len(), 2);
+        assert!(
+            first_reports(&mut reported, &first).is_empty(),
+            "the same scan again reports nothing"
+        );
+        let later = [diagnostic("/s/a", "bad"), diagnostic("/s/c", "bad")];
+        let new: Vec<_> = first_reports(&mut reported, &later)
+            .into_iter()
+            .map(|d| d.path.clone())
+            .collect();
+        assert_eq!(new, vec![std::path::PathBuf::from("/s/c")]);
+    }
 }
 
 fn catalog_entry_to_session_summary(

@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use atomcode_harness::seams::{LlmSvc, SystemPromptSvc, ToolsSvc};
+use atomcode_harness::seams::{Aspect, LlmSvc, OperationsSvc, SystemPromptSvc, ToolsSvc};
 use atomcode_harness::{bundle, plugins, run_turn};
 use atomcode_kernel::tool::{ProgressSink, Tool, ToolContext, ToolResult};
 use atomcode_plexus::{App, ConfigTree, Layer};
@@ -38,9 +38,19 @@ fn scratch(tag: &str) -> PathBuf {
 }
 
 fn tree(root: &std::path::Path, extra: &[&str]) -> ConfigTree {
+    let mut layers = vec![bundle::base().unwrap()];
+    layers.push(Layer::from_toml(&scoped(root)).unwrap());
+    for src in extra {
+        layers.push(Layer::from_toml(src).unwrap());
+    }
+    ConfigTree::from_layers(layers).unwrap()
+}
+
+/// Every row that would otherwise reach outside `root`, pointed inside it.
+fn scoped(root: &std::path::Path) -> String {
     let empty_home = root.join("__no_user_skills__");
     let _ = std::fs::create_dir_all(&empty_home);
-    let scoped = format!(
+    format!(
         "[[patch]]\nid = \"trace\"\nconfig = {{ stream = false, tools = false, summary = false }}\n\n\
          [[patch]]\nid = \"fs\"\nconfig = {{ root = {root:?} }}\n\n\
          [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 20, working_dir = {root:?} }}\n\n\
@@ -52,13 +62,7 @@ fn tree(root: &std::path::Path, extra: &[&str]) -> ConfigTree {
         root = root.to_string_lossy(),
         home = empty_home.to_string_lossy(),
         store = root.join("sessions").to_string_lossy(),
-    );
-    let mut layers = vec![bundle::base().unwrap()];
-    layers.push(Layer::from_toml(&scoped).unwrap());
-    for src in extra {
-        layers.push(Layer::from_toml(src).unwrap());
-    }
-    ConfigTree::from_layers(layers).unwrap()
+    )
 }
 
 async fn start(tree: ConfigTree) -> App {
@@ -296,23 +300,97 @@ async fn it_reports_the_session_the_log_actually_holds() {
 }
 
 #[tokio::test]
-async fn a_tree_with_no_store_says_so_instead_of_naming_a_path() {
-    let dir = scratch("memory-only");
+async fn where_a_session_is_kept_is_only_what_a_mounted_row_says() {
+    // The tool used to decide this itself: the `session-persistence` file is
+    // the store, and no such row means "nowhere — in memory only". Both halves
+    // are assumptions about which rows are mounted. An assembly that keeps its
+    // sessions somewhere else, with no persistence row at all, would have been
+    // told its sessions are lost when they are not.
+    let dir = scratch("unsaid");
     let app = start(tree(
         &dir,
         &["[[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true"],
     ))
     .await;
-
     let said = ask(&app, "session").await;
     assert!(
-        said.contains("nowhere"),
-        "an unpersisted session must admit it:\n{said}"
+        !said.contains(".jsonl"),
+        "no row writes a log, so no log may be named:\n{said}"
+    );
+    for guess in ["nowhere", "memory only", "in memory"] {
+        assert!(
+            !said.contains(guess),
+            "and no row said it is unsaved either — `{guess}` is the tool guessing:\n{said}"
+        );
+    }
+    assert!(said.contains("no mounted row says"), "{said}");
+
+    // A row that DOES keep sessions somewhere is heard, in its own words, for
+    // the session that is asking — and loses its say when it unloads.
+    let log = app.context().only_session().unwrap();
+    let ops = app.context().service::<OperationsSvc>().unwrap();
+    ops.contribute_live(
+        Aspect::Session,
+        "elsewhere",
+        50,
+        Arc::new(|asking| {
+            let log = asking.only_session()?;
+            Some(format!("kept in the elsewhere store as {}", log.id()))
+        }),
+    );
+    let heard = ask(&app, "session").await;
+    assert!(
+        heard.contains(&format!("kept in the elsewhere store as {}", log.id())),
+        "{heard}"
     );
     assert!(
-        !said.contains(".jsonl"),
-        "and must not name a file nobody writes:\n{said}"
+        !heard.contains("no mounted row says"),
+        "a row spoke, so the tool must not also say none did:\n{heard}"
     );
+    ops.remove("elsewhere");
+    assert!(!ask(&app, "session").await.contains("elsewhere store"));
+}
+
+#[tokio::test]
+async fn only_a_launcher_that_reads_patch_layers_teaches_them() {
+    // A tree mounted straight onto the catalog — which is how an embedding
+    // host such as the coding runtime mounts one — reads no patch file and
+    // takes no `--resume`, so nothing in it may tell the agent to use either.
+    let dir = scratch("unlaunched");
+    let bare = ask(&start(tree(&dir, &[])).await, "operations").await;
+    for taught in [
+        "[[patch]]",
+        "harness.patch.toml",
+        "--resume",
+        "resume = true` on",
+    ] {
+        assert!(
+            !bare.contains(taught),
+            "`{taught}` taught by a tree nobody launched:\n{bare}"
+        );
+    }
+
+    // The launcher that does read them says so, with the file it reads.
+    let dir = scratch("launched");
+    let profiles = atomcode_harness::profile::Profiles::builtin();
+    let launch = atomcode_harness::launch::Launch::new(
+        "oneshot",
+        vec![bundle::OFFLINE.to_string(), scoped(&dir)],
+    );
+    let mounted = match launch.mount(plugins::catalog(), &profiles).await {
+        Ok(mounted) => mounted,
+        Err(code) => panic!("the launcher must mount: {code:?}"),
+    };
+    atomcode_harness::create_agent(mounted.app())
+        .await
+        .expect("an agent");
+    let launched = ask(mounted.app(), "operations").await;
+    assert!(launched.contains("[[patch]]"), "{launched}");
+    assert!(
+        launched.contains(&profiles.home_patch_path().display().to_string()),
+        "the layer file named must be the one this launcher reads:\n{launched}"
+    );
+    assert!(launched.contains("--resume <session-id>"), "{launched}");
 }
 
 // ---- through a real turn -------------------------------------------------
@@ -377,7 +455,8 @@ async fn every_mounted_row_can_describe_its_own_knobs() {
     for expected in [
         "MEMORY",
         "RECALL",
-        "SESSIONS",
+        "SESSION EVENT LOG",
+        "SESSION IDENTITY",
         "MODEL",
         "HOW THIS SYSTEM IS PUT TOGETHER",
     ] {
@@ -501,51 +580,33 @@ async fn a_row_that_is_not_mounted_describes_nothing() {
     assert!(!ops.contains("RECALL"), "{ops}");
     // …while the rows that ARE mounted still describe themselves, so this is
     // about removal and not about the registry having failed to fill.
-    assert!(ops.contains("SESSIONS"), "{ops}");
+    assert!(ops.contains("SESSION EVENT LOG"), "{ops}");
 }
 
 #[tokio::test]
-async fn the_settings_answer_is_the_settings_catalog_itself() {
+async fn a_settings_file_is_only_what_a_mounted_row_says_configured_the_tree() {
+    // The tool used to render the settings catalog itself, so every tree — this
+    // one included, which no settings file configures — told the agent to edit
+    // `config.toml`. Whatever reads a settings file says so; nothing did here.
     let dir = scratch("settings");
     let app = start(tree(&dir, &[])).await;
     let said = ask(&app, "settings").await;
+    assert!(!said.contains("config.toml"), "{said}");
+    assert!(said.contains("No mounted row"), "{said}");
 
-    // The judge is the catalog, not a list this test also maintains: add a
-    // setting anywhere in the workspace and this stays true with no edit here.
-    assert!(
-        said.contains(&format!(
-            "{} of them are safely editable",
-            atomcode_config::settings::SETTINGS.len()
-        )),
-        "{said}"
+    // A row that did read one is heard, and leaves with its row.
+    let ops = app.context().service::<OperationsSvc>().unwrap();
+    ops.contribute(
+        Aspect::Settings,
+        "a-settings-file",
+        0,
+        "Settings live in `/somewhere/settings.toml`.",
     );
-    for spec in atomcode_config::settings::SETTINGS {
-        assert!(said.contains(spec.id), "setting {} is missing", spec.id);
-    }
-    // The two questions a person actually asks.
-    assert!(said.contains("language"), "{said}");
-    assert!(
-        said.contains("中文"),
-        "aliases carry, so a Chinese ask still lands"
-    );
-    assert!(
-        said.contains("config.toml"),
-        "and it says which file to edit"
-    );
-}
-
-#[tokio::test]
-async fn settings_says_what_it_deliberately_does_not_cover() {
-    // The catalog excludes model/provider/credentials by design. An answer that
-    // silently omitted them would read as "you cannot change your model".
-    let dir = scratch("settings-gap");
-    let app = start(tree(&dir, &[])).await;
-    let said = ask(&app, "settings").await;
-    assert!(said.contains("deliberately absent"), "{said}");
-    assert!(
-        ask(&app, "operations").await.contains("MODEL"),
-        "and the aspect it points at must actually answer it"
-    );
+    assert!(ask(&app, "settings")
+        .await
+        .contains("/somewhere/settings.toml"));
+    ops.remove("a-settings-file");
+    assert!(ask(&app, "settings").await.contains("No mounted row"));
 }
 
 // ---- the other half: what the repository says ---------------------------

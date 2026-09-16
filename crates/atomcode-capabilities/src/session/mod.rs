@@ -49,7 +49,7 @@ pub use presentation::{
     anchor_from_legacy_position, DisplayAnchor, LegacyTurnBoundary, PresentationEntry,
     PresentationFile, PresentationRole,
 };
-pub use recall::{KeywordIndex, RecallIndex, RecallTool};
+pub use recall::{KeywordIndex, RecallIndex, RecallRequest, RecallTool};
 pub use rewind::{
     FileChangeSummary, RewindPoint, WorkspaceCheckpoint, WorkspaceCheckpointError,
     WorkspaceRestoreReceipt,

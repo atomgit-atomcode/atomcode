@@ -56,6 +56,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
+use atomcode_capabilities::session::SessionManager;
 use atomcode_harness::agent::{Agent, MessageOrigin};
 use atomcode_harness::events::{
     AgentRequest, ModelRequest, ModelResponse, PreStep, RequestError, StepDecision, TurnFinishing,
@@ -70,22 +71,129 @@ use atomcode_plexus::{Context, Listener, Next, Plugin, Waterfall};
 use serde_json::Value;
 
 /// The session a tree's own agent is created with.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct SessionSeed {
     /// The native binding's id. `None` for a sessionless runtime, which lets the
     /// tree mint one.
     pub id: Option<String>,
     /// The stored conversation to continue from.
     pub snapshot: Option<SessionSnapshot>,
+    /// The store the session is kept in. `None` exactly when `id` is: a
+    /// sessionless runtime keeps nothing.
+    pub store: Option<Arc<SessionManager>>,
+}
+
+impl std::fmt::Debug for SessionSeed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionSeed")
+            .field("id", &self.id)
+            .field("snapshot", &self.snapshot)
+            .field("store", &self.store.as_ref().map(|store| store.root()))
+            .finish()
+    }
 }
 
 /// `session-native`: the runtime's session, handed to the tree.
 pub(crate) struct SessionNativePlugin(pub(crate) Arc<SessionSeed>);
 
+impl SessionNativePlugin {
+    /// What this row keeps, said by this row.
+    ///
+    /// It displaced the harness's `session` row and pushed the JSONL row aside
+    /// to a journal, and for a while said nothing — so the only description of
+    /// sessions the agent could find was that journal's, and it told people
+    /// their conversation lived in a file nothing reads back. Displacing a row
+    /// means inheriting what it was responsible for saying (the `model` row
+    /// learned the same, see `on_harness`).
+    ///
+    /// The commands named are the product's contract for continuing a session,
+    /// not one front end's: a terminal UI that replaces the current one keeps
+    /// `/resume`, which is why this row can name it.
+    fn describe(&self, ctx: &Context) {
+        use atomcode_harness::plugins::self_knowledge::{describes, describes_live};
+        use atomcode_harness::seams::Aspect;
+
+        let (Some(id), Some(store)) = (self.0.id.clone(), self.0.store.clone()) else {
+            describes(
+                ctx,
+                "sessions",
+                10,
+                "SESSIONS. This conversation is not kept in the AtomCode session \
+                 store: it is not in the session list and cannot be resumed later.",
+            );
+            describes_live(ctx, Aspect::Session, "sessions/this-session", 10, |_| {
+                Some(
+                    "kept in: no session store — this conversation cannot be resumed later"
+                        .to_string(),
+                )
+            });
+            return;
+        };
+
+        describes(
+            ctx,
+            "sessions",
+            10,
+            format!(
+                "SESSIONS. Sessions are kept per project in the AtomCode session \
+                 store; this project's is `{root}`. For a session id: \
+                 `<id>.snapshot` is the conversation — a resume rebuilds it from \
+                 that file and from nothing else; `<id>.meta` holds its name, \
+                 working directory and per-turn statistics; `<id>.jsonl` is its \
+                 turn-by-turn transcript.\n\
+                 Continuing a session is the person's to do, never yours, and never \
+                 by editing these files or any configuration: `/resume` in the \
+                 terminal UI, `atomcode --continue` (the latest) or `atomcode \
+                 --resume <id-or-name>` when starting — `atomcode -p \"…\" --resume \
+                 <id>` for a one-shot run — or picking it from the session list in \
+                 the web UI.",
+                root = store.root().display(),
+            ),
+        );
+        describes_live(
+            ctx,
+            Aspect::Session,
+            "sessions/this-session",
+            10,
+            move |_| {
+                let mut lines = Vec::new();
+                match store.snapshot_path(&id) {
+                    Ok(path) if path.exists() => lines.push(format!(
+                        "kept in: {} (the session store; a resume rebuilds from this file)",
+                        path.display()
+                    )),
+                    Ok(path) => lines.push(format!(
+                        "kept in: {} (the session store — not written yet)",
+                        path.display()
+                    )),
+                    Err(error) => lines.push(format!("kept in: the session store ({error})")),
+                }
+                // Read when asked: a `/rename`, or the namer finishing, changes
+                // it mid-session.
+                if let Ok(meta) = store.read_meta(&id) {
+                    lines.push(format!("name in the session list: {}", meta.name));
+                    lines.push(format!("created at: {} (unix ms)", meta.created_at));
+                    lines.push(format!("working directory: {}", meta.working_dir));
+                    if let Some(fork) = &meta.fork_info {
+                        lines.push(format!(
+                            "forked from: {} (after its first {} messages)",
+                            fork.parent_id, fork.base_message_count
+                        ));
+                    }
+                }
+                Some(lines.join("\n"))
+            },
+        );
+    }
+}
+
 #[async_trait]
 impl Plugin for SessionNativePlugin {
     fn name(&self) -> &'static str {
         "session-native"
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["operations"]
     }
     fn provides(&self) -> &'static [&'static str] {
         &["session-defaults"]
@@ -94,6 +202,7 @@ impl Plugin for SessionNativePlugin {
         "the coding runtime's native session: its id, and its stored conversation as the seed"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        self.describe(ctx);
         let seed = self
             .0
             .snapshot
@@ -609,9 +718,78 @@ impl Plugin for PlanModeLivePlugin {
 /// had no way in at all. This row serves the registry prepare built, and puts its
 /// catalog in the prompt the way the chain does: rendered once, skills the
 /// project's instructions name first when the budget cuts.
-pub(crate) struct SkillsHostPlugin {
-    pub(crate) registry: Arc<atomcode_capabilities::skills::SkillRegistry>,
-    pub(crate) catalog: Option<String>,
+pub(crate) struct SkillsHostPlugin(pub(crate) LoadedSkills);
+
+/// The skill catalog prepare loaded, and where it looked.
+#[derive(Clone)]
+pub struct LoadedSkills {
+    pub registry: Arc<atomcode_capabilities::skills::SkillRegistry>,
+    /// The catalog as rendered for the prompt.
+    pub catalog: Option<String>,
+    /// Scanned in this order; a skill in a later directory replaces an earlier
+    /// one of the same name.
+    pub dirs: Vec<std::path::PathBuf>,
+    /// Where a new skill goes — `(every project, this project)` — when `dirs`
+    /// is the standard list. `None` when the driver named its own directories.
+    pub install: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    /// Installed plugins whose skills were loaded, under each plugin's name.
+    pub plugins: Vec<String>,
+}
+
+impl SkillsHostPlugin {
+    /// The directories this runtime actually scanned — a driver may name its
+    /// own — rather than the standard list the harness row describes.
+    fn describe(&self, ctx: &Context) {
+        let loaded = &self.0;
+        let mut text = format!("SKILLS — {} loaded.", loaded.registry.len());
+        if loaded.dirs.is_empty() && loaded.plugins.is_empty() {
+            text.push_str(" This runtime was started without skill directories.");
+        } else {
+            if !loaded.dirs.is_empty() {
+                text.push_str(
+                    " A skill is `<name>/SKILL.md` (with any files it uses beside it), or \
+                     a single `<name>.md`, inside one of these directories, scanned in \
+                     this order — a later one's skill replaces an earlier one's of the \
+                     same name:",
+                );
+                for dir in &loaded.dirs {
+                    text.push_str(&format!("\n  {}", dir.display()));
+                }
+                text.push_str(
+                    "\nThe file starts with frontmatter, one `key: value` per line:\n\
+                     ---\n\
+                     name: <name>   (letters, digits, `-`, `_`; defaults to the directory \
+                     or file name)\n\
+                     description: <when to use it — this is what gets it chosen>\n\
+                     ---\n\
+                     then the instructions. `$ARGUMENTS` in them is replaced by what the \
+                     skill was invoked with. A file whose name is invalid is skipped \
+                     without a warning.\n",
+                );
+            }
+            if let Some((every_project, this_project)) = &loaded.install {
+                text.push_str(&format!(
+                    "To add a skill for the person, write it under `{}` for this project \
+                     or `{}` for every project — ask which if they did not say. \
+                     ",
+                    this_project.display(),
+                    every_project.display(),
+                ));
+            }
+            text.push_str(
+                "A new session loads it; in the terminal UI, `/plugin reload` loads it \
+                 into this one.\n",
+            );
+            if !loaded.plugins.is_empty() {
+                text.push_str(&format!(
+                    "Installed plugins' skills are loaded as `<plugin>:<skill>`, from: {}.\n",
+                    loaded.plugins.join(", ")
+                ));
+            }
+            text.push_str("`list_skills` shows what is loaded; `use_skill` loads one.");
+        }
+        atomcode_harness::plugins::self_knowledge::describes(ctx, "skills", 13, text);
+    }
 }
 
 #[async_trait]
@@ -622,6 +800,9 @@ impl Plugin for SkillsHostPlugin {
     fn inject(&self) -> &'static [&'static str] {
         &["tools", "system-prompt"]
     }
+    fn uses(&self) -> &'static [&'static str] {
+        &["operations"]
+    }
     fn provides(&self) -> &'static [&'static str] {
         &["skills"]
     }
@@ -629,18 +810,22 @@ impl Plugin for SkillsHostPlugin {
         "the skill catalog the coding runtime loaded, plugin skills included"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        self.describe(ctx);
+        let LoadedSkills {
+            registry, catalog, ..
+        } = &self.0;
         let _ = ctx
-            .provide::<atomcode_harness::seams::SkillsSvc>(self.registry.clone())
+            .provide::<atomcode_harness::seams::SkillsSvc>(registry.clone())
             .map_err(|e| e.to_string())?;
         let toolbox = ctx
             .require::<atomcode_harness::seams::ToolsSvc>()
             .map_err(|e| e.to_string())?;
         for tool in [
             Arc::new(atomcode_capabilities::skills::UseSkillTool::new(
-                self.registry.clone(),
+                registry.clone(),
             )) as Arc<dyn atomcode_kernel::tool::Tool>,
             Arc::new(atomcode_capabilities::skills::ListSkillsTool::new(
-                self.registry.clone(),
+                registry.clone(),
             )),
         ] {
             let name = tool.name().to_string();
@@ -649,13 +834,55 @@ impl Plugin for SkillsHostPlugin {
             let _ = ctx.effect(move || toolbox.unregister(&name));
         }
         if let (Some(catalog), Some(prompts)) = (
-            self.catalog.as_ref().filter(|c| !c.trim().is_empty()),
+            catalog.as_ref().filter(|c| !c.trim().is_empty()),
             ctx.service::<SystemPromptSvc>(),
         ) {
             let (id, rank) = crate::on_harness::SKILLS_FRAGMENT;
             prompts.contribute(id, rank, catalog.clone());
             let _ = ctx.effect(move || prompts.remove(id));
         }
+        Ok(())
+    }
+}
+
+// ---- the settings file ------------------------------------------------------
+
+/// `config-file`: what this runtime took from `config.toml`, said by the runtime
+/// that read it.
+///
+/// Mounted only for a runtime `CodingRuntimeConfig::from_config` built — the
+/// descriptions are that function's neighbours in `config.rs` and the settings
+/// catalog's own renderer — so a runtime no file configured is never told to
+/// edit one.
+pub(crate) struct ConfigFilePlugin(pub(crate) std::path::PathBuf);
+
+#[async_trait]
+impl Plugin for ConfigFilePlugin {
+    fn name(&self) -> &'static str {
+        "config-file"
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["operations"]
+    }
+    fn description(&self) -> &'static str {
+        "what this runtime took from config.toml, and the settings in it that are safe to edit"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        use atomcode_harness::plugins::self_knowledge::{describes, describes_live};
+        describes(
+            ctx,
+            "config-file",
+            20,
+            crate::config::describe_config_file(&self.0),
+        );
+        let catalog = atomcode_config::settings::describe_catalog(&self.0);
+        describes_live(
+            ctx,
+            atomcode_harness::seams::Aspect::Settings,
+            "config-file/settings",
+            0,
+            move |_| Some(catalog.clone()),
+        );
         Ok(())
     }
 }
@@ -1072,6 +1299,9 @@ impl Plugin for McpHostPlugin {
     fn provides(&self) -> &'static [&'static str] {
         &["mcp"]
     }
+    fn uses(&self) -> &'static [&'static str] {
+        &["operations"]
+    }
     fn description(&self) -> &'static str {
         "the MCP servers the coding runtime connected, their tools published as they come up"
     }
@@ -1079,6 +1309,39 @@ impl Plugin for McpHostPlugin {
         let Some(publication) = self.0.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             return Err("mcp-host mounted twice from one publication".into());
         };
+        // The harness `mcp` row this displaces told the agent servers are entries
+        // on its row config — which nothing in this runtime reads. This is where
+        // the runtime's servers actually come from.
+        atomcode_harness::plugins::self_knowledge::describes(
+            ctx,
+            "mcp",
+            14,
+            format!(
+                "MCP — how third-party tools get in without recompiling. Servers are \
+                 configured in `{user}` (every project) and in `.mcp.json` at the \
+                 project root (this project; a server of the same name there wins). \
+                 The format:\n\
+                 {{ \"mcpServers\": {{\n\
+                 \x20 \"<name>\": {{ \"command\": \"npx\", \"args\": [\"-y\", \"<package>\"], \
+                 \"env\": {{ \"KEY\": \"${{KEY}}\" }} }},\n\
+                 \x20 \"<name>\": {{ \"url\": \"https://…/mcp\", \"headers\": \
+                 {{ \"Authorization\": \"Bearer ${{TOKEN}}\" }} }}\n\
+                 }} }}\n\
+                 Optional per server: `timeout_ms`, `disabled`, `autoApprove` (tool names \
+                 that skip approval), `trust` (every tool of the server skips approval), \
+                 and for HTTP `auth: {{ \"type\": \"oauth\" }}`. `${{VAR}}` is read from the \
+                 environment, so a secret need not be written into the file. Comments are \
+                 allowed; trailing commas are not.\n\
+                 To add a server for the person: write the entry (for a stdio server, \
+                 `atomcode mcp add <name> <command> [args…]` writes `.mcp.json`, and \
+                 `--global` the user file). A project's own servers stay unconnected until \
+                 the person trusts the project with `/mcp trust`; after a file changes, \
+                 `/mcp reload` reconnects; an OAuth server needs `/mcp login <name>`. \
+                 Each server's tools join the catalog as `mcp__<server>__<tool>` and go \
+                 through the same approval as everything else.",
+                user = atomcode_harness::home().join("mcp.json").display(),
+            ),
+        );
         let McpPublication {
             registry,
             connect_rx,

@@ -2840,11 +2840,13 @@ pub(crate) async fn spawn_native_cli_runtime(
     };
     // External-agent subagents (Claude Code / Codex) from `[[subagent.external]]`.
     // Interactive TUI ⇒ dangerous (`bypass`) modes are allowed to be configured
-    // (each risky call is still approval-gated); headless/daemon paths pass none.
+    // (each risky call is still approval-gated); a headless run (`-p`, a schedule)
+    // has nobody to approve with, so a `bypass` entry is downgraded to read-only.
+    // This function serves both, which is how it used to pass `true` for both.
     let external_subagents = cfg
         .subagent_config
         .as_ref()
-        .map(|c| atomcode_coding::parts::resolve_external_subagents(&c.subagent, true))
+        .map(|c| atomcode_coding::parts::resolve_external_subagents(&c.subagent, cfg.interactive))
         .unwrap_or_default();
     let prepare = atomcode_coding::PrepareOptions {
         subagents: atomcode_coding::SubagentPolicy::Enabled,

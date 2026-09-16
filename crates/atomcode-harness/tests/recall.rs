@@ -72,6 +72,10 @@ async fn start(tree: ConfigTree) -> App {
 }
 
 async fn ask(app: &App, query: &str) -> String {
+    ask_with(app, serde_json::json!({ "query": query })).await
+}
+
+async fn ask_with(app: &App, args: serde_json::Value) -> String {
     let tool = app
         .context()
         .service::<ToolsSvc>()
@@ -84,9 +88,7 @@ async fn ask(app: &App, query: &str) -> String {
         progress: ProgressSink::noop(),
         requester: None,
     };
-    let out = tool
-        .execute(&serde_json::json!({ "query": query }).to_string(), &ctx)
-        .await;
+    let out = tool.execute(&args.to_string(), &ctx).await;
     out.content
 }
 
@@ -199,6 +201,42 @@ async fn a_query_that_matches_nothing_says_so_instead_of_inventing() {
     assert!(
         found.contains("rather than inventing"),
         "and it says what to do"
+    );
+}
+
+#[tokio::test]
+async fn with_no_topic_the_latest_turns_come_back_and_a_session_can_be_named() {
+    // "What was our last conversation about?" has a time and no topic. With a
+    // required keyword the model sent `j`; there is nothing to invent now.
+    let store = scratch("by-time");
+    let project = scratch("by-time-proj");
+    let first = start(tree(&store, &project, "we picked sqlite", &[])).await;
+    let old_id = say_and_settle(&first, "which database for the cache?").await;
+    drop(first);
+    // Ids are `<millis>-<pid>`: make sure the second one starts later.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let second = start(tree(&store, &project, "we renamed the crate", &[])).await;
+    say_and_settle(&second, "what did we call the crate?").await;
+
+    let latest = ask_with(&second, serde_json::json!({ "limit": 1 })).await;
+    assert!(latest.contains("by time, newest first"), "{latest}");
+    assert!(latest.contains("renamed the crate"), "{latest}");
+    assert!(!latest.contains("sqlite"), "{latest}");
+
+    let oldest = ask_with(
+        &second,
+        serde_json::json!({ "order": "oldest", "limit": 1 }),
+    )
+    .await;
+    assert!(oldest.contains("sqlite"), "{oldest}");
+
+    // The millisecond part: both sessions start within the same second, so any
+    // shorter prefix names both.
+    let prefix = old_id.split('-').next().unwrap().to_string();
+    let one = ask_with(&second, serde_json::json!({ "session": prefix })).await;
+    assert!(
+        one.contains("sqlite") && !one.contains("renamed the crate"),
+        "{one}"
     );
 }
 

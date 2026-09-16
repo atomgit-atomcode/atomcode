@@ -4043,9 +4043,9 @@ pub struct LoopCtx {
     /// dispatcher as a fallback when the entered name doesn't match a
     /// built-in command.
     pub custom_commands: crate::custom_commands::CustomCommandRegistry,
-    /// Loaded skills (`.claude/skills/*/SKILL.md`, etc.). Same `Arc`
-    /// the agent loop holds, so `reload(...)` there is visible here
-    /// without extra plumbing. Used by the slash-command palette to
+    /// Loaded skills (`.claude/skills/*/SKILL.md`, etc.). The TUI's own copy —
+    /// the runtime loads a separate registry in `prepare`, and `/plugin reload`
+    /// reloads both. Used by the slash-command palette to
     /// surface user-invocable skills, and by the dispatcher to expand
     /// `/skill_name [args]` into a SendMessage.
     pub skill_registry:

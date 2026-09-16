@@ -154,7 +154,17 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 #[derive(Debug, Deserialize)]
 struct Args {
+    /// Optional, for the reason the L1 `recall` gives: most asks are "last time",
+    /// "the first thing I asked" — a time, not a topic — and a required keyword
+    /// made models invent one.
+    #[serde(default)]
     query: String,
+    /// One session: its id or a leading part of it.
+    #[serde(default)]
+    session: Option<String>,
+    /// Without keywords: `newest` (default) or `oldest` first.
+    #[serde(default)]
+    order: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -176,11 +186,14 @@ impl Tool for RecallTool {
     }
 
     fn description(&self) -> &str {
-        "Search this project's past sessions — including earlier turns of the \
-         current one that have since been compacted out of view. Use it when the \
-         user refers to something you have no record of (\"the thing we decided \
-         last week\", \"that bug from yesterday\"), instead of saying you cannot \
-         remember. Returns the matching turns with their session id and date."
+        "Read this project's past sessions — including earlier turns of the current \
+         one that have since been compacted out of view. Use it when the user refers to \
+         something you have no record of, instead of saying you cannot remember.\n\
+         - By topic: put the words you are looking for in `query`.\n\
+         - By time or session: leave `query` OUT — do not invent one — and turns come \
+         back newest first (\"what was our last conversation about\"), or oldest first \
+         with `order: \"oldest\"`; `session` limits it to one session.\n\
+         Returns the turns with their session id and date."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -189,11 +202,12 @@ impl Tool for RecallTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Words to look for. Works with Chinese without spaces."
+                    "description": "Words to look for (works with Chinese without spaces); leave out to list turns by time."
                 },
+                "session": { "type": "string", "description": "Only this session: its id or a leading part of it." },
+                "order": { "type": "string", "enum": ["newest", "oldest"], "description": "Without query: which end comes first (default newest)." },
                 "limit": { "type": "integer", "description": "How many turns to return (default 6)" }
-            },
-            "required": ["query"]
+            }
         })
     }
 
@@ -211,9 +225,15 @@ impl Tool for RecallTool {
             Err(e) => return fail(format!("recall: invalid arguments: {e}")),
         };
         let terms = atomcode_capabilities::search::tokenize(&a.query);
-        if terms.is_empty() {
-            return fail("recall: the query has no searchable terms.");
-        }
+        let session = a
+            .session
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let oldest_first = a
+            .order
+            .as_deref()
+            .is_some_and(|order| order.trim().eq_ignore_ascii_case("oldest"));
         let Some(store) = self.ctx.service::<SessionPersistenceSvc>() else {
             return fail(
                 "recall: nothing is persisted in this tree, so there is no history to search.",
@@ -247,29 +267,59 @@ impl Tool for RecallTool {
             }
         }
 
-        let mut hits: Vec<(atomcode_capabilities::search::Score, &Turn)> = turns
-            .iter()
-            .filter_map(|t| {
-                let s = atomcode_capabilities::search::score(&t.hay, &terms);
-                s.hit().then_some((s, t))
-            })
-            .collect();
-        hits.sort_by(|a, b| {
-            atomcode_capabilities::search::best_first(&a.0, &b.0)
-                .then(b.1.started.cmp(&a.1.started))
-                .then(b.1.turn.cmp(&a.1.turn))
-        });
-
+        turns.retain(|t| session.is_none_or(|s| t.session.starts_with(s)));
         let limit = a.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, 30);
-        if hits.is_empty() {
-            return ok(format!(
-                "No past turn in this project matches “{}”. \
-                 Say so plainly rather than inventing one.",
-                a.query
-            ));
+
+        let (heading, picked): (String, Vec<&Turn>) = if terms.is_empty() {
+            // No topic: by time. Sessions are named by their start, so the pair
+            // (session start, turn) is the order the turns happened in.
+            let mut by_time: Vec<&Turn> = turns.iter().collect();
+            by_time.sort_by_key(|t| (t.started, t.turn));
+            if !oldest_first {
+                by_time.reverse();
+            }
+            by_time.truncate(limit);
+            let order = if oldest_first {
+                "oldest first"
+            } else {
+                "newest first"
+            };
+            (
+                format!(
+                    "{} turn(s) by time, {order} (no keywords given):\n",
+                    by_time.len()
+                ),
+                by_time,
+            )
+        } else {
+            let mut hits: Vec<(atomcode_capabilities::search::Score, &Turn)> = turns
+                .iter()
+                .filter_map(|t| {
+                    let s = atomcode_capabilities::search::score(&t.hay, &terms);
+                    s.hit().then_some((s, t))
+                })
+                .collect();
+            hits.sort_by(|a, b| {
+                atomcode_capabilities::search::best_first(&a.0, &b.0)
+                    .then(b.1.started.cmp(&a.1.started))
+                    .then(b.1.turn.cmp(&a.1.turn))
+            });
+            let picked: Vec<&Turn> = hits.into_iter().take(limit).map(|(_, t)| t).collect();
+            (
+                format!("{} matching turn(s), best first:\n", picked.len()),
+                picked,
+            )
+        };
+        if picked.is_empty() {
+            let what = match (terms.is_empty(), session) {
+                (true, Some(s)) => format!("No past turn in this project is in session “{s}”"),
+                (true, None) => "No past turn in this project".to_string(),
+                (false, _) => format!("No past turn in this project matches “{}”", a.query),
+            };
+            return ok(format!("{what}. Say so plainly rather than inventing one."));
         }
-        let mut out = format!("{} matching turn(s), best first:\n", hits.len().min(limit));
-        for (_, t) in hits.into_iter().take(limit) {
+        let mut out = heading;
+        for t in picked {
             out.push_str(&format!(
                 "\n— {} · session {} · turn {}\n  asked:  {}\n  answered: {}\n",
                 when(t.started),
@@ -330,11 +380,12 @@ impl Plugin for RecallPlugin {
             ctx,
             "recall",
             12,
-            "RECALL. `recall {query, limit}` searches every past session of this \
-             project, plus earlier turns of this one that compaction has removed \
-             from view. Chinese works without spaces. When someone refers to \
-             something you have no record of, search before saying you do not \
-             remember.",
+            "RECALL. `recall` reads every past session of this project, plus earlier \
+             turns of this one that compaction has removed from view: by topic with \
+             `query` (Chinese works without spaces), or — leaving `query` out — by \
+             time, newest first or `order: \"oldest\"`, optionally within one \
+             `session`. When someone refers to something you have no record of, look \
+             before saying you do not remember.",
         );
         Ok(())
     }
