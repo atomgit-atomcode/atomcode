@@ -51,6 +51,20 @@ impl Mounted {
             .collect()
     }
 
+    /// Composition findings for the mounted product, told what this host reads
+    /// and fills itself.
+    pub fn audit(&self) -> Vec<String> {
+        self.app
+            .audit_with(
+                atomcode_harness::seam_map::HOST_CONSUMED,
+                atomcode_harness::seam_map::HOST_PROVIDED,
+            )
+            .iter()
+            .filter(|f| f.is_defect())
+            .map(|f| f.to_string())
+            .collect()
+    }
+
     /// Stop the tree without waiting, for a test that is done with it.
     pub fn stop(self) {
         let mut app = self.app;

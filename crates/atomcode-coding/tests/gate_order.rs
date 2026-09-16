@@ -48,6 +48,49 @@ async fn dump_row_order() {
     mounted.stop();
 }
 
+/// The product mounts clean: no row declares a seam it then leaves empty, and
+/// nothing injects a seam no registered plugin can fill.
+///
+/// Mounting is the only way to catch these — the config tree resolves happily
+/// either way. This is the sweep the hand-written chain never had an equivalent
+/// of: a chain that forgot to wire something simply did not wire it, and you
+/// found out from behaviour. `atomcode-tui` has run this since it existed; the
+/// coding product did not until the chain came out and the row list became the
+/// only assembly.
+///
+/// Negative control: add a row whose plugin declares `provides` and returns
+/// without filling the slot, and this reports `DeclaredButNotProvided`.
+#[tokio::test]
+async fn the_product_mounts_and_audits_clean() {
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+
+    let mounted = support::mount(&cfg, support::quiet_options(), Arc::new(Silent)).await;
+    let defects = mounted.audit();
+    assert!(defects.is_empty(), "composition defects: {defects:?}");
+    mounted.stop();
+
+    // Again with the optional capabilities switched on, which is where a row
+    // left dangling by the collapse would hide: the lean mount simply never
+    // reaches it.
+    let opts = atomcode_coding::PrepareOptions {
+        memory: true,
+        web: true,
+        review: true,
+        subagents: atomcode_coding::SubagentPolicy::Enabled,
+        ..support::quiet_options()
+    };
+    let mounted = support::mount(&cfg, opts, Arc::new(Silent)).await;
+    let defects = mounted.audit();
+    assert!(
+        defects.is_empty(),
+        "composition defects with capabilities on: {defects:?}"
+    );
+    mounted.stop();
+}
+
 /// The person's `[permissions]` rules are evaluated once per tool call, not
 /// twice.
 ///
