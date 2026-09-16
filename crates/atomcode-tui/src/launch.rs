@@ -131,29 +131,35 @@ pub async fn run(
     mounted.ui.run(&ctx, initial).await
 }
 
+/// One audit finding: whether it is a defect, and what it says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Finding {
+    pub defect: bool,
+    pub text: String,
+}
+
 /// Whether the screen's composition is sound, with nothing connected: every row
-/// declared what it does and did it. `Ok` carries the notes that are not
-/// defects; `Err` the report when there is one.
-pub async fn audit(screen: &Screen) -> Result<Vec<String>, Vec<String>> {
-    let mut app = App::new(catalog(), tree(screen, &[]).map_err(|e| vec![e])?);
-    app.start().await.map_err(|e| vec![e.to_string()])?;
+/// declared what it does and did it. Only a defect fails; the rest are notes.
+/// How the findings are marked is the caller's — this crate draws glyphs only
+/// through a screen's capabilities.
+pub async fn audit(screen: &Screen) -> Result<Vec<Finding>, String> {
+    let mut app = App::new(catalog(), tree(screen, &[])?);
+    app.start().await.map_err(|e| e.to_string())?;
     // Read from outside the tree by construction: the launcher runs `ui` and
     // hands over the connection, and tests read the modules and commands.
-    let findings = app.audit_with(
-        &["ui", "tui-modules", "tui-commands", "tui-agent-client"],
-        &["agent-connection"],
-    );
-    let defect = findings.iter().any(|f| f.is_defect());
-    let report: Vec<String> = findings
+    let findings = app
+        .audit_with(
+            &["ui", "tui-modules", "tui-commands", "tui-agent-client"],
+            &["agent-connection"],
+        )
         .iter()
-        .map(|f| format!("{} {f}", if f.is_defect() { "✗" } else { "·" }))
+        .map(|f| Finding {
+            defect: f.is_defect(),
+            text: f.to_string(),
+        })
         .collect();
     app.stop();
-    if defect {
-        Err(report)
-    } else {
-        Ok(report)
-    }
+    Ok(findings)
 }
 
 /// One composed frame of the shipped screen over the conformance facts, as the

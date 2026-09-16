@@ -3,7 +3,7 @@
 //! It resolves a profile into a config tree, mounts it, and hands control to
 //! whichever plugin fills the `ui` slot. It knows nothing about models, tools,
 //! turns, or terminals: those all arrive as rows. The full-screen front end is
-//! a crate of its own with a launcher of its own, `atui`.
+//! an App of its own in front of the agent, entered as `atomcode --tui`.
 //!
 //! ```text
 //! harness "fix the build"                  # the default profile
@@ -65,4 +65,4 @@ PROFILES:
         --sdk              shorthand for --profile sdk
         --headless         shorthand for --profile headless
         --ui <NAME>        swap the front end under any profile
-                           (the full-screen one is `atui`, its own launcher)";
+                           (the full-screen one is `atomcode --tui`)";

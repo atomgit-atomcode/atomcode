@@ -845,6 +845,32 @@ struct Cli {
         default_value_t = false
     )]
     pub dangerously_skip_permissions: bool,
+
+    /// Use the full-screen UI assembled from plugin rows instead of the default
+    /// one. Same runtime, same sessions.
+    #[arg(long, conflicts_with = "headless_input")]
+    pub tui: bool,
+
+    /// With --tui: show the mascot.
+    #[arg(long, requires = "tui")]
+    pub mascot: bool,
+
+    /// With --tui: `auto` (ask the terminal), `dark` or `light`.
+    #[arg(long, requires = "tui", value_name = "THEME")]
+    pub theme: Option<String>,
+
+    /// With --tui: leave the mouse to the terminal (its own selection works).
+    #[arg(long = "no-mouse", requires = "tui")]
+    pub no_mouse: bool,
+
+    /// With --tui: check that the screen's composition is sound, and exit. Needs
+    /// no terminal and no provider.
+    #[arg(long, requires = "tui")]
+    pub audit: bool,
+
+    /// With --tui: print one composed frame of the screen, and exit.
+    #[arg(long, requires = "tui")]
+    pub demo: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -1491,6 +1517,51 @@ async fn run() -> Result<i32> {
         }
     }
     // ── End askpass early exit ────────────────────────────────────────────────
+
+    // `--tui --audit` / `--tui --demo` look at the screen alone: no config, no
+    // provider, no session, no terminal.
+    if cli.tui && cli.audit {
+        let screen = atomcode_tui::launch::Screen {
+            headless: Some((80, 24)),
+            ..Default::default()
+        };
+        return Ok(match atomcode_tui::launch::audit(&screen).await {
+            Ok(findings) if findings.is_empty() => {
+                println!("composition is consistent: every declared role matches the running tree");
+                0
+            }
+            Ok(findings) => {
+                for finding in &findings {
+                    let mark = if finding.defect { "✗" } else { "·" };
+                    println!("{mark} {}", finding.text);
+                }
+                let defects = findings.iter().filter(|f| f.defect).count();
+                if defects == 0 {
+                    println!("\nno defects; {} note(s) above", findings.len());
+                    0
+                } else {
+                    1
+                }
+            }
+            Err(why) => {
+                eprintln!("{why}");
+                1
+            }
+        });
+    }
+    if cli.tui && cli.demo {
+        let size = crossterm::terminal::size().unwrap_or((100, 30));
+        return Ok(match atomcode_tui::launch::demo(size).await {
+            Ok(frame) => {
+                print!("{frame}");
+                0
+            }
+            Err(why) => {
+                eprintln!("{why}");
+                1
+            }
+        });
+    }
 
     let is_admin = atomcode_capabilities::process_utils::is_running_as_admin();
 
@@ -2160,6 +2231,8 @@ async fn run() -> Result<i32> {
         interactive_provider_bootstrap(&runtime_cfg)
     };
     let runtime_start = std::time::Instant::now();
+    // `--tui` reaches the runtime through a front end fed from inside its Apps.
+    let tui_front_end = (cli.tui && !is_headless).then(atomcode_coding::front_end::FrontEnd::new);
     let (native_runtime, native_coding_cfg, continued_session) = spawn_native_cli_runtime(
         &runtime_cfg,
         resume_session_id,
@@ -2170,6 +2243,7 @@ async fn run() -> Result<i32> {
         // TUI-only: the interactive checkpoint replaces the hard round-cap
         // error. Headless (`-p`) keeps the fail-closed hard error (no picker).
         !is_headless,
+        tui_front_end.clone(),
     )
     .await?;
     // The active session id (fresh or resumed) for the on-exit resume hint,
@@ -2409,6 +2483,32 @@ async fn run() -> Result<i32> {
             let (runtime, coding_cfg) = native_tui_runtime
                 .take()
                 .expect("native TUI runtime built above");
+            if let Some(front_end) = tui_front_end {
+                let screen = atomcode_tui::launch::Screen {
+                    mascot: cli.mascot,
+                    theme: cli.theme.clone(),
+                    mouse: !cli.no_mouse,
+                    ..Default::default()
+                };
+                tracing::info!(
+                    target: "atomcode::startup",
+                    stage = "tui_enter",
+                    total_ms = run_start.elapsed().as_millis() as u64,
+                    "handing control to the row-assembled TUI"
+                );
+                let result = atomcode::tui_front::run(runtime, front_end, coding_cfg, &screen)
+                    .await
+                    .map(|()| 0)
+                    .map_err(|why| anyhow::anyhow!(why));
+                if let Some(id) = &active_session_id {
+                    println!("\n{}", resume_hint_line(id, false, hint_zh));
+                }
+                // The same flush every other exit path gets below.
+                telemetry
+                    .shutdown(std::time::Duration::from_millis(500))
+                    .await;
+                return result;
+            }
             let provider_selection = coding_cfg.provider_name.clone();
             let tui_runtime = into_tui_native_runtime(runtime, coding_cfg);
             // Same as the headless arm: don't `?` — a TUI run that ends in an
@@ -2790,6 +2890,9 @@ pub(crate) async fn spawn_native_cli_runtime(
     // event loop, so headless (`-p`) callers pass `false` — otherwise the
     // kernel would emit a checkpoint Request with no requester and fail-closed.
     round_cap_checkpoint: bool,
+    // A front end outside the runtime's App (`atomcode --tui`), fed from every
+    // App the runtime builds. `None` when the driver reads the runtime's events.
+    front_end: Option<Arc<atomcode_coding::front_end::FrontEnd>>,
 ) -> anyhow::Result<(
     atomcode_coding::CodingRuntime,
     atomcode_coding::CodingAgentConfig,
@@ -2869,6 +2972,7 @@ pub(crate) async fn spawn_native_cli_runtime(
         review: !no_tools,
         request_user_input: !no_tools,
         rate_limit_source: Some(atomcode_daemon::coding_plan_rate_limit_source()),
+        front_end,
         ..atomcode_coding::PrepareOptions::default()
     };
     let start = atomcode_coding::CodingRuntimeStart {

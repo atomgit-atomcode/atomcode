@@ -21,3 +21,37 @@ pub mod uninstall;
 /// subcommand in `main.rs`; the engine/dispatch/translate/permission internals
 /// live here. Does not depend on `atomcode-core` (v2 stack only).
 pub mod acp;
+
+/// `atomcode --tui`: the full-screen UI of `atomcode-tui`, in an App of its own,
+/// driving the product runtime through the handle protocol and host control.
+pub mod tui_front {
+    use std::sync::Arc;
+
+    use atomcode_coding::front_end::{connect, FrontEnd};
+    use atomcode_coding::{CodingAgentConfig, CodingRuntime};
+    use atomcode_tui::launch::{self, Screen};
+
+    /// The screen, mounted and connected to `runtime` — which was started with
+    /// `front_end` in its prepare options — and not yet running.
+    pub async fn mount(
+        runtime: CodingRuntime,
+        front_end: Arc<FrontEnd>,
+        config: CodingAgentConfig,
+        screen: &Screen,
+    ) -> Result<launch::Mounted, String> {
+        let connection = connect(runtime, front_end, config)?;
+        launch::mount(screen, &[], connection).await
+    }
+
+    /// Run the screen until the person leaves.
+    pub async fn run(
+        runtime: CodingRuntime,
+        front_end: Arc<FrontEnd>,
+        config: CodingAgentConfig,
+        screen: &Screen,
+    ) -> Result<(), String> {
+        let mounted = mount(runtime, front_end, config, screen).await?;
+        let ctx = mounted.app.context();
+        mounted.ui.run(&ctx, None).await
+    }
+}

@@ -1,11 +1,11 @@
 //! What every launcher shares.
 //!
 //! A launcher resolves a profile into a config tree, mounts it, and hands
-//! control to whichever plugin fills the `ui` slot. `harness` and `atui` are
-//! two of them. What differs is the catalog each brings and a handful of flags
-//! that only mean something with a screen; everything else — the overlay
-//! flags, session lookup, the inspection switches, the mount-and-hand-over
-//! sequence — is here once, so the two cannot drift apart flag by flag.
+//! control to whichever plugin fills the `ui` slot. What differs between
+//! launchers is the catalog each brings and a handful of flags of their own;
+//! everything else — the overlay flags, session lookup, the inspection
+//! switches, the mount-and-hand-over sequence — is here once, so launchers
+//! cannot drift apart flag by flag.
 //!
 //! ```text
 //! let launch = Launch::new("oneshot", vec![]).parse(args, HELP, |_, _, _| Flag::NotMine)?;
@@ -78,8 +78,8 @@ impl Launch {
     /// Parse the command line.
     ///
     /// `own` sees every argument first, so a launcher can claim a flag the
-    /// shared set also knows: `atui` takes `--headless` for its surface where
-    /// `harness` takes it for a profile. A flag neither claims is an error, not
+    /// shared set also knows — a screen's launcher would take `--headless` for
+    /// its surface where `harness` takes it for a profile. A flag neither claims is an error, not
     /// a prompt — a prompt that starts with `-` is rarer than a typo does.
     pub fn parse(
         mut self,
@@ -115,10 +115,11 @@ impl Launch {
                 "--repl" | "-i" => self.overlays.push(bundle::ui_overlay("repl")),
                 "--web" => self.overlays.push(bundle::ui_overlay("web")),
                 "--sdk" => self.overlays.push(bundle::ui_overlay("sdk")),
-                // The full-screen front end is its own crate with its own
-                // launcher; this catalog has no row for it.
+                // The full-screen front end is an App of its own in front of the
+                // agent (`docs/adr/0022` §3), not a row of this catalog — it
+                // depends on this crate, so this crate cannot mount it.
                 "--tui" => {
-                    eprintln!("the full-screen front end is `atui` (crates/atomcode-tui)");
+                    eprintln!("the full-screen front end is `atomcode --tui`");
                     return Err(ExitCode::from(2));
                 }
                 "--headless" => self.profile = "headless".into(),
@@ -524,6 +525,9 @@ mod tests {
         assert_eq!(shared("--ui nope").err(), Some(ExitCode::from(2)));
     }
 
+    /// Still true under `docs/adr/0022` §3, and for a stronger reason than when
+    /// it was written: the screen is an App apart from the agent, entered as
+    /// `atomcode --tui`, not a `ui` row of any agent tree.
     #[test]
     fn the_full_screen_front_end_is_not_a_row_here() {
         assert_eq!(shared("--tui").err(), Some(ExitCode::from(2)));

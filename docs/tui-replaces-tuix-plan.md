@@ -67,7 +67,7 @@ M1 契约地基(kernel)
 | 2.4 | 每个会话一条流:`Presentation` 按 `(会话, BlockId)`;新会话 / resume 建新流、丢旧流;切换时 tip 行提示 | 0022 §6 |
 | 2.5 | 删可调布局:`tui-layout` 提示词片段、`adjust_layout`(`layout_tool.rs`)、`tui-commands-layout` 行、`ctrl-f` / `ctrl-z` / `ctrl-n`、`/mascot`、布局操作日志与撤销;面板行挂载时的 `LayoutOp::Show` / `Hide` 保留 | 0022 §8 |
 | 2.6 | 删读写配置树的命令:`/rows`、`/rows-list`、`/tools-list`、`/audit`、`/patch`;`/effort` 改走宿主控制契约 | 0022 §7 |
-| 2.7 | 入口 `atomcode --tui`:cli 在 `main.rs:2427` 分支(默认仍 tuix);`atui` 的 flag 搬进 cli;删 `tui/src/product.rs` 自拼的 coding 装配,改挂 `runtime::mount` + UI overlay;删 `atui` 二进制;`gates/tui.sh:80` 改调新入口;`launch.rs` 的 `the_full_screen_front_end_is_not_a_row_here` 反向 | 0018 §5 |
+| 2.7 | 入口 `atomcode --tui`:cli 在 `main.rs:2427` 分支(默认仍 tuix);`atui` 的 flag 搬进 cli;删 `tui/src/product.rs` 自拼的 coding 装配,改挂 `runtime::mount` + UI overlay;删 `atui` 二进制;`gates/tui.sh:80` 改调新入口;`launch.rs` 的 `the_full_screen_front_end_is_not_a_row_here` 不反向——0022 §3 定了屏幕是独立 App、tui 依赖 harness,harness 挂不了它;只把拒绝提示改为指向 `atomcode --tui` | 0018 §5、0022 §3 |
 | 2.8 | 功能第一批:发消息、回答提问、取消、压缩、新会话、resume、`/effort` | 0022 §4 |
 
 **判据**

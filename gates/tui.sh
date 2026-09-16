@@ -76,8 +76,9 @@ fi
 step "值类型与几何（单元）"        cargo nextest run -p atomcode-tui --lib
 [ "$FAST" = 1 ] || step "集成与端到端"  cargo nextest run -p atomcode-tui --tests
 [ "$FAST" = 1 ] || step "宿主 harness 未被弄坏" cargo nextest run -p atomcode-harness
-[ "$FAST" = 1 ] || step "启动器能构建"  cargo build -q -p atomcode-tui
-[ "$FAST" = 1 ] || step "启动器能审计（无 tty）" ./target/debug/atui --offline --audit
+[ "$FAST" = 1 ] || step "启动器能构建"  cargo build -q -p atomcode --bin atomcode
+[ "$FAST" = 1 ] || step "启动器能审计（无 tty）" ./target/debug/atomcode --tui --audit
+[ "$FAST" = 1 ] || step "屏幕与产品会话互通" cargo nextest run -p atomcode --test tui_front
 [ "$FAST" = 1 ] || step "判据只能增不能减"     gates/tui-test-count.sh
 step "分层：OS 差异不得漏出屏蔽层" gates/tui-layers.sh
 step "分层闸门自身会判红"          gates/tui-layers.spec.sh
