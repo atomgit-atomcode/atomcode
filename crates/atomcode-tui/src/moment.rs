@@ -218,6 +218,19 @@ pub struct Moment {
     /// in the log is a tip, and copying text to the clipboard commits nothing.
     /// It carries its own expiry so the module draws it without a clock.
     pub notice: Option<Notice>,
+    /// The mounted cell-grid bitmaps, **as of the frame this moment was taken
+    /// for**.
+    ///
+    /// A snapshot rather than a handle: the rasters in it are immutable, so two
+    /// renders against one `Moment` see one picture — the promise `caps` and
+    /// `cwd` keep, and the reason a bitmap cannot tear mid-frame.
+    ///
+    /// It arrives through `Moment` because it has to: `View::render` takes
+    /// `&State` and a `&Viewport`, so a module cannot reach a service or a
+    /// shared table of its own (`module.rs` says why at length). The host puts
+    /// the frame's snapshot here and the module reads it — the same road
+    /// `Moment::members` travels. See `docs/adr/0023` decision ①.
+    pub rasters: crate::raster::RastersView,
     /// What the person has said while a turn was running, and the model has not
     /// been handed yet — oldest first, joined by newlines.
     ///

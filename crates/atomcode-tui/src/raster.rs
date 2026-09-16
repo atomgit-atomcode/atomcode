@@ -177,6 +177,19 @@ impl Raster {
         self.cells
             .get(row as usize * self.columns as usize + column as usize)
     }
+
+    /// Whether every cell would survive a terminal with no Unicode.
+    ///
+    /// `█` and friends do — [`crate::caps::has_ascii_stand_in`] rewrites them to
+    /// `#`, one column for one column, so such a bitmap is still a picture on an
+    /// old console. Braille does **not** (deliberately: `caps.rs` explains why
+    /// for the spinner), so a braille bitmap must not be drawn there rather than
+    /// arriving as a grid of tofu.
+    pub fn all_downgradable(&self) -> bool {
+        self.cells
+            .iter()
+            .all(|cell| crate::caps::has_ascii_stand_in(cell.ch))
+    }
 }
 
 /// `0x00RRGGBB` is a colour; `0x0100_0000` (bit 24 alone) is the terminal's own.
@@ -211,7 +224,7 @@ type Mounted = HashMap<(String, String), Arc<Raster>>;
 /// Immutable, and cloning it is one `Arc` bump rather than a copy of the pixels
 /// — so a `Moment` can carry it and two renders against that moment see the same
 /// picture. That is the same promise `caps` and `cwd` keep.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RastersView(Arc<Mounted>);
 
 impl RastersView {

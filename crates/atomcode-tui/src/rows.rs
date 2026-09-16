@@ -34,7 +34,7 @@ use serde_json::Value;
 use crate::command::Commands;
 use crate::layout::{LayoutOp, Side};
 use crate::module::{Modules, Mounted, Producer};
-use crate::modules::{input, live, status, steering, team, tip, todo, transcript};
+use crate::modules::{input, live, raster, status, steering, team, tip, todo, transcript};
 use crate::plugin::{CommandsSvc, LayoutSvc, ModulesSvc};
 
 /// The screen, panel by panel — the one place that says what a full UI is made
@@ -95,6 +95,13 @@ disabled = true
 name = "tui-panel-team"
 disabled = true
 
+# Off by default too: a screen that never mounts a bitmap has nothing for this
+# to draw, and an empty pane is a column of chrome. Mount one through
+# `RastersSvc` and turn this on.
+[[insert]]
+name = "tui-panel-raster"
+disabled = true
+
 # How a question is drawn. Remove this row and questions still arrive, still
 # answer and still record — as plain lines at the foot of the stream. That is
 # the fallback this row improves on, not a branch it replaces.
@@ -132,6 +139,7 @@ pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
         Arc::new(TeamPanel),
         Arc::new(TodoPanel),
         Arc::new(SteeringPanel),
+        Arc::new(RasterPanel),
         Arc::new(AskCardRow),
         Arc::new(ScreenCommandsRow),
         Arc::new(SessionCommandsRow),
@@ -205,6 +213,14 @@ panel!(
     "tui-panel-tip",
     tip::Tip,
     "the reserved row above the field: right-aligned tips, blank most of the time"
+);
+// A cell-grid bitmap, repainted in place. Off by default: what it draws is
+// whatever a row mounted, and a pane with nothing mounted is a column of chrome.
+panel!(
+    RasterPanel,
+    "tui-panel-raster",
+    raster::RasterPane,
+    "a cell-grid bitmap: the nearest thing to pixels a terminal has, repainted in place"
 );
 
 /// The transcript is a *stream producer*, not a view: it has history, and its

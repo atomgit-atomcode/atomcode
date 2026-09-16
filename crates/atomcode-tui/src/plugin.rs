@@ -38,6 +38,10 @@ plexus_service!(AgentClientSvc => AgentClient, "tui-agent-client", Core, "The co
 // How a question is drawn. A seam rather than a branch: the foot-of-the-stream
 // lines are the fallback every screen has, and anything better is a row.
 plexus_service!(AskViewSvc => dyn crate::ask::AskView, "tui-ask-view", Seam, "How a question is put on screen");
+// Mounted cell-grid bitmaps. The host holds the table and puts a snapshot into
+// every frame's `Moment`; a row reaches it here to mount and repaint. See
+// `docs/adr/0023`.
+plexus_service!(RastersSvc => crate::raster::Rasters, "tui-rasters", Core, "Cell-grid bitmaps, addressed by (module id, key)");
 
 /// The session's clock, and the only place this crate reads one.
 ///
@@ -1800,6 +1804,7 @@ impl Plugin for TuiUiPlugin {
             "ui",
             "tui-agent-client",
             "tui-modules",
+            "tui-rasters",
             "tui-commands",
             "tui-layout",
             "user-questions",
@@ -1825,6 +1830,9 @@ impl Plugin for TuiUiPlugin {
         let (host, tui) = assemble(surface);
         let _ = ctx
             .provide::<ModulesSvc>(host.modules.clone())
+            .map_err(|e| e.to_string())?;
+        let _ = ctx
+            .provide::<RastersSvc>(host.rasters.clone())
             .map_err(|e| e.to_string())?;
         let _ = ctx
             .provide::<CommandsSvc>(host.commands.clone())

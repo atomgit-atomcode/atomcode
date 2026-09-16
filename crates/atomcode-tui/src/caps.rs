@@ -193,6 +193,16 @@ impl Caps {
     }
 }
 
+/// Whether this character survives a terminal that has no Unicode.
+///
+/// `true` for ASCII and for the decorative characters [`ascii_for`] rewrites;
+/// `false` for braille and anything else with no stand-in. A **bitmap** has to
+/// ask this: a grid of tofu is not a picture. It is the same reasoning
+/// [`Caps::spinner`] applies to its own set — see [`SPINNER`].
+pub fn has_ascii_stand_in(ch: char) -> bool {
+    ch.is_ascii() || ascii_for(ch).is_some()
+}
+
 /// The ASCII stand-in for one decorative glyph, or `None` to leave it alone.
 ///
 /// One display column in, one column out, so alignment survives the swap — the

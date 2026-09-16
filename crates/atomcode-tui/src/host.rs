@@ -757,6 +757,10 @@ pub struct Host {
     /// Questions waiting for the person. Rendered as a live block at the foot
     /// of the stream, and given first refusal on every key while it is there.
     pub asks: Arc<crate::ask::Asks>,
+    /// The mounted cell-grid bitmaps. The host holds the table; a row writes
+    /// through `RastersSvc`, and every frame takes a snapshot of it into
+    /// `Moment` for the modules to draw. See `docs/adr/0023`.
+    pub rasters: Arc<crate::raster::Rasters>,
     pub modules: Arc<Modules>,
     pub layout: Arc<crate::layout::Layout>,
     pub moment: RwLock<Moment>,
@@ -957,6 +961,7 @@ impl Host {
             context_menu: RwLock::new(None),
             overlays: Arc::new(crate::overlay::Overlays::new()),
             asks: crate::ask::Asks::new(),
+            rasters: Arc::new(crate::raster::Rasters::new()),
             modules: modules.clone(),
             layout: layout_svc.clone(),
             moment: RwLock::new(Moment::default()),
@@ -1725,7 +1730,12 @@ impl Host {
     pub fn compose(&self, size: (u16, u16)) -> Frame {
         let (w, h) = size;
         let mut frame = Frame::new(w, h);
-        let moment = self.moment.read().expect("moment poisoned").clone();
+        let mut moment = self.moment.read().expect("moment poisoned").clone();
+        // This frame's bitmaps, as a snapshot. Here because `View::render` cannot
+        // reach a service — the module reads `viewport.moment.rasters`, the same
+        // road `members` travels. One `Arc` bump per frame: the map is rebuilt on
+        // a write, not on a draw.
+        moment.rasters = self.rasters.view();
         // The shape half of what this terminal can draw, taken once from the
         // moment this frame was composed against and handed down. Built here
         // rather than read inside `rows_at` because `stream_height`'s contract is
@@ -2431,6 +2441,119 @@ mod tests {
             "after the terminal changed, the count must be re-measured — keying \
              on width alone leaves the second number at 3"
         );
+    }
+
+    /// A bitmap payload: every cell default-coloured, row 0 in `first`, the rest
+    /// in `rest`.
+    fn raster_payload(columns: u16, rows: u16, first: char, rest: char) -> String {
+        use base64::Engine as _;
+        let mut bytes = Vec::new();
+        for row in 0..rows {
+            for _ in 0..columns {
+                let ch = if row == 0 { first } else { rest };
+                bytes.extend_from_slice(&(ch as u32).to_le_bytes());
+                bytes.extend_from_slice(&0x0100_0000u32.to_le_bytes());
+                bytes.extend_from_slice(&0x0100_0000u32.to_le_bytes());
+            }
+        }
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// A host whose whole screen is one bitmap pane.
+    fn host_with_raster(columns: u16, rows: u16) -> Host {
+        let mods = Arc::new(Modules::new());
+        mods.add_view(Arc::new(
+            Mounted::<crate::modules::raster::RasterPane>::new(),
+        ))
+        .unwrap();
+        let h = Host::new(mods, Region::view(crate::modules::raster::ID));
+        h.rasters
+            .mount(
+                crate::modules::raster::ID,
+                crate::modules::raster::KEY,
+                crate::raster::Raster::decode(
+                    columns,
+                    rows,
+                    &raster_payload(columns, rows, '\u{2588}', '\u{2588}'),
+                )
+                .expect("a valid payload"),
+            )
+            .expect("mount");
+        h
+    }
+
+    #[test]
+    fn an_unchanged_bitmap_encodes_no_row_and_a_write_encodes_only_its_own() {
+        // `ROWS_ENCODED` counts the rows a frame had to *encode*, which equality
+        // of the picture cannot show: re-encoding an unchanged row emits the same
+        // bytes. So this is the only way to assert "only what moved is redrawn".
+        use std::sync::atomic::Ordering;
+        let h = host_with_raster(6, 3);
+        let size = (8u16, 4u16);
+        let caps = crate::caps::Caps::default();
+
+        // A first paint draws everything, and is the baseline.
+        let a = crate::ansi::Lines::of(&h.compose(size), caps, None);
+        let after_first = crate::ansi::ROWS_ENCODED.load(Ordering::Relaxed);
+
+        // Nothing moved: a frame composes the same picture, and encodes no row.
+        let b = crate::ansi::Lines::of(&h.compose(size), caps, Some(&a));
+        assert_eq!(
+            crate::ansi::ROWS_ENCODED.load(Ordering::Relaxed),
+            after_first,
+            "an unchanged bitmap must not re-encode a single row"
+        );
+        assert!(
+            b.patch_from(Some(&a)).is_empty(),
+            "and there is no patch to send"
+        );
+
+        // One row of the bitmap changes: exactly one screen row is re-encoded.
+        h.rasters
+            .write(
+                crate::modules::raster::ID,
+                crate::modules::raster::KEY,
+                &raster_payload(6, 3, '\u{2580}', '\u{2588}'),
+            )
+            .expect("a write of the mounted size");
+        let c = crate::ansi::Lines::of(&h.compose(size), caps, Some(&b));
+        assert_eq!(
+            crate::ansi::ROWS_ENCODED.load(Ordering::Relaxed) - after_first,
+            1,
+            "only the bitmap row that changed may be re-encoded"
+        );
+        assert!(
+            !c.patch_from(Some(&b)).is_empty(),
+            "and that row is what gets sent"
+        );
+    }
+
+    #[test]
+    fn a_bitmap_that_changes_nothing_needs_no_repaint_at_all() {
+        // The other half of the claim: writing the *same* cells is not a change,
+        // because the comparison is on the laid-out lines rather than on the
+        // table's revision. Without this, a widget that repaints itself at 60Hz
+        // with an identical frame would push the whole pane every time.
+        use std::sync::atomic::Ordering;
+        let h = host_with_raster(4, 2);
+        let size = (6u16, 3u16);
+        let caps = crate::caps::Caps::default();
+        let a = crate::ansi::Lines::of(&h.compose(size), caps, None);
+        let before = crate::ansi::ROWS_ENCODED.load(Ordering::Relaxed);
+        h.rasters
+            .write(
+                crate::modules::raster::ID,
+                crate::modules::raster::KEY,
+                &raster_payload(4, 2, '\u{2588}', '\u{2588}'),
+            )
+            .expect("a write of the mounted size");
+        let b = crate::ansi::Lines::of(&h.compose(size), caps, Some(&a));
+        assert_eq!(
+            crate::ansi::ROWS_ENCODED.load(Ordering::Relaxed),
+            before,
+            "the same cells must not cost a repaint"
+        );
+        assert!(b.patch_from(Some(&a)).is_empty());
     }
 
     /// A tail module whose height follows `Moment::activity` and nothing else.
