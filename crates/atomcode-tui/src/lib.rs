@@ -61,6 +61,7 @@ pub mod moment;
 pub mod overlay;
 pub mod plugin;
 pub mod product;
+pub mod raster;
 pub mod region;
 pub mod rows;
 pub mod surface;
