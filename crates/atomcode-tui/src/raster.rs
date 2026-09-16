@@ -684,7 +684,7 @@ mod tests {
         let rasters = Rasters::new();
         rasters.mount("pane", "main", solid(2, 2)).unwrap();
         let before = rasters.revision();
-        let payload = b64(&vec![0u8; 3 * 3 * 12]);
+        let payload = b64(&[0u8; 3 * 3 * 12]);
         assert_eq!(
             rasters
                 .write_sized("pane", "main", 3, 3, &payload)

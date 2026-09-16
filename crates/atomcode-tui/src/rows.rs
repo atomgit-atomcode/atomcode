@@ -34,7 +34,7 @@ use serde_json::Value;
 use crate::command::Commands;
 use crate::layout::{LayoutOp, Side};
 use crate::module::{Modules, Mounted, Producer};
-use crate::modules::{input, live, raster, status, steering, team, tip, todo, transcript};
+use crate::modules::{input, live, raster, status, steering, team, tip, todo, transcript, welcome};
 use crate::plugin::{CommandsSvc, LayoutSvc, ModulesSvc};
 
 /// The screen, panel by panel — the one place that says what a full UI is made
@@ -46,6 +46,15 @@ use crate::plugin::{CommandsSvc, LayoutSvc, ModulesSvc};
 /// empty screen. A duplicated fact does not stay duplicated, it diverges — so
 /// there is one.
 pub const SCREEN: &str = r#"
+# The opening block of a new session. It is a block in the stream (a producer),
+# not a panel — so it scrolls away with the conversation: scroll back up and it is
+# still there, rather than sitting on screen taking a row forever.
+#
+# Replace the whole thing with `[[patch]] id = "tui-panel-welcome"` and another
+# `name`; `[[remove]]` it and the conversation simply starts with what was said.
+[[insert]]
+name = "tui-panel-welcome"
+
 [[insert]]
 name = "tui-panel-transcript"
 
@@ -131,6 +140,7 @@ name = "tui-commands-help"
 pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
     vec![
         Arc::new(TranscriptPanel),
+        Arc::new(WelcomePanel),
         Arc::new(StatusPanel),
         Arc::new(LivePanel),
         Arc::new(TipPanel),
@@ -222,6 +232,37 @@ panel!(
     raster::RasterPane,
     "a cell-grid bitmap: the nearest thing to pixels a terminal has, repainted in place"
 );
+
+/// The opening block: a *producer*'s row, in the same shape as
+/// `tui-panel-transcript`.
+///
+/// It claims no position. A block's place is its place in the stream, and the
+/// stream is the line between the conversation and the panels (`docs/adr/0004`) —
+/// so this row needs neither `LayoutSvc` nor `LayoutOp::Show`, unlike the panels
+/// whose spot is written by `host::composer`.
+pub struct WelcomePanel;
+
+#[async_trait]
+impl Plugin for WelcomePanel {
+    fn name(&self) -> &'static str {
+        "tui-panel-welcome"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tui-modules"]
+    }
+    fn description(&self) -> &'static str {
+        "the opening block of a new session: the brand, the mascot, where you are, and a few commands worth knowing"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let mods = ctx.require::<ModulesSvc>().map_err(|e| e.to_string())?;
+        let producer = welcome::Welcome::new();
+        let id = producer.id();
+        mods.add_producer(producer)?;
+        let m: Arc<Modules> = mods.clone();
+        let _ = ctx.effect(move || m.remove_producer(id));
+        Ok(())
+    }
+}
 
 /// The transcript is a *stream producer*, not a view: it has history, and its
 /// settled blocks are unreachable by construction. Different registry, same

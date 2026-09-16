@@ -321,7 +321,7 @@ impl Content for WelcomeBlock {
                 rows.push(line);
             }
         } else {
-            rows.extend(left.drain(..));
+            rows.append(&mut left);
             for row in right {
                 let mut line = Line::from_spans(vec![Span::raw(pad.clone())]);
                 for span in &row.spans {

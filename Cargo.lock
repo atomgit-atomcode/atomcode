@@ -669,6 +669,7 @@ dependencies = [
  "futures",
  "libc",
  "png 0.17.16",
+ "rand 0.8.7",
  "serde",
  "serde_json",
  "tokio",

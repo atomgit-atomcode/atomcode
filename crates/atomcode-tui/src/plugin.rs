@@ -373,6 +373,43 @@ impl UserInterface for Tui {
             let _ = wake_tx.send(Wake::Fact);
         }
 
+        // Let the conversation say its first word — only when the stream is empty.
+        //
+        // **After `catch_up`, and that order is the whole point.** A resumed
+        // session already has its history folded in by the time this runs, so
+        // `open_conversation` finds a stream with something in it and does
+        // nothing. The other order would put a welcome block in front of every
+        // resumed conversation.
+        {
+            let cwd = self
+                .host
+                .moment
+                .read()
+                .expect("moment poisoned")
+                .cwd
+                .clone();
+            let open = crate::module::Opening {
+                // Folded upstream: reading the environment is this function's
+                // business (it already reads the cwd below), and a module may not.
+                cwd: crate::text::collapse_home(&cwd),
+                // Read now rather than cached: `--model` re-points the `llm` row,
+                // so a value copied at assembly time could be stale already.
+                model: client
+                    .agent
+                    .ctx()
+                    .service::<LlmSvc>()
+                    .map(|provider| provider.model_name().to_string()),
+                version: env!("CARGO_PKG_VERSION"),
+                commands: self.host.commands.all(),
+            };
+            if self
+                .host
+                .open_conversation(crate::block::Coord::default(), &open)
+            {
+                let _ = wake_tx.send(Wake::Fact);
+            }
+        }
+
         // Input comes from the surface when it has its own — that is what a
         // headless run is — and from the terminal otherwise.
         let keys_tx = wake_tx.clone();

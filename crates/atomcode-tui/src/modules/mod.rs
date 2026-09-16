@@ -9,3 +9,4 @@ pub mod team;
 pub mod tip;
 pub mod todo;
 pub mod transcript;
+pub mod welcome;
