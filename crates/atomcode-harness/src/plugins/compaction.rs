@@ -41,17 +41,10 @@ fn parse<T: for<'de> serde::Deserialize<'de> + Default>(config: &Value) -> Resul
 
 const SUMMARY_SYSTEM: &str = "You compress the earlier part of an engineering session into a \
 short handover note for whoever continues it. Keep what a continuation needs: what was asked, \
-decisions made, files and commands that mattered, and anything still unresolved. Drop \
-pleasantries and repetition. Write plainly, in the language of the session, with no preamble \
+decisions made, files and commands that mattered, and anything still unresolved. When the notes \
+open with an earlier summary, update it: keep what is still true and fold in what came after. \
+Drop pleasantries and repetition. Write plainly, in the language of the session, with no preamble \
 and no closing offer to help.";
-
-/// The header the model-free strategy uses. Kept here too so a fallback reads the
-/// same as the strategy it replaced — the shape of a compacted block is not this
-/// row's to change.
-const FALLBACK_HEADER: &str =
-    "=== EARLIER IN THIS SESSION ===\nThese turns were compacted. What was asked:\n";
-const FALLBACK_FOOTER: &str =
-    "Ask again for any detail you need from before this point rather than assuming it.\n";
 
 /// A model-written summary, with the model-free list as its floor.
 struct SummarisingCompaction {
@@ -105,12 +98,12 @@ impl Compaction for SummarisingCompaction {
 
     async fn compact(&self, log: &crate::session::SessionLog) -> Option<CompactionDecision> {
         let span = loop_policy::settled_span(log, self.keep_turns)?;
-        let summary = match self.ask(&span.digest).await {
+        let summary = match self.ask(&span.digest()).await {
             Some(written) => format!("=== EARLIER IN THIS SESSION ===\n{written}\n"),
             // The floor. Same text the model-free row would have produced, so a
             // provider that is down degrades the *quality* of the summary and
             // nothing else.
-            None => format!("{FALLBACK_HEADER}{}{FALLBACK_FOOTER}", span.digest),
+            None => loop_policy::listed_summary(&span),
         };
         Some(CompactionDecision {
             through: span.through,

@@ -403,36 +403,145 @@ fn default_keep() -> u64 {
     2
 }
 
-/// The span a compaction folds away, and a plain-text digest of it.
+/// The span a compaction folds away, and what it is made of.
 ///
 /// Shared by the model-free and the model-written strategy so the two agree on
 /// *what* is compacted and on the material a summary is built from — the
 /// boundary is a policy decision, and a second copy of it would be a second
 /// answer to the same question.
+///
+/// Built from what the model already sees of the span, not from the raw log: an
+/// earlier summary stands in for everything it replaced, and is carried rather
+/// than rebuilt from the events under it. Rebuilding is what dropped a written
+/// summary the moment a model-free fold ran after it.
 pub struct CompactedSpan {
     pub through: crate::session::SeqNo,
-    /// What was asked, one line each, and the tools that were used. No header
-    /// and no closing instruction: each strategy wraps it in its own words.
-    pub digest: String,
+    /// The summaries the model already had for this span, oldest first, verbatim.
+    pub prior: Vec<String>,
+    /// What was asked since the last fold, one line each, oldest first.
+    pub prompts: Vec<String>,
+    /// The tools used since the last fold, sorted, once each.
+    pub tools: Vec<String>,
 }
 
-/// The model-free summary of a span: what was asked, and the tools used. The
-/// floor every strategy falls back to.
+impl CompactedSpan {
+    /// The span as plain text: the earlier summary, then what was asked and used
+    /// since. No header and no closing instruction — each strategy wraps it in
+    /// its own words.
+    pub fn digest(&self) -> String {
+        let mut out = String::new();
+        for prior in &self.prior {
+            out.push_str(prior.trim());
+            out.push_str("\n\n");
+        }
+        if !self.prompts.is_empty() {
+            if !self.prior.is_empty() {
+                out.push_str("Asked since:\n");
+            }
+            for prompt in &self.prompts {
+                out.push_str("- ");
+                out.push_str(prompt);
+                out.push('\n');
+            }
+        }
+        if !self.tools.is_empty() {
+            out.push_str(&format!("Tools used: {}\n", self.tools.join(", ")));
+        }
+        out
+    }
+}
+
+const LISTED_HEADER: &str =
+    "=== EARLIER IN THIS SESSION ===\nThese turns were compacted. What was asked:\n";
+const LISTED_FOOTER: &str =
+    "Ask again for any detail you need from before this point rather than assuming it.\n";
+const TOOLS_LINE: &str = "Tools used: ";
+/// Requests a listed summary names. Past this the oldest are counted, not listed:
+/// a list that grows with every prompt of a long session is its own pressure.
+const LISTED_MAX: usize = 40;
+
+/// A listed summary taken apart: what was written before the list, the requests
+/// it names, how many it had already stopped naming, and the tools.
+fn split_listed(text: &str) -> (&str, Vec<String>, usize, Vec<String>) {
+    let Some(at) = text.find(LISTED_HEADER) else {
+        return (text.trim(), Vec::new(), 0, Vec::new());
+    };
+    let list = &text[at + LISTED_HEADER.len()..];
+    let list = list.split(LISTED_FOOTER).next().unwrap_or(list);
+    let (mut asked, mut omitted, mut tools) = (Vec::new(), 0, Vec::new());
+    for line in list.lines() {
+        if let Some(named) = line.strip_prefix(TOOLS_LINE) {
+            tools.extend(named.split(", ").map(str::to_string));
+        } else if let Some(count) = line
+            .strip_prefix("- (")
+            .and_then(|rest| rest.strip_suffix(" earlier requests not listed)"))
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            omitted += count;
+        } else if let Some(prompt) = line.strip_prefix("- ") {
+            asked.push(prompt.to_string());
+        }
+    }
+    (text[..at].trim(), asked, omitted, tools)
+}
+
+/// The model-free summary of a span: whatever earlier summary it carries, then
+/// what was asked and the tools used. The floor every strategy falls back to.
+///
+/// An earlier *listed* summary is merged into one list rather than nested under
+/// a second header; anything written is kept above it, word for word.
 pub fn listed_summary(span: &CompactedSpan) -> String {
-    format!(
-        "=== EARLIER IN THIS SESSION ===\nThese turns were compacted. What was asked:\n{}\
-         Ask again for any detail you need from before this point rather than assuming it.\n",
-        span.digest
-    )
+    let mut written = Vec::new();
+    let mut asked = Vec::new();
+    let mut omitted = 0;
+    let mut tools = std::collections::BTreeSet::new();
+    for prior in &span.prior {
+        let (text, named, skipped, used) = split_listed(prior);
+        if !text.is_empty() {
+            written.push(text);
+        }
+        asked.extend(named);
+        omitted += skipped;
+        tools.extend(used);
+    }
+    asked.extend(span.prompts.iter().cloned());
+    tools.extend(span.tools.iter().cloned());
+    if asked.len() > LISTED_MAX {
+        omitted += asked.len() - LISTED_MAX;
+        asked.drain(..asked.len() - LISTED_MAX);
+    }
+
+    let mut out = String::new();
+    for text in written {
+        out.push_str(text);
+        out.push_str("\n\n");
+    }
+    out.push_str(LISTED_HEADER);
+    if omitted > 0 {
+        out.push_str(&format!("- ({omitted} earlier requests not listed)\n"));
+    }
+    for prompt in &asked {
+        out.push_str("- ");
+        out.push_str(prompt);
+        out.push('\n');
+    }
+    if !tools.is_empty() {
+        let tools: Vec<_> = tools.into_iter().collect();
+        out.push_str(TOOLS_LINE);
+        out.push_str(&tools.join(", "));
+        out.push('\n');
+    }
+    out.push_str(LISTED_FOOTER);
+    out
 }
 
 /// The span a compaction would fold away at this depth. `None` when every turn
-/// still fits inside `keep_turns`, or when nothing was asked in the ones that do
-/// not — there is nothing worth summarizing then.
+/// still fits inside `keep_turns`, when the last fold already reaches as far —
+/// there is nothing new under it, and folding it again only rewrites the same
+/// cut — or when nothing was asked or used since.
 pub fn settled_span(log: &crate::session::SessionLog, keep_turns: u64) -> Option<CompactedSpan> {
     let events = log.events();
-    let current = log.current_turn();
-    let cutoff = current.saturating_sub(keep_turns);
+    let cutoff = log.current_turn().saturating_sub(keep_turns);
     if cutoff == 0 {
         return None;
     }
@@ -441,35 +550,59 @@ pub fn settled_span(log: &crate::session::SessionLog, keep_turns: u64) -> Option
         .filter(|e| e.event.turn() <= cutoff)
         .map(|e| e.seq)
         .max()?;
+    let (folded, summary) = events
+        .iter()
+        .rev()
+        .find_map(|e| match &e.event {
+            SessionEvent::Compacted {
+                through, summary, ..
+            } => Some((*through, Some(summary.clone()))),
+            _ => None,
+        })
+        .unwrap_or((0, None));
+    let undone: std::collections::HashSet<u64> = events
+        .iter()
+        .filter_map(|e| match e.event {
+            SessionEvent::Interrupted { turn, undone: true } => Some(turn),
+            _ => None,
+        })
+        .collect();
 
+    let mut prior: Vec<String> = summary.into_iter().collect();
     let mut prompts = Vec::new();
     let mut tools = Vec::new();
-    for logged in events.iter().filter(|e| e.seq <= boundary) {
+    for logged in events
+        .iter()
+        .filter(|e| e.seq > folded && e.seq <= boundary)
+    {
         match &logged.event {
-            SessionEvent::UserMessage { text, .. } => prompts.push(text.clone()),
-            SessionEvent::AssistantMessage { tool_calls, .. } => {
+            // A summary a resumed session was seeded with.
+            SessionEvent::Injected {
+                text,
+                origin: InjectionOrigin::CompactionSummary,
+                ..
+            } => prior.push(text.clone()),
+            SessionEvent::UserMessage { turn, text, .. } if !undone.contains(turn) => {
+                prompts.push(truncate(text, 200));
+            }
+            SessionEvent::AssistantMessage {
+                turn, tool_calls, ..
+            } if !undone.contains(turn) => {
                 tools.extend(tool_calls.iter().map(|c| c.name.clone()));
             }
             _ => {}
         }
     }
-    if prompts.is_empty() {
+    if prompts.is_empty() && tools.is_empty() {
         return None;
     }
     tools.sort();
     tools.dedup();
-    let mut digest = String::new();
-    for prompt in &prompts {
-        digest.push_str("- ");
-        digest.push_str(&truncate(prompt, 200));
-        digest.push('\n');
-    }
-    if !tools.is_empty() {
-        digest.push_str(&format!("Tools used: {}\n", tools.join(", ")));
-    }
     Some(CompactedSpan {
         through: boundary,
-        digest,
+        prior,
+        prompts,
+        tools,
     })
 }
 

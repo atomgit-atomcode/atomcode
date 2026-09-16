@@ -411,6 +411,100 @@ async fn the_window_decides_whether_compaction_fires() {
     );
 }
 
+fn compaction_cuts(log: &atomcode_harness::session::SessionLog) -> Vec<u64> {
+    log.events()
+        .into_iter()
+        .filter_map(|e| match e.event {
+            SessionEvent::Compacted { through, .. } => Some(through),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The trigger runs before every request of a turn, and pressure does not drop
+/// between two rounds of the same turn when what is kept is itself large. A
+/// history that was folded once has nothing new to fold until another turn
+/// settles — so it is folded once, not once per round.
+#[tokio::test]
+async fn history_already_folded_is_not_folded_again() {
+    let dir = scratch("fold-once");
+    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    let call =
+        r#"{ text = "again", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] }"#;
+    let script = format!(
+        "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [\n  \
+         {{ text = \"first answer\" }},\n  {call},\n  {call},\n  {call},\n  {call},\n  \
+         {{ text = \"done\" }}\n] }}\n"
+    );
+    let eager = "[[patch]]\nid = \"compaction-tail\"\n\
+                 config = { threshold = 0.0000001, keep_turns = 1 }\n\n\
+                 [[remove]]\nid = \"repeat-fuse\"\n\n[[remove]]\nid = \"tool-loop-guard\"";
+    let app = start(tree(&dir, &script, &[eager])).await;
+    run_turn(&app, "first question").await.unwrap();
+    run_turn(&app, "second question").await.unwrap();
+
+    let cuts = compaction_cuts(&app.context().only_session().unwrap());
+    assert_eq!(
+        cuts.len(),
+        1,
+        "five requests in the second turn, one settled turn to fold: {cuts:?}"
+    );
+}
+
+/// A summary is what the model knows of everything before it. A later
+/// compaction that rebuilds its text from the raw log instead drops whatever
+/// that summary said — a written one included, which is the one worth most.
+#[tokio::test]
+async fn a_later_compaction_keeps_what_the_earlier_summary_said() {
+    let dir = scratch("keep-summary");
+    let script = "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = { script = [ \
+                  { text = \"a1\" }, { text = \"a2\" }, { text = \"a3\" }, { text = \"a4\" } ] }";
+    let app = start(tree(&dir, script, &[])).await;
+    run_turn(&app, "q1").await.unwrap();
+    run_turn(&app, "q2").await.unwrap();
+    let log = app.context().only_session().unwrap();
+    let end_of_first_turn = log
+        .events()
+        .iter()
+        .filter(|e| e.event.turn() <= 1)
+        .map(|e| e.seq)
+        .max()
+        .unwrap();
+    // What a written `/compact` leaves behind.
+    atomcode_harness::session::apply_compaction(
+        &app.context(),
+        &log,
+        atomcode_harness::seams::CompactionDecision {
+            through: end_of_first_turn,
+            summary: "WE-AGREED-TO-USE-POSTGRES".into(),
+        },
+    );
+    run_turn(&app, "q3").await.unwrap();
+    run_turn(&app, "q4").await.unwrap();
+
+    let compaction = app.context().service::<CompactionSvc>().unwrap();
+    let decision = compaction.compact(&log).await.expect("turns settled since");
+    atomcode_harness::session::apply_compaction(&app.context(), &log, decision);
+    let projected = log
+        .derive_messages()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        projected.contains("WE-AGREED-TO-USE-POSTGRES"),
+        "the earlier summary is gone: {projected}"
+    );
+    assert!(
+        projected.contains("q2"),
+        "what was asked since is listed: {projected}"
+    );
+    assert!(
+        !projected.contains("- q1"),
+        "what the earlier summary already stands for is not listed again: {projected}"
+    );
+}
+
 // ---- compaction written by the utility model -----------------------------
 
 /// Swapping the strategy is a patch, not a rebuild: remove the model-free row,
