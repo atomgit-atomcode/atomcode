@@ -824,7 +824,7 @@ fn announce_member(
 ) {
     if subscription.members.insert(member.session_id().to_string()) {
         let _ = events.send(AgentEvent::AgentAdded {
-            description: member.describe(),
+            description: Box::new(member.describe()),
         });
         let _ = events.send(AgentEvent::StatusChanged {
             session: member.session_id().to_string(),
@@ -1055,7 +1055,7 @@ async fn pump(
                             members: HashSet::new(),
                         };
                         let _ = events.send(AgentEvent::Described {
-                            description: target.describe(),
+                            description: Box::new(target.describe()),
                         });
                         let _ = events.send(AgentEvent::StatusChanged {
                             session: session.clone(),
@@ -1069,11 +1069,11 @@ async fn pump(
                         for logged in target.session().events() {
                             if logged.seq >= from {
                                 subscription.high = logged.seq;
-                                let _ = events.send(AgentEvent::Fact(Committed {
+                                let _ = events.send(AgentEvent::Fact(Box::new(Committed {
                                     session: session.clone(),
                                     seq: logged.seq,
                                     event: logged.event,
-                                }));
+                                })));
                             }
                         }
                         subscribed.insert(session, subscription);
@@ -1379,7 +1379,7 @@ pub async fn spawn(
             if let Some(subscription) = sessions.get_mut(&committed.session) {
                 if committed.seq > subscription.high {
                     subscription.high = committed.seq;
-                    let _ = out.send(AgentEvent::Fact(committed.clone()));
+                    let _ = out.send(AgentEvent::Fact(Box::new(committed.clone())));
                 }
             }
         }

@@ -350,16 +350,20 @@ pub enum AgentEvent {
     /// One fact of a session this driver subscribed to
     /// ([`AgentCommand::Subscribe`]). The session log is the content; a screen is
     /// a fold over these (`docs/adr/0022` §1).
-    Fact(crate::session::Committed),
+    ///
+    /// Boxed, like the descriptions below: a fact is the largest thing this
+    /// enum carries, and every event on every channel would otherwise be as
+    /// large as one.
+    Fact(Box<crate::session::Committed>),
     /// The agent behind a session just subscribed to, described. Sent first
     /// on every subscription (`docs/adr/0022` §5).
     Described {
-        description: crate::agent::AgentDescription,
+        description: Box<crate::agent::AgentDescription>,
     },
     /// A member joined a subscribed session. Followed by its status; also sent
     /// for each member already there when the subscription starts.
     AgentAdded {
-        description: crate::agent::AgentDescription,
+        description: Box<crate::agent::AgentDescription>,
     },
     /// What an `Invoke` produced, for a person to read.
     Invoked {
@@ -671,10 +675,10 @@ mod tests {
         };
         for event in [
             AgentEvent::Described {
-                description: description.clone(),
+                description: Box::new(description.clone()),
             },
             AgentEvent::AgentAdded {
-                description: description.clone(),
+                description: Box::new(description.clone()),
             },
             AgentEvent::AgentRemoved {
                 session: "lead/scout".into(),
