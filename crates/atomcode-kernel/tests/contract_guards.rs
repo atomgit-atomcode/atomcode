@@ -93,3 +93,43 @@ fn the_kernel_depends_on_no_workspace_crate() {
         "the kernel must not depend on a workspace crate: {offenders:?}"
     );
 }
+
+/// Where a type is defined, by the line that defines it.
+fn definitions_of(needle: &str) -> Vec<String> {
+    workspace_rust_files()
+        .into_iter()
+        .filter_map(|path| {
+            let text = std::fs::read_to_string(&path).ok()?;
+            text.lines()
+                .any(|line| line.trim_start().starts_with(needle))
+                .then(|| path.display().to_string())
+        })
+        .collect()
+}
+
+/// The session vocabulary is the kernel's (`docs/adr/0024` §6): a store that
+/// only knows the kernel and a front end that must not know the harness read the
+/// same facts. The harness keeps the in-memory log and re-exports the words; it
+/// does not define a second copy of them.
+#[test]
+fn the_session_vocabulary_is_defined_once_in_the_kernel() {
+    for needle in [
+        "pub enum SessionEvent",
+        "pub struct SessionHeader",
+        "pub struct LoggedEvent",
+        "pub struct Committed",
+        "pub enum InjectionOrigin",
+        "pub struct Question",
+        "pub struct Answer",
+        "pub struct RateLimitPause",
+        "pub fn derive_messages(events",
+        "pub fn build_compact_stub(",
+    ] {
+        let found = definitions_of(needle);
+        assert_eq!(found.len(), 1, "`{needle}` defined exactly once: {found:?}");
+        assert!(
+            found[0].ends_with("atomcode-kernel/src/session.rs"),
+            "`{needle}` lives in kernel::session: {found:?}"
+        );
+    }
+}

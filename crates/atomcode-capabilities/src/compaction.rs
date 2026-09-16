@@ -943,24 +943,10 @@ fn call_id_to_tool(msgs: &[Message]) -> HashMap<String, String> {
 }
 
 /// The one-line stub a stubbed tool result is replaced with. Byte-for-byte port of core's
-/// `build_compact_stub`: `[<tool> ok|FAILED: N lines, first: <≤80 chars>]`. For a bash
-/// result whose first line is the `[elapsed: …]` metadata prefix, the SECOND line is used
-/// so `first:` surfaces real output, not the exit-code banner.
-pub fn build_compact_stub(tool_name: &str, output: &str, success: bool) -> String {
-    let line_count = output.lines().count();
-    let first_line: String = {
-        let mut iter = output.lines();
-        let l1 = iter.next().unwrap_or("(empty)");
-        let chosen = if l1.starts_with("[elapsed:") {
-            iter.next().unwrap_or(l1)
-        } else {
-            l1
-        };
-        chosen.chars().take(80).collect()
-    };
-    let status = if success { "ok" } else { "FAILED" };
-    format!("[{tool_name} {status}: {line_count} lines, first: {first_line}]")
-}
+/// The one-line stub a compacted tool result becomes. Part of the session
+/// projection, so the kernel's (`docs/adr/0024` §6); re-exported here where
+/// compaction has always called it.
+pub use atomcode_kernel::session::build_compact_stub;
 
 #[cfg(test)]
 mod tests {

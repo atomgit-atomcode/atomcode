@@ -28,6 +28,9 @@ use atomcode_plexus::plexus_event;
 use crate::seams::{StopReason, TurnOutcome};
 use crate::session::Committed;
 
+/// Session vocabulary, so the kernel's (`docs/adr/0024` §6).
+pub use atomcode_kernel::session::RateLimitPause;
+
 /// Everything that goes on the wire for one model call. A listener may rewrite
 /// any of it before delegating.
 #[derive(Clone, Debug)]
@@ -51,18 +54,6 @@ pub struct ModelRequest {
 /// status, a structured code, a real `Retry-After`. Flattening that to a string
 /// at the seam would force every recovery plugin to re-derive it by matching on
 /// message text, which is exactly how a rate-limit handler ends up mistaking a
-/// Why a rate-limited turn stopped rather than failed, and when to come back.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct RateLimitPause {
-    pub reset_at_display: String,
-    pub reset_label: String,
-    #[serde(default)]
-    pub secs_until_reset: Option<u64>,
-    /// The provider's own reason, for a pause that is not a plan window.
-    #[serde(default)]
-    pub server_message: Option<String>,
-}
-
 /// 400 for a 429.
 #[derive(Clone, Debug)]
 pub struct RequestError {

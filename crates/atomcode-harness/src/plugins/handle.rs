@@ -428,6 +428,12 @@ impl Projector {
             // says `Cancelled`. What changed is the model's view, which is the
             // log's business.
             | SessionEvent::Interrupted { .. } => Vec::new(),
+            // `SessionEvent` is the kernel's and `non_exhaustive` (`docs/adr/0024`
+            // §6), so this match can no longer refuse to compile when a fact is
+            // added. The list above stays explicit on purpose: every fact the
+            // harness knows is decided here, by name. A fact added later is
+            // silent until someone adds it to the list.
+            _ => Vec::new(),
         }
     }
 }

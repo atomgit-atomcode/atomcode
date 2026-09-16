@@ -15,7 +15,6 @@ use atomcode_capabilities::skills::SkillRegistry;
 use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::tool::{Tool, ToolDef};
 use atomcode_plexus::{plexus_service, Context};
-use serde::{Deserialize, Serialize};
 
 use crate::agent::{Agent, Agents};
 pub use crate::model_source::{cheapest, choices, delegatable, Chose, ModelInfo, Models};
@@ -537,142 +536,11 @@ pub trait SessionTitle: Send + Sync {
     async fn title(&self, log: &SessionLog) -> Option<String>;
 }
 
-/// The three answers an approval can have. The spelling is
-/// `atomcode_capabilities::tools::approval`'s, so a decision means the same
-/// thing whichever gate asked and whatever carries it.
-pub const ANSWER_ALLOW: &str = "allow";
-pub const ANSWER_ALWAYS: &str = "allow_always";
-pub const ANSWER_DENY: &str = "deny";
-
-/// One answer: what comes back, and what a plain front end prints.
-///
-/// Serialisable because an answered question is a fact of the session, and a
-/// fact is what the log writes down — the card a person answered is not
-/// reproducible from the answer alone, and the options are half of it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Answer {
-    /// Returned by [`UserQuestions::ask`] when this one is picked.
-    pub value: String,
-    /// What a front end with nothing better to show prints. A front end that
-    /// knows the answer's meaning is free to word it its own way.
-    pub label: String,
-}
-
-impl Answer {
-    pub fn new(value: impl Into<String>) -> Self {
-        let value = value.into();
-        Self {
-            label: value.clone(),
-            value,
-        }
-    }
-    pub fn labelled(value: impl Into<String>, label: impl Into<String>) -> Self {
-        Self {
-            value: value.into(),
-            label: label.into(),
-        }
-    }
-}
-
-/// The call an approval is about.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AboutCall {
-    pub tool: String,
-    /// The exact bytes that will run. A front end summarises them for the eye,
-    /// but this is what executes — approve what runs, not a paraphrase of it.
-    pub arguments: String,
-    /// What an `allow_always` would cover, or `None` when this call is not
-    /// something to remember. Empty means every call of this tool; otherwise
-    /// it is the tool's own scope — `bash` reports the command, so approving
-    /// one destructive command never blanket-approves another. Shown, because
-    /// a person saying "always" is owed the scope they are saying it to.
-    pub grant: Option<String>,
-}
-
-/// A question put to a person — data, not a sentence.
-///
-/// A string was enough while one agent asked and the answers were yes and no.
-/// It stopped being enough the moment a delegated member could ask: "allow
-/// `write_file`?" with no way to say *who* wants to write is a question a
-/// person cannot answer honestly. So everything a front end needs to lay a
-/// question out is here, and everything it gets to decide — wording, colour,
-/// which key means which answer — is not.
-///
-/// Serialisable for the same reason: this is the record of what was asked, and
-/// the log is where a screen finds it again after a remount or a resume.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Question {
-    /// The ask, phrased, for a front end that renders nothing else.
-    pub prompt: String,
-    /// The answers, in the order they should be offered.
-    pub options: Vec<Answer>,
-    /// Which agent is asking, when it is not the one the person is driving —
-    /// a team member's name. `None` is this conversation itself.
-    pub asker: Option<String>,
-    /// The call under review, when this is an approval.
-    pub about: Option<AboutCall>,
-}
-
-impl Question {
-    /// A question with nothing behind it: a prompt and some answers.
-    pub fn plain(prompt: impl Into<String>, options: &[&str]) -> Self {
-        Self {
-            prompt: prompt.into(),
-            options: options.iter().map(|o| Answer::new(*o)).collect(),
-            ..Self::default()
-        }
-    }
-
-    /// The card an approval shows: the call under review, and the three answers
-    /// a risky call can have.
-    ///
-    /// One constructor for both asking seams, because they are the same card —
-    /// the `user-questions` one the interactive policy asks through, and the
-    /// handle's own `approval` one a driver round-trips. Two builders that agree
-    /// until one changes is how a person ends up with two products' worth of
-    /// wording for one decision, and how a log records two different questions
-    /// for the same call.
-    ///
-    /// `grant` is what an `allow_always` would cover, or `None` when the call
-    /// may never be remembered — then the option is not offered, because showing
-    /// "always allow" for a decision that will be asked again tells the person
-    /// something untrue about the permission they just gave. Empty means every
-    /// call of this tool.
-    pub fn approval(
-        tool: &str,
-        arguments: &str,
-        grant: Option<&str>,
-        asker: Option<String>,
-    ) -> Self {
-        let mut options = vec![Answer::labelled(ANSWER_ALLOW, "allow once")];
-        if grant.is_some() {
-            options.push(Answer::labelled(ANSWER_ALWAYS, "always allow"));
-        }
-        options.push(Answer::labelled(ANSWER_DENY, "deny"));
-        Self {
-            prompt: match &asker {
-                Some(who) => format!("Allow `{tool}` to run, asked for by `{who}`?"),
-                None => format!("Allow `{tool}` to run?"),
-            },
-            options,
-            asker,
-            about: Some(AboutCall {
-                tool: tool.to_string(),
-                arguments: arguments.to_string(),
-                grant: grant.map(str::to_string),
-            }),
-        }
-    }
-
-    /// Just the values, for an asker that only echoes them.
-    pub fn values(&self) -> Vec<String> {
-        self.options.iter().map(|o| o.value.clone()).collect()
-    }
-    /// The answer whose value is this, if it is one of them.
-    pub fn has(&self, value: &str) -> bool {
-        self.options.iter().any(|o| o.value == value)
-    }
-}
+/// Questions put to a person, and their answers — session vocabulary, so the
+/// kernel's (`docs/adr/0024` §6). Re-exported where the seams have always named them.
+pub use atomcode_kernel::session::{
+    AboutCall, Answer, Question, ANSWER_ALLOW, ANSWER_ALWAYS, ANSWER_DENY,
+};
 
 /// Asking a human. `None` means "no answer" — every caller must treat that as a
 /// refusal, never as consent.

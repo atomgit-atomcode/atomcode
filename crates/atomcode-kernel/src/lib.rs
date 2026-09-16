@@ -16,6 +16,7 @@ pub mod message;
 pub mod middleware;
 pub mod provider;
 pub mod request;
+pub mod session;
 pub mod stream;
 pub mod testkit;
 pub mod tool;
