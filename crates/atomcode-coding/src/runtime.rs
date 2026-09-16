@@ -4842,6 +4842,28 @@ fn spawn_runtime_owner_with_optional_agent(
                                         // so the credentials are still in it. Say
                                         // so rather than reporting a logout that
                                         // did not happen.
+                                        //
+                                        // The TURN, though, is already over: the
+                                        // quiesce above cancelled it and consumed
+                                        // its `TurnComplete` into `stop_report`,
+                                        // so nothing else will ever end it. Ending
+                                        // it here is not bookkeeping — leaving
+                                        // `active_turn` set while announcing
+                                        // `Ready` makes the next `Submit` a STEER
+                                        // (see the `SubmitReceipt::Steered` branch)
+                                        // into a turn that no longer exists, and
+                                        // the person's message goes nowhere with a
+                                        // spinner that never stops.
+                                        finish_stopped_native_turn(
+                                            &stop_report,
+                                            resources.as_ref(),
+                                            &mut active_turn,
+                                            &mut terminal_reason,
+                                            &mut turn_stats,
+                                            &mut conversation_revision,
+                                            &mut snapshot_waiters,
+                                            &runtime_event_tx,
+                                        );
                                         controls.state.store(
                                             runtime_phase_state(
                                                 generation,
@@ -8319,6 +8341,21 @@ fn emit_terminal_persistence_warnings(
     }
 }
 
+/// End a turn the runtime stopped itself, and end it EXACTLY once.
+///
+/// Every path that quiesces the agent has to reach this, including the ones that
+/// then fail: `quiesce_current_agent` consumes the agent's own `TurnComplete`
+/// into the `StopReport`, so after it runs nothing else will ever finish the
+/// turn. A path that skips this leaves `active_turn` set, and the next `Submit`
+/// becomes a steer into a turn that is gone.
+///
+/// **No criterion covers the failing paths, and that is a known gap.** The only
+/// way to fail the logout patch is for a row to refuse to remount, and nothing a
+/// test can reach makes that happen — the layer is a fixed string and the one
+/// row it touches is `llm`. So these branches are held by construction and by
+/// this comment rather than by a red test; if a way to inject a patch failure
+/// ever appears, the criterion to write is "a failed logout still ends the turn
+/// it cancelled".
 fn finish_stopped_native_turn(
     report: &StopReport,
     resources: Option<&RuntimeResources>,

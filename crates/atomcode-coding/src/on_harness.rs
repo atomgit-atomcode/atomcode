@@ -858,6 +858,15 @@ pub async fn swap_provider_for(
     model: &str,
     config: Option<&crate::CodingAgentConfig>,
 ) -> Result<(), String> {
+    // What the slot holds now, so a patch that does not land can be undone.
+    // The slot is not bookkeeping: `CodingModels::provider` serves it to the
+    // `models` seam, which is where a delegated child (`task`, `team`,
+    // `code_review`) gets "the model this conversation is on". Swapping it
+    // before the patch and leaving it there on failure puts the conversation on
+    // one provider and its own children on another — with the model NAME still
+    // reading as the old one, because that comes from the config the tree
+    // mounted with.
+    let previous = slots.current();
     let id = slots.insert(next);
     // Three rows, one patch, and the two extras are there for the same reason:
     // `App::patch` remounts only rows whose OWN entry changed, so a row that
@@ -880,8 +889,14 @@ pub async fn swap_provider_for(
     if let Some(config) = config {
         layer_text.push_str(&model_rows(config));
     }
-    let layer = Layer::from_toml(&layer_text).map_err(|e| e.to_string())?;
-    app.patch(&layer).await.map_err(|e| e.to_string())
+    let restore = |error: String| {
+        if let Some(previous) = previous.clone() {
+            slots.insert(previous);
+        }
+        error
+    };
+    let layer = Layer::from_toml(&layer_text).map_err(|e| restore(e.to_string()))?;
+    app.patch(&layer).await.map_err(|e| restore(e.to_string()))
 }
 
 /// What fills the `llm` seam after a logout.
