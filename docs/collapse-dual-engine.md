@@ -255,6 +255,23 @@ waterfall 的执行顺序我先后猜过「挂载轮次」「底座有重复行�
 `on_emit::<SessionEventCommitted>` 观察者,既不唤醒已结束的回合也不写 sidecar。
 **「某某行顶替了它」要看那行挂在哪个事件上。**
 
+### 6 条修完之后的第二轮真模型冒烟
+
+同一条网关，隔离 home，**验的是修复本身而不只是「还能跑」**：
+
+| 项 | 结果 |
+|---|---|
+| 纯文本 | 回 `pineapple` |
+| 带工具 + todo | 8 轮 7 次工具调用;`note.txt` 内容对;**会话目录里出现 `<id>.todos.json`**,内容是两条已完成的计划 —— F 的修复在真跑上生效 |
+| **凭据边界(A)** | 配 `[permissions] allow = ["Bash(curl *)"]` + `shell_guard_policy = "strict"`,再加 `-y` 跳过所有审批,让模型跑一条带 `$SECRET_TOKEN` 的 curl → **`stopped=PolicyDenied`**,命令没跑 |
+| 同上，阴性对照 | 只把 `shell_guard_policy` 改成 `off`,其余一字不动 → 命令正常执行 |
+
+A 那条对照特别值得留意:**`-y`（自动批准一切）也没能让它通过**。这正是
+`Authorization` 想表达的——`-y` 是「别再问我」,不是「我同意泄露凭据」。
+
+> 配置键是 `[coding] shell_guard_policy`,不是 `[tools] credential_shell`;而且它本来
+> 就有值,是替换不是新增。我在这上面连错两次，记在这里省下一次。
+
 ## 判据(`tests/runtime_criteria.rs`)
 
 运行时判据，只经 `CodingRuntime` 公开面。每条都在两个引擎上写过、并摘掉被测代码证伪过
