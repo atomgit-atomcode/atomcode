@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 
-use crate::frame::{Color, Line, Rect, Span, Style};
+use crate::frame::{Line, Rect, Span, Style};
 use crate::width;
 
 /// How wide a bitmap may be.
@@ -376,6 +376,9 @@ impl Rasters {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests name a `Color`: the module itself handles raw RGB and lets
+    // the palette resolve it, which is the point (see `theme::exact_colour`).
+    use crate::frame::Color;
 
     /// One cell, encoded as the three little-endian words the format promises.
     fn cell(ch: char, fg: u32, bg: u32) -> [u8; 12] {

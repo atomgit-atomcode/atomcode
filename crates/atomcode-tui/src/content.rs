@@ -88,6 +88,354 @@ fn wrapped(text: &str, w: u16, style: Style, prefix: &str) -> Vec<Line> {
 #[derive(Debug)]
 pub struct UserSaid(pub String);
 
+/// The opening block of a new session: the brand, the mascot, where you are, and
+/// a few commands worth knowing.
+///
+/// A **stream producer**'s block, not a view module's: it happens once, it has
+/// history, and a reader who scrolls back up should still find it
+/// (`docs/adr/0004`). That is also why it refuses to fold.
+///
+/// The tips are decided when the block is built, never in `lines`: `lines` is
+/// called every frame and must be pure, so a block that rolled its tips there
+/// would change under the reader and its `content_hash` would move every frame.
+/// Tuix needed a persisted `welcome_tip_indices` to work around exactly that;
+/// deciding once is the cheaper way to the same property.
+#[derive(Debug)]
+pub struct WelcomeBlock {
+    /// Already a display string — the caller folds the home directory away.
+    pub cwd: String,
+    pub model: Option<String>,
+    pub version: &'static str,
+    /// The tips to show, as `(command, what it does)`.
+    pub tips: Vec<(String, String)>,
+}
+
+/// The mascot's source art, borrowed verbatim from `atomcode-tuix`
+/// (`render/mascot.rs`).
+///
+/// Four rows of 18 characters: nine cells, and each cell's two characters are its
+/// **upper and lower** half-pixels — tuix draws them as `▀` with the foreground
+/// above and the cell's background below. Legend: `.` transparent, `o` body,
+/// `e` eyebrow, `w` highlight, `k` pupil.
+const MASCOT_SOURCE: [&str; 4] = [
+    "oooo.o.o.o.o.ooooo",
+    "ooooooewekooewekoo",
+    "ooooookokoookokooo",
+    "..o.ooooooooooo...",
+];
+
+/// How many cells wide the art is.
+const MASCOT_CELLS: usize = 9;
+
+/// Whether one cell's upper or lower half is body, and if so **in which ink**.
+///
+/// The four legend characters are four colours, and that is not decoration: the
+/// art is 85% body, so its face is carried entirely by *which* body — a pupil, a
+/// highlight and an eyebrow in one ink are a filled rectangle with no cat in it.
+/// Tuix draws them with four literal colours for the same reason.
+///
+/// They become **roles**, never bare colours: a role is resolved against the
+/// measured palette at paint time, which is what keeps this legible on a light
+/// terminal and is what the layering gate enforces.
+fn mascot_ink(legend: char) -> Option<Role> {
+    match legend {
+        'o' => Some(Role::Brand),
+        'e' => Some(Role::Muted),
+        'w' => Some(Role::Secondary),
+        'k' => Some(Role::PanelBg),
+        _ => None,
+    }
+}
+
+fn mascot_cell(row: &str, cell: usize) -> (Option<Role>, Option<Role>) {
+    let chars: Vec<char> = row.chars().collect();
+    (
+        chars.get(cell * 2).copied().and_then(mascot_ink),
+        chars.get(cell * 2 + 1).copied().and_then(mascot_ink),
+    )
+}
+
+impl Content for WelcomeBlock {
+    fn kind(&self) -> &'static str {
+        "welcome"
+    }
+
+    fn content_hash(&self) -> ContentHash {
+        // Shape is not in the hash — same class as width. `Content` promises the
+        // hash covers what the block *says* and never the bytes it renders, and
+        // "did the cat get drawn" is rendered bytes.
+        let mut parts: Vec<&str> = vec!["welcome", self.version, &self.cwd];
+        if let Some(model) = &self.model {
+            parts.push(model);
+        }
+        for (command, about) in &self.tips {
+            parts.push(command);
+            parts.push(about);
+        }
+        hash_of(&parts)
+    }
+
+    /// It refuses to fold.
+    ///
+    /// Its whole point is "this is how the session started" — a one-line summary
+    /// of that is the point folded away. The same reasoning as a loaded skill's.
+    fn always_open(&self) -> bool {
+        true
+    }
+
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width as usize;
+        // Nothing fits inside the padding, so there is no block — not a block of
+        // blank rows. A zero-row block still occupies a slot and `blank_between`
+        // would leave a blank row for it, so the screen would gain a stray line.
+        if w <= PAD * 2 {
+            return Vec::new();
+        }
+        let content_w = w - PAD * 2;
+        let pad = " ".repeat(PAD);
+
+        // ---- The left column: the mascot, then the two bullets ----
+        let mut left: Vec<Line> = mascot(ctx, content_w);
+
+        // cwd and model are rendered BELOW the whole block, never zipped into the
+        // left column beside the tips. Tuix learned this: when the tips are taller
+        // than the mascot the spare rows landed on these two, and the screen read
+        // `∙ proj` and `set a goal…` on one line.
+        let mut below: Vec<Line> = Vec::new();
+        let bullet = ctx.caps.g(Glyph::Bullet);
+        for text in std::iter::once(Some(self.cwd.as_str()))
+            .chain(std::iter::once(self.model.as_deref()))
+            .flatten()
+        {
+            below.extend(wrapped(
+                text,
+                content_w as u16,
+                muted(),
+                &format!("{bullet} "),
+            ));
+        }
+
+        // ---- The right column: a heading and the tips ----
+        let mut right: Vec<Line> = Vec::new();
+        if !self.tips.is_empty() {
+            right.push(Line::styled(
+                width::take_width("快速上手", content_w),
+                muted(),
+            ));
+            let command_w = self
+                .tips
+                .iter()
+                .map(|(command, _)| width::str_width(command))
+                .max()
+                .unwrap_or(0);
+            for (command, about) in &self.tips {
+                // The columns line up on the widest command, but never at the cost
+                // of the row: command, gap and description together are clipped to
+                // `content_w`. A tip that does not fit is cut, never drawn past the
+                // edge. (The two-column test above already refuses to place these
+                // beside the mascot when they would not fit there.)
+                let command = width::take_width(command, content_w);
+                let command_w_here = width::str_width(&command);
+                let remaining = content_w.saturating_sub(command_w_here);
+                let want_gap = command_w.saturating_sub(command_w_here) + 2;
+                let gap = want_gap.min(remaining);
+                let room = remaining - gap;
+
+                let mut spans = vec![
+                    Span::styled(command, Style::new().fg(Color::role(Role::Accent)).bold()),
+                    Span::raw(" ".repeat(gap)),
+                ];
+                // No span at all when nothing of the description fits: an empty
+                // styled span is a style with no text, which the encoder would
+                // still have to look at.
+                if room > 0 {
+                    spans.push(Span::styled(width::take_width(about, room), muted()));
+                }
+                right.push(Line::from_spans(spans));
+            }
+        }
+
+        let mut rows: Vec<Line> = Vec::new();
+
+        // ---- The header: brand on the left, version · licence on the right ----
+        //
+        // Clipped to `content_w`, and that clipping is not decoration: a rect
+        // narrower than the two strings would otherwise be drawn past its own
+        // edge, which the frame's containment check catches per block but a reader
+        // sees as a row running into its neighbour.
+        let right_txt = format!("v{}  MIT", self.version);
+        let brand = "◆ AtomCode";
+        let brand_w = width::str_width(brand);
+        let right_w = width::str_width(&right_txt);
+        let brand_style = Style::new().fg(Color::role(Role::Brand));
+        if content_w > brand_w + right_w {
+            let fill = content_w - brand_w - right_w;
+            rows.push(Line::from_spans(vec![
+                Span::raw(pad.clone()),
+                Span::styled(brand.to_string(), brand_style),
+                Span::raw(" ".repeat(fill)),
+                Span::styled(right_txt, muted()),
+            ]));
+        } else {
+            // Too narrow for both on one row: two rows beat a truncated line, and
+            // beat the two colliding. Each is still clipped to what there is.
+            rows.push(Line::from_spans(vec![
+                Span::raw(pad.clone()),
+                Span::styled(width::take_width(brand, content_w), brand_style),
+            ]));
+            rows.push(Line::styled(
+                format!("{pad}{}", width::take_width(&right_txt, content_w)),
+                muted(),
+            ));
+        }
+        rows.push(Line::empty());
+
+        // ---- Two columns only when the widest tip actually fits ----
+        //
+        // Tuix's criterion, and its reason: tip rows are not truncated, so two
+        // columns that do not fit get hard-wrapped by the terminal and the
+        // alignment of the column breaks. It used a fixed underestimate once and
+        // that is precisely what happened on a narrow terminal.
+        let gap = 4usize;
+        let left_w = if left.is_empty() {
+            PAD
+        } else {
+            PAD + MASCOT_CELLS
+        };
+        let tips_col = left_w + gap;
+        let right_w = right.iter().map(Line::width).max().unwrap_or(0);
+        let two_columns = !left.is_empty() && !right.is_empty() && content_w >= tips_col + right_w;
+
+        if two_columns {
+            for i in 0..left.len().max(right.len()) {
+                let mut line = left.get(i).cloned().unwrap_or_else(Line::empty);
+                let have = line.width();
+                if have < tips_col {
+                    line.push(Span::raw(" ".repeat(tips_col - have)));
+                }
+                if let Some(row) = right.get(i) {
+                    for span in &row.spans {
+                        line.push(span.clone());
+                    }
+                }
+                rows.push(line);
+            }
+        } else {
+            rows.extend(left.drain(..));
+            for row in right {
+                let mut line = Line::from_spans(vec![Span::raw(pad.clone())]);
+                for span in &row.spans {
+                    line.push(span.clone());
+                }
+                rows.push(line);
+            }
+        }
+        rows.extend(below);
+
+        // A trailing blank, so whatever arrives next (a connection notice, an
+        // upgrade hint) does not butt against the last row. Tuix keeps one too.
+        rows.push(Line::empty());
+
+        // Nothing fit: no block at all, rather than a block of blank rows. A
+        // zero-row block still occupies a slot and `blank_between` would leave a
+        // blank row for it, so the screen would gain a stray empty line.
+        if rows.iter().all(|line| line.plain().trim().is_empty()) {
+            return Vec::new();
+        }
+        rows
+    }
+}
+
+/// How far the block is set in from the rect it was given.
+const PAD: usize = 2;
+
+/// The mascot, as cells of two vertical pixels each.
+///
+/// **With `cell_background`** the two pixels are the cell's foreground and
+/// background, which is what tuix does and what makes the art recognisable: `▀`
+/// for a cell whose upper half is body and lower half is not, `█` for both,
+/// `▄` for the lower one, a space for neither.
+///
+/// **Without it** the lower pixel would simply not paint — the terminal draws the
+/// glyph and drops the background — so the half-block set comes apart and the cat
+/// loses its chin. That is what tuix hit on bare ssh clients. The fallback draws
+/// one solid cell for either pixel, which is coarser and honest: `█` or nothing.
+///
+/// Cut to `content_w`, like every other row: art wider than the rect it was given
+/// is a row running into its neighbour.
+fn mascot(ctx: &RenderCtx, content_w: usize) -> Vec<Line> {
+    if !ctx.caps.unicode {
+        // No Unicode means no block glyphs at all, and `ascii_for` has no
+        // stand-in that reads as a picture. Nothing beats a rectangle of `#`.
+        return Vec::new();
+    }
+    // The art needs PAD + nine cells. Showing a sliced cat is worse than showing
+    // none, and the caller's width is the one thing that decides.
+    if content_w < MASCOT_CELLS {
+        return Vec::new();
+    }
+    let ink = |role: Role| Style::new().fg(Color::role(role));
+    MASCOT_SOURCE
+        .iter()
+        .map(|row| {
+            let mut spans: Vec<Span> = vec![Span::raw(" ".repeat(PAD))];
+            let mut run = String::new();
+            let mut run_style = ink(Role::Brand);
+            for cell in 0..MASCOT_CELLS {
+                let (top, bottom) = mascot_cell(row, cell);
+                let (glyph, style) = draw_cell(top, bottom, ctx.caps.cell_background);
+                if style == run_style {
+                    run.push_str(glyph);
+                } else {
+                    if !run.is_empty() {
+                        spans.push(Span::styled(std::mem::take(&mut run), run_style));
+                    }
+                    run.push_str(glyph);
+                    run_style = style;
+                }
+            }
+            if !run.is_empty() {
+                spans.push(Span::styled(run, run_style));
+            }
+            Line::from_spans(spans)
+        })
+        .collect()
+}
+
+/// The glyph and style for one cell.
+///
+/// This is where a half block earns its keep: `▀` paints its cell's foreground in
+/// the upper half and its **background** in the lower, so one cell carries two
+/// colours — which is exactly what the art needs for an eye (a highlight above a
+/// pupil). `█` is one colour both halves, `▄` the lower half alone.
+///
+/// `cell_background` decides whether that is available at all. Without it the
+/// background never paints, so a two-colour `▀` would arrive as its top half and
+/// the cat would lose its chin — tuix hit this on bare ssh clients. The fallback
+/// draws one solid cell per pixel in a single ink: coarser, and honest.
+fn draw_cell(
+    top: Option<Role>,
+    bottom: Option<Role>,
+    cell_background: bool,
+) -> (&'static str, Style) {
+    let ink = |role: Role| Style::new().fg(Color::role(role));
+    if !cell_background {
+        // One ink for the whole cell, whichever half has something in it. The
+        // upper one wins where both do: it is the half a `▀` would have drawn.
+        return match (top, bottom) {
+            (Some(role), _) | (None, Some(role)) => ("█", ink(role)),
+            (None, None) => (" ", Style::new()),
+        };
+    }
+    match (top, bottom) {
+        (Some(t), Some(b)) if t == b => ("█", ink(t)),
+        (Some(t), Some(b)) => ("▀", ink(t).bg(Color::role(b))),
+        (Some(t), None) => ("▀", ink(t)),
+        (None, Some(b)) => ("▄", ink(b)),
+        (None, None) => (" ", Style::new()),
+    }
+}
+
 impl Content for UserSaid {
     fn kind(&self) -> &'static str {
         "user"
@@ -1117,6 +1465,192 @@ impl Content for TurnEndBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn welcome() -> WelcomeBlock {
+        WelcomeBlock {
+            cwd: "~/proj".into(),
+            model: Some("a-model".into()),
+            version: "9.9.9",
+            tips: vec![
+                ("/resume".into(), "接着上次".into()),
+                ("/help".into(), "列出所有命令".into()),
+            ],
+        }
+    }
+
+    /// A render context with the two shape bits a caller cares about.
+    fn wctx(width: u16, cell_background: bool) -> RenderCtx {
+        RenderCtx {
+            width,
+            caps: crate::block::ShapeCaps {
+                unicode: true,
+                colors: crate::caps::Colors::Ansi256,
+                cell_background,
+            },
+        }
+    }
+
+    fn lines_of(block: &WelcomeBlock, width: u16, cell_background: bool) -> Vec<String> {
+        block
+            .lines(&wctx(width, cell_background))
+            .iter()
+            .map(Line::plain)
+            .collect()
+    }
+
+    #[test]
+    fn the_welcome_says_the_four_things_it_has() {
+        let all = lines_of(&welcome(), 80, true).join("\n");
+        for want in ["AtomCode", "9.9.9", "~/proj", "a-model", "/resume", "/help"] {
+            assert!(all.contains(want), "{want} missing from:\n{all}");
+        }
+    }
+
+    #[test]
+    fn the_mascot_needs_two_pixels_per_cell_and_says_so() {
+        // The heart of the shape decision: with a cell background the art is the
+        // half-block set (`▀`/`▄`/`█`); without one the bottom half of every glyph
+        // would simply not paint, so it falls back to one solid cell per pixel.
+        let with = lines_of(&welcome(), 80, true).join("\n");
+        assert!(
+            with.contains('▀') || with.contains('▄') || with.contains('█'),
+            "no mascot at all:\n{with}"
+        );
+
+        let without = lines_of(&welcome(), 80, false).join("\n");
+        assert!(
+            !without.contains('▀') && !without.contains('▄'),
+            "half blocks must not be used where the background does not paint:\n{without}"
+        );
+        assert!(
+            without.contains('█'),
+            "the coarser fallback should still draw the cat:\n{without}"
+        );
+    }
+
+    #[test]
+    fn a_terminal_with_no_unicode_gets_no_mascot() {
+        let none = RenderCtx {
+            width: 80,
+            caps: crate::block::ShapeCaps {
+                unicode: false,
+                ..wctx(80, true).caps
+            },
+        };
+        let all = welcome()
+            .lines(&none)
+            .iter()
+            .map(Line::plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !all.contains('█') && !all.contains('▀'),
+            "a grid of tofu is not a picture:\n{all}"
+        );
+        // The words are still there: only the art needs Unicode.
+        assert!(all.contains("AtomCode") && all.contains("~/proj"));
+    }
+
+    #[test]
+    fn cwd_and_model_land_below_the_tips_and_never_on_top_of_them() {
+        // Tuix's bug, kept as a judgement: when the tips are taller than the cat,
+        // the spare rows used to land on these two, and one line read `∙ proj`
+        // and `set a goal…` at once.
+        let lines = lines_of(&welcome(), 80, true);
+        let cwd_row = lines
+            .iter()
+            .position(|l| l.contains("~/proj"))
+            .expect("cwd");
+        let tip_row = lines
+            .iter()
+            .position(|l| l.contains("/resume"))
+            .expect("tips");
+        assert!(
+            cwd_row > tip_row,
+            "the bullets belong under the block, not beside the tips:\n{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn nothing_that_fits_means_no_block_rather_than_a_blank_one() {
+        // A zero-row block still occupies a slot, and `blank_between` would leave a
+        // blank row for it — the screen would gain a stray empty line.
+        for width in [0u16, 1, 2, 3] {
+            assert!(
+                welcome().lines(&wctx(width, true)).is_empty(),
+                "width {width} fits nothing, so there is no block"
+            );
+        }
+    }
+
+    #[test]
+    fn the_welcome_cannot_be_folded_away() {
+        assert!(
+            welcome().always_open(),
+            "its whole point is that it happened"
+        );
+    }
+
+    #[test]
+    fn the_hash_covers_what_it_says_and_not_how_it_draws() {
+        assert_eq!(welcome().content_hash(), welcome().content_hash());
+        assert_ne!(
+            welcome().content_hash(),
+            WelcomeBlock {
+                model: None,
+                ..welcome()
+            }
+            .content_hash(),
+            "a different model is a different block"
+        );
+    }
+
+    #[test]
+    fn no_row_is_wider_than_the_width_it_was_given() {
+        // The invariant every block owes the frame, across widths and both shapes
+        // of terminal.
+        for width in [4u16, 9, 20, 40, 61, 80, 120] {
+            for cell_background in [true, false] {
+                for line in welcome().lines(&wctx(width, cell_background)) {
+                    assert!(
+                        line.width() <= width as usize,
+                        "at {width} (background={cell_background}): {line:?} is {} cells",
+                        line.width()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_tip_list_drops_the_whole_column_and_not_just_the_heading() {
+        // A heading with nothing under it announces nothing.
+        let bare = WelcomeBlock {
+            tips: Vec::new(),
+            ..welcome()
+        };
+        let all = lines_of(&bare, 80, true).join("\n");
+        assert!(!all.contains("快速上手"), "{all}");
+        assert!(all.contains("~/proj"), "the rest is still there: {all}");
+    }
+
+    #[test]
+    fn the_art_source_is_well_formed() {
+        // The constant is borrowed from tuix; if it were ever edited, this says
+        // what the reader below assumes.
+        for (i, row) in MASCOT_SOURCE.iter().enumerate() {
+            assert_eq!(
+                row.chars().count(),
+                MASCOT_CELLS * 2,
+                "row {i} is not {MASCOT_CELLS} cells of two pixels"
+            );
+            assert!(
+                row.chars()
+                    .all(|c| matches!(c, '.' | 'o' | 'e' | 'w' | 'k')),
+                "row {i} has a legend character nobody draws"
+            );
+        }
+    }
 
     /// A block as it reaches the screen, as one string.
     fn drawn(block: &dyn Content, w: u16) -> String {

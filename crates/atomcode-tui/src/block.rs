@@ -97,6 +97,13 @@ pub fn hash_of(parts: &[&str]) -> ContentHash {
 pub struct ShapeCaps {
     pub unicode: bool,
     pub colors: crate::caps::Colors,
+    /// Whether a cell's background colour paints.
+    ///
+    /// A *shape* bit, not a colour one, which is why it belongs here: the one
+    /// thing a block does differently when it is false is draw **less** — half of
+    /// a two-pixel-per-cell glyph is exactly the part that would be missing. See
+    /// [`crate::caps::Caps::cell_background`].
+    pub cell_background: bool,
 }
 
 impl ShapeCaps {
@@ -105,6 +112,7 @@ impl ShapeCaps {
         Self {
             unicode: caps.unicode,
             colors: caps.colors,
+            cell_background: caps.cell_background,
         }
     }
 
@@ -603,6 +611,7 @@ mod tests {
         ShapeCaps {
             unicode,
             colors: crate::caps::Colors::Ansi256,
+            cell_background: true,
         }
     }
 
