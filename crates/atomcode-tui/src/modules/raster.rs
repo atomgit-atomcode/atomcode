@@ -47,7 +47,9 @@ impl View for RasterPane {
         if !vp.moment.caps.unicode && !raster.all_downgradable() {
             return Vec::new();
         }
-        raster.lines_in(vp.rect)
+        // The caps this frame was composed against, so the colours are ones this
+        // terminal can actually draw (see `theme::exact_colour`).
+        raster.lines_in(vp.rect, vp.moment.caps)
     }
 
     /// Ask for nothing in particular.

@@ -145,7 +145,13 @@ impl Raster {
     /// what is visible, the same trade `LiveCache` makes ("a frame's cost is the
     /// screen's, not the answer's"). Row 0 is the first row — a bitmap does not
     /// scroll inside itself.
-    pub fn lines_in(&self, rect: Rect) -> Vec<Line> {
+    ///
+    /// `caps` is how the colours become drawable ones. A bitmap states arbitrary
+    /// RGB, which no role can express, so it goes through
+    /// [`crate::theme::exact_colour`] — the one door an arbitrary RGB enters a
+    /// frame by. Without it a 24-bit sequence goes to a 256-index terminal,
+    /// which then guesses, and two terminals guess differently.
+    pub fn lines_in(&self, rect: Rect, caps: crate::caps::Caps) -> Vec<Line> {
         let rows = (rect.h as usize).min(self.rows as usize);
         let cols = (rect.w as usize).min(self.columns as usize);
         if rows == 0 || cols == 0 {
@@ -159,7 +165,7 @@ impl Raster {
                 // its runs rather than its cells.
                 let mut spans: Vec<Span> = Vec::new();
                 for cell in slice {
-                    let style = style_of(cell);
+                    let style = style_of(cell, caps);
                     match spans.last_mut() {
                         Some(last) if last.style == style => last.text.push(cell.ch),
                         _ => spans.push(Span::styled(cell.ch.to_string(), style)),
@@ -206,15 +212,27 @@ fn colour(word: u32, index: usize) -> Result<Option<Color>, RasterError> {
     }
 }
 
-fn style_of(cell: &Cell) -> Style {
+fn style_of(cell: &Cell, caps: crate::caps::Caps) -> Style {
     let mut style = Style::new();
     if let Some(fg) = cell.fg {
-        style = style.fg(fg);
+        style = style.fg(drawable(fg, caps));
     }
     if let Some(bg) = cell.bg {
-        style = style.bg(bg);
+        style = style.bg(drawable(bg, caps));
     }
     style
+}
+
+/// A bitmap's colour as this terminal can draw it.
+///
+/// The resolve step is not optional and not an optimisation: `Color::Rgb` on a
+/// 256-index terminal is a sequence the terminal has to guess at, and two
+/// terminals guess differently. See [`crate::theme::exact_colour`].
+fn drawable(colour: Color, caps: crate::caps::Caps) -> Color {
+    match colour {
+        Color::Rgb(r, g, b) => crate::theme::exact_colour((r, g, b), caps),
+        thorough => thorough,
+    }
 }
 
 type Mounted = HashMap<(String, String), Arc<Raster>>;
@@ -377,6 +395,23 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 
+    /// The capability set a layout is drawn against in these tests.
+    ///
+    /// `Caps::default()` is a **256-index** terminal, not a truecolour one — worth
+    /// stating because "the default is what a modern terminal does" reads as
+    /// truecolour and is not (`caps.rs`). Tests that want exact colours ask for
+    /// them explicitly.
+    fn caps() -> crate::caps::Caps {
+        crate::caps::Caps::default()
+    }
+
+    fn truecolour() -> crate::caps::Caps {
+        crate::caps::Caps {
+            colors: crate::caps::Colors::True,
+            ..crate::caps::Caps::default()
+        }
+    }
+
     fn solid_payload(columns: u16, rows: u16) -> String {
         let mut bytes = Vec::new();
         for _ in 0..columns as usize * rows as usize {
@@ -390,10 +425,94 @@ mod tests {
     }
 
     #[test]
+    fn a_truecolour_terminal_gets_the_bitmaps_own_colours() {
+        let payload = b64(&cell('\u{2588}', 0x00ff_8800, 0x0100_0000));
+        let raster = Raster::decode(1, 1, &payload).expect("valid");
+        let line = &raster.lines_in(Rect::sized(1, 1), truecolour())[0];
+        assert_eq!(
+            line.spans[0].style.fg,
+            Some(Color::rgb((0xff, 0x88, 0x00))),
+            "a truecolour terminal draws exactly what the bitmap said"
+        );
+    }
+
+    #[test]
+    fn a_256_colour_terminal_gets_an_index_and_never_a_24_bit_sequence() {
+        // The bug this fixes: `Color::Rgb` was written straight through, so a
+        // 256-index terminal was handed `38;2;…` and left to guess. Two terminals
+        // guess differently, and a bitmap is the one thing on screen whose
+        // colours nobody chose — so it is resolved against the palette like
+        // everything else. See `theme::exact_colour`.
+        let payload = b64(&cell('\u{2588}', 0x00ff_8800, 0x0100_0000));
+        let raster = Raster::decode(1, 1, &payload).expect("valid");
+        let ansi256 = crate::caps::Caps {
+            colors: crate::caps::Colors::Ansi256,
+            ..caps()
+        };
+        let line = &raster.lines_in(Rect::sized(1, 1), ansi256)[0];
+        assert!(
+            matches!(line.spans[0].style.fg, Some(Color::Ansi(_))),
+            "expected an index, got {:?}",
+            line.spans[0].style.fg
+        );
+
+        // And the proof at the byte level: no 24-bit sequence reaches the wire.
+        let mut frame = crate::frame::Frame::new(1, 1);
+        frame.place(
+            "raster",
+            Rect::sized(1, 1),
+            raster.lines_in(Rect::sized(1, 1), ansi256),
+        );
+        let encoded = crate::ansi::encode_with(&frame, ansi256);
+        assert!(
+            !encoded.contains("38;2;") && !encoded.contains("48;2;"),
+            "a 256-colour terminal must not be handed 24-bit colour: {encoded:?}"
+        );
+    }
+
+    #[test]
+    fn a_sixteen_colour_terminal_gets_one_of_its_sixteen() {
+        let payload = b64(&cell('\u{2588}', 0x00ff_8800, 0x0100_0000));
+        let raster = Raster::decode(1, 1, &payload).expect("valid");
+        let ansi16 = crate::caps::Caps {
+            colors: crate::caps::Colors::Ansi16,
+            ..caps()
+        };
+        let line = &raster.lines_in(Rect::sized(1, 1), ansi16)[0];
+        match line.spans[0].style.fg {
+            Some(Color::Ansi(n)) => assert!(n <= 15, "slot {n} is not one of the sixteen"),
+            other => panic!("expected a slot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_terminal_with_no_colour_gets_no_colour_sequences() {
+        let payload = b64(&cell('\u{2588}', 0x00ff_8800, 0x00ff_0000));
+        let raster = Raster::decode(1, 1, &payload).expect("valid");
+        let none = crate::caps::Caps {
+            colors: crate::caps::Colors::None,
+            ..caps()
+        };
+        let mut frame = crate::frame::Frame::new(1, 1);
+        frame.place(
+            "raster",
+            Rect::sized(1, 1),
+            raster.lines_in(Rect::sized(1, 1), none),
+        );
+        let encoded = crate::ansi::encode_with(&frame, none);
+        assert!(
+            !encoded.contains("38;") && !encoded.contains("48;"),
+            "no colours at all means no colour sequences: {encoded:?}"
+        );
+    }
+
+    #[test]
     fn a_one_cell_raster_decodes_and_draws() {
         let payload = b64(&cell('\u{2588}', 0x00ff_8800, 0x0100_0000));
         let raster = Raster::decode(1, 1, &payload).expect("valid");
-        let lines = raster.lines_in(Rect::sized(1, 1));
+        // A truecolour terminal, because this asks about the *decoding*: what the
+        // bitmap said. What a narrower terminal gets instead is the next test.
+        let lines = raster.lines_in(Rect::sized(1, 1), truecolour());
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].plain(), "\u{2588}");
         assert_eq!(
@@ -483,7 +602,7 @@ mod tests {
     #[test]
     fn only_the_rect_is_rendered_so_a_frame_costs_the_screen() {
         let raster = solid(4, 4);
-        let lines = raster.lines_in(Rect::sized(2, 2));
+        let lines = raster.lines_in(Rect::sized(2, 2), caps());
         assert_eq!(lines.len(), 2, "rows past the rect are not laid out");
         for line in &lines {
             assert_eq!(line.width(), 2, "columns past the rect are cut");
@@ -493,8 +612,8 @@ mod tests {
     #[test]
     fn a_rect_with_no_room_draws_nothing() {
         let raster = solid(4, 4);
-        assert!(raster.lines_in(Rect::sized(0, 4)).is_empty());
-        assert!(raster.lines_in(Rect::sized(4, 0)).is_empty());
+        assert!(raster.lines_in(Rect::sized(0, 4), caps()).is_empty());
+        assert!(raster.lines_in(Rect::sized(4, 0), caps()).is_empty());
     }
 
     #[test]
@@ -502,7 +621,7 @@ mod tests {
         // Not a micro-optimisation: a row of one colour is one span, so a row's
         // span count is its runs rather than its cells.
         let raster = solid(4, 1);
-        let lines = raster.lines_in(Rect::sized(4, 1));
+        let lines = raster.lines_in(Rect::sized(4, 1), caps());
         assert_eq!(lines[0].spans.len(), 1);
         assert_eq!(lines[0].plain(), "\u{2588}\u{2588}\u{2588}\u{2588}");
     }
@@ -512,7 +631,7 @@ mod tests {
         let mut bytes = cell('\u{2588}', 0x00ff0000, 0x0100_0000).to_vec();
         bytes.extend_from_slice(&cell('\u{2588}', 0x0000ff00, 0x0100_0000));
         let raster = Raster::decode(2, 1, &b64(&bytes)).expect("valid");
-        let lines = raster.lines_in(Rect::sized(2, 1));
+        let lines = raster.lines_in(Rect::sized(2, 1), caps());
         assert_eq!(lines[0].spans.len(), 2, "a colour change is a new span");
     }
 
@@ -591,14 +710,14 @@ mod tests {
         let before = rasters.view().get("pane", "main").cloned();
         let drawn_before = before
             .as_ref()
-            .map(|r| r.lines_in(Rect::sized(1, 1))[0].plain());
+            .map(|r| r.lines_in(Rect::sized(1, 1), caps())[0].plain());
         rasters
             .write("pane", "main", &b64(&cell('x', 0, 0)))
             .unwrap();
         let after = rasters.view().get("pane", "main").cloned();
         let drawn_after = after
             .as_ref()
-            .map(|r| r.lines_in(Rect::sized(1, 1))[0].plain());
+            .map(|r| r.lines_in(Rect::sized(1, 1), caps())[0].plain());
         assert_ne!(drawn_before, drawn_after, "the write landed");
         assert_eq!(drawn_after.as_deref(), Some("x"));
         assert!(rasters.revision() > 0);
@@ -616,7 +735,7 @@ mod tests {
             .unwrap();
         let draw = |v: &RastersView| {
             v.get("pane", "main")
-                .map(|r| r.lines_in(Rect::sized(1, 1))[0].plain())
+                .map(|r| r.lines_in(Rect::sized(1, 1), caps())[0].plain())
         };
         assert_eq!(
             draw(&held),

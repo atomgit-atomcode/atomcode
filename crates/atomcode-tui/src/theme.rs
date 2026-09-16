@@ -637,6 +637,23 @@ fn distance((ar, ag, ab): Rgb, (br, bg_, bb): Rgb) -> f32 {
     d(ar, br) + d(ag, bg_) + d(ab, bb)
 }
 
+/// An exact colour, or the nearest one this terminal can actually show.
+///
+/// **The only door an arbitrary RGB enters a frame by.** A bitmap of a photograph
+/// or a rendered chart states colours nobody chose, so — unlike a role — they
+/// cannot come from the palette; but they must still be *resolved against* it.
+/// Two reasons, and the second is the one that has bitten:
+///
+/// 1. A 24-bit sequence on a terminal that only has 256 indices is a colour the
+///    terminal has to guess at, and the guesses differ.
+/// 2. `Color::Rgb` means "an exact colour, from a measured triple … only the
+///    palette resolver produces these" (`frame.rs`). Code that builds one
+///    directly has left the palette behind, and the layering gate exists to
+///    notice exactly that.
+pub fn exact_colour(rgb: Rgb, caps: Caps) -> Color {
+    exact(rgb, caps.colors, &caps.palette)
+}
+
 /// One line per role: what it resolved to on this terminal, and how far it
 /// stands out from what it sits on.
 ///
