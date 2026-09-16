@@ -561,11 +561,12 @@ fn lid_row(
     lids: &Lids,
     slots: &[crate::block::Slot],
     i: usize,
-    room: u16,
+    ctx: &crate::block::RenderCtx,
     b: &crate::block::Block,
     pres: &Presentation,
 ) -> Option<SlotRows> {
     let kind = b.kind();
+    let room = ctx.width;
     if pres.is_hidden(kind) {
         return None;
     }
@@ -587,7 +588,7 @@ fn lid_row(
             folded: true,
         }),
         None => Some(SlotRows {
-            rows: slots[i].rows_at(&crate::block::RenderCtx::bare(room)).0,
+            rows: slots[i].rows_at(ctx).0,
             kind,
             lid: None,
             folded: false,
@@ -810,10 +811,16 @@ pub struct Host {
 /// earlier members, which draw nothing), and whether a blank row separates it
 /// from the slot above.
 struct RowIndex {
-    /// What the measurements below were taken under. A different width, or a
-    /// different idea of which blocks are folded, changes the answer for
-    /// *every* slot — so those invalidate the lot.
+    /// What the measurements below were taken under. A different width, a
+    /// different terminal, or a different idea of which blocks are folded,
+    /// changes the answer for *every* slot — so those invalidate the lot.
     width: u16,
+    /// The other half of the width's key. Without it a block whose row count
+    /// depends on what the terminal can draw would keep answering with the old
+    /// count while the painter drew the new one — a scroll bound that does not
+    /// match the picture, which is the "one number, two answers" failure this
+    /// table exists to avoid. See [`crate::block::ShapeCaps`].
+    caps: crate::block::ShapeCaps,
     presentation: u64,
     /// One entry per slot measured so far, in slot order. May be shorter than
     /// the stream while entries are being added at the end.
@@ -960,6 +967,7 @@ impl Host {
             pin_gate: Mutex::new(()),
             row_index: Mutex::new(RowIndex {
                 width: 0,
+                caps: crate::block::ShapeCaps::of(&crate::caps::Caps::default()),
                 presentation: 0,
                 measured: Vec::new(),
                 rows: Vec::new(),
@@ -1476,7 +1484,12 @@ impl Host {
     /// the pane was split (`pane_geometry` above gives it the blocks' own
     /// share), and a second read of `moment.scroll` here would be a second
     /// answer to a question someone already answered.
-    fn stream_lines(&self, rect: Rect, scroll: usize) -> (Vec<Line>, Vec<RowOwner>) {
+    fn stream_lines(
+        &self,
+        rect: Rect,
+        scroll: usize,
+        caps: crate::block::ShapeCaps,
+    ) -> (Vec<Line>, Vec<RowOwner>) {
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         let mut out: Vec<Line> = Vec::new();
@@ -1517,7 +1530,14 @@ impl Host {
         // about how tall anything is. It carries the run table too, so the walk
         // below never builds `lids` of its own — that fold is O(slots) and the
         // index already paid for it.
-        let index = self.row_index(rect.w, stream.slots(), &pres);
+        let index = self.row_index(
+            &crate::block::RenderCtx {
+                width: rect.w,
+                caps,
+            },
+            stream.slots(),
+            &pres,
+        );
 
         // **Start where the window starts.** Everything newer than this is
         // wholly inside the rows the reader has scrolled past, so stepping
@@ -1573,6 +1593,10 @@ impl Host {
             // cells.
             let pad = inset(kind);
             let room = rect.w.saturating_sub(pad);
+            // One ctx for this block, at the width it is drawn at and the
+            // capabilities this frame was composed against. The same two values
+            // `row_index` measured it under, so the count and the picture agree.
+            let ctx = crate::block::RenderCtx { width: room, caps };
             let lines: Arc<Vec<Line>> = if let Some(count) = lid {
                 // A run of folded calls behind one lid. Its rows are owned by
                 // the last call, so a click anywhere on the lid folds the run
@@ -1580,9 +1604,7 @@ impl Host {
                 own = Some((block.id, kind));
                 Arc::new(lid_lines(stream.slots(), i, count, room))
             } else if entry.folded {
-                Arc::new(vec![block
-                    .content
-                    .summary(&crate::block::RenderCtx::bare(room))])
+                Arc::new(vec![block.content.summary(&ctx)])
             } else {
                 // The count comes from the index — the same number
                 // `stream_height` summed — rather than from a second measurement
@@ -1621,9 +1643,9 @@ impl Host {
                 // can see this block — and rendering is the one part of this walk
                 // that cannot come from a table. Still through `rows_at`, so a
                 // growing answer extends its live cache in place.
-                match slot.rows_at(&crate::block::RenderCtx::bare(room)).1 {
+                match slot.rows_at(&ctx).1 {
                     Some(lines) => lines,
-                    None => Arc::new(block.content.lines(&crate::block::RenderCtx::bare(room))),
+                    None => Arc::new(block.content.lines(&ctx)),
                 }
             };
             if lines.is_empty() {
@@ -1704,6 +1726,12 @@ impl Host {
         let (w, h) = size;
         let mut frame = Frame::new(w, h);
         let moment = self.moment.read().expect("moment poisoned").clone();
+        // The shape half of what this terminal can draw, taken once from the
+        // moment this frame was composed against and handed down. Built here
+        // rather than read inside `rows_at` because `stream_height`'s contract is
+        // that the caller may already hold the moment's write lock (two callers
+        // in `plugin.rs` do), so nothing below may take it again.
+        let caps = crate::block::ShapeCaps::of(&moment.caps);
 
         let layout = self.layout.tree();
         let modules = self.modules.clone();
@@ -1727,7 +1755,8 @@ impl Host {
                     // frame it did before the split existed.
                     let heights = self.tail_heights_of(&tail, rect.w, &moment);
                     let pane = Self::pane_geometry(rect, moment.scroll.0, &heights);
-                    let (lines, owners) = self.stream_lines(pane.block_rect, pane.block_scroll);
+                    let (lines, owners) =
+                        self.stream_lines(pane.block_rect, pane.block_scroll, caps);
                     *self.hits.lock().expect("hits poisoned") = Hits {
                         rect: pane.block_rect,
                         rows: owners,
@@ -1969,7 +1998,7 @@ impl Host {
     #[cfg(test)]
     fn rows_by_walk(
         &self,
-        width: u16,
+        ctx: &crate::block::RenderCtx,
         slots: &[crate::block::Slot],
         pres: &Presentation,
     ) -> Vec<Option<SlotRows>> {
@@ -1977,8 +2006,18 @@ impl Host {
         (0..slots.len())
             .map(|i| {
                 let b = slots[i].block();
-                let room = width.saturating_sub(inset(b.kind()));
-                lid_row(&lids, slots, i, room, b, pres)
+                let room = ctx.width.saturating_sub(inset(b.kind()));
+                lid_row(
+                    &lids,
+                    slots,
+                    i,
+                    &crate::block::RenderCtx {
+                        width: room,
+                        ..*ctx
+                    },
+                    b,
+                    pres,
+                )
             })
             .collect()
     }
@@ -2006,15 +2045,16 @@ impl Host {
     /// than arguments somebody passes correctly: see `Presentation::revision`.
     fn row_index<'a>(
         &'a self,
-        width: u16,
+        ctx: &crate::block::RenderCtx,
         slots: &[crate::block::Slot],
         pres: &Presentation,
     ) -> std::sync::MutexGuard<'a, RowIndex> {
         let mut idx = self.row_index.lock().expect("row index poisoned");
-        if idx.width != width || idx.presentation != pres.revision() {
+        if idx.width != ctx.width || idx.caps != ctx.caps || idx.presentation != pres.revision() {
             idx.measured.clear();
             idx.rows.clear();
-            idx.width = width;
+            idx.width = ctx.width;
+            idx.caps = ctx.caps;
             idx.presentation = pres.revision();
         }
         let lids = lids(slots, pres);
@@ -2036,13 +2076,23 @@ impl Host {
             // The same width the painter will use: a row count is only the
             // painter's if it was measured at the width the painter draws at,
             // and a block that is set in draws two cells narrower.
-            let room = width.saturating_sub(inset(b.kind()));
+            let room = ctx.width.saturating_sub(inset(b.kind()));
             // Kept as `Option`, not folded to zero. A slot that draws nothing is
             // not a row AND not a neighbour — the seams around it stay where
             // they were — and collapsing the two made a hidden block add itself
             // to the running kind, which moved every blank below it. The ratchet
             // beside this caught exactly that on its first run.
-            let entry = lid_row(&lids, slots, i, room, b, pres);
+            let entry = lid_row(
+                &lids,
+                slots,
+                i,
+                &crate::block::RenderCtx {
+                    width: room,
+                    ..*ctx
+                },
+                b,
+                pres,
+            );
             let m = Measured { id: b.id, settled };
             if idx.measured.len() <= i {
                 idx.measured.push(m);
@@ -2086,6 +2136,7 @@ impl Host {
     /// until one of them changed.
     fn stream_height_in(&self, room: Rect, moment: &Moment) -> (usize, usize) {
         let width = room.w;
+        let caps = crate::block::ShapeCaps::of(&moment.caps);
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         // The sum, from the one place both this and the painter read it — see
@@ -2093,7 +2144,13 @@ impl Host {
         // answer to a question the frame had already asked. On a 1458-slot
         // session the two walks cost 4.1ms here and 13.7ms in `stream_lines`,
         // per wheel notch (measured, debug, 2026-09-15).
-        let total = self.row_index(width, stream.slots(), &pres).total;
+        let total = self
+            .row_index(
+                &crate::block::RenderCtx { width, caps },
+                stream.slots(),
+                &pres,
+            )
+            .total;
         // The tail is content too, so it counts towards what there is to read:
         // leaving it out would put its own rows out of reach at the bottom of
         // the scroll, which is exactly the failure the block walk goes to such
@@ -2325,6 +2382,55 @@ mod tests {
         mods.add_view(Arc::new(Mounted::<input::Input>::new()))
             .unwrap();
         Host::new(mods, default_layout())
+    }
+
+    /// A block whose row count follows the terminal's capabilities.
+    ///
+    /// A real one, not a mock: the judgement below is about whether the row
+    /// index re-measures when the terminal changes, and a block that drew the
+    /// same either way would let a broken index pass.
+    #[derive(Debug)]
+    struct CapsSized;
+
+    impl crate::block::Content for CapsSized {
+        fn kind(&self) -> &'static str {
+            "caps_sized"
+        }
+        fn content_hash(&self) -> crate::block::ContentHash {
+            crate::block::hash_of(&["caps_sized"])
+        }
+        fn lines(&self, ctx: &crate::block::RenderCtx) -> Vec<Line> {
+            let n = if ctx.caps.unicode { 3 } else { 1 };
+            (0..n).map(|_| Line::raw("sized")).collect()
+        }
+    }
+
+    #[test]
+    fn the_row_index_is_keyed_on_capability_and_not_only_width() {
+        // A row count is what the scroll bound is computed from. If the cache
+        // key carried only the width, a block that changed height when the
+        // terminal changed would keep reporting the old count while the painter
+        // drew the new one — a scroll limit that disagrees with the picture.
+        let mods = Arc::new(Modules::new());
+        mods.add_producer(transcript::Transcript::new()).unwrap();
+        let h = Host::new(mods, default_layout());
+        h.stream
+            .write()
+            .unwrap()
+            .writer("test")
+            .emit(crate::block::Coord::default(), Arc::new(CapsSized));
+
+        let size = (80u16, 24u16);
+        let unicode = h.stream_height(size, &h.moment.read().unwrap().clone());
+        h.moment.write().unwrap().caps.unicode = false;
+        let ascii = h.stream_height(size, &h.moment.read().unwrap().clone());
+
+        assert_eq!(
+            (unicode, ascii),
+            (3, 1),
+            "after the terminal changed, the count must be re-measured — keying \
+             on width alone leaves the second number at 3"
+        );
     }
 
     /// A tail module whose height follows `Moment::activity` and nothing else.
@@ -3094,14 +3200,15 @@ mod tests {
     fn the_row_index_says_what_the_walk_says() {
         let h = host();
         let width = 80u16;
+        let ctx = crate::block::RenderCtx::bare(width);
         let check = |label: &str| {
             let stream = h.stream.read().unwrap();
             let pres = h.presentation.read().unwrap();
             let slots = stream.slots();
-            let walk = h.rows_by_walk(width, slots, &pres);
-            let kept = h.row_index(width, slots, &pres).rows.clone();
+            let walk = h.rows_by_walk(&ctx, slots, &pres);
+            let kept = h.row_index(&ctx, slots, &pres).rows.clone();
             h.forget_row_index();
-            let fresh = h.row_index(width, slots, &pres).rows.clone();
+            let fresh = h.row_index(&ctx, slots, &pres).rows.clone();
             assert_eq!(
                 kept, walk,
                 "{label}: the kept index disagrees with a fresh walk — a reuse \
@@ -3183,8 +3290,9 @@ mod tests {
         let stream = h.stream.read().unwrap();
         let pres = h.presentation.read().unwrap();
         let narrow = 40u16;
-        let walk = h.rows_by_walk(narrow, stream.slots(), &pres);
-        let kept = h.row_index(narrow, stream.slots(), &pres).rows.clone();
+        let narrow_ctx = crate::block::RenderCtx::bare(narrow);
+        let walk = h.rows_by_walk(&narrow_ctx, stream.slots(), &pres);
+        let kept = h.row_index(&narrow_ctx, stream.slots(), &pres).rows.clone();
         assert_eq!(kept, walk, "resize: the index was not re-measured");
     }
 
