@@ -27,6 +27,7 @@ pub mod context;
 // Moved to the crate root so a consumer can take the loader without the whole
 // session subsystem. Re-exported here so `session::instructions::…` still resolves.
 pub use crate::instructions;
+pub mod events;
 pub mod manager;
 pub mod presentation;
 pub mod recall;

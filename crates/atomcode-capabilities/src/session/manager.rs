@@ -1053,12 +1053,24 @@ impl SessionManager {
     pub fn artifacts_dir(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "artifacts")
     }
+    /// An event session's metadata is its index (`<id>.index`); a snapshot
+    /// session's is `<id>.meta`. See [`super::events`].
     pub fn meta_path(&self, id: &str) -> SessionResult<PathBuf> {
-        self.path_for(id, "meta")
+        self.format_path(id, "index", "meta")
     }
-    /// Todo-list sidecar path: `<root>/<id>.todos.json` (sibling of meta/snapshot).
+    /// Todo-list sidecar path: `<root>/<id>.todos.json` (sibling of meta/snapshot),
+    /// `<id>.todos` for an event session.
     pub fn todo_sidecar_path(&self, id: &str) -> SessionResult<PathBuf> {
-        self.path_for(id, "todos.json")
+        self.format_path(id, "todos", "todos.json")
+    }
+    /// The event-session name of a file when `id` is an event session, the
+    /// snapshot-session name otherwise.
+    fn format_path(&self, id: &str, events: &str, snapshot: &str) -> SessionResult<PathBuf> {
+        if self.is_event_session(id) {
+            self.path_for(id, events)
+        } else {
+            self.path_for(id, snapshot)
+        }
     }
     /// Write the todo-list sidecar atomically. Best-effort by callers: a failure
     /// only means the todo panel/anchor may fall back to transcript derivation.
@@ -1099,22 +1111,25 @@ impl SessionManager {
     }
     /// The append-only transcript path the [`TranscriptHook`](super::TranscriptHook)
     /// writes (and the recall tool reads).
+    ///
+    /// For an event session this is its event log, which replaces the
+    /// transcript (`docs/adr/0024` §14).
     pub fn jsonl_path(&self, id: &str) -> SessionResult<PathBuf> {
-        self.path_for(id, "jsonl")
+        self.format_path(id, "events", "jsonl")
     }
 
     /// UI-only replay data. This file is intentionally separate from the runtime
     /// snapshot so display-only entries can never enter provider context.
     pub fn presentation_path(&self, id: &str) -> SessionResult<PathBuf> {
-        self.path_for(id, "ui.json")
+        self.format_path(id, "ui", "ui.json")
     }
 
     fn rewind_path(&self, id: &str) -> SessionResult<PathBuf> {
-        self.path_for(id, "rewind.json")
+        self.format_path(id, "rewind", "rewind.json")
     }
 
     fn rewind_transaction_path(&self, id: &str) -> SessionResult<PathBuf> {
-        self.path_for(id, "rewind.txn.json")
+        self.format_path(id, "rewind.txn", "rewind.txn.json")
     }
 
     pub(crate) fn load_rewind_ledger(
@@ -1349,6 +1364,10 @@ impl SessionManager {
     ) -> SessionResult<(LoadedSession, Option<Message>)> {
         self.validate_active_lease(lease)?;
         let mut loaded = self.load_native_session(lease.id())?;
+        // An event session's accepted prompt is already a fact in its log.
+        if self.is_event_session(lease.id()) {
+            return Ok((loaded, None));
+        }
         let inflight = match self.load_inflight_snapshot(lease.id()) {
             Ok(Some(checkpoint)) => checkpoint,
             Ok(None) => return Ok((loaded, None)),
@@ -1395,7 +1414,7 @@ impl SessionManager {
         )
     }
 
-    fn path_for(&self, id: &str, extension: &str) -> SessionResult<PathBuf> {
+    pub(super) fn path_for(&self, id: &str, extension: &str) -> SessionResult<PathBuf> {
         validate_session_id(id)?;
         Ok(self.root.join(format!("{id}.{extension}")))
     }
@@ -1425,7 +1444,13 @@ impl SessionManager {
     }
 
     /// Persist the working-set snapshot (atomic). Overwrites every turn.
+    ///
+    /// An event session's content is its log: there is no snapshot to write,
+    /// and this does nothing.
     pub fn save_snapshot(&self, id: &str, snap: &SessionSnapshot) -> SessionResult<()> {
+        if self.is_event_session(id) {
+            return Ok(());
+        }
         validate_snapshot(snap)?;
         let bytes = serialize_bounded(snap, "snapshot", MAX_SNAPSHOT_BYTES)?;
         self.with_meta_lock(id, || {
@@ -1435,6 +1460,9 @@ impl SessionManager {
     }
 
     pub fn load_snapshot(&self, id: &str) -> SessionResult<SessionSnapshot> {
+        if self.is_event_session(id) {
+            return self.project_snapshot(id);
+        }
         let bytes =
             read_regular_file_bounded(&self.snapshot_path(id)?, "snapshot", MAX_SNAPSHOT_BYTES)?;
         let snapshot: SessionSnapshot = deserialize(&bytes, "snapshot")?;
@@ -1530,7 +1558,7 @@ impl SessionManager {
         })
     }
 
-    fn with_meta_lock<T>(
+    pub(super) fn with_meta_lock<T>(
         &self,
         id: &str,
         operation: impl FnOnce() -> SessionResult<T>,
@@ -1880,7 +1908,14 @@ impl SessionManager {
             });
         }
         let snapshot = self.load_snapshot(id)?;
-        let presentation = self.read_presentation(id)?;
+        let presentation = match self.read_presentation(id) {
+            // An event session has display-only entries only if something added
+            // them.
+            Err(error) if self.is_event_session(id) && error.kind() == io::ErrorKind::NotFound => {
+                PresentationFile::default()
+            }
+            other => other?,
+        };
         Ok(LoadedSession {
             meta,
             snapshot,
@@ -1901,6 +1936,12 @@ impl SessionManager {
         self.validate_active_lease(lease)?;
         self.with_meta_lock(lease.id(), || {
             let id = lease.id();
+            // Nothing of an event session's is missing without its presentation.
+            if self.is_event_session(id) {
+                return self
+                    .load_native_session_unlocked(id)
+                    .map(NativeSessionRepairOutcome::Healthy);
+            }
             let meta = self.read_meta(id)?;
             if meta.owner != StorageOwner::Native {
                 return Err(SessionStoreError::OwnershipConflict {
@@ -1975,6 +2016,11 @@ impl SessionManager {
             base_message_count: source.meta.message_count,
             base_turn_count: source.meta.turn_count,
         });
+        if self.is_event_session(source_id) {
+            self.fork_event_session(source_id, &destination_lease, &meta, now_ms)?;
+            let forked = self.load_native_session(destination_id)?;
+            return Ok((forked, destination_lease));
+        }
         let forked = LoadedSession {
             meta,
             snapshot: source.snapshot,
@@ -2622,9 +2668,16 @@ impl SessionManager {
         validate_snapshot(snapshot)?;
         let snapshot_bytes = serialize_bounded(snapshot, "snapshot", MAX_SNAPSHOT_BYTES)?;
 
+        let events = self.is_event_session(lease.id());
         self.with_meta_lock(lease.id(), || {
-            let (current_snapshot, original_snapshot_bytes) =
-                self.read_snapshot_artifact(lease.id())?;
+            // An event session's content is its log, committed fact by fact as it
+            // happens: what is mutated here is only what sits beside it. Taking
+            // conversation back is a `Rewound` fact, never a rewritten snapshot.
+            let (current_snapshot, original_snapshot_bytes) = if events {
+                (self.project_snapshot(lease.id())?, Vec::new())
+            } else {
+                self.read_snapshot_artifact(lease.id())?
+            };
             let (mut meta, original_meta_bytes) = self.read_meta_artifact(lease.id())?;
             if meta.owner != StorageOwner::Native {
                 return Err(SessionStoreError::OwnershipConflict {
@@ -2633,8 +2686,15 @@ impl SessionManager {
                     operation: "commit native runtime mutation",
                 });
             }
-            let (mut presentation, original_presentation_bytes) =
-                self.read_presentation_artifact(lease.id())?;
+            let (mut presentation, original_presentation_bytes) = if events {
+                match self.read_optional_presentation_artifact(lease.id())? {
+                    Some((presentation, bytes)) => (presentation, Some(bytes)),
+                    None => (PresentationFile::default(), None),
+                }
+            } else {
+                let (presentation, bytes) = self.read_presentation_artifact(lease.id())?;
+                (presentation, Some(bytes))
+            };
             let original_meta = meta.clone();
             let original_presentation = presentation.clone();
             let result = mutate(&current_snapshot, &mut meta, &mut presentation)?;
@@ -2652,7 +2712,7 @@ impl SessionManager {
                 serialize_pretty_bounded(&presentation, "presentation", MAX_PRESENTATION_BYTES)?;
             let meta_bytes = serialize_pretty_bounded(&meta, "session meta", MAX_META_BYTES)?;
             let mut replacements = Vec::with_capacity(3);
-            if current_snapshot != *snapshot {
+            if !events && current_snapshot != *snapshot {
                 replacements.push(CommitReplacement {
                     artifact: CommitArtifact::Snapshot,
                     path: self.snapshot_path(lease.id())?,
@@ -2664,7 +2724,7 @@ impl SessionManager {
                 replacements.push(CommitReplacement {
                     artifact: CommitArtifact::Presentation,
                     path: self.presentation_path(lease.id())?,
-                    before: Some(original_presentation_bytes),
+                    before: original_presentation_bytes,
                     after: presentation_bytes,
                 });
             }
@@ -2883,7 +2943,10 @@ impl SessionManager {
         };
         for entry in rd.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("meta") {
+            if !matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("meta" | "index")
+            ) {
                 continue;
             }
             if let Ok(bytes) = read_regular_file_bounded(&path, "session meta", MAX_META_BYTES) {
@@ -2934,14 +2997,23 @@ impl SessionManager {
         let id = lease.id();
         self.validate_lease(lease)?;
         let targets = [
-            self.snapshot_path(id)?,
+            self.path_for(id, "snapshot")?,
             self.inflight_path(id)?,
-            self.rewind_path(id)?,
-            self.rewind_transaction_path(id)?,
-            self.meta_path(id)?,
-            self.jsonl_path(id)?,
-            self.presentation_path(id)?,
+            self.path_for(id, "rewind.json")?,
+            self.path_for(id, "rewind.txn.json")?,
+            self.path_for(id, "meta")?,
+            self.path_for(id, "jsonl")?,
+            self.path_for(id, "ui.json")?,
             self.legacy_path(id)?,
+            // An event session's files. The index goes last: it is the commit
+            // point, and a delete that stopped half way leaves a session the
+            // catalog still shows rather than sidecars nothing owns.
+            self.path_for(id, "events")?,
+            self.path_for(id, "ui")?,
+            self.path_for(id, "rewind")?,
+            self.path_for(id, "rewind.txn")?,
+            self.path_for(id, "todos")?,
+            self.path_for(id, "index")?,
         ];
         for path in &targets {
             validate_delete_target(path)?;
@@ -2960,6 +3032,11 @@ impl SessionManager {
     }
 
     pub(crate) fn append_jsonl_line(&self, id: &str, line: &[u8]) -> SessionResult<()> {
+        // An event session's log is its transcript (`docs/adr/0024` §14); a
+        // turn record written into it would be a line no reader understands.
+        if self.is_event_session(id) {
+            return Ok(());
+        }
         self.ensure_native_writable(id, "append transcript")?;
         if line.len() > MAX_JSONL_LINE_BYTES {
             return Err(SessionStoreError::TooLarge {
@@ -3015,6 +3092,9 @@ impl SessionManager {
             ts: i64,
         }
 
+        if self.is_event_session(id) {
+            return self.event_turn_timestamps(id);
+        }
         let path = self.jsonl_path(id)?;
         match fs::symlink_metadata(&path) {
             Ok(_) => {}
@@ -3241,7 +3321,13 @@ fn scan_bucket_into(bucket: &str, bucket_path: &Path, out: &mut BucketPartial) {
             .strip_suffix(".snapshot")
             .or_else(|| name.strip_suffix(".jsonl"))
             .or_else(|| name.strip_suffix(".rewind.txn.json"))
-            .or_else(|| name.strip_suffix(".rewind.json"));
+            .or_else(|| name.strip_suffix(".rewind.json"))
+            // An event session's content and sidecars.
+            .or_else(|| name.strip_suffix(".events"))
+            .or_else(|| name.strip_suffix(".rewind.txn"))
+            .or_else(|| name.strip_suffix(".rewind"))
+            .or_else(|| name.strip_suffix(".ui"))
+            .or_else(|| name.strip_suffix(".todos"));
         if let Some(id) = direct_sidecar_id {
             match file_entry.file_type() {
                 Ok(file_type) if file_type.is_file() => {}
@@ -3276,16 +3362,21 @@ fn scan_bucket_into(bucket: &str, bucket_path: &Path, out: &mut BucketPartial) {
                 .or_insert(path);
             continue;
         }
-        let source = if let Some(id) = name.strip_suffix(".meta") {
+        let source = if let Some(id) = name
+            .strip_suffix(".meta")
+            .or_else(|| name.strip_suffix(".index"))
+        {
             Some((id, false))
         } else if let Some(id) = name.strip_suffix(".json") {
             if let Some(presentation_id) = name.strip_suffix(".ui.json") {
-                let has_native_companion = ["meta", "snapshot", "jsonl"].iter().any(|extension| {
-                    bucket_path
-                        .join(format!("{presentation_id}.{extension}"))
-                        .symlink_metadata()
-                        .is_ok()
-                });
+                let has_native_companion = ["meta", "snapshot", "jsonl", "index", "events"]
+                    .iter()
+                    .any(|extension| {
+                        bucket_path
+                            .join(format!("{presentation_id}.{extension}"))
+                            .symlink_metadata()
+                            .is_ok()
+                    });
                 if has_native_companion {
                     None
                 } else {
@@ -3819,7 +3910,7 @@ fn is_windows_device_number(suffix: &str) -> bool {
     matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
 }
 
-fn validate_meta(meta: &SessionMeta) -> SessionResult<()> {
+pub(super) fn validate_meta(meta: &SessionMeta) -> SessionResult<()> {
     validate_session_id(&meta.id)?;
     validate_string("session name", &meta.name, MAX_STORED_STRING_BYTES)?;
     validate_string(
@@ -3976,7 +4067,7 @@ fn serialize_bounded<T: Serialize>(
     Ok(bytes)
 }
 
-fn serialize_pretty_bounded<T: Serialize>(
+pub(super) fn serialize_pretty_bounded<T: Serialize>(
     value: &T,
     kind: &'static str,
     limit: usize,
@@ -4044,7 +4135,7 @@ fn open_read_file(path: &Path) -> SessionResult<File> {
     Ok(file)
 }
 
-fn open_append_file(path: &Path) -> SessionResult<File> {
+pub(super) fn open_append_file(path: &Path) -> SessionResult<File> {
     let mut options = OpenOptions::new();
     // Windows: `append(true)` alone grants only FILE_APPEND_DATA, which is not
     // enough for LockFileEx (requires GENERIC_READ or GENERIC_WRITE) — the
@@ -4092,7 +4183,7 @@ fn acquire_file_lock_until(file: &File, timeout: std::time::Duration) -> io::Res
     }
 }
 
-fn retry_transient_file_access<T>(
+pub(super) fn retry_transient_file_access<T>(
     mut operation: impl FnMut() -> SessionResult<T>,
 ) -> SessionResult<T> {
     for delay_ms in TRANSIENT_FILE_ACCESS_RETRY_DELAYS_MS {
@@ -4200,7 +4291,7 @@ fn no_follow(options: &mut OpenOptions) {
     let _ = options;
 }
 
-fn read_regular_file_bounded(
+pub(super) fn read_regular_file_bounded(
     path: &Path,
     kind: &'static str,
     limit: usize,
@@ -4266,7 +4357,7 @@ pub(crate) fn for_each_jsonl_line(
     Ok((total, lines))
 }
 
-fn io_at(path: &Path, source: io::Error) -> SessionStoreError {
+pub(super) fn io_at(path: &Path, source: io::Error) -> SessionStoreError {
     if source.kind() == io::ErrorKind::NotFound {
         SessionStoreError::NotFound {
             path: path.to_path_buf(),
@@ -4297,7 +4388,7 @@ struct AtomicWriteFailure {
 /// power loss. A crash mid-write never leaves a half-written (corrupt) session file.
 /// The tmp's extension (`…tmp`) is ignored by [`SessionManager::list`]'s `*.meta`
 /// filter, so a leftover tmp from a crash never appears as a session.
-fn atomic_write(path: &Path, bytes: &[u8]) -> SessionResult<()> {
+pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> SessionResult<()> {
     atomic_write_tracked(path, bytes).map_err(|failure| failure.error)
 }
 
