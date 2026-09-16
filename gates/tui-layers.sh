@@ -97,8 +97,22 @@ echo "→ 调色板之外不得写裸颜色（应走 Color::role(Role::…)）"
 # 起因：新 TUI 一开始到处写 Color::Ansi(75)、Ansi(236) —— 那既假设了深色终端，
 # 也和 tuix 的调色板对不上，而两个前端对「muted 是什么颜色」有两种答案就是两个
 # 产品。角色在上屏时才解析成颜色，那里才知道明暗。
+#
+# 两个方向都错过一次，所以这条正则要把「造一个颜色」和「认出一种颜色」分开：
+#
+#  * **漏**：只认大写的枚举变体，于是 `Color::rgb(…)`（`frame.rs` 里那个构造
+#    函数，它的 doc 写着「only the palette resolver produces these」）从门底下
+#    过去了。位图的颜色码正是从那里漏进来的，在 256 色终端上变成"让终端自己猜"。
+#  * **误报**：`Color::Rgb(r, g, b) => …` 是 match **模式**，一分颜色都没造，
+#    却因为写法一样被数进去。上一次它把一个正确解析颜色的 match blow 成违规。
+#
+# 模式与构造在 grep 这一层只能靠形状区分：模式出现在 `=>`/`|` 左边，或者本身
+# 带 `..`/`_` 这样的通配。造颜色不出现在这些位置。
 PALETTE=$(find "${SRC}" -name '*.rs' ! -name theme.rs ! -name frame.rs ! -name ansi.rs)
-n=$(code_only ${PALETTE} | grep -cE 'Color::(Ansi|Rgb)\(')
+n=$(code_only ${PALETTE} \
+  | grep -E 'Color::(Ansi|Rgb)\(|Color::rgb\(' \
+  | grep -vE '=>|\|.*Color::|Color::(Ansi|Rgb)\(\s*(\.\.|_)|matches!\(' \
+  | wc -l | tr -d ' ')
 ratchet raw_colours "${n}" "裸颜色索引，绕过了角色调色板，也绕过了明暗主题" || fail=1
 
 echo "→ 屏蔽层之外不得探测操作系统或终端"

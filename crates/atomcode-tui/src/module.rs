@@ -16,12 +16,12 @@
 //! rather than merely discouraged. The host stores the object-safe
 //! [`ViewObject`] that [`Mounted`] wraps around it.
 
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use atomcode_harness::session::SessionEvent;
 
-use crate::block::StreamWriter;
+use crate::block::{Content, StreamWriter};
 use crate::frame::Line;
 use crate::moment::{Moment, Viewport};
 
@@ -129,6 +129,46 @@ pub trait Producer: Send + Sync {
     /// Fold one fact into the stream. The writer is the only thing that can
     /// change it, and it cannot reach a settled block.
     fn absorb(&self, fact: &SessionEvent, out: &mut StreamWriter<'_>);
+
+    /// Say something first, if this producer has anything to say.
+    ///
+    /// Asked **only when the stream is empty** (`Host::open_conversation`), so it
+    /// does not need to know whether this is a new session — an empty stream is
+    /// that question's answer. The default is `None`, which is why the producers
+    /// that existed before this needed no change.
+    ///
+    /// The block it returns is emitted and settled at once: an opening has no
+    /// stage at which it is still growing.
+    fn opening(&self, _at: crate::block::Coord, _open: &Opening) -> Option<Arc<dyn Content>> {
+        None
+    }
+}
+
+/// What a producer is handed when asked to open a conversation.
+///
+/// **Data, not handles.** A producer cannot reach the host — its `absorb` gets a
+/// [`StreamWriter`] and nothing else — and it must stay that way: a producer able
+/// to reach the host could do anything, including putting a block into a stream
+/// somebody is already talking in. This is the list of what drawing an opening
+/// block actually needs.
+#[derive(Clone, Debug, Default)]
+pub struct Opening {
+    /// The working directory, **already a display string** (home collapsed).
+    ///
+    /// Folded by the caller rather than here: reading the environment is
+    /// `Tui::run`'s business, and a module may not (see `gates/tui-layers.sh`'s
+    /// `os_probes` ratchet, and `docs/adr/0008` for why). Doing it upstream is
+    /// what lets this stay a pure function of its arguments.
+    pub cwd: String,
+    /// The model in use, read now rather than cached: `--model` re-points the
+    /// `llm` row, so a value copied at assembly time could be stale already.
+    pub model: Option<String>,
+    /// The version string this build carries.
+    pub version: &'static str,
+    /// The commands the screen actually has — whatever
+    /// [`Commands::all`](crate::command::Commands::all) returns. A tip naming a
+    /// command that is not there is worse than no tip.
+    pub commands: Vec<crate::command::Command>,
 }
 
 /// Everything mounted, found by id.

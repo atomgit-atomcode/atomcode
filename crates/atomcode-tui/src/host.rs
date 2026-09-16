@@ -982,6 +982,44 @@ impl Host {
         }
     }
 
+    /// Let this conversation say its first word, if any producer will.
+    ///
+    /// **Only when the stream is empty**, and that is the whole test for "a new
+    /// session": a resumed one has its history folded in by `Tui::run` before this
+    /// is called, so its stream is not empty and it opens with nothing. A separate
+    /// "is this new?" flag would be a second source of truth for one fact.
+    ///
+    /// **It does not go through `absorb`.** That path stands for a committed fact
+    /// in the log, and what this synthesises is a way of opening, not a fact:
+    /// going through it would write to `SessionLog` and be replayed on resume. So
+    /// it writes the stream directly — the one place in this crate that does.
+    ///
+    /// The first producer with something to say wins and the loop stops: the rule
+    /// is "when the stream is empty", and once it has spoken the stream is not.
+    /// That is also why no second mechanism is needed to stop a second opener.
+    ///
+    /// `true` when a block was emitted, which is the caller's cue that a frame is
+    /// owed.
+    pub fn open_conversation(
+        &self,
+        at: crate::block::Coord,
+        open: &crate::module::Opening,
+    ) -> bool {
+        let mut stream = self.stream.write().expect("stream poisoned");
+        if !stream.is_empty() {
+            return false;
+        }
+        for producer in self.modules.producers() {
+            if let Some(content) = producer.opening(at, open) {
+                // Under the producer's own id: the block's `producer` field says
+                // who made it, and it is what would have to settle it later.
+                stream.writer(producer.id()).emit(at, content);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Deliver one committed fact to every module.
     ///
     /// Producers first, then views: a view that reacts to the same fact should
@@ -2554,6 +2592,136 @@ mod tests {
             "the same cells must not cost a repaint"
         );
         assert!(b.patch_from(Some(&a)).is_empty());
+    }
+
+    /// A producer that opens with one line naming where we are.
+    ///
+    /// Counts its own asks, so a judgement can tell "the second producer was never
+    /// consulted" from "it was consulted and said nothing".
+    struct Opener {
+        said: std::sync::atomic::AtomicU32,
+    }
+
+    impl crate::module::Producer for Opener {
+        fn id(&self) -> &'static str {
+            "opener"
+        }
+        fn absorb(&self, _fact: &SessionEvent, _out: &mut crate::block::StreamWriter<'_>) {}
+        fn opening(
+            &self,
+            _at: crate::block::Coord,
+            open: &crate::module::Opening,
+        ) -> Option<Arc<dyn crate::block::Content>> {
+            self.said.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(Arc::new(crate::content::NoticeBlock {
+                detail: format!("hello from {}", open.cwd),
+            }))
+        }
+    }
+
+    #[test]
+    fn the_first_thing_a_conversation_says_happens_once_and_only_when_it_is_empty() {
+        let mods = Arc::new(Modules::new());
+        let opener = Arc::new(Opener {
+            said: std::sync::atomic::AtomicU32::new(0),
+        });
+        mods.add_producer(opener.clone()).unwrap();
+        let h = Host::new(mods, default_layout());
+
+        let open = crate::module::Opening {
+            cwd: "~/proj".into(),
+            ..Default::default()
+        };
+        assert!(
+            h.open_conversation(crate::block::Coord::default(), &open),
+            "an empty stream must be opened"
+        );
+        assert_eq!(h.stream.read().unwrap().len(), 1);
+
+        assert!(
+            !h.open_conversation(crate::block::Coord::default(), &open),
+            "a stream that already has something in it is not opening"
+        );
+        assert_eq!(h.stream.read().unwrap().len(), 1, "still just the one");
+        assert_eq!(
+            opener.said.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the producer must not be asked twice — the stream was not empty, so \
+             the loop should not have turned at all"
+        );
+    }
+
+    #[test]
+    fn the_first_producer_with_something_to_say_wins_and_the_rest_are_not_asked() {
+        // The rule is "when the stream is empty", and the first answer makes it
+        // not-empty. So no second mechanism is needed to stop a helper opener, and
+        // the count proves the second one was never consulted.
+        struct Silent;
+        impl crate::module::Producer for Silent {
+            fn id(&self) -> &'static str {
+                "silent"
+            }
+            fn absorb(&self, _fact: &SessionEvent, _out: &mut crate::block::StreamWriter<'_>) {}
+            // `opening` keeps its default: `None`.
+        }
+        struct Extra {
+            said: std::sync::atomic::AtomicU32,
+        }
+        impl crate::module::Producer for Extra {
+            fn id(&self) -> &'static str {
+                "extra"
+            }
+            fn absorb(&self, _fact: &SessionEvent, _out: &mut crate::block::StreamWriter<'_>) {}
+            fn opening(
+                &self,
+                _at: crate::block::Coord,
+                _open: &crate::module::Opening,
+            ) -> Option<Arc<dyn crate::block::Content>> {
+                self.said.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(Arc::new(crate::content::NoticeBlock {
+                    detail: "second".into(),
+                }))
+            }
+        }
+        let mods = Arc::new(Modules::new());
+        mods.add_producer(Arc::new(Silent)).unwrap();
+        let silent_first = Arc::new(Opener {
+            said: std::sync::atomic::AtomicU32::new(0),
+        });
+        mods.add_producer(silent_first.clone()).unwrap();
+        let never = Arc::new(Extra {
+            said: std::sync::atomic::AtomicU32::new(0),
+        });
+        mods.add_producer(never.clone()).unwrap();
+        let h = Host::new(mods, default_layout());
+
+        assert!(h.open_conversation(crate::block::Coord::default(), &Default::default()));
+        assert_eq!(
+            silent_first.said.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first producer that can answer, did"
+        );
+        assert_eq!(
+            never.said.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the third producer was asked even though the stream was already open"
+        );
+    }
+
+    #[test]
+    fn an_opening_block_lands_settled_because_it_is_not_still_growing() {
+        let mods = Arc::new(Modules::new());
+        mods.add_producer(Arc::new(Opener {
+            said: std::sync::atomic::AtomicU32::new(0),
+        }))
+        .unwrap();
+        let h = Host::new(mods, default_layout());
+        h.open_conversation(crate::block::Coord::default(), &Default::default());
+        let stream = h.stream.read().unwrap();
+        assert!(
+            stream.slots()[0].is_settled(),
+            "an opening has no stage at which it is still growing"
+        );
     }
 
     /// A tail module whose height follows `Moment::activity` and nothing else.

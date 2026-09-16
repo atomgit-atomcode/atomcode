@@ -43,8 +43,12 @@ pub struct Cell {
     /// nothing. See `docs/adr/0023` decision ③.
     pub ch: char,
     /// `None` is the terminal's own colour — the payload's `0x0100_0000`.
-    pub fg: Option<Color>,
-    pub bg: Option<Color>,
+    ///
+    /// Raw RGB rather than a [`Color`]: which *drawable* colour this becomes
+    /// depends on the terminal, and that is not known here. Decoding happens in
+    /// [`Raster::lines_in`], which is handed the capabilities.
+    pub fg: Option<crate::theme::Rgb>,
+    pub bg: Option<crate::theme::Rgb>,
 }
 
 /// One bitmap.
@@ -199,12 +203,15 @@ impl Raster {
 }
 
 /// `0x00RRGGBB` is a colour; `0x0100_0000` (bit 24 alone) is the terminal's own.
-fn colour(word: u32, index: usize) -> Result<Option<Color>, RasterError> {
+///
+/// Returns a raw triple rather than a `Color` on purpose: which *drawable* colour
+/// it becomes depends on the terminal, and that answer is not known here. A
+/// `Color` built at decode time would be a colour nobody resolved — see
+/// [`crate::theme::exact_colour`].
+fn colour(word: u32, index: usize) -> Result<Option<crate::theme::Rgb>, RasterError> {
     match word {
         0x0100_0000 => Ok(None),
-        w if w & 0xff00_0000 == 0 => {
-            Ok(Some(Color::rgb(((w >> 16) as u8, (w >> 8) as u8, w as u8))))
-        }
+        w if w & 0xff00_0000 == 0 => Ok(Some(((w >> 16) as u8, (w >> 8) as u8, w as u8))),
         _ => Err(RasterError::BadCell {
             index,
             why: "colour word is neither 0x00RRGGBB nor 0x01000000",
@@ -215,24 +222,12 @@ fn colour(word: u32, index: usize) -> Result<Option<Color>, RasterError> {
 fn style_of(cell: &Cell, caps: crate::caps::Caps) -> Style {
     let mut style = Style::new();
     if let Some(fg) = cell.fg {
-        style = style.fg(drawable(fg, caps));
+        style = style.fg(crate::theme::exact_colour(fg, caps));
     }
     if let Some(bg) = cell.bg {
-        style = style.bg(drawable(bg, caps));
+        style = style.bg(crate::theme::exact_colour(bg, caps));
     }
     style
-}
-
-/// A bitmap's colour as this terminal can draw it.
-///
-/// The resolve step is not optional and not an optimisation: `Color::Rgb` on a
-/// 256-index terminal is a sequence the terminal has to guess at, and two
-/// terminals guess differently. See [`crate::theme::exact_colour`].
-fn drawable(colour: Color, caps: crate::caps::Caps) -> Color {
-    match colour {
-        Color::Rgb(r, g, b) => crate::theme::exact_colour((r, g, b), caps),
-        thorough => thorough,
-    }
 }
 
 type Mounted = HashMap<(String, String), Arc<Raster>>;
