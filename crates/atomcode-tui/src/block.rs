@@ -253,7 +253,13 @@ pub(crate) static LIVE_RESUMES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 struct CachedRender {
-    width: u16,
+    /// What these rows were rendered for: the width, and the capabilities that
+    /// decide shape.
+    ///
+    /// Both, because both are "a different question" rather than "a stale
+    /// answer". **No palette** — colour is not decided here (see [`ShapeCaps`]),
+    /// so a theme change does not walk into this branch.
+    key: (u16, ShapeCaps),
     /// The source the lines were rendered from, whole. The prefix check against
     /// it is what makes reuse safe: text that was extended is text the kept
     /// lines still describe, and text that was edited is not.
@@ -282,9 +288,10 @@ struct CachedRender {
 #[derive(Debug)]
 pub struct Settled {
     block: Arc<Block>,
-    /// `(width, rows)`. The width travels with the number, so a resize is a
-    /// different question rather than a stale answer.
-    rows: RwLock<Option<(u16, usize)>>,
+    /// `(width, caps, rows)`. All three travel with the number, so a resize *and*
+    /// a different terminal are each a different question rather than a stale
+    /// answer.
+    rows: RwLock<Option<(u16, ShapeCaps, usize)>>,
 }
 
 impl Settled {
@@ -344,7 +351,7 @@ impl Slot {
                     // and the text is an extension of what did. Anything else — a
                     // resize, an edit, a different block — renders the whole
                     // thing.
-                    Some(mut c) if c.width == width && text.starts_with(&c.source) => {
+                    Some(mut c) if c.key == (width, ctx.caps) && text.starts_with(&c.source) => {
                         #[cfg(test)]
                         LIVE_RESUMES.fetch_add(1, Ordering::Relaxed);
                         // Everything before the last settled boundary is fixed;
@@ -368,7 +375,7 @@ impl Slot {
                     _ => {
                         let r = crate::markdown::render_settled(text, width, base);
                         CachedRender {
-                            width,
+                            key: (width, ctx.caps),
                             source: text.to_string(),
                             lines: Arc::new(r.lines),
                             settled: r.settled,
@@ -383,14 +390,14 @@ impl Slot {
             }
             Slot::Settled(s) => {
                 let mut measured = s.rows.write().expect("rows poisoned");
-                if let Some((w, n)) = *measured {
-                    if w == ctx.width {
+                if let Some((w, caps, n)) = *measured {
+                    if w == ctx.width && caps == ctx.caps {
                         return (n, None);
                     }
                 }
                 let lines = s.block.content.lines(ctx);
                 let rows = lines.len();
-                *measured = Some((ctx.width, rows));
+                *measured = Some((ctx.width, ctx.caps, rows));
                 (rows, Some(Arc::new(lines)))
             }
         }
@@ -568,6 +575,91 @@ mod tests {
 
     fn text(s: &'static str) -> Arc<dyn Content> {
         Arc::new(Text(s))
+    }
+
+    /// A block that draws two rows on a terminal that does Unicode, one otherwise.
+    ///
+    /// Deliberately a *real* capability-dependent block rather than a mock: a
+    /// judgement about the cache key has to fail when the key does not carry the
+    /// capability, and a block that drew the same either way would let it pass.
+    #[derive(Debug)]
+    struct TwoRowsWhenUnicode;
+
+    impl Content for TwoRowsWhenUnicode {
+        fn kind(&self) -> &'static str {
+            "two_rows"
+        }
+        fn content_hash(&self) -> ContentHash {
+            // Shape is not in the hash: same class as width, see `Content`.
+            hash_of(&["two_rows"])
+        }
+        fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+            let n = if ctx.caps.unicode { 2 } else { 1 };
+            (0..n).map(|_| Line::raw("x")).collect()
+        }
+    }
+
+    fn shape(unicode: bool) -> ShapeCaps {
+        ShapeCaps {
+            unicode,
+            colors: crate::caps::Colors::Ansi256,
+        }
+    }
+
+    #[test]
+    fn a_change_of_terminal_capability_is_not_a_cache_hit() {
+        let mut s = Stream::new();
+        let mut w = s.writer("test");
+        let id = w.emit(Coord::default(), Arc::new(TwoRowsWhenUnicode));
+        w.settle_all();
+
+        let unicode = RenderCtx {
+            width: 40,
+            caps: shape(true),
+        };
+        let ascii = RenderCtx {
+            width: 40,
+            caps: shape(false),
+        };
+
+        let slot = s.get(id).expect("the block");
+        assert_eq!(slot.rows_at(&unicode).0, 2);
+        assert_eq!(
+            slot.rows_at(&ascii).0,
+            1,
+            "the same width with different capabilities must render again rather \
+             than hit the cached row count — otherwise a terminal that changed \
+             under us keeps the old answer, and it looks fine"
+        );
+        // Back again, so neither number was reached by accident.
+        assert_eq!(slot.rows_at(&unicode).0, 2);
+    }
+
+    #[test]
+    fn the_same_key_is_a_cache_hit_and_a_resize_is_not() {
+        // The negative control for the judgement above. Without it, "render every
+        // time" would satisfy that one too.
+        let mut s = Stream::new();
+        let mut w = s.writer("test");
+        let id = w.emit(Coord::default(), Arc::new(TwoRowsWhenUnicode));
+        w.settle_all();
+
+        let ctx = RenderCtx {
+            width: 40,
+            caps: shape(true),
+        };
+        let slot = s.get(id).expect("the block");
+        assert_eq!(slot.rows_at(&ctx).0, 2);
+        assert_eq!(
+            slot.rows_at(&ctx).1,
+            None,
+            "a settled block at the same width and the same capabilities must \
+             answer from what it measured"
+        );
+        assert!(
+            slot.rows_at(&RenderCtx { width: 41, ..ctx }).1.is_some(),
+            "a resize is a different question and must render again"
+        );
     }
 
     #[test]
