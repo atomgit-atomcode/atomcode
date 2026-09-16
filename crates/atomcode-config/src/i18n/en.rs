@@ -431,7 +431,11 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         }
         Msg::ApprovalAlwaysAllowCommand => "Always allow this command (this session)".into(),
         Msg::ApprovalAllowAllBash => {
-            "⚠️ Allow ALL Bash this session (incl. destructive)".into()
+            // Plain `!` marker (not the ⚠️ emoji): U+26A0 is in the wide-emoji table but the
+            // VS16 that would force emoji presentation gets stripped by the cell builder, so
+            // terminals text-render it 1-col against a 2-col allocation → a stray reverse-
+            // highlight box. `!` is width-safe on every terminal (and this option's hotkey).
+            "! Allow ALL Bash this session (incl. destructive)".into()
         }
         Msg::ApprovalDeny => "Deny".into(),
         Msg::ApprovalHint => "↑↓ select · Enter confirm · Esc cancel".into(),
