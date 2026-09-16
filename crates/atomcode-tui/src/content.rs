@@ -5,7 +5,7 @@
 //! them semantic is exactly what lets presentation stay mutable while content
 //! does not.
 
-use crate::block::{hash_of, Content, ContentHash};
+use crate::block::{hash_of, Content, ContentHash, RenderCtx};
 use crate::caps::{Caps, Glyph};
 use crate::frame::{Color, Line, Span, Style};
 use crate::theme::Role;
@@ -105,7 +105,8 @@ impl Content for UserSaid {
     /// nothing else, and the blank row under the bar belongs to the seam between
     /// two blocks — see `host::blank_between`, which is the one place that
     /// decides it for both the painter and the scroll.
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         // Roles, not colours. This used to name `Theme::Dark` outright, which
         // is how the whole transcript stayed dark on a light screen: a module
         // that can resolve is a module that can resolve wrongly.
@@ -147,13 +148,15 @@ impl Content for ModelSaid {
         // width, or with code folded, is the same thing said.
         hash_of(&["assistant", &self.0])
     }
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         crate::markdown::render(&self.0, w, Style::new())
     }
     fn growing_text(&self) -> Option<&str> {
         Some(&self.0)
     }
-    fn summary(&self, w: u16) -> Line {
+    fn summary(&self, ctx: &RenderCtx) -> Line {
+        let w = ctx.width;
         let first = self
             .0
             .lines()
@@ -176,10 +179,12 @@ impl Content for ModelThought {
     fn content_hash(&self) -> ContentHash {
         hash_of(&["reasoning", &self.0])
     }
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         wrapped(&self.0, w, muted(), "· ")
     }
-    fn summary(&self, w: u16) -> Line {
+    fn summary(&self, ctx: &RenderCtx) -> Line {
+        let w = ctx.width;
         let n = self.0.lines().count().max(1);
         Line::styled(
             width::take_width(
@@ -533,7 +538,8 @@ impl Content for ToolCallBlock {
     /// see what actually ran, and a command that ends in `…` is not an answer
     /// to that question — so the whole subject goes on the screen, over as many
     /// rows as it takes, hanging under the marker.
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         if w == 0 {
             return Vec::new();
         }
@@ -575,7 +581,8 @@ impl Content for ToolCallBlock {
     /// note keeps its own style, because it is not the summary — it is the
     /// answer, and a failed call's red is the one thing on a folded line that
     /// has to survive being folded.
-    fn summary(&self, w: u16) -> Line {
+    fn summary(&self, ctx: &RenderCtx) -> Line {
+        let w = ctx.width;
         let style = fold();
         let look = look(&self.name);
         let name = match look.verb {
@@ -661,7 +668,8 @@ impl Content for NoticeBlock {
     fn content_hash(&self) -> ContentHash {
         hash_of(&["notice", &self.detail])
     }
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         wrapped(&self.detail, w, muted(), "⚑ ")
     }
 }
@@ -686,10 +694,12 @@ impl Content for InjectedBlock {
     fn content_hash(&self) -> ContentHash {
         hash_of(&[self.kind, &self.origin, &self.text])
     }
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         wrapped(&self.text, w, muted(), &format!("[{}] ", self.origin))
     }
-    fn summary(&self, w: u16) -> Line {
+    fn summary(&self, ctx: &RenderCtx) -> Line {
+        let w = ctx.width;
         Line::styled(
             width::take_width(&format!("[{}]", self.origin), w as usize),
             muted(),
@@ -778,7 +788,8 @@ impl Content for ChoiceBlock {
             self.answer.as_deref().unwrap_or(""),
         ])
     }
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         if w == 0 {
             return Vec::new();
         }
@@ -812,7 +823,8 @@ impl Content for ChoiceBlock {
             }
         }
     }
-    fn summary(&self, w: u16) -> Line {
+    fn summary(&self, ctx: &RenderCtx) -> Line {
+        let w = ctx.width;
         let head = match &self.answer {
             Some(a) => format!("? {} → {a}", first_line(&self.question)),
             None => format!("? {}", first_line(&self.question)),
@@ -848,7 +860,8 @@ impl Content for CommandSaid {
             if self.refused { "no" } else { "ok" },
         ])
     }
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         let style = if self.refused { bad() } else { muted() };
         let mut out = Vec::new();
         for line in self.text.split('\n') {
@@ -856,7 +869,8 @@ impl Content for CommandSaid {
         }
         out
     }
-    fn summary(&self, w: u16) -> Line {
+    fn summary(&self, ctx: &RenderCtx) -> Line {
+        let w = ctx.width;
         Line::styled(
             width::take_width(first_line(&self.text), w as usize),
             if self.refused { bad() } else { muted() },
@@ -1056,7 +1070,8 @@ impl Content for TurnEndBlock {
     /// line is for. So the caption is built widest-first and falls back to the
     /// outcome alone, with whatever was dropped going under the rule, wrapped —
     /// the same ladder the cause of a failed turn already climbed.
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         let caps = Caps::default();
         let (mark, said, style) = turn_end_note(self.stop);
         let short = format!("{} {said}", caps.g(mark));
@@ -1106,7 +1121,7 @@ mod tests {
     /// A block as it reaches the screen, as one string.
     fn drawn(block: &dyn Content, w: u16) -> String {
         block
-            .lines(w)
+            .lines(&crate::block::RenderCtx::bare(w))
             .iter()
             .map(|l| l.plain())
             .collect::<Vec<_>>()
@@ -1126,7 +1141,7 @@ mod tests {
             error: Some(error.into()),
             stats: TurnStats::default(),
         };
-        let lines = block.lines(100);
+        let lines = block.lines(&crate::block::RenderCtx::bare(100));
         let text: String = lines
             .iter()
             .map(|l| l.plain())
@@ -1151,7 +1166,7 @@ mod tests {
             error: Some("by the user".into()),
             stats: TurnStats::default(),
         };
-        let lines = short.lines(100);
+        let lines = short.lines(&crate::block::RenderCtx::bare(100));
         assert_eq!(lines.len(), 1);
         assert!(lines[0].plain().contains("已中断 · by the user"));
     }
@@ -1168,7 +1183,7 @@ mod tests {
                 error: None,
                 stats: TurnStats::default(),
             }
-            .lines(80)
+            .lines(&crate::block::RenderCtx::bare(80))
             .iter()
             .map(|l| l.plain())
             .collect::<Vec<_>>()
@@ -1272,7 +1287,11 @@ mod tests {
         for want in ["完成", "4 步", "入 90.7k", "出 4200", "缓存 99.82%"] {
             assert!(text.contains(want), "{want} missing from {text:?}");
         }
-        assert_eq!(block.lines(100).len(), 1, "one rule, not a paragraph");
+        assert_eq!(
+            block.lines(&crate::block::RenderCtx::bare(100)).len(),
+            1,
+            "one rule, not a paragraph"
+        );
     }
 
     /// A provider that says nothing about caching reports zero, and zero is not
@@ -1304,7 +1323,7 @@ mod tests {
             error: None,
             stats: TurnStats::default(),
         };
-        let lines = block.lines(80);
+        let lines = block.lines(&crate::block::RenderCtx::bare(80));
         assert_eq!(lines.len(), 1, "nothing to say means no extra row");
         let text = drawn(&block, 80);
         assert!(text.contains("已中断"), "{text:?}");
@@ -1342,7 +1361,7 @@ mod tests {
             for want in ["4步", "入90.7k", "出4200", "缓存99.82%"] {
                 assert!(flat.contains(want), "w={w}: {want} lost from {text:?}");
             }
-            for line in block.lines(w) {
+            for line in block.lines(&crate::block::RenderCtx::bare(w)) {
                 assert!(line.width() <= w as usize, "w={w}: {:?}", line.plain());
             }
         }
@@ -1363,7 +1382,7 @@ mod tests {
             },
         };
         for w in 0..160u16 {
-            for line in block.lines(w) {
+            for line in block.lines(&crate::block::RenderCtx::bare(w)) {
                 assert!(line.width() <= w as usize, "w={w}: {:?}", line.plain());
             }
         }
@@ -1455,7 +1474,7 @@ mod tests {
         ];
         for item in &items {
             for w in 0..60u16 {
-                for line in item.lines(w) {
+                for line in item.lines(&crate::block::RenderCtx::bare(w)) {
                     assert!(
                         line.width() <= w as usize,
                         "{} at width {w}: {:?} is {} cells",
@@ -1474,9 +1493,9 @@ mod tests {
         assert_eq!(a.content_hash(), a.content_hash());
         // Rendering at different widths, and asking for the folded form, must
         // not change what the block *says*.
-        let _ = a.lines(10);
-        let _ = a.lines(200);
-        let _ = a.summary(10);
+        let _ = a.lines(&crate::block::RenderCtx::bare(10));
+        let _ = a.lines(&crate::block::RenderCtx::bare(200));
+        let _ = a.summary(&crate::block::RenderCtx::bare(10));
         assert_eq!(a.content_hash(), ModelSaid("hello".into()).content_hash());
         assert_ne!(a.content_hash(), ModelSaid("hellp".into()).content_hash());
     }
@@ -1502,7 +1521,7 @@ mod tests {
 
         let running = ToolCallBlock::pending("c", "read_file", r#"{"file_path":"a.rs"}"#);
         assert_eq!(running.mark().1.fg, warn, "{:?}", running.mark());
-        let head = running.lines(60).remove(0);
+        let head = running.lines(&crate::block::RenderCtx::bare(60)).remove(0);
         let named = head
             .spans
             .iter()
@@ -1522,7 +1541,7 @@ mod tests {
             let block =
                 ToolCallBlock::pending("c", "read_file", r#"{"file_path":"a.rs"}"#).with(done);
             assert_ne!(block.mark().1.fg, warn, "{:?}", block.mark());
-            let head = block.lines(60).remove(0);
+            let head = block.lines(&crate::block::RenderCtx::bare(60)).remove(0);
             let named = head
                 .spans
                 .iter()
@@ -1553,7 +1572,7 @@ mod tests {
             r#"{"file_path":"/Users/x/crates/atomcode-tui/src/content.rs"}"#,
         );
 
-        let folded = pending.summary(80);
+        let folded = pending.summary(&crate::block::RenderCtx::bare(80));
         let named = folded
             .spans
             .iter()
@@ -1578,7 +1597,7 @@ mod tests {
 
         // And the note survives the fold in its own colour.
         let failed = pending.with(Outcome::Failed("no such file".into()));
-        let line = failed.summary(80);
+        let line = failed.summary(&crate::block::RenderCtx::bare(80));
         let note = line
             .spans
             .iter()
@@ -1608,7 +1627,10 @@ mod tests {
     #[test]
     fn a_folded_thought_says_how_much_it_is_hiding() {
         let t = ModelThought("one\ntwo\nthree".into());
-        assert!(t.summary(40).plain().contains("思考 3 行"));
+        assert!(t
+            .summary(&crate::block::RenderCtx::bare(40))
+            .plain()
+            .contains("思考 3 行"));
     }
 
     #[test]
@@ -1619,7 +1641,10 @@ mod tests {
         // tool nobody wrote a rule for still says something.
         let c = ToolCallBlock::pending("c", "read_file", r#"{"file_path":"a.rs"}"#);
         assert_eq!(subject_of(&c.name, &c.args), "a.rs");
-        assert!(c.summary(40).plain().contains("read_file(a.rs)"));
+        assert!(c
+            .summary(&crate::block::RenderCtx::bare(40))
+            .plain()
+            .contains("read_file(a.rs)"));
 
         let unknown = ToolCallBlock::pending("d", "some_new_tool", r#"{"thing":"x.rs"}"#);
         assert!(
@@ -1646,7 +1671,7 @@ mod tests {
             "the sample must reproduce the old panic, or it guards nothing"
         );
         let c = ToolCallBlock::pending("c", "bash", format!(r#"{{"command":"{command}"}}"#));
-        let line = c.summary(60).plain();
+        let line = c.summary(&crate::block::RenderCtx::bare(60)).plain();
         assert!(line.contains('…'), "{line:?} should be abbreviated");
         // Reading the line back is what panicked before: a cut at a byte offset
         // produced a string that could not be sliced again at all.
@@ -1673,7 +1698,7 @@ mod tests {
         let args = serde_json::json!({ "command": command }).to_string();
         let c = ToolCallBlock::pending("c", "bash", &args);
 
-        let lid = c.summary(200).plain();
+        let lid = c.summary(&crate::block::RenderCtx::bare(200)).plain();
         assert!(
             !lid.contains('\n') && !lid.contains('\r'),
             "the lid is more than one row: {lid:?}"
@@ -1683,7 +1708,7 @@ mod tests {
         assert!(lid.ends_with("PY) · 运行中"), "{lid:?}");
 
         // Expanded: over as many rows as it takes, and every one of them one row.
-        let rows = c.lines(200);
+        let rows = c.lines(&crate::block::RenderCtx::bare(200));
         assert!(rows.len() > 1, "the command came out as one row: {rows:#?}");
         for (i, line) in rows.iter().enumerate() {
             let text = line.plain();
@@ -1716,8 +1741,8 @@ mod tests {
             "bash",
             format!(r#"{{"command":"/x/{}"}}"#, "中".repeat(60)),
         );
-        let a = width::str_width(&ascii.summary(60).plain());
-        let c = width::str_width(&cjk.summary(60).plain());
+        let a = width::str_width(&ascii.summary(&crate::block::RenderCtx::bare(60)).plain());
+        let c = width::str_width(&cjk.summary(&crate::block::RenderCtx::bare(60)).plain());
         assert!(
             (a as i64 - c as i64).abs() <= 1,
             "ascii {a} vs cjk {c} cells"
@@ -1735,7 +1760,7 @@ mod tests {
         let mut c = ToolCallBlock::pending("c", "bash", format!(r#"{{"command":"{command}"}}"#));
         c = c.with(Outcome::Ok("a\nb\nc".into()));
         // Narrower than the command, so the line is forced to abbreviate.
-        let line = c.summary(48).plain();
+        let line = c.summary(&crate::block::RenderCtx::bare(48)).plain();
         assert!(line.contains('…'), "nothing was abbreviated: {line:?}");
         assert!(
             line.starts_with("● $(git log"),
@@ -1766,7 +1791,7 @@ mod tests {
         let c = ToolCallBlock::pending("c", "bash", format!(r#"{{"command":"{command}"}}"#));
         for w in [40u16, 72, 120] {
             let head: String = c
-                .lines(w)
+                .lines(&crate::block::RenderCtx::bare(w))
                 .iter()
                 .map(|l| l.plain())
                 .collect::<Vec<_>>()
@@ -1794,7 +1819,7 @@ mod tests {
             format!(r#"{{"command":"{}"}}"#, "中".repeat(80)),
         );
         for w in 1u16..=40 {
-            for line in c.lines(w) {
+            for line in c.lines(&crate::block::RenderCtx::bare(w)) {
                 assert!(
                     width::str_width(&line.plain()) <= w as usize,
                     "at {w}: {:?} is {} cells",
@@ -1873,7 +1898,13 @@ mod tests {
             text: "keep going".into(),
         };
         assert_eq!(b.kind(), "injected:reminder");
-        assert_eq!(b.lines(40)[0].plain(), "[reminder] keep going");
-        assert_eq!(b.summary(40).plain(), "[reminder]");
+        assert_eq!(
+            b.lines(&crate::block::RenderCtx::bare(40))[0].plain(),
+            "[reminder] keep going"
+        );
+        assert_eq!(
+            b.summary(&crate::block::RenderCtx::bare(40)).plain(),
+            "[reminder]"
+        );
     }
 }

@@ -314,7 +314,14 @@ mod tests {
             .collect();
         assert_eq!(text.len(), 1, "one thing said, one block");
         assert!(text[0].is_live(), "still being said");
-        assert_eq!(text[0].block().content.lines(80)[0].plain(), "Looking.");
+        assert_eq!(
+            text[0]
+                .block()
+                .content
+                .lines(&crate::block::RenderCtx::bare(80))[0]
+                .plain(),
+            "Looking."
+        );
     }
 
     #[test]
@@ -352,7 +359,7 @@ mod tests {
             .map(|c| {
                 c.block()
                     .content
-                    .lines(60)
+                    .lines(&crate::block::RenderCtx::bare(60))
                     .iter()
                     .map(|l| l.plain())
                     .collect()
@@ -375,7 +382,7 @@ mod tests {
             .slots()
             .iter()
             .filter(|x| x.block().kind() == "turn_end")
-            .map(|x| x.block().content.lines(60)[0].plain())
+            .map(|x| x.block().content.lines(&crate::block::RenderCtx::bare(60))[0].plain())
             .collect();
         assert_eq!(ends.len(), 2, "two turns end in the corpus: {ends:?}");
         for want in ["1 步", "入 1200", "出 80", "缓存 33.33%"] {
@@ -404,7 +411,7 @@ mod tests {
             .slots()
             .iter()
             .filter(|x| x.block().kind() == "turn_end")
-            .map(|x| x.block().content.lines(60)[0].plain())
+            .map(|x| x.block().content.lines(&crate::block::RenderCtx::bare(60))[0].plain())
             .collect();
         let last = ends.last().expect("turn 2 ends");
         assert!(last.contains("完成"), "{last:?}");
@@ -421,7 +428,7 @@ mod tests {
             .iter()
             .filter_map(|x| match x {
                 Slot::Settled(s) if s.block().kind() == "tool_call" => {
-                    Some(s.block().content.lines(80)[0].plain())
+                    Some(s.block().content.lines(&crate::block::RenderCtx::bare(80))[0].plain())
                 }
                 _ => None,
             })
@@ -445,7 +452,7 @@ mod tests {
             .unwrap()
             .block()
             .content
-            .lines(60)[1]
+            .lines(&crate::block::RenderCtx::bare(60))[1]
             .plain();
         assert!(
             line.contains("已中断") && !line.contains("失败"),

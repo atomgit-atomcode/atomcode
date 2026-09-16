@@ -587,7 +587,7 @@ fn lid_row(
             folded: true,
         }),
         None => Some(SlotRows {
-            rows: slots[i].rows_at(room).0,
+            rows: slots[i].rows_at(&crate::block::RenderCtx::bare(room)).0,
             kind,
             lid: None,
             folded: false,
@@ -1503,7 +1503,8 @@ impl Host {
                     .collect(),
                 answer: None,
             };
-            let mut lines = crate::block::Content::lines(&pending, rect.w);
+            let mut lines =
+                crate::block::Content::lines(&pending, &crate::block::RenderCtx::bare(rect.w));
             lines.reverse();
             for line in lines {
                 if out.len() < want {
@@ -1579,7 +1580,9 @@ impl Host {
                 own = Some((block.id, kind));
                 Arc::new(lid_lines(stream.slots(), i, count, room))
             } else if entry.folded {
-                Arc::new(vec![block.content.summary(room)])
+                Arc::new(vec![block
+                    .content
+                    .summary(&crate::block::RenderCtx::bare(room))])
             } else {
                 // The count comes from the index — the same number
                 // `stream_height` summed — rather than from a second measurement
@@ -1618,9 +1621,9 @@ impl Host {
                 // can see this block — and rendering is the one part of this walk
                 // that cannot come from a table. Still through `rows_at`, so a
                 // growing answer extends its live cache in place.
-                match slot.rows_at(room).1 {
+                match slot.rows_at(&crate::block::RenderCtx::bare(room)).1 {
                     Some(lines) => lines,
-                    None => Arc::new(block.content.lines(room)),
+                    None => Arc::new(block.content.lines(&crate::block::RenderCtx::bare(room))),
                 }
             };
             if lines.is_empty() {
@@ -2966,7 +2969,7 @@ mod tests {
         fn content_hash(&self) -> crate::block::ContentHash {
             crate::block::hash_of(&self.lines.iter().map(|l| l.as_str()).collect::<Vec<_>>())
         }
-        fn lines(&self, _w: u16) -> Vec<crate::frame::Line> {
+        fn lines(&self, _ctx: &crate::block::RenderCtx) -> Vec<crate::frame::Line> {
             self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.lines
                 .iter()
@@ -3055,7 +3058,7 @@ mod tests {
         fn content_hash(&self) -> crate::block::ContentHash {
             crate::block::hash_of(&self.lines.iter().map(|l| l.as_str()).collect::<Vec<_>>())
         }
-        fn lines(&self, _w: u16) -> Vec<crate::frame::Line> {
+        fn lines(&self, _ctx: &crate::block::RenderCtx) -> Vec<crate::frame::Line> {
             self.lines
                 .iter()
                 .map(|l| crate::frame::Line::raw(l.as_str()))

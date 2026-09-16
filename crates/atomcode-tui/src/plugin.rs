@@ -1627,7 +1627,11 @@ impl Tui {
 fn transcript_text(stream: &Stream, width: u16) -> String {
     let mut out = String::new();
     for slot in stream.slots() {
-        for line in slot.block().content.lines(width.max(20)) {
+        for line in slot
+            .block()
+            .content
+            .lines(&crate::block::RenderCtx::bare(width.max(20)))
+        {
             out.push_str(&crate::text::for_screen(&line.plain()));
             out.push('\n');
         }
@@ -2016,7 +2020,7 @@ mod dump_tests {
         fn content_hash(&self) -> ContentHash {
             hash_of(&[self.0])
         }
-        fn lines(&self, _w: u16) -> Vec<Line> {
+        fn lines(&self, _ctx: &crate::block::RenderCtx) -> Vec<Line> {
             self.0.lines().map(Line::raw).collect()
         }
     }

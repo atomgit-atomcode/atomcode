@@ -358,48 +358,61 @@ impl Caps {
     }
 
     pub fn g(&self, glyph: Glyph) -> &'static str {
-        use Glyph::*;
-        if self.unicode {
-            match glyph {
-                TopLeft => "┌",
-                TopRight => "┐",
-                BottomLeft => "└",
-                BottomRight => "┘",
-                Horizontal => "─",
-                Vertical => "│",
-                Ok => "✓",
-                Fail => "✗",
-                Pending => "⋯",
-                Interrupted => "—",
-                Bullet => "•",
-                Pointer => "▸",
-                Prompt => "❯",
-                Separator => "·",
-                Thumb => "█",
-                Track => "│",
-                ToolMark => "●",
-                Gutter => "⎿",
-                Down => "↓",
-            }
-        } else {
-            match glyph {
-                TopLeft | TopRight | BottomLeft | BottomRight => "+",
-                Horizontal => "-",
-                Vertical => "|",
-                Ok => "v",
-                Fail => "x",
-                Pending => ".",
-                Interrupted => "-",
-                Bullet => "*",
-                Pointer => ">",
-                Prompt => ">",
-                Separator => ".",
-                Thumb => "#",
-                Track => "|",
-                ToolMark => "*",
-                Gutter => "`",
-                Down => "v",
-            }
+        self::glyph(self.unicode, glyph)
+    }
+}
+
+/// A decorative glyph, as a terminal that does or does not do Unicode writes it.
+///
+/// A free function because [`crate::block::ShapeCaps`] needs the same table: a
+/// block cannot hold a whole `Caps` (it also carries the palette), but a glyph
+/// depends on `unicode` alone.
+///
+/// Both tables are **one column in, one column out** — the property that makes
+/// the swap safe to apply after widths were computed, and the reason this set
+/// holds only narrow characters (see [`ascii_for`]).
+pub fn glyph(unicode: bool, glyph: Glyph) -> &'static str {
+    use Glyph::*;
+    if unicode {
+        match glyph {
+            TopLeft => "┌",
+            TopRight => "┐",
+            BottomLeft => "└",
+            BottomRight => "┘",
+            Horizontal => "─",
+            Vertical => "│",
+            Ok => "✓",
+            Fail => "✗",
+            Pending => "⋯",
+            Interrupted => "—",
+            Bullet => "•",
+            Pointer => "▸",
+            Prompt => "❯",
+            Separator => "·",
+            Thumb => "█",
+            Track => "│",
+            ToolMark => "●",
+            Gutter => "⎿",
+            Down => "↓",
+        }
+    } else {
+        match glyph {
+            TopLeft | TopRight | BottomLeft | BottomRight => "+",
+            Horizontal => "-",
+            Vertical => "|",
+            Ok => "v",
+            Fail => "x",
+            Pending => ".",
+            Interrupted => "-",
+            Bullet => "*",
+            Pointer => ">",
+            Prompt => ">",
+            Separator => ".",
+            Thumb => "#",
+            Track => "|",
+            ToolMark => "*",
+            Gutter => "`",
+            Down => "v",
         }
     }
 }
