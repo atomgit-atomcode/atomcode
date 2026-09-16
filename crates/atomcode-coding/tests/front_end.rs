@@ -59,6 +59,10 @@ impl LlmProvider for Scripted {
                     .to_string(),
                 })
             }
+            // A request that never answers: the only way out is a cancel.
+            Some(m) if m.role == Role::User && m.text == "hang" => {
+                return Ok(Box::pin(futures::stream::pending()));
+            }
             Some(m) if m.role == Role::Tool => StreamEvent::TextDelta(format!("saw: {}", m.text)),
             _ => StreamEvent::TextDelta(format!("answer {n}")),
         };
@@ -402,6 +406,63 @@ async fn the_thinking_level_set_through_host_control_reaches_requests_and_is_des
     assert_eq!(
         options.last().and_then(|o| o.reasoning_effort),
         Some(ReasoningEffort::High)
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_from_the_front_end_ends_the_running_turn() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    connection.commands.send(message("hang")).unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), connection.events.recv()).await {
+            Ok(Some(AgentEvent::TurnStarted { .. })) => break,
+            Ok(Some(_)) => continue,
+            other => panic!("the turn never started: {other:?}"),
+        }
+    }
+    connection.commands.send(AgentCommand::Cancel).unwrap();
+    let ended = through_turn(&mut connection).await;
+    assert!(
+        matches!(ended.last(), Some(AgentEvent::TurnComplete { .. })),
+        "{ended:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_compaction_asked_for_by_the_front_end_reports_back() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    connection.commands.send(message("hello")).unwrap();
+    through_turn(&mut connection).await;
+
+    connection
+        .commands
+        .send(AgentCommand::Tagged {
+            id: "c".into(),
+            command: Box::new(AgentCommand::Compact { focus: None }),
+        })
+        .unwrap();
+    let mut seen = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), connection.events.recv()).await {
+            Ok(Some(event)) => {
+                let done = matches!(
+                    event,
+                    AgentEvent::Compacted { .. } | AgentEvent::CompactionFailed { .. }
+                );
+                seen.push(event);
+                if done {
+                    break;
+                }
+            }
+            other => panic!("no compaction outcome: {other:?}; saw {seen:#?}"),
+        }
+    }
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, AgentEvent::Accepted { command, .. } if command == "c")),
+        "the command was taken: {seen:#?}"
     );
 }
 
