@@ -32,15 +32,73 @@ pub struct Entry {
     pub config: Value,
 }
 
+impl Entry {
+    /// A row whose address is its plugin's name — the common case, and what
+    /// TOML does when a row omits `id`.
+    pub fn named(name: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            id: name.clone(),
+            name,
+            disabled: false,
+            config: Value::Null,
+        }
+    }
+
+    /// A second row of the same plugin, which needs its own address.
+    pub fn with_id(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            disabled: false,
+            config: Value::Null,
+        }
+    }
+
+    /// The plugin's own config, from its own type rather than hand-built JSON.
+    ///
+    /// Fails for a type that has no JSON shape at all, such as a map with
+    /// non-string keys. It does NOT validate values: `serde_json` maps a
+    /// non-finite float to `null` rather than failing, so a `f32::NAN` arrives
+    /// as an absent value instead of an error. Pinned by
+    /// `a_non_finite_number_becomes_null_rather_than_an_error`; do not read this
+    /// as validation.
+    pub fn with(mut self, config: impl Serialize) -> Result<Self> {
+        self.config = serde_json::to_value(config)
+            .map_err(|e| PlexusError::Config(format!("row `{}`: {e}", self.id)))?;
+        Ok(self)
+    }
+
+    /// Mounted but inert.
+    pub fn disabled(mut self) -> Self {
+        self.disabled = true;
+        self
+    }
+}
+
 /// One edit to the tree.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Op {
     /// Append rows.
     Insert(Vec<Entry>),
-    /// Address a row by id and replace its whole config (cordis semantics:
-    /// replace, never deep-merge — a half-merged config is a config nobody can
-    /// reason about). Absent fields leave the row's value alone.
+    /// Address a row by id and change what this op names.
+    ///
+    /// The three fields below are independent: whichever ones are `None` leave
+    /// that aspect of the row alone.
+    ///
+    /// **`config` is REPLACED WHOLESALE, never deep-merged** (cordis semantics:
+    /// a half-merged config is a config nobody can reason about). This is the
+    /// part that surprises people, so it is worth being blunt: a patch that
+    /// carries `config` and omits a key the row already had does NOT keep the
+    /// old value — the key is gone, and the plugin reads its serde default.
+    /// `--dump-config` then shows that default with no sign that anyone had
+    /// chosen otherwise.
+    ///
+    /// Three real bugs came from reading this the other way. To change one key
+    /// and keep the rest, carry the rest explicitly.
+    /// `atomcode-coding`'s `no_row_silently_loses_a_configured_field` is a test
+    /// of exactly this, and a good model for anyone patching from a host.
     Patch {
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,6 +122,98 @@ pub struct Layer {
 }
 
 impl Layer {
+    /// An empty layer, to be built up with the methods below.
+    ///
+    /// The same edits [`from_toml`](Self::from_toml) parses, written in Rust —
+    /// for a host that computes its layer rather than shipping a file.
+    ///
+    /// Nothing here changes what a layer MEANS; the criteria in
+    /// `tests/layer_builder.rs` are the same edits written both ways with the
+    /// trees compared. What it removes is the step where a host formats TOML
+    /// into a string and hopes it parses: a value whose `Debug` is not TOML
+    /// (`f32::NAN` prints `NaN`, a control character prints `\u{7f}`) makes the
+    /// layer unparseable at a point far from whoever set it.
+    ///
+    /// It is not validation. See [`Entry::with`] for what a bad value does
+    /// here instead.
+    ///
+    /// ```
+    /// # use atomcode_plexus::{Entry, Layer};
+    /// # #[derive(serde::Serialize)]
+    /// # struct FsRow { root: String }
+    /// # fn demo() -> atomcode_plexus::Result<Layer> {
+    /// Ok(Layer::new()
+    ///     .insert(Entry::named("fs-local").with(FsRow { root: "/tmp".into() })?)
+    ///     .swap("llm", "llm-replay")
+    ///     .disable("telemetry"))
+    /// # }
+    /// ```
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a row.
+    pub fn insert(mut self, entry: Entry) -> Self {
+        match self.ops.last_mut() {
+            // Keep consecutive inserts in one op, the shape `from_toml` builds.
+            Some(Op::Insert(entries)) => entries.push(entry),
+            _ => self.ops.push(Op::Insert(vec![entry])),
+        }
+        self
+    }
+
+    /// Replace a row's config — **wholesale**, so carry every key you mean to
+    /// keep. See [`Op::Patch`].
+    pub fn patch(mut self, id: impl Into<String>, config: impl Serialize) -> Result<Self> {
+        let id = id.into();
+        let config = serde_json::to_value(config)
+            .map_err(|e| PlexusError::Config(format!("patch `{id}`: {e}")))?;
+        self.ops.push(Op::Patch {
+            id,
+            config: Some(config),
+            disabled: None,
+            name: None,
+        });
+        Ok(self)
+    }
+
+    /// Swap which plugin serves a row, keeping its address and config.
+    pub fn swap(mut self, id: impl Into<String>, name: impl Into<String>) -> Self {
+        self.ops.push(Op::Patch {
+            id: id.into(),
+            config: None,
+            disabled: None,
+            name: Some(name.into()),
+        });
+        self
+    }
+
+    /// Turn a row off without removing it, so a later layer can turn it back on.
+    pub fn disable(self, id: impl Into<String>) -> Self {
+        self.set_disabled(id, true)
+    }
+
+    /// Turn a disabled row back on.
+    pub fn enable(self, id: impl Into<String>) -> Self {
+        self.set_disabled(id, false)
+    }
+
+    fn set_disabled(mut self, id: impl Into<String>, disabled: bool) -> Self {
+        self.ops.push(Op::Patch {
+            id: id.into(),
+            config: None,
+            disabled: Some(disabled),
+            name: None,
+        });
+        self
+    }
+
+    /// Drop a row entirely.
+    pub fn remove(mut self, id: impl Into<String>) -> Self {
+        self.ops.push(Op::Remove { id: id.into() });
+        self
+    }
+
     /// Parse a layer from TOML.
     ///
     /// ```toml
