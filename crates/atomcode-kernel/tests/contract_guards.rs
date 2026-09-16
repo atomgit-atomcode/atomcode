@@ -94,14 +94,23 @@ fn the_kernel_depends_on_no_workspace_crate() {
     );
 }
 
-/// Where a type is defined, by the line that defines it.
+/// Where a type is defined, by the line that defines it. A needle that ends in
+/// a name must end where the name does: `pub struct Question` is not `pub struct
+/// QuestionsHandlePlugin`.
 fn definitions_of(needle: &str) -> Vec<String> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let ends_in_name = needle.chars().last().is_some_and(ident);
+    let defines = |line: &str| {
+        line.trim_start()
+            .strip_prefix(needle)
+            .is_some_and(|rest| !ends_in_name || !rest.chars().next().is_some_and(ident))
+    };
     workspace_rust_files()
         .into_iter()
         .filter_map(|path| {
             let text = std::fs::read_to_string(&path).ok()?;
             text.lines()
-                .any(|line| line.trim_start().starts_with(needle))
+                .any(defines)
                 .then(|| path.display().to_string())
         })
         .collect()
