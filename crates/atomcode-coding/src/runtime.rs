@@ -7436,43 +7436,55 @@ fn harness_host_state(
     config: &CodingAgentConfig,
     prepare: &PrepareOptions,
 ) -> Result<crate::on_harness::HostState, std::io::Error> {
-    let session = match &parts.session {
-        Some(binding) => crate::host_rows::SessionSeed {
-            id: Some(binding.id.clone()),
-            snapshot: match binding.manager.load_native_session(&binding.id) {
-                Ok(loaded) => Some(loaded.snapshot),
-                // A fresh session that has not been published yet has nothing on
-                // disk, and that is the ONE reason a file may be missing here. Any
-                // other absence is half a session, and continuing on half a
-                // session hands the model a conversation the store cannot explain
-                // — the person's history, silently gone.
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound
-                        && binding.is_staged_fresh() =>
-                {
-                    None
-                }
-                Err(error) => return Err(error.into()),
-            },
-            store: Some(binding.manager.clone()),
-        },
-        None => crate::host_rows::SessionSeed {
-            id: None,
-            snapshot: parts.runtime_resume_snapshot(),
-            store: None,
-        },
+    // The system prompt's context block as the session started with it.
+    let (session, stored_prompt) = match &parts.session {
+        Some(binding) => {
+            // A fresh session that has not been published yet has nothing on
+            // disk, and that is the ONE reason its log may be missing here. Any
+            // other absence is half a session, and continuing on half a session
+            // hands the model a conversation the store cannot explain — the
+            // person's history, silently gone.
+            let (resume, context) = match binding.staged_header() {
+                Some(header) => (false, header.context.clone()),
+                None => (
+                    true,
+                    binding
+                        .manager
+                        .read_event_header(&binding.id)
+                        .map_err(std::io::Error::from)?
+                        .context,
+                ),
+            };
+            (
+                crate::host_rows::SessionSeed {
+                    id: Some(binding.id.clone()),
+                    snapshot: None,
+                    stored: Some(crate::session_store::StoredSession {
+                        store: binding.manager.clone(),
+                        lease: binding.lease.clone(),
+                        status: parts.snapshot_persistence_status(),
+                    }),
+                    resume,
+                },
+                context,
+            )
+        }
+        None => {
+            let snapshot = parts.runtime_resume_snapshot();
+            let prompt = snapshot
+                .as_ref()
+                .and_then(atomcode_capabilities::session::events::stored_prompt);
+            (
+                crate::host_rows::SessionSeed {
+                    id: None,
+                    snapshot,
+                    stored: None,
+                    resume: false,
+                },
+                prompt,
+            )
+        }
     };
-    // The system prompt a continued session was stored with: its leading
-    // system messages, whichever engine wrote them.
-    let stored_prompt = session.snapshot.as_ref().map(|snapshot| {
-        snapshot
-            .messages
-            .iter()
-            .take_while(|m| m.role == atomcode_kernel::message::Role::System && !m.synthetic)
-            .map(|m| m.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    });
     let session_id = parts.session.as_ref().map(|binding| binding.id.as_str());
 
     // Everything the chain's `prepare` + `assemble` hang on the kernel agent that
@@ -7735,19 +7747,6 @@ struct MemoryPatch<'a> {
 }
 
 #[derive(serde::Serialize)]
-/// What the journal row (`session-journal`, on the `session-persistence-jsonl`
-/// row) actually reads: the project. Where it writes is the row's own decision.
-///
-/// NOT `resume`: that is the `session` row's field, and the string this replaced
-/// had been sending it here — to a row that has never read it — since the
-/// follower was wired. Typing the patch is what surfaced it. Whether the
-/// follower is replayed on resume is decided where it belongs, by
-/// `session-native`'s `SessionDefaults { resume: false }`.
-struct JsonlFollowerPatch<'a> {
-    project_root: &'a std::path::Path,
-}
-
-#[derive(serde::Serialize)]
 struct AgentLoopOptionsPatch<'a> {
     working_dir: &'a std::path::Path,
     undo_cancelled: bool,
@@ -7797,20 +7796,6 @@ fn harness_option_rows(
             )
             .map_err(|e| e.to_string())?;
     }
-    // The tree's own log, kept and written — but NOT where the native store keeps
-    // this session's transcript. That is `session-journal`'s to decide
-    // (`CODING_DEFAULTS` swaps it in, for every host that stacks those rows); the
-    // runtime only says which project this session is.
-    //
-    // `resume = false` for the same reason the decision records: the native
-    // snapshot is what a session is rebuilt from here, and a replay of this log
-    // would be a second, divergent answer to the same question.
-    rows = rows
-        .patch(
-            "session-persistence-jsonl",
-            JsonlFollowerPatch { project_root: wd },
-        )
-        .map_err(|e| e.to_string())?;
     // Ctrl-C semantics: by default a cancelled turn is undone — its prompt and
     // partial work leave what the model sees next, as the chain rolls them back.
     rows.patch(
@@ -7870,6 +7855,9 @@ struct NativeUndoSidecars {
     turn_stats: Vec<TurnStat>,
     archived_turn_stats: Vec<TurnStat>,
     removed_presentation: Vec<(usize, PresentationEntry)>,
+    /// Where the session's log stood before the change was appended: what a
+    /// rollback cuts it back to.
+    events_mark: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -7946,13 +7934,28 @@ fn persist_runtime_undo(
         NativePersistenceError::certain("snapshot message count exceeds native metadata")
     })?;
     let mut snapshot_conflict = false;
+    let events = binding.manager.is_event_session(&binding.id);
+    // Turn statistics count messages the way the conversation the hooks are
+    // handed does, system prompt first; a log projects none.
+    let kept_messages = snapshot.messages.len()
+        + usize::from(
+            events
+                && !snapshot.messages.first().is_some_and(|m| {
+                    m.role == atomcode_kernel::message::Role::System && !m.synthetic
+                }),
+        );
     let sidecars = binding
         .manager
         .commit_native_runtime_mutation(
             &binding.lease,
             snapshot,
             |current_snapshot, meta, presentation| {
-                if expected_snapshot.is_some_and(|expected| current_snapshot != expected) {
+                if expected_snapshot.is_some_and(|expected| {
+                    !atomcode_capabilities::session::events::same_conversation(
+                        &current_snapshot.messages,
+                        &expected.messages,
+                    )
+                }) {
                     snapshot_conflict = true;
                     return Err(SessionStoreError::Corrupt {
                         kind: "session mutation conflict",
@@ -7965,9 +7968,10 @@ fn persist_runtime_undo(
                     turn_stats: meta.turn_stats.clone(),
                     archived_turn_stats: Vec::new(),
                     removed_presentation: Vec::new(),
+                    events_mark: None,
                 };
                 sidecars.archived_turn_stats = meta.archive_turn_stats_where(|stat| {
-                    stat.position_valid && stat.after_message > snapshot.messages.len()
+                    stat.position_valid && stat.after_message > kept_messages
                 });
                 let surviving_turn_ids: BTreeSet<_> = meta
                     .turn_stats
@@ -7998,6 +8002,15 @@ fn persist_runtime_undo(
                     }
                 })?;
                 meta.updated_at = atomcode_capabilities::session::now_ms();
+                // The log is the conversation: the change is a fact appended to
+                // it, last, so a failure before this leaves nothing to undo.
+                if events {
+                    sidecars.events_mark = Some(binding.manager.append_conversation_change(
+                        &binding.lease,
+                        &snapshot.messages,
+                        u64::try_from(meta.updated_at).unwrap_or(0),
+                    )?);
+                }
                 Ok(sidecars)
             },
         )
@@ -8029,6 +8042,7 @@ fn restore_runtime_undo(
         turn_stats,
         archived_turn_stats,
         removed_presentation,
+        events_mark,
     } = sidecars;
     let mut snapshot_conflict = false;
     binding
@@ -8037,7 +8051,10 @@ fn restore_runtime_undo(
             &binding.lease,
             snapshot,
             |current_snapshot, meta, presentation| {
-                if current_snapshot != expected_current_snapshot {
+                if !atomcode_capabilities::session::events::same_conversation(
+                    &current_snapshot.messages,
+                    &expected_current_snapshot.messages,
+                ) {
                     snapshot_conflict = true;
                     return Err(SessionStoreError::Corrupt {
                         kind: "session mutation conflict",
@@ -8054,6 +8071,11 @@ fn restore_runtime_undo(
                         .insert(original_index.min(presentation.entries.len()), entry);
                 }
                 meta.updated_at = atomcode_capabilities::session::now_ms();
+                // Nothing has read the change since it was appended: no agent
+                // ran on it, so it is cut back rather than answered with more.
+                if let Some(mark) = events_mark {
+                    binding.manager.truncate_events(&binding.lease, mark)?;
+                }
                 Ok(())
             },
         )
@@ -8071,12 +8093,22 @@ fn persist_runtime_snapshot(
     snapshot: &SessionSnapshot,
 ) -> Result<(), NativePersistenceError> {
     if let Some(binding) = runtime.parts.session.as_ref() {
+        let events = binding.manager.is_event_session(&binding.id);
         binding
             .manager
             .commit_native_runtime_mutation(
                 &binding.lease,
                 snapshot,
-                |_current_snapshot, _meta, _presentation| Ok(()),
+                |_current_snapshot, _meta, _presentation| {
+                    if events {
+                        binding.manager.append_conversation_change(
+                            &binding.lease,
+                            &snapshot.messages,
+                            u64::try_from(atomcode_capabilities::session::now_ms()).unwrap_or(0),
+                        )?;
+                    }
+                    Ok(())
+                },
             )
             .map_err(NativePersistenceError::from)
     } else {
@@ -9196,9 +9228,11 @@ mod tests {
         release: Arc<std::sync::Barrier>,
     }
 
-    struct DeletePresentationAndFailSecondBuildFactory {
+    /// The second build removes the session's log, then fails: the rebuild
+    /// after a change fails, and so does taking the change back.
+    struct DeleteLogAndFailSecondBuildFactory {
         builds: std::sync::atomic::AtomicUsize,
-        presentation_path: std::path::PathBuf,
+        log_path: std::path::PathBuf,
     }
 
     impl CodingProviderFactory for RecoverableAuthFactory {
@@ -9301,7 +9335,7 @@ mod tests {
         }
     }
 
-    impl CodingProviderFactory for DeletePresentationAndFailSecondBuildFactory {
+    impl CodingProviderFactory for DeleteLogAndFailSecondBuildFactory {
         fn build(
             &self,
             _config: &CodingAgentConfig,
@@ -9312,13 +9346,13 @@ mod tests {
                     vec![],
                 )));
             }
-            std::fs::remove_file(&self.presentation_path).map_err(|error| {
+            std::fs::remove_file(&self.log_path).map_err(|error| {
                 crate::ProviderBuildError::Adapter(format!(
                     "could not arrange rollback persistence failure: {error}"
                 ))
             })?;
             Err(crate::ProviderBuildError::Adapter(
-                "candidate provider failed after presentation removal".into(),
+                "candidate provider failed after the log was removed".into(),
             ))
         }
     }
@@ -15635,7 +15669,36 @@ mod tests {
             Message::assistant("first answer", Vec::new()),
             Message::user("concurrent prompt"),
         ]);
-        manager.save_snapshot(id, &newer).unwrap();
+        // Another writer's fact lands in the log behind the runtime's back.
+        let stored = manager.load_events(id).unwrap();
+        let next = stored.iter().map(|e| e.seq).max().unwrap_or(0) + 1;
+        let turn = stored.iter().map(|e| e.event.turn()).max().unwrap_or(0) + 1;
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(manager.events_path(id).unwrap())
+            .unwrap();
+        for (seq, event) in [
+            (
+                next,
+                atomcode_kernel::session::SessionEvent::TurnStart { turn },
+            ),
+            (
+                next + 1,
+                atomcode_kernel::session::SessionEvent::UserMessage {
+                    turn,
+                    text: "concurrent prompt".into(),
+                    images: Vec::new(),
+                },
+            ),
+        ] {
+            use std::io::Write;
+            writeln!(
+                log,
+                "{}",
+                serde_json::json!({ "seq": seq, "at": 0, "event": event })
+            )
+            .unwrap();
+        }
         let (done, result) = oneshot::channel();
         runtime
             .handle
@@ -15653,7 +15716,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(result.await.unwrap(), Err(RuntimeError::Busy)));
-        assert_eq!(manager.load_snapshot(id).unwrap(), newer);
+        assert_eq!(manager.load_snapshot(id).unwrap().messages, newer.messages);
         runtime.handle.shutdown().await.unwrap();
     }
 
@@ -15674,17 +15737,17 @@ mod tests {
         start.agent.working_dir = project.path().to_path_buf();
         start.prepare.session = crate::SessionMode::Resume(id.into());
         let runtime = CodingRuntime::start(start).await.unwrap();
-        let presentation_path = manager.presentation_path(id).unwrap();
-        std::fs::remove_file(&presentation_path).unwrap();
+        let log_path = manager.events_path(id).unwrap();
+        std::fs::remove_file(&log_path).unwrap();
 
         let error = runtime.handle.undo_to_prompt(None).await.unwrap_err();
 
         let RuntimeError::ReconfigureFailed(message) = &error else {
-            panic!("expected presentation persistence error, got {error:?}");
+            panic!("expected session log persistence error, got {error:?}");
         };
         assert!(
-            message.contains(presentation_path.to_string_lossy().as_ref()),
-            "expected missing presentation path in error, got {error:?}"
+            message.contains(log_path.to_string_lossy().as_ref()),
+            "expected missing session log path in error, got {error:?}"
         );
         assert_eq!(runtime.handle.status().phase, RuntimePhase::Failed);
         assert_eq!(
@@ -15710,20 +15773,21 @@ mod tests {
         let mut start = native_start(false);
         start.agent.working_dir = project.path().to_path_buf();
         start.prepare.session = crate::SessionMode::Resume(id.into());
-        start.provider_factory = Arc::new(DeletePresentationAndFailSecondBuildFactory {
+        start.provider_factory = Arc::new(DeleteLogAndFailSecondBuildFactory {
             builds: std::sync::atomic::AtomicUsize::new(0),
-            presentation_path: manager.presentation_path(id).unwrap(),
+            log_path: manager.events_path(id).unwrap(),
         });
         let runtime = CodingRuntime::start(start).await.unwrap();
 
-        // Resume may normalize the live snapshot (for example, refreshing the
-        // current persona) before a turn persists it. Align the canonical CAS
-        // preimage so this test reaches the intended rollback-failure branch.
+        // The live conversation carries the system prompt a request is assembled
+        // with; the log projects none. The conversation itself must agree, or
+        // the undo stops at its conflict check before the branch under test.
         let live_snapshot = runtime.handle.snapshot().await.unwrap();
-        manager.save_snapshot(id, &live_snapshot).unwrap();
-        assert_eq!(
-            live_snapshot.as_ref(),
-            &manager.load_snapshot(id).unwrap(),
+        assert!(
+            atomcode_capabilities::session::events::same_conversation(
+                &live_snapshot.messages,
+                &manager.load_snapshot(id).unwrap().messages,
+            ),
             "live and canonical snapshots must agree before undo"
         );
 
@@ -15761,13 +15825,12 @@ mod tests {
         let mut start = native_start(false);
         start.agent.working_dir = project.path().to_path_buf();
         start.prepare.session = crate::SessionMode::Resume(id.into());
-        start.provider_factory = Arc::new(DeletePresentationAndFailSecondBuildFactory {
+        start.provider_factory = Arc::new(DeleteLogAndFailSecondBuildFactory {
             builds: std::sync::atomic::AtomicUsize::new(0),
-            presentation_path: manager.presentation_path(id).unwrap(),
+            log_path: manager.events_path(id).unwrap(),
         });
         let mut runtime = CodingRuntime::start(start).await.unwrap();
         let live_snapshot = runtime.handle.snapshot().await.unwrap();
-        manager.save_snapshot(id, &live_snapshot).unwrap();
         let mut replacement = live_snapshot.as_ref().clone();
         replacement.messages.push(Message::user("replacement"));
 
@@ -15917,7 +15980,10 @@ mod tests {
         let receipt = persist_runtime_undo(&mut resources, Some(&original_snapshot), &truncated)
             .unwrap()
             .expect("native undo must retain a sidecar rollback receipt");
-        assert_eq!(manager.load_snapshot(id).unwrap(), truncated);
+        assert_eq!(
+            manager.load_snapshot(id).unwrap().messages,
+            truncated.messages
+        );
         let persisted_meta = manager.read_meta(id).unwrap();
         assert_eq!(persisted_meta.turn_stats, vec![original_stats[0].clone()]);
         assert_eq!(persisted_meta.turn_count, 1);
@@ -15961,7 +16027,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(manager.load_snapshot(id).unwrap(), original_snapshot);
+        assert_eq!(
+            manager.load_snapshot(id).unwrap().messages,
+            original_snapshot.messages
+        );
         let restored_meta = manager.read_meta(id).unwrap();
         assert_eq!(restored_meta.owner, StorageOwner::Native);
         assert_eq!(restored_meta.name, "renamed while undo rebuilds");
@@ -15991,7 +16060,10 @@ mod tests {
             Message::user("concurrent"),
             Message::assistant("newer answer", Vec::new()),
         ]);
-        manager.save_snapshot(id, &concurrently_advanced).unwrap();
+        let binding = resources.parts.session.as_ref().unwrap();
+        manager
+            .append_conversation_change(&binding.lease, &concurrently_advanced.messages, 1)
+            .unwrap();
 
         let error = restore_runtime_undo(
             &mut resources,
@@ -16001,7 +16073,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.is_snapshot_conflict());
-        assert_eq!(manager.load_snapshot(id).unwrap(), concurrently_advanced);
+        assert_eq!(
+            manager.load_snapshot(id).unwrap().messages,
+            concurrently_advanced.messages
+        );
     }
 
     #[test]

@@ -219,63 +219,42 @@ async fn no_row_silently_loses_a_configured_field() {
     );
 }
 
-/// The session rows carry what the runtime meant them to carry.
+/// A session's log goes where the session is: the session store, under the
+/// lease of the session the runtime opened (`docs/adr/0024` §5).
 ///
-/// These are the rows the collapse is most exposed on: the native store is the
-/// master and the harness log is a follower, and the whole arrangement rests on
-/// the follower being pointed somewhere else. A field name that does not match
-/// the row's schema is silently ignored by serde — the follower would fall back
-/// to the DEFAULT root, which is where the native transcript lives, and two
-/// writers with two formats would be back in one file.
-///
-/// Nothing else catches that: `no_row_silently_loses_a_configured_field` only
-/// compares against what the BASE declares, and base declares neither of these.
+/// The harness's JSONL row, left mounted, would keep a second copy under no
+/// lease — two writers of one session again — so it is off, and the store the
+/// tree appends to is the one that reports the session's own log file.
 #[tokio::test]
 #[serial_test::serial(atomcode_home)]
-async fn the_session_rows_carry_what_the_runtime_sent() {
+async fn a_sessions_log_is_kept_in_the_session_store() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
     let project = tempfile::tempdir().unwrap();
     let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+    let mut opts = support::quiet_options();
+    opts.session = atomcode_coding::SessionMode::Fresh;
+    let parts = atomcode_coding::prepare(&cfg, opts.clone())
+        .await
+        .expect("prepare");
+    let binding = parts.session.as_ref().expect("a fresh session is bound");
 
-    let mounted = support::mount(&cfg, support::quiet_options(), Arc::new(Silent)).await;
-    let configs: std::collections::BTreeMap<String, serde_json::Value> =
-        mounted.row_configs().into_iter().collect();
-    let follower = configs
-        .get("session-persistence-jsonl")
-        .expect("the follower row is mounted");
-    assert_eq!(
-        follower["project_root"].as_str(),
-        Some(project.path().to_string_lossy().as_ref()),
-        "the follower buckets by the session's project, not the process cwd"
+    let mounted = support::mount_parts(&parts, &cfg, &opts, Arc::new(Silent)).await;
+    let rows = mounted.rows();
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("session-persistence-jsonl")
+                && row.ends_with("session-store")),
+        "the store row stands in the persistence row's place, not the harness's own: {rows:?}"
     );
-
-    // Where it writes is the row's own decision now, so the judge is the path
-    // the store reports — not a config field that could say one thing while the
-    // row does another.
     let store = mounted
         .context()
         .service::<atomcode_harness::seams::SessionPersistenceSvc>()
         .expect("a store is mounted");
-    let written = std::path::PathBuf::from(store.location("1789000000000-1").unwrap());
-    let bucket = atomcode_capabilities::session::SessionManager::project_hash(project.path());
     assert_eq!(
-        written,
-        home.path()
-            .join("sessions")
-            .join(atomcode_capabilities::session::SessionManager::JOURNAL_DIR)
-            .join(&bucket)
-            .join("1789000000000-1.jsonl"),
-        "the follower must not write into the native store's bucket"
+        std::path::PathBuf::from(store.location(&binding.id).unwrap()),
+        binding.manager.events_path(&binding.id).unwrap(),
     );
-    assert!(
-        mounted
-            .rows()
-            .iter()
-            .any(|row| row.starts_with("session-persistence-jsonl")
-                && row.ends_with("session-journal")),
-        "this product's journal row is what mounted: {:?}",
-        mounted.rows()
-    );
+    assert!(binding.manager.is_event_session(&binding.id));
     mounted.stop();
 }

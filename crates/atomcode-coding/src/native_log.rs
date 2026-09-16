@@ -1,143 +1,23 @@
-//! The native snapshot and the harness session log, in both directions.
+//! A tree agent's log as the conversation the kernel's lifecycle hooks read.
 //!
-//! The coding runtime keeps sessions as native snapshots (`SessionManager`): the
-//! catalog, resume, undo, rewind and the lease all read that store, and so do
-//! tuix, the daemon and ACP. The harness runs a conversation as an event log.
-//! Native is the master; the log is what a running agent holds. So there are
-//! exactly two crossings, and this module is both:
-//!
-//! - [`seed_from_snapshot`]: a stored conversation becomes the events a tree
-//!   agent starts from (resume, undo, restore, a rebuilt tree).
-//! - [`conversation_from_log`]: what a tree agent has done becomes the
-//!   conversation the native store writes.
+//! A session's authority is its log (`docs/adr/0024`), kept in the session store
+//! by `session-store`. The kernel hooks the runtime still runs — the turn's
+//! statistics, the rewind ledger, telemetry — were written against a
+//! `Conversation`, and [`conversation_from_log`] is what they are handed. The
+//! other direction, a stored snapshot into facts, is the store's:
+//! [`atomcode_capabilities::session::events::events_from_snapshot`].
 //!
 //! # What does not cross
 //!
 //! - **Non-synthetic system messages** (persona, memory, session context, a
-//!   model-change note). They are regenerated on every request from the tree's
-//!   prompt registry; seeding them would put a second copy of the instructions
-//!   into the history. [`conversation_from_log`] puts the tree's current system
-//!   prompt back at the head, the way the native store has always held one.
-//! - **Which kind of injection** a synthetic user message was. A reminder, a
-//!   continuation and a peer's report all project to a synthetic user message,
-//!   so on the way back they seed as a continuation — the same message to the
-//!   model, one provenance fewer.
-//! - `cache_epoch`: the harness has no prefix-generation marker; the snapshot's
-//!   own is carried by whoever holds the snapshot.
+//!   model-change note) are not facts. They are regenerated on every request
+//!   from the tree's prompt registry; [`conversation_from_log`] puts the tree's
+//!   current system prompt back at the head, the way a conversation has always
+//!   held one.
+//! - `cache_epoch`: the harness has no prefix-generation marker.
 
-use atomcode_harness::session::{
-    derive_messages_with_meta, InjectionOrigin, LoggedEvent, SeqNo, SessionEvent,
-};
-use atomcode_kernel::message::{Conversation, Message, Role, SessionSnapshot};
-
-/// The events a tree agent starts from, for a stored conversation.
-///
-/// Sequence numbers start at `first_seq`, so a caller that seeds a session whose
-/// log store already holds events can keep the store's numbering monotonic.
-///
-/// Turn numbers come from the stored ids where the messages carry them, and are
-/// counted otherwise; the last event's turn is at least the snapshot's own
-/// `turn_counter`, so the next turn a resumed agent opens continues the
-/// session's sequence instead of reusing an id the native store already filed a
-/// rewind point or a turn stat under.
-pub fn seed_from_snapshot(snapshot: &SessionSnapshot, first_seq: SeqNo) -> Vec<LoggedEvent> {
-    let turns = turn_of_each_prompt(&snapshot.messages);
-    let mut events: Vec<SessionEvent> = Vec::new();
-    let mut turn = 0u64;
-    let mut round = 0u32;
-    let mut prompt = 0usize;
-
-    for message in &snapshot.messages {
-        match message.role {
-            Role::System => {
-                if message.synthetic {
-                    events.push(SessionEvent::Injected {
-                        turn,
-                        text: message.text.clone(),
-                        origin: InjectionOrigin::CompactionSummary,
-                    });
-                }
-            }
-            Role::User if !message.synthetic => {
-                turn = turns[prompt];
-                prompt += 1;
-                round = 0;
-                events.push(SessionEvent::TurnStart { turn });
-                events.push(SessionEvent::UserMessage {
-                    turn,
-                    text: message.text.clone(),
-                    images: message.images.clone(),
-                });
-            }
-            Role::User => {
-                // An empty synthetic user message carrying images right after a
-                // tool result is how a tool's picture reaches a vision model:
-                // it belongs to that result, not to the conversation.
-                let carrier = message.text.is_empty() && !message.images.is_empty();
-                if carrier {
-                    if let Some(SessionEvent::ToolResultLogged { images, .. }) = events.last_mut() {
-                        if images.is_empty() {
-                            images.clone_from(&message.images);
-                            continue;
-                        }
-                    }
-                }
-                events.push(SessionEvent::Injected {
-                    turn,
-                    text: message.text.clone(),
-                    origin: InjectionOrigin::Continuation,
-                });
-            }
-            Role::Assistant => {
-                round = message
-                    .meta
-                    .as_ref()
-                    .map(|meta| meta.round)
-                    .filter(|r| *r > round)
-                    .unwrap_or(round + 1);
-                events.push(SessionEvent::AssistantMessage {
-                    turn,
-                    round,
-                    text: message.text.clone(),
-                    reasoning: message.reasoning.clone().unwrap_or_default(),
-                    tool_calls: message.tool_calls.clone(),
-                    reasoning_blocks: message.reasoning_blocks.clone(),
-                    meta: message.meta.clone(),
-                });
-            }
-            Role::Tool => {
-                events.push(SessionEvent::ToolResultLogged {
-                    turn,
-                    round,
-                    call_id: message.tool_call_id.clone().unwrap_or_default(),
-                    content: message.text.clone(),
-                    is_error: message.is_error,
-                    images: message.images.clone(),
-                });
-            }
-        }
-    }
-
-    // A turn that stored nothing (it failed before any message was kept) still
-    // consumed its id. Say so with a boundary, which is not model-visible.
-    if snapshot.turn_counter > turn {
-        events.push(SessionEvent::TurnEnd {
-            turn: snapshot.turn_counter,
-            stop: atomcode_harness::seams::StopReason::Stopped,
-            error: None,
-        });
-    }
-
-    events
-        .into_iter()
-        .enumerate()
-        .map(|(offset, event)| LoggedEvent {
-            seq: first_seq + offset as SeqNo,
-            at: 0,
-            event,
-        })
-        .collect()
-}
+use atomcode_harness::session::{derive_messages_with_meta, LoggedEvent};
+use atomcode_kernel::message::{Conversation, Message};
 
 /// The conversation the native store writes, for what a tree agent has logged.
 ///
@@ -156,32 +36,13 @@ pub fn conversation_from_log(system: Option<String>, events: &[LoggedEvent]) -> 
     }
 }
 
-/// The turn id each real user prompt opened, in order.
-fn turn_of_each_prompt(messages: &[Message]) -> Vec<u64> {
-    let mut turns = Vec::new();
-    let mut last = 0u64;
-    for (index, message) in messages.iter().enumerate() {
-        if message.role != Role::User || message.synthetic {
-            continue;
-        }
-        let stored = messages[index + 1..]
-            .iter()
-            .take_while(|m| m.role != Role::User || m.synthetic)
-            .filter_map(|m| m.meta.as_ref())
-            .map(|meta| meta.turn_id)
-            .find(|id| *id > 0);
-        let turn = stored.filter(|id| *id > last).unwrap_or(last + 1);
-        turns.push(turn);
-        last = turn;
-    }
-    turns
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_harness::session::derive_messages;
+    use atomcode_capabilities::session::events::events_from_snapshot as seed_from_snapshot;
+    use atomcode_harness::session::{derive_messages, SeqNo, SessionEvent};
     use atomcode_kernel::message::{ImageContent, MessageMeta, ReasoningBlock};
+    use atomcode_kernel::message::{Role, SessionSnapshot};
     use atomcode_kernel::stream::TokenUsage;
     use atomcode_kernel::tool::ToolCall;
 

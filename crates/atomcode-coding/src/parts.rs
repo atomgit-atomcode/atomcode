@@ -25,8 +25,8 @@ use atomcode_capabilities::codeintel::register_codeintel_tools;
 use atomcode_capabilities::mcp::{McpConnectEvent, McpRegistry, McpServerConfig};
 use atomcode_capabilities::session::snapshot::SnapshotPersistenceStatus;
 use atomcode_capabilities::session::{
-    ListSessionsTool, PresentationFile, RecallTool, SessionContextHook, SessionLease,
-    SessionManager, SessionMeta, SnapshotHook, StorageOwner, TranscriptHook,
+    ListSessionsTool, RecallTool, SessionContextHook, SessionLease, SessionManager, SessionMeta,
+    SnapshotHook, StorageOwner, TranscriptHook,
 };
 use atomcode_capabilities::skills::{register_skill_tools, runtime_skill_dirs, SkillRegistry};
 use atomcode_capabilities::tools::{
@@ -34,6 +34,7 @@ use atomcode_capabilities::tools::{
 };
 use atomcode_kernel::message::{Message, SessionSnapshot};
 use atomcode_kernel::provider::LlmProvider;
+use atomcode_kernel::session::SessionHeader;
 use atomcode_kernel::tool::ToolRegistry;
 use atomcode_review::{ReviewTool, ReviewToolConfig, SharedReviewProvider};
 
@@ -299,9 +300,9 @@ pub struct SessionBinding {
     /// Accepted user input recovered from an interrupted turn. It is replayed
     /// through the normal runtime submit path after an agent becomes available.
     pub(crate) pending_resume_prompt: Option<Message>,
-    /// Fresh metadata prepared in memory but not yet catalog-visible. CodingRuntime
+    /// A fresh session prepared in memory but not yet catalog-visible. CodingRuntime
     /// publishes it only after the complete candidate graph has assembled.
-    staged_fresh: Option<SessionMeta>,
+    staged_fresh: Option<(SessionMeta, SessionHeader)>,
 }
 
 struct McpWorkGuard {
@@ -872,16 +873,20 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             let manager = Arc::new(SessionManager::for_project(&cfg.working_dir));
             let lease = session_lease(&manager, &id, reuse_lease.as_ref())?;
             let now = atomcode_capabilities::session::now_ms();
-            let mut meta = SessionMeta::new(&id, cfg.working_dir.to_string_lossy().as_ref(), now);
+            let working_dir = cfg.working_dir.to_string_lossy().into_owned();
+            let mut meta = SessionMeta::new(&id, working_dir.as_str(), now);
             meta.owner = StorageOwner::Native;
+            // The session's log starts with what stays true of it, the context
+            // block its prompt opens with among them: a resume sends that
+            // prefix again rather than one rendered from a repository that has
+            // moved on.
+            let mut header = SessionHeader::new(&id);
+            header.created_at = u64::try_from(now).unwrap_or(0);
+            header.cwd = Some(working_dir);
+            header.context = Some(SessionContextHook::new(&cfg.working_dir).block(None));
             if !stage_fresh {
                 manager
-                    .commit_native_import(
-                        &lease,
-                        Some(&SessionSnapshot::new(Vec::new())),
-                        Some(&PresentationFile::default()),
-                        &meta,
-                    )
+                    .create_event_session(&lease, &header, &meta)
                     .map_err(io::Error::from)?;
             }
             Some(SessionBinding {
@@ -890,7 +895,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 lease,
                 resume: None,
                 pending_resume_prompt: None,
-                staged_fresh: stage_fresh.then_some(meta),
+                staged_fresh: stage_fresh.then_some((meta, header)),
             })
         }
         SessionMode::Resume(id) => {
@@ -899,9 +904,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             // Resume is a native-only boundary. Legacy/unconfirmed data must first
             // converge through a driver importer; accepting a lone snapshot here
             // would bypass ownership and manufacture an incomplete native session.
-            let (loaded, pending_resume_prompt) = manager
-                .load_native_session_for_resume(&lease)
-                .map_err(io::Error::from)?;
+            // A session a released build stored as a snapshot becomes a log here,
+            // once (`docs/adr/0024` §10).
+            let (loaded, pending_resume_prompt) =
+                manager.open_for_resume(&lease).map_err(io::Error::from)?;
             // A version-mismatched snapshot must FAIL here, not fall through to the
             // kernel's empty-start seam — that would silently fresh-start under the
             // SAME session id and corrupt on-disk state.
@@ -919,9 +925,15 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             check_snapshot_version(snapshot)?;
             let manager = Arc::new(SessionManager::for_project(&cfg.working_dir));
             let lease = session_lease(&manager, id, reuse_lease.as_ref())?;
+            manager.open_as_events(&lease).map_err(io::Error::from)?;
             let loaded = manager.load_native_session(id).map_err(io::Error::from)?;
             check_snapshot_version(&loaded.snapshot)?;
-            if loaded.snapshot != *snapshot {
+            // What the log projects carries no system prompt; that is assembled
+            // for each request.
+            if !atomcode_capabilities::session::events::same_conversation(
+                &loaded.snapshot.messages,
+                &snapshot.messages,
+            ) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
@@ -1109,9 +1121,9 @@ fn session_lease(
 }
 
 impl SessionBinding {
-    /// A fresh session prepared in memory whose files are not on disk yet.
-    pub(crate) fn is_staged_fresh(&self) -> bool {
-        self.staged_fresh.is_some()
+    /// The header a session not published yet will be created with.
+    pub(crate) fn staged_header(&self) -> Option<&SessionHeader> {
+        self.staged_fresh.as_ref().map(|(_, header)| header)
     }
 }
 
@@ -1207,17 +1219,12 @@ impl CodingParts {
         let Some(binding) = self.session.as_mut() else {
             return Ok(());
         };
-        let Some(meta) = binding.staged_fresh.as_ref() else {
+        let Some((meta, header)) = binding.staged_fresh.as_ref() else {
             return Ok(());
         };
         binding
             .manager
-            .commit_native_import(
-                &binding.lease,
-                Some(&SessionSnapshot::new(Vec::new())),
-                Some(&PresentationFile::default()),
-                meta,
-            )
+            .create_event_session(&binding.lease, header, meta)
             .map_err(io::Error::from)?;
         binding.staged_fresh = None;
         Ok(())
@@ -1598,6 +1605,7 @@ pub fn subagent_runtime_knobs(
 mod tests {
     use super::*;
     use crate::config::CodingAgentConfig;
+    use atomcode_capabilities::session::PresentationFile;
 
     #[test]
     fn external_profiles_convert_and_guard_bypass() {
@@ -2089,7 +2097,7 @@ mod tests {
             .expect("a complete aggregate mounts")
             .app
             .stop();
-        std::fs::remove_file(manager.presentation_path(id).unwrap()).unwrap();
+        std::fs::remove_file(manager.events_path(id).unwrap()).unwrap();
 
         // Half a session is not a session: rebuilding on one would hand the model
         // a conversation the store cannot explain.
@@ -2098,7 +2106,7 @@ mod tests {
             Err(error) => error,
         };
         assert!(
-            error.contains(&manager.presentation_path(id).unwrap().display().to_string()),
+            error.contains(&manager.events_path(id).unwrap().display().to_string()),
             "the failure must name the missing file: {error}"
         );
         let _ = std::mem::size_of::<SessionStoreError>();
@@ -2150,7 +2158,10 @@ mod tests {
         assert!(error
             .to_string()
             .contains("does not match the canonical native snapshot"));
-        assert_eq!(manager.load_snapshot(id).unwrap(), canonical);
+        assert_eq!(
+            manager.load_snapshot(id).unwrap().messages,
+            canonical.messages
+        );
     }
 
     #[tokio::test]
@@ -2171,7 +2182,14 @@ mod tests {
             snapshot: canonical.clone(),
         };
         let parts = prepare(&cfg, opts).await.unwrap();
-        assert_eq!(parts.session.unwrap().resume.as_ref(), Some(&canonical));
+        assert_eq!(
+            parts
+                .session
+                .unwrap()
+                .resume
+                .map(|resumed| resumed.messages),
+            Some(canonical.messages)
+        );
     }
 
     #[tokio::test]

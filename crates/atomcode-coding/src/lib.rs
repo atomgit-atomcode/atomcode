@@ -57,7 +57,7 @@ pub mod plan_mode;
 pub mod plugin_hooks;
 pub mod provider_factory;
 pub mod runtime;
-pub mod session_journal;
+pub mod session_store;
 pub mod session_title;
 pub mod team;
 pub mod telemetry;

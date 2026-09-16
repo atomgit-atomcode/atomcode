@@ -92,9 +92,10 @@ M1 契约地基(kernel)
 | # | 内容 | 出处 |
 |---|---|---|
 | 3.1 | 落盘记录外层加提交时间(注入时钟) | 0024 §14 |
-| 3.2 | `SessionManager` 存事件日志:`<id>.events` + `<id>.index`,追加复用 `append_jsonl_line`;租约每个落盘 Agent 一份,追加前校验;写失败即停;删 `session-journal` 行 | 0024 §5、§12、§16 |
+| 3.2 | `SessionManager` 存事件日志:`<id>.events` + `<id>.index`,追加 `append_events`(与 `append_jsonl_line` 同样的保证);租约每个落盘 Agent 一份,追加前校验;写失败即停;删 `session-journal` 行 | 0024 §5、§12、§16、落地补充 |
 | 3.3 | 片段不落盘;人取消时半截输出合并成事实;投影带半截文本(只文本) | 0024 §7–9 |
 | 3.4 | resume = 重放事件日志,`session-native` 不再 `seed_from_snapshot` | 0024 §2 |
+| 3.4a | runtime 的撤销 / rewind / 恢复落成事实:`Rewound { to, scope }` 与投影规则、非前缀的恢复整段撤回再提交、重建失败截回(从 5.3 提前) | 0024 §17、落地补充 |
 | 3.5 | 读时转换旧原生会话:补旧 transcript 时间戳;旧文件加 `.migrated` 挪开(含 `.ui.json`) | 0024 §10、§14、§16 |
 | 3.6 | 返回 `SessionSnapshot` 的读接口改为事件投影(daemon / ACP 读路径不动) | 0024 §5 |
 | 3.7 | recall / worklog / `list_sessions` / 网页历史读事件;Claude Code hooks 的 `transcript_path` 指事件日志;删 `SnapshotHook` / `TranscriptHook` / presentation 写入 | 0024 §14、迁移写路径 |
@@ -130,7 +131,7 @@ M3 改 `session-native`),分 worktree 时先约定合并顺序。
 |---|---|---|
 | 5.1 | 重载配置 / skills 走 control patch | 0022 §2、0023 §1 |
 | 5.2 | 登出 / 登录只换模型行,不拆 agent;同一 App 内模型或推理档变了重发 `Described`(M1.6 只做了订阅时发) | 同上、0022 §5 |
-| 5.3 | 撤销、rewind、恢复快照:`Rewound { to, scope }` 事实与投影规则;`Checkpointed { turn, id }`;todo 跟投影走;屏幕把被撤的块标成已撤销并加标记块 | 0024 §17 |
+| 5.3 | 撤销、rewind、恢复快照:`Checkpointed { turn, id }`;todo 跟投影走;屏幕把被撤的块标成已撤销并加标记块(`Rewound` 事实与投影已在 3.4a) | 0024 §17 |
 | 5.4 | 宿主控制契约其余项 + adapter + tui 命令:撤销、rewind、恢复、切模型、MCP 状态与撤回、重载、登出 / 登录 | 0021 §2 |
 | 5.5 | goal / loop / 策略干预 / 本地上下文排队作为能力行,命令登记进命令目录;策略干预的两种错误归该行 | 0021 §3、§8、§10 |
 

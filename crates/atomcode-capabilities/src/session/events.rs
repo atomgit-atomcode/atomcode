@@ -22,9 +22,10 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use atomcode_kernel::message::SessionSnapshot;
+use atomcode_kernel::message::{Message, Role, SessionSnapshot};
 use atomcode_kernel::session::{
-    derive_messages_with_meta, LoggedEvent, SessionEvent, SessionHeader, SESSION_FORMAT_VERSION,
+    derive_messages_with_meta, InjectionOrigin, LoggedEvent, RewindScope, SeqNo, SessionEvent,
+    SessionHeader, SESSION_FORMAT_VERSION,
 };
 
 use super::manager::{
@@ -129,24 +130,7 @@ impl SessionManager {
             if matches!(logged.event, SessionEvent::AssistantChunk { .. }) {
                 continue;
             }
-            let line = serde_json::to_vec(&serde_json::json!({
-                "seq": logged.seq,
-                "at": logged.at,
-                "event": logged.event,
-            }))
-            .map_err(|error| SessionStoreError::Corrupt {
-                kind: "session event",
-                message: error.to_string(),
-            })?;
-            if line.len() + 1 > MAX_JSONL_LINE_BYTES {
-                return Err(SessionStoreError::TooLarge {
-                    kind: "session event",
-                    limit: MAX_JSONL_LINE_BYTES,
-                    actual: line.len() + 1,
-                });
-            }
-            buffer.extend_from_slice(&line);
-            buffer.push(b'\n');
+            buffer.extend_from_slice(&record_line(logged)?);
         }
         if buffer.is_empty() {
             return Ok(());
@@ -303,6 +287,480 @@ impl SessionManager {
     }
 }
 
+impl SessionManager {
+    /// How long the log is now: a point [`Self::truncate_events`] can take an
+    /// append back to.
+    pub fn events_mark(&self, id: &str) -> SessionResult<u64> {
+        let path = self.events_path(id)?;
+        Ok(fs::symlink_metadata(&path)
+            .map_err(|error| io_at(&path, error))?
+            .len())
+    }
+
+    /// Take back an append nobody has read yet: the log is cut to `mark`.
+    ///
+    /// The log is append-only for everyone who reads it. This exists for the one
+    /// writer that appended a change and then failed to put the rest of it in
+    /// place — a rebuilt agent that would not assemble after an undo — and is
+    /// rolling its own transaction back under the lease, with no agent running.
+    pub fn truncate_events(&self, lease: &SessionLease, mark: u64) -> SessionResult<()> {
+        self.validate_active_lease(lease)?;
+        let path = self.events_path(lease.id())?;
+        let file = retry_transient_file_access(|| {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(|error| io_at(&path, error))
+        })?;
+        fs2::FileExt::lock_exclusive(&file).map_err(|error| io_at(&path, error))?;
+        let len = file.metadata().map_err(|error| io_at(&path, error))?.len();
+        if mark > len {
+            return Err(SessionStoreError::Corrupt {
+                kind: "session events",
+                message: format!(
+                    "{}: cannot cut a {len}-byte log back to {mark} bytes",
+                    path.display()
+                ),
+            });
+        }
+        file.set_len(mark).map_err(|error| io_at(&path, error))
+    }
+
+    /// Append what makes this session's conversation `target`, stamped `at`.
+    /// Returns where the log stood before, for [`Self::truncate_events`].
+    pub fn append_conversation_change(
+        &self,
+        lease: &SessionLease,
+        target: &[Message],
+        at: u64,
+    ) -> SessionResult<u64> {
+        let mark = self.events_mark(lease.id())?;
+        let events = self.load_events(lease.id())?;
+        let next = events.iter().map(|e| e.seq).max().unwrap_or(0) + 1;
+        let change: Vec<LoggedEvent> = events_to_become(&events, target)
+            .into_iter()
+            .enumerate()
+            .map(|(offset, event)| LoggedEvent {
+                seq: next + offset as SeqNo,
+                at,
+                event,
+            })
+            .collect();
+        self.append_events(lease, &change)?;
+        Ok(mark)
+    }
+
+    /// Open a session as an event log, converting it once if it is still a
+    /// snapshot (`docs/adr/0024` §10). Returns whether it converted.
+    ///
+    /// The log, the sidecars and then the index are written — the index is the
+    /// commit point — and only then are the files a build from before the
+    /// format reads moved aside with a `.migrated` suffix, never deleted. A
+    /// conversion that stopped half way is finished the next time: files left
+    /// behind are moved aside again.
+    pub fn open_as_events(&self, lease: &SessionLease) -> SessionResult<bool> {
+        self.validate_active_lease(lease)?;
+        let id = lease.id();
+        if self.is_event_session(id) {
+            self.move_snapshot_files_aside(id)?;
+            return Ok(false);
+        }
+        self.convert(lease, self.load_native_session(id)?)?;
+        Ok(true)
+    }
+
+    /// [`Self::open_as_events`] for a resume: a prompt a snapshot-format
+    /// session had accepted but not answered when its process died is carried
+    /// across the conversion and handed back, the way a resume of one always
+    /// has.
+    pub fn open_for_resume(
+        &self,
+        lease: &SessionLease,
+    ) -> SessionResult<(super::manager::LoadedSession, Option<Message>)> {
+        self.validate_active_lease(lease)?;
+        let id = lease.id();
+        if self.is_event_session(id) {
+            self.move_snapshot_files_aside(id)?;
+            return self.load_native_session_for_resume(lease);
+        }
+        let (loaded, pending) = self.load_native_session_for_resume(lease)?;
+        self.convert(lease, loaded)?;
+        Ok((self.load_native_session(id)?, pending))
+    }
+
+    fn convert(
+        &self,
+        lease: &SessionLease,
+        loaded: super::manager::LoadedSession,
+    ) -> SessionResult<()> {
+        let id = lease.id();
+        let times = self.load_transcript_timestamps(id).unwrap_or_default();
+        let mut events = events_from_snapshot(&loaded.snapshot, 1);
+        stamp_turn_times(&mut events, &times);
+
+        let meta = loaded.meta;
+        let mut header = SessionHeader::new(id);
+        header.created_at = u64::try_from(meta.created_at).unwrap_or(0);
+        header.cwd = Some(meta.working_dir.clone());
+        header.parent = meta.fork_info.as_ref().map(|fork| fork.parent_id.clone());
+        header.context = stored_prompt(&loaded.snapshot);
+
+        let mut log = header_line(&header)?;
+        for logged in &events {
+            log.extend_from_slice(&record_line(logged)?);
+        }
+        if log.len() > MAX_JSONL_BYTES {
+            return Err(SessionStoreError::TooLarge {
+                kind: "session events",
+                limit: MAX_JSONL_BYTES,
+                actual: log.len(),
+            });
+        }
+        self.with_meta_lock(id, || {
+            super::manager::atomic_write(&self.events_path(id)?, &log)?;
+            for (from, to) in SIDECARS {
+                let source = self.path_for(id, from)?;
+                if fs::symlink_metadata(&source).is_err() {
+                    continue;
+                }
+                let bytes = read_regular_file_bounded(
+                    &source,
+                    "session sidecar",
+                    super::manager::MAX_META_BYTES.max(MAX_JSONL_BYTES),
+                )?;
+                super::manager::atomic_write(&self.path_for(id, to)?, &bytes)?;
+            }
+            self.write_index_unlocked(&meta)
+        })?;
+        self.move_snapshot_files_aside(id)
+    }
+
+    /// Move what a build from before the event format reads out of its sight.
+    fn move_snapshot_files_aside(&self, id: &str) -> SessionResult<()> {
+        for extension in SNAPSHOT_FILES {
+            let path = self.path_for(id, extension)?;
+            if fs::symlink_metadata(&path).is_err() {
+                continue;
+            }
+            let aside = self.path_for(id, &format!("{extension}.migrated"))?;
+            fs::rename(&path, &aside).map_err(|error| io_at(&path, error))?;
+        }
+        Ok(())
+    }
+}
+
+/// Snapshot-format sidecars and their names beside an event log.
+const SIDECARS: [(&str, &str); 4] = [
+    ("ui.json", "ui"),
+    ("rewind.json", "rewind"),
+    ("rewind.txn.json", "rewind.txn"),
+    ("todos.json", "todos"),
+];
+
+/// Every file a snapshot-format session keeps that a build from before the
+/// event format reads.
+const SNAPSHOT_FILES: [&str; 8] = [
+    "snapshot",
+    "snapshot.inflight",
+    "meta",
+    "jsonl",
+    "ui.json",
+    "rewind.json",
+    "rewind.txn.json",
+    "todos.json",
+];
+
+/// A converted session's facts carry the times its transcript recorded: a
+/// turn's facts when it started, its end when it completed.
+fn stamp_turn_times(
+    events: &mut [LoggedEvent],
+    times: &std::collections::BTreeMap<u64, super::transcript::TurnTimestamp>,
+) {
+    for logged in events {
+        let Some(time) = times.get(&logged.event.turn()) else {
+            continue;
+        };
+        let at = match logged.event {
+            SessionEvent::TurnEnd { .. } => time.completed_at,
+            _ => time.started_at.unwrap_or(time.completed_at),
+        };
+        logged.at = u64::try_from(at).unwrap_or(0);
+    }
+}
+
+/// The prompt a snapshot-format session was stored with: its leading system
+/// messages that no compaction wrote.
+pub fn stored_prompt(snapshot: &SessionSnapshot) -> Option<String> {
+    let prompt = snapshot
+        .messages
+        .iter()
+        .take_while(|m| m.role == Role::System && !m.synthetic)
+        .map(|m| m.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!prompt.is_empty()).then_some(prompt)
+}
+
+/// A conversation as a log projects it: without the system prompt, which is
+/// assembled for each request and was never a fact.
+pub fn without_system_prompt(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .filter(|m| m.role != Role::System || m.synthetic)
+        .cloned()
+        .collect()
+}
+
+/// Whether two conversations are the same one, stats aside: what a log
+/// projects against what a snapshot holds.
+pub fn same_conversation(a: &[Message], b: &[Message]) -> bool {
+    let strip = |messages: &[Message]| -> Vec<Message> {
+        without_system_prompt(messages)
+            .into_iter()
+            .map(|mut m| {
+                m.meta = None;
+                m
+            })
+            .collect()
+    };
+    strip(a) == strip(b)
+}
+
+/// The facts that, appended to `events`, make its projection `target`.
+///
+/// Nothing when it already is. When `target` is what the log held before one
+/// of its turns, a [`SessionEvent::Rewound`] to that turn — an undo, a rewind
+/// of the conversation, a restore to an earlier point. Otherwise the whole
+/// conversation is taken back and `target` is committed after it, so a restore
+/// to a conversation this log never held is still a fact, not a rewrite.
+/// Either way a memory or a compaction summary already injected stays, as it
+/// does for every undo.
+pub fn events_to_become(events: &[LoggedEvent], target: &[Message]) -> Vec<SessionEvent> {
+    if same_conversation(&derive_messages_with_meta(events), target) {
+        return Vec::new();
+    }
+    let turn = events.iter().map(|e| e.event.turn()).max().unwrap_or(0);
+    let next = events.iter().map(|e| e.seq).max().unwrap_or(0) + 1;
+    let rewound = |to: SeqNo| SessionEvent::Rewound {
+        turn,
+        to,
+        scope: RewindScope::Conversation,
+    };
+    let starts: Vec<SeqNo> = events
+        .iter()
+        .filter_map(|logged| {
+            matches!(logged.event, SessionEvent::TurnStart { .. }).then_some(logged.seq)
+        })
+        .collect();
+    let mut probe = events.to_vec();
+    for to in starts.iter().rev() {
+        probe.push(LoggedEvent {
+            seq: next,
+            at: 0,
+            event: rewound(*to),
+        });
+        if same_conversation(&derive_messages_with_meta(&probe), target) {
+            return vec![rewound(*to)];
+        }
+        probe.pop();
+    }
+    let from = starts
+        .first()
+        .copied()
+        .or_else(|| events.first().map(|e| e.seq))
+        .unwrap_or(next);
+    let mut change = vec![rewound(from)];
+    let reseeded = events_from_snapshot(&SessionSnapshot::new(target.to_vec()), 1);
+    let offset = reseeded
+        .iter()
+        .map(|e| e.event.turn())
+        .filter(|t| *t > 0)
+        .min()
+        .map(|first| turn.saturating_add(1).saturating_sub(first))
+        .unwrap_or(0);
+    change.extend(reseeded.into_iter().map(|logged| {
+        let mut event = logged.event;
+        shift_turn(&mut event, offset);
+        event
+    }));
+    change
+}
+
+/// Move a reseeded fact's turn past the turns the log already used.
+fn shift_turn(event: &mut SessionEvent, offset: u64) {
+    if offset == 0 {
+        return;
+    }
+    match event {
+        SessionEvent::TurnStart { turn }
+        | SessionEvent::UserMessage { turn, .. }
+        | SessionEvent::AssistantMessage { turn, .. }
+        | SessionEvent::ToolResultLogged { turn, .. }
+        | SessionEvent::Injected { turn, .. }
+        | SessionEvent::TurnEnd { turn, .. } => *turn += offset,
+        _ => {}
+    }
+}
+
+/// The facts a stored conversation is made of, numbered from `first_seq`.
+///
+/// The one crossing from a snapshot into a log: converting a session stored as
+/// a snapshot, restoring one the log never held, and a runtime with no store
+/// continuing from what it kept in memory. Lossy by construction — a snapshot
+/// holds messages, not what happened — so it is never on the resume path of a
+/// session that has a log.
+///
+/// Non-synthetic system messages are left out: they are regenerated for every
+/// request. A synthetic user message cannot say which kind of injection it was,
+/// so it comes back as a continuation — the same message to the model, one
+/// provenance fewer.
+///
+/// Turn numbers come from the stored ids where the messages carry them, and are
+/// counted otherwise; the last fact's turn is at least the snapshot's own
+/// `turn_counter`, so the next turn continues the session's sequence instead of
+/// reusing an id a rewind point or a turn stat was filed under.
+pub fn events_from_snapshot(snapshot: &SessionSnapshot, first_seq: SeqNo) -> Vec<LoggedEvent> {
+    let turns = turn_of_each_prompt(&snapshot.messages);
+    let mut events: Vec<SessionEvent> = Vec::new();
+    let mut turn = 0u64;
+    let mut round = 0u32;
+    let mut prompt = 0usize;
+
+    for message in &snapshot.messages {
+        match message.role {
+            Role::System => {
+                if message.synthetic {
+                    events.push(SessionEvent::Injected {
+                        turn,
+                        text: message.text.clone(),
+                        origin: InjectionOrigin::CompactionSummary,
+                    });
+                }
+            }
+            Role::User if !message.synthetic => {
+                turn = turns[prompt];
+                prompt += 1;
+                round = 0;
+                events.push(SessionEvent::TurnStart { turn });
+                events.push(SessionEvent::UserMessage {
+                    turn,
+                    text: message.text.clone(),
+                    images: message.images.clone(),
+                });
+            }
+            Role::User => {
+                // An empty synthetic user message carrying images right after a
+                // tool result is how a tool's picture reaches a vision model:
+                // it belongs to that result, not to the conversation.
+                let carrier = message.text.is_empty() && !message.images.is_empty();
+                if carrier {
+                    if let Some(SessionEvent::ToolResultLogged { images, .. }) = events.last_mut() {
+                        if images.is_empty() {
+                            images.clone_from(&message.images);
+                            continue;
+                        }
+                    }
+                }
+                events.push(SessionEvent::Injected {
+                    turn,
+                    text: message.text.clone(),
+                    origin: InjectionOrigin::Continuation,
+                });
+            }
+            Role::Assistant => {
+                round = message
+                    .meta
+                    .as_ref()
+                    .map(|meta| meta.round)
+                    .filter(|r| *r > round)
+                    .unwrap_or(round + 1);
+                events.push(SessionEvent::AssistantMessage {
+                    turn,
+                    round,
+                    text: message.text.clone(),
+                    reasoning: message.reasoning.clone().unwrap_or_default(),
+                    tool_calls: message.tool_calls.clone(),
+                    reasoning_blocks: message.reasoning_blocks.clone(),
+                    meta: message.meta.clone(),
+                });
+            }
+            Role::Tool => {
+                events.push(SessionEvent::ToolResultLogged {
+                    turn,
+                    round,
+                    call_id: message.tool_call_id.clone().unwrap_or_default(),
+                    content: message.text.clone(),
+                    is_error: message.is_error,
+                    images: message.images.clone(),
+                });
+            }
+        }
+    }
+
+    // A turn that stored nothing (it failed before any message was kept) still
+    // consumed its id. Say so with a boundary, which is not model-visible.
+    if snapshot.turn_counter > turn {
+        events.push(SessionEvent::TurnEnd {
+            turn: snapshot.turn_counter,
+            stop: atomcode_kernel::event::StopReason::Stopped,
+            error: None,
+        });
+    }
+
+    events
+        .into_iter()
+        .enumerate()
+        .map(|(offset, event)| LoggedEvent {
+            seq: first_seq + offset as SeqNo,
+            at: 0,
+            event,
+        })
+        .collect()
+}
+
+/// The turn id each real user prompt opened, in order.
+fn turn_of_each_prompt(messages: &[Message]) -> Vec<u64> {
+    let mut turns = Vec::new();
+    let mut last = 0u64;
+    for (index, message) in messages.iter().enumerate() {
+        if message.role != Role::User || message.synthetic {
+            continue;
+        }
+        let stored = messages[index + 1..]
+            .iter()
+            .take_while(|m| m.role != Role::User || m.synthetic)
+            .filter_map(|m| m.meta.as_ref())
+            .map(|meta| meta.turn_id)
+            .find(|id| *id > 0);
+        let turn = stored.filter(|id| *id > last).unwrap_or(last + 1);
+        turns.push(turn);
+        last = turn;
+    }
+    turns
+}
+
+/// One record line of the log, newline included.
+fn record_line(logged: &LoggedEvent) -> SessionResult<Vec<u8>> {
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "seq": logged.seq,
+        "at": logged.at,
+        "event": logged.event,
+    }))
+    .map_err(|error| SessionStoreError::Corrupt {
+        kind: "session event",
+        message: error.to_string(),
+    })?;
+    if line.len() + 1 > MAX_JSONL_LINE_BYTES {
+        return Err(SessionStoreError::TooLarge {
+            kind: "session event",
+            limit: MAX_JSONL_LINE_BYTES,
+            actual: line.len() + 1,
+        });
+    }
+    line.push(b'\n');
+    Ok(line)
+}
+
 /// A snapshot of what `events` project to.
 pub fn snapshot_of(events: &[LoggedEvent]) -> SessionSnapshot {
     let mut snapshot = SessionSnapshot::new(derive_messages_with_meta(events));
@@ -328,6 +786,7 @@ mod tests {
     use super::*;
     use crate::session::manager::StorageOwner;
     use atomcode_kernel::event::StopReason;
+    use atomcode_kernel::message::Message;
 
     const BUCKET: &str = "0123456789abcdef";
 
@@ -562,6 +1021,154 @@ mod tests {
             .collect();
         assert!(left.is_empty(), "{left:?}");
         assert!(!manager.is_event_session("s1"));
+    }
+
+    fn snapshot_session(manager: &SessionManager, id: &str) -> (SessionLease, SessionSnapshot) {
+        let lease = manager.acquire_lease(id).unwrap();
+        let mut answer = Message::assistant("hi there", vec![]);
+        answer.meta = Some(atomcode_kernel::message::MessageMeta {
+            turn_id: 3,
+            round: 1,
+            request_id: 4,
+            ..Default::default()
+        });
+        let mut snapshot = SessionSnapshot::new(vec![
+            Message::system("You are AtomCode\n\n=== CONTEXT"),
+            Message::user("hello"),
+            answer,
+        ]);
+        snapshot.turn_counter = 3;
+        manager
+            .commit_native_import(
+                &lease,
+                Some(&snapshot),
+                Some(&crate::session::PresentationFile::default()),
+                &meta(id),
+            )
+            .unwrap();
+        fs::write(
+            manager.path_for(id, "jsonl").unwrap(),
+            "{\"v\":1,\"ts\":2000,\"started_at\":1500,\"session_id\":\"s1\",\"turn_id\":3}\n",
+        )
+        .unwrap();
+        (lease, snapshot)
+    }
+
+    fn names(manager: &SessionManager) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(manager.root())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.ends_with(".lease") && !name.ends_with(".lock"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A session a released build stored as a snapshot is converted the first
+    /// time it is opened: the same conversation, the prompt it was stored with
+    /// and the times its transcript recorded, now as a log — and every file the
+    /// released build reads is moved aside, not deleted, so rolling back finds
+    /// nothing to continue behind the log's back.
+    #[test]
+    fn a_snapshot_session_is_converted_once_and_its_old_files_moved_aside() {
+        let (_dir, manager) = store();
+        let (lease, snapshot) = snapshot_session(&manager, "s1");
+
+        assert!(manager.open_as_events(&lease).unwrap(), "converted");
+        assert!(manager.is_event_session("s1"));
+        let events = manager.load_events("s1").unwrap();
+        assert!(same_conversation(
+            &derive_messages_with_meta(&events),
+            &snapshot.messages
+        ));
+        assert!(events.iter().all(|e| e.at >= 1500), "{events:?}");
+        let header = manager.read_event_header("s1").unwrap();
+        assert_eq!(
+            header.context.as_deref(),
+            Some("You are AtomCode\n\n=== CONTEXT")
+        );
+
+        let after = names(&manager);
+        for name in &after {
+            for older in [".snapshot", ".meta", ".jsonl", ".json"] {
+                assert!(!name.ends_with(older), "`{name}` left behind: {after:?}");
+            }
+        }
+        for moved in [
+            "s1.snapshot.migrated",
+            "s1.meta.migrated",
+            "s1.jsonl.migrated",
+        ] {
+            assert!(
+                after.iter().any(|n| n == moved),
+                "{moved} missing: {after:?}"
+            );
+        }
+
+        assert!(!manager.open_as_events(&lease).unwrap(), "only once");
+        fs::remove_file(manager.path_for("s1", "snapshot.migrated").unwrap()).unwrap();
+        assert_eq!(manager.load_events("s1").unwrap(), events);
+    }
+
+    /// Making a log's conversation some other one appends facts and rewrites
+    /// nothing: back to before a turn is one `Rewound`; a conversation the log
+    /// never held is everything taken back and that conversation committed.
+    #[test]
+    fn a_conversation_change_is_appended_as_facts() {
+        let mut log = a_turn();
+        log.extend(a_turn().into_iter().map(|mut logged| {
+            logged.seq += 10;
+            shift_turn(&mut logged.event, 1);
+            logged
+        }));
+        let first_turn = derive_messages_with_meta(&log[..5]);
+
+        let undo = events_to_become(&log, &first_turn);
+        assert_eq!(
+            undo,
+            vec![SessionEvent::Rewound {
+                turn: 2,
+                to: 11,
+                scope: RewindScope::Conversation
+            }]
+        );
+
+        let elsewhere = vec![
+            Message::user("restored"),
+            Message::assistant("noted", vec![]),
+        ];
+        let change = events_to_become(&log, &elsewhere);
+        let mut after = log.clone();
+        after.extend(
+            change
+                .into_iter()
+                .enumerate()
+                .map(|(i, event)| LoggedEvent {
+                    seq: 100 + i as u64,
+                    at: 0,
+                    event,
+                }),
+        );
+        assert!(same_conversation(
+            &derive_messages_with_meta(&after),
+            &elsewhere
+        ));
+        assert!(events_to_become(&after, &elsewhere).is_empty());
+    }
+
+    /// The writer that appended a change can take it back while nobody has read
+    /// it, and only under the lease.
+    #[test]
+    fn an_append_can_be_taken_back_to_its_mark() {
+        let (_dir, manager) = store();
+        let lease = created(&manager, "s1");
+        manager.append_events(&lease, &a_turn()).unwrap();
+        let before = manager.load_events("s1").unwrap();
+        let mark = manager.append_conversation_change(&lease, &[], 99).unwrap();
+        assert_ne!(manager.load_events("s1").unwrap(), before);
+        manager.truncate_events(&lease, mark).unwrap();
+        assert_eq!(manager.load_events("s1").unwrap(), before);
     }
 
     /// A fork starts from every fact of the source, under its own identity, with

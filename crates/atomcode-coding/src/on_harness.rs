@@ -138,14 +138,15 @@ pub const CODING_DEFAULTS: &str = r#"
 id = "round-cap"
 config = { max_rounds = 0 }
 
-# --- where the event journal goes ------------------------------------------
-# The harness row writes into `<home>/sessions/<bucket>/`, which in this product
-# is the native session store — every reader of native files then trips over
-# journals. This product's own row keeps the same format in the one directory
-# the native catalog passes over. See `session_journal`.
+# --- where a session's log goes ---------------------------------------------
+# Into the session store, under the lease of the session the runtime opened:
+# the host inserts `session-store` for that (see `session_store`). The harness's
+# own JSONL row would write a second copy beside the store under no lease, and a
+# tree with no session binding keeps nothing. The host swaps `session-store`
+# into this row's place, which is ahead of the agent that resumes from it.
 [[patch]]
 id = "session-persistence-jsonl"
-name = "session-journal"
+disabled = true
 
 # --- what the model can do to the repository ------------------------------
 # All routed through the execution world (`fs`/`shell`), so the fence and the
@@ -1209,7 +1210,6 @@ pub fn plugins() -> Vec<Arc<dyn Plugin>> {
         Arc::new(DatalogPlugin),
         Arc::new(CcHooksPlugin),
         Arc::new(ChatOptionsPlugin),
-        Arc::new(crate::session_journal::SessionJournalPlugin),
     ]
 }
 
@@ -1391,15 +1391,23 @@ pub async fn mount_hosted(
         Layer::from_toml(&coding_overlay(working_dir, &artifacts, presence, &model))
             .map_err(|e| e.to_string())?,
     );
-    // The session is the runtime's: its id, and its stored conversation as the
-    // seed. The harness's own `session` row would mint an id and, asked to
-    // resume, replay the JSONL journal — which is the follower, not the master.
+    // The session is the runtime's: its id, and its log in the session store,
+    // appended by `session-store` under the runtime's lease and replayed by
+    // `session-native`. The harness's own `session` row would mint an id.
     // With live switches, plan mode is the product's and is always mounted — it
     // decides per call whether it is on. Patched in place so it keeps
     // `plan-mode`'s position, ahead of the approval gates: a write plan mode
     // refuses must not first be asked about.
     let mut hosted = Layer::new()
         .swap("session", "session-native")
+        // In the persistence row's place, ahead of the agent that resumes from
+        // it: a row inserted at the end would mount after `ui-handle` had
+        // already created the agent.
+        .when(host.session.stored.is_some(), |layer| {
+            layer
+                .swap("session-persistence-jsonl", "session-store")
+                .enable("session-persistence-jsonl")
+        })
         // With live switches, plan mode is the product's and is always mounted
         // — it decides per call whether it is on.
         .when(host.modes.is_some(), |layer| {
@@ -1478,6 +1486,9 @@ pub async fn mount_hosted(
         registry.register(row);
     }
     registry.register(Arc::new(InjectProvider(providers.clone())));
+    if let Some(stored) = host.session.stored.clone() {
+        registry.register(Arc::new(crate::session_store::SessionStorePlugin(stored)));
+    }
     registry.register(Arc::new(crate::host_rows::SessionNativePlugin(Arc::new(
         host.session,
     ))));

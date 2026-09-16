@@ -469,6 +469,172 @@ async fn a_resumed_session_continues_the_stored_conversation() {
     second.handle.shutdown().await.unwrap();
 }
 
+/// A resumed session is its log and nothing else (`docs/adr/0024`).
+///
+/// A snapshot file beside the log — what a released build would have written —
+/// changes nothing a resume shows; without the log there is nothing to resume,
+/// and the runtime says so rather than falling back to anything else.
+async fn a_resumed_session_is_its_log_and_nothing_else() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut first = CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+        .await
+        .unwrap();
+    let id = first.session.clone().unwrap().id;
+    turn(&mut first, "remember pineapple").await;
+    first.handle.shutdown().await.unwrap();
+    let _ = first.task.await;
+
+    let manager = SessionManager::for_project(env.project.path());
+    std::fs::write(
+        manager.snapshot_path(&id).unwrap(),
+        serde_json::to_vec(&SessionSnapshot::new(vec![
+            Message::user("remember mango"),
+            Message::assistant("answer 1", vec![]),
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut second = CodingRuntime::start(start(
+        env.project.path(),
+        &recorder,
+        SessionMode::Resume(id.clone()),
+    ))
+    .await
+    .unwrap();
+    turn(&mut second, "which fruit?").await;
+    assert_eq!(
+        user_texts(&recorder.last_request()),
+        vec!["remember pineapple".to_string(), "which fruit?".to_string()],
+    );
+    second.handle.shutdown().await.unwrap();
+    let _ = second.task.await;
+
+    std::fs::remove_file(manager.events_path(&id).unwrap()).unwrap();
+    assert!(
+        CodingRuntime::start(start(
+            env.project.path(),
+            &recorder,
+            SessionMode::Resume(id.clone()),
+        ))
+        .await
+        .is_err(),
+        "a session without its log was resumed from something else"
+    );
+}
+
+/// A session a released build stored as a snapshot is resumed, and becomes a
+/// log on the way: resumed again after its snapshot is gone, it shows the same
+/// conversation. The released build's files are moved aside, not deleted.
+async fn a_session_a_released_build_stored_is_converted_when_resumed() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let manager = SessionManager::for_project(env.project.path());
+    let id = "5b0e0b8e-0000-4000-8000-000000000001";
+    let lease = manager.acquire_lease(id).unwrap();
+    let mut meta = atomcode_capabilities::session::SessionMeta::new(
+        id,
+        env.project.path().to_string_lossy(),
+        1,
+    );
+    meta.owner = atomcode_capabilities::session::StorageOwner::Native;
+    manager
+        .commit_native_import(
+            &lease,
+            Some(&SessionSnapshot::new(vec![
+                Message::system("You are AtomCode, as released"),
+                Message::user("remember kiwi"),
+                Message::assistant("noted", vec![]),
+            ])),
+            Some(&atomcode_capabilities::session::PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+    drop(lease);
+
+    let resume_and_ask = || async {
+        let mut runtime = CodingRuntime::start(start(
+            env.project.path(),
+            &recorder,
+            SessionMode::Resume(id.to_string()),
+        ))
+        .await
+        .unwrap();
+        turn(&mut runtime, "which fruit?").await;
+        assert_eq!(
+            user_texts(&recorder.last_request())[..2],
+            ["remember kiwi".to_string(), "which fruit?".to_string()],
+        );
+        runtime.handle.shutdown().await.unwrap();
+        let _ = runtime.task.await;
+    };
+
+    resume_and_ask().await;
+    assert!(manager.is_event_session(id));
+    assert!(!manager.snapshot_path(id).unwrap().exists());
+    let aside = manager.root().join(format!("{id}.snapshot.migrated"));
+    assert!(
+        aside.exists(),
+        "the released build's snapshot is kept aside"
+    );
+
+    std::fs::remove_file(aside).unwrap();
+    resume_and_ask().await;
+}
+
+/// A write to the session's log that fails stops the session: a log with a hole
+/// in it would replay into a conversation that never happened.
+async fn a_failed_write_to_the_log_stops_the_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+    turn(&mut runtime, "one").await;
+
+    let log = SessionManager::for_project(env.project.path())
+        .events_path(&id)
+        .unwrap();
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    runtime.handle.submit(UserInput::from("two")).await.unwrap();
+    let mut stopped = false;
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("turn did not finish")
+            .expect("runtime event stream closed");
+        match event.event {
+            CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::Error {
+                message,
+                ..
+            }) => stopped |= message.contains("runtime stopped"),
+            CodingRuntimeEvent::TurnFinished(_) => break,
+            _ => {}
+        }
+    }
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        stopped,
+        "the runtime went on after its log could not be written"
+    );
+    assert_eq!(
+        runtime.handle.status().phase,
+        atomcode_coding::RuntimePhase::Failed
+    );
+    assert!(runtime
+        .handle
+        .submit(UserInput::from("three"))
+        .await
+        .is_err());
+    let _ = runtime.handle.shutdown().await;
+}
+
 /// After an undo the model no longer sees the turn that was undone.
 async fn an_undone_turn_is_gone_from_what_the_model_sees() {
     let env = env();
@@ -1824,17 +1990,20 @@ async fn a_committed_compaction_is_stored_at_once_and_reported_truthfully() {
             .map(|m| (m.role.clone(), m.text.clone()))
             .collect::<Vec<_>>()
     };
+    // The log projects no system prompt; that is assembled per request.
+    let committed =
+        atomcode_capabilities::session::events::without_system_prompt(&committed.messages);
     assert_eq!(
         shape(&stored),
-        shape(&committed.messages),
+        shape(&committed),
         "the store has not caught up with the compaction"
     );
     assert_eq!(
         outcome.removed_messages,
-        before.len() - committed.messages.len(),
+        before.len() - committed.len(),
         "{} messages became {}",
         before.len(),
-        committed.messages.len()
+        committed.len()
     );
     runtime.handle.shutdown().await.unwrap();
 }
@@ -2478,12 +2647,13 @@ async fn every_model_round_is_reported_even_without_usage() {
     runtime.handle.shutdown().await.unwrap();
 }
 
-/// The session's transcript is the runtime's own, written by nobody else.
+/// The session's log has one writer, and holds facts, not chunks.
 ///
-/// The tree keeps a log of its own facts and the runtime keeps a transcript of
-/// its turns. Both name a file `<bucket>/<id>.jsonl`, and for a while both wrote
-/// the same one: two schemas in one file, which `recall` and the session catalog
-/// then read as a corrupt transcript.
+/// The log took the transcript's place (`docs/adr/0024` §14). For a while two
+/// writers shared `<bucket>/<id>.jsonl` — two schemas in one file, which
+/// `recall` and the session catalog then read as corrupt — and the transcript
+/// hook still runs every turn: a line from it in the log would be that again.
+/// Streamed chunks are the in-memory log's, never the file's (§7).
 #[tokio::test]
 #[serial_test::serial(engine)]
 async fn the_session_transcript_has_one_writer() {
@@ -2498,19 +2668,36 @@ async fn the_session_transcript_has_one_writer() {
     runtime.handle.shutdown().await.unwrap();
 
     let manager = SessionManager::for_project(env.project.path());
-    let path = manager.jsonl_path(&id).unwrap();
-    let transcript = std::fs::read_to_string(&path).unwrap();
-    assert!(!transcript.trim().is_empty(), "nothing was transcribed");
-    for line in transcript.lines().filter(|line| !line.trim().is_empty()) {
-        let record: serde_json::Value = serde_json::from_str(line).expect("a transcript record");
-        assert!(
-            record
-                .get("turn_id")
-                .and_then(serde_json::Value::as_u64)
-                .is_some(),
-            "a line that is not a turn record is another writer's: {line}"
+    let path = manager.events_path(&id).unwrap();
+    let log = std::fs::read_to_string(&path).unwrap();
+    let mut lines = log.lines().filter(|line| !line.trim().is_empty());
+    let header: serde_json::Value = serde_json::from_str(lines.next().expect("a header")).unwrap();
+    assert_eq!(header["header"]["id"], serde_json::json!(id), "{header}");
+    let mut last = 0;
+    let mut kinds = Vec::new();
+    for line in lines {
+        let record: serde_json::Value = serde_json::from_str(line).expect("a log record");
+        let seq = record
+            .get("seq")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(|| panic!("a line that is not a fact is another writer's: {line}"));
+        assert!(seq > last, "facts out of order: {line}");
+        last = seq;
+        kinds.push(
+            record["event"]["kind"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
         );
     }
+    assert!(
+        kinds.iter().any(|kind| kind == "assistant_message"),
+        "the reply was kept: {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|kind| kind == "assistant_chunk"),
+        "chunks were written: {kinds:?}"
+    );
 }
 
 /// The last tool result the model was shown.
@@ -2536,7 +2723,7 @@ fn last_tool_result(recorder: &Recorder) -> String {
 
 /// What the agent is told about its session is what this runtime does with it.
 ///
-/// The judge is the store itself — the snapshot path `SessionManager` resumes
+/// The judge is the store itself — the log path `SessionManager` resumes
 /// from — not the wording. Before, the only session description in this
 /// assembly was the harness journal's, so an agent asked "where is this
 /// conversation kept" named a file nothing reads back, and asked "how do I
@@ -2556,10 +2743,10 @@ async fn the_agent_is_told_where_its_session_really_is() {
     runtime.handle.shutdown().await.unwrap();
 
     let store = SessionManager::for_project(env.project.path());
-    let snapshot = store.snapshot_path(&id).unwrap();
+    let log = store.events_path(&id).unwrap();
     assert!(session.contains(&id), "{session}");
     assert!(
-        session.contains(&format!("kept in: {}", snapshot.display())),
+        session.contains(&format!("kept in: {}", log.display())),
         "the session must be placed where a resume reads it from:\n{session}"
     );
     assert!(
@@ -2574,7 +2761,7 @@ async fn the_agent_is_told_where_its_session_really_is() {
         "{operations}"
     );
     assert!(
-        operations.contains("rebuilds it from that file and from nothing else"),
+        operations.contains("a resume replays that file and nothing else"),
         "what a resume reads is the store's to say:\n{operations}"
     );
     // The product's contract for continuing a session, which every front end
@@ -2899,6 +3086,9 @@ mod criteria {
     criteria!(
         the_turn_is_stored_before_it_is_reported_finished,
         a_resumed_session_continues_the_stored_conversation,
+        a_resumed_session_is_its_log_and_nothing_else,
+        a_session_a_released_build_stored_is_converted_when_resumed,
+        a_failed_write_to_the_log_stops_the_session,
         an_undone_turn_is_gone_from_what_the_model_sees,
         a_sessionless_undo_is_gone_from_what_the_model_sees,
         switching_sessions_switches_what_the_model_sees,

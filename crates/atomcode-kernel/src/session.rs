@@ -452,6 +452,12 @@ pub struct SessionHeader {
     /// resume, a replay and a transcript can all tell the two apart.
     #[serde(default)]
     pub inherited: usize,
+    /// The environment block the session's system prompt carried when it
+    /// started — working directory, project instructions, a git snapshot.
+    /// Kept so a continued session sends the prefix it was sent before, not
+    /// one re-rendered from a repository that has moved on since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 impl SessionHeader {
@@ -463,6 +469,7 @@ impl SessionHeader {
             cwd: None,
             parent: None,
             inherited: 0,
+            context: None,
         }
     }
 }

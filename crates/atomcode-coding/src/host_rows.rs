@@ -9,10 +9,10 @@
 //! # `session-native`
 //!
 //! Stands in for the harness's `session` row. Same seam (`session-defaults`),
-//! with the id the runtime's native binding already has and — instead of
-//! "resume from the log store", which would replay the JSONL journal — the
-//! stored native conversation as a seed. Native is the master; see
-//! [`crate::native_log`].
+//! with the id the runtime's binding already has, resumed from that session's
+//! log in the session store (`session-store`, [`crate::session_store`]). The
+//! log is the session's one authority (`docs/adr/0024`): a rebuilt tree replays
+//! it, whatever it was rebuilt for.
 //!
 //! # `kernel-hooks`
 //!
@@ -73,14 +73,24 @@ use serde_json::Value;
 /// The session a tree's own agent is created with.
 #[derive(Clone, Default)]
 pub struct SessionSeed {
-    /// The native binding's id. `None` for a sessionless runtime, which lets the
-    /// tree mint one.
+    /// The binding's id. `None` for a sessionless runtime, which lets the tree
+    /// mint one.
     pub id: Option<String>,
-    /// The stored conversation to continue from.
+    /// What a sessionless runtime kept in memory to continue from. A session in
+    /// the store continues from its log instead.
     pub snapshot: Option<SessionSnapshot>,
-    /// The store the session is kept in. `None` exactly when `id` is: a
-    /// sessionless runtime keeps nothing.
-    pub store: Option<Arc<SessionManager>>,
+    /// The store the session is kept in, with the lease. `None` exactly when
+    /// `id` is: a sessionless runtime keeps nothing.
+    pub stored: Option<crate::session_store::StoredSession>,
+    /// Replay the stored log. False only for a session not published yet,
+    /// which has none.
+    pub resume: bool,
+}
+
+impl SessionSeed {
+    fn store(&self) -> Option<Arc<SessionManager>> {
+        self.stored.as_ref().map(|stored| stored.store.clone())
+    }
 }
 
 impl std::fmt::Debug for SessionSeed {
@@ -88,7 +98,8 @@ impl std::fmt::Debug for SessionSeed {
         f.debug_struct("SessionSeed")
             .field("id", &self.id)
             .field("snapshot", &self.snapshot)
-            .field("store", &self.store.as_ref().map(|store| store.root()))
+            .field("store", &self.store().as_ref().map(|store| store.root()))
+            .field("resume", &self.resume)
             .finish()
     }
 }
@@ -113,7 +124,7 @@ impl SessionNativePlugin {
         use atomcode_harness::plugins::self_knowledge::{describes, describes_live};
         use atomcode_harness::seams::Aspect;
 
-        let (Some(id), Some(store)) = (self.0.id.clone(), self.0.store.clone()) else {
+        let (Some(id), Some(store)) = (self.0.id.clone(), self.0.store()) else {
             describes(
                 ctx,
                 "sessions",
@@ -137,10 +148,10 @@ impl SessionNativePlugin {
             format!(
                 "SESSIONS. Sessions are kept per project in the AtomCode session \
                  store; this project's is `{root}`. For a session id: \
-                 `<id>.snapshot` is the conversation — a resume rebuilds it from \
-                 that file and from nothing else; `<id>.meta` holds its name, \
-                 working directory and per-turn statistics; `<id>.jsonl` is its \
-                 turn-by-turn transcript.\n\
+                 `<id>.events` is the session's log — every fact of the \
+                 conversation, appended as it happens; a resume replays that file \
+                 and nothing else; `<id>.index` holds its name, working directory \
+                 and per-turn statistics.\n\
                  Continuing a session is the person's to do, never yours, and never \
                  by editing these files or any configuration: `/resume` in the \
                  terminal UI, `atomcode --continue` (the latest) or `atomcode \
@@ -157,9 +168,9 @@ impl SessionNativePlugin {
             10,
             move |_| {
                 let mut lines = Vec::new();
-                match store.snapshot_path(&id) {
+                match store.events_path(&id) {
                     Ok(path) if path.exists() => lines.push(format!(
-                        "kept in: {} (the session store; a resume rebuilds from this file)",
+                        "kept in: {} (the session store; a resume replays this file)",
                         path.display()
                     )),
                     Ok(path) => lines.push(format!(
@@ -199,20 +210,21 @@ impl Plugin for SessionNativePlugin {
         &["session-defaults"]
     }
     fn description(&self) -> &'static str {
-        "the coding runtime's native session: its id, and its stored conversation as the seed"
+        "the coding runtime's session: its id, resumed from its log in the session store"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         self.describe(ctx);
-        let seed = self
-            .0
-            .snapshot
-            .as_ref()
-            .map(|snapshot| crate::native_log::seed_from_snapshot(snapshot, 1))
-            .unwrap_or_default();
+        // Only a runtime with no store continues from a conversation in memory.
+        let seed = match (&self.0.stored, &self.0.snapshot) {
+            (None, Some(snapshot)) => {
+                atomcode_capabilities::session::events::events_from_snapshot(snapshot, 1)
+            }
+            _ => Vec::new(),
+        };
         let _ = ctx
             .provide::<SessionDefaultsSvc>(Arc::new(SessionDefaults {
                 id: self.0.id.clone(),
-                resume: false,
+                resume: self.0.stored.is_some() && self.0.resume,
                 seed,
             }))
             .map_err(|e| e.to_string())?;
