@@ -50,10 +50,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{Agent, MessageOrigin};
-use crate::events::{
-    AgentChange, AgentCreated, AgentInfo, AgentRemoved as AgentRemovedEvent, AgentStatusChanged,
-    InboxInserted, SessionEventCommitted,
-};
+use crate::events::{AgentInfo, InboxInserted, SessionEventCommitted};
 use crate::seams::{
     AgentHandleSource, AgentHandleSvc, AgentLoopSvc, AgentsSvc, ApprovalPolicy, CompactionSvc,
     Decision, LlmSvc, SessionSvc, ToolBox, ToolsSvc, UiSvc, UserInterface, UserQuestions,
@@ -799,40 +796,6 @@ enum Woke {
 /// into the turn already running — is processed while the model is streaming.
 /// A pump that blocked on the turn could not deliver the one command whose
 /// entire purpose is to interrupt it.
-/// Sessions this handle streams facts for, each with the highest seq it has
-/// sent. Shared by the fact listener and the pump, and held across a
-/// subscription's catch-up, so history and live facts meet with no gap and no
-/// repeat.
-type Subscriptions = Arc<Mutex<HashMap<String, Subscription>>>;
-
-/// What one subscribed session's subscriber has been sent so far.
-struct Subscription {
-    /// The last fact.
-    high: crate::session::SeqNo,
-    /// The members it has been told joined and not yet told left. Only these
-    /// are reported on, so a member is never heard of before it is added or
-    /// after it is removed, and never added twice.
-    members: HashSet<String>,
-}
-
-/// Send the picture of a session's members a new subscriber starts from: each
-/// member described, then where it stands.
-fn announce_member(
-    events: &mpsc::UnboundedSender<AgentEvent>,
-    subscription: &mut Subscription,
-    member: &Agent,
-) {
-    if subscription.members.insert(member.session_id().to_string()) {
-        let _ = events.send(AgentEvent::AgentAdded {
-            description: Box::new(member.describe()),
-        });
-        let _ = events.send(AgentEvent::StatusChanged {
-            session: member.session_id().to_string(),
-            status: member.status(),
-        });
-    }
-}
-
 async fn pump(
     ctx: Context,
     agent: Arc<Agent>,
@@ -840,7 +803,7 @@ async fn pump(
     events: mpsc::UnboundedSender<AgentEvent>,
     mut commands: mpsc::UnboundedReceiver<AgentCommand>,
     manual_compaction: Arc<std::sync::atomic::AtomicBool>,
-    subscriptions: Subscriptions,
+    feed: Arc<crate::feed::Feed>,
 ) {
     let Ok(driver) = ctx.require::<AgentLoopSvc>() else {
         let _ = events.send(AgentEvent::Error {
@@ -1033,59 +996,17 @@ async fn pump(
             }
             AgentCommand::Subscribe { session, from } => {
                 // Its own session, or one it can reach by id — a team member's.
-                let agents = ctx.service::<AgentsSvc>();
-                let target = if session == agent.session_id() {
-                    Some(agent.clone())
-                } else {
-                    agents
-                        .as_ref()
-                        .and_then(|agents| agents.by_session(&session))
-                };
-                match target {
+                match crate::feed::Feed::find(&ctx, &session) {
                     None => reject(atomcode_kernel::event::CommandError::NotFound),
                     Some(target) => {
                         accept(None);
-                        // Held while the picture and the history are sent: a
-                        // fact committed, a member added or a status moved
-                        // meanwhile waits in its listener and then compares
-                        // against what is recorded here.
-                        let mut subscribed = subscriptions.lock().expect("subscriptions poisoned");
-                        let mut subscription = Subscription {
-                            high: from.saturating_sub(1),
-                            members: HashSet::new(),
-                        };
-                        let _ = events.send(AgentEvent::Described {
-                            description: Box::new(target.describe()),
-                        });
-                        let _ = events.send(AgentEvent::StatusChanged {
-                            session: session.clone(),
-                            status: target.status(),
-                        });
-                        for member in agents.iter().flat_map(|agents| agents.list()) {
-                            if member.parent() == Some(session.as_str()) {
-                                announce_member(&events, &mut subscription, &member);
-                            }
-                        }
-                        for logged in target.session().events() {
-                            if logged.seq >= from {
-                                subscription.high = logged.seq;
-                                let _ = events.send(AgentEvent::Fact(Box::new(Committed {
-                                    session: session.clone(),
-                                    seq: logged.seq,
-                                    event: logged.event,
-                                })));
-                            }
-                        }
-                        subscribed.insert(session, subscription);
+                        feed.subscribe(&ctx, &target, from);
                     }
                 }
                 continue;
             }
             AgentCommand::Unsubscribe { session } => {
-                subscriptions
-                    .lock()
-                    .expect("subscriptions poisoned")
-                    .remove(&session);
+                feed.unsubscribe(&session);
                 accept(None);
                 continue;
             }
@@ -1370,19 +1291,12 @@ pub async fn spawn(
 
     let out = events.clone();
     let fold = projector.clone();
-    let subscriptions: Subscriptions = Arc::new(Mutex::new(HashMap::new()));
-    let subscribed = subscriptions.clone();
+    // Sessions a driver subscribed to, pushed as they happen. Attached before
+    // the projection below, so a subscribed fact reaches the driver ahead of
+    // what it is projected into.
+    let feed = crate::feed::Feed::new(events.clone());
+    let feeding = feed.attach(ctx);
     let stream = ctx.on_emit::<SessionEventCommitted>(move |committed: &Committed| {
-        // Facts for whoever subscribed to this session — its own or a member's.
-        {
-            let mut sessions = subscribed.lock().expect("subscriptions poisoned");
-            if let Some(subscription) = sessions.get_mut(&committed.session) {
-                if committed.seq > subscription.high {
-                    subscription.high = committed.seq;
-                    let _ = out.send(AgentEvent::Fact(Box::new(committed.clone())));
-                }
-            }
-        }
         // One handle, one conversation. A delegated child commits to its
         // own log and this listener is above both.
         if committed.session != session_id {
@@ -1397,57 +1311,6 @@ pub async fn spawn(
         }
     });
 
-    // A subscribed session's members, as they come and go, and where each
-    // subscribed agent stands. Registered on the tree, which every agent's
-    // realm announces up to.
-    let members_out = events.clone();
-    let members_seen = subscriptions.clone();
-    let registry = agents.clone();
-    let added = ctx.on_emit::<AgentCreated>(move |info: &AgentInfo| {
-        let Some(member) = registry.get(info.id) else {
-            return;
-        };
-        let Some(parent) = member.parent() else {
-            return;
-        };
-        let mut sessions = members_seen.lock().expect("subscriptions poisoned");
-        if let Some(subscription) = sessions.get_mut(parent) {
-            announce_member(&members_out, subscription, &member);
-        }
-    });
-    let removed_out = events.clone();
-    let removed_seen = subscriptions.clone();
-    let removed = ctx.on_emit::<AgentRemovedEvent>(move |gone: &AgentChange| {
-        let Some(parent) = &gone.parent else {
-            return;
-        };
-        let mut sessions = removed_seen.lock().expect("subscriptions poisoned");
-        if let Some(subscription) = sessions.get_mut(parent) {
-            if subscription.members.remove(&gone.session) {
-                let _ = removed_out.send(AgentEvent::AgentRemoved {
-                    session: gone.session.clone(),
-                });
-            }
-        }
-    });
-    let status_out = events.clone();
-    let status_seen = subscriptions.clone();
-    let moved = ctx.on_emit::<AgentStatusChanged>(move |change: &AgentChange| {
-        let sessions = status_seen.lock().expect("subscriptions poisoned");
-        let subscribed = sessions.contains_key(&change.session)
-            || change
-                .parent
-                .as_ref()
-                .and_then(|parent| sessions.get(parent))
-                .is_some_and(|subscription| subscription.members.contains(&change.session));
-        if subscribed {
-            let _ = status_out.send(AgentEvent::StatusChanged {
-                session: change.session.clone(),
-                status: change.status,
-            });
-        }
-    });
-
     let (done_tx, done_rx) = oneshot::channel();
     let pump_ctx = ctx.clone();
     let pump_agent = agent.clone();
@@ -1459,16 +1322,16 @@ pub async fn spawn(
             events,
             command_rx,
             manual_compaction,
-            subscriptions,
+            feed,
         )
         .await;
         // The listener holds a clone of the sender; revoking it is what
         // lets the event channel close, so a driver reading to the end sees
         // the end. Dropping only the local handles would hang it forever.
         stream.dispose();
-        added.dispose();
-        removed.dispose();
-        moved.dispose();
+        for listener in feeding {
+            listener.dispose();
+        }
         let _ = done_tx.send(());
     });
 

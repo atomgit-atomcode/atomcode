@@ -30,6 +30,7 @@ pub mod bundle;
 pub mod control;
 pub mod events;
 pub mod exec;
+pub mod feed;
 pub mod launch;
 pub mod model_source;
 pub mod plugins;
