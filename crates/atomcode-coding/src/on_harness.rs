@@ -1303,6 +1303,8 @@ pub struct HostState {
     /// `[web_search] api_key`. Handed to `tool-web` as a plugin instance, never
     /// as row config — a config tree is printed verbatim, a credential must not be.
     pub web_search_api_key: Option<String>,
+    /// A front end outside the App, fed by the `front-end-feed` row.
+    pub front_end: Option<Arc<crate::front_end::FrontEnd>>,
 }
 
 /// See [`crate::host_rows::SessionContextPlugin`].
@@ -1435,6 +1437,9 @@ pub async fn mount_hosted(
         })
         .when(host.web_search_api_key.is_some(), |layer| {
             layer.swap("tool-web", "tool-web-keyed")
+        })
+        .when(host.front_end.is_some(), |layer| {
+            layer.insert(Entry::named("front-end-feed"))
         });
     if let Some(datalog) = host.datalog.as_ref() {
         hosted = hosted
@@ -1487,6 +1492,9 @@ pub async fn mount_hosted(
     )));
     if let Some(slot) = host.summary_provider {
         registry.register(Arc::new(crate::host_rows::CompactionCodingPlugin(slot)));
+    }
+    if let Some(front_end) = host.front_end {
+        registry.register(Arc::new(crate::front_end::FrontEndFeedPlugin(front_end)));
     }
     if let Some(hook) = host.compaction_checkpoint {
         registry.register(Arc::new(
@@ -2526,6 +2534,17 @@ impl Plugin for ChatOptionsPlugin {
             max_tokens: row.max_tokens,
             temperature: row.temperature,
         };
+        // Said the way it is applied: for every agent, unless something more
+        // specific — a member's role — already said otherwise.
+        if let Some(level) = options.reasoning_effort {
+            let _ = ctx.on_emit::<atomcode_harness::events::DescribeAgent>(
+                move |describing: &atomcode_harness::events::Describing| {
+                    let mut description =
+                        describing.description.lock().expect("description poisoned");
+                    description.reasoning_effort.get_or_insert(level);
+                },
+            );
+        }
         if options.reasoning_effort.is_none()
             && options.max_tokens.is_none()
             && options.temperature.is_none()

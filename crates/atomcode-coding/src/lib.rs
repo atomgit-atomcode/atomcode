@@ -49,6 +49,7 @@ fn _isolate_atomcode_home() {
 pub mod config;
 mod controllers;
 pub mod discipline;
+pub mod front_end;
 pub mod on_harness;
 pub mod parts;
 pub mod persona;

@@ -321,6 +321,7 @@ fn start(
             review: false,
             subagents: SubagentPolicy::Disabled,
             rate_limit_source: None,
+            front_end: None,
         },
         provider_factory: Arc::new(RecordingFactory(recorder.clone())),
         plugin_hooks: Arc::new(StaticPluginHookSource::default()),

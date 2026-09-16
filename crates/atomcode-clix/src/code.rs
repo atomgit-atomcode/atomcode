@@ -208,6 +208,7 @@ pub async fn code(args: CodeArgs) -> Result<()> {
         request_user_input: false,
         // clix is intentionally core/bridge-free; external endpoints keep generic 429 handling.
         rate_limit_source: None,
+        front_end: None,
     };
 
     eprintln!("preparing ({model}) …");

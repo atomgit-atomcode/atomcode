@@ -42,6 +42,7 @@ fn prepare_options() -> PrepareOptions {
         subagents: atomcode_coding::SubagentPolicy::Disabled,
         request_user_input: true,
         rate_limit_source: None,
+        front_end: None,
     }
 }
 

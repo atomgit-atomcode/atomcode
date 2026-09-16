@@ -7599,6 +7599,7 @@ fn harness_host_state(
         skills: parts.skill_registry(),
         mcp,
         rate_limit_source: parts.rate_limit_source().cloned(),
+        front_end: prepare.front_end.clone(),
         compaction_checkpoint: parts.snapshot_hook(),
         summary_provider: Some(parts.side_provider_slot()),
         model: Some(config.model.clone()),
@@ -9739,6 +9740,7 @@ mod tests {
                 review: false,
                 subagents: crate::SubagentPolicy::Disabled,
                 rate_limit_source: None,
+                front_end: None,
             },
             provider_factory: Arc::new(TestProviderFactory {
                 fail: fail_provider,

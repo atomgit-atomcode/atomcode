@@ -44,6 +44,7 @@ async fn sensitive_read_is_gated_and_fails_closed_through_full_assembly() {
         subagents: atomcode_coding::SubagentPolicy::Disabled,
         request_user_input: true,
         rate_limit_source: None,
+        front_end: None,
     };
     let parts = prepare(&cfg, opts.clone()).await.unwrap();
 

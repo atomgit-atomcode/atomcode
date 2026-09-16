@@ -139,6 +139,10 @@ pub struct PrepareOptions {
     pub request_user_input: bool,
     /// Provider-specific quota source supplied by the host. `None` keeps 429 handling generic.
     pub rate_limit_source: Option<Arc<dyn RateLimitWindowSource>>,
+    /// A front end outside the App, fed from every App the runtime builds
+    /// (`crate::front_end`). `None` when the driver reads the runtime's own
+    /// events instead.
+    pub front_end: Option<Arc<crate::front_end::FrontEnd>>,
 }
 
 impl Default for PrepareOptions {
@@ -157,6 +161,7 @@ impl Default for PrepareOptions {
             subagents: SubagentPolicy::Disabled,
             request_user_input: true,
             rate_limit_source: None,
+            front_end: None,
         }
     }
 }
@@ -1831,6 +1836,7 @@ mod tests {
             subagents: SubagentPolicy::Disabled,
             request_user_input: true,
             rate_limit_source: None,
+            front_end: None,
         };
 
         let prepared =
@@ -1906,6 +1912,7 @@ mod tests {
             subagents: SubagentPolicy::Disabled,
             request_user_input: true,
             rate_limit_source: None,
+            front_end: None,
         }
     }
 

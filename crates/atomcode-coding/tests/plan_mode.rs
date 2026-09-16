@@ -41,6 +41,7 @@ async fn plan_mode_blocks_a_write_tool_through_the_assembly() {
         subagents: atomcode_coding::SubagentPolicy::Disabled,
         request_user_input: true,
         rate_limit_source: None,
+        front_end: None,
     };
 
     let parts = prepare(&cfg, opts.clone()).await.unwrap();
