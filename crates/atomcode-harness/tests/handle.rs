@@ -1218,35 +1218,58 @@ async fn a_message_steered_into_a_running_turn_says_which_turn_answers_it() {
 }
 
 /// Every turn a driver is told began is closed exactly once, under the same
-/// number — a cancelled one included.
+/// number — however it ends: on its own, cancelled, failed, or with the driver
+/// shutting the handle down under it.
 #[tokio::test]
 async fn every_turn_started_is_closed_once_under_its_number() {
     let dir = scratch("turn-numbers");
+    // Failures from the third request on: the cancelled turn may or may not get
+    // as far as its request, and the ones after it fail either way.
     let app = start(tree(
         &dir,
-        &replay(r#"{ text = "one" }, { text = "two" }, { text = "three" }"#),
+        &replay(
+            r#"{ text = "one" }, { text = "two" }, { fail = "down" }, { fail = "down" }, { fail = "down" }"#,
+        ),
         &[],
     ))
     .await;
     let mut handle = handle_of(&app);
+    let commands = handle.commands.clone();
+    let mid_turn = |command: AgentCommand| {
+        app.context()
+            .on_waterfall::<atomcode_harness::events::AgentRequest>(
+                std::sync::Arc::new(SendsThroughHandleMidTurn {
+                    commands: commands.clone(),
+                    command: std::sync::Mutex::new(Some(command)),
+                }),
+                false,
+            )
+    };
 
     let mut all = Vec::new();
     handle.commands.send(message("first")).unwrap();
     all.extend(drain_turn(&mut handle).await);
     handle.commands.send(message("second")).unwrap();
     all.extend(drain_turn(&mut handle).await);
-    // A turn cancelled while its request is in flight.
-    let _guard = app
-        .context()
-        .on_waterfall::<atomcode_harness::events::AgentRequest>(
-            std::sync::Arc::new(SendsThroughHandleMidTurn {
-                commands: handle.commands.clone(),
-                command: std::sync::Mutex::new(Some(AgentCommand::Cancel)),
-            }),
-            false,
-        );
+    // Cancelled while its request is in flight.
+    let cancelling = mid_turn(AgentCommand::Cancel);
     handle.commands.send(message("third")).unwrap();
     all.extend(drain_turn(&mut handle).await);
+    cancelling.dispose();
+    // Failed.
+    handle.commands.send(message("fourth")).unwrap();
+    all.extend(drain_turn(&mut handle).await);
+    // Shut down under a running turn.
+    let _shutting = mid_turn(AgentCommand::Shutdown);
+    handle.commands.send(message("fifth")).unwrap();
+    all.extend(drain_turn(&mut handle).await);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), handle.events.recv())
+            .await
+            .expect("the stream ends")
+            .is_none(),
+        "nothing after the last turn closed"
+    );
 
     let started: Vec<Option<u64>> = all
         .iter()
@@ -1255,22 +1278,28 @@ async fn every_turn_started_is_closed_once_under_its_number() {
             _ => None,
         })
         .collect();
-    let closed: Vec<Option<u64>> = all
+    let closed: Vec<(Option<u64>, StopReason)> = all
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::TurnComplete { turn, .. } => Some(*turn),
+            AgentEvent::TurnComplete { turn, reason } => Some((*turn, *reason)),
             _ => None,
         })
         .collect();
-    assert_eq!(started.len(), 3, "{all:#?}");
+    assert_eq!(started.len(), 5, "{all:#?}");
     assert!(started.iter().all(Option::is_some), "{started:?}");
     assert_eq!(
-        started, closed,
+        started,
+        closed.iter().map(|(turn, _)| *turn).collect::<Vec<_>>(),
         "each start closed once, in order, same number"
     );
     let mut unique = started.clone();
     unique.dedup();
-    assert_eq!(unique.len(), 3, "three different turns: {started:?}");
+    assert_eq!(unique.len(), 5, "five different turns: {started:?}");
+    assert_eq!(
+        closed[3].1,
+        StopReason::ProviderError,
+        "the fourth turn is the failed one: {closed:?}"
+    );
 }
 
 #[tokio::test]
@@ -1693,5 +1722,48 @@ async fn a_subscribed_sessions_members_are_added_moved_and_removed_and_no_one_el
         about_agents(&again),
         vec![format!("described {session}"), format!("{session} Idle")],
         "{again:#?}"
+    );
+}
+
+/// A catalog command is answered under its own id. Nothing registers one yet, so
+/// the catalog a subscriber is shown is empty and no name is found.
+#[tokio::test]
+async fn a_command_the_catalog_does_not_have_is_not_found_under_its_own_id() {
+    let dir = scratch("invoke");
+    let app = start(tree(&dir, &replay(r#"{ text = "unused" }"#), &[])).await;
+    let mut handle = handle_of(&app);
+    let (session, _) = only_session(&app);
+    handle
+        .commands
+        .send(AgentCommand::Subscribe {
+            session: session.clone(),
+            from: 0,
+        })
+        .unwrap();
+    handle
+        .commands
+        .send(AgentCommand::Invoke {
+            id: "i-1".into(),
+            session: session.clone(),
+            name: "goal".into(),
+            args: "ship it".into(),
+        })
+        .unwrap();
+    let events = drain_quiet(&mut handle).await;
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Described { description } if description.commands.is_empty()
+        )),
+        "{events:#?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Rejected { command, error }
+                if command == "i-1" && *error == atomcode_kernel::event::CommandError::NotFound
+        )),
+        "{events:#?}"
     );
 }

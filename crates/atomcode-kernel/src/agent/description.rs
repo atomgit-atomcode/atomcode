@@ -61,4 +61,8 @@ pub struct AgentDescription {
     /// Whether the agent can compact its conversation.
     #[serde(default)]
     pub compaction: bool,
+    /// The commands a person can run against this agent
+    /// ([`super::CommandDescription`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<super::CommandDescription>,
 }

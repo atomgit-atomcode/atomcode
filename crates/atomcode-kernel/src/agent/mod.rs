@@ -6,8 +6,10 @@
 //! contract types live in sibling files so a reader can tell, by file, what is
 //! protocol and what is implementation (`docs/adr/0021` §6).
 
+mod catalog;
 mod description;
 mod engine;
 
+pub use catalog::*;
 pub use description::*;
 pub use engine::*;

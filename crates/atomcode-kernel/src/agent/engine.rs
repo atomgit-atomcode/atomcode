@@ -1476,7 +1476,9 @@ impl RunningAgent {
                 // Unwrapped on receipt; nothing tagged reaches this match.
                 AgentCommand::Tagged { .. } => {}
                 // This engine keeps no session log, so there are no facts to send.
-                AgentCommand::Subscribe { .. } | AgentCommand::Unsubscribe { .. } => {}
+                AgentCommand::Subscribe { .. }
+                | AgentCommand::Unsubscribe { .. }
+                | AgentCommand::Invoke { .. } => {}
                 AgentCommand::Shutdown => break,
                 // No turn is running at the top-level loop, but a Cancel that races in
                 // here (turn just returned) must still flush any orphaned parked request
@@ -1672,7 +1674,9 @@ impl RunningAgent {
                     // Unwrapped on receipt; nothing tagged reaches this match.
                     Some(AgentCommand::Tagged { .. }) => {}
                     // No session log here: nothing to subscribe to.
-                    Some(AgentCommand::Subscribe { .. }) | Some(AgentCommand::Unsubscribe { .. }) => {}
+                    Some(AgentCommand::Subscribe { .. })
+                    | Some(AgentCommand::Unsubscribe { .. })
+                    | Some(AgentCommand::Invoke { .. }) => {}
                     Some(AgentCommand::Respond { id, value }) => self.rt.resolve(id, value),
                     Some(AgentCommand::Shutdown) => {
                         // Shutdown during a live turn is a cooperative terminal, not

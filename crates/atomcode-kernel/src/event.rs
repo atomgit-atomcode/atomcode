@@ -233,6 +233,17 @@ pub enum AgentCommand {
     Unsubscribe {
         session: String,
     },
+    /// Run a command from a session's catalog (`docs/adr/0021` §10). `id` is
+    /// the receipt: `Accepted` or `Rejected` names it, and so does the
+    /// `Invoked` that carries the result. `session` is what the command acts
+    /// on — the session, or one agent in it, as the catalog entry says.
+    Invoke {
+        id: CommandId,
+        session: String,
+        name: String,
+        #[serde(default)]
+        args: String,
+    },
 }
 
 /// A driver's name for one command, echoed back on its receipt.
@@ -349,6 +360,11 @@ pub enum AgentEvent {
     /// for each member already there when the subscription starts.
     AgentAdded {
         description: crate::agent::AgentDescription,
+    },
+    /// What an `Invoke` produced, for a person to read.
+    Invoked {
+        id: CommandId,
+        output: String,
     },
     /// A member of a subscribed session is gone.
     AgentRemoved {
@@ -646,6 +662,12 @@ mod tests {
             supports_vision: true,
             reasoning_effort: Some(ReasoningEffort::Low),
             compaction: true,
+            commands: vec![crate::agent::CommandDescription {
+                name: "stop".into(),
+                usage: Some("<member>".into()),
+                summary: "stop a member".into(),
+                target: crate::agent::CommandTarget::Agent,
+            }],
         };
         for event in [
             AgentEvent::Described {
@@ -661,12 +683,28 @@ mod tests {
                 session: "lead/scout".into(),
                 status: AgentStatus::Stopping,
             },
+            AgentEvent::Invoked {
+                id: "i-1".into(),
+                output: "stopped: scout".into(),
+            },
         ] {
             let json = serde_json::to_string(&event).unwrap();
             let back =
                 serde_json::to_string(&serde_json::from_str::<AgentEvent>(&json).unwrap()).unwrap();
             assert_eq!(json, back);
         }
+
+        let invoke = AgentCommand::Invoke {
+            id: "i-1".into(),
+            session: "lead/scout".into(),
+            name: "stop".into(),
+            args: "scout".into(),
+        };
+        let json = serde_json::to_string(&invoke).unwrap();
+        assert_eq!(
+            json,
+            serde_json::to_string(&serde_json::from_str::<AgentCommand>(&json).unwrap()).unwrap()
+        );
 
         let sparse: AgentDescription = serde_json::from_str(r#"{"session":"s"}"#).unwrap();
         assert_eq!(

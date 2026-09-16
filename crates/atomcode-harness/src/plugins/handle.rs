@@ -938,6 +938,8 @@ async fn pump(
         // everything else is answered here, on the spot.
         let (receipt, command) = match command {
             AgentCommand::Tagged { id, command } => (Some(id), command.untagged()),
+            // A catalog command carries its own receipt.
+            AgentCommand::Invoke { ref id, .. } => (Some(id.clone()), command),
             other => (None, other),
         };
         let accept = |turn: Option<u64>| {
@@ -1085,6 +1087,13 @@ async fn pump(
                     .expect("subscriptions poisoned")
                     .remove(&session);
                 accept(None);
+                continue;
+            }
+            // Nothing has put a command in the catalog yet — the registry
+            // capability rows register into comes with the team (plan 4.4) — so
+            // there is no command by any name here.
+            AgentCommand::Invoke { .. } => {
+                reject(atomcode_kernel::event::CommandError::NotFound);
                 continue;
             }
             AgentCommand::Shutdown => {
