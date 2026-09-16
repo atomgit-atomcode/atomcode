@@ -7722,8 +7722,14 @@ struct MemoryPatch<'a> {
 }
 
 #[derive(serde::Serialize)]
+/// What `session-persistence-jsonl` actually reads.
+///
+/// NOT `resume`: that is the `session` row's field, and the string this replaced
+/// had been sending it here — to a row that has never read it — since the
+/// follower was wired. Typing the patch is what surfaced it. Whether the
+/// follower is replayed on resume is decided where it belongs, by
+/// `session-native`'s `SessionDefaults { resume: false }`.
 struct JsonlFollowerPatch<'a> {
-    resume: bool,
     root: std::path::PathBuf,
     project_root: &'a std::path::Path,
 }
@@ -7791,7 +7797,6 @@ fn harness_option_rows(
         .patch(
             "session-persistence-jsonl",
             JsonlFollowerPatch {
-                resume: false,
                 root: atomcode_harness::home().join("sessions").join("harness"),
                 project_root: wd,
             },

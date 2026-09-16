@@ -1,5 +1,10 @@
-//! Probe: the mounted row order, so a claim about gate ordering is read off the
-//! tree instead of inferred from where a row is written in the list.
+//! What the product actually mounts: the row order, the seams, and the config
+//! each row ends up with.
+//!
+//! Every test here sets `ATOMCODE_HOME`, so every one of them takes the
+//! `atomcode_home` serial lock — the same one `mount_wiring` uses. Without it
+//! they clobber each other's home mid-run, which shows up as a test that passes
+//! alone and fails in company.
 mod support;
 
 use std::sync::Arc;
@@ -30,6 +35,7 @@ impl atomcode_kernel::provider::LlmProvider for Silent {
 }
 
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 #[ignore = "probe, not a criterion: prints the mounted row order"]
 async fn dump_row_order() {
     let home = tempfile::tempdir().unwrap();
@@ -61,6 +67,7 @@ async fn dump_row_order() {
 /// Negative control: add a row whose plugin declares `provides` and returns
 /// without filling the slot, and this reports `DeclaredButNotProvided`.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn the_product_mounts_and_audits_clean() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -103,6 +110,7 @@ async fn the_product_mounts_and_audits_clean() {
 /// Negative control: drop the `claimed` filter in `HostMiddleware::rows` and
 /// this finds two rows.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn the_permission_gate_is_mounted_once() {
     let home = tempfile::tempdir().unwrap();
     std::env::set_var("ATOMCODE_HOME", home.path());
@@ -143,8 +151,12 @@ async fn the_permission_gate_is_mounted_once() {
 /// the point: an intentional one is a sentence someone wrote, an accidental one
 /// is a red test.
 #[tokio::test]
+#[serial_test::serial(atomcode_home)]
 async fn no_row_silently_loses_a_configured_field() {
     // (row, field, why losing it is intended)
+    // `session-persistence-jsonl` used to need an entry here for `resume`. It
+    // turned out base was setting a key that row has never read — see
+    // `bundle.rs` — so the answer was to delete it there, not to excuse it here.
     const INTENDED: &[(&str, &str, &str)] = &[(
         "agent-loop",
         "max_rounds",
@@ -205,4 +217,45 @@ async fn no_row_silently_loses_a_configured_field() {
         "a patch replaced a row's config and dropped a field the layer below set \
          (carry it in the patch, or add it to INTENDED with a reason): {lost:?}"
     );
+}
+
+/// The session rows carry what the runtime meant them to carry.
+///
+/// These are the rows the collapse is most exposed on: the native store is the
+/// master and the harness log is a follower, and the whole arrangement rests on
+/// the follower being pointed somewhere else. A field name that does not match
+/// the row's schema is silently ignored by serde — the follower would fall back
+/// to the DEFAULT root, which is where the native transcript lives, and two
+/// writers with two formats would be back in one file.
+///
+/// Nothing else catches that: `no_row_silently_loses_a_configured_field` only
+/// compares against what the BASE declares, and base declares neither of these.
+#[tokio::test]
+#[serial_test::serial(atomcode_home)]
+async fn the_session_rows_carry_what_the_runtime_sent() {
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+
+    let mounted = support::mount(&cfg, support::quiet_options(), Arc::new(Silent)).await;
+    let configs: std::collections::BTreeMap<String, serde_json::Value> =
+        mounted.row_configs().into_iter().collect();
+    let follower = configs
+        .get("session-persistence-jsonl")
+        .expect("the follower row is mounted");
+
+    let root = follower["root"]
+        .as_str()
+        .expect("the follower was given a root");
+    assert!(
+        root.ends_with("sessions/harness"),
+        "the follower must not share the native transcript's root: {root}"
+    );
+    assert_eq!(
+        follower["project_root"].as_str(),
+        Some(project.path().to_string_lossy().as_ref()),
+        "the follower buckets by the session's project, not the process cwd"
+    );
+    mounted.stop();
 }

@@ -41,7 +41,10 @@ name = "session-projection"
 
 [[insert]]
 name = "session-persistence-jsonl"
-config = { resume = false }
+# No `resume` here: that is the `session` row's field. This row appends, and who
+# replays the log is decided where the session is. It carried `resume = false`
+# until 2026-09-16, read by nothing — found when `atomcode-coding` stopped
+# formatting its patches as text and a typed one had nowhere to put the key.
 
 # --- registries: the slots everything else fills or reads -------------------
 [[insert]]
