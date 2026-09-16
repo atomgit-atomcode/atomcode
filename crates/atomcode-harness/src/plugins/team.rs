@@ -30,7 +30,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::agent::{Agent, AgentId, CreateAgent, MessageOrigin};
-use crate::events::{AgentRequest, SessionEventCommitted, TurnStopping};
+use crate::events::{SessionEventCommitted, TurnStopping};
 use crate::seams::{
     AgentsSvc, FsSvc, LlmSvc, LlmUtilitySvc, SessionSvc, ShellSvc, ToolBox, ToolsSvc,
 };
@@ -642,6 +642,11 @@ impl TeamTool {
         // and friends; the closure is `move` and `role` is not otherwise kept.
         let role_effort = effort_override.or(role.effort);
         let member_id = format!("{lead_session}/{name}");
+        let member_session = member_id.clone();
+        let identity = atomcode_kernel::agent::MemberIdentity {
+            name: name.clone(),
+            role: role.id.clone(),
+        };
         let lead_id = lead.id();
         let member_name = name.clone();
         let told_for_tool = told.clone();
@@ -655,47 +660,53 @@ impl TeamTool {
         if let Some((dir, _)) = &worktree {
             req = req.cwd(dir.clone());
         }
-        let child =
-            agents
-                .create(
-                    &self.ctx,
-                    req.setup(Box::new(move |realm: &Context| {
-                        let mut held = Vec::new();
-                        held.push(
-                            realm
-                                .provide::<ToolsSvc>(tools_for_realm)
-                                .map_err(|e| e.to_string())?,
-                        );
-                        held.push(
-                            realm
-                                .provide::<crate::seams::SystemPromptSvc>(prompts.clone())
-                                .map_err(|e| e.to_string())?,
-                        );
-                        if let Some(model) = utility.clone() {
-                            held.push(realm.provide::<LlmSvc>(model).map_err(|e| e.to_string())?);
-                        }
-                        held.push(realm.on_serial::<TurnStopping>(Arc::new(ChildRoundCap {
-                            max_steps: max_rounds,
-                        })));
-                        // The role's thinking tier, on this member's own realm.
-                        //
-                        // Here rather than somewhere global because a member is the
-                        // only thing that is per-role: the level is a fact about the
-                        // job this member was delegated, so it has to be scoped to
-                        // the member or two members in one team would share an
-                        // answer. `prepend` because this is more specific than the
-                        // session's `reasoning-effort` row, which still fills in for
-                        // any role that states no effort of its own.
-                        if let Some(effort) = role_effort {
-                            held.push(realm.on_waterfall::<AgentRequest>(
-                                Arc::new(RoleEffort { effort }),
-                                true,
-                            ));
-                        }
-                        Ok(held)
-                    })),
-                )
-                .await?;
+        let child = agents
+            .create(
+                &self.ctx,
+                req.setup(Box::new(move |realm: &Context| {
+                    let mut held = Vec::new();
+                    held.push(
+                        realm
+                            .provide::<ToolsSvc>(tools_for_realm)
+                            .map_err(|e| e.to_string())?,
+                    );
+                    held.push(
+                        realm
+                            .provide::<crate::seams::SystemPromptSvc>(prompts.clone())
+                            .map_err(|e| e.to_string())?,
+                    );
+                    if let Some(model) = utility.clone() {
+                        held.push(realm.provide::<LlmSvc>(model).map_err(|e| e.to_string())?);
+                    }
+                    held.push(realm.on_serial::<TurnStopping>(Arc::new(ChildRoundCap {
+                        max_steps: max_rounds,
+                    })));
+                    // The role's thinking tier, on this member's own realm.
+                    //
+                    // Here rather than somewhere global because a member is the
+                    // only thing that is per-role: the level is a fact about the
+                    // job this member was delegated, so it has to be scoped to
+                    // the member or two members in one team would share an
+                    // answer. `prepend` because this is more specific than the
+                    // session's `reasoning-effort` row, which still fills in for
+                    // any role that states no effort of its own.
+                    if let Some(effort) = role_effort {
+                        held.extend(RoleEffort { effort }.mount(realm, member_session.clone()));
+                    }
+                    // Who this member is, said by the row that made it one.
+                    held.push(realm.on_emit::<crate::events::DescribeAgent>(
+                        move |describing: &crate::events::Describing| {
+                            let mut description =
+                                describing.description.lock().expect("description poisoned");
+                            if description.session == member_session {
+                                description.member = Some(identity.clone());
+                            }
+                        },
+                    ));
+                    Ok(held)
+                })),
+            )
+            .await?;
         // The tool needs the member's registry id, which exists only now.
         restricted.register(Arc::new(TellParent {
             agents: agents_for_tool,

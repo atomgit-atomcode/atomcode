@@ -19,6 +19,8 @@
 //! removing their rows from the config removes their behaviour, with no branch
 //! left behind in the loop.
 
+use std::sync::Mutex;
+
 use atomcode_kernel::message::Message;
 use atomcode_kernel::provider::ChatOptions;
 use atomcode_kernel::stream::TokenUsage;
@@ -355,6 +357,47 @@ plexus_event!(
     /// An agent was created. A UI, a scheduler or a supervisor listens here
     /// rather than being told by whoever created it.
     AgentCreated, "agent/created", Emit, AgentInfo
+);
+
+/// An agent that changed status or left the registry, with what a listener
+/// needs to place it without looking it up — a removed one can no longer be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentChange {
+    pub id: crate::agent::AgentId,
+    pub session: String,
+    pub parent: Option<String>,
+    pub status: crate::agent::AgentStatus,
+}
+
+plexus_event!(
+    /// An agent's status moved. Emitted on the agent's own context, in the order
+    /// the moves happened, and only for a real move.
+    AgentStatusChanged, "agent/status", Emit, AgentChange
+);
+
+plexus_event!(
+    /// An agent left the registry. Emitted on its own context after what was
+    /// mounted for it alone is torn down; `status` is what it had then.
+    AgentRemoved, "agent/removed", Emit, AgentChange
+);
+
+/// A description being put together. Each row that implements part of an agent
+/// writes that part; see [`DescribeAgent`].
+pub struct Describing {
+    pub description: Mutex<atomcode_kernel::agent::AgentDescription>,
+}
+
+plexus_event!(
+    /// An agent is being described to a front end (`docs/adr/0022` §5).
+    ///
+    /// Emitted on the agent's own context, so a row that gave this agent
+    /// something — a role, a thinking level — hears it from the agent's realm
+    /// and one that serves every agent hears it from above. A listener writes
+    /// only what it implements and matches `description.session` when what it
+    /// knows is about one agent. Registration order decides between two
+    /// writers, so a session-wide default fills a field only if it is still
+    /// empty and a per-agent one overwrites.
+    DescribeAgent, "agent/describe", Emit, Describing
 );
 
 /// A message whose command asked for a receipt was taken by a turn.

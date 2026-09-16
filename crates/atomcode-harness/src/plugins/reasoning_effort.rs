@@ -30,7 +30,9 @@ use atomcode_plexus::{Context, Next, Plugin, Waterfall};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::events::{AgentRequest, ModelRequest, ModelResponse, RequestError};
+use crate::events::{
+    AgentRequest, DescribeAgent, Describing, ModelRequest, ModelResponse, RequestError,
+};
 
 /// The row's settings.
 ///
@@ -70,6 +72,12 @@ impl Plugin for ReasoningEffortPlugin {
         // should cost nothing, and "no opinion" has to look the same on the wire
         // whether the row is absent or empty.
         let _ = ctx.on_waterfall::<AgentRequest>(Arc::new(SetEffort { level }), false);
+        // Said the way it is applied: for every agent, unless something more
+        // specific already said otherwise.
+        let _ = ctx.on_emit::<DescribeAgent>(move |describing: &Describing| {
+            let mut description = describing.description.lock().expect("description poisoned");
+            description.reasoning_effort.get_or_insert(level);
+        });
         Ok(())
     }
 }

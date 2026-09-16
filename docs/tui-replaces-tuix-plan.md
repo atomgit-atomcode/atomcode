@@ -62,7 +62,7 @@ M1 契约地基(kernel)
 | # | 内容 | 出处 |
 |---|---|---|
 | 2.1 | 宿主侧 adapter:`kernel::host` 最小集 → `CodingRuntimeHandle` | 0021 §5 |
-| 2.2 | 事实转发行:每个 App 挂一份,把会话事实与 agent 状态、自述事件转发到宿主持有的流(先例 `native-compaction-checkpoint`,`coding/host_rows.rs:1608`) | 0022 §3 |
+| 2.2 | 事实转发行:每个 App 挂一份,把会话事实与 agent 状态、自述事件转发到宿主持有的流(先例 `native-compaction-checkpoint`,`coding/host_rows.rs:1608`);coding 装配的推理档不经 `reasoning-effort` 行,由这一行在 `agent/describe` 上填 | 0022 §3 |
 | 2.3 | tui 拆成独立 UI App:`ui-tui2` 不再起泵、不 `inject` `agents` / `agent-loop`;`tui-agent-client` 接宿主给的句柄与事实流;6 处 agent 侧服务直读改走契约 | 0022 §3 |
 | 2.4 | 每个会话一条流:`Presentation` 按 `(会话, BlockId)`;新会话 / resume 建新流、丢旧流;切换时 tip 行提示 | 0022 §6 |
 | 2.5 | 删可调布局:`tui-layout` 提示词片段、`adjust_layout`(`layout_tool.rs`)、`tui-commands-layout` 行、`ctrl-f` / `ctrl-z` / `ctrl-n`、`/mascot`、布局操作日志与撤销;面板行挂载时的 `LayoutOp::Show` / `Hide` 保留 | 0022 §8 |
@@ -129,7 +129,7 @@ M3 改 `session-native`),分 worktree 时先约定合并顺序。
 | # | 内容 | 出处 |
 |---|---|---|
 | 5.1 | 重载配置 / skills 走 control patch | 0022 §2、0023 §1 |
-| 5.2 | 登出 / 登录只换模型行,不拆 agent | 同上 |
+| 5.2 | 登出 / 登录只换模型行,不拆 agent;同一 App 内模型或推理档变了重发 `Described`(M1.6 只做了订阅时发) | 同上、0022 §5 |
 | 5.3 | 撤销、rewind、恢复快照:`Rewound { to, scope }` 事实与投影规则;`Checkpointed { turn, id }`;todo 跟投影走;屏幕把被撤的块标成已撤销并加标记块 | 0024 §17 |
 | 5.4 | 宿主控制契约其余项 + adapter + tui 命令:撤销、rewind、恢复、切模型、MCP 状态与撤回、重载、登出 / 登录 | 0021 §2 |
 | 5.5 | goal / loop / 策略干预 / 本地上下文排队作为能力行,命令登记进命令目录;策略干预的两种错误归该行 | 0021 §3、§8、§10 |

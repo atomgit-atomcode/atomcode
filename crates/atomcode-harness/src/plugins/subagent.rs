@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
-use atomcode_plexus::{Context, Plugin};
+use atomcode_plexus::{Context, Disposable, Plugin};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -118,6 +118,27 @@ pub(crate) async fn resolve_child_model(
 /// session default it would otherwise inherit.
 pub(crate) struct RoleEffort {
     pub(crate) effort: ReasoningEffort,
+}
+
+impl RoleEffort {
+    /// Put this level on every request `session` makes, and say so when that
+    /// session is described. One registration for both, so the level an agent
+    /// is described with is the one its requests carry.
+    pub(crate) fn mount(self, realm: &Context, session: String) -> Vec<Disposable> {
+        let effort = self.effort;
+        vec![
+            realm.on_waterfall::<AgentRequest>(Arc::new(self), true),
+            realm.on_emit::<crate::events::DescribeAgent>(
+                move |describing: &crate::events::Describing| {
+                    let mut description =
+                        describing.description.lock().expect("description poisoned");
+                    if description.session == session {
+                        description.reasoning_effort = Some(effort);
+                    }
+                },
+            ),
+        ]
+    }
 }
 
 #[async_trait]
@@ -255,8 +276,9 @@ impl Subagents for InProcessSubagents {
         let parent = crate::agent::current()
             .and_then(|c| c.service::<SessionSvc>())
             .map(|log| log.id().to_string());
+        let child_session = format!("sub-{}", crate::agent::mint_session_id());
         let mut req = crate::agent::CreateAgent::new()
-            .id(format!("sub-{}", crate::agent::mint_session_id()))
+            .id(child_session.clone())
             .persist(false)
             .setup(Box::new(move |realm: &Context| {
                 let mut held = vec![
@@ -278,9 +300,7 @@ impl Subagents for InProcessSubagents {
                     );
                 }
                 if let Some(effort) = effort {
-                    held.push(
-                        realm.on_waterfall::<AgentRequest>(Arc::new(RoleEffort { effort }), true),
-                    );
+                    held.extend(RoleEffort { effort }.mount(realm, child_session));
                 }
                 Ok(held)
             }));

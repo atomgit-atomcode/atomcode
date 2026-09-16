@@ -609,6 +609,69 @@ async fn a_members_tier_comes_from_its_role() {
     );
 }
 
+/// Who a member is, and the tier it thinks at, are said by the row that made it
+/// a member — the same tier its requests carry, and nothing for a role that
+/// states none (`docs/adr/0022` §5).
+#[tokio::test]
+async fn a_member_is_described_by_the_row_that_made_it_one() {
+    let dir = scratch("described");
+    write_role(
+        &dir,
+        "librarian",
+        "---\npermission: explore\ndifficulty: simple\neffort: low\n---\nYou catalogue.\n",
+    );
+    write_role(
+        &dir,
+        "plain",
+        "---\npermission: explore\ndifficulty: simple\n---\nYou look.\n",
+    );
+    let app = start(tree(
+        &dir,
+        r#"{ text = "ok" }"#,
+        r#"{ text = "catalogued" }, { text = "looked" }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    for (name, role) in [("lib", "librarian"), ("pl", "plain")] {
+        let told = as_lead(
+            &app,
+            &lead,
+            &format!(r#"{{"action":"delegate","name":"{name}","role":"{role}","task":"t"}}"#),
+        )
+        .await;
+        assert!(!told.is_error, "{}", told.content);
+    }
+    let described = |name: &str| {
+        agents
+            .by_session(&format!("{}/{name}", lead.session_id()))
+            .expect("the member")
+            .describe()
+    };
+
+    let lib = described("lib");
+    assert_eq!(lib.parent.as_deref(), Some(lead.session_id()));
+    assert_eq!(
+        lib.member,
+        Some(atomcode_kernel::agent::MemberIdentity {
+            name: "lib".into(),
+            role: "librarian".into(),
+        })
+    );
+    assert_eq!(lib.reasoning_effort, Some(ReasoningEffort::Low));
+
+    let plain = described("pl");
+    assert_eq!(plain.member.map(|m| m.role).as_deref(), Some("plain"));
+    assert_eq!(plain.reasoning_effort, None);
+
+    let lead_described = lead.describe();
+    assert_eq!(lead_described.member, None, "the lead is no one's member");
+    assert_eq!(
+        lead_described.reasoning_effort, None,
+        "a member's tier is the member's alone"
+    );
+}
+
 /// A role that states no effort must not have one invented for it — the
 /// session's own row stays in charge, which is what makes `effort` optional in
 /// a role file rather than something every project has to repeat.

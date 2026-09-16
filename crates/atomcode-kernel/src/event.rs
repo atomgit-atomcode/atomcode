@@ -340,6 +340,25 @@ pub enum AgentEvent {
     /// ([`AgentCommand::Subscribe`]). The session log is the content; a screen is
     /// a fold over these (`docs/adr/0022` §1).
     Fact(crate::session::Committed),
+    /// The agent behind a session just subscribed to, described. Sent first
+    /// on every subscription (`docs/adr/0022` §5).
+    Described {
+        description: crate::agent::AgentDescription,
+    },
+    /// A member joined a subscribed session. Followed by its status; also sent
+    /// for each member already there when the subscription starts.
+    AgentAdded {
+        description: crate::agent::AgentDescription,
+    },
+    /// A member of a subscribed session is gone.
+    AgentRemoved {
+        session: String,
+    },
+    /// A subscribed session's agent, or one of its members, changed status.
+    StatusChanged {
+        session: String,
+        status: crate::agent::AgentStatus,
+    },
     TextDelta(String),
     /// **Model-visible context the person did not type.**
     ///
@@ -607,6 +626,56 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// What a subscriber is told about an agent crosses the wire whole, and a
+    /// description written before a field existed still reads.
+    #[test]
+    fn agent_descriptions_and_status_cross_the_wire() {
+        use crate::agent::{AgentDescription, AgentStatus, MemberIdentity};
+        use crate::provider::ReasoningEffort;
+
+        let description = AgentDescription {
+            session: "lead/scout".into(),
+            parent: Some("lead".into()),
+            member: Some(MemberIdentity {
+                name: "scout".into(),
+                role: "explorer".into(),
+            }),
+            model: Some("glm-5".into()),
+            supports_vision: true,
+            reasoning_effort: Some(ReasoningEffort::Low),
+            compaction: true,
+        };
+        for event in [
+            AgentEvent::Described {
+                description: description.clone(),
+            },
+            AgentEvent::AgentAdded {
+                description: description.clone(),
+            },
+            AgentEvent::AgentRemoved {
+                session: "lead/scout".into(),
+            },
+            AgentEvent::StatusChanged {
+                session: "lead/scout".into(),
+                status: AgentStatus::Stopping,
+            },
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            let back =
+                serde_json::to_string(&serde_json::from_str::<AgentEvent>(&json).unwrap()).unwrap();
+            assert_eq!(json, back);
+        }
+
+        let sparse: AgentDescription = serde_json::from_str(r#"{"session":"s"}"#).unwrap();
+        assert_eq!(
+            sparse,
+            AgentDescription {
+                session: "s".into(),
+                ..Default::default()
+            }
+        );
     }
 
     /// The harness's own copy logged a refused input as `InputRejected`; the one

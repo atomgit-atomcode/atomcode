@@ -1484,3 +1484,214 @@ async fn subscribing_to_a_session_nobody_has_is_not_found() {
         }
     }
 }
+
+// ---- agents, described and pushed (docs/adr/0022 §5) ----------------------
+
+/// Everything a subscriber was told about agents, in order, facts left out.
+fn about_agents(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Described { description } => {
+                Some(format!("described {}", description.session))
+            }
+            AgentEvent::AgentAdded { description } => {
+                Some(format!("added {}", description.session))
+            }
+            AgentEvent::AgentRemoved { session } => Some(format!("removed {session}")),
+            AgentEvent::StatusChanged { session, status } => Some(format!("{session} {status:?}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whatever is queued now, without waiting on a turn.
+async fn drain_quiet(handle: &mut AgentHandle) -> Vec<AgentEvent> {
+    let mut seen = Vec::new();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(200), handle.events.recv()).await
+    {
+        seen.push(event);
+    }
+    seen
+}
+
+#[tokio::test]
+async fn a_subscription_starts_with_the_agent_described_and_where_it_stands() {
+    let dir = scratch("described");
+    let effort = "[[patch]]\nid = \"reasoning-effort\"\nconfig = { level = \"high\" }\n";
+    let app = start(tree(&dir, &replay(r#"{ text = "one" }"#), &[effort])).await;
+    let mut handle = handle_of(&app);
+    handle.commands.send(message("go")).unwrap();
+    drain_turn(&mut handle).await;
+    let (session, _) = only_session(&app);
+
+    handle
+        .commands
+        .send(AgentCommand::Subscribe {
+            session: session.clone(),
+            from: 0,
+        })
+        .unwrap();
+    let events = drain_quiet(&mut handle).await;
+
+    let Some(AgentEvent::Described { description }) = events.first() else {
+        panic!("the description comes first: {events:#?}");
+    };
+    assert_eq!(description.session, session);
+    assert_eq!(description.parent, None);
+    assert_eq!(description.member, None);
+    assert_eq!(description.model.as_deref(), Some("replay"));
+    assert_eq!(
+        description.reasoning_effort,
+        Some(atomcode_kernel::provider::ReasoningEffort::High),
+        "the level is said by the row that applies it"
+    );
+    assert!(description.compaction);
+    assert!(
+        matches!(
+            events.get(1),
+            Some(AgentEvent::StatusChanged { session: s, status: atomcode_kernel::agent::AgentStatus::Idle }) if *s == session
+        ),
+        "then where it stands, before any fact: {events:#?}"
+    );
+    assert!(matches!(events.get(2), Some(AgentEvent::Fact(_))));
+}
+
+#[tokio::test]
+async fn status_moves_with_the_turn_and_an_idle_cancel_moves_nothing() {
+    let dir = scratch("status");
+    let app = start(tree(&dir, &replay(r#"{ text = "one" }"#), &[])).await;
+    let mut handle = handle_of(&app);
+    let (session, _) = only_session(&app);
+    handle
+        .commands
+        .send(AgentCommand::Subscribe {
+            session: session.clone(),
+            from: 0,
+        })
+        .unwrap();
+    // Nothing is running: a cancel now stops nothing, and must not leave the
+    // agent reading as stopping until its next turn.
+    handle
+        .commands
+        .send(tagged("c", AgentCommand::Cancel))
+        .unwrap();
+    handle.commands.send(message("go")).unwrap();
+    let events = drain_turn_and_facts(&mut handle).await;
+
+    assert_eq!(
+        about_agents(&events),
+        vec![
+            format!("described {session}"),
+            format!("{session} Idle"),
+            format!("{session} Working"),
+            format!("{session} Idle"),
+        ],
+        "{events:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_subscribed_sessions_members_are_added_moved_and_removed_and_no_one_elses() {
+    let dir = scratch("members");
+    let app = start(tree(&dir, &replay(r#"{ text = "unused" }"#), &[])).await;
+    let mut handle = handle_of(&app);
+    let (session, _) = only_session(&app);
+    let ctx = app.context();
+    let agents = ctx
+        .service::<atomcode_harness::seams::AgentsSvc>()
+        .expect("agents");
+    let child = |parent: &str, id: &str| {
+        atomcode_harness::agent::CreateAgent::new()
+            .id(id)
+            .parent(parent)
+            .persist(false)
+    };
+
+    // One member before the subscription, one after; a stranger with a member
+    // of its own that this subscriber must never hear of.
+    let early = agents.create(&ctx, child(&session, "early")).await.unwrap();
+    let stranger = agents
+        .create(
+            &ctx,
+            atomcode_harness::agent::CreateAgent::new()
+                .id("stranger")
+                .persist(false),
+        )
+        .await
+        .unwrap();
+    handle
+        .commands
+        .send(AgentCommand::Subscribe {
+            session: session.clone(),
+            from: 0,
+        })
+        .unwrap();
+    let picture = drain_quiet(&mut handle).await;
+    assert_eq!(
+        about_agents(&picture),
+        vec![
+            format!("described {session}"),
+            format!("{session} Idle"),
+            "added early".to_string(),
+            "early Idle".to_string(),
+        ],
+        "a member already there is part of the picture: {picture:#?}"
+    );
+
+    let late = agents.create(&ctx, child(&session, "late")).await.unwrap();
+    let not_mine = agents
+        .create(&ctx, child(stranger.session_id(), "not-mine"))
+        .await
+        .unwrap();
+    late.begin_turn();
+    not_mine.begin_turn();
+    stranger.begin_turn();
+    late.cancel();
+    late.end_turn();
+    agents.remove(early.id());
+    agents.remove(not_mine.id());
+    let live = drain_quiet(&mut handle).await;
+    assert_eq!(
+        about_agents(&live),
+        vec![
+            "added late".to_string(),
+            "late Idle".to_string(),
+            "late Working".to_string(),
+            "late Stopping".to_string(),
+            "late Idle".to_string(),
+            "removed early".to_string(),
+        ],
+        "{live:#?}"
+    );
+
+    // Unsubscribed, nothing more — and a member removed meanwhile is simply
+    // not there when the subscriber comes back.
+    handle
+        .commands
+        .send(AgentCommand::Unsubscribe {
+            session: session.clone(),
+        })
+        .unwrap();
+    let _ = drain_quiet(&mut handle).await;
+    late.begin_turn();
+    agents.remove(late.id());
+    assert_eq!(
+        about_agents(&drain_quiet(&mut handle).await),
+        Vec::<String>::new()
+    );
+    handle
+        .commands
+        .send(AgentCommand::Subscribe {
+            session: session.clone(),
+            from: u64::MAX,
+        })
+        .unwrap();
+    let again = drain_quiet(&mut handle).await;
+    assert_eq!(
+        about_agents(&again),
+        vec![format!("described {session}"), format!("{session} Idle")],
+        "{again:#?}"
+    );
+}

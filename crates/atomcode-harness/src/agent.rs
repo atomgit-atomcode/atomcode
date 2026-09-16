@@ -33,8 +33,13 @@ use tokio_util::sync::CancellationToken;
 
 use atomcode_kernel::message::ImageContent;
 
-use crate::events::{AgentCreated, AgentInfo, InboxInserted};
-use crate::seams::{FsSvc, SessionDefaultsSvc, SessionPersistenceSvc, SessionSvc};
+use crate::events::{
+    AgentChange, AgentCreated, AgentInfo, AgentRemoved, AgentStatusChanged, DescribeAgent,
+    Describing, InboxInserted,
+};
+use crate::seams::{
+    CompactionSvc, FsSvc, LlmSvc, SessionDefaultsSvc, SessionPersistenceSvc, SessionSvc,
+};
 use crate::session::{InjectionOrigin, LoggedEvent, SessionEvent, SessionHeader, SessionLog};
 
 // ---- the agent whose turn this is -----------------------------------------
@@ -324,15 +329,9 @@ impl CreateAgent {
 
 pub type AgentId = u64;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AgentStatus {
-    /// Nothing owed; waiting for input.
-    Idle,
-    /// A turn is open.
-    Working,
-    /// Cancellation asked for; the current step is finishing.
-    Stopping,
-}
+/// The contract's status, which is the agent's own: one definition, so what a
+/// front end is told is what the agent is.
+pub use atomcode_kernel::agent::{AgentDescription, AgentStatus};
 
 /// Who asked for a turn.
 ///
@@ -551,6 +550,10 @@ pub struct Agent {
     /// What was mounted for this agent alone, torn down when it is removed.
     world: Mutex<Vec<Disposable>>,
     status: RwLock<AgentStatus>,
+    /// Held across a status move and its announcement, so moves are announced
+    /// in the order they happened. Separate from `status` so a listener may
+    /// still read it.
+    moving: Mutex<()>,
     /// The token the *current* turn runs under.
     ///
     /// Per turn, not per agent. A token that outlives the turn it stopped makes
@@ -639,7 +642,58 @@ impl Agent {
     }
 
     pub(crate) fn set_status(&self, status: AgentStatus) {
-        *self.status.write().expect("agent status poisoned") = status;
+        self.move_status(|_| Some(status));
+    }
+
+    /// Move the status if `to` says where, and announce a real move.
+    fn move_status(&self, to: impl FnOnce(AgentStatus) -> Option<AgentStatus>) {
+        let _moving = self.moving.lock().expect("agent status poisoned");
+        let moved = {
+            let mut status = self.status.write().expect("agent status poisoned");
+            match to(*status) {
+                Some(next) if next != *status => {
+                    *status = next;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if moved {
+            self.ctx.emit::<AgentStatusChanged>(&self.change());
+        }
+    }
+
+    fn change(&self) -> AgentChange {
+        AgentChange {
+            id: self.id,
+            session: self.session_id().to_string(),
+            parent: self.parent.clone(),
+            status: self.status(),
+        }
+    }
+
+    /// This agent as a front end is told about it (`docs/adr/0022` §5).
+    ///
+    /// What the agent's realm resolves is filled here; everything a row gave
+    /// this agent is written by that row, through [`DescribeAgent`].
+    pub fn describe(&self) -> AgentDescription {
+        let model = self.ctx.service::<LlmSvc>();
+        let describing = Describing {
+            description: Mutex::new(AgentDescription {
+                session: self.session_id().to_string(),
+                parent: self.parent.clone(),
+                member: None,
+                model: model.as_ref().map(|m| m.model_name().to_string()),
+                supports_vision: model.as_ref().is_some_and(|m| m.supports_vision()),
+                reasoning_effort: None,
+                compaction: self.ctx.service::<CompactionSvc>().is_some(),
+            }),
+        };
+        self.ctx.emit::<DescribeAgent>(&describing);
+        describing
+            .description
+            .into_inner()
+            .expect("description poisoned")
     }
 
     /// Ask the current turn to stop. Cooperative: the step in flight finishes.
@@ -648,7 +702,10 @@ impl Agent {
     /// means. It does not queue: a cancel that arrives before a turn opens is
     /// not held against that turn.
     pub fn cancel(&self) {
-        self.set_status(AgentStatus::Stopping);
+        // Only a turn can be stopping. An idle agent marked stopping stayed so
+        // until its next turn opened, and a front end showed it stopping all
+        // that while.
+        self.move_status(|now| (now == AgentStatus::Working).then_some(AgentStatus::Stopping));
         self.cancel.read().expect("cancel token poisoned").cancel();
     }
 
@@ -839,6 +896,7 @@ impl Agents {
             persist: req.persist,
             world: Mutex::new(world),
             status: RwLock::new(AgentStatus::Idle),
+            moving: Mutex::new(()),
             cancel: RwLock::new(CancellationToken::new()),
             interrupted: std::sync::atomic::AtomicBool::new(false),
         });
@@ -892,6 +950,7 @@ impl Agents {
             for d in world {
                 d.dispose();
             }
+            agent.ctx.emit::<AgentRemoved>(&agent.change());
         }
         removed
     }

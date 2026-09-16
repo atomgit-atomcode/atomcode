@@ -133,3 +133,22 @@ fn the_session_vocabulary_is_defined_once_in_the_kernel() {
         );
     }
 }
+
+/// What a front end is told about an agent is the kernel's, and the harness's
+/// agent reports its status in those words rather than a copy of them
+/// (`docs/adr/0022` §5).
+#[test]
+fn the_agent_description_is_defined_once_in_the_kernel() {
+    for needle in [
+        "pub enum AgentStatus",
+        "pub struct AgentDescription",
+        "pub struct MemberIdentity",
+    ] {
+        let found = definitions_of(needle);
+        assert_eq!(found.len(), 1, "`{needle}` defined exactly once: {found:?}");
+        assert!(
+            found[0].ends_with("atomcode-kernel/src/agent/description.rs"),
+            "`{needle}` lives in kernel::agent: {found:?}"
+        );
+    }
+}
