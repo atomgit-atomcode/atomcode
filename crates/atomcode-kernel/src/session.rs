@@ -295,6 +295,22 @@ pub enum SessionEvent {
         /// The turn's prompt and partial work no longer reach the model.
         undone: bool,
     },
+    /// Everything from `to` up to this fact no longer reaches the model
+    /// (`docs/adr/0024` §17): an undo, a rewind of the conversation, a return
+    /// to an earlier point. The facts stay in the log — the projection leaves
+    /// them out — so nothing is rewritten and a later reader can still see what
+    /// was undone.
+    ///
+    /// `to` is the sequence number of the `TurnStart` of the first turn undone.
+    /// Facts about the session rather than the turn stay in: an injected memory
+    /// or compaction summary. A compaction that fell inside the range goes with
+    /// it, and the projection falls back to the one before.
+    Rewound {
+        /// The turn this was committed in.
+        turn: u64,
+        to: SeqNo,
+        scope: RewindScope,
+    },
     /// A hard boundary ended the turn and the person has to choose how to go on.
     ///
     /// Screen-visible, so logged: the recovery choices ("complete it yourself",
@@ -338,6 +354,7 @@ impl SessionEvent {
             | Self::Titled { turn, .. }
             | Self::PolicyIntervention { turn, .. }
             | Self::Interrupted { turn, .. }
+            | Self::Rewound { turn, .. }
             | Self::RateLimitPaused { turn, .. }
             | Self::TurnEnd { turn, .. } => *turn,
         }
@@ -383,13 +400,29 @@ impl SessionEvent {
 /// [`SessionEvent::ToolResultsStubbed`] and [`InjectionOrigin::InternalNudge`]. Same shape again: a hard
 /// boundary's recovery choice, and what a person's cancel does to the history,
 /// were kernel behaviour the log never saw.
-pub const SESSION_FORMAT_VERSION: u32 = 4;
+pub const SESSION_FORMAT_VERSION: u32 = 5;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// What a [`SessionEvent::Rewound`] takes back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RewindScope {
+    /// The conversation: what the model sees.
+    Conversation,
+    /// The workspace, restored from a checkpoint. The conversation is untouched.
+    Code,
+    Both,
+}
+
+impl RewindScope {
+    pub fn takes_back_conversation(self) -> bool {
+        matches!(self, Self::Conversation | Self::Both)
+    }
 }
 
 /// What is true of a session before its first event, and stays true.
@@ -525,15 +558,29 @@ pub fn derive_messages_with_meta(events: &[LoggedEvent]) -> Vec<Message> {
 }
 
 fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
+    // What undos took back: every fact from a `Rewound`'s target up to the
+    // `Rewound` itself. Several stack.
+    let rewound: Vec<(SeqNo, SeqNo)> = events
+        .iter()
+        .filter_map(|logged| match &logged.event {
+            SessionEvent::Rewound { to, scope, .. } if scope.takes_back_conversation() => {
+                Some((*to, logged.seq))
+            }
+            _ => None,
+        })
+        .collect();
+    let taken_back = |seq: SeqNo| rewound.iter().any(|(to, at)| seq >= *to && seq < *at);
+
     // A compaction boundary replaces everything at or below it. Find the last
     // one first: replaying then discarding would be wasted work and, worse,
-    // would let a dropped tool result pair with a surviving call.
+    // would let a dropped tool result pair with a surviving call. One that was
+    // taken back no longer counts, and the one before it holds again.
     let mut floor: SeqNo = 0;
     let mut summary: Option<&str> = None;
     // How far the stubbing has reached, for the same reason: a result is shown
     // stubbed because a later fact says so.
     let mut stubbed_through: SeqNo = 0;
-    for logged in events {
+    for logged in events.iter().filter(|logged| !taken_back(logged.seq)) {
         match &logged.event {
             SessionEvent::Compacted {
                 through,
@@ -588,6 +635,18 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
             } | SessionEvent::Interrupted { .. }
         );
         if !session_wide && undone.contains(&logged.event.turn()) {
+            continue;
+        }
+        // An undo takes back a stretch of the log; what stood for the whole
+        // session — a memory, a summary — was never the undone turns' to take.
+        let stands_for_the_session = matches!(
+            &logged.event,
+            SessionEvent::Injected {
+                origin: InjectionOrigin::Memory | InjectionOrigin::CompactionSummary,
+                ..
+            }
+        );
+        if !stands_for_the_session && taken_back(logged.seq) {
             continue;
         }
         match &logged.event {

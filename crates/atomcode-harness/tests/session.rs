@@ -1064,3 +1064,164 @@ async fn every_record_carries_the_time_it_was_committed() {
     assert_eq!(reread.len(), logged.len());
     assert!(reread.iter().all(|e| e.at == 0), "{reread:#?}");
 }
+
+// ---- an undo is a fact (docs/adr/0024 §17) --------------------------------
+
+/// One whole turn: its boundary, a prompt, an answer.
+fn turn_of(
+    log: &SessionLog,
+    turn: u64,
+    said: &str,
+    answered: &str,
+) -> atomcode_harness::session::SeqNo {
+    let start = log.append(SessionEvent::TurnStart { turn });
+    log.append(SessionEvent::UserMessage {
+        turn,
+        text: said.into(),
+        images: vec![],
+    });
+    log.append(SessionEvent::AssistantMessage {
+        turn,
+        round: 1,
+        text: answered.into(),
+        reasoning: String::new(),
+        tool_calls: vec![],
+        reasoning_blocks: Vec::new(),
+        meta: None,
+    });
+    log.append(SessionEvent::TurnEnd {
+        turn,
+        stop: StopReason::Stopped,
+        error: None,
+    });
+    start
+}
+
+fn texts(messages: &[Message]) -> Vec<String> {
+    messages.iter().map(|m| m.text.clone()).collect()
+}
+
+/// Undone to a turn, the model sees exactly what it would if the log had
+/// stopped before that turn — and the log still has everything.
+#[test]
+fn an_undo_projects_what_the_log_held_before_the_undone_turn() {
+    let log = SessionLog::new("t");
+    turn_of(&log, 1, "one", "first");
+    let second = turn_of(&log, 2, "two", "second");
+    turn_of(&log, 3, "three", "third");
+    let before: Vec<LoggedEvent> = log
+        .events()
+        .into_iter()
+        .filter(|e| e.seq < second)
+        .collect();
+    let length = log.len();
+
+    log.append(SessionEvent::Rewound {
+        turn: 3,
+        to: second,
+        scope: atomcode_harness::session::RewindScope::Conversation,
+    });
+
+    assert_eq!(log.derive_messages(), derive_messages(&before));
+    assert_eq!(texts(&log.derive_messages()), vec!["one", "first"]);
+    assert_eq!(
+        log.len(),
+        length + 1,
+        "the undo is added, nothing is removed"
+    );
+
+    // After the undo the session goes on, and the next turn is seen.
+    turn_of(&log, 4, "four", "fourth");
+    assert_eq!(
+        texts(&log.derive_messages()),
+        vec!["one", "first", "four", "fourth"]
+    );
+}
+
+/// A compaction the undo took back no longer counts: the projection falls back
+/// to the history it had replaced. One from before the undone turns still holds.
+#[test]
+fn a_compaction_follows_the_undo_that_contains_it() {
+    let log = SessionLog::new("t");
+    turn_of(&log, 1, "one", "first");
+    let second = turn_of(&log, 2, "two", "second");
+    let through = log.events().last().unwrap().seq;
+    log.append(SessionEvent::Compacted {
+        turn: 3,
+        through,
+        summary: "SUMMARY".into(),
+    });
+    turn_of(&log, 3, "three", "third");
+    assert_eq!(
+        texts(&log.derive_messages()),
+        vec!["SUMMARY", "three", "third"]
+    );
+
+    // Undo to turn 2: the compaction came after its start, so it goes too.
+    log.append(SessionEvent::Rewound {
+        turn: 3,
+        to: second,
+        scope: atomcode_harness::session::RewindScope::Conversation,
+    });
+    assert_eq!(texts(&log.derive_messages()), vec!["one", "first"]);
+
+    // A compaction before the undone turns keeps holding.
+    let kept = SessionLog::new("k");
+    turn_of(&kept, 1, "one", "first");
+    let through = kept.events().last().unwrap().seq;
+    kept.append(SessionEvent::Compacted {
+        turn: 2,
+        through,
+        summary: "SUMMARY".into(),
+    });
+    let later = turn_of(&kept, 2, "two", "second");
+    turn_of(&kept, 3, "three", "third");
+    kept.append(SessionEvent::Rewound {
+        turn: 3,
+        to: later,
+        scope: atomcode_harness::session::RewindScope::Conversation,
+    });
+    assert_eq!(texts(&kept.derive_messages()), vec!["SUMMARY"]);
+}
+
+/// What stood for the whole session was not the undone turns' to take: a memory
+/// injected during them stays. A rewind of the code alone leaves the
+/// conversation as it was.
+#[test]
+fn an_undo_keeps_what_stands_for_the_session_and_a_code_rewind_keeps_the_conversation() {
+    let log = SessionLog::new("t");
+    turn_of(&log, 1, "one", "first");
+    let second = log.append(SessionEvent::TurnStart { turn: 2 });
+    log.append(SessionEvent::Injected {
+        turn: 2,
+        text: "REMEMBERED".into(),
+        origin: InjectionOrigin::Memory,
+    });
+    log.append(SessionEvent::UserMessage {
+        turn: 2,
+        text: "two".into(),
+        images: vec![],
+    });
+
+    let untouched = log.derive_messages();
+    log.append(SessionEvent::Rewound {
+        turn: 2,
+        to: second,
+        scope: atomcode_harness::session::RewindScope::Code,
+    });
+    assert_eq!(
+        log.derive_messages(),
+        untouched,
+        "code only: the conversation stays"
+    );
+
+    log.append(SessionEvent::Rewound {
+        turn: 2,
+        to: second,
+        scope: atomcode_harness::session::RewindScope::Both,
+    });
+    assert_eq!(
+        texts(&log.derive_messages()),
+        vec!["one", "first", "REMEMBERED"]
+    );
+}
