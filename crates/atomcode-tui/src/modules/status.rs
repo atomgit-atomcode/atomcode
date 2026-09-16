@@ -137,6 +137,133 @@ pub enum Mood {
     Sad,
 }
 
+/// Braille dot bit, and the sub-pixel grid position it stands for.
+///
+/// Braille packs **2×4 sub-pixels per cell**, so the art below is written as a
+/// `2w × 4h` grid and folded down. That is eight times the resolution of the old
+/// one-line cat, which is what makes ears and eyes possible at all. See
+/// `docs/adr/0023`.
+const DOTS: [(u32, usize, usize); 8] = [
+    (0x01, 0, 0),
+    (0x02, 0, 1),
+    (0x04, 0, 2),
+    (0x40, 0, 3),
+    (0x08, 1, 0),
+    (0x10, 1, 1),
+    (0x20, 1, 2),
+    (0x80, 1, 3),
+];
+
+/// How many cells wide the art is. Sixteen sub-pixel columns.
+const MASCOT_CELLS: usize = 8;
+/// How many rows the art occupies. Twelve sub-pixel rows ÷ four.
+pub const MASCOT_ROWS: usize = 3;
+
+/// The head, ears and chin: identical in every mood, so a mood change moves only
+/// the eyes and the mouth and the cat does not appear to jump.
+///
+/// Read as a 16 × 12 grid; `#` is fur, space is background.
+const MASCOT_EARS: [&str; 3] = ["   ##      ##   ", "  ####    ####  ", " ######  ###### "];
+
+/// Eyes and mouth, as the two grid rows each occupies.
+///
+/// The eyes are **holes in the fur** rather than drawn dots, which is what keeps
+/// the cat readable in one colour: a role-coloured pupil on a role-coloured head
+/// would be invisible.
+const EYES_OPEN: [&str; 2] = [" ###  ####  ### ", " ###  ####  ### "];
+const EYES_SHUT: [&str; 2] = [" ############## ", " ############## "];
+const MOUTH_SMALL: [&str; 2] = [" ######  ###### ", " ############## "];
+const MOUTH_WIDE: [&str; 2] = [" ############## ", " #####    ##### "];
+
+/// One face: ears, eyes, one filled row, mouth, chin.
+fn face(eyes: [&'static str; 2], mouth: [&'static str; 2]) -> [&'static str; 12] {
+    [
+        MASCOT_EARS[0],
+        MASCOT_EARS[1],
+        MASCOT_EARS[2],
+        " ############## ",
+        " ############## ",
+        eyes[0],
+        eyes[1],
+        " ############## ",
+        mouth[0],
+        mouth[1],
+        "  ############  ",
+        "    ########    ",
+    ]
+}
+
+/// Idle: awake and still. One frame, so an idle screen does not repaint — the
+/// reason `tick` is conditional below.
+fn idle_face() -> [&'static str; 12] {
+    face(EYES_OPEN, MOUTH_SMALL)
+}
+
+/// Thinking: blinking.
+///
+/// **The blink starts on frame 1**, not frame 0: frame 0 is the same open-eyed
+/// face as Idle, so that starting a turn does not make the cat jump — but then the
+/// very next frame has to differ, because "it really moves" is judged between
+/// consecutive ticks. A sequence that spent two frames open was a cat that paused
+/// before blinking.
+fn thinking_faces() -> Vec<[&'static str; 12]> {
+    vec![
+        face(EYES_OPEN, MOUTH_SMALL),
+        face(EYES_SHUT, MOUTH_SMALL),
+        face(EYES_OPEN, MOUTH_SMALL),
+        face(EYES_OPEN, MOUTH_SMALL),
+        face(EYES_SHUT, MOUTH_SMALL),
+        face(EYES_OPEN, MOUTH_SMALL),
+        face(EYES_OPEN, MOUTH_SMALL),
+        face(EYES_SHUT, MOUTH_SMALL),
+    ]
+}
+
+/// Happy: a wide open mouth, drawn as a hole.
+fn happy_face() -> [&'static str; 12] {
+    face(EYES_OPEN, MOUTH_WIDE)
+}
+
+/// Sad: eyes lowered a sub-pixel row and the mouth gone flat.
+fn sad_face() -> [&'static str; 12] {
+    face([" ############## ", " ###  ####  ### "], MOUTH_SMALL)
+}
+
+/// What a terminal with no Unicode gets instead.
+///
+/// Braille has no ASCII stand-in — `caps.rs` explains why for the spinner ("there
+/// is no one-cell ASCII stand-in that reads as motion"), and a grid of tofu is not
+/// a picture, so the art is withheld and this is what remains. Plain ASCII: on
+/// such a terminal the old faces were tofu anyway.
+fn ascii_faces(mood: &Mood) -> &'static [&'static str] {
+    match mood {
+        Mood::Idle => &["(=^.^=)"],
+        Mood::Thinking => &["(=^.^=)", "(=^-^=)"],
+        Mood::Happy => &["(=^o^=)"],
+        Mood::Sad => &["(=^;^=)"],
+    }
+}
+
+/// Fold a `16 × 12` fur grid down to `8 × 3` braille cells.
+fn braille(art: &[&str; 12]) -> Vec<String> {
+    let grid: Vec<Vec<char>> = art.iter().map(|row| row.chars().collect()).collect();
+    (0..MASCOT_ROWS)
+        .map(|cy| {
+            (0..MASCOT_CELLS)
+                .map(|cx| {
+                    let mut bits = 0u32;
+                    for (bit, dx, dy) in DOTS {
+                        if grid[cy * 4 + dy][cx * 2 + dx] != ' ' {
+                            bits |= bit;
+                        }
+                    }
+                    char::from_u32(0x2800 + bits).expect("a braille code point")
+                })
+                .collect()
+        })
+        .collect()
+}
+
 impl View for Mascot {
     type State = Mood;
 
@@ -155,23 +282,37 @@ impl View for Mascot {
     }
 
     fn render(mood: &Mood, vp: &Viewport<'_>) -> Vec<Line> {
-        let frames: &[&str] = match mood {
-            // Idle has one frame, so `tick` changes nothing and an idle screen
-            // does not repaint — the reason `tick()` below is conditional.
-            Mood::Idle => &["(=^·^=)"],
-            Mood::Thinking => &["(=^·^=)", "(=^-^=)", "(=^ω^=)", "(=^-^=)"],
-            Mood::Happy => &["(=^▽^=)"],
-            Mood::Sad => &["(=；ω；=)"],
+        let style = Style::new().fg(Color::role(Role::Error));
+        let w = vp.rect.w as usize;
+        let tick = vp.moment.tick as usize;
+
+        if !vp.moment.caps.unicode {
+            let faces = ascii_faces(mood);
+            let f = faces[tick % faces.len()];
+            return vec![Line::styled(width::take_width(f, w), style)];
+        }
+
+        // Idle, Happy and Sad each have one frame, so `tick` changes nothing and
+        // a screen sitting in one of them does not repaint. Only Thinking spends
+        // frames — animation on an idle screen is bandwidth on an ssh link for
+        // nothing, which is the trade this line makes.
+        let thinking = thinking_faces();
+        let frames: Vec<[&'static str; 12]> = match mood {
+            Mood::Idle => vec![idle_face()],
+            Mood::Thinking => thinking,
+            Mood::Happy => vec![happy_face()],
+            Mood::Sad => vec![sad_face()],
         };
-        let f = frames[(vp.moment.tick as usize) % frames.len()];
-        vec![Line::styled(
-            width::take_width(f, vp.rect.w as usize),
-            Style::new().fg(Color::role(Role::Error)),
-        )]
+        let f = &frames[tick % frames.len()];
+        braille(f)
+            .into_iter()
+            .map(|row| Line::styled(width::take_width(&row, w), style))
+            .collect()
     }
 
     fn height(_: &Mood, _: &Moment, _: u16) -> Height {
-        Height::Fixed(1)
+        // Three cells: twelve sub-pixel rows over four.
+        Height::Fixed(MASCOT_ROWS as u16)
     }
 
     fn tick() -> Option<std::time::Duration> {
@@ -189,11 +330,12 @@ mod tests {
     crate::tui_conformance!(view Mascot as mascot_conformance);
 
     fn draw<V: View>(state: &V::State, w: u16, moment: &Moment) -> String {
-        let vp = Viewport::new(Rect::sized(w, 1), moment);
+        let vp = Viewport::new(Rect::sized(w, 3), moment);
         V::render(state, &vp)
-            .first()
+            .iter()
             .map(|l| l.plain())
-            .unwrap_or_default()
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -312,6 +454,28 @@ mod tests {
             at(Mood::Idle, 5),
             "an idle screen must not repaint — that is bandwidth on an ssh link"
         );
+
+        // The same property on the ASCII path, which is a different set of frames:
+        // a terminal that cannot draw braille still gets a cat that blinks while
+        // it thinks, and one that holds still while it does not.
+        let plain = |mood, tick| {
+            let m = Moment {
+                caps: crate::caps::Caps::plain(),
+                ..Moment::default().at_tick(tick)
+            };
+            Mascot::render(&mood, &Viewport::new(Rect::sized(20, 3), &m))
+                .iter()
+                .map(Line::plain)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_ne!(
+            plain(Mood::Thinking, 0),
+            plain(Mood::Thinking, 1),
+            "the ASCII cat must move too"
+        );
+        assert_eq!(plain(Mood::Idle, 0), plain(Mood::Idle, 5));
+        assert_eq!(plain(Mood::Happy, 0), plain(Mood::Happy, 5));
     }
 
     #[test]
@@ -321,12 +485,112 @@ mod tests {
         for mood in [Mood::Idle, Mood::Thinking, Mood::Happy, Mood::Sad] {
             for tick in 0..12u64 {
                 let m = Moment::default().at_tick(tick);
-                let vp = Viewport::new(Rect::sized(20, 1), &m);
+                let vp = Viewport::new(Rect::sized(20, 3), &m);
                 let lines = Mascot::render(&mood, &vp);
-                assert_eq!(lines.len(), 1);
-                assert!(lines[0].width() <= 20);
-                assert!(!lines[0].plain().is_empty());
+                assert_eq!(
+                    lines.len(),
+                    MASCOT_ROWS,
+                    "{mood:?} at tick {tick}: the art is {MASCOT_ROWS} cells tall"
+                );
+                for line in &lines {
+                    assert!(line.width() <= 20);
+                    assert!(!line.plain().is_empty());
+                }
+                // Every row the same width, or the cat would look sheared: the
+                // braille grid is as wide as its widest sub-pixel row.
+                let widths: Vec<usize> = lines.iter().map(Line::width).collect();
+                assert!(
+                    widths.iter().all(|w| *w == widths[0]),
+                    "{mood:?} at tick {tick}: rows of different widths {widths:?}"
+                );
             }
         }
+    }
+
+    #[test]
+    fn a_terminal_without_unicode_gets_the_plain_cat_rather_than_tofu() {
+        // Braille is deliberately absent from the downgrade table — `caps.rs`
+        // explains why for the spinner, and the same holds for a grid of it. So
+        // the art is withheld and ASCII remains, rather than eight columns of
+        // `?` boxes.
+        let plain = Moment {
+            caps: crate::caps::Caps::plain(),
+            ..Moment::default()
+        };
+        let lines = Mascot::render(&Mood::Idle, &Viewport::new(Rect::sized(20, 3), &plain));
+        assert_eq!(lines.len(), 1, "one ASCII line, not three braille rows");
+        let text = lines[0].plain();
+        assert!(
+            text.is_ascii(),
+            "the fallback must be plain ASCII: {text:?}"
+        );
+        assert!(text.contains("(="), "{text:?}");
+        // And no braille anywhere in it.
+        assert!(
+            !text
+                .chars()
+                .any(|c| (0x2800..=0x28ff).contains(&(c as u32))),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn the_mood_is_visible_in_the_face() {
+        // A mood nobody can see is a mood that does not exist.
+        //
+        // Not "four moods, four pictures at one tick": Thinking's blink **starts
+        // open**, exactly like Idle, and that is right — a cat already blinking
+        // when it started thinking would be a cat that jumped. What is worth
+        // pinning is that each mood differs from the others *somewhere*, and that
+        // each of the others reaches something Idle never shows.
+        fn frame(mood: Mood, tick: u64) -> String {
+            let m = Moment::default().at_tick(tick);
+            Mascot::render(&mood, &Viewport::new(Rect::sized(20, 3), &m))
+                .iter()
+                .map(Line::plain)
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        const TICKS: std::ops::Range<u64> = 0..12;
+
+        let moods = [Mood::Idle, Mood::Thinking, Mood::Happy, Mood::Sad];
+        for (i, a) in moods.iter().enumerate() {
+            for b in moods.iter().skip(i + 1) {
+                assert!(
+                    TICKS.clone().any(|tick| frame(*a, tick) != frame(*b, tick)),
+                    "{a:?} and {b:?} are the same picture at every tick — one of \
+                     them is invisible"
+                );
+            }
+        }
+
+        // Idle is the one that never moves: an idle screen must not repaint, that
+        // is bandwidth on an ssh link. Every other mood has to reach something
+        // other than Idle, or its picture is pointless.
+        let idle: Vec<String> = TICKS.clone().map(|tick| frame(Mood::Idle, tick)).collect();
+        assert!(idle.iter().all(|f| *f == idle[0]), "idle moved: {idle:?}");
+        for mood in [Mood::Thinking, Mood::Happy, Mood::Sad] {
+            assert!(
+                TICKS.clone().any(|tick| frame(mood, tick) != idle[0]),
+                "{mood:?} never looks different from Idle"
+            );
+        }
+
+        // The ears are shared: only the face moves, so a mood change does not make
+        // the cat jump.
+        let ears: Vec<String> = moods
+            .iter()
+            .map(|mood| {
+                frame(*mood, 0)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            ears.iter().all(|e| *e == ears[0]),
+            "the ears moved between moods: {ears:?}"
+        );
     }
 }

@@ -309,7 +309,7 @@ impl Plugin for MascotPanel {
         &["tui-modules", "tui-layout"]
     }
     fn description(&self) -> &'static str {
-        "an animated mascot on a one-row strip at the top"
+        "an animated mascot on a three-row strip at the top"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let mods = ctx.require::<ModulesSvc>().map_err(|e| e.to_string())?;
@@ -324,7 +324,10 @@ impl Plugin for MascotPanel {
                 &LayoutOp::Show {
                     module: id.to_string(),
                     side: Side::Top,
-                    size: Some(1),
+                    // Three rows, because the art is braille: 2×4 sub-pixels per
+                    // cell, so twelve sub-pixel rows over four. One row could only
+                    // ever draw a one-line cat.
+                    size: Some(status::MASCOT_ROWS as u16),
                 },
                 &known,
             )
