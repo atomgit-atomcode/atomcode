@@ -12,6 +12,7 @@ pub mod conformance;
 pub mod event;
 pub use event::{OUTPUT_TRUNCATION_CHECKPOINT_KIND, ROUND_CAP_CHECKPOINT_KIND};
 pub mod hook;
+pub mod host;
 pub mod message;
 pub mod middleware;
 pub mod provider;
