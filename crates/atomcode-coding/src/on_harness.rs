@@ -509,8 +509,33 @@ fn model_rows(cfg: &crate::CodingAgentConfig) -> String {
         "[[patch]]\nid = \"chat-options\"\nconfig = {{ {} }}\n\n",
         fields.join(", ")
     ));
+    // Retries, and they belong HERE rather than in `config_rows` because
+    // `retry_max_attempts` is the PROVIDER's (`ProviderConfig`): a `/model` that
+    // moves the conversation to another provider moves whatever that one said
+    // about retrying, exactly as the 429 judgement above moves with it.
+    //
+    // An explicit upstream budget is the visible tier and wins; an explicit
+    // per-model adapter budget otherwise switches the outer tier off, the
+    // coupling the chain applies. Attempts count the first request.
+    //
+    // Always emitted, never conditional: a swap TO a provider that says nothing
+    // has to put the default back, and a patch that is simply absent leaves the
+    // previous provider's budget in place. Criterion:
+    // `the_retry_budget_follows_a_model_switch`.
+    let attempts = match (cfg.upstream_retry_max_attempts, cfg.retry_max_attempts) {
+        (Some(n), _) => n.saturating_add(1),
+        (None, Some(_)) => 1,
+        (None, None) => DEFAULT_RETRY_ATTEMPTS,
+    };
+    out.push_str(&format!(
+        "[[patch]]\nid = \"llm-retry\"\nconfig = {{ attempts = {attempts}, backoff_ms = 3000, cap_ms = 30000 }}\n\n"
+    ));
     out
 }
+
+/// What `llm-retry` carries in `bundle::INFRA`, restated here because a swap to
+/// a provider with no opinion has to actively put it back.
+const DEFAULT_RETRY_ATTEMPTS: u32 = 3;
 
 pub fn config_rows(cfg: &crate::CodingAgentConfig) -> String {
     let mut out = model_rows(cfg);
@@ -547,19 +572,6 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> String {
         "[[patch]]\nid = \"compaction-tail\"\nconfig = {{ threshold = {:?}, keep_turns = 2 }}\n\n",
         cfg.compact_threshold
     ));
-    // Retries. An explicit upstream budget is the visible tier and wins; an
-    // explicit per-model adapter budget otherwise switches the outer tier off,
-    // the coupling the chain applies. Attempts count the first request.
-    let attempts = match (cfg.upstream_retry_max_attempts, cfg.retry_max_attempts) {
-        (Some(n), _) => Some(n.saturating_add(1)),
-        (None, Some(_)) => Some(1),
-        (None, None) => None,
-    };
-    if let Some(attempts) = attempts {
-        out.push_str(&format!(
-            "[[patch]]\nid = \"llm-retry\"\nconfig = {{ attempts = {attempts}, backoff_ms = 3000, cap_ms = 30000 }}\n\n"
-        ));
-    }
     // How long a question to the person waits. `None` parks until answered.
     let ask = cfg.request_timeout.map(|d| d.as_secs().max(1)).unwrap_or(0);
     out.push_str(&format!(

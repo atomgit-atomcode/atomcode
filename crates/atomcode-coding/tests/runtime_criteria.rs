@@ -97,6 +97,16 @@ impl LlmProvider for RecordingProvider {
                             .to_string(),
                 })
             }
+            // A provider-side failure the retry tier is meant to ride out.
+            Some(m) if m.role == Role::User && m.text == "fail every time" => {
+                return Err(ProviderError {
+                    retryable: true,
+                    message: "HTTP 503: upstream hiccup".into(),
+                    http_status: Some(503),
+                    code: None,
+                    retry_after_secs: None,
+                });
+            }
             Some(m) if m.role == Role::User && m.text == "plan two things" => {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
@@ -1386,6 +1396,53 @@ async fn an_mcp_servers_tools_are_offered_and_run() {
     );
 }
 
+/// The retry budget follows the model, because it is the model's provider that
+/// declared it.
+///
+/// `retry_max_attempts` is per-provider (`ProviderConfig`), and the coupling the
+/// chain applies is that an explicit per-model budget switches the outer tier
+/// OFF — one attempt, no kernel retries. `/model` moves the conversation to a
+/// provider that may have said something else, or nothing at all, and both
+/// tiers have to move with it. Only one of them did: `llm-rate-limit` is
+/// re-patched on a swap, `llm-retry` was not, so a session that started on a
+/// provider with `retry_max_attempts = 0` kept "one attempt" on every model it
+/// switched to afterwards — while the same model, started fresh, retried three
+/// times. Same state, different behaviour, depending on how you got there.
+///
+/// Negative control: drop the `llm-retry` patch from `model_rows` and the second
+/// provider gets one attempt instead of the default three.
+///
+/// Costs ~8s of real time: the second turn burns the default budget and the
+/// backoff between attempts is not mocked. Worth it — the thing being measured
+/// is how many times a failing provider is actually called.
+async fn the_retry_budget_follows_a_model_switch() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    // This provider says "do not retry me". One attempt, and that is the whole
+    // budget for a turn on it.
+    start.agent.retry_max_attempts = Some(0);
+    let mut next = start.agent.clone();
+    next.model = "recorder-two".into();
+    // …and this one says nothing, so it gets the tree's default.
+    next.retry_max_attempts = None;
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    turn(&mut runtime, "fail every time").await;
+    let on_first = recorder.requests.lock().unwrap().len();
+    assert_eq!(on_first, 1, "a provider that forbade retries was retried");
+
+    recorder.requests.lock().unwrap().clear();
+    runtime.handle.reassemble_provider(next).await.unwrap();
+    turn(&mut runtime, "fail every time").await;
+    let on_second = recorder.requests.lock().unwrap().len();
+    assert_eq!(
+        on_second, 3,
+        "after /model the new provider still carries the old one's retry budget"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// A turn that wrote a task list leaves it in the session's todo sidecar.
 ///
 /// The sidecar is what a compacted session has left: compaction drains the
@@ -2456,6 +2513,7 @@ mod criteria {
         an_mcp_servers_tools_are_offered_and_run,
         withdrawing_mcp_takes_the_tools_off_the_model,
         a_written_task_list_outlives_the_messages_it_came_from,
+        the_retry_budget_follows_a_model_switch,
         a_cancelled_turn_is_undone_by_default,
         a_cancelled_turn_is_kept_when_asked,
         a_distant_rate_limit_pauses_the_turn,
