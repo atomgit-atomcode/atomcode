@@ -149,8 +149,8 @@ pub enum El {
     /// Deliberately absent: `flex-wrap` (a terminal row that wraps is a layout
     /// nobody can read, and it would end the "every row is exactly `w` cells"
     /// invariant that catches real bugs) and `order` (the tree order is what a
-    /// person edits and what `describe_for_model` reports; a second ordering
-    /// would make those two disagree).
+    /// the rows that build it write; a second ordering would make the two
+    /// disagree).
     ///
     /// `align-items` is absent too, but only for now and for a concrete
     /// reason: cross-axis alignment needs each child's *cross-axis* wanted
@@ -338,8 +338,8 @@ impl El {
 
     /// Every module id this tree names, in tree order.
     ///
-    /// The tail counts: a module riding the stream is on screen, so `/hide` it
-    /// must be accepted and `/show` it must be refused as already there. Both
+    /// The tail counts: a module riding the stream is on screen, so hiding it
+    /// must be accepted and showing it must be refused as already there. Both
     /// questions are asked of this list (`Layout::apply`).
     pub fn modules(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -1073,9 +1073,9 @@ mod tests {
 
     #[test]
     fn a_tail_id_is_a_module_the_tree_names() {
-        // What `/hide todo` and `/show todo` are decided against. A module
-        // riding the stream is on screen, so leaving it out of this list would
-        // make `/hide` refuse a panel the person can see.
+        // What hiding and showing `todo` are decided against. A module riding
+        // the stream is on screen, so leaving it out of this list would make
+        // `Hide` refuse a panel that is on screen.
         let tree = El::split(
             Dir::Vertical,
             Constraint::Fill,

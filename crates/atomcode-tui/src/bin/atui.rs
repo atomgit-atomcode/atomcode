@@ -219,10 +219,9 @@ KEYS
                  then the turn.  ctrl-c always stops the turn.
     ctrl-d       quit            ctrl-u         clear the line
     ctrl-w       delete a word   ctrl-r         reasoning: one line, full, off
-    ctrl-t       fold tool calls ctrl-n         show or hide the mascot
+    ctrl-t       fold tool calls
     ctrl-o       hand the mouse back to the terminal
     ctrl-l       repaint everything (for when something else wrote here)
-    ctrl-f       focus layout      ctrl-z         undo the last layout change
     up/down      move the caret in what you are typing; at its top or bottom
                  edge, step back and forward through what you have said
     pgup/pgdn    scroll the conversation (so does the wheel, a line a notch)

@@ -19,8 +19,8 @@
 //!   and nothing else notices.
 //! * `--mascot` stops being a boolean on the UI row and becomes
 //!   `[[insert]] name = "tui-panel-mascot"` — and that row puts itself on
-//!   screen through the same `LayoutOp::Show` a keystroke, a slash command and
-//!   the model all go through, rather than through a special case in `assemble`.
+//!   screen through `LayoutOp::Show`, rather than through a special case in
+//!   `assemble`.
 //! * `--audit` sees every panel, so "mounted but never drawn" and "named by a
 //!   layout but never mounted" become findings instead of surprises.
 //! * A third crate adds a panel with a `View` impl and a row. No edit here.
@@ -110,9 +110,6 @@ name = "tui-commands-session"
 [[insert]]
 name = "tui-commands-tree"
 
-[[insert]]
-name = "tui-commands-layout"
-
 # Last, because it lists the others.
 [[insert]]
 name = "tui-commands-help"
@@ -136,7 +133,6 @@ pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
         Arc::new(ScreenCommandsRow),
         Arc::new(SessionCommandsRow),
         Arc::new(TreeCommandsRow),
-        Arc::new(LayoutCommandsRow),
         Arc::new(HelpCommandsRow),
     ]
 }
@@ -236,11 +232,10 @@ impl Plugin for TranscriptPanel {
 
 /// The mascot: the row that proves the point.
 ///
-/// It mounts a view *and* puts itself on screen, and it does the second half
-/// through `LayoutOp::Show` — the same op a keystroke, a `/show mascot` and the
-/// model's `adjust_layout` all produce. Before this it was a branch inside
-/// `assemble` that built a different region tree, which meant the one thing the
-/// layout vocabulary existed for was the one thing that bypassed it.
+/// It mounts a view *and* puts itself on screen, through `LayoutOp::Show`.
+/// Before this it was a branch inside `assemble` that built a different region
+/// tree. Whether it is on screen is whether this row is on (`--mascot`); nothing
+/// toggles it at runtime.
 pub struct MascotPanel;
 
 #[async_trait]
@@ -498,35 +493,6 @@ commands!(
     crate::commands::TreeCommands,
     "inspect and reconfigure the running plugin tree from the screen"
 );
-
-/// Layout commands need the layout and the module list, so they are written out
-/// rather than generated — the dependencies are the interesting part.
-pub struct LayoutCommandsRow;
-
-#[async_trait]
-impl Plugin for LayoutCommandsRow {
-    fn name(&self) -> &'static str {
-        "tui-commands-layout"
-    }
-    fn inject(&self) -> &'static [&'static str] {
-        &["tui-commands", "tui-layout", "tui-modules"]
-    }
-    fn description(&self) -> &'static str {
-        "/show, /hide, /swap, /preset — the second of the three ways into a layout"
-    }
-    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
-        let all = ctx.require::<CommandsSvc>().map_err(|e| e.to_string())?;
-        let set = Arc::new(crate::commands::LayoutCommands {
-            layout: ctx.require::<LayoutSvc>().map_err(|e| e.to_string())?,
-            modules: ctx.require::<ModulesSvc>().map_err(|e| e.to_string())?,
-        });
-        let id = crate::command::CommandSet::id(&*set);
-        all.add(set)?;
-        let c: Arc<Commands> = all.clone();
-        let _ = ctx.effect(move || c.remove(id));
-        Ok(())
-    }
-}
 
 /// `/help` lists whatever else is mounted, so it holds the registry it is in.
 ///

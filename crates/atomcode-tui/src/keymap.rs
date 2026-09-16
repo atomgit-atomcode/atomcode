@@ -8,9 +8,9 @@ use std::collections::HashMap;
 
 use crate::surface::{Key, KeyPress, Mods};
 
-/// What a key or a command asks for. The one vocabulary three entry points
-/// share — a key, a slash command, and the model's `adjust_layout` all end
-/// here, so there is one implementation of each effect rather than three.
+/// What a key or a command asks for. The one vocabulary a key and a slash
+/// command share, so there is one implementation of each effect rather than
+/// two.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     /// Send what is typed.
@@ -72,11 +72,6 @@ pub enum Action {
     /// because `all` is built at dispatch time and leaking it to make the types
     /// match would be a leak per keystroke. The list is five strings long.
     ToggleFolds(Vec<&'static str>),
-    /// Show or hide a module.
-    ToggleModule(&'static str),
-    /// Change the screen's shape. The third entry point into `Layout::apply`,
-    /// alongside a command and the model's tool.
-    Layout(crate::layout::LayoutOp),
     /// Paste arrived as one event rather than N keystrokes.
     Paste(String),
     /// Take whatever image the clipboard holds and attach it to what is being
@@ -210,7 +205,6 @@ impl Keymap for Default_ {
                 ),
                 Action::AttachImage,
             ),
-            (KeyPress::ctrl('n'), Action::ToggleModule("mascot")),
             // Hand the mouse back, and take it again. `o` for "off", and one of
             // the few control keys a terminal does not already claim.
             (KeyPress::ctrl('o'), Action::ToggleMouse),
@@ -218,19 +212,6 @@ impl Keymap for Default_ {
             // that is the reflex to serve: it is the key a person reaches for
             // when the screen is wrong.
             (KeyPress::ctrl('l'), Action::Redraw),
-            // The `focus` preset moved off ctrl-l rather than being dropped —
-            // it is one of the three routes to a layout op, and the layout
-            // tests exist to check that all three still agree.
-            (
-                KeyPress::ctrl('f'),
-                Action::Layout(crate::layout::LayoutOp::Preset {
-                    name: "focus".into(),
-                }),
-            ),
-            (
-                KeyPress::ctrl('z'),
-                Action::Layout(crate::layout::LayoutOp::Undo),
-            ),
         ]
     }
 }

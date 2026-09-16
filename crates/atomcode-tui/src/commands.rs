@@ -27,7 +27,6 @@ const SCREEN: &[Command] = &[
         "showinject",
         "环境注入:收起、只留标签、全文,循环;不带名字则全部",
     ),
-    Command::new("mascot", "显示或隐藏吉祥物"),
     Command::new("mouse", "把鼠标交还终端,或收回来"),
     Command::new("keys", "列出快捷键"),
 ];
@@ -50,14 +49,13 @@ impl CommandSet for ScreenCommands {
                 Ok(action) => Outcome::Do(action),
                 Err(why) => Outcome::Refused(why),
             },
-            "mascot" => Outcome::Do(Action::ToggleModule("mascot")),
             "mouse" => Outcome::Do(Action::ToggleMouse),
             "keys" => Outcome::Said(
                 "enter 发送 · shift+enter 换行(或 ctrl-j) · ctrl-d 退出 · ctrl-w 删词\n\
                  esc 依次:取消选中 -> 清空输入 -> 停止当轮 · ctrl-c 直接停止当轮\n\
                  上/下 在输入里移动游标,到头则翻历史 · 点击输入框定位游标\n\
                  pgup/pgdn 与滚轮滚动对话\n\
-                 ctrl-r 思考(一行/全文/收起,循环) · ctrl-t 折叠工具 · ctrl-n 吉祥物 · ctrl-l 重画屏幕\n\
+                 ctrl-r 思考(一行/全文/收起,循环) · ctrl-t 折叠工具 · ctrl-l 重画屏幕\n\
                  /showinject [名字] 环境注入(默认不显示;不带名字则全部,all 含同伴报告)\n\
                  拖动选中并复制 · esc 取消选中 · 点击思考或工具调用折叠展开那一个\n\
                  ctrl-o 把鼠标交还终端(改用终端自己的框选)"
@@ -332,123 +330,6 @@ impl CommandSet for TreeCommands {
     }
 }
 
-/// The screen's shape, changed while it runs.
-///
-/// One of the three ways in — the others are a key and the model's
-/// `adjust_layout` tool — and all three land on `Layout::apply`, so there is one
-/// implementation of each op rather than three.
-pub struct LayoutCommands {
-    pub layout: Arc<crate::layout::Layout>,
-    pub modules: Arc<crate::module::Modules>,
-}
-
-const LAYOUT: &[Command] = &[
-    Command::new("layout", "挑一个命名布局,或显示/隐藏一个面板"),
-    Command::taking(
-        "show",
-        "<模块> [top|bottom|left|right]",
-        "把一个面板放上屏幕",
-    ),
-    Command::taking("hide", "<模块>", "把一个面板收起来"),
-    Command::new("undo-layout", "撤销上一次布局改动"),
-];
-
-const LAYOUT_HIDDEN: &[Command] = &[Command::taking("layout-set", "<名字>", "")];
-
-impl LayoutCommands {
-    fn known(&self) -> Vec<String> {
-        self.modules
-            .view_ids()
-            .into_iter()
-            .map(str::to_string)
-            .chain(["mascot".to_string(), "findings".to_string()])
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    }
-    fn run_op(&self, op: crate::layout::LayoutOp) -> Outcome {
-        match self.layout.apply(&op, &self.known()) {
-            Ok(what) => Outcome::Said(what),
-            Err(e) => Outcome::Refused(e.to_string()),
-        }
-    }
-}
-
-#[async_trait]
-impl CommandSet for LayoutCommands {
-    fn id(&self) -> &'static str {
-        "cmd-layout"
-    }
-    fn commands(&self) -> Vec<Command> {
-        LAYOUT.to_vec()
-    }
-    fn hidden(&self) -> Vec<Command> {
-        LAYOUT_HIDDEN.to_vec()
-    }
-    async fn run(&self, name: &str, args: &str, _ctx: &Context) -> Outcome {
-        use crate::layout::{LayoutOp, Side};
-        match name {
-            "layout" => {
-                let on = self.layout.tree().modules();
-                let mut choices: Vec<crate::overlay::Choice> = crate::layout::presets()
-                    .iter()
-                    .map(|(n, d)| {
-                        crate::overlay::Choice::new(format!("/layout-set {n}"), format!("布局 {n}"))
-                            .about(*d)
-                    })
-                    .collect();
-                for m in self.known() {
-                    let shown = on.contains(&m);
-                    choices.push(
-                        crate::overlay::Choice::new(
-                            format!("/{} {m}", if shown { "hide" } else { "show" }),
-                            m.clone(),
-                        )
-                        .about(if shown { "在屏幕上" } else { "未显示" })
-                        .marked(shown),
-                    );
-                }
-                Outcome::Open(crate::overlay::Picker::new(
-                    "layout",
-                    "布局 · enter 应用",
-                    choices,
-                ))
-            }
-            "layout-set" => self.run_op(LayoutOp::Preset {
-                name: args.trim().to_string(),
-            }),
-            "show" => {
-                let mut parts = args.split_whitespace();
-                let Some(module) = parts.next() else {
-                    return Outcome::Refused("用法:/show <模块> [top|bottom|left|right]".into());
-                };
-                let side = match parts.next() {
-                    Some("top") => Side::Top,
-                    Some("left") => Side::Left,
-                    Some("right") => Side::Right,
-                    _ => Side::Bottom,
-                };
-                self.run_op(LayoutOp::Show {
-                    module: module.to_string(),
-                    side,
-                    size: parts.next().and_then(|s| s.parse().ok()),
-                })
-            }
-            "hide" => {
-                let module = args.trim();
-                if module.is_empty() {
-                    return Outcome::Refused("用法:/hide <模块>".into());
-                }
-                self.run_op(LayoutOp::Hide {
-                    module: module.to_string(),
-                })
-            }
-            "undo-layout" => self.run_op(LayoutOp::Undo),
-            _ => Outcome::Quiet,
-        }
-    }
-}
-
 /// `/help`, which has to know about everything, so it holds the registry.
 pub struct HelpCommands {
     pub all: Arc<Commands>,
@@ -519,10 +400,6 @@ mod tests {
         let _ = c.add(Arc::new(ScreenCommands));
         let _ = c.add(Arc::new(SessionCommands));
         let _ = c.add(Arc::new(TreeCommands));
-        let _ = c.add(Arc::new(LayoutCommands {
-            layout: Arc::new(crate::layout::Layout::new(crate::host::default_layout())),
-            modules: Arc::new(crate::module::Modules::new()),
-        }));
         let _ = c.add(Arc::new(HelpCommands { all: c.clone() }));
         c
     }
