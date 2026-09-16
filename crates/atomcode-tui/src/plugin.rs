@@ -1,19 +1,22 @@
-//! The rows: how this UI mounts into a harness config tree.
+//! The rows: how this UI mounts into a config tree of its own.
 //!
-//! The whole UI is one `ui` row plus whatever module rows the layout names.
-//! Nothing here is privileged — remove `tui-mascot` from the tree and the cat
-//! is gone, with no branch left behind anywhere.
+//! The screen is an App apart from the agent it drives (`docs/adr/0022` §3).
+//! It holds the surface, the panels, the commands and the layout; the agent's
+//! App belongs to whoever hosts it, and reaches the screen as a
+//! [`HostConnection`] — the handle protocol and host control. When the host
+//! replaces the session, the screen keeps its connection and starts drawing
+//! the new session (`docs/adr/0022` §6).
 
+use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use atomcode_harness::agent::{Agent, CreateAgent};
-use atomcode_harness::events::SessionEventCommitted;
-use atomcode_harness::plugins::handle::{spawn as spawn_driver, wire, Driven};
-use atomcode_harness::seams::{LlmSvc, UiSvc, UserInterface, UserQuestionsSvc};
-use atomcode_harness::session::{Committed, LoggedEvent, SeqNo};
-use atomcode_kernel::agent::AgentHandle;
-use atomcode_kernel::event::{AgentCommand, AgentEvent};
+use atomcode_harness::seams::{UiSvc, UserInterface};
+use atomcode_kernel::agent::{AgentDescription, AgentStatus};
+use atomcode_kernel::event::{AgentCommand, AgentEvent, CommandId, RequestId};
+use atomcode_kernel::host::{HostConnection, HostControl, HostEvent};
+use atomcode_kernel::session::{Committed, LoggedEvent, SeqNo};
 use atomcode_plexus::{plexus_service, Context, Plugin};
 use serde::Deserialize;
 use serde_json::Value;
@@ -33,7 +36,22 @@ plexus_service!(ModulesSvc => Modules, "tui-modules", Core, "Mounted stream prod
 // inside this file, which is precisely why the mascot had to be a special case.
 plexus_service!(LayoutSvc => crate::layout::Layout, "tui-layout", Core, "The region tree on screen");
 plexus_service!(CommandsSvc => crate::command::Commands, "tui-commands", Core, "Slash commands contributed by rows");
-plexus_service!(AgentClientSvc => AgentClient, "tui-agent-client", Core, "The command channel to the agent this screen drives");
+plexus_service!(AgentClientSvc => AgentClient, "tui-agent-client", Core, "The screen's end of its connection to the agent");
+// Declared here, by the one that consumes it (`docs/adr/0021` §6): whoever
+// launches the screen fills it with what its host handed over.
+plexus_service!(ConnectionSvc => Connection, "agent-connection", Seam, "What the host handed this screen: its agent and host control");
+
+/// The connection a launcher hands the screen, taken once when it runs.
+pub struct Connection(Mutex<Option<HostConnection>>);
+
+impl Connection {
+    pub fn new(connection: HostConnection) -> Self {
+        Self(Mutex::new(Some(connection)))
+    }
+    fn take(&self) -> Option<HostConnection> {
+        self.0.lock().expect("connection poisoned").take()
+    }
+}
 
 /// The session's clock, and the only place this crate reads one.
 ///
@@ -61,37 +79,181 @@ impl Clock {
     }
 }
 
-/// The screen's end of the handle protocol.
+/// The screen's end of its connection to the agent.
 ///
 /// Everything this UI tells the agent goes through here as an
-/// [`AgentCommand`] — the same eight the daemon, the SDK and the shipped TUI
-/// speak. The UI does not run turns, does not decide what steering means and
-/// does not order compaction behind the turn: the pump on the other end does,
-/// once, under the differential gate. This row only turns keys into commands.
+/// [`AgentCommand`], and everything the screen knows about the session it
+/// draws — its facts, its description, whether it is busy — it learned from
+/// what came back. It reads no service of the agent's own: the agent is in
+/// another App, and possibly another process.
+#[derive(Default)]
 pub struct AgentClient {
+    link: Mutex<Option<Link>>,
+    view: Mutex<SessionView>,
+    receipts: AtomicU64,
+}
+
+struct Link {
     commands: mpsc::UnboundedSender<AgentCommand>,
-    agent: Arc<Agent>,
+    control: Arc<dyn HostControl>,
+}
+
+/// The session on screen, as its facts and events have described it.
+#[derive(Default)]
+struct SessionView {
+    session: String,
+    /// The last fact folded.
+    high: Option<SeqNo>,
+    events: Vec<LoggedEvent>,
+    described: Option<AgentDescription>,
+    status: Option<AgentStatus>,
+    /// Messages sent and not yet taken by a turn.
+    outstanding: HashSet<CommandId>,
 }
 
 impl AgentClient {
-    /// The conversation this screen shows. Read-only from here: every change
-    /// to it goes through a command.
-    pub fn session(&self) -> Arc<atomcode_harness::session::SessionLog> {
-        self.agent.session()
+    fn connect(
+        &self,
+        commands: mpsc::UnboundedSender<AgentCommand>,
+        control: Arc<dyn HostControl>,
+    ) {
+        *self.link.lock().expect("client poisoned") = Some(Link { commands, control });
     }
+
+    fn command(&self, command: AgentCommand) {
+        if let Some(link) = self.link.lock().expect("client poisoned").as_ref() {
+            let _ = link.commands.send(command);
+        }
+    }
+
+    /// The session on screen.
+    pub fn session(&self) -> String {
+        self.view.lock().expect("client poisoned").session.clone()
+    }
+
+    /// Its facts so far, in log order.
+    pub fn events(&self) -> Vec<LoggedEvent> {
+        self.view.lock().expect("client poisoned").events.clone()
+    }
+
+    /// What its agent was last described as.
+    pub fn described(&self) -> Option<AgentDescription> {
+        self.view.lock().expect("client poisoned").described.clone()
+    }
+
+    /// Host control, once connected.
+    pub fn control(&self) -> Option<Arc<dyn HostControl>> {
+        self.link
+            .lock()
+            .expect("client poisoned")
+            .as_ref()
+            .map(|link| link.control.clone())
+    }
+
+    /// Nothing sent is still waiting for a turn, and the agent says it is idle.
+    pub fn settled(&self) -> bool {
+        let view = self.view.lock().expect("client poisoned");
+        view.outstanding.is_empty() && matches!(view.status, None | Some(AgentStatus::Idle))
+    }
+
     pub fn send(&self, text: String, images: Vec<atomcode_kernel::message::ImageContent>) {
-        let _ = self
-            .commands
-            .send(AgentCommand::SendMessage { text, images });
+        let id = format!("tui-{}", self.receipts.fetch_add(1, Ordering::SeqCst));
+        self.view
+            .lock()
+            .expect("client poisoned")
+            .outstanding
+            .insert(id.clone());
+        self.command(AgentCommand::Tagged {
+            id,
+            command: Box::new(AgentCommand::SendMessage { text, images }),
+        });
     }
     pub fn cancel(&self) {
-        let _ = self.commands.send(AgentCommand::Cancel);
+        self.command(AgentCommand::Cancel);
     }
     pub fn compact(&self, focus: Option<String>) {
-        let _ = self.commands.send(AgentCommand::Compact { focus });
+        self.command(AgentCommand::Compact { focus });
     }
     pub fn shutdown(&self) {
-        let _ = self.commands.send(AgentCommand::Shutdown);
+        self.command(AgentCommand::Shutdown);
+    }
+    fn respond(&self, id: RequestId, value: Value) {
+        self.command(AgentCommand::Respond { id, value });
+    }
+
+    /// Draw `session` from its first fact. Whatever was followed before is let
+    /// go.
+    fn follow(&self, session: &str) {
+        let previous = {
+            let mut view = self.view.lock().expect("client poisoned");
+            let previous = std::mem::take(&mut view.session);
+            *view = SessionView {
+                session: session.to_string(),
+                ..SessionView::default()
+            };
+            previous
+        };
+        if !previous.is_empty() && previous != session {
+            self.command(AgentCommand::Unsubscribe { session: previous });
+        }
+        self.command(AgentCommand::Subscribe {
+            session: session.to_string(),
+            from: 0,
+        });
+    }
+
+    /// Keep a fact of the session on screen. `false` for another session's, or
+    /// one already kept.
+    fn keep(&self, committed: &Committed) -> bool {
+        let mut view = self.view.lock().expect("client poisoned");
+        if committed.session != view.session || view.high.is_some_and(|h| committed.seq <= h) {
+            return false;
+        }
+        view.high = Some(committed.seq);
+        view.events.push(LoggedEvent {
+            seq: committed.seq,
+            event: committed.event.clone(),
+        });
+        true
+    }
+
+    fn describe(&self, description: &AgentDescription) {
+        let mut view = self.view.lock().expect("client poisoned");
+        if description.session == view.session {
+            view.described = Some(description.clone());
+        }
+    }
+
+    /// `true` when it is the session on screen.
+    fn status(&self, session: &str, status: AgentStatus) -> bool {
+        let mut view = self.view.lock().expect("client poisoned");
+        if session != view.session {
+            return false;
+        }
+        view.status = Some(status);
+        true
+    }
+
+    /// The level host control accepted, onto the description the screen holds
+    /// until the agent is described again.
+    pub(crate) fn chose_effort(&self, level: Option<atomcode_kernel::provider::ReasoningEffort>) {
+        if let Some(described) = self
+            .view
+            .lock()
+            .expect("client poisoned")
+            .described
+            .as_mut()
+        {
+            described.reasoning_effort = level;
+        }
+    }
+
+    fn answered(&self, receipt: &str) {
+        self.view
+            .lock()
+            .expect("client poisoned")
+            .outstanding
+            .remove(receipt);
     }
 }
 
@@ -116,8 +278,11 @@ const COALESCE_LIMIT: usize = 256;
 /// What woke the loop up.
 enum Wake {
     Fact,
-    /// The agent said something about itself — over the handle, not the log.
+    /// Something came back over the connection: a fact, a turn boundary, a
+    /// question, what the agents are.
     Event(AgentEvent),
+    /// The host replaced the session.
+    Host(HostEvent),
     Input(Input),
     /// An action from somewhere other than a key — a command, for now.
     Act(Action),
@@ -134,115 +299,17 @@ enum Wake {
 #[serde(deny_unknown_fields)]
 struct Row {}
 
-/// The screen's subscription to its own session's log.
-///
-/// The rule is one line — every committed fact of OUR session reaches the
-/// modules here and nowhere else — but the startup case is the whole reason
-/// this is a type rather than a closure. A resumed process finds the log
-/// already full: [`SessionLog::restore`] puts the history back **silently**,
-/// and silently on purpose (the facts were broadcast once, in the process
-/// that wrote them, and broadcasting them again would have every listener
-/// treat them as news — persistence would append them a second time). So a
-/// listener registered at startup hears only what happens *next*, and a
-/// screen built that way comes back to an empty conversation with the whole
-/// session sitting in the file. Measured: `atui --resume <id>` drew the
-/// composer and the status line and nothing else.
-///
-/// [`SessionLog::restore`]: atomcode_harness::session::SessionLog::restore
-struct Facts {
-    host: Arc<Host>,
-    state: Mutex<Feed>,
-}
-
-/// Whether the history has been folded yet, and how far.
-enum Feed {
-    /// Registered but not yet caught up. Facts queue rather than fold: the
-    /// history is folded from the log in log order, and draining this after
-    /// it is what keeps a fact that arrived mid-catch-up *behind* the
-    /// history it follows. Folding it first would hand a module a tool
-    /// result before the call that produced it.
-    CatchingUp(Vec<Committed>),
-    /// Caught up. Carries the highest seq folded, which is what makes the
-    /// join with the queued facts exact — anything already in the history
-    /// is skipped rather than folded twice.
-    Live(SeqNo),
-}
-
-impl Facts {
-    fn new(host: Arc<Host>) -> Self {
-        Self {
-            host,
-            state: Mutex::new(Feed::CatchingUp(Vec::new())),
-        }
-    }
-
-    /// Fold `c` now, or hold it for the catch-up. `true` when it reached the
-    /// modules, which is the caller's cue that a frame is owed.
-    ///
-    /// The `seq` comparison is not belt-and-braces: the same fact can reach
-    /// both paths, because reading the log and registering this listener are
-    /// two steps and a commit can land between them. Whichever path folds it
-    /// first wins; the other sees `seq <= high` and does nothing.
-    fn deliver(&self, c: &Committed) -> bool {
-        let mut state = self.state.lock().expect("fact feed poisoned");
-        match &mut *state {
-            Feed::CatchingUp(queue) => {
-                queue.push(c.clone());
-                false
-            }
-            Feed::Live(high) => {
-                if c.seq <= *high {
-                    return false;
-                }
-                *high = c.seq;
-                self.host.absorb(&c.event);
-                true
-            }
-        }
-    }
-
-    /// Fold the facts this process did not watch being committed, then let
-    /// facts through as they arrive. `true` if anything was folded.
-    ///
-    /// The lock is held across the whole thing, which is what serialises it
-    /// against `deliver` — so the modules see the history in log order and
-    /// then the live facts in commit order, with no interleaving and no
-    /// gap. The window is one startup, so holding it costs nothing.
-    fn catch_up(&self, history: Vec<LoggedEvent>) -> bool {
-        let mut state = self.state.lock().expect("fact feed poisoned");
-        let queued = match std::mem::replace(&mut *state, Feed::Live(0)) {
-            Feed::CatchingUp(queued) => queued,
-            live @ Feed::Live(_) => {
-                *state = live;
-                return false;
-            }
-        };
-        let mut high: SeqNo = 0;
-        let mut folded = false;
-        for (seq, event) in history
-            .iter()
-            .map(|l| (l.seq, &l.event))
-            .chain(queued.iter().map(|c| (c.seq, &c.event)))
-        {
-            if seq <= high {
-                continue;
-            }
-            high = seq;
-            self.host.absorb(event);
-            folded = true;
-        }
-        *state = Feed::Live(high);
-        folded
-    }
+/// A member of the session on screen, as its events have told it.
+struct Member {
+    name: String,
+    status: AgentStatus,
+    /// Turns it has opened while watched.
+    turns: u64,
 }
 
 /// The assembled UI. Public so a test can drive exactly what ships.
 pub struct Tui {
-    /// The agent, driven through the handle protocol. Opened when the row
-    /// mounts so the registry sees the agent before anyone can type; taken
-    /// once, by `run`.
-    driven: Mutex<Option<Driven>>,
-    client: Mutex<Option<Arc<AgentClient>>>,
+    client: Arc<AgentClient>,
     host: Arc<Host>,
     keys: Keys,
     surface: Arc<dyn Surface>,
@@ -252,6 +319,8 @@ pub struct Tui {
     wake: Mutex<Option<mpsc::UnboundedSender<Wake>>>,
     /// Where the button went down, so a release can tell a click from a drag.
     pressed_at: Mutex<Option<(u16, u16)>>,
+    /// The session's members, by session id.
+    members: Mutex<BTreeMap<String, Member>>,
 }
 
 #[async_trait]
@@ -261,22 +330,18 @@ impl UserInterface for Tui {
     }
 
     async fn run(&self, ctx: &Context, initial: Option<String>) -> Result<(), String> {
-        let Driven { handle, done, .. } = self
-            .driven
-            .lock()
-            .expect("driven poisoned")
-            .take()
-            .ok_or("this front end can only be run once")?;
-        let client = self
-            .client
-            .lock()
-            .expect("client poisoned")
-            .clone()
-            .ok_or("no agent client; the row was not mounted")?;
-        let AgentHandle {
+        let HostConnection {
+            session,
+            commands,
             events: mut agent_events,
-            ..
-        } = handle;
+            control,
+        } = ctx
+            .service::<ConnectionSvc>()
+            .and_then(|slot| slot.take())
+            .ok_or("no connection to an agent: the launcher provides `agent-connection`")?;
+        let client = self.client.clone();
+        let mut host_events = control.subscribe();
+        client.connect(commands, control);
 
         let (wake_tx, mut wake) = mpsc::unbounded_channel::<Wake>();
         // Started before anything can commit a fact, so the first turn's
@@ -313,10 +378,9 @@ impl UserInterface for Tui {
             }
         });
 
-        // What the agent says about itself — turn boundaries, a compaction's
-        // outcome, an error — arrives over the handle. Content never does: the
-        // transcript is a fold over the log (below), and these events only
-        // move the status line and the command surface.
+        // Everything the connection says. Content arrives as the session's facts
+        // and is folded; the rest moves the status line, the members and the
+        // questions.
         let said = wake_tx.clone();
         let events_pump = tokio::spawn(async move {
             while let Some(event) = agent_events.recv().await {
@@ -324,46 +388,20 @@ impl UserInterface for Tui {
                     break;
                 }
             }
+            let _ = said.send(Wake::Closed);
+        });
+        let replaced = wake_tx.clone();
+        let host_pump = tokio::spawn(async move {
+            while let Some(event) = host_events.recv().await {
+                if replaced.send(Wake::Host(event)).is_err() {
+                    break;
+                }
+            }
         });
 
-        // Every committed fact reaches the modules here and nowhere else: the
-        // screen is a fold over the log, so a resumed session and a live one
-        // produce the same picture.
-        //
-        // One screen, one conversation — the same rule the handle's own pump
-        // keeps. This listener sits at the root realm and a realm hears its
-        // descendants, so every delegated member's facts arrive here too;
-        // folding them in interleaves two conversations in one stream, which
-        // is what a person sees as two agents talking over each other. What
-        // the screen may show of a member is what the member *told* this
-        // agent, and that is a fact in this log.
-        let host = self.host.clone();
-        let facts = wake_tx.clone();
-        let mine = client.session().id().to_string();
-        let ours = mine.clone();
-        let feed = Arc::new(Facts::new(host));
-        let subscribed = feed.clone();
-        let stream = ctx.on_emit::<SessionEventCommitted>(move |c: &Committed| {
-            if c.session != ours {
-                return;
-            }
-            if !subscribed.deliver(c) {
-                return;
-            }
-            let _ = facts.send(Wake::Fact);
-        });
-
-        // The history this process did not watch being committed.
-        //
-        // Registered before it is read, and folded through `Facts` rather than
-        // straight from the log, so a fact committed in between is neither lost
-        // (the listener has it) nor folded twice (the seq says who went first).
-        // Without this a resumed session draws an empty conversation: a restored
-        // log is put back silently, so nothing here ever heard about it.
-        let history = client.session().events();
-        if feed.catch_up(history) {
-            let _ = wake_tx.send(Wake::Fact);
-        }
+        // The session on screen, from its first fact: a resumed session and a
+        // live one produce the same picture, because the history is facts too.
+        client.follow(&session);
 
         // Input comes from the surface when it has its own — that is what a
         // headless run is — and from the terminal otherwise.
@@ -422,7 +460,7 @@ impl UserInterface for Tui {
                 // absorb against whatever the last one was — a frame at most out
                 // of date, and the only reading available between commits.
                 self.host.moment.write().expect("moment poisoned").now = clock.reading();
-                self.refresh_members(ctx, &mine);
+                self.refresh_members();
                 // A question that arrived while the loop was asleep is brought
                 // onto the moment here, before the frame it appears in is
                 // composed. The question panel renders from the moment, and the
@@ -478,6 +516,18 @@ impl UserInterface for Tui {
                 // projected into this event, and this is the same news again.
                 // `on_event` says which arrivals did move it.
                 Wake::Event(event) => stale |= self.on_event(event),
+                // The host put another session in place of this one: draw that
+                // one, from its first fact, in a stream of its own.
+                Wake::Host(HostEvent::SessionChanged { session, .. }) => {
+                    if session != client.session() {
+                        self.members.lock().expect("members poisoned").clear();
+                        self.host.switch_session();
+                        client.follow(&session);
+                        self.host.say(format!("已切换到会话 {session}"), false);
+                    }
+                    stale = true;
+                }
+                Wake::Host(_) => {}
                 Wake::Act(action) => {
                     quit = self.act(action, &client);
                     stale = true;
@@ -667,16 +717,29 @@ impl UserInterface for Tui {
 
         reader.abort();
         asks_pump.abort();
-        // The pump stops the turn and closes the asker in the one order that
-        // does not deadlock, then says so. Wait for that rather than racing
-        // it — but not forever: a tool that ignores its cancel is not a reason
-        // to leave the terminal in the alternate screen.
-        client.shutdown();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), done).await;
-        events_pump.abort();
+        host_pump.abort();
+        // Refuse what is waiting and stop what is running, then wait for the
+        // turn to say it has ended — but not forever: a tool that ignores its
+        // cancel is not a reason to leave the terminal in the alternate screen.
         self.host.asks.refuse_all();
+        if !client.settled() {
+            client.cancel();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while let Some(woke) = wake.recv().await {
+                    if matches!(
+                        woke,
+                        Wake::Closed
+                            | Wake::Event(AgentEvent::TurnComplete { .. } | AgentEvent::Cancelled)
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
+        client.shutdown();
+        events_pump.abort();
         self.host.overlays.close_all();
-        stream.dispose();
         self.surface.restore();
         // Full screen swallows the conversation on exit; hand it back so a
         // person can still scroll up and see what happened.
@@ -691,39 +754,27 @@ impl Tui {
         self.surface.present(&frame);
     }
 
-    /// Who else is running under this agent, as the registry has them now.
+    /// The session's members, as their events have told them, onto the moment.
     ///
-    /// Read fresh rather than folded, because there is nothing to fold: a
-    /// member is created, opens a turn and is stopped without this
-    /// conversation committing a single fact, and it must stay that way — a
-    /// member's log is its own. Cheap by construction: the registry is a map
-    /// read, and status and turn are one atomic load each, so this costs less
-    /// than the repaint it precedes.
-    fn refresh_members(&self, ctx: &Context, mine: &str) {
+    /// Nothing is folded for a member: a member is created, opens a turn and
+    /// is stopped without this conversation committing a single fact, and it
+    /// must stay that way — a member's log is its own. What the screen knows of
+    /// one is what the connection pushed about it.
+    fn refresh_members(&self) {
         use crate::moment::{Activity, MemberNow};
-        use atomcode_harness::agent::AgentStatus;
-        use atomcode_harness::seams::AgentsSvc;
-
-        let Some(agents) = ctx.service::<AgentsSvc>() else {
-            return;
-        };
-        let mut members: Vec<MemberNow> = agents
-            .list()
-            .iter()
-            .filter(|a| a.parent() == Some(mine))
-            .map(|a| MemberNow {
-                name: a
-                    .session_id()
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(a.session_id())
-                    .to_string(),
-                activity: match a.status() {
+        let mut members: Vec<MemberNow> = self
+            .members
+            .lock()
+            .expect("members poisoned")
+            .values()
+            .map(|member| MemberNow {
+                name: member.name.clone(),
+                activity: match member.status {
                     AgentStatus::Idle => Activity::Idle,
                     AgentStatus::Working => Activity::Working,
                     AgentStatus::Stopping => Activity::Stopping,
                 },
-                turn: a.session().current_turn(),
+                turn: member.turns,
             })
             .collect();
         members.sort_by(|a, b| a.name.cmp(&b.name));
@@ -731,6 +782,28 @@ impl Tui {
         if moment.members != members {
             moment.members = members;
         }
+    }
+
+    /// A question from the agent, put on the screen and answered back.
+    ///
+    /// The question drawn is the one the agent wrote into the log just before
+    /// asking, when it is there — options, asker and call exactly as recorded —
+    /// and one read off the request otherwise. The answer goes back under the
+    /// request's id, in the request's own terms.
+    fn ask(&self, id: RequestId, kind: &str, payload: Value) {
+        let Some(question) = crate::ask::question_for(kind, &payload, &self.client.events()) else {
+            // Nothing this screen knows how to put to a person: refused, never
+            // left hanging.
+            self.client.respond(id, Value::Null);
+            return;
+        };
+        let answer = self.host.asks.push(question.clone());
+        let client = self.client.clone();
+        let kind = kind.to_string();
+        tokio::spawn(async move {
+            let chosen = answer.await.ok().flatten();
+            client.respond(id, crate::ask::response_for(&kind, &question, chosen));
+        });
     }
 
     /// Put a line of the UI's own into the conversation.
@@ -761,6 +834,79 @@ impl Tui {
     fn on_event(&self, event: AgentEvent) -> bool {
         use crate::moment::Activity;
         match event {
+            // Content: a fact of the session on screen, folded once.
+            AgentEvent::Fact(committed) => {
+                if !self.client.keep(&committed) {
+                    return false;
+                }
+                self.host.absorb(&committed.event);
+                true
+            }
+            AgentEvent::Described { description } => {
+                self.client.describe(&description);
+                false
+            }
+            AgentEvent::Accepted { command, .. } => {
+                self.client.answered(&command);
+                false
+            }
+            AgentEvent::Rejected { command, error } => {
+                self.client.answered(&command);
+                self.say_refused(&format!("没有送达:{error:?}"));
+                true
+            }
+            AgentEvent::Request { id, kind, payload } => {
+                self.ask(id, &kind, payload);
+                true
+            }
+            // The session's own status follows its turn events below; a
+            // member's is the member strip's.
+            AgentEvent::StatusChanged { session, status } => {
+                if self.client.status(&session, status) {
+                    return false;
+                }
+                let mut members = self.members.lock().expect("members poisoned");
+                let Some(member) = members.get_mut(&session) else {
+                    return false;
+                };
+                if status == AgentStatus::Working && member.status != AgentStatus::Working {
+                    member.turns += 1;
+                }
+                member.status = status;
+                true
+            }
+            AgentEvent::AgentAdded { description } => {
+                if description.parent.as_deref() != Some(self.client.session().as_str()) {
+                    return false;
+                }
+                let name = description
+                    .member
+                    .as_ref()
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|| {
+                        description
+                            .session
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&description.session)
+                            .to_string()
+                    });
+                self.members.lock().expect("members poisoned").insert(
+                    description.session.clone(),
+                    Member {
+                        name,
+                        status: AgentStatus::Idle,
+                        turns: 0,
+                    },
+                );
+                true
+            }
+            AgentEvent::AgentRemoved { session } => self
+                .members
+                .lock()
+                .expect("members poisoned")
+                .remove(&session)
+                .is_some(),
             AgentEvent::TurnStarted { .. } => self.set_activity(Activity::Working),
             AgentEvent::TurnComplete { .. } | AgentEvent::Cancelled => {
                 // A cancel or a failure can end the turn with words still in the
@@ -1630,38 +1776,29 @@ fn recall_forward(m: &mut crate::moment::Moment) {
 /// Whether a picture attached to this conversation would actually reach the
 /// model. `Err` is the reason it would not, phrased for the person.
 ///
-/// The provider is the only thing that can answer: an adapter that cannot carry
-/// image content degrades it to a plain-text caption, which is the right
-/// compromise for a conversation being *resumed* on a text-only model and a
-/// silent loss for a screenshot someone pasted a moment ago. Nothing in the
-/// screen could tell those apart, which is why the question is asked here
-/// instead of guessed from the model's name.
+/// The agent's own description is the only thing that can answer: an adapter
+/// that cannot carry image content degrades it to a plain-text caption, which
+/// is the right compromise for a conversation being *resumed* on a text-only
+/// model and a silent loss for a screenshot someone pasted a moment ago.
+/// Nothing in the screen could tell those apart, which is why the question is
+/// asked of what the agent said about itself instead of guessed from a name.
 ///
-/// Asked of the *agent's own realm* — the same `LlmSvc` lookup the turn loop
-/// makes in `drive_as` — so the answer cannot disagree with what happens to the
-/// bytes on the wire. The empty slot is refused rather than waved through as a
-/// default, even though a mounted tree cannot currently be in that state: the
-/// `agent-loop` row depends on `llm`, so a tree without it does not start at
-/// all. Refusing is the safe direction for a match arm that has to say
-/// something, and it keeps the answer from being "sent" by omission if that
-/// dependency ever loosens.
+/// Not knowing yet is refused rather than waved through: a picture with no
+/// known destination is not sent by omission.
 ///
 /// This runs when the picture is taken, not when the message is sent, so it
-/// rests on one assumption: that the model cannot change between the two. In
-/// this front end that holds — `/patch` is the only thing that re-points the
-/// `llm` row, and it is a slash command, which cannot be run while a marker is
-/// in the composer because the line would no longer start with `/`. A model
-/// picker that swapped the row from a modal, leaving a draft intact underneath,
-/// would break it; that is the change this comment is here to catch.
+/// rests on one assumption: that the model cannot change between the two. A
+/// change arrives as a new description, and a person switching models in the
+/// middle of writing about a picture is the case that would break it.
 fn images_reach_the_model(client: &AgentClient) -> Result<(), String> {
-    match client.agent.ctx().service::<LlmSvc>() {
-        Some(provider) if provider.supports_vision() => Ok(()),
-        Some(provider) => Err(format!(
+    match client.described() {
+        Some(described) if described.supports_vision => Ok(()),
+        Some(described) => Err(format!(
             "当前模型 `{}` 看不了图片:贴进去也只会在发出去时被丢掉,所以没贴。\n\
-             换成能看图的模型(改 `llm` 行)再贴。",
-            provider.model_name()
+             换成能看图的模型再贴。",
+            described.model.unwrap_or_default()
         )),
-        None => Err("这棵树里没有挂上模型(`llm` 行是空的),图片没有去处,所以没贴。".to_string()),
+        None => Err("还不知道这个 agent 用的是什么模型,图片没有去处,所以没贴。".to_string()),
     }
 }
 
@@ -1701,14 +1838,14 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
     (
         host.clone(),
         Tui {
-            driven: Mutex::new(None),
-            client: Mutex::new(None),
+            client: Arc::new(AgentClient::default()),
             host,
             keys,
             surface,
             ctx: Mutex::new(None),
             wake: Mutex::new(None),
             pressed_at: Mutex::new(None),
+            members: Mutex::new(BTreeMap::new()),
         },
     )
 }
@@ -1721,26 +1858,18 @@ impl Plugin for TuiUiPlugin {
         "ui-tui2"
     }
     fn inject(&self) -> &'static [&'static str] {
-        &["agents", "agent-loop", "surface"]
-    }
-    fn uses(&self) -> &'static [&'static str] {
-        // What the pump's projection reads, resolved live; where its own
-        // agent's session comes from. **Not** who draws a question: a question
-        // is a module riding the tail now, so this row neither asks for a
-        // drawer nor depends on one being mounted.
-        &["tools", "llm", "compaction", "session-defaults"]
+        &["surface"]
     }
     fn provides(&self) -> &'static [&'static str] {
-        // It owns the screen, so it is the one that can ask. The registries it
-        // provides are filled by other rows — this row supplies the slots, not
-        // the contents.
+        // It owns the screen. The registries it provides are filled by other
+        // rows — this row supplies the slots, not the contents. The agent is not
+        // among them: it is in the host's App (`docs/adr/0022` §3).
         &[
             "ui",
             "tui-agent-client",
             "tui-modules",
             "tui-commands",
             "tui-layout",
-            "user-questions",
         ]
     }
     fn description(&self) -> &'static str {
@@ -1771,26 +1900,8 @@ impl Plugin for TuiUiPlugin {
             .provide::<LayoutSvc>(host.layout.clone())
             .map_err(|e| e.to_string())?;
         let _ = ctx
-            .provide::<UserQuestionsSvc>(Arc::new(crate::ask::ScreenQuestions::new(
-                host.asks.clone(),
-            )))
+            .provide::<AgentClientSvc>(tui.client.clone())
             .map_err(|e| e.to_string())?;
-
-        // The agent, behind the same pump every other driver uses. The screen
-        // holds the questions, so it is what the pump releases on cancel.
-        let wire = wire();
-        let commands = wire.commands.clone();
-        let driven = spawn_driver(ctx, wire, host.asks.clone(), CreateAgent::root(ctx)).await?;
-        let client = Arc::new(AgentClient {
-            commands,
-            agent: driven.agent.clone(),
-        });
-        *tui.driven.lock().expect("driven poisoned") = Some(driven);
-        *tui.client.lock().expect("client poisoned") = Some(client.clone());
-        let _ = ctx
-            .provide::<AgentClientSvc>(client)
-            .map_err(|e| e.to_string())?;
-
         let _ = ctx
             .provide::<UiSvc>(Arc::new(tui))
             .map_err(|e| e.to_string())?;

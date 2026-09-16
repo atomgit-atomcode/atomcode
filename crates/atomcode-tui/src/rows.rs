@@ -107,9 +107,6 @@ name = "tui-commands-screen"
 [[insert]]
 name = "tui-commands-session"
 
-[[insert]]
-name = "tui-commands-tree"
-
 # Last, because it lists the others.
 [[insert]]
 name = "tui-commands-help"
@@ -132,7 +129,6 @@ pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
         Arc::new(AskPanel),
         Arc::new(ScreenCommandsRow),
         Arc::new(SessionCommandsRow),
-        Arc::new(TreeCommandsRow),
         Arc::new(HelpCommandsRow),
     ]
 }
@@ -485,13 +481,7 @@ commands!(
     SessionCommandsRow,
     "tui-commands-session",
     crate::commands::SessionCommands,
-    "what this session is and how to end it"
-);
-commands!(
-    TreeCommandsRow,
-    "tui-commands-tree",
-    crate::commands::TreeCommands,
-    "inspect and reconfigure the running plugin tree from the screen"
+    "the conversation: compact it, look at it, start another, go back to one"
 );
 
 /// `/help` lists whatever else is mounted, so it holds the registry it is in.

@@ -115,6 +115,10 @@ impl Producer for Transcript {
         ID
     }
 
+    fn reset(&self) {
+        *self.open.lock().expect("transcript poisoned") = Open::default();
+    }
+
     fn absorb(&self, fact: &SessionEvent, out: &mut StreamWriter<'_>) {
         let mut open = self.open.lock().expect("transcript poisoned");
         let at = Coord::new(fact.turn(), 0);

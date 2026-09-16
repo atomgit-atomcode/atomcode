@@ -132,6 +132,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(ui::QuietUiPlugin))
         .register(Arc::new(ui_jsonrpc::JsonRpcUiPlugin))
         .register(Arc::new(handle::AgentHandlePlugin))
+        .register(Arc::new(handle::QuestionsHandlePlugin))
         .register(Arc::new(ui_web::WebUiPlugin))
         .register(Arc::new(trace::TracePlugin));
     registry

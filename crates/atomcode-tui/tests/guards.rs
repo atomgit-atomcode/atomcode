@@ -75,3 +75,47 @@ fn no_key_rearranges_the_screen() {
         );
     }
 }
+
+/// The screen is an App apart from the agent (`docs/adr/0022` §3): what it
+/// knows about the agent is what came back over its connection. A read of one
+/// of the agent's own services is the screen reaching into another App — and
+/// works only by accident, when both happen to share a process and a tree.
+#[test]
+fn the_screen_reads_no_service_of_the_agents() {
+    let found = code_lines_naming(&[
+        "AgentsSvc",
+        "LlmSvc",
+        "CompactionSvc",
+        "ControlSvc",
+        "ToolsSvc",
+        "SystemPromptSvc",
+    ]);
+    assert!(found.is_empty(), "{found:#?}");
+}
+
+/// The screen speaks the two contracts (`docs/adr/0021` §5): the handle
+/// protocol and host control. The runtime's driver protocol is the host's
+/// transitional business, so neither its names appear here nor the crate that
+/// defines them among this crate's dependencies.
+#[test]
+fn the_screen_does_not_speak_the_runtime_driver_protocol() {
+    let found = code_lines_naming(&["CodingRuntimeHandle", "DriverCommand", "CodingRuntimeEvent"]);
+    assert!(found.is_empty(), "{found:#?}");
+
+    let manifest =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .expect("the manifest");
+    let mut table = String::new();
+    let mut offenders = Vec::new();
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            table = trimmed.to_string();
+            continue;
+        }
+        if table == "[dependencies]" && trimmed.starts_with("atomcode-coding") {
+            offenders.push(trimmed.to_string());
+        }
+    }
+    assert!(offenders.is_empty(), "{offenders:?}");
+}

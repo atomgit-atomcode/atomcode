@@ -1,0 +1,206 @@
+//! The screen as an App of its own, the one way it is mounted.
+//!
+//! The screen and the agent are two Apps (`docs/adr/0022` §3). This is the
+//! screen's: a surface, the `ui-tui2` row and one row per panel. It builds no
+//! agent and knows no product assembly — whoever launches it hosts the agent
+//! and hands over a [`HostConnection`]. The command-line entry does that for
+//! the product runtime; the end-to-end tests do it for a tree the harness
+//! mounts itself. Both mount the screen through here, so what is tested is what
+//! ships.
+
+use std::sync::Arc;
+
+use atomcode_harness::seams::{UiSvc, UserInterface};
+use atomcode_kernel::host::HostConnection;
+use atomcode_plexus::{App, ConfigTree, Layer, PluginRegistry};
+
+use crate::plugin::{
+    Connection, ConnectionSvc, HeadlessSurfacePlugin, ModulesSvc, SurfaceSvc,
+    TerminalSurfacePlugin, TuiUiPlugin,
+};
+
+/// How the screen is drawn. Everything here is a row edit on the screen's own
+/// App; nothing reaches the agent.
+#[derive(Clone, Debug)]
+pub struct Screen {
+    /// Paint into memory at this size instead of taking the terminal.
+    pub headless: Option<(u16, u16)>,
+    /// Bring the cat: the `tui-panel-mascot` row on.
+    pub mascot: bool,
+    /// `auto`, `dark` or `light`; `None` asks the terminal.
+    pub theme: Option<String>,
+    /// Take the pointer. Off leaves selection to the terminal.
+    pub mouse: bool,
+}
+
+impl Default for Screen {
+    fn default() -> Self {
+        Self {
+            headless: None,
+            mascot: false,
+            theme: None,
+            mouse: true,
+        }
+    }
+}
+
+/// Every row the screen can mount.
+pub fn catalog() -> PluginRegistry {
+    let mut registry = PluginRegistry::new();
+    registry
+        .register(Arc::new(TuiUiPlugin))
+        .register(Arc::new(TerminalSurfacePlugin))
+        .register(Arc::new(HeadlessSurfacePlugin));
+    for row in crate::rows::catalog() {
+        registry.register(row);
+    }
+    registry
+}
+
+/// The screen's tree: the surface, `ui-tui2`, the panels of
+/// [`crate::rows::SCREEN`] — the team strip on, since a screen in front of an
+/// agent that can delegate is what it is for — then `extra`, in order.
+pub fn tree(screen: &Screen, extra: &[&str]) -> Result<ConfigTree, String> {
+    let surface = match screen.headless {
+        Some((width, height)) => format!(
+            "[[insert]]\nid = \"surface\"\nname = \"surface-headless\"\n\
+             config = {{ width = {width}, height = {height} }}\n"
+        ),
+        None => {
+            let mut config = vec![format!("mouse = {}", screen.mouse)];
+            if let Some(theme) = &screen.theme {
+                config.push(format!(
+                    "theme = {}",
+                    atomcode_harness::bundle::toml_string(theme)
+                ));
+            }
+            format!(
+                "[[insert]]\nid = \"surface\"\nname = \"surface-terminal\"\nconfig = {{ {} }}\n",
+                config.join(", ")
+            )
+        }
+    };
+    let mut layers = vec![
+        format!("{surface}\n[[insert]]\nid = \"ui\"\nname = \"ui-tui2\"\n"),
+        crate::rows::SCREEN.to_string(),
+        "[[patch]]\nid = \"tui-panel-team\"\ndisabled = false\n".to_string(),
+    ];
+    if screen.mascot {
+        layers.push("[[patch]]\nid = \"tui-panel-mascot\"\ndisabled = false\n".to_string());
+    }
+    layers.extend(extra.iter().map(|layer| layer.to_string()));
+    let layers = layers
+        .iter()
+        .map(|layer| Layer::from_toml(layer).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    ConfigTree::from_layers(layers).map_err(|e| e.to_string())
+}
+
+/// The screen, mounted and connected, not yet running.
+pub struct Mounted {
+    pub app: App,
+    pub ui: Arc<dyn UserInterface>,
+}
+
+/// Mount the screen and hand it `connection`.
+pub async fn mount(
+    screen: &Screen,
+    extra: &[&str],
+    connection: HostConnection,
+) -> Result<Mounted, String> {
+    let mut app = App::new(catalog(), tree(screen, extra)?);
+    app.start().await.map_err(|e| e.to_string())?;
+    let ctx = app.context();
+    let _ = ctx
+        .provide::<ConnectionSvc>(Arc::new(Connection::new(connection)))
+        .map_err(|e| e.to_string())?;
+    let ui = ctx
+        .service::<UiSvc>()
+        .ok_or("the screen's tree has no `ui` row")?;
+    Ok(Mounted { app, ui })
+}
+
+/// Run the screen until the person leaves.
+pub async fn run(
+    screen: &Screen,
+    connection: HostConnection,
+    initial: Option<String>,
+) -> Result<(), String> {
+    let mounted = mount(screen, &[], connection).await?;
+    let ctx = mounted.app.context();
+    mounted.ui.run(&ctx, initial).await
+}
+
+/// Whether the screen's composition is sound, with nothing connected: every row
+/// declared what it does and did it. `Ok` carries the notes that are not
+/// defects; `Err` the report when there is one.
+pub async fn audit(screen: &Screen) -> Result<Vec<String>, Vec<String>> {
+    let mut app = App::new(catalog(), tree(screen, &[]).map_err(|e| vec![e])?);
+    app.start().await.map_err(|e| vec![e.to_string()])?;
+    // Read from outside the tree by construction: the launcher runs `ui` and
+    // hands over the connection, and tests read the modules and commands.
+    let findings = app.audit_with(
+        &["ui", "tui-modules", "tui-commands", "tui-agent-client"],
+        &["agent-connection"],
+    );
+    let defect = findings.iter().any(|f| f.is_defect());
+    let report: Vec<String> = findings
+        .iter()
+        .map(|f| format!("{} {f}", if f.is_defect() { "✗" } else { "·" }))
+        .collect();
+    app.stop();
+    if defect {
+        Err(report)
+    } else {
+        Ok(report)
+    }
+}
+
+/// One composed frame of the shipped screen over the conformance facts, as the
+/// terminal would be sent it: what the screen looks like, with no tty, no model
+/// and no keyboard. It goes through the real host, modules and encoder — a
+/// mock-up that did not would be a picture of something that does not exist.
+pub async fn demo(size: (u16, u16)) -> Result<String, String> {
+    let screen = Screen {
+        headless: Some(size),
+        ..Screen::default()
+    };
+    let mut app = App::new(catalog(), tree(&screen, &[])?);
+    app.start().await.map_err(|e| e.to_string())?;
+    let ctx = app.context();
+    let modules = ctx
+        .service::<ModulesSvc>()
+        .ok_or("the demo needs the module rows")?;
+    let _surface = ctx
+        .service::<SurfaceSvc>()
+        .ok_or("the demo needs a surface row")?;
+    let host = crate::host::Host::new(modules, crate::host::default_layout());
+    for fact in crate::conformance::facts() {
+        host.absorb(&fact);
+    }
+    let caps = crate::caps::Caps::detect();
+    {
+        let mut moment = host.moment.write().expect("moment poisoned");
+        moment.input = "再帮我看看 crates/ 的结构".into();
+        moment.caret = moment.input.len();
+        moment.caps = caps;
+        moment.cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+    }
+    let frame = host.compose(size);
+    let violations = frame.containment_violations();
+    app.stop();
+    if !violations.is_empty() {
+        return Err(violations
+            .iter()
+            .map(|v| format!("containment: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+    Ok(format!(
+        "{}\x1b[{};1H\n",
+        crate::ansi::encode_with(&frame, caps),
+        size.1 + 1
+    ))
+}

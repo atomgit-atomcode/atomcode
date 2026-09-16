@@ -956,7 +956,7 @@ impl Host {
             stream: RwLock::new(Stream::new()),
             // Empty, like the module registry beside it. Command sets arrive as
             // rows (`crate::rows`); a Host that pre-filled this would make
-            // `[[remove]] id = "tui-commands-tree"` a lie.
+            // `[[remove]] id = "tui-commands-session"` a lie.
             commands: Arc::new(crate::command::Commands::new()),
             menu: RwLock::new(Vec::new()),
             context_menu: RwLock::new(None),
@@ -979,6 +979,44 @@ impl Host {
                 total: 0,
             }),
         }
+    }
+
+    /// Draw another session from here on (`docs/adr/0022` §6).
+    ///
+    /// Each session is a stream of its own, irreversible inside itself; moving
+    /// to another is not a separator drawn into this one. So the stream, how its
+    /// blocks are shown, the measurements taken of it and everything a module
+    /// folded from it go, and the new session's facts start them over. The old
+    /// stream is dropped rather than kept: the session it drew was replaced, and
+    /// there is nothing to switch back to.
+    pub fn switch_session(&self) {
+        *self.stream.write().expect("stream poisoned") = Stream::new();
+        *self.presentation.write().expect("presentation poisoned") = Presentation::default_folds();
+        *self.row_index.lock().expect("row index poisoned") = RowIndex {
+            width: 0,
+            presentation: 0,
+            measured: Vec::new(),
+            rows: Vec::new(),
+            skip_from: Vec::new(),
+            total: 0,
+        };
+        for producer in self.modules.producers() {
+            producer.reset();
+        }
+        for id in self.modules.view_ids() {
+            if let Some(view) = self.modules.view(id) {
+                view.reset();
+            }
+        }
+        // A question belongs to a turn of the session that asked it.
+        self.asks.refuse_all();
+        let mut m = self.moment.write().expect("moment poisoned");
+        m.activity = crate::moment::Activity::Idle;
+        m.scroll = crate::moment::ScrollPos::BOTTOM;
+        m.selection = None;
+        m.turn_started = None;
+        m.members.clear();
+        m.steering.clear();
     }
 
     /// Deliver one committed fact to every module.

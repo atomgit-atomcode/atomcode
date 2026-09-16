@@ -1405,24 +1405,64 @@ impl Plugin for AgentHandlePlugin {
     }
 
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
-        let row: HandleRow = if config.is_null() {
-            HandleRow::default()
-        } else {
-            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
-        };
+        mount_handle(ctx, config, true).await
+    }
+}
 
-        let wire = wire();
-        let asker = Arc::new(Asker::new(
-            ctx.clone(),
-            wire.events.clone(),
-            Duration::from_secs(row.ask_timeout_secs),
-        ));
-        // Both asking seams, filled before anything mounts on top of them: a
-        // consumer that resolves `approval` during its own `apply` must find it
-        // already there.
-        let _ = ctx
-            .provide::<UserQuestionsSvc>(asker.clone())
-            .map_err(|e| e.to_string())?;
+/// `ui-handle-questions`: the same handle, for a tree whose own rows decide
+/// approvals.
+///
+/// A front end outside the App still has to be asked the questions — they
+/// only reach it over the handle — but whether a call needs asking about is the
+/// tree's policy, not the connection's. A tree that runs a never-asks policy, or
+/// one that turns approvals into questions (`approval-interactive`), keeps that
+/// row and mounts this one; `ui-handle` would claim the `approval` seam and
+/// fail to start beside it.
+pub struct QuestionsHandlePlugin;
+
+#[async_trait]
+impl Plugin for QuestionsHandlePlugin {
+    fn name(&self) -> &'static str {
+        "ui-handle-questions"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["agents", "agent-loop"]
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["tools", "llm", "compaction", "session-defaults"]
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["ui", "agent-handle", "user-questions", "tool-driver"]
+    }
+    fn description(&self) -> &'static str {
+        "the AgentHandle protocol, asking the driver questions; approvals are the tree's own rows"
+    }
+
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        mount_handle(ctx, config, false).await
+    }
+}
+
+async fn mount_handle(ctx: &Context, config: &Value, approvals: bool) -> Result<(), String> {
+    let row: HandleRow = if config.is_null() {
+        HandleRow::default()
+    } else {
+        serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+    };
+
+    let wire = wire();
+    let asker = Arc::new(Asker::new(
+        ctx.clone(),
+        wire.events.clone(),
+        Duration::from_secs(row.ask_timeout_secs),
+    ));
+    // The asking seams, filled before anything mounts on top of them: a
+    // consumer that resolves `approval` during its own `apply` must find it
+    // already there.
+    let _ = ctx
+        .provide::<UserQuestionsSvc>(asker.clone())
+        .map_err(|e| e.to_string())?;
+    if approvals {
         let _ = ctx
             .provide::<crate::seams::ApprovalSvc>(asker.clone())
             .map_err(|e| e.to_string())?;
@@ -1433,37 +1473,37 @@ impl Plugin for AgentHandlePlugin {
             Arc::new(super::policy::ApprovalGate { ctx: ctx.clone() }),
             false,
         );
-
-        let initial = wire.commands.clone();
-        let Driven {
-            handle,
-            done,
-            agent,
-        } = spawn(
-            ctx,
-            wire,
-            asker.clone(),
-            crate::agent::CreateAgent::root(ctx),
-        )
-        .await?;
-        let _ = ctx
-            .provide::<crate::seams::ToolDriverSvc>(Arc::new(HandleToolDriver {
-                session: agent.session_id().to_string(),
-                asker,
-            }))
-            .map_err(|e| e.to_string())?;
-
-        let front = Arc::new(HandleFrontEnd {
-            handle: Mutex::new(Some(handle)),
-            done: Mutex::new(Some(done)),
-            initial: Mutex::new(Some(initial)),
-        });
-        let _ = ctx
-            .provide::<AgentHandleSvc>(front.clone())
-            .map_err(|e| e.to_string())?;
-        let _ = ctx.provide::<UiSvc>(front).map_err(|e| e.to_string())?;
-        Ok(())
     }
+
+    let initial = wire.commands.clone();
+    let Driven {
+        handle,
+        done,
+        agent,
+    } = spawn(
+        ctx,
+        wire,
+        asker.clone(),
+        crate::agent::CreateAgent::root(ctx),
+    )
+    .await?;
+    let _ = ctx
+        .provide::<crate::seams::ToolDriverSvc>(Arc::new(HandleToolDriver {
+            session: agent.session_id().to_string(),
+            asker,
+        }))
+        .map_err(|e| e.to_string())?;
+
+    let front = Arc::new(HandleFrontEnd {
+        handle: Mutex::new(Some(handle)),
+        done: Mutex::new(Some(done)),
+        initial: Mutex::new(Some(initial)),
+    });
+    let _ = ctx
+        .provide::<AgentHandleSvc>(front.clone())
+        .map_err(|e| e.to_string())?;
+    let _ = ctx.provide::<UiSvc>(front).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// The projection, addressable on its own.

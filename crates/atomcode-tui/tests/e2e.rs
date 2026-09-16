@@ -6,13 +6,23 @@
 //! `settle` is a quiescence predicate that **fails** on timeout rather than
 //! passing. What is left is a test that either says something true or says
 //! nothing at all.
+//!
+//! Two Apps, as they ship (`docs/adr/0022` §3): the agent's, mounted by the
+//! harness's own host, and the screen's, mounted by `launch` — the same entry
+//! the command line uses. They meet only over the connection the host hands
+//! the screen.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use atomcode_harness::seams::{UiSvc, UserInterface};
-use atomcode_plexus::{App, ConfigTree, Layer, PluginRegistry};
-use atomcode_tui::plugin::{HeadlessSurfacePlugin, SurfaceSvc, TuiUiPlugin};
+use async_trait::async_trait;
+use atomcode_harness::host::{open, Opening, Registry, Trees};
+use atomcode_harness::seams::UserInterface;
+use atomcode_harness::session::SessionEvent;
+use atomcode_plexus::{App, ConfigTree, Context, Layer, Plugin, PluginRegistry};
+use atomcode_tui::launch::{self, Screen};
+use atomcode_tui::plugin::{AgentClientSvc, SurfaceSvc};
 use atomcode_tui::surface::{Headless, Key, KeyPress, Surface};
 
 #[ctor::ctor]
@@ -20,7 +30,7 @@ fn _isolate_atomcode_home() {
     atomcode_kernel::test_support::isolate_home();
 }
 
-fn scratch(tag: &str) -> std::path::PathBuf {
+fn scratch(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::SeqCst);
@@ -30,27 +40,56 @@ fn scratch(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-fn catalog() -> PluginRegistry {
-    let mut c = atomcode_harness::plugins::catalog();
-    c.register(Arc::new(TuiUiPlugin))
-        .register(Arc::new(HeadlessSurfacePlugin))
-        .register(Arc::new(atomcode_tui::plugin::TerminalSurfacePlugin));
-    for row in atomcode_tui::rows::catalog() {
-        c.register(row);
+/// Holds the agent's driver between "the turn ended" being committed and the
+/// agent being marked idle — the window a telemetry or trace subscriber occupies
+/// in a real tree, widened so the screen reliably lands inside it.
+struct HoldTurnEnd;
+
+#[async_trait]
+impl Plugin for HoldTurnEnd {
+    fn name(&self) -> &'static str {
+        "test-hold-turn-end"
     }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        // `block_in_place`, not a bare sleep: a bare sleep pins this worker, and
+        // the screen task the fact just woke sits in this worker's own run queue
+        // until the hold ends — which hides the very race the hold exposes.
+        let _ = ctx.on_emit::<atomcode_harness::events::TurnEnd>(
+            |_: &atomcode_harness::seams::TurnOutcome| {
+                tokio::task::block_in_place(|| std::thread::sleep(Duration::from_millis(300)));
+            },
+        );
+        Ok(())
+    }
+}
+
+fn agent_catalog() -> PluginRegistry {
+    let mut c = atomcode_harness::plugins::catalog();
+    c.register(Arc::new(HoldTurnEnd));
+    c.register(Arc::new(EffortSpyRow));
     c
 }
 
-/// A tree with the model scripted, the world pinned to `root`, and the screen
-/// painted into memory.
-fn tree(root: &std::path::Path, script: &str, extra: &[&str]) -> ConfigTree {
+/// Both halves of what a test runs: the agent's layers and the screen's.
+struct Setup {
+    agent: Vec<String>,
+    screen: Vec<String>,
+}
+
+/// A layer about the screen rather than the agent. The tests hand extra layers
+/// to one list; they are sorted by what they name.
+fn is_screen_layer(layer: &str) -> bool {
+    layer.contains("\"surface\"") || layer.contains("\"tui-")
+}
+
+fn agent_base(root: &Path, persistence: &str, session: &str) -> String {
     let empty = root.join("__no_skills__");
     let _ = std::fs::create_dir_all(&empty);
-    let base = format!(
+    format!(
         "[[patch]]\nid = \"trace\"\nconfig = {{ stream = false, tools = false, summary = false }}\n\n\
          [[patch]]\nid = \"mcp\"\ndisabled = true\n\n\
          [[patch]]\nid = \"tool-web\"\ndisabled = true\n\n\
-         [[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true\n\n\
+         {persistence}\n\
          [[patch]]\nid = \"approval\"\ndisabled = false\nconfig = {{ mode = \"yolo\" }}\n\n\
          [[patch]]\nid = \"approval-interactive\"\ndisabled = true\n\n\
          [[patch]]\nid = \"user-questions-unattended\"\ndisabled = true\n\n\
@@ -58,24 +97,35 @@ fn tree(root: &std::path::Path, script: &str, extra: &[&str]) -> ConfigTree {
          [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
          [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {root:?} }}\n\n\
          [[patch]]\nid = \"fs\"\nconfig = {{ root = {root:?} }}\n\n\
-         [[insert]]\nid = \"surface\"\nname = \"surface-headless\"\nconfig = {{ width = 80, height = 24 }}\n\n\
-         [[patch]]\nid = \"ui\"\nname = \"ui-tui2\"\n",
+         {session}\
+         [[patch]]\nid = \"ui\"\nname = \"ui-handle-questions\"\nconfig = {{ ask_timeout_secs = 0 }}\n",
         root = root.to_string_lossy(),
         home = empty.to_string_lossy()
-    );
-    let mut layers = vec![
-        atomcode_harness::bundle::base().unwrap(),
-        Layer::from_toml(atomcode_harness::bundle::ONESHOT_APP).unwrap(),
-        Layer::from_toml(&base).unwrap(),
-        // The same screen the launcher mounts — taken from the library rather
-        // than restated, so a panel that stops shipping stops being tested.
-        Layer::from_toml(atomcode_tui::rows::SCREEN).unwrap(),
-        Layer::from_toml(script).unwrap(),
+    )
+}
+
+fn setup(base: String, script: &str, extra: &[&str]) -> Setup {
+    let mut agent = vec![
+        atomcode_harness::bundle::ONESHOT_APP.to_string(),
+        base,
+        script.to_string(),
     ];
-    for e in extra {
-        layers.push(Layer::from_toml(e).unwrap());
+    let mut screen = Vec::new();
+    for layer in extra {
+        if is_screen_layer(layer) {
+            screen.push(layer.to_string());
+        } else {
+            agent.push(layer.to_string());
+        }
     }
-    ConfigTree::from_layers(layers).unwrap()
+    Setup { agent, screen }
+}
+
+/// A tree with the model scripted, the world pinned to `root`, and the screen
+/// painted into memory.
+fn tree(root: &Path, script: &str, extra: &[&str]) -> Setup {
+    let persistence = "[[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true\n";
+    setup(agent_base(root, persistence, ""), script, extra)
 }
 
 fn replay(steps: &str) -> String {
@@ -85,51 +135,50 @@ fn replay(steps: &str) -> String {
 /// The same screen as [`tree`], but with a session that persists and can be
 /// resumed — pointed at a private `home` so one test cannot see (or be seen by)
 /// any session on the machine.
-///
-/// `tree` disables the persistence row outright, which is right for the fifty
-/// tests that have nothing to say about resuming and wrong for the one that
-/// does: without a store there is no history to come back to.
 fn tree_resumable(
-    root: &std::path::Path,
-    home: &std::path::Path,
+    root: &Path,
+    home: &Path,
     id: &str,
     resume: bool,
     script: &str,
     extra: &[&str],
-) -> ConfigTree {
-    let empty = root.join("__no_skills__");
-    let _ = std::fs::create_dir_all(&empty);
+) -> Setup {
     let sessions = home.join("sessions");
     let _ = std::fs::create_dir_all(&sessions);
-    let base = format!(
-        "[[patch]]\nid = \"trace\"\nconfig = {{ stream = false, tools = false, summary = false }}\n\n\
-         [[patch]]\nid = \"mcp\"\ndisabled = true\n\n\
-         [[patch]]\nid = \"tool-web\"\ndisabled = true\n\n\
-         [[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ root = {sessions:?} }}\n\n\
-         [[patch]]\nid = \"approval\"\ndisabled = false\nconfig = {{ mode = \"yolo\" }}\n\n\
-         [[patch]]\nid = \"approval-interactive\"\ndisabled = true\n\n\
-         [[patch]]\nid = \"user-questions-unattended\"\ndisabled = true\n\n\
-         [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 8, working_dir = {root:?} }}\n\n\
-         [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
-         [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {root:?} }}\n\n\
-         [[patch]]\nid = \"fs\"\nconfig = {{ root = {root:?} }}\n\n\
-         [[patch]]\nid = \"session\"\nconfig = {{ id = {id:?}, resume = {resume} }}\n\n\
-         [[insert]]\nid = \"surface\"\nname = \"surface-headless\"\nconfig = {{ width = 80, height = 24 }}\n\n\
-         [[patch]]\nid = \"ui\"\nname = \"ui-tui2\"\n",
-        root = root.to_string_lossy(),
-        home = empty.to_string_lossy()
+    let persistence = format!(
+        "[[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ root = {sessions:?} }}\n"
     );
-    let mut layers = vec![
-        atomcode_harness::bundle::base().unwrap(),
-        Layer::from_toml(atomcode_harness::bundle::ONESHOT_APP).unwrap(),
-        Layer::from_toml(&base).unwrap(),
-        Layer::from_toml(atomcode_tui::rows::SCREEN).unwrap(),
-        Layer::from_toml(script).unwrap(),
-    ];
-    for e in extra {
-        layers.push(Layer::from_toml(e).unwrap());
+    let session =
+        format!("[[patch]]\nid = \"session\"\nconfig = {{ id = {id:?}, resume = {resume} }}\n\n");
+    setup(agent_base(root, &persistence, &session), script, extra)
+}
+
+/// Every fact of a session that has reached its file under `home` so far.
+fn persisted_facts(home: &Path, id: &str) -> Vec<SessionEvent> {
+    fn find(dir: &Path, name: &str) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = find(&path, name) {
+                    return Some(found);
+                }
+            } else if path.file_name().is_some_and(|n| n == name) {
+                return Some(path);
+            }
+        }
+        None
     }
-    ConfigTree::from_layers(layers).unwrap()
+    let Some(file) = find(&home.join("sessions"), &format!("{id}.jsonl")) else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let value: serde_json::Value = serde_json::from_str(line).ok()?;
+            serde_json::from_value::<SessionEvent>(value.get("event")?.clone()).ok()
+        })
+        .collect()
 }
 
 /// Wait for the fire-and-forget persistence writer to land `want` facts.
@@ -137,13 +186,9 @@ fn tree_resumable(
 /// The writer is deliberately off the turn's path (a queue behind one task), so
 /// "the turn finished" and "the file has it" are different moments. A resume
 /// test that skipped this would be racing its own fixture.
-async fn persisted(s: &Session, id: &str, want: usize) {
-    let store = s
-        .app
-        .service::<atomcode_harness::seams::SessionPersistenceSvc>()
-        .expect("the persistence row is mounted");
+async fn persisted(home: &Path, id: &str, want: usize) {
     for _ in 0..100 {
-        if store.load(id).await.map(|e| e.len()).unwrap_or(0) >= want {
+        if persisted_facts(home, id).len() >= want {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -163,53 +208,74 @@ fn replay_vision(steps: &str, vision: bool) -> String {
 /// place that can say whether an attachment was actually *sent* — the marker on
 /// screen says what was typed, not what the model received.
 fn images_sent(s: &Session) -> Vec<usize> {
-    let agents = s
-        .app
-        .service::<atomcode_harness::seams::AgentsSvc>()
-        .expect("`agents` is mounted");
-    agents
-        .list()
-        .iter()
-        .flat_map(|a| a.session().events())
+    s.client()
+        .events()
+        .into_iter()
         .filter_map(|logged| match logged.event {
-            atomcode_harness::session::SessionEvent::UserMessage { images, .. } => {
-                Some(images.len())
-            }
+            SessionEvent::UserMessage { images, .. } => Some(images.len()),
             _ => None,
         })
         .collect()
 }
 
 struct Session {
-    /// Held, not just borrowed from: dropping the `App` unloads the whole tree,
-    /// and every screen goes blank in a way that looks like a UI bug.
+    /// Held, not just borrowed from: dropping the screen's `App` unloads its
+    /// tree, and the agent's goes with the connection it holds.
     _app: Arc<tokio::sync::Mutex<App>>,
-    app: atomcode_plexus::Context,
+    app: Context,
     term: Arc<Headless>,
     ui: Arc<dyn UserInterface>,
 }
 
-async fn start(tree: ConfigTree) -> Session {
-    let mut app = App::new(catalog(), tree);
-    app.start().await.expect("the tree must mount");
-    let surface = app
+async fn start(setup: Setup) -> Session {
+    let agent_layers = setup.agent.clone();
+    let registry: Registry = Arc::new(agent_catalog);
+    let trees: Trees = Arc::new(move |opening: &Opening| {
+        let mut layers = vec![atomcode_harness::bundle::base().map_err(|e| e.to_string())?];
+        let mut texts = agent_layers.clone();
+        if let Opening::Resume(id) = opening {
+            texts.push(atomcode_harness::bundle::resume_overlay(id));
+        }
+        for text in &texts {
+            layers.push(Layer::from_toml(text).map_err(|e| e.to_string())?);
+        }
+        ConfigTree::from_layers(layers).map_err(|e| e.to_string())
+    });
+    let connection = open(registry, trees, Opening::Fresh)
+        .await
+        .expect("the agent's tree must mount");
+    let screen = Screen {
+        headless: Some((80, 24)),
+        ..Screen::default()
+    };
+    let extra: Vec<&str> = setup.screen.iter().map(String::as_str).collect();
+    let mounted = launch::mount(&screen, &extra, connection)
+        .await
+        .expect("the screen's tree must mount");
+    let surface = mounted
+        .app
         .context()
         .service::<SurfaceSvc>()
         .expect("the headless surface row provides `surface`");
     let term = surface
         .as_any_headless()
         .expect("this tree mounts the headless surface");
-    let ui = app.context().service::<UiSvc>().expect("`ui` is filled");
-    let ctx = app.context();
+    let ctx = mounted.app.context();
     Session {
-        _app: Arc::new(tokio::sync::Mutex::new(app)),
+        _app: Arc::new(tokio::sync::Mutex::new(mounted.app)),
         app: ctx,
         term,
-        ui,
+        ui: mounted.ui,
     }
 }
 
 impl Session {
+    fn client(&self) -> Arc<atomcode_tui::plugin::AgentClient> {
+        self.app
+            .service::<AgentClientSvc>()
+            .expect("the screen provides its client")
+    }
+
     /// Run the UI in the background and wait for the first frame.
     async fn open(&self) -> tokio::task::JoinHandle<()> {
         let ui = self.ui.clone();
@@ -231,34 +297,22 @@ impl Session {
     /// Screen quiescence alone is not enough: while a tool runs for half a
     /// second no frame changes, and a test that took that for "done" would
     /// assert on a half-finished turn. The predicate is both — frames stopped
-    /// **and** the agent says idle — and it fails on timeout rather than
-    /// passing, because a `settle` that gives up quietly is a test that passes
-    /// while nothing happened.
+    /// **and** the agent says it is settled — and it fails on timeout rather
+    /// than passing, because a `settle` that gives up quietly is a test that
+    /// passes while nothing happened.
     async fn quiet(&self) {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while std::time::Instant::now() < deadline {
-            // Ask the agent, not the screen. Reading "idle" off the status
-            // bar worked until a test hid the status bar — a predicate that
-            // depends on what is *drawn* is a predicate the UI can break.
-            // Settle *first*, then ask: checking busy before waiting lets a turn
-            // start during the wait and still be reported quiet.
+            // Ask what the agent said, not what is drawn: reading "idle" off the
+            // status bar worked until a test hid the status bar. Settle *first*,
+            // then ask: checking busy before waiting lets a turn start during the
+            // wait and still be reported quiet. Settled means nothing sent is
+            // still waiting for a turn to take it, and the agent is idle.
             let still = self
                 .term
                 .settle(Duration::from_millis(60), Duration::from_secs(5))
                 .await;
-            let busy = self
-                .app
-                .service::<atomcode_harness::seams::AgentsSvc>()
-                .map(|a| {
-                    a.list().iter().any(|x| {
-                        // Idle with something still in the inbox is a turn that
-                        // has not started yet, not a turn that has finished.
-                        x.status() != atomcode_harness::agent::AgentStatus::Idle
-                            || x.inbox().has_waking_input()
-                    })
-                })
-                .unwrap_or(false);
-            if still && !busy {
+            if still && self.client().settled() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -563,19 +617,11 @@ async fn a_turn_the_model_never_answers_says_so_and_stops_spinning() {
     // columns the working directory pushes it off the right edge, and an
     // assertion about text that was never drawn passes for the wrong reason.
     let wide = "[[patch]]\nid = \"surface\"\nconfig = { width = 160, height = 24 }\n";
-    let s = start(tree(&dir, &replay(fail), &[wide])).await;
     // Hold the driver between "the turn ended" being committed and the agent
-    // being marked idle — the window a telemetry or trace subscriber occupies
-    // in a real tree, widened so the UI reliably lands inside it. A UI that
-    // reads the agent's status on that fact and never looks again is caught.
-    // `block_in_place`, not a bare sleep: a bare sleep pins this worker, and
-    // the UI task the fact just woke sits in this worker's own run queue until
-    // the hold ends — which hides the very race the hold is meant to expose.
-    let _hold = s.app.on_emit::<atomcode_harness::events::TurnEnd>(
-        |_: &atomcode_harness::seams::TurnOutcome| {
-            tokio::task::block_in_place(|| std::thread::sleep(Duration::from_millis(300)));
-        },
-    );
+    // being marked idle (`HoldTurnEnd`). A UI that reads the agent's status on
+    // that fact and never looks again is caught.
+    let hold = "[[insert]]\nname = \"test-hold-turn-end\"\n";
+    let s = start(tree(&dir, &replay(fail), &[wide, hold])).await;
     let task = s.open().await;
 
     s.term.type_line("hello?");
@@ -712,7 +758,7 @@ async fn esc_stops_the_turn_and_the_next_one_still_runs() {
 
 /// The tree the TUI is meant to run in: it asks before a risky call, and it is
 /// the thing being asked.
-fn asking(root: &std::path::Path, script: &str) -> ConfigTree {
+fn asking(root: &std::path::Path, script: &str) -> Setup {
     tree(
         root,
         script,
@@ -1722,112 +1768,6 @@ async fn a_command_and_a_key_share_one_implementation() {
 
 // ---- modals ---------------------------------------------------------------
 
-/// A tree with `control` mounted, so `/rows` has something to show.
-async fn with_control(tree: ConfigTree) -> (Session, Arc<tokio::sync::Mutex<App>>) {
-    let mut app = App::new(catalog(), tree);
-    app.start().await.expect("the tree must mount");
-    let surface = app.context().service::<SurfaceSvc>().unwrap();
-    let term = surface.as_any_headless().unwrap();
-    let ui = app.context().service::<UiSvc>().unwrap();
-    let ctx = app.context();
-    let app = Arc::new(tokio::sync::Mutex::new(app));
-    let _ = ctx.provide::<atomcode_harness::seams::ControlSvc>(Arc::new(
-        atomcode_harness::control::AppControl::new(app.clone()),
-    ));
-    (
-        Session {
-            _app: app.clone(),
-            app: ctx,
-            term,
-            ui,
-        },
-        app,
-    )
-}
-
-#[tokio::test]
-async fn a_modal_takes_the_keyboard_and_escape_gives_it_back() {
-    let dir = scratch("modal");
-    let (s, _keep) = with_control(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
-    let task = s.open().await;
-
-    s.term.type_line("/rows");
-    s.quiet().await;
-    let open = s.screen();
-    assert!(open.contains("enter 开关"), "the modal is framed:\n{open}");
-    assert!(
-        open.contains("agent-loop") || open.contains("llm"),
-        "{open}"
-    );
-
-    // Typing goes to the modal's filter, not to the prompt.
-    s.term.type_text("llm");
-    s.quiet().await;
-    let filtered = s.screen();
-    assert!(filtered.contains("llm"), "{filtered}");
-    assert!(
-        !filtered.contains("❯ llm"),
-        "the keys went to the modal, not the prompt:\n{filtered}"
-    );
-
-    s.term.press(KeyPress::plain(Key::Esc));
-    s.quiet().await;
-    let closed = s.screen();
-    assert!(!closed.contains("enter 开关"), "closed:\n{closed}");
-
-    // And the prompt has the keyboard back.
-    s.term.type_text("hello");
-    s.quiet().await;
-    let prompt = atomcode_tui::caps::Caps::default().g(atomcode_tui::caps::Glyph::Prompt);
-    assert!(
-        s.screen().contains(&format!("{prompt} hello")),
-        "{}",
-        s.screen()
-    );
-
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-}
-
-#[tokio::test]
-async fn picking_a_row_reconfigures_the_running_tree() {
-    let dir = scratch("swap");
-    let (s, _keep) = with_control(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
-    let task = s.open().await;
-
-    // The tool catalog before.
-    s.term.type_line("/tools-list");
-    s.quiet().await;
-    assert!(s.screen().contains("read_file"), "{}", s.screen());
-
-    // Turn off the row that provides the filesystem tools, from the modal.
-    s.term.type_line("/rows");
-    s.quiet().await;
-    s.term.type_text("tool-fs-world");
-    s.quiet().await;
-    s.term.press(KeyPress::plain(Key::Enter));
-    s.quiet().await;
-
-    s.term.type_line("/tools-list");
-    s.quiet().await;
-    let after = s.screen();
-    // The earlier listing is still scrolled above, so assert on the *last*
-    // answer rather than on the whole screen — a scrollback that still says
-    // `read_file` is the transcript doing its job.
-    let latest = after
-        .lines()
-        .rfind(|l| l.contains("bash") && l.contains("grep"))
-        .unwrap_or_else(|| panic!("no tool listing on screen:\n{after}"));
-    assert!(
-        !latest.contains("read_file"),
-        "the tree really changed under a running session:\n{after}"
-    );
-    assert!(latest.contains("bash"), "and only that row went:\n{after}");
-
-    s.term.press(KeyPress::ctrl('d'));
-    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-}
-
 // ---- runtime layout -------------------------------------------------------
 
 // ---- more than one agent in the tree --------------------------------------
@@ -1894,7 +1834,6 @@ async fn the_team_panel_says_who_is_on_the_team_and_what_each_last_said() {
     );
     let team = format!(
         "[[insert]]\nname = \"team-in-process\"\nconfig = {{ project_root = {dir:?} }}\n\n\
-         [[patch]]\nid = \"tui-panel-team\"\ndisabled = false\n\n\
          [[insert]]\nid = \"llm-utility\"\nname = \"llm-utility-replay\"\n\
          config = {{ script = [ \
            {{ text = \"MEMBER-THINKING-OUT-LOUD\", calls = [ {{ name = \"tell_parent\", args = {{ text = \"sessions are made in agent.rs\" }} }} ] }}, \
@@ -1938,6 +1877,13 @@ async fn the_team_panel_says_who_is_on_the_team_and_what_each_last_said() {
     assert!(
         !panel.contains("MEMBER-THINKING-OUT-LOUD"),
         "and still nothing it said to itself:\n{panel}"
+    );
+    // Where it stands is not in this log: it comes over the connection, as the
+    // member's own status. A member still on the team is never drawn as one
+    // that has finished.
+    assert!(
+        !panel.contains("已结束"),
+        "a live member is shown live:\n{panel}"
     );
 
     s.term.press(KeyPress::ctrl('d'));
@@ -2495,52 +2441,69 @@ async fn a_burst_of_deltas_costs_frames_not_one_per_delta() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
-/// `/effort` must actually move the row in a running screen, not merely be
-/// listed in the menu: the seam it needs (`control`) is provided by the
-/// launcher, so a front end can have the row and the command and still fail
-/// here if that is not wired.
-#[tokio::test]
-async fn the_effort_command_moves_the_row_while_the_screen_runs() {
-    use atomcode_harness::REASONING_EFFORT_ROW;
+/// What each model request asked for, recorded after the chain ran so every
+/// row that writes the level has had its say.
+static EFFORTS: std::sync::Mutex<Vec<Option<atomcode_kernel::provider::ReasoningEffort>>> =
+    std::sync::Mutex::new(Vec::new());
 
+struct EffortSpy;
+
+#[async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for EffortSpy {
+    async fn handle(
+        &self,
+        req: &mut atomcode_harness::events::ModelRequest,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::AgentRequest>,
+    ) -> Result<atomcode_harness::events::ModelResponse, atomcode_harness::events::RequestError>
+    {
+        let answered = next.run(req).await;
+        EFFORTS.lock().unwrap().push(req.options.reasoning_effort);
+        answered
+    }
+}
+
+struct EffortSpyRow;
+
+#[async_trait]
+impl Plugin for EffortSpyRow {
+    fn name(&self) -> &'static str {
+        "test-effort-spy"
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        let _ =
+            ctx.on_waterfall::<atomcode_harness::events::AgentRequest>(Arc::new(EffortSpy), true);
+        Ok(())
+    }
+}
+
+/// `/effort` must actually change what the agent's requests ask for, through
+/// host control — not merely be listed in the menu, and not by reaching into
+/// the agent's tree.
+#[tokio::test]
+async fn the_effort_command_changes_what_requests_ask_for_while_the_screen_runs() {
     let dir = scratch("effort-cmd");
-    let (s, app) = with_control(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let spy = "[[insert]]\nname = \"test-effort-spy\"\n";
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "ok" }, { text = "ok" }"#),
+        &[spy],
+    ))
+    .await;
     let task = s.open().await;
 
-    let level_now = |app: &Arc<tokio::sync::Mutex<App>>| {
-        let app = app.clone();
-        async move {
-            let guard = app.lock().await;
-            guard
-                .tree()
-                .entries
-                .iter()
-                .find(|e| e.id == REASONING_EFFORT_ROW)
-                .and_then(|e| {
-                    e.config
-                        .get("level")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                })
-        }
-    };
-
+    s.term.type_line("before");
+    s.quiet().await;
     assert_eq!(
-        level_now(&app).await,
+        EFFORTS.lock().unwrap().last().copied().flatten(),
         None,
         "the base bundle mounts the row with no opinion"
     );
 
     s.term.type_line("/effort high");
     s.quiet().await;
-    assert_eq!(
-        level_now(&app).await.as_deref(),
-        Some("high"),
-        "the command must move the row, not just say it did"
-    );
     assert!(
-        s.screen().contains("high"),
-        "and say so on screen:\n{}",
+        s.screen().contains("思考强度 → high"),
+        "the command says so on screen:\n{}",
         s.screen()
     );
 
@@ -2548,12 +2511,12 @@ async fn the_effort_command_moves_the_row_while_the_screen_runs() {
     s.term.type_line("/effort");
     s.quiet().await;
     assert!(
-        s.screen().contains("high"),
+        s.screen().contains("当前思考强度:high"),
         "the current level is shown:\n{}",
         s.screen()
     );
 
-    // A value nothing parses is refused, and the row keeps what it had.
+    // A value nothing parses is refused.
     s.term.type_line("/effort bogus");
     s.quiet().await;
     assert!(
@@ -2561,10 +2524,13 @@ async fn the_effort_command_moves_the_row_while_the_screen_runs() {
         "an unknown level is refused:\n{}",
         s.screen()
     );
+
+    s.term.type_line("after");
+    s.quiet().await;
     assert_eq!(
-        level_now(&app).await.as_deref(),
-        Some("high"),
-        "a refused value must not disturb the row"
+        EFFORTS.lock().unwrap().last().copied().flatten(),
+        Some(atomcode_kernel::provider::ReasoningEffort::High),
+        "the next request carries the level the command set"
     );
 
     s.term.press(KeyPress::ctrl('d'));
@@ -2710,7 +2676,7 @@ async fn a_resumed_session_redraws_the_conversation_it_left_behind() {
         s.quiet().await;
         // The writer is behind its own queue, so the turn being over is not the
         // same moment as the file having it.
-        persisted(&s, id, 6).await;
+        persisted(&home, id, 6).await;
         s.term.press(KeyPress::ctrl('d'));
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
@@ -2736,19 +2702,6 @@ async fn a_resumed_session_redraws_the_conversation_it_left_behind() {
     );
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
-}
-
-/// Every fact of a session that has reached the file so far.
-async fn persisted_facts(s: &Session, id: &str) -> Vec<atomcode_harness::session::SessionEvent> {
-    s.app
-        .service::<atomcode_harness::seams::SessionPersistenceSvc>()
-        .expect("the persistence row is mounted")
-        .load(id)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|e| e.event)
-        .collect()
 }
 
 /// An approval survives a resume.
@@ -2807,8 +2760,7 @@ async fn a_resumed_session_shows_the_approval_it_was_given() {
         // fixture, and would sometimes pass on an empty file.
         let mut landed = false;
         for _ in 0..200 {
-            if persisted_facts(&s, id)
-                .await
+            if persisted_facts(&home, id)
                 .iter()
                 .any(|f| matches!(f, SessionEvent::Answered { .. }))
             {
@@ -2841,6 +2793,93 @@ async fn a_resumed_session_shows_the_approval_it_was_given() {
         screen.contains("write_file") && screen.contains("out.txt"),
         "…about the call it was given for:\n{screen}"
     );
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+// ---- one stream per session (docs/adr/0022 §6) ----------------------------
+
+/// A tree whose sessions persist under `home`, each App naming its own.
+fn tree_persistent(root: &Path, home: &Path, script: &str) -> Setup {
+    let sessions = home.join("sessions");
+    let _ = std::fs::create_dir_all(&sessions);
+    let persistence = format!(
+        "[[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ root = {sessions:?} }}\n"
+    );
+    setup(agent_base(root, &persistence, ""), script, &[])
+}
+
+/// Until the screen follows another session than `from`.
+async fn moved_from(s: &Session, from: &str) -> String {
+    for _ in 0..400 {
+        let now = s.client().session();
+        if now != from {
+            return now;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the screen never left {from}:\n{}", s.screen());
+}
+
+/// The host replaces the session — a new one, then the first one again — and
+/// the screen draws each in a stream of its own: nothing of the session it left
+/// is drawn over the one it moved to, nothing is drawn twice, and the session
+/// it moved to keeps drawing as it goes.
+#[tokio::test]
+async fn the_screen_moves_between_sessions_without_repeating_or_freezing() {
+    let home = scratch("switch-home");
+    let root = scratch("switch-work");
+    let s = start(tree_persistent(
+        &root,
+        &home,
+        &replay(r#"{ text = "THE-ANSWER" }, { text = "unused" }"#),
+    ))
+    .await;
+    let task = s.open().await;
+
+    s.term.type_line("first question");
+    s.quiet().await;
+    let first = s.client().session();
+    assert!(s.screen().contains("THE-ANSWER"), "{}", s.screen());
+    persisted(&home, &first, 4).await;
+
+    s.term.type_line("/new");
+    let second = moved_from(&s, &first).await;
+    s.quiet().await;
+    let fresh = s.screen();
+    assert!(
+        !fresh.contains("first question"),
+        "the session left behind is not drawn over the new one:\n{fresh}"
+    );
+    assert!(
+        fresh.contains("已切换到会话"),
+        "the switch is said:\n{fresh}"
+    );
+
+    s.term.type_line("second question");
+    s.quiet().await;
+    let live = s.screen();
+    assert!(
+        live.contains("second question") && live.contains("THE-ANSWER"),
+        "the new session draws as it goes:\n{live}"
+    );
+    persisted(&home, &second, 4).await;
+
+    s.term.type_line(&format!("/resume {first}"));
+    let back = moved_from(&s, &second).await;
+    assert_eq!(back, first);
+    s.quiet().await;
+    let resumed = s.screen();
+    assert_eq!(
+        resumed.matches("first question").count(),
+        1,
+        "its history, drawn once:\n{resumed}"
+    );
+    assert!(
+        !resumed.contains("second question"),
+        "and nothing of the session it came from:\n{resumed}"
+    );
+
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }

@@ -1,9 +1,10 @@
 //! Asking the person, through the screen they are already looking at.
 //!
-//! The `user-questions` seam is answered here rather than by the transcript,
-//! and that split is deliberate: a stream producer that handled keystrokes
-//! would not be a fold any more. So the asker owns the question, the host owns
-//! the block and the keyboard, and they meet over one small mailbox.
+//! A question arrives over the connection as a request, is answered here
+//! rather than by the transcript, and that split is deliberate: a stream
+//! producer that handled keystrokes would not be a fold any more. So the queue
+//! owns the question, the host owns the block and the keyboard, and they meet
+//! over one small mailbox.
 //!
 //! What is *drawn* is not here. It was, as a modal card the event loop opened out
 //! of a seam; it is now a module riding the stream's tail
@@ -19,8 +20,15 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
-use atomcode_harness::seams::{Question, UserQuestions, ANSWER_ALLOW, ANSWER_ALWAYS, ANSWER_DENY};
+use atomcode_capabilities::tools::approval::{ApprovalRequest, APPROVAL_KIND};
+use atomcode_capabilities::tools::request_user_input::{
+    UserInputRequest, UserInputResponse, REQUEST_USER_INPUT_KIND,
+};
+use atomcode_kernel::session::LoggedEvent;
+use atomcode_kernel::session::{
+    Answer, Question, SessionEvent, ANSWER_ALLOW, ANSWER_ALWAYS, ANSWER_DENY,
+};
+use serde_json::Value;
 use tokio::sync::oneshot;
 
 /// A question waiting for an answer.
@@ -129,12 +137,13 @@ impl Asks {
         }
     }
 
-    /// Post a question and get the channel its answer will arrive on.
-    ///
-    /// `pub(crate)` rather than private: it is the seam's own entry point, and the
-    /// host's tests exercise what the queue does to a frame without standing up an
-    /// agent to ask through. Production callers come in via [`ScreenQuestions`].
-    pub(crate) fn push(&self, question: Question) -> oneshot::Receiver<Option<String>> {
+    /// Post a question and get the channel its answer will arrive on. A
+    /// question with no answers offered is still a question: it gets the two
+    /// every front end can draw, rather than a prompt nobody can answer.
+    pub(crate) fn push(&self, mut question: Question) -> oneshot::Receiver<Option<String>> {
+        if question.options.is_empty() {
+            question.options = vec![Answer::new("yes"), Answer::new("no")];
+        }
         let (reply, rx) = oneshot::channel();
         let id = self.next.fetch_add(1, Ordering::SeqCst) + 1;
         self.queue.lock().expect("asks poisoned").push(Pending {
@@ -149,53 +158,85 @@ impl Asks {
     }
 }
 
-/// The pump's view of the screen's questions. Answers never arrive over the
-/// wire here — the person answers on screen — so `answer` has nothing to
-/// route; what the pump needs is the release on cancel and shutdown.
-impl atomcode_harness::plugins::handle::Answers for Asks {
-    fn answer(&self, _id: u64, _value: serde_json::Value) -> bool {
-        false
-    }
-    fn refuse_all(&self) {
-        Asks::refuse_all(self)
-    }
-    fn close(&self) {
-        Asks::refuse_all(self)
-    }
-}
-
-/// Fills `user-questions` by putting the question on the screen.
-pub struct ScreenQuestions {
-    asks: Arc<Asks>,
-}
-
-impl ScreenQuestions {
-    pub fn new(asks: Arc<Asks>) -> Self {
-        Self { asks }
-    }
-}
-
-#[async_trait]
-impl UserQuestions for ScreenQuestions {
-    fn describe(&self) -> String {
-        "the person at the terminal".into()
-    }
-
-    async fn ask(&self, question: &Question) -> Option<String> {
-        // A question with no answers offered is still a question: give it the
-        // two every front end can draw, rather than a prompt nobody can answer.
-        let mut question = question.clone();
-        if question.options.is_empty() {
-            question.options = vec![
-                atomcode_harness::seams::Answer::new("yes"),
-                atomcode_harness::seams::Answer::new("no"),
-            ];
+/// The question a request puts to the person, or `None` for a kind this
+/// screen cannot draw.
+///
+/// The agent writes the question into the log just before it asks, so the fact
+/// is on screen by the time the request is: that one is drawn when it is there
+/// — options, asker and call exactly as recorded, which the request's wire
+/// shape does not carry. The newest match, because a call can be asked about
+/// twice. Otherwise the question is read off the request.
+pub fn question_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Question> {
+    let asked = |matches: &dyn Fn(&Question) -> bool| {
+        events.iter().rev().find_map(|logged| match &logged.event {
+            SessionEvent::Asked { question, .. } if matches(question) => Some(question.clone()),
+            _ => None,
+        })
+    };
+    match kind {
+        APPROVAL_KIND => {
+            let request: ApprovalRequest = serde_json::from_value(payload.clone()).ok()?;
+            Some(
+                asked(&|q| {
+                    q.about
+                        .as_ref()
+                        .is_some_and(|a| a.tool == request.tool && a.arguments == request.args)
+                })
+                .unwrap_or_else(|| {
+                    Question::approval(&request.tool, &request.args, Some(""), None)
+                }),
+            )
         }
-        let rx = self.asks.push(question);
-        // No timeout here on purpose: the person is right there, and a question
-        // that expired while they were reading it would deny a call they were
-        // about to allow. Shutdown refuses everything instead.
-        rx.await.ok().flatten()
+        REQUEST_USER_INPUT_KIND => {
+            let request: UserInputRequest = serde_json::from_value(payload.clone()).ok()?;
+            Some(asked(&|q| q.prompt == request.question).unwrap_or_else(|| {
+                Question {
+                    prompt: request.question.clone(),
+                    options: request
+                        .options
+                        .iter()
+                        .map(|o| {
+                            Answer::labelled(
+                                o.label.clone(),
+                                o.description.clone().unwrap_or_else(|| o.label.clone()),
+                            )
+                        })
+                        .collect(),
+                    asker: request
+                        .header
+                        .strip_prefix("Question · ")
+                        .map(str::to_string),
+                    about: None,
+                }
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// The answer to send back for a request, in the request's own terms. `None` —
+/// declined, or nobody answered — is a refusal, never consent.
+pub fn response_for(kind: &str, _question: &Question, answer: Option<String>) -> Value {
+    match kind {
+        APPROVAL_KIND => serde_json::json!({
+            "decision": match answer.as_deref() {
+                Some(ANSWER_ALLOW) => "allow",
+                Some(ANSWER_ALWAYS) => "allow_always",
+                _ => "deny",
+            }
+        }),
+        REQUEST_USER_INPUT_KIND => {
+            let response = match answer {
+                Some(chosen) => UserInputResponse {
+                    declined: false,
+                    selected: vec![chosen],
+                    ..Default::default()
+                },
+                None => UserInputResponse::declined(),
+            };
+            serde_json::to_value(response).unwrap_or(Value::Null)
+        }
+        _ => Value::Null,
     }
 }
 
@@ -331,41 +372,70 @@ pub fn textwrap(text: &str, width: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn a_question_reaches_the_screen_and_the_answer_comes_back() {
-        let asks = Asks::new();
-        let q = ScreenQuestions::new(asks.clone());
-        let asking = tokio::spawn(async move {
-            q.ask(&Question::plain("Allow `write_file`?", &["yes", "no"]))
-                .await
-        });
-        // The loop would see it here.
-        for _ in 0..100 {
-            if asks.is_waiting() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    fn asked(question: Question) -> LoggedEvent {
+        LoggedEvent {
+            seq: 1,
+            event: SessionEvent::Asked { turn: 1, question },
         }
-        let (_, question) = asks.peek().expect("a question is waiting");
-        assert!(question.prompt.contains("write_file"));
-        assert_eq!(question.values(), vec!["yes", "no"]);
-        asks.take().unwrap().answer(Some("yes".into()));
-        assert_eq!(asking.await.unwrap().as_deref(), Some("yes"));
     }
 
     #[tokio::test]
     async fn no_answer_is_a_refusal_not_a_hang() {
         let asks = Asks::new();
-        let q = ScreenQuestions::new(asks.clone());
-        let asking = tokio::spawn(async move { q.ask(&Question::plain("Allow?", &[])).await });
-        for _ in 0..100 {
-            if asks.is_waiting() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-        // Shutting down must release the caller, refusing.
+        let answer = asks.push(Question::plain("Allow?", &[]));
+        // Shutting down must release whoever waits, refusing.
         asks.refuse_all();
-        assert_eq!(asking.await.unwrap(), None, "never consent by default");
+        assert_eq!(answer.await.unwrap(), None, "never consent by default");
+    }
+
+    /// An approval is drawn as the agent recorded it — whether "always" is on
+    /// offer, and who asked, are not in the request — and answered in the
+    /// request's own decision words.
+    #[test]
+    fn an_approval_is_drawn_as_recorded_and_answered_as_a_decision() {
+        let recorded = Question::approval(
+            "write_file",
+            r#"{"file_path":"a"}"#,
+            None,
+            Some("scout".into()),
+        );
+        let payload = serde_json::json!({ "call_id": "c", "tool": "write_file", "args": r#"{"file_path":"a"}"# });
+        let question =
+            question_for(APPROVAL_KIND, &payload, &[asked(recorded.clone())]).expect("drawn");
+        assert_eq!(question, recorded);
+        assert!(!question.has(ANSWER_ALWAYS), "never offered what was not");
+
+        for (answer, decision) in [
+            (Some(ANSWER_ALLOW), "allow"),
+            (Some(ANSWER_ALWAYS), "allow_always"),
+            (Some(ANSWER_DENY), "deny"),
+            (None, "deny"),
+        ] {
+            let value = response_for(APPROVAL_KIND, &question, answer.map(str::to_string));
+            assert_eq!(value["decision"], decision, "{answer:?}");
+        }
+    }
+
+    #[test]
+    fn a_question_read_off_the_request_when_nothing_was_recorded() {
+        let payload = serde_json::json!({
+            "header": "Question · scout",
+            "question": "Which one?",
+            "mode": "single",
+            "options": [{ "label": "vanilla" }, { "label": "pistachio", "description": "green" }],
+        });
+        let question = question_for(REQUEST_USER_INPUT_KIND, &payload, &[]).expect("drawn");
+        assert_eq!(question.prompt, "Which one?");
+        assert_eq!(question.values(), vec!["vanilla", "pistachio"]);
+        assert_eq!(question.asker.as_deref(), Some("scout"));
+
+        let picked = response_for(REQUEST_USER_INPUT_KIND, &question, Some("pistachio".into()));
+        let picked: UserInputResponse = serde_json::from_value(picked).unwrap();
+        assert!(!picked.declined);
+        assert_eq!(picked.selected, vec!["pistachio"]);
+        let declined: UserInputResponse =
+            serde_json::from_value(response_for(REQUEST_USER_INPUT_KIND, &question, None)).unwrap();
+        assert!(declined.declined);
+        assert!(question_for("something-else", &payload, &[]).is_none());
     }
 }
