@@ -83,6 +83,7 @@ impl Feed {
                 let _ = self.events.send(AgentEvent::Fact(Box::new(Committed {
                     session: session.clone(),
                     seq: logged.seq,
+                    at: logged.at,
                     event: logged.event,
                 })));
             }

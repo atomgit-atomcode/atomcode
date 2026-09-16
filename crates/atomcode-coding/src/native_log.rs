@@ -133,6 +133,7 @@ pub fn seed_from_snapshot(snapshot: &SessionSnapshot, first_seq: SeqNo) -> Vec<L
         .enumerate()
         .map(|(offset, event)| LoggedEvent {
             seq: first_seq + offset as SeqNo,
+            at: 0,
             event,
         })
         .collect()

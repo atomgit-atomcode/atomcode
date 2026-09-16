@@ -47,6 +47,7 @@ plexus_service!(UserQuestionsSvc => dyn UserQuestions, "user-questions", Seam, "
 plexus_service!(McpSvc => McpRegistry, "mcp", Core, "Connected MCP servers");
 plexus_service!(AgentsSvc => Agents, "agents", Core, "Live agent registry");
 plexus_service!(UiSvc => dyn UserInterface, "ui", Seam, "The interaction front end");
+plexus_service!(WallClockSvc => dyn atomcode_kernel::clock::WallClock, "wall-clock", Seam, "When a session record was committed");
 plexus_service!(ControlSvc => dyn Control, "control", Core, "Reconfiguring the running tree");
 plexus_service!(FindingsSvc => dyn Findings, "findings", Seam, "Where structured findings are collected");
 plexus_service!(SubagentsSvc => dyn Subagents, "subagents", Seam, "Delegating work to a child agent");

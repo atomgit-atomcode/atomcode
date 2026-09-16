@@ -375,6 +375,7 @@ mod tests {
     fn asked(question: Question) -> LoggedEvent {
         LoggedEvent {
             seq: 1,
+            at: 0,
             event: SessionEvent::Asked { turn: 1, question },
         }
     }

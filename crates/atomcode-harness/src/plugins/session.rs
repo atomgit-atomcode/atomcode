@@ -293,7 +293,9 @@ impl JsonlStore {
             let event: SessionEvent =
                 serde_json::from_value(value.get("event").cloned().unwrap_or(Value::Null))
                     .map_err(|e| format!("{}:{}: {e}", path.display(), index + 1))?;
-            events.push(LoggedEvent { seq, event });
+            // A record written before commit times were kept reads as unknown.
+            let at = value.get("at").and_then(Value::as_u64).unwrap_or(0);
+            events.push(LoggedEvent { seq, at, event });
         }
         Ok(events)
     }
@@ -333,7 +335,8 @@ impl SessionPersistence for JsonlStore {
         std::fs::create_dir_all(self.dir()).map_err(|e| e.to_string())?;
         let mut buffer = String::new();
         for logged in events {
-            let line = serde_json::json!({ "seq": logged.seq, "event": logged.event });
+            let line =
+                serde_json::json!({ "seq": logged.seq, "at": logged.at, "event": logged.event });
             buffer.push_str(&serde_json::to_string(&line).map_err(|e| e.to_string())?);
             buffer.push('\n');
         }

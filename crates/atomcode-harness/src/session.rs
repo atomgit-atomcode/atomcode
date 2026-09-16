@@ -38,6 +38,8 @@ pub struct SessionLog {
     events: RwLock<Vec<LoggedEvent>>,
     next_seq: AtomicU64,
     turn: AtomicU64,
+    /// What stamps a record with when it was committed.
+    clock: Arc<dyn atomcode_kernel::clock::WallClock>,
 }
 
 impl SessionLog {
@@ -46,11 +48,20 @@ impl SessionLog {
     }
 
     pub fn with_header(header: SessionHeader) -> Self {
+        Self::with_clock(header, Arc::new(atomcode_kernel::clock::SystemWallClock))
+    }
+
+    /// A log whose records are stamped by `clock`.
+    pub fn with_clock(
+        header: SessionHeader,
+        clock: Arc<dyn atomcode_kernel::clock::WallClock>,
+    ) -> Self {
         Self {
             header,
             events: RwLock::new(Vec::new()),
             next_seq: AtomicU64::new(1),
             turn: AtomicU64::new(0),
+            clock,
         }
     }
 
@@ -101,12 +112,18 @@ impl SessionLog {
     /// resumed session. Use [`commit`](crate::session::commit) unless you are
     /// restoring a log that was already broadcast once.
     pub fn append(&self, event: SessionEvent) -> SeqNo {
+        self.record(event).0
+    }
+
+    /// Append, and say both the sequence number and the commit time assigned.
+    pub fn record(&self, event: SessionEvent) -> (SeqNo, u64) {
+        let at = self.clock.now_ms();
+        let mut events = self.events.write().expect("session log poisoned");
+        // Under the lock, so the order of sequence numbers is the order of the
+        // records.
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        self.events
-            .write()
-            .expect("session log poisoned")
-            .push(LoggedEvent { seq, event });
-        seq
+        events.push(LoggedEvent { seq, at, event });
+        (seq, at)
     }
 
     pub fn events(&self) -> Vec<LoggedEvent> {
@@ -204,10 +221,11 @@ fn truncate(text: &str, max: usize) -> String {
 /// in memory and vanished on resume. Turn boundaries, memory injections,
 /// compaction cuts and truncation nudges were each lost that way.
 pub fn commit(ctx: &atomcode_plexus::Context, log: &SessionLog, event: SessionEvent) -> SeqNo {
-    let seq = log.append(event.clone());
+    let (seq, at) = log.record(event.clone());
     ctx.emit::<crate::events::SessionEventCommitted>(&Committed {
         session: log.id().to_string(),
         seq,
+        at,
         event,
     });
     if let Some(projections) = ctx.service::<crate::seams::SessionProjectionsSvc>() {

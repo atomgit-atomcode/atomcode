@@ -105,10 +105,11 @@ impl PluginAgentLoop {
     /// The single write path. A plugin that wants to react to session state
     /// listens to `session/event`; it never has to be called by the loop.
     fn commit(&self, session: &SessionLog, event: SessionEvent) -> SeqNo {
-        let seq = session.append(event.clone());
+        let (seq, at) = session.record(event.clone());
         self.ctx.emit::<SessionEventCommitted>(&Committed {
             session: session.id().to_string(),
             seq,
+            at,
             event,
         });
         if let Some(projections) = self.ctx.service::<SessionProjectionsSvc>() {

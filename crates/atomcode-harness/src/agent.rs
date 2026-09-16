@@ -849,7 +849,10 @@ impl Agents {
             seed = store.load(&session_id).await?;
             seed_len = seed.len();
         }
-        let log = Arc::new(SessionLog::with_header(header));
+        let clock: Arc<dyn atomcode_kernel::clock::WallClock> = ctx
+            .service::<crate::seams::WallClockSvc>()
+            .unwrap_or_else(|| Arc::new(atomcode_kernel::clock::SystemWallClock));
+        let log = Arc::new(SessionLog::with_clock(header, clock));
         if !seed.is_empty() {
             log.restore(seed);
         }

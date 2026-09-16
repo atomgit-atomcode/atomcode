@@ -144,7 +144,8 @@ impl Journal {
             let event: SessionEvent =
                 serde_json::from_value(value.get("event").cloned().unwrap_or(Value::Null))
                     .map_err(|e| format!("{}:{}: {e}", path.display(), index + 1))?;
-            events.push(LoggedEvent { seq, event });
+            let at = value.get("at").and_then(Value::as_u64).unwrap_or(0);
+            events.push(LoggedEvent { seq, at, event });
         }
         Ok(events)
     }
@@ -175,7 +176,8 @@ impl SessionPersistence for Journal {
         }
         let mut buffer = String::new();
         for logged in events {
-            let line = serde_json::json!({ "seq": logged.seq, "event": logged.event });
+            let line =
+                serde_json::json!({ "seq": logged.seq, "at": logged.at, "event": logged.event });
             buffer.push_str(&serde_json::to_string(&line).map_err(|e| e.to_string())?);
             buffer.push('\n');
         }
@@ -362,6 +364,7 @@ mod tests {
                 "1789000000000-1",
                 &[LoggedEvent {
                     seq: 1,
+                    at: 0,
                     event: SessionEvent::TurnStart { turn: 1 },
                 }],
             )
@@ -416,6 +419,7 @@ mod tests {
                 "1700000000000-9",
                 &[LoggedEvent {
                     seq: 2,
+                    at: 0,
                     event: SessionEvent::TurnStart { turn: 2 },
                 }],
             )

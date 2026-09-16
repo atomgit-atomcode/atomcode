@@ -375,10 +375,12 @@ fn restoring_a_log_preserves_sequence_and_turn_numbering() {
     let events = vec![
         LoggedEvent {
             seq: 7,
+            at: 0,
             event: SessionEvent::TurnStart { turn: 3 },
         },
         LoggedEvent {
             seq: 8,
+            at: 0,
             event: SessionEvent::UserMessage {
                 turn: 3,
                 text: "resumed".into(),
@@ -961,4 +963,104 @@ async fn a_fork_carries_the_parents_events_under_its_own_name() {
     let parent_described = store.describe("parent").await.unwrap().unwrap();
     assert_eq!(parent_described.title.as_deref(), Some("the parent's name"));
     assert_eq!(parent_described.turns, 1);
+}
+
+// ---- when a record was committed (docs/adr/0024 §14) ----------------------
+
+/// Fills `wall-clock` with an instant that never moves.
+struct PinnedClock(u64);
+
+#[async_trait::async_trait]
+impl atomcode_plexus::Plugin for PinnedClock {
+    fn name(&self) -> &'static str {
+        "test-pinned-clock"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["wall-clock"]
+    }
+    async fn apply(
+        &self,
+        ctx: &atomcode_plexus::Context,
+        _config: &serde_json::Value,
+    ) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_harness::seams::WallClockSvc>(Arc::new(
+                atomcode_kernel::clock::FixedWallClock(self.0),
+            ))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// Every record carries the time it was committed — in the log, on the fact
+/// stream, and on disk — from the clock the tree provides; a record written
+/// before times were kept reads back as unknown rather than failing the file.
+#[tokio::test]
+async fn every_record_carries_the_time_it_was_committed() {
+    const AT: u64 = 1_789_000_000_000;
+    let home = resume_home("commit-time");
+    let id = "timed-id";
+    let mut catalog = plugins::catalog();
+    catalog.register(Arc::new(PinnedClock(AT)));
+    let mut tree = resumable(&home, Some(id), false);
+    tree.apply(&Layer::from_toml("[[insert]]\nname = \"test-pinned-clock\"\n").unwrap())
+        .unwrap();
+    let mut app = App::new(catalog, tree);
+    app.start().await.unwrap();
+
+    let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = heard.clone();
+    let _listening = app
+        .context()
+        .on_emit::<atomcode_harness::events::SessionEventCommitted>(move |c| {
+            seen.lock().unwrap().push(c.at);
+        });
+    run_turn(&app, "what time is it").await.unwrap();
+    let logged = app.context().only_session().unwrap().events();
+    assert!(!logged.is_empty());
+    settle(&app, id, logged.len()).await;
+    assert!(logged.iter().all(|e| e.at == AT), "{logged:#?}");
+    let heard = heard.lock().unwrap().clone();
+    assert!(
+        !heard.is_empty() && heard.iter().all(|at| *at == AT),
+        "{heard:?}"
+    );
+    let stored = app
+        .context()
+        .service::<SessionPersistenceSvc>()
+        .unwrap()
+        .load(id)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), logged.len());
+    assert!(stored.iter().all(|e| e.at == AT), "{stored:#?}");
+
+    // A file from before commit times: same records, no `at`.
+    let location = app
+        .context()
+        .service::<SessionPersistenceSvc>()
+        .unwrap()
+        .location(id)
+        .expect("the store says where");
+    let untimed: String = std::fs::read_to_string(&location)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(object) = value.as_object_mut() {
+                object.remove("at");
+            }
+            format!("{value}\n")
+        })
+        .collect();
+    std::fs::write(&location, untimed).unwrap();
+    let reread = app
+        .context()
+        .service::<SessionPersistenceSvc>()
+        .unwrap()
+        .load(id)
+        .await
+        .unwrap();
+    assert_eq!(reread.len(), logged.len());
+    assert!(reread.iter().all(|e| e.at == 0), "{reread:#?}");
 }

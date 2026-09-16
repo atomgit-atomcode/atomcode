@@ -212,6 +212,7 @@ impl AgentClient {
         view.high = Some(committed.seq);
         view.events.push(LoggedEvent {
             seq: committed.seq,
+            at: committed.at,
             event: committed.event.clone(),
         });
         true

@@ -437,6 +437,11 @@ impl SessionHeader {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoggedEvent {
     pub seq: SeqNo,
+    /// When it was committed: milliseconds since the Unix epoch, from the log's
+    /// wall clock. Beside the event rather than in it (`docs/adr/0024` §14) —
+    /// the event is what happened, this is when. `0` for a record written
+    /// before commit times were kept.
+    pub at: u64,
     pub event: SessionEvent,
 }
 
@@ -452,6 +457,9 @@ pub struct Committed {
     /// Which log this fact was appended to.
     pub session: String,
     pub seq: SeqNo,
+    /// When it was committed. See [`LoggedEvent::at`].
+    #[serde(default)]
+    pub at: u64,
     pub event: SessionEvent,
 }
 
@@ -460,6 +468,7 @@ impl Committed {
     pub fn logged(&self) -> LoggedEvent {
         LoggedEvent {
             seq: self.seq,
+            at: self.at,
             event: self.event.clone(),
         }
     }
