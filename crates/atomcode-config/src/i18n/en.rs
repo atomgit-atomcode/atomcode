@@ -435,6 +435,7 @@ pub(super) fn en(msg: Msg<'_>) -> Cow<'static, str> {
         }
         Msg::ApprovalDeny => "Deny".into(),
         Msg::ApprovalHint => "↑↓ select · Enter confirm · Esc cancel".into(),
+        Msg::ApprovalExpandHint => "Tab expand/collapse full command".into(),
         Msg::ApprovalHeader { tool, detail } => {
             if detail.is_empty() {
                 format!("Allow {tool}?").into()

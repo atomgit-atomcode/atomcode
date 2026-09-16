@@ -410,6 +410,7 @@ pub(super) fn zh_cn(msg: Msg<'_>) -> Cow<'static, str> {
         Msg::ApprovalAllowAllBash => "⚠️ 本会话允许所有 Bash（含破坏性）".into(),
         Msg::ApprovalDeny => "拒绝".into(),
         Msg::ApprovalHint => "↑↓ 选择 · Enter 确认 · Esc 取消".into(),
+        Msg::ApprovalExpandHint => "Tab 展开/收起完整命令".into(),
         Msg::ApprovalHeader { tool, detail } => {
             if detail.is_empty() {
                 format!("允许 {tool}？").into()

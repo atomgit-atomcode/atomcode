@@ -1103,6 +1103,8 @@ mod tests {
                 selected: 0,
                 note: None,
                 reason: None,
+                full_command: None,
+                expanded: false,
             }),
             ..Default::default()
         };
@@ -1159,6 +1161,8 @@ mod tests {
                 selected: 0,
                 note: Some("advisory note".to_string()),
                 reason: Some("此命令会写到工作区外 — 需要单独确认。".to_string()),
+                full_command: None,
+                expanded: false,
             }),
             ..Default::default()
         };
@@ -1259,6 +1263,8 @@ mod tests {
                 selected: 0,
                 note: None,
                 reason: None,
+                full_command: None,
+                expanded: false,
             }),
             ..Default::default()
         };

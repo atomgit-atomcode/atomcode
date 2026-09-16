@@ -94,9 +94,26 @@ pub struct ApprovalPanel {
     /// above the options in a muted style so the user knows the context for re-approval.
     /// `None` for first-time approvals where no gate added a reason.
     pub reason: Option<String>,
+    /// Full, UNTRUNCATED command text for a Bash approval — the security-boundary needs
+    /// the exact command visible at the decision. Shown multi-line (shell-aware wrap) only
+    /// when `expanded`. `None` for non-Bash tools, which keep the compact `detail` only.
+    pub full_command: Option<String>,
+    /// Whether the full-command block is expanded. Default collapsed (panel stays compact,
+    /// matching current look); toggled by Tab. Only meaningful when `full_command.is_some()`.
+    pub expanded: bool,
 }
 
 impl ApprovalPanel {
+    /// Toggle the full-command expansion. Returns `false` (a no-op) when there is nothing
+    /// to expand, so the caller can skip the redraw and let the key fall through.
+    pub fn toggle_expand(&mut self) -> bool {
+        if self.full_command.is_none() {
+            return false;
+        }
+        self.expanded = !self.expanded;
+        true
+    }
+
     pub fn move_up(&mut self) {
         if self.options.is_empty() {
             return;
@@ -3449,6 +3466,8 @@ mod tests {
             selected: 0,
             note: None,
             reason: None,
+            full_command: None,
+            expanded: false,
         };
         p.move_up();
         assert_eq!(p.selected, 2, "up from 0 wraps to last");
@@ -3459,6 +3478,35 @@ mod tests {
         assert_eq!(p.accel_index('A'), Some(1), "accel is case-insensitive");
         assert_eq!(p.accel_index('n'), Some(2));
         assert_eq!(p.accel_index('z'), None);
+    }
+
+    #[test]
+    fn toggle_expand_only_when_full_command_present() {
+        use crate::state::{ApprovalKind, ApprovalOption, ApprovalPanel};
+        let mk = |full: Option<&str>| ApprovalPanel {
+            tool: "bash".into(),
+            detail: "x".into(),
+            options: vec![ApprovalOption {
+                label: "Allow once".into(),
+                kind: ApprovalKind::AllowOnce,
+                accel: 'y',
+            }],
+            selected: 0,
+            note: None,
+            reason: None,
+            full_command: full.map(String::from),
+            expanded: false,
+        };
+        // No full command (e.g. non-Bash tool) → Tab is a no-op, panel stays collapsed.
+        let mut none = mk(None);
+        assert!(!none.toggle_expand(), "no full command → toggle is a no-op");
+        assert!(!none.expanded);
+        // With a full command → Tab flips expand, again collapses.
+        let mut some = mk(Some("rm -rf a && rm -rf b"));
+        assert!(some.toggle_expand());
+        assert!(some.expanded, "first Tab expands");
+        assert!(some.toggle_expand());
+        assert!(!some.expanded, "second Tab collapses");
     }
 
     #[test]

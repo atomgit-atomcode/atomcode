@@ -485,6 +485,9 @@ pub enum Msg<'a> {
     ApprovalAllowAllBash,
     ApprovalDeny,
     ApprovalHint,
+    /// Appended to the approval hint for Bash: Tab toggles the full-command block so the
+    /// user can read the exact command before deciding.
+    ApprovalExpandHint,
     /// Header line above the interactive approval options, naming what is being
     /// approved (the `▸ Tool(detail)` scrollback row can be far above / hidden).
     ApprovalHeader {

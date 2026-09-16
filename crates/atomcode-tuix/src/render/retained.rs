@@ -3916,12 +3916,74 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// body row above, so the panel is just the selectable choices.
     fn approval_panel_row_count(&self, panel: &crate::render::ApprovalPanelView) -> usize {
         // 1 header row ("Allow Tool(detail)?") + optional reason line + optional advisory
-        // note + N option rows + 1 hint row. MUST track `build_approval_rows` exactly or
-        // the footer height under-counts and the panel overlaps the body.
+        // note + optional expanded full-command block + N option rows + 1 hint row. MUST
+        // track `build_approval_rows` exactly or the footer height under-counts and the
+        // panel overlaps the body — hence both call `visible_command_rows` (width-
+        // independent, so the count can never disagree with what is drawn).
         panel.options.len()
             + 2
             + usize::from(panel.note.is_some())
             + usize::from(panel.reason.is_some())
+            + self.visible_command_rows(panel).len()
+    }
+
+    /// Split a Bash command into DISPLAY lines: honor the author's own newlines (heredocs,
+    /// multi-line scripts), and add a soft break after top-level `&&` / `||` / `|` / `;` so
+    /// a long pipe / chain reads multi-line. NAIVE (not quote-aware) — this only affects the
+    /// DISPLAY, never the command that runs, so a literal separator inside a quoted string
+    /// may wrap cosmetically. Order matters: `&&`/`||` before the single `|`.
+    fn split_command_display_lines(cmd: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for physical in cmd.split('\n') {
+            let softened = physical
+                .replace(" && ", " &&\u{1}")
+                .replace(" || ", " ||\u{1}")
+                .replace(" | ", " |\u{1}")
+                .replace("; ", ";\u{1}");
+            for seg in softened.split('\u{1}') {
+                let seg = seg.trim_end();
+                if !seg.is_empty() {
+                    out.push(seg.to_string());
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push(String::new());
+        }
+        out
+    }
+
+    /// The DISPLAY lines of the expanded full-command block, height-clamped so the header,
+    /// options and hint always stay on-screen (the "don't push the buttons off" rule).
+    /// Empty when collapsed or when there is no full command. Width-INDEPENDENT (each
+    /// logical line is one row, horizontally truncated at draw time), so this length is a
+    /// safe single source of truth for both `build_approval_rows` and `approval_panel_row_count`.
+    fn visible_command_rows(&self, panel: &crate::render::ApprovalPanelView) -> Vec<String> {
+        if !panel.expanded {
+            return Vec::new();
+        }
+        let Some(cmd) = panel.full_command.as_deref() else {
+            return Vec::new();
+        };
+        let lines = Self::split_command_display_lines(cmd);
+        // Rows the rest of the panel needs (header + hint + optional note/reason + options).
+        let reserved = 2
+            + usize::from(panel.note.is_some())
+            + usize::from(panel.reason.is_some())
+            + panel.options.len();
+        // Leave 2 rows of breathing room for the body; never let the command block shove
+        // the options off a short terminal.
+        let avail = (self.screen.height() as usize)
+            .saturating_sub(reserved + 2)
+            .max(1);
+        if lines.len() <= avail {
+            return lines;
+        }
+        let hidden = lines.len() - avail.saturating_sub(1);
+        let mut shown: Vec<String> = lines.into_iter().take(avail.saturating_sub(1)).collect();
+        // Language-neutral "N more lines" marker (the Tab hint already sits in the hint row).
+        shown.push(format!("… (+{hidden})"));
+        shown
     }
 
     /// Build the compact footer approval panel: numbered selectable options
@@ -4000,6 +4062,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
             out.push(row);
         }
 
+        // Expanded full-command block (Bash only, Tab-toggled): the EXACT command, shell-
+        // split into rows so the user reads precisely what will run at the decision point.
+        // `visible_command_rows` already height-clamped it so the options stay on-screen.
+        for line in self.visible_command_rows(panel) {
+            let line = crate::glyph::downgrade_glyphs(&line, unicode);
+            let line = crate::width::truncate_with_ellipsis(
+                &scrub_controls(&line),
+                rule_width.saturating_sub(4),
+            );
+            let style = self.style_for(Role::Secondary);
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "    ", &style); // 4-col indent under the header
+            push_str_cells(&mut row, &line, &style);
+            out.push(row);
+        }
+
         // option rows: `<marker><n>. <label>` (selected: ▸ + reverse padded to screen_width)
         for (i, label) in panel.options.iter().enumerate() {
             let mut row = Vec::new();
@@ -4042,7 +4120,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         // Hint row: `  <localized hint>` in muted style, glyph-downgraded, truncated.
-        let hint_raw = crate::i18n::t(crate::i18n::Msg::ApprovalHint);
+        // Bash approvals append the Tab expand/collapse hint so the affordance is discoverable.
+        let mut hint_raw = crate::i18n::t(crate::i18n::Msg::ApprovalHint).into_owned();
+        if panel.full_command.is_some() {
+            hint_raw.push_str(" · ");
+            hint_raw.push_str(&crate::i18n::t(crate::i18n::Msg::ApprovalExpandHint));
+        }
         let hint = crate::glyph::downgrade_glyphs(&hint_raw, unicode);
         let hint_budget = rule_width.saturating_sub(2);
         let hint_truncated = crate::width::truncate_with_ellipsis(&hint, hint_budget);
@@ -20364,6 +20447,8 @@ mod tests {
             selected: 0,
             note: None,
             reason: None,
+            full_command: None,
+            expanded: false,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -20398,6 +20483,8 @@ mod tests {
             selected: 0,
             note: None,
             reason: None,
+            full_command: None,
+            expanded: false,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -20450,6 +20537,8 @@ mod tests {
             selected: 0,
             note: Some("may send credentials to the provider".into()),
             reason: None,
+            full_command: None,
+            expanded: false,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -20482,6 +20571,8 @@ mod tests {
             selected: 0,
             note: None,
             reason: Some("此命令写到工作区外".into()),
+            full_command: None,
+            expanded: false,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -20508,9 +20599,13 @@ mod tests {
             selected: 0,
             note: None,
             reason: Some("reason text".into()),
+            full_command: None,
+            expanded: false,
         };
         let panel_without = crate::render::ApprovalPanelView {
             reason: None,
+            full_command: None,
+            expanded: false,
             ..panel_with_reason.clone()
         };
         assert_eq!(
@@ -21245,6 +21340,8 @@ mod tests {
             selected: 0,
             note: None,
             reason: None,
+            full_command: None,
+            expanded: false,
         };
         status.approval = Some(panel.clone());
         r.render(UiLine::InputPrompt {
@@ -21321,6 +21418,97 @@ mod tests {
         );
     }
 
+    fn bash_panel(full: &str, expanded: bool) -> crate::render::ApprovalPanelView {
+        crate::render::ApprovalPanelView {
+            tool: "Bash".into(),
+            detail: "cd /tmp && ./deploy …".into(), // compact (truncated) detail
+            options: vec!["Allow once".into(), "Always allow Bash".into(), "Deny".into()],
+            selected: 0,
+            note: None,
+            reason: None,
+            full_command: Some(full.into()),
+            expanded,
+        }
+    }
+
+    fn dump_rows(rows: &[Vec<Cell>]) -> String {
+        rows.iter()
+            .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Expanded Bash approval: the FULL command is visible (shell-split multi-line, not
+    /// truncated to a stub), and the row-count invariant still holds.
+    #[test]
+    fn approval_expanded_shows_full_command_and_count_matches() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.unicode_symbols = true;
+        let panel = bash_panel("cd /tmp && ./deploy.sh --prod | tee deploy.log", true);
+        let rows = r.build_approval_rows(&panel, 78, 80);
+        assert_eq!(
+            rows.len(),
+            r.approval_panel_row_count(&panel),
+            "row_count MUST track the built rows once the command block is expanded"
+        );
+        let dump = dump_rows(&rows);
+        assert!(dump.contains("./deploy.sh --prod"), "full command visible:\n{dump}");
+        assert!(dump.contains("tee deploy.log"), "piped tail visible too:\n{dump}");
+        // Shell-split: the `&&` chain and the pipe read on separate rows.
+        assert!(dump.contains("&&"), "shell-boundary split renders the chain:\n{dump}");
+        // Options + Tab hint remain.
+        assert!(dump.contains("Deny"), "options still present:\n{dump}");
+        assert!(dump.contains("Tab"), "Tab expand/collapse hint present:\n{dump}");
+    }
+
+    /// Collapsed (default): the full command is NOT shown — panel stays compact — but the
+    /// Tab affordance is hinted so the user can reveal it.
+    #[test]
+    fn approval_collapsed_hides_full_command_but_hints_tab() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let (mut r, _buf) = new_capturing(80, 24);
+        let panel = bash_panel("run-the-very-secret-command --flag=value", false);
+        let rows = r.build_approval_rows(&panel, 78, 80);
+        assert_eq!(rows.len(), r.approval_panel_row_count(&panel));
+        let dump = dump_rows(&rows);
+        assert!(
+            !dump.contains("very-secret-command"),
+            "collapsed panel must NOT render the full command:\n{dump}"
+        );
+        assert!(dump.contains("Tab"), "collapsed panel hints Tab to expand:\n{dump}");
+    }
+
+    /// Short terminal: a many-line command is height-clamped so the option rows are never
+    /// pushed off-screen, and the row-count invariant holds under the clamp.
+    #[test]
+    fn approval_expanded_command_height_clamped_keeps_options() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let (mut r, _buf) = new_capturing(80, 8); // tiny height
+        let cmd = (0..40)
+            .map(|i| format!("echo line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let panel = bash_panel(&cmd, true);
+        let rows = r.build_approval_rows(&panel, 78, 80);
+        assert_eq!(
+            rows.len(),
+            r.approval_panel_row_count(&panel),
+            "invariant holds under the height clamp"
+        );
+        // The whole panel fits the short terminal (not 40+ command rows).
+        assert!(rows.len() <= 8, "panel clamped to the short terminal, got {} rows", rows.len());
+        let dump = dump_rows(&rows);
+        assert!(
+            dump.contains("Allow once") && dump.contains("Deny"),
+            "options must stay visible on a short terminal:\n{dump}"
+        );
+        assert!(dump.contains("(+"), "a '(+N)' more-lines marker indicates the clamp:\n{dump}");
+    }
+
     /// Step 1 digit keys: `accel_index` falls back for y/a/n; digit routing is
     /// tested via the pure `ApprovalPanel.accel_index` + index-based resolution
     /// in `handle_approval_key`. This test confirms the option ordering contract
@@ -21351,6 +21539,8 @@ mod tests {
             selected: 0,
             note: None,
             reason: None,
+            full_command: None,
+            expanded: false,
         };
         // Digit routing: index = (c as usize) - ('1' as usize).
         // '1' → idx 0 → AllowOnce
@@ -25916,6 +26106,8 @@ mod tests {
             selected: 0,
             note: None,
             reason: None,
+            full_command: None,
+            expanded: false,
         });
 
         r.render(UiLine::InputPrompt {
@@ -26132,6 +26324,8 @@ mod tests {
             selected: 0,
             note: None,
             reason: None,
+            full_command: None,
+            expanded: false,
         });
 
         r.render(UiLine::InputPrompt {

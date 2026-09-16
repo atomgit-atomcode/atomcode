@@ -20473,6 +20473,19 @@ fn handle_approval_key(
             redraw_idle_plain(&app.buf, &mut app.state, ctx, renderer);
             return Ok(());
         }
+        // Tab toggles the full-command expansion (Bash only). A no-op falls through so
+        // Tab on a non-expandable panel does nothing (never resolves a decision).
+        KeyCode::Tab | KeyCode::BackTab => {
+            let toggled = app
+                .state
+                .approval_panel
+                .as_mut()
+                .is_some_and(|p| p.toggle_expand());
+            if toggled {
+                redraw_idle_plain(&app.buf, &mut app.state, ctx, renderer);
+                return Ok(());
+            }
+        }
         _ => {}
     }
 
@@ -27071,6 +27084,19 @@ fn handle_agent_event(
                     &call.arguments,
                 ))
             .then(|| crate::i18n::t(crate::i18n::Msg::CredentialApprovalNote).into_owned());
+            // Full, untruncated command for a shell approval — the security boundary must
+            // let the user read the EXACT command (Tab expands it multi-line). `None` for
+            // non-shell tools, which keep only the compact `detail`.
+            let full_command = matches!(call.name.as_str(), "bash" | "bash_start")
+                .then(|| {
+                    serde_json::from_str::<serde_json::Value>(&call.arguments)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("command").and_then(|c| c.as_str()).map(str::to_string)
+                        })
+                })
+                .flatten()
+                .filter(|c| !c.trim().is_empty());
             state.approval_panel = Some(crate::state::ApprovalPanel {
                 tool: display.clone(),
                 detail: detail.clone(),
@@ -27078,6 +27104,8 @@ fn handle_agent_event(
                 selected: 0,
                 note,
                 reason: approval_reason,
+                full_command,
+                expanded: false,
             });
             renderer.flush();
             atomcode_capabilities::notify::notify(
@@ -29186,6 +29214,8 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             selected: p.selected,
             note: p.note.clone(),
             reason: p.reason.clone(),
+            full_command: p.full_command.clone(),
+            expanded: p.expanded,
         });
     // A pending batch takes precedence over a single panel (mutually exclusive in
     // practice). The view carries the CURRENT question's fields plus batch navigator
