@@ -1995,7 +1995,11 @@ async fn the_provider_fails_mid_stream_in_production() {
 /// The hermetic scoping every on-harness scenario shares.
 ///
 /// Nothing may reach the network, a subprocess, or the developer's own disk.
-fn quiet_rows(dir: &std::path::Path) -> String {
+fn quiet_rows(dir: &std::path::Path) -> atomcode_plexus::Layer {
+    atomcode_plexus::Layer::from_toml(&quiet_rows_toml(dir)).expect("the test's quiet layer parses")
+}
+
+fn quiet_rows_toml(dir: &std::path::Path) -> String {
     let empty = dir.join("__no_skills__");
     let _ = std::fs::create_dir_all(&empty);
     format!(
@@ -2026,7 +2030,7 @@ async fn on_harness_handle(
         dir,
         atomcode_coding::on_harness::Presence::Attended,
         script,
-        &[quiet.as_str()],
+        &[quiet.clone()],
     )
     .await
     .expect("the coding-on-harness tree must mount")
@@ -2360,7 +2364,7 @@ async fn headless_refuses_what_attended_would_ask_about() {
     let _ = std::fs::remove_file(&outside);
     let empty = dir.join("__no_skills_hl__");
     let _ = std::fs::create_dir_all(&empty);
-    let quiet = format!(
+    let quiet_toml = format!(
         "[[patch]]\nid = \"trace\"\nconfig = {{ stream = false, tools = false, summary = false }}\n\n\
          [[patch]]\nid = \"mcp\"\ndisabled = true\n\n\
          [[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true\n\n\
@@ -2372,6 +2376,7 @@ async fn headless_refuses_what_attended_would_ask_about() {
         dir = dir.to_string_lossy(),
         home = empty.to_string_lossy(),
     );
+    let quiet = atomcode_plexus::Layer::from_toml(&quiet_toml).expect("the quiet layer parses");
     let args = r#"{"file_path":"../outside-headless.txt","content":"x"}"#;
     let script = Script::new(&[
         Reply::call("c1", "write_file", args),
@@ -2381,7 +2386,7 @@ async fn headless_refuses_what_attended_would_ask_about() {
         &dir,
         atomcode_coding::on_harness::Presence::Headless,
         script,
-        &[quiet.as_str()],
+        &[quiet.clone()],
     )
     .await
     .expect("the headless tree must mount");
@@ -2911,7 +2916,7 @@ async fn on_harness_headless(
         dir,
         atomcode_coding::on_harness::Presence::Headless,
         script,
-        &[quiet.as_str()],
+        &[quiet.clone()],
     )
     .await
     .expect("the headless coding-on-harness tree must mount")
@@ -3256,7 +3261,10 @@ async fn the_datalog_records_the_same_turn_on_both_engines() {
         &dir,
         atomcode_coding::on_harness::Presence::Attended,
         script(),
-        &[quiet.as_str(), insert.as_str()],
+        &[
+            quiet.clone(),
+            atomcode_plexus::Layer::from_toml(&insert).expect("parses"),
+        ],
     )
     .await
     .expect("the tree with a datalog must mount");
@@ -3365,7 +3373,10 @@ async fn a_users_hook_can_refuse_a_tool_on_both_engines() {
         &dir,
         atomcode_coding::on_harness::Presence::Attended,
         script(),
-        &[quiet.as_str(), insert.as_str()],
+        &[
+            quiet.clone(),
+            atomcode_plexus::Layer::from_toml(&insert).expect("parses"),
+        ],
     )
     .await
     .expect("the tree with cc-hooks must mount");
@@ -3421,7 +3432,10 @@ async fn without_a_hooks_file_nothing_is_mounted_and_nothing_changes() {
         &dir,
         atomcode_coding::on_harness::Presence::Attended,
         script(),
-        &[quiet.as_str(), insert.as_str()],
+        &[
+            quiet.clone(),
+            atomcode_plexus::Layer::from_toml(&insert).expect("parses"),
+        ],
     )
     .await
     .expect("the tree must mount with an inert cc-hooks row");
@@ -3527,7 +3541,7 @@ async fn a_model_switch_puts_a_different_provider_behind_the_seam() {
         atomcode_coding::on_harness::Presence::Attended,
         first,
         None,
-        &[quiet.as_str()],
+        &[quiet.clone()],
     )
     .await
     .expect("mount");
@@ -3587,7 +3601,7 @@ async fn a_model_switch_renames_the_persona_too() {
         atomcode_coding::on_harness::Presence::Attended,
         Script::text(&["ok"]),
         None,
-        &[quiet.as_str()],
+        &[quiet.clone()],
     )
     .await
     .expect("mount");
@@ -3641,7 +3655,7 @@ async fn the_delegation_guidance_comes_from_the_rows_that_own_the_tools() {
         atomcode_coding::on_harness::Presence::Attended,
         Script::text(&["ok"]).as_model("rows-own-their-words"),
         None,
-        &[quiet.as_str()],
+        &[quiet.clone()],
     )
     .await
     .expect("mount");
@@ -3748,7 +3762,7 @@ async fn a_logout_takes_the_credentials_and_leaves_the_agent() {
         atomcode_coding::on_harness::Presence::Attended,
         Script::text(&["ok"]).as_model("signed-in-model"),
         None,
-        &[quiet.as_str()],
+        &[quiet.clone()],
     )
     .await
     .expect("mount");
@@ -3818,7 +3832,7 @@ async fn a_logout_drops_the_provider_object_and_not_only_the_seam() {
         atomcode_coding::on_harness::Presence::Attended,
         signed_in.clone(),
         None,
-        &[quiet.as_str()],
+        &[quiet.clone()],
     )
     .await
     .expect("mount");

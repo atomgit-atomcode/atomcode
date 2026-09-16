@@ -1898,7 +1898,11 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
         let parts = prepare(&cfg, io_free_opts()).await.unwrap();
-        let names = parts.selected_tool_names();
+        // The field, not an accessor: `selected_tool_names` went with the chain
+        // in `f3a7f048` and this test — behind the `atomgit` feature, so never
+        // compiled by a plain `cargo nextest run -p atomcode-coding` — went on
+        // calling it. A feature nobody builds is a feature nobody tests.
+        let names = parts.tool_names.clone();
 
         for expected in ["atomgit_repo", "atomgit_pr", "atomgit_issue"] {
             assert!(

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use atomcode_kernel::agent::AgentHandle;
 use atomcode_kernel::provider::LlmProvider;
-use atomcode_plexus::{App, ConfigTree, Context, Layer, Plugin};
+use atomcode_plexus::{App, ConfigTree, Context, Entry, Layer, Plugin};
 
 /// Whether a person is at this agent.
 ///
@@ -345,6 +345,47 @@ name = "telemetry"
 disabled = true
 "#;
 
+// ---- the shapes this product patches rows with ------------------------------
+//
+// One struct per config this crate computes, serialized by the layer builder
+// rather than formatted into TOML. Two things that used to be a matter of
+// remembering are now the compiler's:
+//
+//   - a value the person wrote reaches the tree as a value, not as text that
+//     has to survive `{:?}` and come back as legal TOML (a path with a control
+//     character, a `NaN` temperature);
+//   - a patch that means to carry a field has a field to carry, so dropping one
+//     is a missing initializer rather than a missing substring.
+//
+// They are deliberately NOT the harness's own row structs: those are private,
+// and making them public would turn every row's schema into an API this crate
+// pins. These say what THIS product sends, which is the thing worth typing.
+
+#[derive(serde::Serialize)]
+struct AgentLoopPatch<'a> {
+    working_dir: &'a std::path::Path,
+}
+
+#[derive(serde::Serialize)]
+struct LlmInjectedRow<'a> {
+    provider_id: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct FsWorldPatch<'a> {
+    /// `None` is the attended world: no fence, because there is someone to ask.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root: Option<&'a std::path::Path>,
+}
+
+#[derive(serde::Serialize)]
+struct DatalogPatch<'a> {
+    working_dir: &'a std::path::Path,
+    model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dir: Option<&'a str>,
+}
+
 /// The rows that are this product, on top of [`CODING_DEFAULTS`].
 ///
 /// The split between the two lists is: `CODING_DEFAULTS` answers the same
@@ -454,75 +495,74 @@ name = "ui-handle"
 /// `[web_search] provider = "duckduckgo"` would have been read by the chain and
 /// silently dropped by the tree.
 /// The `persona-atomcode` row's config for a model and a language.
-fn persona_config(model: &str, language: Option<atomcode_config::locale::Locale>) -> String {
-    match language
-        .and_then(|l| serde_json::to_value(l).ok())
-        .and_then(|v| v.as_str().map(str::to_string))
-    {
-        Some(language) => format!(
-            "{{ model = {}, language = {} }}",
-            atomcode_harness::bundle::toml_string(model),
-            atomcode_harness::bundle::toml_string(&language)
-        ),
-        None => format!(
-            "{{ model = {} }}",
-            atomcode_harness::bundle::toml_string(model)
-        ),
-    }
+#[derive(serde::Serialize)]
+struct PersonaPatch<'a> {
+    model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<atomcode_config::locale::Locale>,
+}
+
+fn persona_config(
+    model: &str,
+    language: Option<atomcode_config::locale::Locale>,
+) -> PersonaPatch<'_> {
+    PersonaPatch { model, language }
 }
 
 /// Rows whose config follows the running model — patched at mount and again on
 /// every model switch, because each one is a fact about the model.
-fn model_rows(cfg: &crate::CodingAgentConfig) -> String {
-    let mut out = format!(
-        "[[patch]]\nid = \"tool-fs-world\"\nconfig = {{ vision = {} }}\n\n",
-        cfg.supports_vision
-    );
-    // A 429 is judged against the endpoint the request went to: whether it is the
-    // CodingPlan gateway (whose windows say when to come back) follows the model.
-    // The three waiting bounds are carried through because `Op::Patch` replaces a
-    // row's config wholesale: naming them here is what keeps this patch from
-    // dropping what `bundle::INFRA` set. They mirror base's values on purpose,
-    // and `no_row_silently_loses_a_configured_field` fails if base grows a field
-    // this line does not carry. (A base that changes one of these VALUES is the
-    // gap that comment cannot close — keep them in step by hand.)
-    out.push_str(&format!(
-        "[[patch]]\nid = \"llm-rate-limit\"\nname = \"rate-limit-coding\"\nconfig = {{ base_url = {}, max_waits = 5, max_wait_secs = 120, fallback_secs = 5{} }}\n\n",
-        atomcode_harness::bundle::toml_string(&cfg.base_url),
-        cfg.retry_max_attempts
-            .map(|n| format!(", max_attempts = {n}"))
-            .unwrap_or_default()
-    ));
-    let options = &cfg.chat_options;
-    let mut fields = Vec::new();
-    if let Some(level) = options
-        .reasoning_effort
-        .and_then(|l| serde_json::to_value(l).ok())
-        .and_then(|v| v.as_str().map(str::to_string))
-    {
-        fields.push(format!(
-            "reasoning_effort = {}",
-            atomcode_harness::bundle::toml_string(&level)
-        ));
-    }
-    if let Some(max_tokens) = options.max_tokens {
-        fields.push(format!("max_tokens = {max_tokens}"));
-    }
-    if let Some(temperature) = options.temperature {
-        fields.push(format!("temperature = {temperature:?}"));
-    }
-    out.push_str(&format!(
-        "[[patch]]\nid = \"chat-options\"\nconfig = {{ {} }}\n\n",
-        fields.join(", ")
-    ));
-    // Retries, and they belong HERE rather than in `config_rows` because
-    // `retry_max_attempts` is the PROVIDER's (`ProviderConfig`): a `/model` that
-    // moves the conversation to another provider moves whatever that one said
-    // about retrying, exactly as the 429 judgement above moves with it.
-    //
-    // An explicit upstream budget is the visible tier and wins; an explicit
-    // per-model adapter budget otherwise switches the outer tier off, the
-    // coupling the chain applies. Attempts count the first request.
+/// What `llm-retry` carries in `bundle::INFRA`, restated here because a swap to
+/// a provider with no opinion has to actively put it back.
+const DEFAULT_RETRY_ATTEMPTS: u32 = 3;
+
+#[derive(serde::Serialize)]
+struct CodeReviewModelPatch<'a> {
+    model: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct FsVisionPatch {
+    vision: bool,
+}
+
+#[derive(serde::Serialize)]
+struct RateLimitPatch<'a> {
+    base_url: &'a str,
+    // Carried, not omitted: `Op::Patch` replaces a row's config wholesale, so a
+    // field this struct does not have is a field the row loses. Naming them here
+    // is what keeps `bundle::INFRA`'s values. `no_row_silently_loses_a_configured_field`
+    // fails if base grows one this struct lacks; a base that changes one of these
+    // VALUES is the gap no test closes — keep them in step by hand.
+    max_waits: u32,
+    max_wait_secs: u64,
+    fallback_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_attempts: Option<u32>,
+}
+
+#[derive(serde::Serialize)]
+struct ChatOptionsPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<atomcode_kernel::provider::ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+}
+
+#[derive(serde::Serialize)]
+struct RetryPatch {
+    attempts: u32,
+    backoff_ms: u64,
+    cap_ms: u64,
+}
+
+/// Rows whose config follows the running model — patched at mount and again on
+/// every model switch, because each one is a fact about the model.
+fn model_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
+    // Retries. An explicit upstream budget is the visible tier and wins; an
+    // explicit per-model adapter budget otherwise switches the outer tier off,
+    // the coupling the chain applies. Attempts count the first request.
     //
     // Always emitted, never conditional: a swap TO a provider that says nothing
     // has to put the default back, and a patch that is simply absent leaves the
@@ -533,71 +573,182 @@ fn model_rows(cfg: &crate::CodingAgentConfig) -> String {
         (None, Some(_)) => 1,
         (None, None) => DEFAULT_RETRY_ATTEMPTS,
     };
-    out.push_str(&format!(
-        "[[patch]]\nid = \"llm-retry\"\nconfig = {{ attempts = {attempts}, backoff_ms = 3000, cap_ms = 30000 }}\n\n"
-    ));
-    out
+    Layer::new()
+        .patch(
+            "tool-fs-world",
+            FsVisionPatch {
+                vision: cfg.supports_vision,
+            },
+        )
+        .map_err(|e| e.to_string())?
+        // A 429 is judged against the endpoint the request went to: whether it
+        // is the CodingPlan gateway (whose windows say when to come back)
+        // follows the model.
+        .swap("llm-rate-limit", "rate-limit-coding")
+        .patch(
+            "llm-rate-limit",
+            RateLimitPatch {
+                base_url: &cfg.base_url,
+                max_waits: 5,
+                max_wait_secs: 120,
+                fallback_secs: 5,
+                max_attempts: cfg.retry_max_attempts,
+            },
+        )
+        .map_err(|e| e.to_string())?
+        .patch(
+            "chat-options",
+            ChatOptionsPatch {
+                reasoning_effort: cfg.chat_options.reasoning_effort,
+                max_tokens: cfg.chat_options.max_tokens,
+                // A non-finite temperature is dropped HERE, on purpose and where
+                // it can be read. `nan` is legal in `config.toml` and has no JSON
+                // number to become: left alone it serializes as `null`, which the
+                // row reads as "not set" anyway — but as an accident of serde
+                // rather than a decision. Saying it here means the next person
+                // sees a rule instead of a surprise.
+                temperature: cfg.chat_options.temperature.filter(|t| t.is_finite()),
+            },
+        )
+        .map_err(|e| e.to_string())?
+        // Retries belong HERE rather than in `config_rows` because
+        // `retry_max_attempts` is the PROVIDER's (`ProviderConfig`): a `/model`
+        // that moves the conversation to another provider moves whatever that
+        // one said about retrying, exactly as the 429 judgement above does.
+        .patch(
+            "llm-retry",
+            RetryPatch {
+                attempts,
+                backoff_ms: 3000,
+                cap_ms: 30000,
+            },
+        )
+        .map_err(|e| e.to_string())
 }
 
-/// What `llm-retry` carries in `bundle::INFRA`, restated here because a swap to
-/// a provider with no opinion has to actively put it back.
-const DEFAULT_RETRY_ATTEMPTS: u32 = 3;
+#[derive(serde::Serialize)]
+struct TruncationPatch {
+    max_continuations: u32,
+    checkpoint: bool,
+}
 
-pub fn config_rows(cfg: &crate::CodingAgentConfig) -> String {
-    let mut out = model_rows(cfg);
+#[derive(serde::Serialize)]
+struct RoundCapPatch {
+    max_rounds: u32,
+    max_seconds: u64,
+    checkpoint: bool,
+}
+
+#[derive(serde::Serialize)]
+struct LoopGuardPatch {
+    warn_after: u32,
+    stop_after: u32,
+}
+
+#[derive(serde::Serialize)]
+struct CompactionTailPatch {
+    threshold: f32,
+    keep_turns: u32,
+}
+
+#[derive(serde::Serialize)]
+struct AskTimeoutPatch {
+    ask_timeout_secs: u64,
+}
+
+#[derive(serde::Serialize)]
+struct CredentialShellPatch<'a> {
+    policy: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct WebProviderPatch<'a> {
+    provider: &'a str,
+}
+
+/// Everything in `config.toml` that a row can carry, as a layer.
+///
+/// Empty for a default config, so the tree reads the same as if this were not
+/// here at all.
+pub fn config_rows(cfg: &crate::CodingAgentConfig) -> Result<Layer, String> {
+    use atomcode_capabilities::tools::CredentialShellPolicy;
+
+    let mut out = model_rows(cfg)?;
     if cfg.preferred_language.is_some() {
-        out.push_str(&format!(
-            "[[patch]]\nid = \"persona-atomcode\"\nconfig = {}\n\n",
-            persona_config(&cfg.model, cfg.preferred_language)
-        ));
+        out = out
+            .patch(
+                "persona-atomcode",
+                persona_config(&cfg.model, cfg.preferred_language),
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    // With the checkpoint, a front end that draws the question is asked before a
+    // turn is cut off by its budget or ends with its answer cut off.
+    if cfg.round_cap_checkpoint {
+        out = out
+            .patch(
+                "truncation-recovery",
+                TruncationPatch {
+                    max_continuations: 4,
+                    checkpoint: true,
+                },
+            )
+            .map_err(|e| e.to_string())?;
     }
     // A turn's own round budget; `0` is unbounded, which `CODING_DEFAULTS` states.
-    // With the checkpoint, a front end that draws the question is asked before
-    // a turn is cut off by its budget or ends with its answer cut off.
-    if cfg.round_cap_checkpoint {
-        out.push_str(
-            "[[patch]]\nid = \"truncation-recovery\"\nconfig = { max_continuations = 4, checkpoint = true }\n\n",
-        );
-    }
     if cfg.max_rounds != 0 {
-        out.push_str(&format!(
-            "[[patch]]\nid = \"round-cap\"\nconfig = {{ max_rounds = {}, max_seconds = 0, checkpoint = {} }}\n\n",
-            cfg.max_rounds, cfg.round_cap_checkpoint
-        ));
+        out = out
+            .patch(
+                "round-cap",
+                RoundCapPatch {
+                    max_rounds: cfg.max_rounds,
+                    max_seconds: 0,
+                    checkpoint: cfg.round_cap_checkpoint,
+                },
+            )
+            .map_err(|e| e.to_string())?;
     }
     // The exact-repeat guard. `None` is the person turning it off.
-    match cfg.tool_loop_policy {
-        Some(policy) => out.push_str(&format!(
-            "[[patch]]\nid = \"tool-loop-guard\"\nconfig = {{ warn_after = {}, stop_after = {} }}\n\n",
-            policy.warning_threshold(),
-            policy.stop_threshold()
-        )),
-        None => out.push_str("[[patch]]\nid = \"tool-loop-guard\"\ndisabled = true\n\n"),
-    }
-    out.push_str(&format!(
-        "[[patch]]\nid = \"compaction-tail\"\nconfig = {{ threshold = {:?}, keep_turns = 2 }}\n\n",
-        cfg.compact_threshold
-    ));
-    // How long a question to the person waits. `None` parks until answered.
-    let ask = cfg.request_timeout.map(|d| d.as_secs().max(1)).unwrap_or(0);
-    out.push_str(&format!(
-        "[[patch]]\nid = \"ui-handle\"\nconfig = {{ ask_timeout_secs = {ask} }}\n\n"
-    ));
-    // `[tools] credential_shell = "off" | "prompt" | "strict"`. The row's own
-    // default is `prompt`, the same as the L1 default, so only a person who
-    // chose otherwise changes the tree.
-    {
-        use atomcode_capabilities::tools::CredentialShellPolicy;
-        let policy = match cfg.credential_shell_policy {
-            CredentialShellPolicy::Off => Some("off"),
-            CredentialShellPolicy::Prompt => None,
-            CredentialShellPolicy::Strict => Some("strict"),
-        };
-        if let Some(policy) = policy {
-            out.push_str(&format!(
-                "[[patch]]\nid = \"tool-credential-shell\"\nconfig = {{ policy = \"{policy}\" }}\n\n"
-            ));
-        }
+    out = match cfg.tool_loop_policy {
+        Some(policy) => out
+            .patch(
+                "tool-loop-guard",
+                LoopGuardPatch {
+                    warn_after: policy.warning_threshold(),
+                    stop_after: policy.stop_threshold(),
+                },
+            )
+            .map_err(|e| e.to_string())?,
+        None => out.disable("tool-loop-guard"),
+    };
+    out = out
+        .patch(
+            "compaction-tail",
+            CompactionTailPatch {
+                threshold: cfg.compact_threshold,
+                keep_turns: 2,
+            },
+        )
+        .map_err(|e| e.to_string())?
+        // How long a question to the person waits. `0` parks until answered.
+        .patch(
+            "ui-handle",
+            AskTimeoutPatch {
+                ask_timeout_secs: cfg.request_timeout.map(|d| d.as_secs().max(1)).unwrap_or(0),
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    // `[coding] shell_guard_policy`. The row's own default is `prompt`, the same
+    // as the L1 default, so only a person who chose otherwise changes the tree.
+    let policy = match cfg.credential_shell_policy {
+        CredentialShellPolicy::Off => Some("off"),
+        CredentialShellPolicy::Prompt => None,
+        CredentialShellPolicy::Strict => Some("strict"),
+    };
+    if let Some(policy) = policy {
+        out = out
+            .patch("tool-credential-shell", CredentialShellPatch { policy })
+            .map_err(|e| e.to_string())?;
     }
     if let Some(provider) = cfg
         .web_search_provider
@@ -605,11 +756,11 @@ pub fn config_rows(cfg: &crate::CodingAgentConfig) -> String {
         .map(str::trim)
         .filter(|p| !p.is_empty())
     {
-        out.push_str(&format!(
-            "[[patch]]\nid = \"tool-web\"\nconfig = {{ provider = {provider:?} }}\n\n"
-        ));
+        out = out
+            .patch("tool-web", WebProviderPatch { provider })
+            .map_err(|e| e.to_string())?;
     }
-    out
+    Ok(out)
 }
 
 /// The coding overlay with this working directory substituted in.
@@ -886,22 +1037,25 @@ pub async fn swap_provider_for(
     //                     reviewer on the old model, and `/logout` would leave
     //                     it holding the credentials. The logout criterion in
     //                     the differential fails the moment this line is gone.
-    let persona = persona_config(model, config.and_then(|c| c.preferred_language));
-    let mut layer_text = format!(
-        "[[patch]]\nid = \"llm\"\nconfig = {{ provider_id = {id:?} }}\n\n\
-         [[patch]]\nid = \"persona-atomcode\"\nconfig = {persona}\n\n\
-         [[patch]]\nid = \"tool-code-review\"\nconfig = {{ model = {model:?} }}\n\n"
-    );
-    if let Some(config) = config {
-        layer_text.push_str(&model_rows(config));
-    }
     let restore = |error: String| {
         if let Some(previous) = previous.clone() {
             slots.insert(previous);
         }
         error
     };
-    let layer = Layer::from_toml(&layer_text).map_err(|e| restore(e.to_string()))?;
+    let mut layer = Layer::new()
+        .patch("llm", LlmInjectedRow { provider_id: &id })
+        .and_then(|layer| {
+            layer.patch(
+                "persona-atomcode",
+                persona_config(model, config.and_then(|c| c.preferred_language)),
+            )
+        })
+        .and_then(|layer| layer.patch("tool-code-review", CodeReviewModelPatch { model }))
+        .map_err(|e| restore(e.to_string()))?;
+    if let Some(config) = config {
+        layer = layer.then(model_rows(config).map_err(&restore)?);
+    }
     app.patch(&layer).await.map_err(|e| restore(e.to_string()))
 }
 
@@ -1055,7 +1209,7 @@ pub async fn mount(
     working_dir: &Path,
     presence: Presence,
     provider: Arc<dyn LlmProvider>,
-    extra_layers: &[&str],
+    extra_layers: &[Layer],
 ) -> Result<(AgentHandle, App), String> {
     let (handle, app, _) =
         mount_swappable(working_dir, presence, provider, None, extra_layers).await?;
@@ -1072,7 +1226,7 @@ pub async fn mount_swappable(
     presence: Presence,
     provider: Arc<dyn LlmProvider>,
     models: Option<HostModels>,
-    extra_layers: &[&str],
+    extra_layers: &[Layer],
 ) -> Result<(AgentHandle, App, Arc<ProviderSlots>), String> {
     mount_hosted(
         working_dir,
@@ -1115,8 +1269,8 @@ pub struct HostState {
         Option<String>,
     )>,
     /// Row edits the runtime's own options call for (a capability switched off,
-    /// a directory to resolve against), as a TOML layer.
-    pub rows: String,
+    /// a directory to resolve against).
+    pub rows: Layer,
     /// The runtime's MCP registry, published into the tree by `mcp-host`.
     pub(crate) mcp: Option<crate::host_rows::McpPublication>,
     /// What the person chose this conversation to run, when the host knows it.
@@ -1156,7 +1310,7 @@ pub async fn mount_hosted(
     provider: Arc<dyn LlmProvider>,
     models: Option<HostModels>,
     host: HostState,
-    extra_layers: &[&str],
+    extra_layers: &[Layer],
 ) -> Result<(AgentHandle, App, Arc<ProviderSlots>), String> {
     let model = host
         .model
@@ -1174,42 +1328,51 @@ pub async fn mount_hosted(
     // modes because `ui-handle` claims that seam and round-trips the driver, and
     // mounting `ui-handle` at all means a driver is present.
     let boundary = match presence {
-        Presence::Attended => "[[patch]]\nid = \"fs\"\nconfig = {}\n".to_string(),
-        Presence::Headless => format!(
-            "[[patch]]\nid = \"fs\"\nconfig = {{ root = {} }}\n",
-            atomcode_harness::bundle::toml_string(&working_dir.to_string_lossy()),
-        ),
+        Presence::Attended => Layer::new()
+            .patch("fs", FsWorldPatch { root: None })
+            .map_err(|e| e.to_string())?,
+        Presence::Headless => Layer::new()
+            .patch(
+                "fs",
+                FsWorldPatch {
+                    root: Some(working_dir),
+                },
+            )
+            .map_err(|e| e.to_string())?,
     };
-    // With a catalog, the two rows that need one come on; without, they stay
-    // down and `task`/`team` run on the conversation's model, which is what they
-    // did before the seam existed.
-    let catalog = if models.is_some() {
-        "[[patch]]\nid = \"models-host\"\ndisabled = false\n\n\
-         [[patch]]\nid = \"llm-utility-selected\"\ndisabled = false\n"
-    } else {
-        ""
-    };
-    // `toml_string`, not `{:?}`: a working directory is whatever the user made,
-    // and `{:?}` writes a control character as `\u{7f}` — which is not TOML.
-    // See `atomcode_harness::bundle::toml_string`.
-    let scoped = format!(
-        "{catalog}{boundary}\n\
-         [[patch]]\nid = \"agent-loop\"\nconfig = {{ working_dir = {} }}\n\n\
-         [[patch]]\nid = \"llm\"\nname = \"llm-injected\"\nconfig = {{ provider_id = {} }}\n",
-        atomcode_harness::bundle::toml_string(&working_dir.to_string_lossy()),
-        atomcode_harness::bundle::toml_string(&provider_id),
-    );
+    // Built, not formatted. A working directory is whatever the person made, and
+    // a `{:?}` of it writes a control character as `\u{7f}` — which is not TOML,
+    // and the layer then fails to parse a long way from whoever set the path.
+    // `toml_string` exists to dodge that; serializing the row's own shape means
+    // there is nothing to dodge.
+    let scoped = Layer::new()
+        .when(models.is_some(), |layer| {
+            // With a catalog, the two rows that need one come on; without, they
+            // stay down and `task`/`team` run on the conversation's model, which
+            // is what they did before the seam existed.
+            layer.enable("models-host").enable("llm-utility-selected")
+        })
+        .then(boundary)
+        .patch("agent-loop", AgentLoopPatch { working_dir })
+        .map_err(|e| e.to_string())?
+        .swap("llm", "llm-injected")
+        .patch(
+            "llm",
+            LlmInjectedRow {
+                provider_id: &provider_id,
+            },
+        )
+        .map_err(|e| e.to_string())?;
     // `infra`, not `base`: the machine is the harness's, the product decisions
     // are this crate's. See [`CODING_DEFAULTS`] for why that is not the same as
     // taking base and patching it.
     let mut layers = vec![atomcode_harness::bundle::infra().map_err(|e| e.to_string())?];
-    for src in [
-        CODING_DEFAULTS,
-        scoped.as_str(),
-        coding_overlay(working_dir, &artifacts, presence, &model).as_str(),
-    ] {
-        layers.push(Layer::from_toml(src).map_err(|e| e.to_string())?);
-    }
+    layers.push(Layer::from_toml(CODING_DEFAULTS).map_err(|e| e.to_string())?);
+    layers.push(scoped);
+    layers.push(
+        Layer::from_toml(&coding_overlay(working_dir, &artifacts, presence, &model))
+            .map_err(|e| e.to_string())?,
+    );
     // The session is the runtime's: its id, and its stored conversation as the
     // seed. The harness's own `session` row would mint an id and, asked to
     // resume, replay the JSONL journal — which is the follower, not the master.
@@ -1217,76 +1380,62 @@ pub async fn mount_hosted(
     // decides per call whether it is on. Patched in place so it keeps
     // `plan-mode`'s position, ahead of the approval gates: a write plan mode
     // refuses must not first be asked about.
-    let modes_rows = if host.modes.is_some() {
-        "[[patch]]\nid = \"plan-mode\"\nname = \"plan-mode-live\"\ndisabled = false\n\n\
-         [[insert]]\nname = \"modes-host\"\n\n\
-         [[insert]]\nname = \"grants-host\"\n\n"
-    } else {
-        ""
-    };
-    let cc_rows = if host.cc_hooks.is_some() {
-        "[[patch]]\nid = \"cc-hooks\"\nname = \"cc-hooks-host\"\ndisabled = false\n\n"
-    } else {
-        ""
-    };
-    let context_rows = if host.session_context.is_some() {
-        "[[patch]]\nid = \"project-instructions\"\nname = \"session-context\"\n\n"
-    } else {
-        ""
-    };
-    let datalog_rows = host
-        .datalog
-        .as_ref()
-        .map(|datalog| {
-            let dir = datalog
-                .dir
-                .as_deref()
-                .map(|dir| format!(", dir = {}", atomcode_harness::bundle::toml_string(dir)))
-                .unwrap_or_default();
-            format!(
-                "[[insert]]\nname = \"datalog\"\nconfig = {{ working_dir = {}, model = {}{dir} }}\n\n",
-                atomcode_harness::bundle::toml_string(&working_dir.to_string_lossy()),
-                atomcode_harness::bundle::toml_string(&model),
-            )
+    let mut hosted = Layer::new()
+        .swap("session", "session-native")
+        // With live switches, plan mode is the product's and is always mounted
+        // — it decides per call whether it is on.
+        .when(host.modes.is_some(), |layer| {
+            layer
+                .swap("plan-mode", "plan-mode-live")
+                .enable("plan-mode")
+                .insert(Entry::named("modes-host"))
+                .insert(Entry::named("grants-host"))
         })
-        .unwrap_or_default();
-    let checkpoint_rows = match (host.compaction_checkpoint.is_some(), host.summary_provider.is_some()) {
-        (true, true) => "[[insert]]\nname = \"native-compaction-checkpoint\"\n\n[[patch]]\nid = \"compaction-tail\"\nname = \"compaction-coding\"\n\n",
-        (true, false) => "[[insert]]\nname = \"native-compaction-checkpoint\"\n\n",
-        (false, true) => "[[patch]]\nid = \"compaction-tail\"\nname = \"compaction-coding\"\n\n",
-        (false, false) => "",
-    };
-    let mcp_rows = if host.mcp.is_some() {
-        "[[patch]]\nid = \"mcp\"\nname = \"mcp-host\"\ndisabled = false\n\n"
-    } else {
-        ""
-    };
-    let skills_rows = if host.skills.is_some() {
-        "[[patch]]\nid = \"skills\"\nname = \"skills-host\"\n\n\
-         [[patch]]\nid = \"skill-catalog-inline\"\ndisabled = true\n\n"
-    } else {
-        ""
-    };
-    let tools_rows = if host.tools.is_empty() {
-        ""
-    } else {
-        "[[insert]]\nname = \"host-tools\"\n\n"
-    };
-    let hosted = format!(
-        "[[patch]]\nid = \"session\"\nname = \"session-native\"\n\n{modes_rows}{cc_rows}{context_rows}{datalog_rows}{tools_rows}{skills_rows}{mcp_rows}{checkpoint_rows}{}{}{}",
-        host.hooks
-            .as_ref()
-            .map(|hooks| hooks.rows())
-            .unwrap_or_default(),
-        host.middleware
-            .as_ref()
-            .map(|middleware| middleware.rows())
-            .unwrap_or_default(),
-        host.rows,
-    );
-    layers.push(Layer::from_toml(&hosted).map_err(|e| e.to_string())?);
-    for src in extra_layers {
-        layers.push(Layer::from_toml(src).map_err(|e| e.to_string())?);
+        .when(host.cc_hooks.is_some(), |layer| {
+            layer.swap("cc-hooks", "cc-hooks-host").enable("cc-hooks")
+        })
+        .when(host.session_context.is_some(), |layer| {
+            layer.swap("project-instructions", "session-context")
+        })
+        .when(!host.tools.is_empty(), |layer| {
+            layer.insert(Entry::named("host-tools"))
+        })
+        .when(host.skills.is_some(), |layer| {
+            layer
+                .swap("skills", "skills-host")
+                .disable("skill-catalog-inline")
+        })
+        .when(host.mcp.is_some(), |layer| {
+            layer.swap("mcp", "mcp-host").enable("mcp")
+        })
+        .when(host.compaction_checkpoint.is_some(), |layer| {
+            layer.insert(Entry::named("native-compaction-checkpoint"))
+        })
+        .when(host.summary_provider.is_some(), |layer| {
+            layer.swap("compaction-tail", "compaction-coding")
+        });
+    if let Some(datalog) = host.datalog.as_ref() {
+        hosted = hosted
+            .insert(
+                Entry::named("datalog")
+                    .with(DatalogPatch {
+                        working_dir,
+                        model: &model,
+                        dir: datalog.dir.as_deref(),
+                    })
+                    .map_err(|e| e.to_string())?,
+            )
+            .clone();
+    }
+    if let Some(hooks) = host.hooks.as_ref() {
+        hosted = hosted.then(hooks.rows());
+    }
+    if let Some(middleware) = host.middleware.as_ref() {
+        hosted = hosted.then(middleware.rows());
+    }
+    layers.push(hosted.then(host.rows.clone()));
+    for layer in extra_layers {
+        layers.push(layer.clone());
     }
     let tree = ConfigTree::from_layers(layers).map_err(|e| e.to_string())?;
 

@@ -214,6 +214,33 @@ impl Layer {
         self
     }
 
+    /// Append another layer's edits to this one.
+    ///
+    /// Stacking two layers and concatenating their edits into one are the same
+    /// thing — [`ConfigTree::apply`] walks ops in order either way — so this is
+    /// for a host that assembles one layer out of conditional pieces.
+    pub fn then(mut self, other: Layer) -> Self {
+        self.ops.extend(other.ops);
+        self
+    }
+
+    /// [`then`](Self::then), for a piece that may not apply.
+    pub fn maybe(self, other: Option<Layer>) -> Self {
+        match other {
+            Some(other) => self.then(other),
+            None => self,
+        }
+    }
+
+    /// [`then`](Self::then), for a piece that applies only under a condition.
+    pub fn when(self, condition: bool, piece: impl FnOnce(Layer) -> Layer) -> Self {
+        if condition {
+            piece(self)
+        } else {
+            self
+        }
+    }
+
     /// Parse a layer from TOML.
     ///
     /// ```toml

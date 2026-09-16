@@ -8,11 +8,21 @@
 
 use atomcode_plexus::{ConfigTree, Entry, Layer};
 
-/// The tree as `--dump-config` renders it: every row, disabled ones included,
-/// with its plugin and its config. Comparing this compares the whole result,
-/// not a summary of it.
-fn tree(layers: impl IntoIterator<Item = Layer>) -> String {
-    ConfigTree::from_layers(layers).expect("stacks").dump()
+/// The mounted rows, each with its plugin and its config as a VALUE.
+///
+/// Not the `dump()` string, and the reason is worth keeping: whether a config's
+/// keys come out sorted or in struct order depends on whether anything in the
+/// build turned on `serde_json/preserve_order` — and Cargo unifies features
+/// across a workspace, so that depends on which OTHER crates are in the same
+/// `cargo nextest` invocation. Comparing rendered text made these criteria pass
+/// alone and fail next to `atomcode`. Comparing values compares what the rows
+/// actually receive, which is the thing this file is about.
+fn tree(layers: impl IntoIterator<Item = Layer>) -> Vec<(String, String, serde_json::Value)> {
+    ConfigTree::from_layers(layers)
+        .expect("stacks")
+        .active()
+        .map(|e| (e.id.clone(), e.name.clone(), e.config.clone()))
+        .collect()
 }
 
 #[derive(serde::Serialize)]

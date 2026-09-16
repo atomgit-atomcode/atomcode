@@ -2067,49 +2067,64 @@ async fn a_logout_with_no_live_agent_still_leaves_no_provider_alive() {
     runtime.handle.shutdown().await.unwrap();
 }
 
-/// A `/model` the tree cannot apply fails loudly and leaves the session usable.
+/// A `nan` temperature does not break `/model`; it is ignored, and the switch
+/// happens.
 ///
-/// The tree is built by FORMATTING a TOML layer, and that can fail on values a
-/// person can actually write: `temperature = nan` is legal TOML, but `{:?}`
-/// renders it `NaN`, which TOML will not read back. (A model name carrying a
-/// control character is the same shape — `{:?}` renders `\u{7f}`, not a legal
-/// TOML escape.) The switch must then be a clean no-op, not a half-applied one.
+/// `temperature = nan` is legal in `config.toml` and has no JSON number to
+/// become. This used to matter a great deal: the tree's layer was FORMATTED into
+/// TOML, `{:?}` wrote `NaN`, TOML would not read it back, and the whole switch
+/// failed with a parse error naming the layer rather than the setting.
 ///
-/// **What this does NOT cover, and the omission is deliberate:** the provider
-/// SLOT is swapped before that fallible step, and it is the slot — not the tree
-/// — that `CodingModels::provider` serves to the `models` seam, i.e. what
-/// `task` / `team` / `code_review` get when they ask for "the model this
-/// conversation is on". `swap_provider_for` now restores it on failure, but this
-/// criterion passes with and without that restore: the conversation itself keeps
-/// working either way, because the `llm` row captured its provider at mount. A
-/// criterion for the slot needs the delegated child's provider to be
-/// distinguishable from the conversation's, which the recorder cannot do today.
-/// **A test that stays green with the fix removed is worse than no test**, so
-/// this one claims only what it proves, and the gap is written down here.
-async fn a_model_switch_that_cannot_be_applied_changes_nothing() {
+/// Building the layer from typed rows removed that failure — and would have
+/// replaced it with a quieter one, `null` reaching the row by way of serde, so
+/// `model_rows` drops a non-finite temperature where it can be read. The switch
+/// applies, the rest of the options apply with it, and the one value that has no
+/// meaning is the one thing left out.
+///
+/// The control for this one is history rather than a switch to flip: before the
+/// refactor this criterion asserted the OPPOSITE — that the switch failed — and
+/// it was green. Removing `model_rows`'s `.filter(|t| t.is_finite())` does NOT
+/// turn it red, because the row reads a `null` as absent anyway; that filter is
+/// there to say so in code rather than to depend on the row's schema, and this
+/// note exists so nobody mistakes it for something a test is holding.
+///
+/// **What no criterion covers, and the gap is deliberate:** the provider SLOT is
+/// swapped before the fallible part of `swap_provider_for`, and it is the slot —
+/// not the tree — that `CodingModels::provider` serves to the `models` seam, i.e.
+/// what `task` / `team` / `code_review` get when they ask for "the model this
+/// conversation is on". That function restores it on failure, but a criterion for
+/// it needs the delegated child's provider to be distinguishable from the
+/// conversation's, which the recorder cannot do today. **A test that stays green
+/// with the fix removed is worse than no test**, so the gap is written down
+/// rather than papered over.
+async fn a_meaningless_temperature_is_ignored_rather_than_breaking_a_model_switch() {
     let env = env();
     let recorder = Arc::new(Recorder::default());
     let start = start(env.project.path(), &recorder, SessionMode::Fresh);
-    let mut broken = start.agent.clone();
-    broken.model = "recorder-two".into();
-    // Legal TOML in `config.toml`, not legal once it has been through `{:?}`.
-    broken.chat_options.temperature = Some(f32::NAN);
+    let mut next = start.agent.clone();
+    next.model = "recorder-two".into();
+    // Legal in `config.toml`, and with no number to become.
+    next.chat_options.temperature = Some(f32::NAN);
+    next.chat_options.max_tokens = Some(77);
     let mut runtime = CodingRuntime::start(start).await.unwrap();
 
     turn(&mut runtime, "hello").await;
-    let before = recorder.requests.lock().unwrap().len();
+    runtime
+        .handle
+        .reassemble_provider(next)
+        .await
+        .unwrap_or_else(|e| panic!("a meaningless temperature broke the switch: {e:?}"));
 
-    let failed = runtime.handle.reassemble_provider(broken).await;
-    assert!(
-        failed.is_err(),
-        "a layer that cannot be built must not report success"
+    turn(&mut runtime, "again").await;
+    let options = recorder.options.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        options.temperature, None,
+        "a non-finite temperature reached the provider"
     );
-
-    // The turn still runs, on the model it already had.
-    turn(&mut runtime, "hello").await;
-    assert!(
-        recorder.requests.lock().unwrap().len() > before,
-        "the conversation stopped working after a failed /model"
+    assert_eq!(
+        options.max_tokens,
+        Some(77),
+        "the rest of the switch was lost with it"
     );
     runtime.handle.shutdown().await.unwrap();
 }
@@ -2627,7 +2642,7 @@ mod criteria {
         withdrawing_mcp_takes_the_tools_off_the_model,
         a_written_task_list_outlives_the_messages_it_came_from,
         the_retry_budget_follows_a_model_switch,
-        a_model_switch_that_cannot_be_applied_changes_nothing,
+        a_meaningless_temperature_is_ignored_rather_than_breaking_a_model_switch,
         a_cancelled_turn_is_undone_by_default,
         a_cancelled_turn_is_kept_when_asked,
         a_distant_rate_limit_pauses_the_turn,

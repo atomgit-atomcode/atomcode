@@ -148,18 +148,27 @@ impl HostHooks {
     }
 
     /// The row layer that mounts every hook this table holds.
-    pub(crate) fn rows(&self) -> String {
+    pub(crate) fn rows(&self) -> atomcode_plexus::Layer {
         self.names()
             .iter()
-            .map(|name| {
-                format!(
-                    "[[insert]]\nid = {}\nname = \"kernel-hooks\"\nconfig = {{ hook = {} }}\n\n",
-                    atomcode_harness::bundle::toml_string(&format!("kernel-hooks-{name}")),
-                    atomcode_harness::bundle::toml_string(name),
-                )
+            .fold(atomcode_plexus::Layer::new(), |layer, name| {
+                let entry =
+                    atomcode_plexus::Entry::with_id(format!("kernel-hooks-{name}"), "kernel-hooks")
+                        .with(NamedHook { hook: name })
+                        .expect("a hook name is a string");
+                layer.insert(entry)
             })
-            .collect()
     }
+}
+
+#[derive(serde::Serialize)]
+struct NamedHook<'a> {
+    hook: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct NamedMiddleware<'a> {
+    middleware: &'a str,
 }
 
 /// `kernel-hooks`: one host-built lifecycle hook at the harness's moments.
@@ -767,21 +776,22 @@ impl HostMiddleware {
     ///
     /// These land innermost, after every gate has had its say — right for an
     /// observer, wrong for a decider, which is why a decider gets its own row.
-    pub(crate) fn rows(&self) -> String {
+    pub(crate) fn rows(&self) -> atomcode_plexus::Layer {
         let claimed = self.claimed.read().unwrap_or_else(|e| e.into_inner());
         self.entries
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .keys()
             .filter(|name| !claimed.contains(*name))
-            .map(|name| {
-                format!(
-                    "[[insert]]\nid = {}\nname = \"kernel-middleware\"\nconfig = {{ middleware = {} }}\n\n",
-                    atomcode_harness::bundle::toml_string(&format!("kernel-middleware-{name}")),
-                    atomcode_harness::bundle::toml_string(name),
+            .fold(atomcode_plexus::Layer::new(), |layer, name| {
+                let entry = atomcode_plexus::Entry::with_id(
+                    format!("kernel-middleware-{name}"),
+                    "kernel-middleware",
                 )
+                .with(NamedMiddleware { middleware: name })
+                .expect("a middleware name is a string");
+                layer.insert(entry)
             })
-            .collect()
     }
 }
 

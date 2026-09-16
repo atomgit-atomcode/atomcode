@@ -7548,7 +7548,7 @@ fn harness_host_state(
     // and `a_permission_allow_rule_still_skips_the_prompt_it_covers` fail in
     // opposite directions if this moves either way.
     let permission_rows = if config.permission_rules.is_empty() {
-        String::new()
+        atomcode_plexus::Layer::new()
     } else {
         middleware.insert_mounted_by_row(
             "permission-rules",
@@ -7557,7 +7557,16 @@ fn harness_host_state(
                 parts.shared_cwd.clone(),
             )),
         );
-        "[[patch]]\nid = \"permissions\"\nname = \"kernel-middleware\"\nconfig = { middleware = \"permission-rules\", prepend = true }\n\n".to_string()
+        atomcode_plexus::Layer::new()
+            .swap("permissions", "kernel-middleware")
+            .patch(
+                "permissions",
+                KernelMiddlewarePatch {
+                    middleware: "permission-rules",
+                    prepend: true,
+                },
+            )
+            .map_err(|e| std::io::Error::other(e.to_string()))?
     };
     #[cfg(feature = "atomgit")]
     middleware.insert(
@@ -7588,7 +7597,9 @@ fn harness_host_state(
         compaction_checkpoint: parts.snapshot_hook(),
         summary_provider: Some(parts.side_provider_slot()),
         model: Some(config.model.clone()),
-        rows: harness_option_rows(parts, config, prepare) + &permission_rows,
+        rows: harness_option_rows(parts, config, prepare)
+            .map_err(std::io::Error::other)?
+            .then(permission_rows),
         datalog: config.datalog.enabled.then(|| config.datalog.clone()),
         modes: Some(crate::on_harness::HostModes {
             modes: atomcode_harness::seams::Modes {
@@ -7633,14 +7644,8 @@ pub async fn mount(
     } else {
         crate::on_harness::Presence::Headless
     };
-    // What the person wrote in `config.toml` and the chain reads off this
-    // struct. Empty for a default config, so the tree is unchanged.
-    let from_config = crate::on_harness::config_rows(config);
-    let extra: Vec<&str> = if from_config.is_empty() {
-        Vec::new()
-    } else {
-        vec![from_config.as_str()]
-    };
+    // What the person wrote in `config.toml`, as a layer of its own.
+    let extra = vec![crate::on_harness::config_rows(config)?];
     // The model catalog, when this host has one. Both halves come from what
     // `install_subagent_tiers` already put on the config, so the tree and the
     // chain resolve a selection through the same resolver — including its reset
@@ -7704,47 +7709,74 @@ async fn build_agent(
 /// switch after its environment override) rather than re-deriving it from the
 /// options, so the tree and the capability graph cannot disagree about whether a
 /// capability is on.
+#[derive(serde::Serialize)]
+struct KernelMiddlewarePatch<'a> {
+    middleware: &'a str,
+    prepend: bool,
+}
+
+#[derive(serde::Serialize)]
+struct MemoryPatch<'a> {
+    project_root: &'a std::path::Path,
+    inject: bool,
+}
+
+#[derive(serde::Serialize)]
+struct JsonlFollowerPatch<'a> {
+    resume: bool,
+    root: std::path::PathBuf,
+    project_root: &'a std::path::Path,
+}
+
+#[derive(serde::Serialize)]
+struct AgentLoopOptionsPatch<'a> {
+    working_dir: &'a std::path::Path,
+    undo_cancelled: bool,
+    stream_idle_ms: u128,
+}
+
 fn harness_option_rows(
     parts: &crate::CodingParts,
     config: &CodingAgentConfig,
     prepare: &PrepareOptions,
-) -> String {
-    let mut rows = String::new();
-    let mut disable = |id: &str| {
-        rows.push_str(&format!("[[patch]]\nid = \"{id}\"\ndisabled = true\n\n"));
-    };
-    if !prepare.tools {
-        disable("memory");
-    }
-    if !prepare.tools || !prepare.web {
-        disable("tool-web");
-    }
-    // The runtime mounts its own `code_review`, `task`, `team` and `recall` (see
-    // `CodingParts::host_only_tools`) whenever prepare built them; the rows'
-    // versions are different contracts under the same names.
-    disable("tool-code-review");
-    disable("subagent-in-process");
-    disable("team-in-process");
-    disable("recall");
-    if !parts.todo_enabled() {
-        disable("tool-todo");
-        disable("todo-reminder");
-    }
-    // The runtime's own `request_user_input` asks the person, when it is on; the
-    // tree's `ask_user` is a narrower contract for the same capability, and two
-    // question tools is one too many either way.
-    disable("tool-ask");
+) -> Result<atomcode_plexus::Layer, String> {
+    let wd = config.working_dir.as_path();
+    let mut rows = atomcode_plexus::Layer::new()
+        .when(!prepare.tools, |layer| layer.disable("memory"))
+        .when(!prepare.tools || !prepare.web, |layer| {
+            layer.disable("tool-web")
+        })
+        // The runtime mounts its own `code_review`, `task`, `team` and `recall`
+        // (see `CodingParts::host_only_tools`) whenever prepare built them; the
+        // rows' versions are different contracts under the same names.
+        .disable("tool-code-review")
+        .disable("subagent-in-process")
+        .disable("team-in-process")
+        .disable("recall")
+        .when(!parts.todo_enabled(), |layer| {
+            layer.disable("tool-todo").disable("todo-reminder")
+        })
+        // The runtime's own `request_user_input` asks the person, when it is on;
+        // the tree's `ask_user` is a narrower contract for the same capability,
+        // and two question tools is one too many either way.
+        .disable("tool-ask");
+
     // Rows whose directory defaults to the process's cwd, pointed at this
-    // session's working directory instead. `[[patch]]` replaces a row's whole
+    // session's working directory instead. A `[[patch]]` replaces a row's whole
     // config, so each carries every field the row is given elsewhere.
-    let wd = atomcode_harness::bundle::toml_string(&config.working_dir.to_string_lossy());
+    //
     // The chain's `memory` switch is the injection alone; the `memory` tool is
     // one of the core tools and stays either way.
     if prepare.tools {
-        rows.push_str(&format!(
-            "[[patch]]\nid = \"memory\"\nconfig = {{ project_root = {wd}, inject = {} }}\n\n",
-            prepare.memory
-        ));
+        rows = rows
+            .patch(
+                "memory",
+                MemoryPatch {
+                    project_root: wd,
+                    inject: prepare.memory,
+                },
+            )
+            .map_err(|e| e.to_string())?;
     }
     // The tree's own log, kept and written — but NOT where the native store keeps
     // this session's transcript. Both name a file `<bucket>/<id>.jsonl` under
@@ -7755,23 +7787,27 @@ fn harness_option_rows(
     // `resume = false` for the same reason the decision records: the native
     // snapshot is what a session is rebuilt from here, and a replay of this log
     // would be a second, divergent answer to the same question.
-    let follower = atomcode_harness::bundle::toml_string(
-        &atomcode_harness::home()
-            .join("sessions")
-            .join("harness")
-            .to_string_lossy(),
-    );
-    rows.push_str(&format!(
-        "[[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ resume = false, root = {follower}, project_root = {wd} }}\n\n"
-    ));
+    rows = rows
+        .patch(
+            "session-persistence-jsonl",
+            JsonlFollowerPatch {
+                resume: false,
+                root: atomcode_harness::home().join("sessions").join("harness"),
+                project_root: wd,
+            },
+        )
+        .map_err(|e| e.to_string())?;
     // Ctrl-C semantics: by default a cancelled turn is undone — its prompt and
     // partial work leave what the model sees next, as the chain rolls them back.
-    rows.push_str(&format!(
-        "[[patch]]\nid = \"agent-loop\"\nconfig = {{ working_dir = {wd}, undo_cancelled = {}, stream_idle_ms = {} }}\n\n",
-        !config.keep_interrupted_context,
-        config.stream_timeout.as_millis()
-    ));
-    rows
+    rows.patch(
+        "agent-loop",
+        AgentLoopOptionsPatch {
+            working_dir: wd,
+            undo_cancelled: !config.keep_interrupted_context,
+            stream_idle_ms: config.stream_timeout.as_millis(),
+        },
+    )
+    .map_err(|e| e.to_string())
 }
 
 async fn assemble_runtime_resources(runtime: &mut RuntimeResources) -> Result<AgentHandle, String> {
