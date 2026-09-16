@@ -61,6 +61,15 @@ session 开局是一屏空白，只有 composer 和 status 行。
   结论：`∙∙` 这类 bullet 走 `Caps::g(Glyph::Bullet)`，不写字面。
 - **`Caps` 是 `Copy + PartialEq + Eq`**（`caps.rs:82` 的 derive），新位可以
   不新增，缓存键带上它也不贵。
+- **颜色不是块决定的，是上屏时解析的。** 块产出 `Color::Role(Role)`
+  （`frame.rs:149`、`frame.rs:154` 的 `Color::role`），真颜色由
+  `ansi::encode_with` 拿 caps 解析。`Color::Role` 的 doc 把这条说得最清楚：
+  「a module has no idea whether the terminal is light or dark, and threading
+  that answer through every `render` and every `Content::lines` would mean
+  every one of them could get it wrong. Instead they state the role and
+  `encode_with` — which does know — resolves it.」**这句 doc 直接约束了本次的
+  `RenderCtx`：它只能传「决定形状/存在」的能力，不能传 `palette`。** 详见
+  设计 §三。
 - **`Caps` 没有「终端能画 cell background」这一位。** tuix 的像素猫是
   `▀` + fg(上) + 逐格 background(下)，它的门是
   `colors && unicode_symbols && (modern_emulator || jediterm)`——两个环境变量
@@ -169,13 +178,33 @@ slot，`blank_between` 还会再给它留一行空白，屏幕会多出一条莫
 
 ```rust
 // block.rs
+/// 块能看到的那部分终端能力：**只放决定形状或存在的位**。
+///
+/// 不含 `palette`，因为颜色不是块决定的：块写 `Color::Role(Role)`，真颜色由
+/// `ansi::encode_with` 上屏时解析（`frame.rs:143-149` 的 doc 就是为这条写的，
+/// 它明确反对把明暗穿进每个 `Content::lines`）。这里同理，而且顺带换来一个
+/// 好处——缓存不必因为切主题而整片失效。
+///
+/// 将来给 `Caps` 加位时，问一句「它决定形状吗」：是，加到这里（并跟着缓存键
+/// 走）；否，别加。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShapeCaps {
+    pub unicode: bool,
+    pub colors: crate::caps::Colors,
+}
+
+impl ShapeCaps {
+    /// 从终端测得的完整能力里取形状那部分。
+    pub fn of(caps: &crate::caps::Caps) -> Self;
+}
+
 pub struct RenderCtx {
     pub width: u16,
-    pub caps: crate::caps::Caps,
+    pub caps: ShapeCaps,
 }
 
 impl RenderCtx {
-    /// 只要宽度的那条老路：`Caps::default()`（测试与不关心能力的实现用）。
+    /// 只要宽度的那条老路（测试与不关心形状的实现用）。
     pub fn bare(width: u16) -> Self;
 }
 
@@ -190,17 +219,28 @@ impl Slot {
 }
 ```
 
+**为什么是 `ShapeCaps` 而不是整个 `Caps`（这是本次最容易做错的地方）：**
+
+- 传整个 `Caps` 会**把 palette 带进块**，而 `frame.rs:143-149` 已经写下这条
+  禁令及其理由。更要紧的是实际后果：`Palette` 是**每次都会变的值**——它由
+  `measure_palette()` 测出来（`surface.rs:703`），随终端主题变化。
+- 缓存键一旦是 `(width, Caps)`，**切一次主题就击穿全部已结算块的渲染缓存**，
+  26k 行的会话要在下一帧全部重渲染。
+- 用 `ShapeCaps`（两个字段）则缓存键是 `(width, ShapeCaps)`，只有「终端能不能
+  画 unicode / 有没有颜色」变了才失效。这是**真实**会变的东西（换终端），
+  而主题不是。
+
 **缓存键必须一起改，否则是静默 bug：**
 
-- `Settled.rows`：`RwLock<Option<(u16, usize)>>` → `RwLock<Option<(u16, Caps, usize)>>`
-- `CachedRender.width: u16` → `(u16, Caps)`，`starts_with` 那条前缀检查不变
-- `RowIndex` 的失效判据：`width` + presentation revision → `width` + **caps** +
-  presentation revision
+- `Settled.rows`：`RwLock<Option<(u16, usize)>>` → `RwLock<Option<(u16, ShapeCaps, usize)>>`
+- `CachedRender.width: u16` → `(u16, ShapeCaps)`，`starts_with` 那条前缀检查不变
+- `RowIndex` 的失效判据：`width` + presentation revision → `width` +
+  **`ShapeCaps`** + presentation revision
 
-一旦块的行数依赖 caps 而缓存只按宽度索引，「换了终端能力仍是旧行数」会稳定
+一旦块的行数依赖形状能力而缓存只按宽度索引，「换了终端能力仍是旧行数」会稳定
 复现，而且它**看起来是好的**——这正是要在实施时配一条阴性对照的原因。
 
-**`content_hash()` 不把 caps 算进去。** caps 决定的是形状（画不画猫），与宽度
+**`content_hash()` 不把形状能力算进去。** 形状决定的是「画不画猫」，与宽度
 同类——宽度也不进 hash。`Content` 的契约写着「hash 覆盖语义内容，永不覆盖渲染
 出的字节」（`block.rs:91`）。
 
@@ -253,8 +293,11 @@ tuix 踩过，tips 比猫高时多出的行会落到 cwd/model 上，屏幕出�
 **caps 的门只有一个：**
 
 ```rust
-let show_mascot = ctx.caps.unicode && ctx.caps.colors != crate::caps::Colors::None;
+use crate::caps::Colors;
+let show_mascot = ctx.caps.unicode && ctx.caps.colors != Colors::None;
 ```
+
+（`ctx.caps` 是 `ShapeCaps`，只有这两个字段——见 §三。）
 
 - atui 的 `Caps` 没有「能画 cell background」这一位，所以**不复制** tuix 的
   `modern_emulator || jediterm` 两个环境变量启发式。这是有意的：环境变量推不出
@@ -364,15 +407,25 @@ cell background」。** 放弃：环境变量推不出这个能力，推错的�
 探测（`Caps::detect` 那一堆环境变量判断）与所有构造点，而只前景色的猫不需要它。
 真需要背景色的那天再谈。
 
+**把整个 `Caps` 传进块（`RenderCtx { width, caps: Caps }`）。** 看起来更直白，
+但它会把 `palette` 带进块，而 `frame.rs:143-149` 的 doc 已经为「角色在上屏时
+解析」写下了理由；而且 `Palette` 是每次测量都会变的值（`surface.rs:703`），
+缓存键带上它意味着**切一次主题就击穿全部已结算块的缓存**。改用只含两位的
+`ShapeCaps`（§三）。代价是将来给 `Caps` 加位时要多问一句「它决定形状吗」——
+这句话现在写进了 `ShapeCaps` 的 doc 里。
+
 ### 八、判据
 
-1. `modules/welcome.rs` 单测：四种 caps 组合（unicode×colors）下各段的在/不在；
+1. `modules/welcome.rs` 单测：`ShapeCaps` 的四种组合（`unicode` × `colors`）下
+   各段的在/不在；
    一张含 `login` 与一张不含的假命令表，验证固定位的两种行为；同 cwd 两次产出
    相同且 4 条不重复；空命令表 ⇒ 无 tips 段；窄宽度 ⇒ 堆叠而非两列。
-2. **缓存键的守卫**（`block.rs`）：同一宽度下换一套 `Caps` 必须**重新渲染**，
-   而不是命中缓存的行数——并配一条**阴性对照**（caps 相同则命中、不重渲染，
-   走 `LIVE_RESUMES` 那类 test-only 计数器）。这是整个改动里唯一会变成静默 bug
-   的地方，所以它值得一条专门的判据。
+2. **缓存键的守卫**（`block.rs`）：同一宽度下换一套 `ShapeCaps` 必须**重新
+   渲染**，而不是命中缓存的行数——并配一条**阴性对照**（`ShapeCaps` 相同则命中、
+   不重渲染，走 `LIVE_RESUMES` 那类 test-only 计数器）。另加一条：**同一宽度下
+   换 palette 而 `ShapeCaps` 不变，必须命中缓存**——这条钉住「主题切换不击穿
+   缓存」那个决定（见 §三种 `ShapeCaps` 而非 `Caps` 的理由）。这是整个改动里
+   唯一会变成静默 bug 的地方，所以它值得两条判据。
 3. host 层：空流上 `open_conversation` 恰好产出一个**已 settle** 的块；再调一次
    不加东西；`catch_up` 有历史时不产；块 `always_open()`。
 4. e2e（`tests/e2e.rs`，headless 帧）：全新会话的首几行是欢迎块；**接着由测试
