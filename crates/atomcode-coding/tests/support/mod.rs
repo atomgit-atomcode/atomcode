@@ -38,6 +38,19 @@ impl Mounted {
         self.app.stop();
     }
 
+    /// The mounted tree, row by row, in the order it will run — what
+    /// `--dump-config` shows. For a criterion about ordering, which is a
+    /// product decision the row list is supposed to state out loud.
+    pub fn rows(&self) -> Vec<String> {
+        self.app
+            .tree()
+            .dump()
+            .lines()
+            .filter_map(|l| l.strip_prefix("- "))
+            .map(|l| l.trim().to_string())
+            .collect()
+    }
+
     /// Stop the tree without waiting, for a test that is done with it.
     pub fn stop(self) {
         let mut app = self.app;

@@ -226,7 +226,7 @@ impl PluginAgentLoop {
                                     call,
                                     turn,
                                     round: step,
-                                    pre_approved: false,
+                                    authorization: crate::events::Authorization::No,
                                 },
                             )
                             .await,

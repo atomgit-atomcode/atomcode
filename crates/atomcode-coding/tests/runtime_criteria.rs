@@ -1012,6 +1012,101 @@ async fn a_strict_credential_refusal_ends_the_turn_with_a_choice() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// The other half of the `allow` contract, and the guard on where the
+/// `permissions` row sits: moving it after the hard boundaries must not move it
+/// past the convenience gates too, or a matched `allow` would stop skipping the
+/// prompt it exists to skip.
+///
+/// Negative control: drop the two lines that install the rule and this fails
+/// with `asked == 1` — the write outside the workspace does ask by default.
+async fn a_permission_allow_rule_still_skips_the_prompt_it_covers() {
+    let env = env();
+    let outside = outside_dir();
+    let target = outside.path().join("allowed.txt");
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start_attended(env.project.path(), &recorder, SessionMode::Fresh);
+    let (rules, invalid) =
+        atomcode_capabilities::tools::PermissionRules::parse(&["write_file".to_string()], &[]);
+    assert!(invalid.is_empty());
+    start.agent.permission_rules = Arc::new(rules);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    let asked = turn_answering(&mut runtime, &format!("write {}", target.display()), None).await;
+
+    assert_eq!(asked, 0, "the allow rule no longer skips the prompt");
+    assert!(target.exists(), "the write did not happen");
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A person's `[permissions] allow` rule is a convenience — it may skip a
+/// prompt, never a security boundary. The strict credential policy is such a
+/// boundary, so an `allow` covering the very command that would leak a token
+/// must not unlock it.
+///
+/// Negative control: this is [`a_strict_credential_refusal_ends_the_turn_with_a_choice`]
+/// plus the two lines that install the rule. Drop those two lines and this
+/// passes — which is what makes the rule, and not the policy, the thing under
+/// test here.
+async fn a_permission_allow_rule_cannot_unlock_the_credential_boundary() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.agent.credential_shell_policy =
+        atomcode_capabilities::tools::CredentialShellPolicy::Strict;
+    // The person allowed curl for convenience. That is a decision about
+    // prompting, not about credentials leaving the machine.
+    let (rules, invalid) =
+        atomcode_capabilities::tools::PermissionRules::parse(&["Bash(curl *)".to_string()], &[]);
+    assert!(invalid.is_empty());
+    start.agent.permission_rules = Arc::new(rules);
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+
+    runtime
+        .handle
+        .submit(UserInput::from("leak the token"))
+        .await
+        .unwrap();
+    let mut intervention = None;
+    let reason = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("turn did not finish")
+            .expect("runtime event stream closed");
+        match event.event {
+            CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::PolicyIntervention {
+                intervention: offered,
+            }) => intervention = Some(offered),
+            CodingRuntimeEvent::TurnFinished(atomcode_coding::TurnCompletion::Completed {
+                reason,
+                ..
+            }) => break Some(reason),
+            CodingRuntimeEvent::TurnFinished(_) => break None,
+            _ => {}
+        }
+    };
+
+    assert_eq!(
+        reason,
+        Some(atomcode_kernel::event::StopReason::PolicyDenied),
+        "an allow rule unlocked the credential boundary"
+    );
+    let intervention = intervention.unwrap_or_else(|| panic!("no recovery choice"));
+    assert_eq!(
+        recorder.requests.lock().unwrap().len(),
+        1,
+        "the turn went on after the refusal"
+    );
+    runtime
+        .handle
+        .resolve_policy_intervention(
+            intervention.id,
+            atomcode_kernel::event::PolicyRecoveryAction::SkipStep,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("resolve: {error:?}"));
+    runtime.handle.shutdown().await.unwrap();
+}
+
 fn write_skill(dir: &std::path::Path, name: &str, description: &str) {
     let skill = dir.join(name);
     std::fs::create_dir_all(&skill).unwrap();
@@ -2231,6 +2326,8 @@ mod criteria {
         an_eager_todo_reminder_rides_the_first_request,
         a_loop_turn_can_schedule_its_next_pass,
         a_strict_credential_refusal_ends_the_turn_with_a_choice,
+        a_permission_allow_rule_cannot_unlock_the_credential_boundary,
+        a_permission_allow_rule_still_skips_the_prompt_it_covers,
         the_catalog_is_the_skills_the_driver_named,
         memory_is_shown_only_when_switched_on,
         configured_request_options_reach_the_provider_and_follow_a_model_switch,

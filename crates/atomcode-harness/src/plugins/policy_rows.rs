@@ -116,8 +116,12 @@ impl Waterfall<ToolsExecute> for PermissionGate {
             },
             // An explicit allow settles the authorization question without
             // ending the chain: the result transformers below still run.
+            //
+            // PRESUMED, not the person: a rule is something they set up once to
+            // stop being asked, not an answer to this call. A boundary below
+            // will still stop the call, which is the point of writing one.
             RuleDecision::Allow => {
-                exec.pre_approved = true;
+                exec.authorization = crate::events::Authorization::Presumed;
                 next.run(exec).await
             }
             RuleDecision::NoMatch => next.run(exec).await,

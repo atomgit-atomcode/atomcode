@@ -21,7 +21,7 @@ use atomcode_plexus::{Context, Next, Plugin, Waterfall};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::events::{ToolExec, ToolsExecute};
+use crate::events::{Authorization, ToolExec, ToolsExecute};
 use crate::seams::{ApprovalPolicy, ApprovalSvc, Decision, ToolsSvc};
 
 // ---- argument repair ----------------------------------------------------
@@ -137,9 +137,10 @@ pub(super) struct ApprovalGate {
 #[async_trait]
 impl Waterfall<ToolsExecute> for ApprovalGate {
     async fn handle(&self, exec: &mut ToolExec, next: Next<'_, ToolsExecute>) -> ToolResult {
-        // Someone upstream already authorized this call — an allow rule, a
-        // remembered grant. Asking again would be noise.
-        if exec.pre_approved {
+        // Someone upstream already settled this call — an allow rule, a
+        // remembered grant. Asking again would be noise. This row asks the
+        // generic "is this risky" question, so any settled answer ends it.
+        if exec.authorization.settled() {
             return next.run(exec).await;
         }
         let (Some(policy), Some(toolbox)) = (
@@ -350,7 +351,9 @@ pub struct SensitivePathGate {
 #[async_trait]
 impl Waterfall<ToolsExecute> for SensitivePathGate {
     async fn handle(&self, exec: &mut ToolExec, next: Next<'_, ToolsExecute>) -> ToolResult {
-        if exec.pre_approved {
+        // A boundary: only the person may lift it. A rule written to stop being
+        // asked about a tool does not consent to that tool reading their keys.
+        if exec.authorization.by_person() {
             return next.run(exec).await;
         }
         let (Some(policy), Some(toolbox)) = (
@@ -421,7 +424,7 @@ impl Plugin for SensitivePathsPlugin {
 // The judgement itself did not move and was not copied: it lives in
 // `OpenFileWorkspaceGate::authorizes` (L1), which the kernel middleware also
 // calls. Only the vocabulary for saying "already authorized" differs — there
-// `BeforeOutcome::Allow`, here `ToolExec::pre_approved`, and both mean the same
+// `BeforeOutcome::Allow`, here `ToolExec::authorization`, and both mean the same
 // thing to the gate downstream: do not ask about this one.
 //
 // That split is the point. A gate rewritten rather than shared would be two
@@ -437,13 +440,15 @@ impl Waterfall<ToolsExecute> for OpenFileWorkspace {
     async fn handle(&self, exec: &mut ToolExec, next: Next<'_, ToolsExecute>) -> ToolResult {
         // Marking an already-marked call is not wrong, just work: something
         // upstream already settled it.
-        if !exec.pre_approved
+        if !exec.authorization.settled()
             && self
                 .gate
                 .authorizes(&exec.call.name, &exec.call.arguments)
                 .await
         {
-            exec.pre_approved = true;
+            // The gate's own judgement, not anyone's answer: inside the
+            // workspace, so nothing here needs asking.
+            exec.authorization = Authorization::Presumed;
         }
         next.run(exec).await
     }
@@ -608,7 +613,10 @@ impl Waterfall<ToolsExecute> for CredentialShell {
             credential_shell_verdict, grant_scope, CredentialShellVerdict,
             CREDENTIAL_BASH_DENIAL_REASON,
         };
-        if exec.pre_approved {
+        // A boundary, and the sharpest one: the person set `credential_shell`
+        // precisely to be stopped here, so a presumed authorization — an allow
+        // rule, a hook, a gate calling the call benign — does not pass.
+        if exec.authorization.by_person() {
             return next.run(exec).await;
         }
         let policy = self.ctx.service::<ApprovalSvc>();
@@ -667,7 +675,7 @@ impl Waterfall<ToolsExecute> for CredentialShell {
         });
         match policy.decide(&exec.call, &asking).await {
             Decision::Allow => {
-                exec.pre_approved = true;
+                exec.authorization = Authorization::ByPerson;
                 next.run(exec).await
             }
             Decision::Deny(why) => refuse(&format!("{CREDENTIAL_BASH_DENIAL_REASON} ({why})")),
@@ -775,7 +783,12 @@ struct WriteApproval {
 impl Waterfall<ToolsExecute> for WriteApproval {
     async fn handle(&self, exec: &mut ToolExec, next: Next<'_, ToolsExecute>) -> ToolResult {
         use atomcode_capabilities::tools::write_approval::{write_verdict, WriteVerdict};
-        if exec.pre_approved {
+        // This row guards a boundary AND a convenience, so the short-circuit
+        // cannot come before the verdict that tells them apart. A sensitive
+        // target is `Ask { grantable: false }` — not even "always allow" may
+        // grant it, so a presumed authorization certainly may not. Everything
+        // else is an ordinary prompt an allow rule is entitled to skip.
+        if exec.authorization.by_person() {
             return next.run(exec).await;
         }
         // The row's own setting, or the person's live switch when a host
@@ -798,13 +811,20 @@ impl Waterfall<ToolsExecute> for WriteApproval {
         .await;
         let (grantable, scope) = match verdict {
             WriteVerdict::NotOurs => return next.run(exec).await,
-            // Authorized without asking — say so downstream so no later gate asks.
+            // The gate's own judgement — in-workspace, or accept-edits — not
+            // anyone's answer. Say so downstream so no later gate asks.
             WriteVerdict::Allow(_) => {
-                exec.pre_approved = true;
+                exec.authorization = Authorization::Presumed;
                 return next.run(exec).await;
             }
             WriteVerdict::Ask { grantable, scope } => (grantable, scope),
         };
+        // Grantable means an ordinary prompt, which is the convenience half: a
+        // presumed authorization is allowed to skip it. Ungrantable means the
+        // sensitive half, and falls through to ask however it was marked.
+        if grantable && exec.authorization.settled() {
+            return next.run(exec).await;
+        }
         let (Some(policy), Some(toolbox)) = (
             self.ctx.service::<ApprovalSvc>(),
             self.ctx.service::<ToolsSvc>(),
@@ -828,7 +848,7 @@ impl Waterfall<ToolsExecute> for WriteApproval {
             Decision::Allow => {
                 // The person said yes: say so downstream, or the ordinary
                 // approval behind this row asks the same question again.
-                exec.pre_approved = true;
+                exec.authorization = Authorization::ByPerson;
                 next.run(exec).await
             }
             Decision::Deny(why) => ToolResult {
@@ -913,7 +933,11 @@ impl Waterfall<ToolsExecute> for BashWorkspace {
         use atomcode_capabilities::tools::bash_workspace_gate::{
             bash_workspace_verdict, BashWorkspaceVerdict,
         };
-        if exec.pre_approved {
+        // A convenience: leaving the workspace is worth a prompt, not a
+        // boundary — so any settled answer ends it. The destructive/sensitive
+        // commands this would otherwise catch are a boundary, and they are
+        // caught above by `sensitive-paths` and `tool-credential-shell`.
+        if exec.authorization.settled() {
             return next.run(exec).await;
         }
         let (Some(policy), Some(toolbox)) = (
@@ -950,7 +974,7 @@ impl Waterfall<ToolsExecute> for BashWorkspace {
         });
         match policy.decide(&exec.call, &asking).await {
             Decision::Allow => {
-                exec.pre_approved = true;
+                exec.authorization = Authorization::ByPerson;
                 next.run(exec).await
             }
             Decision::Deny(why) => ToolResult {

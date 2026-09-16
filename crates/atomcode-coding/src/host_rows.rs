@@ -490,7 +490,9 @@ impl Waterfall<atomcode_harness::events::ToolsExecute> for PlanModeLive {
             PlanVerdict::Proceed => next.run(exec).await,
             PlanVerdict::Blocked(message) => refuse(exec.call.id.clone(), message),
             PlanVerdict::Granted => {
-                exec.pre_approved = true;
+                // The person allowed this one in plan mode: their own answer,
+                // so a boundary below honors it.
+                exec.authorization = atomcode_harness::events::Authorization::ByPerson;
                 next.run(exec).await
             }
             PlanVerdict::AskMcp => {
@@ -503,7 +505,7 @@ impl Waterfall<atomcode_harness::events::ToolsExecute> for PlanModeLive {
                 let asking: Arc<dyn atomcode_kernel::tool::Tool> = Arc::new(McpInPlanMode(tool));
                 match policy.decide(&exec.call, &asking).await {
                     atomcode_harness::seams::Decision::Allow => {
-                        exec.pre_approved = true;
+                        exec.authorization = atomcode_harness::events::Authorization::ByPerson;
                         next.run(exec).await
                     }
                     atomcode_harness::seams::Decision::Deny(_) => {
@@ -712,6 +714,10 @@ impl Plugin for HostToolsPlugin {
 #[derive(Default)]
 pub struct HostMiddleware {
     entries: RwLock<BTreeMap<String, Arc<dyn atomcode_kernel::middleware::ToolMiddleware>>>,
+    /// Names a row in the list already mounts by hand. [`Self::rows`] skips
+    /// these, or the middleware would run twice per call: once where the row
+    /// puts it, once innermost from the auto-emitted row.
+    claimed: RwLock<std::collections::BTreeSet<String>>,
 }
 
 impl HostMiddleware {
@@ -730,6 +736,24 @@ impl HostMiddleware {
             .insert(name.into(), middleware);
     }
 
+    /// Register a middleware that a named row in the list mounts itself.
+    ///
+    /// Use this whenever the position matters: the row states where the
+    /// middleware sits among the gates, and [`Self::rows`] must not also append
+    /// an innermost copy of it.
+    pub fn insert_mounted_by_row(
+        &self,
+        name: impl Into<String>,
+        middleware: Arc<dyn atomcode_kernel::middleware::ToolMiddleware>,
+    ) {
+        let name = name.into();
+        self.claimed
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.clone());
+        self.insert(name, middleware);
+    }
+
     fn get(&self, name: &str) -> Option<Arc<dyn atomcode_kernel::middleware::ToolMiddleware>> {
         self.entries
             .read()
@@ -738,12 +762,18 @@ impl HostMiddleware {
             .cloned()
     }
 
-    /// The row layer that mounts every middleware this table holds.
+    /// The row layer that mounts every middleware this table holds, except the
+    /// ones a row in the list already mounts (see [`Self::insert_mounted_by_row`]).
+    ///
+    /// These land innermost, after every gate has had its say — right for an
+    /// observer, wrong for a decider, which is why a decider gets its own row.
     pub(crate) fn rows(&self) -> String {
+        let claimed = self.claimed.read().unwrap_or_else(|e| e.into_inner());
         self.entries
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .keys()
+            .filter(|name| !claimed.contains(*name))
             .map(|name| {
                 format!(
                     "[[insert]]\nid = {}\nname = \"kernel-middleware\"\nconfig = {{ middleware = {} }}\n\n",
@@ -792,7 +822,12 @@ impl Waterfall<atomcode_harness::events::ToolsExecute> for MiddlewareBridge {
                 atomcode_kernel::request::RequestCtx::new(events, Some(std::time::Duration::ZERO));
             match self.middleware.before(&mut exec.call, tool, &rt).await {
                 BeforeOutcome::Proceed => {}
-                BeforeOutcome::Allow { .. } => exec.pre_approved = true,
+                // PRESUMED: a `[permissions] allow` rule is convenience the
+                // person configured, not consent to this call. See
+                // `Authorization` for the leak that made the difference matter.
+                BeforeOutcome::Allow { .. } => {
+                    exec.authorization = atomcode_harness::events::Authorization::Presumed
+                }
                 BeforeOutcome::Ask { reason } => {
                     return atomcode_kernel::tool::ToolResult {
                         call_id: exec.call.id.clone(),

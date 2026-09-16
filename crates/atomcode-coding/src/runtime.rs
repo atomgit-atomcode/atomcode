@@ -7475,13 +7475,19 @@ fn harness_host_state(
             )),
         );
     }
-    // The person's `[permissions]` rules decide among the gates, at the position
-    // the `permissions` row holds: after the hard boundaries, before the
-    // convenience gates and the approval prompt — the chain's placement.
+    // The person's `[permissions]` rules decide among the gates, and WHERE they
+    // decide is the whole contract: after every hard boundary, before the
+    // convenience gates and the approval prompt. The `permissions` row states
+    // that position (`CODING_ROWS`), so this only fills it in — no `prepend`,
+    // which would hoist the gate ahead of the boundaries, and
+    // `insert_mounted_by_row` so the middleware table does not ALSO append an
+    // innermost copy. Criteria: `a_permission_allow_rule_cannot_unlock_the_credential_boundary`
+    // and `a_permission_allow_rule_still_skips_the_prompt_it_covers` fail in
+    // opposite directions if this moves either way.
     let permission_rows = if config.permission_rules.is_empty() {
         String::new()
     } else {
-        middleware.insert(
+        middleware.insert_mounted_by_row(
             "permission-rules",
             Arc::new(atomcode_capabilities::tools::PermissionRuleGate::new(
                 config.permission_rules.clone(),

@@ -194,13 +194,59 @@ pub struct ToolExec {
     pub call: ToolCall,
     pub turn: u64,
     pub round: u32,
-    /// Set by a listener that has already authorized this call, so a gate
-    /// further down does not ask again.
+    /// How far this call has been authorized, and by whom.
     ///
     /// This is how cooperating waterfall listeners settle one decision between
-    /// them: an upstream rule marks the shared object and delegates, rather than
-    /// short-circuiting and taking the downstream transforms with it.
-    pub pre_approved: bool,
+    /// them: an upstream listener marks the shared object and delegates, rather
+    /// than short-circuiting and taking the downstream transforms with it.
+    ///
+    /// It says WHO because the answer differs by gate. A convenience gate exists
+    /// to stop asking twice, so any settled answer will do. A security boundary
+    /// exists because the person asked to be stopped, and only that same person
+    /// can lift it — see [`Authorization::by_person`].
+    pub authorization: Authorization,
+}
+
+/// Who settled a tool call, for a gate deciding whether that answer is good
+/// enough for the question it asks.
+///
+/// This was a `bool` until 2026-09-16, and the bug that split it is worth
+/// remembering: a `[permissions] allow` rule someone wrote to stop being asked
+/// about `curl` marked the call exactly as a person's live "yes" does, so the
+/// strict credential shell read it as consent and let a token leave the machine.
+/// Convenience and consent are not the same authority, and a `bool` could not
+/// tell a gate which one it was holding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Authorization {
+    /// Nobody has settled this call yet.
+    #[default]
+    No,
+    /// Settled without asking anyone: a `[permissions] allow` rule, a
+    /// `PreToolUse` hook's `allow`, or a gate that judged the call benign on its
+    /// own (a write inside the workspace, a read inside the workspace).
+    ///
+    /// Enough to skip a prompt. Never enough to lift a boundary — all three are
+    /// things a person set up once, not an answer to this call.
+    Presumed,
+    /// A person answered yes to THIS call: an approval prompt they just
+    /// answered, a plan-mode grant, or a grant they stored earlier for this
+    /// same scope.
+    ByPerson,
+}
+
+impl Authorization {
+    /// Someone settled it — enough for a gate that only exists to avoid asking
+    /// the same question twice.
+    pub fn settled(self) -> bool {
+        !matches!(self, Authorization::No)
+    }
+
+    /// The person themselves settled it — the only answer that may lift a
+    /// security boundary. A gate that guards one asks this, never
+    /// [`settled`](Self::settled).
+    pub fn by_person(self) -> bool {
+        matches!(self, Authorization::ByPerson)
+    }
 }
 
 /// What one step was given, before it becomes model-visible history.

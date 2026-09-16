@@ -1536,7 +1536,7 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::ToolsExecuteBatch> for
         // `a_refused_call_still_reads_as_started_on_the_harness` in the
         // differential, which owns the finding.
         //
-        // Deliberately NOT consulting `pre_approved`. Every other gate does,
+        // Deliberately NOT consulting `authorization`. Every other gate does,
         // because approval is something a person can grant; this is the
         // person's own restriction, and "already approved" is precisely the
         // short-circuit it exists to survive.
@@ -2044,9 +2044,13 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::ToolsExecute> for CcHo
             BeforeOutcome::Deny { reason } | BeforeOutcome::DenyTurn { reason } => {
                 return refuse(reason)
             }
-            // An explicit hook `allow` short-circuits the downstream gates, which
-            // is the point of saying it.
-            BeforeOutcome::Allow { .. } => exec.pre_approved = true,
+            // An explicit hook `allow` short-circuits the downstream CONVENIENCE
+            // gates, which is the point of saying it. Presumed, not the person:
+            // a hook is code installed once, so installing one must not quietly
+            // turn off a boundary the person switched on.
+            BeforeOutcome::Allow { .. } => {
+                exec.authorization = atomcode_harness::events::Authorization::Presumed
+            }
             _ => {}
         }
         let mut result = next.run(exec).await;
