@@ -169,6 +169,17 @@ undo / restore / reprepare 家族今天是「停 agent → 写原生 → 重装�
 - `atomcode-daemon webui::tests::serves_embedded_index` / `unknown_path_falls_back_to_index`
   (内嵌前端资源没构建)
 - `atomcode-tuix modals::config_panel::tests::retry_setting_is_searchable_in_both_languages`
+- **`atomcode-review assemble::tests` 三条超时(各 120s 被 nextest 掐断)**:
+  `max_rounds_stops_runaway_review`、`exact_no_progress_loop_is_stopped_when_rounds_are_unbounded`、
+  `exact_guard_can_be_disabled_for_an_intentional_repetition_policy`。
+  2026-09-16 才发现——之前几轮验证根本没跑 `-p atomcode-review`。
+  **确认与本线无关**:`atomcode-review` 只依赖 `atomcode-kernel`(不依赖 harness/coding),
+  把本分支改过的三个 kernel 文件(`agent.rs`/`hook.rs`/`request.rs`)退回分叉点 `617a93fe`
+  再跑，三条照样超时。三条都用假 provider(`LoopingProvider`),所以不是网络;
+  看名字都在「循环该被拦住」这一族，像是 review 自己的熔断不生效，值得单独查。
+
+  > 教训:**「全绿」只对跑过的 crate 成立。** 这个 worktree 前面十几轮验证的 crate 清单
+  > 里一直没有 review,于是这三条躲了很久。收尾时按 workspace 成员逐个点名跑一遍。
 
 ## 真模型冒烟(步骤 13)
 

@@ -105,6 +105,11 @@ C 和 E 两条**没有判据**，我没假装有：唯一能让 patch 失败的�
 | `atomcode-coding` | 586 绿 |
 | `atomcode-harness` / `-tui` / `-kernel` / `-capabilities` | 全绿 |
 | `atomcode-tuix` / `-cli` / `-daemon` | 3 红 **且都是既有红**（daemon webui 内嵌资源 ×2、tuix 配置面板搜索），在链上也红 |
+| `atomcode-review` | 3 条超时，**既有**（把本分支改过的 kernel 文件退回分叉点仍超时；review 只依赖 kernel） |
+| `-auth` `-config` `-plexus` `-telemetry` `-updater` `-codingplan` `-clix` | 712 绿 |
+
+**按 workspace 成员逐个点名跑过一遍**——review 那三条超时之所以躲到收尾才发现，就是因为
+前面十几轮验证的 crate 清单里一直没有它。**「全绿」只对跑过的 crate 成立。**
 | `clix` | `cargo check` 过（按用户要求「不删，只保证能编译」） |
 | `cargo fmt --all -- --check` | 0 |
 | 差分棘轮 | 不变 |
