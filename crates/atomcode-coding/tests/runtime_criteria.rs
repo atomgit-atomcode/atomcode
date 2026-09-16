@@ -1372,6 +1372,78 @@ async fn an_mcp_servers_tools_are_offered_and_run() {
     );
 }
 
+/// Withdrawing MCP takes the tools away from the model, not just off the books.
+///
+/// This is the fail-closed cutover every mutable-MCP-state command opens with —
+/// `/mcp reload`, `/mcp untrust`, `/mcp logout`. Each may fail AFTER the
+/// withdrawal (a config that no longer parses, a prepare that does not come up)
+/// and return without rebuilding, leaving the tree that is already mounted
+/// running. If withdrawal only cleared the bookkeeping, that tree would still
+/// offer `mcp__*` and calls would still reach the server the person was in the
+/// middle of revoking.
+///
+/// Negative control: drop the unregister loop from `withdraw_mcp_tools` and the
+/// second turn is offered `mcp__t__echo` again.
+async fn withdrawing_mcp_takes_the_tools_off_the_model() {
+    let env = env();
+    let scratch = tempfile::tempdir().unwrap();
+    let spawns = scratch.path().join("spawns.log");
+    let script = write_mcp_server(scratch.path(), &spawns);
+    let recorder = Arc::new(Recorder::default());
+    let mut start = start(env.project.path(), &recorder, SessionMode::Fresh);
+    start.prepare.mcp = true;
+    start.prepare.extra_mcp_servers = vec![atomcode_capabilities::mcp::McpServerConfig {
+        name: "t".into(),
+        disabled: false,
+        config: atomcode_capabilities::mcp::McpTransportConfig::Stdio {
+            command: "sh".into(),
+            args: vec![script.to_string_lossy().into_owned()],
+            env: Default::default(),
+            timeout_ms: Some(10_000),
+        },
+        source: atomcode_capabilities::mcp::config::McpConfigSource::Driver,
+        trust: true,
+        auto_approve: Vec::new(),
+    }];
+    let mut runtime = CodingRuntime::start(start).await.unwrap();
+    runtime
+        .handle
+        .wait_mcp_ready(std::time::Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    turn(&mut runtime, "hello").await;
+    let before = recorder
+        .tools
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        before.iter().any(|name| name == "mcp__t__echo"),
+        "the fixture never offered the tool, so withdrawing it proves nothing: {before:?}"
+    );
+
+    runtime.handle.withdraw_mcp_tools().await.unwrap();
+
+    // No rebuild: this is the state a `/mcp reload` is in when the reload that
+    // follows the withdrawal fails and returns.
+    turn(&mut runtime, "hello again").await;
+    let after = recorder
+        .tools
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !after.iter().any(|name| name.starts_with("mcp__")),
+        "withdrawn MCP tools were still offered to the model: {after:?}"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
 /// Cancel a turn that is waiting on the model, and wait for it to end.
 async fn cancel_hanging_turn(runtime: &mut CodingRuntime, recorder: &Recorder) {
     let before = recorder.requests.lock().unwrap().len();
@@ -2335,6 +2407,7 @@ mod criteria {
         a_permission_rule_refuses_what_it_denies,
         a_round_budget_ends_the_turn,
         an_mcp_servers_tools_are_offered_and_run,
+        withdrawing_mcp_takes_the_tools_off_the_model,
         a_cancelled_turn_is_undone_by_default,
         a_cancelled_turn_is_kept_when_asked,
         a_distant_rate_limit_pauses_the_turn,

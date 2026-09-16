@@ -977,6 +977,9 @@ pub(crate) struct McpPublication {
     pub(crate) publish_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) publication_enabled: Arc<AtomicBool>,
     pub(crate) catalog_ready: tokio::sync::watch::Sender<bool>,
+    /// Where this row hands the mounted catalog back, so `withdraw_mcp_tools`
+    /// can take the published tools off it. Nothing else writes it.
+    pub(crate) toolbox_slot: Arc<RwLock<Option<Arc<atomcode_harness::seams::ToolBox>>>>,
 }
 
 /// `mcp-host`: the MCP servers the runtime connected, and their tools in the tree.
@@ -1073,6 +1076,7 @@ impl Plugin for McpHostPlugin {
             publish_lock,
             publication_enabled,
             catalog_ready,
+            toolbox_slot,
         } = publication;
         let _ = ctx
             .provide::<atomcode_harness::seams::McpSvc>(Arc::clone(&registry))
@@ -1080,6 +1084,9 @@ impl Plugin for McpHostPlugin {
         let toolbox = ctx
             .require::<atomcode_harness::seams::ToolsSvc>()
             .map_err(|e| e.to_string())?;
+        // Withdrawal happens from the runtime, not from here, and it has to
+        // reach this catalog or the model keeps being offered what was revoked.
+        *toolbox_slot.write().unwrap_or_else(|e| e.into_inner()) = Some(toolbox.clone());
         let shared = McpShared {
             tool_names,
             publish_lock,

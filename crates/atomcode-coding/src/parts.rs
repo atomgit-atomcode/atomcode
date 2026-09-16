@@ -350,6 +350,14 @@ pub struct CodingParts {
     mcp_connect_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<McpConnectEvent>>>,
     mcp_publish_lock: Arc<tokio::sync::Mutex<()>>,
     mcp_publication_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// The mounted catalog the `mcp-host` row publishes into, once it is up.
+    ///
+    /// Withdrawal has to reach the SAME catalog the model is offered, not just
+    /// this struct's bookkeeping: `/mcp reload` and friends withdraw first and
+    /// may then fail without rebuilding, leaving the mounted tree serving
+    /// whatever was published. Filled by the row; `None` before it mounts or
+    /// when no MCP is configured, and that is the "nothing published yet" case.
+    mcp_toolbox: Arc<std::sync::RwLock<Option<Arc<atomcode_harness::seams::ToolBox>>>>,
     /// True only after the publisher has reconciled every initial connection into
     /// the mounted kernel catalog. This is distinct from transport readiness.
     mcp_catalog_ready: tokio::sync::watch::Sender<bool>,
@@ -1016,6 +1024,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         mcp_connect_rx: std::sync::Mutex::new(mcp_connect_rx),
         mcp_publish_lock: Arc::new(tokio::sync::Mutex::new(())),
         mcp_publication_enabled,
+        mcp_toolbox: Arc::new(std::sync::RwLock::new(None)),
         mcp_catalog_ready: tokio::sync::watch::channel(mcp_registry.is_none()).0,
         _mcp_work_guard: mcp_work_guard,
         approval: Arc::new(ApprovalMiddleware::in_memory()),
@@ -1135,6 +1144,7 @@ impl CodingParts {
             publish_lock: Arc::clone(&self.mcp_publish_lock),
             publication_enabled: Arc::clone(&self.mcp_publication_enabled),
             catalog_ready: self.mcp_catalog_ready.clone(),
+            toolbox_slot: Arc::clone(&self.mcp_toolbox),
         })
     }
 
@@ -1224,16 +1234,36 @@ impl CodingParts {
     /// Fail-closed cutover used before a capability reload reads mutable MCP
     /// config/trust/auth state. Once disabled, this scope's late connection events
     /// cannot republish tools even if the replacement candidate fails.
+    ///
+    /// Takes the tools OFF the mounted catalog, not just off the books. Every
+    /// caller (`/mcp reload`, `/mcp untrust`, `/mcp logout`) withdraws before it
+    /// reads state that may turn out to be unusable, and returns without
+    /// rebuilding when it does — so the tree that is still mounted must already
+    /// have stopped offering `mcp__*` by the time this returns. Criterion:
+    /// `withdrawing_mcp_takes_the_tools_off_the_model`.
     pub(crate) async fn withdraw_mcp_tools(&mut self) {
         self.mcp_publication_enabled
             .store(false, std::sync::atomic::Ordering::Release);
         if let Some(registry) = &self.mcp_registry {
             registry.cancel_pending_work();
         }
+        // Held across the unregister so a publish that is already inside the
+        // lock finishes first and its names are in the list we drain — rather
+        // than being added right after we cleared it.
         let _publish_guard = self.mcp_publish_lock.lock().await;
-        match self.mcp_tool_names.write() {
-            Ok(mut names) => names.clear(),
-            Err(poisoned) => poisoned.into_inner().clear(),
+        let names: Vec<String> = match self.mcp_tool_names.write() {
+            Ok(mut names) => names.drain(..).collect(),
+            Err(poisoned) => poisoned.into_inner().drain(..).collect(),
+        };
+        let toolbox = self
+            .mcp_toolbox
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(toolbox) = toolbox {
+            for name in &names {
+                toolbox.unregister(name);
+            }
         }
     }
 
