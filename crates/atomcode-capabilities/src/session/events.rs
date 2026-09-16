@@ -326,18 +326,19 @@ impl SessionManager {
         file.set_len(mark).map_err(|error| io_at(&path, error))
     }
 
-    /// Append what makes this session's conversation `target`, stamped `at`.
-    /// Returns where the log stood before, for [`Self::truncate_events`].
-    pub fn append_conversation_change(
+    /// What making this session's conversation `target` would append, stamped
+    /// `at` — planned, not appended, so what is kept beside the log can be
+    /// brought along before the one write that commits it.
+    pub fn plan_conversation_change(
         &self,
-        lease: &SessionLease,
+        id: &str,
         target: &[Message],
         at: u64,
-    ) -> SessionResult<u64> {
-        let mark = self.events_mark(lease.id())?;
-        let events = self.load_events(lease.id())?;
-        let next = events.iter().map(|e| e.seq).max().unwrap_or(0) + 1;
-        let change: Vec<LoggedEvent> = events_to_become(&events, target)
+    ) -> SessionResult<ConversationChange> {
+        let mark = self.events_mark(id)?;
+        let mut after = self.load_events(id)?;
+        let next = after.iter().map(|e| e.seq).max().unwrap_or(0) + 1;
+        let change: Vec<LoggedEvent> = events_to_become(&after, target)
             .into_iter()
             .enumerate()
             .map(|(offset, event)| LoggedEvent {
@@ -346,8 +347,25 @@ impl SessionManager {
                 event,
             })
             .collect();
-        self.append_events(lease, &change)?;
-        Ok(mark)
+        after.extend(change.iter().cloned());
+        Ok(ConversationChange {
+            mark,
+            change,
+            after,
+        })
+    }
+
+    /// Append what makes this session's conversation `target`, stamped `at`.
+    /// Returns where the log stood before, for [`Self::truncate_events`].
+    pub fn append_conversation_change(
+        &self,
+        lease: &SessionLease,
+        target: &[Message],
+        at: u64,
+    ) -> SessionResult<u64> {
+        let plan = self.plan_conversation_change(lease.id(), target, at)?;
+        self.append_events(lease, &plan.change)?;
+        Ok(plan.mark)
     }
 
     /// Open a session as an event log, converting it once if it is still a
@@ -449,6 +467,25 @@ impl SessionManager {
     }
 }
 
+/// A change to a session's conversation, planned against its log.
+#[derive(Clone, Debug)]
+pub struct ConversationChange {
+    /// Where the log stands before it: what [`SessionManager::truncate_events`]
+    /// cuts back to.
+    pub mark: u64,
+    /// The facts to append.
+    pub change: Vec<LoggedEvent>,
+    /// The log as it will be once they are.
+    pub after: Vec<LoggedEvent>,
+}
+
+impl ConversationChange {
+    /// The turns the conversation will still show.
+    pub fn visible_turns(&self) -> std::collections::BTreeSet<u64> {
+        atomcode_kernel::session::visible_turns(&self.after)
+    }
+}
+
 /// Snapshot-format sidecars and their names beside an event log.
 const SIDECARS: [(&str, &str); 4] = [
     ("ui.json", "ui"),
@@ -530,11 +567,12 @@ pub fn same_conversation(a: &[Message], b: &[Message]) -> bool {
 ///
 /// Nothing when it already is. When `target` is what the log held before one
 /// of its turns, a [`SessionEvent::Rewound`] to that turn — an undo, a rewind
-/// of the conversation, a restore to an earlier point. Otherwise the whole
-/// conversation is taken back and `target` is committed after it, so a restore
-/// to a conversation this log never held is still a fact, not a rewrite.
-/// Either way a memory or a compaction summary already injected stays, as it
-/// does for every undo.
+/// of the conversation, a restore to an earlier point. When it is a summary
+/// followed by the log from one of its turns on, a [`SessionEvent::Compacted`]
+/// through the turn before. Otherwise the whole conversation is taken back and
+/// `target` is committed after it, so a restore to a conversation this log
+/// never held is still a fact, not a rewrite. Either way a memory or a
+/// compaction summary already injected stays, as it does for every undo.
 pub fn events_to_become(events: &[LoggedEvent], target: &[Message]) -> Vec<SessionEvent> {
     if same_conversation(&derive_messages_with_meta(events), target) {
         return Vec::new();
@@ -563,6 +601,27 @@ pub fn events_to_become(events: &[LoggedEvent], target: &[Message]) -> Vec<Sessi
             return vec![rewound(*to)];
         }
         probe.pop();
+    }
+    if let Some(summary) = target
+        .first()
+        .filter(|m| m.role == Role::System && m.synthetic)
+    {
+        for to in starts.iter().rev() {
+            let compacted = SessionEvent::Compacted {
+                turn,
+                through: to.saturating_sub(1),
+                summary: summary.text.clone(),
+            };
+            probe.push(LoggedEvent {
+                seq: next,
+                at: 0,
+                event: compacted.clone(),
+            });
+            if same_conversation(&derive_messages_with_meta(&probe), target) {
+                return vec![compacted];
+            }
+            probe.pop();
+        }
     }
     let from = starts
         .first()
@@ -1112,8 +1171,9 @@ mod tests {
     }
 
     /// Making a log's conversation some other one appends facts and rewrites
-    /// nothing: back to before a turn is one `Rewound`; a conversation the log
-    /// never held is everything taken back and that conversation committed.
+    /// nothing: back to before a turn is one `Rewound`; a summary in front of
+    /// the later turns is one `Compacted`; a conversation the log never held is
+    /// everything taken back and that conversation committed.
     #[test]
     fn a_conversation_change_is_appended_as_facts() {
         let mut log = a_turn();
@@ -1131,6 +1191,19 @@ mod tests {
                 turn: 2,
                 to: 11,
                 scope: RewindScope::Conversation
+            }]
+        );
+
+        let mut summary = Message::system("the first turn, summarised");
+        summary.synthetic = true;
+        let mut compacted = vec![summary];
+        compacted.extend(derive_messages_with_meta(&log[5..]));
+        assert_eq!(
+            events_to_become(&log, &compacted),
+            vec![SessionEvent::Compacted {
+                turn: 2,
+                through: 10,
+                summary: "the first turn, summarised".into()
             }]
         );
 

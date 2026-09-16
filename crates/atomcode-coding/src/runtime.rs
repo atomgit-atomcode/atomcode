@@ -7935,15 +7935,6 @@ fn persist_runtime_undo(
     })?;
     let mut snapshot_conflict = false;
     let events = binding.manager.is_event_session(&binding.id);
-    // Turn statistics count messages the way the conversation the hooks are
-    // handed does, system prompt first; a log projects none.
-    let kept_messages = snapshot.messages.len()
-        + usize::from(
-            events
-                && !snapshot.messages.first().is_some_and(|m| {
-                    m.role == atomcode_kernel::message::Role::System && !m.synthetic
-                }),
-        );
     let sidecars = binding
         .manager
         .commit_native_runtime_mutation(
@@ -7970,9 +7961,28 @@ fn persist_runtime_undo(
                     removed_presentation: Vec::new(),
                     events_mark: None,
                 };
-                sidecars.archived_turn_stats = meta.archive_turn_stats_where(|stat| {
-                    stat.position_valid && stat.after_message > kept_messages
-                });
+                // A log session's change is planned first, so the turns it
+                // leaves standing decide which statistics go; it is appended
+                // last, so a failure before that leaves nothing to undo.
+                let plan = events
+                    .then(|| {
+                        binding.manager.plan_conversation_change(
+                            &binding.id,
+                            &snapshot.messages,
+                            u64::try_from(atomcode_capabilities::session::now_ms()).unwrap_or(0),
+                        )
+                    })
+                    .transpose()?;
+                let visible = plan.as_ref().map(|plan| plan.visible_turns());
+                sidecars.archived_turn_stats =
+                    meta.archive_turn_stats_where(|stat| match &visible {
+                        Some(visible) => {
+                            stat.position_valid
+                                && stat.turn_id != 0
+                                && !visible.contains(&stat.turn_id)
+                        }
+                        None => stat.position_valid && stat.after_message > snapshot.messages.len(),
+                    });
                 let surviving_turn_ids: BTreeSet<_> = meta
                     .turn_stats
                     .iter()
@@ -8002,14 +8012,11 @@ fn persist_runtime_undo(
                     }
                 })?;
                 meta.updated_at = atomcode_capabilities::session::now_ms();
-                // The log is the conversation: the change is a fact appended to
-                // it, last, so a failure before this leaves nothing to undo.
-                if events {
-                    sidecars.events_mark = Some(binding.manager.append_conversation_change(
-                        &binding.lease,
-                        &snapshot.messages,
-                        u64::try_from(meta.updated_at).unwrap_or(0),
-                    )?);
+                if let Some(plan) = plan {
+                    binding
+                        .manager
+                        .append_events(&binding.lease, &plan.change)?;
+                    sidecars.events_mark = Some(plan.mark);
                 }
                 Ok(sidecars)
             },

@@ -564,9 +564,43 @@ pub fn derive_messages_with_meta(events: &[LoggedEvent]) -> Vec<Message> {
     project(events, true)
 }
 
-fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
-    // What undos took back: every fact from a `Rewound`'s target up to the
-    // `Rewound` itself. Several stack.
+/// Which turns the conversation still shows: opened after the compaction that
+/// stands, not taken back by an undo, not undone after an interruption.
+///
+/// What is kept beside a log per turn — statistics, display entries — follows
+/// this rather than counting messages, so it agrees with [`derive_messages`]
+/// about which turns are gone.
+pub fn visible_turns(events: &[LoggedEvent]) -> std::collections::BTreeSet<u64> {
+    let taken_back = taken_back(events);
+    let floor = events
+        .iter()
+        .filter(|logged| !taken_back(logged.seq))
+        .filter_map(|logged| match logged.event {
+            SessionEvent::Compacted { through, .. } => Some(through),
+            _ => None,
+        })
+        .next_back()
+        .unwrap_or(0);
+    let undone: std::collections::HashSet<u64> = events
+        .iter()
+        .filter_map(|logged| match logged.event {
+            SessionEvent::Interrupted { turn, undone: true } => Some(turn),
+            _ => None,
+        })
+        .collect();
+    events
+        .iter()
+        .filter(|logged| logged.seq > floor && !taken_back(logged.seq))
+        .filter_map(|logged| match logged.event {
+            SessionEvent::TurnStart { turn } if !undone.contains(&turn) => Some(turn),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What undos took back: every fact from a `Rewound`'s target up to the
+/// `Rewound` itself. Several stack.
+fn taken_back(events: &[LoggedEvent]) -> impl Fn(SeqNo) -> bool {
     let rewound: Vec<(SeqNo, SeqNo)> = events
         .iter()
         .filter_map(|logged| match &logged.event {
@@ -576,7 +610,11 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
             _ => None,
         })
         .collect();
-    let taken_back = |seq: SeqNo| rewound.iter().any(|(to, at)| seq >= *to && seq < *at);
+    move |seq: SeqNo| rewound.iter().any(|(to, at)| seq >= *to && seq < *at)
+}
+
+fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
+    let taken_back = taken_back(events);
 
     // A compaction boundary replaces everything at or below it. Find the last
     // one first: replaying then discarding would be wasted work and, worse,
