@@ -1,0 +1,196 @@
+# 一个会话一个 realm:产品委派改用 realm 版本,成员可切换、可直接对话、日志保留
+
+状态: 已决定(2026-09-17)。承接 [`0014`](./0014-an-agent-owns-its-session-and-world.md)
+(agent 拥有会话与世界);修订 [`0016`](./0016-agent-team-inbox-wake-and-peer-messages.md)
+(成员只认 lead)与 [`0022`](./0022-tui-and-agent-in-separate-apps.md) 第 2 节(同会话
+不重建 App)。
+
+## 背景
+
+用户的模型(原话):「同一个会话,就是一棵树。换会话就换树。team Agent 里的 subAgent,
+也拥有不同的树,可以为 subAgent 渲染界面,在 tui 里切换。」并定:**「树」是 realm**,
+不是 plexus App。
+
+**harness 已经是这个模型。** `Agents::create` 给每个 agent 一个 realm,里面是它自己的
+会话日志、工具、提示词、模型与 cwd(0014)。team 成员按 `<lead>/<name>` 建、
+`persist(false)`、`keep_driven` 驱动(`harness/plugins/team.rs:651-654`),`stop` 时
+移除(`:882`);`task` 子 agent 跑完即移除(`harness/plugins/subagent.rs:258`、`:307`)。
+tui 的监听器其实已经收到了成员的事实,只是按 session id 过滤掉了
+(`tui/plugin.rs:333-348`);0016 的「未做」里写着「tui 的成员面板行未做」。
+
+**产品装配不是。** `runtime.rs:7768-7769` 禁掉 `subagent-in-process` 与
+`team-in-process`,挂 coding 自己的 `task` / `team`;成员是 kernel 的
+`Agent::builder()`(`coding/team/runner.rs:110`、`capabilities/tools/task.rs:1522`),
+不在 plexus 树里,对外只有 `TeamEvent` 的进度——开始、排队、一行 activity、结束摘要
+(`capabilities/team.rs:335-373`)。没有成员的对话可以渲染。两套同名不同契约
+(0016 补节):coding 的 `team` 是 `run_id` + delegate / wait / result,`task` 带
+`subagent_type`;harness 的 `team` 是 delegate / tell / status / stop,`task` 是
+`task` / `instructions` / `model` / `effort`。
+
+**消息来源已有区分。** `MessageOrigin` 有 `User` / `Harness` / `Internal` / `Peer`
+(`harness/agent.rs:344-358`)。0016 定「成员只认 lead」:成员的 `tell_parent` 只捏着
+lead 的 id,成员到成员靠构造不可能;同伴消息标成非用户来源,不当授权。
+
+## 决策
+
+### 1. 一个会话 = 一个 agent realm
+
+- **换会话 = 在同一个 App 里另建顶层 agent 的 realm**,再移除旧的。目标形态下 runtime 不再为
+  换会话重建 App。过渡期(每会话状态还没下沉到 realm:provider 的 session 绑定、hooks、
+  租约、快照写入器、按目录解析的 MCP 与 skills)仍重建 App,前端只看到 session id 变(0022)。
+- **同一会话的操作不换 realm、不重建 App**:撤销、恢复快照做成日志事件;重载配置/skills
+  走 control patch;登出/登录只换模型行,不拆 agent。这一条取代 0022 第 2 节表第二行原先的
+  「用旧日志做种子重建」。
+- **用词**:文档里「树」专指 agent 的 realm;plexus 的整个替换写作「重建 App」。
+
+### 2. 产品的 team / task 改用 harness 的 realm 版本
+
+- 产品树挂 `team-in-process`、`subagent-in-process`;coding 的 `task` / `team` 不再作为
+  host tool 挂载(`CodingParts::host_only_tools`)。coding `team/`(2,369 行)与
+  `capabilities/tools/task.rs` 的委派部分切换后不再被产品挂载,删不删在删 tuix 那一步一起
+  清点。
+- **切换前先对齐差异**:把 coding team / task 的现有测试原样挂到 realm 版本上跑,红的逐条
+  判断是补 harness 还是有意不要——收双引擎时「旧测试挂新装配最能抓 bug」的做法。已知差异
+  至少有:动作集(wait / result 对 tell / status / stop)、`subagent_type`、角色与
+  difficulty 映射、成员继承的中间件(`runner.rs` 的 `inherited_worker_middlewares`、
+  `credential_shell_policy`)、scope 不重叠校验对 worktree 隔离、`CodingRuntimeEvent::Team`
+  进度事件的现有消费方(tuix、daemon)。
+- **安全边界要在产品树上重新立判据。** harness 已证「根上的闸门看得到子 agent 的调用、
+  委派逃不掉根上的拒绝」(`harness/tests/subagent.rs:203-222`、
+  `a_root_denial_cannot_be_escaped_by_delegating`),但那是 harness 的树;产品树的审批、
+  敏感路径、凭据 shell、工作区围栏对成员同样生效,要在产品树上各立一条。
+
+### 3. tui 可以切到任一成员的视图
+
+- 事实流与命令按 session id 寻址(0022 第 1 节),成员 `<lead>/<name>` 同样适用;agent
+  注册事件带父子关系与状态,tui 据此列出可切换的对象。
+- 切换 = 换所看的 session id 并补历史;lead 与成员用同一套面板。
+
+### 4. 人可以直接给成员发消息(修订 0016)
+
+- 0016「成员只认 lead」收窄为 **agent 之间**的规则:成员的 agent 通道仍只指向 lead,成员到
+  成员仍不可能。**人是另一类发送方**,可以对团队里任一 agent 说话。
+- 进成员日志的是 `MessageOrigin::User` 的消息——人说的话,带人的授权分量;不是 `Peer`。
+- 人发的消息经成员的句柄泵(第 6 节)进 inbox,唤醒成员起回合。
+
+### 5. 成员结束后日志保留
+
+`task` 子 agent 跑完、team 成员被 `stop` 之后,仍能切过去看它的完整对话。移除 realm
+不等于丢日志。成员会话落盘(0024)。
+
+### 6. 所有 Agent 用同一种泵:句柄泵
+
+今天三种驱动各不相同:
+
+| | 接命令(发消息、取消、回答提问) | inbox 唤醒 |
+|---|---|---|
+| lead:句柄泵(`harness/plugins/handle.rs:840-935`) | 有;取消时拒掉挂着的提问(`refuse_all`) | 有(`:840`) |
+| 成员:`keep_driven`(`harness/plugins/agent_loop.rs:954`) | 无 | 有 |
+| `task` 子 agent:task 工具直接 `driver.drive`(`subagent.rs:302`) | 无 | 无 |
+
+人要能对成员发消息、取消它的回合、回答它的提问与审批,只有句柄泵有这些。定为:
+
+- 句柄泵能接管一个已存在的 agent(今天的 `spawn` 只收 `CreateAgent`,自己建 agent)。
+- `keep_driven` 删掉,成员由句柄泵驱动。
+- task 工具改成:建子 agent → 发任务 → 等它这一回合的终结事件。
+- 取消某个 agent 只拒掉**它自己**挂着的提问。提问已经带着是谁问的(`Question.asker`,
+  `harness/seams.rs:609-611`);缺的是拒绝按 agent 分:`refuse_all` 今天把所有挂着的提问一起拒掉
+  (`handle.rs:531-541`)。
+
+### 7. 人对成员说话:lead 知情,但不被叫醒
+
+用途是**纠偏或补充信息,lead 仍统筹**。
+
+今天成员每结束一个回合、且这一回合没主动对 lead 说过话,team 行替它给 lead 发一条汇报
+「[X finished turn N: …] + 最后一句」(`harness/plugins/team.rs:1160-1195`)。它用的是
+`send_from`,是**消息**,会叫醒 lead 开一个回合(`harness/agent.rs:409-416`)。人直接对成员
+说话时照这个走,lead 会在不知道人说过什么的情况下被叫醒,读到一句没头没尾的回复。定为:
+
+- **人的原话进 lead 日志,作注入。** 人对成员发消息时,在 lead 日志提交一条注入,新来源
+  「人对成员说」(今天的注入来源是 `Peer`、`Memory`、`Reminder`、`Continuation`、
+  `InternalNudge`、`CompactionSummary`),写明对哪个成员、说了什么。注入不起回合(0016)。
+  渲染给 lead 的模型时写明:这是人对该成员的纠偏或补充,成员正照此执行,不是对 lead 的
+  指令,lead 统筹时不要推翻它。
+- **人发起的成员回合,结束时的汇报改成注入。** 内容是成员这一回合的最后一句,不叫醒 lead,
+  lead 下一回合读到。
+- **带了 lead 消息的回合照旧叫醒。** 一个回合里只要有 lead 发来的消息(成员日志里来源为
+  lead 的 `Peer` 注入,`agent_loop.rs:488-491`),结束时照旧以消息汇报——那是 lead 委派的
+  工作,lead 在等结果。
+- **成员主动 `tell_parent` 照旧叫醒 lead。** 那是成员判断 lead 现在就该知道。
+
+### 8. 成员视图里能做的事
+
+前提是所有 Agent 都由句柄泵驱动(第 6 节),每个成员接同一套命令。
+
+| 操作 | 定为 | 要不要告诉 lead |
+|---|---|---|
+| 发消息 | 可以(第 4 节) | 按第 7 节 |
+| 回答成员的提问与审批 | 可以。**lead 视图里也显示成员的提问**,标明是谁问的(`Question.asker`),也能直接回答——免得成员卡在审批上没人看见 | 不用 |
+| 取消成员当前回合 | 可以,只停它、只拒它自己的提问 | 按第 7 节:回合里有 lead 的消息就照旧以消息汇报(带 `Cancelled`)并叫醒 lead,否则作注入 |
+| 停掉成员 | 可以。今天只有 lead 能经 `team` 工具调 `stop`(0016 判据);agent 之间这条不变,人经前端命令也能停 | 成员手上有 lead 委派、还没汇报的活 → 叫醒 lead;否则只注入。lead 在等它的结果,不叫醒会一直干等 |
+| 压缩成员上下文 | 可以,同一个命令 | 不用 |
+
+人停成员经哪份契约发出,属于 0021 未决的「能力行的命令怎么被前端发现与调用」。
+
+### 9. 取消的级联
+
+今天工具执行拿到的是 lead 的取消令牌(`harness/exec.rs:53-73`),但 task 工具不看它
+(`harness/plugins/subagent.rs` 里没有 cancel),所以 lead 被取消后要等子 agent 自己跑完,
+取消才生效。0016 定了 lead 被取消不停成员。定为:
+
+| | 级联 | 理由 |
+|---|---|---|
+| `task` 子 agent | **级联**:lead 被取消时给子 agent 发取消,task 工具返回已取消 | 它是 lead 这一回合里一次同步的工具调用,本就是这一回合的一部分 |
+| team 成员 | **不级联** | 成员异步、跨回合长驻;人取消 lead 常常只是嫌 lead 啰嗦 |
+| 「全部停下」 | 另给一个前端命令:给 lead 与每个成员各发取消,不 `stop` 成员 | 句柄协议已有取消,不需要新契约命令 |
+| lead 的回合被撤回时(`keep_interrupted_context = false`) | 这一回合里新 delegate 的成员一并 `stop` | lead 的上下文里已经没有派它们去的记录 |
+
+## 权衡过、没做的
+
+- **每个会话 / 每个成员一个 App。** 0014 已否:代码索引、MCP 连接、模型客户端每个 App
+  各一份,成员共享父工具做不了。
+- **保留 coding 的 team / task,让 runner 把成员对话发成事实。** 有日志可渲染,但成员仍在
+  树外,与「subAgent 拥有自己的树」不符,而且两套委派继续并存。
+- **维持 0016「成员只认 lead」。** 用户定人可以直接对成员说话。
+
+## 未决
+
+- ~~**保留范围**~~ 已由 [`0024`](./0024-the-session-log-is-the-authority.md) 定:会话的权威改为 harness
+  日志,成员会话落盘、带 `parent`,重启后仍可看;resume lead 时带回没被 stop 的团队成员(0024 第 11 条)。
+- ~~**人对成员说的话,lead 要不要知道**~~:定为第 7 节,知情不打扰。
+- ~~**成员视图里还能做什么**~~:定为第 8 节。
+- ~~0016「lead 被取消时不级联停止成员」要不要改~~:定为第 9 节。
+
+## 闸门
+
+- **产品只有一套委派**:产品树里的 `task` / `team` 工具来自 `subagent-in-process` /
+  `team-in-process` 行;`CodingParts::host_only_tools` 不含 `task` / `team`。今天是红的。
+- **成员过全部闸门**:产品树上,team 成员与 `task` 子 agent 的写文件、读敏感路径、带凭据
+  shell、工作区外访问,和 lead 一样被拦或被问。
+- **人对成员说话**:发往成员 session id 的消息以 `User` 来源进成员日志,并唤醒成员跑回合;
+  成员到成员仍不可能(0016 原判据保留)。
+- **人纠偏不打扰 lead**:团队空闲时,人对成员 X 发一条消息 → X 跑一回合,lead 不起回合;lead
+  日志里有两条注入(人的原话、X 这一回合的最后一句),lead 下一回合的请求里看得到,且渲染里
+  写明不是对 lead 的指令。
+- **lead 的任务照常叫醒**:lead 发给 X 的消息与人的消息落在 X 的同一回合里 → 回合结束以消息
+  汇报并叫醒 lead;X 主动 `tell_parent` 同样叫醒 lead。
+- **泵统一**:成员与 `task` 子 agent 由句柄泵驱动(没有 `keep_driven`);对一个成员发取消只停它的回合、
+  只拒它的提问,lead 与其他成员挂着的提问不受影响。
+- **成员的提问在 lead 视图可答**:成员发起一次审批 → lead 视图的状态事件里有这个提问且标明
+  提问者;从 lead 视图回答后成员继续跑。
+- **人停成员**:人经前端停掉成员 X → X 日志末尾有「已停止」、realm 被移除;X 有未汇报的 lead
+  委派时 lead 被叫醒,没有时 lead 日志只多一条注入、不起回合。
+- **task 子 agent 跟着停**:lead 在 `task` 调用进行中被取消 → 子 agent 回合以 `Cancelled` 结束,
+  task 工具返回已取消,lead 的回合随即结束、不等子 agent 跑完。今天是红的。
+- **team 成员不跟着停**:lead 被取消时正在跑的成员回合继续跑完。
+- **全部停下**:命令之后 lead 与所有成员的当前回合都结束,成员仍在注册表里。
+- **撤回时停掉新成员**:`keep_interrupted_context = false` 时,lead 被取消的那一回合里 delegate
+  的成员被 `stop`,更早回合里 delegate 的成员不受影响。
+- **成员结束后可看**:`task` 子 agent 跑完、team 成员 `stop` 之后,按它的 session id 仍能
+  补出完整事实流。今天是红的:日志只由 `Agent` 自己持有(`harness/agent.rs:526`),
+  移除之后注册表里没有它,`by_session`(`:822`)查不到。
+- 每条落地时摘掉被测代码证伪一次。
+
+## 失效条件
+
+- 差异对齐时发现某项 realm 版本补不了、又必须保留(例如成员必须跑在树外):重议第 2 节。
