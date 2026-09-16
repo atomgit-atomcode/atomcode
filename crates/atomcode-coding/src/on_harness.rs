@@ -480,8 +480,14 @@ fn model_rows(cfg: &crate::CodingAgentConfig) -> String {
     );
     // A 429 is judged against the endpoint the request went to: whether it is the
     // CodingPlan gateway (whose windows say when to come back) follows the model.
+    // The three waiting bounds are carried through because `Op::Patch` replaces a
+    // row's config wholesale: naming them here is what keeps this patch from
+    // dropping what `bundle::INFRA` set. They mirror base's values on purpose,
+    // and `no_row_silently_loses_a_configured_field` fails if base grows a field
+    // this line does not carry. (A base that changes one of these VALUES is the
+    // gap that comment cannot close — keep them in step by hand.)
     out.push_str(&format!(
-        "[[patch]]\nid = \"llm-rate-limit\"\nname = \"rate-limit-coding\"\nconfig = {{ base_url = {}{} }}\n\n",
+        "[[patch]]\nid = \"llm-rate-limit\"\nname = \"rate-limit-coding\"\nconfig = {{ base_url = {}, max_waits = 5, max_wait_secs = 120, fallback_secs = 5{} }}\n\n",
         atomcode_harness::bundle::toml_string(&cfg.base_url),
         cfg.retry_max_attempts
             .map(|n| format!(", max_attempts = {n}"))

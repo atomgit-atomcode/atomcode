@@ -51,6 +51,18 @@ impl Mounted {
             .collect()
     }
 
+    /// Every mounted row's id and the config it ended up with.
+    ///
+    /// The merged result, which is what the rows actually run on — and the only
+    /// place a field silently lost to a wholesale `[[patch]]` is visible.
+    pub fn row_configs(&self) -> Vec<(String, serde_json::Value)> {
+        self.app
+            .tree()
+            .active()
+            .map(|e| (e.id.clone(), e.config.clone()))
+            .collect()
+    }
+
     /// Composition findings for the mounted product, told what this host reads
     /// and fills itself.
     pub fn audit(&self) -> Vec<String> {

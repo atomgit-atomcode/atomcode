@@ -126,3 +126,83 @@ async fn the_permission_gate_is_mounted_once() {
     );
     mounted.stop();
 }
+
+/// No row silently loses a field the layers below it configured.
+///
+/// `Op::Patch` replaces a row's config WHOLESALE. So a later patch that omits a
+/// field the base bundle set does not leave that field alone — it drops it back
+/// to the serde default, and `--dump-config` cannot tell you whether the value
+/// you are reading was chosen or defaulted.
+///
+/// Two real bugs came out of exactly this and nothing would have caught either:
+/// `llm-retry` lost `attempts` on a `/model` swap, and `agent-loop` loses
+/// `max_rounds` (the base sets 100, the runtime patches three other fields, and
+/// the fuse quietly becomes the serde default — which happens to also be 100).
+///
+/// A drop that is meant lives in the allowlist below, WITH its reason. That is
+/// the point: an intentional one is a sentence someone wrote, an accidental one
+/// is a red test.
+#[tokio::test]
+async fn no_row_silently_loses_a_configured_field() {
+    // (row, field, why losing it is intended)
+    const INTENDED: &[(&str, &str, &str)] = &[(
+        "agent-loop",
+        "max_rounds",
+        "The coarse runaway fuse is base's, and this product keeps it while carrying \
+         its own budget on `round-cap`. Documented at length above the `round-cap` \
+         patch in CODING_DEFAULTS, including that a host patching `agent-loop` \
+         reverts this field — which is what makes it a decision rather than a slip.",
+    )];
+
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    let project = tempfile::tempdir().unwrap();
+    let cfg = CodingAgentConfig::new("k", "http://localhost", "m", project.path());
+
+    // What the layers under the product declare, by row id. Stacked in the real
+    // order — `CODING_DEFAULTS` patches rows `INFRA` inserts, so it does not
+    // stand up on its own.
+    let mut declared: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        Default::default();
+    let under = atomcode_plexus::ConfigTree::from_layers([
+        atomcode_harness::bundle::infra().expect("infra parses"),
+        atomcode_plexus::Layer::from_toml(atomcode_coding::on_harness::CODING_DEFAULTS)
+            .expect("CODING_DEFAULTS parses"),
+    ])
+    .expect("the layers under the product stack");
+    for entry in under.active() {
+        if let Some(obj) = entry.config.as_object() {
+            declared
+                .entry(entry.id.clone())
+                .or_default()
+                .extend(obj.keys().cloned());
+        }
+    }
+
+    let mounted = support::mount(&cfg, support::quiet_options(), Arc::new(Silent)).await;
+    let mut lost: Vec<String> = Vec::new();
+    for (id, config) in mounted.row_configs() {
+        let Some(want) = declared.get(&id) else {
+            continue;
+        };
+        let have: std::collections::BTreeSet<String> = config
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        for field in want.difference(&have) {
+            if INTENDED
+                .iter()
+                .any(|(row, key, _)| *row == id && key == field)
+            {
+                continue;
+            }
+            lost.push(format!("`{id}` lost `{field}`"));
+        }
+    }
+    mounted.stop();
+    assert!(
+        lost.is_empty(),
+        "a patch replaced a row's config and dropped a field the layer below set \
+         (carry it in the patch, or add it to INTENDED with a reason): {lost:?}"
+    );
+}
