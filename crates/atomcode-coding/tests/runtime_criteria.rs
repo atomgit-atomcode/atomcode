@@ -3110,6 +3110,87 @@ async fn a_request_refused_as_too_long_is_folded_and_tried_again() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// A session resumed under pressure is compacted before its first request, the
+/// way it would have been had the process not restarted. What a resumed session
+/// knows of the last request's size is what the stored answer recorded — a
+/// session that read only the provider's live usage reports would see no
+/// pressure at all until it had sent one full-size request.
+async fn a_session_resumed_under_pressure_is_folded_before_its_first_request() {
+    let env = env();
+    let lines: String = (0..200)
+        .map(|n| format!("needle number {n} in a haystack of text\n"))
+        .collect();
+    std::fs::write(env.project.path().join("hay.txt"), &lines).unwrap();
+    let recorder = Arc::new(Recorder::default());
+    recorder.window.store(200_000, Ordering::SeqCst);
+    let mut first = CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+        .await
+        .unwrap();
+    let id = first.session.clone().unwrap().id;
+    turn(&mut first, "search needle").await;
+    // The last answer before the restart is the one that crossed the threshold.
+    recorder.prompt_tokens.store(150_000, Ordering::SeqCst);
+    turn(&mut first, "noted").await;
+    first.handle.shutdown().await.unwrap();
+    let _ = first.task.await;
+
+    let mut second = CodingRuntime::start(start(
+        env.project.path(),
+        &recorder,
+        SessionMode::Resume(id),
+    ))
+    .await
+    .unwrap();
+    let outcomes = turn_reporting_compactions(&mut second, "carry on").await;
+
+    let seen = recorder.last_turn_request();
+    assert!(
+        seen.iter()
+            .any(|m| m.role == Role::Tool && m.text.starts_with("[grep ok")),
+        "the resumed session's first request carried the search in full"
+    );
+    // And what the driver is told matches what happened.
+    let folded = outcomes
+        .iter()
+        .find(|o| o.committed)
+        .expect("the driver heard of no committed compaction");
+    assert!(
+        folded.bytes_before > folded.bytes_after && folded.bytes_after > 0,
+        "the fold was reported as {} → {} bytes",
+        folded.bytes_before,
+        folded.bytes_after
+    );
+    assert!(
+        folded.estimated_tokens_before > folded.estimated_tokens_after,
+        "the fold was reported as saving nothing: {} → {} tokens",
+        folded.estimated_tokens_before,
+        folded.estimated_tokens_after
+    );
+    second.handle.shutdown().await.unwrap();
+}
+
+/// Run a turn and keep every compaction the driver was told finished.
+async fn turn_reporting_compactions(
+    runtime: &mut CodingRuntime,
+    text: &str,
+) -> Vec<atomcode_coding::runtime::CompactionOutcome> {
+    runtime.handle.submit(UserInput::from(text)).await.unwrap();
+    let mut outcomes = Vec::new();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("turn did not finish")
+            .expect("runtime event stream closed");
+        match event.event {
+            CodingRuntimeEvent::TurnFinished(_) => return outcomes,
+            CodingRuntimeEvent::CompactionFinished {
+                completion: atomcode_coding::runtime::CompactionCompletion::Completed(outcome),
+            } => outcomes.push(outcome),
+            _ => {}
+        }
+    }
+}
+
 /// Each scenario as its own test. Serialized because they share the process's
 /// environment (`ATOMCODE_HOME`, the offline verdict), which is also why each is
 /// its own process under `cargo nextest`.
@@ -3176,6 +3257,7 @@ mod criteria {
         under_pressure_old_tool_output_is_folded_in_place_and_the_words_kept,
         past_most_of_the_window_older_turns_are_summarized_and_the_summary_kept_up,
         a_request_refused_as_too_long_is_folded_and_tried_again,
+        a_session_resumed_under_pressure_is_folded_before_its_first_request,
         the_prompt_teaches_each_product_tool_once,
         a_picture_read_reaches_a_model_that_can_see_it,
         every_model_round_is_reported_even_without_usage,

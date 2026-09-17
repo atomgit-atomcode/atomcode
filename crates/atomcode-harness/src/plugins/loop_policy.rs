@@ -782,6 +782,9 @@ pub(crate) fn reproject(req: &mut ModelRequest, session: &crate::session::Sessio
     req.messages = messages;
 }
 
+/// Prompt tokens of the last request: what the provider reported for it, or —
+/// for a session seeded from a stored conversation, which carries no usage
+/// facts — what the stored answer recorded.
 pub(crate) fn last_prompt_tokens(session: &crate::session::SessionLog) -> u32 {
     session
         .events()
@@ -789,6 +792,9 @@ pub(crate) fn last_prompt_tokens(session: &crate::session::SessionLog) -> u32 {
         .rev()
         .find_map(|e| match &e.event {
             SessionEvent::Usage { usage, .. } => Some(usage.prompt),
+            SessionEvent::AssistantMessage {
+                meta: Some(meta), ..
+            } if meta.used_tokens > 0 => Some(meta.used_tokens),
             _ => None,
         })
         .unwrap_or(0)

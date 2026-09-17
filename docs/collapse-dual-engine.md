@@ -311,6 +311,15 @@ A 那条对照特别值得留意:**`-y`（自动批准一切）也没能让它�
   - 判据：harness `tests/compaction_strategy.rs`(6)、`tests/session.rs` 投影 4 条、
     `loop_policy.rs` 2 条 + 触发器 1 条、`recovery.rs` 发送前 1 条;coding
     `runtime_criteria.rs` 端到端 3 条。每条都摘掉被测代码证伪过。
+  - **真模型冒烟(2026-09-17)**:`AtomGit-deepseek-flash`,隔离 home,配置里把窗口写成 64k、
+    `max_tokens` 2500,19 个 headless 回合 + 2 段 ACP。四档都在真网关上提交过：0.77 时把两份
+    settled 的 bash 输出换桩、`read_file` 原样(49.3k→41.0k,缓存命中到改写处);0.83 时模型写
+    锚定摘要(53k→28.9k);`/compact` 在上一份摘要上更新(wire dump 里有 `<previous-summary>`,
+    旧摘要没进 transcript);发送前超窗走溢出第 0 级。每次压缩后不调工具追问被折掉的事实，模型
+    全答对。冒烟里抓到两个问题，已修并各加判据：resume 后首个请求看不到压力(种子日志没有
+    `Usage`,改读助手消息 `meta.used_tokens`)、驱动收到的压缩字节数恒为 0(显示「节省 ~0 tok」)。
+    顺带确认：压缩后 `detached_model_usage` 跳涨是被折回合的用量归档进成本账，不是重复计费;
+    两次整段缓存失效经 datalog 比对请求前缀逐字节相同，属网关侧。
 - **工具指引的归属**:树里 fs / shell / 搜索 / codeintel / web / todo / describe_self 的提示词
   由各自的行写，措辞与链式人设里的段落不同;产品自有工具(`request_user_input` / `task` /
   `team` / `code_review`)的段落由 host-tools 带入，与链式同文。

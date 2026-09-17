@@ -101,9 +101,33 @@ struct Projector {
     /// start is always closed — by the compaction's own facts, or, if it
     /// committed none, by the first thing that happens next.
     compacting: Option<CompactTrigger>,
+    /// The conversation the facts belong to, for measuring what a compaction
+    /// changed. The facts alone cannot say: a cut names a boundary, not a size.
+    /// `None` for a replay, which reports no sizes.
+    log: Option<Arc<crate::session::SessionLog>>,
 }
 
 impl Projector {
+    /// Messages and bytes the model saw before and after the compaction fact at
+    /// `seq`. Zeros when there is no log to measure.
+    fn measure(&self, seq: crate::session::SeqNo) -> (usize, usize, usize, usize) {
+        let Some(log) = self.log.as_ref() else {
+            return (0, 0, 0, 0);
+        };
+        let events = log.events();
+        let size = |messages: Vec<atomcode_kernel::message::Message>| {
+            (
+                messages.len(),
+                messages.iter().map(|m| m.text.len()).sum::<usize>(),
+            )
+        };
+        let before: Vec<_> = events.iter().filter(|e| e.seq < seq).cloned().collect();
+        let after: Vec<_> = events.iter().filter(|e| e.seq <= seq).cloned().collect();
+        let (count_before, bytes_before) = size(crate::session::derive_messages(&before));
+        let (count_after, bytes_after) = size(crate::session::derive_messages(&after));
+        (count_before, bytes_before, count_after, bytes_after)
+    }
+
     // `mounted()` lived here: a guess at whether a named tool would actually
     // dispatch, so an unmounted one was not announced as started. The guess is
     // gone because the question is now answered rather than predicted —
@@ -122,6 +146,11 @@ impl Projector {
     }
 
     fn project(&mut self, event: &SessionEvent) -> Vec<AgentEvent> {
+        self.project_at(0, event)
+    }
+
+    /// [`project`](Self::project), for a fact whose sequence number is known.
+    fn project_at(&mut self, seq: crate::session::SeqNo, event: &SessionEvent) -> Vec<AgentEvent> {
         let closes = matches!(
             event,
             SessionEvent::Compacted { .. } | SessionEvent::MessagesRewritten { .. }
@@ -140,11 +169,15 @@ impl Projector {
                 });
             }
         }
-        out.extend(self.project_fact(event));
+        out.extend(self.project_fact(seq, event));
         out
     }
 
-    fn project_fact(&mut self, event: &SessionEvent) -> Vec<AgentEvent> {
+    fn project_fact(
+        &mut self,
+        seq: crate::session::SeqNo,
+        event: &SessionEvent,
+    ) -> Vec<AgentEvent> {
         match event {
             SessionEvent::TurnStart { .. } => {
                 self.said_this_turn = 0;
@@ -302,15 +335,12 @@ impl Projector {
                         self.last_prompt_tokens as f32 / self.ctx_window as f32
                     },
                 });
-                let bytes_after = match event {
-                    SessionEvent::Compacted { summary, .. } => summary.len(),
-                    _ => 0,
-                };
+                let (count_before, bytes_before, count_after, bytes_after) = self.measure(seq);
                 vec![AgentEvent::Compacted {
                     trigger,
                     epoch: 0,
-                    removed: 0,
-                    bytes_before: 0,
+                    removed: count_before.saturating_sub(count_after),
+                    bytes_before,
                     bytes_after,
                     committed: true,
                     snapshot: None,
@@ -1284,6 +1314,7 @@ pub async fn spawn(
         usage_round: None,
         manual_compaction: manual_compaction.clone(),
         compacting: None,
+        log: Some(agent.session()),
     }));
 
     let out = events.clone();
@@ -1297,7 +1328,7 @@ pub async fn spawn(
         let projected = fold
             .lock()
             .expect("projector poisoned")
-            .project(&committed.event);
+            .project_at(committed.seq, &committed.event);
         for event in projected {
             let _ = out.send(event);
         }
@@ -1470,6 +1501,7 @@ pub fn replay(events: &[SessionEvent], ctx_window: u32) -> Vec<AgentEvent> {
         usage_round: None,
         manual_compaction: Default::default(),
         compacting: None,
+        log: None,
     };
     events
         .iter()
