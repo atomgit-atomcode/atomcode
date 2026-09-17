@@ -1213,6 +1213,14 @@ async fn a_person_cancels_and_compacts_a_member() {
             ..
         }
     )));
+    assert!(
+        app.context()
+            .service::<AgentsSvc>()
+            .unwrap()
+            .by_session(&scout_session)
+            .is_some(),
+        "a cancel is not a stop: the member stays on the team"
+    );
     // Only the member's turn: the lead, woken by the report of a turn it had
     // asked for, runs its own to the end.
     settled(&lead, 1).await;
@@ -1428,6 +1436,64 @@ async fn an_undone_lead_turn_takes_back_the_members_it_delegated() {
             .is_some(),
         "an earlier one is not"
     );
+}
+
+/// Cancelling the lead does not cancel its members: they work across its turns,
+/// and a person stopping a wordy lead has not asked the team to stop
+/// (`docs/adr/0023` §9).
+#[tokio::test]
+async fn cancelling_the_lead_leaves_its_members_working() {
+    use atomcode_kernel::event::AgentCommand;
+
+    let dir = scratch("lead-cancel");
+    let mut layers = layers_with(
+        &dir,
+        r#"{ text = "delegating", calls = [
+             { name = "team", args = { action = "delegate", name = "scout", role = "explorer", task = "look" } },
+             { name = "bash", args = { command = "sleep 30" } }
+           ] }, { text = "done" }"#,
+        "",
+        "",
+    );
+    layers.push(
+        Layer::from_toml("[[patch]]\nid = \"llm-utility\"\nname = \"test-stalling-utility\"\n")
+            .unwrap(),
+    );
+    let mut registry = plugins::catalog();
+    registry.register(Arc::new(StallingUtilityRow));
+    let mut app = App::new(registry, ConfigTree::from_layers(layers).unwrap());
+    app.start().await.expect("must mount");
+    let (lead, handle) = lead_on_a_pump(&app).await;
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let scout_session = format!("{}/scout", lead.session_id());
+    for _ in 0..500 {
+        let working = agents
+            .by_session(&scout_session)
+            .is_some_and(|scout| scout.status() == AgentStatus::Working);
+        let sleeping = lead
+            .session()
+            .events()
+            .iter()
+            .any(|e| matches!(&e.event, SessionEvent::ToolStarted { .. }));
+        if working && sleeping {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let scout = agents.by_session(&scout_session).expect("delegated");
+
+    handle.commands.send(AgentCommand::Cancel).unwrap();
+    settled(&lead, 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(scout.status(), AgentStatus::Working, "the member works on");
+    assert_eq!(turns_ended(&scout), 0, "its turn was not cut short");
 }
 
 /// A member's pump keeps nothing nobody reads: its events are not buffered for
