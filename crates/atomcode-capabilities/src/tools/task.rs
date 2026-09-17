@@ -539,6 +539,10 @@ pub struct TaskTool {
     /// wall-clock timeout, so it does not contradict the "long research runs
     /// freely" policy below.
     stream_timeout: Option<std::time::Duration>,
+    /// Per-child FIRST-token (prefill / TTFB) idle cap. Larger than `stream_timeout`
+    /// for the same slow-local-model reason as the parent; `None` ⇒ the kernel falls
+    /// back to `stream_timeout` for both phases. See `with_first_token_timeout`.
+    first_token_timeout: Option<std::time::Duration>,
     tool_loop_policy: Option<ToolLoopPolicy>,
     inherited_worker_middlewares: Vec<Arc<dyn ToolMiddleware>>,
     team_event_sink: Option<Arc<dyn Fn(crate::team::TeamEvent) + Send + Sync>>,
@@ -562,6 +566,7 @@ impl TaskTool {
             max_concurrent: DEFAULT_MAX_CONCURRENT,
             max_rounds: Some(super::DEFAULT_CHILD_MAX_ROUNDS),
             stream_timeout: None,
+            first_token_timeout: None,
             tool_loop_policy: Some(ToolLoopPolicy::default()),
             inherited_worker_middlewares: Vec::new(),
             team_event_sink: None,
@@ -610,6 +615,15 @@ impl TaskTool {
     /// hanging forever behind provider keep-alives. `None` leaves it unset (no cap).
     pub fn with_stream_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.stream_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the per-child FIRST-token (prefill / TTFB) idle cap — the longer budget the
+    /// kernel applies BEFORE a child's first stream byte. Parity with the parent so a
+    /// subagent on a slow local model is not cut off mid-prefill. `None` ⇒ the child
+    /// falls back to `stream_timeout` for both phases.
+    pub fn with_first_token_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.first_token_timeout = Some(timeout);
         self
     }
 
@@ -857,6 +871,7 @@ parallel workers NON-OVERLAPPING scopes."
         let sem = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
         let max_rounds = self.max_rounds;
         let stream_timeout = self.stream_timeout;
+        let first_token_timeout = self.first_token_timeout;
         let tool_loop_policy = self.tool_loop_policy;
         let inherited_worker_middlewares = self.inherited_worker_middlewares.clone();
         let mut set = tokio::task::JoinSet::new();
@@ -970,6 +985,7 @@ parallel workers NON-OVERLAPPING scopes."
                     tool_loop_policy,
                     max_rounds,
                     stream_timeout,
+                    first_token_timeout,
                     child_middlewares.clone(),
                 );
                 // DETACH: inner spawn lets the child run independent of this future;
@@ -1032,6 +1048,7 @@ parallel workers NON-OVERLAPPING scopes."
                         tool_loop_policy,
                         max_rounds,
                         stream_timeout,
+                        first_token_timeout,
                         child_middlewares,
                     );
                     outcome = run_child_to_completion(
@@ -1517,6 +1534,7 @@ fn build_task_child(
     tool_loop_policy: Option<ToolLoopPolicy>,
     max_rounds: Option<u32>,
     stream_timeout: Option<std::time::Duration>,
+    first_token_timeout: Option<std::time::Duration>,
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
 ) -> Agent {
     let mut builder = Agent::builder()
@@ -1537,6 +1555,11 @@ fn build_task_child(
     // then fails cleanly instead of hanging forever.
     if let Some(timeout) = stream_timeout {
         builder = builder.stream_timeout(timeout);
+    }
+    // Longer prefill (first-token) budget so a slow-local-model child is not cut off
+    // before its first byte. `None` ⇒ the kernel falls back to `stream_timeout`.
+    if let Some(timeout) = first_token_timeout {
+        builder = builder.first_token_timeout(timeout);
     }
     for middleware in middlewares {
         builder = builder.middleware(middleware);

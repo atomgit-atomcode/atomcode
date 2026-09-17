@@ -31,6 +31,9 @@ pub struct TeamRunnerFactory {
     max_rounds: Option<u32>,
     tool_loop_policy: Option<ToolLoopPolicy>,
     stream_timeout: Option<Duration>,
+    /// Per-member FIRST-token (prefill / TTFB) idle cap (parity with the parent /
+    /// TaskTool). `None` ⇒ the member falls back to `stream_timeout` for both phases.
+    first_token_timeout: Option<Duration>,
     request_timeout: Option<Duration>,
     inherited_worker_middlewares: Vec<Arc<dyn ToolMiddleware>>,
     credential_shell_policy: atomcode_capabilities::tools::CredentialShellPolicy,
@@ -49,6 +52,7 @@ impl TeamRunnerFactory {
             max_rounds: None,
             tool_loop_policy: None,
             stream_timeout: None,
+            first_token_timeout: None,
             request_timeout: None,
             inherited_worker_middlewares: Vec::new(),
             credential_shell_policy: Default::default(),
@@ -60,11 +64,13 @@ impl TeamRunnerFactory {
         max_rounds: Option<u32>,
         tool_loop_policy: Option<ToolLoopPolicy>,
         stream_timeout: Option<Duration>,
+        first_token_timeout: Option<Duration>,
         request_timeout: Option<Duration>,
     ) -> Self {
         self.max_rounds = max_rounds.filter(|rounds| *rounds > 0);
         self.tool_loop_policy = tool_loop_policy;
         self.stream_timeout = stream_timeout;
+        self.first_token_timeout = first_token_timeout;
         self.request_timeout = request_timeout;
         self
     }
@@ -132,6 +138,9 @@ impl TeamRunnerFactory {
         }
         if let Some(timeout) = self.stream_timeout {
             builder = builder.stream_timeout(timeout);
+        }
+        if let Some(timeout) = self.first_token_timeout {
+            builder = builder.first_token_timeout(timeout);
         }
         if let Some(timeout) = self.request_timeout {
             builder = builder.request_timeout(timeout);

@@ -167,6 +167,9 @@ pub struct ReviewToolConfig {
     pub model: String,
     pub context_window: u32,
     pub stream_timeout: Duration,
+    /// FIRST-token (prefill / TTFB) idle budget for the review sub-agent; ≥ `stream_timeout`
+    /// so a slow local model is not cut off mid-prefill. Seeded from the coding config.
+    pub first_token_timeout: Duration,
     pub request_timeout: Duration,
     /// Preflight guardrails. Crossing any one requires an explicit scope confirmation.
     pub max_commits_without_confirmation: usize,
@@ -183,6 +186,7 @@ impl Default for ReviewToolConfig {
             model: String::new(),
             context_window: 128_000,
             stream_timeout: Duration::from_secs(120),
+            first_token_timeout: Duration::from_secs(120),
             request_timeout: Duration::from_secs(300),
             max_commits_without_confirmation: 20,
             max_files_without_confirmation: 40,
@@ -540,6 +544,7 @@ impl Tool for ReviewTool {
             let mut cfg = ReviewAgentConfig::new("", "", &self.cfg.model, &ctx.working_dir);
             cfg.context_window = self.cfg.context_window;
             cfg.stream_timeout = self.cfg.stream_timeout;
+            cfg.first_token_timeout = self.cfg.first_token_timeout;
             cfg.request_timeout = self.cfg.request_timeout;
             cfg.max_rounds = self.max_rounds;
             cfg.max_turn_duration = self.max_turn_duration;

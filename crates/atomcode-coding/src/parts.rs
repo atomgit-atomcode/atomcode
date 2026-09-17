@@ -554,6 +554,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                     model: cfg.model.clone(),
                     context_window: cfg.context_window,
                     stream_timeout: cfg.stream_timeout,
+                    first_token_timeout: cfg.first_token_timeout,
                     request_timeout: cfg
                         .request_timeout
                         .unwrap_or_else(|| std::time::Duration::from_secs(300)),
@@ -682,6 +683,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         .with_max_concurrent(subagent_max_concurrent)
         .with_max_rounds(subagent_max_rounds)
         .with_stream_timeout(cfg.stream_timeout)
+        .with_first_token_timeout(cfg.first_token_timeout)
         .with_tool_loop_policy(cfg.tool_loop_policy)
         .with_credential_shell_policy(cfg.credential_shell_policy)
         .with_worker_middleware(turn_execution_policy.clone())
@@ -743,6 +745,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 (subagent_max_rounds > 0).then_some(subagent_max_rounds),
                 cfg.tool_loop_policy,
                 Some(cfg.stream_timeout),
+                Some(cfg.first_token_timeout),
                 cfg.request_timeout,
             )
             .with_credential_shell_policy(cfg.credential_shell_policy)

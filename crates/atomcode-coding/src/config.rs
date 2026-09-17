@@ -676,15 +676,20 @@ impl TierProvider {
     }
 }
 
-/// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
-/// positive integer, else 300s. Ported from core's env-configurable liveness knob.
-fn default_stream_timeout() -> Duration {
-    std::env::var("ATOMCODE_STREAM_TIMEOUT_SECS")
+/// A positive-integer-seconds duration read from env var `var`: `None` when unset,
+/// non-numeric, or ≤ 0 (so a bogus/zero value falls back to the caller's default
+/// rather than silently disabling the timeout).
+fn env_duration_secs(var: &str) -> Option<Duration> {
+    std::env::var(var)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
         .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(300))
+}
+/// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
+/// positive integer, else 300s. Ported from core's env-configurable liveness knob.
+fn default_stream_timeout() -> Duration {
+    env_duration_secs("ATOMCODE_STREAM_TIMEOUT_SECS").unwrap_or_else(|| Duration::from_secs(300))
 }
 /// The default first-token (prefill / TTFB) timeout. An explicit
 /// `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS` (valid positive integer) wins as-is — a
@@ -695,15 +700,8 @@ fn default_stream_timeout() -> Duration {
 /// `ATOMCODE_STREAM_TIMEOUT_SECS` (e.g. following the reconnect hint) must not end
 /// up with a SHORTER prefill window than inter-token — hence the `.max()`.
 fn default_first_token_timeout() -> Duration {
-    if let Some(explicit) = std::env::var("ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|n| *n > 0)
-        .map(Duration::from_secs)
-    {
-        return explicit;
-    }
-    default_stream_timeout().max(Duration::from_secs(600))
+    env_duration_secs("ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS")
+        .unwrap_or_else(|| default_stream_timeout().max(Duration::from_secs(600)))
 }
 /// Share of the CodingPlan 5h rolling `call_limit` a single `/goal` may consume
 /// (percent). A goal that eats more than this starves the user's interactive work
