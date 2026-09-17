@@ -1116,8 +1116,8 @@ fn catalog_for_project_in_root(
 /// bucket that hashes from `working_dir` — no cross-project walk. Nearly every
 /// session lives in that bucket, so this is the common-case fast path. It does NOT
 /// see legacy sessions parked in a different bucket whose working_dir happens to
-/// match (import/migration edge cases); the caller falls back to
-/// [`catalog_for_project`] when a lookup misses here. See [`resolve_catalog_or_full`].
+/// match (import/migration edge cases); the `-c`/resume resolver falls back to the
+/// full [`catalog_for_project`] scan when a lookup misses here.
 pub fn catalog_for_bucket(
     working_dir: &std::path::Path,
 ) -> anyhow::Result<Vec<atomcode_capabilities::session::CatalogEntry>> {
