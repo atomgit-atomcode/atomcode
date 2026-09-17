@@ -33,9 +33,27 @@ impl Skill {
         let positional: Vec<&str> = arguments.split_whitespace().collect();
         let skill_dir = self.skill_dir.to_string_lossy();
 
+        // Substitution order is a SECURITY boundary:
+        //   1. TRUSTED variables (`${CLAUDE_SESSION_ID}`, `${CLAUDE_SKILL_DIR}` — a
+        //      UUID and a filesystem path, NOT attacker-controlled) are substituted
+        //      BEFORE shell expansion, so a template's `!`cat ${CLAUDE_SKILL_DIR}/x``
+        //      still resolves.
+        //   2. The template's own `!`cmd`` shell blocks run.
+        //   3. ARGUMENTS (untrusted — a prompt-injected model can call `use_skill`
+        //      with arbitrary args) are substituted LAST, so an argument value
+        //      containing `!`rm -rf …`` (or `$1`) is inserted as literal text and can
+        //      never introduce/fill a shell block → no command injection via args.
+        // This matches the engine's existing rule that a substituted value is emitted
+        // literally and never re-scanned; only the trusted template's blocks execute.
+        let pre = self
+            .template
+            .replace("${CLAUDE_SESSION_ID}", session_id)
+            .replace("${CLAUDE_SKILL_DIR}", skill_dir.as_ref());
+        let shell_expanded = expand_shell_injections(&pre);
+
         // SINGLE left-to-right pass: each substitution's value is emitted literally and
         // never re-scanned — so an argument that itself contains `$1` is NOT re-expanded.
-        let t = self.template.as_str();
+        let t = shell_expanded.as_str();
         let mut result = String::with_capacity(t.len());
         let mut i = 0;
         while i < t.len() {
@@ -51,11 +69,13 @@ impl Skill {
                 i += ch.len_utf8();
             }
         }
-        // A template with no `$ARGUMENTS` token at all still gets the full args appended.
+        // A template with no `$ARGUMENTS` token at all still gets the full args
+        // appended — as literal text, never shell-expanded (the shell pass already ran
+        // on the template above, so args here can't inject).
         if !self.template.contains("$ARGUMENTS") && !arguments.trim().is_empty() {
             result = format!("{}\n\nARGUMENTS: {}", result.trim_end(), arguments);
         }
-        expand_shell_injections(&result)
+        result
     }
 
     /// [`expand`](Self::expand) plus, for directory-style skills, a `<system-reminder>`
@@ -450,6 +470,41 @@ mod tests {
     fn shell_injection_runs() {
         let out = skill("value=!`echo hi`").expand("", "");
         assert_eq!(out, "value=hi");
+    }
+
+    #[test]
+    fn argument_shell_injection_is_not_executed() {
+        // SECURITY: an argument containing a `!`…`` shell token must be emitted as
+        // LITERAL text, never executed (args are untrusted data). If it ran, the token
+        // would be replaced by the command's stdout ("PWNED"); it must survive verbatim.
+        let out = skill("Hello $ARGUMENTS").expand("!`echo PWNED`", "");
+        assert!(
+            out.contains("!`echo PWNED`"),
+            "arg shell token must stay literal, got: {out}"
+        );
+        assert!(
+            !out.contains("Hello PWNED"),
+            "arg shell command must NOT run, got: {out}"
+        );
+    }
+
+    #[test]
+    fn argument_shell_injection_not_executed_via_appended_args() {
+        // Same guard on the "no $ARGUMENTS token → args appended" path.
+        let out = skill("plain body").expand("!`echo PWNED`", "");
+        assert!(
+            out.contains("!`echo PWNED`") && !out.contains("PWNED\n") && !out.ends_with("PWNED"),
+            "appended arg shell token must stay literal, got: {out}"
+        );
+    }
+
+    #[test]
+    fn trusted_var_substitutes_inside_shell_block() {
+        // `${CLAUDE_SKILL_DIR}` (trusted, not attacker-controlled) must resolve BEFORE
+        // shell expansion so a template shell block can reference bundled files. The
+        // test helper's `skill_dir` is "/sk", so `!`echo ${CLAUDE_SKILL_DIR}`` → "/sk".
+        let out = skill("out=!`echo ${CLAUDE_SKILL_DIR}`").expand("", "sess");
+        assert_eq!(out, "out=/sk", "skill dir must resolve in a shell block: {out}");
     }
 
     #[test]
