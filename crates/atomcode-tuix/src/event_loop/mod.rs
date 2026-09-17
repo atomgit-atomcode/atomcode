@@ -9709,6 +9709,15 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 &session,
                 false,
             );
+            // Restore the session-cumulative token totals (incl. cache) from the
+            // persisted meta so the status-row cache% shows immediately on `-c`/
+            // `--continue` — this startup path bypasses `commit_native_session_changed`,
+            // so without this the tallies stay 0 until the next turn.
+            // `None` bucket → `for_project(working_dir)`, which is exactly where
+            // `-c`/`--continue` loaded this session from (incl. a contention fork,
+            // stored in the same project bucket) — robust regardless of whether
+            // `current_session_project_bucket` is populated this early at startup.
+            seed_session_token_totals(&mut app.state, None, &ctx.working_dir, &session.id);
             // The runtime was prepared against this exact external session id and
             // snapshot before the TUI started; replay here is display-only.
             // Continue accumulating into the runtime-owned session file. That
@@ -25304,6 +25313,29 @@ fn session_token_totals_from_cost(
     (prompt, completion, cached)
 }
 
+/// Seed `state`'s session-cumulative token totals (incl. cache) from the persisted
+/// meta for `session_id`, so the status-row cache% survives a resume/`-c`/switch
+/// instead of blanking until the next turn (mirrors how `ctx` usage is restored).
+/// Live Usage events accumulate on top of this seed. Best-effort: a missing/
+/// unreadable meta (fresh session, legacy import) leaves the totals untouched.
+fn seed_session_token_totals(
+    state: &mut UiState,
+    project_bucket: Option<&str>,
+    working_dir: &std::path::Path,
+    session_id: &str,
+) {
+    let manager = commands::session_manager_for_cost(project_bucket, working_dir);
+    if let Ok(meta) = manager.read_meta(session_id) {
+        let report = atomcode_capabilities::session::aggregate_session_cost(&meta);
+        let (prompt, completion, cached) = session_token_totals_from_cost(&report);
+        state.prompt_tokens = prompt;
+        state.completion_tokens = completion;
+        state.cached_tokens = cached;
+        // Live path does `total_tokens += u.completion`, so mirror it here.
+        state.total_tokens = completion;
+    }
+}
+
 fn commit_native_session_changed(
     session: Session,
     working_dir: PathBuf,
@@ -25347,26 +25379,15 @@ fn commit_native_session_changed(
     state.prompt_tokens = 0;
     state.completion_tokens = 0;
     state.cached_tokens = 0;
-    // Restore the session-cumulative token totals (incl. cache) from the
-    // persisted meta so the status-row cache% survives a `-c`/resume instead of
-    // blanking until the next turn — mirroring how `ctx` usage is restored. Live
-    // Usage events accumulate on top of this seed. Best-effort: a missing/
-    // unreadable meta (fresh session, legacy import) leaves the totals at 0.
-    {
-        let manager = commands::session_manager_for_cost(
-            ctx.current_session_project_bucket.as_deref(),
-            &ctx.working_dir,
-        );
-        if let Ok(meta) = manager.read_meta(&session_id) {
-            let report = atomcode_capabilities::session::aggregate_session_cost(&meta);
-            let (prompt, completion, cached) = session_token_totals_from_cost(&report);
-            state.prompt_tokens = prompt;
-            state.completion_tokens = completion;
-            state.cached_tokens = cached;
-            // Live path does `total_tokens += u.completion`, so mirror it here.
-            state.total_tokens = completion;
-        }
-    }
+    // Restore the session-cumulative token totals (incl. cache) from the persisted
+    // meta so the status-row cache% survives a resume/switch instead of blanking
+    // until the next turn — mirroring how `ctx` usage is restored.
+    seed_session_token_totals(
+        state,
+        ctx.current_session_project_bucket.as_deref(),
+        &ctx.working_dir,
+        &session_id,
+    );
     state.last_context = None;
     // Session history can outlive the model that produced it. Establish the
     // current runtime/model window before replay restores persisted usage, so
