@@ -579,6 +579,7 @@ fn convert_legacy_session_with_diagnostic(
         detached_model_usage: Vec::new(),
         detached_unattributed_tokens: 0,
         origin: SessionOrigin::Manual,
+        format_version: 0,
     };
     meta.auto_name_from_messages(&snapshot.messages);
 
@@ -3682,6 +3683,7 @@ mod tests {
             message_count: 0,
             turn_count: 0,
             presence: CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         };
 
         let old = rename_catalog_entry_in_root(dir.path(), &entry, "chosen", false).unwrap();
@@ -3783,6 +3785,7 @@ mod tests {
             message_count: 1,
             turn_count: 0,
             presence: CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         };
 
         let loaded = load_catalog_session_view_in_root(dir.path(), &entry).unwrap();
@@ -4076,6 +4079,7 @@ mod tests {
             message_count: 1,
             turn_count: 0,
             presence: CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         };
 
         let loaded = load_catalog_session_view_in_root(dir.path(), &entry).unwrap();
@@ -4256,6 +4260,7 @@ mod tests {
             message_count: 1,
             turn_count: 0,
             presence: CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         };
 
         let loaded = load_catalog_session_view_in_root(dir.path(), &entry).unwrap();
@@ -4297,6 +4302,7 @@ mod tests {
             message_count: session.messages.len(),
             turn_count: session.turn_stats.len(),
             presence: CatalogPresence::LegacyOnly,
+            needs_newer_version: false,
         };
 
         let loaded = load_catalog_session_view_in_root(dir.path(), &entry).unwrap();
@@ -4332,6 +4338,7 @@ mod tests {
             message_count: session.messages.len(),
             turn_count: session.turn_stats.len(),
             presence: CatalogPresence::LegacyOnly,
+            needs_newer_version: false,
         };
 
         rename_catalog_entry_in_root(dir.path(), &entry, "native-name", false).unwrap();

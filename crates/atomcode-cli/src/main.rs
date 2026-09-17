@@ -4595,6 +4595,7 @@ mod tests {
             message_count: 1,
             turn_count: 1,
             presence: atomcode_capabilities::session::CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         }
     }
 

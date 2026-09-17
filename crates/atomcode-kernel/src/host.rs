@@ -89,6 +89,10 @@ pub struct StoredSession {
     pub updated_at: u64,
     #[serde(default)]
     pub turns: u32,
+    /// Written by a newer build than the host's: listed so a person knows it is
+    /// there, refused if they try to resume it (`docs/adr/0024` §16).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_newer_version: bool,
 }
 
 /// Something that happened on the host, whoever caused it.
@@ -231,6 +235,7 @@ mod tests {
                     created_at: 1,
                     updated_at: 2,
                     turns: 3,
+                    needs_newer_version: true,
                 }],
             },
         ];

@@ -236,7 +236,13 @@ impl CommandSet for SessionCommands {
                                         format!("/resume {}", stored.id),
                                         stored.title.clone().unwrap_or_else(|| stored.id.clone()),
                                     )
-                                    .about(format!("{} 轮 · {}", stored.turns, stored.id))
+                                    .about(
+                                        if stored.needs_newer_version {
+                                            format!("需要更新版本才能打开 · {}", stored.id)
+                                        } else {
+                                            format!("{} 轮 · {}", stored.turns, stored.id)
+                                        },
+                                    )
                                 })
                                 .collect();
                             if choices.is_empty() {

@@ -424,6 +424,7 @@ impl RuntimeControl {
                 created_at: u64::try_from(entry.created_at_ms).unwrap_or(0),
                 updated_at: u64::try_from(entry.updated_at_ms).unwrap_or(0),
                 turns: u32::try_from(entry.turn_count).unwrap_or(u32::MAX),
+                needs_newer_version: entry.needs_newer_version,
             })
             .filter(|stored| working_dir.is_none() || stored.working_dir == working_dir)
             .collect();
@@ -446,8 +447,19 @@ impl HostControl for RuntimeControl {
                 if target == session {
                     return Err(HostError::SessionInUse { id: target });
                 }
-                if !self.list(None).iter().any(|stored| stored.id == target) {
+                let Some(stored) = self
+                    .list(None)
+                    .into_iter()
+                    .find(|stored| stored.id == target)
+                else {
                     return Err(HostError::NotFound);
+                };
+                if stored.needs_newer_version {
+                    return Err(HostError::Failed {
+                        message: format!(
+                            "session {target} was written by a newer AtomCode; update to resume it"
+                        ),
+                    });
                 }
                 let changed = self.handle.resume_session(target).await?;
                 self.changed(changed.session_id)

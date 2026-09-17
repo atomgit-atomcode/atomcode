@@ -396,6 +396,7 @@ pub(crate) mod test_support {
             message_count: 0,
             turn_count: 0,
             presence: CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         }
     }
 }

@@ -265,9 +265,12 @@ impl TreeHost {
                 id,
                 title: summary.title,
                 working_dir: dir,
-                created_at: header.map(|h| h.created_at).unwrap_or(0),
+                created_at: header.as_ref().map(|h| h.created_at).unwrap_or(0),
                 updated_at: 0,
                 turns: u32::try_from(summary.turns).unwrap_or(u32::MAX),
+                needs_newer_version: header
+                    .as_ref()
+                    .is_some_and(|h| h.version > crate::session::SESSION_FORMAT_VERSION),
             });
         }
         Ok(HostReply::Sessions { sessions })

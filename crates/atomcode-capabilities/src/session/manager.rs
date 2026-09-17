@@ -257,6 +257,8 @@ pub struct CatalogEntry {
     pub message_count: usize,
     pub turn_count: usize,
     pub presence: CatalogPresence,
+    /// Written by a build newer than this one: listed, not resumable here.
+    pub needs_newer_version: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -429,6 +431,12 @@ pub struct SessionMeta {
     /// that sessions written before this field existed deserialize correctly.
     #[serde(default)]
     pub origin: SessionOrigin,
+    /// The session-format version of the last build that wrote this session's
+    /// log and index — what a catalog reads to tell that a session needs a newer
+    /// build without opening its log (`docs/adr/0024` §16). Zero for a session
+    /// stored as a snapshot.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub format_version: u32,
 }
 
 impl SessionMeta {
@@ -454,7 +462,13 @@ impl SessionMeta {
             detached_model_usage: Vec::new(),
             detached_unattributed_tokens: 0,
             origin: SessionOrigin::Manual,
+            format_version: 0,
         }
+    }
+
+    /// Whether a build older than the one that last wrote this session.
+    pub fn needs_newer_version(&self) -> bool {
+        self.format_version > atomcode_kernel::session::SESSION_FORMAT_VERSION
     }
 
     /// Remove turn stats selected by `predicate` while preserving their usage
@@ -674,6 +688,10 @@ fn default_true() -> bool {
 }
 
 fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
@@ -2695,6 +2713,11 @@ impl SessionManager {
             let original_meta = meta.clone();
             let original_presentation = presentation.clone();
             let result = mutate(&current_snapshot, &mut meta, &mut presentation)?;
+            if events {
+                meta.format_version = meta
+                    .format_version
+                    .max(atomcode_kernel::session::SESSION_FORMAT_VERSION);
+            }
             ensure_meta_id(lease.id(), &meta)?;
             if meta.owner != StorageOwner::Native {
                 return Err(SessionStoreError::OwnershipConflict {
@@ -3395,7 +3418,7 @@ fn scan_bucket_into(bucket: &str, bucket_path: &Path, out: &mut BucketPartial) {
     }
 }
 
-fn scan_catalog_root(sessions_root: &Path) -> CatalogScan {
+pub(super) fn scan_catalog_root(sessions_root: &Path) -> CatalogScan {
     let mut scan = CatalogScan::default();
     // Phase 1 (serial, cheap): enumerate valid bucket directories. Bucket-level
     // validation diagnostics are produced here; the expensive per-file read + JSON
@@ -3683,6 +3706,7 @@ fn catalog_entry(
 ) -> Option<CatalogEntry> {
     match (sources.native, sources.legacy) {
         (Some(native), legacy) => Some(CatalogEntry {
+            needs_newer_version: native.needs_newer_version(),
             id,
             fork_root_id: native.fork_info.as_ref().map(|fork| fork.root_id.clone()),
             name: native.name,
@@ -3709,6 +3733,7 @@ fn catalog_entry(
             message_count: legacy.messages.len(),
             turn_count: legacy.turn_stats.len(),
             presence: CatalogPresence::LegacyOnly,
+            needs_newer_version: false,
         }),
         (None, None) => None,
     }

@@ -660,6 +660,7 @@ async fn an_undone_turn_is_gone_from_what_the_model_sees() {
             .await
             .unwrap();
 
+    let id = runtime.session.clone().unwrap().id;
     turn(&mut runtime, "first").await;
     turn(&mut runtime, "second").await;
     let undone = runtime.handle.undo_to_prompt(None).await.unwrap();
@@ -672,6 +673,38 @@ async fn an_undone_turn_is_gone_from_what_the_model_sees() {
         ""
     );
     runtime.handle.shutdown().await.unwrap();
+    let _ = runtime.task.await;
+
+    // An undo is the projection's business (`docs/adr/0024` §17): the log still
+    // holds what was undone, and a resume leaves it out the same way.
+    let log = std::fs::read_to_string(
+        SessionManager::for_project(env.project.path())
+            .events_path(&id)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        log.contains("\"text\":\"second\""),
+        "the undone prompt is gone from the log"
+    );
+    assert!(log.contains("\"kind\":\"rewound\""), "{log}");
+    let mut resumed = CodingRuntime::start(start(
+        env.project.path(),
+        &recorder,
+        SessionMode::Resume(id),
+    ))
+    .await
+    .unwrap();
+    turn(&mut resumed, "fourth").await;
+    assert_eq!(
+        user_texts(&recorder.last_request()),
+        vec![
+            "first".to_string(),
+            "third".to_string(),
+            "fourth".to_string()
+        ],
+    );
+    resumed.handle.shutdown().await.unwrap();
 }
 
 /// Same, without a session: the runtime's in-memory snapshot is the store.

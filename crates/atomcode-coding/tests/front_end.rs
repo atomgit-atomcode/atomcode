@@ -343,6 +343,172 @@ async fn a_stored_session_is_listed_and_resumed_with_its_history() {
     );
 }
 
+/// A resumed session holds every fact it committed, in order and under the same
+/// numbers — a question the person answered, the title, a compaction asked
+/// for, the turns around them — chunks aside, which are not kept
+/// (`docs/adr/0024`: resume is lossless).
+#[tokio::test]
+async fn a_resumed_session_holds_every_fact_it_committed() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let first = connection.session.clone();
+    let facts = |events: &[AgentEvent], session: &str| -> Vec<(u64, String)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Fact(c) if c.session == session => Some(c),
+                _ => None,
+            })
+            .filter(|c| !matches!(c.event, SessionEvent::AssistantChunk { .. }))
+            .map(|c| {
+                let kind = serde_json::to_value(&c.event).unwrap()["kind"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                (c.seq, kind)
+            })
+            .collect()
+    };
+
+    connection.commands.send(message("ask me")).unwrap();
+    let id = loop {
+        match tokio::time::timeout(Duration::from_secs(10), connection.events.recv()).await {
+            Ok(Some(AgentEvent::Request { id, .. })) => break id,
+            Ok(Some(_)) => continue,
+            other => panic!("no question: {other:?}"),
+        }
+    };
+    connection
+        .commands
+        .send(AgentCommand::Respond {
+            id,
+            value: serde_json::json!({ "declined": false, "selected": ["pistachio"] }),
+        })
+        .unwrap();
+    through_turn(&mut connection).await;
+    connection.commands.send(message("hello")).unwrap();
+    through_turn(&mut connection).await;
+    connection
+        .commands
+        .send(AgentCommand::Compact { focus: None })
+        .unwrap();
+    let _ = quiet(&mut connection).await;
+
+    connection.commands.send(subscribe(&first)).unwrap();
+    let before = facts(&quiet(&mut connection).await, &first);
+    for kind in ["tool_result_logged", "titled", "turn_end"] {
+        assert!(
+            before.iter().any(|(_, k)| k == kind),
+            "`{kind}` is among the facts: {before:?}"
+        );
+    }
+
+    let Ok(HostReply::SessionChanged { session: second }) = connection
+        .control
+        .call(HostCommand::NewSession {
+            session: first.clone(),
+        })
+        .await
+    else {
+        panic!("a new session");
+    };
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Resume {
+                session: second,
+                target: first.clone(),
+            })
+            .await,
+        Ok(HostReply::SessionChanged {
+            session: first.clone()
+        })
+    );
+    let _ = quiet(&mut connection).await;
+    connection.commands.send(subscribe(&first)).unwrap();
+    let after = facts(&quiet(&mut connection).await, &first);
+    assert_eq!(after, before);
+}
+
+/// A session a newer build last wrote is listed and marked, and a resume of it
+/// is refused before its log is opened; the others resume as ever
+/// (`docs/adr/0024` §16).
+#[tokio::test]
+async fn a_session_a_newer_build_wrote_is_listed_and_refused() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let first = connection.session.clone();
+    connection
+        .commands
+        .send(message("remember pineapple"))
+        .unwrap();
+    through_turn(&mut connection).await;
+    let Ok(HostReply::SessionChanged { session: second }) = connection
+        .control
+        .call(HostCommand::NewSession {
+            session: first.clone(),
+        })
+        .await
+    else {
+        panic!("a new session");
+    };
+    connection.commands.send(message("remember plum")).unwrap();
+    through_turn(&mut connection).await;
+    let Ok(HostReply::SessionChanged { session: third }) = connection
+        .control
+        .call(HostCommand::NewSession {
+            session: second.clone(),
+        })
+        .await
+    else {
+        panic!("a third session");
+    };
+
+    atomcode_capabilities::session::SessionManager::for_project(env.project.path())
+        .update_meta(&first, |meta| {
+            meta.format_version = atomcode_kernel::session::SESSION_FORMAT_VERSION + 1;
+        })
+        .unwrap();
+
+    let Ok(HostReply::Sessions { sessions }) = connection
+        .control
+        .call(HostCommand::ListSessions { working_dir: None })
+        .await
+    else {
+        panic!("a listing");
+    };
+    let marked = |id: &str| {
+        sessions
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("{id} is listed: {sessions:#?}"))
+            .needs_newer_version
+    };
+    assert!(marked(&first));
+    assert!(!marked(&second));
+
+    assert!(matches!(
+        connection
+            .control
+            .call(HostCommand::Resume {
+                session: third.clone(),
+                target: first.clone(),
+            })
+            .await,
+        Err(HostError::Failed { .. })
+    ));
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Resume {
+                session: third,
+                target: second.clone(),
+            })
+            .await,
+        Ok(HostReply::SessionChanged { session: second })
+    );
+}
+
 #[tokio::test]
 async fn a_question_reaches_the_front_end_and_its_answer_goes_back() {
     let env = env();

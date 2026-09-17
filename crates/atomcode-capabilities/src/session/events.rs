@@ -226,6 +226,9 @@ impl SessionManager {
     }
 
     fn write_index_unlocked(&self, meta: &SessionMeta) -> SessionResult<()> {
+        let mut meta = meta.clone();
+        meta.format_version = meta.format_version.max(SESSION_FORMAT_VERSION);
+        let meta = &meta;
         super::manager::validate_meta(meta)?;
         let bytes = super::manager::serialize_pretty_bounded(
             meta,
@@ -380,6 +383,7 @@ impl SessionManager {
     pub fn open_as_events(&self, lease: &SessionLease) -> SessionResult<bool> {
         self.validate_active_lease(lease)?;
         let id = lease.id();
+        self.refuse_newer(id)?;
         if self.is_event_session(id) {
             self.move_snapshot_files_aside(id)?;
             return Ok(false);
@@ -398,6 +402,7 @@ impl SessionManager {
     ) -> SessionResult<(super::manager::LoadedSession, Option<Message>)> {
         self.validate_active_lease(lease)?;
         let id = lease.id();
+        self.refuse_newer(id)?;
         if self.is_event_session(id) {
             self.move_snapshot_files_aside(id)?;
             return self.load_native_session_for_resume(lease);
@@ -452,6 +457,23 @@ impl SessionManager {
             self.write_index_unlocked(&meta)
         })?;
         self.move_snapshot_files_aside(id)
+    }
+
+    /// A session a newer build last wrote is listed, never opened here: its log
+    /// may hold facts this build would misread.
+    fn refuse_newer(&self, id: &str) -> SessionResult<()> {
+        if !self.is_event_session(id) {
+            return Ok(());
+        }
+        let meta = self.read_meta(id)?;
+        if meta.needs_newer_version() {
+            return Err(SessionStoreError::FutureSchema {
+                kind: "session events",
+                found: meta.format_version,
+                supported: SESSION_FORMAT_VERSION,
+            });
+        }
+        Ok(())
     }
 
     /// Move what a build from before the event format reads out of its sight.
@@ -1322,6 +1344,90 @@ mod tests {
             day.iter().map(|t| t.user.as_str()).collect::<Vec<_>>(),
             vec!["remember kiwi", "and then?"]
         );
+    }
+
+    /// A session a newer build last wrote is listed and marked, and opening it is
+    /// refused before its log is read; the rest of the project is untouched.
+    #[test]
+    fn a_session_a_newer_build_wrote_is_listed_but_not_opened() {
+        let (dir, manager) = store();
+        let newer = created(&manager, "newer");
+        let current = created(&manager, "current");
+        manager
+            .update_meta("newer", |meta| {
+                meta.format_version = SESSION_FORMAT_VERSION + 1
+            })
+            .unwrap();
+
+        let scan = SessionManager::scan_catalog(dir.path());
+        let marked = |id: &str| {
+            scan.entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .unwrap_or_else(|| panic!("{id} listed: {scan:#?}"))
+                .needs_newer_version
+        };
+        assert!(marked("newer"));
+        assert!(!marked("current"));
+
+        assert!(matches!(
+            manager.open_for_resume(&newer),
+            Err(SessionStoreError::FutureSchema { .. })
+        ));
+        manager.open_for_resume(&current).unwrap();
+
+        // What marks a session is this build writing it: at creation, and at
+        // every runtime write after one an older build made.
+        assert_eq!(
+            manager.read_meta("current").unwrap().format_version,
+            SESSION_FORMAT_VERSION
+        );
+        manager
+            .update_meta("current", |meta| meta.format_version = 1)
+            .unwrap();
+        manager
+            .commit_native_runtime_mutation(
+                &current,
+                &SessionSnapshot::new(Vec::new()),
+                |_, _, _| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            manager.read_meta("current").unwrap().format_version,
+            SESSION_FORMAT_VERSION
+        );
+    }
+
+    /// A journal an earlier build of this line kept under `sessions/harness/`
+    /// is never read (`docs/adr/0024` §15): the catalog and recall come out the
+    /// same with it there as without it.
+    #[test]
+    fn an_old_harness_journal_is_not_read() {
+        let (dir, manager) = store();
+        let lease = created(&manager, "s1");
+        manager.append_events(&lease, &a_turn()).unwrap();
+        let listed = |dir: &std::path::Path| {
+            let scan = super::super::manager::scan_catalog_root(dir);
+            (scan.entries, scan.diagnostics)
+        };
+        let recalled = || {
+            crate::session::RecallTool::new()
+                .search_dir(manager.root(), "hello", None, None, 8)
+                .unwrap()
+        };
+        let (before_list, before_recall) = (listed(dir.path()), recalled());
+
+        let journals = dir.path().join(SessionManager::JOURNAL_DIR).join(BUCKET);
+        fs::create_dir_all(&journals).unwrap();
+        fs::write(
+            journals.join("1700000000000-9.jsonl"),
+            "{\"header\":{\"version\":1,\"id\":\"1700000000000-9\",\"created_at\":1,\"inherited\":0}}\n\
+             {\"seq\":1,\"event\":{\"kind\":\"user_message\",\"turn\":1,\"text\":\"hello from a journal\"}}\n",
+        )
+        .unwrap();
+
+        assert_eq!(listed(dir.path()), before_list);
+        assert_eq!(recalled(), before_recall);
     }
 
     /// A fact too long for one line is refused before anything is written: a
