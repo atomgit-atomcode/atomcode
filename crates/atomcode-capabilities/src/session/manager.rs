@@ -2813,6 +2813,14 @@ impl SessionManager {
         scan_catalog_cached(sessions_root)
     }
 
+    /// Scan ONLY one project bucket under `sessions_root` (no cross-bucket walk).
+    /// The `-c`/resume fast path uses this to avoid walking every project on a
+    /// large history; see [`scan_catalog_single_bucket`]. Not cached (a single
+    /// bucket is already cheap, and it must not collide with the full-root cache).
+    pub fn scan_catalog_bucket(sessions_root: &Path, bucket: &str) -> CatalogScan {
+        scan_catalog_single_bucket(sessions_root, bucket)
+    }
+
     /// Collapse automatic fork aggregates into one newest logical conversation
     /// row per project. Exact-ID loading and the raw catalog remain unchanged.
     pub fn collapse_fork_lineages(entries: &mut Vec<CatalogEntry>) {
@@ -3484,10 +3492,37 @@ fn scan_catalog_root(sessions_root: &Path) -> CatalogScan {
         })
     };
 
-    // Phase 3 (serial merge): fold the per-worker partials together. Session keys are
-    // bucket-scoped and each bucket is scanned by exactly one worker, so a given key
-    // appears in at most one partial — `or_insert`/field-set never actually conflict;
-    // the combine is defensive. The single deterministic sort below fixes ordering.
+    finalize_catalog_scan(partials, scan)
+}
+
+/// Scan ONLY one project bucket under `sessions_root` (no cross-bucket walk).
+/// The `-c`/resume fast path uses this: nearly every session lives in the bucket
+/// that hashes from its working dir, so scanning that single bucket avoids walking
+/// all projects (hundreds of buckets / thousands of files on a large history).
+/// A missing/non-dir bucket returns an empty scan (no diagnostics) — the caller
+/// falls back to the full cross-project scan when nothing matches there.
+fn scan_catalog_single_bucket(sessions_root: &Path, bucket: &str) -> CatalogScan {
+    let mut scan = CatalogScan::default();
+    if !valid_project_bucket(bucket) {
+        return scan;
+    }
+    let bucket_path = sessions_root.join(bucket);
+    match fs::symlink_metadata(&bucket_path) {
+        Ok(meta) if meta.is_dir() => {}
+        _ => return scan,
+    }
+    let mut partial = BucketPartial::default();
+    scan_bucket_into(bucket, &bucket_path, &mut partial);
+    finalize_catalog_scan(vec![partial], scan)
+}
+
+/// Phase 3 of a catalog scan: fold per-bucket partials into sorted entries and
+/// diagnostics. Session keys are bucket-scoped and each bucket is scanned by
+/// exactly one worker, so a given key appears in at most one partial —
+/// `or_insert`/field-set never actually conflict; the combine is defensive. The
+/// single deterministic sort fixes ordering. Shared by the full-root and
+/// single-bucket scanners so both produce identical `CatalogEntry` shapes.
+fn finalize_catalog_scan(partials: Vec<BucketPartial>, mut scan: CatalogScan) -> CatalogScan {
     let mut sessions: BTreeMap<(String, String), CatalogAggregate> = BTreeMap::new();
     let mut native_meta_ids: BTreeSet<(String, String)> = BTreeSet::new();
     let mut native_sidecars: BTreeMap<(String, String), PathBuf> = BTreeMap::new();
@@ -6161,6 +6196,32 @@ mod tests {
             "images/todos sidecars must be skipped by name, not parsed + rejected: {:?}",
             scan.diagnostics
         );
+    }
+
+    #[test]
+    fn scan_catalog_bucket_reads_only_the_target_bucket() {
+        let root = tempfile::tempdir().unwrap();
+        let target = "1111111111111111";
+        let other = "2222222222222222";
+        write_legacy_catalog_session(&root.path().join(target), "mine", "/mine", 1);
+        write_legacy_catalog_session(&root.path().join(other), "theirs", "/theirs", 2);
+
+        // Single-bucket scan sees ONLY the target bucket's session.
+        let scan = SessionManager::scan_catalog_bucket(root.path(), target);
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].id, "mine");
+
+        // Full-root scan still sees both — the fast path is a subset, not a change.
+        let full = SessionManager::scan_catalog(root.path());
+        assert_eq!(full.entries.len(), 2);
+
+        // Missing / invalid buckets are empty and quiet (caller falls back).
+        assert!(SessionManager::scan_catalog_bucket(root.path(), "3333333333333333")
+            .entries
+            .is_empty());
+        assert!(SessionManager::scan_catalog_bucket(root.path(), "not-a-bucket")
+            .entries
+            .is_empty());
     }
 
     #[test]
