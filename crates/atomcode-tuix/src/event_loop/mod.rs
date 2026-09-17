@@ -15593,7 +15593,7 @@ fn build_skill_menu_items(
     let mut items: Vec<(String, String)> = Vec::new();
     if let Some(reg) = skill_registry {
         if let Ok(reg) = reg.read() {
-            let skills: Vec<_> = reg.user_invocable().collect();
+            let skills: Vec<_> = reg.user_invocable();
             for skill in &skills {
                 let bare = skill
                     .name
@@ -17902,7 +17902,7 @@ pub(crate) fn reload_plugins(ctx: &mut LoopCtx) -> (usize, Vec<String>) {
     let mut warnings = Vec::new();
     if let Ok(mut guard) = ctx.skill_registry.write() {
         warnings = reload_skill_registry(&mut guard, &ctx.working_dir);
-        loaded = guard.all().count();
+        loaded = guard.all().len();
     }
     ctx.custom_commands = crate::custom_commands::CustomCommandRegistry::load(&ctx.working_dir);
     // Hook executor lives on the agent loop. Send a one-shot rebuild signal

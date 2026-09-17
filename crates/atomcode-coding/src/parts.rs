@@ -657,7 +657,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // `<namespace>:<skill-name>`, matching the slash-menu's core registry
     // convention. Empty when the driver saw no installed plugins (the L1
     // capabilities crate cannot reach the core plugin loader by design).
-    let mut skills = SkillRegistry::load(&skill_dirs);
+    let skills = SkillRegistry::load(&skill_dirs);
     if opts.tools {
         for (dir, ns) in &opts.plugin_skill_dirs {
             skills.load_dir(dir, Some(ns));

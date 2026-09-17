@@ -91,6 +91,28 @@ pub mod tui_front {
         fn current(&self) -> Result<CodingAgentConfig, String> {
             self.resolve(self.provider_override.as_deref())
         }
+
+        /// The file's bytes, hashed. A file that has not been edited reads the
+        /// same, and a reload then leaves the running graph where it is.
+        ///
+        /// The contents rather than the modification time: a config written by
+        /// a tool that rewrites the whole file on every save (which is what an
+        /// editor does) would otherwise look changed every time it was opened.
+        /// No file is its own answer — `default` is a configuration too, and it
+        /// is the same one until a file appears.
+        fn fingerprint(&self) -> Option<String> {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            match std::fs::read(&self.path) {
+                Ok(bytes) => bytes.hash(&mut hasher),
+                Err(_) => "no file".hash(&mut hasher),
+            }
+            // What a model id resolves to also depends on what was asked for at
+            // launch, which is not in the file.
+            self.provider_override.hash(&mut hasher);
+            self.skip_permissions.hash(&mut hasher);
+            Some(format!("{:x}", hasher.finish()))
+        }
     }
 
     #[cfg(test)]
@@ -114,6 +136,56 @@ model = "vendor-a"
 account = "custom"
 model = "vendor-b"
 "#;
+
+        /// What a reload compares: the same file reads the same, an edited one
+        /// reads differently, and so does a launch flag that changes what a
+        /// model id resolves to (`docs/adr/0022` §2).
+        ///
+        /// This is what keeps a reload from rebuilding the running graph when
+        /// nothing about the configuration moved — and from *not* rebuilding it
+        /// when something did.
+        #[test]
+        fn the_configuration_reads_the_same_until_it_is_edited() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let file = |provider_override: Option<&str>| ConfigFile {
+                path: path.clone(),
+                working_dir: dir.path().to_path_buf(),
+                telemetry: None,
+                skip_permissions: false,
+                provider_override: provider_override.map(str::to_string),
+            };
+            // No file yet: still an answer, and a stable one.
+            let none = file(None).fingerprint();
+            assert!(none.is_some());
+            assert_eq!(none, file(None).fingerprint());
+
+            std::fs::write(&path, CONFIG).unwrap();
+            let written = file(None).fingerprint();
+            assert_ne!(written, none, "a file appearing is a configuration change");
+            assert_eq!(
+                written,
+                file(None).fingerprint(),
+                "reading it twice is not a change"
+            );
+
+            std::fs::write(
+                &path,
+                CONFIG.replace(
+                    "default_model = \"custom/a\"",
+                    "default_model = \"custom/b\"",
+                ),
+            )
+            .unwrap();
+            assert_ne!(file(None).fingerprint(), written, "an edit is a change");
+
+            // Not everything a model id resolves through is in the file.
+            assert_ne!(
+                file(Some("custom/b")).fingerprint(),
+                file(None).fingerprint(),
+                "what was asked for at launch counts too"
+            );
+        }
 
         /// A model is resolved from the config file by the id a person picks it
         /// by; one it does not configure is refused; and what signing in reads

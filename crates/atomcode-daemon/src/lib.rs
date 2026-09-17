@@ -5945,6 +5945,7 @@ async fn get_skills(State(state): State<AppState>) -> impl IntoResponse {
     atomcode_capabilities::plugin::loader::reload_skill_registry(&mut registry, &working_dir);
     let skills: Vec<SkillInfo> = registry
         .user_invocable()
+        .into_iter()
         .map(|s| SkillInfo {
             name: s.name.clone(),
             description: s.description.clone(),

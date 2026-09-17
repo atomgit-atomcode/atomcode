@@ -148,6 +148,17 @@ async fn connected_as(
     subagents: SubagentPolicy,
     config: Option<Arc<dyn atomcode_coding::front_end::HostConfig>>,
 ) -> (HostConnection, Arc<FrontEnd>) {
+    connected_full(env, subagents, config, Vec::new()).await
+}
+
+/// `connected_as`, with the skill directories this runtime scans — empty for
+/// every test that is not about skills, so none of them read the machine's own.
+async fn connected_full(
+    env: &Env,
+    subagents: SubagentPolicy,
+    config: Option<Arc<dyn atomcode_coding::front_end::HostConfig>>,
+    skill_dirs: Vec<std::path::PathBuf>,
+) -> (HostConnection, Arc<FrontEnd>) {
     let front_end = match config {
         Some(config) => FrontEnd::new().with_config(config),
         None => FrontEnd::new(),
@@ -165,7 +176,7 @@ async fn connected_as(
             request_user_input: true,
             session: SessionMode::Fresh,
             tools: true,
-            skill_dirs: Some(Vec::new()),
+            skill_dirs: Some(skill_dirs),
             plugin_skill_dirs: Vec::new(),
             mcp: false,
             extra_mcp_servers: Vec::new(),
@@ -861,6 +872,15 @@ fn last_seen(events: &[AgentEvent], session: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn system_text(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .filter(|m| m.role == Role::System)
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn user_texts_in(messages: &[Message]) -> Vec<String> {
     messages
         .iter()
@@ -1164,6 +1184,110 @@ async fn a_turn_logs_the_checkpoint_it_started_from_and_so_does_a_workspace_rewi
     );
 }
 
+/// A host configuration the test edits: `model` is what `current` resolves to,
+/// and `edits` is what a host would read off the file to tell whether it moved.
+struct Editable {
+    dir: std::path::PathBuf,
+    model: Mutex<String>,
+    edits: Mutex<u64>,
+}
+
+impl Editable {
+    fn new(dir: &std::path::Path) -> Arc<Self> {
+        Arc::new(Self {
+            dir: dir.to_path_buf(),
+            model: Mutex::new("scripted".into()),
+            edits: Mutex::new(0),
+        })
+    }
+
+    /// The configuration now names `model` — an edit a person made.
+    fn edit(&self, model: &str) {
+        *self.model.lock().unwrap() = model.to_string();
+        *self.edits.lock().unwrap() += 1;
+    }
+}
+
+impl atomcode_coding::front_end::HostConfig for Editable {
+    fn for_model(&self, model: &str) -> Result<CodingAgentConfig, String> {
+        let mut config = CodingAgentConfig::new("key", "https://example.test/v1", model, &self.dir);
+        config.interactive = true;
+        Ok(config)
+    }
+    fn current(&self) -> Result<CodingAgentConfig, String> {
+        self.for_model(&self.model.lock().unwrap().clone())
+    }
+    fn fingerprint(&self) -> Option<String> {
+        Some(self.edits.lock().unwrap().to_string())
+    }
+}
+
+/// A reload reads the configuration again, and an edited one is applied: the
+/// requests after it go to the model the configuration names now
+/// (`docs/adr/0021` §2).
+///
+/// The other half of `a_reload_reads_the_skills_on_disk_again_without_rebuilding`:
+/// a reload is cheap when the configuration stood still, and a full rebuild when
+/// it moved — because everything the graph is built from (permission rules,
+/// hooks, tools) comes out of it, and taking those one at a time is not
+/// something this host claims to do.
+#[tokio::test]
+async fn a_reload_after_the_configuration_changed_runs_on_what_it_says_now() {
+    let env = env();
+    let config = Editable::new(env.project.path());
+    let (mut connection, front_end) =
+        connected_as(&env, SubagentPolicy::Disabled, Some(config.clone())).await;
+    let session = connection.session.clone();
+    connection.commands.send(message("hello")).unwrap();
+    through_turn(&mut connection).await;
+    let apps = front_end.apps_fed();
+    let model_used = |env: &Env| -> String {
+        env.script
+            .requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .0
+            .clone()
+    };
+    assert_eq!(model_used(&env), "scripted");
+
+    // Nothing was edited: the reload leaves the graph where it is.
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Reload {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    assert_eq!(
+        front_end.apps_fed(),
+        apps,
+        "a reload of an unchanged configuration rebuilt nothing"
+    );
+
+    config.edit("glm-5");
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Reload {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    connection.commands.send(message("which model")).unwrap();
+    through_turn(&mut connection).await;
+    assert_eq!(
+        model_used(&env),
+        "glm-5",
+        "the configuration as it reads now is what the session runs on"
+    );
+}
+
 /// Resolves a model id to a configuration naming it, the way a host's config
 /// file would.
 struct Models(std::path::PathBuf);
@@ -1278,7 +1402,131 @@ async fn the_model_is_switched_signed_out_and_in_through_host_control_without_a_
     );
 }
 
+/// The screen is told which model it is talking to again when that changes
+/// (`docs/adr/0021` §2, `docs/adr/0022` §5).
+///
+/// A front end learns the model from `Described`, and it is described once on
+/// subscribing. Without a second one, `/model` would be a screen that still
+/// names the model the session started on — the one place where the runtime
+/// knows the truth and the person is looking at the opposite.
+#[tokio::test]
+async fn a_switched_model_is_described_again_on_the_session_that_is_open() {
+    let env = env();
+    let (mut connection, _front_end) = connected_as(
+        &env,
+        SubagentPolicy::Disabled,
+        Some(Arc::new(Models(env.project.path().to_path_buf()))),
+    )
+    .await;
+    let session = connection.session.clone();
+    connection.commands.send(subscribe(&session)).unwrap();
+    let described = quiet(&mut connection).await;
+    let model_in = |events: &[AgentEvent]| -> Vec<Option<String>> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Described { description } if description.session == session => {
+                    Some(description.model.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        model_in(&described),
+        vec![Some("scripted".to_string())],
+        "described once on subscribing, with the model it started on: \
+         {described:#?}"
+    );
+
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SwitchModel {
+                session: session.clone(),
+                model: "glm-5".into(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    let described = quiet(&mut connection).await;
+    let after = model_in(&described);
+    // At least one, and every one of them naming the model it is on now. Not a
+    // count: a switch reconfigures the provider *and* reapplies the thinking
+    // level, and each of those is something the session is described by — so
+    // pinning one description here would pin which of them happens to fire.
+    assert!(
+        !after.is_empty() && after.iter().all(|m| m.as_deref() == Some("glm-5")),
+        "described again, with the model it is on now: {described:#?}"
+    );
+}
+
 /// The MCP servers are listed, their tools can be withdrawn, and the
+/// A reload reads the skills on disk again, and with nothing to reconnect it
+/// does not rebuild what the session runs in (`docs/adr/0022` §2).
+///
+/// The skill written after the session started is the whole point: a person
+/// writes one, or installs a plugin, and reloads — and the model is told about
+/// it on the next request. Rebuilding would have reached the same answer and
+/// taken every MCP connection and in-flight screen state with it.
+#[tokio::test]
+async fn a_reload_reads_the_skills_on_disk_again_without_rebuilding() {
+    let env = env();
+    let skills = env.project.path().join("skills");
+    std::fs::create_dir_all(&skills).unwrap();
+    let (mut connection, front_end) =
+        connected_full(&env, SubagentPolicy::Disabled, None, vec![skills.clone()]).await;
+    let session = connection.session.clone();
+    connection.commands.send(message("hello")).unwrap();
+    through_turn(&mut connection).await;
+    let apps = front_end.apps_fed();
+    let asked = |env: &Env| -> Vec<Message> {
+        env.script
+            .requests
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap()
+            .1
+    };
+    assert!(
+        !system_text(&asked(&env)).contains("tea-break"),
+        "the skill does not exist yet"
+    );
+
+    std::fs::write(
+        skills.join("tea-break.md"),
+        "---\nname: tea-break\ndescription: stop and make tea\n---\nboil water\n",
+    )
+    .unwrap();
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Reload {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+
+    connection
+        .commands
+        .send(message("what can you do"))
+        .unwrap();
+    through_turn(&mut connection).await;
+    let prompt = system_text(&asked(&env));
+    assert!(
+        prompt.contains("tea-break") && prompt.contains("stop and make tea"),
+        "the reloaded skill is in the prompt, with what it is for:\n{prompt}"
+    );
+    assert_eq!(
+        front_end.apps_fed(),
+        apps,
+        "a reload with nothing to reconnect rebuilt nothing"
+    );
+}
+
 /// capabilities reloaded, all for the session that is live.
 #[tokio::test]
 async fn mcp_and_a_reload_are_host_controls_on_the_live_session() {

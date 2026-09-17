@@ -3874,6 +3874,7 @@ fn execute_slash_command_impl(
                     .map(|r| {
                         let mut v: Vec<String> = r
                             .user_invocable()
+                            .into_iter()
                             .map(|s| format!("  /skills {:<48}  {}", s.name, s.description))
                             .collect();
                         v.sort();

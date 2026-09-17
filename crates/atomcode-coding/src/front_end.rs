@@ -60,6 +60,23 @@ pub trait HostConfig: Send + Sync {
     fn for_model(&self, model: &str) -> Result<CodingAgentConfig, String>;
     /// The agent configuration as configured now — what signing in again reads.
     fn current(&self) -> Result<CodingAgentConfig, String>;
+
+    /// What the configuration *is* right now, as a value that changes when it
+    /// changes — a hash of the file, a modification time, a revision.
+    ///
+    /// A reload asks this before it does anything: with the configuration where
+    /// it was, a reload is a re-read of what is on disk beside it (skills), and
+    /// the session keeps running in the tree it is already in
+    /// (`docs/adr/0022` §2). With the configuration changed, the whole graph is
+    /// built again from it — permission rules, hooks and tools are all decided
+    /// by it, and patching them one at a time is not a thing this host claims.
+    ///
+    /// `None` is "cannot tell", and a reload then rebuilds: a host that cannot
+    /// say whether its configuration moved should not have a session assume it
+    /// did not.
+    fn fingerprint(&self) -> Option<String> {
+        None
+    }
 }
 
 impl std::fmt::Debug for FrontEnd {
@@ -162,6 +179,11 @@ pub fn connect(
         handle: handle.clone(),
         session: Mutex::new(session.map(|s| s.id).unwrap_or_default()),
         config: Mutex::new(config),
+        fingerprint: Mutex::new(
+            front_end
+                .host_config()
+                .and_then(|source| source.fingerprint()),
+        ),
         watchers: Mutex::new(Vec::new()),
         front_end: front_end.clone(),
     });
@@ -470,6 +492,10 @@ struct RuntimeControl {
     /// What the runtime runs, for a change that is expressed as a new
     /// configuration — the thinking level.
     config: Mutex<CodingAgentConfig>,
+    /// The host configuration this graph was built from, by
+    /// [`HostConfig::fingerprint`]. `None` for a host that has no configuration
+    /// source or cannot say.
+    fingerprint: Mutex<Option<String>>,
     watchers: Mutex<Vec<mpsc::UnboundedSender<HostEvent>>>,
     front_end: Arc<FrontEnd>,
 }
@@ -727,6 +753,32 @@ impl HostControl for RuntimeControl {
             }
             HostCommand::Reload { session } => {
                 self.addressed(&session)?;
+                // The configuration first: with it where it was, what follows is
+                // a re-read of the disk beside it and the session stays in the
+                // tree it is in. With it moved — or with a host that cannot say
+                // — the graph is built again from it.
+                if let Some(source) = self.front_end.host_config() {
+                    let now = source.fingerprint();
+                    let before = self
+                        .fingerprint
+                        .lock()
+                        .expect("fingerprint poisoned")
+                        .clone();
+                    if now.is_none() || now != before {
+                        let next = source
+                            .current()
+                            .map_err(|message| HostError::Failed { message })?;
+                        let changed = self.handle.reprepare_config(next.clone()).await?;
+                        *self.config.lock().expect("config poisoned") = next;
+                        *self.fingerprint.lock().expect("fingerprint poisoned") = now;
+                        return match self.changed(changed.session_id)? {
+                            HostReply::SessionChanged { session: now } if now == session => {
+                                Ok(HostReply::Done)
+                            }
+                            other => Ok(other),
+                        };
+                    }
+                }
                 let changed = self.handle.reload_capabilities().await?;
                 match self.changed(changed.session_id)? {
                     HostReply::SessionChanged { session: now } if now == session => {

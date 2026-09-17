@@ -5080,6 +5080,41 @@ fn spawn_runtime_owner_with_optional_agent(
                             let _ = done.send(Err(RuntimeError::Unavailable));
                             continue;
                         };
+                        // A reload with nothing to reconnect is a re-read, not
+                        // a rebuild (`docs/adr/0022` §2): the skills on disk go
+                        // into the registry the live tree already serves, and
+                        // the catalog the model is told about is re-contributed
+                        // under the same id. Reconnecting is what a rebuild is
+                        // for, so a session with MCP servers still takes that
+                        // route — and so does one mid-turn, which has a request
+                        // in flight against the prompt this would change.
+                        if matches!(
+                            &target,
+                            ReprepareTarget::Reload {
+                                plugin_skill_dirs: None
+                            }
+                        ) && active_turn.is_none()
+                            && !compactions.is_active()
+                            && live_root_agent(&runtime).is_some()
+                            && runtime.parts.mcp_statuses().await.is_empty()
+                        {
+                            if reload_skills_live(&runtime).is_ok() {
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::Reconfiguring {
+                                        operation: ReconfigureKind::Reprepare,
+                                    },
+                                );
+                                let unchanged = session_changed(generation, &runtime);
+                                resources = Some(runtime);
+                                let _ = runtime_event_tx.send(
+                                    CodingRuntimeEvent::Reconfigured {
+                                        operation: ReconfigureKind::Reprepare,
+                                    },
+                                );
+                                let _ = done.send(Ok(unchanged));
+                                continue;
+                            }
+                        }
                         let withdraws_mcp = matches!(
                             &target,
                             ReprepareTarget::Reload { .. } | ReprepareTarget::ReloadConfig(_)
@@ -8106,6 +8141,52 @@ fn record_code_rewind(live: &atomcode_harness::agent::Agent, turn: u64) {
             scope: atomcode_harness::session::RewindScope::Code,
         },
     );
+}
+
+/// Read the skills on disk again, into the registry the live tree is already
+/// serving, and re-render the catalog the model is told about
+/// (`docs/adr/0022` §2).
+///
+/// This is a reload *without* a rebuild: every holder of the registry — the
+/// `use_skill` and `list_skills` tools, the `skills` seam, the slash menu — has
+/// an `Arc` to the one this replaces the contents of, and the prompt fragment is
+/// re-contributed under the same id, which replaces it. A remount would have
+/// taken the whole tree with it, MCP connections and all.
+///
+/// `Err` when the tree has no skills row: there is nothing to re-read into, and
+/// the caller falls back to the rebuild rather than reporting a reload that
+/// reached nothing.
+fn reload_skills_live(runtime: &RuntimeResources) -> Result<usize, ()> {
+    let app = runtime.harness_app.as_ref().ok_or(())?;
+    let ctx = app.context();
+    let registry = ctx
+        .service::<atomcode_harness::seams::SkillsSvc>()
+        .ok_or(())?;
+    // The directories prepare decided on, the same way it decided them: a
+    // driver that named its own is not second-guessed here.
+    let dirs = match runtime.prepare.skill_dirs.clone() {
+        Some(dirs) => dirs,
+        None => {
+            let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+            atomcode_capabilities::skills::runtime_skill_dirs(&home, &runtime.config.working_dir)
+        }
+    };
+    registry.reload_dirs(&dirs, &runtime.prepare.plugin_skill_dirs);
+    // The catalog is ranked against the project's own instruction files, as at
+    // mount — a reload that dropped the ranking would quietly reorder the
+    // prompt prefix.
+    let instructions =
+        atomcode_capabilities::session::SessionContextHook::new(&runtime.config.working_dir)
+            .instruction_text();
+    if let Some(prompts) = ctx.service::<atomcode_harness::seams::SystemPromptSvc>() {
+        let (id, rank) = crate::on_harness::SKILLS_FRAGMENT;
+        match registry.render_catalog_prioritizing(&instructions) {
+            Some(catalog) if !catalog.trim().is_empty() => prompts.contribute(id, rank, catalog),
+            // Every skill is gone: so is what said they were there.
+            _ => prompts.remove(id),
+        }
+    }
+    Ok(registry.len())
 }
 
 /// Whether the change from `live`'s log to `target` is one the log can *say* —
