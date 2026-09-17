@@ -945,10 +945,15 @@ pub struct Agent {
     /// Optional durable writer for committed manual compactions. `None` is an
     /// explicitly ephemeral agent; session-bound production assembly injects one.
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
-    /// LIVENESS: max time to wait for the NEXT stream event (bounds both
-    /// first-token and inter-token latency). `None` (default) = unbounded. See
+    /// LIVENESS: max wait for the NEXT stream event AFTER the first content byte
+    /// (inter-token latency). `None` (default) = unbounded. See
     /// `AgentBuilder::stream_timeout`.
     stream_timeout: Option<std::time::Duration>,
+    /// LIVENESS: max wait for the FIRST content byte (prefill / time-to-first-token),
+    /// which can far exceed inter-token latency on a slow local model with a large
+    /// prompt. `None` ⇒ fall back to `stream_timeout`. See
+    /// `AgentBuilder::first_token_timeout`.
+    first_token_timeout: Option<std::time::Duration>,
     /// LIVENESS: max time a mid-turn `rt.request(...)` round-trip waits for the
     /// driver's `Respond` before degrading to `Value::Null`. `None` (default) =
     /// unbounded. See `AgentBuilder::request_timeout`.
@@ -1054,6 +1059,7 @@ impl Agent {
             compact_threshold: self.compact_threshold,
             compaction_checkpoint: self.compaction_checkpoint,
             stream_timeout: self.stream_timeout,
+            first_token_timeout: self.first_token_timeout,
             chat_options: self.chat_options,
             // Resolve the effective working dir into a single shared handle: an explicit
             // `shared_cwd` wins; else wrap the immutable `working_dir` pin so the snapshot
@@ -1166,8 +1172,12 @@ struct RunningAgent {
     compaction: Arc<dyn CompactionStrategy>,
     compact_threshold: Option<f32>,
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
-    /// LIVENESS: per-stream-event wait bound. `None` = unbounded (no timer arm).
+    /// LIVENESS: per-stream-event wait bound AFTER the first content byte. `None` =
+    /// unbounded (no timer arm).
     stream_timeout: Option<std::time::Duration>,
+    /// LIVENESS: wait bound for the FIRST content byte (prefill). `None` ⇒ use
+    /// `stream_timeout`.
+    first_token_timeout: Option<std::time::Duration>,
     /// NEUTRAL per-call provider request knobs forwarded to `chat_stream` every
     /// round (see `Agent::chat_options`). Default = a neutral request.
     chat_options: ChatOptions,
@@ -2547,6 +2557,18 @@ impl RunningAgent {
                 // mid-stream StreamEvent::Error: on_error + Error + TurnComplete +
                 // return (no partial assistant pushed, no fake success). `biased`
                 // keeps cancel first; the timer is tried before the (silent) stream.
+                //
+                // PHASE-AWARE bound: before the first content byte, use the (typically
+                // longer) `first_token_timeout` — prefill on a slow local model with a
+                // large prompt can take minutes before the first byte; once content has
+                // streamed, `stream_timeout` bounds inter-token latency. Recomputed each
+                // loop turn so it flips the instant the first byte lands.
+                // `first_token_timeout: None` ⇒ `stream_timeout` bounds both (prior behaviour).
+                let idle_timeout = if saw_stream_content {
+                    self.stream_timeout
+                } else {
+                    self.first_token_timeout.or(self.stream_timeout)
+                };
                 let ev = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
@@ -2559,7 +2581,7 @@ impl RunningAgent {
                         .await;
                         return;
                     }
-                    _ = async { tokio::time::sleep(self.stream_timeout.unwrap()).await }, if self.stream_timeout.is_some() => {
+                    _ = async { tokio::time::sleep(idle_timeout.unwrap()).await }, if idle_timeout.is_some() => {
                         // STREAM IDLE TIMEOUT: no event for `stream_timeout`. Rather than
                         // fail the turn outright, RECONNECT up to MAX_STREAM_RETRIES times
                         // (codex parity) — re-issue the SAME round from history (the
@@ -4122,6 +4144,7 @@ pub struct AgentBuilder {
     compact_threshold: Option<f32>,
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
     stream_timeout: Option<std::time::Duration>,
+    first_token_timeout: Option<std::time::Duration>,
     request_timeout: Option<std::time::Duration>,
     chat_options: ChatOptions,
     /// SEAM 1: optional per-agent working dir (see `Agent::working_dir`).
@@ -4177,6 +4200,7 @@ impl Default for AgentBuilder {
             // Production SHOULD set both (see the builder methods) so a turn can
             // never park forever on a stalled provider or a silent driver.
             stream_timeout: None,
+            first_token_timeout: None,
             request_timeout: None,
             // NEUTRAL default: a no-opinion request (all None + ToolChoice::Auto).
             // The provider receives `ChatOptions::default()` unless a specialization
@@ -4357,6 +4381,15 @@ impl AgentBuilder {
         self.stream_timeout = Some(d);
         self
     }
+    /// LIVENESS: the FIRST-content-byte (prefill / time-to-first-token) wait bound. A
+    /// slow local model with a large prompt can take minutes before its first byte —
+    /// far longer than the inter-token `stream_timeout` — so set this LONGER, otherwise
+    /// the prefill is cut off and RE-ISSUED mid-way (restarting the same slow prefill).
+    /// `None` ⇒ `stream_timeout` bounds both phases (prior behaviour).
+    pub fn first_token_timeout(mut self, d: std::time::Duration) -> Self {
+        self.first_token_timeout = Some(d);
+        self
+    }
     /// LIVENESS: bound how long a mid-turn `rt.request(...)` round-trip (e.g. an
     /// approval middleware awaiting the driver) waits for the driver's `Respond`.
     /// When set and the driver does not answer within `d` (a crashed/silent/
@@ -4476,6 +4509,7 @@ impl AgentBuilder {
             compact_threshold: self.compact_threshold,
             compaction_checkpoint: self.compaction_checkpoint,
             stream_timeout: self.stream_timeout,
+            first_token_timeout: self.first_token_timeout,
             request_timeout: self.request_timeout,
             chat_options: self.chat_options,
             working_dir: self.working_dir,

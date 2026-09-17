@@ -38,11 +38,17 @@ pub struct CodingAgentConfig {
     pub working_dir: PathBuf,
     /// Model context window in tokens (forwarded to the provider). Default 128k.
     pub context_window: u32,
-    /// Liveness: max byte-idle wait for the next stream event (first-token + inter-token).
-    /// Default 300s, override via `ATOMCODE_STREAM_TIMEOUT_SECS`. Thinking models go quiet
-    /// for a long stretch after a large (~200K) prompt before the first reasoning byte; the
-    /// old 120s cut them off mid-think and surfaced as a spurious "stream timeout".
+    /// Liveness: max byte-idle wait BETWEEN stream events, once the first content byte
+    /// has arrived (inter-token). Default 300s, override via `ATOMCODE_STREAM_TIMEOUT_SECS`.
+    /// The prefill / first-token wait is governed separately by `first_token_timeout`.
     pub stream_timeout: Duration,
+    /// Liveness: max wait for the FIRST content byte (prefill / time-to-first-token).
+    /// A slow local model on a large prompt can churn far longer before the first byte
+    /// than between subsequent tokens, so this budget is separate from — and usually
+    /// larger than — `stream_timeout`. Env `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS`, default
+    /// 600s. Once the first byte arrives, `stream_timeout` takes over. Reconnecting on a
+    /// slow-but-progressing prefill just restarts it, so we wait longer instead.
+    pub first_token_timeout: Duration,
     /// Liveness: max wait for a driver approval response before it degrades to deny.
     /// `Some(d)` ⇒ fail-closed after `d` — for HEADLESS / no-human drivers where a never-
     /// answered approval must not park a turn forever. `None` ⇒ PARK: block until the driver
@@ -679,6 +685,18 @@ fn default_stream_timeout() -> Duration {
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(300))
 }
+/// The default first-token (prefill / TTFB) timeout: `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS`
+/// if set to a valid positive integer, else 600s. Larger than `default_stream_timeout`
+/// because prefill on a slow local model (large prompt, few tok/s) legitimately exceeds
+/// inter-token latency, and reconnecting mid-prefill just restarts it.
+fn default_first_token_timeout() -> Duration {
+    std::env::var("ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(600))
+}
 /// Share of the CodingPlan 5h rolling `call_limit` a single `/goal` may consume
 /// (percent). A goal that eats more than this starves the user's interactive work
 /// and other controllers within the same rolling window.
@@ -828,6 +846,7 @@ impl CodingAgentConfig {
             working_dir: working_dir.into(),
             context_window: 128_000,
             stream_timeout: default_stream_timeout(),
+            first_token_timeout: default_first_token_timeout(),
             request_timeout: Some(Duration::from_secs(300)),
             max_continuations: 50,
             max_rounds: default_turn_max_rounds(),
@@ -1447,6 +1466,7 @@ impl std::fmt::Debug for CodingAgentConfig {
             .field("working_dir", &self.working_dir)
             .field("context_window", &self.context_window)
             .field("stream_timeout", &self.stream_timeout)
+            .field("first_token_timeout", &self.first_token_timeout)
             .field("request_timeout", &self.request_timeout)
             .field("interactive", &self.interactive)
             .field("max_continuations", &self.max_continuations)

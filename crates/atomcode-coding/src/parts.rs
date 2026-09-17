@@ -1840,6 +1840,7 @@ pub fn assemble(
         ))
         .compact_threshold(cfg.compact_threshold)
         .stream_timeout(cfg.stream_timeout)
+        .first_token_timeout(cfg.first_token_timeout)
         .max_continuations(cfg.max_continuations)
         // Ctrl-C semantics: false = UNDO (default), true = PRESERVE the interrupted turn.
         .keep_interrupted_context(cfg.keep_interrupted_context);
