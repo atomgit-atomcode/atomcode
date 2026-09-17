@@ -1490,6 +1490,14 @@ pub(crate) fn inband_error_http_status(err: &serde_json::Value) -> Option<u16> {
 
 const MAX_TOOL_CALL_DELTAS: usize = 20000;
 
+/// Upper bound on a streamed tool-call `index`. The index pads `tool_calls` up to
+/// its value, so an out-of-range one from a buggy/malicious server (e.g.
+/// `index: 999_999_999`) would allocate a gigantic vector → OOM. Real responses
+/// index parallel tool calls densely from 0 and never approach this; a larger index
+/// is malformed and its delta is dropped. Generous so legitimate high fan-out is
+/// never rejected, while keeping the buffer trivially small.
+const MAX_TOOL_CALLS: usize = 256;
+
 /// Stateful Server-Sent-Events decoder. Feed it raw byte chunks; it returns whole
 /// kernel `StreamEvent`s. Splitting tool-call assembly + usage buffering out here (vs
 /// inline in the network loop) makes the wire→event mapping deterministic and
@@ -1677,6 +1685,13 @@ impl SseDecoder {
             for tc in tcs {
                 self.tool_call_delta_count += 1;
                 let idx = tc.index.unwrap_or(0);
+                // Bound the index BEFORE it pads the vector: an out-of-range value
+                // (e.g. `index: 999_999_999`) would otherwise push ~a billion slots →
+                // OOM. Real responses index densely from 0; a huge sparse index is
+                // malformed, so drop that delta rather than allocate for it.
+                if idx >= MAX_TOOL_CALLS {
+                    continue;
+                }
                 while self.tool_calls.len() <= idx {
                     self.tool_calls
                         .push((String::new(), String::new(), String::new()));
@@ -2971,6 +2986,32 @@ mod tests {
     }
 
     #[test]
+    fn sse_tool_call_out_of_range_index_is_dropped_not_oom() {
+        // A buggy/malicious server sending a huge `index` must NOT pad the buffer up
+        // to that value (which would allocate ~a billion slots → OOM). The
+        // out-of-range delta is dropped; a legitimate index-0 call in the same stream
+        // still assembles. If the bound were missing this test would OOM/hang.
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":999_999_999u64,"id":"evil","function":{"name":"x","arguments":"{}"}}]}}]})).as_bytes()));
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ok","function":{"name":"read","arguments":"{\"path\":\"a\"}"}}]}}]})).as_bytes()));
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()));
+        let calls: Vec<_> = ev
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "only the in-range call is emitted: {calls:?}");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].id, "call_ok");
+    }
+
+    #[test]
     fn sse_empty_string_finish_reason_does_not_drop_tool_calls() {
         // SenseNova's free `deepseek-v4-flash` sends `"finish_reason":""` (EMPTY
         // STRING, not null) on EVERY streaming chunk — reasoning AND tool_call
@@ -4129,12 +4170,18 @@ mod tests {
         };
         // opencode.ai + non-empty session → header carries the stable id.
         assert_eq!(
-            header_of("https://opencode.ai/zen/v1/chat/completions", "sess-abc-123"),
+            header_of(
+                "https://opencode.ai/zen/v1/chat/completions",
+                "sess-abc-123"
+            ),
             Some("sess-abc-123".to_string())
         );
         // Non-opencode host → never sent (no product-identity leak to other gateways).
         assert_eq!(
-            header_of("https://api.deepseek.com/v1/chat/completions", "sess-abc-123"),
+            header_of(
+                "https://api.deepseek.com/v1/chat/completions",
+                "sess-abc-123"
+            ),
             None
         );
         // Empty session (sub-agent / summary) → omitted even on opencode.
