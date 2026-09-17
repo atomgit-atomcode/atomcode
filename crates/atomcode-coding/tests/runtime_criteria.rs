@@ -223,14 +223,21 @@ impl LlmProvider for RecordingProvider {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
                     name: "task".into(),
-                    arguments: serde_json::json!({
-                        "tasks": [{
-                            "description": "look around",
-                            "prompt": "list what is here",
-                            "subagent_type": "explore",
-                        }],
-                    })
-                    .to_string(),
+                    arguments: serde_json::json!({ "task": "list what is here" }).to_string(),
+                })
+            }
+            Some(m) if m.role == Role::User && m.text == "delegate the secret" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "task".into(),
+                    arguments: serde_json::json!({ "task": "fetch dotenv" }).to_string(),
+                })
+            }
+            Some(m) if m.role == Role::User && m.text == "fetch dotenv" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({ "file_path": ".env" }).to_string(),
                 })
             }
             Some(m) if m.role == Role::User && m.text == "delegate a team" => {
@@ -239,11 +246,9 @@ impl LlmProvider for RecordingProvider {
                     name: "team".into(),
                     arguments: serde_json::json!({
                         "action": "delegate",
-                        "tasks": [{
-                            "description": "look around",
-                            "prompt": "list what is here",
-                            "role": "explorer",
-                        }],
+                        "name": "scout",
+                        "role": "explorer",
+                        "task": "list what is here",
                     })
                     .to_string(),
                 })
@@ -2367,6 +2372,41 @@ async fn a_team_run_reaches_the_team_panel() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// On the product's own tree, a delegated agent is held to what no delegated
+/// agent may do: it reads no secret, whatever the approval mode
+/// (`docs/adr/0023` §2, the product-tree gate).
+async fn a_delegated_agent_in_the_product_never_reads_a_secret() {
+    let env = env();
+    std::fs::write(env.project.path().join(".env"), "API_KEY=hunter2").unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(production_start(env.project.path(), &recorder, |_| {}))
+        .await
+        .unwrap();
+    turn(&mut runtime, "delegate the secret").await;
+    runtime.handle.shutdown().await.unwrap();
+
+    let requests = recorder.requests.lock().unwrap().clone();
+    let shown: Vec<&str> = requests.iter().flatten().map(|m| m.text.as_str()).collect();
+    assert!(
+        shown.iter().any(|text| text == &"fetch dotenv"),
+        "the child never ran: {shown:?}"
+    );
+    assert!(
+        !shown.iter().any(|text| text.contains("hunter2")),
+        "a delegated agent read the secret"
+    );
+    let results: Vec<&str> = requests
+        .iter()
+        .flatten()
+        .filter(|m| m.role == Role::Tool)
+        .map(|m| m.text.as_str())
+        .collect();
+    assert!(
+        results.iter().any(|text| text.contains("Refused")),
+        "and was told why: {results:?}"
+    );
+}
+
 /// After a logout no provider the runtime was handed is alive — not behind the
 /// seam, and not in the reviewer's or the subagents' slots either.
 ///
@@ -2805,16 +2845,28 @@ async fn the_prompt_teaches_each_product_tool_once() {
         .map(|m| m.text.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
+    // Delegation is taught by the rows that mount it (`docs/adr/0023` §2), once
+    // each, and nothing describes the product's retired `task`/`team` contract.
     for heading in [
         "## ASKING THE USER:",
-        "## DELEGATING WITH `task`:",
-        "## TEAM AGENT:",
+        "`task` delegates a self-contained job",
+        "`team` runs named child agents",
         "## CODE REVIEW:",
     ] {
         assert_eq!(
             system.matches(heading).count(),
             1,
             "`{heading}` should appear exactly once"
+        );
+    }
+    for retired in [
+        "## DELEGATING WITH `task`:",
+        "## TEAM AGENT:",
+        "subagent_type",
+    ] {
+        assert!(
+            !system.contains(retired),
+            "`{retired}` describes a tool that is gone"
         );
     }
     runtime.handle.shutdown().await.unwrap();
@@ -3348,6 +3400,7 @@ mod criteria {
         a_tools_question_reaches_the_person_and_the_answer_comes_back,
         a_delegated_subtask_is_reported_narrated_and_billed,
         a_team_run_reaches_the_team_panel,
+        a_delegated_agent_in_the_product_never_reads_a_secret,
         a_turn_ending_on_its_last_allowed_round_is_not_cut_off,
         the_round_budget_asks_before_it_cuts_a_turn_off,
         a_turn_left_cut_off_says_so,

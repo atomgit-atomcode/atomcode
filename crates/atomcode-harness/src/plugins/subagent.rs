@@ -499,7 +499,7 @@ impl Tool for TaskTool {
         "task".into()
     }
 
-    async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let args: TaskArgs = match serde_json::from_str(args) {
             Ok(args) => args,
             Err(e) => {
@@ -520,6 +520,12 @@ impl Tool for TaskTool {
             };
         };
         let instructions = args.instructions.as_deref().unwrap_or(DEFAULT_INSTRUCTIONS);
+        // A line when the child starts and one when it ends, on this call: the
+        // only word a front end without the child's log gets of delegated work.
+        ctx.progress.emit(format!(
+            "↻ {}",
+            args.task.lines().next().unwrap_or_default()
+        ));
         let outcome = subagents
             .spawn(crate::seams::Delegation {
                 task: &args.task,
@@ -528,6 +534,11 @@ impl Tool for TaskTool {
                 effort: args.effort.as_deref(),
             })
             .await;
+        ctx.progress.emit(match (&outcome.error, outcome.stop) {
+            (Some(error), _) => format!("✗ failed · {error}"),
+            (None, StopReason::Stopped) => "✓ done".to_string(),
+            (None, stop) => format!("✗ {stop:?}"),
+        });
         ToolResult {
             call_id: String::new(),
             content: outcome.report(),

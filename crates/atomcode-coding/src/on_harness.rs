@@ -1310,6 +1310,11 @@ pub struct HostState {
     pub web_search_api_key: Option<String>,
     /// A front end outside the App, fed by the `front-end-feed` row.
     pub front_end: Option<Arc<crate::front_end::FrontEnd>>,
+    /// The provider a delegated agent inheriting the conversation's model runs
+    /// on, billed to the session apart from it.
+    pub delegated_llm: Option<Arc<dyn LlmProvider>>,
+    /// Where delegated agents' turns go as `Team` events, for the shipped panel.
+    pub(crate) team_events: Option<crate::team_progress::TeamSink>,
 }
 
 /// See [`crate::host_rows::SessionContextPlugin`].
@@ -1439,6 +1444,12 @@ pub async fn mount_hosted(
         .when(host.mcp.is_some(), |layer| {
             layer.swap("mcp", "mcp-host").enable("mcp")
         })
+        .when(host.delegated_llm.is_some(), |layer| {
+            layer.insert(Entry::named("llm-delegated-host"))
+        })
+        .when(host.team_events.is_some(), |layer| {
+            layer.insert(Entry::named("team-progress"))
+        })
         .when(host.compaction_checkpoint.is_some(), |layer| {
             layer.insert(Entry::named("native-compaction-checkpoint"))
         })
@@ -1511,6 +1522,12 @@ pub async fn mount_hosted(
     }
     if let Some(front_end) = host.front_end {
         registry.register(Arc::new(crate::front_end::FrontEndFeedPlugin(front_end)));
+    }
+    if let Some(provider) = host.delegated_llm {
+        registry.register(Arc::new(DelegatedLlmPlugin(provider)));
+    }
+    if let Some(sink) = host.team_events {
+        registry.register(Arc::new(crate::team_progress::TeamProgressPlugin(sink)));
     }
     if let Some(hook) = host.compaction_checkpoint {
         registry.register(Arc::new(
@@ -1749,10 +1766,7 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Exec
         // lead's task, not the person's restriction, so it must not rewrite it:
         // members work under whatever the lead is held to (`docs/adr/0023`,
         // addendum).
-        let delegated = atomcode_harness::agent::scoped(&self.ctx)
-            .service::<atomcode_harness::seams::DelegationLaneSvc>()
-            .is_some();
-        if !delegated {
+        if restates_the_persons_restriction(&self.ctx) {
             self.policy.update_from_messages(&req.messages);
         }
         next.run(req).await
@@ -1837,6 +1851,14 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::ToolsExecuteBatch> for
         }
         results
     }
+}
+
+/// Whether the request being made is one whose messages say what the person
+/// restricted: the conversation's own, not a delegated agent's.
+fn restates_the_persons_restriction(ctx: &Context) -> bool {
+    atomcode_harness::agent::scoped(ctx)
+        .service::<atomcode_harness::seams::DelegationLaneSvc>()
+        .is_none()
 }
 
 /// Mounts the per-turn execution boundary.
@@ -2582,5 +2604,62 @@ impl Plugin for ChatOptionsPlugin {
         // Outermost, so a request a later row retries or trims still carries them.
         let _ = ctx.on_waterfall::<atomcode_harness::events::AgentRequest>(Arc::new(options), true);
         Ok(())
+    }
+}
+
+/// `llm-delegated-host`: the model a delegated agent inheriting the
+/// conversation's runs on — the runtime's own, wrapped so its spend is billed
+/// to the session apart from the conversation and metered as a subagent's.
+struct DelegatedLlmPlugin(Arc<dyn LlmProvider>);
+
+#[async_trait]
+impl Plugin for DelegatedLlmPlugin {
+    fn name(&self) -> &'static str {
+        "llm-delegated-host"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["llm-delegated"]
+    }
+    fn description(&self) -> &'static str {
+        "the conversation's model for delegated agents, billed to the session apart from it"
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_harness::seams::DelegatedLlmSvc>(self.0.clone())
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod delegated_restriction_tests {
+    use super::*;
+
+    /// Only the conversation's own request restates the person's execution
+    /// restriction; a delegated agent's carries the lead's task, and re-reading
+    /// it would lift the restriction while the lead is still held to it.
+    #[tokio::test]
+    async fn a_delegated_request_never_restates_the_persons_restriction() {
+        let app = App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::empty(),
+        );
+        let root = app.context();
+        assert!(restates_the_persons_restriction(&root));
+
+        let member = root.isolate();
+        let _lane = member
+            .provide::<atomcode_harness::seams::DelegationLaneSvc>(Arc::new(
+                atomcode_harness::seams::DelegationLane {
+                    scopes: vec!["**".into()],
+                },
+            ))
+            .unwrap();
+        let tree = root.clone();
+        let restates = atomcode_harness::agent::as_agent(member, async move {
+            restates_the_persons_restriction(&tree)
+        })
+        .await;
+        assert!(!restates);
     }
 }

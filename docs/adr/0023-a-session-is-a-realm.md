@@ -185,7 +185,7 @@ lead 的 id,成员到成员靠构造不可能;同伴消息标成非用户来源,
 - 补齐产品的 14 个内置角色(缺 planner、architect、rust、tui_ux、debugger、security、performance、
   release_manager、migration_compat);写角色的工具集含 `search_replace`。
 - `[subagent].max_rounds` / `ATOMCODE_SUBAGENT_MAX_ROUNDS` 接到两行,0 表示不限;`[subagent].max_concurrent`
-  接到同时在跑的成员数上限;`SubagentPolicy::Disabled` / `ATOMCODE_SUBAGENT=0` 时两行不挂。
+  接到 team 同时存在的成员数上限(`max_members`;成员常驻、回合按消息起,没有另设回合排队);`SubagentPolicy::Disabled` / `ATOMCODE_SUBAGENT=0` 时两行不挂。
 - **子 agent 的花费照记**:委派 agent 日志里的 `Usage` 事实按模型记进会话的 `detached_model_usage`。
 - **前端过渡**:runtime 从成员的 agent 事件与事实合成 `CodingRuntimeEvent::Team`(tuix 团队面板读的那些
   字段),并给 `task` 调用发进度行(daemon / 网页只读这个)。M6 删 tuix 时一并删。

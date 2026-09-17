@@ -7609,6 +7609,11 @@ fn harness_host_state(
         mcp,
         rate_limit_source: parts.rate_limit_source().cloned(),
         front_end: prepare.front_end.clone(),
+        delegated_llm: parts.delegated_provider(),
+        team_events: parts.subagent_knobs().map(|_| {
+            let manager = parts.team_manager.clone();
+            Arc::new(move |event| manager.publish_external(event)) as crate::team_progress::TeamSink
+        }),
         compaction_checkpoint: parts.snapshot_hook(),
         summary_provider: Some(parts.side_provider_slot()),
         model: Some(config.model.clone()),
@@ -7744,6 +7749,18 @@ struct MemoryPatch<'a> {
 }
 
 #[derive(serde::Serialize)]
+struct SubagentRowPatch {
+    max_rounds: u32,
+}
+
+#[derive(serde::Serialize)]
+struct TeamRowPatch<'a> {
+    project_root: &'a std::path::Path,
+    max_members: usize,
+    max_rounds: u32,
+}
+
+#[derive(serde::Serialize)]
 struct AgentLoopOptionsPatch<'a> {
     working_dir: &'a std::path::Path,
     undo_cancelled: bool,
@@ -7761,12 +7778,16 @@ fn harness_option_rows(
         .when(!prepare.tools || !prepare.web, |layer| {
             layer.disable("tool-web")
         })
-        // The runtime mounts its own `code_review`, `task`, `team` and `recall`
-        // (see `CodingParts::host_only_tools`) whenever prepare built them; the
-        // rows' versions are different contracts under the same names.
+        // The runtime mounts its own `code_review` and `recall` (see
+        // `CodingParts::host_only_tools`) whenever prepare built them; the rows'
+        // versions are different contracts under the same names. Delegation is
+        // the tree's own rows, off when the driver turned it off.
         .disable("tool-code-review")
-        .disable("subagent-in-process")
-        .disable("team-in-process")
+        .when(parts.subagent_knobs().is_none(), |layer| {
+            layer
+                .disable("subagent-in-process")
+                .disable("team-in-process")
+        })
         .disable("recall")
         .when(!parts.todo_enabled(), |layer| {
             layer.disable("tool-todo").disable("todo-reminder")
@@ -7789,6 +7810,22 @@ fn harness_option_rows(
                 MemoryPatch {
                     project_root: wd,
                     inject: prepare.memory,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    // `[subagent]`: how long a delegated agent may run, and how many members a
+    // team may hold; roles come from this project and the person's home.
+    if let Some((max_concurrent, max_rounds)) = parts.subagent_knobs() {
+        rows = rows
+            .patch("subagent-in-process", SubagentRowPatch { max_rounds })
+            .map_err(|e| e.to_string())?
+            .patch(
+                "team-in-process",
+                TeamRowPatch {
+                    project_root: wd,
+                    max_members: max_concurrent,
+                    max_rounds,
                 },
             )
             .map_err(|e| e.to_string())?;

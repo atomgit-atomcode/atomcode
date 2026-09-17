@@ -438,6 +438,8 @@ pub struct CodingParts {
     /// Runtime-owned Team Agent orchestration. The manager is shared with the
     /// mounted tool, while lifecycle termination is driven only by CodingRuntime.
     pub team_manager: crate::team::TeamRunManager,
+    /// `[subagent]` `(max_concurrent, max_rounds)`, when delegation is on.
+    pub(crate) subagent_knobs: Option<(usize, u32)>,
     /// User/project CC external hooks (`$ATOMCODE_HOME/hooks.json` + `<root>/.hooks.json`).
     /// ONE instance is registered as BOTH a [`LifecycleHooks`] (already pushed into `hooks`)
     /// and a [`ToolMiddleware`](atomcode_kernel::middleware::ToolMiddleware) (registered by
@@ -626,169 +628,16 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         max_concurrent: subagent_max_concurrent,
         ..Default::default()
     });
-    let subagent_provider: Option<SharedReviewProvider> = if subagents_enabled {
-        use atomcode_capabilities::tools::TaskTool;
-
-        let slot: SharedReviewProvider = Arc::new(std::sync::RwLock::new(None));
-
-        // Child subagent tool registry (mount a subset per type).
-        let mut child_reg = atomcode_kernel::tool::ToolRegistry::new();
-        atomcode_capabilities::tools::register_coding_tools_with_vision(&mut child_reg, false);
-        let child_reg = Arc::new(child_reg);
-
-        let explore_names: Vec<String> = ["read_file", "grep", "glob", "list_directory"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let worker_names: Vec<String> = [
-            "read_file",
-            "edit_file",
-            "write_file",
-            "bash",
-            "grep",
-            "glob",
-            "search_replace",
-            "list_directory",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
-        let reg_e = child_reg.clone();
-        let reg_w = child_reg.clone();
-        let make_explore_tools = move || {
-            let refs: Vec<&str> = explore_names.iter().map(|s| s.as_str()).collect();
-            reg_e.mount(&refs)
-        };
-        let make_worker_tools = move || {
-            let refs: Vec<&str> = worker_names.iter().map(|s| s.as_str()).collect();
-            reg_w.mount(&refs)
-        };
-
-        // Prefer a runtime-injected tier provider, else fall back to the host-provider
-        // slot (filled at assemble — the single-model / same-as-host collapse path). The
-        // tier provider is a SHARED, swap-aware cell ([`TierProvider`]): it builds lazily on
-        // first `task` use (startup never pays the reqwest-client cost) and its cache is
-        // reset by the runtime on a `/model` swap, so routing re-resolves without a respawn.
-        let fast_cell = cfg.subagent_fast_provider.clone();
-        let cap_cell = cfg.subagent_capable_provider.clone();
-        let slot_fast = slot.clone();
-        let slot_cap = slot.clone();
-        let slot_host = slot.clone();
-        let make_fast = move || {
-            fast_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
-                slot_fast
-                    .read()
-                    .ok()
-                    .and_then(|g| g.clone())
-                    .expect("subagent provider slot filled at assemble before any turn")
-            })
-        };
-        let make_capable = move || {
-            cap_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
-                slot_cap
-                    .read()
-                    .ok()
-                    .and_then(|g| g.clone())
-                    .expect("subagent provider slot filled at assemble before any turn")
-            })
-        };
-        let make_host = move || {
-            slot_host
-                .read()
-                .ok()
-                .and_then(|provider| provider.clone())
-                .expect("subagent provider slot filled at assemble before any turn")
-        };
-
-        // `[subagent]` live knobs. There is no total wall-clock limit: a productive
-        // child is never cancelled for its age.
-        let task_team_manager = team_manager.clone();
-        let mut task_tool = TaskTool::new(
-            make_fast,
-            make_capable,
-            make_explore_tools,
-            make_worker_tools,
-        )
-        .with_host_provider(make_host)
-        .with_max_concurrent(subagent_max_concurrent)
-        .with_max_rounds(subagent_max_rounds)
-        .with_stream_timeout(cfg.stream_timeout)
-        .with_tool_loop_policy(cfg.tool_loop_policy)
-        .with_credential_shell_policy(cfg.credential_shell_policy)
-        .with_worker_middleware(turn_execution_policy.clone())
-        .with_team_event_sink(Arc::new(move |event| {
-            task_team_manager.publish_external(event);
-        }));
-        if let Some(models) = cfg.subagent_model_providers.clone() {
-            task_tool = task_tool.with_named_provider(move |selection| models.get(selection));
-        }
-        registry.register(Arc::new(task_tool));
-        names.push("task".to_string());
-        host_only_tools.push("task".into());
-        Some(slot)
-    } else {
-        None
-    };
-
-    let team_runner = subagent_provider.as_ref().map(|slot| {
-        use atomcode_capabilities::team::{TeamDifficulty, TeamPermission};
-
-        let mut child_registry = atomcode_kernel::tool::ToolRegistry::new();
-        atomcode_capabilities::tools::register_coding_tools_with_vision(&mut child_registry, false);
-        let child_registry = Arc::new(child_registry);
-        let provider_slot = slot.clone();
-        let fast_cell = cfg.subagent_fast_provider.clone();
-        let capable_cell = cfg.subagent_capable_provider.clone();
-        let providers = Arc::new(move |difficulty| {
-            let tier = match difficulty {
-                TeamDifficulty::Simple => fast_cell.as_ref(),
-                TeamDifficulty::Hard => capable_cell.as_ref(),
-            };
-            tier.and_then(|cell| cell.get()).unwrap_or_else(|| {
-                provider_slot
-                    .read()
-                    .ok()
-                    .and_then(|provider| provider.clone())
-                    .expect("team provider slot filled at assemble before any turn")
-            })
-        });
-        let tools_registry = Arc::clone(&child_registry);
-        let tools = Arc::new(move |permission| {
-            let names: &[&str] = match permission {
-                TeamPermission::Explore => &["read_file", "grep", "glob", "list_directory"],
-                // Bash is intentionally absent. DenyTeamBash remains a second
-                // fail-closed gate if this registry is broadened later.
-                TeamPermission::Worker => &[
-                    "read_file",
-                    "edit_file",
-                    "write_file",
-                    "grep",
-                    "glob",
-                    "search_replace",
-                    "list_directory",
-                ],
-            };
-            tools_registry.mount(names)
-        });
-        let runner = crate::team::TeamRunnerFactory::new(providers, tools, cfg.working_dir.clone())
-            .with_runtime_policy(
-                (subagent_max_rounds > 0).then_some(subagent_max_rounds),
-                cfg.tool_loop_policy,
-                Some(cfg.stream_timeout),
-                cfg.request_timeout,
-            )
-            .with_credential_shell_policy(cfg.credential_shell_policy)
-            .with_worker_middleware(turn_execution_policy.clone());
-        registry.register(Arc::new(crate::team::TeamTool::new(
-            team_manager.clone(),
-            runner.job_factory(),
-            runner.model_factory(),
-        )));
-        names.push("team".to_string());
-        host_only_tools.push("team".into());
-        runner
-    });
+    // Delegation is the tree's: the `subagent-in-process` and `team-in-process`
+    // rows (`docs/adr/0023` §2), configured from `[subagent]` by the runtime.
+    // What stays here is the provider a delegated agent runs on when it inherits
+    // the conversation's model — billed to the session apart from it — filled at
+    // assemble like the reviewer's.
+    let subagent_provider: Option<SharedReviewProvider> =
+        subagents_enabled.then(|| Arc::new(std::sync::RwLock::new(None)) as SharedReviewProvider);
+    let subagent_knobs =
+        subagents_enabled.then_some((subagent_max_concurrent, subagent_max_rounds));
+    let team_runner: Option<crate::team::TeamRunnerFactory> = None;
 
     // Build the context hook once so skill-catalog ranking and later context
     // injection observe the exact same instruction-file precedence and bytes.
@@ -1070,9 +919,55 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         side_provider: Arc::new(std::sync::RwLock::new(None)),
         team_runner,
         team_manager,
+        subagent_knobs,
         cc_external_hooks: cc_external,
         rate_limit_source: opts.rate_limit_source,
     })
+}
+
+/// A provider that is whatever a slot holds when it is called.
+struct SlotProvider {
+    slot: SharedReviewProvider,
+    model: String,
+}
+
+impl SlotProvider {
+    fn current(&self) -> Option<Arc<dyn LlmProvider>> {
+        self.slot.read().ok().and_then(|provider| provider.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for SlotProvider {
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+    fn context_window(&self) -> u32 {
+        self.current().map(|p| p.context_window()).unwrap_or(0)
+    }
+    fn supports_vision(&self) -> bool {
+        self.current().is_some_and(|p| p.supports_vision())
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[atomcode_kernel::tool::ToolDef],
+        options: &atomcode_kernel::provider::ChatOptions,
+    ) -> Result<
+        futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+        atomcode_kernel::stream::ProviderError,
+    > {
+        match self.current() {
+            Some(provider) => provider.chat_stream(messages, tools, options).await,
+            None => Err(atomcode_kernel::stream::ProviderError {
+                retryable: false,
+                message: "no model is signed in for delegated work".into(),
+                http_status: None,
+                code: None,
+                retry_after_secs: None,
+            }),
+        }
+    }
 }
 
 /// Load plugin-contributed hooks for every prepare/reprepare instead of freezing the startup
@@ -1147,6 +1042,25 @@ impl CodingParts {
 
     pub(crate) fn snapshot_hook(&self) -> Option<Arc<SnapshotHook>> {
         self.snapshot_hook.clone()
+    }
+
+    /// `[subagent]` `(max_concurrent, max_rounds)`, when delegation is on.
+    pub(crate) fn subagent_knobs(&self) -> Option<(usize, u32)> {
+        self.subagent_knobs
+    }
+
+    /// The provider a delegated agent inheriting the conversation's model runs
+    /// on: whatever the subagent slot holds at the moment of each call. Read
+    /// through, never copied — a logout empties the slot, and a copy taken at
+    /// mount would keep the signed-in provider alive in the tree.
+    pub(crate) fn delegated_provider(&self) -> Option<Arc<dyn LlmProvider>> {
+        let slot = self.subagent_provider.clone()?;
+        let model = slot
+            .read()
+            .ok()
+            .and_then(|provider| provider.as_ref().map(|p| p.model_name().to_string()))
+            .unwrap_or_default();
+        Some(Arc::new(SlotProvider { slot, model }))
     }
 
     pub(crate) fn todo_enabled(&self) -> bool {

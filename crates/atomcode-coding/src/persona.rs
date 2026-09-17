@@ -686,8 +686,6 @@ when its distinct capability is the point.";
 pub(crate) fn host_tool_guidance(tool: &str) -> Option<(&'static str, &'static str)> {
     let (key, section) = match tool {
         "request_user_input" => ("ask", REQUEST_USER_INPUT_USAGE),
-        "task" => ("task", SUBAGENT_DELEGATION),
-        "team" => ("team", TEAM_DELEGATION),
         "code_review" => ("code-review", CODE_REVIEW_USAGE),
         name if name.starts_with("subagent_") => {
             ("external-subagents", EXTERNAL_SUBAGENT_DELEGATION)

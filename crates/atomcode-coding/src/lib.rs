@@ -60,6 +60,7 @@ pub mod runtime;
 pub mod session_store;
 pub mod session_title;
 pub mod team;
+mod team_progress;
 pub mod telemetry;
 pub mod vision;
 
