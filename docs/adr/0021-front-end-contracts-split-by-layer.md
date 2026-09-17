@@ -219,6 +219,17 @@ loop、策略干预、本地上下文排队(第 3 条)与人停成员(0023 第 8
   泵自己的 agent 时等于没套信封;找不到、或不是被委派出去的 agent 回 `NotFound`;对成员没有意义的命令
   回 `Unsupported`。发给成员的消息以人的来源进成员的收件箱,回执(`Accepted`)照常从这条连接回来。
 
+## 落地时的补充(2026-09-17,M5.4 执行中)
+
+- **宿主控制其余项的形状**:`Undo { turn?, based_on }`(不给回合即最后一个 prompt,回执带被撤的 prompt 供放回
+  输入框)、`RewindPoints`、`Rewind { turn, scope, based_on }`、`SwitchModel { model }`、`McpStatus`、
+  `WithdrawMcpTools`、`Reload`、`SignOut`、`SignIn`,都按 session 寻址。
+- **「恢复快照」不单列命令**:按第 8 条恢复以 rewind 点为准,就是 `Rewind` 取对话范围;递一份任意快照不是意图。
+- **`based_on` 的判定**:调用方看到的最后一条事实之后,日志里又有了人的消息或新回合,回 `Stale { current }`;
+  其余事实(用量、标题、成员汇报的注入)不算。
+- **切模型要宿主解析配置**:「换到模型 X」要按宿主此刻的配置把 X 解析成完整的 provider 设置,这是宿主的事,
+  前端不递配置。宿主不提供解析时 `SwitchModel` 回 `Failed`;`SignIn` 用宿主此刻的配置重新签入。
+
 ## 权衡过、没做的
 
 - **驱动协议当契约。** 覆盖全、零迁移;不取的理由是背景里的四条。
