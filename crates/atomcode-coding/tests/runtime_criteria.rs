@@ -39,9 +39,37 @@ struct Recorder {
     built: Mutex<Vec<std::sync::Weak<dyn LlmProvider>>>,
     /// Flip to make every later `build` fail, the way expired credentials do.
     build_fails: std::sync::atomic::AtomicBool,
+    /// The context window the provider states. `0`, unknown, unless a scenario
+    /// is about pressure.
+    window: std::sync::atomic::AtomicU32,
+    /// Prompt tokens every answer reports. `0` reports the usual 10.
+    prompt_tokens: std::sync::atomic::AtomicU32,
 }
 
 impl Recorder {
+    /// The requests that asked for a compaction summary rather than a turn.
+    fn summary_requests(&self) -> Vec<Vec<Message>> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| is_summary_request(request))
+            .cloned()
+            .collect()
+    }
+
+    /// The last request a turn made — not one that asked for a summary.
+    fn last_turn_request(&self) -> Vec<Message> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|request| !is_summary_request(request))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn last_request(&self) -> Vec<Message> {
         self.requests
             .lock()
@@ -50,6 +78,13 @@ impl Recorder {
             .cloned()
             .unwrap_or_default()
     }
+}
+
+fn is_summary_request(request: &[Message]) -> bool {
+    request.first().is_some_and(|m| {
+        m.text
+            .starts_with("You are an anchored context summarization assistant")
+    })
 }
 
 /// Long enough that a second copy reads as a re-dump rather than a coincidence.
@@ -62,6 +97,10 @@ struct RecordingProvider(Arc<Recorder>);
 impl LlmProvider for RecordingProvider {
     fn model_name(&self) -> &str {
         "recorder"
+    }
+
+    fn context_window(&self) -> u32 {
+        self.0.window.load(Ordering::SeqCst)
     }
 
     async fn chat_stream(
@@ -82,12 +121,40 @@ impl LlmProvider for RecordingProvider {
         // A request tail (a plan-mode reminder, a skill nudge) rides after the
         // message being answered; answer that message.
         let last = messages.iter().rev().find(|m| !m.synthetic);
+        // A window this conversation no longer fits: refused while a long tool
+        // output is still in it, the way a provider refuses an over-long prompt.
+        let overflowing = messages
+            .iter()
+            .any(|m| m.role == Role::User && m.text.ends_with("until it overflows"));
+        if overflowing
+            && messages
+                .iter()
+                .any(|m| m.role == Role::Tool && m.text.len() > 2_000)
+        {
+            return Err(ProviderError {
+                retryable: false,
+                message: "HTTP 400: this model's maximum context length is 8192 tokens".into(),
+                http_status: Some(400),
+                code: Some("context_length_exceeded".into()),
+                retry_after_secs: None,
+            });
+        }
         let first = match last {
             Some(m) if m.role == Role::User && m.text.starts_with("read ") => {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
                     name: "read_file".into(),
                     arguments: serde_json::json!({ "file_path": &m.text[5..] }).to_string(),
+                })
+            }
+            Some(m) if m.role == Role::User && m.text.starts_with("search ") => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "grep".into(),
+                    arguments: serde_json::json!({
+                        "pattern": m.text[7..].split_whitespace().next().unwrap_or_default(),
+                    })
+                    .to_string(),
                 })
             }
             Some(m) if m.role == Role::User && m.text.starts_with("write ") => {
@@ -258,7 +325,10 @@ impl LlmProvider for RecordingProvider {
         Ok(Box::pin(futures::stream::iter(vec![
             first,
             StreamEvent::Usage(TokenUsage {
-                prompt: 10,
+                prompt: match self.0.prompt_tokens.load(Ordering::SeqCst) {
+                    0 => 10,
+                    reported => reported,
+                },
                 completion: 2,
                 cached: 0,
             }),
@@ -2879,6 +2949,248 @@ async fn a_capability_switched_off_is_not_offered() {
     );
 }
 
+/// Under pressure, tool output nobody needs in full any more is folded in
+/// place, and nothing else is: what was asked and answered stays word for word,
+/// a file read stays whole, and no model is asked to write anything.
+async fn under_pressure_old_tool_output_is_folded_in_place_and_the_words_kept() {
+    let env = env();
+    let lines: String = (0..200)
+        .map(|n| format!("needle number {n} in a haystack of text\n"))
+        .collect();
+    std::fs::write(env.project.path().join("hay.txt"), &lines).unwrap();
+    let recorder = Arc::new(Recorder::default());
+    // 0.75 of the window: past the 0.7 threshold, short of the 0.78 summary mark.
+    recorder.window.store(200_000, Ordering::SeqCst);
+    recorder.prompt_tokens.store(150_000, Ordering::SeqCst);
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+
+    turn(&mut runtime, "search needle").await;
+    turn(&mut runtime, "read hay.txt").await;
+    turn(&mut runtime, "carry on").await;
+
+    let seen = recorder.last_turn_request();
+    let results: Vec<&str> = seen
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .map(|m| m.text.as_str())
+        .collect();
+    assert!(
+        results.iter().any(|t| t.starts_with("[grep ok")),
+        "the search is not folded: {:?}",
+        results
+            .iter()
+            .map(|t| t.chars().take(60).collect::<String>())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        results.iter().any(|t| t.contains("needle number 199")),
+        "the file read was folded too"
+    );
+    assert_eq!(
+        user_texts(&seen),
+        vec!["search needle", "read hay.txt", "carry on"],
+        "what was asked is kept"
+    );
+    assert!(recorder.summary_requests().is_empty(), "a model was asked");
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// Past most of the window, older turns are summarized by the conversation's
+/// own model, billed to the session. The first request and the recent turns
+/// stay as they were, and the next summary is an update of the last — the
+/// model never sees two summaries, nor one summarized as if it were talk.
+async fn past_most_of_the_window_older_turns_are_summarized_and_the_summary_kept_up() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    // A 128k window keeps about 32k tokens of recent turns; each prompt is ~10k.
+    recorder.window.store(128_000, Ordering::SeqCst);
+    recorder.prompt_tokens.store(104_000, Ordering::SeqCst);
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+
+    for n in 0..6 {
+        turn(
+            &mut runtime,
+            &format!("prompt {n} {}", "context ".repeat(5_000)),
+        )
+        .await;
+    }
+
+    let summaries = recorder.summary_requests();
+    assert_eq!(summaries.len(), 2, "one summary, then one update of it");
+    assert!(
+        summaries[1]
+            .last()
+            .is_some_and(|m| m.text.contains("<previous-summary>")),
+        "the second summary did not start from the first"
+    );
+    let seen = recorder.last_turn_request();
+    let asked = user_texts(&seen);
+    assert!(
+        asked[0].starts_with("prompt 0 "),
+        "the first request is gone"
+    );
+    assert!(
+        !asked
+            .iter()
+            .any(|t| t.starts_with("prompt 1 ") || t.starts_with("prompt 2 ")),
+        "the older turns are still there"
+    );
+    assert!(asked.last().unwrap().starts_with("prompt 5 "));
+    assert_eq!(
+        seen.iter()
+            .filter(|m| m
+                .text
+                .starts_with(atomcode_capabilities::compaction::ANCHOR_SENTINEL))
+            .count(),
+        1,
+        "the model sees one summary"
+    );
+    let meta = SessionManager::for_project(env.project.path())
+        .read_meta(&id)
+        .unwrap();
+    assert!(
+        meta.detached_model_usage
+            .iter()
+            .map(|stat| stat.tokens.total())
+            .sum::<u64>()
+            > 0,
+        "the summaries were billed to nobody"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A request the provider refuses as too long is not the end of the turn: the
+/// long output is folded and the same round tried again.
+async fn a_request_refused_as_too_long_is_folded_and_tried_again() {
+    let env = env();
+    let lines: String = (0..200)
+        .map(|n| format!("needle number {n} in a haystack of text\n"))
+        .collect();
+    std::fs::write(env.project.path().join("hay.txt"), &lines).unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+
+    runtime
+        .handle
+        .submit(UserInput::from("search needle until it overflows"))
+        .await
+        .unwrap();
+    let reason = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("turn did not finish")
+            .expect("runtime event stream closed");
+        match event.event {
+            CodingRuntimeEvent::TurnFinished(atomcode_coding::TurnCompletion::Completed {
+                reason,
+                ..
+            }) => break Some(reason),
+            CodingRuntimeEvent::TurnFinished(_) => break None,
+            _ => {}
+        }
+    };
+    assert_eq!(reason, Some(atomcode_kernel::event::StopReason::Stopped));
+    let answer = recorder.last_turn_request();
+    assert!(
+        answer
+            .iter()
+            .any(|m| m.role == Role::Tool && m.text.starts_with("[grep ok")),
+        "the retry did not carry the folded output"
+    );
+    runtime.handle.shutdown().await.unwrap();
+}
+
+/// A session resumed under pressure is compacted before its first request, the
+/// way it would have been had the process not restarted. What a resumed session
+/// knows of the last request's size is what the stored answer recorded — a
+/// session that read only the provider's live usage reports would see no
+/// pressure at all until it had sent one full-size request.
+async fn a_session_resumed_under_pressure_is_folded_before_its_first_request() {
+    let env = env();
+    let lines: String = (0..200)
+        .map(|n| format!("needle number {n} in a haystack of text\n"))
+        .collect();
+    std::fs::write(env.project.path().join("hay.txt"), &lines).unwrap();
+    let recorder = Arc::new(Recorder::default());
+    recorder.window.store(200_000, Ordering::SeqCst);
+    let mut first = CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+        .await
+        .unwrap();
+    let id = first.session.clone().unwrap().id;
+    turn(&mut first, "search needle").await;
+    // The last answer before the restart is the one that crossed the threshold.
+    recorder.prompt_tokens.store(150_000, Ordering::SeqCst);
+    turn(&mut first, "noted").await;
+    first.handle.shutdown().await.unwrap();
+    let _ = first.task.await;
+
+    let mut second = CodingRuntime::start(start(
+        env.project.path(),
+        &recorder,
+        SessionMode::Resume(id),
+    ))
+    .await
+    .unwrap();
+    let outcomes = turn_reporting_compactions(&mut second, "carry on").await;
+
+    let seen = recorder.last_turn_request();
+    assert!(
+        seen.iter()
+            .any(|m| m.role == Role::Tool && m.text.starts_with("[grep ok")),
+        "the resumed session's first request carried the search in full"
+    );
+    // And what the driver is told matches what happened.
+    let folded = outcomes
+        .iter()
+        .find(|o| o.committed)
+        .expect("the driver heard of no committed compaction");
+    assert!(
+        folded.bytes_before > folded.bytes_after && folded.bytes_after > 0,
+        "the fold was reported as {} → {} bytes",
+        folded.bytes_before,
+        folded.bytes_after
+    );
+    assert!(
+        folded.estimated_tokens_before > folded.estimated_tokens_after,
+        "the fold was reported as saving nothing: {} → {} tokens",
+        folded.estimated_tokens_before,
+        folded.estimated_tokens_after
+    );
+    second.handle.shutdown().await.unwrap();
+}
+
+/// Run a turn and keep every compaction the driver was told finished.
+async fn turn_reporting_compactions(
+    runtime: &mut CodingRuntime,
+    text: &str,
+) -> Vec<atomcode_coding::runtime::CompactionOutcome> {
+    runtime.handle.submit(UserInput::from(text)).await.unwrap();
+    let mut outcomes = Vec::new();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("turn did not finish")
+            .expect("runtime event stream closed");
+        match event.event {
+            CodingRuntimeEvent::TurnFinished(_) => return outcomes,
+            CodingRuntimeEvent::CompactionFinished {
+                completion: atomcode_coding::runtime::CompactionCompletion::Completed(outcome),
+            } => outcomes.push(outcome),
+            _ => {}
+        }
+    }
+}
+
 /// Each scenario as its own test. Serialized because they share the process's
 /// environment (`ATOMCODE_HOME`, the offline verdict), which is also why each is
 /// its own process under `cargo nextest`.
@@ -2942,6 +3254,10 @@ mod criteria {
         a_cut_off_turn_asks_before_giving_up,
         a_silent_stream_times_the_turn_out,
         a_requested_compaction_is_summarized_by_the_model_about_the_focus,
+        under_pressure_old_tool_output_is_folded_in_place_and_the_words_kept,
+        past_most_of_the_window_older_turns_are_summarized_and_the_summary_kept_up,
+        a_request_refused_as_too_long_is_folded_and_tried_again,
+        a_session_resumed_under_pressure_is_folded_before_its_first_request,
         the_prompt_teaches_each_product_tool_once,
         a_picture_read_reaches_a_model_that_can_see_it,
         every_model_round_is_reported_even_without_usage,

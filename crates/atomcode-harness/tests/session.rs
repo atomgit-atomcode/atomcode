@@ -252,6 +252,7 @@ fn a_compaction_boundary_replaces_history_without_erasing_it() {
         turn: 2,
         through: boundary,
         summary: "earlier: a question and an answer".into(),
+        from: 0,
     });
     log.append(SessionEvent::UserMessage {
         turn: 2,
@@ -275,6 +276,189 @@ fn a_compaction_boundary_replaces_history_without_erasing_it() {
         4,
         "compaction changes the projection, never the log — replay and audit still see everything"
     );
+}
+
+fn said(turn: u64, text: &str) -> SessionEvent {
+    SessionEvent::UserMessage {
+        turn,
+        text: text.into(),
+        images: vec![],
+    }
+}
+
+fn answered(turn: u64, text: &str) -> SessionEvent {
+    SessionEvent::AssistantMessage {
+        turn,
+        round: 1,
+        text: text.into(),
+        reasoning: String::new(),
+        tool_calls: vec![],
+        reasoning_blocks: Vec::new(),
+        meta: None,
+    }
+}
+
+/// A compaction that keeps the session's first request folds only what lies
+/// between that request and its boundary — and what an earlier compaction
+/// folded does not come back because a later one keeps a head.
+#[test]
+fn a_compaction_keeps_the_head_it_names_and_never_unfolds_an_earlier_one() {
+    let log = SessionLog::new("t");
+    log.append(said(1, "q1"));
+    let a1 = log.append(answered(1, "a1"));
+    log.append(SessionEvent::Compacted {
+        turn: 2,
+        through: a1,
+        summary: "S1".into(),
+        from: 0,
+    });
+    let q2 = log.append(said(2, "q2"));
+    log.append(answered(2, "a2"));
+    let a3 = {
+        log.append(said(3, "q3"));
+        log.append(answered(3, "a3"))
+    };
+    log.append(SessionEvent::Compacted {
+        turn: 4,
+        through: a3,
+        summary: "S2".into(),
+        from: q2,
+    });
+    log.append(said(4, "q4"));
+
+    let texts: Vec<String> = log.derive_messages().into_iter().map(|m| m.text).collect();
+    assert_eq!(
+        texts,
+        vec!["S2", "q2", "q4"],
+        "the last summary, the head it kept, and what came after"
+    );
+}
+
+/// A rewrite is what the model sees from then on; the log keeps what was said.
+#[test]
+fn a_rewritten_message_is_what_the_model_sees_and_the_log_keeps_the_original() {
+    let log = SessionLog::new("t");
+    log.append(said(1, "q1"));
+    log.append(SessionEvent::AssistantMessage {
+        turn: 1,
+        round: 1,
+        text: String::new(),
+        reasoning: String::new(),
+        tool_calls: vec![ToolCall {
+            id: "c1".into(),
+            name: "grep".into(),
+            arguments: "{}".into(),
+        }],
+        reasoning_blocks: Vec::new(),
+        meta: None,
+    });
+    let result = log.append(SessionEvent::ToolResultLogged {
+        turn: 1,
+        round: 1,
+        call_id: "c1".into(),
+        content: "a very long result".into(),
+        is_error: false,
+        images: vec![],
+    });
+    let question = log.append(said(2, "q2"));
+    log.append(SessionEvent::MessagesRewritten {
+        turn: 2,
+        texts: vec![
+            atomcode_harness::session::RewrittenText {
+                seq: result,
+                text: "[grep ok]".into(),
+            },
+            atomcode_harness::session::RewrittenText {
+                seq: question,
+                text: "q2, cut".into(),
+            },
+        ],
+    });
+
+    let texts: Vec<String> = log.derive_messages().into_iter().map(|m| m.text).collect();
+    assert_eq!(texts, vec!["q1", "", "[grep ok]", "q2, cut"]);
+    assert!(
+        log.events().iter().any(|e| matches!(
+            &e.event,
+            SessionEvent::ToolResultLogged { content, .. } if content == "a very long result"
+        )),
+        "the log still holds what the tool said"
+    );
+}
+
+/// A resumed session is seeded with the summary it was stored with. The next
+/// compaction's summary stands for that one too, so the two are never shown
+/// side by side.
+#[test]
+fn a_seeded_summary_gives_way_to_a_later_compaction() {
+    let log = SessionLog::new("t");
+    log.append(SessionEvent::Injected {
+        turn: 0,
+        text: "SEEDED".into(),
+        origin: InjectionOrigin::CompactionSummary,
+    });
+    let q1 = log.append(said(1, "q1"));
+    let a1 = log.append(answered(1, "a1"));
+    log.append(said(2, "q2"));
+    log.append(SessionEvent::Compacted {
+        turn: 2,
+        through: a1,
+        summary: "LATER".into(),
+        from: q1,
+    });
+
+    let texts: Vec<String> = log.derive_messages().into_iter().map(|m| m.text).collect();
+    assert_eq!(texts, vec!["LATER", "q1", "q2"]);
+}
+
+/// Renumbering moves every reference a compaction makes with the events it
+/// points at: its boundary, the head it keeps, the messages it rewrote.
+#[test]
+fn renumbering_moves_a_compactions_references_with_its_events() {
+    let events = vec![
+        LoggedEvent {
+            seq: 1,
+            event: said(1, "q1"),
+        },
+        LoggedEvent {
+            seq: 2,
+            event: answered(1, "a1"),
+        },
+        LoggedEvent {
+            seq: 3,
+            event: said(2, "q2"),
+        },
+        LoggedEvent {
+            seq: 4,
+            event: SessionEvent::MessagesRewritten {
+                turn: 2,
+                texts: vec![atomcode_harness::session::RewrittenText {
+                    seq: 3,
+                    text: "q2, cut".into(),
+                }],
+            },
+        },
+        LoggedEvent {
+            seq: 5,
+            event: SessionEvent::Compacted {
+                turn: 2,
+                through: 2,
+                summary: "S".into(),
+                from: 1,
+            },
+        },
+    ];
+    let before: Vec<String> = derive_messages(&events)
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    let moved = atomcode_harness::session::renumber(events, 101);
+    let after: Vec<String> = derive_messages(&moved)
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    assert_eq!(before, vec!["S", "q1", "q2, cut"]);
+    assert_eq!(after, before, "the same conversation under new numbers");
 }
 
 #[test]

@@ -551,7 +551,7 @@ fn empty_exhaustion_message(
 /// DISPLAYED window (`context_window()`) is unchanged, so users still see the model's
 /// full window while the guard keeps the real request (messages + completion) under
 /// the model's usable limit.
-fn effective_input_limit(window: u32, max_tokens: Option<u32>) -> u32 {
+pub fn effective_input_limit(window: u32, max_tokens: Option<u32>) -> u32 {
     let output_reserve = max_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
     let margin = (window / 8).clamp(16_000, 128_000);
     let reserve = output_reserve.saturating_add(margin);

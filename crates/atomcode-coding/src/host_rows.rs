@@ -1625,7 +1625,10 @@ impl Plugin for NativeCompactionCheckpointPlugin {
         let listener_ctx = ctx.clone();
         let _ = ctx.on_emit::<atomcode_harness::events::SessionEventCommitted>(
             move |committed: &atomcode_harness::session::Committed| {
-                if !matches!(committed.event, SessionEvent::Compacted { .. }) {
+                if !matches!(
+                    committed.event,
+                    SessionEvent::Compacted { .. } | SessionEvent::MessagesRewritten { .. }
+                ) {
                     return;
                 }
                 let Some(agent) = listener_ctx
@@ -1657,87 +1660,72 @@ impl Plugin for NativeCompactionCheckpointPlugin {
 
 /// `compaction-coding`: stands where `compaction-tail` stands.
 ///
-/// Pressure-triggered compaction stays the tree's model-free list — a compactor
-/// that needs a model call cannot run when the provider is what is failing. A
-/// `/compact` the person asks for is the chain's: the conversation's own model
-/// writes the summary, updating the last one, steered by the focus they gave,
-/// billed to the session through the side provider. Anything short of a written
-/// summary falls back to the list.
+/// The product's compaction is the kernel's strategy, decided against the log:
+/// under pressure, old tool output is folded in place and the conversation's
+/// words kept (`read_file` exempt, the active turn whole); past 0.78 of the
+/// window, older turns are summarized by the conversation's own model — the
+/// last summary updated rather than rewritten, the first request and about a
+/// quarter of the window of recent turns kept; on an overflow, stub → truncate
+/// → summarize, splitting a turn too long to keep whole. A `/compact` the
+/// person asks for is that summary, steered by their focus. Every summary is
+/// billed to the session through the side provider, and every way it can fail
+/// falls back to something model-free.
 pub(crate) struct CompactionCodingPlugin(pub(crate) atomcode_review::SharedReviewProvider);
 
 #[derive(serde::Deserialize)]
 struct CompactionCodingRow {
     #[serde(default = "default_compaction_threshold")]
     threshold: f32,
-    #[serde(default = "default_keep_turns")]
-    keep_turns: u64,
 }
 
 fn default_compaction_threshold() -> f32 {
     0.75
 }
 
-fn default_keep_turns() -> u64 {
-    2
-}
-
 struct CodingCompaction {
     provider: atomcode_review::SharedReviewProvider,
-    keep_turns: u64,
+}
+
+impl CodingCompaction {
+    /// Resolved per call: `/model` and a logout swap the provider under it.
+    fn strategy(&self) -> (atomcode_capabilities::compaction::OverflowCompaction, bool) {
+        let provider = self.provider.read().ok().and_then(|slot| slot.clone());
+        let writes = provider.is_some();
+        (
+            atomcode_capabilities::compaction::OverflowCompaction::new(
+                atomcode_capabilities::compaction::StubCompaction::default(),
+                provider,
+            ),
+            writes,
+        )
+    }
 }
 
 #[async_trait]
 impl atomcode_harness::seams::Compaction for CodingCompaction {
     fn describe(&self) -> String {
-        format!(
-            "keep the last {} turn(s); list the rest, or have the model summarize them on request",
-            self.keep_turns
-        )
+        "fold old tool output under pressure; past 0.78 of the window, or on request, have the \
+         conversation's model summarize older turns; on an overflow, stub, truncate, then summarize"
+            .into()
+    }
+
+    fn calls_model(
+        &self,
+        log: &atomcode_harness::session::SessionLog,
+        ask: &atomcode_harness::seams::CompactionAsk,
+    ) -> bool {
+        let (strategy, writes) = self.strategy();
+        writes
+            && atomcode_harness::plugins::compaction::strategy_would_summarize(&strategy, log, ask)
     }
 
     async fn compact(
         &self,
         log: &atomcode_harness::session::SessionLog,
+        ask: &atomcode_harness::seams::CompactionAsk,
     ) -> Option<atomcode_harness::seams::CompactionDecision> {
-        use atomcode_harness::plugins::loop_policy;
-        let span = loop_policy::settled_span(log, self.keep_turns)?;
-        Some(atomcode_harness::seams::CompactionDecision {
-            through: span.through,
-            summary: loop_policy::listed_summary(&span),
-        })
-    }
-
-    async fn compact_requested(
-        &self,
-        log: &atomcode_harness::session::SessionLog,
-        focus: Option<&str>,
-    ) -> Option<atomcode_harness::seams::CompactionDecision> {
-        use atomcode_capabilities::compaction::{summarize_span, SUMMARY_TIMEOUT};
-        use atomcode_harness::plugins::loop_policy;
-        let span = loop_policy::settled_span(log, self.keep_turns)?;
-        let provider = self.provider.read().ok().and_then(|slot| slot.clone());
-        let written = match provider {
-            Some(provider) => {
-                let events: Vec<_> = log
-                    .events()
-                    .into_iter()
-                    .filter(|logged| logged.seq <= span.through)
-                    .collect();
-                let messages = atomcode_harness::session::derive_messages(&events);
-                tokio::time::timeout(
-                    SUMMARY_TIMEOUT,
-                    summarize_span(provider.as_ref(), &messages, focus),
-                )
-                .await
-                .ok()
-                .flatten()
-            }
-            None => None,
-        };
-        Some(atomcode_harness::seams::CompactionDecision {
-            through: span.through,
-            summary: written.unwrap_or_else(|| loop_policy::listed_summary(&span)),
-        })
+        let (strategy, _) = self.strategy();
+        atomcode_harness::plugins::compaction::decide_with_strategy(&strategy, log, ask).await
     }
 }
 
@@ -1761,7 +1749,6 @@ impl Plugin for CompactionCodingPlugin {
         let _ = ctx
             .provide::<atomcode_harness::seams::CompactionSvc>(Arc::new(CodingCompaction {
                 provider: self.0.clone(),
-                keep_turns: row.keep_turns,
             }))
             .map_err(|e| e.to_string())?;
         atomcode_harness::plugins::loop_policy::mount_compaction_trigger(ctx, row.threshold);

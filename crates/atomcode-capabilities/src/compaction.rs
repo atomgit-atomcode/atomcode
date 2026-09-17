@@ -549,7 +549,7 @@ fn render_transcript(span: &[Message]) -> String {
 /// Sentinel first line stamped on every anchored compaction summary. Used to find the
 /// prior anchor in a drained span. Bumping the version invalidates older anchors (they
 /// are simply treated as plain history → re-summarized once, which is safe).
-pub(crate) const ANCHOR_SENTINEL: &str = "<!-- atomcode:anchor v1 -->";
+pub const ANCHOR_SENTINEL: &str = "<!-- atomcode:anchor v1 -->";
 
 /// Injection-time FRAMING placed after the sentinel: tells the model this block is compressed
 /// EARLIER context to reference, NOT instructions to obey — a prompt-injection guard for a
@@ -565,10 +565,13 @@ pub(crate) const SUMMARY_FRAMING: &str = "[Compressed summary of EARLIER convers
 /// UPDATE base. Must remain a prefix of `SUMMARY_FRAMING` (asserted in tests).
 const SUMMARY_FRAMING_LEAD: &str = "[Compressed summary of EARLIER conversation context";
 
-/// True iff `m` is an anchored compaction summary: a kernel-injected (`synthetic`)
-/// user-role message whose text starts with [`ANCHOR_SENTINEL`].
+/// True iff `m` is an anchored compaction summary: an injected (`synthetic`) message whose
+/// text starts with [`ANCHOR_SENTINEL`]. The kernel inserts one as a user message; an event
+/// log projects its summary as a system note. The role is where it was put, not what it is.
 fn is_anchor_message(m: &Message) -> bool {
-    m.role == Role::User && m.synthetic && m.text.starts_with(ANCHOR_SENTINEL)
+    matches!(m.role, Role::User | Role::System)
+        && m.synthetic
+        && m.text.starts_with(ANCHOR_SENTINEL)
 }
 
 /// The body of the LAST anchor in `span` (sentinel + framing stripped, trimmed), or `None` if
@@ -2360,6 +2363,57 @@ mod tests {
             out.contains("[2 image(s) attached]"),
             "image presence must be recorded in the summary input, got: {out}"
         );
+    }
+
+    /// Records the prompt it was asked, answers with a stock summary.
+    struct CapturingProvider(std::sync::Mutex<Vec<Message>>);
+    #[async_trait]
+    impl LlmProvider for CapturingProvider {
+        fn model_name(&self) -> &str {
+            "capture"
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _: &[atomcode_kernel::tool::ToolDef],
+            _: &ChatOptions,
+        ) -> Result<
+            futures::stream::BoxStream<'static, StreamEvent>,
+            atomcode_kernel::stream::ProviderError,
+        > {
+            *self.0.lock().unwrap() = messages.to_vec();
+            Ok(Box::pin(futures::stream::iter(vec![
+                StreamEvent::TextDelta("NEW".into()),
+                StreamEvent::Done { truncated: false },
+            ])))
+        }
+    }
+
+    /// An event-log projection carries the last summary as a synthetic SYSTEM note,
+    /// not the synthetic user message the kernel inserts. Either way it is the
+    /// summary being updated — never a transcript line summarized a second time.
+    #[tokio::test]
+    async fn a_summary_projected_as_a_system_note_is_updated_not_resummarized() {
+        let text = format!("{ANCHOR_SENTINEL}\n{SUMMARY_FRAMING}\n## Goal\n- use postgres");
+        let mut note = Message::system(text.clone());
+        note.synthetic = true;
+        for prior in [Message::synthetic_user(text.clone()), note] {
+            let provider = CapturingProvider(Default::default());
+            let span = vec![prior, Message::user("q3"), Message::assistant("a3", vec![])];
+            summarize_span(&provider, &span, None)
+                .await
+                .expect("a summary");
+            let sent = provider.0.lock().unwrap();
+            let prompt = &sent[1].text;
+            assert!(
+                prompt.contains("<previous-summary>\n## Goal\n- use postgres"),
+                "not updated: {prompt}"
+            );
+            assert!(
+                !prompt.contains(ANCHOR_SENTINEL),
+                "summarized as a transcript line: {prompt}"
+            );
+        }
     }
 }
 

@@ -96,9 +96,38 @@ struct Projector {
     /// fold's generic report of the same commit would be a second, auto-labelled
     /// one.
     manual_compaction: Arc<std::sync::atomic::AtomicBool>,
+    /// A compaction that calls a model was reported started and has not been
+    /// reported finished. A driver holds work back while one is running, so a
+    /// start is always closed — by the compaction's own facts, or, if it
+    /// committed none, by the first thing that happens next.
+    compacting: Option<CompactTrigger>,
+    /// The conversation the facts belong to, for measuring what a compaction
+    /// changed. The facts alone cannot say: a cut names a boundary, not a size.
+    /// `None` for a replay, which reports no sizes.
+    log: Option<Arc<crate::session::SessionLog>>,
 }
 
 impl Projector {
+    /// Messages and bytes the model saw before and after the compaction fact at
+    /// `seq`. Zeros when there is no log to measure.
+    fn measure(&self, seq: crate::session::SeqNo) -> (usize, usize, usize, usize) {
+        let Some(log) = self.log.as_ref() else {
+            return (0, 0, 0, 0);
+        };
+        let events = log.events();
+        let size = |messages: Vec<atomcode_kernel::message::Message>| {
+            (
+                messages.len(),
+                messages.iter().map(|m| m.text.len()).sum::<usize>(),
+            )
+        };
+        let before: Vec<_> = events.iter().filter(|e| e.seq < seq).cloned().collect();
+        let after: Vec<_> = events.iter().filter(|e| e.seq <= seq).cloned().collect();
+        let (count_before, bytes_before) = size(crate::session::derive_messages(&before));
+        let (count_after, bytes_after) = size(crate::session::derive_messages(&after));
+        (count_before, bytes_before, count_after, bytes_after)
+    }
+
     // `mounted()` lived here: a guess at whether a named tool would actually
     // dispatch, so an unmounted one was not announced as started. The guess is
     // gone because the question is now answered rather than predicted —
@@ -117,6 +146,38 @@ impl Projector {
     }
 
     fn project(&mut self, event: &SessionEvent) -> Vec<AgentEvent> {
+        self.project_at(0, event)
+    }
+
+    /// [`project`](Self::project), for a fact whose sequence number is known.
+    fn project_at(&mut self, seq: crate::session::SeqNo, event: &SessionEvent) -> Vec<AgentEvent> {
+        let closes = matches!(
+            event,
+            SessionEvent::Compacted { .. } | SessionEvent::MessagesRewritten { .. }
+        );
+        let mut out = Vec::new();
+        if !closes {
+            if let Some(trigger) = self.compacting.take() {
+                out.push(AgentEvent::Compacted {
+                    trigger,
+                    epoch: 0,
+                    removed: 0,
+                    bytes_before: 0,
+                    bytes_after: 0,
+                    committed: false,
+                    snapshot: None,
+                });
+            }
+        }
+        out.extend(self.project_fact(seq, event));
+        out
+    }
+
+    fn project_fact(
+        &mut self,
+        seq: crate::session::SeqNo,
+        event: &SessionEvent,
+    ) -> Vec<AgentEvent> {
         match event {
             SessionEvent::TurnStart { .. } => {
                 self.said_this_turn = 0;
@@ -256,28 +317,35 @@ impl Projector {
                     ..Default::default()
                 })]
             }
-            SessionEvent::Compacted { .. }
+            SessionEvent::Compacted { .. } | SessionEvent::MessagesRewritten { .. }
                 if self
                     .manual_compaction
                     .load(std::sync::atomic::Ordering::SeqCst) =>
             {
+                self.compacting = None;
                 Vec::new()
             }
-            SessionEvent::Compacted { summary, .. } => vec![AgentEvent::Compacted {
-                trigger: CompactTrigger::Auto {
+            // Pressure or an overflow compacted: a fold, or tool output shown
+            // shorter in place. Reported as the kernel reported both.
+            SessionEvent::Compacted { .. } | SessionEvent::MessagesRewritten { .. } => {
+                let trigger = self.compacting.take().unwrap_or(CompactTrigger::Auto {
                     utilization: if self.ctx_window == 0 {
                         0.0
                     } else {
                         self.last_prompt_tokens as f32 / self.ctx_window as f32
                     },
-                },
-                epoch: 0,
-                removed: 0,
-                bytes_before: 0,
-                bytes_after: summary.len(),
-                committed: true,
-                snapshot: None,
-            }],
+                });
+                let (count_before, bytes_before, count_after, bytes_after) = self.measure(seq);
+                vec![AgentEvent::Compacted {
+                    trigger,
+                    epoch: 0,
+                    removed: count_before.saturating_sub(count_after),
+                    bytes_before,
+                    bytes_after,
+                    committed: true,
+                    snapshot: None,
+                }]
+            }
 
             // Advisory: the turn continues. A driver renders it as a note, not
             // as a failure — a rate-limit wait is not an error.
@@ -322,6 +390,23 @@ impl Projector {
                     // A warning in the kernel protocol too: nothing is being
                     // recovered, the person is being told to ask for the rest.
                     crate::session::NoticeKind::OutputLeftCutOff => {
+                        AgentEvent::Warning(detail.clone())
+                    }
+                    // A summary is being written and the request waits on it. The
+                    // start a driver shows a spinner for; the compaction's own
+                    // facts close it.
+                    crate::session::NoticeKind::Compacting => {
+                        let trigger = CompactTrigger::Auto {
+                            utilization: if self.ctx_window == 0 {
+                                0.0
+                            } else {
+                                self.last_prompt_tokens as f32 / self.ctx_window as f32
+                            },
+                        };
+                        self.compacting = Some(trigger.clone());
+                        AgentEvent::CompactionStarted { trigger }
+                    }
+                    crate::session::NoticeKind::CompactionDegraded => {
                         AgentEvent::Warning(detail.clone())
                     }
                 }]
@@ -414,8 +499,8 @@ impl Projector {
             SessionEvent::StepStart { .. }
             | SessionEvent::RequestHeader { .. }
             | SessionEvent::Titled { .. }
-            // The ladder that stubs says so itself, as a notice; the fact is for
-            // the log and the next request, not for the screen.
+            // The ladder that stubbed says so itself, as a notice; the fact is
+            // for the log and the next request, not for the screen.
             | SessionEvent::ToolResultsStubbed { .. }
             // A question was put, and answered: a card in the log, drawn by the
             // front end that asked for it out of the same fold as every other
@@ -1020,7 +1105,15 @@ async fn compact(
         )
     };
     let (count_before, bytes_before) = measure(&log.derive_messages());
-    let decision = compaction.compact_requested(&log, focus.as_deref()).await;
+    let ask = crate::seams::CompactionAsk {
+        trigger: trigger.clone(),
+        window: ctx
+            .service::<LlmSvc>()
+            .map(|p| p.context_window())
+            .unwrap_or(0),
+        used_tokens: super::loop_policy::last_prompt_tokens(&log),
+    };
+    let decision = compaction.compact(&log, &ask).await;
     let committed = match decision {
         Some(decision) => {
             reporting.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1220,6 +1313,8 @@ pub async fn spawn(
         answering_a_nudge: false,
         usage_round: None,
         manual_compaction: manual_compaction.clone(),
+        compacting: None,
+        log: Some(agent.session()),
     }));
 
     let out = events.clone();
@@ -1233,7 +1328,7 @@ pub async fn spawn(
         let projected = fold
             .lock()
             .expect("projector poisoned")
-            .project(&committed.event);
+            .project_at(committed.seq, &committed.event);
         for event in projected {
             let _ = out.send(event);
         }
@@ -1405,6 +1500,8 @@ pub fn replay(events: &[SessionEvent], ctx_window: u32) -> Vec<AgentEvent> {
         answering_a_nudge: false,
         usage_round: None,
         manual_compaction: Default::default(),
+        compacting: None,
+        log: None,
     };
     events
         .iter()

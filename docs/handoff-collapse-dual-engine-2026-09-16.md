@@ -144,14 +144,16 @@ cargo clean -p atomcode-codingplan-crypto && cargo build -p atomcode
 1. **soak 再 push。** 34 个 commit 一次都没推过；用户要的是先在本地用一段时间。
    合回 `feat/plexus-plugin-architecture` 是纯 fast-forward（它已与 origin 同步）。
    push 之前把 `docs/collapse-dual-engine.md` 的「已知差异」那一节再读一遍 ——
-   它列的是**决定保留**的差异（自动压缩策略、摘要锚点、边界按回合、工具指引归属、
-   `max_continuations`、流重连次数、链式 logout 不清槽），不是待办。
+   它列的是**决定保留**的差异（工具指引归属、`max_continuations`、流重连次数、
+   链式 logout 不清槽），不是待办。自动压缩策略、摘要锚点、边界按回合这三条已在
+   `fix/auto-compaction` 对齐。
 2. **阶段二：行清单从常量变成数据。** 这是 09-14 交接里就定下的下一阶段 ——
    产品 A 与产品 B 换 TOML 不换 Rust。分支 `feat/external-assembly` 已存在，
    本线没碰它。
-3. **自动压缩这条尾巴**（唯一一条「知道怎么做但没做」的差异）：链式是原地把旧工具结果
-   改成桩，追加式日志里没有对应事实。真要对齐，先给会话日志加事件 —— 那是日志模型的
-   决定，不该塞进本线。
+3. ~~**自动压缩这条尾巴**~~ —— 2026-09-16 在 `fix/auto-compaction` 做完：日志加了
+   `MessagesRewritten` 与 `Compacted.from`,`compaction-coding` 通过
+   `decide_with_strategy` 跑链式原策略。细节见 `docs/collapse-dual-engine.md` 已知差异一节。
+   长会话的质量和成本仍是 soak 期最该盯的。
 
 ## 几个位置
 
