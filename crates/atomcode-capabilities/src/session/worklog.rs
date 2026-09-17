@@ -97,9 +97,24 @@ pub fn collect_day_turns(sessions_root: &Path, after_ms: i64, before_ms: i64) ->
             continue;
         }
         sessions_read += 1;
-        let path = sessions_root
-            .join(&entry.project_bucket)
-            .join(format!("{}.jsonl", entry.id));
+        let bucket = sessions_root.join(&entry.project_bucket);
+        let manager = SessionManager::with_root(&bucket);
+        if manager.is_event_session(&entry.id) {
+            let Ok(events) = manager.load_events(&entry.id) else {
+                continue;
+            };
+            for rec in super::events::turn_records(&entry.id, &events) {
+                if out.len() >= MAX_WORKLOG_TURNS {
+                    break;
+                }
+                let in_day = rec.ts >= after_ms && rec.ts < before_ms;
+                if in_day && !rec.undone && !rec.user.trim().is_empty() {
+                    out.push(WorklogTurn::from_record(entry.working_dir.clone(), &rec));
+                }
+            }
+            continue;
+        }
+        let path = bucket.join(format!("{}.jsonl", entry.id));
         let _ = for_each_jsonl_line(&path, |line| {
             if out.len() >= MAX_WORKLOG_TURNS {
                 return Ok(());

@@ -631,6 +631,21 @@ pub fn visible_turns(events: &[LoggedEvent]) -> std::collections::BTreeSet<u64> 
         .collect()
 }
 
+/// Which turns were taken back — by an undo, a rewind of the conversation, or a
+/// person's interruption they asked to have undone. A compacted turn is not
+/// among them: it was summarised, not withdrawn.
+pub fn undone_turns(events: &[LoggedEvent]) -> std::collections::BTreeSet<u64> {
+    let taken_back = taken_back(events);
+    events
+        .iter()
+        .filter_map(|logged| match logged.event {
+            SessionEvent::TurnStart { turn } if taken_back(logged.seq) => Some(turn),
+            SessionEvent::Interrupted { turn, undone: true } => Some(turn),
+            _ => None,
+        })
+        .collect()
+}
+
 /// What undos took back: every fact from a `Rewound`'s target up to the
 /// `Rewound` itself. Several stack.
 fn taken_back(events: &[LoggedEvent]) -> impl Fn(SeqNo) -> bool {

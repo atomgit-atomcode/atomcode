@@ -33,6 +33,7 @@ use super::manager::{
     SessionManager, SessionMeta, SessionResult, SessionStoreError, StorageOwner, MAX_JSONL_BYTES,
     MAX_JSONL_LINE_BYTES,
 };
+use super::transcript::TurnRecord;
 
 /// What an event log line holds.
 #[derive(serde::Deserialize)]
@@ -859,6 +860,119 @@ fn record_line(logged: &LoggedEvent) -> SessionResult<Vec<u8>> {
     Ok(line)
 }
 
+/// Each finished turn of a session's log as the record `recall` and `/worklog`
+/// read — the shape the transcript hook used to append, now folded from the
+/// facts (`docs/adr/0024` §14).
+///
+/// Started when its `TurnStart` was committed and finished when its `TurnEnd`
+/// was; the prompt, every reply's text and reasoning (a stopped reply's too),
+/// each call paired with its result, the turn's usage. A turn taken back is kept
+/// and marked `undone`, which the transcript never could. A turn with neither
+/// words nor calls — a refused prompt — is left out, as it always was.
+pub fn turn_records(session_id: &str, events: &[LoggedEvent]) -> Vec<TurnRecord> {
+    use super::transcript::{ToolRecord, UsageRecord, RECORD_VERSION};
+
+    let undone = atomcode_kernel::session::undone_turns(events);
+    let results: std::collections::HashMap<&str, (&str, bool)> = events
+        .iter()
+        .filter_map(|logged| match &logged.event {
+            SessionEvent::ToolResultLogged {
+                call_id,
+                content,
+                is_error,
+                ..
+            } => Some((call_id.as_str(), (content.as_str(), *is_error))),
+            _ => None,
+        })
+        .collect();
+    let mut records = Vec::new();
+    let mut open: Option<TurnRecord> = None;
+    for logged in events {
+        let at = i64::try_from(logged.at).unwrap_or(i64::MAX);
+        match &logged.event {
+            SessionEvent::TurnStart { turn } => {
+                open = Some(TurnRecord {
+                    v: RECORD_VERSION,
+                    started_at: Some(at),
+                    ts: at,
+                    iso: String::new(),
+                    session_id: session_id.to_string(),
+                    turn_id: *turn,
+                    undone: undone.contains(turn),
+                    user: String::new(),
+                    assistant: String::new(),
+                    reasoning: String::new(),
+                    tools: Vec::new(),
+                    usage: UsageRecord::default(),
+                });
+            }
+            SessionEvent::UserMessage { text, .. } => {
+                if let Some(record) = open.as_mut().filter(|r| r.user.is_empty()) {
+                    record.user = text.clone();
+                }
+            }
+            SessionEvent::AssistantMessage {
+                text,
+                reasoning,
+                tool_calls,
+                meta,
+                ..
+            } => {
+                let Some(record) = open.as_mut() else {
+                    continue;
+                };
+                record.assistant.push_str(text);
+                record.reasoning.push_str(reasoning);
+                for call in tool_calls {
+                    let (result, is_error) = results
+                        .get(call.id.as_str())
+                        .map(|(content, is_error)| (content.to_string(), *is_error))
+                        .unwrap_or_default();
+                    record.tools.push(ToolRecord {
+                        name: call.name.clone(),
+                        args: call.arguments.clone(),
+                        result,
+                        is_error,
+                    });
+                }
+                if let Some(meta) = meta {
+                    // The last round's prompt is how far the turn's context
+                    // reached; output adds up across rounds.
+                    record.usage.prompt = meta.tokens.prompt;
+                    record.usage.completion = record
+                        .usage
+                        .completion
+                        .saturating_add(meta.tokens.completion);
+                    record.usage.cached = record.usage.cached.max(meta.tokens.cached);
+                }
+            }
+            SessionEvent::PartialReply {
+                text, reasoning, ..
+            } => {
+                if let Some(record) = open.as_mut() {
+                    record.assistant.push_str(text);
+                    record.reasoning.push_str(reasoning);
+                }
+            }
+            SessionEvent::TurnEnd { turn, .. } => {
+                let Some(mut record) = open.take().filter(|r| r.turn_id == *turn) else {
+                    continue;
+                };
+                if record.assistant.is_empty() && record.tools.is_empty() {
+                    continue;
+                }
+                record.ts = at;
+                record.iso = chrono::DateTime::from_timestamp_millis(at)
+                    .map(|d| d.to_rfc3339())
+                    .unwrap_or_default();
+                records.push(record);
+            }
+            _ => {}
+        }
+    }
+    records
+}
+
 /// A snapshot of what `events` project to.
 pub fn snapshot_of(events: &[LoggedEvent]) -> SessionSnapshot {
     let mut snapshot = SessionSnapshot::new(derive_messages_with_meta(events));
@@ -1064,6 +1178,179 @@ mod tests {
         );
         assert_eq!(manager.read_meta("s1").unwrap().turn_count, 7);
         assert_eq!(manager.load_snapshot("s1").unwrap().messages.len(), 2);
+    }
+
+    /// `recall` and `/worklog` read a session's turns out of its log: each
+    /// finished turn with its prompt, what was said (a stopped reply's words
+    /// too), each call beside its result and when it ran. A turn taken back is
+    /// kept and marked, and the day's recap leaves it out.
+    #[test]
+    fn a_sessions_turns_are_read_out_of_its_log() {
+        use atomcode_kernel::tool::ToolCall;
+
+        let (dir, manager) = store();
+        let lease = created(&manager, "s1");
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        };
+        let mut facts = vec![
+            logged(1, 1_000, SessionEvent::TurnStart { turn: 1 }),
+            logged(
+                2,
+                1_000,
+                SessionEvent::UserMessage {
+                    turn: 1,
+                    text: "remember kiwi".into(),
+                    images: vec![],
+                },
+            ),
+            logged(
+                3,
+                1_100,
+                SessionEvent::AssistantMessage {
+                    turn: 1,
+                    round: 1,
+                    text: "reading".into(),
+                    reasoning: String::new(),
+                    tool_calls: vec![call],
+                    reasoning_blocks: Vec::new(),
+                    meta: None,
+                },
+            ),
+            logged(
+                4,
+                1_200,
+                SessionEvent::ToolResultLogged {
+                    turn: 1,
+                    round: 1,
+                    call_id: "c1".into(),
+                    content: "kiwi.txt".into(),
+                    is_error: false,
+                    images: vec![],
+                },
+            ),
+            logged(
+                5,
+                1_500,
+                SessionEvent::TurnEnd {
+                    turn: 1,
+                    stop: StopReason::Stopped,
+                    error: None,
+                },
+            ),
+        ];
+        // Turn 2, taken back.
+        facts.extend(a_turn().into_iter().map(|mut fact| {
+            fact.seq += 10;
+            fact.at += 2_000;
+            shift_turn(&mut fact.event, 1);
+            fact
+        }));
+        facts.push(logged(
+            20,
+            2_600,
+            SessionEvent::Rewound {
+                turn: 2,
+                to: 11,
+                scope: RewindScope::Conversation,
+            },
+        ));
+        // Turn 3, stopped part way and kept.
+        facts.extend([
+            logged(21, 3_000, SessionEvent::TurnStart { turn: 3 }),
+            logged(
+                22,
+                3_000,
+                SessionEvent::UserMessage {
+                    turn: 3,
+                    text: "and then?".into(),
+                    images: vec![],
+                },
+            ),
+            logged(
+                23,
+                3_100,
+                SessionEvent::PartialReply {
+                    turn: 3,
+                    round: 1,
+                    text: "I was saying".into(),
+                    reasoning: String::new(),
+                },
+            ),
+            logged(
+                24,
+                3_100,
+                SessionEvent::Interrupted {
+                    turn: 3,
+                    undone: false,
+                },
+            ),
+            logged(
+                25,
+                3_200,
+                SessionEvent::TurnEnd {
+                    turn: 3,
+                    stop: StopReason::Cancelled,
+                    error: None,
+                },
+            ),
+        ]);
+        manager.append_events(&lease, &facts).unwrap();
+
+        let records = turn_records("s1", &manager.load_events("s1").unwrap());
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.turn_id, r.undone))
+                .collect::<Vec<_>>(),
+            vec![(1, false), (2, true), (3, false)]
+        );
+        assert_eq!(records[0].user, "remember kiwi");
+        assert_eq!((records[0].started_at, records[0].ts), (Some(1_000), 1_500));
+        assert_eq!(records[0].tools[0].result, "kiwi.txt");
+        assert_eq!(records[2].assistant, "I was saying");
+
+        let recalled = crate::session::RecallTool::new()
+            .search_dir(manager.root(), "kiwi", None, None, 8)
+            .unwrap();
+        assert!(recalled.contains("remember kiwi"), "{recalled}");
+
+        let day = crate::session::collect_day_turns(dir.path(), 0, 10_000);
+        assert_eq!(
+            day.iter().map(|t| t.user.as_str()).collect::<Vec<_>>(),
+            vec!["remember kiwi", "and then?"]
+        );
+    }
+
+    /// A fact too long for one line is refused before anything is written: a
+    /// log never holds half a record.
+    #[test]
+    fn an_oversized_fact_is_refused_and_nothing_is_written() {
+        let (_dir, manager) = store();
+        let lease = created(&manager, "s1");
+        let before = fs::read(manager.events_path("s1").unwrap()).unwrap();
+        let huge = logged(
+            1,
+            0,
+            SessionEvent::UserMessage {
+                turn: 1,
+                text: "x".repeat(MAX_JSONL_LINE_BYTES),
+                images: vec![],
+            },
+        );
+        assert!(matches!(
+            manager.append_events(&lease, &[a_turn()[0].clone(), huge]),
+            Err(SessionStoreError::TooLarge {
+                kind: "session event",
+                ..
+            })
+        ));
+        assert_eq!(
+            fs::read(manager.events_path("s1").unwrap()).unwrap(),
+            before
+        );
     }
 
     /// Only the holder of the session's own lease appends, and only to an event

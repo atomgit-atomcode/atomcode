@@ -26,7 +26,7 @@ use atomcode_capabilities::mcp::{McpConnectEvent, McpRegistry, McpServerConfig};
 use atomcode_capabilities::session::snapshot::SnapshotPersistenceStatus;
 use atomcode_capabilities::session::{
     ListSessionsTool, RecallTool, SessionContextHook, SessionLease, SessionManager, SessionMeta,
-    SnapshotHook, StorageOwner, TranscriptHook,
+    SnapshotHook, StorageOwner,
 };
 use atomcode_capabilities::skills::{register_skill_tools, runtime_skill_dirs, SkillRegistry};
 use atomcode_capabilities::tools::{
@@ -374,7 +374,6 @@ pub struct CodingParts {
     /// Concrete handle retained so provider-only reassembly can update the
     /// per-turn cost attribution without rebuilding session-owned hooks.
     snapshot_hook: Option<Arc<SnapshotHook>>,
-    transcript_hook: Option<Arc<TranscriptHook>>,
     extra_tools: Vec<Arc<dyn atomcode_kernel::tool::Tool>>,
     host_only_tools: Vec<String>,
     /// The skill catalog prepare loaded, and its prompt rendering (prioritizing
@@ -965,13 +964,13 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         host_only_tools.push("list_sessions".into());
     }
 
-    // The session's two writers, which the `session-native` and `transcript` rows
-    // call at the tree's own moments (see `host_rows`). Everything else the chain
-    // registered here — memory, the skill catalog, the MCP instructions tail, the
-    // verify cadence, the todo reminder, the skill-first nudge — is a row now, and
-    // the row builds its own.
+    // What the session keeps beside its log — per-turn statistics, the rewind
+    // ledger, the name — which a `kernel-hooks` row runs at the tree's own
+    // moments (see `host_rows`). The log itself is `session-store`'s. Everything
+    // else the chain registered here — memory, the skill catalog, the MCP
+    // instructions tail, the verify cadence, the todo reminder, the skill-first
+    // nudge — is a row now, and the row builds its own.
     let mut snapshot_hook_handle = None;
-    let mut transcript_hook_handle = None;
     let mut snapshot_persistence_status = None;
     if let Some(b) = &session {
         let wd = cfg.working_dir.to_string_lossy().into_owned();
@@ -981,11 +980,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .with_model_attribution(&cfg.provider_name, &cfg.model),
         );
         snapshot_persistence_status = Some(snapshot_hook.persistence_status());
-        snapshot_hook_handle = Some(snapshot_hook.clone());
-        transcript_hook_handle = Some(Arc::new(
-            TranscriptHook::new(b.manager.clone(), &b.id)
-                .with_persistence_status(snapshot_hook.persistence_status()),
-        ));
+        snapshot_hook_handle = Some(snapshot_hook);
     }
     // CC external hooks: user/project `hooks.json` + plugin-contributed inline hooks
     // (`plugin_cc_hooks`, resolved by the host), mounted by the `cc-hooks-host` row on
@@ -996,11 +991,12 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         // hook can correlate its events with the session. Empty for non-persistent runs.
         if let Some(b) = &session {
             cc = cc.with_session_id(b.id.as_str());
-            // CC `transcript_path` = the session's append-only JSONL transcript, so a
-            // Stop/StopFailure hook can open the finished turn's full record. The path
-            // resolves even before the file is written; unresolvable (session dir gone)
-            // → left `None` → the payload carries `null`, never a wedge.
-            if let Ok(p) = b.manager.jsonl_path(&b.id) {
+            // CC `transcript_path` = the session's log, which replaced the transcript
+            // (`docs/adr/0024` §14), so a Stop/StopFailure hook can open the finished
+            // turn's full record: one JSON fact per line after a header line. The
+            // path resolves before the file is written (a session not published yet);
+            // unresolvable → left `None` → the payload carries `null`, never a wedge.
+            if let Ok(p) = b.manager.events_path(&b.id) {
                 cc = cc.with_transcript_path(p.to_string_lossy().into_owned());
             }
         }
@@ -1062,7 +1058,6 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         _mcp_work_guard: mcp_work_guard,
         approval: Arc::new(ApprovalMiddleware::in_memory()),
         snapshot_hook: snapshot_hook_handle,
-        transcript_hook: transcript_hook_handle,
         extra_tools: Vec::new(),
         host_only_tools,
         skill_registry,
@@ -1152,10 +1147,6 @@ impl CodingParts {
 
     pub(crate) fn snapshot_hook(&self) -> Option<Arc<SnapshotHook>> {
         self.snapshot_hook.clone()
-    }
-
-    pub(crate) fn transcript_hook(&self) -> Option<Arc<TranscriptHook>> {
-        self.transcript_hook.clone()
     }
 
     pub(crate) fn todo_enabled(&self) -> bool {

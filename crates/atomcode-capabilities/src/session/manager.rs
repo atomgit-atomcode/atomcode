@@ -1109,11 +1109,8 @@ impl SessionManager {
     fn lease_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.path_for(id, "lease")
     }
-    /// The append-only transcript path the [`TranscriptHook`](super::TranscriptHook)
-    /// writes (and the recall tool reads).
-    ///
-    /// For an event session this is its event log, which replaces the
-    /// transcript (`docs/adr/0024` §14).
+    /// The transcript a session a released build kept — or, for an event
+    /// session, its event log, which replaced the transcript (`docs/adr/0024` §14).
     pub fn jsonl_path(&self, id: &str) -> SessionResult<PathBuf> {
         self.format_path(id, "events", "jsonl")
     }
@@ -3031,49 +3028,6 @@ impl SessionManager {
         Ok(())
     }
 
-    pub(crate) fn append_jsonl_line(&self, id: &str, line: &[u8]) -> SessionResult<()> {
-        // An event session's log is its transcript (`docs/adr/0024` §14); a
-        // turn record written into it would be a line no reader understands.
-        if self.is_event_session(id) {
-            return Ok(());
-        }
-        self.ensure_native_writable(id, "append transcript")?;
-        if line.len() > MAX_JSONL_LINE_BYTES {
-            return Err(SessionStoreError::TooLarge {
-                kind: "transcript line",
-                limit: MAX_JSONL_LINE_BYTES,
-                actual: line.len(),
-            });
-        }
-        let path = self.jsonl_path(id)?;
-        fs::create_dir_all(&self.root).map_err(|e| io_at(&self.root, e))?;
-        // Windows security software and indexers can briefly deny an open or
-        // lock while inspecting a newly-updated file. Retry only those
-        // pre-write operations: retrying write_all itself could duplicate a
-        // partially-written JSONL record.
-        let mut file = retry_transient_file_access(|| open_append_file(&path))?;
-        retry_transient_file_access(|| {
-            fs2::FileExt::lock_exclusive(&file).map_err(|e| io_at(&path, e))
-        })?;
-        let current = usize::try_from(file.metadata().map_err(|e| io_at(&path, e))?.len())
-            .unwrap_or(usize::MAX);
-        let next = current
-            .checked_add(line.len())
-            .ok_or(SessionStoreError::TooLarge {
-                kind: "transcript",
-                limit: MAX_JSONL_BYTES,
-                actual: usize::MAX,
-            })?;
-        if next > MAX_JSONL_BYTES {
-            return Err(SessionStoreError::TooLarge {
-                kind: "transcript",
-                limit: MAX_JSONL_BYTES,
-                actual: next,
-            });
-        }
-        file.write_all(line).map_err(|e| io_at(&path, e))
-    }
-
     /// Load only `(turn_id, timestamp_ms)` from this session's bounded transcript.
     /// Message bodies are streamed past instead of retained, so opening a large WebUI
     /// history does not duplicate the full append-only transcript in memory. A missing
@@ -4588,29 +4542,6 @@ mod tests {
         assert_eq!(loaded.messages[0].text, "hello");
     }
 
-    /// Windows 回归测试：transcript 追加必须真实完成 open → lock → append → unlock。
-    /// 曾因 `open_append_file` 仅 `append(true)`（Windows 上只有 FILE_APPEND_DATA），
-    /// `LockFileEx` 要求 GENERIC_READ/GENERIC_WRITE 而必然失败，
-    /// 报 ERROR_ACCESS_DENIED (os error 5)。此问题仅存在于 Windows。
-    #[test]
-    #[cfg(windows)]
-    fn append_jsonl_line_lock_roundtrip_windows() {
-        let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::with_root(dir.path());
-        let id = "s1";
-        let mut payload = br#"{"v":1,"msg":"hello"}"#.to_vec();
-        payload.push(b'\n');
-
-        // 真实代码路径: open_append_file → lock_exclusive → write_all（unlock 随句柄关闭）
-        mgr.append_jsonl_line(id, &payload).unwrap_or_else(|e| {
-            panic!("transcript append must not fail on Windows: {e:?}");
-        });
-
-        // 内容确实被追加写入
-        let written = std::fs::read(mgr.jsonl_path(id).unwrap()).unwrap();
-        assert_eq!(written, payload);
-    }
-
     #[test]
     fn transcript_timestamps_load_without_message_bodies_and_missing_is_empty() {
         let dir = tempfile::tempdir().unwrap();
@@ -4635,7 +4566,7 @@ mod tests {
         });
         let mut bytes = serde_json::to_vec(&line).unwrap();
         bytes.push(b'\n');
-        mgr.append_jsonl_line("s1", &bytes).unwrap();
+        std::fs::write(mgr.jsonl_path("s1").unwrap(), &bytes).unwrap();
 
         let legacy_line = serde_json::json!({
             "v": 1,
@@ -4651,7 +4582,9 @@ mod tests {
         });
         let mut legacy_bytes = serde_json::to_vec(&legacy_line).unwrap();
         legacy_bytes.push(b'\n');
-        mgr.append_jsonl_line("s1", &legacy_bytes).unwrap();
+        let mut transcript = std::fs::read(mgr.jsonl_path("s1").unwrap()).unwrap();
+        transcript.extend_from_slice(&legacy_bytes);
+        std::fs::write(mgr.jsonl_path("s1").unwrap(), transcript).unwrap();
 
         let timestamps = mgr.load_transcript_timestamps("s1").unwrap();
         assert_eq!(timestamps.len(), 2);
@@ -4859,23 +4792,6 @@ mod tests {
                 actual
             }) if actual == MAX_SNAPSHOT_BYTES + 1
         ));
-    }
-
-    #[test]
-    fn transcript_append_rejects_an_oversized_line_without_creating_a_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::with_root(dir.path());
-        let line = vec![b'x'; MAX_JSONL_LINE_BYTES + 1];
-
-        assert!(matches!(
-            mgr.append_jsonl_line("s1", &line),
-            Err(SessionStoreError::TooLarge {
-                kind: "transcript line",
-                limit: MAX_JSONL_LINE_BYTES,
-                ..
-            })
-        ));
-        assert!(!mgr.jsonl_path("s1").unwrap().exists());
     }
 
     #[test]

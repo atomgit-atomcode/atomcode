@@ -7493,9 +7493,6 @@ fn harness_host_state(
     if let Some(snapshot) = parts.snapshot_hook() {
         hooks.insert("native-snapshot", snapshot);
     }
-    if let Some(transcript) = parts.transcript_hook() {
-        hooks.insert("transcript", transcript);
-    }
     let mcp = parts.mcp_publication();
     if let Some(publication) = &mcp {
         // Server-scoped instructions for the MCP tools currently mounted, as an

@@ -1075,6 +1075,59 @@ async fn a_persons_hooks_and_a_plugins_hooks_both_run() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// A Claude Code hook told where the session's transcript is gets the session's
+/// log, which replaced the transcript (`docs/adr/0024` §14) — and by the time
+/// the hook runs, the turn it is told about is in that file.
+async fn a_stop_hook_is_pointed_at_the_sessions_log() {
+    let env = env();
+    let project = env.project.path();
+    let payload = project.join("payload.json");
+    std::fs::write(
+        project.join(".hooks.json"),
+        serde_json::json!({
+            "hooks": {
+                "capture": {
+                    "event": "Stop",
+                    "command": format!("cat > {}", payload.display()),
+                },
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(start(project, &recorder, SessionMode::Fresh))
+        .await
+        .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+    turn(&mut runtime, "remember plum").await;
+    runtime.handle.shutdown().await.unwrap();
+
+    // A Stop hook is spawned, not awaited: wait for what it wrote.
+    let mut written = None;
+    for _ in 0..400 {
+        if let Some(value) = std::fs::read_to_string(&payload)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        {
+            written = Some(value);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let payload = written.expect("the Stop hook ran");
+    let log = SessionManager::for_project(project)
+        .events_path(&id)
+        .unwrap();
+    assert_eq!(
+        payload["transcript_path"],
+        serde_json::json!(log.display().to_string())
+    );
+    assert!(std::fs::read_to_string(&log)
+        .unwrap()
+        .contains("remember plum"));
+}
+
 /// With the datalog on, a turn is written to it.
 async fn the_datalog_is_written_when_it_is_on() {
     let env = env();
@@ -3234,6 +3287,7 @@ mod criteria {
         the_session_context_is_shown_and_its_git_snapshot_survives_a_resume,
         a_turn_is_transcribed_and_metered,
         a_persons_hooks_and_a_plugins_hooks_both_run,
+        a_stop_hook_is_pointed_at_the_sessions_log,
         the_datalog_is_written_when_it_is_on,
         an_eager_todo_reminder_rides_the_first_request,
         a_loop_turn_can_schedule_its_next_pass,
