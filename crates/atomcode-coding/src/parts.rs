@@ -371,6 +371,12 @@ pub struct CodingParts {
     /// The approval gate, handle EXPOSED: respawning on the same parts keeps every
     /// allow-always grant (the in_memory-buried-in-the-assembly bug from the review).
     pub approval: Arc<ApprovalMiddleware>,
+    /// What the `capability-commands` row asks the runtime to do — goal, loop,
+    /// the local-context queue, the policy intervention (`docs/adr/0021` §3).
+    /// Filled by the runtime before it mounts, and kept across a rebuild:
+    /// nothing in `prepare` can build it, because it talks back to the loop that
+    /// owns these parts.
+    pub(crate) runtime_commands: Option<Arc<dyn crate::runtime::RuntimeCommands>>,
     /// Concrete handle retained so provider-only reassembly can update the
     /// per-turn cost attribution without rebuilding session-owned hooks.
     snapshot_hook: Option<Arc<SnapshotHook>>,
@@ -875,6 +881,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     }
 
     Ok(CodingParts {
+        runtime_commands: None,
         shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
         plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         bypass_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1150,6 +1157,14 @@ impl CodingParts {
     }
 
     /// Preserve the exact current conversation across a sessionless provider reassembly.
+    /// The runtime's own capabilities, for the row that offers them as commands.
+    pub(crate) fn set_runtime_commands(
+        &mut self,
+        commands: Arc<dyn crate::runtime::RuntimeCommands>,
+    ) {
+        self.runtime_commands = Some(commands);
+    }
+
     pub(crate) fn set_runtime_resume(&mut self, snapshot: SessionSnapshot) {
         self.runtime_resume = Some(snapshot);
     }

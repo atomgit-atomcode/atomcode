@@ -1287,6 +1287,10 @@ pub struct HostState {
     /// The skill registry the runtime loaded, its prompt catalog, and where it
     /// looked.
     pub skills: Option<crate::host_rows::LoadedSkills>,
+    /// The runtime's own capabilities — goal, loop, the local-context queue,
+    /// the policy intervention — offered as commands a person runs
+    /// (`docs/adr/0021` §3, §10).
+    pub(crate) runtime_commands: Option<Arc<dyn crate::runtime::RuntimeCommands>>,
     /// Row edits the runtime's own options call for (a capability switched off,
     /// a directory to resolve against).
     pub rows: Layer,
@@ -1444,6 +1448,9 @@ pub async fn mount_hosted(
                 .swap("skills", "skills-host")
                 .disable("skill-catalog-inline")
         })
+        .when(host.runtime_commands.is_some(), |layer| {
+            layer.insert(Entry::named("capability-commands"))
+        })
         .when(host.mcp.is_some(), |layer| {
             layer.swap("mcp", "mcp-host").enable("mcp")
         })
@@ -1542,6 +1549,11 @@ pub async fn mount_hosted(
     }
     if let Some(skills) = host.skills {
         registry.register(Arc::new(crate::host_rows::SkillsHostPlugin(skills)));
+    }
+    if let Some(commands) = host.runtime_commands {
+        registry.register(Arc::new(crate::host_rows::CapabilityCommandsPlugin(
+            commands,
+        )));
     }
     if let Some(file) = host.config_file {
         registry.register(Arc::new(crate::host_rows::ConfigFilePlugin(file)));

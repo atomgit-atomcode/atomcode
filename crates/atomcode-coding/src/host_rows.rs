@@ -65,6 +65,7 @@ use atomcode_harness::seams::{
     AgentsSvc, SessionDefaults, SessionDefaultsSvc, SessionSvc, SystemPromptSvc, TurnOutcome,
 };
 use atomcode_harness::session::{InjectionOrigin, SessionEvent};
+use atomcode_kernel::agent::CommandDescription;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message, MessageMeta, SessionSnapshot};
 use atomcode_plexus::{Context, Listener, Next, Plugin, Waterfall};
@@ -1774,5 +1775,229 @@ impl Plugin for CompactionCodingPlugin {
             .map_err(|e| e.to_string())?;
         atomcode_harness::plugins::loop_policy::mount_compaction_trigger(ctx, row.threshold);
         Ok(())
+    }
+}
+
+// ---- the runtime's own capabilities, as commands a person runs ---------------
+//
+// goal, loop, the local-context queue and the policy intervention are
+// capabilities, not host controls: they belong to a row, and a front end reaches
+// them through the command catalog like any other row's command
+// (`docs/adr/0021` §3, §10). The two policy errors are decided here rather than
+// in the host contract (§8) — whether anything is waiting, and whether what a
+// person typed is one of its choices, are this row's judgements.
+
+/// `capability-commands`: goal, loop, queue and policy, in the catalog.
+pub(crate) struct CapabilityCommandsPlugin(pub(crate) Arc<dyn crate::runtime::RuntimeCommands>);
+
+#[async_trait]
+impl Plugin for CapabilityCommandsPlugin {
+    fn name(&self) -> &'static str {
+        "capability-commands"
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["commands"]
+    }
+    fn description(&self) -> &'static str {
+        "goal, loop, the local-context queue and the policy intervention, as commands"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        for command in [
+            Arc::new(GoalCommand(self.0.clone()))
+                as Arc<dyn atomcode_harness::commands::CatalogCommand>,
+            Arc::new(LoopCommand(self.0.clone())),
+            Arc::new(QueueCommand(self.0.clone())),
+            Arc::new(PolicyCommand(self.0.clone())),
+        ] {
+            atomcode_harness::commands::register(ctx, command)?;
+        }
+        Ok(())
+    }
+}
+
+/// A command on the conversation as a whole — never on one member: a member
+/// runs in the same runtime, and starting a goal "on" it would be starting one
+/// on the conversation under another name.
+fn on_the_session(name: &str, usage: Option<&str>, summary: &str) -> CommandDescription {
+    CommandDescription {
+        name: name.into(),
+        usage: usage.map(str::to_string),
+        summary: summary.into(),
+        target: atomcode_kernel::agent::CommandTarget::Session,
+    }
+}
+
+/// Only for the conversation itself. A delegated agent is driven by its lead,
+/// and these drive the runtime.
+fn the_conversation_itself(agent: &atomcode_harness::agent::Agent) -> bool {
+    agent.parent().is_none()
+}
+
+struct GoalCommand(Arc<dyn crate::runtime::RuntimeCommands>);
+
+#[async_trait]
+impl atomcode_harness::commands::CatalogCommand for GoalCommand {
+    fn describe(&self) -> CommandDescription {
+        on_the_session(
+            "goal",
+            Some("<要达成的条件> | stop | pause"),
+            "自己干到条件成立为止;`stop` 收工,`pause` 先搁着。",
+        )
+    }
+    fn offered_for(&self, agent: &atomcode_harness::agent::Agent) -> bool {
+        the_conversation_itself(agent)
+    }
+    async fn run(
+        &self,
+        _agent: Arc<atomcode_harness::agent::Agent>,
+        args: &str,
+    ) -> Result<String, String> {
+        match args.trim() {
+            "" => Err("要一个条件:达成什么才算完。".into()),
+            "stop" => {
+                self.0.stop_goal().await?;
+                Ok("目标停了。".into())
+            }
+            "pause" => {
+                self.0.pause_goal().await?;
+                Ok("目标先搁着,还可以接着干。".into())
+            }
+            condition => {
+                self.0.start_goal(condition.to_string()).await?;
+                Ok(format!("开始干,直到:{condition}"))
+            }
+        }
+    }
+}
+
+struct LoopCommand(Arc<dyn crate::runtime::RuntimeCommands>);
+
+#[async_trait]
+impl atomcode_harness::commands::CatalogCommand for LoopCommand {
+    fn describe(&self) -> CommandDescription {
+        on_the_session(
+            "loop",
+            Some("<每轮要做的事> | stop"),
+            "一遍遍地做同一件事,直到 `stop`。",
+        )
+    }
+    fn offered_for(&self, agent: &atomcode_harness::agent::Agent) -> bool {
+        the_conversation_itself(agent)
+    }
+    async fn run(
+        &self,
+        _agent: Arc<atomcode_harness::agent::Agent>,
+        args: &str,
+    ) -> Result<String, String> {
+        match args.trim() {
+            "" => Err("要一句话:每轮做什么。".into()),
+            "stop" => {
+                self.0.stop_loop().await?;
+                Ok("循环停了。".into())
+            }
+            prompt => {
+                self.0.start_loop(prompt.to_string()).await?;
+                Ok(format!("每轮都做:{prompt}"))
+            }
+        }
+    }
+}
+
+struct QueueCommand(Arc<dyn crate::runtime::RuntimeCommands>);
+
+#[async_trait]
+impl atomcode_harness::commands::CatalogCommand for QueueCommand {
+    fn describe(&self) -> CommandDescription {
+        on_the_session(
+            "queue",
+            Some("<要先说的话>"),
+            "排在下一轮前面的话 —— 现在不打断,下一轮模型先看到它。",
+        )
+    }
+    fn offered_for(&self, agent: &atomcode_harness::agent::Agent) -> bool {
+        the_conversation_itself(agent)
+    }
+    async fn run(
+        &self,
+        _agent: Arc<atomcode_harness::agent::Agent>,
+        args: &str,
+    ) -> Result<String, String> {
+        let text = args.trim();
+        if text.is_empty() {
+            return Err("要有话可排。".into());
+        }
+        self.0.queue_local_context(text.to_string()).await?;
+        Ok("排好了,下一轮先说这个。".into())
+    }
+}
+
+struct PolicyCommand(Arc<dyn crate::runtime::RuntimeCommands>);
+
+impl PolicyCommand {
+    /// What a person types for each way out, and what it means.
+    fn action(word: &str) -> Option<atomcode_kernel::event::PolicyRecoveryAction> {
+        use atomcode_kernel::event::PolicyRecoveryAction as A;
+        match word {
+            "done" => Some(A::CompleteExternally),
+            "skip" => Some(A::SkipStep),
+            "how" => Some(A::ViewSafeInstructions),
+            "end" => Some(A::EndTask),
+            _ => None,
+        }
+    }
+
+    fn word(action: &atomcode_kernel::event::PolicyRecoveryAction) -> &'static str {
+        use atomcode_kernel::event::PolicyRecoveryAction as A;
+        match action {
+            A::CompleteExternally => "done",
+            A::SkipStep => "skip",
+            A::ViewSafeInstructions => "how",
+            A::EndTask => "end",
+            // A way out added since: named by nothing a person can type, which
+            // is better than naming it as one of these.
+            _ => "?",
+        }
+    }
+}
+
+#[async_trait]
+impl atomcode_harness::commands::CatalogCommand for PolicyCommand {
+    fn describe(&self) -> CommandDescription {
+        on_the_session(
+            "policy",
+            Some("done | skip | how | end"),
+            "卡在策略边界上时,说怎么往下走;不带参数就是问有哪些走法。",
+        )
+    }
+    fn offered_for(&self, agent: &atomcode_harness::agent::Agent) -> bool {
+        the_conversation_itself(agent)
+    }
+    async fn run(
+        &self,
+        _agent: Arc<atomcode_harness::agent::Agent>,
+        args: &str,
+    ) -> Result<String, String> {
+        // Both judgements are this row's (`docs/adr/0021` §8): whether anything
+        // is waiting, and whether this is one of its ways out.
+        let pending = self
+            .0
+            .pending_policy()
+            .await
+            .ok_or_else(|| "现在没有卡住的策略边界要你决定。".to_string())?;
+        let choices = pending
+            .actions
+            .iter()
+            .map(Self::word)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let word = args.trim();
+        if word.is_empty() {
+            return Ok(format!("可以怎么走:{choices}"));
+        }
+        let action = Self::action(word)
+            .filter(|action| pending.actions.contains(action))
+            .ok_or_else(|| format!("`{word}` 不是这次的走法;可以选:{choices}"))?;
+        self.0.resolve_policy(pending.id, action).await?;
+        Ok(format!("按 `{word}` 往下走。"))
     }
 }

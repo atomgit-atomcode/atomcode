@@ -1184,6 +1184,101 @@ async fn a_turn_logs_the_checkpoint_it_started_from_and_so_does_a_workspace_rewi
     );
 }
 
+/// The runtime's own capabilities are commands in the catalog, run by a person
+/// from the front end (`docs/adr/0021` §3, §10): a goal, a loop, the queue that
+/// puts a line in front of the next turn, and the way out of a policy
+/// intervention.
+///
+/// They are not host controls and not tools: the model never sees them, and the
+/// host contract has no variant for any of them — a capability that arrives as a
+/// row arrives with its commands.
+#[tokio::test]
+async fn the_runtimes_own_capabilities_are_commands_in_the_catalog() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let session = connection.session.clone();
+    connection.commands.send(subscribe(&session)).unwrap();
+    let described = quiet(&mut connection).await;
+    let offered: Vec<String> = described
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Described { description } if description.session == session => Some(
+                description
+                    .commands
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .last()
+        .unwrap_or_default();
+    for name in ["goal", "loop", "queue", "policy"] {
+        assert!(
+            offered.contains(&name.to_string()),
+            "`{name}` is on offer: {offered:?}"
+        );
+    }
+
+    // The queue is the one whose effect the model itself shows: what was queued
+    // rides in front of the next turn.
+    connection
+        .commands
+        .send(AgentCommand::Invoke {
+            id: "q".into(),
+            session: session.clone(),
+            name: "queue".into(),
+            args: "先看 README".into(),
+        })
+        .unwrap();
+    let seen = until(
+        &mut connection,
+        |e| matches!(e, AgentEvent::Invoked { id, .. } if id == "q"),
+    )
+    .await;
+    assert!(
+        seen.iter().any(|e| matches!(
+            e,
+            AgentEvent::Invoked { id, output } if id == "q" && !output.is_empty()
+        )),
+        "it says what it did: {seen:#?}"
+    );
+    connection.commands.send(message("go on")).unwrap();
+    through_turn(&mut connection).await;
+    let (_, asked) = env.script.requests.lock().unwrap().last().cloned().unwrap();
+    assert!(
+        asked.iter().any(|m| m.text.contains("先看 README")),
+        "what was queued reached the model: {:#?}",
+        user_texts_in(&asked)
+    );
+
+    // Nothing is stuck at a policy boundary, and that judgement is the row's:
+    // the host contract has no error for it.
+    connection
+        .commands
+        .send(AgentCommand::Invoke {
+            id: "p".into(),
+            session: session.clone(),
+            name: "policy".into(),
+            args: "skip".into(),
+        })
+        .unwrap();
+    let seen = until(
+        &mut connection,
+        |e| matches!(e, AgentEvent::Invoked { id, .. } if id == "p"),
+    )
+    .await;
+    // The answer is words for a person, not a contract error: a command that
+    // could not be carried out says why in the same place its result would be.
+    assert!(
+        seen.iter().any(|e| matches!(
+            e,
+            AgentEvent::Invoked { id, output } if id == "p" && output.contains("策略")
+        )),
+        "the row says nothing is waiting: {seen:#?}"
+    );
+}
+
 /// A host configuration the test edits: `model` is what `current` resolves to,
 /// and `edits` is what a host would read off the file to tell whether it moved.
 struct Editable {

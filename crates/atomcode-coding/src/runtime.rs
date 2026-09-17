@@ -577,6 +577,35 @@ impl From<&str> for UserInput {
     }
 }
 
+/// What a capability row asks the runtime to do on a person's word
+/// (`docs/adr/0021` §3, §10).
+///
+/// Narrow on purpose: the row is mounted in the agent's tree and must not grow
+/// a dependency on the whole driver protocol, which is an implementation of the
+/// transition and not a contract (§5). Everything here is something a person
+/// runs from a front end — never a tool the model can reach.
+#[async_trait::async_trait]
+pub trait RuntimeCommands: Send + Sync {
+    /// Work towards `condition` on its own until it holds.
+    async fn start_goal(&self, condition: String) -> Result<(), String>;
+    /// Stop the goal that is running.
+    async fn stop_goal(&self) -> Result<(), String>;
+    /// Leave the goal where it is; it can be taken up again.
+    async fn pause_goal(&self) -> Result<(), String>;
+    /// Run `prompt` again and again until it is stopped.
+    async fn start_loop(&self, prompt: String) -> Result<(), String>;
+    async fn stop_loop(&self) -> Result<(), String>;
+    /// Put `text` in front of the next turn, as the person's own context.
+    async fn queue_local_context(&self, text: String) -> Result<(), String>;
+    /// The policy intervention waiting for a person to say how to go on, if one
+    /// is. The row asks before it resolves: whether there is one, and whether
+    /// what a person typed is among its choices, are the row's two judgements
+    /// to make (`docs/adr/0021` §8) — the host contract has no say in them.
+    async fn pending_policy(&self) -> Option<PolicyIntervention>;
+    /// Go on from the intervention `id` the way `action` says.
+    async fn resolve_policy(&self, id: u64, action: PolicyRecoveryAction) -> Result<(), String>;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubmitReceipt {
     Started { generation: u64, turn_id: u64 },
@@ -1385,6 +1414,15 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    /// The policy intervention waiting for a person, if one is.
+    pub async fn pending_policy_intervention(&self) -> Option<PolicyIntervention> {
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::PendingPolicyIntervention { done })
+            .ok()?;
+        result.await.ok().flatten()
+    }
+
     pub async fn snapshot(&self) -> Result<Arc<SessionSnapshot>, RuntimeError> {
         Ok(self.snapshot_with_revision().await?.snapshot)
     }
@@ -2002,6 +2040,13 @@ impl CodingRuntime {
             wakeup_tx.clone(),
             Arc::clone(&loop_active),
         )));
+        // Before the mount, because a row mounted in it offers the runtime's own
+        // capabilities as commands (`docs/adr/0021` §3) and needs somewhere to
+        // send them. The channel is usable the moment it exists; the loop that
+        // reads it starts below, and a command that arrives before then waits in
+        // it like any other.
+        let (handle, controls) = coding_runtime_control_channel();
+        parts.set_runtime_commands(Arc::new(handle.clone()));
         let session_id = parts.session.as_ref().map(|binding| binding.id.as_str());
         let session = parts.session.as_ref().map(|binding| RuntimeSessionInfo {
             id: binding.id.clone(),
@@ -2052,7 +2097,6 @@ impl CodingRuntime {
             .publish_staged_session()
             .map_err(runtime_start_prepare_error)?;
 
-        let (handle, controls) = coding_runtime_control_channel();
         let (raw_event_tx, _raw_events) = mpsc::unbounded_channel();
         let (tagged_event_tx, mut tagged_events) = mpsc::unbounded_channel();
         let adapter = spawn_runtime_owner_with_optional_agent(
@@ -2308,6 +2352,11 @@ pub enum CodingRuntimeControl {
         generation: u64,
         target: ReprepareTarget,
         done: oneshot::Sender<Result<SessionChanged, RuntimeError>>,
+    },
+    /// What a capability row asks before it resolves one: the intervention
+    /// waiting now, or nothing.
+    PendingPolicyIntervention {
+        done: oneshot::Sender<Option<PolicyIntervention>>,
     },
     ApplyUndo {
         generation: u64,
@@ -3691,6 +3740,9 @@ fn spawn_runtime_owner_with_optional_agent(
                                 let _ = done.send(Ok(()));
                             }
                         }
+                    }
+                    Some(CodingRuntimeControl::PendingPolicyIntervention { done }) => {
+                        let _ = done.send(pending_policy_intervention.clone());
                     }
                     Some(CodingRuntimeControl::ResolvePolicyIntervention {
                         generation: request_generation,
@@ -7080,6 +7132,11 @@ fn reject_runtime_control(
         CodingRuntimeControl::Shutdown { .. } => {}
         // Fire-and-forget self-send with no waiter: nothing to fail-close.
         CodingRuntimeControl::AdjustGoalRounds { .. } => {}
+        // A question, not a change: a stopping runtime has nothing pending, and
+        // dropping the sender says so to a caller that is asking anyway.
+        CodingRuntimeControl::PendingPolicyIntervention { done } => {
+            let _ = done.send(None);
+        }
         CodingRuntimeControl::Submit { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
@@ -7761,6 +7818,7 @@ fn harness_host_state(
             .chain(parts.host_only_tools())
             .collect(),
         skills: parts.skill_registry(),
+        runtime_commands: parts.runtime_commands.clone(),
         mcp,
         rate_limit_source: parts.rate_limit_source().cloned(),
         front_end: prepare.front_end.clone(),
@@ -8187,6 +8245,48 @@ fn reload_skills_live(runtime: &RuntimeResources) -> Result<usize, ()> {
         }
     }
     Ok(registry.len())
+}
+
+#[async_trait::async_trait]
+impl RuntimeCommands for CodingRuntimeHandle {
+    async fn start_goal(&self, condition: String) -> Result<(), String> {
+        CodingRuntimeHandle::start_goal(self, condition)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn stop_goal(&self) -> Result<(), String> {
+        CodingRuntimeHandle::stop_goal(self)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn pause_goal(&self) -> Result<(), String> {
+        CodingRuntimeHandle::pause_goal(self)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn start_loop(&self, prompt: String) -> Result<(), String> {
+        CodingRuntimeHandle::start_loop(self, prompt)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn stop_loop(&self) -> Result<(), String> {
+        CodingRuntimeHandle::stop_loop(self)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn queue_local_context(&self, text: String) -> Result<(), String> {
+        CodingRuntimeHandle::queue_local_context(self, LocalContextInput { content: text })
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn pending_policy(&self) -> Option<PolicyIntervention> {
+        self.pending_policy_intervention().await
+    }
+    async fn resolve_policy(&self, id: u64, action: PolicyRecoveryAction) -> Result<(), String> {
+        self.resolve_policy_intervention(id, action)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Whether the change from `live`'s log to `target` is one the log can *say* —
