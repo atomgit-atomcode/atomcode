@@ -134,7 +134,10 @@ pub trait Producer: Send + Sync {
 
     /// Fold one fact into the stream. The writer is the only thing that can
     /// change it, and it cannot reach a settled block.
-    fn absorb(&self, fact: &SessionEvent, out: &mut StreamWriter<'_>);
+    /// The fact with its sequence number: a producer that has to say what a
+    /// later fact refers to — an undo names the turn it went back to by the
+    /// sequence number of its start — cannot do it from the event alone.
+    fn absorb(&self, logged: &atomcode_harness::session::LoggedEvent, out: &mut StreamWriter<'_>);
 
     /// Forget what is open: the next fact belongs to another session's stream.
     fn reset(&self) {}

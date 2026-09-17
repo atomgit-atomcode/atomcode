@@ -1643,8 +1643,14 @@ impl CodingRuntimeHandle {
         let generation = self.status().generation;
         let original = self.snapshot_with_revision().await?;
         let undo = undo_snapshot_to_prompt(&original.undo_snapshot, nth)?;
-        self.apply_undo(generation, original.revision, original.undo_snapshot, undo)
-            .await
+        self.apply_undo(
+            generation,
+            original.revision,
+            original.undo_snapshot,
+            undo,
+            None,
+        )
+        .await
     }
 
     async fn apply_undo(
@@ -1653,12 +1659,14 @@ impl CodingRuntimeHandle {
         expected_revision: u64,
         original: Arc<SessionSnapshot>,
         undo: SnapshotUndoResult,
+        code_rewound_to: Option<u64>,
     ) -> Result<UndoResult, RuntimeError> {
         let (done, result) = oneshot::channel();
         self.tx
             .send(CodingRuntimeControl::ApplyUndo {
                 generation,
                 expected_revision,
+                code_rewound_to,
                 original,
                 truncated: undo.snapshot,
                 restored_prompt: undo.restored_prompt,
@@ -1761,6 +1769,7 @@ impl CodingRuntimeHandle {
                 catalog.revision,
                 original.undo_snapshot,
                 undo,
+                scope.restores_code().then_some(point.turn_id),
             )
             .await
         {
@@ -2303,6 +2312,10 @@ pub enum CodingRuntimeControl {
     ApplyUndo {
         generation: u64,
         expected_revision: u64,
+        /// The turn whose checkpoint the workspace was restored from, when the
+        /// same rewind took the workspace back too: recorded beside the
+        /// conversation's own fact (`docs/adr/0024` §17).
+        code_rewound_to: Option<u64>,
         original: Arc<SessionSnapshot>,
         truncated: SessionSnapshot,
         restored_prompt: String,
@@ -5383,6 +5396,7 @@ fn spawn_runtime_owner_with_optional_agent(
                     Some(CodingRuntimeControl::ApplyUndo {
                         generation: request_generation,
                         expected_revision,
+                        code_rewound_to,
                         original,
                         truncated,
                         restored_prompt,
@@ -5406,10 +5420,16 @@ fn spawn_runtime_owner_with_optional_agent(
                         if let Some(task) = next_prompt_task.take() {
                             task.abort();
                         }
+                        // With the agent live, the undo is facts in its log and
+                        // nothing is rebuilt (`docs/adr/0022` §2) — as long as
+                        // the log can say the change; see `live_can_say`.
+                        let live = live_root_agent(&runtime)
+                            .filter(|live| live_can_say(live, &truncated.messages));
                         let undo_sidecars = match persist_runtime_undo(
                             &mut runtime,
                             Some(original.as_ref()),
                             &truncated,
+                            live.as_ref(),
                         ) {
                             Ok(sidecars) => sidecars,
                             Err(error) => {
@@ -5461,6 +5481,35 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = runtime_event_tx.send(CodingRuntimeEvent::Reconfiguring {
                             operation: ReconfigureKind::Undo,
                         });
+                        if let Some(agent) = live.as_ref() {
+                            let _ = undo_sidecars;
+                            if let Some(turn) = code_rewound_to {
+                                record_code_rewind(agent, turn);
+                            }
+                            generation = generation.wrapping_add(1);
+                            event_generation.store(generation, Ordering::Release);
+                            pending_steer_acknowledgements.clear();
+                            runtime.parts.team_manager.begin_generation(generation);
+                            observed_tokens = None;
+                            conversation_revision = conversation_revision.wrapping_add(1);
+                            let snapshot = Arc::new(truncated);
+                            resources = Some(runtime);
+                            controls.state.store(
+                                runtime_phase_state(generation, RuntimePhase::Ready),
+                                Ordering::Release,
+                            );
+                            let _ = runtime_event_tx.send(CodingRuntimeEvent::Reconfigured {
+                                operation: ReconfigureKind::Undo,
+                            });
+                            let _ = done.send(Ok(UndoResult {
+                                generation: RuntimeGeneration(generation),
+                                snapshot,
+                                restored_prompt,
+                                target_n,
+                                prompts_before,
+                            }));
+                            continue;
+                        }
                         let stop_report = stop_current_agent(
                             &mut agent,
                             &mut compactions,
@@ -5619,6 +5668,76 @@ fn spawn_runtime_owner_with_optional_agent(
                         let _ = runtime_event_tx.send(CodingRuntimeEvent::Reconfiguring {
                             operation: ReconfigureKind::RestoreSession,
                         });
+                        // Between turns, with the agent live, a restore is facts
+                        // in its log like an undo, and nothing is rebuilt.
+                        let live = (active_turn.is_none() && !compactions.is_active())
+                            .then(|| live_root_agent(&runtime))
+                            .flatten()
+                            .filter(|live| live_can_say(live, &snapshot.messages));
+                        if let Some(live) = live {
+                            let original = current_runtime_snapshot(&runtime)
+                                .or_else(|| runtime.parts.runtime_resume_snapshot());
+                            match persist_runtime_undo(
+                                &mut runtime,
+                                original.as_ref(),
+                                &snapshot,
+                                Some(&live),
+                            ) {
+                                Ok(_) => {
+                                    generation = generation.wrapping_add(1);
+                                    event_generation.store(generation, Ordering::Release);
+                                    pending_steer_acknowledgements.clear();
+                                    runtime.parts.team_manager.begin_generation(generation);
+                                    observed_tokens = None;
+                                    conversation_revision = conversation_revision.wrapping_add(1);
+                                    let changed = session_changed(generation, &runtime);
+                                    resources = Some(runtime);
+                                    controls.state.store(
+                                        runtime_phase_state(generation, RuntimePhase::Ready),
+                                        Ordering::Release,
+                                    );
+                                    let _ = runtime_event_tx.send(
+                                        CodingRuntimeEvent::SessionChanged(changed.clone()),
+                                    );
+                                    if let Some(intervention) = pending_policy_intervention.take()
+                                    {
+                                        let _ = runtime_event_tx.send(
+                                            CodingRuntimeEvent::PolicyInterventionCleared {
+                                                intervention_id: intervention.id,
+                                            },
+                                        );
+                                    }
+                                    let _ = runtime_event_tx.send(
+                                        CodingRuntimeEvent::Reconfigured {
+                                            operation: ReconfigureKind::RestoreSession,
+                                        },
+                                    );
+                                    let _ = done.send(Ok(changed));
+                                }
+                                Err(error) => {
+                                    if error.requires_fail_close() {
+                                        persistence_failure = Some(error.to_string());
+                                        let _ = send_agent_command(&agent, AgentCommand::Shutdown);
+                                        agent = None;
+                                        agent_available = false;
+                                        controls.state.store(
+                                            runtime_phase_state(generation, RuntimePhase::Failed),
+                                            Ordering::Release,
+                                        );
+                                    } else {
+                                        controls.state.store(
+                                            runtime_phase_state(generation, RuntimePhase::Ready),
+                                            Ordering::Release,
+                                        );
+                                    }
+                                    resources = Some(runtime);
+                                    let _ = done.send(Err(RuntimeError::ReconfigureFailed(
+                                        error.to_string(),
+                                    )));
+                                }
+                            }
+                            continue;
+                        }
                         fail_close_pending_requests(
                             &agent,
                             &mut pending_requests,
@@ -5674,6 +5793,7 @@ fn spawn_runtime_owner_with_optional_agent(
                             &mut runtime,
                             original.as_ref(),
                             &snapshot,
+                            None,
                         );
                         let candidate = match persisted.as_ref() {
                             Ok(_) => assemble_runtime_resources(&mut runtime)
@@ -7918,6 +8038,14 @@ impl NativePersistenceError {
         }
     }
 
+    fn uncertain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            uncertain_commit: true,
+            snapshot_conflict: false,
+        }
+    }
+
     fn requires_fail_close(&self) -> bool {
         self.uncertain_commit
     }
@@ -7955,15 +8083,105 @@ fn persistence_fail_close_reason(
     }
 }
 
+/// Record that the workspace went back to before `turn` (`docs/adr/0024` §17).
+///
+/// The conversation's own `Rewound` says what the model no longer sees; this one
+/// says what the working tree no longer holds, and the projection leaves the
+/// conversation alone.
+fn record_code_rewind(live: &atomcode_harness::agent::Agent, turn: u64) {
+    use atomcode_harness::session::SessionEvent;
+    let log = live.session();
+    let Some(to) = log.events().iter().find_map(|logged| {
+        matches!(logged.event, SessionEvent::TurnStart { turn: t } if t == turn)
+            .then_some(logged.seq)
+    }) else {
+        return;
+    };
+    atomcode_harness::session::commit(
+        live.ctx(),
+        &log,
+        SessionEvent::Rewound {
+            turn: log.current_turn(),
+            to,
+            scope: atomcode_harness::session::RewindScope::Code,
+        },
+    );
+}
+
+/// Whether the change from `live`'s log to `target` is one the log can *say* —
+/// an undo or a compaction — rather than a conversation reseeded from outside
+/// it.
+///
+/// A reseed appends the target's own messages as facts, and an unanswered
+/// prompt among them is a prompt the live agent answers: committing one would
+/// make a *restore* send something to the model. So a candidate the log cannot
+/// say goes the other way, through a rebuilt runtime, which is what a
+/// conversation that did not come out of this log always needed.
+fn live_can_say(live: &atomcode_harness::agent::Agent, target: &[Message]) -> bool {
+    use atomcode_harness::session::SessionEvent;
+    atomcode_capabilities::session::events::events_to_become(&live.session().events(), target)
+        .iter()
+        .all(|event| {
+            matches!(
+                event,
+                SessionEvent::Rewound { .. } | SessionEvent::Compacted { .. }
+            )
+        })
+}
+
+/// The conversation's own agent, live in the mounted tree — what a change to
+/// the same session is committed into rather than rebuilt around
+/// (`docs/adr/0022` §2).
+fn live_root_agent(runtime: &RuntimeResources) -> Option<Arc<atomcode_harness::agent::Agent>> {
+    runtime
+        .harness_app
+        .as_ref()?
+        .context()
+        .service::<atomcode_harness::seams::AgentsSvc>()?
+        .list()
+        .into_iter()
+        .find(|agent| agent.parent().is_none())
+}
+
+/// Commit `events` into `live`'s log, in order. The session store appends each
+/// as it is committed; one it could not keep is reported as an uncertain commit.
+fn commit_into_live_log(
+    runtime: &RuntimeResources,
+    live: &atomcode_harness::agent::Agent,
+    events: impl IntoIterator<Item = atomcode_harness::session::SessionEvent>,
+) -> Result<(), NativePersistenceError> {
+    let log = live.session();
+    for event in events {
+        atomcode_harness::session::commit(live.ctx(), &log, event);
+    }
+    match runtime.parts.take_snapshot_persistence_uncertain() {
+        Some(message) => Err(NativePersistenceError::uncertain(message)),
+        None => Ok(()),
+    }
+}
+
+/// Take the stored conversation to `snapshot`, with the facts that make its
+/// projection that (`docs/adr/0024` §17). With a `live` agent they are committed
+/// into its log — every subscriber hears them and nothing is rebuilt; without
+/// one they are appended to the store for a rebuilt tree to replay.
 fn persist_runtime_undo(
     runtime: &mut RuntimeResources,
     expected_snapshot: Option<&SessionSnapshot>,
     snapshot: &SessionSnapshot,
+    live: Option<&Arc<atomcode_harness::agent::Agent>>,
 ) -> Result<Option<NativeUndoSidecars>, NativePersistenceError> {
     let Some(binding) = runtime.parts.session.as_ref() else {
         runtime.parts.set_runtime_resume(snapshot.clone());
+        if let Some(live) = live {
+            let change = atomcode_capabilities::session::events::events_to_become(
+                &live.session().events(),
+                &snapshot.messages,
+            );
+            commit_into_live_log(runtime, live, change)?;
+        }
         return Ok(None);
     };
+    let mut live_change: Vec<atomcode_harness::session::SessionEvent> = Vec::new();
     let message_count = u32::try_from(snapshot.messages.len()).map_err(|_| {
         NativePersistenceError::certain("snapshot message count exceeds native metadata")
     })?;
@@ -8047,9 +8265,17 @@ fn persist_runtime_undo(
                 })?;
                 meta.updated_at = atomcode_capabilities::session::now_ms();
                 if let Some(plan) = plan {
-                    binding
-                        .manager
-                        .append_events(&binding.lease, &plan.change)?;
+                    if live.is_some() {
+                        live_change = plan
+                            .change
+                            .iter()
+                            .map(|logged| logged.event.clone())
+                            .collect();
+                    } else {
+                        binding
+                            .manager
+                            .append_events(&binding.lease, &plan.change)?;
+                    }
                     sidecars.events_mark = Some(plan.mark);
                 }
                 Ok(sidecars)
@@ -8062,6 +8288,9 @@ fn persist_runtime_undo(
                 NativePersistenceError::from(error)
             }
         })?;
+    if let Some(live) = live {
+        commit_into_live_log(runtime, live, live_change)?;
+    }
     Ok(Some(sidecars))
 }
 
@@ -12385,6 +12614,7 @@ mod tests {
         handle
             .tx
             .send(CodingRuntimeControl::ApplyUndo {
+                code_rewound_to: None,
                 generation: handle.status().generation,
                 expected_revision: original.revision,
                 original: original.snapshot,
@@ -15498,6 +15728,7 @@ mod tests {
                 catalog.revision,
                 original.undo_snapshot,
                 undo,
+                None,
             )
             .await
             .unwrap();
@@ -15588,6 +15819,13 @@ mod tests {
         runtime.handle.shutdown().await.unwrap();
     }
 
+    /// A conversation the log cannot say — one with a prompt the session never
+    /// saw — is restored by rebuilding, and a candidate provider that cannot be
+    /// built takes the conversation back to what it was.
+    ///
+    /// The route matters as much as the rollback: see `live_can_say`. A restore
+    /// that committed that prompt as a fact would hand the live agent something
+    /// to answer, which is a restore that talks to the model.
     #[tokio::test]
     async fn failed_sessionless_restore_rolls_back_to_the_original_snapshot() {
         let factory = Arc::new(FailSecondBuildFactory {
@@ -15624,6 +15862,82 @@ mod tests {
             .messages
             .iter()
             .all(|message| message.text != "replacement prompt"));
+        runtime.handle.shutdown().await.unwrap();
+    }
+
+    /// A restore the log *can* say — going back to a conversation this session
+    /// already had — is facts in the live log and nothing else: the provider the
+    /// conversation is running on is kept, and the model is not asked anything
+    /// (`docs/adr/0022` §2, `docs/adr/0024` §17).
+    ///
+    /// A rebuild here would close the fact stream every front end is reading
+    /// and build a second provider for a session that never changed.
+    #[tokio::test]
+    async fn a_restore_the_log_can_say_is_facts_and_keeps_the_provider() {
+        let factory = Arc::new(FailSecondBuildFactory {
+            builds: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut start = native_start(false);
+        start.provider_factory = factory.clone();
+        let mut runtime = CodingRuntime::start(start).await.unwrap();
+        let mut after = Vec::new();
+        for text in ["first prompt", "second prompt"] {
+            runtime.handle.submit(UserInput::from(text)).await.unwrap();
+            loop {
+                if let CodingRuntimeEvent::TurnFinished(TurnCompletion::Completed {
+                    snapshot,
+                    ..
+                }) = runtime.events.recv().await.unwrap().event
+                {
+                    after.push(snapshot);
+                    break;
+                }
+            }
+        }
+        let built = factory.builds.load(Ordering::Acquire);
+        // The conversation as it stood after the first turn: a truncation of the
+        // one that is live, which is what an undo is and what the log says with
+        // one `Rewound`.
+        let candidate = after[0].as_ref().clone();
+
+        runtime
+            .handle
+            .restore_snapshot(candidate)
+            .await
+            .expect("a restore the log can say needs nothing built");
+        assert_eq!(
+            factory.builds.load(Ordering::Acquire),
+            built,
+            "the live session kept the provider it was running on: a second \
+             build is a rebuilt runtime"
+        );
+        let restored = runtime.handle.snapshot().await.unwrap();
+        assert!(
+            restored
+                .messages
+                .iter()
+                .all(|message| message.text != "second prompt"),
+            "the conversation went back: {:#?}",
+            restored.messages
+        );
+        // And nothing was sent: a restore is not a prompt. `TurnStarted` after
+        // the restore is the live agent answering a fact the restore committed.
+        let mut started = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), runtime.events.recv()).await
+        {
+            if matches!(
+                event.event,
+                CodingRuntimeEvent::Agent(AgentEvent::TurnStarted { .. })
+            ) {
+                started.push(event.event);
+            }
+        }
+        assert!(
+            started.is_empty(),
+            "a restore asked the model for something: {started:#?}"
+        );
+        assert_eq!(runtime.handle.status().phase, RuntimePhase::Ready);
         runtime.handle.shutdown().await.unwrap();
     }
 
@@ -15666,6 +15980,7 @@ mod tests {
             .handle
             .tx
             .send(CodingRuntimeControl::ApplyUndo {
+                code_rewound_to: None,
                 generation: runtime.handle.status().generation,
                 expected_revision: original.revision,
                 original: original.snapshot,
@@ -15745,6 +16060,7 @@ mod tests {
             .handle
             .tx
             .send(CodingRuntimeControl::ApplyUndo {
+                code_rewound_to: None,
                 generation: runtime.handle.status().generation,
                 expected_revision: original.revision,
                 original: original.undo_snapshot,
@@ -15795,57 +16111,8 @@ mod tests {
             runtime.handle.submit(UserInput::from("must fail")).await,
             Err(RuntimeError::Unavailable)
         );
-        runtime.handle.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(atomcode_home)]
-    async fn native_undo_rollback_persistence_failure_is_sticky() {
-        let home = tempfile::tempdir().unwrap();
-        let project = tempfile::tempdir().unwrap();
-        std::env::set_var("ATOMCODE_HOME", home.path());
-        let id = "undo-rollback-persistence-failure";
-        let manager = atomcode_capabilities::session::SessionManager::for_project(project.path());
-        let snapshot = SessionSnapshot::new(vec![
-            Message::user("first prompt"),
-            Message::assistant("answer", Vec::new()),
-        ]);
-        persist_native_session(&manager, id, project.path(), &snapshot);
-        let mut start = native_start(false);
-        start.agent.working_dir = project.path().to_path_buf();
-        start.prepare.session = crate::SessionMode::Resume(id.into());
-        start.provider_factory = Arc::new(DeleteLogAndFailSecondBuildFactory {
-            builds: std::sync::atomic::AtomicUsize::new(0),
-            log_path: manager.events_path(id).unwrap(),
-        });
-        let runtime = CodingRuntime::start(start).await.unwrap();
-
-        // The live conversation carries the system prompt a request is assembled
-        // with; the log projects none. The conversation itself must agree, or
-        // the undo stops at its conflict check before the branch under test.
-        let live_snapshot = runtime.handle.snapshot().await.unwrap();
-        assert!(
-            atomcode_capabilities::session::events::same_conversation(
-                &live_snapshot.messages,
-                &manager.load_snapshot(id).unwrap().messages,
-            ),
-            "live and canonical snapshots must agree before undo"
-        );
-
-        let undo = runtime.handle.undo_to_prompt(None).await;
-        assert!(
-            matches!(
-                &undo,
-                Err(RuntimeError::ReconfigureFailed(message))
-                    if message.contains("snapshot restore failed")
-            ),
-            "unexpected undo result: {undo:?}"
-        );
-        assert_eq!(runtime.handle.status().phase, RuntimePhase::Failed);
-        assert_eq!(
-            runtime.handle.submit(UserInput::from("must fail")).await,
-            Err(RuntimeError::Unavailable)
-        );
+        // Sticky, not just refused once: a runtime that could not prove the
+        // undo was kept does not come back through a reload either.
         assert_eq!(
             runtime.handle.reload_capabilities().await,
             Err(RuntimeError::Unavailable)
@@ -15853,6 +16120,12 @@ mod tests {
         runtime.handle.shutdown().await.unwrap();
     }
 
+    /// The rebuild's own rollback, when *that* cannot be persisted either: the
+    /// runtime stops and stays stopped.
+    ///
+    /// Judged here rather than on the undo route as well, because an undo of the
+    /// live session no longer rebuilds (`live_can_say`) — only a conversation
+    /// the log cannot say still goes that way, and this is it.
     #[tokio::test]
     #[serial_test::serial(atomcode_home)]
     async fn restore_snapshot_rollback_persistence_failure_is_sticky() {
@@ -16018,9 +16291,10 @@ mod tests {
 
         let mut truncated = original_snapshot.clone();
         truncated.messages.truncate(2);
-        let receipt = persist_runtime_undo(&mut resources, Some(&original_snapshot), &truncated)
-            .unwrap()
-            .expect("native undo must retain a sidecar rollback receipt");
+        let receipt =
+            persist_runtime_undo(&mut resources, Some(&original_snapshot), &truncated, None)
+                .unwrap()
+                .expect("native undo must retain a sidecar rollback receipt");
         assert_eq!(
             manager.load_snapshot(id).unwrap().messages,
             truncated.messages
@@ -16093,10 +16367,14 @@ mod tests {
 
         let mut second_truncated = original_snapshot.clone();
         second_truncated.messages.truncate(2);
-        let second_receipt =
-            persist_runtime_undo(&mut resources, Some(&original_snapshot), &second_truncated)
-                .unwrap()
-                .expect("second native undo must retain a rollback receipt");
+        let second_receipt = persist_runtime_undo(
+            &mut resources,
+            Some(&original_snapshot),
+            &second_truncated,
+            None,
+        )
+        .unwrap()
+        .expect("second native undo must retain a rollback receipt");
         let concurrently_advanced = SessionSnapshot::new(vec![
             Message::user("concurrent"),
             Message::assistant("newer answer", Vec::new()),

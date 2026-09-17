@@ -34,6 +34,9 @@ struct Call {
     id: String,
     name: String,
     args: String,
+    /// The turn it was made in: a turn the person took back is not part of the
+    /// plan any more, and the panel follows the projection (`docs/adr/0024` §17).
+    turn: u64,
     /// The call came back an error. A rejected plan is not a plan, so it is
     /// kept — the result may arrive after other calls — and skipped in the fold.
     failed: bool,
@@ -66,18 +69,34 @@ pub struct Todo;
 /// Called only where `calls` changes, which is what makes it a fold per fact
 /// rather than a fold per frame.
 fn refold(state: &mut State) {
+    state.items = fold_calls(state, &std::collections::BTreeSet::new());
+}
+
+/// The calls, folded into a list, leaving out the turns that were taken back.
+fn fold_calls(state: &State, undone: &std::collections::BTreeSet<u64>) -> Vec<TodoItem> {
     let mut items = reduce_todos(
         state
             .calls
             .iter()
-            .filter(|c| !c.failed)
+            .filter(|c| !c.failed && !undone.contains(&c.turn))
             .map(|c| (c.name.as_str(), c.args.as_str())),
     );
     // `all` on an empty list is true, which is the answer we want there too.
     if items.iter().all(|t| t.status == TodoStatus::Completed) {
         items.clear();
     }
-    state.items = items;
+    items
+}
+
+/// What the panel draws now: the kept fold when nothing was taken back, and one
+/// that leaves the taken-back turns out when something was. `render` and
+/// `height` both ask this, so they cannot disagree about whether there is a
+/// panel at all.
+fn shown(state: &State, moment: &Moment) -> Vec<TodoItem> {
+    if moment.undone.is_empty() {
+        return state.items.clone();
+    }
+    fold_calls(state, &moment.undone)
 }
 
 impl View for Todo {
@@ -92,13 +111,16 @@ impl View for Todo {
             // The call is recorded when the model makes it, before anyone knows
             // whether it will be accepted. `todowrite` validates its own
             // arguments, so a bad plan comes back as an error result below.
-            SessionEvent::AssistantMessage { tool_calls, .. } => {
+            SessionEvent::AssistantMessage {
+                tool_calls, turn, ..
+            } => {
                 let before = state.calls.len();
                 for call in tool_calls.iter().filter(|c| is_todo_call(&c.name)) {
                     state.calls.push(Call {
                         id: call.id.clone(),
                         name: call.name.clone(),
                         args: call.arguments.clone(),
+                        turn: *turn,
                         failed: false,
                     });
                 }
@@ -146,7 +168,7 @@ impl View for Todo {
         if w == 0 || vp.rect.h == 0 {
             return Vec::new();
         }
-        let items = &state.items;
+        let items = &shown(state, vp.moment);
         if items.is_empty() {
             // Nothing to say: no plan yet, or every item of one finished (see
             // `refold`). `Hug(0)` already asked for nothing; drawing a header
@@ -246,8 +268,8 @@ impl View for Todo {
     /// leaving a blank row of chrome over the conversation between plans. Asked
     /// for here, it arrives and leaves with the panel, from the same predicate
     /// `render` draws from. See `live.rs` for the same bargain.
-    fn height(state: &State, _: &Moment, _: u16) -> Height {
-        let items = state.items.len();
+    fn height(state: &State, moment: &Moment, _: u16) -> Height {
+        let items = shown(state, moment).len();
         Height::Hug(if items == 0 {
             0
         } else {
@@ -374,6 +396,45 @@ mod tests {
         call("c1", "todowrite", args)
     }
 
+    /// The same plan, made in a named turn — for the projection, which is about
+    /// which turn a call belongs to.
+    fn plan_in(turn: u64, id: &str, args: &str) -> SessionEvent {
+        match call(id, "todowrite", args) {
+            SessionEvent::AssistantMessage {
+                round,
+                text,
+                reasoning,
+                tool_calls,
+                reasoning_blocks,
+                meta,
+                ..
+            } => SessionEvent::AssistantMessage {
+                turn,
+                round,
+                text,
+                reasoning,
+                tool_calls,
+                reasoning_blocks,
+                meta,
+            },
+            other => other,
+        }
+    }
+
+    /// What the panel draws for a moment that took some turns back.
+    fn drew_undone(state: &State, w: u16, h: u16, undone: &[u64]) -> (Vec<String>, Height) {
+        let moment = Moment {
+            undone: undone.iter().copied().collect(),
+            ..Moment::default()
+        };
+        let vp = Viewport::new(Rect::sized(w, h), &moment);
+        let lines = Todo::render(state, &vp)
+            .iter()
+            .map(|l| l.plain().trim_end().to_string())
+            .collect();
+        (lines, Todo::height(state, &moment, w))
+    }
+
     fn fold(facts: &[SessionEvent]) -> State {
         let mut state = State::default();
         for fact in facts {
@@ -425,6 +486,50 @@ mod tests {
             lines[4]
         );
         assert_eq!(asks(&state), Height::Hug(5));
+    }
+
+    /// The panel is the plan as it stands *now*, and a turn the person took back
+    /// did not happen: its `todowrite` leaves the fold with it, and the list the
+    /// turn before it wrote comes back (`docs/adr/0024` §17).
+    ///
+    /// The discriminating shape is a plan that was *finished* in the turn that
+    /// was taken back: keeping it would leave no panel at all, so the panel
+    /// arriving is the projection, not a redraw.
+    #[test]
+    fn a_plan_written_in_a_turn_that_was_taken_back_leaves_the_panel() {
+        let state = fold(&[
+            plan_in(
+                1,
+                "c1",
+                r#"{"todos":[{"content":"读代码","status":"in_progress"},{"content":"写面板","status":"pending"}]}"#,
+            ),
+            plan_in(
+                2,
+                "c2",
+                r#"{"todos":[{"content":"读代码","status":"completed"},{"content":"写面板","status":"completed"}]}"#,
+            ),
+        ]);
+        // Turn 2 finished the plan, so with both turns standing there is no
+        // panel — `a_finished_plan_is_not_a_panel_either`.
+        assert_eq!(drew(&state, 60, 10), Vec::<String>::new());
+        assert_eq!(asks(&state), Height::Hug(0));
+
+        let (lines, height) = drew_undone(&state, 60, 10, &[2]);
+        assert_eq!(lines.len(), 4, "the turn-1 list is back: {lines:#?}");
+        assert!(lines[1].contains("1 进行中"), "{:?}", lines[1]);
+        assert!(
+            lines[2].contains("#1") && lines[2].contains("读代码"),
+            "{:?}",
+            lines[2]
+        );
+        assert!(
+            lines[3].contains("#2") && lines[3].contains("写面板"),
+            "{:?}",
+            lines[3]
+        );
+        // The rows the panel drew are the rows it asked for: a panel that drew
+        // more than it asked for would be drawn over the conversation.
+        assert_eq!(height, Height::Hug(4));
     }
 
     #[test]

@@ -181,8 +181,12 @@ pub async fn demo(size: (u16, u16)) -> Result<String, String> {
         .service::<SurfaceSvc>()
         .ok_or("the demo needs a surface row")?;
     let host = crate::host::Host::new(modules, crate::host::default_layout());
-    for fact in crate::conformance::facts() {
-        host.absorb(&fact);
+    for (seq, fact) in crate::conformance::facts().into_iter().enumerate() {
+        host.absorb_logged(&atomcode_harness::session::LoggedEvent {
+            seq: seq as u64 + 1,
+            at: 0,
+            event: fact,
+        });
     }
     let caps = crate::caps::Caps::detect();
     {

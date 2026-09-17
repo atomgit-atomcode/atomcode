@@ -248,6 +248,10 @@ pub struct Moment {
     /// The session on screen — the lead, or one of its members the person
     /// switched to (`docs/adr/0023` §3). Everything drawn is this one's.
     pub viewing: String,
+    /// The turns an undo, a rewind or an interruption took back
+    /// (`docs/adr/0024` §17). What they said stays on screen — the stream is not
+    /// reversible — drawn as one dim line each.
+    pub undone: std::collections::BTreeSet<u64>,
     /// The team panel's pointed-at row, while the panel has the keyboard.
     ///
     /// One owner for the reason [`Ask::cursor`] has one: the row the arrows are

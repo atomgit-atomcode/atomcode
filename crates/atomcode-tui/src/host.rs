@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, Mutex, RwLock};
 
-use atomcode_harness::session::SessionEvent;
+use atomcode_harness::session::{LoggedEvent, SessionEvent};
 
 use crate::block::{BlockId, Slot, Stream};
 use crate::caps::{Caps, Glyph};
@@ -69,6 +69,11 @@ pub struct Presentation {
     /// and it already has a key (ctrl-t) — a click that did it would be a click
     /// that changed six other things the person was looking at.
     by_block: std::collections::HashMap<BlockId, bool>,
+    /// The turns that were taken back: their blocks are drawn as one dim line
+    /// (`docs/adr/0024` §17). Here rather than only on the moment because the
+    /// row count keys on this struct's revision, and folding a turn changes
+    /// what a frame counts.
+    undone: std::collections::BTreeSet<u64>,
     /// Bumped by every change above. See `host::row_index` for why the row
     /// count keys on this rather than being invalidated by hand: folding a
     /// kind, folding one block and hiding a kind all change what the frame
@@ -107,8 +112,24 @@ impl Presentation {
         Self {
             by_kind,
             by_block: std::collections::HashMap::new(),
+            undone: std::collections::BTreeSet::new(),
             revision: 0,
         }
+    }
+
+    /// Whether this turn was taken back.
+    pub fn is_undone(&self, turn: u64) -> bool {
+        self.undone.contains(&turn)
+    }
+
+    /// The turns that were taken back. `true` when that changed.
+    fn set_undone(&mut self, turns: std::collections::BTreeSet<u64>) -> bool {
+        if self.undone == turns {
+            return false;
+        }
+        self.undone = turns;
+        self.bump();
+        true
     }
 
     /// Every change that alters what a frame would count goes through this.
@@ -569,6 +590,18 @@ fn lid_row(
     if pres.is_hidden(kind) {
         return None;
     }
+    // A turn that was taken back is one dim line, whatever its kind does and
+    // whether or not it would have merged into a run: what it said happened, and
+    // the model no longer sees it.
+    if pres.is_undone(b.at.turn) && !b.content.always_open() {
+        return Some(SlotRows {
+            rows: 1,
+            kind,
+            lid: None,
+            folded: true,
+            undone: true,
+        });
+    }
     match lids.at(i) {
         // The last member of a merged run draws the lid, which stands for the
         // whole run.
@@ -577,6 +610,7 @@ fn lid_row(
             kind,
             lid: Some(run.count),
             folded: false,
+            undone: false,
         }),
         // An earlier member of a run: the lid at the end of it already drew.
         None if lids.covers(i) => None,
@@ -585,12 +619,14 @@ fn lid_row(
             kind,
             lid: None,
             folded: true,
+            undone: false,
         }),
         None => Some(SlotRows {
             rows: slots[i].rows_at(room).0,
             kind,
             lid: None,
             folded: false,
+            undone: false,
         }),
     }
 }
@@ -890,6 +926,8 @@ struct SlotRows {
     rows: usize,
     /// The block's kind, kept so the walk does not call `kind()` again.
     kind: &'static str,
+    /// Its turn was taken back: drawn as one dim line.
+    undone: bool,
     /// The run this slot draws a lid for — its member count — or `None`.
     lid: Option<usize>,
     /// Whether it is drawn as a one-row summary.
@@ -1098,11 +1136,38 @@ impl Host {
         crate::modules::team::targets(&m).get(cursor).cloned()
     }
 
-    /// Deliver one committed fact to every module.
+    /// Which turns the screen draws as taken back. `true` when that changed, so
+    /// the caller knows a frame is owed.
+    pub fn mark_undone(&self, turns: std::collections::BTreeSet<u64>) -> bool {
+        let changed = self
+            .presentation
+            .write()
+            .expect("presentation poisoned")
+            .set_undone(turns.clone());
+        if changed {
+            self.moment.write().expect("moment poisoned").undone = turns;
+        }
+        changed
+    }
+
+    /// Deliver one committed fact to every module, with no sequence number of
+    /// its own — for a caller that has only the event. A producer that needs
+    /// the number (an undo naming the turn it went back to) sees zero, which
+    /// matches no fact.
+    pub fn absorb(&self, fact: &SessionEvent) {
+        self.absorb_logged(&LoggedEvent {
+            seq: 0,
+            at: 0,
+            event: fact.clone(),
+        });
+    }
+
+    /// Deliver one committed fact to every module, as the log carries it.
     ///
     /// Producers first, then views: a view that reacts to the same fact should
     /// see a screen whose stream already contains it.
-    pub fn absorb(&self, fact: &SessionEvent) {
+    pub fn absorb_logged(&self, logged: &LoggedEvent) {
+        let fact = &logged.event;
         // When a turn opened or closed, on the clock the host was handed. Here
         // rather than in a module because this is the one place that sees both
         // the fact and the reading — and a duration on screen is the difference
@@ -1122,7 +1187,7 @@ impl Host {
         // Pinned while the reader is holding a position: what the fact does to
         // the conversation is what moves the reading, and the reading has to
         // move with it or the same words slide out from under the same eyes.
-        self.pinned(true, || self.fold(fact));
+        self.pinned(true, || self.fold(logged));
     }
 
     /// Fold one fact into every module, and into the few things the host keeps
@@ -1130,12 +1195,13 @@ impl Host {
     ///
     /// Split out of [`Host::absorb`] so that the pin can wrap it: the pin is
     /// "measure, change, measure again", and the change is this.
-    fn fold(&self, fact: &SessionEvent) {
+    fn fold(&self, logged: &LoggedEvent) {
+        let fact = &logged.event;
         {
             let mut stream = self.stream.write().expect("stream poisoned");
             for p in self.modules.producers() {
                 let mut w = stream.writer(p.id());
-                p.absorb(fact, &mut w);
+                p.absorb(logged, &mut w);
             }
         }
         for id in self.modules.view_ids() {
@@ -1812,6 +1878,14 @@ impl Host {
                 // that drew it — which is the only thing that click could mean.
                 own = Some((block.id, kind));
                 Arc::new(lid_lines(stream.slots(), i, count, room))
+            } else if entry.undone {
+                // Dimmed as well as folded: it is still there to read, and it
+                // is no longer what the model sees.
+                let line = block.content.summary(room);
+                let width = line.width();
+                Arc::new(vec![line.restyle(0, width, |_| {
+                    crate::theme::fg(crate::theme::Role::Muted)
+                })])
             } else if entry.folded {
                 Arc::new(vec![block.content.summary(room)])
             } else {
@@ -2636,6 +2710,101 @@ mod tests {
         mods.add_view(Arc::new(Mounted::<input::Input>::new()))
             .unwrap();
         Host::new(mods, default_layout())
+    }
+
+    /// Two turns, the second with something long enough to take several rows.
+    fn two_turns(h: &Host) {
+        let facts = [
+            SessionEvent::TurnStart { turn: 1 },
+            SessionEvent::UserMessage {
+                turn: 1,
+                text: "the first thing".into(),
+                images: Vec::new(),
+            },
+            SessionEvent::TurnStart { turn: 2 },
+            SessionEvent::UserMessage {
+                turn: 2,
+                text: "the second thing".into(),
+                images: Vec::new(),
+            },
+            SessionEvent::AssistantMessage {
+                turn: 2,
+                round: 1,
+                text: "answer line one\nanswer line two\nanswer line three".into(),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            },
+        ];
+        for (i, fact) in facts.into_iter().enumerate() {
+            h.absorb_logged(&LoggedEvent {
+                seq: i as u64 + 1,
+                at: 0,
+                event: fact,
+            });
+        }
+    }
+
+    /// A turn the person took back stays on the screen — the stream is not
+    /// reversible — as one dim line per block, and the reader can still see what
+    /// it said (`docs/adr/0024` §17).
+    #[test]
+    fn a_taken_back_turn_is_drawn_as_one_dim_line_each() {
+        let h = host();
+        two_turns(&h);
+        let size = (60u16, 24u16);
+        let before = h.compose(size);
+        let shown = |frame: &Frame| {
+            frame
+                .part("stream")
+                .map(|part| {
+                    part.lines
+                        .iter()
+                        .map(|line| line.plain())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default()
+        };
+        let whole = shown(&before);
+        assert!(
+            whole.contains("answer line one") && whole.contains("answer line three"),
+            "the answer is drawn whole while the turn stands:\n{whole}"
+        );
+
+        assert!(h.mark_undone(std::collections::BTreeSet::from([2])));
+        let after = h.compose(size);
+        let text = shown(&after);
+        assert!(
+            text.contains("the first thing"),
+            "the turn that stands is untouched:\n{text}"
+        );
+        assert!(
+            !text.contains("answer line two") && !text.contains("answer line three"),
+            "the taken-back turn is one line, not its whole answer:\n{text}"
+        );
+        assert!(
+            text.contains("answer line one"),
+            "and that line is its own words:\n{text}"
+        );
+        let part = after.part("stream").expect("the stream is drawn");
+        let dim = crate::theme::fg(crate::theme::Role::Muted);
+        let taken_back: Vec<&Line> = part
+            .lines
+            .iter()
+            .filter(|line| line.plain().contains("the second thing"))
+            .collect();
+        assert!(!taken_back.is_empty(), "its prompt is still there");
+        for line in taken_back {
+            assert!(
+                line.spans.iter().all(|span| span.style.fg == dim.fg),
+                "drawn dim: {:?}",
+                line.spans
+            );
+        }
+        // Nothing changed: no second frame is owed.
+        assert!(!h.mark_undone(std::collections::BTreeSet::from([2])));
     }
 
     /// A tail module whose height follows `Moment::activity` and nothing else.

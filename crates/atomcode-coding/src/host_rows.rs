@@ -429,6 +429,15 @@ impl Waterfall<AgentRequest> for Bridge {
         if first {
             let mut convo = self.conversation(&agent);
             self.hook.turn_start(&mut convo).await;
+            // Which checkpoint this turn started from, in the log beside it:
+            // what a rewind of the workspace to before it restores.
+            if let Some(id) = self.hook.checkpoint_taken() {
+                atomcode_harness::session::commit(
+                    agent.ctx(),
+                    &agent.session(),
+                    SessionEvent::Checkpointed { turn: req.turn, id },
+                );
+            }
         }
         let ctx = self.turn_ctx(&agent, req.turn, req.round);
         // `pre_request` may only ADD to the end. What a hook appends is an

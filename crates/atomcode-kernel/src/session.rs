@@ -344,6 +344,13 @@ pub enum SessionEvent {
         to: SeqNo,
         scope: RewindScope,
     },
+    /// The workspace was checkpointed as `turn` started: `id` names what a
+    /// rewind of the workspace to before that turn restores (`docs/adr/0024`
+    /// §17). Not model-visible.
+    Checkpointed {
+        turn: u64,
+        id: String,
+    },
     /// A hard boundary ended the turn and the person has to choose how to go on.
     ///
     /// Screen-visible, so logged: the recovery choices ("complete it yourself",
@@ -390,6 +397,7 @@ impl SessionEvent {
             | Self::PolicyIntervention { turn, .. }
             | Self::Interrupted { turn, .. }
             | Self::Rewound { turn, .. }
+            | Self::Checkpointed { turn, .. }
             | Self::RateLimitPaused { turn, .. }
             | Self::TurnEnd { turn, .. } => *turn,
         }
@@ -451,10 +459,13 @@ impl SessionEvent {
 /// [`InjectionOrigin::TeamNote`]: what a lead is told about its team without
 /// being woken (`docs/adr/0023` §7).
 ///
+/// **9** — added [`SessionEvent::Checkpointed`]: which workspace checkpoint a
+/// turn started from (`docs/adr/0024` §17).
+///
 /// A file's header records the version that created it; a later build may
 /// append facts of a kind added since. A reader that meets a kind it does not
 /// know treats the file as newer than itself, the same refusal.
-pub const SESSION_FORMAT_VERSION: u32 = 8;
+pub const SESSION_FORMAT_VERSION: u32 = 9;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()

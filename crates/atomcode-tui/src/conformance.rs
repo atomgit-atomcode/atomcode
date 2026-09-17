@@ -20,6 +20,16 @@ use atomcode_harness::session::{HeaderReason, InjectionOrigin, NoticeKind, Sessi
 use atomcode_kernel::stream::TokenUsage;
 use atomcode_kernel::tool::ToolCall;
 
+/// One fact with a sequence number, as a log would carry it: what a producer
+/// reads to say which fact a later one refers to.
+pub fn logged(index: usize, fact: &SessionEvent) -> atomcode_harness::session::LoggedEvent {
+    atomcode_harness::session::LoggedEvent {
+        seq: index as u64 + 1,
+        at: 0,
+        event: fact.clone(),
+    }
+}
+
 /// A representative conversation, as facts.
 ///
 /// Every variant a module might fold appears at least once, including the awkward
@@ -447,9 +457,9 @@ pub fn check_producer(
     // Fold one at a time.
     let mut incremental = Stream::new();
     let p = make();
-    for fact in &all {
+    for (i, fact) in all.iter().enumerate() {
         let mut w = incremental.writer(p.id());
-        p.absorb(fact, &mut w);
+        p.absorb(&logged(i, fact), &mut w);
     }
     let inc_hashes = incremental.settled_hashes();
 
@@ -460,7 +470,7 @@ pub fn check_producer(
     let mut prev: Vec<_> = Vec::new();
     for (i, fact) in all.iter().enumerate() {
         let mut w = grown.writer(q.id());
-        q.absorb(fact, &mut w);
+        q.absorb(&logged(i, fact), &mut w);
         let now = grown.settled_hashes();
         if now.len() < prev.len() {
             bad.push(format!("{} lost settled blocks at fact {i}", p.id()));
@@ -489,7 +499,7 @@ pub fn check_producer(
             let mut s = Stream::new();
             let p = make();
             let mut w = s.writer(p.id());
-            p.absorb(fact, &mut w);
+            p.absorb(&logged(i, fact), &mut w);
         }));
         if r.is_err() {
             bad.push(format!("{} panicked on fact {i}: {fact:?}", p.id()));

@@ -224,6 +224,13 @@ pub trait LifecycleHooks: Send + Sync {
     /// Mutate the conversation. PERMANENT (stored).
     async fn turn_start(&self, _convo: &mut Conversation) {}
 
+    /// The workspace checkpoint this hook took as the turn now starting began,
+    /// when it took one — for the host to record beside the turn
+    /// (`docs/adr/0024` §17). Read after [`Self::turn_start`].
+    fn checkpoint_taken(&self) -> Option<String> {
+        None
+    }
+
     /// Before EACH LLM request (every round). Mutate the OUTGOING messages.
     /// EPHEMERAL: operates on a per-request clone, NOT stored — projections never
     /// poison the prefix cache. `ctx` carries round / max_rounds. Provider-side
@@ -416,6 +423,10 @@ impl LifecycleHooks for HookChain {
         for h in &self.hooks {
             h.turn_start(convo).await;
         }
+    }
+
+    fn checkpoint_taken(&self) -> Option<String> {
+        self.hooks.iter().find_map(|h| h.checkpoint_taken())
     }
 
     async fn pre_request(&self, messages: &mut Vec<Message>, ctx: &TurnCtx) {

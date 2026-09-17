@@ -716,6 +716,53 @@ pub const INJECTIONS: &[(&str, &str)] = &[
     ("team-note", "injected:team-note"),
 ];
 
+/// An undo, a rewind or a restore, as a line in the stream (`docs/adr/0024`
+/// §17): the stream is not reversible, so what was taken back stays where it is
+/// — dimmed — and this says where the conversation went back to.
+#[derive(Debug)]
+pub struct RewoundBlock {
+    /// The turn it went back to before. `None` for a log whose start this
+    /// screen never saw.
+    pub to_turn: Option<u64>,
+    pub scope: atomcode_harness::session::RewindScope,
+}
+
+impl Content for RewoundBlock {
+    fn kind(&self) -> &'static str {
+        "rewound"
+    }
+    fn content_hash(&self) -> ContentHash {
+        hash_of(&[
+            "rewound",
+            &self.to_turn.unwrap_or(0).to_string(),
+            match self.scope {
+                atomcode_harness::session::RewindScope::Conversation => "conversation",
+                atomcode_harness::session::RewindScope::Code => "code",
+                atomcode_harness::session::RewindScope::Both => "both",
+            },
+        ])
+    }
+    fn always_open(&self) -> bool {
+        true
+    }
+    fn lines(&self, width: u16) -> Vec<Line> {
+        use atomcode_harness::session::RewindScope;
+        let what = match self.scope {
+            RewindScope::Conversation => "对话",
+            RewindScope::Code => "工作区",
+            RewindScope::Both => "对话与工作区",
+        };
+        let text = match self.to_turn {
+            Some(turn) => format!("↶ 已把{what}撤回到第 {turn} 轮之前"),
+            None => format!("↶ 已把{what}撤回到更早的一轮之前"),
+        };
+        vec![Line::styled(
+            crate::width::take_width(&text, width as usize),
+            crate::theme::fg(Role::Warning),
+        )]
+    }
+}
+
 /// The injections the screen opens without.
 ///
 /// Context the harness added on its own initiative, addressed to the model: a

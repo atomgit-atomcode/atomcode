@@ -770,6 +770,15 @@ impl CompactionCheckpoint for SnapshotHook {
 
 #[async_trait]
 impl LifecycleHooks for SnapshotHook {
+    fn checkpoint_taken(&self) -> Option<String> {
+        self.rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.before_tree.clone())
+    }
+
     /// Mark the turn's wall-clock start (for `duration_ms`) and reset per-turn counters.
     async fn user_prompt_submit(&self, _text: &mut String) -> Result<(), String> {
         let mut a = self.lock();

@@ -928,6 +928,77 @@ async fn an_undo_through_host_control_hands_the_prompt_back_and_the_model_no_lon
     );
 }
 
+/// An undo on the session that is live is a *fact in its log*, not a new App:
+/// the subscriber that is reading the session sees `Rewound` arrive on the
+/// stream it already has, and nothing was rebuilt under it (`docs/adr/0022`
+/// §4, `docs/adr/0024` §17).
+///
+/// This is the shape the screen depends on. An undo that rebuilt the App would
+/// close the fact stream the screen is reading and open another one, and every
+/// module riding it would have to be told to start again — which is the
+/// same-session rebuild ADR 0022 rules out.
+#[tokio::test]
+async fn an_undo_reaches_the_subscriber_as_a_fact_and_rebuilds_nothing() {
+    let env = env();
+    let (mut connection, front_end) = connected_as(&env, SubagentPolicy::Disabled, None).await;
+    let session = connection.session.clone();
+    connection.commands.send(subscribe(&session)).unwrap();
+    connection.commands.send(message("first thing")).unwrap();
+    let seen = [
+        through_turn(&mut connection).await,
+        quiet(&mut connection).await,
+    ]
+    .concat();
+    let latest = last_seen(&seen, &session);
+    let apps = front_end.apps_fed();
+
+    assert!(matches!(
+        connection
+            .control
+            .call(HostCommand::Undo {
+                session: session.clone(),
+                turn: None,
+                based_on: latest,
+            })
+            .await,
+        Ok(HostReply::Undone { .. })
+    ));
+
+    let seen = quiet(&mut connection).await;
+    let rewound: Vec<(u64, atomcode_kernel::session::RewindScope)> = seen
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Fact(c) if c.session == session => match &c.event {
+                SessionEvent::Rewound { to, scope, .. } => Some((*to, *scope)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rewound.len(),
+        1,
+        "the undo arrived once, as a fact on the stream that was already \
+         open:\n{seen:#?}"
+    );
+    let (to, scope) = rewound[0];
+    assert_eq!(
+        scope,
+        atomcode_kernel::session::RewindScope::Conversation,
+        "{seen:#?}"
+    );
+    assert!(
+        to > 0 && to <= latest,
+        "it names the point it went back to, inside the log the subscriber \
+         has: {to} against {latest}"
+    );
+    assert_eq!(
+        front_end.apps_fed(),
+        apps,
+        "an undo on the live session rebuilt nothing"
+    );
+}
+
 /// The turns a rewind can go back to are listed, and a rewind of the
 /// conversation to one of them takes it and everything after it back; a turn
 /// that is not a point is refused.
@@ -992,6 +1063,104 @@ async fn a_rewind_through_host_control_goes_back_to_a_listed_turn() {
     assert_eq!(
         user_texts_in(&last),
         vec!["one".to_string(), "four".to_string()]
+    );
+}
+
+/// A project that is a git repository with Code Rewind opted in — what a
+/// workspace checkpoint needs to exist at all.
+fn env_with_code_rewind() -> Env {
+    let env = env();
+    std::env::set_var("ATOMCODE_CODE_REWIND", "1");
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(env.project.path())
+        .status()
+        .unwrap();
+    assert!(status.success(), "the project is a git repository");
+    env
+}
+
+/// The workspace checkpoint a turn started from is a fact in the session's log,
+/// and so is a rewind that took the workspace back (`docs/adr/0024` §17).
+///
+/// Both are what makes an undo of the *files* readable after the fact: the log
+/// is the authority, and a restore that left no trace in it would be a change
+/// to the person's working tree that the session cannot account for.
+#[tokio::test]
+async fn a_turn_logs_the_checkpoint_it_started_from_and_so_does_a_workspace_rewind() {
+    use atomcode_kernel::session::RewindScope;
+    let env = env_with_code_rewind();
+    let mut connection = connected(&env).await;
+    let session = connection.session.clone();
+    connection.commands.send(subscribe(&session)).unwrap();
+    let mut seen = Vec::new();
+    for text in ["one", "two"] {
+        connection.commands.send(message(text)).unwrap();
+        seen.extend(through_turn(&mut connection).await);
+    }
+    seen.extend(quiet(&mut connection).await);
+
+    let checkpoints: Vec<(u64, String)> = seen
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Fact(c) if c.session == session => match &c.event {
+                SessionEvent::Checkpointed { turn, id } => Some((*turn, id.clone())),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        checkpoints.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        vec![1, 2],
+        "one checkpoint per turn, as the turn starts: {checkpoints:#?}"
+    );
+    assert!(
+        checkpoints.iter().all(|(_, id)| !id.is_empty()),
+        "and each names what a restore would go back to: {checkpoints:#?}"
+    );
+
+    let Ok(HostReply::RewindPoints { points, .. }) = connection
+        .control
+        .call(HostCommand::RewindPoints {
+            session: session.clone(),
+        })
+        .await
+    else {
+        panic!("rewind points");
+    };
+    let one = points.iter().find(|p| p.prompt == "one").unwrap().turn;
+    let based_on = last_seen(&seen, &session);
+    let rewound = connection
+        .control
+        .call(HostCommand::Rewind {
+            session: session.clone(),
+            turn: one,
+            scope: RewindScope::Both,
+            based_on,
+        })
+        .await;
+    assert!(
+        matches!(&rewound, Ok(HostReply::Undone { prompt: Some(p), .. }) if p == "one"),
+        "{rewound:?}"
+    );
+
+    let seen = quiet(&mut connection).await;
+    let scopes: Vec<RewindScope> = seen
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Fact(c) if c.session == session => match &c.event {
+                SessionEvent::Rewound { scope, .. } => Some(*scope),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert!(
+        scopes.contains(&RewindScope::Conversation) && scopes.contains(&RewindScope::Code),
+        "a rewind of both says so twice — once for the conversation and once \
+         for the workspace, which are two different things to have taken \
+         back: {scopes:?}"
     );
 }
 

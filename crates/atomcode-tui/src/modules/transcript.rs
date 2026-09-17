@@ -47,6 +47,9 @@ struct Open {
 #[derive(Default)]
 pub struct Transcript {
     open: Mutex<Open>,
+    /// Which turn each `TurnStart` opened, by its sequence number: what an undo
+    /// names the turn it went back to by (`docs/adr/0024` §17).
+    turns: Mutex<Vec<(atomcode_harness::session::SeqNo, u64)>>,
 }
 
 /// The card a question draws, before or after it is answered.
@@ -121,12 +124,38 @@ impl Producer for Transcript {
 
     fn reset(&self) {
         *self.open.lock().expect("transcript poisoned") = Open::default();
+        self.turns.lock().expect("transcript poisoned").clear();
     }
 
-    fn absorb(&self, fact: &SessionEvent, out: &mut StreamWriter<'_>) {
+    fn absorb(&self, logged: &atomcode_harness::session::LoggedEvent, out: &mut StreamWriter<'_>) {
+        let fact = &logged.event;
         let mut open = self.open.lock().expect("transcript poisoned");
         let at = Coord::new(fact.turn(), 0);
         match fact {
+            // Where the turns start, so an undo can say which one it went back
+            // to; and the undo itself, as a line in the stream that says so.
+            SessionEvent::TurnStart { turn } => {
+                self.turns
+                    .lock()
+                    .expect("transcript poisoned")
+                    .push((logged.seq, *turn));
+            }
+            SessionEvent::Rewound { to, scope, .. } => {
+                let to_turn = self
+                    .turns
+                    .lock()
+                    .expect("transcript poisoned")
+                    .iter()
+                    .find(|(seq, _)| *seq == *to)
+                    .map(|(_, turn)| *turn);
+                out.emit(
+                    at,
+                    Arc::new(crate::content::RewoundBlock {
+                        to_turn,
+                        scope: *scope,
+                    }),
+                );
+            }
             SessionEvent::UserMessage { text, .. } => {
                 out.emit(at, Arc::new(UserSaid(text.clone())));
             }
@@ -430,15 +459,84 @@ mod tests {
     fn fold(facts: &[SessionEvent]) -> Stream {
         let mut s = Stream::new();
         let t = Transcript::default();
-        for f in facts {
+        for (i, f) in facts.iter().enumerate() {
             let mut w = s.writer(ID);
-            t.absorb(f, &mut w);
+            t.absorb(&conformance::logged(i, f), &mut w);
         }
         s
     }
 
     fn kinds(s: &Stream) -> Vec<&'static str> {
         s.slots().iter().map(|x| x.block().kind()).collect()
+    }
+
+    /// An undo is a line in the conversation, and it says which turn the session
+    /// went back to and how far the undo reached (`docs/adr/0024` §17).
+    ///
+    /// The turn number is the transcript's to work out: the fact names the
+    /// sequence number it rewound to, because that is what the log can be
+    /// truncated by — and a person reads turns, not sequence numbers.
+    #[test]
+    fn an_undo_says_which_turn_it_went_back_to_and_how_far_it_reached() {
+        use atomcode_harness::session::RewindScope;
+        let said = |turn: u64, text: &str| SessionEvent::UserMessage {
+            turn,
+            text: text.into(),
+            images: Vec::new(),
+        };
+        // Turn 2 opens at seq 3 — `conformance::logged` numbers from one.
+        let facts = [
+            SessionEvent::TurnStart { turn: 1 },
+            said(1, "the first thing"),
+            SessionEvent::TurnStart { turn: 2 },
+            said(2, "the second thing"),
+            SessionEvent::Rewound {
+                turn: 2,
+                to: 3,
+                scope: RewindScope::Both,
+            },
+        ];
+        let s = fold(&facts);
+        let line = |s: &Stream| -> String {
+            s.slots()
+                .iter()
+                .filter(|x| x.block().kind() == "rewound")
+                .map(|x| {
+                    crate::block::Content::lines(&*x.block().content, 60)
+                        .iter()
+                        .map(|l| l.plain())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let drawn = line(&s);
+        assert!(
+            drawn.contains("第 2 轮"),
+            "the turn it went back to, not the sequence number it was logged \
+             against:\n{drawn}"
+        );
+        assert!(
+            drawn.contains("对话与工作区"),
+            "and how far it reached:\n{drawn}"
+        );
+
+        // A `to` that names no turn start — an undo whose turn the screen never
+        // saw, which is what a resumed session can hand it — still draws a line.
+        // Losing the undo entirely would leave a conversation that silently
+        // disagrees with the model's.
+        let mut earlier = facts.to_vec();
+        earlier[4] = SessionEvent::Rewound {
+            turn: 2,
+            to: 99,
+            scope: RewindScope::Conversation,
+        };
+        let drawn = line(&fold(&earlier));
+        assert!(
+            drawn.contains("更早的一轮") && drawn.contains("对话"),
+            "an undo the screen cannot date is still an undo:\n{drawn}"
+        );
     }
 
     #[test]

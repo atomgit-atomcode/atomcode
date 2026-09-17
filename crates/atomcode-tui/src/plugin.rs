@@ -1000,8 +1000,9 @@ impl Tui {
         };
         self.host.switch_view();
         for logged in &known {
-            self.host.absorb(&logged.event);
+            self.host.absorb_logged(logged);
         }
+        self.mark_undone();
         let working = self
             .members
             .lock()
@@ -1014,6 +1015,14 @@ impl Tui {
             m.activity = crate::moment::Activity::Working;
         }
         true
+    }
+
+    /// Tell the screen which turns were taken back, from the facts it has.
+    fn mark_undone(&self) -> bool {
+        self.host
+            .mark_undone(atomcode_kernel::session::undone_turns(
+                &self.client.events(),
+            ))
     }
 
     /// A key while the team panel has the keyboard: move, switch, or give it back.
@@ -1107,7 +1116,21 @@ impl Tui {
                 if !self.client.keep(&committed) {
                     return false;
                 }
-                self.host.absorb(&committed.event);
+                self.host
+                    .absorb_logged(&atomcode_kernel::session::LoggedEvent {
+                        seq: committed.seq,
+                        at: committed.at,
+                        event: committed.event.clone(),
+                    });
+                // What an undo took back is the whole log's to say, so it is
+                // read off the facts rather than folded fact by fact.
+                if matches!(
+                    committed.event,
+                    atomcode_kernel::session::SessionEvent::Rewound { .. }
+                        | atomcode_kernel::session::SessionEvent::Interrupted { .. }
+                ) {
+                    self.mark_undone();
+                }
                 true
             }
             AgentEvent::Described { description } => {
