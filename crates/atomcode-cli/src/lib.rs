@@ -56,6 +56,34 @@ pub mod tui_front {
         pub provider_override: Option<String>,
     }
 
+    /// Which screen this launch opens: what was asked for now, else what the
+    /// configuration says, else this build's default
+    /// (`docs/tui-replaces-tuix-plan.md` M6.2).
+    ///
+    /// One place rather than a condition at the launch site, because the two
+    /// halves — the flag and the setting — are what makes the default movable:
+    /// the setting is a decision a person makes once, the flag is the escape
+    /// hatch for one launch, and `Screen::Default` is the only thing that has to
+    /// change when the default moves.
+    pub fn screen_for(
+        asked_for_rows: bool,
+        asked_for_classic: bool,
+        configured: atomcode_config::config::Screen,
+    ) -> atomcode_config::config::Screen {
+        use atomcode_config::config::Screen;
+        if asked_for_rows {
+            return Screen::Rows;
+        }
+        if asked_for_classic {
+            return Screen::Classic;
+        }
+        match configured {
+            // What this build opens when nobody said. It moves once, here.
+            Screen::Default => Screen::Classic,
+            chosen => chosen,
+        }
+    }
+
     impl ConfigFile {
         fn resolve(&self, model: Option<&str>) -> Result<CodingAgentConfig, String> {
             use atomcode_config::config::Config;
@@ -136,6 +164,28 @@ model = "vendor-a"
 account = "custom"
 model = "vendor-b"
 "#;
+
+        /// Which screen opens: the flag beats the setting, the setting beats the
+        /// build's default, and `--classic` is the escape hatch that keeps
+        /// working after the default moves
+        /// (`docs/tui-replaces-tuix-plan.md` M6.2).
+        #[test]
+        fn what_was_asked_for_beats_what_was_configured() {
+            use atomcode_config::config::Screen;
+            // Nobody said anything: this build's default.
+            assert_eq!(
+                screen_for(false, false, Screen::Default),
+                Screen::Classic,
+                "the default this build opens"
+            );
+            // The setting decides once.
+            assert_eq!(screen_for(false, false, Screen::Rows), Screen::Rows);
+            assert_eq!(screen_for(false, false, Screen::Classic), Screen::Classic);
+            // A flag decides this launch, either way — including against a
+            // setting that says the opposite, which is what an escape hatch is.
+            assert_eq!(screen_for(true, false, Screen::Classic), Screen::Rows);
+            assert_eq!(screen_for(false, true, Screen::Rows), Screen::Classic);
+        }
 
         /// What a reload compares: the same file reads the same, an edited one
         /// reads differently, and so does a launch flag that changes what a

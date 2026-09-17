@@ -87,6 +87,8 @@ const LANGUAGES: &[&str] = &["auto", "en", "zh_CN"];
 const SHELL_GUARD_POLICIES: &[&str] = &["prompt", "strict", "off"];
 const SUBAGENT_LEVELS: &[&str] = &["off", "read-only", "accept-edits", "auto"];
 const MODE_SWITCH_KEYS: &[&str] = &["shift_tab", "tab"];
+/// `default` is this build's, which is what a person gets back by unsetting it.
+const SCREENS: &[&str] = &["default", "rows", "classic"];
 
 pub static SETTINGS: &[SettingSpec] = &[
     bool_setting(
@@ -193,6 +195,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         aliases: &["task", "agent"],
         kind: SettingKind::Integer { min: 0, max: 10000 },
         apply: ApplyPolicy::CapabilityReprepare,
+    },
+    SettingSpec {
+        id: "ui.screen",
+        path: &["ui", "screen"],
+        label_en: "Screen",
+        label_zh: "界面",
+        aliases: &["tui", "classic", "rows", "界面", "屏幕"],
+        kind: SettingKind::Choice(SCREENS),
+        apply: ApplyPolicy::NextStartup,
     },
     SettingSpec {
         id: "ui.theme",
@@ -380,6 +391,7 @@ impl SettingSpec {
             "subagent.max_rounds" => config.subagent.max_rounds.to_string(),
             "subagent.codex" => config.subagent.codex.clone(),
             "subagent.claude" => config.subagent.claude.clone(),
+            "ui.screen" => format!("{:?}", config.ui.screen).to_lowercase(),
             "ui.theme" => format!("{:?}", config.ui.theme).to_lowercase(),
             "ui.mode_switch_key" => match config.ui.mode_switch_key {
                 crate::config::ModeSwitchKey::ShiftTab => "shift_tab",

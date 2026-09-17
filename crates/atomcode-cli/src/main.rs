@@ -847,20 +847,27 @@ struct Cli {
     pub dangerously_skip_permissions: bool,
 
     /// Use the full-screen UI assembled from plugin rows instead of the default
-    /// one. Same runtime, same sessions.
+    /// one. Same runtime, same sessions. `[ui] screen = "rows"` makes it the
+    /// one that opens without the flag.
     #[arg(long, conflicts_with = "headless_input")]
     pub tui: bool,
 
-    /// With --tui: show the mascot.
-    #[arg(long, requires = "tui")]
+    /// Open the classic screen for this launch, whatever `[ui] screen` says —
+    /// the escape hatch.
+    #[arg(long, conflicts_with = "tui")]
+    pub classic: bool,
+
+    /// On the row-assembled screen: show the mascot.
+    #[arg(long)]
     pub mascot: bool,
 
-    /// With --tui: `auto` (ask the terminal), `dark` or `light`.
-    #[arg(long, requires = "tui", value_name = "THEME")]
+    /// On the row-assembled screen: `auto` (ask the terminal), `dark` or `light`.
+    #[arg(long, value_name = "THEME")]
     pub theme: Option<String>,
 
-    /// With --tui: leave the mouse to the terminal (its own selection works).
-    #[arg(long = "no-mouse", requires = "tui")]
+    /// On the row-assembled screen: leave the mouse to the terminal (its own
+    /// selection works).
+    #[arg(long = "no-mouse")]
     pub no_mouse: bool,
 
     /// With --tui: check that the screen's composition is sound, and exit. Needs
@@ -2232,7 +2239,12 @@ async fn run() -> Result<i32> {
     };
     let runtime_start = std::time::Instant::now();
     // `--tui` reaches the runtime through a front end fed from inside its Apps.
-    let tui_front_end = (cli.tui && !is_headless).then(atomcode_coding::front_end::FrontEnd::new);
+    // What was asked for now, else what the configuration says — one rule, in
+    // one place (`atomcode::tui_front::screen_for`).
+    let rows_screen = atomcode::tui_front::screen_for(cli.tui, cli.classic, config.ui.screen)
+        == atomcode_config::config::Screen::Rows;
+    let tui_front_end =
+        (rows_screen && !is_headless).then(atomcode_coding::front_end::FrontEnd::new);
     let (native_runtime, native_coding_cfg, continued_session) = spawn_native_cli_runtime(
         &runtime_cfg,
         resume_session_id,

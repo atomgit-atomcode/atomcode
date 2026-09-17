@@ -145,7 +145,7 @@ serde 往返 + adapter 行为判据。
 | # | 内容 |
 |---|---|
 | 6.1 | 自用到「不想切回 tuix」;真模型冒烟(codingplan-crypto 的临时拷贝流程,跑完还原,绝不提交) |
-| 6.2 | 翻默认:`atomcode` 默认进 tui,tuix 留逃生口 soak |
+| 6.2 | 翻默认:`atomcode` 默认进 tui,tuix 留逃生口 soak(**机制已备好**:`[ui] screen = "default" \| "rows" \| "classic"` + `--tui` / `--classic`,`screen_for` 一处判定;`Screen::Default` 现在解析成 classic,翻默认时只动这一处。等 6.1 自用过关再翻) |
 | 6.3 | daemon / ACP / clix 迁到两份契约;ACP 的可用命令改由命令目录投影 |
 | 6.4 | 删 tuix:`cli/src/acp/commands.rs:21` 的 `CommandRegistry`、`cli/Cargo.toml:21` 的 `distro-pm` 转发、`main.rs` 的 tuix 分支、workspace 成员 |
 | 6.5 | 清点并删掉不再被挂载的代码:runtime 驱动协议、coding `team/`、capabilities `tools/task.rs` 的委派部分 |

@@ -106,6 +106,26 @@ impl Default for TodoToolConfig {
     }
 }
 
+/// Which screen `atomcode` opens (`[ui] screen`).
+///
+/// Two screens exist while the row-assembled one replaces the other
+/// (`docs/adr/0012`, `docs/tui-replaces-tuix-plan.md` M6): same runtime, same
+/// sessions, same configuration — only what draws them differs. The setting is
+/// what makes the switch a decision a person makes once, rather than a flag
+/// they have to remember on every launch, and it is what keeps an escape hatch
+/// after the default moves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Screen {
+    /// The screen this build opens by default. Today that is the classic one.
+    #[default]
+    Default,
+    /// The screen assembled from plugin rows (`atomcode --tui`).
+    Rows,
+    /// The classic screen.
+    Classic,
+}
+
 /// Tool-specific policies. Persisted as `[tools.*]` tables.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -488,6 +508,11 @@ pub struct UiConfig {
     /// configs see no behaviour change.
     #[serde(default)]
     pub theme: UiTheme,
+    /// Which screen `atomcode` opens. Missing means this build's default, so
+    /// nobody's launch changes by upgrading into this field; `--tui` and
+    /// `--classic` still win over it for one launch.
+    #[serde(default)]
+    pub screen: Screen,
     /// Auto-copy a rendered code block's raw source to the clipboard when the
     /// AI finishes emitting it. OFF by default — it silently overwrote the
     /// user's clipboard on every code-block reply (issue #699 feedback). Env
@@ -540,6 +565,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: UiTheme::default(),
+            screen: Screen::default(),
             auto_copy_code_blocks: default_auto_copy_code_blocks(),
             ai_session_naming: default_ai_session_naming(),
             terminal_status_glyph: default_terminal_status_glyph(),
@@ -2248,6 +2274,24 @@ pub enum SeedOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which screen opens is a setting, and a config that does not mention it
+    /// keeps this build's default — an upgrade must not move anyone's screen
+    /// (`docs/tui-replaces-tuix-plan.md` M6.2).
+    #[test]
+    fn the_screen_is_a_setting_and_a_config_that_says_nothing_keeps_the_default() {
+        let silent: Config = toml::from_str("").unwrap();
+        assert_eq!(silent.ui.screen, Screen::Default);
+
+        let chosen: Config = toml::from_str("[ui]\nscreen = \"rows\"\n").unwrap();
+        assert_eq!(chosen.ui.screen, Screen::Rows);
+        let back: Config = toml::from_str("[ui]\nscreen = \"classic\"\n").unwrap();
+        assert_eq!(back.ui.screen, Screen::Classic);
+
+        // And a `[ui]` about something else does not drag the screen with it.
+        let other: Config = toml::from_str("[ui]\ntheme = \"dark\"\n").unwrap();
+        assert_eq!(other.ui.screen, Screen::Default);
+    }
 
     #[test]
     fn subagent_external_entries_deserialize_with_defaults() {
