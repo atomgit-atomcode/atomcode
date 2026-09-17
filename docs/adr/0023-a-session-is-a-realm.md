@@ -155,6 +155,50 @@ lead 的 id,成员到成员靠构造不可能;同伴消息标成非用户来源,
 | 「全部停下」 | 另给一个前端命令:给 lead 与每个成员各发取消,不 `stop` 成员 | 句柄协议已有取消,不需要新契约命令 |
 | lead 的回合被撤回时(`keep_interrupted_context = false`) | 这一回合里新 delegate 的成员一并 `stop` | lead 的上下文里已经没有派它们去的记录 |
 
+## 落地时的补充:切换前对齐的差异(2026-09-17,M4.2)
+
+逐条对照了 coding `team/`(32 条测试)、capabilities `tools/task.rs`(40 条)与 harness 两行。结论按第 2 节
+「红的逐条判断」定下来;安全相关的在切换前补齐,不以「以后再补」换切换。
+
+**委派出去的 agent 的边界(team 成员与 `task` 子 agent 一样),补进 harness,切换前必须有:**
+
+- **敏感路径对委派 agent 是硬拒**,不是询问。产品今天就是硬拒(子 agent 结束回合);harness 根上的
+  `sensitive-paths` 只问,自动 / 绕过模式下等于放行,lead 的「总是允许」还会盖到成员。
+- **写 `.git/` 内部一律拒**(git hook 会跑 shell,等于绕开「成员没有 shell」)。
+- **工作区外的写一律拒**,解析 `..`、绝对路径与符号链接;委派 agent 不问人。
+- **成员与子 agent 永远没有 `bash`、`team`、`task`,也没有 `web_fetch` / `web_search`。** 角色文件的
+  `tools:` 只能在允许集里挑;仓库内角色文件(`<project>/.atomcode/agents`)的 `model:` 按模型自选
+  (`Chose::Model`)的规矩解析,只有用户目录下的才算人选。
+- **写入范围(scope)**:写角色的成员没有独立 worktree 时必须声明 scope,写只落在 scope 内,两个
+  在跑的写成员 scope 不得重叠(沿用 capabilities `team.rs` 的判定,宁可误拒)。有独立 worktree 时
+  scope 可省。
+- **被策略拦下的委派结果扣住**:子 agent 以 `PolicyDenied` 结束时,交回 lead 的是固定说明,不是它的原话;
+  策略干预提升到 lead 的回合上(沿用产品的恢复契约)。
+- **本回合的执行限制按会话记**,不是全树一份:成员的请求不得改写 lead 的限制。
+
+**产品体验与配置,补:**
+
+- 风险按参数算:`task`(子 agent 只读)与 `team` 的 `status` / `tell` / `stop` 是 Safe,派出写角色的
+  `delegate` 才是 Risky。否则每次委派都要问、计划模式全挡。
+- 补齐产品的 14 个内置角色(缺 planner、architect、rust、tui_ux、debugger、security、performance、
+  release_manager、migration_compat);写角色的工具集含 `search_replace`。
+- `[subagent].max_rounds` / `ATOMCODE_SUBAGENT_MAX_ROUNDS` 接到两行,0 表示不限;`[subagent].max_concurrent`
+  接到同时在跑的成员数上限;`SubagentPolicy::Disabled` / `ATOMCODE_SUBAGENT=0` 时两行不挂。
+- **子 agent 的花费照记**:委派 agent 日志里的 `Usage` 事实按模型记进会话的 `detached_model_usage`。
+- **前端过渡**:runtime 从成员的 agent 事件与事实合成 `CodingRuntimeEvent::Team`(tuix 团队面板读的那些
+  字段),并给 `task` 调用发进度行(daemon / 网页只读这个)。M6 删 tuix 时一并删。
+- 登出与重建 App 时成员随 App 结束(过渡期仍重建 App),立判据。
+
+**有意不要:**
+
+- `team` 的 `wait` / `result` / `run_id` 与 JSON 快照:改为成员主动汇报(第 2 节已定的推模型)。
+- `task` 的批量、`subagent_type`、`difficulty`、`role`、worker 子 agent(带 `bash`):改动走 `team` 的写角色;
+  同一步里多个 `task` 调用本就并行。
+- 困难子 agent 瞬时失败回退主模型重试一次:困难档就是主模型,没有可退。
+- 工具参数修复(控制字符、未转义引号):不是委派特有,留给全树。
+- 成员读也限在 scope 内:不要,读不改东西。
+- 结果格式:保留 harness 的「最后一句 + 统计」。
+
 ## 权衡过、没做的
 
 - **每个会话 / 每个成员一个 App。** 0014 已否:代码索引、MCP 连接、模型客户端每个 App
