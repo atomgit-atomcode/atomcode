@@ -37,7 +37,6 @@ use crate::seams::{
 use crate::session::{Committed, SessionEvent};
 use crate::REASONING_EFFORT_LEVELS;
 
-use super::agent_loop::{keep_driven, Driving};
 use super::subagent::{ChildRoundCap, RoleEffort};
 use super::tools::{contribute_prompt, mount};
 
@@ -385,7 +384,9 @@ struct Member {
     /// turn. A member that ends a turn silently is reported on by the team,
     /// so the lead is never left waiting on a member that forgot to speak.
     told: Arc<Mutex<bool>>,
-    _driving: Driving,
+    /// Its pump. Dropped with the member, which stops the pump and any turn
+    /// it is running.
+    _driven: super::handle::Driven,
 }
 
 /// Members, by lead session and then by name.
@@ -715,7 +716,7 @@ impl TeamTool {
             name: member_name,
             told: told_for_tool,
         }))?;
-        let driving = keep_driven(child.clone())?;
+        let driven = super::handle::drive(&self.ctx, child.clone());
         self.members.leads.lock().expect("leads poisoned").insert(
             child.session_id().to_string(),
             (lead_session.clone(), name.clone()),
@@ -733,7 +734,7 @@ impl TeamTool {
                     agent: child.clone(),
                     worktree: worktree.clone(),
                     told,
-                    _driving: driving,
+                    _driven: driven,
                 },
             );
         child.send_from(task, MessageOrigin::Peer(lead_id));

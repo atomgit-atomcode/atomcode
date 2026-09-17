@@ -411,3 +411,59 @@ config = { script = [ { text = "nothing to do" } ] }
     // passing because the child got no tools at all.
     assert!(said.contains("read_file"), "{said}");
 }
+
+/// A delegated task is part of the turn that delegated it: stopping that turn
+/// stops the child's, and the tool comes back instead of waiting the child out
+/// (`docs/adr/0023` §9).
+#[tokio::test]
+async fn stopping_the_parent_stops_its_delegated_child() {
+    use atomcode_harness::seams::AgentsSvc;
+    use atomcode_harness::session::SessionEvent;
+
+    let dir = scratch("cascade");
+    let script = delegating_script(
+        "wait for a long time",
+        r#"{ text = "Waiting.", calls = [ { name = "bash", args = { command = "sleep 30" } } ] },"#,
+    );
+    let with_bash = "[[patch]]\nid = \"subagent-in-process\"\ndisabled = false\n\
+                     config = { allowed_tools = [\"bash\"] }";
+    let app = start(tree(&dir, &script, &[YOLO, with_bash])).await;
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let started = std::time::Instant::now();
+
+    let stop_the_parent = async {
+        // Once the child is waiting on its tool, stop the parent's turn.
+        loop {
+            let waiting = agents.list().into_iter().any(|agent| {
+                agent.parent().is_some()
+                    && agent
+                        .session()
+                        .events()
+                        .iter()
+                        .any(|e| matches!(e.event, SessionEvent::ToolStarted { .. }))
+            });
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        for agent in agents.list() {
+            if agent.parent().is_none() {
+                agent.cancel();
+            }
+        }
+    };
+    let (outcome, ()) = tokio::join!(run_turn(&app, "delegate the wait"), stop_the_parent);
+    let outcome = outcome.unwrap();
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "the parent waited its child out: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(outcome.stop, StopReason::Cancelled);
+    assert!(
+        agents.list().iter().all(|agent| agent.parent().is_none()),
+        "the child is gone"
+    );
+}

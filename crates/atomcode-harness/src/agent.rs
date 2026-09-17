@@ -565,6 +565,11 @@ pub struct Agent {
     /// Set when the current turn was stopped by a person rather than by the
     /// harness (a reconfigure, a shutdown). Read once, at the turn's end.
     interrupted: std::sync::atomic::AtomicBool,
+    /// The pump driving this agent, while one is (`docs/adr/0023` §6). Weak: the
+    /// agent must not keep its own pump alive — the pump stops when whoever
+    /// drives the agent lets go of it.
+    commands:
+        Mutex<Option<tokio::sync::mpsc::WeakUnboundedSender<atomcode_kernel::event::AgentCommand>>>,
 }
 
 impl Agent {
@@ -695,6 +700,41 @@ impl Agent {
             .description
             .into_inner()
             .expect("description poisoned")
+    }
+
+    /// Hand a command to the pump driving this agent. `false` when nothing
+    /// drives it.
+    pub fn command(&self, command: atomcode_kernel::event::AgentCommand) -> bool {
+        let sender = self
+            .commands
+            .lock()
+            .expect("agent commands poisoned")
+            .as_ref()
+            .and_then(|weak| weak.upgrade());
+        sender.is_some_and(|sender| sender.send(command).is_ok())
+    }
+
+    /// Whether a pump drives this agent.
+    pub fn is_driven(&self) -> bool {
+        self.commands
+            .lock()
+            .expect("agent commands poisoned")
+            .as_ref()
+            .is_some_and(|weak| weak.upgrade().is_some())
+    }
+
+    pub(crate) fn attach_commands(
+        &self,
+        sender: &tokio::sync::mpsc::UnboundedSender<atomcode_kernel::event::AgentCommand>,
+    ) {
+        *self.commands.lock().expect("agent commands poisoned") = Some(sender.downgrade());
+    }
+
+    pub(crate) fn detach_commands(&self) {
+        self.commands
+            .lock()
+            .expect("agent commands poisoned")
+            .take();
     }
 
     /// Ask the current turn to stop. Cooperative: the step in flight finishes.
@@ -903,6 +943,7 @@ impl Agents {
             moving: Mutex::new(()),
             cancel: RwLock::new(CancellationToken::new()),
             interrupted: std::sync::atomic::AtomicBool::new(false),
+            commands: Mutex::new(None),
         });
         self.agents
             .write()

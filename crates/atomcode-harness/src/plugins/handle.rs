@@ -442,6 +442,10 @@ impl Projector {
 
 // ---- inward: asking the driver ------------------------------------------
 
+/// Questions waiting on an answer: who asked (the asking agent's session) and
+/// where the answer goes.
+type Pending = HashMap<RequestId, (Option<String>, oneshot::Sender<Value>)>;
+
 /// The half that asks. Fills both the `approval` and `user-questions` seams,
 /// because a driver that can render a prompt can answer either.
 struct Asker {
@@ -454,7 +458,10 @@ struct Asker {
     /// the tree — so a sender it held forever would keep the event channel
     /// open forever, and a driver reading to the end would never reach one.
     events: Mutex<Option<mpsc::UnboundedSender<AgentEvent>>>,
-    pending: Mutex<HashMap<RequestId, oneshot::Sender<Value>>>,
+    /// Every question still waiting, with the session of the agent that asked
+    /// it: cancelling one agent refuses its questions and nobody else's
+    /// (`docs/adr/0023` §6).
+    pending: Mutex<Pending>,
     next_id: AtomicU64,
     /// Calls the driver said to stop asking about, as `{tool}::{scope}`.
     ///
@@ -496,7 +503,7 @@ impl Asker {
     fn answer(&self, id: RequestId, value: Value) -> bool {
         let waiting = self.pending.lock().expect("pending poisoned").remove(&id);
         match waiting {
-            Some(tx) => tx.send(value).is_ok(),
+            Some((_, tx)) => tx.send(value).is_ok(),
             None => false,
         }
     }
@@ -517,6 +524,24 @@ impl Asker {
             .expect("pending poisoned")
             .drain()
             .collect();
+        for (_, (_, tx)) in waiting {
+            let _ = tx.send(Value::Null);
+        }
+    }
+
+    /// Every question `session`'s agent is waiting on, refused.
+    fn refuse_asked_by(&self, session: &str) {
+        let waiting: Vec<_> = {
+            let mut pending = self.pending.lock().expect("pending poisoned");
+            let ids: Vec<RequestId> = pending
+                .iter()
+                .filter(|(_, (asker, _))| asker.as_deref() == Some(session))
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| pending.remove(&id))
+                .collect()
+        };
         for (_, tx) in waiting {
             let _ = tx.send(Value::Null);
         }
@@ -527,10 +552,15 @@ impl Asker {
     async fn request(&self, kind: &str, payload: Value) -> Option<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
+        // Whose turn is asking: a question is refused when that agent is
+        // stopped, not when some other one is.
+        let asker = crate::agent::current()
+            .and_then(|ctx| ctx.service::<SessionSvc>())
+            .map(|log| log.id().to_string());
         self.pending
             .lock()
             .expect("pending poisoned")
-            .insert(id, tx);
+            .insert(id, (asker, tx));
         let sent = match self.events.lock().expect("events poisoned").as_ref() {
             Some(events) => events.send(AgentEvent::Request {
                 id,
@@ -715,6 +745,9 @@ pub trait Answers: Send + Sync {
     fn answer(&self, id: RequestId, value: Value) -> bool;
     /// Every pending question, refused at once.
     fn refuse_all(&self);
+    /// Every question the agent of `session` is waiting on, refused — and only
+    /// those: stopping one agent must not refuse another's approval.
+    fn refuse_asked_by(&self, session: &str);
     /// No more questions; whatever is still waiting is refused.
     fn close(&self);
 }
@@ -726,9 +759,26 @@ impl Answers for Asker {
     fn refuse_all(&self) {
         Asker::refuse_all(self)
     }
+    fn refuse_asked_by(&self, session: &str) {
+        Asker::refuse_asked_by(self, session)
+    }
     fn close(&self) {
         Asker::close(self)
     }
+}
+
+/// For an agent driven by a pump that holds no questions of its own — a team
+/// member, a delegated child. Their questions reach the person through the
+/// tree's own asker, which refuses them when the agent stops.
+pub(crate) struct NoAnswers;
+
+impl Answers for NoAnswers {
+    fn answer(&self, _id: RequestId, _value: Value) -> bool {
+        false
+    }
+    fn refuse_all(&self) {}
+    fn refuse_asked_by(&self, _session: &str) {}
+    fn close(&self) {}
 }
 
 // ---- the pump -----------------------------------------------------------
@@ -796,6 +846,7 @@ enum Woke {
 /// into the turn already running — is processed while the model is streaming.
 /// A pump that blocked on the turn could not deliver the one command whose
 /// entire purpose is to interrupt it.
+#[allow(clippy::too_many_arguments)]
 async fn pump(
     ctx: Context,
     agent: Arc<Agent>,
@@ -804,6 +855,7 @@ async fn pump(
     mut commands: mpsc::UnboundedReceiver<AgentCommand>,
     manual_compaction: Arc<std::sync::atomic::AtomicBool>,
     feed: Arc<crate::feed::Feed>,
+    owns_answers: bool,
 ) {
     let Ok(driver) = ctx.require::<AgentLoopSvc>() else {
         let _ = events.send(AgentEvent::Error {
@@ -966,8 +1018,10 @@ async fn pump(
                 // differential rig sat on it for the full twenty seconds.
                 //
                 // A pending approval becomes a refusal, which is the right
-                // reading: the person asked to stop, not to proceed.
-                asker.refuse_all();
+                // reading: the person asked to stop, not to proceed. This
+                // agent's questions only — a teammate's approval is not the
+                // person's to withdraw by stopping someone else.
+                asker.refuse_asked_by(agent.session_id());
                 continue;
             }
             AgentCommand::Snapshot => {
@@ -1041,7 +1095,11 @@ async fn pump(
     // that is never coming. The other order deadlocks — a tool waiting on
     // approval never observes the cancel.
     agent.cancel();
-    asker.close();
+    if owns_answers {
+        asker.close();
+    } else {
+        asker.refuse_asked_by(agent.session_id());
+    }
     wake.dispose();
     claimed.dispose();
     if let Some(handle) = turn.take() {
@@ -1261,6 +1319,32 @@ pub async fn spawn(
     answers: Arc<dyn Answers>,
     req: crate::agent::CreateAgent,
 ) -> Result<Driven, String> {
+    // One agent, created here rather than on the first message, so the
+    // registry and any `agent/created` observer see it before the driver
+    // can send anything. Its log comes with it.
+    let agents = ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
+    let agent = agents.create(ctx, req).await?;
+    Ok(attach(ctx, agent, wire, answers, true))
+}
+
+/// Drive an agent that already exists — a team member, a delegated child —
+/// through the same pump a front end's agent runs on (`docs/adr/0023` §6).
+///
+/// Its questions are the tree's asker's to hold: stopping it refuses the ones it
+/// asked, and nobody else's. The agent keeps a way to reach the pump
+/// ([`Agent::command`]) for as long as the returned handle is held; dropping
+/// the handle stops the pump, which stops a turn in flight.
+pub fn drive(ctx: &Context, agent: Arc<Agent>) -> Driven {
+    attach(ctx, agent, wire(), Arc::new(NoAnswers), false)
+}
+
+fn attach(
+    ctx: &Context,
+    agent: Arc<Agent>,
+    wire: Wire,
+    answers: Arc<dyn Answers>,
+    owns_answers: bool,
+) -> Driven {
     let Wire {
         commands,
         events,
@@ -1268,11 +1352,7 @@ pub async fn spawn(
         event_rx,
     } = wire;
 
-    // One agent, created here rather than on the first message, so the
-    // registry and any `agent/created` observer see it before the driver
-    // can send anything. Its log comes with it.
-    let agents = ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
-    let agent = agents.create(ctx, req).await?;
+    agent.attach_commands(&commands);
     let session_id = agent.session_id().to_string();
     let manual_compaction = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let projector = Arc::new(Mutex::new(Projector {
@@ -1317,14 +1397,16 @@ pub async fn spawn(
     let task = tokio::spawn(async move {
         pump(
             pump_ctx,
-            pump_agent,
+            pump_agent.clone(),
             answers,
             events,
             command_rx,
             manual_compaction,
             feed,
+            owns_answers,
         )
         .await;
+        pump_agent.detach_commands();
         // The listener holds a clone of the sender; revoking it is what
         // lets the event channel close, so a driver reading to the end sees
         // the end. Dropping only the local handles would hang it forever.
@@ -1335,7 +1417,7 @@ pub async fn spawn(
         let _ = done_tx.send(());
     });
 
-    Ok(Driven {
+    Driven {
         handle: AgentHandle {
             commands,
             events: event_rx,
@@ -1343,7 +1425,7 @@ pub async fn spawn(
         },
         done: done_rx,
         agent,
-    })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1456,6 +1538,23 @@ async fn mount_handle(ctx: &Context, config: &Value, approvals: bool) -> Result<
         wire.events.clone(),
         Duration::from_secs(row.ask_timeout_secs),
     ));
+    // Any agent in the tree asks through this asker. Stopping one — a person's
+    // cancel, a parent's cancel reaching a delegated child — or removing it
+    // refuses what it is waiting on: a tool parked on an approval nobody will
+    // now give never observes the cancel, and its turn would hang.
+    let refusing = asker.clone();
+    let _ = ctx.on_emit::<crate::events::AgentStatusChanged>(
+        move |change: &crate::events::AgentChange| {
+            if change.status == crate::agent::AgentStatus::Stopping {
+                refusing.refuse_asked_by(&change.session);
+            }
+        },
+    );
+    let refusing = asker.clone();
+    let _ =
+        ctx.on_emit::<crate::events::AgentRemoved>(move |change: &crate::events::AgentChange| {
+            refusing.refuse_asked_by(&change.session);
+        });
     // The asking seams, filled before anything mounts on top of them: a
     // consumer that resolves `approval` during its own `apply` must find it
     // already there.
@@ -1541,4 +1640,61 @@ pub fn question_payload(question: &str, options: &[String]) -> Value {
             .collect::<Vec<_>>(),
         "custom": true,
     })
+}
+
+#[cfg(test)]
+mod asking_tests {
+    use super::*;
+
+    fn realm_of(ctx: &Context, session: &str) -> Context {
+        let realm = ctx.isolate();
+        let _ = realm
+            .provide::<SessionSvc>(Arc::new(crate::session::SessionLog::new(session)))
+            .unwrap();
+        realm
+    }
+
+    /// Stopping one agent refuses the questions it asked and nobody else's
+    /// (`docs/adr/0023` §6): a teammate's approval is not withdrawn by
+    /// stopping someone else.
+    #[tokio::test]
+    async fn stopping_one_agent_refuses_only_its_own_questions() {
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::empty(),
+        );
+        let ctx = app.context();
+        let (events, _rx) = mpsc::unbounded_channel();
+        let asker = Arc::new(Asker::new(ctx.clone(), events, Duration::ZERO));
+
+        let ask = |session: &str| {
+            let asker = asker.clone();
+            let realm = realm_of(&ctx, session);
+            tokio::spawn(crate::agent::as_agent(realm, async move {
+                asker.request("approval", Value::Null).await
+            }))
+        };
+        let lead = ask("lead");
+        let member = ask("lead/scout");
+        for _ in 0..100 {
+            if asker.pending.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(asker.pending.lock().unwrap().len(), 2);
+
+        asker.refuse_asked_by("lead/scout");
+        // A refusal is a null answer, which every caller reads as "no".
+        assert_eq!(
+            member.await.unwrap(),
+            Some(Value::Null),
+            "the stopped agent's question"
+        );
+        assert!(!lead.is_finished(), "the other agent is still asking");
+
+        let id = *asker.pending.lock().unwrap().keys().next().unwrap();
+        assert!(asker.answer(id, json!("allow")));
+        assert_eq!(lead.await.unwrap(), Some(json!("allow")));
+    }
 }

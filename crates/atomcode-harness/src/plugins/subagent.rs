@@ -319,22 +319,104 @@ impl Subagents for InProcessSubagents {
                 max_steps: self.max_rounds,
             }));
 
-        child.send(task);
-        let outcome = driver.drive(&child).await;
+        // The parent whose tool call this is. Its turn being stopped stops the
+        // child's: the delegation is part of that turn (`docs/adr/0023` §9).
+        let parent_turn = crate::agent::current()
+            .and_then(|ctx| ctx.service::<SessionSvc>())
+            .and_then(|log| agents.by_session(log.id()))
+            .map(|parent| parent.cancel_token());
+
+        // Driven like every other agent: the task goes in as a message, and the
+        // delegation lasts until the turn it starts has ended.
+        let (ended_tx, ended_rx) = tokio::sync::oneshot::channel::<()>();
+        let ended_tx = std::sync::Mutex::new(Some(ended_tx));
+        let watched = child.session_id().to_string();
+        // On the tree, not the child's realm: a fact is announced where the loop
+        // commits it, and visibility only runs upward.
+        let ending = self.ctx.on_emit::<crate::events::SessionEventCommitted>(
+            move |committed: &crate::session::Committed| {
+                if committed.session == watched
+                    && matches!(
+                        committed.event,
+                        crate::session::SessionEvent::TurnEnd { .. }
+                    )
+                {
+                    if let Some(tx) = ended_tx.lock().expect("ended poisoned").take() {
+                        let _ = tx.send(());
+                    }
+                }
+            },
+        );
+        let driven = super::handle::drive(&self.ctx, child.clone());
+        let _ = driven
+            .handle
+            .commands
+            .send(atomcode_kernel::event::AgentCommand::SendMessage {
+                text: task.to_string(),
+                images: Vec::new(),
+            });
+        let _ = driver;
+        let mut ended_rx = ended_rx;
+        tokio::select! {
+            _ = &mut ended_rx => {}
+            _ = async {
+                match &parent_turn {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                child.cancel();
+                let _ = ended_rx.await;
+            }
+        }
+        ending.dispose();
+        let super::handle::Driven { handle, done, .. } = driven;
+        drop(handle);
+        let _ = done.await;
 
         round_cap.dispose();
+        let outcome = turn_outcome(&log.events());
         // Removing the agent tears down what was mounted for it alone.
         agents.remove(child.id());
 
         SubagentOutcome {
-            text: outcome.text,
-            rounds: outcome.steps,
-            tool_calls: outcome.tool_calls,
-            stop: outcome.stop,
-            error: outcome.error,
             transcript_len: log.len(),
+            ..outcome
         }
     }
+}
+
+/// What the child's one turn came to, read off its log: how it ended, what it
+/// last said, how many steps and calls it took.
+fn turn_outcome(events: &[crate::session::LoggedEvent]) -> SubagentOutcome {
+    use crate::session::SessionEvent;
+    let mut outcome = SubagentOutcome {
+        text: String::new(),
+        rounds: 0,
+        tool_calls: 0,
+        stop: StopReason::Stopped,
+        error: None,
+        transcript_len: events.len(),
+    };
+    for logged in events {
+        match &logged.event {
+            SessionEvent::StepStart { .. } => outcome.rounds += 1,
+            SessionEvent::AssistantMessage {
+                text, tool_calls, ..
+            } => {
+                outcome.tool_calls += tool_calls.len() as u32;
+                if !text.is_empty() {
+                    outcome.text = text.clone();
+                }
+            }
+            SessionEvent::TurnEnd { stop, error, .. } => {
+                outcome.stop = *stop;
+                outcome.error = error.clone();
+            }
+            _ => {}
+        }
+    }
+    outcome
 }
 
 // ---- the model-facing tool ----------------------------------------------

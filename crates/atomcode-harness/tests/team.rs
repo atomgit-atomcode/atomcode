@@ -736,3 +736,60 @@ async fn a_typo_in_a_roles_effort_is_refused_at_mount() {
         "the finding must name the file, the key and the value: {rendered}"
     );
 }
+
+/// A member is driven by a pump of its own, like the agent a front end holds
+/// (`docs/adr/0023` §6): what reaches it through that pump runs a turn, and
+/// stopping the member stops the pump.
+#[tokio::test]
+async fn a_member_is_driven_through_a_pump_of_its_own() {
+    let dir = scratch("pumped");
+    let app = start(tree(
+        &dir,
+        &format!(r#"{DELEGATE}, {{ text = "delegated" }}"#),
+        r#"{ text = "first look" }, { text = "heard you" }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    run_turn(&app, "delegate the look").await.unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let scout = agents
+        .by_session(&format!("{}/scout", lead.session_id()))
+        .expect("the member exists");
+    until_idle(&scout).await;
+    assert!(scout.is_driven(), "a pump drives the member");
+
+    assert!(
+        scout.command(atomcode_kernel::event::AgentCommand::SendMessage {
+            text: "a word from the person".into(),
+            images: Vec::new(),
+        })
+    );
+    let ended = |agent: &Agent| {
+        agent
+            .session()
+            .events()
+            .iter()
+            .filter(|e| matches!(e.event, SessionEvent::TurnEnd { .. }))
+            .count()
+    };
+    for _ in 0..300 {
+        if ended(&scout) >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(ended(&scout), 2, "the command ran a turn");
+    assert!(scout.session().events().iter().any(|e| matches!(
+        &e.event,
+        SessionEvent::UserMessage { text, .. } if text == "a word from the person"
+    )));
+
+    as_lead(&app, &lead, r#"{"action":"stop","name":"scout"}"#).await;
+    for _ in 0..300 {
+        if !scout.is_driven() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!scout.is_driven(), "stopping the member stopped its pump");
+}

@@ -631,7 +631,7 @@ async fn a_message_wakes_an_idle_agent_nobody_is_driving() {
     let dir = scratch("wake");
     let app = start(tree(&dir, &talker(&["ok", "ok"]), &[])).await;
     let agent = create_agent(&app).await.unwrap();
-    let driving = atomcode_harness::plugins::agent_loop::keep_driven(agent.clone()).unwrap();
+    let driving = atomcode_harness::plugins::handle::drive(&app.context(), agent.clone());
 
     // Nobody calls `drive`. A peer, a timer, a goal controller would do
     // exactly this: put a message in the inbox and expect a turn.
@@ -653,9 +653,11 @@ async fn a_message_wakes_an_idle_agent_nobody_is_driving() {
 
     agent.send("and again");
     assert_eq!(until_turns(&agent, 2).await, 2);
-    drop(driving);
+    let atomcode_harness::plugins::handle::Driven { handle, done, .. } = driving;
+    drop(handle);
+    let _ = done.await;
 
-    // Listening stopped with the guard: a third message sits in the inbox.
+    // Listening stopped with the pump: a third message sits in the inbox.
     agent.send("after the driver left");
     tokio::time::sleep(std::time::Duration::from_millis(60)).await;
     assert_eq!(until_turns(&agent, 2).await, 2);
