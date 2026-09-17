@@ -854,6 +854,30 @@ mod tests {
         assert!(r.content.contains("cover.jpg"), "{}", r.content);
     }
 
+    #[test]
+    fn description_is_vision_aware() {
+        // Discoverability contract (guards against a future edit inverting/dropping the
+        // `self.vision` branch): a vision model is told it can SEE images and should read
+        // them proactively; a text-only model is warned NOT to treat image files as text.
+        let vision_tool = ReadFileTool::new(true);
+        let text_tool = ReadFileTool::new(false);
+        let vision = vision_tool.description();
+        let text_only = text_tool.description();
+        assert!(vision.contains("You can see images"), "vision desc: {vision}");
+        assert!(vision.contains("proactively"), "vision desc: {vision}");
+        assert!(
+            text_only.contains("cannot display image"),
+            "text-only desc must warn: {text_only}"
+        );
+        assert!(
+            !text_only.contains("You can see images"),
+            "text-only must NOT advertise vision: {text_only}"
+        );
+        // Both keep the shared base and are actually different.
+        assert!(vision.starts_with("Read a file") && text_only.starts_with("Read a file"));
+        assert_ne!(vision, text_only, "the two descriptions must differ by capability");
+    }
+
     #[tokio::test]
     async fn image_file_stays_binary_text_for_text_only_model() {
         // A text-only model would reject a base64 image / waste tokens → keep the
