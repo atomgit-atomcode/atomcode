@@ -32,6 +32,12 @@ name = "agents"
 [[insert]]
 name = "operations"
 
+# What a person can run from a front end beyond talking to the agent — stopping
+# a team member, say. Filled by the rows the commands belong to; first for the
+# same reason as the row above.
+[[insert]]
+name = "commands"
+
 # --- the session domain: the log, its projections, its durable store --------
 [[insert]]
 name = "session"

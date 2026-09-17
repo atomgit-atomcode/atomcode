@@ -512,6 +512,53 @@ struct Members {
     leads: Mutex<HashMap<String, (String, String)>>,
 }
 
+/// A person stopping a member from a front end (`docs/adr/0023` §8): the same
+/// stop the lead's `team` tool does, reached through the command catalog rather
+/// than through a turn. Offered for a team member, never for a lead.
+struct StopMember {
+    team: Arc<TeamTool>,
+}
+
+#[async_trait]
+impl crate::commands::CatalogCommand for StopMember {
+    fn describe(&self) -> atomcode_kernel::agent::CommandDescription {
+        atomcode_kernel::agent::CommandDescription {
+            name: "stop".into(),
+            usage: None,
+            summary: "Stop this team member. Its log is kept, and says it was stopped.".into(),
+            target: atomcode_kernel::agent::CommandTarget::Agent,
+        }
+    }
+
+    fn offered_for(&self, agent: &Agent) -> bool {
+        self.team
+            .members
+            .leads
+            .lock()
+            .expect("leads poisoned")
+            .contains_key(agent.session_id())
+    }
+
+    async fn run(&self, agent: Arc<Agent>, _args: &str) -> Result<String, String> {
+        let (lead_session, name) = self
+            .team
+            .members
+            .leads
+            .lock()
+            .expect("leads poisoned")
+            .get(agent.session_id())
+            .cloned()
+            .ok_or_else(|| format!("{} is not on a team any more", agent.session_id()))?;
+        let lead = self
+            .team
+            .ctx
+            .service::<AgentsSvc>()
+            .and_then(|agents| agents.by_session(&lead_session))
+            .ok_or_else(|| format!("`{name}`'s lead is gone"))?;
+        self.team.stop(&lead, Some(&name)).await
+    }
+}
+
 /// The member's one way of talking: to the lead, and only the lead.
 struct TellParent {
     agents: Arc<crate::agent::Agents>,
@@ -1505,7 +1552,7 @@ impl Plugin for TeamPlugin {
         "team-in-process"
     }
     fn inject(&self) -> &'static [&'static str] {
-        &["tools", "agents", "agent-loop"]
+        &["tools", "agents", "agent-loop", "commands"]
     }
     fn uses(&self) -> &'static [&'static str] {
         &["llm-utility", "system-prompt", "shell", "fs"]
@@ -1552,6 +1599,7 @@ impl Plugin for TeamPlugin {
             worktrees_dir: row.worktrees_dir.map(PathBuf::from),
         });
         mount(ctx, vec![team.clone() as Arc<dyn Tool>])?;
+        crate::commands::register(ctx, Arc::new(StopMember { team: team.clone() }))?;
 
         // A lead resumed from its log brings back the members it had and did
         // not stop (`docs/adr/0024` §11): found by their headers naming it as

@@ -47,6 +47,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(registries::ToolsPlugin))
         .register(Arc::new(registries::SystemPromptPlugin))
         .register(Arc::new(registries::OperationsPlugin))
+        .register(Arc::new(registries::CommandsPlugin))
         .register(Arc::new(agents::AgentsPlugin))
         .register(Arc::new(session::SessionPlugin))
         .register(Arc::new(session::SessionProjectionsPlugin))

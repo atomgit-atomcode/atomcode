@@ -340,7 +340,7 @@ impl CommandSet for HelpCommands {
             .all
             .all()
             .iter()
-            .map(|c| c.name.len() + c.takes.map(|t| t.len() + 1).unwrap_or(0))
+            .map(|c| c.name.len() + c.takes.as_ref().map(|t| t.len() + 1).unwrap_or(0))
             .max()
             .unwrap_or(8);
         Outcome::Said(
@@ -348,7 +348,7 @@ impl CommandSet for HelpCommands {
                 .all()
                 .iter()
                 .map(|c| {
-                    let head = match c.takes {
+                    let head = match &c.takes {
                         Some(t) => format!("/{} {t}", c.name),
                         None => format!("/{}", c.name),
                     };
@@ -357,6 +357,40 @@ impl CommandSet for HelpCommands {
                 .collect::<Vec<_>>()
                 .join("\n"),
         )
+    }
+}
+
+/// The agent's own commands, as its description lists them (`docs/adr/0021`
+/// §10): whatever the rows in its tree registered — stopping a team member, say.
+/// Run by name through the connection; what one produced comes back on screen.
+///
+/// Read when asked rather than copied at mount, so what is listed is what the
+/// agent on screen was last described as offering.
+pub struct AgentCatalogCommands {
+    pub client: Arc<crate::plugin::AgentClient>,
+}
+
+#[async_trait]
+impl CommandSet for AgentCatalogCommands {
+    fn id(&self) -> &'static str {
+        "cmd-agent-catalog"
+    }
+    fn commands(&self) -> Vec<Command> {
+        self.client
+            .described()
+            .map(|d| d.commands)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| Command {
+                name: c.name.into(),
+                about: c.summary.into(),
+                takes: c.usage.map(Into::into),
+            })
+            .collect()
+    }
+    async fn run(&self, name: &str, args: &str, _ctx: &Context) -> Outcome {
+        self.client.invoke(name, args);
+        Outcome::Quiet
     }
 }
 
@@ -396,8 +430,10 @@ mod tests {
     #[test]
     fn the_shipped_set_mounts_without_conflicting_with_itself() {
         let c = builtin_for_test();
-        let names: Vec<_> = c.all().iter().map(|x| x.name).collect();
-        assert!(names.contains(&"help") && names.contains(&"compact") && names.contains(&"effort"));
+        let names: Vec<_> = c.all().iter().map(|x| x.name.to_string()).collect();
+        assert!(["help", "compact", "effort"]
+            .iter()
+            .all(|n| names.contains(&n.to_string())));
         let mut sorted = names.clone();
         sorted.sort();
         sorted.dedup();

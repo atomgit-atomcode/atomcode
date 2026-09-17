@@ -6,6 +6,7 @@
 //! three-role convention the seams use, applied to the command surface, and it
 //! is why adding a capability adds its command without touching this file.
 
+use std::borrow::Cow;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -14,27 +15,30 @@ use atomcode_plexus::Context;
 use crate::keymap::Action;
 
 /// What a command looks like in the menu.
+///
+/// Owned or borrowed: the screen's own commands are written into the build,
+/// the agent's arrive in its description.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Command {
-    pub name: &'static str,
-    pub about: &'static str,
+    pub name: Cow<'static, str>,
+    pub about: Cow<'static, str>,
     /// Shown after the name when it takes something, e.g. `<id>`.
-    pub takes: Option<&'static str>,
+    pub takes: Option<Cow<'static, str>>,
 }
 
 impl Command {
     pub const fn new(name: &'static str, about: &'static str) -> Self {
         Self {
-            name,
-            about,
+            name: Cow::Borrowed(name),
+            about: Cow::Borrowed(about),
             takes: None,
         }
     }
     pub const fn taking(name: &'static str, takes: &'static str, about: &'static str) -> Self {
         Self {
-            name,
-            about,
-            takes: Some(takes),
+            name: Cow::Borrowed(name),
+            about: Cow::Borrowed(about),
+            takes: Some(Cow::Borrowed(takes)),
         }
     }
 }
@@ -134,16 +138,22 @@ impl Commands {
     }
 
     /// Everything available, sorted, for the menu and for the model's view of
-    /// what it can ask for.
+    /// what it can ask for. A name two sets offer is listed once, as the set
+    /// that runs it: the one mounted first.
     pub fn all(&self) -> Vec<Command> {
-        let mut out: Vec<Command> = self
+        let mut out: Vec<Command> = Vec::new();
+        for command in self
             .sets
             .read()
             .expect("commands poisoned")
             .iter()
             .flat_map(|s| s.commands())
-            .collect();
-        out.sort_by_key(|c| c.name);
+        {
+            if !out.iter().any(|c| c.name == command.name) {
+                out.push(command);
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
 
@@ -242,11 +252,14 @@ mod tests {
     fn the_menu_is_sorted_and_prefix_filtered() {
         let c = registry();
         assert_eq!(
-            c.all().iter().map(|x| x.name).collect::<Vec<_>>(),
+            c.all().iter().map(|x| x.name.clone()).collect::<Vec<_>>(),
             vec!["alpha", "also", "beta"]
         );
         assert_eq!(
-            c.matching("al").iter().map(|x| x.name).collect::<Vec<_>>(),
+            c.matching("al")
+                .iter()
+                .map(|x| x.name.clone())
+                .collect::<Vec<_>>(),
             vec!["alpha", "also"]
         );
         assert!(c.matching("zz").is_empty());

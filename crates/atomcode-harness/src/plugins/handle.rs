@@ -1064,11 +1064,31 @@ async fn pump(
                 accept(None);
                 continue;
             }
-            // Nothing has put a command in the catalog yet — the registry
-            // capability rows register into comes with the team (plan 4.4) — so
-            // there is no command by any name here.
-            AgentCommand::Invoke { .. } => {
-                reject(atomcode_kernel::event::CommandError::NotFound);
+            // A command from the catalog, against this agent or one it can
+            // reach by id. Accepted once it is known to exist for that agent;
+            // what it produced follows as `Invoked`, so a command that takes a
+            // while — a member winding down — does not hold this pump up.
+            AgentCommand::Invoke {
+                id,
+                session,
+                name,
+                args,
+            } => {
+                let found = crate::feed::Feed::find(&ctx, &session).and_then(|target| {
+                    ctx.service::<crate::seams::CommandsSvc>()?
+                        .find(&name, &target)
+                        .map(|command| (target, command))
+                });
+                let Some((target, command)) = found else {
+                    reject(atomcode_kernel::event::CommandError::NotFound);
+                    continue;
+                };
+                accept(None);
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let output = command.run(target, &args).await.unwrap_or_else(|e| e);
+                    let _ = events.send(AgentEvent::Invoked { id, output });
+                });
                 continue;
             }
             AgentCommand::Shutdown => {
@@ -1468,6 +1488,7 @@ impl Plugin for AgentHandlePlugin {
             "approval",
             "session-defaults",
             "grants",
+            "commands",
         ]
     }
     fn provides(&self) -> &'static [&'static str] {
@@ -1511,7 +1532,7 @@ impl Plugin for QuestionsHandlePlugin {
         &["agents", "agent-loop"]
     }
     fn uses(&self) -> &'static [&'static str] {
-        &["tools", "llm", "compaction", "session-defaults"]
+        &["tools", "llm", "compaction", "session-defaults", "commands"]
     }
     fn provides(&self) -> &'static [&'static str] {
         &["ui", "agent-handle", "user-questions", "tool-driver"]

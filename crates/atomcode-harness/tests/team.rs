@@ -820,6 +820,153 @@ async fn a_member_is_driven_through_a_pump_of_its_own() {
     assert!(!scout.is_driven(), "stopping the member stopped its pump");
 }
 
+// ---- a person's commands ------------------------------------------------------
+
+/// Events off a handle until `done` says so, or give up naming what came.
+async fn events_until(
+    handle: &mut atomcode_kernel::agent::AgentHandle,
+    done: impl Fn(&atomcode_kernel::event::AgentEvent) -> bool,
+) -> Vec<atomcode_kernel::event::AgentEvent> {
+    let mut seen = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), handle.events.recv()).await {
+            Ok(Some(event)) => {
+                let last = done(&event);
+                seen.push(event);
+                if last {
+                    return seen;
+                }
+            }
+            _ => panic!("gave up waiting; saw {seen:#?}"),
+        }
+    }
+}
+
+/// A person stops a member from a front end, through the command catalog
+/// (`docs/adr/0021` §10, `docs/adr/0023` §8). A member's description offers
+/// `stop` and the lead's does not; invoking it on the member stops it the way
+/// the lead's tool would and says so, and asking the lead for it is refused.
+#[tokio::test]
+async fn a_person_stops_a_member_from_the_catalog() {
+    use atomcode_kernel::agent::CommandTarget;
+    use atomcode_kernel::event::{AgentCommand, AgentEvent, CommandError};
+
+    let dir = scratch("catalog-stop");
+    let app = start(tree(&dir, r#"{ text = "ok" }"#, r#"{ text = "looked" }"#)).await;
+    let lead = create_agent(&app).await.unwrap();
+    let told = as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"scout","role":"explorer","task":"look around"}"#,
+    )
+    .await;
+    assert!(!told.is_error, "{}", told.content);
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let scout_session = format!("{}/scout", lead.session_id());
+    let scout = agents.by_session(&scout_session).unwrap();
+    until_idle(&scout).await;
+
+    assert!(
+        scout
+            .describe()
+            .commands
+            .iter()
+            .any(|c| c.name == "stop" && c.target == CommandTarget::Agent),
+        "{:?}",
+        scout.describe().commands
+    );
+    assert!(
+        !lead.describe().commands.iter().any(|c| c.name == "stop"),
+        "a lead is no one's member"
+    );
+
+    let mut handle = atomcode_harness::plugins::handle::drive(&app.context(), lead.clone()).handle;
+    for (id, session) in [
+        ("on-lead", lead.session_id()),
+        ("on-scout", scout_session.as_str()),
+    ] {
+        handle
+            .commands
+            .send(AgentCommand::Invoke {
+                id: id.into(),
+                session: session.into(),
+                name: "stop".into(),
+                args: String::new(),
+            })
+            .unwrap();
+    }
+    let seen = events_until(
+        &mut handle,
+        |e| matches!(e, AgentEvent::Invoked { id, .. } if id == "on-scout"),
+    )
+    .await;
+    assert!(
+        seen.iter().any(|e| matches!(
+            e,
+            AgentEvent::Rejected { command, error: CommandError::NotFound } if command == "on-lead"
+        )),
+        "{seen:#?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, AgentEvent::Accepted { command, .. } if command == "on-scout")),
+        "{seen:#?}"
+    );
+    assert!(
+        seen.iter().any(|e| matches!(
+            e,
+            AgentEvent::Invoked { id, output } if id == "on-scout" && output == "stopped: scout"
+        )),
+        "{seen:#?}"
+    );
+    assert!(
+        agents.by_session(&scout_session).is_none(),
+        "the member is gone"
+    );
+    assert!(
+        scout
+            .session()
+            .events()
+            .last()
+            .is_some_and(|e| matches!(e.event, SessionEvent::Stopped { .. })),
+        "and its log says it was stopped"
+    );
+}
+
+/// A row's commands are the row's: switching the team row off takes `stop`
+/// out of the catalog with it (`docs/adr/0021` §10).
+#[tokio::test]
+async fn a_rows_commands_go_when_the_row_does() {
+    let dir = scratch("catalog-unload");
+    let mut app = start(tree(&dir, r#"{ text = "ok" }"#, r#"{ text = "looked" }"#)).await;
+    let lead = create_agent(&app).await.unwrap();
+    as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"scout","role":"explorer","task":"look around"}"#,
+    )
+    .await;
+    let scout = app
+        .context()
+        .service::<AgentsSvc>()
+        .unwrap()
+        .by_session(&format!("{}/scout", lead.session_id()))
+        .unwrap();
+    let catalog = app
+        .context()
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .expect("the commands row is in the base bundle");
+    assert!(catalog.find("stop", &scout).is_some());
+
+    app.patch(&Layer::from_toml("[[patch]]\nid = \"team-in-process\"\ndisabled = true").unwrap())
+        .await
+        .unwrap();
+    assert!(
+        catalog.find("stop", &scout).is_none(),
+        "the team row is gone, and its command with it"
+    );
+}
+
 // ---- a team across a restart ---------------------------------------------------
 
 /// Wait until `id`'s stored log satisfies `done`.

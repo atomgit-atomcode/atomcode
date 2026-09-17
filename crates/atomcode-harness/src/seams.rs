@@ -31,6 +31,7 @@ plexus_service!(SystemPromptSvc => PromptRegistry, "system-prompt", Core, "Order
 // describe a knob in as much detail as the knob deserves without that detail
 // costing tokens on every single request — and, unlike the system prompt, an
 // answer may depend on the session asking (see `Descriptions`).
+plexus_service!(CommandsSvc => crate::commands::CommandCatalog, "commands", Core, "The commands a person can run from a front end against a session or one agent in it, registered by the rows they belong to");
 plexus_service!(OperationsSvc => Descriptions, "operations", Core, "What each row says about itself — how to work it, and its part of this session — answered when asked");
 plexus_service!(SessionSvc => SessionLog, "sessions", Core, "The append-only session log of the agent whose realm this is");
 plexus_service!(SessionDefaultsSvc => SessionDefaults, "session-defaults", Core, "What the front end's own agent is told about its session: an id, whether to resume it");

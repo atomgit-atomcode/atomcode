@@ -67,6 +67,7 @@ fn agent_catalog() -> PluginRegistry {
     let mut c = atomcode_harness::plugins::catalog();
     c.register(Arc::new(HoldTurnEnd));
     c.register(Arc::new(EffortSpyRow));
+    c.register(Arc::new(EchoCommandRow));
     c
 }
 
@@ -2436,6 +2437,65 @@ async fn a_burst_of_deltas_costs_frames_not_one_per_delta() {
         painted * 4 < words,
         "{words} deltas cost {painted} frames, so what is queued is not being drained into one frame"
     );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// A command a row of the agent's tree puts in its catalog, for a person to run.
+struct EchoCommand;
+
+#[async_trait]
+impl atomcode_harness::commands::CatalogCommand for EchoCommand {
+    fn describe(&self) -> atomcode_kernel::agent::CommandDescription {
+        atomcode_kernel::agent::CommandDescription {
+            name: "echo".into(),
+            usage: Some("<text>".into()),
+            summary: "say it back".into(),
+            target: atomcode_kernel::agent::CommandTarget::Session,
+        }
+    }
+    async fn run(
+        &self,
+        _agent: Arc<atomcode_harness::agent::Agent>,
+        args: &str,
+    ) -> Result<String, String> {
+        Ok(format!("echoed: {args}"))
+    }
+}
+
+struct EchoCommandRow;
+
+#[async_trait]
+impl Plugin for EchoCommandRow {
+    fn name(&self) -> &'static str {
+        "test-echo-command"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["commands"]
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        atomcode_harness::commands::register(ctx, Arc::new(EchoCommand))
+    }
+}
+
+/// A command a row of the agent's tree registers is on the screen's slash menu
+/// and runs from it, with nothing about it written into the screen
+/// (`docs/adr/0021` §10): listed as the agent describes it, run by name, its
+/// output shown in the conversation.
+#[tokio::test]
+async fn a_command_the_agent_offers_is_on_the_slash_menu_and_runs() {
+    let dir = scratch("catalog-cmd");
+    let echo = "[[insert]]\nname = \"test-echo-command\"\n";
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[echo])).await;
+    let task = s.open().await;
+
+    s.term.type_line("/help");
+    until(&s, "/echo <text>").await;
+    assert!(s.screen().contains("say it back"), "{}", s.screen());
+
+    s.term.type_line("/echo hello there");
+    until(&s, "echoed: hello there").await;
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;

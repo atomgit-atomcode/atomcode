@@ -697,7 +697,11 @@ impl Agent {
                 supports_vision: model.as_ref().is_some_and(|m| m.supports_vision()),
                 reasoning_effort: None,
                 compaction: self.ctx.service::<CompactionSvc>().is_some(),
-                commands: Vec::new(),
+                commands: self
+                    .ctx
+                    .service::<crate::seams::CommandsSvc>()
+                    .map(|catalog| catalog.offered_for(self))
+                    .unwrap_or_default(),
             }),
         };
         self.ctx.emit::<DescribeAgent>(&describing);

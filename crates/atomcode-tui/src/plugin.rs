@@ -171,6 +171,17 @@ impl AgentClient {
     pub fn cancel(&self) {
         self.command(AgentCommand::Cancel);
     }
+    /// Run a command from the catalog of the agent on screen.
+    pub fn invoke(&self, name: &str, args: &str) {
+        let id = format!("tui-{}", self.receipts.fetch_add(1, Ordering::SeqCst));
+        let session = self.session();
+        self.command(AgentCommand::Invoke {
+            id,
+            session,
+            name: name.to_string(),
+            args: args.to_string(),
+        });
+    }
     pub fn compact(&self, focus: Option<String>) {
         self.command(AgentCommand::Compact { focus });
     }
@@ -860,6 +871,12 @@ impl Tui {
                 self.ask(id, &kind, payload);
                 true
             }
+            AgentEvent::Invoked { output, .. } => {
+                if !output.is_empty() {
+                    self.say(&output);
+                }
+                true
+            }
             // The session's own status follows its turn events below; a
             // member's is the member strip's.
             AgentEvent::StatusChanged { session, status } => {
@@ -1445,7 +1462,7 @@ impl Tui {
                 .matching(rest)
                 .into_iter()
                 .map(|c| {
-                    let name = match c.takes {
+                    let name = match &c.takes {
                         Some(t) => format!("{} {t}", c.name),
                         None => c.name.to_string(),
                     };

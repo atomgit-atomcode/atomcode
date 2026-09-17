@@ -943,7 +943,7 @@ mod retry_backoff_tests {
 /// 那一件东西，而这个判据要 `RoundCap` 与 `TurnProgress`。
 #[cfg(test)]
 mod round_budget_tests {
-    use super::{RoundCap, TurnProgress, TurnStopping};
+    use super::{RoundCap, TurnProgress};
     use crate::seams::StopReason;
     use atomcode_plexus::Listener;
     use std::time::Duration;

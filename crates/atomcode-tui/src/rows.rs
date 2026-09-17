@@ -107,6 +107,11 @@ name = "tui-commands-screen"
 [[insert]]
 name = "tui-commands-session"
 
+# The agent's own commands, from its description. After the screen's and the
+# session's, so a name one of those already has stays theirs.
+[[insert]]
+name = "tui-commands-agent"
+
 # Last, because it lists the others.
 [[insert]]
 name = "tui-commands-help"
@@ -129,6 +134,7 @@ pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
         Arc::new(AskPanel),
         Arc::new(ScreenCommandsRow),
         Arc::new(SessionCommandsRow),
+        Arc::new(AgentCatalogCommandsRow),
         Arc::new(HelpCommandsRow),
     ]
 }
@@ -483,6 +489,35 @@ commands!(
     crate::commands::SessionCommands,
     "the conversation: compact it, look at it, start another, go back to one"
 );
+
+/// The agent's catalog commands. It holds the connection, because what it lists
+/// is what the agent on screen was described as offering.
+pub struct AgentCatalogCommandsRow;
+
+#[async_trait]
+impl Plugin for AgentCatalogCommandsRow {
+    fn name(&self) -> &'static str {
+        "tui-commands-agent"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tui-commands", "tui-agent-client"]
+    }
+    fn description(&self) -> &'static str {
+        "the agent's own commands, as its description lists them — run by name through the connection"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let all = ctx.require::<CommandsSvc>().map_err(|e| e.to_string())?;
+        let client = ctx
+            .require::<crate::plugin::AgentClientSvc>()
+            .map_err(|e| e.to_string())?;
+        let set = Arc::new(crate::commands::AgentCatalogCommands { client });
+        let id = crate::command::CommandSet::id(&*set);
+        all.add(set)?;
+        let c: Arc<Commands> = all.clone();
+        let _ = ctx.effect(move || c.remove(id));
+        Ok(())
+    }
+}
 
 /// `/help` lists whatever else is mounted, so it holds the registry it is in.
 ///
