@@ -25,15 +25,22 @@ use futures::stream::BoxStream;
 struct Script {
     count: AtomicUsize,
     options: Mutex<Vec<ChatOptions>>,
+    /// What each request showed the model, and which model it went to.
+    requests: Mutex<Vec<(String, Vec<Message>)>>,
+    /// The model of every provider the factory built.
+    built: Mutex<Vec<String>>,
 }
 
 /// `answer N`, or a question for the person when told `ask me`.
-struct Scripted(Arc<Script>);
+struct Scripted {
+    script: Arc<Script>,
+    model: String,
+}
 
 #[async_trait::async_trait]
 impl LlmProvider for Scripted {
     fn model_name(&self) -> &str {
-        "scripted"
+        &self.model
     }
 
     async fn chat_stream(
@@ -42,8 +49,13 @@ impl LlmProvider for Scripted {
         _tools: &[ToolDef],
         options: &ChatOptions,
     ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
-        self.0.options.lock().unwrap().push(options.clone());
-        let n = self.0.count.fetch_add(1, Ordering::SeqCst) + 1;
+        self.script.options.lock().unwrap().push(options.clone());
+        self.script
+            .requests
+            .lock()
+            .unwrap()
+            .push((self.model.clone(), messages.to_vec()));
+        let n = self.script.count.fetch_add(1, Ordering::SeqCst) + 1;
         let last = messages.iter().rev().find(|m| !m.synthetic);
         let first = match last {
             Some(m) if m.role == Role::User && m.text == "ask me" => {
@@ -99,7 +111,11 @@ impl CodingProviderFactory for Factory {
         _config: &CodingAgentConfig,
         _session_id: Option<&str>,
     ) -> Result<Arc<dyn LlmProvider>, ProviderBuildError> {
-        Ok(Arc::new(Scripted(self.0.clone())))
+        self.0.built.lock().unwrap().push(_config.model.clone());
+        Ok(Arc::new(Scripted {
+            script: self.0.clone(),
+            model: _config.model.clone(),
+        }))
     }
 }
 
@@ -124,7 +140,18 @@ async fn connected(env: &Env) -> HostConnection {
 }
 
 async fn connected_with(env: &Env, subagents: SubagentPolicy) -> HostConnection {
-    let front_end = FrontEnd::new();
+    connected_as(env, subagents, None).await.0
+}
+
+async fn connected_as(
+    env: &Env,
+    subagents: SubagentPolicy,
+    config: Option<Arc<dyn atomcode_coding::front_end::HostConfig>>,
+) -> (HostConnection, Arc<FrontEnd>) {
+    let front_end = match config {
+        Some(config) => FrontEnd::new().with_config(config),
+        None => FrontEnd::new(),
+    };
     let mut agent = CodingAgentConfig::new(
         "key",
         "https://example.test/v1",
@@ -157,7 +184,10 @@ async fn connected_with(env: &Env, subagents: SubagentPolicy) -> HostConnection 
     let runtime = CodingRuntime::start(start)
         .await
         .expect("the runtime starts");
-    connect(runtime, front_end, agent).expect("connects once")
+    (
+        connect(runtime, front_end.clone(), agent).expect("connects once"),
+        front_end,
+    )
 }
 
 fn message(text: &str) -> AgentCommand {
@@ -815,4 +845,315 @@ fn runtime_errors_are_host_errors_by_the_table() {
         HostError::from(RuntimeError::ReconfigureFailed("broke".into())),
         HostError::Failed { message } if message.contains("broke")
     ));
+}
+
+// ---- host control over the session ---------------------------------------
+
+/// The last fact a subscriber has seen, from what came.
+fn last_seen(events: &[AgentEvent], session: &str) -> u64 {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Fact(c) if c.session == session => Some(c.seq),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn user_texts_in(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|m| m.role == Role::User && !m.synthetic)
+        .map(|m| m.text.clone())
+        .collect()
+}
+
+/// An undo through host control takes the last prompt back and hands it over;
+/// the next request does not show it. One based on a fact older than a turn
+/// since is refused (`docs/adr/0021` §9, `docs/adr/0024` §17).
+#[tokio::test]
+async fn an_undo_through_host_control_hands_the_prompt_back_and_the_model_no_longer_sees_it() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let session = connection.session.clone();
+    connection.commands.send(subscribe(&session)).unwrap();
+    connection.commands.send(message("first thing")).unwrap();
+    let seen = [
+        through_turn(&mut connection).await,
+        quiet(&mut connection).await,
+    ]
+    .concat();
+    let before_second = last_seen(&seen, &session);
+    connection.commands.send(message("second thing")).unwrap();
+    let seen = [
+        through_turn(&mut connection).await,
+        quiet(&mut connection).await,
+    ]
+    .concat();
+    let latest = last_seen(&seen, &session);
+
+    assert!(matches!(
+        connection
+            .control
+            .call(HostCommand::Undo {
+                session: session.clone(),
+                turn: None,
+                based_on: before_second,
+            })
+            .await,
+        Err(HostError::Stale { .. })
+    ));
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Undo {
+                session: session.clone(),
+                turn: None,
+                based_on: latest,
+            })
+            .await,
+        Ok(HostReply::Undone {
+            prompt: Some("second thing".into()),
+            restored_files: Vec::new(),
+        })
+    );
+    let _ = quiet(&mut connection).await;
+    connection.commands.send(message("third thing")).unwrap();
+    through_turn(&mut connection).await;
+    let (_, last) = env.script.requests.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        user_texts_in(&last),
+        vec!["first thing".to_string(), "third thing".to_string()]
+    );
+}
+
+/// The turns a rewind can go back to are listed, and a rewind of the
+/// conversation to one of them takes it and everything after it back; a turn
+/// that is not a point is refused.
+#[tokio::test]
+async fn a_rewind_through_host_control_goes_back_to_a_listed_turn() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let session = connection.session.clone();
+    connection.commands.send(subscribe(&session)).unwrap();
+    let mut seen = Vec::new();
+    for text in ["one", "two", "three"] {
+        connection.commands.send(message(text)).unwrap();
+        seen.extend(through_turn(&mut connection).await);
+    }
+    seen.extend(quiet(&mut connection).await);
+    let Ok(HostReply::RewindPoints { points, .. }) = connection
+        .control
+        .call(HostCommand::RewindPoints {
+            session: session.clone(),
+        })
+        .await
+    else {
+        panic!("rewind points");
+    };
+    assert_eq!(
+        points.iter().map(|p| p.prompt.as_str()).collect::<Vec<_>>(),
+        vec!["three", "two", "one"],
+        "newest first: {points:#?}"
+    );
+    let two = points.iter().find(|p| p.prompt == "two").unwrap().turn;
+    let based_on = last_seen(&seen, &session);
+
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Rewind {
+                session: session.clone(),
+                turn: 999,
+                scope: atomcode_kernel::session::RewindScope::Conversation,
+                based_on,
+            })
+            .await,
+        Err(HostError::RewindPointNotFound { turn: 999 })
+    );
+    let rewound = connection
+        .control
+        .call(HostCommand::Rewind {
+            session: session.clone(),
+            turn: two,
+            scope: atomcode_kernel::session::RewindScope::Conversation,
+            based_on,
+        })
+        .await;
+    assert!(
+        matches!(&rewound, Ok(HostReply::Undone { prompt: Some(p), .. }) if p == "two"),
+        "{rewound:?}"
+    );
+    let _ = quiet(&mut connection).await;
+    connection.commands.send(message("four")).unwrap();
+    through_turn(&mut connection).await;
+    let (_, last) = env.script.requests.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        user_texts_in(&last),
+        vec!["one".to_string(), "four".to_string()]
+    );
+}
+
+/// Resolves a model id to a configuration naming it, the way a host's config
+/// file would.
+struct Models(std::path::PathBuf);
+
+impl atomcode_coding::front_end::HostConfig for Models {
+    fn for_model(&self, model: &str) -> Result<CodingAgentConfig, String> {
+        if model == "missing" {
+            return Err("no model `missing` is configured".into());
+        }
+        let mut config = CodingAgentConfig::new("key", "https://example.test/v1", model, &self.0);
+        config.interactive = true;
+        Ok(config)
+    }
+    fn current(&self) -> Result<CodingAgentConfig, String> {
+        self.for_model("scripted-again")
+    }
+}
+
+/// A model switched through host control is the one the next request goes to;
+/// one the host cannot resolve is refused. Signing out takes the model away and
+/// signing in brings it back — neither rebuilding what the session runs in
+/// (`docs/adr/0022` §2).
+#[tokio::test]
+async fn the_model_is_switched_signed_out_and_in_through_host_control_without_a_rebuild() {
+    let env = env();
+    let (mut connection, front_end) = connected_as(
+        &env,
+        SubagentPolicy::Disabled,
+        Some(Arc::new(Models(env.project.path().to_path_buf()))),
+    )
+    .await;
+    let session = connection.session.clone();
+    connection.commands.send(message("hello")).unwrap();
+    through_turn(&mut connection).await;
+    let apps = front_end.apps_fed();
+
+    assert!(matches!(
+        connection
+            .control
+            .call(HostCommand::SwitchModel {
+                session: session.clone(),
+                model: "missing".into(),
+            })
+            .await,
+        Err(HostError::Failed { .. })
+    ));
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SwitchModel {
+                session: session.clone(),
+                model: "glm-5".into(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    connection.commands.send(message("which model")).unwrap();
+    through_turn(&mut connection).await;
+    assert_eq!(
+        env.script
+            .requests
+            .lock()
+            .unwrap()
+            .last()
+            .map(|(m, _)| m.clone()),
+        Some("glm-5".to_string())
+    );
+
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SignOut {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    let asked = env.script.requests.lock().unwrap().len();
+    connection.commands.send(message("anyone there")).unwrap();
+    let _ = quiet(&mut connection).await;
+    assert_eq!(
+        env.script.requests.lock().unwrap().len(),
+        asked,
+        "signed out: nothing reached a model"
+    );
+
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SignIn {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    connection.commands.send(message("back again")).unwrap();
+    through_turn(&mut connection).await;
+    assert_eq!(
+        env.script
+            .requests
+            .lock()
+            .unwrap()
+            .last()
+            .map(|(m, _)| m.clone()),
+        Some("scripted-again".to_string()),
+        "signed in with the configuration as it is now"
+    );
+    assert_eq!(
+        front_end.apps_fed(),
+        apps,
+        "switching models and signing out and in rebuilt nothing"
+    );
+}
+
+/// The MCP servers are listed, their tools can be withdrawn, and the
+/// capabilities reloaded, all for the session that is live.
+#[tokio::test]
+async fn mcp_and_a_reload_are_host_controls_on_the_live_session() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let session = connection.session.clone();
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::McpStatus {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::McpServers {
+            servers: Vec::new()
+        })
+    );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::WithdrawMcpTools {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Reload {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    assert!(matches!(
+        connection
+            .control
+            .call(HostCommand::Reload {
+                session: "some-other-session".into(),
+            })
+            .await,
+        Err(HostError::NotFound)
+    ));
+    connection.commands.send(message("still here")).unwrap();
+    through_turn(&mut connection).await;
 }

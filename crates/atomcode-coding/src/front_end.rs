@@ -46,6 +46,20 @@ pub struct FrontEnd {
     /// row before the old one unloads, so an unload only clears its own.
     app: Mutex<Option<(u64, Context)>>,
     mounts: AtomicU64,
+    /// How the host resolves configuration, when it can.
+    config: Mutex<Option<Arc<dyn HostConfig>>>,
+}
+
+/// What a host knows about configuration that a front end asks it to act on:
+/// the provider settings a model id means, and the settings as they are now
+/// (`docs/adr/0021`, M5.4 addendum). The front end names the intent; the host
+/// reads its own configuration.
+pub trait HostConfig: Send + Sync {
+    /// The agent configuration for `model`, as the host's configuration
+    /// resolves that id now.
+    fn for_model(&self, model: &str) -> Result<CodingAgentConfig, String>;
+    /// The agent configuration as configured now — what signing in again reads.
+    fn current(&self) -> Result<CodingAgentConfig, String>;
 }
 
 impl std::fmt::Debug for FrontEnd {
@@ -64,7 +78,24 @@ impl FrontEnd {
             receiver: Mutex::new(Some(receiver)),
             app: Mutex::new(None),
             mounts: AtomicU64::new(0),
+            config: Mutex::new(None),
         })
+    }
+
+    /// Let host control resolve configuration through `config`.
+    pub fn with_config(self: Arc<Self>, config: Arc<dyn HostConfig>) -> Arc<Self> {
+        *self.config.lock().expect("front end poisoned") = Some(config);
+        self
+    }
+
+    /// How many Apps have fed this front end. A host that rebuilds its App for
+    /// something done to the same session shows up here (`docs/adr/0022` §2).
+    pub fn apps_fed(&self) -> u64 {
+        self.mounts.load(Ordering::SeqCst)
+    }
+
+    fn host_config(&self) -> Option<Arc<dyn HostConfig>> {
+        self.config.lock().expect("front end poisoned").clone()
     }
 
     fn app(&self) -> Option<Context> {
@@ -452,6 +483,43 @@ impl RuntimeControl {
         }
     }
 
+    /// Refuse a command based on a fact older than a message or a turn the
+    /// session has had since (`docs/adr/0021` §9).
+    fn fresh(
+        &self,
+        session: &str,
+        based_on: atomcode_kernel::session::SeqNo,
+    ) -> Result<(), HostError> {
+        let Some(app) = self.front_end.app() else {
+            return Err(HostError::Unavailable);
+        };
+        let Some(agent) = Feed::find(&app, session) else {
+            return Ok(());
+        };
+        let events = agent.session().events();
+        let moved = events.iter().any(|logged| {
+            logged.seq > based_on
+                && matches!(
+                    logged.event,
+                    atomcode_harness::session::SessionEvent::TurnStart { .. }
+                        | atomcode_harness::session::SessionEvent::UserMessage { .. }
+                )
+        });
+        if moved {
+            return Err(HostError::Stale {
+                current: events.last().map(|logged| logged.seq).unwrap_or(0),
+            });
+        }
+        Ok(())
+    }
+
+    /// Put `next` in place of the configuration the runtime runs, and keep it.
+    async fn reconfigure(&self, next: CodingAgentConfig) -> Result<HostReply, HostError> {
+        self.handle.reassemble_provider(next.clone()).await?;
+        *self.config.lock().expect("config poisoned") = next;
+        Ok(HostReply::Done)
+    }
+
     fn announce(&self, event: HostEvent) {
         self.watchers
             .lock()
@@ -542,6 +610,148 @@ impl HostControl for RuntimeControl {
             HostCommand::ListSessions { working_dir } => Ok(HostReply::Sessions {
                 sessions: self.list(working_dir),
             }),
+            HostCommand::Undo {
+                session,
+                turn,
+                based_on,
+            } => {
+                self.addressed(&session)?;
+                self.fresh(&session, based_on)?;
+                let nth = match turn {
+                    None => None,
+                    Some(turn) => Some(
+                        self.handle
+                            .rewind_points()
+                            .await?
+                            .points
+                            .into_iter()
+                            .find(|point| point.turn_id == turn)
+                            .map(|point| point.prompt_number)
+                            .ok_or(HostError::RewindPointNotFound { turn })?,
+                    ),
+                };
+                let undone = self.handle.undo_to_prompt(nth).await?;
+                Ok(HostReply::Undone {
+                    prompt: Some(undone.restored_prompt),
+                    restored_files: Vec::new(),
+                })
+            }
+            HostCommand::RewindPoints { session } => {
+                self.addressed(&session)?;
+                let catalog = self.handle.rewind_points().await?;
+                Ok(HostReply::RewindPoints {
+                    points: catalog
+                        .points
+                        .into_iter()
+                        .rev()
+                        .map(|point| atomcode_kernel::host::RewindPoint {
+                            turn: point.turn_id,
+                            prompt: point.prompt_preview,
+                            files: point.files.len(),
+                            code: point.before_tree.is_some(),
+                        })
+                        .collect(),
+                    code_unavailable: catalog.code_unavailable,
+                })
+            }
+            HostCommand::Rewind {
+                session,
+                turn,
+                scope,
+                based_on,
+            } => {
+                self.addressed(&session)?;
+                self.fresh(&session, based_on)?;
+                let scope = match scope {
+                    atomcode_kernel::session::RewindScope::Conversation => {
+                        crate::runtime::RewindScope::Conversation
+                    }
+                    atomcode_kernel::session::RewindScope::Code => {
+                        crate::runtime::RewindScope::Code
+                    }
+                    atomcode_kernel::session::RewindScope::Both => {
+                        crate::runtime::RewindScope::ConversationAndCode
+                    }
+                };
+                let rewound = self.handle.rewind(turn, scope).await?;
+                Ok(HostReply::Undone {
+                    prompt: rewound.restored_prompt,
+                    restored_files: rewound.restored_files,
+                })
+            }
+            HostCommand::SwitchModel { session, model } => {
+                self.addressed(&session)?;
+                let Some(source) = self.front_end.host_config() else {
+                    return Err(HostError::Failed {
+                        message: "this host does not resolve models".into(),
+                    });
+                };
+                let mut next = source
+                    .for_model(&model)
+                    .map_err(|message| HostError::Failed { message })?;
+                // The thinking level is the session's, not the model's default.
+                next.chat_options.reasoning_effort = self
+                    .config
+                    .lock()
+                    .expect("config poisoned")
+                    .chat_options
+                    .reasoning_effort;
+                self.reconfigure(next).await
+            }
+            HostCommand::McpStatus { session } => {
+                self.addressed(&session)?;
+                use atomcode_capabilities::mcp::ServerStatus;
+                use atomcode_kernel::host::{McpServer, McpServerState};
+                let status = self.handle.mcp_status().await?;
+                Ok(HostReply::McpServers {
+                    servers: status
+                        .servers
+                        .into_iter()
+                        .map(|(name, state)| McpServer {
+                            name,
+                            state: match state {
+                                ServerStatus::Connecting => McpServerState::Connecting,
+                                ServerStatus::Connected => McpServerState::Connected,
+                                ServerStatus::BlockedUntrusted => McpServerState::Untrusted,
+                                ServerStatus::Failed(message) => McpServerState::Failed { message },
+                                ServerStatus::Disconnected => McpServerState::Disconnected,
+                            },
+                        })
+                        .collect(),
+                })
+            }
+            HostCommand::WithdrawMcpTools { session } => {
+                self.addressed(&session)?;
+                self.handle.withdraw_mcp_tools().await?;
+                Ok(HostReply::Done)
+            }
+            HostCommand::Reload { session } => {
+                self.addressed(&session)?;
+                let changed = self.handle.reload_capabilities().await?;
+                match self.changed(changed.session_id)? {
+                    HostReply::SessionChanged { session: now } if now == session => {
+                        Ok(HostReply::Done)
+                    }
+                    other => Ok(other),
+                }
+            }
+            HostCommand::SignOut { session } => {
+                self.addressed(&session)?;
+                self.handle
+                    .deactivate_provider(ProviderUnavailableReason::AuthenticationRequired)
+                    .await?;
+                Ok(HostReply::Done)
+            }
+            HostCommand::SignIn { session } => {
+                self.addressed(&session)?;
+                let next = match self.front_end.host_config() {
+                    Some(source) => source
+                        .current()
+                        .map_err(|message| HostError::Failed { message })?,
+                    None => self.config.lock().expect("config poisoned").clone(),
+                };
+                self.reconfigure(next).await
+            }
             _ => Err(HostError::Failed {
                 message: "this host does not do that yet".into(),
             }),

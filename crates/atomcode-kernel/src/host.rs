@@ -43,6 +43,41 @@ pub enum HostCommand {
     /// The stored sessions a person could resume, newest first — those of one
     /// working directory, or all of them.
     ListSessions { working_dir: Option<String> },
+    /// Take the conversation back to before the person's message that opened
+    /// `turn` — the last one they sent, when none is named — and hand that
+    /// message back (`docs/adr/0024` §17). `based_on` is the last fact the
+    /// caller saw: a message or a turn since then makes it `Stale`.
+    Undo {
+        session: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<u64>,
+        based_on: SeqNo,
+    },
+    /// The turns a rewind can go back to, newest first.
+    RewindPoints { session: String },
+    /// Take back what `turn` and everything after it did: the conversation,
+    /// the workspace, or both. Restoring a snapshot is this, over the
+    /// conversation.
+    Rewind {
+        session: String,
+        turn: u64,
+        scope: crate::session::RewindScope,
+        based_on: SeqNo,
+    },
+    /// The model `session`'s requests go to from now on, by the id a person
+    /// picks it by.
+    SwitchModel { session: String, model: String },
+    /// The MCP servers `session` was given, and how each one is.
+    McpStatus { session: String },
+    /// Take every MCP tool off `session`'s model now — what has to happen
+    /// before anything changes which servers are trusted.
+    WithdrawMcpTools { session: String },
+    /// Read skills, MCP servers and configuration again, for the same session.
+    Reload { session: String },
+    /// Take `session`'s credentials out of the process. The session stays.
+    SignOut { session: String },
+    /// Sign `session` back in, with the credentials configured now.
+    SignIn { session: String },
 }
 
 impl HostCommand {
@@ -51,7 +86,16 @@ impl HostCommand {
         match self {
             Self::NewSession { session }
             | Self::Resume { session, .. }
-            | Self::SetReasoningEffort { session, .. } => Some(session),
+            | Self::SetReasoningEffort { session, .. }
+            | Self::Undo { session, .. }
+            | Self::RewindPoints { session }
+            | Self::Rewind { session, .. }
+            | Self::SwitchModel { session, .. }
+            | Self::McpStatus { session }
+            | Self::WithdrawMcpTools { session }
+            | Self::Reload { session }
+            | Self::SignOut { session }
+            | Self::SignIn { session } => Some(session),
             Self::ListSessions { .. } => None,
         }
     }
@@ -71,6 +115,59 @@ pub enum HostReply {
     Sessions {
         sessions: Vec<StoredSession>,
     },
+    /// An undo or a rewind went through. `prompt` is the person's message the
+    /// conversation went back to before — for where they type, to edit and
+    /// send again; `restored_files` the workspace files put back.
+    Undone {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        restored_files: Vec<String>,
+    },
+    RewindPoints {
+        points: Vec<RewindPoint>,
+        /// Why the workspace cannot be rewound here, when it cannot: only the
+        /// conversation can.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code_unavailable: Option<String>,
+    },
+    McpServers {
+        servers: Vec<McpServer>,
+    },
+}
+
+/// A turn a rewind can go back to.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewindPoint {
+    pub turn: u64,
+    /// The person's message that opened it, shortened for a list.
+    pub prompt: String,
+    /// How many workspace files it changed.
+    #[serde(default)]
+    pub files: usize,
+    /// Whether the workspace can be put back to before it.
+    #[serde(default)]
+    pub code: bool,
+}
+
+/// One MCP server, as a status list shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServer {
+    pub name: String,
+    pub state: McpServerState,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpServerState {
+    Connecting,
+    Connected,
+    /// Not started: the project is not trusted.
+    Untrusted,
+    Failed {
+        message: String,
+    },
+    Disconnected,
 }
 
 /// One stored session, as a picker shows it.
@@ -209,13 +306,55 @@ mod tests {
             HostCommand::ListSessions {
                 working_dir: Some("/w".into()),
             },
+            HostCommand::Undo {
+                session: "a".into(),
+                turn: Some(3),
+                based_on: 40,
+            },
+            HostCommand::RewindPoints {
+                session: "a".into(),
+            },
+            HostCommand::Rewind {
+                session: "a".into(),
+                turn: 2,
+                scope: crate::session::RewindScope::Both,
+                based_on: 40,
+            },
+            HostCommand::SwitchModel {
+                session: "a".into(),
+                model: "glm-5".into(),
+            },
+            HostCommand::McpStatus {
+                session: "a".into(),
+            },
+            HostCommand::WithdrawMcpTools {
+                session: "a".into(),
+            },
+            HostCommand::Reload {
+                session: "a".into(),
+            },
+            HostCommand::SignOut {
+                session: "a".into(),
+            },
+            HostCommand::SignIn {
+                session: "a".into(),
+            },
         ];
         for c in &all {
             match c {
                 HostCommand::NewSession { .. }
                 | HostCommand::Resume { .. }
                 | HostCommand::SetReasoningEffort { .. }
-                | HostCommand::ListSessions { .. } => {}
+                | HostCommand::ListSessions { .. }
+                | HostCommand::Undo { .. }
+                | HostCommand::RewindPoints { .. }
+                | HostCommand::Rewind { .. }
+                | HostCommand::SwitchModel { .. }
+                | HostCommand::McpStatus { .. }
+                | HostCommand::WithdrawMcpTools { .. }
+                | HostCommand::Reload { .. }
+                | HostCommand::SignOut { .. }
+                | HostCommand::SignIn { .. } => {}
             }
         }
         all
@@ -238,11 +377,54 @@ mod tests {
                     needs_newer_version: true,
                 }],
             },
+            HostReply::Undone {
+                prompt: Some("fix the parser".into()),
+                restored_files: vec!["src/parser.rs".into()],
+            },
+            HostReply::RewindPoints {
+                points: vec![RewindPoint {
+                    turn: 2,
+                    prompt: "fix the parser".into(),
+                    files: 1,
+                    code: true,
+                }],
+                code_unavailable: Some("not a repository".into()),
+            },
+            HostReply::McpServers {
+                servers: vec![
+                    McpServer {
+                        name: "docs".into(),
+                        state: McpServerState::Connected,
+                    },
+                    McpServer {
+                        name: "db".into(),
+                        state: McpServerState::Failed {
+                            message: "refused".into(),
+                        },
+                    },
+                    McpServer {
+                        name: "a".into(),
+                        state: McpServerState::Connecting,
+                    },
+                    McpServer {
+                        name: "b".into(),
+                        state: McpServerState::Untrusted,
+                    },
+                    McpServer {
+                        name: "c".into(),
+                        state: McpServerState::Disconnected,
+                    },
+                ],
+            },
         ];
         for r in &all {
             match r {
-                HostReply::Done | HostReply::SessionChanged { .. } | HostReply::Sessions { .. } => {
-                }
+                HostReply::Done
+                | HostReply::SessionChanged { .. }
+                | HostReply::Sessions { .. }
+                | HostReply::Undone { .. }
+                | HostReply::RewindPoints { .. }
+                | HostReply::McpServers { .. } => {}
             }
         }
         all

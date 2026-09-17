@@ -131,6 +131,25 @@ const SESSION: &[Command] = &[
         "<low|medium|high|xhigh|max|default>",
         "改这个会话的思考强度(与模型无关)",
     ),
+    Command::taking(
+        "undo",
+        "[回合]",
+        "撤回最后一句话(或某一回合)及其后的一切,那句话放回输入框",
+    ),
+    Command::taking(
+        "rewind",
+        "[回合 [对话|代码|全部]]",
+        "回到某一回合之前:对话、工作区或两者;不带参数则挑一个",
+    ),
+    Command::taking("model", "<模型 id>", "这个会话从现在起用哪个模型"),
+    Command::taking(
+        "mcp",
+        "[withdraw]",
+        "MCP 服务器的状态;withdraw 立刻撤下全部 MCP 工具",
+    ),
+    Command::new("reload", "重新读取 skills、MCP 与配置,会话不变"),
+    Command::new("logout", "把凭据拿出进程;会话留着"),
+    Command::new("login", "用现在配置的凭据重新登录"),
 ];
 
 /// A host's refusal, in words a person can act on.
@@ -159,6 +178,12 @@ impl CommandSet for SessionCommands {
             return Outcome::Refused("这块屏幕没接上 agent".into());
         };
         let control = client.control();
+        // What host control acts on is the session this screen follows, whoever
+        // is on screen.
+        let root = client.root();
+        let host = |control: Option<std::sync::Arc<dyn atomcode_kernel::host::HostControl>>| {
+            control.ok_or_else(|| Outcome::Refused("这块屏幕没接上宿主".into()))
+        };
         match name {
             "cancel-all" => {
                 let members = client.cancel_all();
@@ -217,7 +242,7 @@ impl CommandSet for SessionCommands {
                 };
                 match control
                     .call(HostCommand::NewSession {
-                        session: client.session(),
+                        session: root.clone(),
                     })
                     .await
                 {
@@ -273,7 +298,7 @@ impl CommandSet for SessionCommands {
                 }
                 match control
                     .call(HostCommand::Resume {
-                        session: client.session(),
+                        session: root.clone(),
                         target: target.to_string(),
                     })
                     .await
@@ -315,7 +340,7 @@ impl CommandSet for SessionCommands {
                 };
                 match control
                     .call(HostCommand::SetReasoningEffort {
-                        session: client.session(),
+                        session: root.clone(),
                         level,
                     })
                     .await
@@ -324,6 +349,199 @@ impl CommandSet for SessionCommands {
                         client.chose_effort(level);
                         Outcome::Said(format!("思考强度 → {wanted}"))
                     }
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
+            // The conversation goes back; the words the person said go back to
+            // where they type, to change and send again (`docs/adr/0024` §17).
+            "undo" | "rewind" => {
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refused) => return refused,
+                };
+                if client.session() != root {
+                    return Outcome::Refused("撤销只对主会话:先切回「主」".into());
+                }
+                let mut words = args.split_whitespace();
+                let turn = match words.next().map(str::parse::<u64>) {
+                    None => None,
+                    Some(Ok(turn)) => Some(turn),
+                    Some(Err(_)) => {
+                        return Outcome::Refused(format!("`{}` 不是回合号", args.trim()))
+                    }
+                };
+                let based_on = client.root_high();
+                let reply = if name == "undo" {
+                    control
+                        .call(HostCommand::Undo {
+                            session: root,
+                            turn,
+                            based_on,
+                        })
+                        .await
+                } else {
+                    let Some(turn) = turn else {
+                        return match control
+                            .call(HostCommand::RewindPoints { session: root })
+                            .await
+                        {
+                            Ok(HostReply::RewindPoints {
+                                points,
+                                code_unavailable,
+                            }) if !points.is_empty() => {
+                                let choices = points
+                                    .into_iter()
+                                    .map(|point| {
+                                        let scope = if point.code && code_unavailable.is_none() {
+                                            " 全部"
+                                        } else {
+                                            ""
+                                        };
+                                        crate::overlay::Choice::new(
+                                            format!("/rewind {}{scope}", point.turn),
+                                            point.prompt.clone(),
+                                        )
+                                        .about(format!(
+                                            "回合 {} · {} 个文件改动",
+                                            point.turn, point.files
+                                        ))
+                                    })
+                                    .collect();
+                                Outcome::Open(crate::overlay::Picker::new(
+                                    "rewind",
+                                    "回到哪一回合之前 · enter 回去",
+                                    choices,
+                                ))
+                            }
+                            Ok(HostReply::RewindPoints { .. }) => {
+                                Outcome::Said("还没有可以回去的回合".into())
+                            }
+                            Ok(other) => Outcome::Refused(format!("{other:?}")),
+                            Err(error) => Outcome::Refused(refusal(error)),
+                        };
+                    };
+                    let scope = match words.next() {
+                        None | Some("对话") | Some("conversation") => {
+                            atomcode_kernel::session::RewindScope::Conversation
+                        }
+                        Some("代码") | Some("code") => {
+                            atomcode_kernel::session::RewindScope::Code
+                        }
+                        Some("全部") | Some("both") => {
+                            atomcode_kernel::session::RewindScope::Both
+                        }
+                        Some(other) => {
+                            return Outcome::Refused(format!(
+                                "`{other}` 不是范围;可选:对话、代码、全部"
+                            ))
+                        }
+                    };
+                    control
+                        .call(HostCommand::Rewind {
+                            session: root,
+                            turn,
+                            scope,
+                            based_on,
+                        })
+                        .await
+                };
+                match reply {
+                    Ok(HostReply::Undone {
+                        prompt: Some(prompt),
+                        ..
+                    }) => Outcome::Do(Action::Paste(prompt)),
+                    Ok(HostReply::Undone { restored_files, .. }) => {
+                        Outcome::Said(format!("已还原 {} 个文件", restored_files.len()))
+                    }
+                    Ok(other) => Outcome::Refused(format!("{other:?}")),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
+            "model" => {
+                let wanted = args.trim();
+                if wanted.is_empty() {
+                    let current = client
+                        .described()
+                        .and_then(|d| d.model)
+                        .unwrap_or_else(|| "(未知)".into());
+                    return Outcome::Said(format!("当前模型:{current}"));
+                }
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refused) => return refused,
+                };
+                match control
+                    .call(HostCommand::SwitchModel {
+                        session: root,
+                        model: wanted.to_string(),
+                    })
+                    .await
+                {
+                    Ok(_) => Outcome::Said(format!("模型 → {wanted}")),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
+            "mcp" => {
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refused) => return refused,
+                };
+                match args.trim() {
+                    "" => match control.call(HostCommand::McpStatus { session: root }).await {
+                        Ok(HostReply::McpServers { servers }) if servers.is_empty() => {
+                            Outcome::Said("没有配置 MCP 服务器".into())
+                        }
+                        Ok(HostReply::McpServers { servers }) => Outcome::Said(
+                            servers
+                                .into_iter()
+                                .map(|server| {
+                                    use atomcode_kernel::host::McpServerState as S;
+                                    let state = match server.state {
+                                        S::Connecting => "连接中".to_string(),
+                                        S::Connected => "已连接".to_string(),
+                                        S::Untrusted => "未信任项目,未启动".to_string(),
+                                        S::Failed { message } => format!("失败:{message}"),
+                                        S::Disconnected => "已断开".to_string(),
+                                        _ => "未知".to_string(),
+                                    };
+                                    format!("{} · {state}", server.name)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ),
+                        Ok(other) => Outcome::Refused(format!("{other:?}")),
+                        Err(error) => Outcome::Refused(refusal(error)),
+                    },
+                    "withdraw" => match control
+                        .call(HostCommand::WithdrawMcpTools { session: root })
+                        .await
+                    {
+                        Ok(_) => Outcome::Said("已撤下全部 MCP 工具".into()),
+                        Err(error) => Outcome::Refused(refusal(error)),
+                    },
+                    other => {
+                        Outcome::Refused(format!("`/mcp {other}` 不认识;可用:/mcp、/mcp withdraw"))
+                    }
+                }
+            }
+            "reload" | "logout" | "login" => {
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refused) => return refused,
+                };
+                let (command, done) = match name {
+                    "reload" => (
+                        HostCommand::Reload { session: root },
+                        "已重新读取 skills、MCP 与配置",
+                    ),
+                    "logout" => (
+                        HostCommand::SignOut { session: root },
+                        "已登出;/login 重新登录",
+                    ),
+                    _ => (HostCommand::SignIn { session: root }, "已登录"),
+                };
+                match control.call(command).await {
+                    Ok(_) => Outcome::Said(done.into()),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
@@ -418,6 +636,189 @@ fn first_line(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host that answers from a script and keeps what it was asked.
+    #[derive(Default)]
+    struct Recording {
+        asked: std::sync::Mutex<Vec<HostCommand>>,
+        replies: std::sync::Mutex<std::collections::VecDeque<Result<HostReply, HostError>>>,
+    }
+
+    #[async_trait]
+    impl atomcode_kernel::host::HostControl for Recording {
+        async fn call(&self, command: HostCommand) -> Result<HostReply, HostError> {
+            self.asked.lock().unwrap().push(command);
+            self.replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(HostReply::Done))
+        }
+        fn subscribe(
+            &self,
+        ) -> tokio::sync::mpsc::UnboundedReceiver<atomcode_kernel::host::HostEvent> {
+            tokio::sync::mpsc::unbounded_channel().1
+        }
+    }
+
+    /// A screen following session `lead`, whose last fact it saw is number 7.
+    fn following(host: &Arc<Recording>) -> (App, Arc<crate::plugin::AgentClient>, Arc<Commands>) {
+        let app = bare();
+        let client = Arc::new(crate::plugin::AgentClient::default());
+        let (commands, _agent) = tokio::sync::mpsc::unbounded_channel();
+        client.connect(commands, host.clone());
+        client.follow("lead");
+        client.keep(&atomcode_kernel::session::Committed {
+            session: "lead".into(),
+            seq: 7,
+            at: 0,
+            event: SessionEvent::TurnStart { turn: 1 },
+        });
+        let _ = app
+            .context()
+            .provide::<crate::plugin::AgentClientSvc>(client.clone());
+        let all = Arc::new(Commands::new());
+        let _ = all.add(Arc::new(SessionCommands));
+        (app, client, all)
+    }
+
+    /// `/undo` asks the host about the session this screen follows, based on the
+    /// last fact it saw, and puts the words it hands back where the person
+    /// types (`docs/adr/0024` §17).
+    #[tokio::test]
+    async fn undo_is_asked_of_the_host_and_the_words_come_back_to_the_composer() {
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Undone {
+                prompt: Some("fix the parser".into()),
+                restored_files: Vec::new(),
+            }));
+        let (app, client, all) = following(&host);
+        assert_eq!(
+            all.dispatch("/undo", &app.context()).await,
+            Outcome::Do(Action::Paste("fix the parser".into()))
+        );
+        let _ = all.dispatch("/undo 3", &app.context()).await;
+        assert_eq!(
+            *host.asked.lock().unwrap(),
+            vec![
+                HostCommand::Undo {
+                    session: "lead".into(),
+                    turn: None,
+                    based_on: 7,
+                },
+                HostCommand::Undo {
+                    session: "lead".into(),
+                    turn: Some(3),
+                    based_on: 7,
+                },
+            ]
+        );
+
+        // With a member on screen, the lead's conversation is not what is shown.
+        let _ = client.look_at("lead/scout");
+        assert!(matches!(
+            all.dispatch("/undo", &app.context()).await,
+            Outcome::Refused(_)
+        ));
+        assert_eq!(
+            host.asked.lock().unwrap().len(),
+            2,
+            "nothing more was asked"
+        );
+    }
+
+    /// `/rewind` with nothing after it offers the points to pick from; with a
+    /// turn and a scope it goes back.
+    #[tokio::test]
+    async fn rewind_offers_the_points_and_goes_back_with_a_scope() {
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::RewindPoints {
+                points: vec![atomcode_kernel::host::RewindPoint {
+                    turn: 2,
+                    prompt: "two".into(),
+                    files: 1,
+                    code: true,
+                }],
+                code_unavailable: None,
+            }));
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Undone {
+                prompt: None,
+                restored_files: vec!["src/a.rs".into()],
+            }));
+        let (app, _client, all) = following(&host);
+        match all.dispatch("/rewind", &app.context()).await {
+            Outcome::Open(picker) => assert_eq!(picker.id(), "rewind"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            all.dispatch("/rewind 2 代码", &app.context()).await,
+            Outcome::Said("已还原 1 个文件".into())
+        );
+        assert_eq!(
+            host.asked.lock().unwrap().last(),
+            Some(&HostCommand::Rewind {
+                session: "lead".into(),
+                turn: 2,
+                scope: atomcode_kernel::session::RewindScope::Code,
+                based_on: 7,
+            })
+        );
+    }
+
+    /// The rest of host control over a session is a command each, for the
+    /// session this screen follows even while a member is on screen.
+    #[tokio::test]
+    async fn model_mcp_reload_and_signing_in_and_out_are_asked_of_the_host() {
+        let host = Arc::new(Recording::default());
+        let (app, client, all) = following(&host);
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::Done),
+            Ok(HostReply::McpServers {
+                servers: Vec::new(),
+            }),
+        ]);
+        let _ = client.look_at("lead/scout");
+        for line in [
+            "/model glm-5",
+            "/mcp",
+            "/mcp withdraw",
+            "/reload",
+            "/logout",
+            "/login",
+        ] {
+            assert!(
+                !matches!(
+                    all.dispatch(line, &app.context()).await,
+                    Outcome::Refused(_)
+                ),
+                "{line}"
+            );
+        }
+        let lead = || "lead".to_string();
+        assert_eq!(
+            *host.asked.lock().unwrap(),
+            vec![
+                HostCommand::SwitchModel {
+                    session: lead(),
+                    model: "glm-5".into(),
+                },
+                HostCommand::McpStatus { session: lead() },
+                HostCommand::WithdrawMcpTools { session: lead() },
+                HostCommand::Reload { session: lead() },
+                HostCommand::SignOut { session: lead() },
+                HostCommand::SignIn { session: lead() },
+            ]
+        );
+    }
     use atomcode_plexus::{App, ConfigTree, PluginRegistry};
 
     fn bare() -> App {

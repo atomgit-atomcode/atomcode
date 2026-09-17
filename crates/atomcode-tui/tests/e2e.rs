@@ -2721,9 +2721,13 @@ async fn a_command_the_agent_offers_is_on_the_slash_menu_and_runs() {
     let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[echo])).await;
     let task = s.open().await;
 
-    s.term.type_line("/help");
+    // The menu narrows to it as it is typed, with its hint and what it does.
+    s.term.type_text("/ec");
     until(&s, "/echo <text>").await;
     assert!(s.screen().contains("say it back"), "{}", s.screen());
+    for _ in 0..3 {
+        s.term.press(KeyPress::plain(Key::Backspace));
+    }
 
     s.term.type_line("/echo hello there");
     until(&s, "echoed: hello there").await;

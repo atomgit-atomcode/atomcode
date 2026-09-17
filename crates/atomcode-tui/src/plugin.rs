@@ -145,7 +145,7 @@ impl Views {
 }
 
 impl AgentClient {
-    fn connect(
+    pub(crate) fn connect(
         &self,
         commands: mpsc::UnboundedSender<AgentCommand>,
         control: Arc<dyn HostControl>,
@@ -167,6 +167,17 @@ impl AgentClient {
     /// The session this screen follows — the lead, when there is a team.
     pub fn root(&self) -> String {
         self.view.lock().expect("client poisoned").root.clone()
+    }
+
+    /// The last fact of the session this screen follows — what a host command
+    /// about its conversation is based on (`docs/adr/0021` §9).
+    pub fn root_high(&self) -> atomcode_kernel::session::SeqNo {
+        let views = self.view.lock().expect("client poisoned");
+        views
+            .sessions
+            .get(&views.root)
+            .and_then(|view| view.high)
+            .unwrap_or(0)
     }
 
     /// The facts of the session on screen so far, in log order.
@@ -274,7 +285,7 @@ impl AgentClient {
 
     /// Draw `session` from its first fact. Whatever was followed before — the
     /// session and any member looked at — is let go.
-    fn follow(&self, session: &str) {
+    pub(crate) fn follow(&self, session: &str) {
         let previous = {
             let mut views = self.view.lock().expect("client poisoned");
             let previous: Vec<String> = views.sessions.keys().cloned().collect();
@@ -301,7 +312,7 @@ impl AgentClient {
     /// it already is; otherwise what is known of it so far, to draw from. A
     /// member looked at for the first time is followed from its first fact, and
     /// stays followed: looking at it again draws what arrived meanwhile.
-    fn look_at(&self, session: &str) -> Option<Vec<LoggedEvent>> {
+    pub(crate) fn look_at(&self, session: &str) -> Option<Vec<LoggedEvent>> {
         let (known, subscribe) = {
             let mut views = self.view.lock().expect("client poisoned");
             if views.on_screen == session {
@@ -329,7 +340,7 @@ impl AgentClient {
 
     /// Keep a fact of a followed session. `true` when it is the one on screen
     /// and new, which is when it is drawn.
-    fn keep(&self, committed: &Committed) -> bool {
+    pub(crate) fn keep(&self, committed: &Committed) -> bool {
         let mut views = self.view.lock().expect("client poisoned");
         let on_screen = views.on_screen == committed.session;
         let Some(view) = views.sessions.get_mut(&committed.session) else {

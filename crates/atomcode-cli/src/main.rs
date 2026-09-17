@@ -2496,6 +2496,14 @@ async fn run() -> Result<i32> {
                     total_ms = run_start.elapsed().as_millis() as u64,
                     "handing control to the row-assembled TUI"
                 );
+                let front_end =
+                    front_end.with_config(std::sync::Arc::new(atomcode::tui_front::ConfigFile {
+                        path: config_path.clone(),
+                        working_dir: working_dir.clone(),
+                        telemetry: Some(telemetry.clone()),
+                        skip_permissions: cli.dangerously_skip_permissions,
+                        provider_override: cli.provider.clone(),
+                    }));
                 let result = atomcode::tui_front::run(runtime, front_end, coding_cfg, &screen)
                     .await
                     .map(|()| 0)
