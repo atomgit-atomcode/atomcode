@@ -443,14 +443,26 @@ impl Tool for ReviewTool {
         json!({
             "type": "object",
             "properties": {
+                // Flat object (NOT oneOf/const): strict OpenAI-compatible function-
+                // schema validators (e.g. DeepSeek) reject oneOf/const with
+                // "Invalid schema … null is not of type array". The per-kind field
+                // rules (base required when kind=range, etc.) are enforced at runtime
+                // by the tagged `ScopeArg` deserialization + `review_scope()`, so the
+                // wire schema only needs to describe the shape.
                 "scope": {
-                    "oneOf": [
-                        { "type": "object", "properties": { "kind": { "const": "working_tree" } }, "required": ["kind"] },
-                        { "type": "object", "properties": { "kind": { "const": "staged" } }, "required": ["kind"] },
-                        { "type": "object", "properties": { "kind": { "const": "range" }, "base": { "type": "string" }, "head": { "type": "string", "default": "HEAD" } }, "required": ["kind", "base"] },
-                        { "type": "object", "properties": { "kind": { "const": "commit" }, "rev": { "type": "string", "default": "HEAD" } }, "required": ["kind"] }
-                    ],
-                    "description": "Explicit mutually-exclusive review scope. Omit for working-tree changes."
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["working_tree", "staged", "range", "commit"],
+                            "description": "Which changes to review: `working_tree` (uncommitted, default), `staged`, `range` (needs `base`), or `commit` (uses `rev`)."
+                        },
+                        "base": { "type": "string", "description": "Base ref — REQUIRED when kind=range." },
+                        "head": { "type": "string", "description": "Head ref for kind=range (default HEAD)." },
+                        "rev": { "type": "string", "description": "Commit to review for kind=commit (default HEAD)." }
+                    },
+                    "required": ["kind"],
+                    "description": "Explicit review scope. Omit entirely for working-tree changes."
                 },
                 "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional repo-relative path filters." },
                 "confirm_scope": { "type": "string", "description": "Opaque token from a preflight. Pass only after explicit user confirmation." },
@@ -1006,6 +1018,37 @@ mod tests {
         assert!(s.staged);
         let b: Args = serde_json::from_str(r#"{"base":"main"}"#).unwrap();
         assert_eq!(b.base.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn parameters_schema_stays_strict_gateway_safe() {
+        // DeepSeek and other strict OpenAI-compatible function-schema validators
+        // reject `oneOf`/`anyOf`/`allOf`/`const` with "Invalid schema … null is not
+        // of type array". The scope was rewritten to a flat enum-based object; guard
+        // against reintroducing those keywords anywhere in the schema.
+        fn assert_no_forbidden_keys(value: &serde_json::Value, path: &str) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for key in ["oneOf", "anyOf", "allOf", "const"] {
+                        assert!(
+                            !map.contains_key(key),
+                            "schema uses `{key}` at {path} — unsupported by strict gateways (DeepSeek)"
+                        );
+                    }
+                    for (k, v) in map {
+                        assert_no_forbidden_keys(v, &format!("{path}.{k}"));
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for (i, v) in items.iter().enumerate() {
+                        assert_no_forbidden_keys(v, &format!("{path}[{i}]"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let tool = ReviewTool::new(Arc::new(RwLock::new(None)), ReviewToolConfig::default());
+        assert_no_forbidden_keys(&tool.parameters_schema(), "$");
     }
 
     #[test]
