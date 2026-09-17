@@ -29154,12 +29154,16 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         status_context_usage(state, ctx.config.default_context_window(), !no_provider);
     // Cache-hit indicator for the status row: the SESSION-cumulative share of
     // prompt tokens served from the provider's prompt cache (`cached / prompt`
-    // over the whole session, the same figure `/cost` reports as 会话累计缓存命中率).
-    // Uses the session-level tallies — which, unlike the per-turn `turn_*` ones,
-    // are NOT cleared at turn end — so the indicator is stable across turns and
-    // never blanks at idle. Reuses `turn_token_summary`'s cached-pct math for a
-    // consistent denominator/rounding; `None` until the first cached round lands,
-    // so providers that never report cached tokens keep the row clean.
+    // over the whole session). Uses the session-level tallies — which, unlike the
+    // per-turn `turn_*` ones, are NOT cleared at turn end — so the indicator is
+    // stable across turns and never blanks at idle. These tallies accumulate
+    // live in THIS runtime (reset on session switch, not restored from disk), so
+    // after a resume the figure rebuilds from the next turn — it is NOT sourced
+    // from the persisted session meta that `/cost` aggregates, and the two can
+    // differ until this runtime re-accumulates. Reuses `turn_token_summary`'s
+    // cached-pct math for a consistent denominator/rounding; `None` until the
+    // first cached round lands, so providers that never report cached tokens keep
+    // the row clean.
     let cache_indicator = {
         let (_, cached_pct) = crate::state::turn_token_summary(
             state.prompt_tokens,
