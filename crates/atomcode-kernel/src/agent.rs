@@ -2599,8 +2599,17 @@ impl RunningAgent {
                             // slow local / large-context model whose prefill legitimately
                             // exceeds the idle window should RAISE the timeout, not reconnect
                             // (a reconnect re-issues the round and restarts that same prefill).
+                            // This branch is content-free (`!saw_stream_content`), i.e. the
+                            // PREFILL phase, so the knob that actually governs it is
+                            // `first_token_timeout` when set — point users at THAT one, else
+                            // fall back to naming the `stream_timeout` knob (the None-first_token
+                            // case where prefill is bounded by stream_timeout).
                             let tuning_hint = if stream_retry == 1 {
-                                " · 慢的本地/大 context 模型可调高 ATOMCODE_STREAM_TIMEOUT_SECS(默认 300s)"
+                                if self.first_token_timeout.is_some() {
+                                    " · 慢的本地/大 context 模型 prefill 慢可调高 ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS(默认 600s)"
+                                } else {
+                                    " · 慢的本地/大 context 模型可调高 ATOMCODE_STREAM_TIMEOUT_SECS(默认 300s)"
+                                }
                             } else {
                                 ""
                             };

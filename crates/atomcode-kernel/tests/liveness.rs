@@ -512,12 +512,16 @@ async fn prefill_stall_uses_first_token_timeout_not_stream_timeout() {
 
     handle.commands.send(send("go")).unwrap();
 
-    let (saw_reconnect, completed) = tokio::time::timeout(OUTER_GUARD, async {
-        let mut saw_reconnect = false;
+    let (first_reconnect_msg, completed) = tokio::time::timeout(OUTER_GUARD, async {
+        let mut first_reconnect_msg: Option<String> = None;
         let mut completed = false;
         while let Some(ev) = handle.events.recv().await {
             match ev {
-                AgentEvent::Warning(m) if m.contains("reconnecting") => saw_reconnect = true,
+                AgentEvent::Warning(m) if m.contains("reconnecting") => {
+                    if first_reconnect_msg.is_none() {
+                        first_reconnect_msg = Some(m);
+                    }
+                }
                 AgentEvent::TurnComplete { .. } => {
                     completed = true;
                     break;
@@ -525,15 +529,27 @@ async fn prefill_stall_uses_first_token_timeout_not_stream_timeout() {
                 _ => {}
             }
         }
-        (saw_reconnect, completed)
+        (first_reconnect_msg, completed)
     })
     .await
     .expect("prefill must time out on the FAST first-token budget, not the slow stream budget");
 
     assert!(
-        saw_reconnect,
+        first_reconnect_msg.is_some(),
         "a content-free prefill stall must fire first_token_timeout (50ms), \
          not stream_timeout (30s)"
+    );
+    // When `first_token_timeout` is set, the prefill-reconnect hint must name the knob
+    // that actually governs this phase (ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS), NOT the
+    // inter-token ATOMCODE_STREAM_TIMEOUT_SECS — raising the latter would not help.
+    let msg = first_reconnect_msg.unwrap();
+    assert!(
+        msg.contains("ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS"),
+        "with first_token_timeout set, the prefill hint must name the first-token knob: {msg:?}"
+    );
+    assert!(
+        !msg.contains("ATOMCODE_STREAM_TIMEOUT_SECS"),
+        "the prefill hint must not misdirect to the inter-token knob: {msg:?}"
     );
     assert!(completed, "the turn must recover and complete");
 }

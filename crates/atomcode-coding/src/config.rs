@@ -45,9 +45,10 @@ pub struct CodingAgentConfig {
     /// Liveness: max wait for the FIRST content byte (prefill / time-to-first-token).
     /// A slow local model on a large prompt can churn far longer before the first byte
     /// than between subsequent tokens, so this budget is separate from — and usually
-    /// larger than — `stream_timeout`. Env `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS`, default
-    /// 600s. Once the first byte arrives, `stream_timeout` takes over. Reconnecting on a
-    /// slow-but-progressing prefill just restarts it, so we wait longer instead.
+    /// larger than — `stream_timeout`. Env `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS` (explicit
+    /// value wins), else `max(600s, stream_timeout)` so it never drops below the
+    /// inter-token budget. Once the first byte arrives, `stream_timeout` takes over.
+    /// Reconnecting on a slow-but-progressing prefill just restarts it, so we wait longer.
     pub first_token_timeout: Duration,
     /// Liveness: max wait for a driver approval response before it degrades to deny.
     /// `Some(d)` ⇒ fail-closed after `d` — for HEADLESS / no-human drivers where a never-
@@ -685,17 +686,24 @@ fn default_stream_timeout() -> Duration {
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(300))
 }
-/// The default first-token (prefill / TTFB) timeout: `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS`
-/// if set to a valid positive integer, else 600s. Larger than `default_stream_timeout`
-/// because prefill on a slow local model (large prompt, few tok/s) legitimately exceeds
-/// inter-token latency, and reconnecting mid-prefill just restarts it.
+/// The default first-token (prefill / TTFB) timeout. An explicit
+/// `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS` (valid positive integer) wins as-is — a
+/// deliberate user choice, even if shorter than `stream_timeout`. Otherwise it
+/// defaults to 600s but is NEVER shorter than `stream_timeout`: prefill on a slow
+/// local model legitimately exceeds inter-token latency, so a first-token budget
+/// below the inter-token one inverts the intent. In particular a user who raised
+/// `ATOMCODE_STREAM_TIMEOUT_SECS` (e.g. following the reconnect hint) must not end
+/// up with a SHORTER prefill window than inter-token — hence the `.max()`.
 fn default_first_token_timeout() -> Duration {
-    std::env::var("ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS")
+    if let Some(explicit) = std::env::var("ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
         .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(600))
+    {
+        return explicit;
+    }
+    default_stream_timeout().max(Duration::from_secs(600))
 }
 /// Share of the CodingPlan 5h rolling `call_limit` a single `/goal` may consume
 /// (percent). A goal that eats more than this starves the user's interactive work
