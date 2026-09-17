@@ -286,6 +286,79 @@ async fn an_overflow_compacts_and_retries_with_less_history() {
     assert!(compactions >= 1);
 }
 
+/// Records the longest message each request carried.
+struct Widest(Arc<std::sync::Mutex<Vec<usize>>>);
+
+#[async_trait]
+impl Waterfall<AgentRequest> for Widest {
+    async fn handle(
+        &self,
+        req: &mut ModelRequest,
+        next: Next<'_, AgentRequest>,
+    ) -> Result<ModelResponse, RequestError> {
+        let widest = req.messages.iter().map(|m| m.text.len()).max().unwrap_or(0);
+        self.0.lock().unwrap().push(widest);
+        next.run(req).await
+    }
+}
+
+/// A request already past what the model can take is compacted before it is
+/// sent. Not every gateway refuses one: some answer it with an empty success,
+/// and a ladder that only climbs on a refusal never starts.
+#[tokio::test]
+async fn a_request_that_would_not_fit_is_compacted_before_it_is_sent() {
+    let dir = scratch("overflow-presend");
+    let window = "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\n\
+                  config = { context_window = 30000, script = [ { text = \"ok\" } ] }";
+    let app = start(tree(&dir, &[window])).await;
+    run_turn(&app, "first").await.unwrap();
+
+    // A tool result far larger than the 30k window, as a first turn leaves one.
+    let ctx = app.context();
+    let log = ctx.only_session().unwrap();
+    let turn = log.current_turn();
+    let call = atomcode_kernel::tool::ToolCall {
+        id: "big".into(),
+        name: "read_file".into(),
+        arguments: "{}".into(),
+    };
+    atomcode_harness::session::commit(
+        &ctx,
+        &log,
+        SessionEvent::AssistantMessage {
+            turn,
+            round: 2,
+            text: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![call],
+            reasoning_blocks: Vec::new(),
+            meta: None,
+        },
+    );
+    atomcode_harness::session::commit(
+        &ctx,
+        &log,
+        SessionEvent::ToolResultLogged {
+            turn,
+            round: 2,
+            call_id: "big".into(),
+            content: "a line of a very large file\n".repeat(6_000),
+            is_error: false,
+            images: vec![],
+        },
+    );
+
+    let widest = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _guard = ctx.on_waterfall::<AgentRequest>(Arc::new(Widest(widest.clone())), false);
+    let run = run_with(&app, 0, overflowing()).await;
+    assert_eq!(run.attempts, 1, "sent once");
+    let widest = widest.lock().unwrap().clone();
+    assert!(
+        widest.iter().all(|w| *w < 10_000),
+        "a request went out carrying the whole result: {widest:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_bounded_ladder_gives_up_instead_of_spinning() {
     let dir = scratch("overflow-hopeless");

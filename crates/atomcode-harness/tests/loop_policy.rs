@@ -411,6 +411,218 @@ async fn the_window_decides_whether_compaction_fires() {
     );
 }
 
+fn compaction_cuts(log: &atomcode_harness::session::SessionLog) -> Vec<u64> {
+    log.events()
+        .into_iter()
+        .filter_map(|e| match e.event {
+            SessionEvent::Compacted { through, .. } => Some(through),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The trigger runs before every request of a turn, and pressure does not drop
+/// between two rounds of the same turn when what is kept is itself large. A
+/// history that was folded once has nothing new to fold until another turn
+/// settles — so it is folded once, not once per round.
+#[tokio::test]
+async fn history_already_folded_is_not_folded_again() {
+    let dir = scratch("fold-once");
+    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    let call =
+        r#"{ text = "again", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] }"#;
+    let script = format!(
+        "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [\n  \
+         {{ text = \"first answer\" }},\n  {call},\n  {call},\n  {call},\n  {call},\n  \
+         {{ text = \"done\" }}\n] }}\n"
+    );
+    let eager = "[[patch]]\nid = \"compaction-tail\"\n\
+                 config = { threshold = 0.0000001, keep_turns = 1 }\n\n\
+                 [[remove]]\nid = \"repeat-fuse\"\n\n[[remove]]\nid = \"tool-loop-guard\"";
+    let app = start(tree(&dir, &script, &[eager])).await;
+    run_turn(&app, "first question").await.unwrap();
+    run_turn(&app, "second question").await.unwrap();
+
+    let cuts = compaction_cuts(&app.context().only_session().unwrap());
+    assert_eq!(
+        cuts.len(),
+        1,
+        "five requests in the second turn, one settled turn to fold: {cuts:?}"
+    );
+}
+
+/// A summary is what the model knows of everything before it. A later
+/// compaction that rebuilds its text from the raw log instead drops whatever
+/// that summary said — a written one included, which is the one worth most.
+#[tokio::test]
+async fn a_later_compaction_keeps_what_the_earlier_summary_said() {
+    let dir = scratch("keep-summary");
+    let script = "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = { script = [ \
+                  { text = \"a1\" }, { text = \"a2\" }, { text = \"a3\" }, { text = \"a4\" } ] }";
+    let app = start(tree(&dir, script, &[])).await;
+    run_turn(&app, "q1").await.unwrap();
+    run_turn(&app, "q2").await.unwrap();
+    let log = app.context().only_session().unwrap();
+    let end_of_first_turn = log
+        .events()
+        .iter()
+        .filter(|e| e.event.turn() <= 1)
+        .map(|e| e.seq)
+        .max()
+        .unwrap();
+    // What a written `/compact` leaves behind.
+    atomcode_harness::session::apply_compaction(
+        &app.context(),
+        &log,
+        atomcode_harness::seams::CompactionDecision::fold(
+            end_of_first_turn,
+            "WE-AGREED-TO-USE-POSTGRES",
+        ),
+    );
+    run_turn(&app, "q3").await.unwrap();
+    run_turn(&app, "q4").await.unwrap();
+
+    let compaction = app.context().service::<CompactionSvc>().unwrap();
+    let pressure = atomcode_harness::seams::CompactionAsk {
+        trigger: atomcode_kernel::message::CompactTrigger::Auto { utilization: 0.8 },
+        window: 128_000,
+        used_tokens: 102_400,
+    };
+    let decision = compaction
+        .compact(&log, &pressure)
+        .await
+        .expect("turns settled since");
+    atomcode_harness::session::apply_compaction(&app.context(), &log, decision);
+    let projected = log
+        .derive_messages()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        projected.contains("WE-AGREED-TO-USE-POSTGRES"),
+        "the earlier summary is gone: {projected}"
+    );
+    assert!(
+        projected.contains("q2"),
+        "what was asked since is listed: {projected}"
+    );
+    assert!(
+        !projected.contains("- q1"),
+        "what the earlier summary already stands for is not listed again: {projected}"
+    );
+}
+
+/// A compaction strategy that says it would call a model and never finds
+/// anything to commit — and counts how often it was asked.
+struct Reluctant(Arc<AtomicU32>);
+
+#[async_trait]
+impl atomcode_harness::seams::Compaction for Reluctant {
+    fn describe(&self) -> String {
+        "asks a model, commits nothing".into()
+    }
+    fn calls_model(
+        &self,
+        _: &atomcode_harness::session::SessionLog,
+        _: &atomcode_harness::seams::CompactionAsk,
+    ) -> bool {
+        true
+    }
+    async fn compact(
+        &self,
+        _: &atomcode_harness::session::SessionLog,
+        _: &atomcode_harness::seams::CompactionAsk,
+    ) -> Option<atomcode_harness::seams::CompactionDecision> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        None
+    }
+}
+
+struct ReluctantRow(Arc<AtomicU32>);
+
+#[async_trait]
+impl atomcode_plexus::Plugin for ReluctantRow {
+    fn name(&self) -> &'static str {
+        "compaction-reluctant"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["compaction"]
+    }
+    fn description(&self) -> &'static str {
+        "a compaction that never commits"
+    }
+    async fn apply(
+        &self,
+        ctx: &atomcode_plexus::Context,
+        _: &serde_json::Value,
+    ) -> Result<(), String> {
+        let _ = ctx
+            .provide::<CompactionSvc>(Arc::new(Reluctant(self.0.clone())))
+            .map_err(|e| e.to_string())?;
+        plugins::loop_policy::mount_compaction_trigger(ctx, 0.0000001);
+        Ok(())
+    }
+}
+
+/// Pressure does not fall between two rounds of one turn, and the trigger runs
+/// before each. A compaction that calls a model is tried once a turn — not once
+/// a round, billed each time for finding nothing — and the start a driver was
+/// shown for it is closed even though it committed nothing, or the driver
+/// holds its work back for a compaction that is never going to finish.
+#[tokio::test]
+async fn a_slow_compaction_is_tried_once_a_turn_and_its_start_is_always_closed() {
+    let dir = scratch("once-a-turn");
+    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    let call =
+        r#"{ text = "again", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] }"#;
+    let script = format!(
+        "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [\n  \
+         {call},\n  {call},\n  {call},\n  {call},\n  {{ text = \"done\" }}\n] }}\n"
+    );
+    let swap = "[[remove]]\nid = \"compaction-tail\"\n\n\
+                [[insert]]\nid = \"compaction-reluctant\"\nname = \"compaction-reluctant\"\n\n\
+                [[remove]]\nid = \"repeat-fuse\"\n\n[[remove]]\nid = \"tool-loop-guard\"";
+    let asked = Arc::new(AtomicU32::new(0));
+    let mut registry = plugins::catalog();
+    registry.register(Arc::new(ReluctantRow(asked.clone())));
+    let mut app = App::new(registry, tree(&dir, &script, &[swap]));
+    app.start().await.expect("must mount");
+
+    run_turn(&app, "first").await.unwrap();
+    // The first request has no usage to measure; the four after it all do.
+    assert_eq!(asked.load(Ordering::SeqCst), 1, "asked once in the turn");
+
+    let events: Vec<SessionEvent> = app
+        .context()
+        .only_session()
+        .unwrap()
+        .events()
+        .into_iter()
+        .map(|e| e.event)
+        .collect();
+    let driven = plugins::handle::replay(&events, 128_000);
+    let started = driven
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                atomcode_kernel::event::AgentEvent::CompactionStarted { .. }
+            )
+        })
+        .expect("the driver was told a compaction started");
+    assert!(
+        driven[started..].iter().any(|e| matches!(
+            e,
+            atomcode_kernel::event::AgentEvent::Compacted {
+                committed: false,
+                ..
+            }
+        )),
+        "and never that it finished"
+    );
+}
+
 // ---- compaction written by the utility model -----------------------------
 
 /// Swapping the strategy is a patch, not a rebuild: remove the model-free row,

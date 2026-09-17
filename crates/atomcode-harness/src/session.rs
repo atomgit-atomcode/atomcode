@@ -234,30 +234,60 @@ pub fn commit(ctx: &atomcode_plexus::Context, log: &SessionLog, event: SessionEv
     seq
 }
 
-/// Apply a compaction decision: cut the history at `through`, and record what
-/// the model sees in place of what was cut.
+/// Apply a compaction decision: record what the model sees in other words, cut
+/// the history at `through`, and tell the person anything they should know.
 ///
 /// Four callers arrive at a decision by different routes — a usage threshold,
 /// an overflow retry, an `AgentHandle` request, a `/compact` command — and each
-/// has to turn it into the same fact. The
+/// has to turn it into the same facts. The
 /// [`Compaction`](crate::seams::Compaction) seam deliberately cannot do it for
 /// them: it takes a log and no context, so a policy stays a pure decision that
 /// can be tested off the tree. This is where that one translation lives, so
 /// there is no fifth spelling of it.
+///
+/// The rewrites land before the cut: a consumer that reacts to the cut (the
+/// native store) then sees both.
 pub fn apply_compaction(
     ctx: &atomcode_plexus::Context,
     log: &SessionLog,
     decision: crate::seams::CompactionDecision,
 ) -> SeqNo {
-    commit(
-        ctx,
-        log,
-        SessionEvent::Compacted {
-            turn: log.current_turn(),
-            through: decision.through,
-            summary: decision.summary,
-        },
-    )
+    let turn = log.current_turn();
+    let mut last = 0;
+    if !decision.rewrites.is_empty() {
+        last = commit(
+            ctx,
+            log,
+            SessionEvent::MessagesRewritten {
+                turn,
+                texts: decision.rewrites,
+            },
+        );
+    }
+    if decision.through != 0 {
+        last = commit(
+            ctx,
+            log,
+            SessionEvent::Compacted {
+                turn,
+                through: decision.through,
+                summary: decision.summary,
+                from: decision.from,
+            },
+        );
+    }
+    if let Some(note) = decision.note {
+        commit(
+            ctx,
+            log,
+            SessionEvent::Notice {
+                turn,
+                notice: NoticeKind::CompactionDegraded,
+                detail: note,
+            },
+        );
+    }
+    last
 }
 
 // ---- projections --------------------------------------------------------

@@ -160,7 +160,7 @@ grep -c 'name = "hkdf"\|name = "hmac"\|name = "zeroize_derive"' Cargo.lock   # �
   - 一句话：只转慢榜上的测试，且先 grep 一遍 `elapsed`。
 - 按 crate 跑 `-p <crate>`，不要随手 `--workspace`。9 个 consumer 各开不同的 `atomcode-capabilities` feature 子集，resolver v2 刻意不跨 crate 统一 feature，于是这个 95k 行的库会被编 19 次（单份 28–138MB）；全量构建 91 个 test binary 一次吃掉 8.5GB 磁盘。2026-09-13 一次全量 nextest 把磁盘顶到 99%、swap 耗尽，test binary 被 SIGKILL，整个 66GB `target/` 随后消失。
 - 不要给 dev profile 加 `[profile.dev.build-override] opt-level = 3`。已做过 A/B，结论为负：冷 check capabilities 从 21.7s 变 42.0s（多烧 144s CPU 把 syn/serde_derive 编成 -O3），稳态 CPU 无差异（1.95s vs 2.00s）。全仓 derive 密度约每 280 行一个，这笔一次性成本摊不平。
-- `[profile.dev.package."*"] debug = 0` 只砍依赖的 debuginfo，workspace 内自己的 crate 保留（已验证：`tokio.o` 的 `__debug` 段数 0、`kernel.o` 5）。不要改成对整个 dev profile 生效，那会连自己代码的单步调试一起砍掉。
+- 调试信息分两档：依赖 `[profile.dev.package."*"] debug = 0`（连行号也不留，panic 仍有符号名），workspace 内自己的 crate `[profile.dev] debug = "line-tables-only"`（**2026-09-18 用户决定改的**，此前是默认的 `debug = 2`）。原来那条规矩写的是"不要改成对整个 dev profile 生效，那会连自己代码的单步调试一起砍掉"——代价确实是这个：backtrace 的函数名与行号还在，失去的是调试器里看局部变量和单步。要单步某个 crate，临时加 `[profile.dev.package.atomcode-xxx] debug = 2` 只编那一个包。**收益尚未 A/B 量过**：改它的动机是 target 体积（量到过一个 worktree 56GB，其中 deps 34GB、incremental 21GB），但 macOS 上 debuginfo 留在 `.o` 里、不进最终二进制（见下一条 strip 的实测），所以省的是 `deps/` 与链接时间，不是二进制大小。谁先做出 A/B，把数字补在这里。
 - 已排除的加速手段，别重复试：换链接器（macOS 已是 Apple 新 ld，`rust-lld` 不支持 mach-o）、sccache（不同 feature 组合是不同缓存键，救不了 19 个变体，还要额外磁盘）、砍 test binary 的 debuginfo（`profile.test` 的 `line-tables-only` 早已生效，strip 一个 98MB 的 binary 只掉 10MB）。
 - `cargo check` 从来不是瓶颈：冷编译 capabilities 21.7s，稳态重编 2.5s。遇到"编译慢"先分清是 check 慢还是 test 慢，再分清是 CPU 饱和还是 I/O 等待（对比 `/usr/bin/time -p` 的 real 与 user+sys）。
 - 仅当变更跨 crate、公共协议、持久化格式、workspace 依赖或构建配置时，运行相关 workspace 检查。

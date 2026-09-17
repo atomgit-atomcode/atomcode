@@ -651,6 +651,7 @@ pub fn events_to_become(events: &[LoggedEvent], target: &[Message]) -> Vec<Sessi
                 turn,
                 through: to.saturating_sub(1),
                 summary: summary.text.clone(),
+                from: 0,
             };
             probe.push(LoggedEvent {
                 seq: next,
@@ -1744,7 +1745,8 @@ mod tests {
             vec![SessionEvent::Compacted {
                 turn: 2,
                 through: 10,
-                summary: "the first turn, summarised".into()
+                summary: "the first turn, summarised".into(),
+                from: 0,
             }]
         );
 

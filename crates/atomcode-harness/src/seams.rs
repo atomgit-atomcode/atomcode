@@ -451,13 +451,51 @@ pub struct SessionSummary {
     pub events: usize,
 }
 
-/// Where to cut the history, and what to leave in its place.
-#[derive(Clone, Debug)]
+/// Where to cut the history, what to leave in its place, and what the model sees
+/// shortened from here on.
+#[derive(Clone, Debug, Default)]
 pub struct CompactionDecision {
     /// Everything at or below this sequence number stops being model-visible.
+    /// `0` folds nothing.
     pub through: crate::session::SeqNo,
     /// What the model sees instead.
     pub summary: String,
+    /// Events at or below this are not folded — the session's first request.
+    /// `0` folds from the start.
+    pub from: crate::session::SeqNo,
+    /// Messages the model sees in other words from here on: stubbed tool
+    /// output, a message too large to send.
+    pub rewrites: Vec<crate::session::RewrittenText>,
+    /// For the person, when the compaction did less than was asked.
+    pub note: Option<String>,
+}
+
+impl CompactionDecision {
+    /// Fold everything at or below `through` into `summary`.
+    pub fn fold(through: crate::session::SeqNo, summary: impl Into<String>) -> Self {
+        Self {
+            through,
+            summary: summary.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Whether committing it would change anything.
+    pub fn is_empty(&self) -> bool {
+        self.through == 0 && self.rewrites.is_empty()
+    }
+}
+
+/// Why compaction is being asked for, and the pressure it answers to.
+#[derive(Clone, Debug)]
+pub struct CompactionAsk {
+    /// Pressure before a request, the provider refusing one as too long, or a
+    /// person asking (with the topic they gave).
+    pub trigger: atomcode_kernel::message::CompactTrigger,
+    /// The model's context window. `0` when unknown.
+    pub window: u32,
+    /// Prompt tokens the provider reported for the last request. `0` when none.
+    pub used_tokens: u32,
 }
 
 /// History compaction. A seam because the right answer differs by deployment:
@@ -466,17 +504,18 @@ pub struct CompactionDecision {
 #[async_trait]
 pub trait Compaction: Send + Sync {
     fn describe(&self) -> String;
-    /// `None` means "nothing worth compacting yet".
-    async fn compact(&self, log: &crate::session::SessionLog) -> Option<CompactionDecision>;
-    /// A compaction the person asked for, steered toward `focus` when they gave
-    /// one. A strategy with nothing to do with a topic compacts as it always does.
-    async fn compact_requested(
+    /// `None` means "nothing worth compacting" — for an overflow, nothing
+    /// further this strategy can shrink.
+    async fn compact(
         &self,
         log: &crate::session::SessionLog,
-        focus: Option<&str>,
-    ) -> Option<CompactionDecision> {
-        let _ = focus;
-        self.compact(log).await
+        ask: &CompactionAsk,
+    ) -> Option<CompactionDecision>;
+    /// Whether [`compact`](Self::compact) would call a model for this ask: a
+    /// compaction slow enough that a person should see it start.
+    fn calls_model(&self, log: &crate::session::SessionLog, ask: &CompactionAsk) -> bool {
+        let _ = (log, ask);
+        false
     }
 }
 
