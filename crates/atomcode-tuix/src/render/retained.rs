@@ -3325,9 +3325,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             String::new()
         };
+        let cache_str = status
+            .cache_indicator
+            .as_deref()
+            .map(scrub_controls)
+            .unwrap_or_default();
         // Widths of the static " · " separators between visible parts.
         let sep_w = if !model_str.is_empty() { 3 } else { 0 }
             + if !ctx_str.is_empty() && (!model_str.is_empty() || !status.cwd.is_empty()) {
+                3
+            } else {
+                0
+            }
+            + if !cache_str.is_empty()
+                && (!ctx_str.is_empty() || !model_str.is_empty() || !status.cwd.is_empty())
+            {
                 3
             } else {
                 0
@@ -3355,6 +3367,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
         if !ctx_str.is_empty() {
             parts.push(ctx_str);
+        }
+        if !cache_str.is_empty() {
+            parts.push(cache_str);
         }
         // NOTE: the goal indicator is NOT appended here any more — it lives on
         // its own dedicated footer row (`build_goal_row`) so it can't be the
@@ -12378,6 +12393,7 @@ mod tests {
             hint: None,
             mode_indicator: None,
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12806,6 +12822,7 @@ mod tests {
                 colour: BadgeColour::Mode,
             }),
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12863,6 +12880,7 @@ mod tests {
                 colour: BadgeColour::Mode,
             }),
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12939,6 +12957,7 @@ mod tests {
                 colour: BadgeColour::Mode,
             }),
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12991,6 +13010,7 @@ mod tests {
                 colour: BadgeColour::Mode,
             }),
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -13047,6 +13067,7 @@ mod tests {
                 colour: BadgeColour::Plan,
             }),
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -13103,6 +13124,7 @@ mod tests {
                 colour: BadgeColour::Secondary,
             }),
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -13143,6 +13165,7 @@ mod tests {
             hint: None,
             mode_indicator: None,
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -13165,6 +13188,69 @@ mod tests {
         assert!(
             !visible.contains("PLAN"),
             "no mode_indicator should produce no PLAN badge; got: {:?}",
+            visible
+        );
+    }
+
+    /// Cache-hit indicator: when the turn reported cached tokens, the
+    /// left info group must carry a `cache NN%` segment after the ctx
+    /// usage; when `cache_indicator` is `None` (cold start / provider
+    /// never reported cache), the row stays clean.
+    #[test]
+    fn build_status_row_renders_cache_indicator_after_ctx_usage() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let status = StatusLine {
+            model: "glm-5".into(),
+            cwd: "~/proj".into(),
+            history: None,
+            search: None,
+            command_output: None,
+            ctx_used: 12_300,
+            ctx_window: 64_000,
+            hint: None,
+            mode_indicator: None,
+            bypass_indicator: None,
+            cache_indicator: Some("cache 70%".into()),
+            session_name: None,
+            reasoning_effort: None,
+            goal: None,
+            loop_status: None,
+            todo: None,
+            subtasks: None,
+            approval: None,
+            user_input: None,
+            pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
+            round_cap_panel: None,
+        };
+        let row = r.build_status_row(&status, 60, false);
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        assert!(
+            visible.contains("cache 70%"),
+            "cache indicator must appear on the status row; got: {:?}",
+            visible
+        );
+        // Order: ctx usage segment precedes the cache segment.
+        let ctx_idx = visible.find("tok").expect("ctx usage must render");
+        let cache_idx = visible
+            .find("cache 70%")
+            .expect("cache indicator must render");
+        assert!(
+            ctx_idx < cache_idx,
+            "cache segment must come after the ctx usage; got: {:?}",
+            visible
+        );
+
+        // None → no cache segment at all.
+        let mut clean = status;
+        clean.cache_indicator = None;
+        let row = r.build_status_row(&clean, 60, false);
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        assert!(
+            !visible.contains("cache"),
+            "no cache_indicator must produce no cache segment; got: {:?}",
             visible
         );
     }
@@ -26305,6 +26391,7 @@ mod tests {
             hint: None,
             mode_indicator: None,
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,

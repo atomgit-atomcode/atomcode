@@ -29152,6 +29152,20 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // has this session burned in total". See render::StatusLine docs.
     let (ctx_used, ctx_window) =
         status_context_usage(state, ctx.config.default_context_window(), !no_provider);
+    // Cache-hit indicator for the status row: the share of the current
+    // turn's prompt tokens served from the provider's prompt cache.
+    // Reuses `turn_token_summary`'s cached-pct math (same denominator /
+    // rounding as the per-turn footer annotation) and inherits its
+    // suppression rule — `None` before the first cached round arrives,
+    // so providers that never report cached tokens keep the row clean.
+    let cache_indicator = {
+        let (_, cached_pct) = crate::state::turn_token_summary(
+            state.turn_prompt_tokens,
+            state.turn_completion_tokens,
+            state.turn_cached_tokens,
+        );
+        cached_pct.map(|pct| format!("cache {}%", pct))
+    };
     // Session-name badge: surfaced only when the user has explicitly
     // renamed the conversation. Auto-named sessions (default /
     // session-* / first-message-derived) intentionally stay badge-less
@@ -29302,6 +29316,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         hint,
         mode_indicator,
         bypass_indicator,
+        cache_indicator,
         reasoning_effort: if reasoning_effort_applicable_on_provider(ctx) {
             ctx.reasoning_effort.clone()
         } else {
