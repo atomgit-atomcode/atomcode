@@ -82,25 +82,32 @@ async fn stream_timeout_reconnects_then_recovers() {
 
     handle.commands.send(send("go")).unwrap();
 
-    let (saw_reconnect, error_msg, completed) = tokio::time::timeout(OUTER_GUARD, async {
-        let mut saw_reconnect = false;
-        let mut error_msg: Option<String> = None;
-        let mut completed = false;
-        while let Some(ev) = handle.events.recv().await {
-            match ev {
-                AgentEvent::Warning(m) if m.contains("reconnecting") => saw_reconnect = true,
-                AgentEvent::Error { message, .. } => error_msg = Some(message),
-                AgentEvent::TurnComplete { .. } => {
-                    completed = true;
-                    break;
+    let (saw_reconnect, first_reconnect_msg, error_msg, completed) =
+        tokio::time::timeout(OUTER_GUARD, async {
+            let mut saw_reconnect = false;
+            let mut first_reconnect_msg: Option<String> = None;
+            let mut error_msg: Option<String> = None;
+            let mut completed = false;
+            while let Some(ev) = handle.events.recv().await {
+                match ev {
+                    AgentEvent::Warning(m) if m.contains("reconnecting") => {
+                        if first_reconnect_msg.is_none() {
+                            first_reconnect_msg = Some(m);
+                        }
+                        saw_reconnect = true;
+                    }
+                    AgentEvent::Error { message, .. } => error_msg = Some(message),
+                    AgentEvent::TurnComplete { .. } => {
+                        completed = true;
+                        break;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-        (saw_reconnect, error_msg, completed)
-    })
-    .await
-    .expect("reconnect-and-recover must finish within the outer guard, not hang");
+            (saw_reconnect, first_reconnect_msg, error_msg, completed)
+        })
+        .await
+        .expect("reconnect-and-recover must finish within the outer guard, not hang");
 
     assert!(
         completed,
@@ -109,6 +116,14 @@ async fn stream_timeout_reconnects_then_recovers() {
     assert!(
         saw_reconnect,
         "a `reconnecting` Warning must be emitted on the idle timeout"
+    );
+    // The FIRST reconnect surfaces the tuning knob so a slow-local-model user can raise
+    // the idle window instead of filing a bug (discoverability, not a default change).
+    assert!(
+        first_reconnect_msg
+            .as_deref()
+            .is_some_and(|m| m.contains("ATOMCODE_STREAM_TIMEOUT_SECS")),
+        "first reconnect Warning must name the tuning env var: {first_reconnect_msg:?}"
     );
     assert!(
         error_msg.is_none(),

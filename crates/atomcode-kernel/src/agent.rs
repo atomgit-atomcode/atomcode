@@ -1928,17 +1928,14 @@ impl RunningAgent {
         // `get(rollback_len..)` not direct indexing: a mid-turn overflow compaction can shrink
         // history BELOW `rollback_len` (documented on the truncate below), and a bare slice
         // would panic there. None ⇒ no tail ⇒ no work ⇒ undo (the truncate stays a safe no-op).
-        let turn_did_work = convo
-            .messages
-            .get(rollback_len..)
-            .is_some_and(|tail| {
-                tail.iter().any(|m| {
-                    matches!(
-                        m.role,
-                        crate::message::Role::Assistant | crate::message::Role::Tool
-                    )
-                })
-            });
+        let turn_did_work = convo.messages.get(rollback_len..).is_some_and(|tail| {
+            tail.iter().any(|m| {
+                matches!(
+                    m.role,
+                    crate::message::Role::Assistant | crate::message::Role::Tool
+                )
+            })
+        });
         if self.keep_interrupted_context && turn_did_work {
             // PRESERVE: keep this turn's partial assistant/tool work; backfill a
             // `(cancelled)` result for every dangling tool_call so the wire stays
@@ -2576,8 +2573,17 @@ impl RunningAgent {
                         // stays capped by `partial_stream_recoveries` below.
                         if !saw_stream_content && stream_retry < MAX_STREAM_RETRIES {
                             stream_retry += 1;
+                            // Surface the tuning knob ONCE (first reconnect only, no spam): a
+                            // slow local / large-context model whose prefill legitimately
+                            // exceeds the idle window should RAISE the timeout, not reconnect
+                            // (a reconnect re-issues the round and restarts that same prefill).
+                            let tuning_hint = if stream_retry == 1 {
+                                " · 慢的本地/大 context 模型可调高 ATOMCODE_STREAM_TIMEOUT_SECS(默认 300s)"
+                            } else {
+                                ""
+                            };
                             self.rt.emit(AgentEvent::Warning(format!(
-                                "stream idle timeout — reconnecting ({stream_retry}/{MAX_STREAM_RETRIES})"
+                                "stream idle timeout — reconnecting ({stream_retry}/{MAX_STREAM_RETRIES}){tuning_hint}"
                             )));
                             // Exponential backoff: 200ms, 400, 800, 1600, 3200 (cap 8s).
                             let backoff = std::time::Duration::from_millis(
@@ -3210,8 +3216,7 @@ impl RunningAgent {
                 let redump = last_truncated_text
                     .as_deref()
                     .is_some_and(|prev| truncation_is_redump(prev, &assistant_text));
-                if truncated && !redump && truncation_continuations < MAX_TRUNCATION_CONTINUATIONS
-                {
+                if truncated && !redump && truncation_continuations < MAX_TRUNCATION_CONTINUATIONS {
                     truncation_continuations += 1;
                     last_truncated_text = Some(assistant_text.clone());
                     self.rt.emit(AgentEvent::OutputTruncationRecovery {
@@ -5949,7 +5954,10 @@ mod truncation_redump_tests {
     fn genuine_continuation_is_not_a_redump() {
         let prev = "第 1 节:玩家可选性别,只画脸,滚动条调肤色……".repeat(20);
         let curr = "第 2 节:多点触控时其余脸随机肤色,来回判定加分……".repeat(20);
-        assert!(!truncation_is_redump(&prev, &curr), "different content = resume");
+        assert!(
+            !truncation_is_redump(&prev, &curr),
+            "different content = resume"
+        );
     }
 
     #[test]
