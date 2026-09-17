@@ -126,6 +126,11 @@ pub fn build_review_provider(
     // Byte-idle liveness follows the review config's stream_timeout (mirrors
     // `atomcode_review::build_review_agent`), not the adapter's hardcoded 120s.
     pc.idle_timeout = cfg.stream_timeout;
+    // Prefill (first-byte) gets the separate, floored budget — parity with
+    // `atomcode_review::build_review_agent`. WITHOUT this the provider keeps its 120s
+    // first-token default, so a review with `stream_timeout > 120s` would cut prefill
+    // off at 120s (shorter than inter-token) before the kernel's budget even applies.
+    pc.first_token_timeout = cfg.effective_first_token_timeout();
     OpenAiCompatProvider::new(pc)
         .map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
         .map_err(|e| e.message)
