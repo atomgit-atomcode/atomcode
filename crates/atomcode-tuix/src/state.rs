@@ -1215,12 +1215,6 @@ pub struct UiState {
     /// to `None` when a CLEAN summary renders (`turn_summary_label`) so a reason
     /// from an error path that produced no summary can never fold into a later turn.
     pub last_turn_error: Option<String>,
-    /// Cache-hit ratio of the LAST completed turn, snapshotted before the
-    /// per-turn `turn_*_tokens` tallies are cleared. The status-row cache
-    /// indicator falls back to this at idle (mirroring how `ctx` usage persists
-    /// via `last_context`), so `cache NN%` stays visible between turns instead of
-    /// vanishing the moment the turn ends. `None` until a cached turn completes.
-    pub last_turn_cached_pct: Option<u8>,
     /// Driver-owned, sanitized explanation for a credential policy denial.
     /// Kept separate from `last_turn_error` so a provider/rate-limit failure can
     /// never be presented as the cause of a later security-policy terminal.
@@ -1597,7 +1591,6 @@ impl UiState {
             last_assistant_response: String::new(),
             response_finalized: false,
             last_turn_error: None,
-            last_turn_cached_pct: None,
             last_policy_denial_reason: None,
             pending_policy_intervention: None,
             pending_policy_resolution: None,
@@ -1993,17 +1986,9 @@ impl UiState {
         self.turn_started_at = None;
         self.phase_started_at = None;
         // Per-turn token tallies are consumed by the separator that renders just
-        // before this; snapshot the cache ratio so the status row can keep
-        // showing `cache NN%` at idle, THEN clear them so the next turn starts
-        // fresh. A turn that reported no cache leaves the last known value intact
-        // rather than blanking the indicator on every cache-less round.
-        if let (_, Some(pct)) = turn_token_summary(
-            self.turn_prompt_tokens,
-            self.turn_completion_tokens,
-            self.turn_cached_tokens,
-        ) {
-            self.last_turn_cached_pct = Some(pct);
-        }
+        // before this; clear them so the next turn starts fresh. (The status-row
+        // cache indicator reads the SESSION-cumulative tallies, which are not
+        // touched here, so it stays visible across turns.)
         self.turn_prompt_tokens = 0;
         self.turn_completion_tokens = 0;
         self.turn_cached_tokens = 0;
@@ -2794,26 +2779,23 @@ mod tests {
     }
 
     #[test]
-    fn on_turn_complete_persists_cache_pct_after_clearing_tallies() {
+    fn on_turn_complete_keeps_session_cumulative_tallies() {
+        // The status-row cache indicator reads the SESSION-level tallies, so
+        // `on_turn_complete` must clear only the per-turn ones — leaving the
+        // cumulative prompt/cached counts (hence the ratio) intact at idle.
         let mut s = UiState::new();
-        // A cached turn: 100 prompt, 80 cached → 80%.
+        s.prompt_tokens = 100;
+        s.cached_tokens = 80;
         s.turn_prompt_tokens = 100;
-        s.turn_completion_tokens = 10;
         s.turn_cached_tokens = 80;
         s.on_turn_complete();
-        // Per-turn tallies are cleared, but the ratio survives for the idle row.
-        assert_eq!(s.turn_cached_tokens, 0);
-        assert_eq!(s.last_turn_cached_pct, Some(80));
-
-        // A subsequent cache-less turn must NOT blank the last known ratio.
-        s.turn_prompt_tokens = 50;
-        s.turn_completion_tokens = 5;
-        s.turn_cached_tokens = 0;
-        s.on_turn_complete();
+        assert_eq!(s.turn_cached_tokens, 0, "per-turn tally cleared");
+        assert_eq!(s.prompt_tokens, 100, "session prompt tally survives");
+        assert_eq!(s.cached_tokens, 80, "session cache tally survives");
+        // Session ratio the status row will show: 80 / 100 = 80%.
         assert_eq!(
-            s.last_turn_cached_pct,
-            Some(80),
-            "a turn without cache keeps the last known ratio rather than blanking it"
+            turn_token_summary(s.prompt_tokens, s.completion_tokens, s.cached_tokens).1,
+            Some(80)
         );
     }
 

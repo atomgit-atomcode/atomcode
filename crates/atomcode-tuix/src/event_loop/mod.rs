@@ -29152,24 +29152,21 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // has this session burned in total". See render::StatusLine docs.
     let (ctx_used, ctx_window) =
         status_context_usage(state, ctx.config.default_context_window(), !no_provider);
-    // Cache-hit indicator for the status row: the share of the current turn's
-    // prompt tokens served from the provider's prompt cache. Reuses
-    // `turn_token_summary`'s cached-pct math (same denominator / rounding as the
-    // per-turn footer annotation). During a turn the live tally wins; at idle it
-    // falls back to the last completed turn's ratio (`last_turn_cached_pct`) so
-    // `cache NN%` persists between turns just like ctx usage does — instead of
-    // blanking the instant the turn ends and the per-turn tallies reset. `None`
-    // only until the first cached turn completes, so providers that never report
-    // cached tokens keep the row clean.
+    // Cache-hit indicator for the status row: the SESSION-cumulative share of
+    // prompt tokens served from the provider's prompt cache (`cached / prompt`
+    // over the whole session, the same figure `/cost` reports as 会话累计缓存命中率).
+    // Uses the session-level tallies — which, unlike the per-turn `turn_*` ones,
+    // are NOT cleared at turn end — so the indicator is stable across turns and
+    // never blanks at idle. Reuses `turn_token_summary`'s cached-pct math for a
+    // consistent denominator/rounding; `None` until the first cached round lands,
+    // so providers that never report cached tokens keep the row clean.
     let cache_indicator = {
-        let (_, live_pct) = crate::state::turn_token_summary(
-            state.turn_prompt_tokens,
-            state.turn_completion_tokens,
-            state.turn_cached_tokens,
+        let (_, cached_pct) = crate::state::turn_token_summary(
+            state.prompt_tokens,
+            state.completion_tokens,
+            state.cached_tokens,
         );
-        live_pct
-            .or(state.last_turn_cached_pct)
-            .map(|pct| format!("cache {}%", pct))
+        cached_pct.map(|pct| format!("cache {}%", pct))
     };
     // Session-name badge: surfaced only when the user has explicitly
     // renamed the conversation. Auto-named sessions (default /
