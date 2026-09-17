@@ -412,6 +412,62 @@ config = { script = [ { text = "nothing to do" } ] }
     assert!(said.contains("read_file"), "{said}");
 }
 
+/// A tool that takes half a minute unless its turn is stopped — a delegated
+/// child's long job, without a shell (a delegated agent never has one).
+struct WaitAWhile;
+
+#[async_trait]
+impl atomcode_kernel::tool::Tool for WaitAWhile {
+    fn name(&self) -> &str {
+        "wait_a_while"
+    }
+    fn description(&self) -> &str {
+        "waits half a minute"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+    fn risk(&self, _args: &str) -> atomcode_kernel::tool::RiskLevel {
+        atomcode_kernel::tool::RiskLevel::Safe
+    }
+    async fn execute(&self, _args: &str, ctx: &atomcode_kernel::tool::ToolContext) -> ToolResult {
+        let content = tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => "waited",
+            _ = ctx.cancel.cancelled() => "stopped",
+        };
+        ToolResult {
+            call_id: String::new(),
+            content: content.into(),
+            is_error: false,
+            images: vec![],
+        }
+    }
+}
+
+struct WaitAWhileRow;
+
+#[async_trait]
+impl atomcode_plexus::Plugin for WaitAWhileRow {
+    fn name(&self) -> &'static str {
+        "test-wait-a-while"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools"]
+    }
+    fn description(&self) -> &'static str {
+        "a slow tool"
+    }
+    async fn apply(
+        &self,
+        ctx: &atomcode_plexus::Context,
+        _config: &serde_json::Value,
+    ) -> Result<(), String> {
+        ctx.service::<ToolsSvc>()
+            .ok_or("no tools")?
+            .register(Arc::new(WaitAWhile))
+    }
+}
+
 /// A delegated task is part of the turn that delegated it: stopping that turn
 /// stops the child's, and the tool comes back instead of waiting the child out
 /// (`docs/adr/0023` §9).
@@ -423,11 +479,15 @@ async fn stopping_the_parent_stops_its_delegated_child() {
     let dir = scratch("cascade");
     let script = delegating_script(
         "wait for a long time",
-        r#"{ text = "Waiting.", calls = [ { name = "bash", args = { command = "sleep 30" } } ] },"#,
+        r#"{ text = "Waiting.", calls = [ { name = "wait_a_while", args = {} } ] },"#,
     );
-    let with_bash = "[[patch]]\nid = \"subagent-in-process\"\ndisabled = false\n\
-                     config = { allowed_tools = [\"bash\"] }";
-    let app = start(tree(&dir, &script, &[YOLO, with_bash])).await;
+    let slow = "[[insert]]\nname = \"test-wait-a-while\"\n\n\
+                [[patch]]\nid = \"subagent-in-process\"\ndisabled = false\n\
+                config = { allowed_tools = [\"wait_a_while\"] }";
+    let mut registry = plugins::catalog();
+    registry.register(Arc::new(WaitAWhileRow));
+    let mut app = App::new(registry, tree(&dir, &script, &[YOLO, slow]));
+    app.start().await.expect("must mount");
     let agents = app.context().service::<AgentsSvc>().unwrap();
     let started = std::time::Instant::now();
 
@@ -445,6 +505,10 @@ async fn stopping_the_parent_stops_its_delegated_child() {
             if waiting {
                 break;
             }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the child never started its tool"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         for agent in agents.list() {
@@ -466,4 +530,50 @@ async fn stopping_the_parent_stops_its_delegated_child() {
         agents.list().iter().all(|agent| agent.parent().is_none()),
         "the child is gone"
     );
+}
+
+/// A delegated child never reads a sensitive path, whatever the approval mode:
+/// nobody is watching it, and an automatic yes is not the person's
+/// (`docs/adr/0023`, addendum).
+#[tokio::test]
+async fn a_delegated_child_never_reads_a_sensitive_path() {
+    use atomcode_harness::events::ToolResultEvent;
+
+    let dir = scratch("sensitive");
+    std::fs::write(dir.join(".env"), "API_KEY=hunter2").unwrap();
+    let script = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [
+  { text = "Reading.", calls = [ { name = "read_file", args = { file_path = ".env" } } ] },
+  { text = "Done." },
+] }
+"#;
+    let app = start(tree(&dir, script, &[YOLO])).await;
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let spy = seen.clone();
+    let _listening = app.context().on_emit::<ToolResultEvent>(
+        move |result: &atomcode_kernel::tool::ToolResult| {
+            spy.lock().unwrap().push(result.content.clone());
+        },
+    );
+
+    let _ = app
+        .context()
+        .service::<SubagentsSvc>()
+        .unwrap()
+        .spawn(atomcode_harness::seams::Delegation {
+            task: "read .env",
+            instructions: "do the task",
+            ..Default::default()
+        })
+        .await;
+
+    let seen = seen.lock().unwrap().join("\n");
+    assert!(
+        !seen.contains("hunter2"),
+        "the child read the secret: {seen}"
+    );
+    assert!(seen.contains("Refused"), "and was told why: {seen}");
 }

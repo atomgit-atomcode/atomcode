@@ -291,6 +291,11 @@ disabled = true
 # `persona-atomcode` in `CODING_ROWS` fills that slot in this product's own
 # words, and two personas in one system prompt is worse than either.
 
+# What a delegated agent (a team member, a `task` child) may never do, refused
+# ahead of every rule and question: nobody is watching it call tools.
+[[insert]]
+name = "delegation-bounds"
+
 # No rules by default, so the row is inert until a user writes some.
 [[insert]]
 name = "permissions"
@@ -1724,6 +1729,7 @@ impl Plugin for VerifyCadencePlugin {
 //   - `tools/execute`, outermost: refuse what the restriction forbids.
 
 struct ExecutionBoundary {
+    ctx: Context,
     policy: Arc<crate::execution_policy::TurnExecutionPolicy>,
 }
 
@@ -1738,7 +1744,17 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Exec
         // BEFORE delegating: the calls this round produces are gated on what
         // the person said, and they are gated by the other half below, which
         // has no messages of its own to read.
-        self.policy.update_from_messages(&req.messages);
+        //
+        // The person talks to the lead. A delegated agent's request carries the
+        // lead's task, not the person's restriction, so it must not rewrite it:
+        // members work under whatever the lead is held to (`docs/adr/0023`,
+        // addendum).
+        let delegated = atomcode_harness::agent::scoped(&self.ctx)
+            .service::<atomcode_harness::seams::DelegationLaneSvc>()
+            .is_some();
+        if !delegated {
+            self.policy.update_from_messages(&req.messages);
+        }
         next.run(req).await
     }
 }
@@ -1836,6 +1852,7 @@ impl Plugin for ExecutionPolicyPlugin {
     }
     async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
         let boundary = Arc::new(ExecutionBoundary {
+            ctx: ctx.clone(),
             policy: Arc::new(crate::execution_policy::TurnExecutionPolicy::new()),
         });
         let _ = ctx.on_waterfall::<atomcode_harness::events::AgentRequest>(boundary.clone(), true);

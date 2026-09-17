@@ -394,6 +394,94 @@ impl Waterfall<ToolsExecute> for SensitivePathGate {
     }
 }
 
+// ---- what a delegated agent may never do ------------------------------------
+//
+// A team member or a `task` child acts for the lead, not for the person, and
+// nobody is watching it call tools. The rows above ask; for a delegated agent
+// asking is the wrong answer — an automatic or bypass mode says yes on the
+// person's behalf, and a lead's "always allow" would reach the member. So these
+// are refused outright, whatever any policy downstream would say
+// (`docs/adr/0023`, the alignment addendum).
+
+/// See the block comment above.
+pub struct DelegationBounds {
+    pub ctx: Context,
+}
+
+/// Tools a delegated agent never runs: a shell, and delegating further.
+const NEVER_DELEGATED: &[&str] = &["bash", "team", "task"];
+
+#[async_trait]
+impl Waterfall<ToolsExecute> for DelegationBounds {
+    async fn handle(&self, exec: &mut ToolExec, next: Next<'_, ToolsExecute>) -> ToolResult {
+        // Delegated: it was given a lane by whoever delegated it, or it has a
+        // parent. The lane is on its own realm, so the lead never sees one.
+        let scoped = crate::agent::scoped(&self.ctx);
+        let lane = scoped.service::<crate::seams::DelegationLaneSvc>();
+        let has_parent = scoped
+            .service::<crate::seams::SessionSvc>()
+            .and_then(|log| {
+                self.ctx
+                    .service::<crate::seams::AgentsSvc>()?
+                    .by_session(log.id())
+            })
+            .is_some_and(|agent| agent.parent().is_some());
+        if lane.is_none() && !has_parent {
+            return next.run(exec).await;
+        }
+        let refuse = |why: String| ToolResult {
+            call_id: exec.call.id.clone(),
+            content: format!("Refused: {why}"),
+            is_error: true,
+            images: vec![],
+        };
+        let name = exec.call.name.as_str();
+        if NEVER_DELEGATED.contains(&name) {
+            return refuse(format!("a delegated agent never runs `{name}`"));
+        }
+        if atomcode_capabilities::tools::references_sensitive_path(&exec.call.arguments) {
+            return refuse(format!(
+                "a delegated agent may not touch sensitive paths (credentials, keys, `.env`): `{name}`"
+            ));
+        }
+        let scopes = lane
+            .map(|lane| lane.scopes.clone())
+            .unwrap_or_else(|| vec!["**".to_string()]);
+        if let Some(why) = atomcode_capabilities::tools::delegated_write_violation(
+            &scopes,
+            &exec.working_dir,
+            name,
+            &exec.call.arguments,
+        ) {
+            return refuse(why);
+        }
+        next.run(exec).await
+    }
+}
+
+pub struct DelegationBoundsPlugin;
+
+#[async_trait]
+impl Plugin for DelegationBoundsPlugin {
+    fn name(&self) -> &'static str {
+        "delegation-bounds"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools"]
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["agents"]
+    }
+    fn description(&self) -> &'static str {
+        "refuse outright what a delegated agent may never do: a shell, delegating, sensitive paths, writes outside its lane"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let _ = ctx
+            .on_waterfall::<ToolsExecute>(Arc::new(DelegationBounds { ctx: ctx.clone() }), false);
+        Ok(())
+    }
+}
+
 pub struct SensitivePathsPlugin;
 
 #[async_trait]

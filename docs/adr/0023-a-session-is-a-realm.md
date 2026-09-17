@@ -166,15 +166,17 @@ lead 的 id,成员到成员靠构造不可能;同伴消息标成非用户来源,
   `sensitive-paths` 只问,自动 / 绕过模式下等于放行,lead 的「总是允许」还会盖到成员。
 - **写 `.git/` 内部一律拒**(git hook 会跑 shell,等于绕开「成员没有 shell」)。
 - **工作区外的写一律拒**,解析 `..`、绝对路径与符号链接;委派 agent 不问人。
-- **成员与子 agent 永远没有 `bash`、`team`、`task`,也没有 `web_fetch` / `web_search`。** 角色文件的
-  `tools:` 只能在允许集里挑;仓库内角色文件(`<project>/.atomcode/agents`)的 `model:` 按模型自选
+- **成员与子 agent 永远没有 `bash`、`team`、`task`。** 网络读工具照给:名单按父 agent 的工具集解析,
+  父 agent 自己就能不经询问调用,给成员不是放宽(`harness/plugins/team.rs` `EXPLORE_TOOLS` 的既有决定)。
+  角色文件的 `tools:` 只能在允许集里挑;仓库内角色文件(`<project>/.atomcode/agents`)的 `model:` 按模型自选
   (`Chose::Model`)的规矩解析,只有用户目录下的才算人选。
 - **写入范围(scope)**:写角色的成员没有独立 worktree 时必须声明 scope,写只落在 scope 内,两个
   在跑的写成员 scope 不得重叠(沿用 capabilities `team.rs` 的判定,宁可误拒)。有独立 worktree 时
   scope 可省。
-- **被策略拦下的委派结果扣住**:子 agent 以 `PolicyDenied` 结束时,交回 lead 的是固定说明,不是它的原话;
-  策略干预提升到 lead 的回合上(沿用产品的恢复契约)。
-- **本回合的执行限制按会话记**,不是全树一份:成员的请求不得改写 lead 的限制。
+- ~~被策略拦下的委派结果扣住~~:落地时发现在 harness 上走不到——树上唯一提交策略干预的是凭据 shell
+  闸门,而委派 agent 的 `bash` 在它之前就被 `delegation-bounds` 拒掉。产品需要它,是因为产品的 worker
+  子 agent 有 shell;这里没有,不做。将来给委派 agent 任何会提交策略干预的能力时,先补这一条。
+- **本回合的执行限制只由 lead 的请求更新**,成员照 lead 的限制执行:成员的请求不得改写它。
 
 **产品体验与配置,补:**
 

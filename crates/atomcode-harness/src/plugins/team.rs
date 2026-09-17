@@ -78,10 +78,14 @@ struct Role {
     /// of its models is the good reviewer. A `delegate` call may still override
     /// it per member.
     ///
-    /// Written by a person in a file, so it may name ANY model the host can
-    /// build, including one on a second account. The lead asking for a model
-    /// mid-turn may not; that asymmetry is the whole of `Chose`.
+    /// Written in a file, so a role under the person's own home may name ANY
+    /// model the host can build, including one on a second account. A role that
+    /// came with the project (`<project>/.atomcode/agents`) arrived with a clone,
+    /// not from the person, and is held to what the model may pick for itself —
+    /// as is the lead asking mid-turn. That asymmetry is the whole of `Chose`.
     model: Option<String>,
+    /// Read from the project's own directory rather than the person's.
+    from_project: bool,
     /// How hard this member should think, when the role says. `None` leaves the
     /// session's own setting (the `reasoning-effort` row) in charge.
     ///
@@ -111,6 +115,7 @@ fn built_in(
         // deployment, and a shipped default naming one would be wrong everywhere
         // but where it was written.
         model: None,
+        from_project: false,
         effort: Some(effort),
     }
 }
@@ -205,7 +210,7 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
     let mut difficulty = None;
     let mut effort = None;
     let mut when = String::new();
-    let mut tools = None;
+    let mut tools: Option<Vec<String>> = None;
     let mut model = None;
     let mut body = String::new();
     let mut in_front = true;
@@ -295,16 +300,34 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
             path.display()
         ));
     }
+    let permission =
+        permission.ok_or_else(|| format!("{}: `permission` is required", path.display()))?;
+    // A member's tools are chosen from what its permission allows, never beyond:
+    // a role file in a cloned repository must not hand a member a shell.
+    if let Some(listed) = &tools {
+        let allowed = default_tools(permission);
+        if let Some(extra) = listed.iter().find(|tool| !allowed.contains(tool)) {
+            return Err(format!(
+                "{}: a {} member may not have `{extra}`; choose from: {}",
+                path.display(),
+                match permission {
+                    Permission::Explore => "explore",
+                    Permission::Worker => "worker",
+                },
+                allowed.join(", ")
+            ));
+        }
+    }
     Ok(Role {
         id,
-        permission: permission
-            .ok_or_else(|| format!("{}: `permission` is required", path.display()))?,
+        permission,
         difficulty: difficulty
             .ok_or_else(|| format!("{}: `difficulty` is required", path.display()))?,
         persona,
         when,
         tools,
         model,
+        from_project: false,
         effort,
     })
 }
@@ -313,7 +336,7 @@ fn parse_role_file(path: &Path) -> Result<Role, String> {
 /// name replaces it. A directory that does not exist is simply empty.
 fn load_roles(dirs: &[PathBuf]) -> Result<Vec<Role>, String> {
     let mut roles = built_in_roles();
-    for dir in dirs {
+    for (index, dir) in dirs.iter().enumerate() {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
@@ -324,7 +347,9 @@ fn load_roles(dirs: &[PathBuf]) -> Result<Vec<Role>, String> {
             .collect();
         files.sort();
         for file in files {
-            let role = parse_role_file(&file)?;
+            let mut role = parse_role_file(&file)?;
+            // The first directory is the project's own; see `Role::model`.
+            role.from_project = index == 0;
             match roles.iter_mut().find(|r| r.id == role.id) {
                 Some(existing) => *existing = role,
                 None => roles.push(role),
@@ -358,17 +383,22 @@ pub(crate) const EXPLORE_TOOLS: &[&str] = &[
     "web_search",
     "web_fetch",
 ];
-const WORKER_TOOLS: &[&str] = &["edit_file", "write_file"];
+const WORKER_TOOLS: &[&str] = &["edit_file", "write_file", "search_replace"];
 
-fn tools_for(role: &Role) -> Vec<String> {
-    if let Some(explicit) = &role.tools {
-        return explicit.clone();
-    }
+/// Everything a member with `permission` may be given.
+fn default_tools(permission: Permission) -> Vec<String> {
     let mut names: Vec<String> = EXPLORE_TOOLS.iter().map(|s| s.to_string()).collect();
-    if role.permission == Permission::Worker {
+    if permission == Permission::Worker {
         names.extend(WORKER_TOOLS.iter().map(|s| s.to_string()));
     }
     names
+}
+
+fn tools_for(role: &Role) -> Vec<String> {
+    match &role.tools {
+        Some(explicit) => explicit.clone(),
+        None => default_tools(role.permission),
+    }
 }
 
 // ---- the members ----------------------------------------------------------
@@ -384,6 +414,9 @@ struct Member {
     /// turn. A member that ends a turn silently is reported on by the team,
     /// so the lead is never left waiting on a member that forgot to speak.
     told: Arc<Mutex<bool>>,
+    /// The files it may write, for a writing member sharing the lead's
+    /// workspace. Empty for a reader or a member with a checkout of its own.
+    scope: Vec<String>,
     /// Its pump. Dropped with the member, which stops the pump and any turn
     /// it is running.
     _driven: super::handle::Driven,
@@ -499,6 +532,9 @@ struct TeamArgs {
     /// How hard this member should think, overriding the role's `effort`.
     #[serde(default)]
     effort: Option<String>,
+    /// The files a writing member may write, as globs relative to the workspace.
+    #[serde(default)]
+    scope: Option<Vec<String>>,
 }
 
 impl TeamTool {
@@ -541,6 +577,23 @@ impl TeamTool {
             .filter(|t| !t.trim().is_empty())
             .ok_or("`task` is required")?;
         let lead_session = lead.session_id().to_string();
+        // A writer sharing the lead's workspace writes only where it was told,
+        // and never where another writer was told (`docs/adr/0023`, addendum).
+        // One with a checkout of its own writes anywhere in that checkout.
+        let scope: Vec<String> = args
+            .scope
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let shares_workspace = role.permission == Permission::Worker && !self.worktrees;
+        if shares_workspace && scope.is_empty() {
+            return Err(format!(
+                "`{name}` writes, so `scope` is required: the files it may change, as globs \
+                 relative to the workspace (for example `src/auth/**`)"
+            ));
+        }
         {
             let all = self.members.by_lead.lock().expect("members poisoned");
             let mine = all.get(&lead_session);
@@ -552,7 +605,26 @@ impl TeamTool {
             if mine.map(|m| m.len()).unwrap_or(0) >= self.max_members {
                 return Err(format!("the team is full ({} members)", self.max_members));
             }
+            if shares_workspace {
+                if let Some((other, member)) = mine.into_iter().flatten().find(|(_, m)| {
+                    atomcode_capabilities::team::worker_scopes_overlap(&scope, &m.scope)
+                }) {
+                    return Err(format!(
+                        "`scope` [{}] overlaps what `{other}` may write [{}]; give each writer \
+                         files of its own",
+                        scope.join(", "),
+                        member.scope.join(", ")
+                    ));
+                }
+            }
         }
+        // Every member has a lane, which is what marks it as delegated; one
+        // that does not share the workspace may write anywhere in its own.
+        let lane = if shares_workspace {
+            scope.clone()
+        } else {
+            vec!["**".to_string()]
+        };
 
         let agents = self.ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
         let parent_tools = lead
@@ -614,7 +686,14 @@ impl TeamTool {
             .filter(|m| !m.is_empty())
         {
             Some(asked) => (Some(asked.to_string()), crate::seams::Chose::Model),
-            None => (role.model.clone(), crate::seams::Chose::Person),
+            None => (
+                role.model.clone(),
+                if role.from_project {
+                    crate::seams::Chose::Model
+                } else {
+                    crate::seams::Chose::Person
+                },
+            ),
         };
         // Same order as the model, for the same reason: what this call said,
         // else what the role standing behind it said, else nothing — and
@@ -682,6 +761,13 @@ impl TeamTool {
                     held.push(realm.on_serial::<TurnStopping>(Arc::new(ChildRoundCap {
                         max_steps: max_rounds,
                     })));
+                    held.push(
+                        realm
+                            .provide::<crate::seams::DelegationLaneSvc>(Arc::new(
+                                crate::seams::DelegationLane { scopes: lane },
+                            ))
+                            .map_err(|e| e.to_string())?,
+                    );
                     // The role's thinking tier, on this member's own realm.
                     //
                     // Here rather than somewhere global because a member is the
@@ -734,6 +820,7 @@ impl TeamTool {
                     agent: child.clone(),
                     worktree: worktree.clone(),
                     told,
+                    scope,
                     _driven: driven,
                 },
             );
@@ -852,9 +939,12 @@ impl TeamTool {
                     } else {
                         ""
                     },
-                    match &m.worktree {
-                        Some((dir, branch)) => format!(", branch `{branch}` at {}", dir.display()),
-                        None => String::new(),
+                    match (&m.worktree, m.scope.is_empty()) {
+                        (Some((dir, branch)), _) => {
+                            format!(", branch `{branch}` at {}", dir.display())
+                        }
+                        (None, false) => format!(", writes [{}]", m.scope.join(", ")),
+                        (None, true) => String::new(),
                     }
                 )
             })
@@ -1011,6 +1101,7 @@ impl Tool for TeamTool {
                     "description": self.roles.iter().map(|r| format!("{}: {}", r.id, r.when)).collect::<Vec<_>>().join("; ")
                 },
                 "task": { "type": "string", "description": "The complete task (delegate)" },
+                "scope": { "type": "array", "items": { "type": "string" }, "description": "For a role that writes: the files this member may change, as globs relative to the workspace (e.g. `src/auth/**`). Required unless members get checkouts of their own; two writers' scopes may not overlap." },
                 "text": { "type": "string", "description": "What to tell the member (tell)" }
             },
             "required": ["action"]

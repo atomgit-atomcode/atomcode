@@ -897,3 +897,129 @@ async fn a_word_that_is_not_a_level_is_refused() {
     );
     drop(app);
 }
+
+// ---- who wrote the role file ---------------------------------------------
+
+/// A team whose roles come from `project` (the repository's own
+/// `.atomcode/agents`) and `home` (the person's), over `offer`.
+async fn team_with_roles(
+    tag: &str,
+    offer: Vec<ModelInfo>,
+    roles: &[(&str, &str, &str)],
+) -> (App, Calls) {
+    let root = scratch(tag);
+    let home = root.join("__home__");
+    for (place, id, model) in roles {
+        let dir = match *place {
+            "project" => root.join(".atomcode").join("agents"),
+            _ => home.join("agents"),
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.md")),
+            format!(
+                "---\npermission: explore\ndifficulty: simple\nmodel: {model}\nwhen: looking\n---\nYou look.\n"
+            ),
+        )
+        .unwrap();
+    }
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let catalog = Arc::new(TestCatalog {
+        offer,
+        current: Some("lead-model".into()),
+        calls: calls.clone(),
+    });
+    let lead = Arc::new(Lead {
+        args: String::new(),
+        calls: calls.clone(),
+        round: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let scoped = format!(
+        "[[patch]]\nid = \"trace\"\nconfig = {{ stream = false, tools = false, summary = false }}\n\n\
+         [[patch]]\nid = \"fs\"\nconfig = {{ root = {root:?} }}\n\n\
+         [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 6, working_dir = {root:?} }}\n\n\
+         [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
+         [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {root:?} }}\n\n\
+         [[patch]]\nid = \"project-instructions\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
+         [[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"approval\"\nconfig = {{ mode = \"yolo\" }}\n\n\
+         [[patch]]\nid = \"llm\"\nname = \"test-lead-model\"\nconfig = {{}}\n\n\
+         [[insert]]\nname = \"test-models\"\n\n\
+         [[insert]]\nname = \"model-catalog\"\n\n\
+         [[insert]]\nname = \"team-in-process\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n",
+        root = root.to_string_lossy(),
+        home = home.to_string_lossy(),
+    );
+    let tree = ConfigTree::from_layers(vec![
+        bundle::base().unwrap(),
+        Layer::from_toml(&scoped).unwrap(),
+    ])
+    .expect("tree");
+    let mut registry = plugins::catalog();
+    registry.register(Arc::new(ProvideCatalog(catalog)));
+    registry.register(Arc::new(ProvideLead(lead)));
+    let mut app = App::new(registry, tree);
+    app.start().await.expect("must mount");
+    (app, calls)
+}
+
+async fn delegate_as_lead(
+    app: &App,
+    lead: &Arc<atomcode_harness::agent::Agent>,
+    role: &str,
+) -> String {
+    let tool = app
+        .context()
+        .service::<atomcode_harness::seams::ToolsSvc>()
+        .unwrap()
+        .get("team")
+        .expect("team tool mounted");
+    let ctx = atomcode_kernel::tool::ToolContext {
+        working_dir: std::env::current_dir().unwrap(),
+        cancel: Default::default(),
+        progress: atomcode_kernel::tool::ProgressSink::noop(),
+        requester: None,
+    };
+    let args =
+        serde_json::json!({ "action": "delegate", "name": role, "role": role, "task": "look" })
+            .to_string();
+    atomcode_harness::agent::as_agent(lead.ctx().clone(), async move {
+        tool.execute(&args, &ctx).await
+    })
+    .await
+    .content
+}
+
+/// A role that came with the repository arrived with a clone, not from the
+/// person: it names only what the model could pick for itself. The person's own
+/// role file may still point at their second account (`docs/adr/0023`, addendum).
+#[tokio::test]
+async fn a_role_that_came_with_the_project_may_not_name_another_account() {
+    let offer = || vec![model("lead-model", 30), elsewhere("theirs", 5)];
+    let (app, calls) = team_with_roles(
+        "project-role",
+        offer(),
+        &[("project", "cloned", "theirs"), ("home", "mine", "theirs")],
+    )
+    .await;
+    let lead = atomcode_harness::create_agent(&app).await.unwrap();
+
+    let refused = delegate_as_lead(&app, &lead, "cloned").await;
+    assert!(
+        refused.contains("not available to delegate to"),
+        "a project's role reached another account: {refused}"
+    );
+
+    let taken = delegate_as_lead(&app, &lead, "mine").await;
+    assert!(taken.contains("delegated to `mine`"), "{taken}");
+    for _ in 0..200 {
+        if who(&calls).iter().any(|c| c == "theirs") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        who(&calls).iter().any(|c| c == "theirs"),
+        "the person's own role runs where they pointed it"
+    );
+}

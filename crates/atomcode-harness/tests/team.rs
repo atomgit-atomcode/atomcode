@@ -793,3 +793,125 @@ async fn a_member_is_driven_through_a_pump_of_its_own() {
     }
     assert!(!scout.is_driven(), "stopping the member stopped its pump");
 }
+
+// ---- what a writing member may touch ------------------------------------------
+
+/// A writer that shares the lead's workspace writes only inside the scope it
+/// was given — never into `.git`, never outside the workspace, whatever the
+/// scope says (`docs/adr/0023`, addendum).
+#[tokio::test]
+async fn a_writing_member_writes_only_inside_its_scope() {
+    let dir = scratch("lane");
+    write_role(
+        &dir,
+        "scribe",
+        "---\npermission: worker\ndifficulty: simple\nwhen: writing a note\n---\nYou write what you are told.\n",
+    );
+    let app = start(tree(
+        &dir,
+        r#"{ text = "delegating", calls = [ { name = "team", args = { action = "delegate", name = "scribe", role = "scribe", task = "write the notes", scope = ["src/**", ".git/**"] } } ] }, { text = "delegated" }"#,
+        r#"{ text = "writing", calls = [
+            { name = "write_file", args = { file_path = "src/in.txt", content = "ok" } },
+            { name = "write_file", args = { file_path = "docs/out.txt", content = "no" } },
+            { name = "write_file", args = { file_path = ".git/hooks/pre-commit", content = "no" } },
+            { name = "write_file", args = { file_path = "../escaped.txt", content = "no" } }
+        ] }, { text = "written" }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    run_turn(&app, "go").await.unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let scribe = agents
+        .by_session(&format!("{}/scribe", lead.session_id()))
+        .unwrap();
+    until_idle(&scribe).await;
+
+    assert!(dir.join("src/in.txt").exists(), "inside its scope");
+    assert!(!dir.join("docs/out.txt").exists(), "outside its scope");
+    assert!(
+        !dir.join(".git/hooks/pre-commit").exists(),
+        "into .git, though the scope named it"
+    );
+    assert!(
+        !dir.parent().unwrap().join("escaped.txt").exists(),
+        "outside the workspace"
+    );
+    // Refused by the member's bounds, not by whatever else happens to fence
+    // this tree's filesystem: a product tree with an unfenced world has only them.
+    let results: Vec<String> = scribe
+        .session()
+        .events()
+        .into_iter()
+        .filter_map(|e| match e.event {
+            SessionEvent::ToolResultLogged { content, .. } => Some(content),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        results
+            .iter()
+            .any(|r| r.contains("escaped.txt is outside the working directory")),
+        "{results:#?}"
+    );
+}
+
+/// Writers sharing a workspace say what they will write, and never the same
+/// files.
+#[tokio::test]
+async fn writers_sharing_the_workspace_need_scopes_of_their_own() {
+    let dir = scratch("scopes");
+    let app = start(tree(
+        &dir,
+        r#"{ text = "ok" }"#,
+        r#"{ text = "ok" }, { text = "ok" }, { text = "ok" }"#,
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    let delegate = |name: &str, scope: Option<&[&str]>| {
+        let mut args = serde_json::json!({
+            "action": "delegate", "name": name, "role": "implementer", "task": "change it"
+        });
+        if let Some(scope) = scope {
+            args["scope"] = serde_json::json!(scope);
+        }
+        args.to_string()
+    };
+
+    let unscoped = as_lead(&app, &lead, &delegate("a", None)).await;
+    assert!(
+        unscoped.is_error && unscoped.content.contains("`scope` is required"),
+        "{}",
+        unscoped.content
+    );
+    let first = as_lead(&app, &lead, &delegate("b", Some(&["src/**"]))).await;
+    assert!(!first.is_error, "{}", first.content);
+    let overlapping = as_lead(&app, &lead, &delegate("c", Some(&["src/auth/x.rs"]))).await;
+    assert!(
+        overlapping.is_error && overlapping.content.contains("overlaps what `b` may write"),
+        "{}",
+        overlapping.content
+    );
+    let disjoint = as_lead(&app, &lead, &delegate("d", Some(&["docs/**"]))).await;
+    assert!(!disjoint.is_error, "{}", disjoint.content);
+}
+
+/// A role file chooses a member's tools from what its permission allows: a
+/// file in a cloned repository cannot hand a member a shell.
+#[tokio::test]
+async fn a_role_file_cannot_hand_a_member_a_shell() {
+    let dir = scratch("shell-role");
+    write_role(
+        &dir,
+        "operator",
+        "---\npermission: worker\ndifficulty: simple\ntools: read_file, bash\n---\nYou run things.\n",
+    );
+    let mut app = App::new(
+        plugins::catalog(),
+        tree(&dir, r#"{ text = "ok" }"#, r#"{ text = "ok" }"#),
+    );
+    let err = app.start().await.expect_err("a role listing `bash`");
+    assert!(
+        format!("{err:?}").contains("may not have `bash`"),
+        "{err:?}"
+    );
+}

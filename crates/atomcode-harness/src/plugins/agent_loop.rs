@@ -229,6 +229,7 @@ impl PluginAgentLoop {
                                     turn,
                                     round: step,
                                     authorization: crate::events::Authorization::No,
+                                    working_dir: working_dir.clone(),
                                 },
                             )
                             .await,

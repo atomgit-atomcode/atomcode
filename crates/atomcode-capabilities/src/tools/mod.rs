@@ -128,8 +128,8 @@ pub use report_finding::{Finding, ReportFindingTool};
 pub use search_replace::SearchReplaceTool;
 pub use sensitive_path::{path_is_sensitive, references_sensitive_path, SensitivePathGate};
 pub use task::{
-    subagent_child_middlewares, subagent_child_middlewares_for_policy, team_child_middlewares,
-    team_child_middlewares_for_policy, TaskTool,
+    delegated_write_violation, subagent_child_middlewares, subagent_child_middlewares_for_policy,
+    team_child_middlewares, team_child_middlewares_for_policy, TaskTool,
 };
 pub use todo::TodoTool;
 #[cfg(feature = "web")]

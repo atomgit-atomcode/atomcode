@@ -56,6 +56,7 @@ plexus_service!(ApprovalSvc => dyn ApprovalPolicy, "approval", Seam, "Whether a 
 plexus_service!(AgentHandleSvc => dyn AgentHandleSource, "agent-handle", Seam, "A driver-protocol handle on this harness");
 plexus_service!(ModesSvc => Modes, "modes", Core, "Switches a person flips mid-session — plan mode, accept edits — read live by the rows they govern");
 plexus_service!(ToolDriverSvc => dyn ToolDriver, "tool-driver", Seam, "What a running tool reaches of the person's front end: a progress line, a structured question");
+plexus_service!(DelegationLaneSvc => DelegationLane, "delegation-lane", Core, "Where a delegated agent may write: the scopes it was given, on its own realm");
 plexus_service!(GrantsSvc => dyn atomcode_capabilities::tools::PermissionStore, "grants", Core, "The session's remembered always-allow answers, kept by a host that outlives the tree");
 
 /// The live tool catalog.
@@ -710,4 +711,13 @@ pub trait ToolDriver: Send + Sync {
     fn progress(&self, session: &str, call_id: &str) -> atomcode_kernel::tool::ProgressSink;
     /// A round trip to the person, or `None` when this session has nobody to ask.
     fn requester(&self, session: &str) -> Option<atomcode_kernel::request::Requester>;
+}
+
+/// The files a delegated agent was given to write, as scopes (globs relative to
+/// its working directory). Provided on the agent's own realm by whoever
+/// delegated it; an agent without one may write anywhere in its workspace, and
+/// `delegation-bounds` holds it to that.
+#[derive(Clone, Debug)]
+pub struct DelegationLane {
+    pub scopes: Vec<String>,
 }

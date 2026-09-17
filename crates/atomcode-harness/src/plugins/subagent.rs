@@ -285,6 +285,15 @@ impl Subagents for InProcessSubagents {
                     realm
                         .provide::<ToolsSvc>(restricted)
                         .map_err(|e| e.to_string())?,
+                    // Marks it delegated, for `delegation-bounds`: a child reads,
+                    // and its tools could write nowhere but its workspace.
+                    realm
+                        .provide::<crate::seams::DelegationLaneSvc>(Arc::new(
+                            crate::seams::DelegationLane {
+                                scopes: vec!["**".to_string()],
+                            },
+                        ))
+                        .map_err(|e| e.to_string())?,
                     realm
                         .provide::<SystemPromptSvc>(prompts)
                         .map_err(|e| e.to_string())?,

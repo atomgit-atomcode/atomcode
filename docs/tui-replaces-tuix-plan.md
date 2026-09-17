@@ -116,7 +116,7 @@ M3 改 `session-native`),分 worktree 时先约定合并顺序。
 |---|---|---|
 | 4.1 | 统一句柄泵:泵接管已存在的 agent;删 `keep_driven`;task 工具改为发任务 + 等终结;取消只拒该 agent 自己的提问 | 0023 §6 |
 | 4.2 | 产品改用 `team-in-process` / `subagent-in-process`:先把 coding team / task 的现有测试原样挂到 realm 版本上跑,逐条对齐差异;在产品树上立成员的安全判据;撤掉 coding 的 `task` / `team` host tool | 0023 §2 |
-| 4.2a | harness 委派边界:敏感路径硬拒、`.git` 与工作区外写拒、成员无 shell / 委派 / 网络、角色文件 `tools:` / `model:` 受限、写 scope、被拦结果扣住、执行限制按会话 | 0023 落地补充 |
+| 4.2a | harness 委派边界:敏感路径硬拒、`.git` 与工作区外写拒、成员无 shell / 委派、角色文件 `tools:` / `model:` 受限、写 scope、执行限制只由 lead 更新 | 0023 落地补充 |
 | 4.2b | 体验与配置:风险按参数、补齐 14 角色、轮数 / 并发 / 开关接配置、子 agent 计费、tuix `Team` 事件与 `task` 进度行过渡适配、登出结束成员 | 0023 落地补充 |
 | 4.3 | 成员落盘:会话头 `member` 字段、「已停止」事实、resume 带回没被 stop 的成员;权限按当前角色重算 | 0024 §11、§13 |
 | 4.4 | 命令目录:harness 加 `commands` 核心注册表;泵处理 `Invoke`;team 行登记 `stop`;tui 斜杠菜单合并 UI 自己的、宿主控制的、目录里的命令 | 0021 §10 |

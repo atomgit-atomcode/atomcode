@@ -198,6 +198,9 @@ pub struct ToolExec {
     /// exists because the person asked to be stopped, and only that same person
     /// can lift it — see [`Authorization::by_person`].
     pub authorization: Authorization,
+    /// Where the call runs: the calling agent's own world when it has one, the
+    /// loop's directory otherwise. What a relative path in the arguments means.
+    pub working_dir: std::path::PathBuf,
 }
 
 /// Who settled a tool call, for a gate deciding whether that answer is good

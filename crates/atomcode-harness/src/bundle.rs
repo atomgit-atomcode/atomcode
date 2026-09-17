@@ -302,6 +302,11 @@ disabled = true
 [[insert]]
 name = "persona-coding"
 
+# What a delegated agent (a team member, a `task` child) may never do, refused
+# ahead of every rule and question: nobody is watching it call tools.
+[[insert]]
+name = "delegation-bounds"
+
 # No rules by default, so the row is inert until a user writes some.
 [[insert]]
 name = "permissions"
