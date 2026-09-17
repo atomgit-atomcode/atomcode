@@ -2514,6 +2514,165 @@ async fn cancel_all_stops_every_members_turn_and_keeps_the_team() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// A team whose member speaks for itself, so its screen is recognisably its own.
+fn team_with_a_talking_member(dir: &Path) -> (String, String) {
+    let script = replay(
+        r#"{ text = "Delegating.", calls = [ { name = "team", args = { action = "delegate", name = "scout", role = "explorer", task = "look around" } } ] },
+           { text = "Delegated." },
+           { text = "Noted." },
+           { text = "Noted again." }"#,
+    );
+    let team = format!(
+        "[[insert]]\nname = \"team-in-process\"\nconfig = {{ project_root = {dir:?} }}\n\n\
+         [[insert]]\nid = \"llm-utility\"\nname = \"llm-utility-replay\"\n\
+         config = {{ script = [ \
+           {{ text = \"MEMBER-THINKING-OUT-LOUD\", calls = [ {{ name = \"tell_parent\", args = {{ text = \"scout reporting in\" }} }} ] }}, \
+           {{ text = \"MEMBER-TRAILING-WORDS\" }}, \
+           {{ text = \"MEMBER-HEARD-YOU\" }} ] }}\n",
+        dir = dir.to_string_lossy(),
+    );
+    (script, team)
+}
+
+fn panel_text(s: &Session) -> String {
+    s.term
+        .last()
+        .and_then(|frame| frame.part("team").cloned())
+        .map(|part| {
+            part.lines
+                .iter()
+                .map(|l| l.plain())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// The team panel is a way in (`docs/adr/0023` §3): Tab gives it the keyboard,
+/// the arrows pick an agent, Enter puts it on screen — its own conversation,
+/// and what is typed goes to it — and `主` brings the lead back.
+#[tokio::test]
+async fn the_keyboard_switches_the_screen_to_a_member_and_back() {
+    let dir = scratch("switch-keys");
+    let (script, team) = team_with_a_talking_member(&dir);
+    let s = start(tree(&dir, &script, &[&team])).await;
+    let task = s.open().await;
+
+    s.term.type_line("have someone look around");
+    until(&s, "scout reporting in").await;
+    s.quiet().await;
+    assert!(!s.screen().contains("MEMBER-THINKING-OUT-LOUD"));
+    assert!(panel_text(&s).contains("主"), "{}", panel_text(&s));
+
+    s.term.press(KeyPress::plain(Key::Tab));
+    until(&s, "Enter 切换").await;
+    s.term.press(KeyPress::plain(Key::Down));
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "MEMBER-THINKING-OUT-LOUD").await;
+    assert!(s.screen().contains("正在看 scout"), "{}", s.screen());
+    let status = |s: &Session| {
+        s.term
+            .last()
+            .and_then(|frame| frame.part("status").cloned())
+            .map(|part| part.lines.iter().map(|l| l.plain()).collect::<String>())
+            .unwrap_or_default()
+    };
+    assert!(
+        status(&s).contains("成员 scout"),
+        "the status line says whose screen: {}",
+        status(&s)
+    );
+    assert!(
+        !s.screen().contains("Delegated."),
+        "the lead's conversation is off the screen:\n{}",
+        s.screen()
+    );
+
+    s.term.type_line("one more thing");
+    until(&s, "MEMBER-HEARD-YOU").await;
+
+    s.term.press(KeyPress::plain(Key::Tab));
+    until(&s, "Enter 切换").await;
+    s.term.press(KeyPress::plain(Key::Up));
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "Delegated.").await;
+    assert!(
+        !status(&s).contains("成员"),
+        "the lead's again: {}",
+        status(&s)
+    );
+    assert!(
+        !s.screen().contains("MEMBER-THINKING-OUT-LOUD"),
+        "the member's own conversation is off the lead's screen again:\n{}",
+        s.screen()
+    );
+    assert!(
+        s.screen().contains("one more thing"),
+        "and the lead was told what the person said to it:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// A press on a member's row switches to it, and the row under the pointer is
+/// the row lit — the one a press would take.
+#[tokio::test]
+async fn a_press_on_a_team_row_switches_to_that_agent() {
+    use atomcode_tui::surface::Click;
+
+    let dir = scratch("switch-pointer");
+    let (script, team) = team_with_a_talking_member(&dir);
+    let s = start(tree(&dir, &script, &[&team])).await;
+    let task = s.open().await;
+    s.term.type_line("have someone look around");
+    until(&s, "scout reporting in").await;
+    s.quiet().await;
+
+    let part = s.term.last().unwrap().part("team").unwrap().clone();
+    let scout_row = part
+        .lines
+        .iter()
+        .position(|l| l.plain().contains("scout"))
+        .expect("a row for the member") as u16;
+    let (x, y) = (part.rect.x + 2, part.rect.y + scout_row);
+
+    s.term.pointer(Click::Hover, x, y);
+    for _ in 0..100 {
+        let lit = s
+            .term
+            .last()
+            .and_then(|frame| frame.part("team").cloned())
+            .is_some_and(|part| {
+                part.lines
+                    .get(scout_row as usize)
+                    .is_some_and(|line| line.spans.iter().any(|span| span.style.bg.is_some()))
+            });
+        if lit {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        s.term
+            .last()
+            .and_then(|frame| frame.part("team").cloned())
+            .is_some_and(|part| part.lines[scout_row as usize]
+                .spans
+                .iter()
+                .any(|span| span.style.bg.is_some())),
+        "the row under the pointer is lit"
+    );
+    s.term.pointer(Click::Press, x, y);
+    s.term.pointer(Click::Release, x, y);
+    until(&s, "MEMBER-THINKING-OUT-LOUD").await;
+    assert!(s.screen().contains("正在看 scout"), "{}", s.screen());
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 /// A command a row of the agent's tree puts in its catalog, for a person to run.
 struct EchoCommand;
 

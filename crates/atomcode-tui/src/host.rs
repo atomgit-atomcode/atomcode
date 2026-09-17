@@ -688,6 +688,9 @@ pub struct Hits {
     /// answer is a fact about how the prompt wrapped — the panel already knows,
     /// and a second copy here would be a second wrapping.
     ask: Option<Rect>,
+    /// Where the team panel was drawn, so a press or the pointer on a row finds
+    /// the agent it switches to.
+    team: Option<Rect>,
 }
 
 impl Hits {
@@ -989,7 +992,21 @@ impl Host {
     /// folded from it go, and the new session's facts start them over. The old
     /// stream is dropped rather than kept: the session it drew was replaced, and
     /// there is nothing to switch back to.
+    /// Another session in place of this one: everything drawn goes, and what was
+    /// waiting on this one — a question, the members — goes with it.
     pub fn switch_session(&self) {
+        self.switch_view();
+        // A question belongs to a turn of the session that asked it.
+        self.asks.refuse_all();
+        let mut m = self.moment.write().expect("moment poisoned");
+        m.members.clear();
+        m.team_cursor = None;
+    }
+
+    /// The screen, emptied to draw another agent of the same session — the lead
+    /// or one of its members (`docs/adr/0023` §3). Their questions stay, and so
+    /// does the team: only what was drawn from the one on screen goes.
+    pub fn switch_view(&self) {
         *self.stream.write().expect("stream poisoned") = Stream::new();
         *self.presentation.write().expect("presentation poisoned") = Presentation::default_folds();
         *self.row_index.lock().expect("row index poisoned") = RowIndex {
@@ -1008,15 +1025,77 @@ impl Host {
                 view.reset();
             }
         }
-        // A question belongs to a turn of the session that asked it.
-        self.asks.refuse_all();
         let mut m = self.moment.write().expect("moment poisoned");
         m.activity = crate::moment::Activity::Idle;
         m.scroll = crate::moment::ScrollPos::BOTTOM;
         m.selection = None;
         m.turn_started = None;
-        m.members.clear();
         m.steering.clear();
+    }
+
+    /// Which team panel row a screen point is on, when it is a row that switches
+    /// — read off the rect the panel was drawn in, like [`Host::answer_row_at`].
+    pub fn team_row_at(&self, x: u16, y: u16) -> Option<usize> {
+        let rect = *self.hits.lock().expect("hits poisoned").team.as_ref()?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        crate::modules::team::target_at_line(&m, (y - rect.y) as usize)
+    }
+
+    /// Whether the team panel has the keyboard.
+    pub fn team_focused(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .team_cursor
+            .is_some()
+    }
+
+    /// Give the team panel the keyboard, pointing at the agent on screen. `false`
+    /// when there is no team to switch between.
+    pub fn focus_team(&self) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let targets = crate::modules::team::targets(&m);
+        if targets.is_empty() {
+            return false;
+        }
+        let here = targets.iter().position(|s| *s == m.viewing).unwrap_or(0);
+        m.team_cursor = Some(here);
+        true
+    }
+
+    /// Point at `row` of the team panel, clamped to the rows there are; with the
+    /// keyboard elsewhere this also lights it, which is what a pointer over it
+    /// means.
+    pub fn point_team_at(&self, row: usize) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let last = crate::modules::team::targets(&m).len().saturating_sub(1);
+        let row = row.min(last);
+        if m.team_cursor == Some(row) {
+            return false;
+        }
+        m.team_cursor = Some(row);
+        true
+    }
+
+    /// Move the team panel's pointer by `delta` rows, clamped.
+    pub fn move_team_by(&self, delta: i32) -> bool {
+        let cur = self
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .team_cursor
+            .unwrap_or(0) as i32;
+        self.point_team_at((cur + delta).max(0) as usize)
+    }
+
+    /// Hand the keyboard back to the composer. What was pointed at, if anything.
+    pub fn unfocus_team(&self) -> Option<String> {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let cursor = m.team_cursor.take()?;
+        crate::modules::team::targets(&m).get(cursor).cloned()
     }
 
     /// Deliver one committed fact to every module.
@@ -1886,6 +1965,7 @@ impl Host {
                         jump: None,
                         field: None,
                         ask: None,
+                        team: None,
                     };
                     *self.last_room.lock().expect("room poisoned") = rect;
                     // The **blocks'** rect, not the pane's. The badge reports
@@ -1942,6 +2022,9 @@ impl Host {
                     if id == crate::modules::input::ID {
                         frame.cursor = Some(crate::modules::input::caret(&moment, rect));
                         self.hits.lock().expect("hits poisoned").field = Some(rect);
+                    }
+                    if id == crate::modules::team::ID {
+                        self.hits.lock().expect("hits poisoned").team = Some(rect);
                     }
                     frame.place(id, rect, lines);
                 }
