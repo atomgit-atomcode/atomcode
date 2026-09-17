@@ -295,6 +295,26 @@ pub enum SessionEvent {
         /// The turn's prompt and partial work no longer reach the model.
         undone: bool,
     },
+    /// What a reply had streamed when the person stopped it: the text and the
+    /// reasoning received for a step that never became an
+    /// [`SessionEvent::AssistantMessage`] (`docs/adr/0024` §8–9).
+    ///
+    /// Chunks are not kept on disk, so without this the part of the answer the
+    /// person had already read would be gone from a resumed session — and from
+    /// the model, which is told it was interrupted without being told where.
+    /// Committed just before [`SessionEvent::Interrupted`], only for a person's
+    /// cancel and only when something had arrived. A kept turn shows the model
+    /// its text as an assistant message ahead of the interruption note; the
+    /// reasoning stays in the log for a screen, never in a request (an unsigned
+    /// thinking block is one some providers refuse), and a tool call that had
+    /// not finished is not here at all — it would be a call with no result.
+    PartialReply {
+        turn: u64,
+        round: u32,
+        text: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reasoning: String,
+    },
     /// Everything from `to` up to this fact no longer reaches the model
     /// (`docs/adr/0024` §17): an undo, a rewind of the conversation, a return
     /// to an earlier point. The facts stay in the log — the projection leaves
@@ -342,6 +362,7 @@ impl SessionEvent {
             | Self::RequestHeader { turn, .. }
             | Self::AssistantChunk { turn, .. }
             | Self::AssistantMessage { turn, .. }
+            | Self::PartialReply { turn, .. }
             | Self::ToolStarted { turn, .. }
             | Self::ToolResultLogged { turn, .. }
             | Self::Injected { turn, .. }
@@ -372,6 +393,7 @@ impl SessionEvent {
                 | Self::Compacted { .. }
                 | Self::ToolResultsStubbed { .. }
                 | Self::Interrupted { .. }
+                | Self::PartialReply { .. }
         )
     }
 }
@@ -400,7 +422,18 @@ impl SessionEvent {
 /// [`SessionEvent::ToolResultsStubbed`] and [`InjectionOrigin::InternalNudge`]. Same shape again: a hard
 /// boundary's recovery choice, and what a person's cancel does to the history,
 /// were kernel behaviour the log never saw.
-pub const SESSION_FORMAT_VERSION: u32 = 5;
+///
+/// **5** — added [`SessionEvent::Rewound`] and [`RewindScope`]: an undo, a
+/// rewind or a restore is a fact the projection honours, not a rewritten log
+/// (`docs/adr/0024` §17).
+///
+/// **6** — added [`SessionEvent::PartialReply`]: what a reply had said when the
+/// person stopped it, now that chunks are not kept (`docs/adr/0024` §7–9).
+///
+/// A file's header records the version that created it; a later build may
+/// append facts of a kind added since. A reader that meets a kind it does not
+/// know treats the file as newer than itself, the same refusal.
+pub const SESSION_FORMAT_VERSION: u32 = 6;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -787,6 +820,9 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
                     message.meta = meta.clone();
                 }
                 messages.push(message);
+            }
+            SessionEvent::PartialReply { text, .. } if !text.is_empty() => {
+                messages.push(Message::assistant(text, Vec::new()));
             }
             SessionEvent::ToolResultLogged {
                 call_id,

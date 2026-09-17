@@ -24,7 +24,7 @@ use atomcode_kernel::message::{Message, Role, SessionSnapshot};
 use atomcode_kernel::provider::{ChatOptions, LlmProvider};
 use atomcode_kernel::stream::{ProviderError, StreamEvent, TokenUsage};
 use atomcode_kernel::tool::{ToolCall, ToolDef};
-use futures::stream::BoxStream;
+use futures::stream::{BoxStream, StreamExt as _};
 
 /// Answers every request with `answer N` and keeps what each request showed.
 #[derive(Default)]
@@ -174,6 +174,22 @@ impl LlmProvider for RecordingProvider {
                     StreamEvent::TextDelta("hushed".into()),
                     StreamEvent::Done { truncated: false },
                 ])));
+            }
+            // A reply that thinks, says a few words, starts a call and then
+            // goes quiet: the only way out is a cancel.
+            Some(m) if m.role == Role::User && m.text == "half" => {
+                return Ok(Box::pin(
+                    futures::stream::iter(vec![
+                        StreamEvent::Reasoning("thinking half".into()),
+                        StreamEvent::TextDelta("I was saying".into()),
+                        StreamEvent::ToolCall(ToolCall {
+                            id: format!("call-{n}"),
+                            name: "bash".into(),
+                            arguments: serde_json::json!({ "command": "ls" }).to_string(),
+                        }),
+                    ])
+                    .chain(futures::stream::pending()),
+                ));
             }
             // A request that never answers: the only way out is a cancel.
             Some(m) if m.role == Role::User && m.text == "hang" => {
@@ -1759,6 +1775,123 @@ async fn cancel_hanging_turn(runtime: &mut CodingRuntime, recorder: &Recorder) {
     }
 }
 
+/// A reply the person stopped part way is kept as far as it got
+/// (`docs/adr/0024` §8–9), though chunks are not.
+///
+/// Kept, the next request shows the model the words it had said, then the
+/// interruption — not its half-finished thinking, not the call it had not
+/// finished asking for — and a resume shows it the same conversation. Undone,
+/// the words go with the rest of the turn. Either way the log on disk holds
+/// them, ahead of the interruption.
+async fn a_stopped_reply_is_kept_as_far_as_it_got() {
+    for keep in [true, false] {
+        let env = env();
+        let recorder = Arc::new(Recorder::default());
+        let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+        config.agent.keep_interrupted_context = keep;
+        let mut runtime = CodingRuntime::start(config).await.unwrap();
+        let id = runtime.session.clone().unwrap().id;
+        turn(&mut runtime, "first").await;
+
+        runtime
+            .handle
+            .submit(UserInput::from("half"))
+            .await
+            .unwrap();
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+                    .await
+                    .expect("the reply did not start")
+                    .expect("runtime event stream closed");
+            if let CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::TextDelta(text)) =
+                event.event
+            {
+                if text.contains("I was saying") {
+                    break;
+                }
+            }
+        }
+        runtime.handle.cancel().await.unwrap();
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+                    .await
+                    .expect("the stopped turn did not finish")
+                    .expect("runtime event stream closed");
+            if matches!(event.event, CodingRuntimeEvent::TurnFinished(_)) {
+                break;
+            }
+        }
+        turn(&mut runtime, "third").await;
+
+        let seen = recorder.last_request();
+        let said = seen
+            .iter()
+            .position(|m| m.role == Role::Assistant && m.text == "I was saying");
+        assert!(
+            !seen.iter().any(|m| m.text.contains("thinking half")
+                || m.reasoning
+                    .as_deref()
+                    .is_some_and(|r| r.contains("thinking half"))),
+            "half a thought reached the model: {seen:?}"
+        );
+        if keep {
+            let at = said.unwrap_or_else(|| panic!("the words said are gone: {seen:?}"));
+            assert!(seen[at].tool_calls.is_empty(), "{:?}", seen[at]);
+            assert!(seen[at + 1].is_user_interruption(), "{seen:?}");
+        } else {
+            assert!(said.is_none(), "an undone turn's words stayed: {seen:?}");
+        }
+
+        let manager = SessionManager::for_project(env.project.path());
+        let kinds: Vec<String> = std::fs::read_to_string(manager.events_path(&id).unwrap())
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let record: serde_json::Value = serde_json::from_str(line).ok()?;
+                record["event"]["kind"].as_str().map(str::to_owned)
+            })
+            .collect();
+        let partial = kinds.iter().position(|kind| kind == "partial_reply");
+        let interrupted = kinds.iter().position(|kind| kind == "interrupted");
+        assert!(
+            matches!((partial, interrupted), (Some(p), Some(i)) if p < i),
+            "the log: {kinds:?}"
+        );
+
+        if keep {
+            let before: Vec<Message> = seen
+                .into_iter()
+                .filter(|m| m.role != Role::System)
+                .collect();
+            runtime.handle.shutdown().await.unwrap();
+            let _ = runtime.task.await;
+            let mut resumed = CodingRuntime::start(start(
+                env.project.path(),
+                &recorder,
+                SessionMode::Resume(id.clone()),
+            ))
+            .await
+            .unwrap();
+            turn(&mut resumed, "fourth").await;
+            let after: Vec<Message> = recorder
+                .last_request()
+                .into_iter()
+                .filter(|m| m.role != Role::System)
+                .collect();
+            assert_eq!(
+                after[..before.len()],
+                before[..],
+                "a resume changed the conversation"
+            );
+            resumed.handle.shutdown().await.unwrap();
+        } else {
+            runtime.handle.shutdown().await.unwrap();
+        }
+    }
+}
+
 /// By default a cancelled turn leaves no trace in what the model sees next —
 /// only a note that the person interrupted.
 async fn a_cancelled_turn_is_undone_by_default() {
@@ -3120,6 +3253,7 @@ mod criteria {
         a_meaningless_temperature_is_ignored_rather_than_breaking_a_model_switch,
         a_cancelled_turn_is_undone_by_default,
         a_cancelled_turn_is_kept_when_asked,
+        a_stopped_reply_is_kept_as_far_as_it_got,
         a_distant_rate_limit_pauses_the_turn,
         an_exhausted_plan_window_pauses_until_its_reset,
         a_brief_rate_limit_is_waited_out,

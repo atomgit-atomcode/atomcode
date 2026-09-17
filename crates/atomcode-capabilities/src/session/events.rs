@@ -44,7 +44,7 @@ struct Line {
     #[serde(default)]
     at: u64,
     #[serde(default)]
-    event: Option<SessionEvent>,
+    event: Option<serde_json::Value>,
 }
 
 impl SessionManager {
@@ -211,7 +211,7 @@ impl SessionManager {
                 (Some(seq), Some(event)) => events.push(LoggedEvent {
                     seq,
                     at: line.at,
-                    event,
+                    event: event_of(event, &path, index, header.as_ref())?,
                 }),
                 _ => {
                     return Err(SessionStoreError::Corrupt {
@@ -798,6 +798,45 @@ fn turn_of_each_prompt(messages: &[Message]) -> Vec<u64> {
     turns
 }
 
+/// A record's fact. A kind this build does not know was added by a newer one
+/// — a later build appends kinds to a file an earlier one created, so the
+/// header's version alone cannot say — and the file is refused as newer, not
+/// read as corrupt.
+fn event_of(
+    value: serde_json::Value,
+    path: &std::path::Path,
+    index: usize,
+    header: Option<&SessionHeader>,
+) -> SessionResult<SessionEvent> {
+    let kind = value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    serde_json::from_value(value).map_err(|error| {
+        if error.to_string().starts_with("unknown variant") {
+            SessionStoreError::FutureSchema {
+                kind: "session events",
+                found: header
+                    .map(|h| h.version)
+                    .unwrap_or(SESSION_FORMAT_VERSION)
+                    .max(SESSION_FORMAT_VERSION)
+                    + 1,
+                supported: SESSION_FORMAT_VERSION,
+            }
+        } else {
+            SessionStoreError::Corrupt {
+                kind: "session events",
+                message: format!(
+                    "{}:{}: {} {error}",
+                    path.display(),
+                    index + 1,
+                    kind.unwrap_or_default()
+                ),
+            }
+        }
+    })
+}
+
 /// One record line of the log, newline included.
 fn record_line(logged: &LoggedEvent) -> SessionResult<Vec<u8>> {
     let mut line = serde_json::to_vec(&serde_json::json!({
@@ -1059,6 +1098,29 @@ mod tests {
         manager
             .create_event_session(&lease, &header, &meta("s1"))
             .unwrap();
+        assert!(matches!(
+            manager.load_events("s1"),
+            Err(SessionStoreError::FutureSchema { .. })
+        ));
+    }
+
+    /// A later build appends kinds of fact to a file an earlier one created:
+    /// a kind this build does not know is a newer file, refused as one.
+    #[test]
+    fn a_fact_of_a_kind_this_build_does_not_know_is_refused_as_newer() {
+        let (_dir, manager) = store();
+        let lease = created(&manager, "s1");
+        manager.append_events(&lease, &a_turn()).unwrap();
+        let mut log = fs::OpenOptions::new()
+            .append(true)
+            .open(manager.events_path("s1").unwrap())
+            .unwrap();
+        writeln!(
+            log,
+            "{}",
+            serde_json::json!({ "seq": 9, "at": 0, "event": { "kind": "from_the_future", "turn": 1 } })
+        )
+        .unwrap();
         assert!(matches!(
             manager.load_events("s1"),
             Err(SessionStoreError::FutureSchema { .. })

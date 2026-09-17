@@ -36,7 +36,9 @@ use crate::seams::{
     AgentLoop, AgentLoopSvc, LlmSvc, SessionProjectionsSvc, StopReason, SystemPromptSvc, ToolsSvc,
     TurnOutcome,
 };
-use crate::session::{Committed, HeaderReason, InjectionOrigin, SeqNo, SessionEvent, SessionLog};
+use crate::session::{
+    Committed, HeaderReason, InjectionOrigin, LoggedEvent, SeqNo, SessionEvent, SessionLog,
+};
 
 #[derive(Debug, Deserialize)]
 struct LoopRow {
@@ -733,6 +735,9 @@ impl PluginAgentLoop {
         }
 
         if outcome.stop == StopReason::Cancelled && agent.take_interrupted() {
+            if let Some(partial) = partial_reply(&session.events(), turn) {
+                self.commit(&session, partial);
+            }
             self.commit(
                 &session,
                 SessionEvent::Interrupted {
@@ -757,6 +762,44 @@ impl PluginAgentLoop {
         agent.end_turn();
         outcome
     }
+}
+
+/// What the turn's unfinished step had streamed, as one fact: the chunks of a
+/// round that never got its `AssistantMessage`. `None` when nothing arrived.
+fn partial_reply(events: &[LoggedEvent], turn: u64) -> Option<SessionEvent> {
+    let finished: std::collections::HashSet<u32> = events
+        .iter()
+        .filter_map(|logged| match &logged.event {
+            SessionEvent::AssistantMessage { turn: t, round, .. } if *t == turn => Some(*round),
+            _ => None,
+        })
+        .collect();
+    let (mut round, mut text, mut reasoning) = (0, String::new(), String::new());
+    for logged in events {
+        if let SessionEvent::AssistantChunk {
+            turn: t,
+            round: r,
+            delta,
+            reasoning: is_reasoning,
+        } = &logged.event
+        {
+            if *t != turn || finished.contains(r) {
+                continue;
+            }
+            round = *r;
+            if *is_reasoning {
+                reasoning.push_str(delta);
+            } else {
+                text.push_str(delta);
+            }
+        }
+    }
+    (!text.is_empty() || !reasoning.is_empty()).then_some(SessionEvent::PartialReply {
+        turn,
+        round,
+        text,
+        reasoning,
+    })
 }
 
 /// The stats a stored message carries about the response that produced it.
