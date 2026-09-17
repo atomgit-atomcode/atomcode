@@ -46,7 +46,9 @@ pub(crate) struct ChildRoundCap {
 #[async_trait]
 impl atomcode_plexus::Listener<TurnStopping> for ChildRoundCap {
     async fn call(&self, progress: &TurnProgress) -> Option<StopReason> {
-        (progress.rounds >= self.max_steps).then_some(StopReason::MaxRounds)
+        // Zero is "no budget of its own", the way the product's `[subagent]
+        // max_rounds` has always read it — not a budget of nothing.
+        (self.max_steps > 0 && progress.rounds >= self.max_steps).then_some(StopReason::MaxRounds)
     }
 }
 
@@ -277,6 +279,7 @@ impl Subagents for InProcessSubagents {
             .and_then(|c| c.service::<SessionSvc>())
             .map(|log| log.id().to_string());
         let child_session = format!("sub-{}", crate::agent::mint_session_id());
+        let delegated_llm = self.ctx.service::<crate::seams::DelegatedLlmSvc>();
         let mut req = crate::agent::CreateAgent::new()
             .id(child_session.clone())
             .persist(false)
@@ -301,7 +304,9 @@ impl Subagents for InProcessSubagents {
                 // The child's own `llm`, on its own realm: lookup walks up, so
                 // the parent keeps the model it had and a sibling delegated
                 // elsewhere is unaffected.
-                if let Some(model) = model.clone() {
+                // A named model, or — inheriting the conversation's — the
+                // host's delegated one, when it keeps a child's spend apart.
+                if let Some(model) = model.clone().or_else(|| delegated_llm.clone()) {
                     held.push(
                         realm
                             .provide::<crate::seams::LlmSvc>(model)
@@ -453,6 +458,9 @@ have no one to ask.";
 
 struct TaskTool {
     ctx: Context,
+    /// Every tool a child may be handed only reads. Then delegating is reading
+    /// too, and asking about it would be asking about a search.
+    read_only: bool,
 }
 
 #[async_trait]
@@ -481,7 +489,11 @@ impl Tool for TaskTool {
     /// The child runs under the same root policy, but it does run real tools,
     /// so the call itself is a decision worth gating.
     fn risk(&self, _args: &str) -> RiskLevel {
-        RiskLevel::Risky
+        if self.read_only {
+            RiskLevel::Safe
+        } else {
+            RiskLevel::Risky
+        }
     }
     fn always_grant_scope(&self, _args: &str) -> String {
         "task".into()
@@ -591,7 +603,13 @@ impl Plugin for SubagentPlugin {
             .map_err(|e| e.to_string())?;
         mount(
             ctx,
-            vec![Arc::new(TaskTool { ctx: ctx.clone() }) as Arc<dyn Tool>],
+            vec![Arc::new(TaskTool {
+                ctx: ctx.clone(),
+                read_only: row
+                    .allowed_tools
+                    .iter()
+                    .all(|tool| crate::plugins::team::EXPLORE_TOOLS.contains(&tool.as_str())),
+            }) as Arc<dyn Tool>],
         )?;
         // This row's guidance for this row's tool, and nothing else: the rules a parameter list
         // cannot carry — when NOT to delegate, and how to run several at once without them

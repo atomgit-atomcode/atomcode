@@ -1023,3 +1023,78 @@ async fn a_role_that_came_with_the_project_may_not_name_another_account() {
         "the person's own role runs where they pointed it"
     );
 }
+
+/// A host that keeps a delegated agent's spend apart hands the harness the
+/// provider a child should use when it inherits the conversation's model; a
+/// child that names no model runs on that one, and the lead keeps its own.
+#[tokio::test]
+async fn a_child_on_the_conversations_model_runs_on_the_hosts_delegated_provider() {
+    struct ProvideDelegated(Calls);
+
+    #[async_trait]
+    impl Plugin for ProvideDelegated {
+        fn name(&self) -> &'static str {
+            "test-delegated-model"
+        }
+        fn provides(&self) -> &'static [&'static str] {
+            &["llm-delegated"]
+        }
+        fn description(&self) -> &'static str {
+            "the conversation's model, billed apart"
+        }
+        async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+            let _ = ctx
+                .provide::<atomcode_harness::seams::DelegatedLlmSvc>(Arc::new(Signed {
+                    id: "delegated".into(),
+                    calls: self.0.clone(),
+                }))
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+    }
+
+    let root = scratch("delegated");
+    let empty_home = root.join("__no_user_skills__");
+    let _ = std::fs::create_dir_all(&empty_home);
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    let lead = Arc::new(Lead {
+        args: r#"{"task":"look around"}"#.into(),
+        calls: calls.clone(),
+        round: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let scoped = format!(
+        "[[patch]]\nid = \"trace\"\nconfig = {{ stream = false, tools = false, summary = false }}\n\n\
+         [[patch]]\nid = \"fs\"\nconfig = {{ root = {root:?} }}\n\n\
+         [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 6, working_dir = {root:?} }}\n\n\
+         [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
+         [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {root:?} }}\n\n\
+         [[patch]]\nid = \"project-instructions\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
+         [[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"approval\"\nconfig = {{ mode = \"yolo\" }}\n\n\
+         [[patch]]\nid = \"subagent-in-process\"\ndisabled = false\n\n\
+         [[patch]]\nid = \"llm\"\nname = \"test-lead-model\"\nconfig = {{}}\n\n\
+         [[insert]]\nname = \"test-delegated-model\"\n",
+        root = root.to_string_lossy(),
+        home = empty_home.to_string_lossy(),
+    );
+    let tree = ConfigTree::from_layers(vec![
+        bundle::base().unwrap(),
+        Layer::from_toml(&scoped).unwrap(),
+    ])
+    .expect("tree");
+    let mut registry = plugins::catalog();
+    registry.register(Arc::new(ProvideLead(lead)));
+    registry.register(Arc::new(ProvideDelegated(calls.clone())));
+    let mut app = App::new(registry, tree);
+    app.start().await.expect("must mount");
+    atomcode_harness::run_turn(&app, "delegate it")
+        .await
+        .expect("a turn");
+
+    let calls = who(&calls);
+    assert!(calls.iter().any(|c| c == "delegated"), "{calls:?}");
+    assert!(
+        calls.iter().filter(|c| *c == "lead-model").count() >= 2,
+        "{calls:?}"
+    );
+}

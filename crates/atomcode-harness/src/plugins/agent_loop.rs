@@ -696,8 +696,12 @@ impl PluginAgentLoop {
             }
 
             let owes_a_request = tool_count > 0 || response.truncated;
-            if let Some(stop) = self
-                .ctx
+            // Asked on the agent's own context: a delegated agent's budget is a
+            // listener on its realm, which the tree cannot see — asked on the
+            // tree, a child's round cap never answered. Visibility runs upward,
+            // so the tree's own listeners still do.
+            if let Some(stop) = agent
+                .ctx()
                 .serial::<TurnStopping>(&TurnProgress {
                     turn,
                     rounds: step,

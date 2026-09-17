@@ -915,3 +915,78 @@ async fn a_role_file_cannot_hand_a_member_a_shell() {
         "{err:?}"
     );
 }
+
+/// Only putting a writer to work is a decision to ask about: looking at the
+/// team, telling or stopping a member, delegating a reader, and a `task`
+/// whose children only read are not (`docs/adr/0023`, addendum).
+#[tokio::test]
+async fn only_putting_a_writer_to_work_is_risky() {
+    use atomcode_kernel::tool::RiskLevel;
+    let dir = scratch("risk");
+    let mut layers = tree(&dir, r#"{ text = "ok" }"#, r#"{ text = "ok" }"#);
+    layers
+        .apply(
+            &Layer::from_toml("[[patch]]\nid = \"subagent-in-process\"\ndisabled = false\n")
+                .unwrap(),
+        )
+        .unwrap();
+    let app = start(layers).await;
+    let tools = app.context().service::<ToolsSvc>().unwrap();
+    let team = tools.get("team").unwrap();
+    for safe in [
+        r#"{"action":"status"}"#,
+        r#"{"action":"tell","name":"a","text":"more"}"#,
+        r#"{"action":"stop","name":"a"}"#,
+        r#"{"action":"delegate","name":"a","role":"explorer","task":"look"}"#,
+        r#"{"action":"delegate","name":"a","role":"security","task":"look"}"#,
+    ] {
+        assert_eq!(team.risk(safe), RiskLevel::Safe, "{safe}");
+    }
+    assert_eq!(
+        team.risk(r#"{"action":"delegate","name":"a","role":"implementer","task":"edit","scope":["src/**"]}"#),
+        RiskLevel::Risky
+    );
+    assert_eq!(
+        tools.get("task").unwrap().risk(r#"{"task":"look"}"#),
+        RiskLevel::Safe,
+        "a child that only reads"
+    );
+}
+
+/// The roles the product always shipped are built in, so a switch to this row
+/// does not take any away.
+#[tokio::test]
+async fn the_products_roles_are_built_in() {
+    let dir = scratch("roles");
+    let app = start(tree(&dir, r#"{ text = "ok" }"#, r#"{ text = "ok" }"#)).await;
+    let schema = app
+        .context()
+        .service::<ToolsSvc>()
+        .unwrap()
+        .get("team")
+        .unwrap()
+        .parameters_schema();
+    let roles: Vec<String> =
+        serde_json::from_value(schema["properties"]["role"]["enum"].clone()).unwrap();
+    for role in [
+        "planner",
+        "architect",
+        "explorer",
+        "implementer",
+        "rust",
+        "tui_ux",
+        "reviewer",
+        "tester",
+        "debugger",
+        "security",
+        "performance",
+        "docs_writer",
+        "release_manager",
+        "migration_compat",
+    ] {
+        assert!(
+            roles.iter().any(|r| r == role),
+            "`{role}` missing: {roles:?}"
+        );
+    }
+}

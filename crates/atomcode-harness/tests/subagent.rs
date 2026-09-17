@@ -577,3 +577,68 @@ config = { script = [
     );
     assert!(seen.contains("Refused"), "and was told why: {seen}");
 }
+
+/// A child budget of zero rounds is no budget of its own, the way the product's
+/// `[subagent] max_rounds` has always read it — not a budget of nothing.
+#[tokio::test]
+async fn a_child_budget_of_zero_rounds_is_no_budget() {
+    let dir = scratch("unbounded");
+    std::fs::write(dir.join("a.txt"), "one").unwrap();
+    let script = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [
+  { text = "One.", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] },
+  { text = "Two.", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] },
+  { text = "Done." },
+] }
+"#;
+    let unbounded =
+        "[[patch]]\nid = \"subagent-in-process\"\ndisabled = false\nconfig = { max_rounds = 0 }";
+    let app = start(tree(&dir, script, &[YOLO, unbounded])).await;
+    let outcome = app
+        .context()
+        .service::<SubagentsSvc>()
+        .unwrap()
+        .spawn(atomcode_harness::seams::Delegation {
+            task: "read twice",
+            instructions: "do the task",
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(outcome.stop, StopReason::Stopped, "{outcome:?}");
+    assert_eq!(outcome.text, "Done.");
+}
+
+/// A child stops at its own round budget, which is a listener on its own realm
+/// — asked on the tree, it never answered and a child ran as long as it liked.
+#[tokio::test]
+async fn a_child_stops_at_its_own_round_budget() {
+    let dir = scratch("budget");
+    std::fs::write(dir.join("a.txt"), "one").unwrap();
+    let script = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [
+  { text = "One.", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] },
+  { text = "Two.", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] },
+  { text = "Done." },
+] }
+"#;
+    let one =
+        "[[patch]]\nid = \"subagent-in-process\"\ndisabled = false\nconfig = { max_rounds = 1 }";
+    let app = start(tree(&dir, script, &[YOLO, one])).await;
+    let outcome = app
+        .context()
+        .service::<SubagentsSvc>()
+        .unwrap()
+        .spawn(atomcode_harness::seams::Delegation {
+            task: "read twice",
+            instructions: "do the task",
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(outcome.stop, StopReason::MaxRounds, "{outcome:?}");
+}

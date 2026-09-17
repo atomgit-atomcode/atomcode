@@ -167,6 +167,87 @@ fn built_in_roles() -> Vec<Role> {
             "adding or fixing tests for a change",
         ),
         built_in(
+            "planner",
+            Permission::Explore,
+            Difficulty::Hard,
+            ReasoningEffort::Max,
+            "You break work down and plan who does what. You report a plan: the steps, their \
+             order, what each depends on and which role should take it.",
+            "decomposing a task and planning delegation",
+        ),
+        built_in(
+            "architect",
+            Permission::Explore,
+            Difficulty::Hard,
+            ReasoningEffort::Max,
+            "You map ownership and boundaries: which crate or module owns what, what a change \
+             crosses, and what it does to protocols and stored data. You cite files.",
+            "runtime ownership, crate boundaries, protocol and persistence impact",
+        ),
+        built_in(
+            "rust",
+            Permission::Worker,
+            Difficulty::Hard,
+            ReasoningEffort::Max,
+            "You write Rust: async, traits, error handling and tests. You make the smallest \
+             change that compiles cleanly and report exactly what you changed.",
+            "Rust async, trait, error-handling and test work",
+        ),
+        built_in(
+            "tui_ux",
+            Permission::Worker,
+            Difficulty::Hard,
+            ReasoningEffort::Max,
+            "You build terminal UI: state, layout, width and interaction. You report what \
+             changed on screen and in which files.",
+            "terminal UI state, layout, width and interaction",
+        ),
+        built_in(
+            "debugger",
+            Permission::Explore,
+            Difficulty::Hard,
+            ReasoningEffort::Max,
+            "You reproduce failures and isolate their root cause. You report the cause with \
+             the evidence for it, and you change nothing.",
+            "reproducing a failure and isolating its root cause",
+        ),
+        built_in(
+            "security",
+            Permission::Explore,
+            Difficulty::Hard,
+            ReasoningEffort::Max,
+            "You assess risk: approvals, secrets, path scope and anything that runs without \
+             asking. You report each risk with where it is and why it matters.",
+            "approval, secrets, path scope and auto-execution risk",
+        ),
+        built_in(
+            "performance",
+            Permission::Explore,
+            Difficulty::Hard,
+            ReasoningEffort::Max,
+            "You analyse performance: concurrency, tokens, rendering, latency and memory. You \
+             report what is slow or large, with the evidence.",
+            "concurrency, token, rendering, latency and memory concerns",
+        ),
+        built_in(
+            "release_manager",
+            Permission::Explore,
+            Difficulty::Simple,
+            ReasoningEffort::Low,
+            "You check that a change is ready to ship: the validation that ran, what did not, \
+             and the state of the branch. You report a checklist.",
+            "the final validation matrix and branch hygiene",
+        ),
+        built_in(
+            "migration_compat",
+            Permission::Explore,
+            Difficulty::Hard,
+            ReasoningEffort::Max,
+            "You review compatibility: legacy data, importers and anything on the wire. You \
+             report what an older reader or writer would get wrong.",
+            "legacy, importer and wire compatibility review",
+        ),
+        built_in(
             "docs_writer",
             Permission::Worker,
             Difficulty::Simple,
@@ -716,7 +797,9 @@ impl TeamTool {
         let utility = match (chosen, role.difficulty) {
             (Some(model), _) => Some(model),
             (None, Difficulty::Simple) => self.ctx.service::<LlmUtilitySvc>(),
-            (None, Difficulty::Hard) => None,
+            // The conversation's model — as the host's delegated provider when
+            // it keeps a member's spend apart, else inherited by lookup.
+            (None, Difficulty::Hard) => self.ctx.service::<crate::seams::DelegatedLlmSvc>(),
         };
         // Captured out of `role` before the realm closure takes `tools_for_realm`
         // and friends; the closure is `move` and `role` is not otherwise kept.
@@ -1107,8 +1190,31 @@ impl Tool for TeamTool {
             "required": ["action"]
         })
     }
-    fn risk(&self, _args: &str) -> RiskLevel {
-        RiskLevel::Risky
+    /// Only putting a writer to work is a decision worth asking about. Looking
+    /// at the team, telling a member more, stopping one, or delegating a reader
+    /// changes nothing the member could not already read.
+    fn risk(&self, args: &str) -> RiskLevel {
+        let Ok(args) = serde_json::from_str::<TeamArgs>(args) else {
+            return RiskLevel::Risky;
+        };
+        if args.action != "delegate" {
+            return RiskLevel::Safe;
+        }
+        let reads = args
+            .role
+            .as_deref()
+            .and_then(|id| self.roles.iter().find(|role| role.id == id))
+            .is_some_and(|role| {
+                role.permission == Permission::Explore
+                    && tools_for(role)
+                        .iter()
+                        .all(|tool| EXPLORE_TOOLS.contains(&tool.as_str()))
+            });
+        if reads {
+            RiskLevel::Safe
+        } else {
+            RiskLevel::Risky
+        }
     }
     fn always_grant_scope(&self, _args: &str) -> String {
         "team".into()

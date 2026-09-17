@@ -2036,7 +2036,7 @@ async fn the_todo_panel_leaves_once_every_task_is_done() {
 async fn an_approval_asked_for_by_a_member_says_which_member() {
     let dir = scratch("ask-member");
     let script = replay(
-        r#"{ text = "Delegating.", calls = [ { name = "team", args = { action = "delegate", name = "scribe", role = "docs_writer", task = "write notes.md" } } ] },
+        r#"{ text = "Delegating.", calls = [ { name = "team", args = { action = "delegate", name = "scribe", role = "docs_writer", task = "write notes.md", scope = ["notes.md"] } } ] },
            { text = "Delegated." },
            { text = "Noted." }"#,
     );
