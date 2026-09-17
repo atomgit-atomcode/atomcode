@@ -40,6 +40,35 @@ impl Clock for SystemClock {
     }
 }
 
+/// Wall-clock time, for when something happened rather than how long it took:
+/// the commit time a session record carries. A seam of its own because it is a
+/// different question from [`Clock`], and so a test or a replay can pin it.
+pub trait WallClock: Send + Sync {
+    /// Milliseconds since the Unix epoch.
+    fn now_ms(&self) -> u64;
+}
+
+/// The real wall clock.
+pub struct SystemWallClock;
+
+impl WallClock for SystemWallClock {
+    fn now_ms(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
+
+/// A wall clock that always reads the same instant.
+pub struct FixedWallClock(pub u64);
+
+impl WallClock for FixedWallClock {
+    fn now_ms(&self) -> u64 {
+        self.0
+    }
+}
+
 /// A FIXED clock: `now_millis` always returns the same value, so every measured
 /// `elapsed_ms` is `0` — making a run's snapshots reproducible for eval / replay.
 pub struct FixedClock(pub u64);

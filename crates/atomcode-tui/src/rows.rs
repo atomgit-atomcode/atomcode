@@ -19,8 +19,8 @@
 //!   and nothing else notices.
 //! * `--mascot` stops being a boolean on the UI row and becomes
 //!   `[[insert]] name = "tui-panel-mascot"` — and that row puts itself on
-//!   screen through the same `LayoutOp::Show` a keystroke, a slash command and
-//!   the model all go through, rather than through a special case in `assemble`.
+//!   screen through `LayoutOp::Show`, rather than through a special case in
+//!   `assemble`.
 //! * `--audit` sees every panel, so "mounted but never drawn" and "named by a
 //!   layout but never mounted" become findings instead of surprises.
 //! * A third crate adds a panel with a `View` impl and a row. No edit here.
@@ -107,11 +107,10 @@ name = "tui-commands-screen"
 [[insert]]
 name = "tui-commands-session"
 
+# The agent's own commands, from its description. After the screen's and the
+# session's, so a name one of those already has stays theirs.
 [[insert]]
-name = "tui-commands-tree"
-
-[[insert]]
-name = "tui-commands-layout"
+name = "tui-commands-agent"
 
 # Last, because it lists the others.
 [[insert]]
@@ -135,8 +134,7 @@ pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
         Arc::new(AskPanel),
         Arc::new(ScreenCommandsRow),
         Arc::new(SessionCommandsRow),
-        Arc::new(TreeCommandsRow),
-        Arc::new(LayoutCommandsRow),
+        Arc::new(AgentCatalogCommandsRow),
         Arc::new(HelpCommandsRow),
     ]
 }
@@ -236,11 +234,10 @@ impl Plugin for TranscriptPanel {
 
 /// The mascot: the row that proves the point.
 ///
-/// It mounts a view *and* puts itself on screen, and it does the second half
-/// through `LayoutOp::Show` — the same op a keystroke, a `/show mascot` and the
-/// model's `adjust_layout` all produce. Before this it was a branch inside
-/// `assemble` that built a different region tree, which meant the one thing the
-/// layout vocabulary existed for was the one thing that bypassed it.
+/// It mounts a view *and* puts itself on screen, through `LayoutOp::Show`.
+/// Before this it was a branch inside `assemble` that built a different region
+/// tree. Whether it is on screen is whether this row is on (`--mascot`); nothing
+/// toggles it at runtime.
 pub struct MascotPanel;
 
 #[async_trait]
@@ -490,36 +487,30 @@ commands!(
     SessionCommandsRow,
     "tui-commands-session",
     crate::commands::SessionCommands,
-    "what this session is and how to end it"
-);
-commands!(
-    TreeCommandsRow,
-    "tui-commands-tree",
-    crate::commands::TreeCommands,
-    "inspect and reconfigure the running plugin tree from the screen"
+    "the conversation: compact it, look at it, start another, go back to one"
 );
 
-/// Layout commands need the layout and the module list, so they are written out
-/// rather than generated — the dependencies are the interesting part.
-pub struct LayoutCommandsRow;
+/// The agent's catalog commands. It holds the connection, because what it lists
+/// is what the agent on screen was described as offering.
+pub struct AgentCatalogCommandsRow;
 
 #[async_trait]
-impl Plugin for LayoutCommandsRow {
+impl Plugin for AgentCatalogCommandsRow {
     fn name(&self) -> &'static str {
-        "tui-commands-layout"
+        "tui-commands-agent"
     }
     fn inject(&self) -> &'static [&'static str] {
-        &["tui-commands", "tui-layout", "tui-modules"]
+        &["tui-commands", "tui-agent-client"]
     }
     fn description(&self) -> &'static str {
-        "/show, /hide, /swap, /preset — the second of the three ways into a layout"
+        "the agent's own commands, as its description lists them — run by name through the connection"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let all = ctx.require::<CommandsSvc>().map_err(|e| e.to_string())?;
-        let set = Arc::new(crate::commands::LayoutCommands {
-            layout: ctx.require::<LayoutSvc>().map_err(|e| e.to_string())?,
-            modules: ctx.require::<ModulesSvc>().map_err(|e| e.to_string())?,
-        });
+        let client = ctx
+            .require::<crate::plugin::AgentClientSvc>()
+            .map_err(|e| e.to_string())?;
+        let set = Arc::new(crate::commands::AgentCatalogCommands { client });
         let id = crate::command::CommandSet::id(&*set);
         all.add(set)?;
         let c: Arc<Commands> = all.clone();

@@ -27,16 +27,17 @@ use serde_json::Value;
 
 use crate::agent::{Agent, MessageOrigin};
 use crate::events::{
-    AgentInfo, AgentRequest, AssistantChunk, AssistantMessage, Chunk, InboxInserted, ModelRequest,
-    ModelResponse, PreStep, RequestError, SessionEventCommitted, StepDecision, ToolBatch, ToolExec,
-    ToolResultEvent, ToolsExecuteBatch, TurnEnd, TurnFinishing, TurnProgress, TurnStart,
-    TurnStarted, TurnStopping,
+    AgentRequest, AssistantChunk, AssistantMessage, Chunk, ModelRequest, ModelResponse, PreStep,
+    RequestError, SessionEventCommitted, StepDecision, ToolBatch, ToolExec, ToolResultEvent,
+    ToolsExecuteBatch, TurnEnd, TurnFinishing, TurnProgress, TurnStart, TurnStarted, TurnStopping,
 };
 use crate::seams::{
     AgentLoop, AgentLoopSvc, LlmSvc, SessionProjectionsSvc, StopReason, SystemPromptSvc, ToolsSvc,
     TurnOutcome,
 };
-use crate::session::{Committed, HeaderReason, InjectionOrigin, SeqNo, SessionEvent, SessionLog};
+use crate::session::{
+    Committed, HeaderReason, InjectionOrigin, LoggedEvent, SeqNo, SessionEvent, SessionLog,
+};
 
 #[derive(Debug, Deserialize)]
 struct LoopRow {
@@ -105,10 +106,11 @@ impl PluginAgentLoop {
     /// The single write path. A plugin that wants to react to session state
     /// listens to `session/event`; it never has to be called by the loop.
     fn commit(&self, session: &SessionLog, event: SessionEvent) -> SeqNo {
-        let seq = session.append(event.clone());
+        let (seq, at) = session.record(event.clone());
         self.ctx.emit::<SessionEventCommitted>(&Committed {
             session: session.id().to_string(),
             seq,
+            at,
             event,
         });
         if let Some(projections) = self.ctx.service::<SessionProjectionsSvc>() {
@@ -227,6 +229,7 @@ impl PluginAgentLoop {
                                     turn,
                                     round: step,
                                     authorization: crate::events::Authorization::No,
+                                    working_dir: working_dir.clone(),
                                 },
                             )
                             .await,
@@ -393,6 +396,16 @@ impl PluginAgentLoop {
             // later passes this is what folds a mid-turn message into the turn
             // already running instead of making it wait for the next one.
             let claimed = agent.inbox().claim();
+            if let (Some(receipt), true) = (claimed.receipt.clone(), claimed.message.is_some()) {
+                agent
+                    .ctx()
+                    .emit::<crate::events::InputClaimed>(&crate::events::ClaimedInput {
+                        agent: agent.id(),
+                        receipt,
+                        turn,
+                        steered: step > 0,
+                    });
+            }
             let mut decision = StepDecision {
                 turn,
                 step: step + 1,
@@ -416,7 +429,7 @@ impl PluginAgentLoop {
                 if let Some(reason) = decision.rejected.clone() {
                     // The attempt is a fact even though nothing was sent: a
                     // turn that was refused must be visible in the log.
-                    outcome.stop = StopReason::InputRejected;
+                    outcome.stop = StopReason::PromptRejected;
                     outcome.error = Some(reason);
                     break;
                 }
@@ -683,8 +696,12 @@ impl PluginAgentLoop {
             }
 
             let owes_a_request = tool_count > 0 || response.truncated;
-            if let Some(stop) = self
-                .ctx
+            // Asked on the agent's own context: a delegated agent's budget is a
+            // listener on its realm, which the tree cannot see — asked on the
+            // tree, a child's round cap never answered. Visibility runs upward,
+            // so the tree's own listeners still do.
+            if let Some(stop) = agent
+                .ctx()
                 .serial::<TurnStopping>(&TurnProgress {
                     turn,
                     rounds: step,
@@ -722,6 +739,9 @@ impl PluginAgentLoop {
         }
 
         if outcome.stop == StopReason::Cancelled && agent.take_interrupted() {
+            if let Some(partial) = partial_reply(&session.events(), turn) {
+                self.commit(&session, partial);
+            }
             self.commit(
                 &session,
                 SessionEvent::Interrupted {
@@ -746,6 +766,44 @@ impl PluginAgentLoop {
         agent.end_turn();
         outcome
     }
+}
+
+/// What the turn's unfinished step had streamed, as one fact: the chunks of a
+/// round that never got its `AssistantMessage`. `None` when nothing arrived.
+fn partial_reply(events: &[LoggedEvent], turn: u64) -> Option<SessionEvent> {
+    let finished: std::collections::HashSet<u32> = events
+        .iter()
+        .filter_map(|logged| match &logged.event {
+            SessionEvent::AssistantMessage { turn: t, round, .. } if *t == turn => Some(*round),
+            _ => None,
+        })
+        .collect();
+    let (mut round, mut text, mut reasoning) = (0, String::new(), String::new());
+    for logged in events {
+        if let SessionEvent::AssistantChunk {
+            turn: t,
+            round: r,
+            delta,
+            reasoning: is_reasoning,
+        } = &logged.event
+        {
+            if *t != turn || finished.contains(r) {
+                continue;
+            }
+            round = *r;
+            if *is_reasoning {
+                reasoning.push_str(delta);
+            } else {
+                text.push_str(delta);
+            }
+        }
+    }
+    (!text.is_empty() || !reasoning.is_empty()).then_some(SessionEvent::PartialReply {
+        turn,
+        round,
+        text,
+        reasoning,
+    })
 }
 
 /// The stats a stored message carries about the response that produced it.
@@ -930,53 +988,4 @@ impl Plugin for AgentLoopPlugin {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
-}
-
-// ---- driving an agent nobody holds a handle on -----------------------------
-
-/// An agent kept running by its inbox: whenever a message lands and no turn is
-/// in flight, one starts. Dropping this stops listening and stops the task.
-///
-/// For agents that are not behind a driver protocol — a team member, a goal
-/// the harness runs on its own. The handle pump does the same for the agent a
-/// driver holds.
-pub struct Driving {
-    _wake: atomcode_plexus::Disposable,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for Driving {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-pub fn keep_driven(agent: Arc<Agent>) -> Result<Driving, String> {
-    let driver = agent
-        .ctx()
-        .require::<AgentLoopSvc>()
-        .map_err(|e| e.to_string())?;
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let me = agent.id();
-    let wake = agent
-        .ctx()
-        .on_emit::<InboxInserted>(move |info: &AgentInfo| {
-            if info.id == me {
-                let _ = tx.send(());
-            }
-        });
-    let task = tokio::spawn(async move {
-        // Whatever was queued before anyone listened counts as a wake.
-        while agent.inbox().has_waking_input() {
-            driver.drive(&agent).await;
-        }
-        // Wakes are edge-triggered and the queue is level-checked: several
-        // arriving mid-turn collapse into one look at the inbox afterwards.
-        while rx.recv().await.is_some() {
-            while agent.inbox().has_waking_input() {
-                driver.drive(&agent).await;
-            }
-        }
-    });
-    Ok(Driving { _wake: wake, task })
 }

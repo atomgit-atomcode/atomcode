@@ -187,12 +187,12 @@ pub mod skills;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
-/// Session persistence + cross-session recall: a two-tier on-disk store (a per-turn
-/// compacted `<id>.snapshot` for RESUME + an append-only, never-compacted `<id>.jsonl`
-/// transcript for RECALL), driven entirely by kernel seams ([`SnapshotHook`](session::SnapshotHook)
-/// / [`TranscriptHook`](session::TranscriptHook) on the `turn_complete` terminal hook, a
-/// `recall` tool, a current-date injection hook). Wall-clock lives only here (the kernel
-/// is clock-free). Opt-in `session` feature. See [`session`].
+/// Session persistence + cross-session recall: a session is its append-only event log
+/// (`<id>.events`) beside a metadata index, with RESUME replaying the log and RECALL
+/// folding per-turn records out of it; per-turn statistics ride the kernel's
+/// `turn_complete` seam ([`SnapshotHook`](session::SnapshotHook)), `recall` is a tool.
+/// Wall-clock lives only here (the kernel is clock-free). Opt-in `session` feature. See
+/// [`session`].
 /// The three-tier project-instructions loader (`AGENTS.md` / `CLAUDE.md` /
 /// `.atomcode.md`, global + project + user). Pure — paths in, string out, no
 /// dependencies beyond `std::path` — so it is its own feature: a consumer that

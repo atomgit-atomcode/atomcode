@@ -25,8 +25,8 @@ use atomcode_capabilities::codeintel::register_codeintel_tools;
 use atomcode_capabilities::mcp::{McpConnectEvent, McpRegistry, McpServerConfig};
 use atomcode_capabilities::session::snapshot::SnapshotPersistenceStatus;
 use atomcode_capabilities::session::{
-    ListSessionsTool, PresentationFile, RecallTool, SessionContextHook, SessionLease,
-    SessionManager, SessionMeta, SnapshotHook, StorageOwner, TranscriptHook,
+    ListSessionsTool, RecallTool, SessionContextHook, SessionLease, SessionManager, SessionMeta,
+    SnapshotHook, StorageOwner,
 };
 use atomcode_capabilities::skills::{register_skill_tools, runtime_skill_dirs, SkillRegistry};
 use atomcode_capabilities::tools::{
@@ -34,6 +34,7 @@ use atomcode_capabilities::tools::{
 };
 use atomcode_kernel::message::{Message, SessionSnapshot};
 use atomcode_kernel::provider::LlmProvider;
+use atomcode_kernel::session::SessionHeader;
 use atomcode_kernel::tool::ToolRegistry;
 use atomcode_review::{ReviewTool, ReviewToolConfig, SharedReviewProvider};
 
@@ -139,6 +140,10 @@ pub struct PrepareOptions {
     pub request_user_input: bool,
     /// Provider-specific quota source supplied by the host. `None` keeps 429 handling generic.
     pub rate_limit_source: Option<Arc<dyn RateLimitWindowSource>>,
+    /// A front end outside the App, fed from every App the runtime builds
+    /// (`crate::front_end`). `None` when the driver reads the runtime's own
+    /// events instead.
+    pub front_end: Option<Arc<crate::front_end::FrontEnd>>,
 }
 
 impl Default for PrepareOptions {
@@ -157,6 +162,7 @@ impl Default for PrepareOptions {
             subagents: SubagentPolicy::Disabled,
             request_user_input: true,
             rate_limit_source: None,
+            front_end: None,
         }
     }
 }
@@ -294,9 +300,9 @@ pub struct SessionBinding {
     /// Accepted user input recovered from an interrupted turn. It is replayed
     /// through the normal runtime submit path after an agent becomes available.
     pub(crate) pending_resume_prompt: Option<Message>,
-    /// Fresh metadata prepared in memory but not yet catalog-visible. CodingRuntime
+    /// A fresh session prepared in memory but not yet catalog-visible. CodingRuntime
     /// publishes it only after the complete candidate graph has assembled.
-    staged_fresh: Option<SessionMeta>,
+    staged_fresh: Option<(SessionMeta, SessionHeader)>,
 }
 
 struct McpWorkGuard {
@@ -368,7 +374,6 @@ pub struct CodingParts {
     /// Concrete handle retained so provider-only reassembly can update the
     /// per-turn cost attribution without rebuilding session-owned hooks.
     snapshot_hook: Option<Arc<SnapshotHook>>,
-    transcript_hook: Option<Arc<TranscriptHook>>,
     extra_tools: Vec<Arc<dyn atomcode_kernel::tool::Tool>>,
     host_only_tools: Vec<String>,
     /// The skill catalog prepare loaded, and its prompt rendering (prioritizing
@@ -433,6 +438,8 @@ pub struct CodingParts {
     /// Runtime-owned Team Agent orchestration. The manager is shared with the
     /// mounted tool, while lifecycle termination is driven only by CodingRuntime.
     pub team_manager: crate::team::TeamRunManager,
+    /// `[subagent]` `(max_concurrent, max_rounds)`, when delegation is on.
+    pub(crate) subagent_knobs: Option<(usize, u32)>,
     /// User/project CC external hooks (`$ATOMCODE_HOME/hooks.json` + `<root>/.hooks.json`).
     /// ONE instance is registered as BOTH a [`LifecycleHooks`] (already pushed into `hooks`)
     /// and a [`ToolMiddleware`](atomcode_kernel::middleware::ToolMiddleware) (registered by
@@ -621,169 +628,16 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         max_concurrent: subagent_max_concurrent,
         ..Default::default()
     });
-    let subagent_provider: Option<SharedReviewProvider> = if subagents_enabled {
-        use atomcode_capabilities::tools::TaskTool;
-
-        let slot: SharedReviewProvider = Arc::new(std::sync::RwLock::new(None));
-
-        // Child subagent tool registry (mount a subset per type).
-        let mut child_reg = atomcode_kernel::tool::ToolRegistry::new();
-        atomcode_capabilities::tools::register_coding_tools_with_vision(&mut child_reg, false);
-        let child_reg = Arc::new(child_reg);
-
-        let explore_names: Vec<String> = ["read_file", "grep", "glob", "list_directory"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let worker_names: Vec<String> = [
-            "read_file",
-            "edit_file",
-            "write_file",
-            "bash",
-            "grep",
-            "glob",
-            "search_replace",
-            "list_directory",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
-        let reg_e = child_reg.clone();
-        let reg_w = child_reg.clone();
-        let make_explore_tools = move || {
-            let refs: Vec<&str> = explore_names.iter().map(|s| s.as_str()).collect();
-            reg_e.mount(&refs)
-        };
-        let make_worker_tools = move || {
-            let refs: Vec<&str> = worker_names.iter().map(|s| s.as_str()).collect();
-            reg_w.mount(&refs)
-        };
-
-        // Prefer a runtime-injected tier provider, else fall back to the host-provider
-        // slot (filled at assemble — the single-model / same-as-host collapse path). The
-        // tier provider is a SHARED, swap-aware cell ([`TierProvider`]): it builds lazily on
-        // first `task` use (startup never pays the reqwest-client cost) and its cache is
-        // reset by the runtime on a `/model` swap, so routing re-resolves without a respawn.
-        let fast_cell = cfg.subagent_fast_provider.clone();
-        let cap_cell = cfg.subagent_capable_provider.clone();
-        let slot_fast = slot.clone();
-        let slot_cap = slot.clone();
-        let slot_host = slot.clone();
-        let make_fast = move || {
-            fast_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
-                slot_fast
-                    .read()
-                    .ok()
-                    .and_then(|g| g.clone())
-                    .expect("subagent provider slot filled at assemble before any turn")
-            })
-        };
-        let make_capable = move || {
-            cap_cell.as_ref().and_then(|c| c.get()).unwrap_or_else(|| {
-                slot_cap
-                    .read()
-                    .ok()
-                    .and_then(|g| g.clone())
-                    .expect("subagent provider slot filled at assemble before any turn")
-            })
-        };
-        let make_host = move || {
-            slot_host
-                .read()
-                .ok()
-                .and_then(|provider| provider.clone())
-                .expect("subagent provider slot filled at assemble before any turn")
-        };
-
-        // `[subagent]` live knobs. There is no total wall-clock limit: a productive
-        // child is never cancelled for its age.
-        let task_team_manager = team_manager.clone();
-        let mut task_tool = TaskTool::new(
-            make_fast,
-            make_capable,
-            make_explore_tools,
-            make_worker_tools,
-        )
-        .with_host_provider(make_host)
-        .with_max_concurrent(subagent_max_concurrent)
-        .with_max_rounds(subagent_max_rounds)
-        .with_stream_timeout(cfg.stream_timeout)
-        .with_tool_loop_policy(cfg.tool_loop_policy)
-        .with_credential_shell_policy(cfg.credential_shell_policy)
-        .with_worker_middleware(turn_execution_policy.clone())
-        .with_team_event_sink(Arc::new(move |event| {
-            task_team_manager.publish_external(event);
-        }));
-        if let Some(models) = cfg.subagent_model_providers.clone() {
-            task_tool = task_tool.with_named_provider(move |selection| models.get(selection));
-        }
-        registry.register(Arc::new(task_tool));
-        names.push("task".to_string());
-        host_only_tools.push("task".into());
-        Some(slot)
-    } else {
-        None
-    };
-
-    let team_runner = subagent_provider.as_ref().map(|slot| {
-        use atomcode_capabilities::team::{TeamDifficulty, TeamPermission};
-
-        let mut child_registry = atomcode_kernel::tool::ToolRegistry::new();
-        atomcode_capabilities::tools::register_coding_tools_with_vision(&mut child_registry, false);
-        let child_registry = Arc::new(child_registry);
-        let provider_slot = slot.clone();
-        let fast_cell = cfg.subagent_fast_provider.clone();
-        let capable_cell = cfg.subagent_capable_provider.clone();
-        let providers = Arc::new(move |difficulty| {
-            let tier = match difficulty {
-                TeamDifficulty::Simple => fast_cell.as_ref(),
-                TeamDifficulty::Hard => capable_cell.as_ref(),
-            };
-            tier.and_then(|cell| cell.get()).unwrap_or_else(|| {
-                provider_slot
-                    .read()
-                    .ok()
-                    .and_then(|provider| provider.clone())
-                    .expect("team provider slot filled at assemble before any turn")
-            })
-        });
-        let tools_registry = Arc::clone(&child_registry);
-        let tools = Arc::new(move |permission| {
-            let names: &[&str] = match permission {
-                TeamPermission::Explore => &["read_file", "grep", "glob", "list_directory"],
-                // Bash is intentionally absent. DenyTeamBash remains a second
-                // fail-closed gate if this registry is broadened later.
-                TeamPermission::Worker => &[
-                    "read_file",
-                    "edit_file",
-                    "write_file",
-                    "grep",
-                    "glob",
-                    "search_replace",
-                    "list_directory",
-                ],
-            };
-            tools_registry.mount(names)
-        });
-        let runner = crate::team::TeamRunnerFactory::new(providers, tools, cfg.working_dir.clone())
-            .with_runtime_policy(
-                (subagent_max_rounds > 0).then_some(subagent_max_rounds),
-                cfg.tool_loop_policy,
-                Some(cfg.stream_timeout),
-                cfg.request_timeout,
-            )
-            .with_credential_shell_policy(cfg.credential_shell_policy)
-            .with_worker_middleware(turn_execution_policy.clone());
-        registry.register(Arc::new(crate::team::TeamTool::new(
-            team_manager.clone(),
-            runner.job_factory(),
-            runner.model_factory(),
-        )));
-        names.push("team".to_string());
-        host_only_tools.push("team".into());
-        runner
-    });
+    // Delegation is the tree's: the `subagent-in-process` and `team-in-process`
+    // rows (`docs/adr/0023` §2), configured from `[subagent]` by the runtime.
+    // What stays here is the provider a delegated agent runs on when it inherits
+    // the conversation's model — billed to the session apart from it — filled at
+    // assemble like the reviewer's.
+    let subagent_provider: Option<SharedReviewProvider> =
+        subagents_enabled.then(|| Arc::new(std::sync::RwLock::new(None)) as SharedReviewProvider);
+    let subagent_knobs =
+        subagents_enabled.then_some((subagent_max_concurrent, subagent_max_rounds));
+    let team_runner: Option<crate::team::TeamRunnerFactory> = None;
 
     // Build the context hook once so skill-catalog ranking and later context
     // injection observe the exact same instruction-file precedence and bytes.
@@ -867,16 +721,20 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             let manager = Arc::new(SessionManager::for_project(&cfg.working_dir));
             let lease = session_lease(&manager, &id, reuse_lease.as_ref())?;
             let now = atomcode_capabilities::session::now_ms();
-            let mut meta = SessionMeta::new(&id, cfg.working_dir.to_string_lossy().as_ref(), now);
+            let working_dir = cfg.working_dir.to_string_lossy().into_owned();
+            let mut meta = SessionMeta::new(&id, working_dir.as_str(), now);
             meta.owner = StorageOwner::Native;
+            // The session's log starts with what stays true of it, the context
+            // block its prompt opens with among them: a resume sends that
+            // prefix again rather than one rendered from a repository that has
+            // moved on.
+            let mut header = SessionHeader::new(&id);
+            header.created_at = u64::try_from(now).unwrap_or(0);
+            header.cwd = Some(working_dir);
+            header.context = Some(SessionContextHook::new(&cfg.working_dir).block(None));
             if !stage_fresh {
                 manager
-                    .commit_native_import(
-                        &lease,
-                        Some(&SessionSnapshot::new(Vec::new())),
-                        Some(&PresentationFile::default()),
-                        &meta,
-                    )
+                    .create_event_session(&lease, &header, &meta)
                     .map_err(io::Error::from)?;
             }
             Some(SessionBinding {
@@ -885,7 +743,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 lease,
                 resume: None,
                 pending_resume_prompt: None,
-                staged_fresh: stage_fresh.then_some(meta),
+                staged_fresh: stage_fresh.then_some((meta, header)),
             })
         }
         SessionMode::Resume(id) => {
@@ -894,9 +752,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             // Resume is a native-only boundary. Legacy/unconfirmed data must first
             // converge through a driver importer; accepting a lone snapshot here
             // would bypass ownership and manufacture an incomplete native session.
-            let (loaded, pending_resume_prompt) = manager
-                .load_native_session_for_resume(&lease)
-                .map_err(io::Error::from)?;
+            // A session a released build stored as a snapshot becomes a log here,
+            // once (`docs/adr/0024` §10).
+            let (loaded, pending_resume_prompt) =
+                manager.open_for_resume(&lease).map_err(io::Error::from)?;
             // A version-mismatched snapshot must FAIL here, not fall through to the
             // kernel's empty-start seam — that would silently fresh-start under the
             // SAME session id and corrupt on-disk state.
@@ -914,9 +773,15 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             check_snapshot_version(snapshot)?;
             let manager = Arc::new(SessionManager::for_project(&cfg.working_dir));
             let lease = session_lease(&manager, id, reuse_lease.as_ref())?;
+            manager.open_as_events(&lease).map_err(io::Error::from)?;
             let loaded = manager.load_native_session(id).map_err(io::Error::from)?;
             check_snapshot_version(&loaded.snapshot)?;
-            if loaded.snapshot != *snapshot {
+            // What the log projects carries no system prompt; that is assembled
+            // for each request.
+            if !atomcode_capabilities::session::events::same_conversation(
+                &loaded.snapshot.messages,
+                &snapshot.messages,
+            ) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
@@ -948,13 +813,13 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         host_only_tools.push("list_sessions".into());
     }
 
-    // The session's two writers, which the `session-native` and `transcript` rows
-    // call at the tree's own moments (see `host_rows`). Everything else the chain
-    // registered here — memory, the skill catalog, the MCP instructions tail, the
-    // verify cadence, the todo reminder, the skill-first nudge — is a row now, and
-    // the row builds its own.
+    // What the session keeps beside its log — per-turn statistics, the rewind
+    // ledger, the name — which a `kernel-hooks` row runs at the tree's own
+    // moments (see `host_rows`). The log itself is `session-store`'s. Everything
+    // else the chain registered here — memory, the skill catalog, the MCP
+    // instructions tail, the verify cadence, the todo reminder, the skill-first
+    // nudge — is a row now, and the row builds its own.
     let mut snapshot_hook_handle = None;
-    let mut transcript_hook_handle = None;
     let mut snapshot_persistence_status = None;
     if let Some(b) = &session {
         let wd = cfg.working_dir.to_string_lossy().into_owned();
@@ -964,11 +829,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 .with_model_attribution(&cfg.provider_name, &cfg.model),
         );
         snapshot_persistence_status = Some(snapshot_hook.persistence_status());
-        snapshot_hook_handle = Some(snapshot_hook.clone());
-        transcript_hook_handle = Some(Arc::new(
-            TranscriptHook::new(b.manager.clone(), &b.id)
-                .with_persistence_status(snapshot_hook.persistence_status()),
-        ));
+        snapshot_hook_handle = Some(snapshot_hook);
     }
     // CC external hooks: user/project `hooks.json` + plugin-contributed inline hooks
     // (`plugin_cc_hooks`, resolved by the host), mounted by the `cc-hooks-host` row on
@@ -979,11 +840,12 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         // hook can correlate its events with the session. Empty for non-persistent runs.
         if let Some(b) = &session {
             cc = cc.with_session_id(b.id.as_str());
-            // CC `transcript_path` = the session's append-only JSONL transcript, so a
-            // Stop/StopFailure hook can open the finished turn's full record. The path
-            // resolves even before the file is written; unresolvable (session dir gone)
-            // → left `None` → the payload carries `null`, never a wedge.
-            if let Ok(p) = b.manager.jsonl_path(&b.id) {
+            // CC `transcript_path` = the session's log, which replaced the transcript
+            // (`docs/adr/0024` §14), so a Stop/StopFailure hook can open the finished
+            // turn's full record: one JSON fact per line after a header line. The
+            // path resolves before the file is written (a session not published yet);
+            // unresolvable → left `None` → the payload carries `null`, never a wedge.
+            if let Ok(p) = b.manager.events_path(&b.id) {
                 cc = cc.with_transcript_path(p.to_string_lossy().into_owned());
             }
         }
@@ -1045,7 +907,6 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         _mcp_work_guard: mcp_work_guard,
         approval: Arc::new(ApprovalMiddleware::in_memory()),
         snapshot_hook: snapshot_hook_handle,
-        transcript_hook: transcript_hook_handle,
         extra_tools: Vec::new(),
         host_only_tools,
         skill_registry,
@@ -1058,9 +919,55 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         side_provider: Arc::new(std::sync::RwLock::new(None)),
         team_runner,
         team_manager,
+        subagent_knobs,
         cc_external_hooks: cc_external,
         rate_limit_source: opts.rate_limit_source,
     })
+}
+
+/// A provider that is whatever a slot holds when it is called.
+struct SlotProvider {
+    slot: SharedReviewProvider,
+    model: String,
+}
+
+impl SlotProvider {
+    fn current(&self) -> Option<Arc<dyn LlmProvider>> {
+        self.slot.read().ok().and_then(|provider| provider.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for SlotProvider {
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+    fn context_window(&self) -> u32 {
+        self.current().map(|p| p.context_window()).unwrap_or(0)
+    }
+    fn supports_vision(&self) -> bool {
+        self.current().is_some_and(|p| p.supports_vision())
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[atomcode_kernel::tool::ToolDef],
+        options: &atomcode_kernel::provider::ChatOptions,
+    ) -> Result<
+        futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+        atomcode_kernel::stream::ProviderError,
+    > {
+        match self.current() {
+            Some(provider) => provider.chat_stream(messages, tools, options).await,
+            None => Err(atomcode_kernel::stream::ProviderError {
+                retryable: false,
+                message: "no model is signed in for delegated work".into(),
+                http_status: None,
+                code: None,
+                retry_after_secs: None,
+            }),
+        }
+    }
 }
 
 /// Load plugin-contributed hooks for every prepare/reprepare instead of freezing the startup
@@ -1104,9 +1011,9 @@ fn session_lease(
 }
 
 impl SessionBinding {
-    /// A fresh session prepared in memory whose files are not on disk yet.
-    pub(crate) fn is_staged_fresh(&self) -> bool {
-        self.staged_fresh.is_some()
+    /// The header a session not published yet will be created with.
+    pub(crate) fn staged_header(&self) -> Option<&SessionHeader> {
+        self.staged_fresh.as_ref().map(|(_, header)| header)
     }
 }
 
@@ -1137,8 +1044,23 @@ impl CodingParts {
         self.snapshot_hook.clone()
     }
 
-    pub(crate) fn transcript_hook(&self) -> Option<Arc<TranscriptHook>> {
-        self.transcript_hook.clone()
+    /// `[subagent]` `(max_concurrent, max_rounds)`, when delegation is on.
+    pub(crate) fn subagent_knobs(&self) -> Option<(usize, u32)> {
+        self.subagent_knobs
+    }
+
+    /// The provider a delegated agent inheriting the conversation's model runs
+    /// on: whatever the subagent slot holds at the moment of each call. Read
+    /// through, never copied — a logout empties the slot, and a copy taken at
+    /// mount would keep the signed-in provider alive in the tree.
+    pub(crate) fn delegated_provider(&self) -> Option<Arc<dyn LlmProvider>> {
+        let slot = self.subagent_provider.clone()?;
+        let model = slot
+            .read()
+            .ok()
+            .and_then(|provider| provider.as_ref().map(|p| p.model_name().to_string()))
+            .unwrap_or_default();
+        Some(Arc::new(SlotProvider { slot, model }))
     }
 
     pub(crate) fn todo_enabled(&self) -> bool {
@@ -1202,17 +1124,12 @@ impl CodingParts {
         let Some(binding) = self.session.as_mut() else {
             return Ok(());
         };
-        let Some(meta) = binding.staged_fresh.as_ref() else {
+        let Some((meta, header)) = binding.staged_fresh.as_ref() else {
             return Ok(());
         };
         binding
             .manager
-            .commit_native_import(
-                &binding.lease,
-                Some(&SessionSnapshot::new(Vec::new())),
-                Some(&PresentationFile::default()),
-                meta,
-            )
+            .create_event_session(&binding.lease, header, meta)
             .map_err(io::Error::from)?;
         binding.staged_fresh = None;
         Ok(())
@@ -1593,6 +1510,7 @@ pub fn subagent_runtime_knobs(
 mod tests {
     use super::*;
     use crate::config::CodingAgentConfig;
+    use atomcode_capabilities::session::PresentationFile;
 
     #[test]
     fn external_profiles_convert_and_guard_bypass() {
@@ -1831,6 +1749,7 @@ mod tests {
             subagents: SubagentPolicy::Disabled,
             request_user_input: true,
             rate_limit_source: None,
+            front_end: None,
         };
 
         let prepared =
@@ -1906,6 +1825,7 @@ mod tests {
             subagents: SubagentPolicy::Disabled,
             request_user_input: true,
             rate_limit_source: None,
+            front_end: None,
         }
     }
 
@@ -2082,7 +2002,7 @@ mod tests {
             .expect("a complete aggregate mounts")
             .app
             .stop();
-        std::fs::remove_file(manager.presentation_path(id).unwrap()).unwrap();
+        std::fs::remove_file(manager.events_path(id).unwrap()).unwrap();
 
         // Half a session is not a session: rebuilding on one would hand the model
         // a conversation the store cannot explain.
@@ -2091,7 +2011,7 @@ mod tests {
             Err(error) => error,
         };
         assert!(
-            error.contains(&manager.presentation_path(id).unwrap().display().to_string()),
+            error.contains(&manager.events_path(id).unwrap().display().to_string()),
             "the failure must name the missing file: {error}"
         );
         let _ = std::mem::size_of::<SessionStoreError>();
@@ -2143,7 +2063,10 @@ mod tests {
         assert!(error
             .to_string()
             .contains("does not match the canonical native snapshot"));
-        assert_eq!(manager.load_snapshot(id).unwrap(), canonical);
+        assert_eq!(
+            manager.load_snapshot(id).unwrap().messages,
+            canonical.messages
+        );
     }
 
     #[tokio::test]
@@ -2164,7 +2087,14 @@ mod tests {
             snapshot: canonical.clone(),
         };
         let parts = prepare(&cfg, opts).await.unwrap();
-        assert_eq!(parts.session.unwrap().resume.as_ref(), Some(&canonical));
+        assert_eq!(
+            parts
+                .session
+                .unwrap()
+                .resume
+                .map(|resumed| resumed.messages),
+            Some(canonical.messages)
+        );
     }
 
     #[tokio::test]

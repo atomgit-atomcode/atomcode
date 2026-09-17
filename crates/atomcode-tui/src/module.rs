@@ -79,6 +79,9 @@ pub trait ViewObject: Send + Sync {
     fn render(&self, viewport: &Viewport<'_>) -> Vec<Line>;
     fn height(&self, moment: &Moment, width: u16) -> Height;
     fn tick(&self) -> Option<Duration>;
+    /// Forget everything folded: the screen moved to another session, and a
+    /// view that kept the last one's state would draw it over the new one.
+    fn reset(&self);
 }
 
 /// A [`View`] plus the state it has folded so far.
@@ -120,6 +123,9 @@ impl<V: View> ViewObject for Mounted<V> {
     fn tick(&self) -> Option<Duration> {
         V::tick()
     }
+    fn reset(&self) {
+        *self.state.write().expect("view state poisoned") = V::State::default();
+    }
 }
 
 /// A stream producer: turns facts into blocks that can never be taken back.
@@ -129,6 +135,9 @@ pub trait Producer: Send + Sync {
     /// Fold one fact into the stream. The writer is the only thing that can
     /// change it, and it cannot reach a settled block.
     fn absorb(&self, fact: &SessionEvent, out: &mut StreamWriter<'_>);
+
+    /// Forget what is open: the next fact belongs to another session's stream.
+    fn reset(&self) {}
 }
 
 /// Everything mounted, found by id.

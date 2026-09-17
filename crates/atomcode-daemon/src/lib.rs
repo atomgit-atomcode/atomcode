@@ -4341,7 +4341,7 @@ impl ChatRuntimeProjector {
                 auto_resuming,
                 server_message,
             }],
-            Agent::TurnStarted
+            Agent::TurnStarted { .. }
             | Agent::ToolCallStreaming { .. }
             | Agent::ToolBatchCompleted { .. }
             | Agent::Request { .. }
@@ -8241,6 +8241,7 @@ mod tests {
             message_count: 0,
             turn_count: 0,
             presence: CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         };
 
         let entries = [entry];

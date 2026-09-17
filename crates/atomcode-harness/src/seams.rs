@@ -15,7 +15,6 @@ use atomcode_capabilities::skills::SkillRegistry;
 use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::tool::{Tool, ToolDef};
 use atomcode_plexus::{plexus_service, Context};
-use serde::{Deserialize, Serialize};
 
 use crate::agent::{Agent, Agents};
 pub use crate::model_source::{cheapest, choices, delegatable, Chose, ModelInfo, Models};
@@ -32,6 +31,7 @@ plexus_service!(SystemPromptSvc => PromptRegistry, "system-prompt", Core, "Order
 // describe a knob in as much detail as the knob deserves without that detail
 // costing tokens on every single request — and, unlike the system prompt, an
 // answer may depend on the session asking (see `Descriptions`).
+plexus_service!(CommandsSvc => crate::commands::CommandCatalog, "commands", Core, "The commands a person can run from a front end against a session or one agent in it, registered by the rows they belong to");
 plexus_service!(OperationsSvc => Descriptions, "operations", Core, "What each row says about itself — how to work it, and its part of this session — answered when asked");
 plexus_service!(SessionSvc => SessionLog, "sessions", Core, "The append-only session log of the agent whose realm this is");
 plexus_service!(SessionDefaultsSvc => SessionDefaults, "session-defaults", Core, "What the front end's own agent is told about its session: an id, whether to resume it");
@@ -48,6 +48,7 @@ plexus_service!(UserQuestionsSvc => dyn UserQuestions, "user-questions", Seam, "
 plexus_service!(McpSvc => McpRegistry, "mcp", Core, "Connected MCP servers");
 plexus_service!(AgentsSvc => Agents, "agents", Core, "Live agent registry");
 plexus_service!(UiSvc => dyn UserInterface, "ui", Seam, "The interaction front end");
+plexus_service!(WallClockSvc => dyn atomcode_kernel::clock::WallClock, "wall-clock", Seam, "When a session record was committed");
 plexus_service!(ControlSvc => dyn Control, "control", Core, "Reconfiguring the running tree");
 plexus_service!(FindingsSvc => dyn Findings, "findings", Seam, "Where structured findings are collected");
 plexus_service!(SubagentsSvc => dyn Subagents, "subagents", Seam, "Delegating work to a child agent");
@@ -56,6 +57,8 @@ plexus_service!(ApprovalSvc => dyn ApprovalPolicy, "approval", Seam, "Whether a 
 plexus_service!(AgentHandleSvc => dyn AgentHandleSource, "agent-handle", Seam, "A driver-protocol handle on this harness");
 plexus_service!(ModesSvc => Modes, "modes", Core, "Switches a person flips mid-session — plan mode, accept edits — read live by the rows they govern");
 plexus_service!(ToolDriverSvc => dyn ToolDriver, "tool-driver", Seam, "What a running tool reaches of the person's front end: a progress line, a structured question");
+plexus_service!(DelegatedLlmSvc => dyn LlmProvider, "llm-delegated", Seam, "The model a delegated agent runs on when it inherits the conversation's, for a host that keeps a child's spend apart");
+plexus_service!(DelegationLaneSvc => DelegationLane, "delegation-lane", Core, "Where a delegated agent may write: the scopes it was given, on its own realm");
 plexus_service!(GrantsSvc => dyn atomcode_capabilities::tools::PermissionStore, "grants", Core, "The session's remembered always-allow answers, kept by a host that outlives the tree");
 
 /// The live tool catalog.
@@ -379,8 +382,17 @@ pub trait SessionPersistence: Send + Sync {
     /// Replay a session's events in order.
     async fn load(&self, session_id: &str) -> Result<Vec<LoggedEvent>, String>;
 
-    /// Session ids this store holds, newest first where the backend can tell.
+    /// The sessions a person can pick up, newest first where the backend can
+    /// tell. A delegated agent's session — a team member, a task child — is
+    /// not one of them: it is kept under its parent, not beside it
+    /// (`docs/adr/0024` §11), and [`Self::children`] is how it is found.
     async fn list(&self) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+
+    /// The headers of the sessions whose header names `parent` — what a resumed
+    /// lead reads to bring its team back.
+    async fn children(&self, _parent: &str) -> Result<Vec<crate::session::SessionHeader>, String> {
         Ok(Vec::new())
     }
 
@@ -576,142 +588,11 @@ pub trait SessionTitle: Send + Sync {
     async fn title(&self, log: &SessionLog) -> Option<String>;
 }
 
-/// The three answers an approval can have. The spelling is
-/// `atomcode_capabilities::tools::approval`'s, so a decision means the same
-/// thing whichever gate asked and whatever carries it.
-pub const ANSWER_ALLOW: &str = "allow";
-pub const ANSWER_ALWAYS: &str = "allow_always";
-pub const ANSWER_DENY: &str = "deny";
-
-/// One answer: what comes back, and what a plain front end prints.
-///
-/// Serialisable because an answered question is a fact of the session, and a
-/// fact is what the log writes down — the card a person answered is not
-/// reproducible from the answer alone, and the options are half of it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Answer {
-    /// Returned by [`UserQuestions::ask`] when this one is picked.
-    pub value: String,
-    /// What a front end with nothing better to show prints. A front end that
-    /// knows the answer's meaning is free to word it its own way.
-    pub label: String,
-}
-
-impl Answer {
-    pub fn new(value: impl Into<String>) -> Self {
-        let value = value.into();
-        Self {
-            label: value.clone(),
-            value,
-        }
-    }
-    pub fn labelled(value: impl Into<String>, label: impl Into<String>) -> Self {
-        Self {
-            value: value.into(),
-            label: label.into(),
-        }
-    }
-}
-
-/// The call an approval is about.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AboutCall {
-    pub tool: String,
-    /// The exact bytes that will run. A front end summarises them for the eye,
-    /// but this is what executes — approve what runs, not a paraphrase of it.
-    pub arguments: String,
-    /// What an `allow_always` would cover, or `None` when this call is not
-    /// something to remember. Empty means every call of this tool; otherwise
-    /// it is the tool's own scope — `bash` reports the command, so approving
-    /// one destructive command never blanket-approves another. Shown, because
-    /// a person saying "always" is owed the scope they are saying it to.
-    pub grant: Option<String>,
-}
-
-/// A question put to a person — data, not a sentence.
-///
-/// A string was enough while one agent asked and the answers were yes and no.
-/// It stopped being enough the moment a delegated member could ask: "allow
-/// `write_file`?" with no way to say *who* wants to write is a question a
-/// person cannot answer honestly. So everything a front end needs to lay a
-/// question out is here, and everything it gets to decide — wording, colour,
-/// which key means which answer — is not.
-///
-/// Serialisable for the same reason: this is the record of what was asked, and
-/// the log is where a screen finds it again after a remount or a resume.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Question {
-    /// The ask, phrased, for a front end that renders nothing else.
-    pub prompt: String,
-    /// The answers, in the order they should be offered.
-    pub options: Vec<Answer>,
-    /// Which agent is asking, when it is not the one the person is driving —
-    /// a team member's name. `None` is this conversation itself.
-    pub asker: Option<String>,
-    /// The call under review, when this is an approval.
-    pub about: Option<AboutCall>,
-}
-
-impl Question {
-    /// A question with nothing behind it: a prompt and some answers.
-    pub fn plain(prompt: impl Into<String>, options: &[&str]) -> Self {
-        Self {
-            prompt: prompt.into(),
-            options: options.iter().map(|o| Answer::new(*o)).collect(),
-            ..Self::default()
-        }
-    }
-
-    /// The card an approval shows: the call under review, and the three answers
-    /// a risky call can have.
-    ///
-    /// One constructor for both asking seams, because they are the same card —
-    /// the `user-questions` one the interactive policy asks through, and the
-    /// handle's own `approval` one a driver round-trips. Two builders that agree
-    /// until one changes is how a person ends up with two products' worth of
-    /// wording for one decision, and how a log records two different questions
-    /// for the same call.
-    ///
-    /// `grant` is what an `allow_always` would cover, or `None` when the call
-    /// may never be remembered — then the option is not offered, because showing
-    /// "always allow" for a decision that will be asked again tells the person
-    /// something untrue about the permission they just gave. Empty means every
-    /// call of this tool.
-    pub fn approval(
-        tool: &str,
-        arguments: &str,
-        grant: Option<&str>,
-        asker: Option<String>,
-    ) -> Self {
-        let mut options = vec![Answer::labelled(ANSWER_ALLOW, "allow once")];
-        if grant.is_some() {
-            options.push(Answer::labelled(ANSWER_ALWAYS, "always allow"));
-        }
-        options.push(Answer::labelled(ANSWER_DENY, "deny"));
-        Self {
-            prompt: match &asker {
-                Some(who) => format!("Allow `{tool}` to run, asked for by `{who}`?"),
-                None => format!("Allow `{tool}` to run?"),
-            },
-            options,
-            asker,
-            about: Some(AboutCall {
-                tool: tool.to_string(),
-                arguments: arguments.to_string(),
-                grant: grant.map(str::to_string),
-            }),
-        }
-    }
-
-    /// Just the values, for an asker that only echoes them.
-    pub fn values(&self) -> Vec<String> {
-        self.options.iter().map(|o| o.value.clone()).collect()
-    }
-    /// The answer whose value is this, if it is one of them.
-    pub fn has(&self, value: &str) -> bool {
-        self.options.iter().any(|o| o.value == value)
-    }
-}
+/// Questions put to a person, and their answers — session vocabulary, so the
+/// kernel's (`docs/adr/0024` §6). Re-exported where the seams have always named them.
+pub use atomcode_kernel::session::{
+    AboutCall, Answer, Question, ANSWER_ALLOW, ANSWER_ALWAYS, ANSWER_DENY,
+};
 
 /// Asking a human. `None` means "no answer" — every caller must treat that as a
 /// refusal, never as consent.
@@ -859,49 +740,10 @@ pub struct TurnOutcome {
     pub error: Option<String>,
 }
 
-/// Why a turn ended.
-///
-/// Serialized by variant name, which is what `format!("{:?}")` produced when
-/// the log stored a rendering of this instead of the value — so a session
-/// written before it was typed still loads.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum StopReason {
-    /// The model answered with no further tool calls.
-    #[default]
-    Stopped,
-    /// The round budget ran out.
-    MaxRounds,
-    /// The provider failed.
-    ProviderError,
-    /// A `agent/turn-stopping` listener asked for the turn to end — a round
-    /// budget, a deadline, a cost ceiling.
-    StoppedByPolicy,
-    /// The loop's own runaway fuse. Not a policy: the fuse exists so a tree with
-    /// no stopping policy at all still terminates.
-    RunawayFuse,
-    /// A tool-loop guard saw no progress and ended the turn.
-    ToolLoopDetected,
-    /// The agent was asked to stop.
-    Cancelled,
-    /// A `agent/pre-step` listener rejected the claimed input, so no step ran.
-    InputRejected,
-    /// Something reached the model that the session log cannot explain. The
-    /// turn is stopped rather than continued: a prompt nobody can reconstruct
-    /// makes resume, fork and compaction unsound from here on.
-    InvariantViolated,
-    /// A hard policy boundary refused a call and ended the turn, because trying
-    /// another spelling of the same thing would be unsafe. The refusal is in the
-    /// log as the tool's result; what to do next is the person's, and the
-    /// choices are the [`crate::session::SessionEvent::PolicyIntervention`]
-    /// committed with it.
-    PolicyDenied,
-    /// A rate limit paused the turn — not a failure: already-produced work is
-    /// kept, and the pause committed with it says when the limit resets.
-    RateLimited,
-    /// The model's stream went silent past the liveness bound, and retrying did
-    /// not bring it back.
-    Timeout,
-}
+/// Why a turn ended — the kernel's one enum, re-exported where the loop has
+/// always named it. There used to be a second copy here that the handle pump
+/// translated (`docs/adr/0021` §6).
+pub use atomcode_kernel::event::StopReason;
 
 /// What a running tool can reach of the front end driving its agent.
 ///
@@ -919,4 +761,13 @@ pub trait ToolDriver: Send + Sync {
     fn progress(&self, session: &str, call_id: &str) -> atomcode_kernel::tool::ProgressSink;
     /// A round trip to the person, or `None` when this session has nobody to ask.
     fn requester(&self, session: &str) -> Option<atomcode_kernel::request::Requester>;
+}
+
+/// The files a delegated agent was given to write, as scopes (globs relative to
+/// its working directory). Provided on the agent's own realm by whoever
+/// delegated it; an agent without one may write anywhere in its workspace, and
+/// `delegation-bounds` holds it to that.
+#[derive(Clone, Debug)]
+pub struct DelegationLane {
+    pub scopes: Vec<String>,
 }

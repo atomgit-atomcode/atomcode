@@ -32,6 +32,12 @@ name = "agents"
 [[insert]]
 name = "operations"
 
+# What a person can run from a front end beyond talking to the agent — stopping
+# a team member, say. Filled by the rows the commands belong to; first for the
+# same reason as the row above.
+[[insert]]
+name = "commands"
+
 # --- the session domain: the log, its projections, its durable store --------
 [[insert]]
 name = "session"
@@ -301,6 +307,11 @@ disabled = true
 
 [[insert]]
 name = "persona-coding"
+
+# What a delegated agent (a team member, a `task` child) may never do, refused
+# ahead of every rule and question: nobody is watching it call tools.
+[[insert]]
+name = "delegation-bounds"
 
 # No rules by default, so the row is inert until a user writes some.
 [[insert]]

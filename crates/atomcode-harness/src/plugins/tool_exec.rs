@@ -98,6 +98,7 @@ impl Waterfall<ToolsExecuteBatch> for Parallel {
                 turn: batch.turn,
                 round: batch.step,
                 authorization: crate::events::Authorization::No,
+                working_dir: working_dir.clone(),
             };
             ordered.push_back(Box::pin(async move {
                 let _permit = permits.acquire().await.expect("semaphore open");

@@ -712,6 +712,8 @@ pub const INJECTIONS: &[(&str, &str)] = &[
     ("continuation", "injected:continuation"),
     ("compaction", "injected:compaction"),
     ("peer", "injected:peer"),
+    ("to-member", "injected:to-member"),
+    ("team-note", "injected:team-note"),
 ];
 
 /// The injections the screen opens without.
@@ -723,7 +725,9 @@ pub const INJECTIONS: &[(&str, &str)] = &[
 /// in what the model was actually sent — and are simply not painted.
 ///
 /// `injected:peer` is deliberately not here. A teammate's report is an answer
-/// somebody asked for, and the team panel is showing it for that reason.
+/// somebody asked for, and the team panel is showing it for that reason. Nor
+/// are what the lead is told about its team — what the person said to a member,
+/// a member's report on a turn the person started: the person is the audience.
 ///
 /// A slice of strings rather than a filter over [`INJECTIONS`], because both
 /// consumers need it as a `&'static [&'static str]` — the default fold state and
@@ -1007,7 +1011,7 @@ fn turn_end_note(stop: StopReason) -> (Glyph, String, Style) {
             "已中断 · 检测到重复循环".to_string(),
             warn,
         ),
-        InputRejected => (Glyph::Interrupted, "已中断 · 输入被拒绝".to_string(), warn),
+        PromptRejected => (Glyph::Interrupted, "已中断 · 输入被拒绝".to_string(), warn),
         // A hard boundary refused a call; the refusal itself is the tool's result.
         PolicyDenied => (
             Glyph::Interrupted,
@@ -1033,6 +1037,21 @@ fn turn_end_note(stop: StopReason) -> (Glyph, String, Style) {
             "已中断 · 内部不变量被破坏,这条会话不宜再续".to_string(),
             bad(),
         ),
+        // The kernel's two fuses. One `StopReason` now serves the log and the
+        // handle (`docs/adr/0021` §6), so these can reach a screen too.
+        MaxContinuations => (
+            Glyph::Interrupted,
+            "已中断 · 自动续跑次数用完了".to_string(),
+            warn,
+        ),
+        RepeatLoop => (
+            Glyph::Interrupted,
+            "已中断 · 检测到重复循环".to_string(),
+            warn,
+        ),
+        // `StopReason` is `non_exhaustive`: a cause added later still ends the
+        // turn visibly rather than failing to compile a screen.
+        _ => (Glyph::Interrupted, "已中断".to_string(), warn),
     }
 }
 
@@ -1257,7 +1276,7 @@ mod tests {
             StopReason::StoppedByPolicy,
             StopReason::RunawayFuse,
             StopReason::ToolLoopDetected,
-            StopReason::InputRejected,
+            StopReason::PromptRejected,
             StopReason::ProviderError,
             StopReason::InvariantViolated,
         ] {

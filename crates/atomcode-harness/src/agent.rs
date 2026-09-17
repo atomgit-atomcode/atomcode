@@ -33,8 +33,13 @@ use tokio_util::sync::CancellationToken;
 
 use atomcode_kernel::message::ImageContent;
 
-use crate::events::{AgentCreated, AgentInfo, InboxInserted};
-use crate::seams::{FsSvc, SessionDefaultsSvc, SessionPersistenceSvc, SessionSvc};
+use crate::events::{
+    AgentChange, AgentCreated, AgentInfo, AgentRemoved, AgentStatusChanged, DescribeAgent,
+    Describing, InboxInserted,
+};
+use crate::seams::{
+    CompactionSvc, FsSvc, LlmSvc, SessionDefaultsSvc, SessionPersistenceSvc, SessionSvc,
+};
 use crate::session::{InjectionOrigin, LoggedEvent, SessionEvent, SessionHeader, SessionLog};
 
 // ---- the agent whose turn this is -----------------------------------------
@@ -259,9 +264,10 @@ pub struct CreateAgent {
     pub seed_len: usize,
     /// Load `seed` from the persistence seam under `id` when none was given.
     pub resume: bool,
-    /// Whether the persistence seam should keep this session. A delegated
-    /// child's transcript is its parent's business, not a session of its own.
+    /// Whether the persistence seam should keep this session.
     pub persist: bool,
+    /// For a team member: what it was created with, into its header.
+    pub member: Option<crate::session::MemberHeader>,
     pub setup: Option<Setup>,
 }
 
@@ -316,6 +322,10 @@ impl CreateAgent {
         self.persist = persist;
         self
     }
+    pub fn member(mut self, member: crate::session::MemberHeader) -> Self {
+        self.member = Some(member);
+        self
+    }
     pub fn setup(mut self, setup: Setup) -> Self {
         self.setup = Some(setup);
         self
@@ -324,15 +334,9 @@ impl CreateAgent {
 
 pub type AgentId = u64;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AgentStatus {
-    /// Nothing owed; waiting for input.
-    Idle,
-    /// A turn is open.
-    Working,
-    /// Cancellation asked for; the current step is finishing.
-    Stopping,
-}
+/// The contract's status, which is the agent's own: one definition, so what a
+/// front end is told is what the agent is.
+pub use atomcode_kernel::agent::{AgentDescription, AgentStatus};
 
 /// Who asked for a turn.
 ///
@@ -367,6 +371,9 @@ pub enum InboxItem {
         /// Attachments that belong to this message. Model-visible, so they
         /// travel with it rather than being handed to the request separately.
         images: Vec<ImageContent>,
+        /// The driver's id for the command that sent this, when it asked for a
+        /// receipt. Never logged: it names a command, not a fact of the session.
+        receipt: Option<atomcode_kernel::event::CommandId>,
     },
     /// Model-visible context that rides along with the next message. Never
     /// wakes anything on its own.
@@ -387,6 +394,8 @@ pub struct Claimed {
     pub images: Vec<ImageContent>,
     /// Context that came along with it.
     pub injections: Vec<(String, InjectionOrigin)>,
+    /// The receipt the message's command asked for, if any.
+    pub receipt: Option<atomcode_kernel::event::CommandId>,
 }
 
 impl Claimed {
@@ -424,6 +433,18 @@ impl Inbox {
         origin: MessageOrigin,
         images: Vec<ImageContent>,
     ) {
+        self.send_receipted(text, origin, images, None);
+    }
+
+    /// Queue a message whose command wants a receipt: when a turn claims it,
+    /// [`crate::events::InputClaimed`] says which turn, carrying `receipt`.
+    pub fn send_receipted(
+        &self,
+        text: impl Into<String>,
+        origin: MessageOrigin,
+        images: Vec<ImageContent>,
+        receipt: Option<atomcode_kernel::event::CommandId>,
+    ) {
         self.queue
             .lock()
             .expect("inbox poisoned")
@@ -431,6 +452,7 @@ impl Inbox {
                 text: text.into(),
                 origin,
                 images,
+                receipt,
             });
     }
 
@@ -464,10 +486,12 @@ impl Inbox {
                     text,
                     origin,
                     images,
+                    receipt,
                 } => {
                     claimed.message = Some(text);
                     claimed.origin = origin;
                     claimed.images = images;
+                    claimed.receipt = receipt;
                     break;
                 }
             }
@@ -494,6 +518,15 @@ impl Inbox {
     }
 
     /// Is there a message waiting — something that should wake or extend a turn?
+    /// Whether a message from `origin` is waiting.
+    pub fn waiting_from(&self, origin: MessageOrigin) -> bool {
+        self.queue
+            .lock()
+            .expect("inbox poisoned")
+            .iter()
+            .any(|i| matches!(i, InboxItem::Message { origin: o, .. } if *o == origin))
+    }
+
     pub fn has_waking_input(&self) -> bool {
         self.queue
             .lock()
@@ -531,6 +564,10 @@ pub struct Agent {
     /// What was mounted for this agent alone, torn down when it is removed.
     world: Mutex<Vec<Disposable>>,
     status: RwLock<AgentStatus>,
+    /// Held across a status move and its announcement, so moves are announced
+    /// in the order they happened. Separate from `status` so a listener may
+    /// still read it.
+    moving: Mutex<()>,
     /// The token the *current* turn runs under.
     ///
     /// Per turn, not per agent. A token that outlives the turn it stopped makes
@@ -542,6 +579,11 @@ pub struct Agent {
     /// Set when the current turn was stopped by a person rather than by the
     /// harness (a reconfigure, a shutdown). Read once, at the turn's end.
     interrupted: std::sync::atomic::AtomicBool,
+    /// The pump driving this agent, while one is (`docs/adr/0023` §6). Weak: the
+    /// agent must not keep its own pump alive — the pump stops when whoever
+    /// drives the agent lets go of it.
+    commands:
+        Mutex<Option<tokio::sync::mpsc::WeakUnboundedSender<atomcode_kernel::event::AgentCommand>>>,
 }
 
 impl Agent {
@@ -581,6 +623,18 @@ impl Agent {
         self.woke();
     }
 
+    /// Queue a message with a receipt. See [`Inbox::send_receipted`].
+    pub fn send_receipted(
+        &self,
+        text: impl Into<String>,
+        origin: MessageOrigin,
+        images: Vec<ImageContent>,
+        receipt: Option<atomcode_kernel::event::CommandId>,
+    ) {
+        self.inbox.send_receipted(text, origin, images, receipt);
+        self.woke();
+    }
+
     /// Take every queued injection, leaving messages. See [`Inbox::claim_injections`].
     pub fn claim_injections(&self) -> Vec<(String, InjectionOrigin)> {
         self.inbox.claim_injections()
@@ -596,6 +650,32 @@ impl Agent {
         self.woke();
     }
 
+    /// Tell this agent something it should know without being woken for it.
+    ///
+    /// Into its log at once when no turn is running — before the next
+    /// `TurnStart`, so whoever is watching sees it now — and queued for the next
+    /// turn otherwise: never into a running one, where it could land between a
+    /// tool call and its result.
+    pub fn note(&self, text: impl Into<String>, origin: InjectionOrigin) {
+        let text = text.into();
+        {
+            let _moving = self.moving.lock().expect("agent status poisoned");
+            if self.status() == AgentStatus::Idle {
+                crate::session::commit(
+                    &self.ctx,
+                    &self.session,
+                    SessionEvent::Injected {
+                        turn: self.session.current_turn(),
+                        text,
+                        origin,
+                    },
+                );
+                return;
+            }
+        }
+        self.inject(text, origin);
+    }
+
     /// Say the inbox changed. Whether that starts a turn is the driver's call
     /// — an injection alone never does — but the driver has to be told.
     fn woke(&self) {
@@ -607,7 +687,98 @@ impl Agent {
     }
 
     pub(crate) fn set_status(&self, status: AgentStatus) {
-        *self.status.write().expect("agent status poisoned") = status;
+        self.move_status(|_| Some(status));
+    }
+
+    /// Move the status if `to` says where, and announce a real move.
+    fn move_status(&self, to: impl FnOnce(AgentStatus) -> Option<AgentStatus>) {
+        let _moving = self.moving.lock().expect("agent status poisoned");
+        let moved = {
+            let mut status = self.status.write().expect("agent status poisoned");
+            match to(*status) {
+                Some(next) if next != *status => {
+                    *status = next;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if moved {
+            self.ctx.emit::<AgentStatusChanged>(&self.change());
+        }
+    }
+
+    fn change(&self) -> AgentChange {
+        AgentChange {
+            id: self.id,
+            session: self.session_id().to_string(),
+            parent: self.parent.clone(),
+            status: self.status(),
+        }
+    }
+
+    /// This agent as a front end is told about it (`docs/adr/0022` §5).
+    ///
+    /// What the agent's realm resolves is filled here; everything a row gave
+    /// this agent is written by that row, through [`DescribeAgent`].
+    pub fn describe(&self) -> AgentDescription {
+        let model = self.ctx.service::<LlmSvc>();
+        let describing = Describing {
+            description: Mutex::new(AgentDescription {
+                session: self.session_id().to_string(),
+                parent: self.parent.clone(),
+                member: None,
+                model: model.as_ref().map(|m| m.model_name().to_string()),
+                supports_vision: model.as_ref().is_some_and(|m| m.supports_vision()),
+                reasoning_effort: None,
+                compaction: self.ctx.service::<CompactionSvc>().is_some(),
+                commands: self
+                    .ctx
+                    .service::<crate::seams::CommandsSvc>()
+                    .map(|catalog| catalog.offered_for(self))
+                    .unwrap_or_default(),
+            }),
+        };
+        self.ctx.emit::<DescribeAgent>(&describing);
+        describing
+            .description
+            .into_inner()
+            .expect("description poisoned")
+    }
+
+    /// Hand a command to the pump driving this agent. `false` when nothing
+    /// drives it.
+    pub fn command(&self, command: atomcode_kernel::event::AgentCommand) -> bool {
+        let sender = self
+            .commands
+            .lock()
+            .expect("agent commands poisoned")
+            .as_ref()
+            .and_then(|weak| weak.upgrade());
+        sender.is_some_and(|sender| sender.send(command).is_ok())
+    }
+
+    /// Whether a pump drives this agent.
+    pub fn is_driven(&self) -> bool {
+        self.commands
+            .lock()
+            .expect("agent commands poisoned")
+            .as_ref()
+            .is_some_and(|weak| weak.upgrade().is_some())
+    }
+
+    pub(crate) fn attach_commands(
+        &self,
+        sender: &tokio::sync::mpsc::UnboundedSender<atomcode_kernel::event::AgentCommand>,
+    ) {
+        *self.commands.lock().expect("agent commands poisoned") = Some(sender.downgrade());
+    }
+
+    pub(crate) fn detach_commands(&self) {
+        self.commands
+            .lock()
+            .expect("agent commands poisoned")
+            .take();
     }
 
     /// Ask the current turn to stop. Cooperative: the step in flight finishes.
@@ -616,7 +787,10 @@ impl Agent {
     /// means. It does not queue: a cancel that arrives before a turn opens is
     /// not held against that turn.
     pub fn cancel(&self) {
-        self.set_status(AgentStatus::Stopping);
+        // Only a turn can be stopping. An idle agent marked stopping stayed so
+        // until its next turn opened, and a front end showed it stopping all
+        // that while.
+        self.move_status(|now| (now == AgentStatus::Working).then_some(AgentStatus::Stopping));
         self.cancel.read().expect("cancel token poisoned").cancel();
     }
 
@@ -734,6 +908,7 @@ impl Agents {
         let mut header = SessionHeader::new(session_id.clone());
         header.cwd = req.cwd.as_ref().map(|p| p.display().to_string());
         header.parent = req.parent.clone();
+        header.member = req.member.take();
         if req.parent.is_some() {
             header.inherited = seed_len;
         }
@@ -759,7 +934,10 @@ impl Agents {
             seed = store.load(&session_id).await?;
             seed_len = seed.len();
         }
-        let log = Arc::new(SessionLog::with_header(header));
+        let clock: Arc<dyn atomcode_kernel::clock::WallClock> = ctx
+            .service::<crate::seams::WallClockSvc>()
+            .unwrap_or_else(|| Arc::new(atomcode_kernel::clock::SystemWallClock));
+        let log = Arc::new(SessionLog::with_clock(header, clock));
         if !seed.is_empty() {
             log.restore(seed);
         }
@@ -807,8 +985,10 @@ impl Agents {
             persist: req.persist,
             world: Mutex::new(world),
             status: RwLock::new(AgentStatus::Idle),
+            moving: Mutex::new(()),
             cancel: RwLock::new(CancellationToken::new()),
             interrupted: std::sync::atomic::AtomicBool::new(false),
+            commands: Mutex::new(None),
         });
         self.agents
             .write()
@@ -860,6 +1040,7 @@ impl Agents {
             for d in world {
                 d.dispose();
             }
+            agent.ctx.emit::<AgentRemoved>(&agent.change());
         }
         removed
     }

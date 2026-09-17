@@ -456,6 +456,7 @@ fn with_decision(events: &[LoggedEvent], decision: &CompactionDecision) -> Vec<L
         seq += 1;
         out.push(LoggedEvent {
             seq,
+            at: 0,
             event: SessionEvent::MessagesRewritten {
                 turn: 0,
                 texts: decision.rewrites.clone(),
@@ -466,6 +467,7 @@ fn with_decision(events: &[LoggedEvent], decision: &CompactionDecision) -> Vec<L
         seq += 1;
         out.push(LoggedEvent {
             seq,
+            at: 0,
             event: SessionEvent::Compacted {
                 turn: 0,
                 through: decision.through,

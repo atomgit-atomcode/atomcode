@@ -23131,7 +23131,7 @@ fn project_kernel_event(
 ) -> Option<AgentEvent> {
     use atomcode_kernel::event::AgentEvent as Kernel;
     match event {
-        Kernel::TurnStarted => Some(AgentEvent::PhaseChange(AgentPhase::Thinking)),
+        Kernel::TurnStarted { .. } => Some(AgentEvent::PhaseChange(AgentPhase::Thinking)),
         Kernel::TextDelta(text) => Some(AgentEvent::TextDelta(text)),
         Kernel::Reasoning(text) => Some(AgentEvent::ReasoningDelta(text)),
         Kernel::ToolCallStreaming {

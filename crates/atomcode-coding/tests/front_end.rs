@@ -1,0 +1,1159 @@
+//! The product agent reached from outside its App: one connection, speaking the
+//! handle protocol and host control, fed from every App the runtime builds
+//! (`docs/adr/0021` §5, `docs/adr/0022` §3).
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use atomcode_coding::front_end::{connect, FrontEnd};
+use atomcode_coding::{
+    CodingAgentConfig, CodingProviderFactory, CodingRuntime, CodingRuntimeStart, PrepareOptions,
+    ProviderBuildError, ProviderUnavailableReason, RuntimeError, SessionMode,
+    StaticPluginHookSource, SubagentPolicy,
+};
+use atomcode_harness::session::SessionEvent;
+use atomcode_kernel::event::{AgentCommand, AgentEvent};
+use atomcode_kernel::host::{HostCommand, HostConnection, HostError, HostEvent, HostReply};
+use atomcode_kernel::message::{Message, Role};
+use atomcode_kernel::provider::{ChatOptions, LlmProvider, ReasoningEffort};
+use atomcode_kernel::stream::{ProviderError, StreamEvent, TokenUsage};
+use atomcode_kernel::tool::{ToolCall, ToolDef};
+use futures::stream::BoxStream;
+
+#[derive(Default)]
+struct Script {
+    count: AtomicUsize,
+    options: Mutex<Vec<ChatOptions>>,
+    /// What each request showed the model, and which model it went to.
+    requests: Mutex<Vec<(String, Vec<Message>)>>,
+    /// The model of every provider the factory built.
+    built: Mutex<Vec<String>>,
+}
+
+/// `answer N`, or a question for the person when told `ask me`.
+struct Scripted {
+    script: Arc<Script>,
+    model: String,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for Scripted {
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _tools: &[ToolDef],
+        options: &ChatOptions,
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        self.script.options.lock().unwrap().push(options.clone());
+        self.script
+            .requests
+            .lock()
+            .unwrap()
+            .push((self.model.clone(), messages.to_vec()));
+        let n = self.script.count.fetch_add(1, Ordering::SeqCst) + 1;
+        let last = messages.iter().rev().find(|m| !m.synthetic);
+        let first = match last {
+            Some(m) if m.role == Role::User && m.text == "ask me" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "request_user_input".into(),
+                    arguments: serde_json::json!({
+                        "header": "Flavour",
+                        "question": "Which one?",
+                        "mode": "single",
+                        "options": [{ "label": "vanilla" }, { "label": "pistachio" }],
+                    })
+                    .to_string(),
+                })
+            }
+            Some(m) if m.role == Role::User && m.text == "delegate a team" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "team".into(),
+                    arguments: serde_json::json!({
+                        "action": "delegate",
+                        "name": "scout",
+                        "role": "explorer",
+                        "task": "list what is here",
+                    })
+                    .to_string(),
+                })
+            }
+            // A request that never answers: the only way out is a cancel.
+            Some(m) if m.role == Role::User && m.text == "hang" => {
+                return Ok(Box::pin(futures::stream::pending()));
+            }
+            Some(m) if m.role == Role::Tool => StreamEvent::TextDelta(format!("saw: {}", m.text)),
+            _ => StreamEvent::TextDelta(format!("answer {n}")),
+        };
+        Ok(Box::pin(futures::stream::iter(vec![
+            first,
+            StreamEvent::Usage(TokenUsage {
+                prompt: 10,
+                completion: 2,
+                cached: 0,
+            }),
+            StreamEvent::Done { truncated: false },
+        ])))
+    }
+}
+
+struct Factory(Arc<Script>);
+
+impl CodingProviderFactory for Factory {
+    fn build(
+        &self,
+        _config: &CodingAgentConfig,
+        _session_id: Option<&str>,
+    ) -> Result<Arc<dyn LlmProvider>, ProviderBuildError> {
+        self.0.built.lock().unwrap().push(_config.model.clone());
+        Ok(Arc::new(Scripted {
+            script: self.0.clone(),
+            model: _config.model.clone(),
+        }))
+    }
+}
+
+struct Env {
+    _home: tempfile::TempDir,
+    project: tempfile::TempDir,
+    script: Arc<Script>,
+}
+
+fn env() -> Env {
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("ATOMCODE_HOME", home.path());
+    Env {
+        _home: home,
+        project: tempfile::tempdir().unwrap(),
+        script: Arc::new(Script::default()),
+    }
+}
+
+async fn connected(env: &Env) -> HostConnection {
+    connected_with(env, SubagentPolicy::Disabled).await
+}
+
+async fn connected_with(env: &Env, subagents: SubagentPolicy) -> HostConnection {
+    connected_as(env, subagents, None).await.0
+}
+
+async fn connected_as(
+    env: &Env,
+    subagents: SubagentPolicy,
+    config: Option<Arc<dyn atomcode_coding::front_end::HostConfig>>,
+) -> (HostConnection, Arc<FrontEnd>) {
+    let front_end = match config {
+        Some(config) => FrontEnd::new().with_config(config),
+        None => FrontEnd::new(),
+    };
+    let mut agent = CodingAgentConfig::new(
+        "key",
+        "https://example.test/v1",
+        "scripted",
+        env.project.path(),
+    );
+    agent.interactive = true;
+    let start = CodingRuntimeStart {
+        agent: agent.clone(),
+        prepare: PrepareOptions {
+            request_user_input: true,
+            session: SessionMode::Fresh,
+            tools: true,
+            skill_dirs: Some(Vec::new()),
+            plugin_skill_dirs: Vec::new(),
+            mcp: false,
+            extra_mcp_servers: Vec::new(),
+            external_subagents: Vec::new(),
+            memory: false,
+            web: false,
+            review: false,
+            subagents,
+            rate_limit_source: None,
+            front_end: Some(front_end.clone()),
+        },
+        provider_factory: Arc::new(Factory(env.script.clone())),
+        plugin_hooks: Arc::new(StaticPluginHookSource::default()),
+        image_preprocessor: None,
+    };
+    let runtime = CodingRuntime::start(start)
+        .await
+        .expect("the runtime starts");
+    (
+        connect(runtime, front_end.clone(), agent).expect("connects once"),
+        front_end,
+    )
+}
+
+fn message(text: &str) -> AgentCommand {
+    AgentCommand::SendMessage {
+        text: text.into(),
+        images: Vec::new(),
+    }
+}
+
+fn subscribe(session: &str) -> AgentCommand {
+    AgentCommand::Subscribe {
+        session: session.into(),
+        from: 0,
+    }
+}
+
+async fn through_turn(connection: &mut HostConnection) -> Vec<AgentEvent> {
+    let mut seen = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), connection.events.recv()).await {
+            Ok(Some(event)) => {
+                let done = matches!(event, AgentEvent::TurnComplete { .. });
+                seen.push(event);
+                if done {
+                    return seen;
+                }
+            }
+            other => panic!("no end of turn: {other:?}; saw {seen:#?}"),
+        }
+    }
+}
+
+async fn quiet(connection: &mut HostConnection) -> Vec<AgentEvent> {
+    let mut seen = Vec::new();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(400), connection.events.recv()).await
+    {
+        seen.push(event);
+    }
+    seen
+}
+
+fn user_messages(events: &[AgentEvent], session: &str) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Fact(c) if c.session == session => match &c.event {
+                SessionEvent::UserMessage { text, .. } => Some(text.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Events until `done`, or give up naming what came.
+async fn until(
+    connection: &mut HostConnection,
+    done: impl Fn(&AgentEvent) -> bool,
+) -> Vec<AgentEvent> {
+    let mut seen = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), connection.events.recv()).await {
+            Ok(Some(event)) => {
+                let last = done(&event);
+                seen.push(event);
+                if last {
+                    return seen;
+                }
+            }
+            other => panic!("gave up: {other:?}; saw {seen:#?}"),
+        }
+    }
+}
+
+/// The product's front end reaches the team the way the harness's own pump
+/// does (`docs/adr/0021` §9–10, `docs/adr/0023` §4, §5, §8): a message
+/// addressed to a member is the person's and runs its turn, the catalog's
+/// `stop` stops it, and its log can still be read by its session id after.
+#[tokio::test]
+async fn a_front_end_talks_to_a_member_stops_it_and_reads_it_after() {
+    let env = env();
+    let mut connection = connected_with(&env, SubagentPolicy::Enabled).await;
+    let lead = connection.session.clone();
+    let scout = format!("{lead}/scout");
+    connection.commands.send(subscribe(&lead)).unwrap();
+    connection
+        .commands
+        .send(message("delegate a team"))
+        .unwrap();
+    until(
+        &mut connection,
+        |e| matches!(e, AgentEvent::AgentAdded { description } if description.session == scout),
+    )
+    .await;
+    quiet(&mut connection).await;
+
+    connection
+        .commands
+        .send(AgentCommand::To {
+            session: scout.clone(),
+            command: Box::new(AgentCommand::Tagged {
+                id: "to-scout".into(),
+                command: Box::new(message("and look again")),
+            }),
+        })
+        .unwrap();
+    until(&mut connection, |e| {
+        matches!(e, AgentEvent::Accepted { command, turn: Some(_), .. } if command == "to-scout")
+    })
+    .await;
+    connection.commands.send(subscribe(&scout)).unwrap();
+    let seen = until(&mut connection, |e| {
+        matches!(e, AgentEvent::Fact(c) if c.session == scout
+            && matches!(&c.event, SessionEvent::UserMessage { text, .. } if text == "and look again"))
+    })
+    .await;
+    assert!(
+        seen.iter().any(|e| matches!(
+            e,
+            AgentEvent::Described { description } if description.session == scout
+                && description.commands.iter().any(|c| c.name == "stop")
+        )),
+        "a member offers `stop`: {seen:#?}"
+    );
+    quiet(&mut connection).await;
+
+    connection
+        .commands
+        .send(AgentCommand::Invoke {
+            id: "stop".into(),
+            session: scout.clone(),
+            name: "stop".into(),
+            args: String::new(),
+        })
+        .unwrap();
+    until(&mut connection, |e| {
+        matches!(e, AgentEvent::Invoked { id, output } if id == "stop" && output == "stopped: scout")
+    })
+    .await;
+    quiet(&mut connection).await;
+
+    connection
+        .commands
+        .send(AgentCommand::Unsubscribe {
+            session: scout.clone(),
+        })
+        .unwrap();
+    connection.commands.send(subscribe(&scout)).unwrap();
+    let kept = until(&mut connection, |e| {
+        matches!(e, AgentEvent::Fact(c) if c.session == scout && matches!(c.event, SessionEvent::Stopped { .. }))
+    })
+    .await;
+    assert_eq!(
+        user_messages(&kept, &scout),
+        vec!["and look again".to_string()],
+        "the whole of it, from its kept log"
+    );
+}
+
+#[tokio::test]
+async fn a_front_end_hears_the_turn_and_the_facts_of_the_session_the_runtime_runs() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let session = connection.session.clone();
+    assert!(!session.is_empty(), "the runtime's session is named");
+
+    connection.commands.send(subscribe(&session)).unwrap();
+    connection.commands.send(message("hello")).unwrap();
+    let events = through_turn(&mut connection).await;
+    let events = [events, quiet(&mut connection).await].concat();
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Described { description } if description.session == session
+        )),
+        "{events:#?}"
+    );
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::TurnStarted { .. })));
+    assert_eq!(user_messages(&events, &session), vec!["hello".to_string()]);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Fact(c) if matches!(&c.event, SessionEvent::AssistantMessage { text, .. } if text == "answer 1")
+        )),
+        "{events:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_new_session_is_a_session_change_and_the_rebuilt_app_feeds_the_same_channel() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let first = connection.session.clone();
+    let mut watching = connection.control.subscribe();
+    connection.commands.send(message("first words")).unwrap();
+    through_turn(&mut connection).await;
+
+    let reply = connection
+        .control
+        .call(HostCommand::NewSession {
+            session: first.clone(),
+        })
+        .await;
+    let Ok(HostReply::SessionChanged { session: second }) = reply else {
+        panic!("{reply:?}");
+    };
+    assert_ne!(second, first);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), watching.recv())
+            .await
+            .unwrap(),
+        Some(HostEvent::SessionChanged {
+            session: second.clone(),
+            previous: Some(first.clone()),
+        })
+    );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::NewSession {
+                session: first.clone()
+            })
+            .await,
+        Err(HostError::NotFound),
+        "a command for the replaced session names nothing live"
+    );
+
+    let _ = quiet(&mut connection).await;
+    connection.commands.send(subscribe(&second)).unwrap();
+    connection.commands.send(message("second words")).unwrap();
+    let events = through_turn(&mut connection).await;
+    let events = [events, quiet(&mut connection).await].concat();
+    assert_eq!(
+        user_messages(&events, &second),
+        vec!["second words".to_string()],
+        "the App built for the new session feeds the channel the front end holds: {events:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_stored_session_is_listed_and_resumed_with_its_history() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let first = connection.session.clone();
+    connection
+        .commands
+        .send(message("remember pineapple"))
+        .unwrap();
+    through_turn(&mut connection).await;
+
+    let Ok(HostReply::Sessions { sessions }) = connection
+        .control
+        .call(HostCommand::ListSessions { working_dir: None })
+        .await
+    else {
+        panic!("a listing");
+    };
+    assert!(
+        sessions.iter().any(|s| s.id == first),
+        "{first} is listed: {sessions:#?}"
+    );
+
+    let Ok(HostReply::SessionChanged { session: second }) = connection
+        .control
+        .call(HostCommand::NewSession {
+            session: first.clone(),
+        })
+        .await
+    else {
+        panic!("a new session");
+    };
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Resume {
+                session: second.clone(),
+                target: "no-such-session".into(),
+            })
+            .await,
+        Err(HostError::NotFound)
+    );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Resume {
+                session: second,
+                target: first.clone(),
+            })
+            .await,
+        Ok(HostReply::SessionChanged {
+            session: first.clone()
+        })
+    );
+    let _ = quiet(&mut connection).await;
+    connection.commands.send(subscribe(&first)).unwrap();
+    let history = quiet(&mut connection).await;
+    assert_eq!(
+        user_messages(&history, &first),
+        vec!["remember pineapple".to_string()],
+        "{history:#?}"
+    );
+}
+
+/// A resumed session holds every fact it committed, in order and under the same
+/// numbers — a question the person answered, the title, a compaction asked
+/// for, the turns around them — chunks aside, which are not kept
+/// (`docs/adr/0024`: resume is lossless).
+#[tokio::test]
+async fn a_resumed_session_holds_every_fact_it_committed() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let first = connection.session.clone();
+    let facts = |events: &[AgentEvent], session: &str| -> Vec<(u64, String)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Fact(c) if c.session == session => Some(c),
+                _ => None,
+            })
+            .filter(|c| !matches!(c.event, SessionEvent::AssistantChunk { .. }))
+            .map(|c| {
+                let kind = serde_json::to_value(&c.event).unwrap()["kind"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                (c.seq, kind)
+            })
+            .collect()
+    };
+
+    connection.commands.send(message("ask me")).unwrap();
+    let id = loop {
+        match tokio::time::timeout(Duration::from_secs(10), connection.events.recv()).await {
+            Ok(Some(AgentEvent::Request { id, .. })) => break id,
+            Ok(Some(_)) => continue,
+            other => panic!("no question: {other:?}"),
+        }
+    };
+    connection
+        .commands
+        .send(AgentCommand::Respond {
+            id,
+            value: serde_json::json!({ "declined": false, "selected": ["pistachio"] }),
+        })
+        .unwrap();
+    through_turn(&mut connection).await;
+    connection.commands.send(message("hello")).unwrap();
+    through_turn(&mut connection).await;
+    connection
+        .commands
+        .send(AgentCommand::Compact { focus: None })
+        .unwrap();
+    let _ = quiet(&mut connection).await;
+
+    connection.commands.send(subscribe(&first)).unwrap();
+    let before = facts(&quiet(&mut connection).await, &first);
+    for kind in ["tool_result_logged", "titled", "turn_end"] {
+        assert!(
+            before.iter().any(|(_, k)| k == kind),
+            "`{kind}` is among the facts: {before:?}"
+        );
+    }
+
+    let Ok(HostReply::SessionChanged { session: second }) = connection
+        .control
+        .call(HostCommand::NewSession {
+            session: first.clone(),
+        })
+        .await
+    else {
+        panic!("a new session");
+    };
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Resume {
+                session: second,
+                target: first.clone(),
+            })
+            .await,
+        Ok(HostReply::SessionChanged {
+            session: first.clone()
+        })
+    );
+    let _ = quiet(&mut connection).await;
+    connection.commands.send(subscribe(&first)).unwrap();
+    let after = facts(&quiet(&mut connection).await, &first);
+    assert_eq!(after, before);
+}
+
+/// A session a newer build last wrote is listed and marked, and a resume of it
+/// is refused before its log is opened; the others resume as ever
+/// (`docs/adr/0024` §16).
+#[tokio::test]
+async fn a_session_a_newer_build_wrote_is_listed_and_refused() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let first = connection.session.clone();
+    connection
+        .commands
+        .send(message("remember pineapple"))
+        .unwrap();
+    through_turn(&mut connection).await;
+    let Ok(HostReply::SessionChanged { session: second }) = connection
+        .control
+        .call(HostCommand::NewSession {
+            session: first.clone(),
+        })
+        .await
+    else {
+        panic!("a new session");
+    };
+    connection.commands.send(message("remember plum")).unwrap();
+    through_turn(&mut connection).await;
+    let Ok(HostReply::SessionChanged { session: third }) = connection
+        .control
+        .call(HostCommand::NewSession {
+            session: second.clone(),
+        })
+        .await
+    else {
+        panic!("a third session");
+    };
+
+    atomcode_capabilities::session::SessionManager::for_project(env.project.path())
+        .update_meta(&first, |meta| {
+            meta.format_version = atomcode_kernel::session::SESSION_FORMAT_VERSION + 1;
+        })
+        .unwrap();
+
+    let Ok(HostReply::Sessions { sessions }) = connection
+        .control
+        .call(HostCommand::ListSessions { working_dir: None })
+        .await
+    else {
+        panic!("a listing");
+    };
+    let marked = |id: &str| {
+        sessions
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("{id} is listed: {sessions:#?}"))
+            .needs_newer_version
+    };
+    assert!(marked(&first));
+    assert!(!marked(&second));
+
+    assert!(matches!(
+        connection
+            .control
+            .call(HostCommand::Resume {
+                session: third.clone(),
+                target: first.clone(),
+            })
+            .await,
+        Err(HostError::Failed { .. })
+    ));
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Resume {
+                session: third,
+                target: second.clone(),
+            })
+            .await,
+        Ok(HostReply::SessionChanged { session: second })
+    );
+}
+
+#[tokio::test]
+async fn a_question_reaches_the_front_end_and_its_answer_goes_back() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    connection.commands.send(message("ask me")).unwrap();
+    let (id, kind) = loop {
+        match tokio::time::timeout(Duration::from_secs(10), connection.events.recv()).await {
+            Ok(Some(AgentEvent::Request { id, kind, .. })) => break (id, kind),
+            Ok(Some(_)) => continue,
+            other => panic!("no question: {other:?}"),
+        }
+    };
+    assert_eq!(kind, "request_user_input");
+    connection
+        .commands
+        .send(AgentCommand::Respond {
+            id,
+            value: serde_json::json!({ "declined": false, "selected": ["pistachio"] }),
+        })
+        .unwrap();
+    let events = through_turn(&mut connection).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta(t) if t.contains("pistachio"))),
+        "the answer reached the model: {events:#?}"
+    );
+}
+
+#[tokio::test]
+async fn the_thinking_level_set_through_host_control_reaches_requests_and_is_described() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let session = connection.session.clone();
+    connection.commands.send(subscribe(&session)).unwrap();
+    let _ = quiet(&mut connection).await;
+
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SetReasoningEffort {
+                session: session.clone(),
+                level: Some(ReasoningEffort::High),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    let described = quiet(&mut connection).await;
+    assert!(
+        described.iter().any(|e| matches!(
+            e,
+            AgentEvent::Described { description }
+                if description.reasoning_effort == Some(ReasoningEffort::High)
+        )),
+        "described again, with the level: {described:#?}"
+    );
+
+    connection.commands.send(message("think")).unwrap();
+    through_turn(&mut connection).await;
+    let options = env.script.options.lock().unwrap().clone();
+    assert_eq!(
+        options.last().and_then(|o| o.reasoning_effort),
+        Some(ReasoningEffort::High)
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_from_the_front_end_ends_the_running_turn() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    connection.commands.send(message("hang")).unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), connection.events.recv()).await {
+            Ok(Some(AgentEvent::TurnStarted { .. })) => break,
+            Ok(Some(_)) => continue,
+            other => panic!("the turn never started: {other:?}"),
+        }
+    }
+    connection.commands.send(AgentCommand::Cancel).unwrap();
+    let ended = through_turn(&mut connection).await;
+    assert!(
+        matches!(ended.last(), Some(AgentEvent::TurnComplete { .. })),
+        "{ended:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_compaction_asked_for_by_the_front_end_reports_back() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    connection.commands.send(message("hello")).unwrap();
+    through_turn(&mut connection).await;
+
+    connection
+        .commands
+        .send(AgentCommand::Tagged {
+            id: "c".into(),
+            command: Box::new(AgentCommand::Compact { focus: None }),
+        })
+        .unwrap();
+    let mut seen = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), connection.events.recv()).await {
+            Ok(Some(event)) => {
+                let done = matches!(
+                    event,
+                    AgentEvent::Compacted { .. } | AgentEvent::CompactionFailed { .. }
+                );
+                seen.push(event);
+                if done {
+                    break;
+                }
+            }
+            other => panic!("no compaction outcome: {other:?}; saw {seen:#?}"),
+        }
+    }
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, AgentEvent::Accepted { command, .. } if command == "c")),
+        "the command was taken: {seen:#?}"
+    );
+}
+
+/// `docs/adr/0021` §8, one row at a time.
+#[test]
+fn runtime_errors_are_host_errors_by_the_table() {
+    let cases: Vec<(RuntimeError, HostError)> = vec![
+        (
+            RuntimeError::Busy,
+            HostError::Busy {
+                reason: "the runtime is busy".into(),
+            },
+        ),
+        (RuntimeError::Cancelled, HostError::Cancelled),
+        (
+            RuntimeError::SessionInUse { id: "s".into() },
+            HostError::SessionInUse { id: "s".into() },
+        ),
+        (RuntimeError::DeliveryFailed, HostError::Unavailable),
+        (RuntimeError::Unavailable, HostError::Unavailable),
+        (
+            RuntimeError::ProviderUnavailable(ProviderUnavailableReason::AuthenticationRequired),
+            HostError::ProviderUnavailable {
+                reason: atomcode_kernel::host::ProviderUnavailableReason::AuthenticationRequired,
+            },
+        ),
+        (
+            RuntimeError::SnapshotUnavailable("gone".into()),
+            HostError::NotFound,
+        ),
+        (
+            RuntimeError::InvalidWorkingDirectory("nope".into()),
+            HostError::InvalidWorkingDirectory {
+                message: "nope".into(),
+            },
+        ),
+        (
+            RuntimeError::UndoOutOfRange {
+                requested: 3,
+                available: 1,
+            },
+            HostError::UndoOutOfRange {
+                requested: 3,
+                available: 1,
+            },
+        ),
+        (
+            RuntimeError::RewindPointUnavailable { turn_id: 7 },
+            HostError::RewindPointNotFound { turn: 7 },
+        ),
+        (
+            RuntimeError::CodeRewindUnavailable("no git".into()),
+            HostError::CodeRewindUnavailable {
+                message: "no git".into(),
+            },
+        ),
+    ];
+    for (runtime, host) in cases {
+        assert_eq!(HostError::from(runtime.clone()), host, "{runtime:?}");
+    }
+    assert!(matches!(
+        HostError::from(RuntimeError::ReconfigureFailed("broke".into())),
+        HostError::Failed { message } if message.contains("broke")
+    ));
+}
+
+// ---- host control over the session ---------------------------------------
+
+/// The last fact a subscriber has seen, from what came.
+fn last_seen(events: &[AgentEvent], session: &str) -> u64 {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Fact(c) if c.session == session => Some(c.seq),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn user_texts_in(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|m| m.role == Role::User && !m.synthetic)
+        .map(|m| m.text.clone())
+        .collect()
+}
+
+/// An undo through host control takes the last prompt back and hands it over;
+/// the next request does not show it. One based on a fact older than a turn
+/// since is refused (`docs/adr/0021` §9, `docs/adr/0024` §17).
+#[tokio::test]
+async fn an_undo_through_host_control_hands_the_prompt_back_and_the_model_no_longer_sees_it() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let session = connection.session.clone();
+    connection.commands.send(subscribe(&session)).unwrap();
+    connection.commands.send(message("first thing")).unwrap();
+    let seen = [
+        through_turn(&mut connection).await,
+        quiet(&mut connection).await,
+    ]
+    .concat();
+    let before_second = last_seen(&seen, &session);
+    connection.commands.send(message("second thing")).unwrap();
+    let seen = [
+        through_turn(&mut connection).await,
+        quiet(&mut connection).await,
+    ]
+    .concat();
+    let latest = last_seen(&seen, &session);
+
+    assert!(matches!(
+        connection
+            .control
+            .call(HostCommand::Undo {
+                session: session.clone(),
+                turn: None,
+                based_on: before_second,
+            })
+            .await,
+        Err(HostError::Stale { .. })
+    ));
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Undo {
+                session: session.clone(),
+                turn: None,
+                based_on: latest,
+            })
+            .await,
+        Ok(HostReply::Undone {
+            prompt: Some("second thing".into()),
+            restored_files: Vec::new(),
+        })
+    );
+    let _ = quiet(&mut connection).await;
+    connection.commands.send(message("third thing")).unwrap();
+    through_turn(&mut connection).await;
+    let (_, last) = env.script.requests.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        user_texts_in(&last),
+        vec!["first thing".to_string(), "third thing".to_string()]
+    );
+}
+
+/// The turns a rewind can go back to are listed, and a rewind of the
+/// conversation to one of them takes it and everything after it back; a turn
+/// that is not a point is refused.
+#[tokio::test]
+async fn a_rewind_through_host_control_goes_back_to_a_listed_turn() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let session = connection.session.clone();
+    connection.commands.send(subscribe(&session)).unwrap();
+    let mut seen = Vec::new();
+    for text in ["one", "two", "three"] {
+        connection.commands.send(message(text)).unwrap();
+        seen.extend(through_turn(&mut connection).await);
+    }
+    seen.extend(quiet(&mut connection).await);
+    let Ok(HostReply::RewindPoints { points, .. }) = connection
+        .control
+        .call(HostCommand::RewindPoints {
+            session: session.clone(),
+        })
+        .await
+    else {
+        panic!("rewind points");
+    };
+    assert_eq!(
+        points.iter().map(|p| p.prompt.as_str()).collect::<Vec<_>>(),
+        vec!["three", "two", "one"],
+        "newest first: {points:#?}"
+    );
+    let two = points.iter().find(|p| p.prompt == "two").unwrap().turn;
+    let based_on = last_seen(&seen, &session);
+
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Rewind {
+                session: session.clone(),
+                turn: 999,
+                scope: atomcode_kernel::session::RewindScope::Conversation,
+                based_on,
+            })
+            .await,
+        Err(HostError::RewindPointNotFound { turn: 999 })
+    );
+    let rewound = connection
+        .control
+        .call(HostCommand::Rewind {
+            session: session.clone(),
+            turn: two,
+            scope: atomcode_kernel::session::RewindScope::Conversation,
+            based_on,
+        })
+        .await;
+    assert!(
+        matches!(&rewound, Ok(HostReply::Undone { prompt: Some(p), .. }) if p == "two"),
+        "{rewound:?}"
+    );
+    let _ = quiet(&mut connection).await;
+    connection.commands.send(message("four")).unwrap();
+    through_turn(&mut connection).await;
+    let (_, last) = env.script.requests.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        user_texts_in(&last),
+        vec!["one".to_string(), "four".to_string()]
+    );
+}
+
+/// Resolves a model id to a configuration naming it, the way a host's config
+/// file would.
+struct Models(std::path::PathBuf);
+
+impl atomcode_coding::front_end::HostConfig for Models {
+    fn for_model(&self, model: &str) -> Result<CodingAgentConfig, String> {
+        if model == "missing" {
+            return Err("no model `missing` is configured".into());
+        }
+        let mut config = CodingAgentConfig::new("key", "https://example.test/v1", model, &self.0);
+        config.interactive = true;
+        Ok(config)
+    }
+    fn current(&self) -> Result<CodingAgentConfig, String> {
+        self.for_model("scripted-again")
+    }
+}
+
+/// A model switched through host control is the one the next request goes to;
+/// one the host cannot resolve is refused. Signing out takes the model away and
+/// signing in brings it back — neither rebuilding what the session runs in
+/// (`docs/adr/0022` §2).
+#[tokio::test]
+async fn the_model_is_switched_signed_out_and_in_through_host_control_without_a_rebuild() {
+    let env = env();
+    let (mut connection, front_end) = connected_as(
+        &env,
+        SubagentPolicy::Disabled,
+        Some(Arc::new(Models(env.project.path().to_path_buf()))),
+    )
+    .await;
+    let session = connection.session.clone();
+    connection.commands.send(message("hello")).unwrap();
+    through_turn(&mut connection).await;
+    let apps = front_end.apps_fed();
+
+    assert!(matches!(
+        connection
+            .control
+            .call(HostCommand::SwitchModel {
+                session: session.clone(),
+                model: "missing".into(),
+            })
+            .await,
+        Err(HostError::Failed { .. })
+    ));
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SwitchModel {
+                session: session.clone(),
+                model: "glm-5".into(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    connection.commands.send(message("which model")).unwrap();
+    through_turn(&mut connection).await;
+    assert_eq!(
+        env.script
+            .requests
+            .lock()
+            .unwrap()
+            .last()
+            .map(|(m, _)| m.clone()),
+        Some("glm-5".to_string())
+    );
+
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SignOut {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    let asked = env.script.requests.lock().unwrap().len();
+    connection.commands.send(message("anyone there")).unwrap();
+    let _ = quiet(&mut connection).await;
+    assert_eq!(
+        env.script.requests.lock().unwrap().len(),
+        asked,
+        "signed out: nothing reached a model"
+    );
+
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SignIn {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    connection.commands.send(message("back again")).unwrap();
+    through_turn(&mut connection).await;
+    assert_eq!(
+        env.script
+            .requests
+            .lock()
+            .unwrap()
+            .last()
+            .map(|(m, _)| m.clone()),
+        Some("scripted-again".to_string()),
+        "signed in with the configuration as it is now"
+    );
+    assert_eq!(
+        front_end.apps_fed(),
+        apps,
+        "switching models and signing out and in rebuilt nothing"
+    );
+}
+
+/// The MCP servers are listed, their tools can be withdrawn, and the
+/// capabilities reloaded, all for the session that is live.
+#[tokio::test]
+async fn mcp_and_a_reload_are_host_controls_on_the_live_session() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let session = connection.session.clone();
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::McpStatus {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::McpServers {
+            servers: Vec::new()
+        })
+    );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::WithdrawMcpTools {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Reload {
+                session: session.clone(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    assert!(matches!(
+        connection
+            .control
+            .call(HostCommand::Reload {
+                session: "some-other-session".into(),
+            })
+            .await,
+        Err(HostError::NotFound)
+    ));
+    connection.commands.send(message("still here")).unwrap();
+    through_turn(&mut connection).await;
+}

@@ -400,6 +400,7 @@ mod tests {
             message_count: 3,
             turn_count: 1,
             presence: CatalogPresence::NativeOnly,
+            needs_newer_version: false,
         };
 
         let projected = SessionMeta::from(entry);

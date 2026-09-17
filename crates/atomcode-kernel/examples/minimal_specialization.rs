@@ -82,7 +82,7 @@ async fn main() {
                     })
                     .unwrap();
             }
-            AgentEvent::TurnComplete { reason } => {
+            AgentEvent::TurnComplete { reason, .. } => {
                 println!("\n[turn complete: {reason:?}]");
                 break;
             }

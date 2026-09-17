@@ -9,7 +9,7 @@ use atomcode_plexus::{Context, Plugin};
 use serde_json::Value;
 
 use crate::seams::{
-    Descriptions, OperationsSvc, PromptRegistry, SystemPromptSvc, ToolBox, ToolsSvc,
+    CommandsSvc, Descriptions, OperationsSvc, PromptRegistry, SystemPromptSvc, ToolBox, ToolsSvc,
 };
 
 pub struct ToolsPlugin;
@@ -49,6 +49,27 @@ impl Plugin for SystemPromptPlugin {
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let _ = ctx
             .provide::<SystemPromptSvc>(Arc::new(PromptRegistry::new()))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+pub struct CommandsPlugin;
+
+#[async_trait]
+impl Plugin for CommandsPlugin {
+    fn name(&self) -> &'static str {
+        "commands"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["commands"]
+    }
+    fn description(&self) -> &'static str {
+        "the commands a person can run from a front end, each registered by the row it belongs to"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<CommandsSvc>(Arc::new(crate::commands::CommandCatalog::new()))
             .map_err(|e| e.to_string())?;
         Ok(())
     }

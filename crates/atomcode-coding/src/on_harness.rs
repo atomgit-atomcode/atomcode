@@ -138,14 +138,15 @@ pub const CODING_DEFAULTS: &str = r#"
 id = "round-cap"
 config = { max_rounds = 0 }
 
-# --- where the event journal goes ------------------------------------------
-# The harness row writes into `<home>/sessions/<bucket>/`, which in this product
-# is the native session store — every reader of native files then trips over
-# journals. This product's own row keeps the same format in the one directory
-# the native catalog passes over. See `session_journal`.
+# --- where a session's log goes ---------------------------------------------
+# Into the session store, under the lease of the session the runtime opened:
+# the host inserts `session-store` for that (see `session_store`). The harness's
+# own JSONL row would write a second copy beside the store under no lease, and a
+# tree with no session binding keeps nothing. The host swaps `session-store`
+# into this row's place, which is ahead of the agent that resumes from it.
 [[patch]]
 id = "session-persistence-jsonl"
-name = "session-journal"
+disabled = true
 
 # --- what the model can do to the repository ------------------------------
 # All routed through the execution world (`fs`/`shell`), so the fence and the
@@ -289,6 +290,11 @@ disabled = true
 # `persona-coding`, the harness's generic identity row, is deliberately absent:
 # `persona-atomcode` in `CODING_ROWS` fills that slot in this product's own
 # words, and two personas in one system prompt is worse than either.
+
+# What a delegated agent (a team member, a `task` child) may never do, refused
+# ahead of every rule and question: nobody is watching it call tools.
+[[insert]]
+name = "delegation-bounds"
 
 # No rules by default, so the row is inert until a user writes some.
 [[insert]]
@@ -1212,7 +1218,6 @@ pub fn plugins() -> Vec<Arc<dyn Plugin>> {
         Arc::new(DatalogPlugin),
         Arc::new(CcHooksPlugin),
         Arc::new(ChatOptionsPlugin),
-        Arc::new(crate::session_journal::SessionJournalPlugin),
     ]
 }
 
@@ -1306,6 +1311,13 @@ pub struct HostState {
     /// `[web_search] api_key`. Handed to `tool-web` as a plugin instance, never
     /// as row config — a config tree is printed verbatim, a credential must not be.
     pub web_search_api_key: Option<String>,
+    /// A front end outside the App, fed by the `front-end-feed` row.
+    pub front_end: Option<Arc<crate::front_end::FrontEnd>>,
+    /// The provider a delegated agent inheriting the conversation's model runs
+    /// on, billed to the session apart from it.
+    pub delegated_llm: Option<Arc<dyn LlmProvider>>,
+    /// Where delegated agents' turns go as `Team` events, for the shipped panel.
+    pub(crate) team_events: Option<crate::team_progress::TeamSink>,
 }
 
 /// See [`crate::host_rows::SessionContextPlugin`].
@@ -1392,15 +1404,23 @@ pub async fn mount_hosted(
         Layer::from_toml(&coding_overlay(working_dir, &artifacts, presence, &model))
             .map_err(|e| e.to_string())?,
     );
-    // The session is the runtime's: its id, and its stored conversation as the
-    // seed. The harness's own `session` row would mint an id and, asked to
-    // resume, replay the JSONL journal — which is the follower, not the master.
+    // The session is the runtime's: its id, and its log in the session store,
+    // appended by `session-store` under the runtime's lease and replayed by
+    // `session-native`. The harness's own `session` row would mint an id.
     // With live switches, plan mode is the product's and is always mounted — it
     // decides per call whether it is on. Patched in place so it keeps
     // `plan-mode`'s position, ahead of the approval gates: a write plan mode
     // refuses must not first be asked about.
     let mut hosted = Layer::new()
         .swap("session", "session-native")
+        // In the persistence row's place, ahead of the agent that resumes from
+        // it: a row inserted at the end would mount after `ui-handle` had
+        // already created the agent.
+        .when(host.session.stored.is_some(), |layer| {
+            layer
+                .swap("session-persistence-jsonl", "session-store")
+                .enable("session-persistence-jsonl")
+        })
         // With live switches, plan mode is the product's and is always mounted
         // — it decides per call whether it is on.
         .when(host.modes.is_some(), |layer| {
@@ -1427,6 +1447,12 @@ pub async fn mount_hosted(
         .when(host.mcp.is_some(), |layer| {
             layer.swap("mcp", "mcp-host").enable("mcp")
         })
+        .when(host.delegated_llm.is_some(), |layer| {
+            layer.insert(Entry::named("llm-delegated-host"))
+        })
+        .when(host.team_events.is_some(), |layer| {
+            layer.insert(Entry::named("team-progress"))
+        })
         .when(host.compaction_checkpoint.is_some(), |layer| {
             layer.insert(Entry::named("native-compaction-checkpoint"))
         })
@@ -1438,6 +1464,9 @@ pub async fn mount_hosted(
         })
         .when(host.web_search_api_key.is_some(), |layer| {
             layer.swap("tool-web", "tool-web-keyed")
+        })
+        .when(host.front_end.is_some(), |layer| {
+            layer.insert(Entry::named("front-end-feed"))
         });
     if let Some(datalog) = host.datalog.as_ref() {
         hosted = hosted
@@ -1476,6 +1505,9 @@ pub async fn mount_hosted(
         registry.register(row);
     }
     registry.register(Arc::new(InjectProvider(providers.clone())));
+    if let Some(stored) = host.session.stored.clone() {
+        registry.register(Arc::new(crate::session_store::SessionStorePlugin(stored)));
+    }
     registry.register(Arc::new(crate::host_rows::SessionNativePlugin(Arc::new(
         host.session,
     ))));
@@ -1490,6 +1522,15 @@ pub async fn mount_hosted(
     )));
     if let Some(slot) = host.summary_provider {
         registry.register(Arc::new(crate::host_rows::CompactionCodingPlugin(slot)));
+    }
+    if let Some(front_end) = host.front_end {
+        registry.register(Arc::new(crate::front_end::FrontEndFeedPlugin(front_end)));
+    }
+    if let Some(provider) = host.delegated_llm {
+        registry.register(Arc::new(DelegatedLlmPlugin(provider)));
+    }
+    if let Some(sink) = host.team_events {
+        registry.register(Arc::new(crate::team_progress::TeamProgressPlugin(sink)));
     }
     if let Some(hook) = host.compaction_checkpoint {
         registry.register(Arc::new(
@@ -1708,6 +1749,7 @@ impl Plugin for VerifyCadencePlugin {
 //   - `tools/execute`, outermost: refuse what the restriction forbids.
 
 struct ExecutionBoundary {
+    ctx: Context,
     policy: Arc<crate::execution_policy::TurnExecutionPolicy>,
 }
 
@@ -1722,7 +1764,14 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest> for Exec
         // BEFORE delegating: the calls this round produces are gated on what
         // the person said, and they are gated by the other half below, which
         // has no messages of its own to read.
-        self.policy.update_from_messages(&req.messages);
+        //
+        // The person talks to the lead. A delegated agent's request carries the
+        // lead's task, not the person's restriction, so it must not rewrite it:
+        // members work under whatever the lead is held to (`docs/adr/0023`,
+        // addendum).
+        if restates_the_persons_restriction(&self.ctx) {
+            self.policy.update_from_messages(&req.messages);
+        }
         next.run(req).await
     }
 }
@@ -1807,6 +1856,14 @@ impl atomcode_plexus::Waterfall<atomcode_harness::events::ToolsExecuteBatch> for
     }
 }
 
+/// Whether the request being made is one whose messages say what the person
+/// restricted: the conversation's own, not a delegated agent's.
+fn restates_the_persons_restriction(ctx: &Context) -> bool {
+    atomcode_harness::agent::scoped(ctx)
+        .service::<atomcode_harness::seams::DelegationLaneSvc>()
+        .is_none()
+}
+
 /// Mounts the per-turn execution boundary.
 pub struct ExecutionPolicyPlugin;
 
@@ -1820,6 +1877,7 @@ impl Plugin for ExecutionPolicyPlugin {
     }
     async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
         let boundary = Arc::new(ExecutionBoundary {
+            ctx: ctx.clone(),
             policy: Arc::new(crate::execution_policy::TurnExecutionPolicy::new()),
         });
         let _ = ctx.on_waterfall::<atomcode_harness::events::AgentRequest>(boundary.clone(), true);
@@ -2529,6 +2587,17 @@ impl Plugin for ChatOptionsPlugin {
             max_tokens: row.max_tokens,
             temperature: row.temperature,
         };
+        // Said the way it is applied: for every agent, unless something more
+        // specific — a member's role — already said otherwise.
+        if let Some(level) = options.reasoning_effort {
+            let _ = ctx.on_emit::<atomcode_harness::events::DescribeAgent>(
+                move |describing: &atomcode_harness::events::Describing| {
+                    let mut description =
+                        describing.description.lock().expect("description poisoned");
+                    description.reasoning_effort.get_or_insert(level);
+                },
+            );
+        }
         if options.reasoning_effort.is_none()
             && options.max_tokens.is_none()
             && options.temperature.is_none()
@@ -2538,5 +2607,62 @@ impl Plugin for ChatOptionsPlugin {
         // Outermost, so a request a later row retries or trims still carries them.
         let _ = ctx.on_waterfall::<atomcode_harness::events::AgentRequest>(Arc::new(options), true);
         Ok(())
+    }
+}
+
+/// `llm-delegated-host`: the model a delegated agent inheriting the
+/// conversation's runs on — the runtime's own, wrapped so its spend is billed
+/// to the session apart from the conversation and metered as a subagent's.
+struct DelegatedLlmPlugin(Arc<dyn LlmProvider>);
+
+#[async_trait]
+impl Plugin for DelegatedLlmPlugin {
+    fn name(&self) -> &'static str {
+        "llm-delegated-host"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["llm-delegated"]
+    }
+    fn description(&self) -> &'static str {
+        "the conversation's model for delegated agents, billed to the session apart from it"
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_harness::seams::DelegatedLlmSvc>(self.0.clone())
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod delegated_restriction_tests {
+    use super::*;
+
+    /// Only the conversation's own request restates the person's execution
+    /// restriction; a delegated agent's carries the lead's task, and re-reading
+    /// it would lift the restriction while the lead is still held to it.
+    #[tokio::test]
+    async fn a_delegated_request_never_restates_the_persons_restriction() {
+        let app = App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::empty(),
+        );
+        let root = app.context();
+        assert!(restates_the_persons_restriction(&root));
+
+        let member = root.isolate();
+        let _lane = member
+            .provide::<atomcode_harness::seams::DelegationLaneSvc>(Arc::new(
+                atomcode_harness::seams::DelegationLane {
+                    scopes: vec!["**".into()],
+                },
+            ))
+            .unwrap();
+        let tree = root.clone();
+        let restates = atomcode_harness::agent::as_agent(member, async move {
+            restates_the_persons_restriction(&tree)
+        })
+        .await;
+        assert!(!restates);
     }
 }

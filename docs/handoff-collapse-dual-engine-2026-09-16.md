@@ -32,6 +32,8 @@
    那一行照写，但 `resume = false`，而且写在**自己的 root**
    `<home>/sessions/harness/`，和原生 transcript 不共用文件。谁也不许读对方的文件当权威。
    （AGENTS.md 已写死这一条。）
+   > **2026-09-17 已推翻**:用户定会话的唯一权威改为 harness 日志,见
+   > [`adr/0024`](./adr/0024-the-session-log-is-the-authority.md)。第 2、3 条不受影响。
 2. **翻默认和删链在同一分支，分成两个 commit**（`c81218a4` 翻、`f3a7f048` 删），
    完事之后不留引擎开关。
 3. **差分台变成「树 对 存档」。** 删链前用链式把 56 个场景的事件流录成

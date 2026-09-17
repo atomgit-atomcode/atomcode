@@ -10,11 +10,15 @@
 //! `docs/adr/0012`; the earlier "headless only" stance is `docs/adr/0011`,
 //! superseded. Don't read tuix for what to build; build it here as rows.
 //!
-//! What makes this crate the one worth growing: 20 end-to-end tests drive the
-//! whole UI with no tty, no model and no human; `--audit` checks an assembly
-//! on a machine with no terminal; `--demo` prints one composed frame. The
-//! headless surface is a row next to the terminal one, so every feature added
-//! is testable the day it lands.
+//! What makes this crate the one worth growing: end-to-end tests drive the
+//! whole UI with no tty, no model and no human; `atomcode --tui --audit` checks
+//! the screen's composition on a machine with no terminal; `--demo` prints one
+//! composed frame. The headless surface is a row next to the terminal one, so
+//! every feature added is testable the day it lands.
+//!
+//! The screen is an App of its own and drives an agent it does not build: a
+//! host hands it a connection — the handle protocol and host control
+//! (`docs/adr/0021`, `docs/adr/0022`). [`launch`] is how it is mounted.
 //!
 //! Nothing here is a monolith with extension points bolted on. The host owns
 //! four things nobody else can — the surface, the event loop, layout
@@ -51,8 +55,8 @@ pub mod el;
 pub mod frame;
 pub mod host;
 pub mod keymap;
+pub mod launch;
 pub mod layout;
-pub mod layout_tool;
 pub mod markdown;
 pub mod menu;
 pub mod module;
@@ -60,7 +64,6 @@ pub mod modules;
 pub mod moment;
 pub mod overlay;
 pub mod plugin;
-pub mod product;
 pub mod region;
 pub mod rows;
 pub mod surface;

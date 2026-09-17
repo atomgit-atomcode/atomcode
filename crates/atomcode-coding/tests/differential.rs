@@ -355,7 +355,7 @@ async fn golden_value<T: serde::de::DeserializeOwned>(key: &str) -> T {
 fn normalise(event: &AgentEvent) -> Option<Step> {
     let step = |kind, detail: String| Some(Step { kind, detail });
     match event {
-        AgentEvent::TurnStarted => step("TurnStarted", String::new()),
+        AgentEvent::TurnStarted { .. } => step("TurnStarted", String::new()),
         // Kept, so it shows in every rendered report and the criteria can read
         // it — but EXCLUDED from the divergence count; see `ONE_SIDED_BY_DESIGN`.
         AgentEvent::ContextAdded { text, .. } => step("ContextAdded", text.clone()),
@@ -392,7 +392,7 @@ fn normalise(event: &AgentEvent) -> Option<Step> {
             }
             step("Snapshot", roles.join(","))
         }
-        AgentEvent::TurnComplete { reason } => step("TurnComplete", format!("{reason:?}")),
+        AgentEvent::TurnComplete { reason, .. } => step("TurnComplete", format!("{reason:?}")),
         AgentEvent::Error { message, .. } => step("Error", message.clone()),
         AgentEvent::Cancelled => step("Cancelled", String::new()),
         AgentEvent::Warning(_) => None,
@@ -586,7 +586,7 @@ async fn drive_answering(
                         });
                     }
                 }
-                if matches!(event, AgentEvent::TurnStarted) {
+                if matches!(event, AgentEvent::TurnStarted { .. }) {
                     if let Some(cmd) = late.clone() {
                         // Give the round a moment to be genuinely in flight.
                         tokio::time::sleep(std::time::Duration::from_millis(60)).await;

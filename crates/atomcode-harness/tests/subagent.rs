@@ -13,6 +13,7 @@ use atomcode_harness::agent::OnlySession;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use atomcode_harness::events::{ToolExec, ToolsExecute};
@@ -268,6 +269,65 @@ async fn the_childs_conversation_never_enters_the_parents_log() {
     assert!(parent_transcript(&app).contains("round(s)"));
 }
 
+/// A task child's session is kept like any other, under its parent: its log
+/// is readable by id after the child is gone, and it is not a session a person
+/// picks up on its own (`docs/adr/0024` §1, §11).
+#[tokio::test]
+async fn a_childs_log_is_kept_under_its_parent() {
+    let dir = scratch("kept-child");
+    let sessions = scratch("kept-child-sessions");
+    std::fs::write(dir.join("a.txt"), "child-only detail").unwrap();
+    let script = delegating_script(
+        "read a.txt",
+        r#"{ text = "Looking.", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] },
+  { text = "Summary only." },"#,
+    );
+    let kept = format!(
+        "[[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ root = {:?}, project_root = {:?} }}",
+        sessions.to_string_lossy(),
+        dir.to_string_lossy()
+    );
+    let app = start(tree(&dir, &script, &[YOLO, &kept])).await;
+    run_turn(&app, "delegate").await.unwrap();
+    let parent = app.context().only_session().unwrap().id().to_string();
+    let store = app
+        .context()
+        .service::<atomcode_harness::seams::SessionPersistenceSvc>()
+        .unwrap();
+
+    let mut children = Vec::new();
+    let mut read = Vec::new();
+    for _ in 0..300 {
+        children = store.children(&parent).await.unwrap();
+        if let [child] = children.as_slice() {
+            read = store.load(&child.id).await.unwrap();
+            if read.iter().any(|e| {
+                matches!(
+                    e.event,
+                    atomcode_harness::session::SessionEvent::TurnEnd { .. }
+                )
+            }) {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        children.len(),
+        1,
+        "one child, under its parent: {children:?}"
+    );
+    assert!(
+        format!("{read:?}").contains("child-only detail"),
+        "its whole conversation is kept: {read:?}"
+    );
+    assert_eq!(
+        store.list().await.unwrap(),
+        vec![parent],
+        "and it is not listed beside its parent"
+    );
+}
+
 #[tokio::test]
 async fn the_child_leaves_nothing_behind() {
     let dir = scratch("cleanup");
@@ -410,4 +470,235 @@ config = { script = [ { text = "nothing to do" } ] }
     // Local reading is unaffected either way, or the assertions above could be
     // passing because the child got no tools at all.
     assert!(said.contains("read_file"), "{said}");
+}
+
+/// A tool that takes half a minute unless its turn is stopped — a delegated
+/// child's long job, without a shell (a delegated agent never has one).
+struct WaitAWhile;
+
+#[async_trait]
+impl atomcode_kernel::tool::Tool for WaitAWhile {
+    fn name(&self) -> &str {
+        "wait_a_while"
+    }
+    fn description(&self) -> &str {
+        "waits half a minute"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+    fn risk(&self, _args: &str) -> atomcode_kernel::tool::RiskLevel {
+        atomcode_kernel::tool::RiskLevel::Safe
+    }
+    async fn execute(&self, _args: &str, ctx: &atomcode_kernel::tool::ToolContext) -> ToolResult {
+        let content = tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => "waited",
+            _ = ctx.cancel.cancelled() => "stopped",
+        };
+        ToolResult {
+            call_id: String::new(),
+            content: content.into(),
+            is_error: false,
+            images: vec![],
+        }
+    }
+}
+
+struct WaitAWhileRow;
+
+#[async_trait]
+impl atomcode_plexus::Plugin for WaitAWhileRow {
+    fn name(&self) -> &'static str {
+        "test-wait-a-while"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tools"]
+    }
+    fn description(&self) -> &'static str {
+        "a slow tool"
+    }
+    async fn apply(
+        &self,
+        ctx: &atomcode_plexus::Context,
+        _config: &serde_json::Value,
+    ) -> Result<(), String> {
+        ctx.service::<ToolsSvc>()
+            .ok_or("no tools")?
+            .register(Arc::new(WaitAWhile))
+    }
+}
+
+/// A delegated task is part of the turn that delegated it: stopping that turn
+/// stops the child's, and the tool comes back instead of waiting the child out
+/// (`docs/adr/0023` §9).
+#[tokio::test]
+async fn stopping_the_parent_stops_its_delegated_child() {
+    use atomcode_harness::seams::AgentsSvc;
+    use atomcode_harness::session::SessionEvent;
+
+    let dir = scratch("cascade");
+    let script = delegating_script(
+        "wait for a long time",
+        r#"{ text = "Waiting.", calls = [ { name = "wait_a_while", args = {} } ] },"#,
+    );
+    let slow = "[[insert]]\nname = \"test-wait-a-while\"\n\n\
+                [[patch]]\nid = \"subagent-in-process\"\ndisabled = false\n\
+                config = { allowed_tools = [\"wait_a_while\"] }";
+    let mut registry = plugins::catalog();
+    registry.register(Arc::new(WaitAWhileRow));
+    let mut app = App::new(registry, tree(&dir, &script, &[YOLO, slow]));
+    app.start().await.expect("must mount");
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let started = std::time::Instant::now();
+
+    let stop_the_parent = async {
+        // Once the child is waiting on its tool, stop the parent's turn.
+        loop {
+            let waiting = agents.list().into_iter().any(|agent| {
+                agent.parent().is_some()
+                    && agent
+                        .session()
+                        .events()
+                        .iter()
+                        .any(|e| matches!(e.event, SessionEvent::ToolStarted { .. }))
+            });
+            if waiting {
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the child never started its tool"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        for agent in agents.list() {
+            if agent.parent().is_none() {
+                agent.cancel();
+            }
+        }
+    };
+    let (outcome, ()) = tokio::join!(run_turn(&app, "delegate the wait"), stop_the_parent);
+    let outcome = outcome.unwrap();
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(15),
+        "the parent waited its child out: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(outcome.stop, StopReason::Cancelled);
+    assert!(
+        agents.list().iter().all(|agent| agent.parent().is_none()),
+        "the child is gone"
+    );
+}
+
+/// A delegated child never reads a sensitive path, whatever the approval mode:
+/// nobody is watching it, and an automatic yes is not the person's
+/// (`docs/adr/0023`, addendum).
+#[tokio::test]
+async fn a_delegated_child_never_reads_a_sensitive_path() {
+    use atomcode_harness::events::ToolResultEvent;
+
+    let dir = scratch("sensitive");
+    std::fs::write(dir.join(".env"), "API_KEY=hunter2").unwrap();
+    let script = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [
+  { text = "Reading.", calls = [ { name = "read_file", args = { file_path = ".env" } } ] },
+  { text = "Done." },
+] }
+"#;
+    let app = start(tree(&dir, script, &[YOLO])).await;
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let spy = seen.clone();
+    let _listening = app.context().on_emit::<ToolResultEvent>(
+        move |result: &atomcode_kernel::tool::ToolResult| {
+            spy.lock().unwrap().push(result.content.clone());
+        },
+    );
+
+    let _ = app
+        .context()
+        .service::<SubagentsSvc>()
+        .unwrap()
+        .spawn(atomcode_harness::seams::Delegation {
+            task: "read .env",
+            instructions: "do the task",
+            ..Default::default()
+        })
+        .await;
+
+    let seen = seen.lock().unwrap().join("\n");
+    assert!(
+        !seen.contains("hunter2"),
+        "the child read the secret: {seen}"
+    );
+    assert!(seen.contains("Refused"), "and was told why: {seen}");
+}
+
+/// A child budget of zero rounds is no budget of its own, the way the product's
+/// `[subagent] max_rounds` has always read it — not a budget of nothing.
+#[tokio::test]
+async fn a_child_budget_of_zero_rounds_is_no_budget() {
+    let dir = scratch("unbounded");
+    std::fs::write(dir.join("a.txt"), "one").unwrap();
+    let script = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [
+  { text = "One.", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] },
+  { text = "Two.", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] },
+  { text = "Done." },
+] }
+"#;
+    let unbounded =
+        "[[patch]]\nid = \"subagent-in-process\"\ndisabled = false\nconfig = { max_rounds = 0 }";
+    let app = start(tree(&dir, script, &[YOLO, unbounded])).await;
+    let outcome = app
+        .context()
+        .service::<SubagentsSvc>()
+        .unwrap()
+        .spawn(atomcode_harness::seams::Delegation {
+            task: "read twice",
+            instructions: "do the task",
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(outcome.stop, StopReason::Stopped, "{outcome:?}");
+    assert_eq!(outcome.text, "Done.");
+}
+
+/// A child stops at its own round budget, which is a listener on its own realm
+/// — asked on the tree, it never answered and a child ran as long as it liked.
+#[tokio::test]
+async fn a_child_stops_at_its_own_round_budget() {
+    let dir = scratch("budget");
+    std::fs::write(dir.join("a.txt"), "one").unwrap();
+    let script = r#"
+[[patch]]
+id = "llm"
+name = "llm-replay"
+config = { script = [
+  { text = "One.", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] },
+  { text = "Two.", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] },
+  { text = "Done." },
+] }
+"#;
+    let one =
+        "[[patch]]\nid = \"subagent-in-process\"\ndisabled = false\nconfig = { max_rounds = 1 }";
+    let app = start(tree(&dir, script, &[YOLO, one])).await;
+    let outcome = app
+        .context()
+        .service::<SubagentsSvc>()
+        .unwrap()
+        .spawn(atomcode_harness::seams::Delegation {
+            task: "read twice",
+            instructions: "do the task",
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(outcome.stop, StopReason::MaxRounds, "{outcome:?}");
 }

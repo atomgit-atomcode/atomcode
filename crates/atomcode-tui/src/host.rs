@@ -688,6 +688,9 @@ pub struct Hits {
     /// answer is a fact about how the prompt wrapped — the panel already knows,
     /// and a second copy here would be a second wrapping.
     ask: Option<Rect>,
+    /// Where the team panel was drawn, so a press or the pointer on a row finds
+    /// the agent it switches to.
+    team: Option<Rect>,
 }
 
 impl Hits {
@@ -956,7 +959,7 @@ impl Host {
             stream: RwLock::new(Stream::new()),
             // Empty, like the module registry beside it. Command sets arrive as
             // rows (`crate::rows`); a Host that pre-filled this would make
-            // `[[remove]] id = "tui-commands-tree"` a lie.
+            // `[[remove]] id = "tui-commands-session"` a lie.
             commands: Arc::new(crate::command::Commands::new()),
             menu: RwLock::new(Vec::new()),
             context_menu: RwLock::new(None),
@@ -979,6 +982,120 @@ impl Host {
                 total: 0,
             }),
         }
+    }
+
+    /// Draw another session from here on (`docs/adr/0022` §6).
+    ///
+    /// Each session is a stream of its own, irreversible inside itself; moving
+    /// to another is not a separator drawn into this one. So the stream, how its
+    /// blocks are shown, the measurements taken of it and everything a module
+    /// folded from it go, and the new session's facts start them over. The old
+    /// stream is dropped rather than kept: the session it drew was replaced, and
+    /// there is nothing to switch back to.
+    /// Another session in place of this one: everything drawn goes, and what was
+    /// waiting on this one — a question, the members — goes with it.
+    pub fn switch_session(&self) {
+        self.switch_view();
+        // A question belongs to a turn of the session that asked it.
+        self.asks.refuse_all();
+        let mut m = self.moment.write().expect("moment poisoned");
+        m.members.clear();
+        m.team_cursor = None;
+    }
+
+    /// The screen, emptied to draw another agent of the same session — the lead
+    /// or one of its members (`docs/adr/0023` §3). Their questions stay, and so
+    /// does the team: only what was drawn from the one on screen goes.
+    pub fn switch_view(&self) {
+        *self.stream.write().expect("stream poisoned") = Stream::new();
+        *self.presentation.write().expect("presentation poisoned") = Presentation::default_folds();
+        *self.row_index.lock().expect("row index poisoned") = RowIndex {
+            width: 0,
+            presentation: 0,
+            measured: Vec::new(),
+            rows: Vec::new(),
+            skip_from: Vec::new(),
+            total: 0,
+        };
+        for producer in self.modules.producers() {
+            producer.reset();
+        }
+        for id in self.modules.view_ids() {
+            if let Some(view) = self.modules.view(id) {
+                view.reset();
+            }
+        }
+        let mut m = self.moment.write().expect("moment poisoned");
+        m.activity = crate::moment::Activity::Idle;
+        m.scroll = crate::moment::ScrollPos::BOTTOM;
+        m.selection = None;
+        m.turn_started = None;
+        m.steering.clear();
+    }
+
+    /// Which team panel row a screen point is on, when it is a row that switches
+    /// — read off the rect the panel was drawn in, like [`Host::answer_row_at`].
+    pub fn team_row_at(&self, x: u16, y: u16) -> Option<usize> {
+        let rect = *self.hits.lock().expect("hits poisoned").team.as_ref()?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        crate::modules::team::target_at_line(&m, (y - rect.y) as usize)
+    }
+
+    /// Whether the team panel has the keyboard.
+    pub fn team_focused(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .team_cursor
+            .is_some()
+    }
+
+    /// Give the team panel the keyboard, pointing at the agent on screen. `false`
+    /// when there is no team to switch between.
+    pub fn focus_team(&self) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let targets = crate::modules::team::targets(&m);
+        if targets.is_empty() {
+            return false;
+        }
+        let here = targets.iter().position(|s| *s == m.viewing).unwrap_or(0);
+        m.team_cursor = Some(here);
+        true
+    }
+
+    /// Point at `row` of the team panel, clamped to the rows there are; with the
+    /// keyboard elsewhere this also lights it, which is what a pointer over it
+    /// means.
+    pub fn point_team_at(&self, row: usize) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let last = crate::modules::team::targets(&m).len().saturating_sub(1);
+        let row = row.min(last);
+        if m.team_cursor == Some(row) {
+            return false;
+        }
+        m.team_cursor = Some(row);
+        true
+    }
+
+    /// Move the team panel's pointer by `delta` rows, clamped.
+    pub fn move_team_by(&self, delta: i32) -> bool {
+        let cur = self
+            .moment
+            .read()
+            .expect("moment poisoned")
+            .team_cursor
+            .unwrap_or(0) as i32;
+        self.point_team_at((cur + delta).max(0) as usize)
+    }
+
+    /// Hand the keyboard back to the composer. What was pointed at, if anything.
+    pub fn unfocus_team(&self) -> Option<String> {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let cursor = m.team_cursor.take()?;
+        crate::modules::team::targets(&m).get(cursor).cloned()
     }
 
     /// Deliver one committed fact to every module.
@@ -1848,6 +1965,7 @@ impl Host {
                         jump: None,
                         field: None,
                         ask: None,
+                        team: None,
                     };
                     *self.last_room.lock().expect("room poisoned") = rect;
                     // The **blocks'** rect, not the pane's. The badge reports
@@ -1904,6 +2022,9 @@ impl Host {
                     if id == crate::modules::input::ID {
                         frame.cursor = Some(crate::modules::input::caret(&moment, rect));
                         self.hits.lock().expect("hits poisoned").field = Some(rect);
+                    }
+                    if id == crate::modules::team::ID {
+                        self.hits.lock().expect("hits poisoned").team = Some(rect);
                     }
                     frame.place(id, rect, lines);
                 }
@@ -2273,9 +2394,9 @@ impl Host {
     ///
     /// The frame has them — they came out of the `Region::Stream` it is
     /// composing. Reading the tree again would be a second answer, and the two
-    /// can differ: `adjust_layout` runs on another thread, so a preset switched
-    /// between the layout and the compose would have this frame draw the old
-    /// arrangement's tail while the flex above placed the new one's.
+    /// can differ: a panel row mounting on another thread between the layout
+    /// and the compose would have this frame draw the old arrangement's tail
+    /// while the flex above placed the new one's.
     fn tail_heights_of(&self, ids: &[String], width: u16, moment: &Moment) -> Vec<(String, u16)> {
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
@@ -2394,12 +2515,10 @@ fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16
 
 /// The view modules whose rows ride at the foot of the conversation.
 ///
-/// **One list, in one place.** Three trees have to agree about it — the shipped
-/// [`default_layout`] and the `focus` and `wide` presets — and a tree that
-/// forgot one would not be caught by the check that refuses a module named
-/// twice: naming it *nowhere* is not naming it twice. Everything that builds a
-/// scroll region goes through [`scroll_region`], so the list is added to once
-/// or not at all.
+/// **One list, in one place.** Every tree that builds a scroll region goes
+/// through [`scroll_region`], and a tree that forgot one would not be caught by
+/// the check that refuses a module named twice: naming it *nowhere* is not
+/// naming it twice. So the list is added to once or not at all.
 ///
 /// What belongs here is "what this turn is working through", which is worth
 /// scrolling back for. What does not is the frame — the input box, the tip row,
@@ -2697,19 +2816,12 @@ mod tests {
 
     /// Every tree this build ships, by name.
     fn shipped_trees() -> Vec<(String, Region)> {
-        let mut trees = vec![("default".to_string(), default_layout())];
-        for (name, _) in crate::layout::presets() {
-            trees.push((
-                name.to_string(),
-                crate::layout::preset_for_test(name).expect("every listed preset resolves"),
-            ));
-        }
-        trees
+        vec![("default".to_string(), default_layout())]
     }
 
     #[test]
     fn the_layout_this_build_ships_names_no_module_twice() {
-        // `default_layout()` and every preset are trees that never pass through
+        // `default_layout()` is a tree that never passes through
         // `Layout::apply`, which is where a tail id that is also a leaf gets
         // refused. A shipped tree that named one twice would draw it twice on
         // every frame, and nothing else in the suite would notice — `compose`
@@ -2727,7 +2839,7 @@ mod tests {
     fn every_shipped_tree_rides_the_tail_exactly_once() {
         // The other direction, and the one `named_twice` cannot see: a tree that
         // names a tail module **nowhere** is not naming it twice, so dropping
-        // the tail from one preset would leave that arrangement quietly missing
+        // the tail from a shipped tree would leave that arrangement quietly missing
         // its task list while every other check stayed green.
         //
         // "Exactly once" rather than "at least once" because the two faults are
@@ -2862,105 +2974,6 @@ mod tests {
         mods.add_view(Arc::new(Mounted::<status::Status>::new()))
             .unwrap();
         Host::new(mods, default_layout())
-    }
-
-    /// The same tree with one module id renamed, for exercising an arrangement
-    /// whose side panel is a module that is not mounted in this build.
-    fn replace_named(region: &Region, from: &str, to: &str) -> Region {
-        match region {
-            Region::Module(id) if id == from => Region::view(to),
-            Region::Module(_) => region.clone(),
-            Region::Stream { tail } => Region::Stream {
-                tail: tail
-                    .iter()
-                    .map(|t| if t == from { to.to_string() } else { t.clone() })
-                    .collect(),
-            },
-            Region::Flex { dir, items, gap } => Region::Flex {
-                dir: *dir,
-                gap: *gap,
-                items: items
-                    .iter()
-                    .map(|it| crate::el::Item {
-                        basis: it.basis,
-                        grow: it.grow,
-                        el: replace_named(&it.el, from, to),
-                    })
-                    .collect(),
-            },
-            Region::Stack(children) => Region::Stack(
-                children
-                    .iter()
-                    .map(|c| replace_named(c, from, to))
-                    .collect(),
-            ),
-            other => other.clone(),
-        }
-    }
-
-    #[test]
-    fn the_wide_layout_puts_the_tail_in_the_conversations_column() {
-        // `wide` splits the conversation off from `findings`, so the scroll
-        // region is 65% of the screen. The tail rides the *stream*, which means
-        // it shrinks into that column with it — a change from before ADR 0020,
-        // where the task list was a full-width band under the conversation.
-        //
-        // Pinned here because nothing else would notice: the panel is on screen
-        // and has the right rows either way, and only its width says which
-        // column it ended up in.
-        let mods = Arc::new(Modules::new());
-        mods.add_producer(transcript::Transcript::new()).unwrap();
-        mods.add_view(Arc::new(Mounted::<crate::modules::todo::Todo>::new()))
-            .unwrap();
-        mods.add_view(Arc::new(Mounted::<input::Input>::new()))
-            .unwrap();
-        mods.add_view(Arc::new(Mounted::<status::Status>::new()))
-            .unwrap();
-        // `team`, not `findings`: the latter is the layout's example of a name
-        // that is never mounted, so `prune` collapses it away and the wide
-        // arrangement becomes a single column — which would make this judgement
-        // about nothing. The tree still says what the real one says.
-        mods.add_view(Arc::new(Mounted::<crate::modules::team::Team>::new()))
-            .unwrap();
-        let mut wide = crate::layout::preset_for_test("wide").expect("the wide preset resolves");
-        wide = replace_named(&wide, "findings", crate::modules::team::ID);
-        let h = Host::new(mods, wide);
-        h.absorb(&SessionEvent::AssistantMessage {
-            turn: 1,
-            round: 1,
-            text: String::new(),
-            reasoning: String::new(),
-            tool_calls: vec![atomcode_kernel::tool::ToolCall {
-                id: "t1".into(),
-                name: "todowrite".into(),
-                arguments: serde_json::json!({
-                    "todos": [ { "content": "only", "status": "in_progress" } ]
-                })
-                .to_string(),
-            }],
-            reasoning_blocks: Vec::new(),
-            meta: None,
-        });
-
-        let size = (100, 24);
-        let frame = h.compose(size);
-        let todo = frame.part("todo").expect("the plan is up");
-        let stream = frame.part("stream").expect("the conversation").rect;
-        assert_eq!(
-            todo.rect.w, stream.w,
-            "the tail is in the conversation's column, not the whole screen"
-        );
-        assert_eq!(todo.rect.x, stream.x, "and against its left edge");
-        // 65% of 100, which is what `wide` splits the conversation off at. The
-        // number is stated rather than derived from `findings`' rect: the side
-        // panel is `Hug(0)` when it has nothing to show, so it is not on screen
-        // here and cannot be measured — which is an arrangement worth knowing
-        // about, not a detail to paper over.
-        assert_eq!(todo.rect.w, 65, "the column, not the screen");
-        assert!(
-            stream.right() <= size.0,
-            "and inside the screen: {stream:?}"
-        );
     }
 
     #[test]

@@ -83,13 +83,21 @@ pub struct SteeredInput {
 /// `Stopped` is the NORMAL terminal (the model emitted no tool calls and the
 /// `offer_continuation` hook did not continue), and is the `Default` so `Outcome::default()`
 /// still compiles.
+///
+/// **The only one.** The harness used to keep a second `StopReason` for the
+/// session log's `TurnEnd`, and its pump translated one into the other, folding
+/// three causes into `MaxRounds` / `ProviderError` on the way — so a front end
+/// read one reason in the log and another on the handle (`docs/adr/0021` §6).
+/// Serialized by variant name, which is also how the log stored the harness's
+/// copy; `InputRejected` is that copy's name for [`Self::PromptRejected`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum StopReason {
     /// Normal completion: model produced no tool calls and `offer_continuation` returned None.
     #[default]
     Stopped,
-    /// The `max_rounds` safety fuse tripped (too many LLM rounds this turn).
+    /// The round budget ran out: the `max_rounds` cap was reached and nobody
+    /// granted more (a person at a round-cap checkpoint, or no one to ask).
     MaxRounds,
     /// The `max_continuations` safety fuse tripped (a `offer_continuation` hook
     /// kept injecting continuations with no model agency to stop — a runaway loop).
@@ -108,7 +116,9 @@ pub enum StopReason {
     Timeout,
     /// The turn was cooperatively cancelled (`AgentCommand::Cancel`).
     Cancelled,
-    /// A `user_prompt_submit` hook rejected the prompt — no turn ran.
+    /// The input was refused before a step ran: a `user_prompt_submit` hook
+    /// rejected the prompt, or a pre-step listener rejected the claimed input.
+    #[serde(alias = "InputRejected")]
     PromptRejected,
     /// A tool middleware enforced a hard policy boundary. The blocked tool
     /// result was persisted before the turn terminated, so provider pairing is valid.
@@ -116,6 +126,35 @@ pub enum StopReason {
     /// The provider returned 429 and the host chose to PAUSE (reset too far to
     /// wait out). Not a failure — already-produced content is preserved.
     RateLimited,
+    /// A stopping policy other than the round budget ended the turn — a
+    /// deadline, a cost ceiling.
+    StoppedByPolicy,
+    /// The loop's own coarse runaway fuse. Not a policy: it exists so a loop with
+    /// no stopping policy at all still terminates.
+    RunawayFuse,
+    /// Something reached the model that the session log cannot explain. The turn
+    /// is stopped rather than continued: a prompt nobody can reconstruct makes
+    /// resume, fork and compaction unsound from here on.
+    InvariantViolated,
+}
+
+impl StopReason {
+    /// The reason as drivers of the coding runtime's own protocol have always
+    /// seen it: the three causes the harness pump used to fold away are folded
+    /// the same way here.
+    ///
+    /// Transitional. Those drivers (tuix, daemon, ACP, clix) and the lifecycle
+    /// hooks behind them match on the folded set; applying this where the runtime
+    /// takes a reason off the tree keeps their behaviour unchanged while the tree
+    /// and its new front end carry the real cause. Delete with the runtime's
+    /// driver protocol (`docs/tui-replaces-tuix-plan.md` M6).
+    pub fn folded_for_runtime_drivers(self) -> Self {
+        match self {
+            Self::StoppedByPolicy | Self::RunawayFuse => Self::MaxRounds,
+            Self::InvariantViolated => Self::ProviderError,
+            other => other,
+        }
+    }
 }
 
 /// Driver → agent. Serializable so it crosses process/network boundaries
@@ -168,6 +207,84 @@ pub enum AgentCommand {
     },
     Cancel,
     Shutdown,
+    /// Any command, carrying an id the driver chose, so the agent can answer
+    /// *this* command: [`AgentEvent::Accepted`] or [`AgentEvent::Rejected`] with
+    /// the same id (`docs/adr/0021` §7).
+    ///
+    /// An envelope rather than a field on every command, so a driver that does
+    /// not want receipts sends what it always sent. The id never reaches the
+    /// session log; an ACP JSON-RPC request id maps onto it directly.
+    Tagged {
+        id: CommandId,
+        command: Box<AgentCommand>,
+    },
+    /// Start receiving a session's facts as [`AgentEvent::Fact`]: every fact
+    /// from `from` on that is already in its log, then each new one as it is
+    /// committed — in order, none twice, none skipped (`docs/adr/0022` §1).
+    ///
+    /// Any session this agent can reach by id: its own, or a team member's.
+    /// Content reaches a front end only this way; events carry status.
+    Subscribe {
+        session: String,
+        #[serde(default)]
+        from: crate::session::SeqNo,
+    },
+    /// Stop receiving a session's facts.
+    Unsubscribe {
+        session: String,
+    },
+    /// Run a command from a session's catalog (`docs/adr/0021` §10). `id` is
+    /// the receipt: `Accepted` or `Rejected` names it, and so does the
+    /// `Invoked` that carries the result. `session` is what the command acts
+    /// on — the session, or one agent in it, as the catalog entry says.
+    Invoke {
+        id: CommandId,
+        session: String,
+        name: String,
+        #[serde(default)]
+        args: String,
+    },
+    /// `command`, for the agent behind `session` rather than the one this
+    /// connection drives — a team member the person is talking to, cancelling
+    /// or compacting (`docs/adr/0021` §9, `docs/adr/0023` §4, §8). An envelope,
+    /// like [`Self::Tagged`], so no command grows an address field it only
+    /// sometimes needs.
+    To {
+        session: String,
+        command: Box<AgentCommand>,
+    },
+}
+
+/// A driver's name for one command, echoed back on its receipt.
+pub type CommandId = String;
+
+impl AgentCommand {
+    /// The command inside any [`AgentCommand::Tagged`] envelopes, for a loop that
+    /// sends no receipts and so has no use for the id.
+    pub fn untagged(self) -> Self {
+        match self {
+            Self::Tagged { command, .. } => command.untagged(),
+            other => other,
+        }
+    }
+}
+
+/// Why a tagged command was refused on the spot (`docs/adr/0021` §8).
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommandError {
+    /// The question being answered is no longer waiting for an answer.
+    StaleQuestion,
+    /// There is no turn running for this to act on.
+    NotRunning,
+    /// The agent cannot take commands now, or at all any more.
+    Unavailable,
+    /// Not now: something the agent is doing has to finish first.
+    Busy { reason: String },
+    /// Nothing by that id is here — a session this agent cannot reach.
+    NotFound,
+    /// A command this agent has no answer for.
+    Unsupported,
 }
 
 /// One call inside a `ToolBatchStarted` payload — everything the driver/UI
@@ -203,6 +320,10 @@ pub enum ContextSource {
     Continuation,
     /// A summary standing in for history that was dropped.
     CompactionSummary,
+    /// What the person said directly to a team member, shown to the lead.
+    PersonToMember { member: String },
+    /// Something about a team member the lead should know without being woken.
+    TeamNote { member: String },
 }
 
 /// Agent → driver. Serializable for the same reason. The id-correlated
@@ -212,7 +333,65 @@ pub enum ContextSource {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AgentEvent {
     /// A turn began (perception granularity).
-    TurnStarted,
+    ///
+    /// `turn` is the session log's turn number when the agent keeps a log — the
+    /// same number as the [`Self::TurnComplete`] that closes it and the
+    /// [`Self::Accepted`] of every message it answered. `None` from a source that
+    /// numbers no turns.
+    TurnStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<u64>,
+    },
+    /// A tagged command was taken (`docs/adr/0021` §7).
+    ///
+    /// For a message: `turn` is the turn that answers it, and `steered` says it
+    /// was folded into that turn while it was already running rather than
+    /// starting it. Commands that belong to no turn (a compaction, a snapshot, an
+    /// answer) are accepted with `turn: None`.
+    Accepted {
+        command: CommandId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<u64>,
+        #[serde(default)]
+        steered: bool,
+    },
+    /// A tagged command was refused on the spot. Nothing it asked for happened.
+    Rejected {
+        command: CommandId,
+        error: CommandError,
+    },
+    /// One fact of a session this driver subscribed to
+    /// ([`AgentCommand::Subscribe`]). The session log is the content; a screen is
+    /// a fold over these (`docs/adr/0022` §1).
+    ///
+    /// Boxed, like the descriptions below: a fact is the largest thing this
+    /// enum carries, and every event on every channel would otherwise be as
+    /// large as one.
+    Fact(Box<crate::session::Committed>),
+    /// The agent behind a session just subscribed to, described. Sent first
+    /// on every subscription (`docs/adr/0022` §5).
+    Described {
+        description: Box<crate::agent::AgentDescription>,
+    },
+    /// A member joined a subscribed session. Followed by its status; also sent
+    /// for each member already there when the subscription starts.
+    AgentAdded {
+        description: Box<crate::agent::AgentDescription>,
+    },
+    /// What an `Invoke` produced, for a person to read.
+    Invoked {
+        id: CommandId,
+        output: String,
+    },
+    /// A member of a subscribed session is gone.
+    AgentRemoved {
+        session: String,
+    },
+    /// A subscribed session's agent, or one of its members, changed status.
+    StatusChanged {
+        session: String,
+        status: crate::agent::AgentStatus,
+    },
     TextDelta(String),
     /// **Model-visible context the person did not type.**
     ///
@@ -301,7 +480,12 @@ pub enum AgentEvent {
     /// `MaxContinuations`/`RepeatLoop`/`ToolLoopDetected`/`Cancelled`/
     /// `PromptRejected`/`PolicyDenied`). A driver can no longer mistake a failed turn for an empty
     /// success.
+    ///
+    /// Exactly one per [`Self::TurnStarted`], with the same `turn` — cancelled,
+    /// failed and shut-down turns included.
     TurnComplete {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<u64>,
         reason: StopReason,
     },
     /// A failure (failed open / mid-stream / timeout / max-rounds / prompt-rejected /
@@ -382,6 +566,9 @@ pub enum AgentEvent {
     /// a round boundary. `count` folded this round. Drivers relabel their
     /// type-ahead indicator from "queued" to "folded into current turn".
     Steered {
+        /// The running turn the inputs were folded into.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<u64>,
         count: usize,
         /// Exact inputs folded at this boundary. Additive for wire
         /// compatibility: older events deserialize with an empty list.
@@ -428,6 +615,175 @@ pub enum AgentEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tagged command crosses the wire whole, and the events that answer it
+    /// read without the fields an older peer does not send (`docs/adr/0021` §7).
+    #[test]
+    fn receipts_and_turn_numbers_cross_the_wire() {
+        let command = AgentCommand::Tagged {
+            id: "req-7".into(),
+            command: Box::new(AgentCommand::SendMessage {
+                text: "hi".into(),
+                images: Vec::new(),
+            }),
+        };
+        let back: AgentCommand =
+            serde_json::from_str(&serde_json::to_string(&command).unwrap()).unwrap();
+        assert!(matches!(
+            back.clone(),
+            AgentCommand::Tagged { id, command } if id == "req-7"
+                && matches!(*command, AgentCommand::SendMessage { ref text, .. } if text == "hi")
+        ));
+        assert!(matches!(back.untagged(), AgentCommand::SendMessage { .. }));
+
+        let old: AgentEvent =
+            serde_json::from_str(r#"{"TurnComplete":{"reason":"Stopped"}}"#).unwrap();
+        assert!(matches!(
+            old,
+            AgentEvent::TurnComplete {
+                turn: None,
+                reason: StopReason::Stopped
+            }
+        ));
+        let accepted = AgentEvent::Accepted {
+            command: "req-7".into(),
+            turn: Some(3),
+            steered: true,
+        };
+        let json = serde_json::to_string(&accepted).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<AgentEvent>(&json).unwrap(),
+            AgentEvent::Accepted {
+                turn: Some(3),
+                steered: true,
+                ..
+            }
+        ));
+    }
+
+    /// What a subscriber is told about an agent crosses the wire whole, and a
+    /// description written before a field existed still reads.
+    #[test]
+    fn agent_descriptions_and_status_cross_the_wire() {
+        use crate::agent::{AgentDescription, AgentStatus, MemberIdentity};
+        use crate::provider::ReasoningEffort;
+
+        let description = AgentDescription {
+            session: "lead/scout".into(),
+            parent: Some("lead".into()),
+            member: Some(MemberIdentity {
+                name: "scout".into(),
+                role: "explorer".into(),
+            }),
+            model: Some("glm-5".into()),
+            supports_vision: true,
+            reasoning_effort: Some(ReasoningEffort::Low),
+            compaction: true,
+            commands: vec![crate::agent::CommandDescription {
+                name: "stop".into(),
+                usage: Some("<member>".into()),
+                summary: "stop a member".into(),
+                target: crate::agent::CommandTarget::Agent,
+            }],
+        };
+        for event in [
+            AgentEvent::Described {
+                description: Box::new(description.clone()),
+            },
+            AgentEvent::AgentAdded {
+                description: Box::new(description.clone()),
+            },
+            AgentEvent::AgentRemoved {
+                session: "lead/scout".into(),
+            },
+            AgentEvent::StatusChanged {
+                session: "lead/scout".into(),
+                status: AgentStatus::Stopping,
+            },
+            AgentEvent::Invoked {
+                id: "i-1".into(),
+                output: "stopped: scout".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            let back =
+                serde_json::to_string(&serde_json::from_str::<AgentEvent>(&json).unwrap()).unwrap();
+            assert_eq!(json, back);
+        }
+
+        for command in [
+            AgentCommand::Invoke {
+                id: "i-1".into(),
+                session: "lead/scout".into(),
+                name: "stop".into(),
+                args: "scout".into(),
+            },
+            AgentCommand::To {
+                session: "lead/scout".into(),
+                command: Box::new(AgentCommand::Tagged {
+                    id: "m-1".into(),
+                    command: Box::new(AgentCommand::SendMessage {
+                        text: "use the other file".into(),
+                        images: Vec::new(),
+                    }),
+                }),
+            },
+        ] {
+            let json = serde_json::to_string(&command).unwrap();
+            assert_eq!(
+                json,
+                serde_json::to_string(&serde_json::from_str::<AgentCommand>(&json).unwrap())
+                    .unwrap()
+            );
+        }
+
+        let sparse: AgentDescription = serde_json::from_str(r#"{"session":"s"}"#).unwrap();
+        assert_eq!(
+            sparse,
+            AgentDescription {
+                session: "s".into(),
+                ..Default::default()
+            }
+        );
+    }
+
+    /// The harness's own copy logged a refused input as `InputRejected`; the one
+    /// enum still reads that name.
+    #[test]
+    fn a_stop_reason_logged_under_the_harness_name_still_reads() {
+        let reason: StopReason = serde_json::from_str("\"InputRejected\"").unwrap();
+        assert_eq!(reason, StopReason::PromptRejected);
+        assert_eq!(
+            serde_json::to_string(&StopReason::RunawayFuse).unwrap(),
+            "\"RunawayFuse\""
+        );
+    }
+
+    /// What the coding runtime's drivers are handed is exactly what the harness
+    /// pump used to hand them: the three causes it folded, folded the same way,
+    /// and every other reason untouched.
+    #[test]
+    fn runtime_drivers_see_the_causes_the_pump_used_to_fold_folded_the_same_way() {
+        use StopReason::*;
+        for (reason, seen) in [
+            (StoppedByPolicy, MaxRounds),
+            (RunawayFuse, MaxRounds),
+            (InvariantViolated, ProviderError),
+            (Stopped, Stopped),
+            (MaxRounds, MaxRounds),
+            (MaxContinuations, MaxContinuations),
+            (RepeatLoop, RepeatLoop),
+            (ToolLoopDetected, ToolLoopDetected),
+            (ProviderError, ProviderError),
+            (Timeout, Timeout),
+            (Cancelled, Cancelled),
+            (PromptRejected, PromptRejected),
+            (PolicyDenied, PolicyDenied),
+            (RateLimited, RateLimited),
+        ] {
+            assert_eq!(reason.folded_for_runtime_drivers(), seen, "{reason:?}");
+        }
+    }
 
     #[test]
     fn send_message_serde_is_additive_for_images() {
@@ -488,11 +844,11 @@ mod tests {
             old,
             AgentEvent::Steered {
                 count: 1,
-                inputs
-            } if inputs.is_empty()
+                inputs, .. } if inputs.is_empty()
         ));
 
         let event = AgentEvent::Steered {
+            turn: None,
             count: 1,
             inputs: vec![SteeredInput {
                 text: "follow up".into(),
@@ -505,8 +861,7 @@ mod tests {
             roundtrip,
             AgentEvent::Steered {
                 count: 1,
-                inputs
-            } if inputs == vec![SteeredInput {
+                inputs, .. } if inputs == vec![SteeredInput {
                 text: "follow up".into(),
                 images: Vec::new(),
             }]

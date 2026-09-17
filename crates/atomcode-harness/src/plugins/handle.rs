@@ -179,9 +179,9 @@ impl Projector {
         event: &SessionEvent,
     ) -> Vec<AgentEvent> {
         match event {
-            SessionEvent::TurnStart { .. } => {
+            SessionEvent::TurnStart { turn } => {
                 self.said_this_turn = 0;
-                vec![AgentEvent::TurnStarted]
+                vec![AgentEvent::TurnStarted { turn: Some(*turn) }]
             }
 
             SessionEvent::AssistantChunk {
@@ -425,7 +425,7 @@ impl Projector {
                 }]
             }
 
-            SessionEvent::TurnEnd { stop, error, .. } => {
+            SessionEvent::TurnEnd { turn, stop, error } => {
                 let mut out = Vec::new();
                 if let Some(message) = error {
                     out.push(AgentEvent::Error {
@@ -439,7 +439,8 @@ impl Projector {
                     out.push(AgentEvent::Cancelled);
                 }
                 out.push(AgentEvent::TurnComplete {
-                    reason: stop_reason(*stop),
+                    turn: Some(*turn),
+                    reason: *stop,
                 });
                 out
             }
@@ -459,13 +460,14 @@ impl Projector {
             // driver was never told, so a UI could not say "your message was
             // folded into this turn". The reference engine announces it; a
             // differential run showed this as the only difference on that path.
-            SessionEvent::UserMessage { text, images, .. } => {
+            SessionEvent::UserMessage { turn, text, images } => {
                 if self.said_this_turn == 0 {
                     self.said_this_turn = 1;
                     Vec::new()
                 } else {
                     self.said_this_turn += 1;
                     vec![AgentEvent::Steered {
+                        turn: Some(*turn),
                         count: 1,
                         inputs: vec![atomcode_kernel::event::SteeredInput {
                             text: text.clone(),
@@ -492,6 +494,12 @@ impl Projector {
                         In::Continuation => Out::Continuation,
                         In::InternalNudge => Out::Continuation,
                         In::CompactionSummary => Out::CompactionSummary,
+                        In::PersonToMember { member } => Out::PersonToMember {
+                            member: member.clone(),
+                        },
+                        In::TeamNote { member } => Out::TeamNote {
+                            member: member.clone(),
+                        },
                     },
                 }]
             }
@@ -513,37 +521,21 @@ impl Projector {
             // says `Cancelled`. What changed is the model's view, which is the
             // log's business.
             | SessionEvent::Interrupted { .. } => Vec::new(),
+            // `SessionEvent` is the kernel's and `non_exhaustive` (`docs/adr/0024`
+            // §6), so this match can no longer refuse to compile when a fact is
+            // added. The list above stays explicit on purpose: every fact the
+            // harness knows is decided here, by name. A fact added later is
+            // silent until someone adds it to the list.
+            _ => Vec::new(),
         }
     }
 }
 
-/// This harness's stop reasons, in the driver's vocabulary.
-///
-/// Where the two disagree the mapping is deliberate rather than clever:
-/// `StoppedByPolicy` and `RunawayFuse` are both budgets running out, and
-/// `InvariantViolated` has no counterpart at all — it rides out as a failure
-/// with the real cause in the `Error` that precedes it, because the one thing a
-/// driver must never do is read it as a clean stop.
-/// The kernel protocol's name for why a turn ended. Public so a host that runs
-/// kernel-shaped hooks at the harness's moments says the same thing the driver
-/// is told.
-pub fn stop_reason(stop: crate::seams::StopReason) -> atomcode_kernel::event::StopReason {
-    use crate::seams::StopReason as In;
-    use atomcode_kernel::event::StopReason as Out;
-    match stop {
-        In::Stopped => Out::Stopped,
-        In::MaxRounds | In::StoppedByPolicy | In::RunawayFuse => Out::MaxRounds,
-        In::ProviderError | In::InvariantViolated => Out::ProviderError,
-        In::ToolLoopDetected => Out::ToolLoopDetected,
-        In::Cancelled => Out::Cancelled,
-        In::InputRejected => Out::PromptRejected,
-        In::PolicyDenied => Out::PolicyDenied,
-        In::RateLimited => Out::RateLimited,
-        In::Timeout => Out::Timeout,
-    }
-}
-
 // ---- inward: asking the driver ------------------------------------------
+
+/// Questions waiting on an answer: who asked (the asking agent's session) and
+/// where the answer goes.
+type Pending = HashMap<RequestId, (Option<String>, oneshot::Sender<Value>)>;
 
 /// The half that asks. Fills both the `approval` and `user-questions` seams,
 /// because a driver that can render a prompt can answer either.
@@ -557,7 +549,10 @@ struct Asker {
     /// the tree — so a sender it held forever would keep the event channel
     /// open forever, and a driver reading to the end would never reach one.
     events: Mutex<Option<mpsc::UnboundedSender<AgentEvent>>>,
-    pending: Mutex<HashMap<RequestId, oneshot::Sender<Value>>>,
+    /// Every question still waiting, with the session of the agent that asked
+    /// it: cancelling one agent refuses its questions and nobody else's
+    /// (`docs/adr/0023` §6).
+    pending: Mutex<Pending>,
     next_id: AtomicU64,
     /// Calls the driver said to stop asking about, as `{tool}::{scope}`.
     ///
@@ -599,7 +594,7 @@ impl Asker {
     fn answer(&self, id: RequestId, value: Value) -> bool {
         let waiting = self.pending.lock().expect("pending poisoned").remove(&id);
         match waiting {
-            Some(tx) => tx.send(value).is_ok(),
+            Some((_, tx)) => tx.send(value).is_ok(),
             None => false,
         }
     }
@@ -620,6 +615,24 @@ impl Asker {
             .expect("pending poisoned")
             .drain()
             .collect();
+        for (_, (_, tx)) in waiting {
+            let _ = tx.send(Value::Null);
+        }
+    }
+
+    /// Every question `session`'s agent is waiting on, refused.
+    fn refuse_asked_by(&self, session: &str) {
+        let waiting: Vec<_> = {
+            let mut pending = self.pending.lock().expect("pending poisoned");
+            let ids: Vec<RequestId> = pending
+                .iter()
+                .filter(|(_, (asker, _))| asker.as_deref() == Some(session))
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| pending.remove(&id))
+                .collect()
+        };
         for (_, tx) in waiting {
             let _ = tx.send(Value::Null);
         }
@@ -630,17 +643,24 @@ impl Asker {
     async fn request(&self, kind: &str, payload: Value) -> Option<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
+        // Whose turn is asking: a question is refused when that agent is
+        // stopped, not when some other one is.
+        let asker = crate::agent::current()
+            .and_then(|ctx| ctx.service::<SessionSvc>())
+            .map(|log| log.id().to_string());
         self.pending
             .lock()
             .expect("pending poisoned")
-            .insert(id, tx);
+            .insert(id, (asker, tx));
         let sent = match self.events.lock().expect("events poisoned").as_ref() {
             Some(events) => events.send(AgentEvent::Request {
                 id,
                 kind: kind.to_string(),
                 payload,
             }),
-            None => Err(mpsc::error::SendError(AgentEvent::TurnStarted)),
+            None => Err(mpsc::error::SendError(AgentEvent::TurnStarted {
+                turn: None,
+            })),
         };
         // Nobody on the other end: a refusal, not a wait.
         if sent.is_err() {
@@ -816,6 +836,9 @@ pub trait Answers: Send + Sync {
     fn answer(&self, id: RequestId, value: Value) -> bool;
     /// Every pending question, refused at once.
     fn refuse_all(&self);
+    /// Every question the agent of `session` is waiting on, refused — and only
+    /// those: stopping one agent must not refuse another's approval.
+    fn refuse_asked_by(&self, session: &str);
     /// No more questions; whatever is still waiting is refused.
     fn close(&self);
 }
@@ -827,9 +850,163 @@ impl Answers for Asker {
     fn refuse_all(&self) {
         Asker::refuse_all(self)
     }
+    fn refuse_asked_by(&self, session: &str) {
+        Asker::refuse_asked_by(self, session)
+    }
     fn close(&self) {
         Asker::close(self)
     }
+}
+
+/// For an agent driven by a pump that holds no questions of its own — a team
+/// member, a delegated child. Their questions reach the person through the
+/// tree's own asker, which refuses them when the agent stops.
+pub struct NoAnswers;
+
+impl Answers for NoAnswers {
+    fn answer(&self, _id: RequestId, _value: Value) -> bool {
+        false
+    }
+    fn refuse_all(&self) {}
+    fn refuse_asked_by(&self, _session: &str) {}
+    fn close(&self) {}
+}
+
+// ---- a person's reach into the team ----------------------------------------
+
+/// Receipts of messages a connection sent to team members.
+///
+/// A member claims such a message in its own realm, which only the tree sees,
+/// so the receipt is watched for there and sent back on the connection that
+/// asked for it (`docs/adr/0021` §7).
+#[derive(Default)]
+pub struct Forwarded {
+    waiting: Mutex<HashSet<atomcode_kernel::event::CommandId>>,
+}
+
+impl Forwarded {
+    pub fn new() -> Arc<Self> {
+        Arc::default()
+    }
+
+    /// Listen on `tree` for the claims, answering on `events`.
+    pub fn listen(
+        self: &Arc<Self>,
+        tree: &Context,
+        events: mpsc::UnboundedSender<AgentEvent>,
+    ) -> atomcode_plexus::Disposable {
+        let forwarded = self.clone();
+        tree.on_emit::<crate::events::InputClaimed>(move |input: &crate::events::ClaimedInput| {
+            if forwarded
+                .waiting
+                .lock()
+                .expect("forwarded poisoned")
+                .remove(&input.receipt)
+            {
+                let _ = events.send(AgentEvent::Accepted {
+                    command: input.receipt.clone(),
+                    turn: Some(input.turn),
+                    steered: input.steered,
+                });
+            }
+        })
+    }
+}
+
+/// A command a person addressed to a team member (`docs/adr/0023` §4, §8):
+/// a message, taken as the person's; a cancel of its turn; a compaction between
+/// its turns.
+///
+/// `Ok(Some(turn))` is taken now; `Ok(None)` is taken when the member claims
+/// it, and the receipt comes through `forwarded`. Only an agent delegated from
+/// another is reachable this way — another conversation in the same tree is
+/// not the sender's to steer.
+pub fn command_member(
+    ctx: &Context,
+    session: &str,
+    command: AgentCommand,
+    receipt: Option<&atomcode_kernel::event::CommandId>,
+    forwarded: &Forwarded,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+) -> Result<Option<Option<u64>>, atomcode_kernel::event::CommandError> {
+    use atomcode_kernel::event::CommandError;
+    let target = crate::feed::Feed::find(ctx, session)
+        .filter(|target| target.parent().is_some())
+        .ok_or(CommandError::NotFound)?;
+    match command {
+        AgentCommand::SendMessage { text, images } => {
+            if let Some(id) = receipt {
+                forwarded
+                    .waiting
+                    .lock()
+                    .expect("forwarded poisoned")
+                    .insert(id.clone());
+            }
+            target.send_receipted(text, MessageOrigin::User, images, receipt.cloned());
+            Ok(None)
+        }
+        // Only its turn.
+        AgentCommand::Cancel => {
+            let running = target.status() != crate::agent::AgentStatus::Idle;
+            target.interrupt();
+            if running {
+                Ok(Some(Some(target.session().current_turn())))
+            } else {
+                Err(CommandError::NotRunning)
+            }
+        }
+        // Between its turns, never under one; off the caller's loop, since a
+        // summary is a model call.
+        AgentCommand::Compact { focus } => {
+            if target.status() != crate::agent::AgentStatus::Idle {
+                return Err(CommandError::Busy {
+                    reason: format!("{session} is working"),
+                });
+            }
+            let events = events.clone();
+            let member = target.ctx().clone();
+            tokio::spawn(async move {
+                let reporting = std::sync::atomic::AtomicBool::new(false);
+                compact(&member, &events, focus, &reporting).await;
+            });
+            Ok(Some(None))
+        }
+        _ => Err(CommandError::Unsupported),
+    }
+}
+
+/// The catalog command `name`, for the agent behind `session`, when it is on
+/// offer for it (`docs/adr/0021` §10).
+pub fn catalog_command(
+    ctx: &Context,
+    session: &str,
+    name: &str,
+) -> Result<
+    (Arc<Agent>, Arc<dyn crate::commands::CatalogCommand>),
+    atomcode_kernel::event::CommandError,
+> {
+    let target = crate::feed::Feed::find(ctx, session)
+        .ok_or(atomcode_kernel::event::CommandError::NotFound)?;
+    let command = ctx
+        .service::<crate::seams::CommandsSvc>()
+        .and_then(|catalog| catalog.find(name, &target))
+        .ok_or(atomcode_kernel::event::CommandError::NotFound)?;
+    Ok((target, command))
+}
+
+/// Run it where it cannot hold anything up, and say what it produced as
+/// `Invoked`.
+pub fn run_catalog_command(
+    target: Arc<Agent>,
+    command: Arc<dyn crate::commands::CatalogCommand>,
+    id: atomcode_kernel::event::CommandId,
+    args: String,
+    events: mpsc::UnboundedSender<AgentEvent>,
+) {
+    tokio::spawn(async move {
+        let output = command.run(target, &args).await.unwrap_or_else(|e| e);
+        let _ = events.send(AgentEvent::Invoked { id, output });
+    });
 }
 
 // ---- the pump -----------------------------------------------------------
@@ -897,6 +1074,7 @@ enum Woke {
 /// into the turn already running — is processed while the model is streaming.
 /// A pump that blocked on the turn could not deliver the one command whose
 /// entire purpose is to interrupt it.
+#[allow(clippy::too_many_arguments)]
 async fn pump(
     ctx: Context,
     agent: Arc<Agent>,
@@ -904,6 +1082,8 @@ async fn pump(
     events: mpsc::UnboundedSender<AgentEvent>,
     mut commands: mpsc::UnboundedReceiver<AgentCommand>,
     manual_compaction: Arc<std::sync::atomic::AtomicBool>,
+    feed: Arc<crate::feed::Feed>,
+    owns_answers: bool,
 ) {
     let Ok(driver) = ctx.require::<AgentLoopSvc>() else {
         let _ = events.send(AgentEvent::Error {
@@ -914,6 +1094,11 @@ async fn pump(
         });
         return;
     };
+    // A message this pump forwarded to a team member is claimed in the
+    // member's realm, which only the tree sees; its receipt still comes back
+    // on this connection.
+    let forwarded = Forwarded::new();
+    let claimed_elsewhere = forwarded.listen(&ctx, events.clone());
     // Snapshots and compactions act on this agent's log, which lives in its
     // realm; the tree's context would not find it.
     let ctx = agent.ctx().clone();
@@ -927,6 +1112,20 @@ async fn pump(
             let _ = woke_tx.send(());
         }
     });
+    // A message a driver asked a receipt for is accepted when a turn claims it
+    // — not when it is queued, because only then is it known whether it starts
+    // a turn or joins the one running (`docs/adr/0021` §7).
+    let receipts = events.clone();
+    let claimed =
+        ctx.on_emit::<crate::events::InputClaimed>(move |input: &crate::events::ClaimedInput| {
+            if input.agent == me {
+                let _ = receipts.send(AgentEvent::Accepted {
+                    command: input.receipt.clone(),
+                    turn: Some(input.turn),
+                    steered: input.steered,
+                });
+            }
+        });
     // Anything that landed before the listener existed: this task is spawned
     // at mount and a message can reach the inbox before it runs. Listener
     // first, then the look — so nothing falls between them.
@@ -982,9 +1181,58 @@ async fn pump(
             Woke::Command(Some(command)) => command,
         };
 
+        // A tagged command is the command it carries, plus an id the driver wants
+        // echoed on its receipt. Messages are receipted when a turn claims them;
+        // everything else is answered here, on the spot.
+        let (receipt, command) = match command {
+            AgentCommand::Tagged { id, command } => (Some(id), command.untagged()),
+            // A catalog command carries its own receipt.
+            AgentCommand::Invoke { ref id, .. } => (Some(id.clone()), command),
+            other => (None, other),
+        };
+        // An address: the command inside is for the agent it names, receipt and
+        // all. Addressed to the agent this pump drives, it is just the command.
+        let (receipt, command) = match command {
+            AgentCommand::To { session, command } => {
+                let (receipt, inner) = match *command {
+                    AgentCommand::Tagged { id, command } => (Some(id), command.untagged()),
+                    other => (receipt, other.untagged()),
+                };
+                if session == agent.session_id() {
+                    (receipt, inner)
+                } else {
+                    (
+                        receipt,
+                        AgentCommand::To {
+                            session,
+                            command: Box::new(inner),
+                        },
+                    )
+                }
+            }
+            other => (receipt, other),
+        };
+        let accept = |turn: Option<u64>| {
+            if let Some(id) = &receipt {
+                let _ = events.send(AgentEvent::Accepted {
+                    command: id.clone(),
+                    turn,
+                    steered: false,
+                });
+            }
+        };
+        let reject = |error: atomcode_kernel::event::CommandError| {
+            if let Some(id) = &receipt {
+                let _ = events.send(AgentEvent::Rejected {
+                    command: id.clone(),
+                    error,
+                });
+            }
+        };
+
         match command {
             AgentCommand::SendMessage { text, images } => {
-                agent.send_full(text, MessageOrigin::User, images);
+                agent.send_receipted(text, MessageOrigin::User, images, receipt.clone());
             }
             // Context first, then the prompt: one command, one turn. The
             // context is model-visible and logged as the harness's, so a
@@ -995,16 +1243,25 @@ async fn pump(
                 context,
             } => {
                 agent.inject(context, crate::session::InjectionOrigin::Continuation);
-                agent.send_full(text, MessageOrigin::User, images);
+                agent.send_receipted(text, MessageOrigin::User, images, receipt.clone());
             }
             AgentCommand::SendSyntheticMessage { text } => {
-                agent.send_from(text, MessageOrigin::Harness);
+                agent.send_receipted(text, MessageOrigin::Harness, Vec::new(), receipt.clone());
             }
             AgentCommand::Respond { id, value } => {
-                asker.answer(id, value);
+                if asker.answer(id, value) {
+                    accept(None);
+                } else {
+                    reject(atomcode_kernel::event::CommandError::StaleQuestion);
+                }
                 continue;
             }
             AgentCommand::Cancel => {
+                if turn.is_some() {
+                    accept(Some(agent.session().current_turn()));
+                } else {
+                    reject(atomcode_kernel::event::CommandError::NotRunning);
+                }
                 // The driver's cancel is a person's: the turn's end records it.
                 agent.interrupt();
                 // And release anything parked on an answer. Cancelling is
@@ -1016,11 +1273,14 @@ async fn pump(
                 // differential rig sat on it for the full twenty seconds.
                 //
                 // A pending approval becomes a refusal, which is the right
-                // reading: the person asked to stop, not to proceed.
-                asker.refuse_all();
+                // reading: the person asked to stop, not to proceed. This
+                // agent's questions only — a teammate's approval is not the
+                // person's to withdraw by stopping someone else.
+                asker.refuse_asked_by(agent.session_id());
                 continue;
             }
             AgentCommand::Snapshot => {
+                accept(None);
                 // Queued while a turn is in flight; answered the moment it
                 // ends. Answering now would describe a conversation that is
                 // still being written.
@@ -1032,6 +1292,7 @@ async fn pump(
                 continue;
             }
             AgentCommand::Compact { focus } => {
+                accept(None);
                 // Behind the turn, like a snapshot and for the same reason:
                 // rewriting the conversation while a round is mid-flight
                 // compacts a history the turn is still appending to.
@@ -1042,10 +1303,79 @@ async fn pump(
                 }
                 continue;
             }
-            AgentCommand::Shutdown => break,
+            AgentCommand::Subscribe { session, from } => {
+                // Its own session, or one it can reach by id — a team member's,
+                // or a member's that is gone, from its kept log.
+                match crate::feed::Feed::find(&ctx, &session) {
+                    Some(target) => {
+                        accept(None);
+                        feed.subscribe(&ctx, &target, from);
+                    }
+                    None => match feed.replay_kept(&ctx, &session, from).await {
+                        Ok(()) => accept(None),
+                        Err(error) => reject(error),
+                    },
+                }
+                continue;
+            }
+            AgentCommand::Unsubscribe { session } => {
+                feed.unsubscribe(&session);
+                accept(None);
+                continue;
+            }
+            // A command from the catalog, against this agent or one it can
+            // reach by id. Accepted once it is known to exist for that agent;
+            // what it produced follows as `Invoked`, so a command that takes a
+            // while — a member winding down — does not hold this pump up.
+            AgentCommand::Invoke {
+                id,
+                session,
+                name,
+                args,
+            } => {
+                match catalog_command(&ctx, &session, &name) {
+                    Ok((target, command)) => {
+                        accept(None);
+                        run_catalog_command(target, command, id, args, events.clone());
+                    }
+                    Err(error) => reject(error),
+                }
+                continue;
+            }
+            // For a team member, through the connection the person has
+            // (`docs/adr/0023` §4, §8): the same three things they can do to
+            // the agent this pump drives.
+            AgentCommand::To { session, command } => {
+                let cancelling = matches!(*command, AgentCommand::Cancel);
+                match command_member(
+                    &ctx,
+                    &session,
+                    *command,
+                    receipt.as_ref(),
+                    &forwarded,
+                    &events,
+                ) {
+                    Ok(Some(turn)) => accept(turn),
+                    Ok(None) => {}
+                    Err(error) => reject(error),
+                }
+                // Its questions go with its turn — held here, where the tree's
+                // are.
+                if cancelling {
+                    asker.refuse_asked_by(&session);
+                }
+                continue;
+            }
+            AgentCommand::Shutdown => {
+                accept(None);
+                break;
+            }
             // `#[non_exhaustive]`: a command this harness has no answer for is
-            // ignored rather than guessed at.
-            _ => continue,
+            // refused rather than guessed at.
+            _ => {
+                reject(atomcode_kernel::event::CommandError::Unsupported);
+                continue;
+            }
         }
 
         // Everything that falls through here queued work. A turn already
@@ -1060,8 +1390,14 @@ async fn pump(
     // that is never coming. The other order deadlocks — a tool waiting on
     // approval never observes the cancel.
     agent.cancel();
-    asker.close();
+    if owns_answers {
+        asker.close();
+    } else {
+        asker.refuse_asked_by(agent.session_id());
+    }
     wake.dispose();
+    claimed.dispose();
+    claimed_elsewhere.dispose();
     if let Some(handle) = turn.take() {
         let _ = handle.await;
     }
@@ -1287,6 +1623,37 @@ pub async fn spawn(
     answers: Arc<dyn Answers>,
     req: crate::agent::CreateAgent,
 ) -> Result<Driven, String> {
+    // One agent, created here rather than on the first message, so the
+    // registry and any `agent/created` observer see it before the driver
+    // can send anything. Its log comes with it.
+    let agents = ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
+    let agent = agents.create(ctx, req).await?;
+    Ok(attach(ctx, agent, wire, answers, true))
+}
+
+/// Drive an agent that already exists — a team member, a delegated child —
+/// through the same pump a front end's agent runs on (`docs/adr/0023` §6).
+///
+/// Its questions are the tree's asker's to hold: stopping it refuses the ones it
+/// asked, and nobody else's. The agent keeps a way to reach the pump
+/// ([`Agent::command`]) for as long as the returned handle is held; dropping
+/// the handle stops the pump, which stops a turn in flight.
+pub fn drive(ctx: &Context, agent: Arc<Agent>) -> Driven {
+    let mut driven = attach(ctx, agent, wire(), Arc::new(NoAnswers), false);
+    // Nothing reads what this pump says — the person follows a member through
+    // its facts, on their own connection — so it is not kept for the member's
+    // whole life.
+    driven.handle.events.close();
+    driven
+}
+
+fn attach(
+    ctx: &Context,
+    agent: Arc<Agent>,
+    wire: Wire,
+    answers: Arc<dyn Answers>,
+    owns_answers: bool,
+) -> Driven {
     let Wire {
         commands,
         events,
@@ -1294,11 +1661,7 @@ pub async fn spawn(
         event_rx,
     } = wire;
 
-    // One agent, created here rather than on the first message, so the
-    // registry and any `agent/created` observer see it before the driver
-    // can send anything. Its log comes with it.
-    let agents = ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
-    let agent = agents.create(ctx, req).await?;
+    agent.attach_commands(&commands);
     let session_id = agent.session_id().to_string();
     let manual_compaction = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let projector = Arc::new(Mutex::new(Projector {
@@ -1319,6 +1682,11 @@ pub async fn spawn(
 
     let out = events.clone();
     let fold = projector.clone();
+    // Sessions a driver subscribed to, pushed as they happen. Attached before
+    // the projection below, so a subscribed fact reaches the driver ahead of
+    // what it is projected into.
+    let feed = crate::feed::Feed::new(events.clone());
+    let feeding = feed.attach(ctx);
     let stream = ctx.on_emit::<SessionEventCommitted>(move |committed: &Committed| {
         // One handle, one conversation. A delegated child commits to its
         // own log and this listener is above both.
@@ -1340,21 +1708,27 @@ pub async fn spawn(
     let task = tokio::spawn(async move {
         pump(
             pump_ctx,
-            pump_agent,
+            pump_agent.clone(),
             answers,
             events,
             command_rx,
             manual_compaction,
+            feed,
+            owns_answers,
         )
         .await;
+        pump_agent.detach_commands();
         // The listener holds a clone of the sender; revoking it is what
         // lets the event channel close, so a driver reading to the end sees
         // the end. Dropping only the local handles would hang it forever.
         stream.dispose();
+        for listener in feeding {
+            listener.dispose();
+        }
         let _ = done_tx.send(());
     });
 
-    Ok(Driven {
+    Driven {
         handle: AgentHandle {
             commands,
             events: event_rx,
@@ -1362,7 +1736,7 @@ pub async fn spawn(
         },
         done: done_rx,
         agent,
-    })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1405,6 +1779,7 @@ impl Plugin for AgentHandlePlugin {
             "approval",
             "session-defaults",
             "grants",
+            "commands",
         ]
     }
     fn provides(&self) -> &'static [&'static str] {
@@ -1424,24 +1799,81 @@ impl Plugin for AgentHandlePlugin {
     }
 
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
-        let row: HandleRow = if config.is_null() {
-            HandleRow::default()
-        } else {
-            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
-        };
+        mount_handle(ctx, config, true).await
+    }
+}
 
-        let wire = wire();
-        let asker = Arc::new(Asker::new(
-            ctx.clone(),
-            wire.events.clone(),
-            Duration::from_secs(row.ask_timeout_secs),
-        ));
-        // Both asking seams, filled before anything mounts on top of them: a
-        // consumer that resolves `approval` during its own `apply` must find it
-        // already there.
-        let _ = ctx
-            .provide::<UserQuestionsSvc>(asker.clone())
-            .map_err(|e| e.to_string())?;
+/// `ui-handle-questions`: the same handle, for a tree whose own rows decide
+/// approvals.
+///
+/// A front end outside the App still has to be asked the questions — they
+/// only reach it over the handle — but whether a call needs asking about is the
+/// tree's policy, not the connection's. A tree that runs a never-asks policy, or
+/// one that turns approvals into questions (`approval-interactive`), keeps that
+/// row and mounts this one; `ui-handle` would claim the `approval` seam and
+/// fail to start beside it.
+pub struct QuestionsHandlePlugin;
+
+#[async_trait]
+impl Plugin for QuestionsHandlePlugin {
+    fn name(&self) -> &'static str {
+        "ui-handle-questions"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["agents", "agent-loop"]
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["tools", "llm", "compaction", "session-defaults", "commands"]
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["ui", "agent-handle", "user-questions", "tool-driver"]
+    }
+    fn description(&self) -> &'static str {
+        "the AgentHandle protocol, asking the driver questions; approvals are the tree's own rows"
+    }
+
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        mount_handle(ctx, config, false).await
+    }
+}
+
+async fn mount_handle(ctx: &Context, config: &Value, approvals: bool) -> Result<(), String> {
+    let row: HandleRow = if config.is_null() {
+        HandleRow::default()
+    } else {
+        serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+    };
+
+    let wire = wire();
+    let asker = Arc::new(Asker::new(
+        ctx.clone(),
+        wire.events.clone(),
+        Duration::from_secs(row.ask_timeout_secs),
+    ));
+    // Any agent in the tree asks through this asker. Stopping one — a person's
+    // cancel, a parent's cancel reaching a delegated child — or removing it
+    // refuses what it is waiting on: a tool parked on an approval nobody will
+    // now give never observes the cancel, and its turn would hang.
+    let refusing = asker.clone();
+    let _ = ctx.on_emit::<crate::events::AgentStatusChanged>(
+        move |change: &crate::events::AgentChange| {
+            if change.status == crate::agent::AgentStatus::Stopping {
+                refusing.refuse_asked_by(&change.session);
+            }
+        },
+    );
+    let refusing = asker.clone();
+    let _ =
+        ctx.on_emit::<crate::events::AgentRemoved>(move |change: &crate::events::AgentChange| {
+            refusing.refuse_asked_by(&change.session);
+        });
+    // The asking seams, filled before anything mounts on top of them: a
+    // consumer that resolves `approval` during its own `apply` must find it
+    // already there.
+    let _ = ctx
+        .provide::<UserQuestionsSvc>(asker.clone())
+        .map_err(|e| e.to_string())?;
+    if approvals {
         let _ = ctx
             .provide::<crate::seams::ApprovalSvc>(asker.clone())
             .map_err(|e| e.to_string())?;
@@ -1452,37 +1884,37 @@ impl Plugin for AgentHandlePlugin {
             Arc::new(super::policy::ApprovalGate { ctx: ctx.clone() }),
             false,
         );
-
-        let initial = wire.commands.clone();
-        let Driven {
-            handle,
-            done,
-            agent,
-        } = spawn(
-            ctx,
-            wire,
-            asker.clone(),
-            crate::agent::CreateAgent::root(ctx),
-        )
-        .await?;
-        let _ = ctx
-            .provide::<crate::seams::ToolDriverSvc>(Arc::new(HandleToolDriver {
-                session: agent.session_id().to_string(),
-                asker,
-            }))
-            .map_err(|e| e.to_string())?;
-
-        let front = Arc::new(HandleFrontEnd {
-            handle: Mutex::new(Some(handle)),
-            done: Mutex::new(Some(done)),
-            initial: Mutex::new(Some(initial)),
-        });
-        let _ = ctx
-            .provide::<AgentHandleSvc>(front.clone())
-            .map_err(|e| e.to_string())?;
-        let _ = ctx.provide::<UiSvc>(front).map_err(|e| e.to_string())?;
-        Ok(())
     }
+
+    let initial = wire.commands.clone();
+    let Driven {
+        handle,
+        done,
+        agent,
+    } = spawn(
+        ctx,
+        wire,
+        asker.clone(),
+        crate::agent::CreateAgent::root(ctx),
+    )
+    .await?;
+    let _ = ctx
+        .provide::<crate::seams::ToolDriverSvc>(Arc::new(HandleToolDriver {
+            session: agent.session_id().to_string(),
+            asker,
+        }))
+        .map_err(|e| e.to_string())?;
+
+    let front = Arc::new(HandleFrontEnd {
+        handle: Mutex::new(Some(handle)),
+        done: Mutex::new(Some(done)),
+        initial: Mutex::new(Some(initial)),
+    });
+    let _ = ctx
+        .provide::<AgentHandleSvc>(front.clone())
+        .map_err(|e| e.to_string())?;
+    let _ = ctx.provide::<UiSvc>(front).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// The projection, addressable on its own.
@@ -1522,4 +1954,61 @@ pub fn question_payload(question: &str, options: &[String]) -> Value {
             .collect::<Vec<_>>(),
         "custom": true,
     })
+}
+
+#[cfg(test)]
+mod asking_tests {
+    use super::*;
+
+    fn realm_of(ctx: &Context, session: &str) -> Context {
+        let realm = ctx.isolate();
+        let _ = realm
+            .provide::<SessionSvc>(Arc::new(crate::session::SessionLog::new(session)))
+            .unwrap();
+        realm
+    }
+
+    /// Stopping one agent refuses the questions it asked and nobody else's
+    /// (`docs/adr/0023` §6): a teammate's approval is not withdrawn by
+    /// stopping someone else.
+    #[tokio::test]
+    async fn stopping_one_agent_refuses_only_its_own_questions() {
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::empty(),
+        );
+        let ctx = app.context();
+        let (events, _rx) = mpsc::unbounded_channel();
+        let asker = Arc::new(Asker::new(ctx.clone(), events, Duration::ZERO));
+
+        let ask = |session: &str| {
+            let asker = asker.clone();
+            let realm = realm_of(&ctx, session);
+            tokio::spawn(crate::agent::as_agent(realm, async move {
+                asker.request("approval", Value::Null).await
+            }))
+        };
+        let lead = ask("lead");
+        let member = ask("lead/scout");
+        for _ in 0..100 {
+            if asker.pending.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(asker.pending.lock().unwrap().len(), 2);
+
+        asker.refuse_asked_by("lead/scout");
+        // A refusal is a null answer, which every caller reads as "no".
+        assert_eq!(
+            member.await.unwrap(),
+            Some(Value::Null),
+            "the stopped agent's question"
+        );
+        assert!(!lead.is_finished(), "the other agent is still asking");
+
+        let id = *asker.pending.lock().unwrap().keys().next().unwrap();
+        assert!(asker.answer(id, json!("allow")));
+        assert_eq!(lead.await.unwrap(), Some(json!("allow")));
+    }
 }

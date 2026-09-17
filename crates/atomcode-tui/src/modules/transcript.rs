@@ -87,6 +87,8 @@ fn origin_label(origin: &InjectionOrigin) -> String {
         InjectionOrigin::Continuation => "continuation".into(),
         InjectionOrigin::InternalNudge => "nudge".into(),
         InjectionOrigin::CompactionSummary => "compaction summary".into(),
+        InjectionOrigin::PersonToMember { member } => format!("you → {member}"),
+        InjectionOrigin::TeamNote { member } => format!("about {member}"),
     }
 }
 
@@ -107,12 +109,18 @@ pub(crate) fn origin_kind(origin: &InjectionOrigin) -> &'static str {
         InjectionOrigin::Continuation => "injected:continuation",
         InjectionOrigin::InternalNudge => "injected:nudge",
         InjectionOrigin::CompactionSummary => "injected:compaction",
+        InjectionOrigin::PersonToMember { .. } => "injected:to-member",
+        InjectionOrigin::TeamNote { .. } => "injected:team-note",
     }
 }
 
 impl Producer for Transcript {
     fn id(&self) -> &'static str {
         ID
+    }
+
+    fn reset(&self) {
+        *self.open.lock().expect("transcript poisoned") = Open::default();
     }
 
     fn absorb(&self, fact: &SessionEvent, out: &mut StreamWriter<'_>) {
@@ -197,6 +205,36 @@ impl Producer for Transcript {
                     let block = ToolCallBlock::pending(&call.id, &call.name, &call.arguments);
                     let id = out.open(at, Arc::new(block.with(Outcome::Pending)));
                     open.calls.insert(call.id.clone(), (id, block));
+                }
+            }
+
+            // What a stopped reply had said. Live, the chunks already drew it
+            // and it only settles; replayed from a log that keeps no chunks, it
+            // is the only record of the words the person read.
+            SessionEvent::PartialReply {
+                text,
+                reasoning,
+                turn,
+                round,
+            } => {
+                let at = Coord::new(*turn, *round);
+                match open.thought.take() {
+                    Some((id, _)) => {
+                        out.settle(id);
+                    }
+                    None if !reasoning.is_empty() => {
+                        out.emit(at, Arc::new(ModelThought(reasoning.clone())));
+                    }
+                    None => {}
+                }
+                match open.text.take() {
+                    Some((id, _)) => {
+                        out.settle(id);
+                    }
+                    None if !text.is_empty() => {
+                        out.emit(at, Arc::new(ModelSaid(text.clone())));
+                    }
+                    None => {}
                 }
             }
 
@@ -614,6 +652,42 @@ mod tests {
             s.slots().iter().all(|x| x.is_settled()),
             "a turn that ended leaves nothing open"
         );
+    }
+
+    /// A reply the person stopped: live, the chunks drew it and the fact only
+    /// settles it — one block, not two; replayed from a log that keeps no
+    /// chunks, the fact is what draws it.
+    #[test]
+    fn a_stopped_reply_is_drawn_once_live_and_again_on_replay() {
+        let partial = SessionEvent::PartialReply {
+            turn: 1,
+            round: 1,
+            text: "I was saying".into(),
+            reasoning: "thinking".into(),
+        };
+        let said = |s: &Stream| -> Vec<String> {
+            s.slots()
+                .iter()
+                .filter(|x| x.block().kind() == "assistant")
+                .map(|x| x.block().content.lines(80)[0].plain())
+                .collect()
+        };
+
+        let live = fold(&[
+            SessionEvent::AssistantChunk {
+                turn: 1,
+                round: 1,
+                delta: "I was saying".into(),
+                reasoning: false,
+            },
+            partial.clone(),
+        ]);
+        assert_eq!(said(&live), vec!["I was saying".to_string()]);
+        assert!(live.slots().iter().all(|x| !x.is_live()), "settled");
+
+        let replayed = fold(&[partial]);
+        assert_eq!(said(&replayed), vec!["I was saying".to_string()]);
+        assert!(kinds(&replayed).contains(&"reasoning"));
     }
 
     #[test]

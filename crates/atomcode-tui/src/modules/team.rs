@@ -21,6 +21,16 @@
 //! the lead's transcript, two conversations interleaved by turn coordinate.
 //! The answer is not a filtered copy of someone else's screen — it is a
 //! summary of what the lead knows, which is what a lead has.
+//!
+//! # A way in
+//!
+//! It is also where the person switches the screen to one of them and back
+//! (`docs/adr/0023` §3): the lead is its first row, `主`, and each member
+//! follows. Which rows can be switched to is [`targets`] — the lead and every
+//! member the registry announced, gone ones included — and the panel lights the
+//! row [`Moment::team_cursor`] points at and marks the one on screen. Both are
+//! the moment's, so the row the arrows are on, the row under the pointer and the
+//! row a press takes are one row.
 
 use std::collections::HashMap;
 
@@ -67,6 +77,25 @@ const NAME_CAP: usize = 14;
 const ROLE_CAP: usize = 12;
 
 pub struct Team;
+
+/// The sessions the panel's selectable rows switch to, in the order they are
+/// drawn: the lead, then each member the registry announced. Empty with no
+/// team — there is nothing to switch between.
+pub fn targets(moment: &Moment) -> Vec<String> {
+    if moment.members.is_empty() || moment.lead.is_empty() {
+        return Vec::new();
+    }
+    std::iter::once(moment.lead.clone())
+        .chain(moment.members.iter().map(|m| m.session.clone()))
+        .collect()
+}
+
+/// Which selectable row a line of the drawn panel is, when it is one: the
+/// header is line 0, the lead line 1.
+pub fn target_at_line(moment: &Moment, line: usize) -> Option<usize> {
+    let index = line.checked_sub(1)?;
+    (index < targets(moment).len()).then_some(index)
+}
 
 impl Team {
     fn find<'a>(state: &'a mut State, name: &str) -> Option<&'a mut Member> {
@@ -188,17 +217,72 @@ impl View for Team {
         let caps = vp.moment.caps;
         let muted = theme::fg(Role::Muted);
 
+        let switchable = targets(vp.moment);
+        let focused = vp.moment.team_cursor.is_some() && !switchable.is_empty();
         let mut out = vec![Line::styled(
             width::take_width(
                 &if rows.is_empty() {
                     "团队 · 还没有成员".to_string()
+                } else if focused {
+                    format!(
+                        "团队 · {} 名成员 · ↑↓ 选 · Enter 切换 · Esc 返回",
+                        rows.len()
+                    )
                 } else {
-                    format!("团队 · {} 名成员", rows.len())
+                    format!("团队 · {} 名成员 · Tab 切换查看", rows.len())
                 },
                 w as usize,
             ),
             muted,
         )];
+        // Where the person is, and where the keyboard or the pointer is.
+        let lit = |i: usize| focused && vp.moment.team_cursor == Some(i);
+        let here = |session: &str| !vp.moment.viewing.is_empty() && vp.moment.viewing == session;
+        let band = |line: Vec<El>, lit: bool| -> Vec<Line> {
+            let lines = El::row(line).lay(w);
+            if !lit {
+                return lines;
+            }
+            // A band across the row, the panel one step brighter — the same
+            // mark a question's pointed-at answer gets.
+            let band = theme::bg(Role::PanelSelBg);
+            lines
+                .into_iter()
+                .map(|line| {
+                    let used = line.width();
+                    let mut spans: Vec<crate::frame::Span> = line
+                        .spans
+                        .into_iter()
+                        .map(|span| crate::frame::Span::styled(span.text, span.style.under(band)))
+                        .collect();
+                    if used < w as usize {
+                        spans.push(crate::frame::Span::styled(
+                            " ".repeat(w as usize - used),
+                            band,
+                        ));
+                    }
+                    Line::from_spans(spans).truncate(w as usize)
+                })
+                .collect()
+        };
+        if !switchable.is_empty() {
+            let mark = if here(&vp.moment.lead) { "› " } else { "  " };
+            out.extend(band(
+                vec![
+                    El::styled(mark.to_string(), theme::fg(Role::Accent)),
+                    El::styled("主".to_string(), theme::fg(Role::Secondary)),
+                    El::styled(
+                        if here(&vp.moment.lead) {
+                            " 正在看".to_string()
+                        } else {
+                            String::new()
+                        },
+                        muted,
+                    ),
+                ],
+                lit(0),
+            ));
+        }
 
         // One column width for everyone, so the eye reads down rather than
         // hunting: the longest name, capped, and the same for roles.
@@ -214,6 +298,7 @@ impl View for Team {
             .unwrap_or(0);
 
         for row in &rows {
+            let selectable = switchable.iter().position(|s| *s == row.session);
             let (mark, mark_style) = match row.state {
                 Shown::Working => (
                     caps.spinner(vp.moment.tick).to_string(),
@@ -230,10 +315,18 @@ impl View for Team {
                 Shown::Idle => "空闲".to_string(),
                 Shown::Stopped => "已结束".to_string(),
             };
-            let mut line: Vec<El> = vec![
-                El::styled(format!("{mark} "), mark_style),
-                El::styled(pad(&row.member.name, name_w), theme::fg(Role::Secondary)),
-            ];
+            let mut line: Vec<El> = Vec::new();
+            if !switchable.is_empty() {
+                line.push(El::styled(
+                    if here(&row.session) { "› " } else { "  " }.to_string(),
+                    theme::fg(Role::Accent),
+                ));
+            }
+            line.push(El::styled(format!("{mark} "), mark_style));
+            line.push(El::styled(
+                pad(&row.member.name, name_w),
+                theme::fg(Role::Secondary),
+            ));
             if role_w > 0 {
                 line.push(El::styled(
                     format!(" {}", pad(&row.member.role, role_w)),
@@ -241,13 +334,16 @@ impl View for Team {
                 ));
             }
             line.push(El::styled(format!(" {said}"), muted));
+            if here(&row.session) {
+                line.push(El::styled(" 正在看".to_string(), muted));
+            }
             if !row.member.last.is_empty() {
                 line.push(El::styled(
                     format!(" {} {}", caps.g(Glyph::Separator), row.member.last),
                     muted,
                 ));
             }
-            out.extend(El::row(line).lay(w));
+            out.extend(band(line, selectable.is_some_and(lit)));
         }
         out
     }
@@ -256,7 +352,8 @@ impl View for Team {
     /// room for six — and the host still caps it, because a module requests
     /// and never seizes.
     fn height(state: &State, moment: &Moment, _: u16) -> Height {
-        Height::Hug(1 + rows(state, moment).len().min(u16::MAX as usize) as u16)
+        let lead = u16::from(!targets(moment).is_empty());
+        Height::Hug(1 + lead + rows(state, moment).len().min(u16::MAX as usize) as u16)
     }
 
     /// The spinner needs frames. The same cadence as the status line, for the
@@ -278,6 +375,8 @@ struct Row {
     member: Member,
     state: Shown,
     turn: u64,
+    /// Empty for a member only this log knows of, which cannot be switched to.
+    session: String,
 }
 
 /// The two sources, joined by name.
@@ -287,36 +386,38 @@ struct Row {
 /// subagent the `task` tool created, or a member delegated before this panel
 /// was mounted. Live state wins over folded state, because it is now.
 fn rows(state: &State, moment: &Moment) -> Vec<Row> {
+    // The registry's first, in the order `targets` switches between them, so
+    // the drawn rows and the selectable ones agree; what the log adds — a role,
+    // the last thing said — is joined on by name.
     let mut out: Vec<Row> = Vec::new();
-    for member in &state.members {
-        let live = moment.members.iter().find(|m| m.name == member.name);
-        let shown = match (live, member.stopped) {
-            (None, _) => Shown::Stopped,
-            (Some(_), true) => Shown::Stopped,
-            (Some(l), false) if l.activity == Activity::Idle => Shown::Idle,
-            (Some(_), false) => Shown::Working,
-        };
+    for live in &moment.members {
+        let logged = state.members.iter().find(|m| m.name == live.name);
+        let stopped = live.gone || logged.is_some_and(|m| m.stopped);
         out.push(Row {
-            member: member.clone(),
-            state: shown,
-            turn: live.map(|l| l.turn).unwrap_or_default(),
+            member: logged.cloned().unwrap_or_else(|| Member {
+                name: live.name.clone(),
+                ..Member::default()
+            }),
+            state: match (stopped, live.activity) {
+                (true, _) => Shown::Stopped,
+                (false, Activity::Idle) => Shown::Idle,
+                (false, _) => Shown::Working,
+            },
+            turn: live.turn,
+            session: live.session.clone(),
         });
     }
-    for live in &moment.members {
-        if state.members.iter().any(|m| m.name == live.name) {
+    // Then what only this log remembers — a member stopped before this screen
+    // was opened: shown, not switched to.
+    for member in &state.members {
+        if moment.members.iter().any(|m| m.name == member.name) {
             continue;
         }
         out.push(Row {
-            member: Member {
-                name: live.name.clone(),
-                ..Member::default()
-            },
-            state: if live.activity == Activity::Idle {
-                Shown::Idle
-            } else {
-                Shown::Working
-            },
-            turn: live.turn,
+            member: member.clone(),
+            state: Shown::Stopped,
+            turn: 0,
+            session: String::new(),
         });
     }
     out
@@ -431,6 +532,7 @@ mod tests {
             name: "scout".into(),
             activity: Activity::Working,
             turn: 2,
+            ..MemberNow::default()
         }]);
         assert!(
             drew(&state, &live).contains("第 2 轮"),
@@ -449,6 +551,7 @@ mod tests {
             name: "task-1".into(),
             activity: Activity::Working,
             turn: 1,
+            ..MemberNow::default()
         }]);
         let screen = drew(&State::default(), &live);
         assert!(screen.contains("task-1"), "{screen}");
@@ -479,11 +582,13 @@ mod tests {
                 name: "巡查员-with-a-very-long-name".into(),
                 activity: Activity::Working,
                 turn: 3,
+                ..MemberNow::default()
             },
             MemberNow {
                 name: "lib".into(),
                 activity: Activity::Idle,
                 turn: 1,
+                ..MemberNow::default()
             },
         ]);
         for w in 1u16..100 {

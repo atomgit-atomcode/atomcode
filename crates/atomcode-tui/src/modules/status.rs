@@ -69,6 +69,16 @@ impl View for Status {
         let sep = || El::styled(format!(" {} ", caps.g(Glyph::Separator)), dim);
 
         let mut row: Vec<El> = Vec::new();
+        // Whose screen this is, when it is a team member's rather than the
+        // lead's: everything below and everything typed is that member's.
+        let viewing = &vp.moment.viewing;
+        if !viewing.is_empty() && *viewing != vp.moment.lead {
+            row.push(El::styled(
+                format!("成员 {}", viewing.rsplit('/').next().unwrap_or(viewing)),
+                theme::fg(Role::Accent),
+            ));
+            row.push(sep());
+        }
         row.push(El::styled(
             if state.model.is_empty() {
                 "atomcode".to_string()

@@ -31,8 +31,9 @@
         │  谁也不依赖                                                       │
         └──────────────────────────────────────────────────────────────────┘
 
-契约只有三份:①句柄协议 8 命令/25 事件(SDK 面,ACP 是它的 wire 投影)
-              ②缝 trait(提供方替换面)  ③配置树 insert/patch/remove(组合面)
+契约只有四份:①句柄协议 8 命令/26 事件(会话内)  ②宿主控制契约(会话切换/撤销/模型/MCP)
+              ①+② 是 SDK 面,ACP 是它们的 wire 投影(0021)
+              ③缝 trait(提供方替换面)  ④配置树 insert/patch/remove(组合面)
 ```
 
 ## 1. 四条原则
@@ -123,7 +124,7 @@
 **事件**:`tools/execute` 与 `agent/request` 是 waterfall,策略行(参数修复、审批、结果封顶、
 压缩、溢出重试、截断续写)是挂在上面的监听器,顺序由行序表达。
 
-**realm**:每个 agent 一个 realm,子 agent fork 自父;服务表与事件总线用同一个
+**realm**:每个 agent 一个 realm;子 agent 的 realm 与 lead 一样从根 isolate(兄弟而非嵌套,父子只是 `parent` 字段,2026-09-17 核实 `harness/plugins/team.rs:1146`、`subagent.rs:476`);服务表与事件总线用同一个
 `visible_from`,子 agent 看不到父的服务,也画不到父的屏幕。**agent 拥有自己的会话与
 世界**(0014):`Agents::create(ctx, CreateAgent)` 在发布前把日志、cwd 和 `setup` 装进
 realm;树级监听器通过任务局部的「当前 agent」(`agent::scoped`)解析日志,不再有全局
@@ -133,21 +134,23 @@ realm;树级监听器通过任务局部的「当前 agent」(`agent::scoped`)解
 → 命令行 overlay。操作词汇 insert / patch / remove / disabled。`--dump-config` 与
 `--audit` 是必需品:树越能 patch,「为什么我的 agent 是这样」越要能回答。
 
-## 4. 三份契约
+## 4. 四份契约
 
 | 契约 | 内容 | 谁用 | 变更规则 |
 |---|---|---|---|
-| **句柄协议** | `AgentCommand` 8 个 + `AgentEvent` 25 个 | tui 控制面、daemon、SDK、ACP | 新命令只由 Agent 机制加;所有前端与 SDK 是它的投影,不各自长方法 |
+| **句柄协议** | `AgentCommand` 8 个 + `AgentEvent` 26 个;会话内操作 | tui 控制面、daemon、SDK、ACP | 新命令只由 Agent 机制加;所有前端与 SDK 是它的投影,不各自长方法 |
+| **宿主控制契约**(0021,待落地) | 新会话、resume、切目录、撤销、rewind、恢复快照、模型、MCP、重载;载荷是意图,不暴露会话模型 | 同上 | 宿主填缝;契约先行,过渡期由 adapter 翻译到 `CodingRuntimeHandle` |
 | **缝 trait** | `Seam` 类型的 trait 签名 | 能力行、Product、Host 填提供方 | 加缝用 `plexus_service!`;改签名要过所有提供方 |
 | **配置树操作** | insert / patch / remove / disabled + 行名 | Product、用户、Host | 行名是公开地址,改名等于破坏兼容 |
 
-**ACP 是句柄协议的 wire 投影**(2026-09-12 决定)。做成 `ui-acp` 行,把老栈
+**ACP 是句柄协议与宿主控制契约的 wire 投影**(2026-09-12 决定,09-17 由 0021 补上后者)。做成 `ui-acp` 行,把老栈
 `cli/src/acp/`(7.7k 行)移植过来;`ui-jsonrpc` 不再扩展。进程内 SDK 是 Agent 机制
 的公开面(`embed` profile + `App` / `Context` + `AgentHandle` + `Plugin`),建议加一个
 薄 facade crate 只做 re-export 与语义化版本。
 
-句柄协议的能力上限就是 SDK 的能力上限:缺口清单(0013)里 28 个无对应的句柄方法不补,
-任何 SDK 都没有。
+两份契约合起来是 SDK 的能力上限。0013 原先定的「28 个无对应的句柄方法不补,任何 SDK
+都没有」已由 0021 修订:其中的宿主操作(含 undo / rewind / 恢复快照)进宿主控制契约;
+goal / loop / 策略干预归能力行。
 
 ## 5. 数据流
 
@@ -186,6 +189,10 @@ tui 在 `tui-agent-client` 行里持有命令通道,面板与命令只发 `Agent
 不翻协议客户端,直到真的需要 daemon 背后或远端的 tui:那时要付的代价是一层
 日志到协议的投影(SDK 反正要做)、`adjust_layout` 这类模型可调 UI 工具需要客户端
 工具通道、realm 隔离从类型保证降为 session id 约定。
+
+**重议(2026-09-17,[0022](./adr/0022-tui-and-agent-in-separate-apps.md))**:触发条件不是远端
+tui,而是 tui 接到产品装配后,过渡期 runtime 仍会重建 App。定为 tui 与 agent 分两个 App,
+每次重建 App 由宿主重新接线;会话事实流进句柄协议;重建 App 对前端只以会话身份体现。上面三笔代价逐笔认下。
 
 ## 7. 宿主形态
 
@@ -289,6 +296,10 @@ tui 线永远对着 replay 模型与 Headless surface 开发;新命令只由 har
 | 0017 | 配置统一在折树时装配:变量展开一趟遍历、敏感值用类型打码;`apply` 只读终态 config |
 | 0018 | Host 契约:唯一入口 `atomcode`(`harness` 不是入口、`atui` 不再是 host);薄组装;读取位置;越界症状;**接线由 host 建立**(今天不是) |
 | 0019 | 贡献者要能被声明:把 `apply` 里的 register 提到行上(`contributes()`),`--dump-seams` 多一列,**不造收集机制** |
+| 0021 | 前端契约按层拆:会话内走句柄协议(补回执/turn id/唯一终结),宿主控制单独一份中立契约;undo / rewind / 恢复快照进 SDK 面(修订 0013) |
+| 0022 | tui 与 agent 分两个 App;会话事实流进句柄协议;重建 App 对前端只以会话身份体现(同会话操作不重建 App,撤销/恢复做成日志事件);tui 先不开放撤销/恢复/重载/登录 |
+| 0023 | 「树」= agent 的 realm,一个会话一个 realm;产品 team/task 改用 harness 的 realm 版本;tui 可切到任一成员视图、人可直接对成员说话(修订 0016)、成员结束后日志保留 |
+| 0024 | 会话的唯一权威是 harness 事件日志(推翻 09-16「原生快照是主」);lead 与成员都落盘;resume 即重放;原生存储的能力逐项搬到日志之上 |
 
 执行计划:[`assembly-and-host-plan.md`](./assembly-and-host-plan.md)(0017/0018/0019 的落地顺序与判据)。
 

@@ -27,6 +27,12 @@ inbox 与 steering(父到子)、`findings` 缝(结构化结果)、`CreateAgent.s
 
 ## 机制二:同伴消息是日志里的事实,成员只认 lead
 
+> **2026-09-17 修订([`0023`](./0023-a-session-is-a-realm.md))**:「成员只认 lead」收窄为
+> **agent 之间**的规则——成员的 agent 通道仍只指向 lead,成员到成员仍不可能。**人**是另一类
+> 发送方,可以直接对任一成员说话,消息以 `MessageOrigin::User` 进成员日志。
+> 人发起的成员回合结束时,team 行的汇报改为注入 lead(不叫醒);带了 lead 消息的回合与成员
+> 主动 `tell_parent` 照旧叫醒 lead。见 0023 第 7 节。
+
 - `MessageOrigin::Peer(AgentId)`、`InjectionOrigin::Peer { from: session_id }`。
   agent-loop 把 Peer 消息记成带发送方 session id 的 `Injected`,日志比两个 agent
   都活得久。`derive_messages` 把它渲染成 user 角色的「[message from …]」,是要
@@ -135,9 +141,10 @@ condition as the mount decision」。env 判不出挂的是哪一套 team。
 
 ## 未做
 
-- lead 被取消时不级联停止成员;`stop` 是显式的。
+- lead 被取消时不级联停止成员;`stop` 是显式的。(2026-09-17 由 0023 第 9 节细化:team 成员仍不级联;`task` 子 agent 级联;另有「全部停下」;lead 回合被撤回时停掉这一回合新 delegate 的成员。)
 - 报告在 lead 回合进行中到达会作为 steering 折进当前回合,回合外到达才唤醒——
   对报告是对的,对「每小时跑一遍」这类定时消息要另加「等回合结束」的语义。
 - ACP 里成员的输出怎么给客户端(作为 delegate 那次 tool call 的进度,还是
-  `_meta`)未定;tui 的成员面板行未做。
+  `_meta`)未定;tui 的成员面板行未做(2026-09-17 由 0023 定:tui 可切到任一成员的完整
+  视图,成员结束后日志保留)。
 - 成员到成员的直接通话不开,等有真实场景再按 lead 授权的白名单开。

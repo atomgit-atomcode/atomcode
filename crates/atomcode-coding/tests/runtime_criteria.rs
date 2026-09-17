@@ -24,7 +24,7 @@ use atomcode_kernel::message::{Message, Role, SessionSnapshot};
 use atomcode_kernel::provider::{ChatOptions, LlmProvider};
 use atomcode_kernel::stream::{ProviderError, StreamEvent, TokenUsage};
 use atomcode_kernel::tool::{ToolCall, ToolDef};
-use futures::stream::BoxStream;
+use futures::stream::{BoxStream, StreamExt as _};
 
 /// Answers every request with `answer N` and keeps what each request showed.
 #[derive(Default)]
@@ -242,6 +242,22 @@ impl LlmProvider for RecordingProvider {
                     StreamEvent::Done { truncated: false },
                 ])));
             }
+            // A reply that thinks, says a few words, starts a call and then
+            // goes quiet: the only way out is a cancel.
+            Some(m) if m.role == Role::User && m.text == "half" => {
+                return Ok(Box::pin(
+                    futures::stream::iter(vec![
+                        StreamEvent::Reasoning("thinking half".into()),
+                        StreamEvent::TextDelta("I was saying".into()),
+                        StreamEvent::ToolCall(ToolCall {
+                            id: format!("call-{n}"),
+                            name: "bash".into(),
+                            arguments: serde_json::json!({ "command": "ls" }).to_string(),
+                        }),
+                    ])
+                    .chain(futures::stream::pending()),
+                ));
+            }
             // A request that never answers: the only way out is a cancel.
             Some(m) if m.role == Role::User && m.text == "hang" => {
                 return Ok(Box::pin(futures::stream::pending()));
@@ -274,14 +290,21 @@ impl LlmProvider for RecordingProvider {
                 StreamEvent::ToolCall(ToolCall {
                     id: format!("call-{n}"),
                     name: "task".into(),
-                    arguments: serde_json::json!({
-                        "tasks": [{
-                            "description": "look around",
-                            "prompt": "list what is here",
-                            "subagent_type": "explore",
-                        }],
-                    })
-                    .to_string(),
+                    arguments: serde_json::json!({ "task": "list what is here" }).to_string(),
+                })
+            }
+            Some(m) if m.role == Role::User && m.text == "delegate the secret" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "task".into(),
+                    arguments: serde_json::json!({ "task": "fetch dotenv" }).to_string(),
+                })
+            }
+            Some(m) if m.role == Role::User && m.text == "fetch dotenv" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({ "file_path": ".env" }).to_string(),
                 })
             }
             Some(m) if m.role == Role::User && m.text == "delegate a team" => {
@@ -290,11 +313,42 @@ impl LlmProvider for RecordingProvider {
                     name: "team".into(),
                     arguments: serde_json::json!({
                         "action": "delegate",
-                        "tasks": [{
-                            "description": "look around",
-                            "prompt": "list what is here",
-                            "role": "explorer",
-                        }],
+                        "name": "scout",
+                        "role": "explorer",
+                        "task": "list what is here",
+                    })
+                    .to_string(),
+                })
+            }
+            Some(m) if m.role == Role::User && m.text == "delegate a second" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "team".into(),
+                    arguments: serde_json::json!({
+                        "action": "delegate",
+                        "name": "mapper",
+                        "role": "explorer",
+                        "task": "map what is here",
+                    })
+                    .to_string(),
+                })
+            }
+            Some(m) if m.role == Role::User && m.text == "stop the mapper" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "team".into(),
+                    arguments: serde_json::json!({ "action": "stop", "name": "mapper" })
+                        .to_string(),
+                })
+            }
+            Some(m) if m.role == Role::User && m.text == "tell the scout" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "team".into(),
+                    arguments: serde_json::json!({
+                        "action": "tell",
+                        "name": "scout",
+                        "text": "and once more",
                     })
                     .to_string(),
                 })
@@ -391,6 +445,7 @@ fn start(
             review: false,
             subagents: SubagentPolicy::Disabled,
             rate_limit_source: None,
+            front_end: None,
         },
         provider_factory: Arc::new(RecordingFactory(recorder.clone())),
         plugin_hooks: Arc::new(StaticPluginHookSource::default()),
@@ -538,6 +593,172 @@ async fn a_resumed_session_continues_the_stored_conversation() {
     second.handle.shutdown().await.unwrap();
 }
 
+/// A resumed session is its log and nothing else (`docs/adr/0024`).
+///
+/// A snapshot file beside the log — what a released build would have written —
+/// changes nothing a resume shows; without the log there is nothing to resume,
+/// and the runtime says so rather than falling back to anything else.
+async fn a_resumed_session_is_its_log_and_nothing_else() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut first = CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+        .await
+        .unwrap();
+    let id = first.session.clone().unwrap().id;
+    turn(&mut first, "remember pineapple").await;
+    first.handle.shutdown().await.unwrap();
+    let _ = first.task.await;
+
+    let manager = SessionManager::for_project(env.project.path());
+    std::fs::write(
+        manager.snapshot_path(&id).unwrap(),
+        serde_json::to_vec(&SessionSnapshot::new(vec![
+            Message::user("remember mango"),
+            Message::assistant("answer 1", vec![]),
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut second = CodingRuntime::start(start(
+        env.project.path(),
+        &recorder,
+        SessionMode::Resume(id.clone()),
+    ))
+    .await
+    .unwrap();
+    turn(&mut second, "which fruit?").await;
+    assert_eq!(
+        user_texts(&recorder.last_request()),
+        vec!["remember pineapple".to_string(), "which fruit?".to_string()],
+    );
+    second.handle.shutdown().await.unwrap();
+    let _ = second.task.await;
+
+    std::fs::remove_file(manager.events_path(&id).unwrap()).unwrap();
+    assert!(
+        CodingRuntime::start(start(
+            env.project.path(),
+            &recorder,
+            SessionMode::Resume(id.clone()),
+        ))
+        .await
+        .is_err(),
+        "a session without its log was resumed from something else"
+    );
+}
+
+/// A session a released build stored as a snapshot is resumed, and becomes a
+/// log on the way: resumed again after its snapshot is gone, it shows the same
+/// conversation. The released build's files are moved aside, not deleted.
+async fn a_session_a_released_build_stored_is_converted_when_resumed() {
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let manager = SessionManager::for_project(env.project.path());
+    let id = "5b0e0b8e-0000-4000-8000-000000000001";
+    let lease = manager.acquire_lease(id).unwrap();
+    let mut meta = atomcode_capabilities::session::SessionMeta::new(
+        id,
+        env.project.path().to_string_lossy(),
+        1,
+    );
+    meta.owner = atomcode_capabilities::session::StorageOwner::Native;
+    manager
+        .commit_native_import(
+            &lease,
+            Some(&SessionSnapshot::new(vec![
+                Message::system("You are AtomCode, as released"),
+                Message::user("remember kiwi"),
+                Message::assistant("noted", vec![]),
+            ])),
+            Some(&atomcode_capabilities::session::PresentationFile::default()),
+            &meta,
+        )
+        .unwrap();
+    drop(lease);
+
+    let resume_and_ask = || async {
+        let mut runtime = CodingRuntime::start(start(
+            env.project.path(),
+            &recorder,
+            SessionMode::Resume(id.to_string()),
+        ))
+        .await
+        .unwrap();
+        turn(&mut runtime, "which fruit?").await;
+        assert_eq!(
+            user_texts(&recorder.last_request())[..2],
+            ["remember kiwi".to_string(), "which fruit?".to_string()],
+        );
+        runtime.handle.shutdown().await.unwrap();
+        let _ = runtime.task.await;
+    };
+
+    resume_and_ask().await;
+    assert!(manager.is_event_session(id));
+    assert!(!manager.snapshot_path(id).unwrap().exists());
+    let aside = manager.root().join(format!("{id}.snapshot.migrated"));
+    assert!(
+        aside.exists(),
+        "the released build's snapshot is kept aside"
+    );
+
+    std::fs::remove_file(aside).unwrap();
+    resume_and_ask().await;
+}
+
+/// A write to the session's log that fails stops the session: a log with a hole
+/// in it would replay into a conversation that never happened.
+async fn a_failed_write_to_the_log_stops_the_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = env();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime =
+        CodingRuntime::start(start(env.project.path(), &recorder, SessionMode::Fresh))
+            .await
+            .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+    turn(&mut runtime, "one").await;
+
+    let log = SessionManager::for_project(env.project.path())
+        .events_path(&id)
+        .unwrap();
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    runtime.handle.submit(UserInput::from("two")).await.unwrap();
+    let mut stopped = false;
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+            .await
+            .expect("turn did not finish")
+            .expect("runtime event stream closed");
+        match event.event {
+            CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::Error {
+                message,
+                ..
+            }) => stopped |= message.contains("runtime stopped"),
+            CodingRuntimeEvent::TurnFinished(_) => break,
+            _ => {}
+        }
+    }
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        stopped,
+        "the runtime went on after its log could not be written"
+    );
+    assert_eq!(
+        runtime.handle.status().phase,
+        atomcode_coding::RuntimePhase::Failed
+    );
+    assert!(runtime
+        .handle
+        .submit(UserInput::from("three"))
+        .await
+        .is_err());
+    let _ = runtime.handle.shutdown().await;
+}
+
 /// After an undo the model no longer sees the turn that was undone.
 async fn an_undone_turn_is_gone_from_what_the_model_sees() {
     let env = env();
@@ -547,6 +768,7 @@ async fn an_undone_turn_is_gone_from_what_the_model_sees() {
             .await
             .unwrap();
 
+    let id = runtime.session.clone().unwrap().id;
     turn(&mut runtime, "first").await;
     turn(&mut runtime, "second").await;
     let undone = runtime.handle.undo_to_prompt(None).await.unwrap();
@@ -559,6 +781,38 @@ async fn an_undone_turn_is_gone_from_what_the_model_sees() {
         ""
     );
     runtime.handle.shutdown().await.unwrap();
+    let _ = runtime.task.await;
+
+    // An undo is the projection's business (`docs/adr/0024` §17): the log still
+    // holds what was undone, and a resume leaves it out the same way.
+    let log = std::fs::read_to_string(
+        SessionManager::for_project(env.project.path())
+            .events_path(&id)
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        log.contains("\"text\":\"second\""),
+        "the undone prompt is gone from the log"
+    );
+    assert!(log.contains("\"kind\":\"rewound\""), "{log}");
+    let mut resumed = CodingRuntime::start(start(
+        env.project.path(),
+        &recorder,
+        SessionMode::Resume(id),
+    ))
+    .await
+    .unwrap();
+    turn(&mut resumed, "fourth").await;
+    assert_eq!(
+        user_texts(&recorder.last_request()),
+        vec![
+            "first".to_string(),
+            "third".to_string(),
+            "fourth".to_string()
+        ],
+    );
+    resumed.handle.shutdown().await.unwrap();
 }
 
 /// Same, without a session: the runtime's in-memory snapshot is the store.
@@ -960,6 +1214,59 @@ async fn a_persons_hooks_and_a_plugins_hooks_both_run() {
     assert!(from_file.exists(), "the hooks.json hook did not run");
     assert!(from_plugin.exists(), "the plugin's hook did not run");
     runtime.handle.shutdown().await.unwrap();
+}
+
+/// A Claude Code hook told where the session's transcript is gets the session's
+/// log, which replaced the transcript (`docs/adr/0024` §14) — and by the time
+/// the hook runs, the turn it is told about is in that file.
+async fn a_stop_hook_is_pointed_at_the_sessions_log() {
+    let env = env();
+    let project = env.project.path();
+    let payload = project.join("payload.json");
+    std::fs::write(
+        project.join(".hooks.json"),
+        serde_json::json!({
+            "hooks": {
+                "capture": {
+                    "event": "Stop",
+                    "command": format!("cat > {}", payload.display()),
+                },
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(start(project, &recorder, SessionMode::Fresh))
+        .await
+        .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+    turn(&mut runtime, "remember plum").await;
+    runtime.handle.shutdown().await.unwrap();
+
+    // A Stop hook is spawned, not awaited: wait for what it wrote.
+    let mut written = None;
+    for _ in 0..400 {
+        if let Some(value) = std::fs::read_to_string(&payload)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        {
+            written = Some(value);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let payload = written.expect("the Stop hook ran");
+    let log = SessionManager::for_project(project)
+        .events_path(&id)
+        .unwrap();
+    assert_eq!(
+        payload["transcript_path"],
+        serde_json::json!(log.display().to_string())
+    );
+    assert!(std::fs::read_to_string(&log)
+        .unwrap()
+        .contains("remember plum"));
 }
 
 /// With the datalog on, a turn is written to it.
@@ -1662,6 +1969,123 @@ async fn cancel_hanging_turn(runtime: &mut CodingRuntime, recorder: &Recorder) {
     }
 }
 
+/// A reply the person stopped part way is kept as far as it got
+/// (`docs/adr/0024` §8–9), though chunks are not.
+///
+/// Kept, the next request shows the model the words it had said, then the
+/// interruption — not its half-finished thinking, not the call it had not
+/// finished asking for — and a resume shows it the same conversation. Undone,
+/// the words go with the rest of the turn. Either way the log on disk holds
+/// them, ahead of the interruption.
+async fn a_stopped_reply_is_kept_as_far_as_it_got() {
+    for keep in [true, false] {
+        let env = env();
+        let recorder = Arc::new(Recorder::default());
+        let mut config = start(env.project.path(), &recorder, SessionMode::Fresh);
+        config.agent.keep_interrupted_context = keep;
+        let mut runtime = CodingRuntime::start(config).await.unwrap();
+        let id = runtime.session.clone().unwrap().id;
+        turn(&mut runtime, "first").await;
+
+        runtime
+            .handle
+            .submit(UserInput::from("half"))
+            .await
+            .unwrap();
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+                    .await
+                    .expect("the reply did not start")
+                    .expect("runtime event stream closed");
+            if let CodingRuntimeEvent::Agent(atomcode_kernel::event::AgentEvent::TextDelta(text)) =
+                event.event
+            {
+                if text.contains("I was saying") {
+                    break;
+                }
+            }
+        }
+        runtime.handle.cancel().await.unwrap();
+        loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(10), runtime.events.recv())
+                    .await
+                    .expect("the stopped turn did not finish")
+                    .expect("runtime event stream closed");
+            if matches!(event.event, CodingRuntimeEvent::TurnFinished(_)) {
+                break;
+            }
+        }
+        turn(&mut runtime, "third").await;
+
+        let seen = recorder.last_request();
+        let said = seen
+            .iter()
+            .position(|m| m.role == Role::Assistant && m.text == "I was saying");
+        assert!(
+            !seen.iter().any(|m| m.text.contains("thinking half")
+                || m.reasoning
+                    .as_deref()
+                    .is_some_and(|r| r.contains("thinking half"))),
+            "half a thought reached the model: {seen:?}"
+        );
+        if keep {
+            let at = said.unwrap_or_else(|| panic!("the words said are gone: {seen:?}"));
+            assert!(seen[at].tool_calls.is_empty(), "{:?}", seen[at]);
+            assert!(seen[at + 1].is_user_interruption(), "{seen:?}");
+        } else {
+            assert!(said.is_none(), "an undone turn's words stayed: {seen:?}");
+        }
+
+        let manager = SessionManager::for_project(env.project.path());
+        let kinds: Vec<String> = std::fs::read_to_string(manager.events_path(&id).unwrap())
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let record: serde_json::Value = serde_json::from_str(line).ok()?;
+                record["event"]["kind"].as_str().map(str::to_owned)
+            })
+            .collect();
+        let partial = kinds.iter().position(|kind| kind == "partial_reply");
+        let interrupted = kinds.iter().position(|kind| kind == "interrupted");
+        assert!(
+            matches!((partial, interrupted), (Some(p), Some(i)) if p < i),
+            "the log: {kinds:?}"
+        );
+
+        if keep {
+            let before: Vec<Message> = seen
+                .into_iter()
+                .filter(|m| m.role != Role::System)
+                .collect();
+            runtime.handle.shutdown().await.unwrap();
+            let _ = runtime.task.await;
+            let mut resumed = CodingRuntime::start(start(
+                env.project.path(),
+                &recorder,
+                SessionMode::Resume(id.clone()),
+            ))
+            .await
+            .unwrap();
+            turn(&mut resumed, "fourth").await;
+            let after: Vec<Message> = recorder
+                .last_request()
+                .into_iter()
+                .filter(|m| m.role != Role::System)
+                .collect();
+            assert_eq!(
+                after[..before.len()],
+                before[..],
+                "a resume changed the conversation"
+            );
+            resumed.handle.shutdown().await.unwrap();
+        } else {
+            runtime.handle.shutdown().await.unwrap();
+        }
+    }
+}
+
 /// By default a cancelled turn leaves no trace in what the model sees next —
 /// only a note that the person interrupted.
 async fn a_cancelled_turn_is_undone_by_default() {
@@ -1893,17 +2317,20 @@ async fn a_committed_compaction_is_stored_at_once_and_reported_truthfully() {
             .map(|m| (m.role.clone(), m.text.clone()))
             .collect::<Vec<_>>()
     };
+    // The log projects no system prompt; that is assembled per request.
+    let committed =
+        atomcode_capabilities::session::events::without_system_prompt(&committed.messages);
     assert_eq!(
         shape(&stored),
-        shape(&committed.messages),
+        shape(&committed),
         "the store has not caught up with the compaction"
     );
     assert_eq!(
         outcome.removed_messages,
-        before.len() - committed.messages.len(),
+        before.len() - committed.len(),
         "{} messages became {}",
         before.len(),
-        committed.messages.len()
+        committed.len()
     );
     runtime.handle.shutdown().await.unwrap();
 }
@@ -2046,6 +2473,149 @@ async fn a_team_run_reaches_the_team_panel() {
         "the team run never reached the driver"
     );
     runtime.handle.shutdown().await.unwrap();
+}
+
+/// Wait until `id`'s stored log satisfies `done`.
+async fn stored_until(
+    store: &SessionManager,
+    id: &str,
+    what: &str,
+    done: impl Fn(&[atomcode_kernel::session::LoggedEvent]) -> bool,
+) {
+    for _ in 0..500 {
+        if store.is_event_session(id) && store.load_events(id).is_ok_and(|events| done(&events)) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("`{id}` never {what}");
+}
+
+fn turns_ended(events: &[atomcode_kernel::session::LoggedEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.event,
+                atomcode_kernel::session::SessionEvent::TurnEnd { .. }
+            )
+        })
+        .count()
+}
+
+fn in_use(store: &SessionManager, id: &str) -> bool {
+    matches!(
+        store.acquire_lease(id),
+        Err(atomcode_capabilities::session::SessionStoreError::SessionInUse { .. })
+    )
+}
+
+/// A team outlives the process (`docs/adr/0024` §11–§13). Each member's log is
+/// a session of its own under the lead, written under a lease of its own and
+/// never listed beside the lead; resuming the lead brings back the members it
+/// did not stop — the lead can put one to work again — and leaves the stopped
+/// one's log where it was, ending in the fact that it was stopped.
+async fn a_team_is_kept_and_comes_back_with_its_lead() {
+    let env = env();
+    let project = env.project.path();
+    let recorder = Arc::new(Recorder::default());
+    let store = SessionManager::for_project(project);
+    let mut runtime = CodingRuntime::start(production_start(project, &recorder, |_| {}))
+        .await
+        .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+    let scout = format!("{id}~scout");
+    let mapper = format!("{id}~mapper");
+    // A member's report wakes the lead for a turn of its own, so what each
+    // step did is read from the store rather than from which turn finished.
+    turn(&mut runtime, "delegate a team").await;
+    stored_until(&store, &scout, "ended a turn", |e| turns_ended(e) >= 1).await;
+    turn(&mut runtime, "delegate a second").await;
+    stored_until(&store, &mapper, "ended a turn", |e| turns_ended(e) >= 1).await;
+    turn(&mut runtime, "stop the mapper").await;
+    stored_until(&store, &mapper, "ended saying it was stopped", |e| {
+        e.last().is_some_and(|last| {
+            matches!(
+                last.event,
+                atomcode_kernel::session::SessionEvent::Stopped { .. }
+            )
+        })
+    })
+    .await;
+
+    assert!(in_use(&store, &scout), "a member's log has one writer");
+    assert!(!in_use(&store, &mapper), "a stopped member lets its log go");
+    let header = store.read_event_header(&scout).unwrap();
+    assert_eq!(header.parent.as_deref(), Some(id.as_str()));
+    assert_eq!(
+        header.member.map(|m| (m.name, m.role)),
+        Some(("scout".to_string(), "explorer".to_string()))
+    );
+    assert_eq!(
+        store.list().into_iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![id.clone()],
+        "a member is kept under its lead, not listed beside it"
+    );
+    runtime.handle.shutdown().await.unwrap();
+    assert!(!in_use(&store, &scout), "its lease went with the runtime");
+
+    let mut resumed = CodingRuntime::start(production_start(project, &recorder, |start| {
+        start.prepare.session = SessionMode::Resume(id.clone());
+    }))
+    .await
+    .unwrap();
+    for _ in 0..500 {
+        if in_use(&store, &scout) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        in_use(&store, &scout),
+        "the scout came back and holds its log"
+    );
+    assert!(!in_use(&store, &mapper), "the stopped one did not");
+    turn(&mut resumed, "tell the scout").await;
+    stored_until(&store, &scout, "ran a turn after the resume", |e| {
+        turns_ended(e) >= 2
+    })
+    .await;
+    resumed.handle.shutdown().await.unwrap();
+}
+
+/// On the product's own tree, a delegated agent is held to what no delegated
+/// agent may do: it reads no secret, whatever the approval mode
+/// (`docs/adr/0023` §2, the product-tree gate).
+async fn a_delegated_agent_in_the_product_never_reads_a_secret() {
+    let env = env();
+    std::fs::write(env.project.path().join(".env"), "API_KEY=hunter2").unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let mut runtime = CodingRuntime::start(production_start(env.project.path(), &recorder, |_| {}))
+        .await
+        .unwrap();
+    turn(&mut runtime, "delegate the secret").await;
+    runtime.handle.shutdown().await.unwrap();
+
+    let requests = recorder.requests.lock().unwrap().clone();
+    let shown: Vec<&str> = requests.iter().flatten().map(|m| m.text.as_str()).collect();
+    assert!(
+        shown.iter().any(|text| text == &"fetch dotenv"),
+        "the child never ran: {shown:?}"
+    );
+    assert!(
+        !shown.iter().any(|text| text.contains("hunter2")),
+        "a delegated agent read the secret"
+    );
+    let results: Vec<&str> = requests
+        .iter()
+        .flatten()
+        .filter(|m| m.role == Role::Tool)
+        .map(|m| m.text.as_str())
+        .collect();
+    assert!(
+        results.iter().any(|text| text.contains("Refused")),
+        "and was told why: {results:?}"
+    );
 }
 
 /// After a logout no provider the runtime was handed is alive — not behind the
@@ -2486,16 +3056,28 @@ async fn the_prompt_teaches_each_product_tool_once() {
         .map(|m| m.text.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
+    // Delegation is taught by the rows that mount it (`docs/adr/0023` §2), once
+    // each, and nothing describes the product's retired `task`/`team` contract.
     for heading in [
         "## ASKING THE USER:",
-        "## DELEGATING WITH `task`:",
-        "## TEAM AGENT:",
+        "`task` delegates a self-contained job",
+        "`team` runs named child agents",
         "## CODE REVIEW:",
     ] {
         assert_eq!(
             system.matches(heading).count(),
             1,
             "`{heading}` should appear exactly once"
+        );
+    }
+    for retired in [
+        "## DELEGATING WITH `task`:",
+        "## TEAM AGENT:",
+        "subagent_type",
+    ] {
+        assert!(
+            !system.contains(retired),
+            "`{retired}` describes a tool that is gone"
         );
     }
     runtime.handle.shutdown().await.unwrap();
@@ -2547,12 +3129,13 @@ async fn every_model_round_is_reported_even_without_usage() {
     runtime.handle.shutdown().await.unwrap();
 }
 
-/// The session's transcript is the runtime's own, written by nobody else.
+/// The session's log has one writer, and holds facts, not chunks.
 ///
-/// The tree keeps a log of its own facts and the runtime keeps a transcript of
-/// its turns. Both name a file `<bucket>/<id>.jsonl`, and for a while both wrote
-/// the same one: two schemas in one file, which `recall` and the session catalog
-/// then read as a corrupt transcript.
+/// The log took the transcript's place (`docs/adr/0024` §14). For a while two
+/// writers shared `<bucket>/<id>.jsonl` — two schemas in one file, which
+/// `recall` and the session catalog then read as corrupt — and the transcript
+/// hook still runs every turn: a line from it in the log would be that again.
+/// Streamed chunks are the in-memory log's, never the file's (§7).
 #[tokio::test]
 #[serial_test::serial(engine)]
 async fn the_session_transcript_has_one_writer() {
@@ -2567,19 +3150,36 @@ async fn the_session_transcript_has_one_writer() {
     runtime.handle.shutdown().await.unwrap();
 
     let manager = SessionManager::for_project(env.project.path());
-    let path = manager.jsonl_path(&id).unwrap();
-    let transcript = std::fs::read_to_string(&path).unwrap();
-    assert!(!transcript.trim().is_empty(), "nothing was transcribed");
-    for line in transcript.lines().filter(|line| !line.trim().is_empty()) {
-        let record: serde_json::Value = serde_json::from_str(line).expect("a transcript record");
-        assert!(
-            record
-                .get("turn_id")
-                .and_then(serde_json::Value::as_u64)
-                .is_some(),
-            "a line that is not a turn record is another writer's: {line}"
+    let path = manager.events_path(&id).unwrap();
+    let log = std::fs::read_to_string(&path).unwrap();
+    let mut lines = log.lines().filter(|line| !line.trim().is_empty());
+    let header: serde_json::Value = serde_json::from_str(lines.next().expect("a header")).unwrap();
+    assert_eq!(header["header"]["id"], serde_json::json!(id), "{header}");
+    let mut last = 0;
+    let mut kinds = Vec::new();
+    for line in lines {
+        let record: serde_json::Value = serde_json::from_str(line).expect("a log record");
+        let seq = record
+            .get("seq")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(|| panic!("a line that is not a fact is another writer's: {line}"));
+        assert!(seq > last, "facts out of order: {line}");
+        last = seq;
+        kinds.push(
+            record["event"]["kind"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
         );
     }
+    assert!(
+        kinds.iter().any(|kind| kind == "assistant_message"),
+        "the reply was kept: {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|kind| kind == "assistant_chunk"),
+        "chunks were written: {kinds:?}"
+    );
 }
 
 /// The last tool result the model was shown.
@@ -2605,7 +3205,7 @@ fn last_tool_result(recorder: &Recorder) -> String {
 
 /// What the agent is told about its session is what this runtime does with it.
 ///
-/// The judge is the store itself — the snapshot path `SessionManager` resumes
+/// The judge is the store itself — the log path `SessionManager` resumes
 /// from — not the wording. Before, the only session description in this
 /// assembly was the harness journal's, so an agent asked "where is this
 /// conversation kept" named a file nothing reads back, and asked "how do I
@@ -2625,10 +3225,10 @@ async fn the_agent_is_told_where_its_session_really_is() {
     runtime.handle.shutdown().await.unwrap();
 
     let store = SessionManager::for_project(env.project.path());
-    let snapshot = store.snapshot_path(&id).unwrap();
+    let log = store.events_path(&id).unwrap();
     assert!(session.contains(&id), "{session}");
     assert!(
-        session.contains(&format!("kept in: {}", snapshot.display())),
+        session.contains(&format!("kept in: {}", log.display())),
         "the session must be placed where a resume reads it from:\n{session}"
     );
     assert!(
@@ -2643,7 +3243,7 @@ async fn the_agent_is_told_where_its_session_really_is() {
         "{operations}"
     );
     assert!(
-        operations.contains("rebuilds it from that file and from nothing else"),
+        operations.contains("a resume replays that file and nothing else"),
         "what a resume reads is the store's to say:\n{operations}"
     );
     // The product's contract for continuing a session, which every front end
@@ -3210,6 +3810,9 @@ mod criteria {
     criteria!(
         the_turn_is_stored_before_it_is_reported_finished,
         a_resumed_session_continues_the_stored_conversation,
+        a_resumed_session_is_its_log_and_nothing_else,
+        a_session_a_released_build_stored_is_converted_when_resumed,
+        a_failed_write_to_the_log_stops_the_session,
         an_undone_turn_is_gone_from_what_the_model_sees,
         a_sessionless_undo_is_gone_from_what_the_model_sees,
         switching_sessions_switches_what_the_model_sees,
@@ -3222,6 +3825,7 @@ mod criteria {
         the_session_context_is_shown_and_its_git_snapshot_survives_a_resume,
         a_turn_is_transcribed_and_metered,
         a_persons_hooks_and_a_plugins_hooks_both_run,
+        a_stop_hook_is_pointed_at_the_sessions_log,
         the_datalog_is_written_when_it_is_on,
         an_eager_todo_reminder_rides_the_first_request,
         a_loop_turn_can_schedule_its_next_pass,
@@ -3241,6 +3845,7 @@ mod criteria {
         a_meaningless_temperature_is_ignored_rather_than_breaking_a_model_switch,
         a_cancelled_turn_is_undone_by_default,
         a_cancelled_turn_is_kept_when_asked,
+        a_stopped_reply_is_kept_as_far_as_it_got,
         a_distant_rate_limit_pauses_the_turn,
         an_exhausted_plan_window_pauses_until_its_reset,
         a_brief_rate_limit_is_waited_out,
@@ -3248,6 +3853,8 @@ mod criteria {
         a_tools_question_reaches_the_person_and_the_answer_comes_back,
         a_delegated_subtask_is_reported_narrated_and_billed,
         a_team_run_reaches_the_team_panel,
+        a_team_is_kept_and_comes_back_with_its_lead,
+        a_delegated_agent_in_the_product_never_reads_a_secret,
         a_turn_ending_on_its_last_allowed_round_is_not_cut_off,
         the_round_budget_asks_before_it_cuts_a_turn_off,
         a_turn_left_cut_off_says_so,

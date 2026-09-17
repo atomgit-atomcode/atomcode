@@ -22,7 +22,9 @@ if ! cargo nextest --version >/dev/null 2>&1; then
   exit 1
 fi
 
-out=$(eval "$CMD" 2>&1)
+# 去掉颜色码：环境里设了 FORCE_COLOR 时 nextest 即使不接终端也上色，
+# 汇总行成了 `516\e[0m tests run`，数字就解析不出来。
+out=$(eval "$CMD" 2>&1 | sed $'s/\x1b\[[0-9;]*m//g')
 # nextest 的失败面：编译期 `error...`、单测 `FAIL [`、汇总行 `N failed`。
 if echo "$out" | grep -qE "^error|FAIL \[|[1-9][0-9]* failed"; then
   echo "  ✗ 测试没跑通，数量无从谈起"

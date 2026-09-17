@@ -365,6 +365,25 @@ impl WorkerScopeGate {
     }
 }
 
+/// Why a delegated agent may not make this write, or `None` when it may.
+///
+/// The judgement the product's own subagents run under, for any host that
+/// delegates: a write tool's target must resolve — through `..`, absolute paths
+/// and symlinks — inside `working_dir`, match one of `scopes`, and never land in
+/// a `.git` directory. `["**"]` is "anywhere in the workspace". Reads and every
+/// tool that is not a write are not this function's to judge.
+pub fn delegated_write_violation(
+    scopes: &[String],
+    working_dir: &Path,
+    tool: &str,
+    args: &str,
+) -> Option<String> {
+    if !matches!(tool, "edit_file" | "write_file" | "search_replace") {
+        return None;
+    }
+    WorkerScopeGate::new(scopes, working_dir).violation(tool, args)
+}
+
 #[async_trait]
 impl ToolMiddleware for WorkerScopeGate {
     async fn before(
@@ -1614,7 +1633,7 @@ async fn run_child_to_completion(
             AgentEvent::PolicyIntervention { intervention } => {
                 outcome.policy_intervention = Some(intervention);
             }
-            AgentEvent::TurnComplete { reason } => {
+            AgentEvent::TurnComplete { reason, .. } => {
                 outcome.stop = reason;
                 let _ = handle.commands.send(AgentCommand::Shutdown);
                 break;

@@ -48,6 +48,7 @@ async fn always_allow_grants_survive_reassembly() {
         subagents: atomcode_coding::SubagentPolicy::Disabled,
         request_user_input: true,
         rate_limit_source: None,
+        front_end: None,
     };
     let parts = prepare(&cfg, opts.clone()).await.unwrap();
 

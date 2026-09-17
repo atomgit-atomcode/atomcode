@@ -655,7 +655,7 @@ impl ReviewRun {
                     );
                 }
             }
-            AgentEvent::TurnComplete { reason } => {
+            AgentEvent::TurnComplete { reason, .. } => {
                 self.stop = reason;
                 return false;
             }
@@ -1282,6 +1282,7 @@ mod tests {
             tool("c2", "report_finding"),
             AgentEvent::TextDelta("## 审查总结\nP0: 1, P1: 2\n整体风险：HIGH".into()),
             AgentEvent::TurnComplete {
+                turn: None,
                 reason: StopReason::Stopped,
             },
         ];

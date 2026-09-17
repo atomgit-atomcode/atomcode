@@ -222,7 +222,7 @@ async fn lifecycle_hook_injects_and_continues_loop() {
     let (mut turn_started, mut echoed, mut completed) = (false, false, false);
     while let Some(ev) = events.recv().await {
         match ev {
-            AgentEvent::TurnStarted => turn_started = true,
+            AgentEvent::TurnStarted { .. } => turn_started = true,
             AgentEvent::ToolResult { result } if result.content.contains("echo: ") => echoed = true,
             AgentEvent::TurnComplete { .. } => {
                 completed = true;
@@ -958,7 +958,7 @@ async fn user_prompt_submit_can_block_a_prompt() {
     while let Some(ev) = handle.events.recv().await {
         match ev {
             AgentEvent::Error { message, .. } if message.contains("rejected") => rejected = true,
-            AgentEvent::TurnStarted => turn_started = true,
+            AgentEvent::TurnStarted { .. } => turn_started = true,
             AgentEvent::TurnComplete { .. } => break,
             _ => {}
         }

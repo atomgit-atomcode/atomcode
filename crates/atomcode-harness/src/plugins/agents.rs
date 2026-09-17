@@ -20,6 +20,10 @@ impl Plugin for AgentsPlugin {
     fn name(&self) -> &'static str {
         "agents"
     }
+    fn uses(&self) -> &'static [&'static str] {
+        // An agent describes itself with the commands on offer for it.
+        &["commands"]
+    }
     fn provides(&self) -> &'static [&'static str] {
         &["agents"]
     }

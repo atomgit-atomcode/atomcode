@@ -47,6 +47,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(registries::ToolsPlugin))
         .register(Arc::new(registries::SystemPromptPlugin))
         .register(Arc::new(registries::OperationsPlugin))
+        .register(Arc::new(registries::CommandsPlugin))
         .register(Arc::new(agents::AgentsPlugin))
         .register(Arc::new(session::SessionPlugin))
         .register(Arc::new(session::SessionProjectionsPlugin))
@@ -88,6 +89,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(persona::SecurityPersonaPlugin))
         .register(Arc::new(agent_loop::AgentLoopPlugin))
         .register(Arc::new(policy::RepairArgsPlugin))
+        .register(Arc::new(policy::DelegationBoundsPlugin))
         .register(Arc::new(policy::SensitivePathsPlugin))
         .register(Arc::new(policy::ApprovalPlugin))
         .register(Arc::new(policy::ResultCapPlugin))
@@ -132,6 +134,7 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(ui::QuietUiPlugin))
         .register(Arc::new(ui_jsonrpc::JsonRpcUiPlugin))
         .register(Arc::new(handle::AgentHandlePlugin))
+        .register(Arc::new(handle::QuestionsHandlePlugin))
         .register(Arc::new(ui_web::WebUiPlugin))
         .register(Arc::new(trace::TracePlugin));
     registry

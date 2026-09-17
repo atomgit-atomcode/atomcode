@@ -184,20 +184,20 @@ async fn the_assembly_lifecycle() {
         );
     }
 
-    // The turn persisted all three session files.
+    // The turn persisted the session: its log and its index, and no snapshot.
     assert!(
-        sessions_root
+        sessions_root.join(format!("{session_id}.events")).exists(),
+        "log persisted"
+    );
+    assert!(
+        sessions_root.join(format!("{session_id}.index")).exists(),
+        "index persisted"
+    );
+    assert!(
+        !sessions_root
             .join(format!("{session_id}.snapshot"))
             .exists(),
-        "snapshot persisted"
-    );
-    assert!(
-        sessions_root.join(format!("{session_id}.meta")).exists(),
-        "meta persisted"
-    );
-    assert!(
-        sessions_root.join(format!("{session_id}.jsonl")).exists(),
-        "transcript persisted"
+        "a log session writes no snapshot"
     );
 
     // ===== Phase 2: RESPAWN on the SAME parts (model swap) continues the session ====
@@ -266,16 +266,14 @@ async fn the_assembly_lifecycle() {
         }
     }
 
-    // Transcript turn_ids are MONOTONIC across the resume (the 8c06a9e2 seeding,
-    // end-to-end through prepare/assemble): lines say turn 1 then turn 2.
-    let jsonl = std::fs::read_to_string(sessions_root.join(format!("{session_id}.jsonl"))).unwrap();
-    let turn_ids: Vec<u64> = jsonl
+    // Turn ids are MONOTONIC across the respawn and the resume: the log opens
+    // turn 1, then 2, then 3.
+    let log = std::fs::read_to_string(sessions_root.join(format!("{session_id}.events"))).unwrap();
+    let turn_ids: Vec<u64> = log
         .lines()
-        .map(|l| {
-            serde_json::from_str::<serde_json::Value>(l).unwrap()["turn_id"]
-                .as_u64()
-                .unwrap()
-        })
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|record| record["event"]["kind"] == "turn_start")
+        .map(|record| record["event"]["turn"].as_u64().unwrap())
         .collect();
     assert_eq!(
         turn_ids,

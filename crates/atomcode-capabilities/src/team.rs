@@ -296,6 +296,17 @@ fn path_is_under(path: &str, root: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// Whether two writers' declared scopes may touch the same file. Errs on the
+/// side of "yes" for glob forms it cannot decide, like
+/// [`validate_non_overlapping_worker_scopes`].
+pub fn worker_scopes_overlap(a: &[String], b: &[String]) -> bool {
+    a.iter().filter(|s| !s.trim().is_empty()).any(|x| {
+        b.iter()
+            .filter(|s| !s.trim().is_empty())
+            .any(|y| scopes_provably_overlap(&normalize_scope(x), &normalize_scope(y)))
+    })
+}
+
 fn scopes_provably_overlap(a: &str, b: &str) -> bool {
     if a == b {
         return true;

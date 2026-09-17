@@ -1,4 +1,4 @@
-//! Conformance gates for the `session` capability: the `recall` tool and the three
+//! Conformance gates for the `session` capability: the `recall` tool and the
 //! persistence/injection hooks must each satisfy the kernel seam contracts
 //! (must-not-panic, bounded, meta-preserving, return-shape) — the same gates a
 //! third-party provider/tool/hook is held to.
@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use atomcode_capabilities::session::{
-    RecallTool, SessionManager, SnapshotHook, StatusReminderHook, TranscriptHook,
+    RecallTool, SessionManager, SnapshotHook, StatusReminderHook,
 };
 use atomcode_kernel::conformance;
 use atomcode_kernel::hook::LifecycleHooks;
@@ -57,14 +57,6 @@ async fn recall_tool_passes_kernel_tool_conformance() {
     conformance::tool::check(tool, &[r#"{"query":"oauth refresh"}"#, "{\"query\":\"\"}"])
         .await
         .assert_conformant();
-}
-
-#[tokio::test]
-async fn transcript_hook_passes_lifecycle_conformance() {
-    let dir = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(SessionManager::with_root(dir.path()));
-    let h: Arc<dyn LifecycleHooks> = Arc::new(TranscriptHook::new(mgr, "s1"));
-    conformance::hooks::check(h).await.assert_conformant();
 }
 
 #[tokio::test]

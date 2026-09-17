@@ -897,3 +897,387 @@ async fn a_word_that_is_not_a_level_is_refused() {
     );
     drop(app);
 }
+
+// ---- who wrote the role file ---------------------------------------------
+
+/// A team whose roles come from `project` (the repository's own
+/// `.atomcode/agents`) and `home` (the person's), over `offer`.
+async fn team_with_roles(
+    tag: &str,
+    offer: Vec<ModelInfo>,
+    roles: &[(&str, &str, &str)],
+) -> (App, Calls) {
+    let root = scratch(tag);
+    let home = root.join("__home__");
+    for (place, id, model) in roles {
+        let dir = match *place {
+            "project" => root.join(".atomcode").join("agents"),
+            _ => home.join("agents"),
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.md")),
+            format!(
+                "---\npermission: explore\ndifficulty: simple\nmodel: {model}\nwhen: looking\n---\nYou look.\n"
+            ),
+        )
+        .unwrap();
+    }
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let catalog = Arc::new(TestCatalog {
+        offer,
+        current: Some("lead-model".into()),
+        calls: calls.clone(),
+    });
+    let lead = Arc::new(Lead {
+        args: String::new(),
+        calls: calls.clone(),
+        round: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let scoped = format!(
+        "[[patch]]\nid = \"trace\"\nconfig = {{ stream = false, tools = false, summary = false }}\n\n\
+         [[patch]]\nid = \"fs\"\nconfig = {{ root = {root:?} }}\n\n\
+         [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 6, working_dir = {root:?} }}\n\n\
+         [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
+         [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {root:?} }}\n\n\
+         [[patch]]\nid = \"project-instructions\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
+         [[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"approval\"\nconfig = {{ mode = \"yolo\" }}\n\n\
+         [[patch]]\nid = \"llm\"\nname = \"test-lead-model\"\nconfig = {{}}\n\n\
+         [[insert]]\nname = \"test-models\"\n\n\
+         [[insert]]\nname = \"model-catalog\"\n\n\
+         [[insert]]\nname = \"team-in-process\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n",
+        root = root.to_string_lossy(),
+        home = home.to_string_lossy(),
+    );
+    let tree = ConfigTree::from_layers(vec![
+        bundle::base().unwrap(),
+        Layer::from_toml(&scoped).unwrap(),
+    ])
+    .expect("tree");
+    let mut registry = plugins::catalog();
+    registry.register(Arc::new(ProvideCatalog(catalog)));
+    registry.register(Arc::new(ProvideLead(lead)));
+    let mut app = App::new(registry, tree);
+    app.start().await.expect("must mount");
+    (app, calls)
+}
+
+async fn delegate_as_lead(
+    app: &App,
+    lead: &Arc<atomcode_harness::agent::Agent>,
+    role: &str,
+) -> String {
+    let tool = app
+        .context()
+        .service::<atomcode_harness::seams::ToolsSvc>()
+        .unwrap()
+        .get("team")
+        .expect("team tool mounted");
+    let ctx = atomcode_kernel::tool::ToolContext {
+        working_dir: std::env::current_dir().unwrap(),
+        cancel: Default::default(),
+        progress: atomcode_kernel::tool::ProgressSink::noop(),
+        requester: None,
+    };
+    let args =
+        serde_json::json!({ "action": "delegate", "name": role, "role": role, "task": "look" })
+            .to_string();
+    atomcode_harness::agent::as_agent(lead.ctx().clone(), async move {
+        tool.execute(&args, &ctx).await
+    })
+    .await
+    .content
+}
+
+/// A role that came with the repository arrived with a clone, not from the
+/// person: it names only what the model could pick for itself. The person's own
+/// role file may still point at their second account (`docs/adr/0023`, addendum).
+#[tokio::test]
+async fn a_role_that_came_with_the_project_may_not_name_another_account() {
+    let offer = || vec![model("lead-model", 30), elsewhere("theirs", 5)];
+    let (app, calls) = team_with_roles(
+        "project-role",
+        offer(),
+        &[("project", "cloned", "theirs"), ("home", "mine", "theirs")],
+    )
+    .await;
+    let lead = atomcode_harness::create_agent(&app).await.unwrap();
+
+    let refused = delegate_as_lead(&app, &lead, "cloned").await;
+    assert!(
+        refused.contains("not available to delegate to"),
+        "a project's role reached another account: {refused}"
+    );
+
+    let taken = delegate_as_lead(&app, &lead, "mine").await;
+    assert!(taken.contains("delegated to `mine`"), "{taken}");
+    for _ in 0..200 {
+        if who(&calls).iter().any(|c| c == "theirs") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        who(&calls).iter().any(|c| c == "theirs"),
+        "the person's own role runs where they pointed it"
+    );
+}
+
+/// A host that keeps a delegated agent's spend apart hands the harness the
+/// provider a child should use when it inherits the conversation's model; a
+/// child that names no model runs on that one, and the lead keeps its own.
+#[tokio::test]
+async fn a_child_on_the_conversations_model_runs_on_the_hosts_delegated_provider() {
+    struct ProvideDelegated(Calls);
+
+    #[async_trait]
+    impl Plugin for ProvideDelegated {
+        fn name(&self) -> &'static str {
+            "test-delegated-model"
+        }
+        fn provides(&self) -> &'static [&'static str] {
+            &["llm-delegated"]
+        }
+        fn description(&self) -> &'static str {
+            "the conversation's model, billed apart"
+        }
+        async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+            let _ = ctx
+                .provide::<atomcode_harness::seams::DelegatedLlmSvc>(Arc::new(Signed {
+                    id: "delegated".into(),
+                    calls: self.0.clone(),
+                }))
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+    }
+
+    let root = scratch("delegated");
+    let empty_home = root.join("__no_user_skills__");
+    let _ = std::fs::create_dir_all(&empty_home);
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    let lead = Arc::new(Lead {
+        args: r#"{"task":"look around"}"#.into(),
+        calls: calls.clone(),
+        round: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let scoped = format!(
+        "[[patch]]\nid = \"trace\"\nconfig = {{ stream = false, tools = false, summary = false }}\n\n\
+         [[patch]]\nid = \"fs\"\nconfig = {{ root = {root:?} }}\n\n\
+         [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 6, working_dir = {root:?} }}\n\n\
+         [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
+         [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {root:?} }}\n\n\
+         [[patch]]\nid = \"project-instructions\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
+         [[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = true\n\n\
+         [[patch]]\nid = \"approval\"\nconfig = {{ mode = \"yolo\" }}\n\n\
+         [[patch]]\nid = \"subagent-in-process\"\ndisabled = false\n\n\
+         [[patch]]\nid = \"llm\"\nname = \"test-lead-model\"\nconfig = {{}}\n\n\
+         [[insert]]\nname = \"test-delegated-model\"\n",
+        root = root.to_string_lossy(),
+        home = empty_home.to_string_lossy(),
+    );
+    let tree = ConfigTree::from_layers(vec![
+        bundle::base().unwrap(),
+        Layer::from_toml(&scoped).unwrap(),
+    ])
+    .expect("tree");
+    let mut registry = plugins::catalog();
+    registry.register(Arc::new(ProvideLead(lead)));
+    registry.register(Arc::new(ProvideDelegated(calls.clone())));
+    let mut app = App::new(registry, tree);
+    app.start().await.expect("must mount");
+    atomcode_harness::run_turn(&app, "delegate it")
+        .await
+        .expect("a turn");
+
+    let calls = who(&calls);
+    assert!(calls.iter().any(|c| c == "delegated"), "{calls:?}");
+    assert!(
+        calls.iter().filter(|c| *c == "lead-model").count() >= 2,
+        "{calls:?}"
+    );
+}
+
+// ---- a team member's model, across a restart -----------------------------
+
+/// The lead of a team: delegates once through `team`, then answers.
+struct TeamLead {
+    args: String,
+    round: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl LlmProvider for TeamLead {
+    fn model_name(&self) -> &str {
+        "lead-model"
+    }
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDef],
+        _options: &ChatOptions,
+    ) -> Result<BoxStream<'static, StreamEvent>, ProviderError> {
+        let events = if self.round.fetch_add(1, Ordering::SeqCst) == 0 {
+            vec![StreamEvent::ToolCall(atomcode_kernel::tool::ToolCall {
+                id: "c1".into(),
+                name: "team".into(),
+                arguments: self.args.clone(),
+            })]
+        } else {
+            vec![StreamEvent::TextDelta("noted".into())]
+        };
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+struct ProvideTeamLead(Arc<TeamLead>);
+
+#[async_trait]
+impl Plugin for ProvideTeamLead {
+    fn name(&self) -> &'static str {
+        "test-team-lead-model"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["llm"]
+    }
+    fn description(&self) -> &'static str {
+        "a lead that delegates once"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_harness::seams::LlmSvc>(self.0.clone())
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// A member delegated to a named model runs on it again after its lead is
+/// resumed (`docs/adr/0024` §13): the name is in its header, and bringing it
+/// back resolves it the way delegating did.
+#[tokio::test]
+async fn a_member_brought_back_by_a_resume_runs_on_the_model_it_was_given() {
+    use atomcode_harness::agent::{AgentStatus, MessageOrigin};
+    use atomcode_harness::seams::AgentsSvc;
+
+    let root = scratch("member-model");
+    let sessions = root.join("sessions");
+    let empty_home = root.join("__no_user_skills__");
+    let _ = std::fs::create_dir_all(&empty_home);
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    let lead_id = "member-model-lead";
+    let scout_id = format!("{lead_id}/scout");
+
+    let app_for = |resume: bool| {
+        let calls = calls.clone();
+        let root = root.clone();
+        let sessions = sessions.clone();
+        let empty_home = empty_home.clone();
+        async move {
+            let scoped = format!(
+                "[[patch]]\nid = \"trace\"\nconfig = {{ stream = false, tools = false, summary = false }}\n\n\
+                 [[patch]]\nid = \"fs\"\nconfig = {{ root = {root:?} }}\n\n\
+                 [[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 6, working_dir = {root:?} }}\n\n\
+                 [[patch]]\nid = \"skills\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
+                 [[patch]]\nid = \"memory\"\nconfig = {{ project_root = {root:?} }}\n\n\
+                 [[patch]]\nid = \"project-instructions\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
+                 [[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ root = {sessions:?}, project_root = {root:?} }}\n\n\
+                 [[patch]]\nid = \"session\"\nconfig = {{ id = {lead_id:?}, resume = {resume} }}\n\n\
+                 [[patch]]\nid = \"approval\"\nconfig = {{ mode = \"yolo\" }}\n\n\
+                 [[insert]]\nname = \"team-in-process\"\nconfig = {{ project_root = {root:?}, home = {home:?} }}\n\n\
+                 [[patch]]\nid = \"llm\"\nname = \"test-team-lead-model\"\nconfig = {{}}\n\n\
+                 [[insert]]\nname = \"test-models\"\n\n\
+                 [[insert]]\nname = \"model-catalog\"\n",
+                root = root.to_string_lossy(),
+                home = empty_home.to_string_lossy(),
+                sessions = sessions.to_string_lossy(),
+            );
+            let tree = ConfigTree::from_layers(vec![
+                bundle::base().unwrap(),
+                Layer::from_toml(&scoped).unwrap(),
+            ])
+            .expect("tree");
+            let mut registry = plugins::catalog();
+            registry.register(Arc::new(ProvideCatalog(Arc::new(TestCatalog {
+                offer: vec![model("cheap", 10), model("lead-model", 30)],
+                current: Some("lead-model".into()),
+                calls,
+            }))));
+            registry.register(Arc::new(ProvideTeamLead(Arc::new(TeamLead {
+                args: r#"{"action":"delegate","name":"scout","role":"explorer","task":"look around","model":"cheap"}"#.into(),
+                round: std::sync::atomic::AtomicUsize::new(if resume { 1 } else { 0 }),
+            }))));
+            let mut app = App::new(registry, tree);
+            app.start().await.expect("must mount");
+            app
+        }
+    };
+
+    let settle = |app: &App, turns: usize| {
+        let agents = app.context().service::<AgentsSvc>().unwrap();
+        let scout_id = scout_id.clone();
+        async move {
+            for _ in 0..500 {
+                if let Some(scout) = agents.by_session(&scout_id) {
+                    let ended = scout
+                        .session()
+                        .events()
+                        .iter()
+                        .filter(|e| {
+                            matches!(
+                                e.event,
+                                atomcode_harness::session::SessionEvent::TurnEnd { .. }
+                            )
+                        })
+                        .count();
+                    if ended >= turns && scout.status() == AgentStatus::Idle {
+                        return scout;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("the member never finished turn {turns}");
+        }
+    };
+
+    {
+        let app = app_for(false).await;
+        atomcode_harness::run_turn(&app, "delegate it")
+            .await
+            .expect("a turn");
+        settle(&app, 1).await;
+        assert!(
+            who(&calls).iter().any(|c| c == "cheap"),
+            "{:?}",
+            who(&calls)
+        );
+        let store = app
+            .context()
+            .service::<atomcode_harness::seams::SessionPersistenceSvc>()
+            .unwrap();
+        for _ in 0..300 {
+            let kept = store.load(&scout_id).await.unwrap_or_default();
+            if kept.iter().any(|e| {
+                matches!(
+                    e.event,
+                    atomcode_harness::session::SessionEvent::TurnEnd { .. }
+                )
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+    calls.lock().unwrap().clear();
+
+    let app = app_for(true).await;
+    atomcode_harness::create_agent(&app).await.unwrap();
+    let scout = settle(&app, 1).await;
+    scout.send_from("look again", MessageOrigin::User);
+    settle(&app, 2).await;
+    assert_eq!(
+        who(&calls),
+        vec!["cheap".to_string()],
+        "the member's request after the restart went to the model it was given"
+    );
+}

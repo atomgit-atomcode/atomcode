@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
-use atomcode_plexus::{Context, Plugin};
+use atomcode_plexus::{Context, Disposable, Plugin};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -46,7 +46,9 @@ pub(crate) struct ChildRoundCap {
 #[async_trait]
 impl atomcode_plexus::Listener<TurnStopping> for ChildRoundCap {
     async fn call(&self, progress: &TurnProgress) -> Option<StopReason> {
-        (progress.rounds >= self.max_steps).then_some(StopReason::MaxRounds)
+        // Zero is "no budget of its own", the way the product's `[subagent]
+        // max_rounds` has always read it — not a budget of nothing.
+        (self.max_steps > 0 && progress.rounds >= self.max_steps).then_some(StopReason::MaxRounds)
     }
 }
 
@@ -99,7 +101,7 @@ pub(crate) async fn resolve_child_model(
             }
         });
     }
-    models.provider(&id).await.map(Some)
+    models.provider(id).await.map(Some)
 }
 
 /// The thinking level one delegated child runs at, on its own realm.
@@ -118,6 +120,27 @@ pub(crate) async fn resolve_child_model(
 /// session default it would otherwise inherit.
 pub(crate) struct RoleEffort {
     pub(crate) effort: ReasoningEffort,
+}
+
+impl RoleEffort {
+    /// Put this level on every request `session` makes, and say so when that
+    /// session is described. One registration for both, so the level an agent
+    /// is described with is the one its requests carry.
+    pub(crate) fn mount(self, realm: &Context, session: String) -> Vec<Disposable> {
+        let effort = self.effort;
+        vec![
+            realm.on_waterfall::<AgentRequest>(Arc::new(self), true),
+            realm.on_emit::<crate::events::DescribeAgent>(
+                move |describing: &crate::events::Describing| {
+                    let mut description =
+                        describing.description.lock().expect("description poisoned");
+                    if description.session == session {
+                        description.reasoning_effort = Some(effort);
+                    }
+                },
+            ),
+        ]
+    }
 }
 
 #[async_trait]
@@ -250,18 +273,28 @@ impl Subagents for InProcessSubagents {
 
         // Its own conversation, its own tools and its own prompt, composed
         // before anyone can see it. The parent's session is the one whose turn
-        // this tool call is running in. Not persisted: a delegated child's
-        // transcript is the parent's business, not a session of its own.
+        // this tool call is running in. Kept, like every session: its log is
+        // readable by id after it is gone (`docs/adr/0024` §1).
         let parent = crate::agent::current()
             .and_then(|c| c.service::<SessionSvc>())
             .map(|log| log.id().to_string());
+        let child_session = format!("sub-{}", crate::agent::mint_session_id());
+        let delegated_llm = self.ctx.service::<crate::seams::DelegatedLlmSvc>();
         let mut req = crate::agent::CreateAgent::new()
-            .id(format!("sub-{}", crate::agent::mint_session_id()))
-            .persist(false)
+            .id(child_session.clone())
             .setup(Box::new(move |realm: &Context| {
                 let mut held = vec![
                     realm
                         .provide::<ToolsSvc>(restricted)
+                        .map_err(|e| e.to_string())?,
+                    // Marks it delegated, for `delegation-bounds`: a child reads,
+                    // and its tools could write nowhere but its workspace.
+                    realm
+                        .provide::<crate::seams::DelegationLaneSvc>(Arc::new(
+                            crate::seams::DelegationLane {
+                                scopes: vec!["**".to_string()],
+                            },
+                        ))
                         .map_err(|e| e.to_string())?,
                     realm
                         .provide::<SystemPromptSvc>(prompts)
@@ -270,7 +303,9 @@ impl Subagents for InProcessSubagents {
                 // The child's own `llm`, on its own realm: lookup walks up, so
                 // the parent keeps the model it had and a sibling delegated
                 // elsewhere is unaffected.
-                if let Some(model) = model.clone() {
+                // A named model, or — inheriting the conversation's — the
+                // host's delegated one, when it keeps a child's spend apart.
+                if let Some(model) = model.clone().or_else(|| delegated_llm.clone()) {
                     held.push(
                         realm
                             .provide::<crate::seams::LlmSvc>(model)
@@ -278,9 +313,7 @@ impl Subagents for InProcessSubagents {
                     );
                 }
                 if let Some(effort) = effort {
-                    held.push(
-                        realm.on_waterfall::<AgentRequest>(Arc::new(RoleEffort { effort }), true),
-                    );
+                    held.extend(RoleEffort { effort }.mount(realm, child_session));
                 }
                 Ok(held)
             }));
@@ -299,22 +332,104 @@ impl Subagents for InProcessSubagents {
                 max_steps: self.max_rounds,
             }));
 
-        child.send(task);
-        let outcome = driver.drive(&child).await;
+        // The parent whose tool call this is. Its turn being stopped stops the
+        // child's: the delegation is part of that turn (`docs/adr/0023` §9).
+        let parent_turn = crate::agent::current()
+            .and_then(|ctx| ctx.service::<SessionSvc>())
+            .and_then(|log| agents.by_session(log.id()))
+            .map(|parent| parent.cancel_token());
+
+        // Driven like every other agent: the task goes in as a message, and the
+        // delegation lasts until the turn it starts has ended.
+        let (ended_tx, ended_rx) = tokio::sync::oneshot::channel::<()>();
+        let ended_tx = std::sync::Mutex::new(Some(ended_tx));
+        let watched = child.session_id().to_string();
+        // On the tree, not the child's realm: a fact is announced where the loop
+        // commits it, and visibility only runs upward.
+        let ending = self.ctx.on_emit::<crate::events::SessionEventCommitted>(
+            move |committed: &crate::session::Committed| {
+                if committed.session == watched
+                    && matches!(
+                        committed.event,
+                        crate::session::SessionEvent::TurnEnd { .. }
+                    )
+                {
+                    if let Some(tx) = ended_tx.lock().expect("ended poisoned").take() {
+                        let _ = tx.send(());
+                    }
+                }
+            },
+        );
+        let driven = super::handle::drive(&self.ctx, child.clone());
+        let _ = driven
+            .handle
+            .commands
+            .send(atomcode_kernel::event::AgentCommand::SendMessage {
+                text: task.to_string(),
+                images: Vec::new(),
+            });
+        let _ = driver;
+        let mut ended_rx = ended_rx;
+        tokio::select! {
+            _ = &mut ended_rx => {}
+            _ = async {
+                match &parent_turn {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                child.cancel();
+                let _ = ended_rx.await;
+            }
+        }
+        ending.dispose();
+        let super::handle::Driven { handle, done, .. } = driven;
+        drop(handle);
+        let _ = done.await;
 
         round_cap.dispose();
+        let outcome = turn_outcome(&log.events());
         // Removing the agent tears down what was mounted for it alone.
         agents.remove(child.id());
 
         SubagentOutcome {
-            text: outcome.text,
-            rounds: outcome.steps,
-            tool_calls: outcome.tool_calls,
-            stop: outcome.stop,
-            error: outcome.error,
             transcript_len: log.len(),
+            ..outcome
         }
     }
+}
+
+/// What the child's one turn came to, read off its log: how it ended, what it
+/// last said, how many steps and calls it took.
+fn turn_outcome(events: &[crate::session::LoggedEvent]) -> SubagentOutcome {
+    use crate::session::SessionEvent;
+    let mut outcome = SubagentOutcome {
+        text: String::new(),
+        rounds: 0,
+        tool_calls: 0,
+        stop: StopReason::Stopped,
+        error: None,
+        transcript_len: events.len(),
+    };
+    for logged in events {
+        match &logged.event {
+            SessionEvent::StepStart { .. } => outcome.rounds += 1,
+            SessionEvent::AssistantMessage {
+                text, tool_calls, ..
+            } => {
+                outcome.tool_calls += tool_calls.len() as u32;
+                if !text.is_empty() {
+                    outcome.text = text.clone();
+                }
+            }
+            SessionEvent::TurnEnd { stop, error, .. } => {
+                outcome.stop = *stop;
+                outcome.error = error.clone();
+            }
+            _ => {}
+        }
+    }
+    outcome
 }
 
 // ---- the model-facing tool ----------------------------------------------
@@ -342,6 +457,9 @@ have no one to ask.";
 
 struct TaskTool {
     ctx: Context,
+    /// Every tool a child may be handed only reads. Then delegating is reading
+    /// too, and asking about it would be asking about a search.
+    read_only: bool,
 }
 
 #[async_trait]
@@ -370,13 +488,17 @@ impl Tool for TaskTool {
     /// The child runs under the same root policy, but it does run real tools,
     /// so the call itself is a decision worth gating.
     fn risk(&self, _args: &str) -> RiskLevel {
-        RiskLevel::Risky
+        if self.read_only {
+            RiskLevel::Safe
+        } else {
+            RiskLevel::Risky
+        }
     }
     fn always_grant_scope(&self, _args: &str) -> String {
         "task".into()
     }
 
-    async fn execute(&self, args: &str, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, args: &str, ctx: &ToolContext) -> ToolResult {
         let args: TaskArgs = match serde_json::from_str(args) {
             Ok(args) => args,
             Err(e) => {
@@ -397,6 +519,12 @@ impl Tool for TaskTool {
             };
         };
         let instructions = args.instructions.as_deref().unwrap_or(DEFAULT_INSTRUCTIONS);
+        // A line when the child starts and one when it ends, on this call: the
+        // only word a front end without the child's log gets of delegated work.
+        ctx.progress.emit(format!(
+            "↻ {}",
+            args.task.lines().next().unwrap_or_default()
+        ));
         let outcome = subagents
             .spawn(crate::seams::Delegation {
                 task: &args.task,
@@ -405,6 +533,11 @@ impl Tool for TaskTool {
                 effort: args.effort.as_deref(),
             })
             .await;
+        ctx.progress.emit(match (&outcome.error, outcome.stop) {
+            (Some(error), _) => format!("✗ failed · {error}"),
+            (None, StopReason::Stopped) => "✓ done".to_string(),
+            (None, stop) => format!("✗ {stop:?}"),
+        });
         ToolResult {
             call_id: String::new(),
             content: outcome.report(),
@@ -480,7 +613,13 @@ impl Plugin for SubagentPlugin {
             .map_err(|e| e.to_string())?;
         mount(
             ctx,
-            vec![Arc::new(TaskTool { ctx: ctx.clone() }) as Arc<dyn Tool>],
+            vec![Arc::new(TaskTool {
+                ctx: ctx.clone(),
+                read_only: row
+                    .allowed_tools
+                    .iter()
+                    .all(|tool| crate::plugins::team::EXPLORE_TOOLS.contains(&tool.as_str())),
+            }) as Arc<dyn Tool>],
         )?;
         // This row's guidance for this row's tool, and nothing else: the rules a parameter list
         // cannot carry — when NOT to delegate, and how to run several at once without them

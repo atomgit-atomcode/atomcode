@@ -1,24 +1,22 @@
 //! Session persistence + cross-session recall (L1).
 //!
-//! Two on-disk tiers, both under `$ATOMCODE_HOME/sessions/<project_hash>/` (the SAME
-//! bucket scheme production uses, so old `<id>.json` and new sessions coexist):
-//! - `<id>.snapshot` — the kernel [`SessionSnapshot`](atomcode_kernel::message::SessionSnapshot)
-//!   (the COMPACTED working set), rewritten every turn → used to RESUME. Lossy over
-//!   time (bounded by the context window); NOT the system of record.
-//! - `<id>.jsonl` — an append-only, NEVER-compacted, one-record-per-turn RAW transcript
-//!   → the ground truth for RECALL (the agent retrieving any past exchange, including
-//!   from OTHER sessions of the same project). Compaction shrinks the snapshot; it never
-//!   touches the transcript.
-//! - `<id>.meta` — fast-listing metadata (name / dirs / timestamps / turn_stats). JSON
-//!   content with a `.meta` extension that deliberately AVOIDS production's `*.json`
-//!   session glob, so the two schemes share a project dir without the production lister
-//!   choking on our files.
+//! Sessions live under `$ATOMCODE_HOME/sessions/<project_hash>/`. A session's one
+//! authority is its event log (`docs/adr/0024`, [`events`]):
+//! - `<id>.events` — the header, then every committed fact, appended as it
+//!   happens and never rewritten. A resume replays it; the conversation a
+//!   snapshot reader wants is projected from it; `recall` and `/worklog` fold
+//!   their per-turn records out of it.
+//! - `<id>.index` — fast-listing metadata (name / dirs / timestamps / turn_stats),
+//!   beside `.ui`, `.rewind`, `.rewind.txn` and `.todos` sidecars.
 //!
-//! Everything is driven by EXISTING kernel seams (zero core, zero kernel change): the
-//! [`SnapshotHook`] / [`TranscriptHook`] hang off the `turn_complete` terminal hook so
-//! they persist HOWEVER a turn ended; `recall` is a normal tool; current-date injection
-//! is an append-only tail in `pre_request`. WALL-CLOCK LIVES ONLY HERE — the kernel is
-//! deliberately clock-free — so L1 stamps every record via [`now_ms`].
+//! A session a released build kept as `<id>.snapshot` + `<id>.meta` + an
+//! `<id>.jsonl` transcript is read as it is and converted the first time it is
+//! opened; its files are moved aside, not deleted.
+//!
+//! What is not the log is driven by kernel seams: [`SnapshotHook`] keeps the
+//! index's per-turn statistics and the rewind ledger at `turn_complete`; `recall`
+//! and `list_sessions` are normal tools. WALL-CLOCK LIVES ONLY HERE — the kernel is
+//! deliberately clock-free — so L1 stamps what it writes via [`now_ms`].
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,6 +25,7 @@ pub mod context;
 // Moved to the crate root so a consumer can take the loader without the whole
 // session subsystem. Re-exported here so `session::instructions::…` still resolves.
 pub use crate::instructions;
+pub mod events;
 pub mod manager;
 pub mod presentation;
 pub mod recall;
@@ -57,7 +56,7 @@ pub use rewind::{
 pub use session_list::ListSessionsTool;
 pub use snapshot::{RewindTransactionReceipt, SnapshotHook};
 pub use status_reminder::StatusReminderHook;
-pub use transcript::{ToolRecord, TranscriptHook, TurnRecord, TurnTimestamp, UsageRecord};
+pub use transcript::{ToolRecord, TurnRecord, TurnTimestamp, UsageRecord};
 pub use usage_provider::UsageRecordingProvider;
 pub use worklog::{build_worklog_prompt, collect_day_turns, resolve_worklog_date, WorklogTurn};
 

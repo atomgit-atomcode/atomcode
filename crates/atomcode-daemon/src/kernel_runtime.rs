@@ -170,6 +170,7 @@ async fn start_native_runtime_with_session_bootstrap(
         web: true,
         review: true,
         rate_limit_source: Some(crate::coding_plan_rate_limit_source()),
+        front_end: None,
     };
     let start = atomcode_coding::CodingRuntimeStart {
         agent: coding_cfg.clone(),

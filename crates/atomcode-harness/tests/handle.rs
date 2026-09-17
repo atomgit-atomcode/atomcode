@@ -133,7 +133,7 @@ fn names(events: &[AgentEvent]) -> Vec<&'static str> {
     events
         .iter()
         .map(|e| match e {
-            AgentEvent::TurnStarted => "TurnStarted",
+            AgentEvent::TurnStarted { .. } => "TurnStarted",
             AgentEvent::TextDelta(_) => "TextDelta",
             AgentEvent::Reasoning(_) => "Reasoning",
             AgentEvent::ToolBatchStarted { .. } => "ToolBatchStarted",
@@ -188,7 +188,8 @@ async fn a_message_produces_the_turn_a_driver_expects() {
         matches!(
             events.last(),
             Some(AgentEvent::TurnComplete {
-                reason: StopReason::Stopped
+                reason: StopReason::Stopped,
+                ..
             })
         ),
         "{seen:?}"
@@ -545,7 +546,8 @@ async fn a_cancelled_turn_ends_and_the_next_one_still_runs() {
         matches!(
             first.last(),
             Some(AgentEvent::TurnComplete {
-                reason: StopReason::Cancelled
+                reason: StopReason::Cancelled,
+                ..
             })
         ),
         "the turn must end because it was cancelled, not because it ran out: {:?}",
@@ -569,7 +571,8 @@ async fn a_cancelled_turn_ends_and_the_next_one_still_runs() {
         matches!(
             second.last(),
             Some(AgentEvent::TurnComplete {
-                reason: StopReason::Stopped
+                reason: StopReason::Stopped,
+                ..
             })
         ),
         "{:?}",
@@ -900,7 +903,9 @@ fn a_failure_never_projects_as_a_clean_stop() {
     use atomcode_harness::seams::StopReason as Harness;
     use atomcode_harness::session::SessionEvent as Fact;
 
-    // The one reason with no counterpart in the driver's vocabulary. It must
+    // Once the reason with no counterpart in the driver's vocabulary, folded into
+    // `ProviderError` on the way out. There is one `StopReason` now
+    // (`docs/adr/0021` §6), so the driver is told the cause itself — and it must
     // still be impossible to read as success.
     let events = project(
         &[Fact::TurnEnd {
@@ -914,7 +919,8 @@ fn a_failure_never_projects_as_a_clean_stop() {
     assert!(matches!(
         events.last(),
         Some(AgentEvent::TurnComplete {
-            reason: StopReason::ProviderError
+            reason: StopReason::InvariantViolated,
+            ..
         })
     ));
 }
@@ -1032,5 +1038,732 @@ async fn a_resume_is_silent_for_a_driver_and_the_log_is_where_history_comes_from
         "the resumed turn's own answer must not be replayed to a driver by the \
          handle — history is the log's to give, not this stream's: {:#?}",
         names(&seen)
+    );
+}
+
+/// The handle says why a turn ended in the log's own words. The pump used to
+/// translate between two `StopReason`s and fold a runaway fuse, a stopping
+/// policy and a broken invariant into `MaxRounds` / `ProviderError`, so a front
+/// end read one reason in the log and another here (`docs/adr/0021` §6).
+#[test]
+fn the_handle_reports_the_logged_stop_reason_unfolded() {
+    use atomcode_harness::session::SessionEvent;
+    for stop in [
+        StopReason::RunawayFuse,
+        StopReason::StoppedByPolicy,
+        StopReason::InvariantViolated,
+        StopReason::MaxRounds,
+    ] {
+        let events = atomcode_harness::plugins::handle::replay(
+            &[
+                SessionEvent::TurnStart { turn: 1 },
+                SessionEvent::TurnEnd {
+                    turn: 1,
+                    stop,
+                    error: None,
+                },
+            ],
+            0,
+        );
+        let reported: Vec<StopReason> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::TurnComplete { reason, .. } => Some(*reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reported, vec![stop], "{stop:?}: {events:?}");
+    }
+}
+
+// ---- receipts and turn numbers (docs/adr/0021 §7) ------------------------
+
+/// Sends one command through the handle while the agent's first request is in
+/// flight — how a person types while the model is answering.
+struct SendsThroughHandleMidTurn {
+    commands: tokio::sync::mpsc::UnboundedSender<AgentCommand>,
+    command: std::sync::Mutex<Option<AgentCommand>>,
+}
+
+#[async_trait::async_trait]
+impl atomcode_plexus::Waterfall<atomcode_harness::events::AgentRequest>
+    for SendsThroughHandleMidTurn
+{
+    async fn handle(
+        &self,
+        req: &mut atomcode_harness::events::ModelRequest,
+        next: atomcode_plexus::Next<'_, atomcode_harness::events::AgentRequest>,
+    ) -> Result<atomcode_harness::events::ModelResponse, atomcode_harness::events::RequestError>
+    {
+        let taken = self.command.lock().unwrap().take();
+        if let Some(command) = taken {
+            let _ = self.commands.send(command);
+            // Let the pump queue it before this step decides whether to go on.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        next.run(req).await
+    }
+}
+
+fn tagged(id: &str, command: AgentCommand) -> AgentCommand {
+    AgentCommand::Tagged {
+        id: id.into(),
+        command: Box::new(command),
+    }
+}
+
+fn message(text: &str) -> AgentCommand {
+    AgentCommand::SendMessage {
+        text: text.into(),
+        images: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn a_tagged_message_is_accepted_into_the_turn_that_answers_it() {
+    let dir = scratch("receipt");
+    let app = start(tree(&dir, &replay(r#"{ text = "Hello." }"#), &[])).await;
+    let mut handle = handle_of(&app);
+
+    handle.commands.send(tagged("a", message("hi"))).unwrap();
+    let events = drain_turn(&mut handle).await;
+
+    let started = events.iter().find_map(|e| match e {
+        AgentEvent::TurnStarted { turn } => Some(*turn),
+        _ => None,
+    });
+    let accepted = events.iter().find_map(|e| match e {
+        AgentEvent::Accepted {
+            command,
+            turn,
+            steered,
+        } if command == "a" => Some((*turn, *steered)),
+        _ => None,
+    });
+    let closed = events.iter().find_map(|e| match e {
+        AgentEvent::TurnComplete { turn, .. } => Some(*turn),
+        _ => None,
+    });
+    let turn = started
+        .flatten()
+        .expect("TurnStarted carries the log's turn number");
+    assert_eq!(accepted, Some((Some(turn), false)), "{events:#?}");
+    assert_eq!(closed, Some(Some(turn)), "{events:#?}");
+}
+
+/// The attribution a driver could not make before: a message typed while the
+/// model was answering was folded in, and only the order of events said which
+/// terminal answered it.
+#[tokio::test]
+async fn a_message_steered_into_a_running_turn_says_which_turn_answers_it() {
+    let dir = scratch("steer-receipt");
+    let app = start(tree(
+        &dir,
+        &replay(r#"{ text = "first" }, { text = "second" }"#),
+        &[],
+    ))
+    .await;
+    let mut handle = handle_of(&app);
+    let _guard = app
+        .context()
+        .on_waterfall::<atomcode_harness::events::AgentRequest>(
+            std::sync::Arc::new(SendsThroughHandleMidTurn {
+                commands: handle.commands.clone(),
+                command: std::sync::Mutex::new(Some(tagged("b", message("also this")))),
+            }),
+            false,
+        );
+
+    handle
+        .commands
+        .send(tagged("a", message("do this")))
+        .unwrap();
+    let events = drain_turn(&mut handle).await;
+
+    let accepted: Vec<(String, Option<u64>, bool)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Accepted {
+                command,
+                turn,
+                steered,
+            } => Some((command.clone(), *turn, *steered)),
+            _ => None,
+        })
+        .collect();
+    let closed: Vec<Option<u64>> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TurnComplete { turn, .. } => Some(*turn),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed.len(), 1, "one turn: {events:#?}");
+    let turn = closed[0];
+    assert!(turn.is_some(), "{events:#?}");
+    assert_eq!(
+        accepted,
+        vec![
+            ("a".to_string(), turn, false),
+            ("b".to_string(), turn, true)
+        ],
+        "{events:#?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Steered { turn: t, .. } if *t == turn)),
+        "{events:#?}"
+    );
+}
+
+/// Every turn a driver is told began is closed exactly once, under the same
+/// number — however it ends: on its own, cancelled, failed, or with the driver
+/// shutting the handle down under it.
+#[tokio::test]
+async fn every_turn_started_is_closed_once_under_its_number() {
+    let dir = scratch("turn-numbers");
+    // Failures from the third request on: the cancelled turn may or may not get
+    // as far as its request, and the ones after it fail either way.
+    let app = start(tree(
+        &dir,
+        &replay(
+            r#"{ text = "one" }, { text = "two" }, { fail = "down" }, { fail = "down" }, { fail = "down" }"#,
+        ),
+        &[],
+    ))
+    .await;
+    let mut handle = handle_of(&app);
+    let commands = handle.commands.clone();
+    let mid_turn = |command: AgentCommand| {
+        app.context()
+            .on_waterfall::<atomcode_harness::events::AgentRequest>(
+                std::sync::Arc::new(SendsThroughHandleMidTurn {
+                    commands: commands.clone(),
+                    command: std::sync::Mutex::new(Some(command)),
+                }),
+                false,
+            )
+    };
+
+    let mut all = Vec::new();
+    handle.commands.send(message("first")).unwrap();
+    all.extend(drain_turn(&mut handle).await);
+    handle.commands.send(message("second")).unwrap();
+    all.extend(drain_turn(&mut handle).await);
+    // Cancelled while its request is in flight.
+    let cancelling = mid_turn(AgentCommand::Cancel);
+    handle.commands.send(message("third")).unwrap();
+    all.extend(drain_turn(&mut handle).await);
+    cancelling.dispose();
+    // Failed.
+    handle.commands.send(message("fourth")).unwrap();
+    all.extend(drain_turn(&mut handle).await);
+    // Shut down under a running turn.
+    let _shutting = mid_turn(AgentCommand::Shutdown);
+    handle.commands.send(message("fifth")).unwrap();
+    all.extend(drain_turn(&mut handle).await);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), handle.events.recv())
+            .await
+            .expect("the stream ends")
+            .is_none(),
+        "nothing after the last turn closed"
+    );
+
+    let started: Vec<Option<u64>> = all
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TurnStarted { turn } => Some(*turn),
+            _ => None,
+        })
+        .collect();
+    let closed: Vec<(Option<u64>, StopReason)> = all
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TurnComplete { turn, reason } => Some((*turn, *reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started.len(), 5, "{all:#?}");
+    assert!(started.iter().all(Option::is_some), "{started:?}");
+    assert_eq!(
+        started,
+        closed.iter().map(|(turn, _)| *turn).collect::<Vec<_>>(),
+        "each start closed once, in order, same number"
+    );
+    let mut unique = started.clone();
+    unique.dedup();
+    assert_eq!(unique.len(), 5, "five different turns: {started:?}");
+    assert_eq!(
+        closed[3].1,
+        StopReason::ProviderError,
+        "the fourth turn is the failed one: {closed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_command_that_cannot_act_is_rejected_on_the_spot() {
+    let dir = scratch("rejected");
+    let app = start(tree(&dir, &replay(r#"{ text = "unused" }"#), &[])).await;
+    let mut handle = handle_of(&app);
+
+    handle
+        .commands
+        .send(tagged("c", AgentCommand::Cancel))
+        .unwrap();
+    handle
+        .commands
+        .send(tagged(
+            "r",
+            AgentCommand::Respond {
+                id: 999,
+                value: serde_json::json!({ "decision": "allow" }),
+            },
+        ))
+        .unwrap();
+    handle
+        .commands
+        .send(tagged("k", AgentCommand::Compact { focus: None }))
+        .unwrap();
+
+    let mut receipts = Vec::new();
+    while receipts.len() < 3 {
+        match tokio::time::timeout(Duration::from_secs(5), handle.events.recv()).await {
+            Ok(Some(AgentEvent::Accepted { command, turn, .. })) => {
+                receipts.push(format!("{command}: accepted {turn:?}"))
+            }
+            Ok(Some(AgentEvent::Rejected { command, error })) => {
+                receipts.push(format!("{command}: rejected {error:?}"))
+            }
+            Ok(Some(_)) => continue,
+            other => panic!("receipts stopped at {receipts:?}: {other:?}"),
+        }
+    }
+    assert_eq!(
+        receipts,
+        vec![
+            "c: rejected NotRunning".to_string(),
+            "r: rejected StaleQuestion".to_string(),
+            "k: accepted None".to_string(),
+        ]
+    );
+}
+
+// ---- the session fact stream (docs/adr/0022 §1) --------------------------
+
+fn only_session(
+    app: &App,
+) -> (
+    String,
+    std::sync::Arc<atomcode_harness::session::SessionLog>,
+) {
+    let agents = app
+        .context()
+        .service::<atomcode_harness::seams::AgentsSvc>()
+        .expect("agents");
+    let agent = agents
+        .list()
+        .into_iter()
+        .next()
+        .expect("the handle's agent");
+    (agent.session_id().to_string(), agent.session())
+}
+
+fn fact_seqs(events: &[AgentEvent], session: &str) -> Vec<u64> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Fact(c) if c.session == session => Some(c.seq),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Read events until a fact with `seq` of `session` has arrived, the turn has
+/// ended, and nothing more is queued.
+async fn drain_turn_and_facts(handle: &mut AgentHandle) -> Vec<AgentEvent> {
+    let mut seen = drain_turn(handle).await;
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(200), handle.events.recv()).await
+    {
+        seen.push(event);
+    }
+    seen
+}
+
+#[tokio::test]
+async fn a_subscriber_gets_the_history_then_live_facts_with_no_gap_or_repeat() {
+    let dir = scratch("facts");
+    let app = start(tree(
+        &dir,
+        &replay(r#"{ text = "one" }, { text = "two" }"#),
+        &[],
+    ))
+    .await;
+    let mut handle = handle_of(&app);
+
+    handle.commands.send(message("first")).unwrap();
+    let before = drain_turn(&mut handle).await;
+    assert!(
+        fact_seqs(&before, "").is_empty()
+            && !before.iter().any(|e| matches!(e, AgentEvent::Fact(_))),
+        "no facts without a subscription: {before:#?}"
+    );
+
+    let (session, log) = only_session(&app);
+    handle
+        .commands
+        .send(AgentCommand::Subscribe {
+            session: session.clone(),
+            from: 0,
+        })
+        .unwrap();
+    handle.commands.send(message("second")).unwrap();
+    let after = drain_turn_and_facts(&mut handle).await;
+
+    let seqs = fact_seqs(&after, &session);
+    let expected: Vec<u64> = log.events().iter().map(|l| l.seq).collect();
+    assert!(!expected.is_empty());
+    assert_eq!(
+        seqs, expected,
+        "history then live, every fact once, in log order"
+    );
+}
+
+#[tokio::test]
+async fn subscribing_while_a_turn_runs_misses_and_repeats_nothing() {
+    let dir = scratch("facts-mid-turn");
+    let app = start(tree(&dir, &replay(r#"{ text = "one" }"#), &[])).await;
+    let mut handle = handle_of(&app);
+    let (session, log) = only_session(&app);
+    let _guard = app
+        .context()
+        .on_waterfall::<atomcode_harness::events::AgentRequest>(
+            std::sync::Arc::new(SendsThroughHandleMidTurn {
+                commands: handle.commands.clone(),
+                command: std::sync::Mutex::new(Some(AgentCommand::Subscribe {
+                    session: session.clone(),
+                    from: 0,
+                })),
+            }),
+            false,
+        );
+
+    handle.commands.send(message("go")).unwrap();
+    let events = drain_turn_and_facts(&mut handle).await;
+
+    let seqs = fact_seqs(&events, &session);
+    let expected: Vec<u64> = log.events().iter().map(|l| l.seq).collect();
+    assert_eq!(seqs, expected, "{events:#?}");
+}
+
+#[tokio::test]
+async fn a_subscription_starts_at_the_seq_it_asks_for() {
+    let dir = scratch("facts-from");
+    let app = start(tree(&dir, &replay(r#"{ text = "one" }"#), &[])).await;
+    let mut handle = handle_of(&app);
+    handle.commands.send(message("go")).unwrap();
+    drain_turn(&mut handle).await;
+    let (session, log) = only_session(&app);
+    let all: Vec<u64> = log.events().iter().map(|l| l.seq).collect();
+    let from = all[all.len() / 2];
+
+    handle
+        .commands
+        .send(AgentCommand::Subscribe {
+            session: session.clone(),
+            from,
+        })
+        .unwrap();
+    let mut facts = Vec::new();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(300), handle.events.recv()).await
+    {
+        facts.push(event);
+    }
+    let expected: Vec<u64> = all.into_iter().filter(|s| *s >= from).collect();
+    assert_eq!(fact_seqs(&facts, &session), expected);
+}
+
+#[tokio::test]
+async fn subscribing_to_a_session_nobody_has_is_not_found() {
+    let dir = scratch("facts-missing");
+    let app = start(tree(&dir, &replay(r#"{ text = "unused" }"#), &[])).await;
+    let mut handle = handle_of(&app);
+    handle
+        .commands
+        .send(tagged(
+            "s",
+            AgentCommand::Subscribe {
+                session: "no-such-session".into(),
+                from: 0,
+            },
+        ))
+        .unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), handle.events.recv()).await {
+            Ok(Some(AgentEvent::Rejected { command, error })) => {
+                assert_eq!(command, "s");
+                assert_eq!(error, atomcode_kernel::event::CommandError::NotFound);
+                break;
+            }
+            Ok(Some(_)) => continue,
+            other => panic!("no rejection: {other:?}"),
+        }
+    }
+}
+
+// ---- agents, described and pushed (docs/adr/0022 §5) ----------------------
+
+/// Everything a subscriber was told about agents, in order, facts left out.
+fn about_agents(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Described { description } => {
+                Some(format!("described {}", description.session))
+            }
+            AgentEvent::AgentAdded { description } => {
+                Some(format!("added {}", description.session))
+            }
+            AgentEvent::AgentRemoved { session } => Some(format!("removed {session}")),
+            AgentEvent::StatusChanged { session, status } => Some(format!("{session} {status:?}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whatever is queued now, without waiting on a turn.
+async fn drain_quiet(handle: &mut AgentHandle) -> Vec<AgentEvent> {
+    let mut seen = Vec::new();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(200), handle.events.recv()).await
+    {
+        seen.push(event);
+    }
+    seen
+}
+
+#[tokio::test]
+async fn a_subscription_starts_with_the_agent_described_and_where_it_stands() {
+    let dir = scratch("described");
+    let effort = "[[patch]]\nid = \"reasoning-effort\"\nconfig = { level = \"high\" }\n";
+    let app = start(tree(&dir, &replay(r#"{ text = "one" }"#), &[effort])).await;
+    let mut handle = handle_of(&app);
+    handle.commands.send(message("go")).unwrap();
+    drain_turn(&mut handle).await;
+    let (session, _) = only_session(&app);
+
+    handle
+        .commands
+        .send(AgentCommand::Subscribe {
+            session: session.clone(),
+            from: 0,
+        })
+        .unwrap();
+    let events = drain_quiet(&mut handle).await;
+
+    let Some(AgentEvent::Described { description }) = events.first() else {
+        panic!("the description comes first: {events:#?}");
+    };
+    assert_eq!(description.session, session);
+    assert_eq!(description.parent, None);
+    assert_eq!(description.member, None);
+    assert_eq!(description.model.as_deref(), Some("replay"));
+    assert_eq!(
+        description.reasoning_effort,
+        Some(atomcode_kernel::provider::ReasoningEffort::High),
+        "the level is said by the row that applies it"
+    );
+    assert!(description.compaction);
+    assert!(
+        matches!(
+            events.get(1),
+            Some(AgentEvent::StatusChanged { session: s, status: atomcode_kernel::agent::AgentStatus::Idle }) if *s == session
+        ),
+        "then where it stands, before any fact: {events:#?}"
+    );
+    assert!(matches!(events.get(2), Some(AgentEvent::Fact(_))));
+}
+
+#[tokio::test]
+async fn status_moves_with_the_turn_and_an_idle_cancel_moves_nothing() {
+    let dir = scratch("status");
+    let app = start(tree(&dir, &replay(r#"{ text = "one" }"#), &[])).await;
+    let mut handle = handle_of(&app);
+    let (session, _) = only_session(&app);
+    handle
+        .commands
+        .send(AgentCommand::Subscribe {
+            session: session.clone(),
+            from: 0,
+        })
+        .unwrap();
+    // Nothing is running: a cancel now stops nothing, and must not leave the
+    // agent reading as stopping until its next turn.
+    handle
+        .commands
+        .send(tagged("c", AgentCommand::Cancel))
+        .unwrap();
+    handle.commands.send(message("go")).unwrap();
+    let events = drain_turn_and_facts(&mut handle).await;
+
+    assert_eq!(
+        about_agents(&events),
+        vec![
+            format!("described {session}"),
+            format!("{session} Idle"),
+            format!("{session} Working"),
+            format!("{session} Idle"),
+        ],
+        "{events:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_subscribed_sessions_members_are_added_moved_and_removed_and_no_one_elses() {
+    let dir = scratch("members");
+    let app = start(tree(&dir, &replay(r#"{ text = "unused" }"#), &[])).await;
+    let mut handle = handle_of(&app);
+    let (session, _) = only_session(&app);
+    let ctx = app.context();
+    let agents = ctx
+        .service::<atomcode_harness::seams::AgentsSvc>()
+        .expect("agents");
+    let child = |parent: &str, id: &str| {
+        atomcode_harness::agent::CreateAgent::new()
+            .id(id)
+            .parent(parent)
+            .persist(false)
+    };
+
+    // One member before the subscription, one after; a stranger with a member
+    // of its own that this subscriber must never hear of.
+    let early = agents.create(&ctx, child(&session, "early")).await.unwrap();
+    let stranger = agents
+        .create(
+            &ctx,
+            atomcode_harness::agent::CreateAgent::new()
+                .id("stranger")
+                .persist(false),
+        )
+        .await
+        .unwrap();
+    handle
+        .commands
+        .send(AgentCommand::Subscribe {
+            session: session.clone(),
+            from: 0,
+        })
+        .unwrap();
+    let picture = drain_quiet(&mut handle).await;
+    assert_eq!(
+        about_agents(&picture),
+        vec![
+            format!("described {session}"),
+            format!("{session} Idle"),
+            "added early".to_string(),
+            "early Idle".to_string(),
+        ],
+        "a member already there is part of the picture: {picture:#?}"
+    );
+
+    let late = agents.create(&ctx, child(&session, "late")).await.unwrap();
+    let not_mine = agents
+        .create(&ctx, child(stranger.session_id(), "not-mine"))
+        .await
+        .unwrap();
+    late.begin_turn();
+    not_mine.begin_turn();
+    stranger.begin_turn();
+    late.cancel();
+    late.end_turn();
+    agents.remove(early.id());
+    agents.remove(not_mine.id());
+    let live = drain_quiet(&mut handle).await;
+    assert_eq!(
+        about_agents(&live),
+        vec![
+            "added late".to_string(),
+            "late Idle".to_string(),
+            "late Working".to_string(),
+            "late Stopping".to_string(),
+            "late Idle".to_string(),
+            "removed early".to_string(),
+        ],
+        "{live:#?}"
+    );
+
+    // Unsubscribed, nothing more — and a member removed meanwhile is simply
+    // not there when the subscriber comes back.
+    handle
+        .commands
+        .send(AgentCommand::Unsubscribe {
+            session: session.clone(),
+        })
+        .unwrap();
+    let _ = drain_quiet(&mut handle).await;
+    late.begin_turn();
+    agents.remove(late.id());
+    assert_eq!(
+        about_agents(&drain_quiet(&mut handle).await),
+        Vec::<String>::new()
+    );
+    handle
+        .commands
+        .send(AgentCommand::Subscribe {
+            session: session.clone(),
+            from: u64::MAX,
+        })
+        .unwrap();
+    let again = drain_quiet(&mut handle).await;
+    assert_eq!(
+        about_agents(&again),
+        vec![format!("described {session}"), format!("{session} Idle")],
+        "{again:#?}"
+    );
+}
+
+/// A catalog command is answered under its own id. Nothing registers one yet, so
+/// the catalog a subscriber is shown is empty and no name is found.
+#[tokio::test]
+async fn a_command_the_catalog_does_not_have_is_not_found_under_its_own_id() {
+    let dir = scratch("invoke");
+    let app = start(tree(&dir, &replay(r#"{ text = "unused" }"#), &[])).await;
+    let mut handle = handle_of(&app);
+    let (session, _) = only_session(&app);
+    handle
+        .commands
+        .send(AgentCommand::Subscribe {
+            session: session.clone(),
+            from: 0,
+        })
+        .unwrap();
+    handle
+        .commands
+        .send(AgentCommand::Invoke {
+            id: "i-1".into(),
+            session: session.clone(),
+            name: "goal".into(),
+            args: "ship it".into(),
+        })
+        .unwrap();
+    let events = drain_quiet(&mut handle).await;
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Described { description } if description.commands.is_empty()
+        )),
+        "{events:#?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Rejected { command, error }
+                if command == "i-1" && *error == atomcode_kernel::event::CommandError::NotFound
+        )),
+        "{events:#?}"
     );
 }

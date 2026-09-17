@@ -1,7 +1,8 @@
 //! `recall` tool — lets the agent retrieve ANY past turn of THIS project, including
 //! from OTHER sessions, by topic and/or time ("昨天我们讨论过的那个 OAuth 的事").
 //!
-//! Reads the never-compacted `<id>.jsonl` transcripts (the recall ground truth) under
+//! Reads each session's never-compacted log, `<id>.events` (or the `<id>.jsonl`
+//! transcript of a session not yet converted) — the recall ground truth — under
 //! the project's `<project_hash>` bucket — derived from `ToolContext.working_dir`, so the
 //! tool needs no session wiring. Matching is keyword/full-text v1 behind a swappable
 //! [`RecallIndex`] so a semantic/embedding backend can drop in later without touching the
@@ -152,7 +153,7 @@ impl RecallTool {
         self
     }
 
-    /// The testable core: load every `*.jsonl` under `sessions_dir`, time-filter, rank,
+    /// The testable core: load every session log (and old transcript) under `sessions_dir`, time-filter, rank,
     /// and format the result the model reads. Separated from `execute` so it is unit-
     /// testable against a temp dir without `$ATOMCODE_HOME`.
     pub fn search_dir(
@@ -231,12 +232,12 @@ impl RecallTool {
         };
         // Self-documenting fallback: point the model at the raw ground truth (prints the
         // REAL dir, so it never goes stale) and restate the freshness boundary right where
-        // a confused "why is nothing here?" lands. Reading those `<id>.jsonl` files gives
+        // a confused "why is nothing here?" lands. Reading those `<id>.events` files gives
         // the exact, full turn (incl. tool I/O) when the keyword digest above isn't enough.
         out.push_str(&format!(
-            "\n(Raw per-turn transcripts: {} — one `<session_id>.jsonl` per session, full \
-             text incl. tool I/O. The current in-progress turn is appended there only once \
-             it finishes.)",
+            "\n(Raw session logs: {} — one `<session_id>.events` per session, one JSON \
+             fact per line, full text incl. tool I/O. The current in-progress turn is \
+             listed here only once it finishes.)",
             sessions_dir.display()
         ));
         Ok(out)
@@ -358,6 +359,46 @@ fn load_records(dir: &Path) -> SessionResult<Vec<TurnRecord>> {
             source,
         })?;
         let path = entry.path();
+        // A session's log is its record (`docs/adr/0024` §14); a transcript
+        // is what a session a released build kept, until it is converted.
+        if path.extension().and_then(|e| e.to_str()) == Some("events") {
+            let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let file_bytes = regular_file_len(&path)?;
+            total_bytes = total_bytes.saturating_add(file_bytes);
+            if total_bytes > MAX_JSONL_BYTES {
+                return Err(SessionStoreError::TooLarge {
+                    kind: "recall transcripts",
+                    limit: MAX_JSONL_BYTES,
+                    actual: total_bytes,
+                });
+            }
+            let store = SessionManager::with_root(dir);
+            // A delegated agent's session is kept under its parent, and what
+            // it found reached the parent already. (A fork's header names a
+            // parent too, and is a session of its own: the index decides.)
+            if store.read_meta(id).is_ok_and(|meta| meta.parent.is_some()) {
+                continue;
+            }
+            let events = match store.load_events(id) {
+                Ok(events) => events,
+                // Written by a newer build: listed elsewhere as needing one,
+                // and no reason to fail every search in the project.
+                Err(SessionStoreError::FutureSchema { .. }) => continue,
+                Err(error) => return Err(error),
+            };
+            let records = super::events::turn_records(id, &events);
+            if out.len() + records.len() > MAX_JSONL_LINES {
+                return Err(SessionStoreError::TooLarge {
+                    kind: "recall transcript lines",
+                    limit: MAX_JSONL_LINES,
+                    actual: out.len() + records.len(),
+                });
+            }
+            out.extend(records);
+            continue;
+        }
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }

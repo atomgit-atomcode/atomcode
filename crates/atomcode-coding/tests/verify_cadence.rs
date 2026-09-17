@@ -102,7 +102,7 @@ async fn reasoning_only_verify_continuation_is_suppressed() {
                     })
                     .unwrap();
             }
-            AgentEvent::TurnComplete { reason } => {
+            AgentEvent::TurnComplete { reason, .. } => {
                 assert_eq!(reason, StopReason::Stopped);
                 break;
             }
@@ -218,7 +218,7 @@ async fn later_user_turn_does_not_reopen_prior_unverified_edit() {
                     })
                     .unwrap();
             }
-            AgentEvent::TurnComplete { reason } => {
+            AgentEvent::TurnComplete { reason, .. } => {
                 assert_eq!(reason, StopReason::Stopped);
                 break;
             }
@@ -252,7 +252,7 @@ async fn later_user_turn_does_not_reopen_prior_unverified_edit() {
                     })
                     .unwrap();
             }
-            AgentEvent::TurnComplete { reason } => {
+            AgentEvent::TurnComplete { reason, .. } => {
                 assert_eq!(reason, StopReason::Stopped);
                 break;
             }

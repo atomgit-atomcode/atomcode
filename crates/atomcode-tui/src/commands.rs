@@ -1,14 +1,19 @@
 //! The commands this build ships, grouped by what they are about.
 //!
-//! Split into sets on purpose: the session commands belong with the session,
-//! the tree commands with the tree. Removing a set removes its commands, and a
-//! capability that wants a command of its own contributes a set rather than
-//! editing anything here.
+//! Split into sets on purpose: the screen's own verbs, the session's, and
+//! `/help`. Removing a set removes its commands, and a capability that wants a
+//! command of its own contributes a set rather than editing anything here.
+//!
+//! There are no commands that read or rewrite the agent's config tree: the
+//! agent is in the host's App, and what a person may change about it is what
+//! host control offers (`docs/adr/0022` §7).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use atomcode_harness::seams::{CompactionSvc, ControlSvc, ToolsSvc};
+use atomcode_kernel::host::{HostCommand, HostError, HostReply};
+use atomcode_kernel::provider::ReasoningEffort;
+use atomcode_kernel::session::{derive_messages, SessionEvent};
 use atomcode_plexus::Context;
 
 use crate::command::{Command, CommandSet, Commands, Outcome};
@@ -27,7 +32,6 @@ const SCREEN: &[Command] = &[
         "showinject",
         "环境注入:收起、只留标签、全文,循环;不带名字则全部",
     ),
-    Command::new("mascot", "显示或隐藏吉祥物"),
     Command::new("mouse", "把鼠标交还终端,或收回来"),
     Command::new("keys", "列出快捷键"),
 ];
@@ -50,14 +54,13 @@ impl CommandSet for ScreenCommands {
                 Ok(action) => Outcome::Do(action),
                 Err(why) => Outcome::Refused(why),
             },
-            "mascot" => Outcome::Do(Action::ToggleModule("mascot")),
             "mouse" => Outcome::Do(Action::ToggleMouse),
             "keys" => Outcome::Said(
                 "enter 发送 · shift+enter 换行(或 ctrl-j) · ctrl-d 退出 · ctrl-w 删词\n\
                  esc 依次:取消选中 -> 清空输入 -> 停止当轮 · ctrl-c 直接停止当轮\n\
                  上/下 在输入里移动游标,到头则翻历史 · 点击输入框定位游标\n\
                  pgup/pgdn 与滚轮滚动对话\n\
-                 ctrl-r 思考(一行/全文/收起,循环) · ctrl-t 折叠工具 · ctrl-n 吉祥物 · ctrl-l 重画屏幕\n\
+                 ctrl-r 思考(一行/全文/收起,循环) · ctrl-t 折叠工具 · ctrl-l 重画屏幕\n\
                  /showinject [名字] 环境注入(默认不显示;不带名字则全部,all 含同伴报告)\n\
                  拖动选中并复制 · esc 取消选中 · 点击思考或工具调用折叠展开那一个\n\
                  ctrl-o 把鼠标交还终端(改用终端自己的框选)"
@@ -110,14 +113,57 @@ fn showinject(what: &str) -> Result<Action, String> {
     }
 }
 
-/// The conversation: what is in it, and what to do with it.
+/// The conversation: what is in it, what to do with it, and which one it is.
 pub struct SessionCommands;
 
 const SESSION: &[Command] = &[
     Command::new("compact", "压缩历史,给上下文腾地方"),
+    Command::new(
+        "cancel-all",
+        "停下这个会话与每个团队成员正在跑的回合;成员留在团队里",
+    ),
     Command::new("context", "这次会话用掉了多少"),
     Command::new("transcript", "把对话按模型看到的样子列出来"),
+    Command::new("new", "开一个新会话"),
+    Command::taking("resume", "[会话 id]", "回到一个存下的会话;不带 id 则挑一个"),
+    Command::taking(
+        "effort",
+        "<low|medium|high|xhigh|max|default>",
+        "改这个会话的思考强度(与模型无关)",
+    ),
+    Command::taking(
+        "undo",
+        "[回合]",
+        "撤回最后一句话(或某一回合)及其后的一切,那句话放回输入框",
+    ),
+    Command::taking(
+        "rewind",
+        "[回合 [对话|代码|全部]]",
+        "回到某一回合之前:对话、工作区或两者;不带参数则挑一个",
+    ),
+    Command::taking("model", "<模型 id>", "这个会话从现在起用哪个模型"),
+    Command::taking(
+        "mcp",
+        "[withdraw]",
+        "MCP 服务器的状态;withdraw 立刻撤下全部 MCP 工具",
+    ),
+    Command::new("reload", "重新读取 skills、MCP 与配置,会话不变"),
+    Command::new("logout", "把凭据拿出进程;会话留着"),
+    Command::new("login", "用现在配置的凭据重新登录"),
 ];
+
+/// A host's refusal, in words a person can act on.
+fn refusal(error: HostError) -> String {
+    match error {
+        HostError::Busy { reason } => format!("现在不行:{reason}"),
+        HostError::NotFound => "找不到:会话已经换过,或者没有这个会话".into(),
+        HostError::SessionInUse { id } => format!("会话 {id} 正在别处用着"),
+        HostError::Unavailable => "宿主现在不可用".into(),
+        HostError::ProviderUnavailable { reason } => format!("没有可用的模型:{reason:?}"),
+        HostError::Failed { message } => message,
+        other => format!("{other:?}"),
+    }
+}
 
 #[async_trait]
 impl CommandSet for SessionCommands {
@@ -128,24 +174,29 @@ impl CommandSet for SessionCommands {
         SESSION.to_vec()
     }
     async fn run(&self, name: &str, args: &str, ctx: &Context) -> Outcome {
-        // The screen's agent owns the conversation; the tree has no log of
-        // its own any more.
-        let Some(log) = ctx
-            .service::<crate::plugin::AgentClientSvc>()
-            .map(|c| c.session())
-        else {
+        let Some(client) = ctx.service::<crate::plugin::AgentClientSvc>() else {
             return Outcome::Refused("这块屏幕没接上 agent".into());
         };
+        let control = client.control();
+        // What host control acts on is the session this screen follows, whoever
+        // is on screen.
+        let root = client.root();
+        let host = |control: Option<std::sync::Arc<dyn atomcode_kernel::host::HostControl>>| {
+            control.ok_or_else(|| Outcome::Refused("这块屏幕没接上宿主".into()))
+        };
         match name {
+            "cancel-all" => {
+                let members = client.cancel_all();
+                Outcome::Said(if members == 0 {
+                    "已停下当前回合".into()
+                } else {
+                    format!("已停下当前回合,以及 {members} 个成员的")
+                })
+            }
             "compact" => {
-                if ctx.service::<CompactionSvc>().is_none() {
-                    return Outcome::Refused(
-                        "这棵树没挂压缩策略;`compaction-tail` 那一行是关的".into(),
-                    );
+                if !client.described().is_some_and(|d| d.compaction) {
+                    return Outcome::Refused("这个 agent 没有压缩策略".into());
                 }
-                let Some(client) = ctx.service::<crate::plugin::AgentClientSvc>() else {
-                    return Outcome::Refused("这块屏幕没接上 agent".into());
-                };
                 // Over the handle, so it waits behind a running turn like every
                 // other driver's `/compact`. The outcome comes back as an event
                 // and is said then; saying "done" here would be saying it
@@ -155,16 +206,23 @@ impl CommandSet for SessionCommands {
                 Outcome::Quiet
             }
             "context" => {
-                let messages = log.derive_messages().len();
-                let events = log.len();
+                let events = client.events();
+                let turn = events
+                    .iter()
+                    .filter_map(|logged| match logged.event {
+                        SessionEvent::TurnStart { turn } => Some(turn),
+                        _ => None,
+                    })
+                    .max()
+                    .unwrap_or(0);
                 Outcome::Said(format!(
-                    "{} 轮 · {messages} 条模型可见消息 · {events} 条事实",
-                    log.current_turn()
+                    "{turn} 轮 · {} 条模型可见消息 · {} 条事实",
+                    derive_messages(&events).len(),
+                    events.len()
                 ))
             }
             "transcript" => {
-                let text = log
-                    .derive_messages()
+                let text = derive_messages(&client.events())
                     .iter()
                     .map(|m| format!("{:?}: {}", m.role, first_line(&m.text)))
                     .collect::<Vec<_>>()
@@ -175,275 +233,318 @@ impl CommandSet for SessionCommands {
                     text
                 })
             }
-            _ => Outcome::Quiet,
-        }
-    }
-}
-
-/// The running tree itself. These exist because the tree is data — so a person
-/// can look at it and change it without restarting.
-pub struct TreeCommands;
-
-const TREE: &[Command] = &[
-    Command::new("rows", "挑一行开关它——运行时换插件"),
-    Command::new("rows-list", "把行列出来,不开模态"),
-    Command::new("tools-list", "列出模型能用的工具"),
-    Command::new("audit", "检查这棵树的组合是否自洽"),
-    Command::taking(
-        "effort",
-        "<low|medium|high|xhigh|max>",
-        "运行时改思考强度(与模型无关;开关在 llm 行的 thinking_type)",
-    ),
-    Command::taking("patch", "<TOML>", "在运行中改一行配置"),
-];
-
-/// Hidden: only a pick dispatches to it.
-const TREE_HIDDEN: &[Command] = &[Command::taking("row-toggle", "<行> on|off", "")];
-
-#[async_trait]
-impl CommandSet for TreeCommands {
-    fn id(&self) -> &'static str {
-        "cmd-tree"
-    }
-    fn commands(&self) -> Vec<Command> {
-        TREE.to_vec()
-    }
-    fn hidden(&self) -> Vec<Command> {
-        TREE_HIDDEN.to_vec()
-    }
-    async fn run(&self, name: &str, args: &str, ctx: &Context) -> Outcome {
-        if name == "tools-list" {
-            let Some(tools) = ctx.service::<ToolsSvc>() else {
-                return Outcome::Refused("这棵树没挂工具目录".into());
-            };
-            let mut names = tools.names();
-            names.sort();
-            return Outcome::Said(if names.is_empty() {
-                "一个工具都没挂".into()
-            } else {
-                names.join(" ")
-            });
-        }
-        // Check the argument before the seam: "you left out the TOML" is true
-        // in every tree and teaches the syntax, while "no control seam here" is
-        // about this tree and teaches nothing.
-        if name == "patch" && args.is_empty() {
-            return Outcome::Refused(
-                "/patch 要一段 TOML,例如:/patch [[patch]]\\nid = \"llm\"\\nconfig = { model = \"…\" }"
-                    .into(),
-            );
-        }
-        let Some(control) = ctx.service::<ControlSvc>() else {
-            return Outcome::Refused("只有启动器能给出这个能力,这棵树里没有".into());
-        };
-        match name {
-            "rows-list" => {
-                let rows = control.rows().await;
-                Outcome::Said(
-                    rows.iter()
-                        .map(|(id, plugin, on)| {
-                            format!("{} {id:20} {plugin}", if *on { "●" } else { "○" })
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )
-            }
-            // The modal that makes runtime reconfiguration a thing a person can
-            // do, not just a thing the architecture claims: pick a row, press
-            // enter, the tree changes under a running session.
-            "rows" => {
-                let rows = control.rows().await;
-                Outcome::Open(crate::overlay::Picker::new(
-                    "rows",
-                    "行 · enter 开关",
-                    rows.into_iter()
-                        .map(|(id, plugin, on)| {
-                            crate::overlay::Choice::new(
-                                format!("/row-toggle {id} {}", if on { "off" } else { "on" }),
-                                id,
-                            )
-                            .about(plugin)
-                            .marked(on)
-                        })
-                        .collect(),
-                ))
-            }
-            // Not in the menu: it exists so a pick has something to dispatch to,
-            // which is how a modal and a command share one implementation.
-            "row-toggle" => {
-                let mut parts = args.split_whitespace();
-                let (Some(id), Some(state)) = (parts.next(), parts.next()) else {
-                    return Outcome::Refused("用法:/row-toggle <行> on|off".into());
+            // The switch itself is not done here: the host announces the new
+            // session, and the screen moves to it on that — the same way it
+            // moves when something else replaced the session.
+            "new" => {
+                let Some(control) = control else {
+                    return Outcome::Refused("这块屏幕没接上宿主".into());
                 };
-                let disabled = state == "off";
-                let toml = format!("[[patch]]\nid = \"{id}\"\ndisabled = {disabled}\n");
-                match control.patch(&toml).await {
-                    Ok(what) => Outcome::Said(format!("{id} → {state}\n{what}")),
-                    Err(e) => Outcome::Refused(e),
+                match control
+                    .call(HostCommand::NewSession {
+                        session: root.clone(),
+                    })
+                    .await
+                {
+                    Ok(_) => Outcome::Quiet,
+                    Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
-            "audit" => {
-                let findings = control.audit().await;
-                Outcome::Said(if findings.is_empty() {
-                    "组合自洽".into()
-                } else {
-                    findings.join("\n")
-                })
+            "resume" => {
+                let Some(control) = control else {
+                    return Outcome::Refused("这块屏幕没接上宿主".into());
+                };
+                let target = args.trim();
+                if target.is_empty() {
+                    let working_dir = std::env::current_dir()
+                        .ok()
+                        .map(|dir| dir.display().to_string());
+                    return match control
+                        .call(HostCommand::ListSessions { working_dir })
+                        .await
+                    {
+                        Ok(HostReply::Sessions { sessions }) => {
+                            let live = client.session();
+                            let choices: Vec<crate::overlay::Choice> = sessions
+                                .into_iter()
+                                .filter(|stored| stored.id != live)
+                                .map(|stored| {
+                                    crate::overlay::Choice::new(
+                                        format!("/resume {}", stored.id),
+                                        stored.title.clone().unwrap_or_else(|| stored.id.clone()),
+                                    )
+                                    .about(
+                                        if stored.needs_newer_version {
+                                            format!("需要更新版本才能打开 · {}", stored.id)
+                                        } else {
+                                            format!("{} 轮 · {}", stored.turns, stored.id)
+                                        },
+                                    )
+                                })
+                                .collect();
+                            if choices.is_empty() {
+                                Outcome::Said("没有别的存下的会话".into())
+                            } else {
+                                Outcome::Open(crate::overlay::Picker::new(
+                                    "resume",
+                                    "回到哪个会话 · enter 打开",
+                                    choices,
+                                ))
+                            }
+                        }
+                        Ok(other) => Outcome::Refused(format!("{other:?}")),
+                        Err(error) => Outcome::Refused(refusal(error)),
+                    };
+                }
+                match control
+                    .call(HostCommand::Resume {
+                        session: root.clone(),
+                        target: target.to_string(),
+                    })
+                    .await
+                {
+                    Ok(_) => Outcome::Quiet,
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
             }
-            "patch" => match control.patch(&args.replace("\\n", "\n")).await {
-                Ok(what) => Outcome::Said(what),
-                Err(e) => Outcome::Refused(e),
-            },
             // A level is the session's, not the model route's, so this survives
-            // a model switch. The switch itself is NOT here on purpose: whether
-            // a route can reason at all is `thinking_type` on the `llm` row.
+            // a model switch. Whether a route can reason at all is the model's.
             "effort" => {
                 let wanted = args.trim();
                 // One vocabulary, taken from the place that defines it, so this
                 // command cannot offer a level nothing parses.
                 let levels = atomcode_harness::REASONING_EFFORT_LEVELS;
-                let current = control
-                    .row_config(atomcode_harness::REASONING_EFFORT_ROW)
-                    .await
-                    .and_then(|c| c.get("level").and_then(|v| v.as_str()).map(str::to_string));
                 if wanted.is_empty() {
+                    let current = client
+                        .described()
+                        .and_then(|d| d.reasoning_effort)
+                        .map(|level| level.as_str().to_string())
+                        .unwrap_or_else(|| "端点默认".into());
                     return Outcome::Said(format!(
-                        "当前思考强度:{}\n可选:{}",
-                        current.unwrap_or_else(|| "端点默认".into()),
+                        "当前思考强度:{current}\n可选:{}, default",
                         levels.join(", ")
                     ));
                 }
-                if !levels.contains(&wanted) {
+                let level = if wanted == "default" {
+                    None
+                } else if levels.contains(&wanted) {
+                    ReasoningEffort::from_config(Some(wanted))
+                } else {
                     return Outcome::Refused(format!(
-                        "未知强度 `{wanted}`;可选:{}",
+                        "未知强度 `{wanted}`;可选:{}, default",
                         levels.join(", ")
                     ));
-                }
-                let toml = format!(
-                    "[[patch]]\nid = \"reasoning-effort\"\nconfig = {{ level = {wanted:?} }}\n"
-                );
-                match control.patch(&toml).await {
-                    Ok(what) => Outcome::Said(format!("思考强度 → {wanted}\n{what}")),
-                    Err(e) => Outcome::Refused(e),
-                }
-            }
-            _ => Outcome::Quiet,
-        }
-    }
-}
-
-/// The screen's shape, changed while it runs.
-///
-/// One of the three ways in — the others are a key and the model's
-/// `adjust_layout` tool — and all three land on `Layout::apply`, so there is one
-/// implementation of each op rather than three.
-pub struct LayoutCommands {
-    pub layout: Arc<crate::layout::Layout>,
-    pub modules: Arc<crate::module::Modules>,
-}
-
-const LAYOUT: &[Command] = &[
-    Command::new("layout", "挑一个命名布局,或显示/隐藏一个面板"),
-    Command::taking(
-        "show",
-        "<模块> [top|bottom|left|right]",
-        "把一个面板放上屏幕",
-    ),
-    Command::taking("hide", "<模块>", "把一个面板收起来"),
-    Command::new("undo-layout", "撤销上一次布局改动"),
-];
-
-const LAYOUT_HIDDEN: &[Command] = &[Command::taking("layout-set", "<名字>", "")];
-
-impl LayoutCommands {
-    fn known(&self) -> Vec<String> {
-        self.modules
-            .view_ids()
-            .into_iter()
-            .map(str::to_string)
-            .chain(["mascot".to_string(), "findings".to_string()])
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    }
-    fn run_op(&self, op: crate::layout::LayoutOp) -> Outcome {
-        match self.layout.apply(&op, &self.known()) {
-            Ok(what) => Outcome::Said(what),
-            Err(e) => Outcome::Refused(e.to_string()),
-        }
-    }
-}
-
-#[async_trait]
-impl CommandSet for LayoutCommands {
-    fn id(&self) -> &'static str {
-        "cmd-layout"
-    }
-    fn commands(&self) -> Vec<Command> {
-        LAYOUT.to_vec()
-    }
-    fn hidden(&self) -> Vec<Command> {
-        LAYOUT_HIDDEN.to_vec()
-    }
-    async fn run(&self, name: &str, args: &str, _ctx: &Context) -> Outcome {
-        use crate::layout::{LayoutOp, Side};
-        match name {
-            "layout" => {
-                let on = self.layout.tree().modules();
-                let mut choices: Vec<crate::overlay::Choice> = crate::layout::presets()
-                    .iter()
-                    .map(|(n, d)| {
-                        crate::overlay::Choice::new(format!("/layout-set {n}"), format!("布局 {n}"))
-                            .about(*d)
+                };
+                let Some(control) = control else {
+                    return Outcome::Refused("这块屏幕没接上宿主".into());
+                };
+                match control
+                    .call(HostCommand::SetReasoningEffort {
+                        session: root.clone(),
+                        level,
                     })
-                    .collect();
-                for m in self.known() {
-                    let shown = on.contains(&m);
-                    choices.push(
-                        crate::overlay::Choice::new(
-                            format!("/{} {m}", if shown { "hide" } else { "show" }),
-                            m.clone(),
-                        )
-                        .about(if shown { "在屏幕上" } else { "未显示" })
-                        .marked(shown),
-                    );
+                    .await
+                {
+                    Ok(_) => {
+                        client.chose_effort(level);
+                        Outcome::Said(format!("思考强度 → {wanted}"))
+                    }
+                    Err(error) => Outcome::Refused(refusal(error)),
                 }
-                Outcome::Open(crate::overlay::Picker::new(
-                    "layout",
-                    "布局 · enter 应用",
-                    choices,
-                ))
             }
-            "layout-set" => self.run_op(LayoutOp::Preset {
-                name: args.trim().to_string(),
-            }),
-            "show" => {
-                let mut parts = args.split_whitespace();
-                let Some(module) = parts.next() else {
-                    return Outcome::Refused("用法:/show <模块> [top|bottom|left|right]".into());
+            // The conversation goes back; the words the person said go back to
+            // where they type, to change and send again (`docs/adr/0024` §17).
+            "undo" | "rewind" => {
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refused) => return refused,
                 };
-                let side = match parts.next() {
-                    Some("top") => Side::Top,
-                    Some("left") => Side::Left,
-                    Some("right") => Side::Right,
-                    _ => Side::Bottom,
-                };
-                self.run_op(LayoutOp::Show {
-                    module: module.to_string(),
-                    side,
-                    size: parts.next().and_then(|s| s.parse().ok()),
-                })
-            }
-            "hide" => {
-                let module = args.trim();
-                if module.is_empty() {
-                    return Outcome::Refused("用法:/hide <模块>".into());
+                if client.session() != root {
+                    return Outcome::Refused("撤销只对主会话:先切回「主」".into());
                 }
-                self.run_op(LayoutOp::Hide {
-                    module: module.to_string(),
-                })
+                let mut words = args.split_whitespace();
+                let turn = match words.next().map(str::parse::<u64>) {
+                    None => None,
+                    Some(Ok(turn)) => Some(turn),
+                    Some(Err(_)) => {
+                        return Outcome::Refused(format!("`{}` 不是回合号", args.trim()))
+                    }
+                };
+                let based_on = client.root_high();
+                let reply = if name == "undo" {
+                    control
+                        .call(HostCommand::Undo {
+                            session: root,
+                            turn,
+                            based_on,
+                        })
+                        .await
+                } else {
+                    let Some(turn) = turn else {
+                        return match control
+                            .call(HostCommand::RewindPoints { session: root })
+                            .await
+                        {
+                            Ok(HostReply::RewindPoints {
+                                points,
+                                code_unavailable,
+                            }) if !points.is_empty() => {
+                                let choices = points
+                                    .into_iter()
+                                    .map(|point| {
+                                        let scope = if point.code && code_unavailable.is_none() {
+                                            " 全部"
+                                        } else {
+                                            ""
+                                        };
+                                        crate::overlay::Choice::new(
+                                            format!("/rewind {}{scope}", point.turn),
+                                            point.prompt.clone(),
+                                        )
+                                        .about(format!(
+                                            "回合 {} · {} 个文件改动",
+                                            point.turn, point.files
+                                        ))
+                                    })
+                                    .collect();
+                                Outcome::Open(crate::overlay::Picker::new(
+                                    "rewind",
+                                    "回到哪一回合之前 · enter 回去",
+                                    choices,
+                                ))
+                            }
+                            Ok(HostReply::RewindPoints { .. }) => {
+                                Outcome::Said("还没有可以回去的回合".into())
+                            }
+                            Ok(other) => Outcome::Refused(format!("{other:?}")),
+                            Err(error) => Outcome::Refused(refusal(error)),
+                        };
+                    };
+                    let scope = match words.next() {
+                        None | Some("对话") | Some("conversation") => {
+                            atomcode_kernel::session::RewindScope::Conversation
+                        }
+                        Some("代码") | Some("code") => {
+                            atomcode_kernel::session::RewindScope::Code
+                        }
+                        Some("全部") | Some("both") => {
+                            atomcode_kernel::session::RewindScope::Both
+                        }
+                        Some(other) => {
+                            return Outcome::Refused(format!(
+                                "`{other}` 不是范围;可选:对话、代码、全部"
+                            ))
+                        }
+                    };
+                    control
+                        .call(HostCommand::Rewind {
+                            session: root,
+                            turn,
+                            scope,
+                            based_on,
+                        })
+                        .await
+                };
+                match reply {
+                    Ok(HostReply::Undone {
+                        prompt: Some(prompt),
+                        ..
+                    }) => Outcome::Do(Action::Paste(prompt)),
+                    Ok(HostReply::Undone { restored_files, .. }) => {
+                        Outcome::Said(format!("已还原 {} 个文件", restored_files.len()))
+                    }
+                    Ok(other) => Outcome::Refused(format!("{other:?}")),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
             }
-            "undo-layout" => self.run_op(LayoutOp::Undo),
+            "model" => {
+                let wanted = args.trim();
+                if wanted.is_empty() {
+                    let current = client
+                        .described()
+                        .and_then(|d| d.model)
+                        .unwrap_or_else(|| "(未知)".into());
+                    return Outcome::Said(format!("当前模型:{current}"));
+                }
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refused) => return refused,
+                };
+                match control
+                    .call(HostCommand::SwitchModel {
+                        session: root,
+                        model: wanted.to_string(),
+                    })
+                    .await
+                {
+                    Ok(_) => Outcome::Said(format!("模型 → {wanted}")),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
+            "mcp" => {
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refused) => return refused,
+                };
+                match args.trim() {
+                    "" => match control.call(HostCommand::McpStatus { session: root }).await {
+                        Ok(HostReply::McpServers { servers }) if servers.is_empty() => {
+                            Outcome::Said("没有配置 MCP 服务器".into())
+                        }
+                        Ok(HostReply::McpServers { servers }) => Outcome::Said(
+                            servers
+                                .into_iter()
+                                .map(|server| {
+                                    use atomcode_kernel::host::McpServerState as S;
+                                    let state = match server.state {
+                                        S::Connecting => "连接中".to_string(),
+                                        S::Connected => "已连接".to_string(),
+                                        S::Untrusted => "未信任项目,未启动".to_string(),
+                                        S::Failed { message } => format!("失败:{message}"),
+                                        S::Disconnected => "已断开".to_string(),
+                                        _ => "未知".to_string(),
+                                    };
+                                    format!("{} · {state}", server.name)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ),
+                        Ok(other) => Outcome::Refused(format!("{other:?}")),
+                        Err(error) => Outcome::Refused(refusal(error)),
+                    },
+                    "withdraw" => match control
+                        .call(HostCommand::WithdrawMcpTools { session: root })
+                        .await
+                    {
+                        Ok(_) => Outcome::Said("已撤下全部 MCP 工具".into()),
+                        Err(error) => Outcome::Refused(refusal(error)),
+                    },
+                    other => {
+                        Outcome::Refused(format!("`/mcp {other}` 不认识;可用:/mcp、/mcp withdraw"))
+                    }
+                }
+            }
+            "reload" | "logout" | "login" => {
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refused) => return refused,
+                };
+                let (command, done) = match name {
+                    "reload" => (
+                        HostCommand::Reload { session: root },
+                        "已重新读取 skills、MCP 与配置",
+                    ),
+                    "logout" => (
+                        HostCommand::SignOut { session: root },
+                        "已登出;/login 重新登录",
+                    ),
+                    _ => (HostCommand::SignIn { session: root }, "已登录"),
+                };
+                match control.call(command).await {
+                    Ok(_) => Outcome::Said(done.into()),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
             _ => Outcome::Quiet,
         }
     }
@@ -469,7 +570,7 @@ impl CommandSet for HelpCommands {
             .all
             .all()
             .iter()
-            .map(|c| c.name.len() + c.takes.map(|t| t.len() + 1).unwrap_or(0))
+            .map(|c| c.name.len() + c.takes.as_ref().map(|t| t.len() + 1).unwrap_or(0))
             .max()
             .unwrap_or(8);
         Outcome::Said(
@@ -477,7 +578,7 @@ impl CommandSet for HelpCommands {
                 .all()
                 .iter()
                 .map(|c| {
-                    let head = match c.takes {
+                    let head = match &c.takes {
                         Some(t) => format!("/{} {t}", c.name),
                         None => format!("/{}", c.name),
                     };
@@ -486,6 +587,40 @@ impl CommandSet for HelpCommands {
                 .collect::<Vec<_>>()
                 .join("\n"),
         )
+    }
+}
+
+/// The agent's own commands, as its description lists them (`docs/adr/0021`
+/// §10): whatever the rows in its tree registered — stopping a team member, say.
+/// Run by name through the connection; what one produced comes back on screen.
+///
+/// Read when asked rather than copied at mount, so what is listed is what the
+/// agent on screen was last described as offering.
+pub struct AgentCatalogCommands {
+    pub client: Arc<crate::plugin::AgentClient>,
+}
+
+#[async_trait]
+impl CommandSet for AgentCatalogCommands {
+    fn id(&self) -> &'static str {
+        "cmd-agent-catalog"
+    }
+    fn commands(&self) -> Vec<Command> {
+        self.client
+            .described()
+            .map(|d| d.commands)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| Command {
+                name: c.name.into(),
+                about: c.summary.into(),
+                takes: c.usage.map(Into::into),
+            })
+            .collect()
+    }
+    async fn run(&self, name: &str, args: &str, _ctx: &Context) -> Outcome {
+        self.client.invoke(name, args);
+        Outcome::Quiet
     }
 }
 
@@ -501,6 +636,189 @@ fn first_line(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host that answers from a script and keeps what it was asked.
+    #[derive(Default)]
+    struct Recording {
+        asked: std::sync::Mutex<Vec<HostCommand>>,
+        replies: std::sync::Mutex<std::collections::VecDeque<Result<HostReply, HostError>>>,
+    }
+
+    #[async_trait]
+    impl atomcode_kernel::host::HostControl for Recording {
+        async fn call(&self, command: HostCommand) -> Result<HostReply, HostError> {
+            self.asked.lock().unwrap().push(command);
+            self.replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(HostReply::Done))
+        }
+        fn subscribe(
+            &self,
+        ) -> tokio::sync::mpsc::UnboundedReceiver<atomcode_kernel::host::HostEvent> {
+            tokio::sync::mpsc::unbounded_channel().1
+        }
+    }
+
+    /// A screen following session `lead`, whose last fact it saw is number 7.
+    fn following(host: &Arc<Recording>) -> (App, Arc<crate::plugin::AgentClient>, Arc<Commands>) {
+        let app = bare();
+        let client = Arc::new(crate::plugin::AgentClient::default());
+        let (commands, _agent) = tokio::sync::mpsc::unbounded_channel();
+        client.connect(commands, host.clone());
+        client.follow("lead");
+        client.keep(&atomcode_kernel::session::Committed {
+            session: "lead".into(),
+            seq: 7,
+            at: 0,
+            event: SessionEvent::TurnStart { turn: 1 },
+        });
+        let _ = app
+            .context()
+            .provide::<crate::plugin::AgentClientSvc>(client.clone());
+        let all = Arc::new(Commands::new());
+        let _ = all.add(Arc::new(SessionCommands));
+        (app, client, all)
+    }
+
+    /// `/undo` asks the host about the session this screen follows, based on the
+    /// last fact it saw, and puts the words it hands back where the person
+    /// types (`docs/adr/0024` §17).
+    #[tokio::test]
+    async fn undo_is_asked_of_the_host_and_the_words_come_back_to_the_composer() {
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Undone {
+                prompt: Some("fix the parser".into()),
+                restored_files: Vec::new(),
+            }));
+        let (app, client, all) = following(&host);
+        assert_eq!(
+            all.dispatch("/undo", &app.context()).await,
+            Outcome::Do(Action::Paste("fix the parser".into()))
+        );
+        let _ = all.dispatch("/undo 3", &app.context()).await;
+        assert_eq!(
+            *host.asked.lock().unwrap(),
+            vec![
+                HostCommand::Undo {
+                    session: "lead".into(),
+                    turn: None,
+                    based_on: 7,
+                },
+                HostCommand::Undo {
+                    session: "lead".into(),
+                    turn: Some(3),
+                    based_on: 7,
+                },
+            ]
+        );
+
+        // With a member on screen, the lead's conversation is not what is shown.
+        let _ = client.look_at("lead/scout");
+        assert!(matches!(
+            all.dispatch("/undo", &app.context()).await,
+            Outcome::Refused(_)
+        ));
+        assert_eq!(
+            host.asked.lock().unwrap().len(),
+            2,
+            "nothing more was asked"
+        );
+    }
+
+    /// `/rewind` with nothing after it offers the points to pick from; with a
+    /// turn and a scope it goes back.
+    #[tokio::test]
+    async fn rewind_offers_the_points_and_goes_back_with_a_scope() {
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::RewindPoints {
+                points: vec![atomcode_kernel::host::RewindPoint {
+                    turn: 2,
+                    prompt: "two".into(),
+                    files: 1,
+                    code: true,
+                }],
+                code_unavailable: None,
+            }));
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Undone {
+                prompt: None,
+                restored_files: vec!["src/a.rs".into()],
+            }));
+        let (app, _client, all) = following(&host);
+        match all.dispatch("/rewind", &app.context()).await {
+            Outcome::Open(picker) => assert_eq!(picker.id(), "rewind"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            all.dispatch("/rewind 2 代码", &app.context()).await,
+            Outcome::Said("已还原 1 个文件".into())
+        );
+        assert_eq!(
+            host.asked.lock().unwrap().last(),
+            Some(&HostCommand::Rewind {
+                session: "lead".into(),
+                turn: 2,
+                scope: atomcode_kernel::session::RewindScope::Code,
+                based_on: 7,
+            })
+        );
+    }
+
+    /// The rest of host control over a session is a command each, for the
+    /// session this screen follows even while a member is on screen.
+    #[tokio::test]
+    async fn model_mcp_reload_and_signing_in_and_out_are_asked_of_the_host() {
+        let host = Arc::new(Recording::default());
+        let (app, client, all) = following(&host);
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::Done),
+            Ok(HostReply::McpServers {
+                servers: Vec::new(),
+            }),
+        ]);
+        let _ = client.look_at("lead/scout");
+        for line in [
+            "/model glm-5",
+            "/mcp",
+            "/mcp withdraw",
+            "/reload",
+            "/logout",
+            "/login",
+        ] {
+            assert!(
+                !matches!(
+                    all.dispatch(line, &app.context()).await,
+                    Outcome::Refused(_)
+                ),
+                "{line}"
+            );
+        }
+        let lead = || "lead".to_string();
+        assert_eq!(
+            *host.asked.lock().unwrap(),
+            vec![
+                HostCommand::SwitchModel {
+                    session: lead(),
+                    model: "glm-5".into(),
+                },
+                HostCommand::McpStatus { session: lead() },
+                HostCommand::WithdrawMcpTools { session: lead() },
+                HostCommand::Reload { session: lead() },
+                HostCommand::SignOut { session: lead() },
+                HostCommand::SignIn { session: lead() },
+            ]
+        );
+    }
     use atomcode_plexus::{App, ConfigTree, PluginRegistry};
 
     fn bare() -> App {
@@ -518,11 +836,6 @@ mod tests {
         let c = Arc::new(Commands::new());
         let _ = c.add(Arc::new(ScreenCommands));
         let _ = c.add(Arc::new(SessionCommands));
-        let _ = c.add(Arc::new(TreeCommands));
-        let _ = c.add(Arc::new(LayoutCommands {
-            layout: Arc::new(crate::layout::Layout::new(crate::host::default_layout())),
-            modules: Arc::new(crate::module::Modules::new()),
-        }));
         let _ = c.add(Arc::new(HelpCommands { all: c.clone() }));
         c
     }
@@ -530,8 +843,10 @@ mod tests {
     #[test]
     fn the_shipped_set_mounts_without_conflicting_with_itself() {
         let c = builtin_for_test();
-        let names: Vec<_> = c.all().iter().map(|x| x.name).collect();
-        assert!(names.contains(&"help") && names.contains(&"compact") && names.contains(&"rows"));
+        let names: Vec<_> = c.all().iter().map(|x| x.name.to_string()).collect();
+        assert!(["help", "compact", "effort"]
+            .iter()
+            .all(|n| names.contains(&n.to_string())));
         let mut sorted = names.clone();
         sorted.sort();
         sorted.dedup();
@@ -546,7 +861,7 @@ mod tests {
             Outcome::Said(text) => {
                 assert!(text.contains("/help"));
                 assert!(
-                    text.contains("/patch <TOML>"),
+                    text.contains("/resume [会话 id]"),
                     "argument hints show:\n{text}"
                 );
                 assert_eq!(text.lines().count(), c.all().len());
@@ -559,23 +874,11 @@ mod tests {
     async fn a_command_whose_seam_is_missing_says_so_instead_of_panicking() {
         let c = builtin_for_test();
         let app = bare(); // no session, no control, no tools
-        for line in ["/compact", "/context", "/rows", "/audit", "/tools-list"] {
+        for line in ["/compact", "/context", "/new", "/resume", "/effort high"] {
             match c.dispatch(line, &app.context()).await {
                 Outcome::Refused(m) => assert!(!m.is_empty(), "{line} refused with nothing"),
                 other => panic!("{line} should refuse, got {other:?}"),
             }
-        }
-    }
-
-    #[tokio::test]
-    async fn patch_without_an_argument_shows_what_it_wants() {
-        let c = builtin_for_test();
-        let app = bare();
-        match c.dispatch("/patch", &app.context()).await {
-            Outcome::Refused(m) => assert!(m.contains("TOML"), "{m}"),
-            // With no `control` seam it refuses for that reason first, which is
-            // also correct — either refusal is a refusal, never a silent no-op.
-            other => panic!("{other:?}"),
         }
     }
 

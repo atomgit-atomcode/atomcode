@@ -48,6 +48,11 @@ pub struct MemberNow {
     pub activity: Activity,
     /// Which turn it is on, in its own log.
     pub turn: u64,
+    /// Its session id: what switching the screen to it addresses.
+    pub session: String,
+    /// Gone from the team — stopped — and still there to be looked at: its log
+    /// is kept (`docs/adr/0023` §5).
+    pub gone: bool,
 }
 
 /// How far the stream is scrolled from the bottom, in rendered lines.
@@ -238,6 +243,17 @@ pub struct Moment {
     /// a module that folded "is a question waiting?" from facts would be folding
     /// something that is not in them. See `modules::ask`.
     pub asking: Option<Ask>,
+    /// The session this screen follows: the lead, when there is a team.
+    pub lead: String,
+    /// The session on screen — the lead, or one of its members the person
+    /// switched to (`docs/adr/0023` §3). Everything drawn is this one's.
+    pub viewing: String,
+    /// The team panel's pointed-at row, while the panel has the keyboard.
+    ///
+    /// One owner for the reason [`Ask::cursor`] has one: the row the arrows are
+    /// on and the row the pointer is over are the same row. An index into
+    /// `modules::team::targets`.
+    pub team_cursor: Option<usize>,
 }
 
 /// A question on screen, with the row that is pointed at.
