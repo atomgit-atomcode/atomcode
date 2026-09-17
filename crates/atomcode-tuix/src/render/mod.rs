@@ -661,8 +661,8 @@ pub struct StatusLine {
     /// from `mode_indicator` (left-aligned PLAN badge) so it does not
     /// displace the mode indicator.
     pub bypass_indicator: Option<String>,
-    /// Right-aligned cache-hit indicator for the current turn, rendered in
-    /// the left info group after the ctx-usage segment (e.g. `cache 70%`).
+    /// Cache-hit indicator for the current turn, rendered in the left info
+    /// group after the ctx-usage segment (e.g. `cache 70%`).
     /// Derived from the per-turn prompt/cached token tallies; `None` while
     /// no cached usage has been reported this turn (cold start, providers
     /// that don't report cached tokens), so the status row stays quiet.
