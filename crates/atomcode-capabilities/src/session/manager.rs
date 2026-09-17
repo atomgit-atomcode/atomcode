@@ -3282,6 +3282,13 @@ fn scan_bucket_into(bucket: &str, bucket_path: &Path, out: &mut BucketPartial) {
         }
         let source = if let Some(id) = name.strip_suffix(".meta") {
             Some((id, false))
+        } else if name.ends_with(".images.json") || name.ends_with(".todos.json") {
+            // Per-session sidecars (image payloads / todo lists), NOT catalog
+            // sources. Skip by NAME so we never read + JSON-parse them: an images
+            // sidecar can be hundreds of KB, and previously every one was fully
+            // parsed as a legacy session, rejected, and logged — once per file,
+            // per bucket. On a large history that dominated `-c`/resume startup.
+            None
         } else if let Some(id) = name.strip_suffix(".json") {
             if let Some(presentation_id) = name.strip_suffix(".ui.json") {
                 let has_native_companion = ["meta", "snapshot", "jsonl"].iter().any(|extension| {
@@ -6121,6 +6128,37 @@ mod tests {
         assert!(
             scan.diagnostics.is_empty(),
             "rewind sidecars must not be parsed as legacy session JSON: {:?}",
+            scan.diagnostics
+        );
+    }
+
+    #[test]
+    fn catalog_skips_images_and_todos_sidecars_without_parsing_them() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = root.path().join("0123456789abcdef");
+        let manager = SessionManager::with_root(&bucket);
+        let id = "sidecar-skip";
+        manager
+            .write_meta(&SessionMeta::new(id, "/project", 1))
+            .unwrap();
+        // Per-session sidecars that are NOT valid session JSON (no `id` field);
+        // the images payload is large enough that parsing it would be wasteful.
+        // Before the fix these were read + JSON-parsed as legacy sessions, then
+        // rejected + logged once per file, per bucket — a big `-c`/resume cost.
+        std::fs::write(
+            bucket.join(format!("{id}.images.json")),
+            format!("{{\"data\":\"{}\"}}", "x".repeat(200_000)),
+        )
+        .unwrap();
+        std::fs::write(bucket.join(format!("{id}.todos.json")), "{\"items\":[]}").unwrap();
+
+        let scan = SessionManager::scan_catalog(root.path());
+
+        assert_eq!(scan.entries.len(), 1, "only the real session is cataloged");
+        assert_eq!(scan.entries[0].id, id);
+        assert!(
+            scan.diagnostics.is_empty(),
+            "images/todos sidecars must be skipped by name, not parsed + rejected: {:?}",
             scan.diagnostics
         );
     }

@@ -1774,12 +1774,26 @@ fn validate_project_bucket(project_bucket: &str) -> anyhow::Result<()> {
 }
 
 fn report_catalog_diagnostics(diagnostics: &[atomcode_capabilities::session::CatalogDiagnostic]) {
-    for diagnostic in diagnostics {
+    // Cap the per-entry detail: a large history with orphaned sidecars / corrupt
+    // legacy files can produce THOUSANDS of these, and each `tracing::warn!` is a
+    // synchronous write to the log file — that alone was a measurable chunk of
+    // `-c`/resume startup. Log a bounded sample, then one summary line.
+    const MAX_DETAIL: usize = 20;
+    for diagnostic in diagnostics.iter().take(MAX_DETAIL) {
         tracing::warn!(
             path = %diagnostic.path.display(),
             kind = ?diagnostic.kind,
             message = %diagnostic.message,
             "session catalog entry was skipped"
+        );
+    }
+    if diagnostics.len() > MAX_DETAIL {
+        tracing::warn!(
+            skipped = diagnostics.len(),
+            shown = MAX_DETAIL,
+            "session catalog skipped {} entries ({} shown above)",
+            diagnostics.len(),
+            MAX_DETAIL,
         );
     }
 }
