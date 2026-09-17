@@ -8189,28 +8189,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         normalized
     }
 
-    #[allow(dead_code)]
-    fn build_wrapped_text_rows(
-        &self,
-        parts: &[(&str, CellStyle)],
-        content_width: usize,
-    ) -> Vec<Vec<Cell>> {
-        let mut content = Vec::new();
-        for (text, style) in parts {
-            push_str_cells(&mut content, text, style);
-        }
-        let chunks = wrap_cells_to_width(&content, content_width.max(1));
-        let mut rows = Vec::with_capacity(chunks.len().max(1));
-        for chunk in chunks {
-            let mut row = Vec::new();
-            let pad = CellStyle::default();
-            push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
-            row.extend(chunk);
-            rows.push(row);
-        }
-        rows
-    }
-
     /// Render the baked mascot const into cell rows (no leading pad; caller
     /// positions it). Each cell is `▀` with fg=top-subpixel / bg=bottom-subpixel;
     /// a fully transparent cell is a blank space.
