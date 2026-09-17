@@ -103,6 +103,57 @@ impl Feed {
         Ok(())
     }
 
+    /// A delegated agent that is gone, from the log its store kept
+    /// (`docs/adr/0023` §5): described as its header records it, then every
+    /// fact from `from` on. Nothing follows — it will say nothing more.
+    ///
+    /// Only a delegated session: another conversation is not reachable by id
+    /// from this one.
+    pub async fn replay_kept(
+        &self,
+        ctx: &Context,
+        session: &str,
+        from: SeqNo,
+    ) -> Result<(), CommandError> {
+        let store = ctx
+            .service::<crate::seams::SessionPersistenceSvc>()
+            .ok_or(CommandError::NotFound)?;
+        let header = store
+            .header(session)
+            .await
+            .ok()
+            .flatten()
+            .filter(|header| header.parent.is_some())
+            .ok_or(CommandError::NotFound)?;
+        let events = store
+            .load(session)
+            .await
+            .map_err(|_| CommandError::Unavailable)?;
+        let _ = self.events.send(AgentEvent::Described {
+            description: Box::new(atomcode_kernel::agent::AgentDescription {
+                session: session.to_string(),
+                parent: header.parent.clone(),
+                member: header
+                    .member
+                    .as_ref()
+                    .map(|m| atomcode_kernel::agent::MemberIdentity {
+                        name: m.name.clone(),
+                        role: m.role.clone(),
+                    }),
+                ..Default::default()
+            }),
+        });
+        for logged in events.into_iter().filter(|logged| logged.seq >= from) {
+            let _ = self.events.send(AgentEvent::Fact(Box::new(Committed {
+                session: session.to_string(),
+                seq: logged.seq,
+                at: logged.at,
+                event: logged.event,
+            })));
+        }
+        Ok(())
+    }
+
     pub fn unsubscribe(&self, session: &str) {
         self.subscriptions
             .lock()

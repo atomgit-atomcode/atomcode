@@ -1517,6 +1517,103 @@ async fn a_driven_agents_unread_events_are_not_kept() {
     ));
 }
 
+/// A member that is gone can still be read, whole, by its session id — from
+/// the log its store kept (`docs/adr/0023` §5); a conversation that was never
+/// delegated from anyone cannot be reached that way.
+#[tokio::test]
+async fn a_stopped_members_log_is_read_by_its_session_id() {
+    use atomcode_kernel::event::{AgentCommand, AgentEvent, CommandError};
+
+    let dir = scratch("read-stopped");
+    let sessions = scratch("read-stopped-sessions");
+    let app = start(kept(
+        &dir,
+        &sessions,
+        ("read-stopped-lead", false),
+        r#"{ text = "noted" }"#,
+        r#"{ text = "found the thing" }"#,
+        "",
+    ))
+    .await;
+    let (lead, mut handle) = lead_on_a_pump(&app).await;
+    as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"scout","role":"explorer","task":"look around"}"#,
+    )
+    .await;
+    let scout_session = format!("{}/scout", lead.session_id());
+    let scout = app
+        .context()
+        .service::<AgentsSvc>()
+        .unwrap()
+        .by_session(&scout_session)
+        .unwrap();
+    settled(&scout, 1).await;
+    as_lead(&app, &lead, r#"{"action":"stop","name":"scout"}"#).await;
+    stored_until(&app, &scout_session, "said it was stopped", |events| {
+        events
+            .iter()
+            .any(|e| matches!(e.event, SessionEvent::Stopped { .. }))
+    })
+    .await;
+
+    // A conversation of its own, kept and no longer live.
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let stranger = agents
+        .create(&app.context(), atomcode_harness::agent::CreateAgent::new())
+        .await
+        .unwrap();
+    let stranger_session = stranger.session_id().to_string();
+    agents.remove(stranger.id());
+    drop(stranger);
+    let store = app
+        .context()
+        .service::<atomcode_harness::seams::SessionPersistenceSvc>()
+        .unwrap();
+    assert!(
+        store.header(&stranger_session).await.unwrap().is_some(),
+        "kept, so only the rule refuses it"
+    );
+    handle
+        .commands
+        .send(AgentCommand::Tagged {
+            id: "not-delegated".into(),
+            command: Box::new(AgentCommand::Subscribe {
+                session: stranger_session,
+                from: 0,
+            }),
+        })
+        .unwrap();
+    handle
+        .commands
+        .send(AgentCommand::Subscribe {
+            session: scout_session.clone(),
+            from: 0,
+        })
+        .unwrap();
+    let seen = events_until(&mut handle, |e| {
+        matches!(e, AgentEvent::Fact(c) if c.session == scout_session
+            && matches!(c.event, SessionEvent::Stopped { .. }))
+    })
+    .await;
+    assert!(
+        seen.iter().any(|e| matches!(
+            e,
+            AgentEvent::Rejected { command, error: CommandError::NotFound } if command == "not-delegated"
+        )),
+        "{seen:#?}"
+    );
+    assert!(
+        seen.iter().any(|e| matches!(
+            e,
+            AgentEvent::Fact(c) if c.session == scout_session
+                && matches!(&c.event, SessionEvent::AssistantMessage { text, .. } if text == "found the thing")
+        )),
+        "{seen:#?}"
+    );
+}
+
 /// A row's commands are the row's: switching the team row off takes `stop`
 /// out of the catalog with it (`docs/adr/0021` §10).
 #[tokio::test]

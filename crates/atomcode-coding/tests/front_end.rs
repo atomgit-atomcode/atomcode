@@ -59,6 +59,19 @@ impl LlmProvider for Scripted {
                     .to_string(),
                 })
             }
+            Some(m) if m.role == Role::User && m.text == "delegate a team" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "team".into(),
+                    arguments: serde_json::json!({
+                        "action": "delegate",
+                        "name": "scout",
+                        "role": "explorer",
+                        "task": "list what is here",
+                    })
+                    .to_string(),
+                })
+            }
             // A request that never answers: the only way out is a cancel.
             Some(m) if m.role == Role::User && m.text == "hang" => {
                 return Ok(Box::pin(futures::stream::pending()));
@@ -107,6 +120,10 @@ fn env() -> Env {
 }
 
 async fn connected(env: &Env) -> HostConnection {
+    connected_with(env, SubagentPolicy::Disabled).await
+}
+
+async fn connected_with(env: &Env, subagents: SubagentPolicy) -> HostConnection {
     let front_end = FrontEnd::new();
     let mut agent = CodingAgentConfig::new(
         "key",
@@ -129,7 +146,7 @@ async fn connected(env: &Env) -> HostConnection {
             memory: false,
             web: false,
             review: false,
-            subagents: SubagentPolicy::Disabled,
+            subagents,
             rate_limit_source: None,
             front_end: Some(front_end.clone()),
         },
@@ -194,6 +211,111 @@ fn user_messages(events: &[AgentEvent], session: &str) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// Events until `done`, or give up naming what came.
+async fn until(
+    connection: &mut HostConnection,
+    done: impl Fn(&AgentEvent) -> bool,
+) -> Vec<AgentEvent> {
+    let mut seen = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), connection.events.recv()).await {
+            Ok(Some(event)) => {
+                let last = done(&event);
+                seen.push(event);
+                if last {
+                    return seen;
+                }
+            }
+            other => panic!("gave up: {other:?}; saw {seen:#?}"),
+        }
+    }
+}
+
+/// The product's front end reaches the team the way the harness's own pump
+/// does (`docs/adr/0021` §9–10, `docs/adr/0023` §4, §5, §8): a message
+/// addressed to a member is the person's and runs its turn, the catalog's
+/// `stop` stops it, and its log can still be read by its session id after.
+#[tokio::test]
+async fn a_front_end_talks_to_a_member_stops_it_and_reads_it_after() {
+    let env = env();
+    let mut connection = connected_with(&env, SubagentPolicy::Enabled).await;
+    let lead = connection.session.clone();
+    let scout = format!("{lead}/scout");
+    connection.commands.send(subscribe(&lead)).unwrap();
+    connection
+        .commands
+        .send(message("delegate a team"))
+        .unwrap();
+    until(
+        &mut connection,
+        |e| matches!(e, AgentEvent::AgentAdded { description } if description.session == scout),
+    )
+    .await;
+    quiet(&mut connection).await;
+
+    connection
+        .commands
+        .send(AgentCommand::To {
+            session: scout.clone(),
+            command: Box::new(AgentCommand::Tagged {
+                id: "to-scout".into(),
+                command: Box::new(message("and look again")),
+            }),
+        })
+        .unwrap();
+    until(&mut connection, |e| {
+        matches!(e, AgentEvent::Accepted { command, turn: Some(_), .. } if command == "to-scout")
+    })
+    .await;
+    connection.commands.send(subscribe(&scout)).unwrap();
+    let seen = until(&mut connection, |e| {
+        matches!(e, AgentEvent::Fact(c) if c.session == scout
+            && matches!(&c.event, SessionEvent::UserMessage { text, .. } if text == "and look again"))
+    })
+    .await;
+    assert!(
+        seen.iter().any(|e| matches!(
+            e,
+            AgentEvent::Described { description } if description.session == scout
+                && description.commands.iter().any(|c| c.name == "stop")
+        )),
+        "a member offers `stop`: {seen:#?}"
+    );
+    quiet(&mut connection).await;
+
+    connection
+        .commands
+        .send(AgentCommand::Invoke {
+            id: "stop".into(),
+            session: scout.clone(),
+            name: "stop".into(),
+            args: String::new(),
+        })
+        .unwrap();
+    until(&mut connection, |e| {
+        matches!(e, AgentEvent::Invoked { id, output } if id == "stop" && output == "stopped: scout")
+    })
+    .await;
+    quiet(&mut connection).await;
+
+    connection
+        .commands
+        .send(AgentCommand::Unsubscribe {
+            session: scout.clone(),
+        })
+        .unwrap();
+    connection.commands.send(subscribe(&scout)).unwrap();
+    let kept = until(&mut connection, |e| {
+        matches!(e, AgentEvent::Fact(c) if c.session == scout && matches!(c.event, SessionEvent::Stopped { .. }))
+    })
+    .await;
+    assert_eq!(
+        user_messages(&kept, &scout),
+        vec!["and look again".to_string()],
+        "the whole of it, from its kept log"
+    );
 }
 
 #[tokio::test]

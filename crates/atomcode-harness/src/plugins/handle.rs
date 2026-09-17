@@ -787,6 +787,143 @@ impl Answers for NoAnswers {
     fn close(&self) {}
 }
 
+// ---- a person's reach into the team ----------------------------------------
+
+/// Receipts of messages a connection sent to team members.
+///
+/// A member claims such a message in its own realm, which only the tree sees,
+/// so the receipt is watched for there and sent back on the connection that
+/// asked for it (`docs/adr/0021` §7).
+#[derive(Default)]
+pub struct Forwarded {
+    waiting: Mutex<HashSet<atomcode_kernel::event::CommandId>>,
+}
+
+impl Forwarded {
+    pub fn new() -> Arc<Self> {
+        Arc::default()
+    }
+
+    /// Listen on `tree` for the claims, answering on `events`.
+    pub fn listen(
+        self: &Arc<Self>,
+        tree: &Context,
+        events: mpsc::UnboundedSender<AgentEvent>,
+    ) -> atomcode_plexus::Disposable {
+        let forwarded = self.clone();
+        tree.on_emit::<crate::events::InputClaimed>(move |input: &crate::events::ClaimedInput| {
+            if forwarded
+                .waiting
+                .lock()
+                .expect("forwarded poisoned")
+                .remove(&input.receipt)
+            {
+                let _ = events.send(AgentEvent::Accepted {
+                    command: input.receipt.clone(),
+                    turn: Some(input.turn),
+                    steered: input.steered,
+                });
+            }
+        })
+    }
+}
+
+/// A command a person addressed to a team member (`docs/adr/0023` §4, §8):
+/// a message, taken as the person's; a cancel of its turn; a compaction between
+/// its turns.
+///
+/// `Ok(Some(turn))` is taken now; `Ok(None)` is taken when the member claims
+/// it, and the receipt comes through `forwarded`. Only an agent delegated from
+/// another is reachable this way — another conversation in the same tree is
+/// not the sender's to steer.
+pub fn command_member(
+    ctx: &Context,
+    session: &str,
+    command: AgentCommand,
+    receipt: Option<&atomcode_kernel::event::CommandId>,
+    forwarded: &Forwarded,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+) -> Result<Option<Option<u64>>, atomcode_kernel::event::CommandError> {
+    use atomcode_kernel::event::CommandError;
+    let target = crate::feed::Feed::find(ctx, session)
+        .filter(|target| target.parent().is_some())
+        .ok_or(CommandError::NotFound)?;
+    match command {
+        AgentCommand::SendMessage { text, images } => {
+            if let Some(id) = receipt {
+                forwarded
+                    .waiting
+                    .lock()
+                    .expect("forwarded poisoned")
+                    .insert(id.clone());
+            }
+            target.send_receipted(text, MessageOrigin::User, images, receipt.cloned());
+            Ok(None)
+        }
+        // Only its turn.
+        AgentCommand::Cancel => {
+            let running = target.status() != crate::agent::AgentStatus::Idle;
+            target.interrupt();
+            if running {
+                Ok(Some(Some(target.session().current_turn())))
+            } else {
+                Err(CommandError::NotRunning)
+            }
+        }
+        // Between its turns, never under one; off the caller's loop, since a
+        // summary is a model call.
+        AgentCommand::Compact { focus } => {
+            if target.status() != crate::agent::AgentStatus::Idle {
+                return Err(CommandError::Busy {
+                    reason: format!("{session} is working"),
+                });
+            }
+            let events = events.clone();
+            let member = target.ctx().clone();
+            tokio::spawn(async move {
+                let reporting = std::sync::atomic::AtomicBool::new(false);
+                compact(&member, &events, focus, &reporting).await;
+            });
+            Ok(Some(None))
+        }
+        _ => Err(CommandError::Unsupported),
+    }
+}
+
+/// The catalog command `name`, for the agent behind `session`, when it is on
+/// offer for it (`docs/adr/0021` §10).
+pub fn catalog_command(
+    ctx: &Context,
+    session: &str,
+    name: &str,
+) -> Result<
+    (Arc<Agent>, Arc<dyn crate::commands::CatalogCommand>),
+    atomcode_kernel::event::CommandError,
+> {
+    let target = crate::feed::Feed::find(ctx, session)
+        .ok_or(atomcode_kernel::event::CommandError::NotFound)?;
+    let command = ctx
+        .service::<crate::seams::CommandsSvc>()
+        .and_then(|catalog| catalog.find(name, &target))
+        .ok_or(atomcode_kernel::event::CommandError::NotFound)?;
+    Ok((target, command))
+}
+
+/// Run it where it cannot hold anything up, and say what it produced as
+/// `Invoked`.
+pub fn run_catalog_command(
+    target: Arc<Agent>,
+    command: Arc<dyn crate::commands::CatalogCommand>,
+    id: atomcode_kernel::event::CommandId,
+    args: String,
+    events: mpsc::UnboundedSender<AgentEvent>,
+) {
+    tokio::spawn(async move {
+        let output = command.run(target, &args).await.unwrap_or_else(|e| e);
+        let _ = events.send(AgentEvent::Invoked { id, output });
+    });
+}
+
 // ---- the pump -----------------------------------------------------------
 
 /// Wait on the turn in flight, or forever when there is none.
@@ -875,25 +1012,8 @@ async fn pump(
     // A message this pump forwarded to a team member is claimed in the
     // member's realm, which only the tree sees; its receipt still comes back
     // on this connection.
-    let me = agent.id();
-    let forwarded: Arc<Mutex<HashSet<atomcode_kernel::event::CommandId>>> = Arc::default();
-    let forwarded_receipts = events.clone();
-    let forwarded_claims = forwarded.clone();
-    let claimed_elsewhere =
-        ctx.on_emit::<crate::events::InputClaimed>(move |input: &crate::events::ClaimedInput| {
-            if input.agent != me
-                && forwarded_claims
-                    .lock()
-                    .expect("forwarded poisoned")
-                    .remove(&input.receipt)
-            {
-                let _ = forwarded_receipts.send(AgentEvent::Accepted {
-                    command: input.receipt.clone(),
-                    turn: Some(input.turn),
-                    steered: input.steered,
-                });
-            }
-        });
+    let forwarded = Forwarded::new();
+    let claimed_elsewhere = forwarded.listen(&ctx, events.clone());
     // Snapshots and compactions act on this agent's log, which lives in its
     // realm; the tree's context would not find it.
     let ctx = agent.ctx().clone();
@@ -1099,13 +1219,17 @@ async fn pump(
                 continue;
             }
             AgentCommand::Subscribe { session, from } => {
-                // Its own session, or one it can reach by id — a team member's.
+                // Its own session, or one it can reach by id — a team member's,
+                // or a member's that is gone, from its kept log.
                 match crate::feed::Feed::find(&ctx, &session) {
-                    None => reject(atomcode_kernel::event::CommandError::NotFound),
                     Some(target) => {
                         accept(None);
                         feed.subscribe(&ctx, &target, from);
                     }
+                    None => match feed.replay_kept(&ctx, &session, from).await {
+                        Ok(()) => accept(None),
+                        Err(error) => reject(error),
+                    },
                 }
                 continue;
             }
@@ -1124,73 +1248,36 @@ async fn pump(
                 name,
                 args,
             } => {
-                let found = crate::feed::Feed::find(&ctx, &session).and_then(|target| {
-                    ctx.service::<crate::seams::CommandsSvc>()?
-                        .find(&name, &target)
-                        .map(|command| (target, command))
-                });
-                let Some((target, command)) = found else {
-                    reject(atomcode_kernel::event::CommandError::NotFound);
-                    continue;
-                };
-                accept(None);
-                let events = events.clone();
-                tokio::spawn(async move {
-                    let output = command.run(target, &args).await.unwrap_or_else(|e| e);
-                    let _ = events.send(AgentEvent::Invoked { id, output });
-                });
+                match catalog_command(&ctx, &session, &name) {
+                    Ok((target, command)) => {
+                        accept(None);
+                        run_catalog_command(target, command, id, args, events.clone());
+                    }
+                    Err(error) => reject(error),
+                }
                 continue;
             }
             // For a team member, through the connection the person has
             // (`docs/adr/0023` §4, §8): the same three things they can do to
             // the agent this pump drives.
             AgentCommand::To { session, command } => {
-                let Some(target) = crate::feed::Feed::find(&ctx, &session)
-                    .filter(|target| target.parent().is_some())
-                else {
-                    reject(atomcode_kernel::event::CommandError::NotFound);
-                    continue;
-                };
-                match *command {
-                    // The person's words, as the person's: a member acts on
-                    // them with the weight a person's word has.
-                    AgentCommand::SendMessage { text, images } => {
-                        if let Some(id) = &receipt {
-                            forwarded
-                                .lock()
-                                .expect("forwarded poisoned")
-                                .insert(id.clone());
-                        }
-                        target.send_receipted(text, MessageOrigin::User, images, receipt.clone());
-                    }
-                    // Only its turn, and only its questions.
-                    AgentCommand::Cancel => {
-                        if target.status() == crate::agent::AgentStatus::Idle {
-                            reject(atomcode_kernel::event::CommandError::NotRunning);
-                        } else {
-                            accept(Some(target.session().current_turn()));
-                        }
-                        target.interrupt();
-                        asker.refuse_asked_by(target.session_id());
-                    }
-                    // Between its turns, never under one; off this pump, since a
-                    // summary is a model call.
-                    AgentCommand::Compact { focus } => {
-                        if target.status() != crate::agent::AgentStatus::Idle {
-                            reject(atomcode_kernel::event::CommandError::Busy {
-                                reason: format!("{session} is working"),
-                            });
-                            continue;
-                        }
-                        accept(None);
-                        let events = events.clone();
-                        let member = target.ctx().clone();
-                        tokio::spawn(async move {
-                            let reporting = std::sync::atomic::AtomicBool::new(false);
-                            compact(&member, &events, focus, &reporting).await;
-                        });
-                    }
-                    _ => reject(atomcode_kernel::event::CommandError::Unsupported),
+                let cancelling = matches!(*command, AgentCommand::Cancel);
+                match command_member(
+                    &ctx,
+                    &session,
+                    *command,
+                    receipt.as_ref(),
+                    &forwarded,
+                    &events,
+                ) {
+                    Ok(Some(turn)) => accept(turn),
+                    Ok(None) => {}
+                    Err(error) => reject(error),
+                }
+                // Its questions go with its turn — held here, where the tree's
+                // are.
+                if cancelling {
+                    asker.refuse_asked_by(&session);
                 }
                 continue;
             }

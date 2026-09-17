@@ -38,6 +38,8 @@ use crate::CodingAgentConfig;
 /// What a runtime keeps for a front end across the Apps it builds.
 pub struct FrontEnd {
     feed: Arc<Feed>,
+    /// Messages this front end sent to team members, until each is claimed.
+    forwarded: Arc<atomcode_harness::plugins::handle::Forwarded>,
     events: mpsc::UnboundedSender<AgentEvent>,
     receiver: Mutex<Option<mpsc::UnboundedReceiver<AgentEvent>>>,
     /// The App now mounted, by the mount that set it. A rebuilt App mounts its
@@ -57,6 +59,7 @@ impl FrontEnd {
         let (events, receiver) = mpsc::unbounded_channel();
         Arc::new(Self {
             feed: Feed::new(events.clone()),
+            forwarded: atomcode_harness::plugins::handle::Forwarded::new(),
             events,
             receiver: Mutex::new(Some(receiver)),
             app: Mutex::new(None),
@@ -89,6 +92,7 @@ impl Plugin for FrontEndFeedPlugin {
         let front = self.0.clone();
         // Registered through this row's context, so they go when it unloads.
         let _ = front.feed.attach(ctx);
+        let _ = front.forwarded.listen(ctx, front.events.clone());
         let mount = front.mounts.fetch_add(1, Ordering::SeqCst);
         *front.app.lock().expect("front end poisoned") = Some((mount, ctx.clone()));
         let _ = ctx.effect(move || {
@@ -181,6 +185,65 @@ pub fn connect(
                 AgentCommand::Tagged { id, command } => (Some(id), command.untagged()),
                 AgentCommand::Invoke { ref id, .. } => (Some(id.clone()), command),
                 other => (None, other),
+            };
+            // A team member's, not the runtime's: reached in the App, the way
+            // the harness's own pump reaches it (`docs/adr/0023` §4, §8).
+            let command = match command {
+                AgentCommand::To { session, command } => {
+                    let (receipt, inner) = match *command {
+                        AgentCommand::Tagged { id, command } => (Some(id), command.untagged()),
+                        other => (receipt, other.untagged()),
+                    };
+                    let answered = match front.app() {
+                        None => Err((CommandError::Unavailable, None)),
+                        Some(app) => atomcode_harness::plugins::handle::command_member(
+                            &app,
+                            &session,
+                            inner,
+                            receipt.as_ref(),
+                            &front.forwarded,
+                            &out,
+                        )
+                        .map_err(|error| (error, None)),
+                    };
+                    match answered {
+                        // Its receipt comes when the member takes it.
+                        Ok(None) => {}
+                        Ok(Some(turn)) => reply(&out, receipt, Ok(turn)),
+                        Err(refused) => reply(&out, receipt, Err(refused)),
+                    }
+                    continue;
+                }
+                AgentCommand::Invoke {
+                    id,
+                    session,
+                    name,
+                    args,
+                } => {
+                    let found = front
+                        .app()
+                        .ok_or(CommandError::Unavailable)
+                        .and_then(|app| {
+                            atomcode_harness::plugins::handle::catalog_command(
+                                &app, &session, &name,
+                            )
+                        });
+                    match found {
+                        Ok((target, command)) => {
+                            reply(&out, receipt, Ok(None));
+                            atomcode_harness::plugins::handle::run_catalog_command(
+                                target,
+                                command,
+                                id,
+                                args,
+                                out.clone(),
+                            );
+                        }
+                        Err(error) => reply(&out, receipt, Err((error, None))),
+                    }
+                    continue;
+                }
+                other => other,
             };
             let stop = matches!(command, AgentCommand::Shutdown);
             let answered = run(&handle, &front, &out, command).await;
@@ -287,11 +350,17 @@ async fn run(
             let Some(app) = front.app() else {
                 return Err((CommandError::Unavailable, None));
             };
-            front
-                .feed
-                .subscribe_to(&app, &session, from)
-                .map(|_| None)
-                .map_err(|error| (error, None))
+            match front.feed.subscribe_to(&app, &session, from) {
+                Ok(()) => Ok(None),
+                // A member that is gone, from its kept log.
+                Err(CommandError::NotFound) => front
+                    .feed
+                    .replay_kept(&app, &session, from)
+                    .await
+                    .map(|_| None)
+                    .map_err(|error| (error, None)),
+                Err(error) => Err((error, None)),
+            }
         }
         AgentCommand::Unsubscribe { session } => {
             front.feed.unsubscribe(&session);
@@ -301,8 +370,6 @@ async fn run(
             let _ = handle.shutdown().await;
             Ok(None)
         }
-        // No capability row registers catalog commands yet (plan 4.4).
-        AgentCommand::Invoke { .. } => Err((CommandError::NotFound, None)),
         _ => Err((CommandError::Unsupported, None)),
     }
 }
