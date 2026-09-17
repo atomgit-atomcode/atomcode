@@ -5689,14 +5689,40 @@ mod buffer_tests {
     fn spinner_shows_tok_per_sec_once_a_second_elapses() {
         let mut s = UiState::new();
         s.on_submit();
-        // Backdate the turn start so `turn_elapsed >= 1s`; 40_000 chars ≈ 10K tokens
+        // Backdate the PHASE clock so `phase_elapsed >= 1s`; baseline is captured at
+        // stamp time (0 chars), then 40_000 chars ≈ 10K tokens produced this phase
         // over 10s → 1000 tok/s.
-        s.turn_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        s.stamp_phase_start(std::time::Instant::now() - std::time::Duration::from_secs(10));
         s.turn_output_chars = 40_000;
         let active = format_spinner_label(&s, 0, None);
         assert!(
-            active.contains("tok/s"),
-            "expected a `tok/s` throughput, got {active:?}"
+            active.contains("1000 tok/s"),
+            "expected `1000 tok/s` throughput, got {active:?}"
+        );
+    }
+
+    #[test]
+    fn spinner_tok_per_sec_is_current_phase_not_diluted_by_whole_turn() {
+        // Regression: the rate must reflect the CURRENT generation phase, not the
+        // whole turn. A long, tool-heavy turn used to divide cumulative output by
+        // total wall time → a diluted "1 tok/s" that swung wildly.
+        let mut s = UiState::new();
+        s.on_submit();
+        // Whole turn has run 600s (mostly tool execution) — the OLD formula would
+        // report ~2 tok/s (1500 tokens / 600s).
+        s.turn_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(600));
+        // A fresh generation phase started 3s ago and produced 6000 chars (1500
+        // tokens): baseline is snapshotted at stamp time (0), delta = 6000.
+        s.stamp_phase_start(std::time::Instant::now() - std::time::Duration::from_secs(3));
+        s.turn_output_chars = 6_000;
+        let active = format_spinner_label(&s, 0, None);
+        assert!(
+            active.contains("500 tok/s"),
+            "expected phase-scoped 500 tok/s (1500 tokens / 3s), got {active:?}"
+        );
+        assert!(
+            !active.contains("2 tok/s"),
+            "must NOT use the diluted whole-turn rate, got {active:?}"
         );
     }
 
@@ -29657,19 +29683,24 @@ fn format_spinner_label(
         let elapsed = fmt_elapsed(d.as_millis() as u64);
         let tokens = state.turn_output_token_estimate();
         if tokens > 0 {
-            // Live throughput as a "still moving, not hung" signal: the turn's token
-            // total over turn elapsed — a turn AVERAGE (numerator/denominator both
-            // whole-turn, so it's the rate of the `↑ N tokens` count shown). If the
-            // stream hangs it decays toward 0 as elapsed grows. NOTE it is not the
-            // same window as the displayed `phase_elapsed` clock, so on a multi-phase
-            // turn the shown seconds and this rate won't reconcile. Omitted under 1s
-            // to avoid a divide-by-zero and wild early numbers.
-            let rate = state
-                .turn_elapsed()
-                .map(|d| d.as_secs())
-                .filter(|secs| *secs >= 1)
-                .map(|secs| format!(" · {} tok/s", tokens / secs as usize))
-                .unwrap_or_default();
+            // Live throughput as a "still moving, not hung" signal — the rate of the
+            // CURRENT generation phase: tokens produced THIS phase over the SAME
+            // `phase_elapsed` window shown in the clock. Scoping to the phase (not the
+            // whole turn) keeps earlier tool-execution / idle time out of the
+            // denominator, so a tool-heavy turn no longer reads a diluted "1 tok/s"
+            // and the number doesn't swing as phases alternate. Omitted under 1s (to
+            // avoid divide-by-zero / wild early numbers) and when this phase has
+            // produced no output yet (e.g. mid tool execution — show the clock only).
+            let phase_tokens = state.phase_output_token_estimate();
+            // Fractional seconds (not integer `as_secs()`) so the rate doesn't step /
+            // jump as the whole-second boundary ticks over at low elapsed. Gate at 1s
+            // to avoid divide-by-zero / wild early numbers; round for a clean integer.
+            let secs = d.as_secs_f64();
+            let rate = if secs >= 1.0 && phase_tokens > 0 {
+                format!(" · {} tok/s", (phase_tokens as f64 / secs).round() as usize)
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
                 " ({elapsed} · \u{2191} {} tokens{rate})",
                 crate::i18n::fmt_tokens(tokens)
