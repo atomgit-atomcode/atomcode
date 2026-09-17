@@ -66,7 +66,12 @@ pub struct AnthropicConfig {
     /// with `thinking`.
     pub send_sampling_params: bool,
     /// Per-chunk stream-idle watchdog: no bytes for this long ⇒ terminal error.
+    /// Governs the INTER-token phase (after the first byte of a stream).
     pub idle_timeout: Duration,
+    /// FIRST-byte (prefill / TTFB) idle watchdog: no bytes for this long BEFORE the
+    /// first byte of a (re)opened stream ⇒ terminal error. Separate from (and ≥)
+    /// `idle_timeout`; wired from the coding-layer `first_token_timeout`.
+    pub first_token_timeout: Duration,
     pub connect_timeout: Duration,
     /// Per-ATTEMPT first-byte (TTFB) watchdog for the OPEN call — see the matching
     /// field on `OpenAiCompatConfig`. A gateway that accepts the connection but never
@@ -101,6 +106,7 @@ impl AnthropicConfig {
             thinking: false,
             send_sampling_params: false,
             idle_timeout: Duration::from_secs(120),
+            first_token_timeout: Duration::from_secs(120),
             open_timeout: Duration::from_secs(90),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
@@ -183,6 +189,7 @@ impl LlmProvider for AnthropicProvider {
         // Snapshot the session id once; reused across the open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
+        let first_token = self.cfg.first_token_timeout;
         let open_timeout = self.cfg.open_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
         let resp = open_stream(
@@ -214,8 +221,18 @@ impl LlmProvider for AnthropicProvider {
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
+                // PHASE-AWARE byte-idle watchdog: prefill (before the first byte of this
+                // (re)opened stream) waits up to `first_token`; after the first byte we
+                // tighten to the inter-token `idle`. See openai_compat for the rationale.
+                // Reset per (re)open — a transparent reconnect restarts prefill.
+                let mut first_byte_seen = false;
                 loop {
-                    match tokio::time::timeout(idle, byte_stream.next()).await {
+                    let watchdog = if first_byte_seen { idle } else { first_token };
+                    let next = tokio::time::timeout(watchdog, byte_stream.next()).await;
+                    if matches!(&next, Ok(Some(_))) {
+                        first_byte_seen = true;
+                    }
+                    match next {
                         Err(_elapsed) => {
                             yield StreamEvent::Error(ProviderError {
                                 retryable: false,

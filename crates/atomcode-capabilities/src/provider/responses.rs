@@ -752,6 +752,7 @@ impl LlmProvider for ResponsesProvider {
         let api_key = self.cfg.api_key.clone();
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
+        let first_token = self.cfg.first_token_timeout;
         let open_timeout = self.cfg.open_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
         let resp = match open_stream(
@@ -789,8 +790,19 @@ impl LlmProvider for ResponsesProvider {
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
+                // PHASE-AWARE byte-idle watchdog: prefill (before the first byte of this
+                // (re)opened stream) waits up to `first_token`; after the first byte we
+                // tighten to the inter-token `idle`. See openai_compat for the rationale
+                // (keep-alives flip early but keep resetting; silent prefill gets the full
+                // first-token budget). Reset per (re)open — a reconnect restarts prefill.
+                let mut first_byte_seen = false;
                 loop {
-                    match tokio::time::timeout(idle, byte_stream.next()).await {
+                    let watchdog = if first_byte_seen { idle } else { first_token };
+                    let next = tokio::time::timeout(watchdog, byte_stream.next()).await;
+                    if matches!(&next, Ok(Some(_))) {
+                        first_byte_seen = true;
+                    }
+                    match next {
                         Err(_elapsed) => {
                             yield StreamEvent::Error(ProviderError {
                                 retryable: false,

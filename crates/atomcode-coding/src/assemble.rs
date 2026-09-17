@@ -46,6 +46,10 @@ pub fn build_coding_agent(cfg: CodingAgentConfig) -> Result<Agent, String> {
     // (default 300s), so propagating it here makes the documented tunable actually
     // govern the L1 watchdog end-to-end.
     provider_cfg.idle_timeout = cfg.stream_timeout;
+    // Prefill (TTFB) gets the SEPARATE, larger first-token budget so a slow local model
+    // that is silent for minutes before its first byte is not cut off at the inter-token
+    // `stream_timeout`. Mirrors the kernel-level `first_token_timeout`; see config.rs.
+    provider_cfg.first_token_timeout = cfg.first_token_timeout;
     // Text-only models must NOT receive image content — a resumed conversation whose
     // history contains an image would otherwise 400 every turn. SAME canonical detector
     // as the tool-mount / read_file vision gate above.

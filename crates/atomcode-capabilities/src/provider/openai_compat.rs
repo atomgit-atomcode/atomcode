@@ -157,7 +157,13 @@ pub struct OpenAiCompatConfig {
     /// Kimi K2.6 preserved thinking: `thinking.keep` in the request body.
     pub thinking_keep: Option<String>,
     /// Per-chunk stream-idle watchdog: no bytes for this long ⇒ terminal error.
+    /// Governs the INTER-token phase (after the first byte of a stream).
     pub idle_timeout: Duration,
+    /// FIRST-byte (prefill / TTFB) idle watchdog: no bytes for this long BEFORE the
+    /// first byte of a (re)opened stream ⇒ terminal error. Separate from (and ≥)
+    /// `idle_timeout` because prefill on a slow local model can be silent far longer
+    /// than inter-token gaps. Wired from the coding-layer `first_token_timeout`.
+    pub first_token_timeout: Duration,
     pub connect_timeout: Duration,
     /// Per-ATTEMPT first-byte (TTFB) watchdog for the OPEN call. A gateway that
     /// accepts the connection but never responds would otherwise hang FOREVER —
@@ -240,6 +246,7 @@ impl OpenAiCompatConfig {
             thinking_type: None,
             thinking_keep: None,
             idle_timeout: Duration::from_secs(120),
+            first_token_timeout: Duration::from_secs(120),
             open_timeout: Duration::from_secs(90),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
@@ -579,6 +586,7 @@ impl LlmProvider for OpenAiCompatProvider {
         // the initial open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
+        let first_token = self.cfg.first_token_timeout;
         let open_timeout = self.cfg.open_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
         let resp = match open_stream(
@@ -629,8 +637,21 @@ impl LlmProvider for OpenAiCompatProvider {
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
+                // PHASE-AWARE byte-idle watchdog: before the first byte of THIS (re)opened
+                // stream we are in prefill (TTFB) — a slow local model can be silent for
+                // minutes — so allow up to `first_token`; once any byte has arrived, tighten
+                // to the inter-token `idle`. Keep-alive bytes flip us early but also keep
+                // resetting the watchdog, so it won't fire spuriously; a fully-silent prefill
+                // gets the full first-token budget, matching the kernel first_token_timeout.
+                // Reset per (re)open: a transparent reconnect restarts prefill on the server.
+                let mut first_byte_seen = false;
                 loop {
-                    match tokio::time::timeout(idle, byte_stream.next()).await {
+                    let watchdog = if first_byte_seen { idle } else { first_token };
+                    let next = tokio::time::timeout(watchdog, byte_stream.next()).await;
+                    if matches!(&next, Ok(Some(_))) {
+                        first_byte_seen = true;
+                    }
+                    match next {
                         Err(_elapsed) => {
                             // Mid-stream idle: non-recoverable (partial deltas may already
                             // have reached the consumer), so not retryable.
