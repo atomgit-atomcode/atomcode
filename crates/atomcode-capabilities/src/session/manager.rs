@@ -3502,7 +3502,7 @@ fn scan_catalog_root(sessions_root: &Path) -> CatalogScan {
 /// A missing/non-dir bucket returns an empty scan (no diagnostics) — the caller
 /// falls back to the full cross-project scan when nothing matches there.
 fn scan_catalog_single_bucket(sessions_root: &Path, bucket: &str) -> CatalogScan {
-    let mut scan = CatalogScan::default();
+    let scan = CatalogScan::default();
     if !valid_project_bucket(bucket) {
         return scan;
     }
