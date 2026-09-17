@@ -3488,7 +3488,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // Per-segment colours (all collapse to plain when colours are off).
         let model_style = self.style_for(Role::Accent);
         let cwd_style = secondary.clone();
-        let cache_style = self.style_for(Role::Success);
+        // Cache hit ratio in gold — the same `Role::Warning` yellow the `auto`
+        // badge uses, per user preference.
+        let cache_style = self.style_for(Role::Warning);
         let sep_style = self.style_for(Role::Muted);
         // ctx% shifts green → yellow → red as the window fills toward the
         // auto-compaction threshold, mirroring the reference status bar.
@@ -13498,8 +13500,8 @@ mod tests {
         );
         assert_eq!(
             fg_of(&row, "cache 98%"),
-            r.style_for(Role::Success).fg,
-            "cache coloured even at full width"
+            r.style_for(Role::Warning).fg,
+            "cache coloured (gold, same as `auto`) even at full width"
         );
         assert_eq!(
             fg_of(&row, "56.8k/1m tok (6%)"),
@@ -13522,8 +13524,8 @@ mod tests {
     }
 
     /// Colour differentiation: each left-group segment carries its own colour —
-    /// model = accent, cache = success-green, and ctx% shifts green → yellow →
-    /// red as the context window fills.
+    /// model = accent, cache = gold (`Warning`, same as `auto`), and ctx% shifts
+    /// green → yellow → red as the context window fills.
     #[test]
     fn build_status_row_colours_left_segments_by_kind() {
         // First cell whose char-run equals `needle`; returns its fg. Robust to
@@ -13560,8 +13562,8 @@ mod tests {
         );
         assert_eq!(
             fg_of(&row, "cache 70%"),
-            r.style_for(Role::Success).fg,
-            "cache uses success green"
+            r.style_for(Role::Warning).fg,
+            "cache uses gold (same as `auto`)"
         );
         assert_eq!(
             fg_of(&row, "tok"),

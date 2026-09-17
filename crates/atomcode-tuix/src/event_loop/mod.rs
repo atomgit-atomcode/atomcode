@@ -25285,6 +25285,25 @@ fn apply_native_session_changed(
     commit_native_session_changed(session, working_dir, state, renderer, ctx)
 }
 
+/// Sum a persisted session cost report into `(prompt, completion, cached)` token
+/// totals for seeding `UiState`'s session-cumulative tallies on load. `prompt` is
+/// TOTAL input (uncached `input` + `cached_input`) to match the live accumulation
+/// at the Usage-event site, so the status-row cache ratio (`cached / prompt`)
+/// stays consistent before and after a `-c`/resume.
+fn session_token_totals_from_cost(
+    report: &atomcode_capabilities::session::SessionCostReport,
+) -> (usize, usize, usize) {
+    let mut prompt = 0usize;
+    let mut completion = 0usize;
+    let mut cached = 0usize;
+    for model in &report.models {
+        prompt += (model.tokens.input + model.tokens.cached_input) as usize;
+        completion += model.tokens.output as usize;
+        cached += model.tokens.cached_input as usize;
+    }
+    (prompt, completion, cached)
+}
+
 fn commit_native_session_changed(
     session: Session,
     working_dir: PathBuf,
@@ -25328,6 +25347,26 @@ fn commit_native_session_changed(
     state.prompt_tokens = 0;
     state.completion_tokens = 0;
     state.cached_tokens = 0;
+    // Restore the session-cumulative token totals (incl. cache) from the
+    // persisted meta so the status-row cache% survives a `-c`/resume instead of
+    // blanking until the next turn — mirroring how `ctx` usage is restored. Live
+    // Usage events accumulate on top of this seed. Best-effort: a missing/
+    // unreadable meta (fresh session, legacy import) leaves the totals at 0.
+    {
+        let manager = commands::session_manager_for_cost(
+            ctx.current_session_project_bucket.as_deref(),
+            &ctx.working_dir,
+        );
+        if let Ok(meta) = manager.read_meta(&session_id) {
+            let report = atomcode_capabilities::session::aggregate_session_cost(&meta);
+            let (prompt, completion, cached) = session_token_totals_from_cost(&report);
+            state.prompt_tokens = prompt;
+            state.completion_tokens = completion;
+            state.cached_tokens = cached;
+            // Live path does `total_tokens += u.completion`, so mirror it here.
+            state.total_tokens = completion;
+        }
+    }
     state.last_context = None;
     // Session history can outlive the model that produced it. Establish the
     // current runtime/model window before replay restores persisted usage, so
@@ -31859,6 +31898,63 @@ mod tool_bullet_outcome_tests {
         // No failure-class distinction: only success is coloured, so every
         // failure is the same neutral `Failure`.
         assert_eq!(tool_bullet_outcome(false), ToolOutcome::Failure);
+    }
+}
+
+#[cfg(test)]
+mod session_token_seed_tests {
+    use super::session_token_totals_from_cost;
+    use atomcode_capabilities::session::{
+        ModelCostSummary, SessionCostReport, TokenBreakdown,
+    };
+
+    #[test]
+    fn sums_prompt_as_uncached_plus_cached_across_models() {
+        let report = SessionCostReport {
+            models: vec![
+                ModelCostSummary {
+                    provider_id: "p".into(),
+                    model_id: "a".into(),
+                    // 20 uncached input + 80 cached input, 10 output.
+                    tokens: TokenBreakdown {
+                        input: 20,
+                        output: 10,
+                        cached_input: 80,
+                    },
+                },
+                ModelCostSummary {
+                    provider_id: "p".into(),
+                    model_id: "b".into(),
+                    tokens: TokenBreakdown {
+                        input: 100,
+                        output: 5,
+                        cached_input: 0,
+                    },
+                },
+            ],
+            unattributed_tokens: 0,
+            total_tokens: 0,
+        };
+        let (prompt, completion, cached) = session_token_totals_from_cost(&report);
+        // prompt = (20+80) + (100+0) = 200; cached = 80; completion = 10+5 = 15.
+        assert_eq!(prompt, 200);
+        assert_eq!(cached, 80);
+        assert_eq!(completion, 15);
+        // Ratio the status row shows on resume: 80 / 200 = 40%.
+        assert_eq!(
+            crate::state::turn_token_summary(prompt, completion, cached).1,
+            Some(40)
+        );
+    }
+
+    #[test]
+    fn empty_report_seeds_zero() {
+        let report = SessionCostReport {
+            models: Vec::new(),
+            unattributed_tokens: 0,
+            total_tokens: 0,
+        };
+        assert_eq!(session_token_totals_from_cost(&report), (0, 0, 0));
     }
 }
 

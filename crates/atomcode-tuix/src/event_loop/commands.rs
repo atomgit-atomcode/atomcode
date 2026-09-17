@@ -5642,7 +5642,7 @@ fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
     build_cost_report_text(report, &ctx.config, &provider, &ctx.model_name)
 }
 
-fn session_manager_for_cost(
+pub(crate) fn session_manager_for_cost(
     project_bucket: Option<&str>,
     working_dir: &std::path::Path,
 ) -> atomcode_capabilities::session::SessionManager {
