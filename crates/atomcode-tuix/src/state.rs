@@ -1215,6 +1215,12 @@ pub struct UiState {
     /// to `None` when a CLEAN summary renders (`turn_summary_label`) so a reason
     /// from an error path that produced no summary can never fold into a later turn.
     pub last_turn_error: Option<String>,
+    /// Cache-hit ratio of the LAST completed turn, snapshotted before the
+    /// per-turn `turn_*_tokens` tallies are cleared. The status-row cache
+    /// indicator falls back to this at idle (mirroring how `ctx` usage persists
+    /// via `last_context`), so `cache NN%` stays visible between turns instead of
+    /// vanishing the moment the turn ends. `None` until a cached turn completes.
+    pub last_turn_cached_pct: Option<u8>,
     /// Driver-owned, sanitized explanation for a credential policy denial.
     /// Kept separate from `last_turn_error` so a provider/rate-limit failure can
     /// never be presented as the cause of a later security-policy terminal.
@@ -1591,6 +1597,7 @@ impl UiState {
             last_assistant_response: String::new(),
             response_finalized: false,
             last_turn_error: None,
+            last_turn_cached_pct: None,
             last_policy_denial_reason: None,
             pending_policy_intervention: None,
             pending_policy_resolution: None,
@@ -1986,7 +1993,17 @@ impl UiState {
         self.turn_started_at = None;
         self.phase_started_at = None;
         // Per-turn token tallies are consumed by the separator that renders just
-        // before this; clear them so the next turn starts fresh.
+        // before this; snapshot the cache ratio so the status row can keep
+        // showing `cache NN%` at idle, THEN clear them so the next turn starts
+        // fresh. A turn that reported no cache leaves the last known value intact
+        // rather than blanking the indicator on every cache-less round.
+        if let (_, Some(pct)) = turn_token_summary(
+            self.turn_prompt_tokens,
+            self.turn_completion_tokens,
+            self.turn_cached_tokens,
+        ) {
+            self.last_turn_cached_pct = Some(pct);
+        }
         self.turn_prompt_tokens = 0;
         self.turn_completion_tokens = 0;
         self.turn_cached_tokens = 0;
@@ -2774,6 +2791,30 @@ mod tests {
         let (billable, pct) = turn_token_summary(118_000, 2_000, 114_460);
         assert_eq!(billable, 5_540);
         assert_eq!(pct, Some(97));
+    }
+
+    #[test]
+    fn on_turn_complete_persists_cache_pct_after_clearing_tallies() {
+        let mut s = UiState::new();
+        // A cached turn: 100 prompt, 80 cached → 80%.
+        s.turn_prompt_tokens = 100;
+        s.turn_completion_tokens = 10;
+        s.turn_cached_tokens = 80;
+        s.on_turn_complete();
+        // Per-turn tallies are cleared, but the ratio survives for the idle row.
+        assert_eq!(s.turn_cached_tokens, 0);
+        assert_eq!(s.last_turn_cached_pct, Some(80));
+
+        // A subsequent cache-less turn must NOT blank the last known ratio.
+        s.turn_prompt_tokens = 50;
+        s.turn_completion_tokens = 5;
+        s.turn_cached_tokens = 0;
+        s.on_turn_complete();
+        assert_eq!(
+            s.last_turn_cached_pct,
+            Some(80),
+            "a turn without cache keeps the last known ratio rather than blanking it"
+        );
     }
 
     #[test]

@@ -29152,19 +29152,24 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // has this session burned in total". See render::StatusLine docs.
     let (ctx_used, ctx_window) =
         status_context_usage(state, ctx.config.default_context_window(), !no_provider);
-    // Cache-hit indicator for the status row: the share of the current
-    // turn's prompt tokens served from the provider's prompt cache.
-    // Reuses `turn_token_summary`'s cached-pct math (same denominator /
-    // rounding as the per-turn footer annotation) and inherits its
-    // suppression rule — `None` before the first cached round arrives,
-    // so providers that never report cached tokens keep the row clean.
+    // Cache-hit indicator for the status row: the share of the current turn's
+    // prompt tokens served from the provider's prompt cache. Reuses
+    // `turn_token_summary`'s cached-pct math (same denominator / rounding as the
+    // per-turn footer annotation). During a turn the live tally wins; at idle it
+    // falls back to the last completed turn's ratio (`last_turn_cached_pct`) so
+    // `cache NN%` persists between turns just like ctx usage does — instead of
+    // blanking the instant the turn ends and the per-turn tallies reset. `None`
+    // only until the first cached turn completes, so providers that never report
+    // cached tokens keep the row clean.
     let cache_indicator = {
-        let (_, cached_pct) = crate::state::turn_token_summary(
+        let (_, live_pct) = crate::state::turn_token_summary(
             state.turn_prompt_tokens,
             state.turn_completion_tokens,
             state.turn_cached_tokens,
         );
-        cached_pct.map(|pct| format!("cache {}%", pct))
+        live_pct
+            .or(state.last_turn_cached_pct)
+            .map(|pct| format!("cache {}%", pct))
     };
     // Session-name badge: surfaced only when the user has explicitly
     // renamed the conversation. Auto-named sessions (default /
