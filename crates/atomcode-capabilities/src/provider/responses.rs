@@ -797,12 +797,14 @@ impl LlmProvider for ResponsesProvider {
                 // first-token budget). Reset per (re)open — a reconnect restarts prefill.
                 let mut first_byte_seen = false;
                 loop {
-                    let watchdog = if first_byte_seen { idle } else { first_token };
-                    let next = tokio::time::timeout(watchdog, byte_stream.next()).await;
-                    if matches!(&next, Ok(Some(_))) {
-                        first_byte_seen = true;
-                    }
-                    match next {
+                    match retry::next_chunk_phased(
+                        &mut byte_stream,
+                        first_token,
+                        idle,
+                        &mut first_byte_seen,
+                    )
+                    .await
+                    {
                         Err(_elapsed) => {
                             yield StreamEvent::Error(ProviderError {
                                 retryable: false,
