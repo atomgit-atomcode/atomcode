@@ -409,6 +409,12 @@ impl Projector {
                         In::Continuation => Out::Continuation,
                         In::InternalNudge => Out::Continuation,
                         In::CompactionSummary => Out::CompactionSummary,
+                        In::PersonToMember { member } => Out::PersonToMember {
+                            member: member.clone(),
+                        },
+                        In::TeamNote { member } => Out::TeamNote {
+                            member: member.clone(),
+                        },
                     },
                 }]
             }
@@ -770,7 +776,7 @@ impl Answers for Asker {
 /// For an agent driven by a pump that holds no questions of its own — a team
 /// member, a delegated child. Their questions reach the person through the
 /// tree's own asker, which refuses them when the agent stops.
-pub(crate) struct NoAnswers;
+pub struct NoAnswers;
 
 impl Answers for NoAnswers {
     fn answer(&self, _id: RequestId, _value: Value) -> bool {
@@ -866,6 +872,28 @@ async fn pump(
         });
         return;
     };
+    // A message this pump forwarded to a team member is claimed in the
+    // member's realm, which only the tree sees; its receipt still comes back
+    // on this connection.
+    let me = agent.id();
+    let forwarded: Arc<Mutex<HashSet<atomcode_kernel::event::CommandId>>> = Arc::default();
+    let forwarded_receipts = events.clone();
+    let forwarded_claims = forwarded.clone();
+    let claimed_elsewhere =
+        ctx.on_emit::<crate::events::InputClaimed>(move |input: &crate::events::ClaimedInput| {
+            if input.agent != me
+                && forwarded_claims
+                    .lock()
+                    .expect("forwarded poisoned")
+                    .remove(&input.receipt)
+            {
+                let _ = forwarded_receipts.send(AgentEvent::Accepted {
+                    command: input.receipt.clone(),
+                    turn: Some(input.turn),
+                    steered: input.steered,
+                });
+            }
+        });
     // Snapshots and compactions act on this agent's log, which lives in its
     // realm; the tree's context would not find it.
     let ctx = agent.ctx().clone();
@@ -956,6 +984,28 @@ async fn pump(
             // A catalog command carries its own receipt.
             AgentCommand::Invoke { ref id, .. } => (Some(id.clone()), command),
             other => (None, other),
+        };
+        // An address: the command inside is for the agent it names, receipt and
+        // all. Addressed to the agent this pump drives, it is just the command.
+        let (receipt, command) = match command {
+            AgentCommand::To { session, command } => {
+                let (receipt, inner) = match *command {
+                    AgentCommand::Tagged { id, command } => (Some(id), command.untagged()),
+                    other => (receipt, other.untagged()),
+                };
+                if session == agent.session_id() {
+                    (receipt, inner)
+                } else {
+                    (
+                        receipt,
+                        AgentCommand::To {
+                            session,
+                            command: Box::new(inner),
+                        },
+                    )
+                }
+            }
+            other => (receipt, other),
         };
         let accept = |turn: Option<u64>| {
             if let Some(id) = &receipt {
@@ -1091,6 +1141,59 @@ async fn pump(
                 });
                 continue;
             }
+            // For a team member, through the connection the person has
+            // (`docs/adr/0023` §4, §8): the same three things they can do to
+            // the agent this pump drives.
+            AgentCommand::To { session, command } => {
+                let Some(target) = crate::feed::Feed::find(&ctx, &session)
+                    .filter(|target| target.parent().is_some())
+                else {
+                    reject(atomcode_kernel::event::CommandError::NotFound);
+                    continue;
+                };
+                match *command {
+                    // The person's words, as the person's: a member acts on
+                    // them with the weight a person's word has.
+                    AgentCommand::SendMessage { text, images } => {
+                        if let Some(id) = &receipt {
+                            forwarded
+                                .lock()
+                                .expect("forwarded poisoned")
+                                .insert(id.clone());
+                        }
+                        target.send_receipted(text, MessageOrigin::User, images, receipt.clone());
+                    }
+                    // Only its turn, and only its questions.
+                    AgentCommand::Cancel => {
+                        if target.status() == crate::agent::AgentStatus::Idle {
+                            reject(atomcode_kernel::event::CommandError::NotRunning);
+                        } else {
+                            accept(Some(target.session().current_turn()));
+                        }
+                        target.interrupt();
+                        asker.refuse_asked_by(target.session_id());
+                    }
+                    // Between its turns, never under one; off this pump, since a
+                    // summary is a model call.
+                    AgentCommand::Compact { focus } => {
+                        if target.status() != crate::agent::AgentStatus::Idle {
+                            reject(atomcode_kernel::event::CommandError::Busy {
+                                reason: format!("{session} is working"),
+                            });
+                            continue;
+                        }
+                        accept(None);
+                        let events = events.clone();
+                        let member = target.ctx().clone();
+                        tokio::spawn(async move {
+                            let reporting = std::sync::atomic::AtomicBool::new(false);
+                            compact(&member, &events, focus, &reporting).await;
+                        });
+                    }
+                    _ => reject(atomcode_kernel::event::CommandError::Unsupported),
+                }
+                continue;
+            }
             AgentCommand::Shutdown => {
                 accept(None);
                 break;
@@ -1122,6 +1225,7 @@ async fn pump(
     }
     wake.dispose();
     claimed.dispose();
+    claimed_elsewhere.dispose();
     if let Some(handle) = turn.take() {
         let _ = handle.await;
     }
@@ -1355,7 +1459,12 @@ pub async fn spawn(
 /// ([`Agent::command`]) for as long as the returned handle is held; dropping
 /// the handle stops the pump, which stops a turn in flight.
 pub fn drive(ctx: &Context, agent: Arc<Agent>) -> Driven {
-    attach(ctx, agent, wire(), Arc::new(NoAnswers), false)
+    let mut driven = attach(ctx, agent, wire(), Arc::new(NoAnswers), false);
+    // Nothing reads what this pump says — the person follows a member through
+    // its facts, on their own connection — so it is not kept for the member's
+    // whole life.
+    driven.handle.events.close();
+    driven
 }
 
 fn attach(

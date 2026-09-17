@@ -244,6 +244,15 @@ pub enum AgentCommand {
         #[serde(default)]
         args: String,
     },
+    /// `command`, for the agent behind `session` rather than the one this
+    /// connection drives — a team member the person is talking to, cancelling
+    /// or compacting (`docs/adr/0021` §9, `docs/adr/0023` §4, §8). An envelope,
+    /// like [`Self::Tagged`], so no command grows an address field it only
+    /// sometimes needs.
+    To {
+        session: String,
+        command: Box<AgentCommand>,
+    },
 }
 
 /// A driver's name for one command, echoed back on its receipt.
@@ -311,6 +320,10 @@ pub enum ContextSource {
     Continuation,
     /// A summary standing in for history that was dropped.
     CompactionSummary,
+    /// What the person said directly to a team member, shown to the lead.
+    PersonToMember { member: String },
+    /// Something about a team member the lead should know without being woken.
+    TeamNote { member: String },
 }
 
 /// Agent → driver. Serializable for the same reason. The id-correlated
@@ -698,17 +711,31 @@ mod tests {
             assert_eq!(json, back);
         }
 
-        let invoke = AgentCommand::Invoke {
-            id: "i-1".into(),
-            session: "lead/scout".into(),
-            name: "stop".into(),
-            args: "scout".into(),
-        };
-        let json = serde_json::to_string(&invoke).unwrap();
-        assert_eq!(
-            json,
-            serde_json::to_string(&serde_json::from_str::<AgentCommand>(&json).unwrap()).unwrap()
-        );
+        for command in [
+            AgentCommand::Invoke {
+                id: "i-1".into(),
+                session: "lead/scout".into(),
+                name: "stop".into(),
+                args: "scout".into(),
+            },
+            AgentCommand::To {
+                session: "lead/scout".into(),
+                command: Box::new(AgentCommand::Tagged {
+                    id: "m-1".into(),
+                    command: Box::new(AgentCommand::SendMessage {
+                        text: "use the other file".into(),
+                        images: Vec::new(),
+                    }),
+                }),
+            },
+        ] {
+            let json = serde_json::to_string(&command).unwrap();
+            assert_eq!(
+                json,
+                serde_json::to_string(&serde_json::from_str::<AgentCommand>(&json).unwrap())
+                    .unwrap()
+            );
+        }
 
         let sparse: AgentDescription = serde_json::from_str(r#"{"session":"s"}"#).unwrap();
         assert_eq!(

@@ -822,6 +822,73 @@ async fn a_member_is_driven_through_a_pump_of_its_own() {
 
 // ---- a person's commands ------------------------------------------------------
 
+/// A lead a person is connected to: created and driven by a pump, the way a
+/// front end's own agent is.
+async fn lead_on_a_pump(app: &App) -> (Arc<Agent>, atomcode_kernel::agent::AgentHandle) {
+    use atomcode_harness::plugins::handle;
+    let ctx = app.context();
+    let driven = handle::spawn(
+        &ctx,
+        handle::wire(),
+        Arc::new(handle::NoAnswers),
+        atomcode_harness::agent::CreateAgent::root(&ctx),
+    )
+    .await
+    .unwrap();
+    (driven.agent, driven.handle)
+}
+
+/// A command for the agent behind `session`, with a receipt.
+fn to(
+    session: &str,
+    id: &str,
+    command: atomcode_kernel::event::AgentCommand,
+) -> atomcode_kernel::event::AgentCommand {
+    atomcode_kernel::event::AgentCommand::To {
+        session: session.into(),
+        command: Box::new(atomcode_kernel::event::AgentCommand::Tagged {
+            id: id.into(),
+            command: Box::new(command),
+        }),
+    }
+}
+
+async fn settled(agent: &Agent, turns: usize) {
+    for _ in 0..500 {
+        if turns_ended(agent) >= turns
+            && agent.status() == AgentStatus::Idle
+            && !agent.inbox().has_waking_input()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "{} never settled after {turns} turn(s); it ended {}",
+        agent.session_id(),
+        turns_ended(agent)
+    );
+}
+
+fn notes(agent: &Agent) -> Vec<(InjectionOrigin, String)> {
+    agent
+        .session()
+        .events()
+        .into_iter()
+        .filter_map(|e| match e.event {
+            SessionEvent::Injected { text, origin, .. }
+                if matches!(
+                    origin,
+                    InjectionOrigin::PersonToMember { .. } | InjectionOrigin::TeamNote { .. }
+                ) =>
+            {
+                Some((origin, text))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Events off a handle until `done` says so, or give up naming what came.
 async fn events_until(
     handle: &mut atomcode_kernel::agent::AgentHandle,
@@ -853,7 +920,7 @@ async fn a_person_stops_a_member_from_the_catalog() {
 
     let dir = scratch("catalog-stop");
     let app = start(tree(&dir, r#"{ text = "ok" }"#, r#"{ text = "looked" }"#)).await;
-    let lead = create_agent(&app).await.unwrap();
+    let (lead, mut handle) = lead_on_a_pump(&app).await;
     let told = as_lead(
         &app,
         &lead,
@@ -880,7 +947,6 @@ async fn a_person_stops_a_member_from_the_catalog() {
         "a lead is no one's member"
     );
 
-    let mut handle = atomcode_harness::plugins::handle::drive(&app.context(), lead.clone()).handle;
     for (id, session) in [
         ("on-lead", lead.session_id()),
         ("on-scout", scout_session.as_str()),
@@ -931,6 +997,458 @@ async fn a_person_stops_a_member_from_the_catalog() {
             .is_some_and(|e| matches!(e.event, SessionEvent::Stopped { .. })),
         "and its log says it was stopped"
     );
+}
+
+/// A person talks to a member through the connection they have to the lead
+/// (`docs/adr/0023` §4, §7): the member takes it as the person's word and runs
+/// a turn; the lead is told — what was said, and what the member answered —
+/// and is not woken for it.
+#[tokio::test]
+async fn a_person_talks_to_a_member_and_the_lead_is_told_without_being_woken() {
+    use atomcode_kernel::event::{AgentCommand, AgentEvent};
+
+    let dir = scratch("person-to-member");
+    let app = start(tree(
+        &dir,
+        r#"{ text = "noted" }, { text = "should not run" }"#,
+        r#"{ text = "found it" }, { text = "switched files" }"#,
+    ))
+    .await;
+    let (lead, mut handle) = lead_on_a_pump(&app).await;
+    as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"scout","role":"explorer","task":"look around"}"#,
+    )
+    .await;
+    let scout_session = format!("{}/scout", lead.session_id());
+    let scout = app
+        .context()
+        .service::<AgentsSvc>()
+        .unwrap()
+        .by_session(&scout_session)
+        .unwrap();
+    settled(&scout, 1).await;
+    // The lead asked for that one, so it was woken to hear it.
+    settled(&lead, 1).await;
+
+    handle
+        .commands
+        .send(to(
+            &scout_session,
+            "to-scout",
+            AgentCommand::SendMessage {
+                text: "use the other file".into(),
+                images: Vec::new(),
+            },
+        ))
+        .unwrap();
+    let seen = events_until(
+        &mut handle,
+        |e| matches!(e, AgentEvent::Accepted { command, .. } if command == "to-scout"),
+    )
+    .await;
+    assert!(
+        matches!(
+            seen.last(),
+            Some(AgentEvent::Accepted { turn: Some(2), .. })
+        ),
+        "the receipt names the member's turn: {seen:#?}"
+    );
+    settled(&scout, 2).await;
+    assert!(scout.session().events().iter().any(|e| matches!(
+        &e.event,
+        SessionEvent::UserMessage { text, .. } if text == "use the other file"
+    )));
+
+    for _ in 0..300 {
+        if notes(&lead).len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(turns_ended(&lead), 1, "the lead was not woken");
+    assert!(!lead.inbox().has_waking_input());
+    let told = notes(&lead);
+    assert!(
+        told.iter().any(|(origin, text)| matches!(
+            origin,
+            InjectionOrigin::PersonToMember { member } if member == "scout"
+        ) && text == "use the other file"),
+        "{told:#?}"
+    );
+    assert!(
+        told.iter().any(|(origin, text)| matches!(
+            origin,
+            InjectionOrigin::TeamNote { member } if member == "scout"
+        ) && text.contains("switched files")),
+        "{told:#?}"
+    );
+    let shown = lead
+        .session()
+        .derive_messages()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(shown.contains("not an instruction to you"), "{shown}");
+}
+
+/// A member turn that carries the lead's message reports as a message and wakes
+/// the lead, whoever else spoke in it (`docs/adr/0023` §7).
+#[tokio::test]
+async fn a_turn_carrying_the_leads_message_still_wakes_the_lead() {
+    use atomcode_harness::agent::MessageOrigin;
+
+    let dir = scratch("lead-and-person");
+    let app = start(tree(
+        &dir,
+        r#"{ text = "noted" }, { text = "noted again" }"#,
+        r#"{ text = "found it" }, { text = "tests are fine" }, { text = "docs too" }"#,
+    ))
+    .await;
+    let (lead, _handle) = lead_on_a_pump(&app).await;
+    as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"scout","role":"explorer","task":"look around"}"#,
+    )
+    .await;
+    let scout = app
+        .context()
+        .service::<AgentsSvc>()
+        .unwrap()
+        .by_session(&format!("{}/scout", lead.session_id()))
+        .unwrap();
+    settled(&scout, 1).await;
+    settled(&lead, 1).await;
+
+    // Both queued before the member's pump can run: one turn takes them both.
+    scout.send_from("and the tests?", MessageOrigin::Peer(lead.id()));
+    scout.send_from("and the docs", MessageOrigin::User);
+    settled(&scout, 2).await;
+    settled(&lead, 2).await;
+    assert!(
+        lead.session().events().iter().any(|e| matches!(
+            &e.event,
+            SessionEvent::Injected { text, origin: InjectionOrigin::Peer { .. }, .. }
+                if text.starts_with("[scout finished turn 2")
+        )),
+        "reported as a message: {:#?}",
+        notes(&lead)
+    );
+}
+
+/// A person cancels a member's turn and compacts it through the lead's
+/// connection; an address nobody answers to is refused (`docs/adr/0023` §8).
+#[tokio::test]
+async fn a_person_cancels_and_compacts_a_member() {
+    use atomcode_kernel::event::{AgentCommand, AgentEvent, CommandError};
+
+    let dir = scratch("cancel-member");
+    let mut layers = layers_with(&dir, r#"{ text = "noted" }, { text = "noted" }"#, "", "");
+    layers.push(
+        Layer::from_toml("[[patch]]\nid = \"llm-utility\"\nname = \"test-stalling-utility\"\n")
+            .unwrap(),
+    );
+    let mut registry = plugins::catalog();
+    registry.register(Arc::new(StallingUtilityRow));
+    let mut app = App::new(registry, ConfigTree::from_layers(layers).unwrap());
+    app.start().await.expect("must mount");
+    let (lead, mut handle) = lead_on_a_pump(&app).await;
+    as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"scout","role":"explorer","task":"look around"}"#,
+    )
+    .await;
+    let scout_session = format!("{}/scout", lead.session_id());
+    let scout = app
+        .context()
+        .service::<AgentsSvc>()
+        .unwrap()
+        .by_session(&scout_session)
+        .unwrap();
+    for _ in 0..300 {
+        if scout.status() == AgentStatus::Working {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Another conversation in the same tree is not this connection's to steer.
+    let stranger = create_agent(&app).await.unwrap();
+    handle
+        .commands
+        .send(to(stranger.session_id(), "stranger", AgentCommand::Cancel))
+        .unwrap();
+    handle
+        .commands
+        .send(to("nobody/here", "nobody", AgentCommand::Cancel))
+        .unwrap();
+    handle
+        .commands
+        .send(to(&scout_session, "cancel", AgentCommand::Cancel))
+        .unwrap();
+    let seen = events_until(
+        &mut handle,
+        |e| matches!(e, AgentEvent::Accepted { command, .. } if command == "cancel"),
+    )
+    .await;
+    for refused in ["nobody", "stranger"] {
+        assert!(
+            seen.iter().any(|e| matches!(
+                e,
+                AgentEvent::Rejected { command, error: CommandError::NotFound } if command == refused
+            )),
+            "{refused}: {seen:#?}"
+        );
+    }
+    settled(&scout, 1).await;
+    assert!(scout.session().events().iter().any(|e| matches!(
+        e.event,
+        SessionEvent::TurnEnd {
+            stop: atomcode_harness::seams::StopReason::Cancelled,
+            ..
+        }
+    )));
+    // Only the member's turn: the lead, woken by the report of a turn it had
+    // asked for, runs its own to the end.
+    settled(&lead, 1).await;
+    assert!(
+        !lead.session().events().iter().any(|e| matches!(
+            e.event,
+            SessionEvent::TurnEnd {
+                stop: atomcode_harness::seams::StopReason::Cancelled,
+                ..
+            }
+        )),
+        "the lead's turn was not cancelled"
+    );
+
+    handle
+        .commands
+        .send(to(
+            &scout_session,
+            "compact",
+            AgentCommand::Compact { focus: None },
+        ))
+        .unwrap();
+    let seen = events_until(&mut handle, |e| matches!(e, AgentEvent::Compacted { .. })).await;
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, AgentEvent::Accepted { command, .. } if command == "compact")),
+        "{seen:#?}"
+    );
+}
+
+/// A person stopping a member tells the lead in proportion (`docs/adr/0023`
+/// §8): a member with nothing of the lead's outstanding is a note; one still
+/// working on what the lead asked wakes the lead, which is waiting on it.
+#[tokio::test]
+async fn a_person_stopping_a_member_wakes_the_lead_only_when_it_was_owed_a_report() {
+    use atomcode_kernel::event::{AgentCommand, AgentEvent};
+
+    // Nothing outstanding: it reported, and the lead heard.
+    let dir = scratch("stop-reported");
+    let app = start(tree(
+        &dir,
+        r#"{ text = "noted" }, { text = "should not run" }"#,
+        r#"{ text = "found it" }"#,
+    ))
+    .await;
+    let (lead, mut handle) = lead_on_a_pump(&app).await;
+    as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"scout","role":"explorer","task":"look around"}"#,
+    )
+    .await;
+    let scout_session = format!("{}/scout", lead.session_id());
+    let scout = app
+        .context()
+        .service::<AgentsSvc>()
+        .unwrap()
+        .by_session(&scout_session)
+        .unwrap();
+    settled(&scout, 1).await;
+    settled(&lead, 1).await;
+    handle
+        .commands
+        .send(AgentCommand::Invoke {
+            id: "stop".into(),
+            session: scout_session.clone(),
+            name: "stop".into(),
+            args: String::new(),
+        })
+        .unwrap();
+    events_until(&mut handle, |e| matches!(e, AgentEvent::Invoked { .. })).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(turns_ended(&lead), 1, "not woken");
+    assert!(
+        notes(&lead).iter().any(|(origin, text)| matches!(
+            origin,
+            InjectionOrigin::TeamNote { member } if member == "scout"
+        ) && text.contains("stopped")),
+        "{:#?}",
+        notes(&lead)
+    );
+
+    // Still on the lead's task: the lead is woken to hear it will not come.
+    let dir = scratch("stop-owed");
+    let mut layers = layers_with(&dir, r#"{ text = "noted" }"#, "", "");
+    layers.push(
+        Layer::from_toml("[[patch]]\nid = \"llm-utility\"\nname = \"test-stalling-utility\"\n")
+            .unwrap(),
+    );
+    let mut registry = plugins::catalog();
+    registry.register(Arc::new(StallingUtilityRow));
+    let mut app = App::new(registry, ConfigTree::from_layers(layers).unwrap());
+    app.start().await.expect("must mount");
+    let (lead, mut handle) = lead_on_a_pump(&app).await;
+    as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"scout","role":"explorer","task":"look around"}"#,
+    )
+    .await;
+    let scout_session = format!("{}/scout", lead.session_id());
+    let scout = app
+        .context()
+        .service::<AgentsSvc>()
+        .unwrap()
+        .by_session(&scout_session)
+        .unwrap();
+    for _ in 0..300 {
+        if scout.status() == AgentStatus::Working {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    handle
+        .commands
+        .send(AgentCommand::Invoke {
+            id: "stop".into(),
+            session: scout_session.clone(),
+            name: "stop".into(),
+            args: String::new(),
+        })
+        .unwrap();
+    events_until(&mut handle, |e| matches!(e, AgentEvent::Invoked { .. })).await;
+    settled(&lead, 1).await;
+    assert!(
+        lead.session().events().iter().any(|e| matches!(
+            &e.event,
+            SessionEvent::Injected { text, origin: InjectionOrigin::Peer { .. }, .. }
+                if text.contains("stopped by the person before it reported back")
+        )),
+        "woken with a message: {:#?}",
+        lead.session()
+            .events()
+            .iter()
+            .map(|e| &e.event)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A lead turn the person interrupts and has undone takes back the members it
+/// delegated; one delegated before it stays (`docs/adr/0023` §9).
+#[tokio::test]
+async fn an_undone_lead_turn_takes_back_the_members_it_delegated() {
+    use atomcode_kernel::event::AgentCommand;
+
+    let dir = scratch("undone-delegation");
+    let mut layers = layers_with(
+        &dir,
+        r#"{ text = "noted" }, { text = "delegating", calls = [
+             { name = "team", args = { action = "delegate", name = "fresh", role = "explorer", task = "look" } },
+             { name = "bash", args = { command = "sleep 30" } }
+           ] }, { text = "done" }"#,
+        r#"{ text = "looked" }, { text = "looked" }"#,
+        "",
+    );
+    layers.push(
+        Layer::from_toml(&format!(
+            "[[patch]]\nid = \"agent-loop\"\nconfig = {{ max_rounds = 20, working_dir = {:?}, undo_cancelled = true }}\n",
+            dir.to_string_lossy()
+        ))
+        .unwrap(),
+    );
+    let app = start(ConfigTree::from_layers(layers).unwrap()).await;
+    let (lead, handle) = lead_on_a_pump(&app).await;
+    as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"old","role":"explorer","task":"look"}"#,
+    )
+    .await;
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let old = agents
+        .by_session(&format!("{}/old", lead.session_id()))
+        .unwrap();
+    settled(&old, 1).await;
+    settled(&lead, 1).await;
+
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "go".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
+    let fresh_session = format!("{}/fresh", lead.session_id());
+    for _ in 0..500 {
+        if agents.by_session(&fresh_session).is_some()
+            && lead
+                .session()
+                .events()
+                .iter()
+                .any(|e| matches!(&e.event, SessionEvent::ToolStarted { .. }))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(agents.by_session(&fresh_session).is_some(), "delegated");
+    handle.commands.send(AgentCommand::Cancel).unwrap();
+    for _ in 0..500 {
+        if agents.by_session(&fresh_session).is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        agents.by_session(&fresh_session).is_none(),
+        "the member of the undone turn is stopped"
+    );
+    assert!(
+        agents
+            .by_session(&format!("{}/old", lead.session_id()))
+            .is_some(),
+        "an earlier one is not"
+    );
+}
+
+/// A member's pump keeps nothing nobody reads: its events are not buffered for
+/// the member's whole life.
+#[tokio::test]
+async fn a_driven_agents_unread_events_are_not_kept() {
+    let dir = scratch("unread-events");
+    let app = start(tree(&dir, r#"{ text = "hi" }"#, "")).await;
+    let agent = create_agent(&app).await.unwrap();
+    let mut driven = atomcode_harness::plugins::handle::drive(&app.context(), agent.clone());
+    assert!(
+        agent.command(atomcode_kernel::event::AgentCommand::SendMessage {
+            text: "hello".into(),
+            images: Vec::new(),
+        })
+    );
+    settled(&agent, 1).await;
+    assert!(matches!(
+        driven.handle.events.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+    ));
 }
 
 /// A row's commands are the row's: switching the team row off takes `stop`

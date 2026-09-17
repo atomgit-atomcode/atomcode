@@ -109,6 +109,8 @@ struct SessionView {
     status: Option<AgentStatus>,
     /// Messages sent and not yet taken by a turn.
     outstanding: HashSet<CommandId>,
+    /// Its team members, by session id, as they joined and left.
+    members: std::collections::BTreeSet<String>,
 }
 
 impl AgentClient {
@@ -170,6 +172,19 @@ impl AgentClient {
     }
     pub fn cancel(&self) {
         self.command(AgentCommand::Cancel);
+    }
+    /// Stop the turn of the session on screen and of every member of its team;
+    /// the members stay (`docs/adr/0023` §9). Says how many members it asked.
+    pub fn cancel_all(&self) -> usize {
+        self.cancel();
+        let members = self.view.lock().expect("client poisoned").members.clone();
+        for session in &members {
+            self.command(AgentCommand::To {
+                session: session.clone(),
+                command: Box::new(AgentCommand::Cancel),
+            });
+        }
+        members.len()
     }
     /// Run a command from the catalog of the agent on screen.
     pub fn invoke(&self, name: &str, args: &str) {
@@ -233,6 +248,16 @@ impl AgentClient {
         let mut view = self.view.lock().expect("client poisoned");
         if description.session == view.session {
             view.described = Some(description.clone());
+        }
+    }
+
+    /// A member of the session on screen joined, or left.
+    fn member(&self, session: &str, joined: bool) {
+        let mut view = self.view.lock().expect("client poisoned");
+        if joined {
+            view.members.insert(session.to_string());
+        } else {
+            view.members.remove(session);
         }
     }
 
@@ -897,6 +922,7 @@ impl Tui {
                 if description.parent.as_deref() != Some(self.client.session().as_str()) {
                     return false;
                 }
+                self.client.member(&description.session, true);
                 let name = description
                     .member
                     .as_ref()
@@ -919,12 +945,14 @@ impl Tui {
                 );
                 true
             }
-            AgentEvent::AgentRemoved { session } => self
-                .members
-                .lock()
-                .expect("members poisoned")
-                .remove(&session)
-                .is_some(),
+            AgentEvent::AgentRemoved { session } => {
+                self.client.member(&session, false);
+                self.members
+                    .lock()
+                    .expect("members poisoned")
+                    .remove(&session)
+                    .is_some()
+            }
             AgentEvent::TurnStarted { .. } => self.set_activity(Activity::Working),
             AgentEvent::TurnComplete { .. } | AgentEvent::Cancelled => {
                 // A cancel or a failure can end the turn with words still in the

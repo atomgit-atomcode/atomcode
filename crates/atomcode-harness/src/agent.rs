@@ -518,6 +518,15 @@ impl Inbox {
     }
 
     /// Is there a message waiting — something that should wake or extend a turn?
+    /// Whether a message from `origin` is waiting.
+    pub fn waiting_from(&self, origin: MessageOrigin) -> bool {
+        self.queue
+            .lock()
+            .expect("inbox poisoned")
+            .iter()
+            .any(|i| matches!(i, InboxItem::Message { origin: o, .. } if *o == origin))
+    }
+
     pub fn has_waking_input(&self) -> bool {
         self.queue
             .lock()
@@ -639,6 +648,32 @@ impl Agent {
     pub fn inject(&self, text: impl Into<String>, origin: InjectionOrigin) {
         self.inbox.inject(text, origin);
         self.woke();
+    }
+
+    /// Tell this agent something it should know without being woken for it.
+    ///
+    /// Into its log at once when no turn is running — before the next
+    /// `TurnStart`, so whoever is watching sees it now — and queued for the next
+    /// turn otherwise: never into a running one, where it could land between a
+    /// tool call and its result.
+    pub fn note(&self, text: impl Into<String>, origin: InjectionOrigin) {
+        let text = text.into();
+        {
+            let _moving = self.moving.lock().expect("agent status poisoned");
+            if self.status() == AgentStatus::Idle {
+                crate::session::commit(
+                    &self.ctx,
+                    &self.session,
+                    SessionEvent::Injected {
+                        turn: self.session.current_turn(),
+                        text,
+                        origin,
+                    },
+                );
+                return;
+            }
+        }
+        self.inject(text, origin);
     }
 
     /// Say the inbox changed. Whether that starts a turn is the driver's call

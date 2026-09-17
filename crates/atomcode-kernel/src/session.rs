@@ -56,6 +56,13 @@ pub enum InjectionOrigin {
     InternalNudge,
     /// A compaction summary standing in for dropped history.
     CompactionSummary,
+    /// What the person said directly to one of this agent's team members
+    /// (`docs/adr/0023` §7): the lead is told, not asked. `member` is its name.
+    PersonToMember { member: String },
+    /// Something about a team member the lead should know and need not act on
+    /// now — its report on a turn the person started, its being stopped with
+    /// nothing of the lead's outstanding.
+    TeamNote { member: String },
 }
 
 /// Why the harness is telling a person something.
@@ -440,10 +447,14 @@ impl SessionEvent {
 /// **7** — added [`SessionEvent::Stopped`]: a team member stopped for good,
 /// which a resume of its lead leaves where it is (`docs/adr/0024` §13).
 ///
+/// **8** — added [`InjectionOrigin::PersonToMember`] and
+/// [`InjectionOrigin::TeamNote`]: what a lead is told about its team without
+/// being woken (`docs/adr/0023` §7).
+///
 /// A file's header records the version that created it; a later build may
 /// append facts of a kind added since. A reader that meets a kind it does not
 /// know treats the file as newer than itself, the same refusal.
-pub const SESSION_FORMAT_VERSION: u32 = 7;
+pub const SESSION_FORMAT_VERSION: u32 = 8;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -761,10 +772,15 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
     }
 
     for logged in events.iter().filter(|e| e.seq > floor) {
+        // What the lead is told about its team is not the work of whichever
+        // of its turns it landed in either, so undoing that turn keeps it.
         let session_wide = matches!(
             &logged.event,
             SessionEvent::Injected {
-                origin: InjectionOrigin::Memory | InjectionOrigin::CompactionSummary,
+                origin: InjectionOrigin::Memory
+                    | InjectionOrigin::CompactionSummary
+                    | InjectionOrigin::PersonToMember { .. }
+                    | InjectionOrigin::TeamNote { .. },
                 ..
             } | SessionEvent::Interrupted { .. }
         );
@@ -850,6 +866,18 @@ fn project(events: &[LoggedEvent], with_meta: bool) -> Vec<Message> {
                     // user run (`merge_consecutive_user`, which names this very
                     // case), OpenAI/Ollama tolerate the adjacency.
                     InjectionOrigin::Reminder => Message::user(text),
+                    // The person's own words, but to a member rather than to
+                    // this agent: something the member now acts on, which the
+                    // lead coordinates around rather than overrides.
+                    InjectionOrigin::PersonToMember { member } => Message::user(format!(
+                        "[the person said this directly to your team member `{member}`, which \
+                         is acting on it — a correction or an addition, not an instruction to \
+                         you; do not override it when you coordinate]\n{text}"
+                    )),
+                    InjectionOrigin::TeamNote { member } => Message::user(format!(
+                        "[about your team member `{member}` — for your information; not the \
+                         user, and nothing you are asked to do now]\n{text}"
+                    )),
                     // A summary stands in for the history it replaced, so it is
                     // part of the frozen prefix rather than a note beside it.
                     InjectionOrigin::CompactionSummary | InjectionOrigin::Memory => {

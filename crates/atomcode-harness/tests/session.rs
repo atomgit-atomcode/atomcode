@@ -108,6 +108,60 @@ fn an_interrupted_turn_is_undone_or_kept_and_always_noted() {
     assert!(kept.last().unwrap().is_user_interruption());
 }
 
+/// What a lead is told about its team is not the work of the turn it landed
+/// in: undoing that turn keeps it, while the turn's own note goes
+/// (`docs/adr/0023` §7).
+#[test]
+fn what_a_lead_is_told_about_its_team_outlives_an_undone_turn() {
+    let log = log_with(vec![
+        SessionEvent::TurnStart { turn: 1 },
+        SessionEvent::UserMessage {
+            turn: 1,
+            text: "go".into(),
+            images: vec![],
+        },
+        SessionEvent::Injected {
+            turn: 1,
+            text: "use the other file".into(),
+            origin: InjectionOrigin::PersonToMember {
+                member: "scout".into(),
+            },
+        },
+        SessionEvent::Injected {
+            turn: 1,
+            text: "[scout finished turn 2: Stopped]\nswitched".into(),
+            origin: InjectionOrigin::TeamNote {
+                member: "scout".into(),
+            },
+        },
+        SessionEvent::Injected {
+            turn: 1,
+            text: "a note for this turn".into(),
+            origin: InjectionOrigin::Reminder,
+        },
+        SessionEvent::Interrupted {
+            turn: 1,
+            undone: true,
+        },
+    ]);
+    let shown = log
+        .derive_messages()
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!shown.contains("a note for this turn"), "{shown}");
+    assert!(
+        shown.contains("directly to your team member `scout`")
+            && shown.contains("use the other file"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("about your team member `scout`") && shown.contains("switched"),
+        "{shown}"
+    );
+}
+
 #[test]
 fn the_projection_is_the_only_path_from_facts_to_a_prompt() {
     let log = log_with(vec![

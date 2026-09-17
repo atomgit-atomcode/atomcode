@@ -87,6 +87,8 @@ fn origin_label(origin: &InjectionOrigin) -> String {
         InjectionOrigin::Continuation => "continuation".into(),
         InjectionOrigin::InternalNudge => "nudge".into(),
         InjectionOrigin::CompactionSummary => "compaction summary".into(),
+        InjectionOrigin::PersonToMember { member } => format!("you → {member}"),
+        InjectionOrigin::TeamNote { member } => format!("about {member}"),
     }
 }
 
@@ -107,6 +109,8 @@ pub(crate) fn origin_kind(origin: &InjectionOrigin) -> &'static str {
         InjectionOrigin::Continuation => "injected:continuation",
         InjectionOrigin::InternalNudge => "injected:nudge",
         InjectionOrigin::CompactionSummary => "injected:compaction",
+        InjectionOrigin::PersonToMember { .. } => "injected:to-member",
+        InjectionOrigin::TeamNote { .. } => "injected:team-note",
     }
 }
 

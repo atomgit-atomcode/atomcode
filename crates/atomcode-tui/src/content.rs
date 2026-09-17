@@ -712,6 +712,8 @@ pub const INJECTIONS: &[(&str, &str)] = &[
     ("continuation", "injected:continuation"),
     ("compaction", "injected:compaction"),
     ("peer", "injected:peer"),
+    ("to-member", "injected:to-member"),
+    ("team-note", "injected:team-note"),
 ];
 
 /// The injections the screen opens without.
@@ -723,7 +725,9 @@ pub const INJECTIONS: &[(&str, &str)] = &[
 /// in what the model was actually sent — and are simply not painted.
 ///
 /// `injected:peer` is deliberately not here. A teammate's report is an answer
-/// somebody asked for, and the team panel is showing it for that reason.
+/// somebody asked for, and the team panel is showing it for that reason. Nor
+/// are what the lead is told about its team — what the person said to a member,
+/// a member's report on a turn the person started: the person is the audience.
 ///
 /// A slice of strings rather than a filter over [`INJECTIONS`], because both
 /// consumers need it as a `&'static [&'static str]` — the default fold state and

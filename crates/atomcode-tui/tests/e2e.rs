@@ -68,6 +68,7 @@ fn agent_catalog() -> PluginRegistry {
     c.register(Arc::new(HoldTurnEnd));
     c.register(Arc::new(EffortSpyRow));
     c.register(Arc::new(EchoCommandRow));
+    c.register(Arc::new(StallingUtilityRow));
     c
 }
 
@@ -2437,6 +2438,77 @@ async fn a_burst_of_deltas_costs_frames_not_one_per_delta() {
         painted * 4 < words,
         "{words} deltas cost {painted} frames, so what is queued is not being drained into one frame"
     );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// A side-call model that never answers, so a member is busy until stopped.
+struct Stalling;
+
+#[async_trait]
+impl atomcode_kernel::provider::LlmProvider for Stalling {
+    fn model_name(&self) -> &str {
+        "stalling"
+    }
+    async fn chat_stream(
+        &self,
+        _messages: &[atomcode_kernel::message::Message],
+        _tools: &[atomcode_kernel::tool::ToolDef],
+        _options: &atomcode_kernel::provider::ChatOptions,
+    ) -> Result<
+        futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+        atomcode_kernel::stream::ProviderError,
+    > {
+        Ok(Box::pin(futures::stream::pending()))
+    }
+}
+
+struct StallingUtilityRow;
+
+#[async_trait]
+impl Plugin for StallingUtilityRow {
+    fn name(&self) -> &'static str {
+        "test-stalling-utility"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["llm-utility"]
+    }
+    async fn apply(&self, ctx: &Context, _config: &serde_json::Value) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_harness::seams::LlmUtilitySvc>(Arc::new(Stalling))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// `/cancel-all` stops the turn of the session on screen and of every member
+/// of its team (`docs/adr/0023` §9): the member's turn ends cancelled, and since
+/// it was the lead's errand the lead hears so. That the members stay is the
+/// harness's to show: a cancel is not a stop.
+#[tokio::test]
+async fn cancel_all_stops_every_members_turn_and_keeps_the_team() {
+    let dir = scratch("cancel-all");
+    let script = replay(
+        r#"{ text = "Delegating.", calls = [ { name = "team", args = { action = "delegate", name = "scout", role = "explorer", task = "look around" } } ] },
+           { text = "Delegated." },
+           { text = "Heard." }"#,
+    );
+    let member = format!(
+        "[[insert]]\nname = \"team-in-process\"\nconfig = {{ project_root = {dir:?} }}\n\n\
+         [[insert]]\nid = \"llm-utility\"\nname = \"test-stalling-utility\"\n",
+        dir = dir.to_string_lossy(),
+    );
+    let s = start(tree(&dir, &script, &[&member])).await;
+    let task = s.open().await;
+
+    s.term.type_line("have someone look around");
+    until(&s, "Delegated.").await;
+    s.quiet().await;
+
+    s.term.type_line("/cancel-all");
+    until(&s, "1 个成员").await;
+    until(&s, "Cancelled").await;
 
     s.term.press(KeyPress::ctrl('d'));
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;

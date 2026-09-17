@@ -1478,7 +1478,8 @@ impl RunningAgent {
                 // This engine keeps no session log, so there are no facts to send.
                 AgentCommand::Subscribe { .. }
                 | AgentCommand::Unsubscribe { .. }
-                | AgentCommand::Invoke { .. } => {}
+                | AgentCommand::Invoke { .. }
+                | AgentCommand::To { .. } => {}
                 AgentCommand::Shutdown => break,
                 // No turn is running at the top-level loop, but a Cancel that races in
                 // here (turn just returned) must still flush any orphaned parked request
@@ -1676,7 +1677,8 @@ impl RunningAgent {
                     // No session log here: nothing to subscribe to.
                     Some(AgentCommand::Subscribe { .. })
                     | Some(AgentCommand::Unsubscribe { .. })
-                    | Some(AgentCommand::Invoke { .. }) => {}
+                    | Some(AgentCommand::Invoke { .. })
+                    | Some(AgentCommand::To { .. }) => {}
                     Some(AgentCommand::Respond { id, value }) => self.rt.resolve(id, value),
                     Some(AgentCommand::Shutdown) => {
                         // Shutdown during a live turn is a cooperative terminal, not

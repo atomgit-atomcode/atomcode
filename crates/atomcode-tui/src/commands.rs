@@ -118,6 +118,10 @@ pub struct SessionCommands;
 
 const SESSION: &[Command] = &[
     Command::new("compact", "压缩历史,给上下文腾地方"),
+    Command::new(
+        "cancel-all",
+        "停下这个会话与每个团队成员正在跑的回合;成员留在团队里",
+    ),
     Command::new("context", "这次会话用掉了多少"),
     Command::new("transcript", "把对话按模型看到的样子列出来"),
     Command::new("new", "开一个新会话"),
@@ -156,6 +160,14 @@ impl CommandSet for SessionCommands {
         };
         let control = client.control();
         match name {
+            "cancel-all" => {
+                let members = client.cancel_all();
+                Outcome::Said(if members == 0 {
+                    "已停下当前回合".into()
+                } else {
+                    format!("已停下当前回合,以及 {members} 个成员的")
+                })
+            }
             "compact" => {
                 if !client.described().is_some_and(|d| d.compaction) {
                     return Outcome::Refused("这个 agent 没有压缩策略".into());

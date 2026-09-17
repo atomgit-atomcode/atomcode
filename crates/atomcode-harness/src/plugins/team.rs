@@ -498,6 +498,10 @@ struct Member {
     /// The files it may write, for a writing member sharing the lead's
     /// workspace. Empty for a reader or a member with a checkout of its own.
     scope: Vec<String>,
+    /// The lead's turn that delegated it. A turn the person interrupts and
+    /// has undone takes its members with it; a member brought back by a resume
+    /// has none.
+    delegated_in: Option<u64>,
     /// Its pump. Dropped with the member, which stops the pump and any turn
     /// it is running.
     _driven: super::handle::Driven,
@@ -555,8 +559,49 @@ impl crate::commands::CatalogCommand for StopMember {
             .service::<AgentsSvc>()
             .and_then(|agents| agents.by_session(&lead_session))
             .ok_or_else(|| format!("`{name}`'s lead is gone"))?;
-        self.team.stop(&lead, Some(&name)).await
+        // Whether it has the lead's work in hand and has not reported on it: a
+        // lead waiting on that result must hear, or it waits for good
+        // (`docs/adr/0023` §8).
+        let owes = {
+            let turn = agent.session().current_turn();
+            let working_for_the_lead = agent.status() != crate::agent::AgentStatus::Idle
+                && agent
+                    .session()
+                    .events()
+                    .iter()
+                    .any(|e| from_lead_in(&e.event, turn, &lead_session));
+            working_for_the_lead || agent.inbox().waiting_from(MessageOrigin::Peer(lead.id()))
+        };
+        let said = last_said(&agent.session());
+        let stopped = self.team.stop(&lead, Some(&name)).await?;
+        if owes {
+            lead.send_from(
+                format!(
+                    "[{name} was stopped by the person before it reported back]\n{}",
+                    said.unwrap_or_else(|| "(it had said nothing yet)".into())
+                ),
+                MessageOrigin::Peer(agent.id()),
+            );
+        } else {
+            lead.note(
+                format!("[the person stopped {name}]"),
+                crate::session::InjectionOrigin::TeamNote { member: name },
+            );
+        }
+        Ok(stopped)
     }
+}
+
+/// Whether `event` is the lead's message to a member, in `turn`.
+fn from_lead_in(event: &SessionEvent, turn: u64, lead_session: &str) -> bool {
+    matches!(
+        event,
+        SessionEvent::Injected {
+            turn: t,
+            origin: crate::session::InjectionOrigin::Peer { from },
+            ..
+        } if *t == turn && from == lead_session
+    )
 }
 
 /// The member's one way of talking: to the lead, and only the lead.
@@ -1139,6 +1184,7 @@ impl TeamTool {
                     worktree: worktree.clone(),
                     told,
                     scope,
+                    delegated_in: (!resuming).then(|| lead.session().current_turn()),
                     _driven: driven,
                 },
             );
@@ -1605,6 +1651,7 @@ impl Plugin for TeamPlugin {
         // not stop (`docs/adr/0024` §11): found by their headers naming it as
         // parent, recreated with their own logs.
         let restoring = ctx.clone();
+        let finish_team = team.clone();
         let _ = ctx.on_emit::<crate::events::AgentCreated>(
             move |created: &crate::events::AgentInfo| {
                 let Some(lead) = restoring
@@ -1629,9 +1676,65 @@ impl Plugin for TeamPlugin {
         // A member that ends a turn without having spoken is reported on, so
         // the lead learns it finished. Facts are seen by session here — this
         // listener is above every member — and routed to the lead by name.
+        //
+        // Whether that wakes the lead depends on whose turn it was
+        // (`docs/adr/0023` §7): one that had the lead's message in it reports as
+        // a message, because the lead is waiting on it; one the person started
+        // is a note the lead reads on its next turn. What the person said to a
+        // member reaches the lead the same way.
         let finish_ctx = ctx.clone();
         let finish_members = members.clone();
         let _ = ctx.on_emit::<SessionEventCommitted>(move |committed: &Committed| {
+            if let SessionEvent::Interrupted { turn, undone: true } = &committed.event {
+                // A lead's turn taken back takes back the members it delegated.
+                let delegated: Vec<String> = finish_members
+                    .by_lead
+                    .lock()
+                    .expect("members poisoned")
+                    .get(&committed.session)
+                    .map(|mine| {
+                        mine.iter()
+                            .filter(|(_, m)| m.delegated_in == Some(*turn))
+                            .map(|(name, _)| name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let Some(lead) = finish_ctx
+                    .service::<AgentsSvc>()
+                    .and_then(|agents| agents.by_session(&committed.session))
+                else {
+                    return;
+                };
+                for name in delegated {
+                    let team = finish_team.clone();
+                    let lead = lead.clone();
+                    tokio::spawn(async move {
+                        let _ = team.stop(&lead, Some(&name)).await;
+                    });
+                }
+                return;
+            }
+            if let SessionEvent::UserMessage { text, .. } = &committed.event {
+                let Some((lead_session, name)) = finish_members
+                    .leads
+                    .lock()
+                    .expect("leads poisoned")
+                    .get(&committed.session)
+                    .cloned()
+                else {
+                    return;
+                };
+                if let Some(lead) = finish_ctx
+                    .service::<AgentsSvc>()
+                    .and_then(|agents| agents.by_session(&lead_session))
+                {
+                    lead.note(
+                        text.clone(),
+                        crate::session::InjectionOrigin::PersonToMember { member: name },
+                    );
+                }
+                return;
+            }
             let SessionEvent::TurnEnd { turn, stop, .. } = &committed.event else {
                 return;
             };
@@ -1662,10 +1765,20 @@ impl Plugin for TeamPlugin {
                 return;
             };
             let said = last_said(&member.session()).unwrap_or_else(|| "(nothing)".into());
-            lead.send_from(
-                format!("[{name} finished turn {turn}: {stop:?}]\n{said}"),
-                MessageOrigin::Peer(member.id()),
-            );
+            let report = format!("[{name} finished turn {turn}: {stop:?}]\n{said}");
+            let lead_asked = member
+                .session()
+                .events()
+                .iter()
+                .any(|e| from_lead_in(&e.event, *turn, &lead_session));
+            if lead_asked {
+                lead.send_from(report, MessageOrigin::Peer(member.id()));
+            } else {
+                lead.note(
+                    report,
+                    crate::session::InjectionOrigin::TeamNote { member: name },
+                );
+            }
         });
 
         contribute_prompt(
