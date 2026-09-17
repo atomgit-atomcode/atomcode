@@ -13,6 +13,7 @@ use atomcode_harness::agent::OnlySession;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use atomcode_harness::events::{ToolExec, ToolsExecute};
@@ -266,6 +267,65 @@ async fn the_childs_conversation_never_enters_the_parents_log() {
     );
     // The accounting line reports how much the child did without carrying it.
     assert!(parent_transcript(&app).contains("round(s)"));
+}
+
+/// A task child's session is kept like any other, under its parent: its log
+/// is readable by id after the child is gone, and it is not a session a person
+/// picks up on its own (`docs/adr/0024` §1, §11).
+#[tokio::test]
+async fn a_childs_log_is_kept_under_its_parent() {
+    let dir = scratch("kept-child");
+    let sessions = scratch("kept-child-sessions");
+    std::fs::write(dir.join("a.txt"), "child-only detail").unwrap();
+    let script = delegating_script(
+        "read a.txt",
+        r#"{ text = "Looking.", calls = [ { name = "read_file", args = { file_path = "a.txt" } } ] },
+  { text = "Summary only." },"#,
+    );
+    let kept = format!(
+        "[[patch]]\nid = \"session-persistence-jsonl\"\nconfig = {{ root = {:?}, project_root = {:?} }}",
+        sessions.to_string_lossy(),
+        dir.to_string_lossy()
+    );
+    let app = start(tree(&dir, &script, &[YOLO, &kept])).await;
+    run_turn(&app, "delegate").await.unwrap();
+    let parent = app.context().only_session().unwrap().id().to_string();
+    let store = app
+        .context()
+        .service::<atomcode_harness::seams::SessionPersistenceSvc>()
+        .unwrap();
+
+    let mut children = Vec::new();
+    let mut read = Vec::new();
+    for _ in 0..300 {
+        children = store.children(&parent).await.unwrap();
+        if let [child] = children.as_slice() {
+            read = store.load(&child.id).await.unwrap();
+            if read.iter().any(|e| {
+                matches!(
+                    e.event,
+                    atomcode_harness::session::SessionEvent::TurnEnd { .. }
+                )
+            }) {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        children.len(),
+        1,
+        "one child, under its parent: {children:?}"
+    );
+    assert!(
+        format!("{read:?}").contains("child-only detail"),
+        "its whole conversation is kept: {read:?}"
+    );
+    assert_eq!(
+        store.list().await.unwrap(),
+        vec![parent],
+        "and it is not listed beside its parent"
+    );
 }
 
 #[tokio::test]

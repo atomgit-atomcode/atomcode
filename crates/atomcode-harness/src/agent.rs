@@ -264,9 +264,10 @@ pub struct CreateAgent {
     pub seed_len: usize,
     /// Load `seed` from the persistence seam under `id` when none was given.
     pub resume: bool,
-    /// Whether the persistence seam should keep this session. A delegated
-    /// child's transcript is its parent's business, not a session of its own.
+    /// Whether the persistence seam should keep this session.
     pub persist: bool,
+    /// For a team member: what it was created with, into its header.
+    pub member: Option<crate::session::MemberHeader>,
     pub setup: Option<Setup>,
 }
 
@@ -319,6 +320,10 @@ impl CreateAgent {
     }
     pub fn persist(mut self, persist: bool) -> Self {
         self.persist = persist;
+        self
+    }
+    pub fn member(mut self, member: crate::session::MemberHeader) -> Self {
+        self.member = Some(member);
         self
     }
     pub fn setup(mut self, setup: Setup) -> Self {
@@ -864,6 +869,7 @@ impl Agents {
         let mut header = SessionHeader::new(session_id.clone());
         header.cwd = req.cwd.as_ref().map(|p| p.display().to_string());
         header.parent = req.parent.clone();
+        header.member = req.member.take();
         if req.parent.is_some() {
             header.inherited = seed_len;
         }

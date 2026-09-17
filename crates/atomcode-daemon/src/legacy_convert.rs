@@ -580,6 +580,7 @@ fn convert_legacy_session_with_diagnostic(
         detached_unattributed_tokens: 0,
         origin: SessionOrigin::Manual,
         format_version: 0,
+        parent: None,
     };
     meta.auto_name_from_messages(&snapshot.messages);
 

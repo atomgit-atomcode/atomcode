@@ -247,6 +247,28 @@ impl JsonlStore {
         Ok(Some(header))
     }
 
+    /// Every session file in this project's bucket, newest first. This
+    /// project's, not every session on the machine: a list that crossed
+    /// projects would make "what did we do here" unanswerable by the same
+    /// amount the flat layout did.
+    fn stored(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(self.dir()) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                (path.extension()? == "jsonl")
+                    .then(|| path.file_stem()?.to_str().map(str::to_string))
+                    .flatten()
+            })
+            .collect();
+        ids.sort();
+        ids.reverse();
+        ids
+    }
+
     /// The header this store holds for `session_id`, read synchronously: what a
     /// description reports as the session's recorded start, which is not the
     /// in-memory log's when the log was seeded rather than resumed from here.
@@ -362,24 +384,20 @@ impl SessionPersistence for JsonlStore {
     }
 
     async fn list(&self) -> Result<Vec<String>, String> {
-        // This project's sessions, not every session on the machine. A list
-        // that crossed projects would make "what did we do here" unanswerable
-        // by the same amount the flat layout did.
-        let Ok(entries) = std::fs::read_dir(self.dir()) else {
-            return Ok(Vec::new());
-        };
-        let mut ids: Vec<String> = entries
-            .flatten()
-            .filter_map(|e| {
-                let path = e.path();
-                (path.extension()? == "jsonl")
-                    .then(|| path.file_stem()?.to_str().map(str::to_string))
-                    .flatten()
-            })
-            .collect();
-        ids.sort();
-        ids.reverse();
-        Ok(ids)
+        Ok(self
+            .stored()
+            .into_iter()
+            .filter(|id| self.stored_header(id).is_none_or(|h| h.parent.is_none()))
+            .collect())
+    }
+
+    async fn children(&self, parent: &str) -> Result<Vec<SessionHeader>, String> {
+        Ok(self
+            .stored()
+            .into_iter()
+            .filter_map(|id| self.stored_header(&id))
+            .filter(|h| h.parent.as_deref() == Some(parent))
+            .collect())
     }
 }
 

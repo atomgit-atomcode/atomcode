@@ -437,6 +437,12 @@ pub struct SessionMeta {
     /// stored as a snapshot.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub format_version: u32,
+    /// The session this one was delegated from — a team member's lead, a task
+    /// child's parent — by its session id. Such a session is kept under its
+    /// parent: no catalog, picker or `--continue` offers it on its own, and it
+    /// is found through [`SessionManager::children`] (`docs/adr/0024` §11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 impl SessionMeta {
@@ -463,6 +469,7 @@ impl SessionMeta {
             detached_unattributed_tokens: 0,
             origin: SessionOrigin::Manual,
             format_version: 0,
+            parent: None,
         }
     }
 
@@ -2956,7 +2963,24 @@ impl SessionManager {
     /// List all sessions in this project bucket, NEWEST FIRST. Reads ONLY `*.meta`
     /// (never the big snapshot / transcript files); a malformed meta is skipped, not
     /// fatal. Production's `<id>.json` files are ignored (different extension).
+    ///
+    /// A delegated agent's session is not one of them: see [`Self::children`].
     pub fn list(&self) -> Vec<SessionMeta> {
+        self.every_meta()
+            .into_iter()
+            .filter(|meta| meta.parent.is_none())
+            .collect()
+    }
+
+    /// The sessions delegated from `parent` (a session id), newest first.
+    pub fn children(&self, parent: &str) -> Vec<SessionMeta> {
+        self.every_meta()
+            .into_iter()
+            .filter(|meta| meta.parent.as_deref() == Some(parent))
+            .collect()
+    }
+
+    fn every_meta(&self) -> Vec<SessionMeta> {
         let mut out = Vec::new();
         let Ok(rd) = fs::read_dir(&self.root) else {
             return out;
@@ -3016,6 +3040,19 @@ impl SessionManager {
     pub fn delete(&self, lease: &SessionLease) -> SessionResult<()> {
         let id = lease.id();
         self.validate_lease(lease)?;
+        // What was delegated from it goes first: nothing would ever offer those
+        // sessions again once it is gone. One another runtime holds is left.
+        let session_id = if self.is_event_session(id) {
+            self.read_event_header(id)
+                .map_or_else(|_| id.to_string(), |header| header.id)
+        } else {
+            id.to_string()
+        };
+        for child in self.children(&session_id) {
+            if let Ok(child_lease) = self.acquire_lease(&child.id) {
+                self.delete(&child_lease)?;
+            }
+        }
         let targets = [
             self.path_for(id, "snapshot")?,
             self.inflight_path(id)?,
@@ -3705,6 +3742,8 @@ fn catalog_entry(
     sources: CatalogAggregate,
 ) -> Option<CatalogEntry> {
     match (sources.native, sources.legacy) {
+        // Kept under the session it was delegated from, not listed beside it.
+        (Some(native), _) if native.parent.is_some() => None,
         (Some(native), legacy) => Some(CatalogEntry {
             needs_newer_version: native.needs_newer_version(),
             id,

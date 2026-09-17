@@ -374,7 +374,14 @@ fn load_records(dir: &Path) -> SessionResult<Vec<TurnRecord>> {
                     actual: total_bytes,
                 });
             }
-            let events = match SessionManager::with_root(dir).load_events(id) {
+            let store = SessionManager::with_root(dir);
+            // A delegated agent's session is kept under its parent, and what
+            // it found reached the parent already. (A fork's header names a
+            // parent too, and is a session of its own: the index decides.)
+            if store.read_meta(id).is_ok_and(|meta| meta.parent.is_some()) {
+                continue;
+            }
+            let events = match store.load_events(id) {
                 Ok(events) => events,
                 // Written by a newer build: listed elsewhere as needing one,
                 // and no reason to fail every search in the project.

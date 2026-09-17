@@ -253,6 +253,39 @@ impl LlmProvider for RecordingProvider {
                     .to_string(),
                 })
             }
+            Some(m) if m.role == Role::User && m.text == "delegate a second" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "team".into(),
+                    arguments: serde_json::json!({
+                        "action": "delegate",
+                        "name": "mapper",
+                        "role": "explorer",
+                        "task": "map what is here",
+                    })
+                    .to_string(),
+                })
+            }
+            Some(m) if m.role == Role::User && m.text == "stop the mapper" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "team".into(),
+                    arguments: serde_json::json!({ "action": "stop", "name": "mapper" })
+                        .to_string(),
+                })
+            }
+            Some(m) if m.role == Role::User && m.text == "tell the scout" => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "team".into(),
+                    arguments: serde_json::json!({
+                        "action": "tell",
+                        "name": "scout",
+                        "text": "and once more",
+                    })
+                    .to_string(),
+                })
+            }
             // What the agent is told about itself, the way the model asks for it.
             Some(m) if m.role == Role::User && m.text.starts_with("describe ") => {
                 StreamEvent::ToolCall(ToolCall {
@@ -2372,6 +2405,114 @@ async fn a_team_run_reaches_the_team_panel() {
     runtime.handle.shutdown().await.unwrap();
 }
 
+/// Wait until `id`'s stored log satisfies `done`.
+async fn stored_until(
+    store: &SessionManager,
+    id: &str,
+    what: &str,
+    done: impl Fn(&[atomcode_kernel::session::LoggedEvent]) -> bool,
+) {
+    for _ in 0..500 {
+        if store.is_event_session(id) && store.load_events(id).is_ok_and(|events| done(&events)) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("`{id}` never {what}");
+}
+
+fn turns_ended(events: &[atomcode_kernel::session::LoggedEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.event,
+                atomcode_kernel::session::SessionEvent::TurnEnd { .. }
+            )
+        })
+        .count()
+}
+
+fn in_use(store: &SessionManager, id: &str) -> bool {
+    matches!(
+        store.acquire_lease(id),
+        Err(atomcode_capabilities::session::SessionStoreError::SessionInUse { .. })
+    )
+}
+
+/// A team outlives the process (`docs/adr/0024` §11–§13). Each member's log is
+/// a session of its own under the lead, written under a lease of its own and
+/// never listed beside the lead; resuming the lead brings back the members it
+/// did not stop — the lead can put one to work again — and leaves the stopped
+/// one's log where it was, ending in the fact that it was stopped.
+async fn a_team_is_kept_and_comes_back_with_its_lead() {
+    let env = env();
+    let project = env.project.path();
+    let recorder = Arc::new(Recorder::default());
+    let store = SessionManager::for_project(project);
+    let mut runtime = CodingRuntime::start(production_start(project, &recorder, |_| {}))
+        .await
+        .unwrap();
+    let id = runtime.session.clone().unwrap().id;
+    let scout = format!("{id}~scout");
+    let mapper = format!("{id}~mapper");
+    // A member's report wakes the lead for a turn of its own, so what each
+    // step did is read from the store rather than from which turn finished.
+    turn(&mut runtime, "delegate a team").await;
+    stored_until(&store, &scout, "ended a turn", |e| turns_ended(e) >= 1).await;
+    turn(&mut runtime, "delegate a second").await;
+    stored_until(&store, &mapper, "ended a turn", |e| turns_ended(e) >= 1).await;
+    turn(&mut runtime, "stop the mapper").await;
+    stored_until(&store, &mapper, "ended saying it was stopped", |e| {
+        e.last().is_some_and(|last| {
+            matches!(
+                last.event,
+                atomcode_kernel::session::SessionEvent::Stopped { .. }
+            )
+        })
+    })
+    .await;
+
+    assert!(in_use(&store, &scout), "a member's log has one writer");
+    assert!(!in_use(&store, &mapper), "a stopped member lets its log go");
+    let header = store.read_event_header(&scout).unwrap();
+    assert_eq!(header.parent.as_deref(), Some(id.as_str()));
+    assert_eq!(
+        header.member.map(|m| (m.name, m.role)),
+        Some(("scout".to_string(), "explorer".to_string()))
+    );
+    assert_eq!(
+        store.list().into_iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![id.clone()],
+        "a member is kept under its lead, not listed beside it"
+    );
+    runtime.handle.shutdown().await.unwrap();
+    assert!(!in_use(&store, &scout), "its lease went with the runtime");
+
+    let mut resumed = CodingRuntime::start(production_start(project, &recorder, |start| {
+        start.prepare.session = SessionMode::Resume(id.clone());
+    }))
+    .await
+    .unwrap();
+    for _ in 0..500 {
+        if in_use(&store, &scout) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        in_use(&store, &scout),
+        "the scout came back and holds its log"
+    );
+    assert!(!in_use(&store, &mapper), "the stopped one did not");
+    turn(&mut resumed, "tell the scout").await;
+    stored_until(&store, &scout, "ran a turn after the resume", |e| {
+        turns_ended(e) >= 2
+    })
+    .await;
+    resumed.handle.shutdown().await.unwrap();
+}
+
 /// On the product's own tree, a delegated agent is held to what no delegated
 /// agent may do: it reads no secret, whatever the approval mode
 /// (`docs/adr/0023` §2, the product-tree gate).
@@ -3400,6 +3541,7 @@ mod criteria {
         a_tools_question_reaches_the_person_and_the_answer_comes_back,
         a_delegated_subtask_is_reported_narrated_and_billed,
         a_team_run_reaches_the_team_panel,
+        a_team_is_kept_and_comes_back_with_its_lead,
         a_delegated_agent_in_the_product_never_reads_a_secret,
         a_turn_ending_on_its_last_allowed_round_is_not_cut_off,
         the_round_budget_asks_before_it_cuts_a_turn_off,

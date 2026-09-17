@@ -35,6 +35,33 @@ fn tree(root: &std::path::Path, lead: &str, member: &str) -> ConfigTree {
 
 /// `team` is the team row's config, as TOML inline-table fields.
 fn tree_with(root: &std::path::Path, lead: &str, member: &str, team: &str) -> ConfigTree {
+    ConfigTree::from_layers(layers_with(root, lead, member, team)).unwrap()
+}
+
+/// [`tree_with`], with sessions kept under `sessions` and the lead's session
+/// named `id` — resumed from there when `resume`.
+fn kept(
+    root: &std::path::Path,
+    sessions: &std::path::Path,
+    (id, resume): (&str, bool),
+    lead: &str,
+    member: &str,
+    team: &str,
+) -> ConfigTree {
+    let mut layers = layers_with(root, lead, member, team);
+    layers.push(
+        Layer::from_toml(&format!(
+            "[[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = false\nconfig = {{ root = {sessions:?}, project_root = {root:?} }}\n\n\
+             [[patch]]\nid = \"session\"\nconfig = {{ id = {id:?}, resume = {resume} }}\n",
+            sessions = sessions.to_string_lossy(),
+            root = root.to_string_lossy(),
+        ))
+        .unwrap(),
+    );
+    ConfigTree::from_layers(layers).unwrap()
+}
+
+fn layers_with(root: &std::path::Path, lead: &str, member: &str, team: &str) -> Vec<Layer> {
     let quiet =
         "[[patch]]\nid = \"trace\"\nconfig = { stream = false, tools = false, summary = false }";
     let empty_home = root.join("__no_user_skills__");
@@ -55,13 +82,12 @@ fn tree_with(root: &std::path::Path, lead: &str, member: &str, team: &str) -> Co
     let lead = format!(
         "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [ {lead} ] }}"
     );
-    let layers = vec![
+    vec![
         bundle::base().unwrap(),
         Layer::from_toml(&lead).unwrap(),
         Layer::from_toml(quiet).unwrap(),
         Layer::from_toml(&scoped).unwrap(),
-    ];
-    ConfigTree::from_layers(layers).unwrap()
+    ]
 }
 
 async fn start(tree: ConfigTree) -> App {
@@ -332,7 +358,7 @@ async fn status_tell_and_stop_are_the_leads_to_call() {
     )
     .await;
     assert!(
-        gone.content.contains("do not survive a restart"),
+        gone.content.contains("live members: none"),
         "{}",
         gone.content
     );
@@ -792,6 +818,404 @@ async fn a_member_is_driven_through_a_pump_of_its_own() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(!scout.is_driven(), "stopping the member stopped its pump");
+}
+
+// ---- a team across a restart ---------------------------------------------------
+
+/// Wait until `id`'s stored log satisfies `done`.
+async fn stored_until(
+    app: &App,
+    id: &str,
+    what: &str,
+    done: impl Fn(&[atomcode_harness::session::LoggedEvent]) -> bool,
+) -> Vec<atomcode_harness::session::LoggedEvent> {
+    let store = app
+        .context()
+        .service::<atomcode_harness::seams::SessionPersistenceSvc>()
+        .expect("sessions are kept");
+    for _ in 0..300 {
+        let events = store.load(id).await.unwrap_or_default();
+        if done(&events) {
+            return events;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("`{id}` never {what} on disk");
+}
+
+fn turns_ended(agent: &Agent) -> usize {
+    agent
+        .session()
+        .events()
+        .iter()
+        .filter(|e| matches!(e.event, SessionEvent::TurnEnd { .. }))
+        .count()
+}
+
+/// A team outlives a restart (`docs/adr/0024` §11, §13). Every member's log is
+/// kept under the lead, and a stopped member's ends saying so; resuming the
+/// lead brings back the others — the same sessions, idle, with their own
+/// history and what they were delegated with — and a word to one of them runs
+/// a turn. The stopped one stays stopped, its log still readable by id.
+#[tokio::test]
+async fn a_resumed_lead_brings_back_the_members_it_did_not_stop() {
+    let dir = scratch("kept-team");
+    let sessions = scratch("kept-team-sessions");
+    write_role(
+        &dir,
+        "scribe",
+        "---\npermission: worker\ndifficulty: simple\nwhen: writing a note\n---\nYou write what you are told.\n",
+    );
+    let lead_id = "kept-lead";
+    let scribe_id = format!("{lead_id}/scribe");
+    let scout_id = format!("{lead_id}/scout");
+    {
+        let app = start(kept(
+            &dir,
+            &sessions,
+            (lead_id, false),
+            r#"{ text = "ok" }"#,
+            r#"{ text = "noted" }, { text = "looked" }"#,
+            "",
+        ))
+        .await;
+        let lead = create_agent(&app).await.unwrap();
+        assert_eq!(lead.session_id(), lead_id);
+        run_turn(&app, "put a team together").await.unwrap();
+        for args in [
+            r#"{"action":"delegate","name":"scribe","role":"scribe","task":"keep the notes","scope":["notes/**"],"effort":"high"}"#,
+            r#"{"action":"delegate","name":"scout","role":"explorer","task":"look around"}"#,
+        ] {
+            let told = as_lead(&app, &lead, args).await;
+            assert!(!told.is_error, "{}", told.content);
+        }
+        let agents = app.context().service::<AgentsSvc>().unwrap();
+        until_idle(&agents.by_session(&scribe_id).unwrap()).await;
+        until_idle(&agents.by_session(&scout_id).unwrap()).await;
+        let stopped = as_lead(&app, &lead, r#"{"action":"stop","name":"scout"}"#).await;
+        assert_eq!(stopped.content, "stopped: scout");
+
+        stored_until(&app, lead_id, "ended its turn", |events| {
+            events
+                .iter()
+                .any(|e| matches!(e.event, SessionEvent::TurnEnd { .. }))
+        })
+        .await;
+        stored_until(&app, &scribe_id, "ended its turn", |events| {
+            events
+                .iter()
+                .any(|e| matches!(e.event, SessionEvent::TurnEnd { .. }))
+        })
+        .await;
+        stored_until(&app, &scout_id, "said it was stopped", |events| {
+            events
+                .last()
+                .is_some_and(|e| matches!(e.event, SessionEvent::Stopped { .. }))
+        })
+        .await;
+
+        let store = app
+            .context()
+            .service::<atomcode_harness::seams::SessionPersistenceSvc>()
+            .unwrap();
+        let header = store.header(&scribe_id).await.unwrap().expect("a header");
+        assert_eq!(header.parent.as_deref(), Some(lead_id));
+        assert_eq!(
+            header.member.as_ref().map(|m| m.scope.clone()),
+            Some(vec!["notes/**".to_string()]),
+            "what it was delegated with is in its header"
+        );
+        assert_eq!(
+            store.list().await.unwrap(),
+            vec![lead_id.to_string()],
+            "a member is kept under its lead, not listed beside it"
+        );
+    }
+
+    let app = start(kept(
+        &dir,
+        &sessions,
+        (lead_id, true),
+        r#"{ text = "back" }"#,
+        r#"{ text = "heard you" }"#,
+        "",
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    assert!(lead.seed_len() > 0, "the lead was resumed");
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let mut scribe = None;
+    for _ in 0..300 {
+        scribe = agents.by_session(&scribe_id);
+        if scribe.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let scribe = scribe.expect("the member the lead did not stop came back");
+    assert!(
+        agents.by_session(&scout_id).is_none(),
+        "the stopped one did not"
+    );
+    assert_eq!(scribe.status(), AgentStatus::Idle);
+    assert_eq!(
+        scribe.describe().reasoning_effort,
+        Some(ReasoningEffort::High),
+        "at the tier it was delegated at"
+    );
+    assert_eq!(turns_ended(&scribe), 1, "with its own history, and idle");
+    assert_eq!(
+        peers(&scribe),
+        vec![(lead_id.to_string(), "keep the notes".to_string())],
+        "the task it was given is its history, not sent again"
+    );
+    let status = as_lead(&app, &lead, r#"{"action":"status"}"#).await;
+    assert!(
+        status.content.starts_with("scribe (scribe): Idle")
+            && status.content.contains("writes [notes/**]")
+            && !status.content.contains("scout"),
+        "{}",
+        status.content
+    );
+
+    assert!(
+        scribe.command(atomcode_kernel::event::AgentCommand::SendMessage {
+            text: "a word after the restart".into(),
+            images: Vec::new(),
+        }),
+        "it is driven again"
+    );
+    for _ in 0..300 {
+        if turns_ended(&scribe) >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(turns_ended(&scribe), 2, "the word ran a turn");
+    assert_eq!(last_said(&scribe).as_deref(), Some("heard you"));
+
+    let store = app
+        .context()
+        .service::<atomcode_harness::seams::SessionPersistenceSvc>()
+        .unwrap();
+    let scout_log = store.load(&scout_id).await.unwrap();
+    assert!(
+        scout_log
+            .last()
+            .is_some_and(|e| matches!(e.event, SessionEvent::Stopped { .. })),
+        "the stopped member's log is still there to read"
+    );
+    let again = as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"scout","role":"explorer","task":"look again"}"#,
+    )
+    .await;
+    assert!(
+        again.is_error && again.content.contains("was stopped"),
+        "and no new member writes after it: {}",
+        again.content
+    );
+}
+
+/// A model that never answers, so a member is still busy when it is stopped.
+struct Stalling;
+
+#[async_trait::async_trait]
+impl atomcode_kernel::provider::LlmProvider for Stalling {
+    fn model_name(&self) -> &str {
+        "stalling"
+    }
+    async fn chat_stream(
+        &self,
+        _messages: &[atomcode_kernel::message::Message],
+        _tools: &[atomcode_kernel::tool::ToolDef],
+        _options: &atomcode_kernel::provider::ChatOptions,
+    ) -> Result<
+        futures::stream::BoxStream<'static, atomcode_kernel::stream::StreamEvent>,
+        atomcode_kernel::stream::ProviderError,
+    > {
+        Ok(Box::pin(futures::stream::pending()))
+    }
+}
+
+struct StallingUtilityRow;
+
+#[async_trait::async_trait]
+impl atomcode_plexus::Plugin for StallingUtilityRow {
+    fn name(&self) -> &'static str {
+        "test-stalling-utility"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["llm-utility"]
+    }
+    fn description(&self) -> &'static str {
+        "a side-call model that never answers"
+    }
+    async fn apply(
+        &self,
+        ctx: &atomcode_plexus::Context,
+        _config: &serde_json::Value,
+    ) -> Result<(), String> {
+        let _ = ctx
+            .provide::<atomcode_harness::seams::LlmUtilitySvc>(Arc::new(Stalling))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// A member stopped in the middle of a turn is stopped after that turn has
+/// unwound: its log ends with the turn closed and then the fact that it was
+/// stopped, never the other way round (`docs/adr/0024` §13).
+#[tokio::test]
+async fn a_member_stopped_mid_turn_says_so_last() {
+    let dir = scratch("stopped-busy");
+    let sessions = scratch("stopped-busy-sessions");
+    let lead_id = "stopped-busy-lead";
+    let scout_id = format!("{lead_id}/scout");
+    let mut layers = layers_with(&dir, r#"{ text = "ok" }"#, "", "");
+    layers.push(
+        Layer::from_toml(&format!(
+            "[[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = false\nconfig = {{ root = {sessions:?}, project_root = {root:?} }}\n\n\
+             [[patch]]\nid = \"session\"\nconfig = {{ id = {lead_id:?}, resume = false }}\n\n\
+             [[patch]]\nid = \"llm-utility\"\nname = \"test-stalling-utility\"\n",
+            sessions = sessions.to_string_lossy(),
+            root = dir.to_string_lossy(),
+        ))
+        .unwrap(),
+    );
+    let mut registry = plugins::catalog();
+    registry.register(Arc::new(StallingUtilityRow));
+    let mut app = App::new(registry, ConfigTree::from_layers(layers).unwrap());
+    app.start().await.expect("must mount");
+    let lead = create_agent(&app).await.unwrap();
+    let told = as_lead(
+        &app,
+        &lead,
+        r#"{"action":"delegate","name":"scout","role":"explorer","task":"look around"}"#,
+    )
+    .await;
+    assert!(!told.is_error, "{}", told.content);
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let scout = agents.by_session(&scout_id).unwrap();
+    for _ in 0..300 {
+        if scout.status() == AgentStatus::Working {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(scout.status(), AgentStatus::Working, "busy when stopped");
+
+    let stopped = as_lead(&app, &lead, r#"{"action":"stop","name":"scout"}"#).await;
+    assert_eq!(stopped.content, "stopped: scout");
+    let on_disk = stored_until(
+        &app,
+        &scout_id,
+        "closed its turn and said it was stopped",
+        |events| {
+            events
+                .iter()
+                .any(|e| matches!(e.event, SessionEvent::TurnEnd { .. }))
+                && events
+                    .iter()
+                    .any(|e| matches!(e.event, SessionEvent::Stopped { .. }))
+        },
+    )
+    .await;
+    assert!(
+        on_disk
+            .last()
+            .is_some_and(|e| matches!(e.event, SessionEvent::Stopped { .. })),
+        "{:#?}",
+        on_disk.iter().map(|e| &e.event).collect::<Vec<_>>()
+    );
+}
+
+/// A member that worked in a checkout of its own comes back to it, with the
+/// branch it was on (`docs/adr/0024` §13).
+#[tokio::test]
+async fn a_resumed_member_works_in_its_checkout_again() {
+    let dir = scratch("kept-worktree");
+    let sessions = scratch("kept-worktree-sessions");
+    sh(
+        &dir,
+        "git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init",
+    );
+    write_role(
+        &dir,
+        "scribe",
+        "---\npermission: worker\ndifficulty: simple\nwhen: writing a note\n---\nYou write what you are told.\n",
+    );
+    let lead_id = "kept-worktree-lead";
+    let scribe_id = format!("{lead_id}/scribe");
+    let worktree = dir.join(".atomcode").join("worktrees").join("scribe");
+    let branch = {
+        let app = start(kept(
+            &dir,
+            &sessions,
+            (lead_id, false),
+            r#"{ text = "ok" }"#,
+            r#"{ text = "noted" }"#,
+            "worktrees = true",
+        ))
+        .await;
+        let lead = create_agent(&app).await.unwrap();
+        run_turn(&app, "put a team together").await.unwrap();
+        let told = as_lead(
+            &app,
+            &lead,
+            r#"{"action":"delegate","name":"scribe","role":"scribe","task":"keep the notes"}"#,
+        )
+        .await;
+        assert!(!told.is_error, "{}", told.content);
+        let agents = app.context().service::<AgentsSvc>().unwrap();
+        until_idle(&agents.by_session(&scribe_id).unwrap()).await;
+        stored_until(&app, &scribe_id, "ended its turn", |events| {
+            events
+                .iter()
+                .any(|e| matches!(e.event, SessionEvent::TurnEnd { .. }))
+        })
+        .await;
+        stored_until(&app, lead_id, "ended its turn", |events| {
+            events
+                .iter()
+                .any(|e| matches!(e.event, SessionEvent::TurnEnd { .. }))
+        })
+        .await;
+        let status = as_lead(&app, &lead, r#"{"action":"status"}"#).await.content;
+        status
+            .split('`')
+            .find(|part| part.starts_with("team/scribe-"))
+            .unwrap_or_else(|| panic!("no branch in: {status}"))
+            .to_string()
+    };
+
+    let app = start(kept(
+        &dir,
+        &sessions,
+        (lead_id, true),
+        r#"{ text = "back" }"#,
+        r#"{ text = "heard you" }"#,
+        "worktrees = true",
+    ))
+    .await;
+    let lead = create_agent(&app).await.unwrap();
+    let agents = app.context().service::<AgentsSvc>().unwrap();
+    let mut scribe = None;
+    for _ in 0..300 {
+        scribe = agents.by_session(&scribe_id);
+        if scribe.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let scribe = scribe.expect("the member came back");
+    assert_eq!(scribe.cwd(), Some(&worktree), "to its own checkout");
+    let status = as_lead(&app, &lead, r#"{"action":"status"}"#).await.content;
+    assert!(
+        status.contains(&format!("branch `{branch}`")),
+        "on the branch it was on: {status}"
+    );
 }
 
 // ---- what a writing member may touch ------------------------------------------

@@ -381,8 +381,17 @@ pub trait SessionPersistence: Send + Sync {
     /// Replay a session's events in order.
     async fn load(&self, session_id: &str) -> Result<Vec<LoggedEvent>, String>;
 
-    /// Session ids this store holds, newest first where the backend can tell.
+    /// The sessions a person can pick up, newest first where the backend can
+    /// tell. A delegated agent's session — a team member, a task child — is
+    /// not one of them: it is kept under its parent, not beside it
+    /// (`docs/adr/0024` §11), and [`Self::children`] is how it is found.
     async fn list(&self) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+
+    /// The headers of the sessions whose header names `parent` — what a resumed
+    /// lead reads to bring its team back.
+    async fn children(&self, _parent: &str) -> Result<Vec<crate::session::SessionHeader>, String> {
         Ok(Vec::new())
     }
 

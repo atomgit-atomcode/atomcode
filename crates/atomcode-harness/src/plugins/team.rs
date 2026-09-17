@@ -618,6 +618,19 @@ struct TeamArgs {
     scope: Option<Vec<String>>,
 }
 
+/// Everything a member is made from, whether new or brought back.
+struct MemberSpec {
+    name: String,
+    role: Role,
+    task: String,
+    named: Option<String>,
+    chose: crate::seams::Chose,
+    asked_effort: Option<String>,
+    scope: Vec<String>,
+    lane: Vec<String>,
+    worktree: Option<(PathBuf, String)>,
+}
+
 impl TeamTool {
     /// The agent whose turn is calling: the lead.
     fn lead(&self) -> Result<Arc<Agent>, String> {
@@ -637,6 +650,16 @@ impl TeamTool {
             .name
             .filter(|n| !n.trim().is_empty())
             .ok_or("`name` is required")?;
+        // A name is part of the member's session id, and a session id is part of
+        // a file name.
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(format!(
+                "`{name}` is not a member name: use letters, digits, `_` and `-`"
+            ));
+        }
         let role_id = args.role.ok_or("`role` is required")?;
         let role = self
             .roles
@@ -686,6 +709,26 @@ impl TeamTool {
             if mine.map(|m| m.len()).unwrap_or(0) >= self.max_members {
                 return Err(format!("the team is full ({} members)", self.max_members));
             }
+        }
+        // A stopped member's log is kept under its name, and ends saying it was
+        // stopped; a second member by that name would write after it.
+        if let Some(store) = self.ctx.service::<crate::seams::SessionPersistenceSvc>() {
+            if store
+                .header(&format!("{lead_session}/{name}"))
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return Err(format!(
+                    "`{name}` was a member of this team and was stopped; its log is kept under \
+                     that name — choose another"
+                ));
+            }
+        }
+        {
+            let all = self.members.by_lead.lock().expect("members poisoned");
+            let mine = all.get(&lead_session);
             if shares_workspace {
                 if let Some((other, member)) = mine.into_iter().flatten().find(|(_, m)| {
                     atomcode_capabilities::team::worker_scopes_overlap(&scope, &m.scope)
@@ -707,6 +750,175 @@ impl TeamTool {
             vec!["**".to_string()]
         };
 
+        // A writing member gets a checkout of its own, so two members never
+        // edit the same tree and the lead merges branches, not diffs.
+        let worktree = if self.worktrees && role.permission == Permission::Worker {
+            Some(self.make_worktree(lead, &name).await?)
+        } else {
+            None
+        };
+        // `args.model` the model produced this turn; `role.model` a person wrote
+        // into their own `agents/<role>.md` before the run and is theirs to point
+        // wherever they like — including at their own second account. A role that
+        // came with the project is held to what the model may pick.
+        let (named, chose) = match args
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            Some(asked) => (Some(asked.to_string()), crate::seams::Chose::Model),
+            None => (
+                role.model.clone(),
+                if role.from_project {
+                    crate::seams::Chose::Model
+                } else {
+                    crate::seams::Chose::Person
+                },
+            ),
+        };
+        let asked_effort = args
+            .effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(str::to_string);
+        let report = format!(
+            "delegated to `{name}` ({}{}){}. It will report through `tell_parent`; use `status` \
+             to look.",
+            role.id,
+            match &named {
+                Some(model) => format!(" on {model}"),
+                None => String::new(),
+            },
+            match &worktree {
+                Some((dir, branch)) => format!(
+                    ", working in its own checkout {} on branch `{branch}`",
+                    dir.display()
+                ),
+                None => String::new(),
+            }
+        );
+        self.spawn_member(
+            lead,
+            MemberSpec {
+                name,
+                role,
+                task,
+                named,
+                chose,
+                asked_effort,
+                scope,
+                lane,
+                worktree,
+            },
+            false,
+        )
+        .await?;
+        Ok(report)
+    }
+
+    /// Bring back a member a resumed lead had and did not stop
+    /// (`docs/adr/0024` §11): the same session, its own log as the history,
+    /// idle. Its role is looked up as defined now, so its tools and permissions
+    /// are today's, not the ones it was created with.
+    async fn restore(
+        &self,
+        lead: &Arc<Agent>,
+        member: crate::session::MemberHeader,
+    ) -> Result<(), String> {
+        let role = self
+            .roles
+            .iter()
+            .find(|r| r.id == member.role)
+            .cloned()
+            .ok_or_else(|| format!("`{}`'s role `{}` is gone", member.name, member.role))?;
+        let worktree = match (member.worktree, member.branch) {
+            (Some(dir), Some(branch)) if Path::new(&dir).is_dir() => {
+                Some((PathBuf::from(dir), branch))
+            }
+            _ => None,
+        };
+        let shares_workspace = role.permission == Permission::Worker && worktree.is_none();
+        let lane = if shares_workspace {
+            member.scope.clone()
+        } else {
+            vec!["**".to_string()]
+        };
+        self.spawn_member(
+            lead,
+            MemberSpec {
+                name: member.name,
+                role,
+                task: member.task,
+                named: member.model,
+                // Named when it was delegated, and accepted then.
+                chose: crate::seams::Chose::Person,
+                asked_effort: member.effort,
+                scope: member.scope,
+                lane,
+                worktree,
+            },
+            true,
+        )
+        .await
+    }
+
+    async fn restore_members(
+        &self,
+        lead: &Arc<Agent>,
+        store: &dyn crate::seams::SessionPersistence,
+    ) {
+        let Ok(children) = store.children(lead.session_id()).await else {
+            return;
+        };
+        for header in children {
+            // A task child has a parent too; only a member has a header saying
+            // what it was delegated with.
+            let Some(member) = header.member.clone() else {
+                continue;
+            };
+            let stopped = store.load(&header.id).await.ok().is_some_and(|events| {
+                events
+                    .iter()
+                    .any(|e| matches!(e.event, SessionEvent::Stopped { .. }))
+            });
+            let known = self
+                .members
+                .by_lead
+                .lock()
+                .expect("members poisoned")
+                .get(lead.session_id())
+                .is_some_and(|mine| mine.contains_key(&member.name));
+            if stopped || known {
+                continue;
+            }
+            if let Err(e) = self.restore(lead, member).await {
+                eprintln!("team: a member was not brought back: {e}");
+            }
+        }
+    }
+
+    /// Create a member and put it to work — or, `resuming`, recreate it from
+    /// its stored log and leave it idle.
+    async fn spawn_member(
+        &self,
+        lead: &Arc<Agent>,
+        spec: MemberSpec,
+        resuming: bool,
+    ) -> Result<(), String> {
+        let MemberSpec {
+            name,
+            role,
+            task,
+            named,
+            chose,
+            asked_effort,
+            scope,
+            lane,
+            worktree,
+        } = spec;
+        let lead_session = lead.session_id().to_string();
         let agents = self.ctx.require::<AgentsSvc>().map_err(|e| e.to_string())?;
         let parent_tools = lead
             .ctx()
@@ -718,13 +930,6 @@ impl TeamTool {
                 restricted.register(tool)?;
             }
         }
-        // A writing member gets a checkout of its own, so two members never
-        // edit the same tree and the lead merges branches, not diffs.
-        let worktree = if self.worktrees && role.permission == Permission::Worker {
-            Some(self.make_worktree(lead, &name).await?)
-        } else {
-            None
-        };
         let told = Arc::new(Mutex::new(false));
         let prompts = Arc::new(crate::seams::PromptRegistry::new());
         prompts.contribute(
@@ -751,42 +956,12 @@ impl TeamTool {
         //   1. what this `delegate` call named — the person's hint, relayed;
         //   2. what the role file named — a project's standing choice;
         //   3. `difficulty: simple` ⇒ the `llm-utility` seam, when one is mounted;
-        //   4. nothing ⇒ inherit the conversation's, by realm lookup.
+        //   4. nothing ⇒ the conversation's.
         //
         // A named id that is not on offer FAILS here rather than falling through
         // to the next rule: silently demoting a member the person asked to run on
-        // a specific model is the failure nobody would see.
-        // Two sources, two rules, and the difference is who wrote the string.
-        // `args.model` the model produced this turn; `role.model` a person wrote
-        // into `.atomcode/agents/<role>.md` before the run and is theirs to
-        // point wherever they like — including at their own second account.
-        let (named, chose) = match args
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-        {
-            Some(asked) => (Some(asked.to_string()), crate::seams::Chose::Model),
-            None => (
-                role.model.clone(),
-                if role.from_project {
-                    crate::seams::Chose::Model
-                } else {
-                    crate::seams::Chose::Person
-                },
-            ),
-        };
-        // Same order as the model, for the same reason: what this call said,
-        // else what the role standing behind it said, else nothing — and
-        // "nothing" leaves the session's `reasoning-effort` row in charge.
-        // Validated against the model it will actually run on, so a level that
-        // model would silently drop is refused here instead.
-        let asked_effort = args
-            .effort
-            .as_deref()
-            .map(str::trim)
-            .filter(|e| !e.is_empty())
-            .map(str::to_string);
+        // a specific model is the failure nobody would see. The effort is
+        // validated against the model it will actually run on.
         let effort_override = super::subagent::resolve_child_effort(
             self.ctx.service::<crate::seams::ModelsSvc>().as_ref(),
             named.as_deref(),
@@ -816,10 +991,23 @@ impl TeamTool {
         let agents_for_tool = agents.clone();
         let max_rounds = self.max_rounds;
         let tools_for_realm = restricted.clone();
+        // Kept like any session, under the lead (`docs/adr/0024` §11, §13): what
+        // it was created with goes in its header, so a resume can bring it back.
+        let header = crate::session::MemberHeader {
+            name: name.clone(),
+            role: role.id.clone(),
+            task: task.clone(),
+            model: named.clone(),
+            effort: asked_effort.clone(),
+            worktree: worktree.as_ref().map(|(dir, _)| dir.display().to_string()),
+            branch: worktree.as_ref().map(|(_, branch)| branch.clone()),
+            scope: scope.clone(),
+        };
         let mut req = CreateAgent::new()
             .id(member_id)
             .parent(lead_session.clone())
-            .persist(false);
+            .member(header)
+            .resume(resuming);
         if let Some((dir, _)) = &worktree {
             req = req.cwd(dir.clone());
         }
@@ -907,23 +1095,10 @@ impl TeamTool {
                     _driven: driven,
                 },
             );
-        child.send_from(task, MessageOrigin::Peer(lead_id));
-        Ok(format!(
-            "delegated to `{name}` ({}{}){}. It will report through `tell_parent`; use `status` \
-             to look.",
-            role.id,
-            match &named {
-                Some(model) => format!(" on {model}"),
-                None => String::new(),
-            },
-            match &worktree {
-                Some((dir, branch)) => format!(
-                    ", working in its own checkout {} on branch `{branch}`",
-                    dir.display()
-                ),
-                None => String::new(),
-            }
-        ))
+        if !resuming {
+            child.send_from(task, MessageOrigin::Peer(lead_id));
+        }
+        Ok(())
     }
 
     /// A checkout of the lead's repository for one member: `git worktree add`
@@ -981,7 +1156,7 @@ impl TeamTool {
                 .map(|(n, m)| format!("{n} ({})", m.role))
                 .collect::<Vec<_>>()
                 .join(", "),
-            None => "none — members do not survive a restart; `delegate` again".into(),
+            None => "none — `delegate` to start one".into(),
         }
     }
 
@@ -1058,7 +1233,24 @@ impl TeamTool {
         };
         let mut stopped = Vec::new();
         for (n, member) in taken {
+            // Its log says it was stopped, last, before it goes: a resume of the
+            // lead reads that and leaves it where it is (`docs/adr/0024` §13).
+            // Last means after the turn it was cancelled out of has unwound.
             member.agent.cancel();
+            for _ in 0..500 {
+                if member.agent.status() == crate::agent::AgentStatus::Idle {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let log = member.agent.session();
+            crate::session::commit(
+                &self.ctx,
+                &log,
+                SessionEvent::Stopped {
+                    turn: log.current_turn(),
+                },
+            );
             self.members
                 .leads
                 .lock()
@@ -1159,8 +1351,9 @@ impl Tool for TeamTool {
          unique per team; to give an existing member more work, `tell` it. Simple roles \
          run on the cheaper utility model, hard ones on this one. When worktrees are on, a \
          writing member gets its own checkout and branch; you merge the branch. \
-         Members live in memory only: they do not survive a restart, and your history may \
-         mention members that are gone — `status` is the truth about who exists now.\n\
+         Members outlive a restart: resuming this conversation brings back the ones you did \
+         not stop, idle, with their own context. Your history may mention members that were \
+         stopped — `status` is the truth about who exists now.\n\
          \n\
          Example: {\"action\":\"delegate\",\"name\":\"scout\",\"role\":\"explorer\",\
          \"task\":\"Find where sessions are created in crates/atomcode-harness/src and report \
@@ -1349,18 +1542,41 @@ impl Plugin for TeamPlugin {
             .map(|r| format!("{} — {}", r.id, r.when))
             .collect::<Vec<_>>()
             .join("; ");
-        mount(
-            ctx,
-            vec![Arc::new(TeamTool {
-                ctx: ctx.clone(),
-                members: members.clone(),
-                roles,
-                max_members: row.max_members,
-                max_rounds: row.max_rounds,
-                worktrees: row.worktrees,
-                worktrees_dir: row.worktrees_dir.map(PathBuf::from),
-            }) as Arc<dyn Tool>],
-        )?;
+        let team = Arc::new(TeamTool {
+            ctx: ctx.clone(),
+            members: members.clone(),
+            roles,
+            max_members: row.max_members,
+            max_rounds: row.max_rounds,
+            worktrees: row.worktrees,
+            worktrees_dir: row.worktrees_dir.map(PathBuf::from),
+        });
+        mount(ctx, vec![team.clone() as Arc<dyn Tool>])?;
+
+        // A lead resumed from its log brings back the members it had and did
+        // not stop (`docs/adr/0024` §11): found by their headers naming it as
+        // parent, recreated with their own logs.
+        let restoring = ctx.clone();
+        let _ = ctx.on_emit::<crate::events::AgentCreated>(
+            move |created: &crate::events::AgentInfo| {
+                let Some(lead) = restoring
+                    .service::<AgentsSvc>()
+                    .and_then(|agents| agents.get(created.id))
+                else {
+                    return;
+                };
+                if lead.parent().is_some() || lead.seed_len() == 0 {
+                    return;
+                }
+                let Some(store) = restoring.service::<crate::seams::SessionPersistenceSvc>() else {
+                    return;
+                };
+                let team = team.clone();
+                tokio::spawn(async move {
+                    team.restore_members(&lead, store.as_ref()).await;
+                });
+            },
+        );
 
         // A member that ends a turn without having spoken is reported on, so
         // the lead learns it finished. Facts are seen by session here — this

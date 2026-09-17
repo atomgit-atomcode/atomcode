@@ -101,7 +101,7 @@ pub(crate) async fn resolve_child_model(
             }
         });
     }
-    models.provider(&id).await.map(Some)
+    models.provider(id).await.map(Some)
 }
 
 /// The thinking level one delegated child runs at, on its own realm.
@@ -273,8 +273,8 @@ impl Subagents for InProcessSubagents {
 
         // Its own conversation, its own tools and its own prompt, composed
         // before anyone can see it. The parent's session is the one whose turn
-        // this tool call is running in. Not persisted: a delegated child's
-        // transcript is the parent's business, not a session of its own.
+        // this tool call is running in. Kept, like every session: its log is
+        // readable by id after it is gone (`docs/adr/0024` §1).
         let parent = crate::agent::current()
             .and_then(|c| c.service::<SessionSvc>())
             .map(|log| log.id().to_string());
@@ -282,7 +282,6 @@ impl Subagents for InProcessSubagents {
         let delegated_llm = self.ctx.service::<crate::seams::DelegatedLlmSvc>();
         let mut req = crate::agent::CreateAgent::new()
             .id(child_session.clone())
-            .persist(false)
             .setup(Box::new(move |realm: &Context| {
                 let mut held = vec![
                     realm

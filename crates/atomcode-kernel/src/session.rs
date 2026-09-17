@@ -315,6 +315,12 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         reasoning: String,
     },
+    /// The agent was stopped for good and taken off its team
+    /// (`docs/adr/0024` §13). Its log stays readable; a resume of the lead does
+    /// not bring it back.
+    Stopped {
+        turn: u64,
+    },
     /// Everything from `to` up to this fact no longer reaches the model
     /// (`docs/adr/0024` §17): an undo, a rewind of the conversation, a return
     /// to an earlier point. The facts stay in the log — the projection leaves
@@ -363,6 +369,7 @@ impl SessionEvent {
             | Self::AssistantChunk { turn, .. }
             | Self::AssistantMessage { turn, .. }
             | Self::PartialReply { turn, .. }
+            | Self::Stopped { turn }
             | Self::ToolStarted { turn, .. }
             | Self::ToolResultLogged { turn, .. }
             | Self::Injected { turn, .. }
@@ -430,10 +437,13 @@ impl SessionEvent {
 /// **6** — added [`SessionEvent::PartialReply`]: what a reply had said when the
 /// person stopped it, now that chunks are not kept (`docs/adr/0024` §7–9).
 ///
+/// **7** — added [`SessionEvent::Stopped`]: a team member stopped for good,
+/// which a resume of its lead leaves where it is (`docs/adr/0024` §13).
+///
 /// A file's header records the version that created it; a later build may
 /// append facts of a kind added since. A reader that meets a kind it does not
 /// know treats the file as newer than itself, the same refusal.
-pub const SESSION_FORMAT_VERSION: u32 = 6;
+pub const SESSION_FORMAT_VERSION: u32 = 7;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -491,6 +501,36 @@ pub struct SessionHeader {
     /// one re-rendered from a repository that has moved on since.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
+    /// For a team member: what it was created with (`docs/adr/0024` §13). Set
+    /// once at creation, like the rest of the header; a resume recreates the
+    /// member from it, with its tools and permissions worked out again from the
+    /// role as it is defined then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<MemberHeader>,
+}
+
+/// What a team member was created with.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemberHeader {
+    pub name: String,
+    /// The role's id; its definition is looked up again on a resume.
+    pub role: String,
+    /// The task it was first given.
+    pub task: String,
+    /// The model it was put on by name, if one was named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The thinking level it was given, if one was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Its own checkout, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The files it may write, when it shares the lead's workspace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope: Vec<String>,
 }
 
 impl SessionHeader {
@@ -503,6 +543,7 @@ impl SessionHeader {
             parent: None,
             inherited: 0,
             context: None,
+            member: None,
         }
     }
 }

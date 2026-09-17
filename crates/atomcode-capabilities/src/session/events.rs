@@ -48,6 +48,14 @@ struct Line {
     event: Option<serde_json::Value>,
 }
 
+/// The id a session is stored under. A team member's session id is
+/// `<lead>/<name>` (`docs/adr/0023` §5), and a path separator cannot be part of
+/// a file name; `~` never appears in a minted id or a member name, so the
+/// mapping cannot collide.
+pub fn storage_id(session_id: &str) -> String {
+    session_id.replace('/', "~")
+}
+
 impl SessionManager {
     /// Whether `id` is stored as an event log. The index is the commit point of
     /// such a session, so it is what decides.
@@ -78,7 +86,7 @@ impl SessionManager {
     ) -> SessionResult<()> {
         self.validate_active_lease(lease)?;
         let id = lease.id();
-        if header.id != id || meta.id != id {
+        if storage_id(&header.id) != id || meta.id != id {
             return Err(SessionStoreError::Corrupt {
                 kind: "session events",
                 message: format!(
@@ -460,7 +468,8 @@ impl SessionManager {
     }
 
     /// A session a newer build last wrote is listed, never opened here: its log
-    /// may hold facts this build would misread.
+    /// may hold facts this build would misread. A delegated agent's session is
+    /// not opened on its own either.
     fn refuse_newer(&self, id: &str) -> SessionResult<()> {
         if !self.is_event_session(id) {
             return Ok(());
@@ -471,6 +480,14 @@ impl SessionManager {
                 kind: "session events",
                 found: meta.format_version,
                 supported: SESSION_FORMAT_VERSION,
+            });
+        }
+        // Nor one kept under the session it was delegated from: that session's
+        // resume is what brings it back (`docs/adr/0024` §11).
+        if meta.parent.is_some() {
+            return Err(SessionStoreError::InvalidId {
+                id: id.to_string(),
+                reason: "is kept under the session it was delegated from; open that one",
             });
         }
         Ok(())
@@ -1046,6 +1063,75 @@ mod tests {
 
     fn logged(seq: u64, at: u64, event: SessionEvent) -> LoggedEvent {
         LoggedEvent { seq, at, event }
+    }
+
+    /// A delegated agent's session is kept under its parent (`docs/adr/0024`
+    /// §11): stored under an id a file can have, found through its parent,
+    /// never listed, searched or opened on its own, and deleted with it.
+    #[test]
+    fn a_delegated_session_is_kept_under_its_parent() {
+        let (dir, manager) = store();
+        let lead = created(&manager, "lead");
+        let said = |text: &str| {
+            a_turn()
+                .into_iter()
+                .map(|mut logged| {
+                    if let SessionEvent::UserMessage { text: said, .. } = &mut logged.event {
+                        *said = text.into();
+                    }
+                    logged
+                })
+                .collect::<Vec<_>>()
+        };
+        manager
+            .append_events(&lead, &said("the lead asked about kiwi"))
+            .unwrap();
+
+        let child = storage_id("lead/scout");
+        assert_eq!(child, "lead~scout");
+        let child_lease = manager.acquire_lease(&child).unwrap();
+        let mut header = SessionHeader::new("lead/scout");
+        header.parent = Some("lead".into());
+        let mut child_meta = meta(&child);
+        child_meta.parent = Some("lead".into());
+        manager
+            .create_event_session(&child_lease, &header, &child_meta)
+            .unwrap();
+        manager
+            .append_events(&child_lease, &said("the scout looked for kiwi"))
+            .unwrap();
+        assert_eq!(manager.read_event_header(&child).unwrap().id, "lead/scout");
+
+        let ids = |metas: Vec<SessionMeta>| metas.into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(manager.list()), ["lead"]);
+        assert_eq!(ids(manager.children("lead")), ["lead~scout"]);
+        assert_eq!(
+            SessionManager::scan_catalog(dir.path())
+                .entries
+                .into_iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            ["lead"],
+            "no catalog offers it"
+        );
+        let found = crate::session::RecallTool::new()
+            .search_dir(manager.root(), "kiwi", None, None, 8)
+            .unwrap();
+        assert!(
+            found.contains("the lead asked") && !found.contains("the scout looked"),
+            "{found}"
+        );
+        assert!(
+            matches!(
+                manager.open_for_resume(&child_lease),
+                Err(SessionStoreError::InvalidId { .. })
+            ),
+            "it is not opened on its own"
+        );
+
+        drop(child_lease);
+        manager.delete(&lead).unwrap();
+        assert!(!manager.is_event_session(&child), "it went with its parent");
     }
 
     fn a_turn() -> Vec<LoggedEvent> {
