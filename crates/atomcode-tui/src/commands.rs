@@ -419,11 +419,33 @@ impl CommandSet for SessionCommands {
                     })
                     .max()
                     .unwrap_or(0);
-                Outcome::Said(format!(
+                let mut said = format!(
                     "{turn} 轮 · {} 条模型可见消息 · {} 条事实",
                     derive_messages(&events).len(),
                     events.len()
-                ))
+                );
+                // What the screen counted is not the budget: the host packs a
+                // system prompt, instructions and tool definitions nobody here
+                // ever saw. Ask it, and say both — the counts answer "what is
+                // in this conversation", the budget answers "how much room is
+                // left", and a person asking `/context` wants the second.
+                if let Some(control) = control {
+                    if let Ok(HostReply::Context {
+                        window,
+                        used,
+                        model,
+                        ..
+                    }) = control.call(HostCommand::Context { session: root }).await
+                    {
+                        if window > 0 {
+                            said.push_str(&format!(
+                                "\n{used} / {window} tokens · {:.0}% · {model}",
+                                used as f32 / window as f32 * 100.0
+                            ));
+                        }
+                    }
+                }
+                Outcome::Said(said)
             }
             "transcript" => {
                 let text = derive_messages(&client.events())
@@ -1789,6 +1811,73 @@ mod tests {
             ]
         );
     }
+    /// `/context` says both numbers, because they answer different questions.
+    ///
+    /// What the screen can count is what it was shown. The budget is the host's
+    /// — it packs a system prompt, instructions and tool definitions that never
+    /// reach a front end — so a `/context` that only counted would be reporting
+    /// the smaller half of the answer and calling it the answer.
+    #[tokio::test]
+    async fn context_says_what_is_in_the_conversation_and_how_much_room_is_left() {
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Context {
+                window: 200_000,
+                used: 50_000,
+                model: "glm-5".into(),
+                working_dir: "/w".into(),
+            }));
+        let (app, _client, all) = following(&host);
+
+        match all.dispatch("/context", &app.context()).await {
+            Outcome::Said(text) => {
+                assert!(text.contains("条事实"), "the counted half: {text}");
+                assert!(text.contains("50000 / 200000"), "the budget half: {text}");
+                assert!(text.contains("25%"), "and how full that is: {text}");
+                assert!(
+                    text.contains("glm-5"),
+                    "a window belongs to a model: {text}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            *host.asked.lock().unwrap(),
+            vec![HostCommand::Context {
+                session: "lead".into()
+            }]
+        );
+    }
+
+    /// A host that cannot say what the window is says nothing rather than
+    /// `0 / 0`, and the counted half still reaches the person.
+    #[tokio::test]
+    async fn context_without_a_known_window_still_says_what_it_knows() {
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::Context {
+                window: 0,
+                used: 0,
+                model: String::new(),
+                working_dir: "/w".into(),
+            }));
+        let (app, _client, all) = following(&host);
+        match all.dispatch("/context", &app.context()).await {
+            Outcome::Said(text) => {
+                assert!(text.contains("条事实"), "{text}");
+                assert!(
+                    !text.contains("0 / 0"),
+                    "a window nobody knows is not a number: {text}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// `/usage` answers what `/cost` cannot: not what this conversation spent,
     /// but what the account may still do and when a spent window comes back.
     ///

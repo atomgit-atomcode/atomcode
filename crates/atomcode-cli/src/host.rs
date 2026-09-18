@@ -965,6 +965,16 @@ impl HostControl for RuntimeControl {
                     .or_else(|| now.looping.map(running_of_loop));
                 Ok(HostReply::Autonomy { running })
             }
+            HostCommand::Context { session } => {
+                self.addressed(&session)?;
+                let now = self.handle.context_stats().await.map_err(refused)?;
+                Ok(HostReply::Context {
+                    window: now.context_window,
+                    used: now.used_tokens,
+                    model: now.model,
+                    working_dir: now.working_dir.display().to_string(),
+                })
+            }
             // Best-effort by contract: a host that meters nothing, and a source
             // that is slow or down, both answer with an empty list. "I could not
             // reach the meter" and "there is no meter" look the same to a person

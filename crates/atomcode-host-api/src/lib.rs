@@ -136,6 +136,14 @@ pub enum HostCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         file: Option<String>,
     },
+    /// How much of the model's context this session is using.
+    ///
+    /// The budget, not the bill: [`HostCommand::Usage`] says what the account
+    /// may still do, this says how close this conversation is to the window it
+    /// has to fit in. A front end that could not ask this could only count what
+    /// it had seen, which is not the same number — the host packs a system
+    /// prompt, instructions and tool definitions the screen never sees.
+    Context { session: String },
     /// What the account has left to spend, as rolling windows.
     ///
     /// Separate from the token counts a turn reports: those say what this
@@ -180,6 +188,7 @@ impl HostCommand {
             | Self::Changes { session, .. }
             | Self::Providers { session }
             | Self::Autonomy { session }
+            | Self::Context { session }
             | Self::Usage { session }
             | Self::Thinking { session }
             | Self::SetThinking { session, .. } => Some(session),
@@ -240,6 +249,20 @@ pub enum HostReply {
     /// What the session is doing on its own, if anything. `None` is idle.
     Autonomy {
         running: Option<Running>,
+    },
+    /// How much of the window this session occupies.
+    Context {
+        /// Tokens the model may take in one request, as the host resolves it
+        /// for the model in use. `0` when the host does not know.
+        window: u32,
+        /// Tokens this session would send now.
+        used: u32,
+        /// The model the window belongs to — the two travel together because a
+        /// window without its model is a number a person cannot act on.
+        model: String,
+        /// Where the session works. Part of the same answer because "what am I
+        /// carrying" and "what am I carrying it over" are asked together.
+        working_dir: String,
     },
     /// What the account has left, window by window. Empty for a host that
     /// meters nothing.
@@ -639,6 +662,9 @@ mod tests {
             HostCommand::Usage {
                 session: "a".into(),
             },
+            HostCommand::Context {
+                session: "a".into(),
+            },
             HostCommand::Rename {
                 session: "a".into(),
                 title: "配置重构".into(),
@@ -699,6 +725,7 @@ mod tests {
                 | HostCommand::ChangeDirectory { .. }
                 | HostCommand::Models { .. }
                 | HostCommand::Usage { .. }
+                | HostCommand::Context { .. }
                 | HostCommand::Rename { .. }
                 | HostCommand::McpStatus { .. }
                 | HostCommand::McpTools { .. }
@@ -830,6 +857,12 @@ mod tests {
                 who: Some("lichao".into()),
                 detail: Some("atomgit".into()),
             },
+            HostReply::Context {
+                window: 200_000,
+                used: 48_000,
+                model: "glm-5".into(),
+                working_dir: "/w".into(),
+            },
             HostReply::Usage {
                 windows: vec![UsageWindow {
                     label: "5 小时".into(),
@@ -855,6 +888,7 @@ mod tests {
                 | HostReply::Providers { .. }
                 | HostReply::Autonomy { .. }
                 | HostReply::Usage { .. }
+                | HostReply::Context { .. }
                 | HostReply::Identity { .. } => {}
             }
         }

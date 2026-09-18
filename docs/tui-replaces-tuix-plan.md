@@ -293,7 +293,12 @@ tuix 的老毛病——现在改是十几行,等下游移植完再改就是他�
   `/status`,我写成了精确匹配
 - ⬜ ACP 拿 `HostConnection`
 - ⬜ `turn.rs` 换流(7 处 4 种事件;`translate()` 已经把这 4 种映射好了,是换流不是重写)
-- ⬜ 7 个方法换契约(12 + 3 处),`context_stats` 那 1 处契约里仍然没有对应项
+- ✅ **`context_stats` 的契约缺口补上了**:`HostCommand::Context` /
+  `HostReply::Context { window, used, model, working_dir }`。这是 6.3 里最后一个
+  "契约里没有对应项",补掉之后剩下的三步是纯机械搬运。顺带 tui 的 `/context` 第一次
+  能说出预算 —— 它以前只能数自己看见的,而宿主还打包了系统提示、instructions 与工具
+  定义,屏幕一条都没见过
+- ⬜ 7 个方法换契约(12 + 3 处)
 
 #### 6.5 测绘(2026-09-18)：今天能删的只有一半,另一半卡在 6.3/6.4 后面
 
