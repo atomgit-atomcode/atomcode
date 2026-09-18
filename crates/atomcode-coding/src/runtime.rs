@@ -7886,6 +7886,9 @@ fn harness_host_state(
         )),
     );
     Ok(crate::on_harness::HostState {
+        // None: this runtime mounts the product's own rows and nothing else.
+        // The field is for a host outside this workspace that brings its own.
+        plugins: Vec::new(),
         session_context: Some(crate::on_harness::HostContext {
             hook: Arc::new(atomcode_capabilities::session::SessionContextHook::new(
                 &config.working_dir,

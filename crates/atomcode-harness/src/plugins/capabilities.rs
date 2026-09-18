@@ -506,6 +506,15 @@ struct MemoryRow {
     /// run that must not depend on someone's notes) still wants the first.
     #[serde(default = "yes")]
     inject: bool,
+    /// The global tier's file. Defaults to `$ATOMCODE_HOME/memory.md`.
+    ///
+    /// A file rather than a home directory, and deliberately not called `home`:
+    /// the `skills` row's `home` is the person's `$HOME`, while this file lives
+    /// under AtomCode's own home. One word meaning two directories in two rows is
+    /// how a product built on the harness ends up with its users' memory in the
+    /// wrong place.
+    #[serde(default)]
+    global: Option<String>,
 }
 
 impl Default for MemoryRow {
@@ -513,6 +522,7 @@ impl Default for MemoryRow {
         Self {
             project_root: None,
             inject: true,
+            global: None,
         }
     }
 }
@@ -606,6 +616,14 @@ struct MemoryCommand {
     summary: &'static str,
     action: &'static str,
     project: PathBuf,
+    /// The global tier's file, as the row resolved it.
+    ///
+    /// Carried rather than looked up, for the same reason the tool takes one: a
+    /// product that keeps its users' memory outside `$ATOMCODE_HOME` names the
+    /// file on the row, and a command that went back to `MemoryStore::global()`
+    /// would write somewhere else than the tool the model uses — the two doors
+    /// onto one memory disagreeing about where it is.
+    global: PathBuf,
 }
 
 #[async_trait]
@@ -627,9 +645,19 @@ impl crate::commands::CatalogCommand for MemoryCommand {
         }
         let mut call = serde_json::json!({ "action": self.action });
         if !content.is_empty() {
-            call["content"] = serde_json::Value::String(content.to_string());
+            // Under the name this action reads it by. `forget` takes a
+            // `keyword` and `remember` a `content`, and sending one as the
+            // other is refused by the tool — which is what `/forget` did from
+            // the day it was added until a criterion ran it
+            // (`a_product_can_keep_its_users_state_out_of_the_atomcode_home`).
+            let key = if self.action == "forget" {
+                "keyword"
+            } else {
+                "content"
+            };
+            call[key] = serde_json::Value::String(content.to_string());
         }
-        let result = atomcode_capabilities::tools::MemoryTool
+        let result = atomcode_capabilities::tools::MemoryTool::with_global(self.global.clone())
             .execute(
                 &call.to_string(),
                 &ToolContext {
@@ -680,8 +708,14 @@ impl Plugin for MemoryPlugin {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "project".into());
+        // Resolved once, and handed to both halves: the injection that reads the
+        // global tier and the tool that writes it must agree on which file it is.
+        let global = row
+            .global
+            .map(PathBuf::from)
+            .unwrap_or_else(|| MemoryStore::global().path().to_path_buf());
         let merged = MemoryStore::merged_for_prompt(
-            &MemoryStore::global(),
+            &MemoryStore::new(global.clone()),
             &MemoryStore::project(&project),
             &MemoryStore::local(&project),
             &project_name,
@@ -691,7 +725,9 @@ impl Plugin for MemoryPlugin {
         // a human could carry out — in a system whose whole point is that the
         // agent carries things out.
         if let Some(toolbox) = ctx.service::<crate::seams::ToolsSvc>() {
-            toolbox.register(Arc::new(atomcode_capabilities::tools::MemoryTool))?;
+            toolbox.register(Arc::new(
+                atomcode_capabilities::tools::MemoryTool::with_global(global.clone()),
+            ))?;
             let toolbox = toolbox.clone();
             let _ = ctx.effect(move || toolbox.unregister("memory"));
         }
@@ -708,6 +744,7 @@ impl Plugin for MemoryPlugin {
                 summary: "存下来的那些话",
                 action: "list",
                 project: project.clone(),
+                global: global.clone(),
             }) as Arc<dyn crate::commands::CatalogCommand>,
             Arc::new(MemoryCommand {
                 name: "remember",
@@ -715,6 +752,7 @@ impl Plugin for MemoryPlugin {
                 summary: "记住一句话,以后每个会话都带着",
                 action: "remember",
                 project: project.clone(),
+                global: global.clone(),
             }),
             Arc::new(MemoryCommand {
                 name: "forget",
@@ -722,6 +760,7 @@ impl Plugin for MemoryPlugin {
                 summary: "把记住的某句话删掉",
                 action: "forget",
                 project: project.clone(),
+                global: global.clone(),
             }),
         ] {
             crate::commands::register(ctx, command)?;
@@ -740,7 +779,7 @@ impl Plugin for MemoryPlugin {
                  `{{action: remember|forget|list, content, scope: project|local|global}}`. \
                  Memory is what someone chose to state; for everything that was \
                  merely *said*, use `recall` instead.",
-                MemoryStore::global().path().display(),
+                global.display(),
                 MemoryStore::project(&project).path().display(),
                 MemoryStore::local(&project).path().display(),
             ),

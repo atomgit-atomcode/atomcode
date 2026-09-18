@@ -1135,7 +1135,33 @@ pub async fn deactivate_provider(app: &mut App, slots: &ProviderSlots) -> Result
 }
 
 /// Hands the tree whichever provider its config names.
-struct InjectProvider(Arc<ProviderSlots>);
+/// The row that serves a provider the host already built, by id.
+///
+/// Public for a host composing its own tree — its own front end, its own layer
+/// order — that still builds the provider itself, because building one takes
+/// credentials, gateway signing and subagent tiers a tree must not handle.
+/// Register one per [`ProviderSlots`] table and lay [`provider_layer`]; from
+/// then on [`swap_provider`] and [`deactivate_provider`] work on that tree as
+/// they do on a mounted one, provided coding's `persona-atomcode` and
+/// `tool-code-review` rows are in it (disabled is fine) — a swap re-points those
+/// two as well, and a patch cannot address a row no layer inserted.
+pub struct InjectProvider(Arc<ProviderSlots>);
+
+impl InjectProvider {
+    pub fn new(slots: Arc<ProviderSlots>) -> Self {
+        Self(slots)
+    }
+}
+
+/// The layer that puts [`InjectProvider`] behind the `llm` seam, serving
+/// `provider_id`. What [`mount_hosted`] lays for itself, for a host laying its
+/// own.
+pub fn provider_layer(provider_id: &str) -> Result<Layer, String> {
+    Layer::new()
+        .swap("llm", "llm-injected")
+        .patch("llm", LlmInjectedRow { provider_id })
+        .map_err(|e| e.to_string())
+}
 
 #[derive(serde::Deserialize)]
 struct LlmRow {
@@ -1312,6 +1338,20 @@ pub struct HostState {
     pub rate_limit_source: Option<Arc<dyn crate::rate_limit::RateLimitWindowSource>>,
     /// The settings file this runtime was configured from, when it was.
     pub config_file: Option<std::path::PathBuf>,
+    /// Rows the host wrote, registered alongside coding's own.
+    ///
+    /// What `extra_layers` may name. Without this a host could reorder, patch
+    /// and disable coding's rows but never add one of its own: a layer naming a
+    /// plugin nobody registered fails to mount, and the registry is built in
+    /// here, out of the caller's reach. That was the whole of what kept this
+    /// entry closed to a product outside this workspace.
+    ///
+    /// A name already taken — by the harness's catalog, by [`plugins`], or by
+    /// the rows above — is refused rather than registered. Replacing one of
+    /// coding's rows is a patch pointing that row at a differently named plugin
+    /// (`[[patch]]` `id = "persona-atomcode"` `name = "my-persona"`), which keeps
+    /// the row's id, its place in the tree, and every patch aimed at it.
+    pub plugins: Vec<Arc<dyn atomcode_plexus::Plugin>>,
     /// `[web_search] api_key`. Handed to `tool-web` as a plugin instance, never
     /// as row config — a config tree is printed verbatim, a credential must not be.
     pub web_search_api_key: Option<String>,
@@ -1336,6 +1376,19 @@ pub struct HostModes {
     pub plan_mcp_grants: Arc<dyn atomcode_capabilities::tools::PermissionStore>,
     /// Every other "always allow", in the store the approval seam remembers into.
     pub approval_grants: Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+}
+
+impl HostState {
+    /// What a host outside this workspace fills: the rows it wrote, and nothing
+    /// else. The other fields are this runtime's own wiring — its session store,
+    /// its MCP publication, the switches `set_mode` writes — and three of them
+    /// are crate-private, so `..Default::default()` is not available out there.
+    pub fn with_plugins(plugins: Vec<Arc<dyn atomcode_plexus::Plugin>>) -> Self {
+        Self {
+            plugins,
+            ..Default::default()
+        }
+    }
 }
 
 /// As [`mount_swappable`], carrying the runtime's own state into the tree.
@@ -1589,6 +1642,16 @@ pub async fn mount_hosted(
             host,
             slots: providers.clone(),
         }))));
+    }
+    for plugin in host.plugins {
+        let name = plugin.name();
+        if registry.get(name).is_some() {
+            return Err(format!(
+                "plugin `{name}` is already in the coding catalog; to replace that row, patch \
+                 it to a plugin with a different name rather than registering a second `{name}`"
+            ));
+        }
+        registry.register(plugin);
     }
 
     let mut app = App::new(registry, tree);

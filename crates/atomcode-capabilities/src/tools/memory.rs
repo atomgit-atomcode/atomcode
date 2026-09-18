@@ -1,6 +1,7 @@
 //! `memory` — let the model persist a durable, non-obvious learning to memory.md so
 //! future sessions remember it. Reuses the same store the user's /remember writes to
-//! (`.atomcode/memory.md` per project, `$ATOMCODE_HOME/memory.md` global). Injection is
+//! (`.atomcode/memory.md` per project, `$ATOMCODE_HOME/memory.md` global unless
+//! the host names another file with [`MemoryTool::with_global`]). Injection is
 //! handled separately by `MemoryHook` at session start; this tool only writes.
 
 use super::{err, ok};
@@ -9,7 +10,7 @@ use async_trait::async_trait;
 use atomcode_kernel::tool::{RiskLevel, Tool, ToolContext, ToolResult};
 use serde::Deserialize;
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const MEMORY_DESC: &str = "Persist a durable, non-obvious learning about the user or THIS \
 project so future sessions remember it. Use `action:\"remember\"` when the user states a \
@@ -19,7 +20,13 @@ project convention/quirk. Use `action:\"forget\"` to drop entries matching a key
 tool/language behavior, anything already in AGENTS.md/.atomcode.md, verbose explanations, \
 or session-specific one-offs. Keep each entry to one concise line.";
 
-pub struct MemoryTool;
+/// Where the global tier lives is the tool's to know, not the store's to look up:
+/// a host that keeps its users' state out of `$ATOMCODE_HOME` has to be able to
+/// say so to the one thing that writes there.
+#[derive(Default)]
+pub struct MemoryTool {
+    global: Option<PathBuf>,
+}
 
 #[derive(Deserialize)]
 struct Args {
@@ -33,9 +40,28 @@ struct Args {
 }
 
 impl MemoryTool {
-    fn store(scope: &str, cwd: &Path) -> MemoryStore {
+    /// The global tier at `$ATOMCODE_HOME/memory.md`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The global tier at `path` — the file itself, not a directory.
+    pub fn with_global(path: impl Into<PathBuf>) -> Self {
+        Self {
+            global: Some(path.into()),
+        }
+    }
+
+    fn global(&self) -> MemoryStore {
+        match &self.global {
+            Some(path) => MemoryStore::new(path.clone()),
+            None => MemoryStore::global(),
+        }
+    }
+
+    fn store(&self, scope: &str, cwd: &Path) -> MemoryStore {
         match scope {
-            "global" => MemoryStore::global(),
+            "global" => self.global(),
             "local" => MemoryStore::local(cwd),
             _ => MemoryStore::project(cwd),
         }
@@ -106,7 +132,7 @@ impl Tool for MemoryTool {
                     Some(c) => c,
                     None => return err("memory: action=remember requires a non-empty `content`."),
                 };
-                match Self::store(scope, &ctx.working_dir).append_deduped(content) {
+                match self.store(scope, &ctx.working_dir).append_deduped(content) {
                     Ok(true) => ok(format!("📝 remembered ({scope}): {content}")),
                     Ok(false) => ok(format!("already remembered ({scope}), skipped: {content}")),
                     Err(e) => err(format!("memory: failed to write: {e}")),
@@ -134,11 +160,7 @@ impl Tool for MemoryTool {
                         .remove_matching(keyword)
                         .unwrap_or_default(),
                 );
-                removed.extend(
-                    MemoryStore::global()
-                        .remove_matching(keyword)
-                        .unwrap_or_default(),
-                );
+                removed.extend(self.global().remove_matching(keyword).unwrap_or_default());
                 if removed.is_empty() {
                     ok(format!("no memory entries matched '{keyword}'."))
                 } else {
@@ -150,7 +172,7 @@ impl Tool for MemoryTool {
                 }
             }
             "list" => {
-                let g = MemoryStore::global();
+                let g = self.global();
                 let p = MemoryStore::project(&ctx.working_dir);
                 let l = MemoryStore::local(&ctx.working_dir);
                 let name = ctx
@@ -190,7 +212,7 @@ mod tests {
     #[tokio::test]
     async fn remember_writes_local_scope_entry() {
         let tmp = tempfile::tempdir().unwrap();
-        let r = MemoryTool
+        let r = MemoryTool::new()
             .execute(
                 r#"{"action":"remember","content":"node at /opt/homebrew/bin/node","scope":"local"}"#,
                 &ctx(tmp.path()),
@@ -210,13 +232,13 @@ mod tests {
     #[tokio::test]
     async fn forget_scan_removes_local_entry_without_scope() {
         let tmp = tempfile::tempdir().unwrap();
-        MemoryTool
+        MemoryTool::new()
             .execute(
                 r#"{"action":"remember","content":"local-only fact lq1","scope":"local"}"#,
                 &ctx(tmp.path()),
             )
             .await;
-        let r = MemoryTool
+        let r = MemoryTool::new()
             .execute(r#"{"action":"forget","keyword":"lq1"}"#, &ctx(tmp.path()))
             .await;
         assert!(!r.is_error, "{}", r.content);
@@ -231,13 +253,13 @@ mod tests {
     #[tokio::test]
     async fn list_includes_local_section() {
         let tmp = tempfile::tempdir().unwrap();
-        MemoryTool
+        MemoryTool::new()
             .execute(
                 r#"{"action":"remember","content":"l1 local marker","scope":"local"}"#,
                 &ctx(tmp.path()),
             )
             .await;
-        let r = MemoryTool
+        let r = MemoryTool::new()
             .execute(r#"{"action":"list"}"#, &ctx(tmp.path()))
             .await;
         assert!(!r.is_error);
@@ -247,7 +269,7 @@ mod tests {
     #[tokio::test]
     async fn remember_writes_project_entry() {
         let tmp = tempfile::tempdir().unwrap();
-        let r = MemoryTool
+        let r = MemoryTool::new()
             .execute(
                 r#"{"action":"remember","content":"uses tabs"}"#,
                 &ctx(tmp.path()),
@@ -263,10 +285,10 @@ mod tests {
     #[tokio::test]
     async fn remember_dedup_reports_skip() {
         let tmp = tempfile::tempdir().unwrap();
-        MemoryTool
+        MemoryTool::new()
             .execute(r#"{"action":"remember","content":"x"}"#, &ctx(tmp.path()))
             .await;
-        let r = MemoryTool
+        let r = MemoryTool::new()
             .execute(r#"{"action":"remember","content":"x"}"#, &ctx(tmp.path()))
             .await;
         assert!(!r.is_error);
@@ -276,7 +298,7 @@ mod tests {
     #[tokio::test]
     async fn remember_missing_content_errors_not_panics() {
         let tmp = tempfile::tempdir().unwrap();
-        let r = MemoryTool
+        let r = MemoryTool::new()
             .execute(r#"{"action":"remember"}"#, &ctx(tmp.path()))
             .await;
         assert!(r.is_error);
@@ -285,13 +307,13 @@ mod tests {
     #[tokio::test]
     async fn forget_removes_matching() {
         let tmp = tempfile::tempdir().unwrap();
-        MemoryTool
+        MemoryTool::new()
             .execute(
                 r#"{"action":"remember","content":"delete me please"}"#,
                 &ctx(tmp.path()),
             )
             .await;
-        let r = MemoryTool
+        let r = MemoryTool::new()
             .execute(
                 r#"{"action":"forget","keyword":"delete me"}"#,
                 &ctx(tmp.path()),
@@ -309,19 +331,19 @@ mod tests {
         // with the `/forget` command, which scans both stores. Unique keywords avoid
         // colliding with the process-shared (isolated-home) global store.
         let tmp = tempfile::tempdir().unwrap();
-        MemoryTool
+        MemoryTool::new()
             .execute(
                 r#"{"action":"remember","content":"projq7x1 marker"}"#,
                 &ctx(tmp.path()),
             )
             .await;
-        MemoryTool
+        MemoryTool::new()
             .execute(
                 r#"{"action":"remember","content":"globq7x2 marker","scope":"global"}"#,
                 &ctx(tmp.path()),
             )
             .await;
-        let r = MemoryTool
+        let r = MemoryTool::new()
             .execute(r#"{"action":"forget","keyword":"q7x"}"#, &ctx(tmp.path()))
             .await;
         assert!(!r.is_error);
@@ -336,22 +358,76 @@ mod tests {
         );
     }
 
+    /// All three actions reach the global tier through the path the tool was
+    /// given — `remember` alone is not enough, a `forget` or `list` that still
+    /// read `$ATOMCODE_HOME` would leave the host's users with two global
+    /// memories and no way to tell which one the model sees.
+    #[tokio::test]
+    async fn a_global_path_given_to_the_tool_is_the_only_global_tier_it_touches() {
+        let project = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let global = state.path().join("memory.md");
+        let tool = MemoryTool::with_global(&global);
+
+        let r = tool
+            .execute(
+                r#"{"action":"remember","content":"hostg4k1 marker","scope":"global"}"#,
+                &ctx(project.path()),
+            )
+            .await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(
+            crate::memory::MemoryStore::new(global.clone())
+                .load()
+                .iter()
+                .any(|e| e == "hostg4k1 marker"),
+            "remember must write the given file"
+        );
+        assert!(
+            crate::memory::MemoryStore::global()
+                .find_matching("hostg4k1")
+                .is_empty(),
+            "remember must not also write $ATOMCODE_HOME"
+        );
+
+        let listed = tool
+            .execute(r#"{"action":"list"}"#, &ctx(project.path()))
+            .await;
+        assert!(
+            listed.content.contains("hostg4k1 marker"),
+            "list must read the given file: {}",
+            listed.content
+        );
+
+        tool.execute(
+            r#"{"action":"forget","keyword":"hostg4k1"}"#,
+            &ctx(project.path()),
+        )
+        .await;
+        assert!(
+            crate::memory::MemoryStore::new(global)
+                .find_matching("hostg4k1")
+                .is_empty(),
+            "forget must remove from the given file"
+        );
+    }
+
     #[test]
     fn risk_is_safe_by_default_and_risky_under_approval_env() {
         // 默认 Safe
         std::env::remove_var("ATOMCODE_MEMORY_APPROVAL");
         assert!(matches!(
-            MemoryTool.risk(r#"{"action":"remember","content":"x"}"#),
+            MemoryTool::new().risk(r#"{"action":"remember","content":"x"}"#),
             RiskLevel::Safe
         ));
         // 开审批 → remember Risky, list 仍 Safe
         std::env::set_var("ATOMCODE_MEMORY_APPROVAL", "1");
         assert!(matches!(
-            MemoryTool.risk(r#"{"action":"remember","content":"x"}"#),
+            MemoryTool::new().risk(r#"{"action":"remember","content":"x"}"#),
             RiskLevel::Risky
         ));
         assert!(matches!(
-            MemoryTool.risk(r#"{"action":"list"}"#),
+            MemoryTool::new().risk(r#"{"action":"list"}"#),
             RiskLevel::Safe
         ));
         std::env::remove_var("ATOMCODE_MEMORY_APPROVAL");
