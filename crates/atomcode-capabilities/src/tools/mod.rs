@@ -127,10 +127,12 @@ pub use repair::{repair_tool_args, RepairToolArgsMiddleware};
 pub use report_finding::{Finding, ReportFindingTool};
 pub use search_replace::SearchReplaceTool;
 pub use sensitive_path::{path_is_sensitive, references_sensitive_path, SensitivePathGate};
-pub use task::{
-    delegated_write_violation, subagent_child_middlewares, subagent_child_middlewares_for_policy,
-    team_child_middlewares, team_child_middlewares_for_policy, TaskTool,
-};
+// What is left of `task`: the scope gate the harness's `DelegationBoundsPlugin`
+// puts around a delegated child, and nothing else. The tool itself, its child
+// runner and its middlewares had no production caller — the agent that runs
+// today mounts the harness's own `subagent-in-process` row, which carries its
+// own `task` tool (`harness/src/plugins/subagent.rs`).
+pub use task::delegated_write_violation;
 pub use todo::TodoTool;
 #[cfg(feature = "web")]
 pub use web_fetch::WebFetchTool;

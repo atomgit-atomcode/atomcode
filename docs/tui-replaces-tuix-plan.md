@@ -281,6 +281,28 @@ tuix 的老毛病——现在改是十几行,等下游移植完再改就是他�
 **顺序**：ACP 先拿 `HostConnection`(`connect()` 已在 cli 里，和 tui 用的是同一个)→
 `turn.rs` 换流 → 7 个方法换契约 → `commands.rs` 改从目录投影、删 tuix 那一行。
 
+#### 6.5 测绘(2026-09-18)：今天能删的只有一半,另一半卡在 6.3/6.4 后面
+
+三块逐个追了构造点(不是按名字匹配),结论:
+
+| 块 | 规模 | 生产调用方 | 判定 |
+|---|---|---|---|
+| **runtime 驱动协议** | `coding/src/runtime.rs` 17,529 行(协议面 ~1,650) | **~440 处**:cli(含 `host.rs` adapter 与 `main.rs:3023/3025`)、acp(6 文件)、daemon(~170)、clix(20)、tuix(~240) | **仍被挂载**。`atomcode --tui` 今天也是经 `cli/src/host.rs` 坐在它上面 —— `tui/tests/guards.rs:101` 那道守卫只保证 tui **crate 内**不出现这三个名字,证明不了协议不可达 |
+| `coding/src/team/runner.rs` + `tool.rs` | 919 | **0** —— `TeamTool::new` / `TeamRunnerFactory::new` 只在各自 `cfg(test)` 与 `tests/team_runtime.rs`;`parts.rs:646` 写死 `None`,而那个字段除结构体初始化外无人读 | **已删** |
+| `manager.rs` 的 run-store 半边 | ~400 | 0(`store.runs` 只由 `delegate` 填,`delegate` 无生产调用方 ⇒ 生产下 store 恒空) | **不单独删**。`stop_all` 还有 3 处调用且读这个 store,摘它要连带拆 `quiesce_current_agent` / `stop_current_agent` 的 `team_manager` 参数 —— 为 400 行去动回合循环,不划算。随 6.4 整块走 |
+| `manager.rs` 的事件中继半边 + `team_progress.rs` | ~320 | `parts.rs:633` + runtime.rs 21 处 | **仍被挂载**:唯一目的是喂 tuix 的 team 面板,随 6.4 走 |
+| `capabilities/tools/task.rs` 的委派部分 | ~2,590(含测试) | **0** —— `TaskTool::new` 全部构造点都在 `:1762` 之后的 `cfg(test)` 里;产品挂的是 harness 自己的同名私有工具(`plugins/subagent.rs:458`,经 `subagent-in-process` 挂上) | **已删**,文件 3,190 → 597 |
+| `task.rs` 的 `WorkerScopeGate` + `delegated_write_violation` + 路径 helper | ~290 | `harness/src/plugins/policy.rs:450`(`DelegationBoundsPlugin`) | **必留** |
+
+顺带发现:`SUBAGENT_ACTIVITY_MARKER` 留着(tuix 在 strip 它),但**发它的两处都在已删的委派里**,
+所以 tuix 那两处 `strip_prefix` 今天已经匹配不到 subagent 活动了 —— 它还能匹配
+`review_tool.rs:50` 发的同一个字符,所以前端那段代码本身不算死。
+
+Cargo 影响:无 feature / profile 牵连。唯一陈旧的是
+`capabilities/Cargo.toml:35-37` 那条注释——它用"`task` 工具的 `CancellationToken`"
+论证 `tokio-util`,现在理由不成立了,但**依赖必须留**(`mcp/transport_stdio.rs:16`、
+`codeintel/lsp_tool.rs:262` 都是生产用户)。
+
 ### 后续(不挡替换)
 
 - **换会话不重建 App**:每会话状态下沉到 realm——provider 的 session 绑定、hooks、按目录

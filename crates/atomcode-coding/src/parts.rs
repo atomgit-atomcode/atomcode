@@ -440,7 +440,6 @@ pub struct CodingParts {
     side_provider: SharedReviewProvider,
     /// Child-agent assembly prepared from the same live tier-provider cells and
     /// execution policy as `task`. The `team` tool is mounted in the next phase.
-    pub team_runner: Option<crate::team::TeamRunnerFactory>,
     /// Runtime-owned Team Agent orchestration. The manager is shared with the
     /// mounted tool, while lifecycle termination is driven only by CodingRuntime.
     pub team_manager: crate::team::TeamRunManager,
@@ -643,7 +642,6 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         subagents_enabled.then(|| Arc::new(std::sync::RwLock::new(None)) as SharedReviewProvider);
     let subagent_knobs =
         subagents_enabled.then_some((subagent_max_concurrent, subagent_max_rounds));
-    let team_runner: Option<crate::team::TeamRunnerFactory> = None;
 
     // Build the context hook once so skill-catalog ranking and later context
     // injection observe the exact same instruction-file precedence and bytes.
@@ -924,7 +922,6 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         review_provider,
         subagent_provider,
         side_provider: Arc::new(std::sync::RwLock::new(None)),
-        team_runner,
         team_manager,
         subagent_knobs,
         cc_external_hooks: cc_external,
