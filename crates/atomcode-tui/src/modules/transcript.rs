@@ -301,6 +301,62 @@ impl Producer for Transcript {
                 );
             }
 
+            // ---- things the harness did that change what the model sees -----
+            //
+            // All four are what `NoticeBlock` is for — "something the harness
+            // did that a person should know and the model must not" — and all
+            // four were in the log and off the screen
+            // (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md`
+            // A5, A6, A8, A9). A person reading a conversation where the middle
+            // silently left, or where a tool's output is not what the model was
+            // handed, needs it said.
+            SessionEvent::Compacted { through, .. } => {
+                out.emit(
+                    at,
+                    Arc::new(NoticeBlock {
+                        detail: format!("已把这里之前的对话压成一段摘要(到 #{through})"),
+                    }),
+                );
+            }
+            SessionEvent::MessagesRewritten { texts, .. } => {
+                out.emit(
+                    at,
+                    Arc::new(NoticeBlock {
+                        detail: format!(
+                            "模型看到的 {} 处工具输出被就地换短了;这里显示的仍是原文",
+                            texts.len()
+                        ),
+                    }),
+                );
+            }
+            SessionEvent::ToolResultsStubbed { through, .. } => {
+                out.emit(
+                    at,
+                    Arc::new(NoticeBlock {
+                        detail: format!("到 #{through} 为止的工具结果没有再发给模型"),
+                    }),
+                );
+            }
+            SessionEvent::RateLimitPaused { pause, .. } => {
+                let mut detail = format!("被限速,等到 {}", pause.reset_at_display);
+                if let Some(message) = &pause.server_message {
+                    detail.push_str(&format!(" · {message}"));
+                }
+                out.emit(at, Arc::new(NoticeBlock { detail }));
+            }
+            // A member of this session's team stopped for good
+            // (`docs/adr/0024` §13). The team panel says so while it is
+            // mounted; the conversation should say it too, because a lead whose
+            // member is gone is reading a conversation that will not continue.
+            SessionEvent::Stopped { .. } => {
+                out.emit(
+                    at,
+                    Arc::new(NoticeBlock {
+                        detail: "这个成员已经结束,不会再说话了".into(),
+                    }),
+                );
+            }
+
             SessionEvent::Injected { text, origin, .. } => {
                 out.emit(
                     at,
@@ -464,6 +520,116 @@ mod tests {
             t.absorb(&conformance::logged(i, f), &mut w);
         }
         s
+    }
+
+    /// Every line of every block, joined — for judging that something was said
+    /// at all, rather than where.
+    fn said(s: &Stream) -> String {
+        s.slots()
+            .iter()
+            .flat_map(|x| {
+                crate::block::Content::lines(
+                    &*x.block().content,
+                    &crate::block::RenderCtx::bare(80),
+                )
+            })
+            .map(|l| l.plain())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// What the harness did to what the model sees is on the screen too
+    /// (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` A5, A6,
+    /// A9): a conversation whose middle was compacted away, whose tool output
+    /// the model was handed shorter than it is here, or whose results stopped
+    /// being sent, reads as a conversation that makes no sense — unless it says
+    /// so.
+    #[test]
+    fn what_the_model_was_handed_instead_is_said_on_screen() {
+        use atomcode_harness::session::RewrittenText;
+        let s = fold(&[
+            SessionEvent::TurnStart { turn: 1 },
+            SessionEvent::Compacted {
+                turn: 1,
+                through: 7,
+                from: 1,
+                summary: "早先说过的事".into(),
+            },
+            SessionEvent::MessagesRewritten {
+                turn: 1,
+                texts: vec![
+                    RewrittenText {
+                        seq: 3,
+                        text: "…".into(),
+                    },
+                    RewrittenText {
+                        seq: 5,
+                        text: "…".into(),
+                    },
+                ],
+            },
+            SessionEvent::ToolResultsStubbed {
+                turn: 1,
+                through: 9,
+            },
+        ]);
+        let drawn = said(&s);
+        assert!(
+            drawn.contains("压成一段摘要") && drawn.contains("#7"),
+            "the compaction says how far it reached:\n{drawn}"
+        );
+        assert!(
+            drawn.contains("2 处工具输出被就地换短"),
+            "and how much the model was handed differently:\n{drawn}"
+        );
+        assert!(
+            drawn.contains("#9") && drawn.contains("没有再发给模型"),
+            "and where results stopped being sent:\n{drawn}"
+        );
+    }
+
+    /// A pause is on screen with the time it ends, because the screen is
+    /// otherwise a conversation that simply stopped (A6).
+    #[test]
+    fn being_rate_limited_says_so_and_says_until_when() {
+        use atomcode_harness::session::RateLimitPause;
+        let s = fold(&[
+            SessionEvent::TurnStart { turn: 1 },
+            SessionEvent::RateLimitPaused {
+                turn: 1,
+                pause: RateLimitPause {
+                    reset_at_display: "14:30".into(),
+                    reset_label: "14:30".into(),
+                    secs_until_reset: Some(600),
+                    server_message: Some("配额用完了".into()),
+                },
+            },
+        ]);
+        let drawn = said(&s);
+        assert!(
+            drawn.contains("被限速") && drawn.contains("14:30"),
+            "it says what happened and until when:\n{drawn}"
+        );
+        assert!(
+            drawn.contains("配额用完了"),
+            "and what the other end said about it:\n{drawn}"
+        );
+    }
+
+    /// A member that stopped for good says so in its own conversation (A8): the
+    /// team panel is a panel a screen may not have mounted, and the log is what
+    /// every screen reads.
+    #[test]
+    fn a_member_that_stopped_says_so_in_its_own_conversation() {
+        let s = fold(&[
+            SessionEvent::TurnStart { turn: 1 },
+            SessionEvent::Stopped { turn: 1 },
+        ]);
+        assert!(
+            said(&s).contains("已经结束"),
+            "the stop is on screen:\n{}",
+            said(&s)
+        );
     }
 
     fn kinds(s: &Stream) -> Vec<&'static str> {

@@ -141,11 +141,22 @@ const SESSION: &[Command] = &[
         "[回合 [对话|代码|全部]]",
         "回到某一回合之前:对话、工作区或两者;不带参数则挑一个",
     ),
-    Command::taking("model", "<模型 id>", "这个会话从现在起用哪个模型"),
+    Command::taking(
+        "model",
+        "[模型 id]",
+        "这个会话从现在起用哪个模型;不带 id 则挑一个",
+    ),
+    Command::taking("rename", "<名字>", "给这个会话改个名字"),
+    Command::taking(
+        "mode",
+        "[plan|ask|edits|auto]",
+        "改要不要问:plan 只看不动、ask 动手前问、edits 改文件不问、auto 全不问;不带参数则说现在是哪个",
+    ),
+    Command::taking("cd", "<目录>", "换到另一个目录干活;会开一条新会话"),
     Command::taking(
         "mcp",
-        "[withdraw]",
-        "MCP 服务器的状态;withdraw 立刻撤下全部 MCP 工具",
+        "[tools <服务器>|withdraw]",
+        "MCP 服务器的状态;tools 列某个服务器挂上来的工具;withdraw 立刻撤下全部 MCP 工具",
     ),
     Command::new("reload", "重新读取 skills、MCP 与配置,会话不变"),
     Command::new("logout", "把凭据拿出进程;会话留着"),
@@ -459,12 +470,44 @@ impl CommandSet for SessionCommands {
             }
             "model" => {
                 let wanted = args.trim();
+                // With no argument: the catalog, to pick from. It used to print
+                // the current model and stop, which left the id itself as
+                // something a person had to know by heart — the host has the
+                // catalog and now says so (`HostCommand::Models`).
                 if wanted.is_empty() {
-                    let current = client
-                        .described()
-                        .and_then(|d| d.model)
-                        .unwrap_or_else(|| "(未知)".into());
-                    return Outcome::Said(format!("当前模型:{current}"));
+                    let control = match host(control) {
+                        Ok(control) => control,
+                        Err(refused) => return refused,
+                    };
+                    return match control.call(HostCommand::Models { session: root }).await {
+                        Ok(HostReply::Models { models, current }) if models.is_empty() => {
+                            Outcome::Said(match current {
+                                Some(current) => format!("当前模型:{current};没有别的可选"),
+                                None => "没有配置可选的模型".into(),
+                            })
+                        }
+                        Ok(HostReply::Models { models, current }) => {
+                            let choices: Vec<crate::overlay::Choice> = models
+                                .into_iter()
+                                .map(|model| {
+                                    let here = current.as_deref() == Some(model.id.as_str());
+                                    crate::overlay::Choice::new(
+                                        format!("/model {}", model.id),
+                                        model.id.clone(),
+                                    )
+                                    .about(model.about)
+                                    .marked(here)
+                                })
+                                .collect();
+                            Outcome::Open(crate::overlay::Picker::new(
+                                "model",
+                                "换成哪个模型 · enter 换过去",
+                                choices,
+                            ))
+                        }
+                        Ok(other) => Outcome::Refused(format!("{other:?}")),
+                        Err(error) => Outcome::Refused(refusal(error)),
+                    };
                 }
                 let control = match host(control) {
                     Ok(control) => control,
@@ -478,6 +521,84 @@ impl CommandSet for SessionCommands {
                     .await
                 {
                     Ok(_) => Outcome::Said(format!("模型 → {wanted}")),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
+            "mode" => {
+                use atomcode_kernel::host::Mode;
+                let wanted = match args.trim() {
+                    "" => {
+                        return Outcome::Said(
+                            "plan 只看不动 · ask 动手前问 · edits 改文件不问 · auto 全不问".into(),
+                        )
+                    }
+                    "plan" => Mode::Plan,
+                    "ask" => Mode::Ask,
+                    "edits" | "accept-edits" => Mode::AcceptEdits,
+                    "auto" => Mode::Auto,
+                    other => {
+                        return Outcome::Refused(format!(
+                            "`{other}` 不是一档;可选:plan、ask、edits、auto"
+                        ))
+                    }
+                };
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refused) => return refused,
+                };
+                match control
+                    .call(HostCommand::SetMode {
+                        session: root,
+                        mode: wanted,
+                    })
+                    .await
+                {
+                    Ok(_) => Outcome::Said(format!("现在是 {}", args.trim())),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
+            "cd" => {
+                let directory = args.trim();
+                if directory.is_empty() {
+                    return Outcome::Refused("要一个目录:/cd <目录>".into());
+                }
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refused) => return refused,
+                };
+                match control
+                    .call(HostCommand::ChangeDirectory {
+                        session: root,
+                        directory: directory.to_string(),
+                    })
+                    .await
+                {
+                    // A new session: what was read and written belongs to where
+                    // it ran, so the screen follows the new stream.
+                    Ok(HostReply::SessionChanged { session }) => {
+                        Outcome::Said(format!("现在在 {directory} 里干活 · 新会话 {session}"))
+                    }
+                    Ok(_) => Outcome::Said(format!("现在在 {directory} 里干活")),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
+            "rename" => {
+                let title = args.trim();
+                if title.is_empty() {
+                    return Outcome::Refused("要一个名字:/rename <名字>".into());
+                }
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refused) => return refused,
+                };
+                match control
+                    .call(HostCommand::Rename {
+                        session: root,
+                        title: title.to_string(),
+                    })
+                    .await
+                {
+                    Ok(_) => Outcome::Said(format!("这个会话现在叫「{title}」")),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
@@ -519,9 +640,32 @@ impl CommandSet for SessionCommands {
                         Ok(_) => Outcome::Said("已撤下全部 MCP 工具".into()),
                         Err(error) => Outcome::Refused(refusal(error)),
                     },
-                    other => {
-                        Outcome::Refused(format!("`/mcp {other}` 不认识;可用:/mcp、/mcp withdraw"))
+                    // `tools <server>`: which tools that server actually put on
+                    // the model. The status line says a server is connected;
+                    // this says what came of it.
+                    rest if rest.starts_with("tools") => {
+                        let server = rest.trim_start_matches("tools").trim();
+                        if server.is_empty() {
+                            return Outcome::Refused("要一个服务器名:/mcp tools <服务器>".into());
+                        }
+                        match control
+                            .call(HostCommand::McpTools {
+                                session: root,
+                                server: server.to_string(),
+                            })
+                            .await
+                        {
+                            Ok(HostReply::McpTools { tools }) if tools.is_empty() => {
+                                Outcome::Said(format!("{server} 没有挂上任何工具"))
+                            }
+                            Ok(HostReply::McpTools { tools }) => Outcome::Said(tools.join("\n")),
+                            Ok(other) => Outcome::Refused(format!("{other:?}")),
+                            Err(error) => Outcome::Refused(refusal(error)),
+                        }
                     }
+                    other => Outcome::Refused(format!(
+                        "`/mcp {other}` 不认识;可用:/mcp、/mcp tools <服务器>、/mcp withdraw"
+                    )),
                 }
             }
             "reload" | "logout" | "login" => {

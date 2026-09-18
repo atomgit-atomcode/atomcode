@@ -84,6 +84,19 @@ impl LlmProvider for Scripted {
                     .to_string(),
                 })
             }
+            // `write <path>`: the call a mode decides about — refused under
+            // plan, asked about under ask, through under accept-edits.
+            Some(m) if m.role == Role::User && m.text.starts_with("write ") => {
+                StreamEvent::ToolCall(ToolCall {
+                    id: format!("call-{n}"),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({
+                        "file_path": &m.text[6..],
+                        "content": "written\n",
+                    })
+                    .to_string(),
+                })
+            }
             // A request that never answers: the only way out is a cancel.
             Some(m) if m.role == Role::User && m.text == "hang" => {
                 return Ok(Box::pin(futures::stream::pending()));
@@ -1619,6 +1632,156 @@ async fn a_reload_reads_the_skills_on_disk_again_without_rebuilding() {
         front_end.apps_fed(),
         apps,
         "a reload with nothing to reconnect rebuilt nothing"
+    );
+}
+
+/// How much the agent may do without asking is a host control, and plan mode
+/// means a write is refused rather than asked about
+/// (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` A1).
+///
+/// The four the contract names are what a *person* chooses; this runtime calls
+/// them something else, and the mapping is what this judges — a mode that
+/// arrived as the wrong one would still report `Done`.
+#[tokio::test]
+async fn the_mode_a_person_picks_is_the_one_the_session_runs_in() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let session = connection.session.clone();
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SetMode {
+                session: session.clone(),
+                mode: atomcode_kernel::host::Mode::Plan,
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+
+    // In plan mode a write is refused by the mode itself: the scripted model
+    // asks to write, and the turn comes back having been told no — without a
+    // question reaching the person, which is what "refused, not asked about"
+    // means.
+    let planned = env.project.path().join("planned.txt");
+    connection
+        .commands
+        .send(message(&format!("write {}", planned.display())))
+        .unwrap();
+    through_turn(&mut connection).await;
+    assert!(
+        !planned.exists(),
+        "plan mode let a write through: the mode a person picked did not reach \
+         the session"
+    );
+
+    // The other half, and what makes the judgement above mean something:
+    // without it, a runtime that refused every write would pass.
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::SetMode {
+                session: session.clone(),
+                mode: atomcode_kernel::host::Mode::Auto,
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    let allowed = env.project.path().join("allowed.txt");
+    connection
+        .commands
+        .send(message(&format!("write {}", allowed.display())))
+        .unwrap();
+    through_turn(&mut connection).await;
+    assert!(
+        allowed.exists(),
+        "with nothing in the way the same write lands"
+    );
+}
+
+/// The catalog a person picks a model from, the name they give the session, and
+/// the tools one MCP server put on the model — three things the host knows and
+/// the screen could not reach
+/// (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` A4, A11, A12).
+///
+/// Before this, `/model` could only take an id typed from memory, a session kept
+/// whatever name its first message gave it, and `/mcp` could say a server was
+/// connected but not what came of it.
+#[tokio::test]
+async fn the_model_catalog_a_rename_and_one_servers_tools_are_host_controls() {
+    let env = env();
+    let mut connection = connected(&env).await;
+    let session = connection.session.clone();
+    connection.commands.send(subscribe(&session)).unwrap();
+    connection.commands.send(message("hello")).unwrap();
+    through_turn(&mut connection).await;
+    quiet(&mut connection).await;
+
+    // The catalog: what this host has configured, with the one in use marked.
+    let listed = connection
+        .control
+        .call(HostCommand::Models {
+            session: session.clone(),
+        })
+        .await;
+    match listed {
+        Ok(HostReply::Models { models, current }) => {
+            assert!(
+                models.iter().any(|m| m.id == "scripted"),
+                "the model this conversation runs on is in the catalog: {models:#?}"
+            );
+            assert_eq!(current.as_deref(), Some("scripted"));
+        }
+        // A host with no catalog says so rather than pretending to have none.
+        Err(HostError::Failed { message }) => {
+            assert!(message.contains("模型目录"), "{message}");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // A name is a fact, so it reaches every front end reading the session.
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::Rename {
+                session: session.clone(),
+                title: "配置重构".into(),
+            })
+            .await,
+        Ok(HostReply::Done)
+    );
+    let seen = quiet(&mut connection).await;
+    assert!(
+        seen.iter().any(|e| matches!(
+            e,
+            AgentEvent::Fact(c) if c.session == session
+                && matches!(&c.event, SessionEvent::Titled { title, .. } if title == "配置重构")
+        )),
+        "the new name arrives as a fact: {seen:#?}"
+    );
+    // An empty name is refused rather than stored: a session with no name is
+    // one a person cannot find again.
+    assert!(matches!(
+        connection
+            .control
+            .call(HostCommand::Rename {
+                session: session.clone(),
+                title: "   ".into(),
+            })
+            .await,
+        Err(HostError::Failed { .. })
+    ));
+
+    // No MCP in this runtime, so the tools of a server it does not have are
+    // none — and the question is answered rather than refused.
+    assert_eq!(
+        connection
+            .control
+            .call(HostCommand::McpTools {
+                session: session.clone(),
+                server: "fs".into(),
+            })
+            .await,
+        Ok(HostReply::McpTools { tools: Vec::new() })
     );
 }
 

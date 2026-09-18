@@ -746,9 +746,94 @@ impl HostControl for RuntimeControl {
                         .collect(),
                 })
             }
+            // The four a person means, onto the four this runtime has. `Ask` is
+            // its `Build`: the names differ because the contract names what a
+            // person chooses and the runtime names what it does.
+            HostCommand::SetMode { session, mode } => {
+                self.addressed(&session)?;
+                use atomcode_kernel::host::Mode;
+                self.handle
+                    .set_mode(match mode {
+                        Mode::Plan => crate::RuntimeMode::Plan,
+                        Mode::Ask => crate::RuntimeMode::Build,
+                        Mode::AcceptEdits => crate::RuntimeMode::AcceptEdits,
+                        Mode::Auto => crate::RuntimeMode::Auto,
+                        _ => crate::RuntimeMode::Build,
+                    })
+                    .await?;
+                Ok(HostReply::Done)
+            }
+            // A new session, because what a conversation read and wrote belongs
+            // to where it ran — the runtime says so by handing back a session
+            // id, and the front end follows that stream instead.
+            HostCommand::ChangeDirectory { session, directory } => {
+                self.addressed(&session)?;
+                let changed = self
+                    .handle
+                    .change_directory(std::path::PathBuf::from(directory))
+                    .await?;
+                self.changed(changed.session_id)
+            }
+            HostCommand::McpTools { session, server } => {
+                self.addressed(&session)?;
+                let tools = self.handle.mcp_tools(server).await?;
+                Ok(HostReply::McpTools { tools: tools.tools })
+            }
             HostCommand::WithdrawMcpTools { session } => {
                 self.addressed(&session)?;
                 self.handle.withdraw_mcp_tools().await?;
+                Ok(HostReply::Done)
+            }
+            // The catalog is the tree's — the `models` seam the `/model` switch
+            // already resolves through — read here rather than by the screen,
+            // which may not reach into the agent's App (`docs/adr/0022` §3).
+            HostCommand::Models { session } => {
+                self.addressed(&session)?;
+                use atomcode_kernel::host::ModelChoice;
+                let app = self.front_end.app().ok_or(HostError::Unavailable)?;
+                let models = app
+                    .service::<atomcode_harness::seams::ModelsSvc>()
+                    .ok_or_else(|| HostError::Failed {
+                        message: "这个宿主没有模型目录".into(),
+                    })?;
+                let current = models.current();
+                Ok(HostReply::Models {
+                    models: models
+                        .list()
+                        .into_iter()
+                        .map(|model| ModelChoice {
+                            // What tells two of them apart at a glance: whose
+                            // account it is, and how much it can hold.
+                            about: format!("{} · {}k", model.account, model.context_window / 1000),
+                            id: model.id,
+                        })
+                        .collect(),
+                    current,
+                })
+            }
+            // A name is a fact in the log like everything else about the
+            // session (`docs/adr/0024`): committed into the live one, so every
+            // front end reading it hears the new name without being told twice.
+            HostCommand::Rename { session, title } => {
+                self.addressed(&session)?;
+                let title = title.trim().to_string();
+                if title.is_empty() {
+                    return Err(HostError::Failed {
+                        message: "名字不能是空的".into(),
+                    });
+                }
+                let app = self.front_end.app().ok_or(HostError::Unavailable)?;
+                let agent = app
+                    .service::<atomcode_harness::seams::AgentsSvc>()
+                    .and_then(|agents| agents.by_session(&session))
+                    .ok_or(HostError::NotFound)?;
+                let log = agent.session();
+                let turn = log.current_turn();
+                atomcode_harness::session::commit(
+                    agent.ctx(),
+                    &log,
+                    atomcode_harness::session::SessionEvent::Titled { turn, title },
+                );
                 Ok(HostReply::Done)
             }
             HostCommand::Reload { session } => {

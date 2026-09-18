@@ -67,8 +67,26 @@ pub enum HostCommand {
     /// The model `session`'s requests go to from now on, by the id a person
     /// picks it by.
     SwitchModel { session: String, model: String },
+    /// How much `session` may do without asking, from now on
+    /// (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` A1).
+    SetMode { session: String, mode: Mode },
+    /// Work in `directory` from now on. A new conversation, because what a
+    /// session read and wrote belongs to where it ran (A2).
+    ChangeDirectory { session: String, directory: String },
+    /// The models a person may pick from, as the host resolves them now.
+    ///
+    /// The catalog is the host's: only it knows what is configured, and a
+    /// screen that had to be told a model id to switch to could only offer
+    /// typing it out (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md`
+    /// A12).
+    Models { session: String },
+    /// Name `session`. What a person calls a conversation when the title it
+    /// took from its first message is not what it turned out to be about (A4).
+    Rename { session: String, title: String },
     /// The MCP servers `session` was given, and how each one is.
     McpStatus { session: String },
+    /// The tools one MCP server put on `session`'s model (A11).
+    McpTools { session: String, server: String },
     /// Take every MCP tool off `session`'s model now — what has to happen
     /// before anything changes which servers are trusted.
     WithdrawMcpTools { session: String },
@@ -91,7 +109,12 @@ impl HostCommand {
             | Self::RewindPoints { session }
             | Self::Rewind { session, .. }
             | Self::SwitchModel { session, .. }
+            | Self::SetMode { session, .. }
+            | Self::ChangeDirectory { session, .. }
+            | Self::Models { session }
+            | Self::Rename { session, .. }
             | Self::McpStatus { session }
+            | Self::McpTools { session, .. }
             | Self::WithdrawMcpTools { session }
             | Self::Reload { session }
             | Self::SignOut { session }
@@ -134,6 +157,49 @@ pub enum HostReply {
     McpServers {
         servers: Vec<McpServer>,
     },
+    /// The tools one MCP server put on the model, by the names the model calls
+    /// them by.
+    McpTools {
+        tools: Vec<String>,
+    },
+    /// What a person may switch to — the host's own catalog. `current` is the
+    /// one this conversation runs on, when the host knows it.
+    Models {
+        models: Vec<ModelChoice>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current: Option<String>,
+    },
+}
+
+/// How much an agent may do before it asks.
+///
+/// Four steps, from "read, do not touch" to "do not ask at all". Named by what
+/// a person means rather than by a host's internals: a front end offers these
+/// four and the host maps them onto whatever it calls them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// Explore and plan; writes and commands are refused, not asked about.
+    Plan,
+    /// Ask before anything that changes the workspace or runs a command.
+    #[default]
+    Ask,
+    /// Edits go through; commands still ask.
+    AcceptEdits,
+    /// Nothing asks. For a sandbox, an eval, a CI run.
+    Auto,
+}
+
+/// One model a person can pick, as the host lists it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelChoice {
+    /// What [`HostCommand::SwitchModel`] takes — the id a person picks it by.
+    pub id: String,
+    /// What to show beside the id: the provider, the context window, whatever
+    /// the host thinks tells two of them apart. Empty when there is nothing to
+    /// add.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub about: String,
 }
 
 /// A turn a rewind can go back to.
@@ -324,8 +390,27 @@ mod tests {
                 session: "a".into(),
                 model: "glm-5".into(),
             },
+            HostCommand::SetMode {
+                session: "a".into(),
+                mode: Mode::Plan,
+            },
+            HostCommand::ChangeDirectory {
+                session: "a".into(),
+                directory: "/w/other".into(),
+            },
+            HostCommand::Models {
+                session: "a".into(),
+            },
+            HostCommand::Rename {
+                session: "a".into(),
+                title: "配置重构".into(),
+            },
             HostCommand::McpStatus {
                 session: "a".into(),
+            },
+            HostCommand::McpTools {
+                session: "a".into(),
+                server: "fs".into(),
             },
             HostCommand::WithdrawMcpTools {
                 session: "a".into(),
@@ -350,7 +435,12 @@ mod tests {
                 | HostCommand::RewindPoints { .. }
                 | HostCommand::Rewind { .. }
                 | HostCommand::SwitchModel { .. }
+                | HostCommand::SetMode { .. }
+                | HostCommand::ChangeDirectory { .. }
+                | HostCommand::Models { .. }
+                | HostCommand::Rename { .. }
                 | HostCommand::McpStatus { .. }
+                | HostCommand::McpTools { .. }
                 | HostCommand::WithdrawMcpTools { .. }
                 | HostCommand::Reload { .. }
                 | HostCommand::SignOut { .. }
@@ -416,6 +506,22 @@ mod tests {
                     },
                 ],
             },
+            HostReply::McpTools {
+                tools: vec!["fs__read".into(), "fs__write".into()],
+            },
+            HostReply::Models {
+                models: vec![
+                    ModelChoice {
+                        id: "glm-5".into(),
+                        about: "zhipu · 200k".into(),
+                    },
+                    ModelChoice {
+                        id: "local/qwen".into(),
+                        about: String::new(),
+                    },
+                ],
+                current: Some("glm-5".into()),
+            },
         ];
         for r in &all {
             match r {
@@ -424,7 +530,9 @@ mod tests {
                 | HostReply::Sessions { .. }
                 | HostReply::Undone { .. }
                 | HostReply::RewindPoints { .. }
-                | HostReply::McpServers { .. } => {}
+                | HostReply::McpServers { .. }
+                | HostReply::McpTools { .. }
+                | HostReply::Models { .. } => {}
             }
         }
         all
