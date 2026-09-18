@@ -951,6 +951,24 @@ impl HostControl for RuntimeControl {
                 };
                 self.reconfigure(next).await
             }
+            HostCommand::Changes { session, file } => {
+                self.addressed(&session)?;
+                let changes = self.handle.workspace_changes(file).await?;
+                Ok(HostReply::Changes {
+                    files: changes
+                        .files
+                        .into_iter()
+                        .map(|f| atomcode_kernel::host::ChangedFile {
+                            path: f.path,
+                            added: f.additions,
+                            removed: f.deletions,
+                            binary: f.binary,
+                        })
+                        .collect(),
+                    diff: changes.diff,
+                    unavailable: changes.unavailable,
+                })
+            }
             HostCommand::WhoAmI { session } => {
                 self.addressed(&session)?;
                 let identity = self

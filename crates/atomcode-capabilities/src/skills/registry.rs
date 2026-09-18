@@ -436,7 +436,7 @@ mod tests {
             "---\nname: atomcode-smoke-test\ndescription: probe\n---\nbody\n",
         )
         .unwrap();
-        let mut reg = SkillRegistry::new();
+        let reg = SkillRegistry::new();
         reg.load_dir(d.path(), Some("skills"));
 
         // Stored under the namespaced key…
@@ -456,7 +456,7 @@ mod tests {
     /// still resolves via exact match).
     #[test]
     fn get_bare_name_is_ambiguous_across_namespaces() {
-        let mut reg = SkillRegistry::new();
+        let reg = SkillRegistry::new();
         reg.register(Skill {
             name: "skills:dup".into(),
             description: "a".into(),
@@ -487,7 +487,7 @@ mod tests {
     /// otherwise the "menu shows it but resolve fails → 未知技能" bug returns.
     #[test]
     fn get_bare_name_prefers_sole_user_invocable_over_hidden() {
-        let mut reg = SkillRegistry::new();
+        let reg = SkillRegistry::new();
         reg.register(Skill {
             name: "skills:review".into(),
             description: "visible".into(),

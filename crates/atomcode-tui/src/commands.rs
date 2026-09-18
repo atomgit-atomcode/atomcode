@@ -304,6 +304,11 @@ const SESSION: &[Command] = &[
     ),
     Command::taking("rename", "<名字>", "给这个会话改个名字"),
     Command::taking(
+        "diff",
+        "[文件]",
+        "这个会话把工作区改成了什么样;不带文件则列出改过的文件,选一个看它的改动",
+    ),
+    Command::taking(
         "mode",
         "[plan|ask|edits|auto]",
         "改要不要问:plan 只看不动、ask 动手前问、edits 改文件不问、auto 全不问;不带参数则说现在是哪个",
@@ -792,6 +797,78 @@ impl CommandSet for SessionCommands {
                     .await
                 {
                     Ok(_) => Outcome::Said(format!("{id} = {value}")),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
+            // Two levels, one command: the list, then one file's diff. The
+            // most-asked question of a coding session is "what did it do to my
+            // code", and before this the only way to ask it was to leave for
+            // another window or spend a turn asking the model — which answers
+            // from what it remembers doing, not from the workspace.
+            "diff" => {
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refusal) => return refusal,
+                };
+                let wanted = args.trim();
+                let file = (!wanted.is_empty()).then(|| wanted.to_string());
+                match control
+                    .call(HostCommand::Changes {
+                        session: root.clone(),
+                        file: file.clone(),
+                    })
+                    .await
+                {
+                    // "Cannot tell" and "nothing changed" are different answers
+                    // and must read differently: one is a session without
+                    // workspace snapshots, the other is a session that has not
+                    // touched anything.
+                    Ok(HostReply::Changes {
+                        unavailable: Some(why),
+                        ..
+                    }) => Outcome::Refused(why),
+                    Ok(HostReply::Changes {
+                        diff: Some(text), ..
+                    }) => {
+                        let what = file.unwrap_or_default();
+                        if text.trim().is_empty() {
+                            return Outcome::Said(format!("{what} 没有改动"));
+                        }
+                        Outcome::Open(crate::overlay::Reading::diff(what, &text))
+                    }
+                    Ok(HostReply::Changes { files, .. }) if files.is_empty() => {
+                        Outcome::Said("这个会话还没有改过工作区里的文件".into())
+                    }
+                    Ok(HostReply::Changes { files, .. }) => {
+                        let count = files.len();
+                        let (added, removed): (u64, u64) = files
+                            .iter()
+                            .fold((0, 0), |(a, r), f| (a + f.added, r + f.removed));
+                        let choices = files
+                            .into_iter()
+                            .map(|f| {
+                                let about = if f.binary {
+                                    "二进制".to_string()
+                                } else {
+                                    format!("+{} -{}", f.added, f.removed)
+                                };
+                                // The value is the command that opens it, so a
+                                // pick and a typed `/diff <path>` reach the same
+                                // implementation.
+                                crate::overlay::Choice::new(
+                                    format!("/diff {}", f.path),
+                                    f.path.clone(),
+                                )
+                                .about(about)
+                            })
+                            .collect();
+                        Outcome::Open(crate::overlay::Picker::new(
+                            "diff",
+                            format!("改过 {count} 个文件 · +{added} -{removed} · enter 看改动"),
+                            choices,
+                        ))
+                    }
+                    Ok(other) => Outcome::Refused(format!("宿主答了别的:{other:?}")),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
@@ -1306,6 +1383,96 @@ mod tests {
             ]
         );
     }
+    /// `/diff` answers the most-asked question of a coding session at two
+    /// depths: which files, then what changed in one.
+    ///
+    /// "Cannot tell" and "nothing changed" are different answers — one is a
+    /// session with no workspace snapshots, the other a session that has not
+    /// touched anything — and a screen that said the same for both would send
+    /// somebody looking for a bug that is not there.
+    #[tokio::test]
+    async fn diff_lists_what_changed_and_then_shows_one_of_them() {
+        let host = Arc::new(Recording::default());
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::Changes {
+                files: vec![
+                    atomcode_kernel::host::ChangedFile {
+                        path: "src/parser.rs".into(),
+                        added: 12,
+                        removed: 3,
+                        binary: false,
+                    },
+                    atomcode_kernel::host::ChangedFile {
+                        path: "logo.png".into(),
+                        added: 0,
+                        removed: 0,
+                        binary: true,
+                    },
+                ],
+                diff: None,
+                unavailable: None,
+            }),
+            Ok(HostReply::Changes {
+                files: Vec::new(),
+                diff: Some("@@ -1 +1 @@\n-a\n+b\n".into()),
+                unavailable: None,
+            }),
+            Ok(HostReply::Changes {
+                files: Vec::new(),
+                diff: None,
+                unavailable: None,
+            }),
+            Ok(HostReply::Changes {
+                files: Vec::new(),
+                diff: None,
+                unavailable: Some("这个会话不做工作区快照".into()),
+            }),
+        ]);
+        let (app, _client, all) = following(&host);
+
+        match all.dispatch("/diff", &app.context()).await {
+            Outcome::Open(picker) => assert_eq!(picker.id(), "diff"),
+            other => panic!("{other:?}"),
+        }
+        match all.dispatch("/diff src/parser.rs", &app.context()).await {
+            Outcome::Open(reader) => assert_eq!(reader.id(), "view"),
+            other => panic!("{other:?}"),
+        }
+        // Changed nothing: said, not refused.
+        match all.dispatch("/diff", &app.context()).await {
+            Outcome::Said(text) => assert!(text.contains("还没有改过"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        // Cannot tell: refused, with the host's own reason.
+        match all.dispatch("/diff", &app.context()).await {
+            Outcome::Refused(why) => assert!(why.contains("工作区快照"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+
+        let lead = || "lead".to_string();
+        assert_eq!(
+            *host.asked.lock().unwrap(),
+            vec![
+                HostCommand::Changes {
+                    session: lead(),
+                    file: None,
+                },
+                HostCommand::Changes {
+                    session: lead(),
+                    file: Some("src/parser.rs".into()),
+                },
+                HostCommand::Changes {
+                    session: lead(),
+                    file: None,
+                },
+                HostCommand::Changes {
+                    session: lead(),
+                    file: None,
+                },
+            ]
+        );
+    }
+
     /// Who is signed in, and the other thinking knob.
     ///
     /// `/think` is not `/effort`: one says whether the model thinks at all, the

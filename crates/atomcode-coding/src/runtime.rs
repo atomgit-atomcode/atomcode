@@ -232,6 +232,23 @@ impl RewindScope {
     }
 }
 
+/// What a session has done to the workspace, for a front end to show.
+///
+/// One shape for both levels of the answer: the list of files, or one file's
+/// diff. Two messages that differed only in which field was filled would be two
+/// round trips to keep in step.
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceChanges {
+    /// Every file this session changed, with how much.
+    pub files: Vec<atomcode_capabilities::session::FileChangeSummary>,
+    /// The unified diff of the one file that was asked for.
+    pub diff: Option<String>,
+    /// Why there is no answer, when there is none. Not an error: a session with
+    /// no workspace checkpointing is an ordinary session, and the screen has to
+    /// say which of "nothing changed" and "cannot tell" it is.
+    pub unavailable: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RewindCatalog {
     pub generation: RuntimeGeneration,
@@ -1728,6 +1745,24 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    /// What this session has changed in the workspace — every file, or one
+    /// file's diff.
+    pub async fn workspace_changes(
+        &self,
+        file: Option<String>,
+    ) -> Result<WorkspaceChanges, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::WorkspaceChanges {
+                generation: runtime_state_generation(state),
+                file,
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     pub async fn rewind(
         &self,
         turn_id: u64,
@@ -2375,6 +2410,13 @@ pub enum CodingRuntimeControl {
     RewindCatalog {
         generation: u64,
         done: oneshot::Sender<Result<RewindCatalog, RuntimeError>>,
+    },
+    /// What this session has changed in the workspace. `file` asks for one
+    /// file's diff text instead of the summary of all of them.
+    WorkspaceChanges {
+        generation: u64,
+        file: Option<String>,
+        done: oneshot::Sender<Result<WorkspaceChanges, RuntimeError>>,
     },
     BeginRewind {
         generation: u64,
@@ -3841,6 +3883,45 @@ fn spawn_runtime_owner_with_optional_agent(
                             points: hook.rewind_points(),
                             code_unavailable: hook.code_rewind_unavailable(),
                         }));
+                    }
+                    // Reading only: unlike the rewind catalog this does not
+                    // refuse while a turn is running. Looking at what has
+                    // changed so far is exactly what a person does *while* the
+                    // model works, and nothing here writes.
+                    Some(CodingRuntimeControl::WorkspaceChanges {
+                        generation: request_generation,
+                        file,
+                        done,
+                    }) => {
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let Some(runtime) = resources.as_ref() else {
+                            let _ = done.send(Err(RuntimeError::Unavailable));
+                            continue;
+                        };
+                        let Some(hook) = runtime.parts.snapshot_hook() else {
+                            let _ = done.send(Ok(WorkspaceChanges {
+                                unavailable: Some("这个会话不做工作区快照".into()),
+                                ..Default::default()
+                            }));
+                            continue;
+                        };
+                        let answer = match file {
+                            Some(path) => hook.file_diff(&path).map(|diff| WorkspaceChanges {
+                                diff: Some(diff),
+                                ..Default::default()
+                            }),
+                            None => hook.changes().map(|files| WorkspaceChanges {
+                                files,
+                                ..Default::default()
+                            }),
+                        };
+                        let _ = done.send(Ok(answer.unwrap_or_else(|why| WorkspaceChanges {
+                            unavailable: Some(why),
+                            ..Default::default()
+                        })));
                     }
                     Some(CodingRuntimeControl::BeginRewind {
                         generation: request_generation,
@@ -7175,6 +7256,9 @@ fn reject_runtime_control(
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::RewindCatalog { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::WorkspaceChanges { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::BeginRewind { done, .. } => {

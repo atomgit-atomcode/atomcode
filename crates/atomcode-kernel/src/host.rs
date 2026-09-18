@@ -113,6 +113,17 @@ pub enum HostCommand {
     SignIn { session: String },
     /// Who is signed in, as the host knows it.
     WhoAmI { session: String },
+    /// What `session` has changed in the workspace. `file` asks for that one
+    /// file's diff instead of the list.
+    ///
+    /// Two levels in one command because they are one question asked at two
+    /// depths, and a front end that showed the list would otherwise have to
+    /// know a second command's name to open a row of it.
+    Changes {
+        session: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<String>,
+    },
     /// Whether `session`'s requests carry thinking at all, as a setting to read.
     Thinking { session: String },
     /// Turn thinking on or off for `session` from now on.
@@ -147,6 +158,7 @@ impl HostCommand {
             | Self::SignOut { session }
             | Self::SignIn { session }
             | Self::WhoAmI { session }
+            | Self::Changes { session, .. }
             | Self::Thinking { session }
             | Self::SetThinking { session, .. } => Some(session),
             Self::ListSessions { .. } => None,
@@ -203,6 +215,20 @@ pub enum HostReply {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         current: Option<String>,
     },
+    /// What a session has done to the workspace.
+    ///
+    /// `unavailable` is why there is no answer, when there is none — a session
+    /// with no workspace checkpointing is an ordinary session, and "nothing
+    /// changed" and "cannot tell" must read differently on screen.
+    Changes {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<ChangedFile>,
+        /// The one file's unified diff, when one was asked for.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unavailable: Option<String>,
+    },
     /// Who is signed in.
     ///
     /// `signed_in: false` is an answer, not a failure — a build that runs on a
@@ -216,6 +242,18 @@ pub enum HostReply {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+}
+
+/// One file a session changed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedFile {
+    /// Relative to the working directory.
+    pub path: String,
+    pub added: u64,
+    pub removed: u64,
+    /// A file with no line counts to give. Shown as changed, not as `+0 -0`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub binary: bool,
 }
 
 /// How much an agent may do before it asks.
@@ -500,6 +538,10 @@ mod tests {
             HostCommand::WhoAmI {
                 session: "a".into(),
             },
+            HostCommand::Changes {
+                session: "a".into(),
+                file: Some("src/parser.rs".into()),
+            },
             HostCommand::Thinking {
                 session: "a".into(),
             },
@@ -531,6 +573,7 @@ mod tests {
                 | HostCommand::SignOut { .. }
                 | HostCommand::SignIn { .. }
                 | HostCommand::WhoAmI { .. }
+                | HostCommand::Changes { .. }
                 | HostCommand::Thinking { .. }
                 | HostCommand::SetThinking { .. } => {}
             }
@@ -619,6 +662,16 @@ mod tests {
                 ],
                 current: Some("glm-5".into()),
             },
+            HostReply::Changes {
+                files: vec![ChangedFile {
+                    path: "src/parser.rs".into(),
+                    added: 12,
+                    removed: 3,
+                    binary: false,
+                }],
+                diff: Some("@@ -1 +1 @@\n-a\n+b\n".into()),
+                unavailable: None,
+            },
             HostReply::Identity {
                 signed_in: true,
                 who: Some("lichao".into()),
@@ -636,6 +689,7 @@ mod tests {
                 | HostReply::McpTools { .. }
                 | HostReply::Settings { .. }
                 | HostReply::Models { .. }
+                | HostReply::Changes { .. }
                 | HostReply::Identity { .. } => {}
             }
         }

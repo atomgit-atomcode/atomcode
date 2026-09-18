@@ -18,8 +18,8 @@ use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
 use atomcode_kernel::message::{Conversation, Message, SessionSnapshot};
 
 use super::rewind::{
-    RewindLedger, RewindPoint, RewindTransactionJournal, WorkspaceRestorePlan, LEDGER_VERSION,
-    TRANSACTION_VERSION,
+    FileChangeSummary, RewindLedger, RewindPoint, RewindTransactionJournal, WorkspaceRestorePlan,
+    LEDGER_VERSION, TRANSACTION_VERSION,
 };
 use super::{
     now_ms, ModelUsageStat, PresentationFile, SessionLease, SessionManager, SessionMeta,
@@ -250,6 +250,62 @@ impl SnapshotHook {
             .unwrap_or_else(|error| error.into_inner())
             .points
             .clone()
+    }
+
+    /// What this session has changed in the workspace, so far.
+    ///
+    /// From the tree as it stood before the session's first prompt to the tree
+    /// as it stands now — not turn by turn. "What did it do to my code" is a
+    /// question about the whole session; the per-turn view is what rewind
+    /// points are for.
+    ///
+    /// `Err` is why it cannot be answered (no workspace checkpointing, or git
+    /// refused); `Ok(empty)` is a session that has changed nothing, which is a
+    /// different thing and must read differently on screen.
+    pub fn changes(&self) -> Result<Vec<FileChangeSummary>, String> {
+        let (checkpoint, first) = self.diff_ends()?;
+        let now = checkpoint
+            .capture()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "工作区快照现在取不到".to_string())?;
+        checkpoint.diff(&first, &now).map_err(|e| e.to_string())
+    }
+
+    /// The unified diff of one changed file, over the same two ends.
+    pub fn file_diff(&self, path: &str) -> Result<String, String> {
+        let (checkpoint, first) = self.diff_ends()?;
+        let now = checkpoint
+            .capture()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "工作区快照现在取不到".to_string())?;
+        checkpoint
+            .diff_text(&first, &now, path)
+            .map_err(|e| e.to_string())
+    }
+
+    /// The checkpoint and the tree this session started from.
+    fn diff_ends(&self) -> Result<(Arc<WorkspaceCheckpoint>, String), String> {
+        let state = self
+            .rewind
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(reason) = &state.unavailable {
+            return Err(reason.clone());
+        }
+        let checkpoint = state
+            .checkpoint
+            .clone()
+            .ok_or_else(|| "这个会话没有工作区快照".to_string())?;
+        // The oldest point that has one: the earliest state this session ever
+        // saw. A point with no tree is a conversation-only one and says nothing
+        // about files.
+        let first = state
+            .points
+            .iter()
+            .find_map(|point| point.before_tree.clone())
+            .or_else(|| state.pending.as_ref().and_then(|p| p.before_tree.clone()))
+            .ok_or_else(|| "这个会话还没有动过工作区".to_string())?;
+        Ok((checkpoint, first))
     }
 
     pub fn code_rewind_unavailable(&self) -> Option<String> {

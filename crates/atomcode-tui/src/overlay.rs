@@ -159,6 +159,11 @@ pub struct Reading {
     what: String,
     lines: Vec<String>,
     at: RwLock<usize>,
+    /// A diff carries its own line numbers and its own signs, so it is drawn
+    /// differently from a file. One type rather than two, because scrolling,
+    /// closing and "picks nothing" are the same for both and would otherwise be
+    /// written twice.
+    diff: bool,
 }
 
 impl Reading {
@@ -168,6 +173,20 @@ impl Reading {
             what: what.into(),
             lines: text.lines().map(str::to_string).collect(),
             at: RwLock::new(0),
+            diff: false,
+        })
+    }
+
+    /// The same reader over a unified diff: no line numbers of its own, and the
+    /// signs coloured. An uncoloured diff is a wall of text with punctuation in
+    /// it — the colour is what makes it readable, and it is the one place a
+    /// role means exactly what it says (added, removed).
+    pub fn diff(what: impl Into<String>, text: &str) -> Arc<Self> {
+        Arc::new(Self {
+            what: what.into(),
+            lines: text.lines().map(str::to_string).collect(),
+            at: RwLock::new(0),
+            diff: true,
         })
     }
 
@@ -180,6 +199,21 @@ impl Reading {
         let mut at = self.at.write().expect("reading poisoned");
         let last = self.lines.len().saturating_sub(1);
         *at = at.saturating_add_signed(by).min(last);
+    }
+}
+
+/// How one line of a unified diff is drawn.
+///
+/// `+++`/`---` are headers rather than content, so they are muted with the
+/// hunk markers instead of being coloured as a whole added or removed file.
+fn diff_style(line: &str) -> Style {
+    if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@") {
+        return Style::new().fg(Color::role(Role::Muted));
+    }
+    match line.as_bytes().first() {
+        Some(b'+') => Style::new().fg(Color::role(Role::Success)),
+        Some(b'-') => Style::new().fg(Color::role(Role::Error)),
+        _ => Style::new(),
     }
 }
 
@@ -206,7 +240,10 @@ impl Overlay for Reading {
         let room = vp.rect.h as usize;
         let at = (*self.at.read().expect("reading poisoned")).min(self.lines.len() - 1);
         // Numbered, because the reason to open a file mid-session is usually to
-        // say a line number out loud. Dim, so the text reads as the text.
+        // say a line number out loud. Dim, so the text reads as the text. A
+        // diff is not numbered: it carries `@@` markers of its own, and a
+        // second set of numbers beside them would be two answers to "which
+        // line".
         let width = self.lines.len().to_string().len();
         self.lines
             .iter()
@@ -214,12 +251,16 @@ impl Overlay for Reading {
             .skip(at)
             .take(room)
             .map(|(i, text)| {
+                let shown = crate::text::for_screen(text).into_owned();
+                if self.diff {
+                    return Line::styled(shown, diff_style(text)).truncate(w);
+                }
                 Line::from_spans(vec![
                     Span::styled(
                         format!("{:>width$}  ", i + 1, width = width),
                         Style::new().fg(Color::role(Role::Muted)),
                     ),
-                    Span::raw(crate::text::for_screen(text).into_owned()),
+                    Span::raw(shown),
                 ])
                 .truncate(w)
             })
@@ -595,6 +636,33 @@ mod tests {
         // An empty file says so rather than drawing nothing at all.
         let empty = Reading::new("empty.txt", "");
         assert!(drawn(&empty)[0].contains("空文件"), "{:?}", drawn(&empty));
+    }
+
+    /// A diff is drawn by its signs rather than by line numbers.
+    ///
+    /// Uncoloured it is a wall of text with punctuation in it; the colour is
+    /// what makes it readable. `+++`/`---` are headers, not a whole added or
+    /// removed file, so they wear the hunk marker's colour rather than green
+    /// and red.
+    #[test]
+    fn a_diff_is_read_by_its_signs_and_not_by_line_numbers() {
+        let text = "--- a/src/parser.rs\n+++ b/src/parser.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n ok\n";
+        let r = Reading::diff("src/parser.rs", text);
+        let m = Moment::default();
+        let lines = r.render(&Viewport::new(Rect::sized(40, 6), &m));
+        let plain: Vec<String> = lines.iter().map(|l| l.plain()).collect();
+        assert!(
+            plain.iter().all(|l| !l.starts_with(" 1 ")),
+            "no numbers of its own: {plain:?}"
+        );
+        let colour = |n: usize| lines[n].spans.first().and_then(|s| s.style.fg);
+        let role = |r: Role| Some(Color::role(r));
+        assert_eq!(colour(0), role(Role::Muted), "--- is a header");
+        assert_eq!(colour(1), role(Role::Muted), "+++ is a header");
+        assert_eq!(colour(2), role(Role::Muted), "@@ is a marker");
+        assert_eq!(colour(3), role(Role::Error), "a removed line");
+        assert_eq!(colour(4), role(Role::Success), "an added line");
+        assert_eq!(colour(5), None, "context is neither");
     }
 
     #[test]
