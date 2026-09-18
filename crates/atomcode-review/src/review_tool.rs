@@ -36,9 +36,9 @@ use serde_json::json;
 use crate::config::ReviewAgentConfig;
 use crate::diff::annotate_diff_line_numbers;
 use crate::fanout::{
-    dimension_coverage, merge_deep_findings, render_deep_result, render_verify_task, run_deep_review,
-    run_verify, verify_reconfirms, DimensionOutcome, REVIEW_DIMENSIONS, VERIFY_CONCURRENCY,
-    VERIFY_LENS,
+    dimension_coverage, merge_deep_findings, render_deep_result, render_verify_task,
+    run_deep_review, run_verify, verify_reconfirms, DimensionOutcome, REVIEW_DIMENSIONS,
+    VERIFY_CONCURRENCY, VERIFY_LENS,
 };
 use crate::impact_plan::render_review_impact_plan;
 use crate::rules::{changed_files_from_diff, render_rules_section};
@@ -83,7 +83,8 @@ impl ReviewProgressHook {
             self.findings.load(Ordering::Relaxed),
             tail,
         );
-        self.progress.emit(format!("{REVIEW_ACTIVITY_MARKER}{line}"));
+        self.progress
+            .emit(format!("{REVIEW_ACTIVITY_MARKER}{line}"));
     }
 }
 
@@ -166,6 +167,9 @@ pub struct ReviewToolConfig {
     pub model: String,
     pub context_window: u32,
     pub stream_timeout: Duration,
+    /// FIRST-token (prefill / TTFB) idle budget for the review sub-agent; ≥ `stream_timeout`
+    /// so a slow local model is not cut off mid-prefill. Seeded from the coding config.
+    pub first_token_timeout: Duration,
     pub request_timeout: Duration,
     /// Preflight guardrails. Crossing any one requires an explicit scope confirmation.
     pub max_commits_without_confirmation: usize,
@@ -182,6 +186,7 @@ impl Default for ReviewToolConfig {
             model: String::new(),
             context_window: 128_000,
             stream_timeout: Duration::from_secs(120),
+            first_token_timeout: Duration::from_secs(120),
             request_timeout: Duration::from_secs(300),
             max_commits_without_confirmation: 20,
             max_files_without_confirmation: 40,
@@ -442,14 +447,26 @@ impl Tool for ReviewTool {
         json!({
             "type": "object",
             "properties": {
+                // Flat object (NOT oneOf/const): strict OpenAI-compatible function-
+                // schema validators (e.g. DeepSeek) reject oneOf/const with
+                // "Invalid schema … null is not of type array". The per-kind field
+                // rules (base required when kind=range, etc.) are enforced at runtime
+                // by the tagged `ScopeArg` deserialization + `review_scope()`, so the
+                // wire schema only needs to describe the shape.
                 "scope": {
-                    "oneOf": [
-                        { "type": "object", "properties": { "kind": { "const": "working_tree" } }, "required": ["kind"] },
-                        { "type": "object", "properties": { "kind": { "const": "staged" } }, "required": ["kind"] },
-                        { "type": "object", "properties": { "kind": { "const": "range" }, "base": { "type": "string" }, "head": { "type": "string", "default": "HEAD" } }, "required": ["kind", "base"] },
-                        { "type": "object", "properties": { "kind": { "const": "commit" }, "rev": { "type": "string", "default": "HEAD" } }, "required": ["kind"] }
-                    ],
-                    "description": "Explicit mutually-exclusive review scope. Omit for working-tree changes."
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["working_tree", "staged", "range", "commit"],
+                            "description": "Which changes to review: `working_tree` (uncommitted, default), `staged`, `range` (needs `base`), or `commit` (uses `rev`)."
+                        },
+                        "base": { "type": "string", "description": "Base ref — REQUIRED when kind=range." },
+                        "head": { "type": "string", "description": "Head ref for kind=range (default HEAD)." },
+                        "rev": { "type": "string", "description": "Commit to review for kind=commit (default HEAD)." }
+                    },
+                    "required": ["kind"],
+                    "description": "Explicit review scope. Omit entirely for working-tree changes."
                 },
                 "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional repo-relative path filters." },
                 "confirm_scope": { "type": "string", "description": "Opaque token from a preflight. Pass only after explicit user confirmation." },
@@ -527,6 +544,7 @@ impl Tool for ReviewTool {
             let mut cfg = ReviewAgentConfig::new("", "", &self.cfg.model, &ctx.working_dir);
             cfg.context_window = self.cfg.context_window;
             cfg.stream_timeout = self.cfg.stream_timeout;
+            cfg.first_token_timeout = self.cfg.first_token_timeout;
             cfg.request_timeout = self.cfg.request_timeout;
             cfg.max_rounds = self.max_rounds;
             cfg.max_turn_duration = self.max_turn_duration;
@@ -551,7 +569,12 @@ impl Tool for ReviewTool {
             return if stop == StopReason::Stopped && run_error.is_none() {
                 ok(render_findings(&findings, files.len()))
             } else {
-                err(render_incomplete_review(&findings, files.len(), stop, run_error.as_deref()))
+                err(render_incomplete_review(
+                    &findings,
+                    files.len(),
+                    stop,
+                    run_error.as_deref(),
+                ))
             };
         }
 
@@ -627,9 +650,19 @@ impl Tool for ReviewTool {
             merged.retain(|_| mask.next().unwrap_or(true));
             verify_dropped = Some(before - merged.len());
         }
-        let (is_error, content) =
-            render_deep_result(&merged, files.len(), &completed, &failed, deduped, verify_dropped);
-        if is_error { err(content) } else { ok(content) }
+        let (is_error, content) = render_deep_result(
+            &merged,
+            files.len(),
+            &completed,
+            &failed,
+            deduped,
+            verify_dropped,
+        );
+        if is_error {
+            err(content)
+        } else {
+            ok(content)
+        }
     }
 }
 
@@ -918,7 +951,10 @@ mod tests {
     #[test]
     fn review_activity_line_composes_label_findings_and_tail() {
         // No label, no findings → bare marker text + tail (round is never shown).
-        assert_eq!(review_activity_line(None, 0, "thinking"), "review · thinking");
+        assert_eq!(
+            review_activity_line(None, 0, "thinking"),
+            "review · thinking"
+        );
         // Singular finding, no label.
         assert_eq!(
             review_activity_line(None, 1, "thinking"),
@@ -990,6 +1026,37 @@ mod tests {
     }
 
     #[test]
+    fn parameters_schema_stays_strict_gateway_safe() {
+        // DeepSeek and other strict OpenAI-compatible function-schema validators
+        // reject `oneOf`/`anyOf`/`allOf`/`const` with "Invalid schema … null is not
+        // of type array". The scope was rewritten to a flat enum-based object; guard
+        // against reintroducing those keywords anywhere in the schema.
+        fn assert_no_forbidden_keys(value: &serde_json::Value, path: &str) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for key in ["oneOf", "anyOf", "allOf", "const"] {
+                        assert!(
+                            !map.contains_key(key),
+                            "schema uses `{key}` at {path} — unsupported by strict gateways (DeepSeek)"
+                        );
+                    }
+                    for (k, v) in map {
+                        assert_no_forbidden_keys(v, &format!("{path}.{k}"));
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for (i, v) in items.iter().enumerate() {
+                        assert_no_forbidden_keys(v, &format!("{path}[{i}]"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let tool = ReviewTool::new(Arc::new(RwLock::new(None)), ReviewToolConfig::default());
+        assert_no_forbidden_keys(&tool.parameters_schema(), "$");
+    }
+
+    #[test]
     fn commit_scope_defaults_rev_to_head() {
         // Weak models emit {"kind":"commit"} without `rev`; it must default to HEAD, not
         // hard-fail with `missing field 'rev'`.
@@ -1000,7 +1067,8 @@ mod tests {
             _ => panic!("expected Commit{{rev:HEAD}}"),
         }
         // An explicit rev is still honored.
-        let e: Args = serde_json::from_str(r#"{"scope":{"kind":"commit","rev":"abc123"}}"#).unwrap();
+        let e: Args =
+            serde_json::from_str(r#"{"scope":{"kind":"commit","rev":"abc123"}}"#).unwrap();
         match e.review_scope().unwrap() {
             ReviewScope::Commit { rev } => assert_eq!(rev, "abc123"),
             _ => panic!("expected Commit{{rev:abc123}}"),
@@ -1551,7 +1619,10 @@ mod tests {
             "{depth_desc}"
         );
         // Cost caution keeps a weak model from over-escalating.
-        assert!(depth_desc.contains("escalate only when warranted"), "{depth_desc}");
+        assert!(
+            depth_desc.contains("escalate only when warranted"),
+            "{depth_desc}"
+        );
         // The tool description also points at depth selection.
         assert!(tool.description().contains("depth"));
         assert!(tool.description().contains("escalate"));
@@ -1578,7 +1649,10 @@ mod tests {
             Arc::new(RwLock::new(Some(Arc::new(ScriptedReviewProvider))));
         let tool = ReviewTool::new(
             provider,
-            ReviewToolConfig { model: "mock-model".into(), ..Default::default() },
+            ReviewToolConfig {
+                model: "mock-model".into(),
+                ..Default::default()
+            },
         );
         let ctx = ToolContext {
             working_dir: dir.path().to_path_buf(),
@@ -1592,9 +1666,21 @@ mod tests {
         // 4 dimensions report the same finding → merged to 1; each finding's
         // verify agent (ScriptedReviewProvider) re-reports it → kept, dropped 0.
         assert!(!res.is_error, "deep+verify should succeed: {}", res.content);
-        assert!(res.content.contains("Deep review"), "deep header: {}", res.content);
-        assert!(res.content.contains("verify dropped 0"), "verify note, nothing culled: {}", res.content);
-        assert!(res.content.contains("1 finding"), "the confirmed finding survives: {}", res.content);
+        assert!(
+            res.content.contains("Deep review"),
+            "deep header: {}",
+            res.content
+        );
+        assert!(
+            res.content.contains("verify dropped 0"),
+            "verify note, nothing culled: {}",
+            res.content
+        );
+        assert!(
+            res.content.contains("1 finding"),
+            "the confirmed finding survives: {}",
+            res.content
+        );
     }
 
     #[tokio::test]

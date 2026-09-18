@@ -266,23 +266,44 @@ where
     })
 }
 
+macro_rules! read_file_description {
+    ($image_guidance:literal) => {
+        concat!(
+            "Read a file — or any slice of one — from the filesystem. This is the way to read \
+             or slice files: prefer it over `bash cat`/`head`/`tail` or a `python`/`awk` script, \
+             which return partial content and bypass paging, caching, and history retention. \
+             Returns the contents prefixed with 1-based line numbers (`<n>\\t<content>`). By \
+             default returns up to 1500 lines; a ~50 KiB output budget may return fewer. When a result \
+             shows a continuation offset, continue from that offset instead of rereading line 1. \
+             Use `offset` (1-based start line) and `limit` (max lines) when a larger relevant \
+             window is needed; avoid many tiny overlapping reads. To grab several disjoint \
+             windows at once (e.g. multiple symbols listed in a skeleton), pass `ranges` instead \
+             of paginating or splitting the file yourself. If the path is a directory its entries \
+             are listed instead. Relative paths resolve against the working directory. \
+             ",
+            $image_guidance
+        )
+    };
+}
+
 #[async_trait]
 impl Tool for ReadFileTool {
     fn name(&self) -> &str {
         "read_file"
     }
     fn description(&self) -> &str {
-        "Read a file — or any slice of one — from the filesystem. This is the way to read \
-         or slice files: prefer it over `bash cat`/`head`/`tail` or a `python`/`awk` script, \
-         which return partial content and bypass paging, caching, and history retention. \
-         Returns the contents prefixed with 1-based line numbers (`<n>\\t<content>`). By \
-         default returns up to 1500 lines; a ~50 KiB output budget may return fewer. When a result \
-         shows a continuation offset, continue from that offset instead of rereading line 1. \
-         Use `offset` (1-based start line) and `limit` (max lines) when a larger relevant \
-         window is needed; avoid many tiny overlapping reads. To grab several disjoint \
-         windows at once (e.g. multiple symbols listed in a skeleton), pass `ranges` instead \
-         of paginating or splitting the file yourself. If the path is a directory its entries \
-         are listed instead. Relative paths resolve against the working directory."
+        if self.vision {
+            read_file_description!(
+                "You can see images: whenever a relevant JPG, JPEG, PNG, GIF, or WebP path is \
+                 present, proactively call this tool to inspect it. The image is returned as \
+                 visual content."
+            )
+        } else {
+            read_file_description!(
+                "This tool cannot display image contents in the current text-only mode; do not \
+                 treat JPG, JPEG, PNG, GIF, or WebP files as readable text."
+            )
+        }
     }
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
@@ -683,13 +704,22 @@ mod tests {
         let text = ten_lines();
         let total = text.lines().count();
         let ranges = vec![
-            RangeArg { offset: Some(2), limit: Some(2) },
-            RangeArg { offset: Some(7), limit: Some(1) },
+            RangeArg {
+                offset: Some(2),
+                limit: Some(2),
+            },
+            RangeArg {
+                offset: Some(7),
+                limit: Some(1),
+            },
         ];
         let out = render_multi_range("a.txt", &text, total, &ranges);
         assert!(out.contains("[Lines 2-3]"), "{out}");
         assert!(out.contains("2\tl2") && out.contains("3\tl3"), "{out}");
-        assert!(out.contains("[Lines 7-7]") && out.contains("7\tl7"), "{out}");
+        assert!(
+            out.contains("[Lines 7-7]") && out.contains("7\tl7"),
+            "{out}"
+        );
         // only the requested windows — unrequested lines are absent
         assert!(!out.contains("1\tl1") && !out.contains("5\tl5"), "{out}");
         // rendered in request order
@@ -703,7 +733,10 @@ mod tests {
             "a.txt",
             &text,
             10,
-            &[RangeArg { offset: Some(99), limit: Some(3) }],
+            &[RangeArg {
+                offset: Some(99),
+                limit: Some(3),
+            }],
         );
         assert!(out.contains("beyond end of file"), "{out}");
     }
@@ -717,10 +750,17 @@ mod tests {
             .join("\n");
         let total = text.lines().count();
         let ranges: Vec<RangeArg> = (1..=50)
-            .map(|k| RangeArg { offset: Some(k * 50), limit: Some(20) })
+            .map(|k| RangeArg {
+                offset: Some(k * 50),
+                limit: Some(20),
+            })
             .collect();
         let out = render_multi_range("big.txt", &text, total, &ranges);
-        assert!(out.len() <= MAX_READ_OUTPUT_BYTES, "exceeded budget: {}", out.len());
+        assert!(
+            out.len() <= MAX_READ_OUTPUT_BYTES,
+            "exceeded budget: {}",
+            out.len()
+        );
         assert!(out.contains("Output budget reached"), "{out}");
     }
 
@@ -742,7 +782,11 @@ mod tests {
         let r0 = ReadFileTool::default()
             .execute(r#"{"file_path":"a.txt","limit":0}"#, &ctx(d.path()))
             .await;
-        assert!(r0.is_error && r0.content.contains("at least 1"), "{}", r0.content);
+        assert!(
+            r0.is_error && r0.content.contains("at least 1"),
+            "{}",
+            r0.content
+        );
     }
 
     #[tokio::test]
@@ -764,7 +808,11 @@ mod tests {
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("10\tfn f10()"), "{}", r.content);
         assert!(r.content.contains("300\tfn f300()"), "{}", r.content);
-        assert!(!r.content.contains("File skeleton"), "ranges must bypass skeleton: {}", r.content);
+        assert!(
+            !r.content.contains("File skeleton"),
+            "ranges must bypass skeleton: {}",
+            r.content
+        );
         // an unrequested line must not appear
         assert!(!r.content.contains("200\tfn f200()"), "{}", r.content);
     }
@@ -804,6 +852,36 @@ mod tests {
         );
         assert!(!r.content.starts_with("Binary file"), "{}", r.content);
         assert!(r.content.contains("cover.jpg"), "{}", r.content);
+    }
+
+    #[test]
+    fn description_is_vision_aware() {
+        // Discoverability contract (guards against a future edit inverting/dropping the
+        // `self.vision` branch): a vision model is told it can SEE images and should read
+        // them proactively; a text-only model is warned NOT to treat image files as text.
+        let vision_tool = ReadFileTool::new(true);
+        let text_tool = ReadFileTool::new(false);
+        let vision = vision_tool.description();
+        let text_only = text_tool.description();
+        assert!(
+            vision.contains("You can see images"),
+            "vision desc: {vision}"
+        );
+        assert!(vision.contains("proactively"), "vision desc: {vision}");
+        assert!(
+            text_only.contains("cannot display image"),
+            "text-only desc must warn: {text_only}"
+        );
+        assert!(
+            !text_only.contains("You can see images"),
+            "text-only must NOT advertise vision: {text_only}"
+        );
+        // Both keep the shared base and are actually different.
+        assert!(vision.starts_with("Read a file") && text_only.starts_with("Read a file"));
+        assert_ne!(
+            vision, text_only,
+            "the two descriptions must differ by capability"
+        );
     }
 
     #[tokio::test]
@@ -1215,11 +1293,11 @@ mod tests {
     #[cfg(feature = "codeintel")]
     #[tokio::test]
     async fn large_symbolless_code_file_falls_back_to_a_bounded_page() {
-        // A >300-line .rs with NO symbols (only comments) has no skeleton, so it
-        // falls back to the same bounded page as other text files.
+        // A .rs past the 1500-line default page with NO symbols (only comments) has no
+        // skeleton, so it falls back to the same bounded page as other text files.
         let d = tempfile::tempdir().unwrap();
         let mut src = String::new();
-        for i in 0..400 {
+        for i in 0..1600 {
             src.push_str(&format!("// comment {i}\n"));
         }
         std::fs::write(d.path().join("c.rs"), &src).unwrap();
@@ -1228,7 +1306,7 @@ mod tests {
             .await;
         assert!(!r.content.contains("File skeleton"), "{}", r.content);
         assert!(r.content.contains("comment 0"), "{}", r.content);
-        assert!(!r.content.contains("comment 300"), "{}", r.content);
+        assert!(!r.content.contains("comment 1500"), "{}", r.content);
         assert!(
             r.content.contains("Continue with read_file("),
             "{}",
@@ -1240,9 +1318,10 @@ mod tests {
     #[tokio::test]
     async fn large_non_code_file_uses_a_bounded_page() {
         // .txt has no tree-sitter language, so it uses normal bounded pagination.
+        // Short lines, so the 1500-line cap binds before the 50 KiB byte budget.
         let d = tempfile::tempdir().unwrap();
         let mut src = String::new();
-        for i in 0..400 {
+        for i in 0..1600 {
             src.push_str(&format!("line {i}\n"));
         }
         std::fs::write(d.path().join("big.txt"), &src).unwrap();
@@ -1251,7 +1330,7 @@ mod tests {
             .await;
         assert!(!r.content.contains("File skeleton"), "{}", r.content);
         assert!(r.content.contains("line 0"), "{}", r.content);
-        assert!(!r.content.contains("line 300"), "{}", r.content);
+        assert!(!r.content.contains("line 1500"), "{}", r.content);
         assert!(
             r.content.contains("Continue with read_file("),
             "{}",

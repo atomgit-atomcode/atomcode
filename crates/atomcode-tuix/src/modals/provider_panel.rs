@@ -61,9 +61,14 @@ struct AddForm {
 }
 
 /// Protocol presets the fully-custom add/edit form cycles through with `←/→`,
-/// in display order. Each id resolves to a real `PRESETS` entry: the two generic
+/// in display order. Each id resolves to a real `PRESETS` entry: the generic
 /// `*-compatible` custom endpoints plus the keyless local `ollama` preset.
-const CYCLE_PROTOCOL_IDS: [&str; 3] = ["openai-compatible", "anthropic-compatible", "ollama"];
+const CYCLE_PROTOCOL_IDS: [&str; 4] = [
+    "openai-compatible",
+    "anthropic-compatible",
+    "ollama",
+    "openai-responses",
+];
 
 /// `PRESETS` index for a preset id (falls back to the first entry).
 fn preset_idx_by_id(id: &str) -> usize {
@@ -82,6 +87,7 @@ fn protocol_preset_idx(ty: provider_preset::ProviderType) -> usize {
         provider_preset::ProviderType::Anthropic => "anthropic-compatible",
         provider_preset::ProviderType::Ollama => "ollama",
         provider_preset::ProviderType::OpenAi => "openai-compatible",
+        provider_preset::ProviderType::Responses => "openai-responses",
     })
 }
 
@@ -92,6 +98,7 @@ fn protocol_label(ty: provider_preset::ProviderType) -> &'static str {
         provider_preset::ProviderType::Anthropic => "Anthropic",
         provider_preset::ProviderType::Ollama => "Ollama",
         provider_preset::ProviderType::OpenAi => "OpenAI",
+        provider_preset::ProviderType::Responses => "OpenAI Responses",
     }
 }
 
@@ -680,17 +687,20 @@ impl ModelForm {
     }
 
     /// Render the level toggles with the sub-cursor marked, e.g.
-    /// ` ● low  ‹○ medium›  ● high  ● max ` (focused level in guillemets).
+    /// ` [✓] low  ‹[ ] medium›  [✓] high  [✓] max ` (focused level in guillemets).
     ///
-    /// Use text glyphs rather than emoji so each marker stays monochrome and
-    /// occupies one terminal cell on the terminals supported by the TUI.
+    /// Checkbox glyphs (`[✓]`/`[ ]`) rather than radio-style `●`/`○`: this row is a
+    /// MULTI-select of which effort levels the model exposes, and the checkbox reads
+    /// unambiguously as on/off — matching the `设为默认 [✓]` toggle in the same form.
+    /// It also downgrades legibly on non-unicode terminals (`✓`→`v` ⇒ `[v]`/`[ ]`),
+    /// whereas `●`/`○` collapse to the ambiguous `*`/`o`.
     fn effort_levels_label(&self, focused: bool) -> String {
         atomcode_config::config::REASONING_EFFORT_LEVELS
             .iter()
             .enumerate()
             .map(|(i, level)| {
-                let mark = if self.effort_levels[i] { '●' } else { '○' };
-                let cell = format!("{mark} {level}");
+                let mark = if self.effort_levels[i] { '✓' } else { ' ' };
+                let cell = format!("[{mark}] {level}");
                 if focused && i == self.effort_level_cursor {
                     format!("‹{cell}›")
                 } else {
@@ -1917,9 +1927,9 @@ impl Modal for ProviderPanel {
         items.push((String::new(), String::new()));
 
         let mut selected = items.len(); // nothing highlighted by default
-        let hint: String; // assigned once per match arm below
-                          // Forms use the box-less `PluginInfo` layout; the list uses the `Plugin`
-                          // layout whose reserved index-2 slot is rendered as the search box.
+        let mut hint: String; // assigned per match arm below (Model arm may refine it)
+                              // Forms use the box-less `PluginInfo` layout; the list uses the `Plugin`
+                              // layout whose reserved index-2 slot is rendered as the search box.
         let mut kind = MenuKind::PluginInfo;
         let mut buf = String::new();
         // PluginInfo rows are flush-left inside a one-column rule margin.
@@ -2274,6 +2284,12 @@ impl Modal for ProviderPanel {
                     form.focus == ModelField::MakeDefault,
                 ));
                 hint = crate::i18n::t(crate::i18n::Msg::ProviderPanelModelFormHint).into_owned();
+                // On the multi-select tier row, surface what Space does and what the
+                // checkbox marks mean — the generic form hint doesn't explain either.
+                if form.focus == ModelField::EffortLevels {
+                    hint = crate::i18n::t(crate::i18n::Msg::ProviderPanelEffortLevelsHint)
+                        .into_owned();
+                }
             }
         }
 
@@ -2412,13 +2428,17 @@ mod tests {
         );
         assert!(f.base_url.is_empty());
         assert_eq!(f.protocol_label(), "OpenAI");
-        // ←→ cycles OpenAI → Anthropic → Ollama → OpenAI (never a vendor list).
+        // ←→ cycles OpenAI → Anthropic → Ollama → Responses → OpenAI (never a
+        // vendor list).
         f.cycle_preset(true);
         assert_eq!(f.protocol_label(), "Anthropic");
         assert_eq!(f.preset().id, "anthropic-compatible");
         f.cycle_preset(true);
         assert_eq!(f.protocol_label(), "Ollama");
         assert_eq!(f.preset().id, "ollama");
+        f.cycle_preset(true);
+        assert_eq!(f.protocol_label(), "OpenAI Responses");
+        assert_eq!(f.preset().id, "openai-responses");
         f.cycle_preset(true);
         assert_eq!(f.protocol_label(), "OpenAI");
         assert_eq!(f.preset().id, "openai-compatible");
@@ -2427,6 +2447,8 @@ mod tests {
     #[test]
     fn add_form_protocol_toggle_cycles_backward() {
         let mut f = AddForm::new(); // OpenAI
+        f.cycle_preset(false);
+        assert_eq!(f.preset().id, "openai-responses");
         f.cycle_preset(false);
         assert_eq!(f.preset().id, "ollama");
         f.cycle_preset(false);
@@ -2449,6 +2471,7 @@ mod tests {
         );
         // The field is never silently wiped when cycling away — the value stays
         // visible and editable (auto-fill only ever fills a blank field).
+        f.cycle_preset(true); // Responses
         f.cycle_preset(true); // OpenAI
         assert_eq!(f.preset().id, "openai-compatible");
         assert_eq!(f.base_url, "http://localhost:11434");
@@ -2486,7 +2509,8 @@ mod tests {
         .unwrap();
         let mut edit = ProviderPanel::open_edit(&cfg, "local");
         assert_eq!(edit.base_url, "http://localhost:11434");
-        edit.cycle_preset(true); // Ollama → OpenAI
+        edit.cycle_preset(true); // Ollama → Responses
+        edit.cycle_preset(true); // Responses → OpenAI
         assert_eq!(edit.preset().id, "openai-compatible");
         assert_eq!(
             edit.base_url, "http://localhost:11434",
@@ -2848,12 +2872,18 @@ mod tests {
         assert_eq!(add.effort_levels, [true, false, true, true, true]);
         assert_eq!(
             add.effort_levels_label(true),
-            " ● low ‹○ medium› ● high  ● xhigh  ● max "
+            " [✓] low ‹[ ] medium› [✓] high  [✓] xhigh  [✓] max "
         );
         assert_eq!(
             add.effort_levels_label(false),
-            " ● low  ○ medium  ● high  ● xhigh  ● max "
+            " [✓] low  [ ] medium  [✓] high  [✓] xhigh  [✓] max "
         );
+        // Non-unicode terminals downgrade `✓`→`v`, so the checkbox stays
+        // legible as `[v]`/`[ ]` (unlike `●`/`○` → ambiguous `*`/`o`).
+        let unicode_label = add.effort_levels_label(false);
+        let ascii = crate::glyph::downgrade_glyphs(&unicode_label, false);
+        assert!(ascii.contains("[v] low"), "ascii checkbox on: {ascii}");
+        assert!(ascii.contains("[ ] medium"), "ascii checkbox off: {ascii}");
         // The DEFAULT cycle now skips medium: None → auto → low → high.
         add.reasoning_effort = None;
         add.cycle_effort(true);

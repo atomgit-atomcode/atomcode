@@ -380,7 +380,13 @@ pub fn login_github_oauth(
     }
     let Some(client_secret_env) = client_secret_env else {
         bail!(
-            "GitHub MCP OAuth requires --client-secret-env or auth.client_secret_env in mcp.json"
+            "GitHub MCP OAuth (the bring-your-own GitHub OAuth App flow) requires \
+             --client-secret-env or auth.client_secret_env in mcp.json.\n\
+             If '{server_name}' is a standard remote MCP server (most are), you probably \
+             don't need this flow at all: drop --provider/--client-id (and the `provider`/\
+             `client_id` fields in mcp.json) and run `atomcode mcp login {server_name}` — it \
+             auto-discovers OAuth (RFC 9728/8414) and registers a client dynamically \
+             (RFC 7591), no client secret needed."
         );
     };
     let client_secret = std::env::var(client_secret_env).with_context(|| {
@@ -467,22 +473,30 @@ fn discover_oauth_metadata(
         });
     }
 
-    let resource_metadata_url = discover_resource_metadata_url(client, mcp_url, auth)?;
-    let prm: ProtectedResourceMetadata = client
-        .get(&resource_metadata_url)
-        .header("Accept", "application/json")
-        .send()
-        .with_context(|| {
-            format!("Failed to fetch MCP OAuth resource metadata from {resource_metadata_url}")
-        })?
-        .error_for_status()
-        .with_context(|| {
-            format!("MCP OAuth resource metadata request failed for {resource_metadata_url}")
-        })?
-        .json()
-        .with_context(|| {
-            format!("Failed to parse MCP OAuth resource metadata from {resource_metadata_url}")
-        })?;
+    let resource_metadata_urls = discover_resource_metadata_urls(client, mcp_url, auth)?;
+    let mut prm: Option<ProtectedResourceMetadata> = None;
+    let mut last_err = None;
+    for url in &resource_metadata_urls {
+        match client
+            .get(url)
+            .header("Accept", "application/json")
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json::<ProtectedResourceMetadata>())
+        {
+            Ok(metadata) => {
+                prm = Some(metadata);
+                break;
+            }
+            Err(e) => last_err = Some((url.clone(), e)),
+        }
+    }
+    let prm: ProtectedResourceMetadata = prm.ok_or_else(|| match last_err {
+        Some((url, e)) => {
+            anyhow::anyhow!("MCP OAuth resource metadata request failed for {url}: {e}")
+        }
+        None => anyhow::anyhow!("MCP OAuth resource metadata: no candidate URL to try"),
+    })?;
     let auth_server = prm.authorization_servers.first().ok_or_else(|| {
         anyhow::anyhow!("MCP OAuth resource metadata has no authorization_servers")
     })?;
@@ -497,14 +511,19 @@ fn discover_oauth_metadata(
     })
 }
 
-fn discover_resource_metadata_url(
+/// Candidate RFC 9728 protected-resource-metadata URLs to try, best first.
+/// A `WWW-Authenticate: … resource_metadata="…"` challenge (or an explicit
+/// `auth.resource` pointing at a `.well-known` doc) pins the exact URL; otherwise
+/// we fall back to all path shapes of the well-known document (insert / append /
+/// origin-root — see [`well_known_metadata_urls`]).
+fn discover_resource_metadata_urls(
     client: &reqwest::blocking::Client,
     mcp_url: &str,
     auth: &McpOAuthConfig,
-) -> Result<String> {
+) -> Result<Vec<String>> {
     if let Some(resource) = &auth.resource {
         if resource.contains("/.well-known/") {
-            return Ok(resource.clone());
+            return Ok(vec![resource.clone()]);
         }
     }
 
@@ -529,15 +548,17 @@ fn discover_resource_metadata_url(
                 .and_then(|v| v.to_str().ok())
             {
                 if let Some(url) = parse_www_authenticate_resource_metadata(header) {
-                    return Ok(url);
+                    return Ok(vec![url]);
                 }
             }
         }
     }
 
-    let parsed = Url::parse(mcp_url).context("Invalid MCP server URL")?;
-    let origin = parsed.origin().ascii_serialization();
-    Ok(format!("{}/.well-known/oauth-protected-resource", origin))
+    let candidates = well_known_metadata_urls(mcp_url, "oauth-protected-resource");
+    if candidates.is_empty() {
+        bail!("Invalid MCP server URL: {mcp_url}");
+    }
+    Ok(candidates)
 }
 
 pub fn parse_www_authenticate_resource_metadata(header: &str) -> Option<String> {
@@ -553,6 +574,38 @@ pub fn parse_www_authenticate_resource_metadata(header: &str) -> Option<String> 
     None
 }
 
+/// Candidate `.well-known` metadata URLs for `base_url` + a well-known `suffix`
+/// (e.g. `oauth-authorization-server`), most-canonical first, deduped.
+///
+/// For a base WITH a path (`https://host/docs`), RFC 8414 §3.1 / RFC 9728 §3.1
+/// put the document at the path-INSERT form `https://host/.well-known/<suffix>/docs`.
+/// atomcode previously only built the naive APPEND (`https://host/docs/.well-known/<suffix>`),
+/// which 404s on gateways that route by sub-path (e.g. `mcp.espressif.com/docs`,
+/// which serves `…/.well-known/oauth-protected-resource/docs`). We now try, in
+/// order: insert (spec-canonical) → append (OIDC/legacy) → origin-root. A base
+/// with no path collapses all three to the single origin-root form, so existing
+/// servers see identical behaviour. Mirrors oh-my-pi's `buildWellKnownUrls`.
+fn well_known_metadata_urls(base_url: &str, suffix: &str) -> Vec<String> {
+    let Ok(parsed) = Url::parse(base_url) else {
+        return Vec::new();
+    };
+    let origin = parsed.origin().ascii_serialization();
+    let path = parsed.path().trim_end_matches('/'); // "" when the base is origin-only
+    let mut candidates = Vec::new();
+    if !path.is_empty() {
+        // RFC 8414 §3.1 path-ful (insert the well-known segment before the path):
+        candidates.push(format!("{origin}/.well-known/{suffix}{path}"));
+        // OIDC Discovery / legacy (append to the full issuer):
+        candidates.push(format!("{origin}{path}/.well-known/{suffix}"));
+    }
+    // Origin-root default (also the RFC 8414 form when the issuer has no path).
+    let root = format!("{origin}/.well-known/{suffix}");
+    if !candidates.contains(&root) {
+        candidates.push(root);
+    }
+    candidates
+}
+
 fn fetch_authorization_server_metadata(
     client: &reqwest::blocking::Client,
     issuer: &str,
@@ -560,16 +613,14 @@ fn fetch_authorization_server_metadata(
     if issuer.contains("/.well-known/") {
         return fetch_metadata_url(client, issuer);
     }
-    let issuer = issuer.trim_end_matches('/');
-    let candidates = [
-        format!("{issuer}/.well-known/oauth-authorization-server"),
-        format!("{issuer}/.well-known/openid-configuration"),
-    ];
+    // Try the RFC 8414 form AND the OIDC form, each across all path shapes.
     let mut last_err = None;
-    for candidate in candidates {
-        match fetch_metadata_url(client, &candidate) {
-            Ok(metadata) => return Ok(metadata),
-            Err(e) => last_err = Some(e),
+    for suffix in ["oauth-authorization-server", "openid-configuration"] {
+        for candidate in well_known_metadata_urls(issuer, suffix) {
+            match fetch_metadata_url(client, &candidate) {
+                Ok(metadata) => return Ok(metadata),
+                Err(e) => last_err = Some(e),
+            }
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No OAuth metadata URL candidates")))
@@ -775,8 +826,89 @@ fn open_browser(url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        base64_url_no_pad, parse_www_authenticate_resource_metadata, McpOAuthToken, McpTokenStore,
+        base64_url_no_pad, login_github_oauth, parse_www_authenticate_resource_metadata,
+        well_known_metadata_urls, McpOAuthToken, McpTokenStore,
     };
+
+    #[test]
+    fn github_flow_without_secret_signposts_the_discovery_flow() {
+        // The bring-your-own GitHub-App flow legitimately needs a client secret;
+        // when it's missing the error must POINT the user at the plain discovery
+        // login (which needs no secret) instead of dead-ending. Bails before any
+        // network/browser work, so this is a pure error-shape check.
+        let err = login_github_oauth("espressif-documentation", "cid", None, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("mcp login espressif-documentation"),
+            "should signpost the discovery login: {err}"
+        );
+        assert!(
+            err.contains("RFC 7591") || err.contains("dynamically"),
+            "should mention dynamic registration: {err}"
+        );
+    }
+
+    #[test]
+    fn well_known_urls_path_bearing_issuer_includes_rfc8414_insert_form() {
+        // The espressif case: issuer/base has a `/docs` path. The RFC 8414 §3.1
+        // insert form MUST be tried (it's the only one the server serves) and be
+        // FIRST (spec-canonical), alongside the legacy append + origin-root.
+        let urls = well_known_metadata_urls(
+            "https://mcp.espressif.com/docs",
+            "oauth-authorization-server",
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "https://mcp.espressif.com/.well-known/oauth-authorization-server/docs".to_string(),
+                "https://mcp.espressif.com/docs/.well-known/oauth-authorization-server".to_string(),
+                "https://mcp.espressif.com/.well-known/oauth-authorization-server".to_string(),
+            ]
+        );
+        // Resource-metadata suffix gets the same treatment (the fallback path).
+        assert!(well_known_metadata_urls(
+            "https://mcp.espressif.com/docs",
+            "oauth-protected-resource"
+        )
+        .contains(
+            &"https://mcp.espressif.com/.well-known/oauth-protected-resource/docs".to_string()
+        ));
+    }
+
+    #[test]
+    fn well_known_urls_multi_segment_path_uses_full_path_and_is_well_formed() {
+        // Multi-segment base (e.g. an endpoint URL used for the resource-metadata
+        // fallback). We preserve the FULL path per RFC 9728 §3.1 — no dropped
+        // segments, no double slashes. (The common case still comes via the exact
+        // WWW-Authenticate `resource_metadata` URL, so this is a best-effort probe.)
+        let urls = well_known_metadata_urls("https://host/api/v1/mcp", "oauth-protected-resource");
+        assert_eq!(
+            urls,
+            vec![
+                "https://host/.well-known/oauth-protected-resource/api/v1/mcp".to_string(),
+                "https://host/api/v1/mcp/.well-known/oauth-protected-resource".to_string(),
+                "https://host/.well-known/oauth-protected-resource".to_string(),
+            ]
+        );
+        assert!(urls.iter().all(|u| !u.contains("//.well-known")
+            && !u.contains(".well-known//")
+            && u.matches("://").count() == 1));
+        // A malformed base yields no candidates (caller turns this into an error).
+        assert!(well_known_metadata_urls("not a url", "oauth-authorization-server").is_empty());
+    }
+
+    #[test]
+    fn well_known_urls_pathless_issuer_collapses_to_origin_root() {
+        // No path → the three shapes collapse to the single origin-root form, so
+        // existing (path-less) servers see byte-identical behaviour.
+        for base in ["https://mcp.example.com", "https://mcp.example.com/"] {
+            assert_eq!(
+                well_known_metadata_urls(base, "oauth-authorization-server"),
+                vec!["https://mcp.example.com/.well-known/oauth-authorization-server".to_string()]
+            );
+        }
+    }
 
     #[test]
     fn base64_url_omits_padding() {

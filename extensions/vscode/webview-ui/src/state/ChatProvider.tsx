@@ -283,7 +283,12 @@ export function ChatProvider({ children }: { children: React.ReactNode }) {
           dispatch({ type: 'SET_SETUP_STATUS', error: msg.message });
           break;
         case 'sessionMessages':
-          dispatch({ type: 'LOAD_SESSION_MESSAGES', messages: msg.messages, terminal: msg.terminal });
+          dispatch({
+            type: 'LOAD_SESSION_MESSAGES',
+            messages: msg.messages,
+            terminal: msg.terminal,
+            todos: msg.todos,
+          });
           break;
         case 'context':
           dispatch({

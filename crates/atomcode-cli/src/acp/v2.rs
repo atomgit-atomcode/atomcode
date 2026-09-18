@@ -270,7 +270,9 @@ pub fn event_to_update(ev: &AgentEvent, message_id: &str) -> Option<SessionUpdat
                 .title(call.name.clone())
                 .kind(tool_kind(&call.name))
                 .status(ToolCallStatus::InProgress)
-                .raw_input(crate::acp::replay::raw_input_from_arguments(&call.arguments)),
+                .raw_input(crate::acp::replay::raw_input_from_arguments(
+                    &call.arguments,
+                )),
         )),
         AgentEvent::ToolResult { result } => {
             let status = if result.is_error {
@@ -1139,18 +1141,26 @@ mod tests {
             .find(|c| c.name == "api")
             .expect("http server connected");
         match &http.config {
-            McpTransportConfig::Http { url, headers, auth, .. } => {
+            McpTransportConfig::Http {
+                url, headers, auth, ..
+            } => {
                 assert_eq!(url, "https://api.example.com/mcp");
                 assert_eq!(
                     headers.get("Authorization").map(String::as_str),
                     Some("Bearer t")
                 );
-                assert!(auth.is_none(), "ACP McpServer::Http carries no auth metadata");
+                assert!(
+                    auth.is_none(),
+                    "ACP McpServer::Http carries no auth metadata"
+                );
             }
             other => panic!("expected Http transport, got {other:?}"),
         }
         assert_eq!(http.source, McpConfigSource::Driver);
-        assert!(!http.trust, "client-injected server routes through kernel approval");
+        assert!(
+            !http.trust,
+            "client-injected server routes through kernel approval"
+        );
     }
 
     /// Persist a native session (meta + snapshot + presentation) under a

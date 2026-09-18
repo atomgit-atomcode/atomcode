@@ -50,10 +50,30 @@ pub struct OllamaConfig {
     /// Output cap → `options.num_predict` when `ChatOptions::max_tokens` is `None`.
     /// `None` ⇒ let Ollama decide.
     pub max_tokens: Option<u32>,
+    /// Runtime context window → `options.num_ctx`. `None` ⇒ OMIT the knob and let the
+    /// daemon use its own default (`OLLAMA_CONTEXT_LENGTH`).
+    ///
+    /// DELIBERATELY separate from [`Self::context_window`]: that one is what the KERNEL
+    /// divides by when deciding to compact, and it always carries a fallback value.
+    /// Sending that fallback as `num_ctx` would FORCE the daemon down to it — a host
+    /// whose server is configured for 32k would silently drop to the 8k fallback. So
+    /// only a window the caller actually KNOWS (user-configured, or read back from
+    /// `/api/ps`) belongs here; anything else must leave the daemon's default alone.
+    ///
+    /// Why pinning it matters when the caller does know: Ollama does NOT reject an
+    /// over-long prompt, it TRUNCATES silently — no error, so the kernel's
+    /// context-overflow ladder never fires and the model just loses the head of the
+    /// conversation. Pinning `num_ctx` makes the declared window the real one.
+    pub num_ctx: Option<u32>,
     /// Enable thinking (`think: true`) for thinking-capable models. A per-call
     /// `reasoning_effort` overrides this with a level string (`think: "high"`).
     pub think: bool,
+    /// Inter-token stream-idle watchdog (after the first byte of a stream).
     pub idle_timeout: Duration,
+    /// FIRST-byte (prefill / TTFB) idle watchdog: no bytes for this long BEFORE the
+    /// first byte of a (re)opened stream ⇒ terminal error. Separate from (and ≥)
+    /// `idle_timeout`; wired from the coding-layer `first_token_timeout`.
+    pub first_token_timeout: Duration,
     pub connect_timeout: Duration,
     pub retry: RetryPolicy,
     /// User-Agent sent on every request. `None` ⇒ [`super::DEFAULT_USER_AGENT`]; the
@@ -74,8 +94,10 @@ impl OllamaConfig {
             model,
             context_window: 8_192,
             max_tokens: None,
+            num_ctx: None,
             think: false,
             idle_timeout: Duration::from_secs(120),
+            first_token_timeout: Duration::from_secs(120),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
             user_agent: None,
@@ -156,6 +178,7 @@ impl LlmProvider for OllamaProvider {
         // Snapshot the session id once; reused across the open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
+        let first_token = self.cfg.first_token_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
         let resp = open_stream(
             &client,
@@ -184,8 +207,20 @@ impl LlmProvider for OllamaProvider {
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
+                // PHASE-AWARE byte-idle watchdog: prefill (before the first byte of this
+                // (re)opened stream) waits up to `first_token`; after the first byte we
+                // tighten to the inter-token `idle`. See openai_compat for the rationale.
+                // Reset per (re)open — a transparent reconnect restarts prefill.
+                let mut first_byte_seen = false;
                 loop {
-                    match tokio::time::timeout(idle, byte_stream.next()).await {
+                    match retry::next_chunk_phased(
+                        &mut byte_stream,
+                        first_token,
+                        idle,
+                        &mut first_byte_seen,
+                    )
+                    .await
+                    {
                         Err(_elapsed) => {
                             yield StreamEvent::Error(ProviderError {
                                 retryable: false,
@@ -424,6 +459,10 @@ fn build_request_body(
     }
     if let Some(mt) = options.max_tokens.or(cfg.max_tokens) {
         opts.insert("num_predict".into(), json!(mt));
+    }
+    // Pin the runtime window ONLY when the caller knows it; see `OllamaConfig::num_ctx`.
+    if let Some(n) = cfg.num_ctx {
+        opts.insert("num_ctx".into(), json!(n));
     }
     if !opts.is_empty() {
         body.insert("options".into(), Value::Object(opts));
@@ -737,6 +776,23 @@ mod tests {
             body["tools"][0],
             json!({"type":"function","function":{"name":"read","description":"d","parameters":{"type":"object"}}})
         );
+    }
+
+    /// `num_ctx` is only sent when the caller pinned a window; otherwise the daemon's
+    /// own default must survive untouched (sending our fallback would SHRINK it).
+    #[test]
+    fn body_sends_num_ctx_only_when_pinned() {
+        let mut cfg = OllamaConfig::new("http://h", "m");
+        let msgs = [Message::user("hi")];
+        let body = build_request_body("m", &msgs, &[], &ChatOptions::default(), &cfg);
+        assert!(
+            body.get("options").and_then(|o| o.get("num_ctx")).is_none(),
+            "unpinned ⇒ no num_ctx"
+        );
+
+        cfg.num_ctx = Some(32_768);
+        let body = build_request_body("m", &msgs, &[], &ChatOptions::default(), &cfg);
+        assert_eq!(body["options"]["num_ctx"].as_u64(), Some(32_768));
     }
 
     #[test]

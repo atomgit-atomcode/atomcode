@@ -1,6 +1,6 @@
 //! `trace_callers` — reverse call graph (who calls a symbol), BFS to a depth. `Safe`.
 
-use super::index::CodeIndex;
+use super::index::{CodeIndex, IndexLimits};
 use super::{canonical, display_path, err, ok};
 use async_trait::async_trait;
 use atomcode_kernel::tool::{Tool, ToolContext, ToolResult};
@@ -65,7 +65,10 @@ impl Tool for TraceCallersTool {
 }
 
 fn render(index: &CodeIndex, root: &Path, symbol: &str, depth: usize) -> ToolResult {
-    let g = index.get(root);
+    let g = match index.get_limited(root, &IndexLimits::default()) {
+        Ok(g) => g,
+        Err(e) => return err(format!("trace_callers: {}", e)),
+    };
     let croot = canonical(root);
     let root: &Path = &croot;
     let matches = g.find_by_name(symbol);
@@ -127,6 +130,39 @@ mod tests {
         assert!(!r.is_error, "{}", r.content);
         assert!(r.content.contains("Callers of target"), "{}", r.content);
         assert!(r.content.contains("caller_a"), "{}", r.content);
+    }
+
+    #[tokio::test]
+    async fn traces_kotlin_callers_across_files() {
+        // End-to-end proof the Kotlin call graph works: .kt files are walked,
+        // symbols + call edges extracted, and trace_callers resolves cross-file.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("Target.kt"),
+            "fun target() {}\nclass Widget {}\n",
+        )
+        .unwrap();
+        // callerA does a plain call; makeWidget does a constructor call `Widget()`
+        // (Kotlin constructors parse as a plain call → must produce a callee edge).
+        std::fs::write(
+            d.path().join("Caller.kt"),
+            "fun callerA() { target() }\nfun makeWidget() { Widget() }\n",
+        )
+        .unwrap();
+        let tool = TraceCallersTool::new(Arc::new(CodeIndex::new()));
+        let ctx = ToolContext {
+            working_dir: d.path().to_path_buf(),
+            cancel: CancellationToken::new(),
+            progress: atomcode_kernel::tool::ProgressSink::noop(),
+            requester: None,
+        };
+        let r = tool.execute(r#"{"symbol":"target"}"#, &ctx).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("callerA"), "{}", r.content);
+        // Constructor call edge: `Widget()` in makeWidget → the Widget class.
+        let w = tool.execute(r#"{"symbol":"Widget"}"#, &ctx).await;
+        assert!(!w.is_error, "{}", w.content);
+        assert!(w.content.contains("makeWidget"), "{}", w.content);
     }
 
     #[tokio::test]

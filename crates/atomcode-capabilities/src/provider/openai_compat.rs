@@ -36,19 +36,26 @@ use std::time::Duration;
 /// App-attribution headers sent to OpenRouter so real user traffic is credited
 /// to a public "AtomCode" app entry on openrouter.ai (rankings / app page).
 ///
-/// Per OpenRouter's app-attribution contract:
-///   - `HTTP-Referer` is the app's STABLE identifier (primary domain) — it alone
-///     creates the app page;
-///   - `X-OpenRouter-Title` is the display name on the rankings;
-///   - `X-OpenRouter-Categories` places the app in the marketplace categories.
+/// Per OpenRouter's documented app-attribution contract these are the ONLY two
+/// header names it reads (https://openrouter.ai/docs/api-reference/overview):
+///   - `HTTP-Referer` is the app's STABLE identifier (primary URL) — it creates
+///     the app page and is how the request is matched to a listed app;
+///   - `X-Title` is the display name on the rankings / app leaderboard.
 ///
-/// These are sent ONLY when the request actually targets `openrouter.ai` (see
+/// These two together are what identify the request as coming from a recognized
+/// agentic harness. Free models gated to "agentic harnesses" 403 without them —
+/// earlier we sent `X-OpenRouter-Title` / `X-OpenRouter-Categories`, header names
+/// OpenRouter does NOT read, so the app was never recognized and the gate failed.
+///
+/// Sent ONLY when the request actually targets `openrouter.ai` (see
 /// [`is_openrouter_url`]) so other OpenAI-compatible endpoints — including
 /// AtomGit's own signing gateway — never receive them.
-pub const OPENROUTER_ATTRIBUTION_HEADERS: &[(&str, &str); 3] = &[
-    ("HTTP-Referer", "https://gitcode.com/atomgit_atomcode/atomcode"),
-    ("X-OpenRouter-Title", "AtomCode"),
-    ("X-OpenRouter-Categories", "cli-agent"),
+pub const OPENROUTER_ATTRIBUTION_HEADERS: &[(&str, &str); 2] = &[
+    (
+        "HTTP-Referer",
+        "https://gitcode.com/atomgit_atomcode/atomcode",
+    ),
+    ("X-Title", "AtomCode"),
 ];
 
 /// True when `url` targets the OpenRouter API (any path under the `openrouter.ai`
@@ -60,26 +67,47 @@ pub const OPENROUTER_ATTRIBUTION_HEADERS: &[(&str, &str); 3] = &[
 /// `provider` alone). The label-aware suffix match reuses
 /// [`atomcode_config::endpoints::host_matches_domain`] so it agrees with the rest
 /// of the codebase and can't drift.
-pub fn is_openrouter_url(url: &str) -> bool {
-    let authority = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(url);
-    // Host = the authority minus path/query/fragment...
-    let host_port = authority
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(authority);
-    // ...minus any `userinfo@` prefix. Without this, a crafted
-    // `https://openrouter.ai:x@evil.com/…` would parse the userinfo `openrouter.ai`
-    // as the host and leak the attribution headers to `evil.com`.
+/// The host of a URL, extracted safely for host-gated header helpers. Shared so the
+/// gates (openrouter attribution, opencode session) can't drift in how they parse — and
+/// can't be fooled by a crafted `https://good.example:x@evil.com/…` into reading the
+/// `userinfo` as the host. Authority minus path/query/fragment, minus `userinfo@`, minus
+/// `:port`.
+fn url_host(url: &str) -> &str {
+    let authority = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let host_port = authority.split(['/', '?', '#']).next().unwrap_or(authority);
     let host_port = host_port
         .rsplit_once('@')
         .map(|(_userinfo, host)| host)
         .unwrap_or(host_port);
-    // ...minus an explicit `:port`.
-    let host = host_port.split(':').next().unwrap_or(host_port);
-    atomcode_config::endpoints::host_matches_domain(host, "openrouter.ai")
+    host_port.split(':').next().unwrap_or(host_port)
+}
+
+pub fn is_openrouter_url(url: &str) -> bool {
+    atomcode_config::endpoints::host_matches_domain(url_host(url), "openrouter.ai")
+}
+
+/// True when `url` targets OpenCode Zen (`opencode.ai`, the OpenAI-compatible `/zen/v1`
+/// endpoint atomcode ships a preset for). Gates the `x-opencode-session` header so it is
+/// sent ONLY there — meaningless (and an unwanted product-identity leak) on any other
+/// OpenAI-compatible endpoint, same rationale as the openrouter-attribution gate.
+fn is_opencode_zen_url(url: &str) -> bool {
+    atomcode_config::endpoints::host_matches_domain(url_host(url), "opencode.ai")
+}
+
+/// Attach OpenCode Zen's required `x-opencode-session` header — one stable ID per
+/// conversation — when `url` targets opencode.ai. We already carry exactly that stable id
+/// (sent as `x-atomcode-session-id`), so surface it under their header name too rather than
+/// mint a second one. Gated to their host; an empty session (session-less sub-agent /
+/// summary) is omitted, matching the `x-atomcode-session-id` behavior.
+fn apply_opencode_session(
+    url: &str,
+    req: reqwest::RequestBuilder,
+    session_id: &str,
+) -> reqwest::RequestBuilder {
+    if session_id.is_empty() || !is_opencode_zen_url(url) {
+        return req;
+    }
+    req.header("x-opencode-session", session_id)
 }
 
 /// Attach the OpenRouter app-attribution headers to `req` when `url` targets
@@ -129,7 +157,13 @@ pub struct OpenAiCompatConfig {
     /// Kimi K2.6 preserved thinking: `thinking.keep` in the request body.
     pub thinking_keep: Option<String>,
     /// Per-chunk stream-idle watchdog: no bytes for this long ⇒ terminal error.
+    /// Governs the INTER-token phase (after the first byte of a stream).
     pub idle_timeout: Duration,
+    /// FIRST-byte (prefill / TTFB) idle watchdog: no bytes for this long BEFORE the
+    /// first byte of a (re)opened stream ⇒ terminal error. Separate from (and ≥)
+    /// `idle_timeout` because prefill on a slow local model can be silent far longer
+    /// than inter-token gaps. Wired from the coding-layer `first_token_timeout`.
+    pub first_token_timeout: Duration,
     pub connect_timeout: Duration,
     /// Per-ATTEMPT first-byte (TTFB) watchdog for the OPEN call. A gateway that
     /// accepts the connection but never responds would otherwise hang FOREVER —
@@ -212,6 +246,7 @@ impl OpenAiCompatConfig {
             thinking_type: None,
             thinking_keep: None,
             idle_timeout: Duration::from_secs(120),
+            first_token_timeout: Duration::from_secs(120),
             open_timeout: Duration::from_secs(90),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
@@ -278,8 +313,9 @@ impl OpenAiCompatProvider {
 
 /// Build a fresh streaming HTTP client from the process's current proxy env.
 /// Extracted so [`SwappableClient`] can rebuild an identical client with an EMPTY
-/// connection pool when a pooled connection goes stale.
-fn build_http_client(
+/// connection pool when a pooled connection goes stale. `pub(crate)`: the
+/// Responses-API adapter reuses the identical client policy.
+pub(crate) fn build_http_client(
     connect_timeout: std::time::Duration,
     skip_tls_verify: bool,
     user_agent: Option<String>,
@@ -448,7 +484,7 @@ pub(crate) struct SwappableClient {
 }
 
 impl SwappableClient {
-    fn new(
+    pub(crate) fn new(
         force_tls12: bool,
         build: impl Fn(bool) -> Result<reqwest::Client, ProviderError> + Send + Sync + 'static,
     ) -> Result<Self, ProviderError> {
@@ -550,6 +586,7 @@ impl LlmProvider for OpenAiCompatProvider {
         // the initial open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
+        let first_token = self.cfg.first_token_timeout;
         let open_timeout = self.cfg.open_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
         let resp = match open_stream(
@@ -600,8 +637,23 @@ impl LlmProvider for OpenAiCompatProvider {
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
+                // PHASE-AWARE byte-idle watchdog: before the first byte of THIS (re)opened
+                // stream we are in prefill (TTFB) — a slow local model can be silent for
+                // minutes — so allow up to `first_token`; once any byte has arrived, tighten
+                // to the inter-token `idle`. Keep-alive bytes flip us early but also keep
+                // resetting the watchdog, so it won't fire spuriously; a fully-silent prefill
+                // gets the full first-token budget, matching the kernel first_token_timeout.
+                // Reset per (re)open: a transparent reconnect restarts prefill on the server.
+                let mut first_byte_seen = false;
                 loop {
-                    match tokio::time::timeout(idle, byte_stream.next()).await {
+                    match retry::next_chunk_phased(
+                        &mut byte_stream,
+                        first_token,
+                        idle,
+                        &mut first_byte_seen,
+                    )
+                    .await
+                    {
                         Err(_elapsed) => {
                             // Mid-stream idle: non-recoverable (partial deltas may already
                             // have reached the consumer), so not retryable.
@@ -629,6 +681,32 @@ impl LlmProvider for OpenAiCompatProvider {
                             return;
                         }
                         Ok(Some(Err(e))) => {
+                            // Message already logically complete (a real, non-empty
+                            // finish_reason arrived) AND the error is a benign transport
+                            // drop — a gateway closing the keep-alive after the final
+                            // event but before the `[DONE]` sentinel, which rustls
+                            // surfaces as a missing TLS close_notify / UnexpectedEof.
+                            // Treat it as a CLEAN stream end (flush + Done), not a
+                            // spurious mid-turn "响应中断": deepseek-v4-flash relies on
+                            // `[DONE]` to terminate, so a keep-alive drop between the
+                            // finish_reason chunk and `[DONE]` otherwise killed a
+                            // fully-generated 20-minute turn.
+                            if dec.seen_finish() && retry::is_stale_connection_error(&e) {
+                                for ev in dec.finish() {
+                                    if !emitted_replay_sensitive && retry::is_attempt_metadata_event(&ev) {
+                                        pending_metadata.push(ev);
+                                        continue;
+                                    }
+                                    if retry::is_replay_sensitive_event(&ev)
+                                        || matches!(ev, StreamEvent::Done { .. } | StreamEvent::Error(_))
+                                    {
+                                        for metadata in pending_metadata.drain(..) { yield metadata; }
+                                    }
+                                    emitted_replay_sensitive |= retry::is_replay_sensitive_event(&ev);
+                                    yield ev;
+                                }
+                                return;
+                            }
                             // No replay-sensitive output reached the consumer yet → re-open
                             // the whole request transparently (bounded by MAX_STREAM_ATTEMPTS).
                             if !emitted_replay_sensitive && stream_attempt < MAX_STREAM_ATTEMPTS {
@@ -729,8 +807,10 @@ fn authentication_expired_error(code: u16) -> ProviderError {
 /// transport) per `policy`. Builds the request fresh each attempt so a signer
 /// (if any) re-auths with a new nonce/timestamp. Returns the live `Response` on
 /// a 2xx, or a terminal `ProviderError`. Shared by the initial open and the
-/// mid-stream re-open so both paths behave identically.
-async fn open_stream(
+/// mid-stream re-open so both paths behave identically. `pub(crate)`: the
+/// Responses-API adapter reuses the identical open/retry/idle semantics — only
+/// the URL and body bytes differ.
+pub(crate) async fn open_stream(
     client: &SwappableClient,
     url: &str,
     body_bytes: &[u8],
@@ -776,6 +856,8 @@ async fn open_stream(
         if !session_id.is_empty() {
             req = req.header("x-atomcode-session-id", session_id);
         }
+        // OpenCode Zen requires its own `x-opencode-session` (same stable id); host-gated.
+        req = apply_opencode_session(url, req, session_id);
         req = apply_openrouter_attribution(url, req);
         let was_capped = tls12_probe || atomcode_config::tls::should_cap_url(url);
         // TTFB watchdog for THIS attempt. `send()` resolves as soon as the response
@@ -1163,6 +1245,10 @@ fn normalize_openai_tool_schema(schema: &Value) -> Value {
     normalized
 }
 
+pub(crate) fn shared_normalize_tool_schema(schema: &Value) -> Value {
+    normalize_openai_tool_schema(schema)
+}
+
 fn normalize_openai_tool_schema_in_place(schema: &mut Value) {
     let Value::Object(map) = schema else {
         return;
@@ -1321,7 +1407,7 @@ fn truncate_msg(s: &str) -> String {
 /// `atomcode_core::provider::extract_error_message`'s shape list (kept LOCAL — L1 must
 /// not depend on core). Previously only the `error` object was handled, so GLM-style
 /// top-level `message` bodies dumped raw JSON into the user-facing error.
-fn extract_error_detail(text: &str) -> String {
+pub(crate) fn extract_error_detail(text: &str) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
         if let Some(detail) = v.get("detail") {
             if detail.is_object() {
@@ -1348,7 +1434,7 @@ fn extract_error_detail(text: &str) -> String {
 
 /// Format an OpenAI-compatible error OBJECT (`{"message","type","code"}`) as a readable
 /// "[type/code] message" one-liner carrying BOTH the error CODE and the REASON.
-fn parse_error_obj(err: &serde_json::Value) -> String {
+pub(crate) fn parse_error_obj(err: &serde_json::Value) -> String {
     let msg = err
         .get("message")
         .and_then(|m| m.as_str())
@@ -1383,7 +1469,7 @@ fn error_code_value(code: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn error_code(err: &serde_json::Value) -> Option<String> {
+pub(crate) fn error_code(err: &serde_json::Value) -> Option<String> {
     err.get("code").and_then(error_code_value).or_else(|| {
         err.get("type")
             .and_then(|t| t.as_str())
@@ -1402,6 +1488,22 @@ fn provider_error_code(envelope: &serde_json::Value) -> Option<String> {
         .or_else(|| envelope.get("code").and_then(error_code_value))
 }
 
+/// Recover the HTTP status embedded in an in-band SSE error object. Gateways such
+/// as OpenRouter open the stream with HTTP 200, then relay an upstream failure
+/// (often a rate-limit) as `data: {"error":{"code":<status>,..}}`, where `code` is
+/// the upstream HTTP status. Only treat it as one when it is a plausible HTTP status
+/// (100–599), so vendor-specific numeric codes (e.g. billing `1113`) are not
+/// mislabeled. Returns `None` for string codes that are not pure HTTP status numbers.
+pub(crate) fn inband_error_http_status(err: &serde_json::Value) -> Option<u16> {
+    let n = match err.get("code")? {
+        serde_json::Value::Number(n) => n.as_u64()?,
+        serde_json::Value::String(s) => s.trim().parse::<u64>().ok()?,
+        _ => return None,
+    };
+    let n = u16::try_from(n).ok()?;
+    (100..=599).contains(&n).then_some(n)
+}
+
 // `friendly_http_error` (was here) moved to the shared `provider` module so
 // every protocol wraps auth/billing codes identically; see `super::friendly_http_error`.
 
@@ -1410,6 +1512,14 @@ fn provider_error_code(envelope: &serde_json::Value) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 const MAX_TOOL_CALL_DELTAS: usize = 20000;
+
+/// Upper bound on a streamed tool-call `index`. The index pads `tool_calls` up to
+/// its value, so an out-of-range one from a buggy/malicious server (e.g.
+/// `index: 999_999_999`) would allocate a gigantic vector → OOM. Real responses
+/// index parallel tool calls densely from 0 and never approach this; a larger index
+/// is malformed and its delta is dropped. Generous so legitimate high fan-out is
+/// never rejected, while keeping the buffer trivially small.
+const MAX_TOOL_CALLS: usize = 256;
 
 /// Stateful Server-Sent-Events decoder. Feed it raw byte chunks; it returns whole
 /// kernel `StreamEvent`s. Splitting tool-call assembly + usage buffering out here (vs
@@ -1462,6 +1572,15 @@ impl SseDecoder {
         out
     }
 
+    /// True once a NON-EMPTY `finish_reason` has been seen — the model's own
+    /// "message complete" signal. After this point a trailing transport EOF
+    /// (e.g. a gateway closing the keep-alive after the final event but before
+    /// the `[DONE]` sentinel, which rustls surfaces as a missing TLS
+    /// close_notify / `UnexpectedEof`) is benign, not a truncation.
+    fn seen_finish(&self) -> bool {
+        self.seen_finish
+    }
+
     /// Stream ended WITHOUT a `[DONE]` sentinel: flush buffered tool calls + usage,
     /// then emit `Done`.
     fn finish(&mut self) -> Vec<StreamEvent> {
@@ -1470,13 +1589,24 @@ impl SseDecoder {
             return out;
         }
         for (id, name, args) in std::mem::take(&mut self.tool_calls) {
-            if !id.is_empty() || !name.is_empty() || !args.is_empty() {
-                out.push(StreamEvent::ToolCall(ToolCall {
-                    id,
-                    name,
-                    arguments: args,
-                }));
+            // A tool call with NO function name is UNDISPATCHABLE: executors resolve tools
+            // BY NAME, so emitting one buys a guaranteed failed round trip — a 0ms
+            // "unknown tool" result that burns a round and, on hosts that classify tools
+            // by name, is reported as an UNKNOWN (hence destructive, approval-gated) call.
+            // A slot reaches this state whenever a gateway sends an `id`, or argument
+            // fragments, at an index whose `function.name` never arrives — including the
+            // placeholder slots this loop pads out for sparse `index` values. Dropping it
+            // leaves the round tool-call-free, which the agent loop already handles
+            // (empty-response re-issue); that is strictly better than dispatching a name
+            // that cannot resolve.
+            if name.is_empty() {
+                continue;
             }
+            out.push(StreamEvent::ToolCall(ToolCall {
+                id,
+                name,
+                arguments: args,
+            }));
         }
         if let Some(u) = self.last_usage.take() {
             out.push(StreamEvent::Usage(u));
@@ -1533,13 +1663,20 @@ impl SseDecoder {
                 out.push(StreamEvent::ResponseModel(model.to_string()));
             }
         }
-        // A mid-stream provider error chunk: surface it (code + reason) and TERMINATE —
-        // mid-stream is non-recoverable. (Previously such chunks were silently dropped.)
+        // A mid-stream provider error chunk: surface it (code + reason). Gateways
+        // (e.g. OpenRouter) relay an upstream failure — often a rate-limit — as an
+        // in-band error object over an HTTP-200 SSE stream. Recover its HTTP status
+        // from the error `code` so the kernel's status-aware handling applies (in
+        // particular the mid-stream 429 retry, which is safe when no content has
+        // streamed yet) instead of treating every in-stream error as a status-less,
+        // non-retryable failure that terminates the turn.
+        // (Previously such chunks were silently dropped.)
         if let Some(err) = &chunk.error {
+            let http_status = inband_error_http_status(err);
             out.push(StreamEvent::Error(ProviderError {
-                retryable: false,
+                retryable: http_status.is_some_and(retry::is_retryable_status),
                 message: format!("provider error: {}", parse_error_obj(err)),
-                http_status: None,
+                http_status,
                 code: error_code(err),
                 retry_after_secs: None, // mid-stream error: no response headers
             }));
@@ -1571,6 +1708,13 @@ impl SseDecoder {
             for tc in tcs {
                 self.tool_call_delta_count += 1;
                 let idx = tc.index.unwrap_or(0);
+                // Bound the index BEFORE it pads the vector: an out-of-range value
+                // (e.g. `index: 999_999_999`) would otherwise push ~a billion slots →
+                // OOM. Real responses index densely from 0; a huge sparse index is
+                // malformed, so drop that delta rather than allocate for it.
+                if idx >= MAX_TOOL_CALLS {
+                    continue;
+                }
                 while self.tool_calls.len() <= idx {
                     self.tool_calls
                         .push((String::new(), String::new(), String::new()));
@@ -1620,13 +1764,16 @@ impl SseDecoder {
         if let Some(fr) = choice.finish_reason.filter(|s| !s.is_empty()) {
             self.seen_finish = true;
             for (id, name, args) in std::mem::take(&mut self.tool_calls) {
-                if !id.is_empty() || !name.is_empty() || !args.is_empty() {
-                    out.push(StreamEvent::ToolCall(ToolCall {
-                        id,
-                        name,
-                        arguments: args,
-                    }));
+                // Same rule as `finish()`: a nameless tool call cannot be dispatched, so
+                // dropping it beats emitting a call that is certain to fail.
+                if name.is_empty() {
+                    continue;
                 }
+                out.push(StreamEvent::ToolCall(ToolCall {
+                    id,
+                    name,
+                    arguments: args,
+                }));
             }
             if fr == "length" {
                 self.truncated = true;
@@ -2842,6 +2989,58 @@ mod tests {
     }
 
     #[test]
+    fn seen_finish_gates_benign_trailing_eof_swallow() {
+        // The mid-stream "gateway dropped keep-alive before `[DONE]`" swallow is
+        // gated on `seen_finish()`. A NON-EMPTY finish_reason means the message is
+        // complete → a trailing close_notify / UnexpectedEof is benign. An EMPTY
+        // finish_reason (deepseek-v4-flash sends `""` on every content chunk) must
+        // NOT arm it, or a genuine mid-content truncation would be silently
+        // accepted as a complete turn.
+        let mut d = SseDecoder::new();
+        let _ = d.feed(
+            line(json!({"choices":[{"delta":{"content":"hi"},"finish_reason":""}]})).as_bytes(),
+        );
+        assert!(
+            !d.seen_finish(),
+            "empty finish_reason must NOT arm seen_finish"
+        );
+        let _ = d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})).as_bytes());
+        assert!(d.seen_finish(), "non-empty finish_reason arms seen_finish");
+    }
+
+    #[test]
+    fn sse_tool_call_out_of_range_index_is_dropped_not_oom() {
+        // A buggy/malicious server sending a huge `index` must NOT pad the buffer up
+        // to that value (which would allocate ~a billion slots → OOM). The
+        // out-of-range delta is dropped; a legitimate index-0 call in the same stream
+        // still assembles. If the bound were missing this test would OOM/hang.
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":999_999_999u64,"id":"evil","function":{"name":"x","arguments":"{}"}}]}}]})).as_bytes()));
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ok","function":{"name":"read","arguments":"{\"path\":\"a\"}"}}]}}]})).as_bytes()));
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()),
+        );
+        let calls: Vec<_> = ev
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "only the in-range call is emitted: {calls:?}"
+        );
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].id, "call_ok");
+    }
+
+    #[test]
     fn sse_empty_string_finish_reason_does_not_drop_tool_calls() {
         // SenseNova's free `deepseek-v4-flash` sends `"finish_reason":""` (EMPTY
         // STRING, not null) on EVERY streaming chunk — reasoning AND tool_call
@@ -2941,6 +3140,77 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "a");
         assert_eq!(calls[1].name, "b");
+    }
+
+    /// A gateway can leave a buffered slot WITHOUT a `function.name`: an `id` on its own,
+    /// or argument fragments landing on an index whose name never arrives. Such a call
+    /// cannot be dispatched (tools resolve by name), so it must not be emitted — doing so
+    /// produced a 0ms unknown-tool failure every single time, observed downstream as
+    /// recurring "empty tool name" errors accumulating through long sessions.
+    #[test]
+    fn sse_nameless_tool_call_is_dropped() {
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(
+            d.feed(
+                line(json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"c0","function":{"arguments":"{}"}},
+                    {"index":1,"id":"c1","function":{"name":"real","arguments":"{}"}}
+                ]}}]}))
+                .as_bytes(),
+            ),
+        );
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()),
+        );
+        let calls: Vec<_> = ev
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "only the named call may survive: {calls:?}");
+        assert_eq!(calls[0].name, "real");
+    }
+
+    /// Companion to `sse_nameless_tool_call_is_dropped` covering the OTHER flush site:
+    /// `finish()` (stream terminates at `[DONE]` with only a non-terminal
+    /// `finish_reason:""`, so buffered calls flush there, not in the finish_reason
+    /// branch). A nameless slot must be dropped here too; the named call survives.
+    #[test]
+    fn sse_nameless_tool_call_dropped_on_finish_flush() {
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(
+            d.feed(
+                line(json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"c0","function":{"arguments":"{}"}},
+                    {"index":1,"id":"c1","function":{"name":"real","arguments":"{}"}}
+                ]},"finish_reason":""}]}))
+                .as_bytes(),
+            ),
+        );
+        ev.extend(d.feed(b"data: [DONE]\n"));
+        let calls: Vec<_> = ev
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the finish() flush must drop the nameless slot too: {calls:?}"
+        );
+        assert_eq!(calls[0].name, "real");
     }
 
     #[test]
@@ -3211,11 +3481,79 @@ mod tests {
             "must carry reason: {}",
             err.message
         );
-        assert!(!err.retryable, "mid-stream errors are non-retryable");
+        assert!(
+            !err.retryable,
+            "a non-HTTP-status mid-stream error stays non-retryable"
+        );
+        assert_eq!(err.http_status, None, "a string code is not an HTTP status");
         assert_eq!(
             err.code.as_deref(),
             Some("overloaded"),
             "structured code on mid-stream error"
+        );
+    }
+
+    #[test]
+    fn sse_mid_stream_429_error_chunk_recovers_http_status_for_retry() {
+        // OpenRouter (and similar gateways) open the stream with HTTP 200, then relay
+        // an upstream rate-limit as an in-band error object: `data: {"error":{"code":429,..}}`.
+        // The decoder must recover the 429 as `http_status` so the kernel's mid-stream
+        // 429 handler fires (safe to retry before any content), instead of surfacing a
+        // status-less, non-retryable provider error that terminates the turn.
+        let mut d = SseDecoder::new();
+        let ev = d.feed(
+            line(json!({"error":{"message":"Provider returned error","code":429}})).as_bytes(),
+        );
+        let err = ev
+            .iter()
+            .find_map(|e| {
+                if let StreamEvent::Error(e) = e {
+                    Some(e.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("a mid-stream error chunk must surface a StreamEvent::Error");
+        assert_eq!(
+            err.http_status,
+            Some(429),
+            "in-band 429 must recover its HTTP status for the kernel retry path"
+        );
+        assert!(
+            err.retryable,
+            "an in-band 429 is retryable (kernel decides retry vs pause by content/terminal)"
+        );
+        assert_eq!(
+            err.code.as_deref(),
+            Some("429"),
+            "structured code preserved"
+        );
+    }
+
+    #[test]
+    fn sse_mid_stream_vendor_code_not_mislabeled_as_http_status() {
+        // A vendor-specific numeric code (e.g. billing `1113`) is NOT an HTTP status:
+        // it must not be mislabeled, so the turn takes the generic terminate path rather
+        // than the 429 retry path.
+        let mut d = SseDecoder::new();
+        let ev = d.feed(line(json!({"error":{"message":"余额不足","code":1113}})).as_bytes());
+        let err = ev
+            .iter()
+            .find_map(|e| {
+                if let StreamEvent::Error(e) = e {
+                    Some(e.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("a mid-stream error chunk must surface a StreamEvent::Error");
+        assert_eq!(
+            err.http_status, None,
+            "a vendor code outside 100-599 is not an HTTP status"
+        );
+        assert!(
+            !err.retryable,
+            "an unmapped vendor code stays non-retryable"
         );
     }
 
@@ -3301,7 +3639,32 @@ mod tests {
             friendly_http_error(403, "USER HAS NO CODINGPLAN"),
             "CodingPlan 未领取或已失效（HTTP 403）。请运行 /login 重新登录并领取 CodingPlan。"
         );
-        assert!(friendly_http_error(401, "").contains("API key"));
+        // 401 KEEPS its detail (unlike 402): `invalid_api_key` and
+        // `invalid_client_signature` both arrive as 401 and need opposite fixes,
+        // and the headline is identical for both.
+        assert_eq!(
+            friendly_http_error(
+                401,
+                "[invalid_request_error/invalid_api_key] Incorrect API key provided."
+            ),
+            "API key 未授权或已失效（HTTP 401）：[invalid_request_error/invalid_api_key] Incorrect API key provided."
+        );
+        assert_eq!(
+            friendly_http_error(
+                401,
+                "[authentication_error/invalid_client_signature] bad signature"
+            ),
+            "API key 未授权或已失效（HTTP 401）：[authentication_error/invalid_client_signature] bad signature"
+        );
+        // Empty / whitespace-only body: bare headline, no dangling separator.
+        assert_eq!(
+            friendly_http_error(401, ""),
+            "API key 未授权或已失效（HTTP 401）"
+        );
+        assert_eq!(
+            friendly_http_error(401, "   "),
+            "API key 未授权或已失效（HTTP 401）"
+        );
         // 429 is NOT wrapped (kernel rate-limit path owns it — must keep the
         // literal `HTTP 429: ` prefix so `rate_limit_server_message` can strip it).
         assert_eq!(friendly_http_error(429, "slow down"), "HTTP 429: slow down");
@@ -3785,8 +4148,12 @@ mod tests {
         // Real OpenRouter endpoints (any path, http or https, explicit port).
         assert!(is_openrouter_url("https://openrouter.ai/api/v1"));
         assert!(is_openrouter_url("https://openrouter.ai"));
-        assert!(is_openrouter_url("http://openrouter.ai:443/api/v1/chat/completions"));
-        assert!(is_openrouter_url("https://openrouter.ai/api/v1/chat/completions"));
+        assert!(is_openrouter_url(
+            "http://openrouter.ai:443/api/v1/chat/completions"
+        ));
+        assert!(is_openrouter_url(
+            "https://openrouter.ai/api/v1/chat/completions"
+        ));
         // Subdomains count as OpenRouter too.
         assert!(is_openrouter_url("https://api.openrouter.ai/v1"));
         // Legit userinfo on the real host still matches (host is after `@`).
@@ -3805,19 +4172,66 @@ mod tests {
     }
 
     #[test]
+    fn is_opencode_zen_url_matches_only_opencode_hosts() {
+        assert!(is_opencode_zen_url("https://opencode.ai/zen/v1"));
+        assert!(is_opencode_zen_url(
+            "https://opencode.ai/zen/v1/chat/completions"
+        ));
+        assert!(is_opencode_zen_url("https://api.opencode.ai/zen/v1")); // subdomain
+        assert!(!is_opencode_zen_url("https://openrouter.ai/api/v1"));
+        // Suffix trick: opencode.ai must be the domain, not a prefix of the real host.
+        assert!(!is_opencode_zen_url("https://opencode.ai.evil.com/v1"));
+        // Userinfo trick: the host is after `@`, so this targets evil.com, not opencode.
+        assert!(!is_opencode_zen_url("https://opencode.ai:x@evil.com/v1"));
+    }
+
+    #[test]
+    fn apply_opencode_session_gated_to_opencode_and_nonempty() {
+        let client = reqwest::Client::new();
+        let header_of = |url: &str, sess: &str| {
+            apply_opencode_session(url, client.post(url), sess)
+                .build()
+                .expect("request must build")
+                .headers()
+                .get("x-opencode-session")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        // opencode.ai + non-empty session → header carries the stable id.
+        assert_eq!(
+            header_of(
+                "https://opencode.ai/zen/v1/chat/completions",
+                "sess-abc-123"
+            ),
+            Some("sess-abc-123".to_string())
+        );
+        // Non-opencode host → never sent (no product-identity leak to other gateways).
+        assert_eq!(
+            header_of(
+                "https://api.deepseek.com/v1/chat/completions",
+                "sess-abc-123"
+            ),
+            None
+        );
+        // Empty session (sub-agent / summary) → omitted even on opencode.
+        assert_eq!(
+            header_of("https://opencode.ai/zen/v1/chat/completions", ""),
+            None
+        );
+    }
+
+    #[test]
     fn apply_openrouter_attribution_only_targets_openrouter() {
         let client = reqwest::Client::new();
 
-        // OpenRouter endpoint → all three attribution headers present.
+        // OpenRouter endpoint → the attribution headers present.
         let req = client
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header(reqwest::header::CONTENT_TYPE, "application/json");
-        let built = apply_openrouter_attribution(
-            "https://openrouter.ai/api/v1/chat/completions",
-            req,
-        )
-        .build()
-        .expect("request must build");
+        let built =
+            apply_openrouter_attribution("https://openrouter.ai/api/v1/chat/completions", req)
+                .build()
+                .expect("request must build");
         for (name, value) in OPENROUTER_ATTRIBUTION_HEADERS {
             assert_eq!(
                 built.headers().get(*name).and_then(|v| v.to_str().ok()),
@@ -3825,17 +4239,28 @@ mod tests {
                 "{name} must be set on openrouter.ai"
             );
         }
+        // Pin OpenRouter's exact documented header names — these are what identify
+        // the app and unlock "agentic harness" free models. A rename here (e.g. the
+        // old `X-OpenRouter-Title`) silently reintroduces the 403 gate, so assert
+        // the wire names directly rather than only looping the constant.
+        assert_eq!(
+            built.headers().get("X-Title").and_then(|v| v.to_str().ok()),
+            Some("AtomCode"),
+            "OpenRouter reads `X-Title` (not `X-OpenRouter-Title`) for the app name"
+        );
+        assert!(
+            built.headers().contains_key("HTTP-Referer"),
+            "OpenRouter reads `HTTP-Referer` to match the listed app"
+        );
 
         // Non-OpenRouter endpoint → NONE of the attribution headers leak.
         let req = client
             .post("https://api.deepseek.com/v1/chat/completions")
             .header(reqwest::header::CONTENT_TYPE, "application/json");
-        let built = apply_openrouter_attribution(
-            "https://api.deepseek.com/v1/chat/completions",
-            req,
-        )
-        .build()
-        .expect("request must build");
+        let built =
+            apply_openrouter_attribution("https://api.deepseek.com/v1/chat/completions", req)
+                .build()
+                .expect("request must build");
         for (name, _) in OPENROUTER_ATTRIBUTION_HEADERS {
             assert!(
                 !built.headers().contains_key(*name),

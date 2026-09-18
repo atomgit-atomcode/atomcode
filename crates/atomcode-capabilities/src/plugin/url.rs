@@ -199,7 +199,10 @@ mod trusted_host_tests {
     #[test]
     fn trusted_hosts_and_subdomains() {
         for domain in atomcode_config::endpoints::trusted_domains() {
-            assert!(host_is_trusted(&format!("https://{domain}/o/r")), "{domain}");
+            assert!(
+                host_is_trusted(&format!("https://{domain}/o/r")),
+                "{domain}"
+            );
             assert!(
                 host_is_trusted(&format!("https://www.{domain}/o/r")),
                 "{domain}"

@@ -178,18 +178,62 @@ enum ResumeSelector {
 /// a project's scanned catalog: an exact `id` match wins; otherwise the
 /// most-recently-updated session whose `name` equals the selector. `None` when
 /// nothing matches. Pure over the catalog so it is unit-tested without the store.
+/// The catalog entry a `resume <id|name>` selector points at: exact id first,
+/// then the most-recently-updated name match (names can repeat across sessions).
+/// Single source of truth for the precedence rule, shared by the in-project and
+/// cross-project resolvers so they can never drift.
+fn find_catalog_entry<'a>(
+    catalog: &'a [atomcode_capabilities::session::CatalogEntry],
+    selector: &str,
+) -> Option<&'a atomcode_capabilities::session::CatalogEntry> {
+    catalog.iter().find(|e| e.id == selector).or_else(|| {
+        catalog
+            .iter()
+            .filter(|e| e.name == selector)
+            .max_by_key(|e| e.updated_at_ms)
+    })
+}
+
 fn resolve_in_catalog(
     catalog: &[atomcode_capabilities::session::CatalogEntry],
     selector: &str,
 ) -> Option<String> {
-    if let Some(entry) = catalog.iter().find(|e| e.id == selector) {
-        return Some(entry.id.clone());
+    find_catalog_entry(catalog, selector).map(|e| e.id.clone())
+}
+
+/// Outcome of resolving a `resume <id|name>` selector that was NOT found in the
+/// current project, against the GLOBAL (all-projects) catalog. Plan A: a session
+/// is anchored to its own directory (its recorded file paths only make sense
+/// there), so resuming it means adopting that directory.
+#[derive(Debug)]
+enum ResumeElsewhere {
+    /// Found in another project whose directory still exists → switch to it.
+    SwitchTo { id: String, dir: std::path::PathBuf },
+    /// Found in another project but its recorded directory is gone.
+    DirMissing { dir: std::path::PathBuf },
+    /// Not found in ANY project.
+    NotFound,
+}
+
+/// Resolve `selector` against the global catalog: exact id first, then the
+/// most-recently-updated name match (names can repeat across projects). The
+/// chosen session's own `working_dir` is adopted iff it still exists.
+/// `dir_exists` is injected so the decision is unit-testable without the FS.
+fn resolve_resume_elsewhere(
+    global: &[atomcode_capabilities::session::CatalogEntry],
+    selector: &str,
+    dir_exists: impl Fn(&std::path::Path) -> bool,
+) -> ResumeElsewhere {
+    match find_catalog_entry(global, selector) {
+        Some(e) if dir_exists(&e.working_dir) => ResumeElsewhere::SwitchTo {
+            id: e.id.clone(),
+            dir: e.working_dir.clone(),
+        },
+        Some(e) => ResumeElsewhere::DirMissing {
+            dir: e.working_dir.clone(),
+        },
+        None => ResumeElsewhere::NotFound,
     }
-    catalog
-        .iter()
-        .filter(|e| e.name == selector)
-        .max_by_key(|e| e.updated_at_ms)
-        .map(|e| e.id.clone())
 }
 
 /// Truncate a string to at most `max_chars` *characters* (not bytes), replacing
@@ -855,6 +899,9 @@ enum Commands {
         /// ATOMCODE_DAEMON_IDLE_TIMEOUT overrides. Default 1800 (30 min).
         #[arg(long)]
         idle_timeout: Option<u64>,
+        /// Disable daemon API token authentication.
+        #[arg(long)]
+        no_auth: bool,
     },
     /// 启动本地浏览器 webui（进程内起 server，无需额外二进制）
     Webui {
@@ -1585,6 +1632,7 @@ async fn run() -> Result<i32> {
                 port,
                 client,
                 idle_timeout,
+                no_auth,
             } => {
                 HEADLESS_MODE.store(true, Ordering::Relaxed);
                 eprintln!("Starting AtomCode daemon on port {}...", port);
@@ -1592,11 +1640,8 @@ async fn run() -> Result<i32> {
                 // Run the bundled server IN-PROCESS (same `run_server` the webui uses),
                 // instead of re-exec'ing into a separate `atomcode-daemon` binary that
                 // may not be installed. This is an equivalent daemon entrypoint to the
-                // standalone `atomcode-daemon` binary, so it MUST enforce the local token
-                // identically (mirror of `atomcode-daemon/src/main.rs`): mint/resolve a
-                // token, enable enforcement, and write `~/.atomcode/daemon-<port>.json`.
-                // Otherwise `atomcode daemon` would be an unauthenticated bypass of the
-                // very surface the token guards.
+                // standalone `atomcode-daemon` binary. Authentication is enabled by
+                // default; `--no-auth` explicitly disables it in both entrypoints.
                 let idle = idle_timeout
                     .or_else(|| {
                         std::env::var("ATOMCODE_DAEMON_IDLE_TIMEOUT")
@@ -1611,11 +1656,15 @@ async fn run() -> Result<i32> {
                     Some("atomcode-air") => atomcode_telemetry::SessionMode::AtomcodeAir,
                     _ => atomcode_telemetry::SessionMode::Ide,
                 };
-                let token_store = atomcode_daemon::auth_token::WebuiTokenStore::new();
-                let daemon_token = atomcode_daemon::resolve_daemon_token(
+                let (webui_tokens, daemon_token_file) = atomcode_daemon::resolve_daemon_auth(
+                    no_auth,
                     std::env::var("ATOMCODE_DAEMON_TOKEN").ok(),
-                    &token_store,
                 );
+                if no_auth {
+                    eprintln!(
+                        "WARNING: daemon authentication is disabled; all API endpoints are accessible without a token"
+                    );
+                }
                 let res = atomcode_daemon::run_server(atomcode_daemon::ServerOpts {
                     host: "127.0.0.1".to_string(),
                     port,
@@ -1624,12 +1673,12 @@ async fn run() -> Result<i32> {
                     },
                     idle_timeout_secs: idle,
                     startup_mode,
-                    webui_tokens: Some(token_store),
+                    webui_tokens,
                     quiet: false,
                     working_dir_override: None,
                     prebound_listener: None,
                     app_user_id: None,
-                    daemon_token_file: Some(daemon_token),
+                    daemon_token_file,
                 })
                 .await;
                 telemetry
@@ -2018,7 +2067,14 @@ async fn run() -> Result<i32> {
 
     apply_cli_runtime_overrides(&mut config, cli.provider.as_deref(), cli.model.as_deref());
 
-    let working_dir = resolve_working_dir(cli.dir.clone());
+    // Mutable: a `resume <id>` whose session lives in another project adopts that
+    // session's own directory below (Plan A).
+    let mut working_dir = resolve_working_dir(cli.dir.clone());
+    // Set when a cross-project resume switched `working_dir`. Surfaced as a durable
+    // in-band TUI notice (stderr alone is cleared by the alternate screen), so the
+    // implicit cwd change — and the target project's hooks/MCP now in effect — is
+    // loud, not silent.
+    let mut resume_switch_notice: Option<String> = None;
 
     // Determine if we're running in headless mode BEFORE loading MCP.
     // Headless mode requires MCP tools immediately; TUI can load them in background.
@@ -2031,20 +2087,77 @@ async fn run() -> Result<i32> {
     // TUI.
     let resume_session_id = match &resume_selector {
         Some(ResumeSelector::Specific(sel)) => {
-            let catalog = atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)?;
-            match resolve_in_catalog(&catalog, sel) {
+            // Fast path: scan only this project's bucket first (nearly every
+            // session lives in the bucket that hashes from its working dir). Fall
+            // back to the full in-project scan on a miss — that catches a legacy
+            // session parked in a different bucket for this same directory.
+            let mut resolved = resolve_in_catalog(
+                &atomcode_daemon::legacy_convert::catalog_for_bucket(&working_dir)?,
+                sel,
+            );
+            if resolved.is_none() {
+                resolved = resolve_in_catalog(
+                    &atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)?,
+                    sel,
+                );
+            }
+            match resolved {
                 Some(id) => Some(id),
-                None => anyhow::bail!(
-                    "no session matches id or name {sel:?} in this project — run `{} resume` to list, or check the working directory (-C)",
-                    BIN_NAME
-                ),
+                // Not in THIS project — a session is anchored to its own directory,
+                // so look across every project and adopt that directory (Plan A),
+                // instead of erroring with a generic "check -C". The global scan
+                // only runs on this miss path, never on a normal in-project resume.
+                None => {
+                    let scan = atomcode_capabilities::session::SessionManager::scan_catalog(
+                        &atomcode_capabilities::session::SessionManager::sessions_root(),
+                    );
+                    // Collapse busy-continue fork lineages exactly like the
+                    // in-project view (`catalog_for_project`) so a cross-project
+                    // name match can't land on a hidden stale fork sibling.
+                    let mut entries = scan.entries;
+                    atomcode_capabilities::session::SessionManager::collapse_fork_lineages(
+                        &mut entries,
+                    );
+                    match resolve_resume_elsewhere(&entries, sel, |p| p.is_dir()) {
+                        ResumeElsewhere::SwitchTo { id, dir } => {
+                            let notice = format!(
+                                "Resumed a session from another project — working directory switched to {} (was {}).",
+                                dir.display(),
+                                working_dir.display()
+                            );
+                            eprintln!("{BIN_NAME}: {notice}");
+                            resume_switch_notice = Some(notice);
+                            working_dir = dir;
+                            Some(id)
+                        }
+                        ResumeElsewhere::DirMissing { dir } => anyhow::bail!(
+                            "session {sel:?} belongs to {} which no longer exists — cd into an existing copy of that project, or start fresh",
+                            dir.display()
+                        ),
+                        ResumeElsewhere::NotFound => anyhow::bail!(
+                            "no session matches id or name {sel:?} in any project — run `{} resume` to list",
+                            BIN_NAME
+                        ),
+                    }
+                }
             }
         }
         Some(ResumeSelector::Latest) => {
-            atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)?
+            // Fast path: this project's bucket only — avoids the full cross-project
+            // walk on every `-c`. Fall back to the full in-project scan only when
+            // the bucket has nothing resumable (e.g. a legacy session parked in a
+            // different bucket for this same directory).
+            let from_bucket = atomcode_daemon::legacy_convert::catalog_for_bucket(&working_dir)?
                 .into_iter()
                 .find(|entry| entry.message_count > 0)
-                .map(|entry| entry.id)
+                .map(|entry| entry.id);
+            match from_bucket {
+                Some(id) => Some(id),
+                None => atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)?
+                    .into_iter()
+                    .find(|entry| entry.message_count > 0)
+                    .map(|entry| entry.id),
+            }
         }
         None => None,
     };
@@ -2086,8 +2199,7 @@ async fn run() -> Result<i32> {
     // The active session id (fresh or resumed) for the on-exit resume hint,
     // captured before the runtime is moved into the headless/TUI arms below.
     // `None` for an ephemeral run (no persisted session → nothing to resume).
-    let active_session_id: Option<String> =
-        native_runtime.session.as_ref().map(|s| s.id.clone());
+    let active_session_id: Option<String> = native_runtime.session.as_ref().map(|s| s.id.clone());
     tracing::info!(
         target: "atomcode::startup",
         stage = "runtime_start",
@@ -2126,7 +2238,12 @@ async fn run() -> Result<i32> {
             })
             .into_owned()
         });
-    let startup_notice = merge_startup_notices(config_startup_notice, session_startup_notice);
+    // Cross-project resume notice rides on top so the switched working directory
+    // is the first thing the user sees in the TUI.
+    let startup_notice = merge_startup_notices(
+        resume_switch_notice,
+        merge_startup_notices(config_startup_notice, session_startup_notice),
+    );
     let (mut native_headless_runtime, mut native_tui_runtime) = if is_headless {
         (Some(native_runtime), None)
     } else {
@@ -4355,9 +4472,9 @@ mod tests {
         format_thinking_chunk, format_verbose_tool_chunk, headless_completion_exit_code,
         headless_completion_notify_reason, headless_denial_exit_code,
         interactive_provider_bootstrap, is_completion_invocation, merge_startup_notices,
-        print_shell_completion, resolve_working_dir, runtime_config_from,
-        resolve_in_catalog, resume_hint_line, should_fork_busy_continue, truncate_log_line, Cli,
-        Commands, HeadlessOutputFormat, DEFAULT_LOG_DIRECTIVES,
+        print_shell_completion, resolve_in_catalog, resolve_working_dir, resume_hint_line,
+        runtime_config_from, should_fork_busy_continue, truncate_log_line, Cli, Commands,
+        HeadlessOutputFormat, DEFAULT_LOG_DIRECTIVES,
     };
     use clap::Parser;
     use clap_complete::Shell;
@@ -4392,12 +4509,72 @@ mod tests {
         // Exact id wins even when a name also matches something.
         assert_eq!(resolve_in_catalog(&catalog, "ccc").as_deref(), Some("ccc"));
         // Ambiguous name resolves to the most-recently-updated session.
-        assert_eq!(resolve_in_catalog(&catalog, "review").as_deref(), Some("bbb"));
+        assert_eq!(
+            resolve_in_catalog(&catalog, "review").as_deref(),
+            Some("bbb")
+        );
         // Unique name.
-        assert_eq!(resolve_in_catalog(&catalog, "deploy").as_deref(), Some("ccc"));
+        assert_eq!(
+            resolve_in_catalog(&catalog, "deploy").as_deref(),
+            Some("ccc")
+        );
         // No match.
         assert_eq!(resolve_in_catalog(&catalog, "nope"), None);
         assert_eq!(resolve_in_catalog(&[], "review"), None);
+    }
+
+    #[test]
+    fn resolve_resume_elsewhere_switches_to_the_sessions_own_existing_dir() {
+        use super::{resolve_resume_elsewhere, ResumeElsewhere};
+        let mut a = catalog_entry("aaa", "review", 100);
+        a.working_dir = PathBuf::from("/proj/a");
+        let mut b = catalog_entry("bbb", "deploy", 200);
+        b.working_dir = PathBuf::from("/proj/b");
+        let global = vec![a, b];
+        // Exact id → adopt that session's own directory (which "exists").
+        match resolve_resume_elsewhere(&global, "bbb", |_| true) {
+            ResumeElsewhere::SwitchTo { id, dir } => {
+                assert_eq!(id, "bbb");
+                assert_eq!(dir, PathBuf::from("/proj/b"));
+            }
+            other => panic!("expected SwitchTo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_resume_elsewhere_reports_missing_dir_without_switching() {
+        use super::{resolve_resume_elsewhere, ResumeElsewhere};
+        let mut a = catalog_entry("aaa", "review", 100);
+        a.working_dir = PathBuf::from("/gone");
+        // Found, but its directory no longer exists → DirMissing (caller errors,
+        // does NOT silently switch to a dead path).
+        match resolve_resume_elsewhere(&[a], "aaa", |_| false) {
+            ResumeElsewhere::DirMissing { dir } => assert_eq!(dir, PathBuf::from("/gone")),
+            other => panic!("expected DirMissing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_resume_elsewhere_name_picks_most_recent_else_not_found() {
+        use super::{resolve_resume_elsewhere, ResumeElsewhere};
+        let mut a = catalog_entry("aaa", "review", 100);
+        a.working_dir = PathBuf::from("/a");
+        let mut b = catalog_entry("bbb", "review", 300); // newer duplicate name
+        b.working_dir = PathBuf::from("/b");
+        let global = vec![a, b];
+        // Ambiguous name across projects → most-recently-updated session's dir.
+        match resolve_resume_elsewhere(&global, "review", |_| true) {
+            ResumeElsewhere::SwitchTo { id, dir } => {
+                assert_eq!(id, "bbb");
+                assert_eq!(dir, PathBuf::from("/b"));
+            }
+            other => panic!("expected SwitchTo, got {other:?}"),
+        }
+        // Nothing matches anywhere → NotFound (caller keeps the hard error).
+        assert!(matches!(
+            resolve_resume_elsewhere(&global, "nope", |_| true),
+            ResumeElsewhere::NotFound
+        ));
     }
 
     #[test]
@@ -4432,7 +4609,10 @@ mod tests {
         ));
         // bare `resume` → most recent.
         let c = Cli::try_parse_from(["atomcode", "resume"]).unwrap();
-        assert!(matches!(c.command, Some(Commands::Resume { session: None })));
+        assert!(matches!(
+            c.command,
+            Some(Commands::Resume { session: None })
+        ));
         // `--resume` conflicts with `--continue`.
         assert!(Cli::try_parse_from(["atomcode", "-p", "hi", "-c", "--resume", "x"]).is_err());
     }

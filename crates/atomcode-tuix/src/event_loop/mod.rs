@@ -21,6 +21,7 @@ pub(crate) mod loop_ctrl;
 pub(crate) mod loop_parse;
 pub(crate) mod monitor;
 pub(crate) mod oauth_poll;
+pub(crate) mod openrouter_connect;
 pub(crate) mod pointer_select;
 pub(crate) mod ui_event;
 pub(crate) mod usage_monitor;
@@ -3877,8 +3878,6 @@ pub struct LoopCtx {
     pub(crate) pending_provider_deactivation: bool,
     pub runtime: RuntimeControl,
     pub pending_runtime_request_id: Option<atomcode_kernel::event::RequestId>,
-    /// Cache of "Always Allow" tool/command decisions for the active TUI session.
-    pub allowed_always: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub native_tools: std::collections::HashMap<String, (String, std::time::Instant)>,
     /// Force-exit watchdog deadline. Armed by [`arm_shutdown_watchdog`] when the
     /// user genuinely asks to leave (`/quit`, `/exit`, a confirmed Ctrl+C). The
@@ -3985,6 +3984,19 @@ pub struct LoopCtx {
     pub oauth_event_rx: mpsc::UnboundedReceiver<oauth_poll::OauthEvent>,
     /// Sender cloned into each spawned poll task.
     pub oauth_event_tx: mpsc::UnboundedSender<oauth_poll::OauthEvent>,
+    /// Receiver for `OpenRouterConnectEvent`s emitted by the background
+    /// OpenRouter connect thread (see `event_loop::openrouter_connect`).
+    /// One event per `/openrouter` invocation (Ready or Failed). The
+    /// `tokio::select!` arm that reads this channel assembles the provider
+    /// config, persists it, and reloads the runtime.
+    pub openrouter_event_rx: mpsc::UnboundedReceiver<openrouter_connect::OpenRouterConnectEvent>,
+    /// Sender cloned into each spawned connect task.
+    pub openrouter_event_tx: mpsc::UnboundedSender<openrouter_connect::OpenRouterConnectEvent>,
+    /// Cancellation flag for the active OpenRouter connect task. Set to
+    /// `true` on ESC to abort the OAuth wait. A new `Arc` is created on
+    /// each `/openrouter` invocation so prior-task cancellation does not
+    /// leak.
+    pub openrouter_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Control handle for the crossterm reader thread — `Some` in raw-mode
     /// TTY sessions, `None` in pipe mode. Used by child-process handoffs
     /// (OAuth login, future `/shell`) to pause+resume event consumption
@@ -4017,6 +4029,11 @@ pub struct LoopCtx {
     /// Modal-to-Modal transition that needs mutable `active_modal`
     /// access only the event loop has.
     pub pending_open_provider_wizard: bool,
+    /// Set to `true` just before an `OnboardingWizard` is installed as
+    /// `active_modal`.  Drained (via `std::mem::take`) in the
+    /// `ModalAction::Close` handler so the /openrouter nudge fires only
+    /// when the wizard — not an arbitrary modal — closes.
+    pub pending_onboarding_nudge: bool,
     /// Telemetry handle — used to emit `UseCommand` at each slash dispatch.
     pub telemetry: std::sync::Arc<atomcode_telemetry::Telemetry>,
     /// Original working dir before `/worktree create`, for `/worktree done`.
@@ -5664,6 +5681,52 @@ mod buffer_tests {
             active.contains("(0s \u{b7} \u{2191} 12.40K tokens)"),
             "expected `(0s · ↑ 12.40K tokens)`, got {active:?}"
         );
+        // Under 1s elapsed, no throughput is shown (avoids div-by-zero / wild rates).
+        assert!(
+            !active.contains("tok/s"),
+            "no rate under 1s, got {active:?}"
+        );
+    }
+
+    #[test]
+    fn spinner_shows_tok_per_sec_once_a_second_elapses() {
+        let mut s = UiState::new();
+        s.on_submit();
+        // Backdate the PHASE clock so `phase_elapsed >= 1s`; baseline is captured at
+        // stamp time (0 chars), then 40_000 chars ≈ 10K tokens produced this phase
+        // over 10s → 1000 tok/s.
+        s.stamp_phase_start(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        s.turn_output_chars = 40_000;
+        let active = format_spinner_label(&s, 0, None);
+        assert!(
+            active.contains("1000 tok/s"),
+            "expected `1000 tok/s` throughput, got {active:?}"
+        );
+    }
+
+    #[test]
+    fn spinner_tok_per_sec_is_current_phase_not_diluted_by_whole_turn() {
+        // Regression: the rate must reflect the CURRENT generation phase, not the
+        // whole turn. A long, tool-heavy turn used to divide cumulative output by
+        // total wall time → a diluted "1 tok/s" that swung wildly.
+        let mut s = UiState::new();
+        s.on_submit();
+        // Whole turn has run 600s (mostly tool execution) — the OLD formula would
+        // report ~2 tok/s (1500 tokens / 600s).
+        s.turn_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(600));
+        // A fresh generation phase started 3s ago and produced 6000 chars (1500
+        // tokens): baseline is snapshotted at stamp time (0), delta = 6000.
+        s.stamp_phase_start(std::time::Instant::now() - std::time::Duration::from_secs(3));
+        s.turn_output_chars = 6_000;
+        let active = format_spinner_label(&s, 0, None);
+        assert!(
+            active.contains("500 tok/s"),
+            "expected phase-scoped 500 tok/s (1500 tokens / 3s), got {active:?}"
+        );
+        assert!(
+            !active.contains("2 tok/s"),
+            "must NOT use the diluted whole-turn rate, got {active:?}"
+        );
     }
 
     #[test]
@@ -5688,8 +5751,7 @@ mod buffer_tests {
         assert!(active.contains("(0s)"), "just the clock, got {active:?}");
         // Even silent past the stall threshold there is NO "较慢/slow" label any
         // more — the ticking clock already shows it's alive.
-        s.last_stream_activity =
-            Some(std::time::Instant::now() - crate::state::STREAM_STALL_HINT);
+        s.last_stream_activity = Some(std::time::Instant::now() - crate::state::STREAM_STALL_HINT);
         let stalled = format_spinner_label(&s, 0, None);
         assert!(
             !stalled.contains("较慢") && !stalled.to_lowercase().contains("slow"),
@@ -6470,15 +6532,56 @@ mod menu_tests {
 
     #[test]
     fn main_composer_reserves_plain_tab_for_completion() {
+        use atomcode_config::config::ModeSwitchKey::ShiftTab;
         use crossterm::event::KeyModifiers;
 
-        assert!(!is_mode_cycle_key(KeyCode::Tab, KeyModifiers::NONE));
-        assert!(is_mode_cycle_key(KeyCode::BackTab, KeyModifiers::SHIFT));
-        assert!(is_mode_cycle_key(KeyCode::BackTab, KeyModifiers::NONE));
-        assert!(is_mode_cycle_key(KeyCode::Tab, KeyModifiers::SHIFT));
+        // Default (shift_tab) preference: plain Tab stays a completion key.
+        assert!(!is_mode_cycle_key(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+            ShiftTab
+        ));
+        assert!(is_mode_cycle_key(
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT,
+            ShiftTab
+        ));
+        assert!(is_mode_cycle_key(
+            KeyCode::BackTab,
+            KeyModifiers::NONE,
+            ShiftTab
+        ));
+        assert!(is_mode_cycle_key(
+            KeyCode::Tab,
+            KeyModifiers::SHIFT,
+            ShiftTab
+        ));
         assert!(!is_mode_cycle_key(
             KeyCode::BackTab,
-            KeyModifiers::SHIFT | KeyModifiers::CONTROL
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+            ShiftTab
+        ));
+    }
+
+    #[test]
+    fn tab_preference_makes_plain_tab_cycle_mode() {
+        use atomcode_config::config::ModeSwitchKey::{ShiftTab, Tab};
+        use crossterm::event::KeyModifiers;
+
+        // `tab` preference (HarmonyOS default): plain Tab cycles the mode.
+        assert!(is_mode_cycle_key(KeyCode::Tab, KeyModifiers::NONE, Tab));
+        // Shift+Tab / BackTab keep cycling under either preference — no
+        // terminal loses the gesture.
+        assert!(is_mode_cycle_key(KeyCode::Tab, KeyModifiers::SHIFT, Tab));
+        assert!(is_mode_cycle_key(KeyCode::BackTab, KeyModifiers::NONE, Tab));
+        // Modified Tab never cycles regardless of preference (would collide
+        // with terminal chords / newline aliases).
+        assert!(!is_mode_cycle_key(KeyCode::Tab, KeyModifiers::CONTROL, Tab));
+        // Sanity: the same plain Tab is NOT a cycle key under shift_tab.
+        assert!(!is_mode_cycle_key(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+            ShiftTab
         ));
     }
 
@@ -6927,14 +7030,20 @@ mod menu_tests {
         .expect("effort dropdown");
         let names: Vec<&str> = items.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"low") && names.contains(&"medium") && names.contains(&"xhigh"));
-        assert!(!names.contains(&"high") && !names.contains(&"max"), "got: {names:?}");
+        assert!(
+            !names.contains(&"high") && !names.contains(&"max"),
+            "got: {names:?}"
+        );
         assert!(names.contains(&"default"), "default is always offered");
         // `None` ⇒ full canonical set, now including xhigh.
         let all = build_menu_items_with_efforts("/effort ", 0, &reg, &custom, None, None, None)
             .expect("canonical dropdown");
         let all_names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
         for lvl in ["low", "medium", "high", "xhigh", "max"] {
-            assert!(all_names.contains(&lvl), "canonical must include {lvl}: {all_names:?}");
+            assert!(
+                all_names.contains(&lvl),
+                "canonical must include {lvl}: {all_names:?}"
+            );
         }
         // Prefix narrowing still works against the configured set.
         let x = build_menu_items_with_efforts(
@@ -6950,7 +7059,6 @@ mod menu_tests {
         assert_eq!(x.len(), 1);
         assert_eq!(x[0].0, "xhigh");
     }
-
 
     #[test]
     fn no_skill_registry_is_no_op() {
@@ -8242,7 +8350,10 @@ mod tool_format_tests {
     /// `mcp · fs · read`.
     #[test]
     fn display_tool_name_short_keeps_mcp_suffix() {
-        assert_eq!(display_tool_name_short("mcp__fs__read_file"), "fs · read_file");
+        assert_eq!(
+            display_tool_name_short("mcp__fs__read_file"),
+            "fs · read_file"
+        );
         assert_eq!(
             display_tool_name_short("mcp__playwright-mcp-server__browser_snapshot"),
             "playwright-mcp-server · browser_snapshot"
@@ -8655,10 +8766,7 @@ mod tool_format_tests {
     #[test]
     fn summarise_mcp_result_strips_markdown_heading() {
         // MCP markdown result: `### Result` → `Result (N lines)`.
-        assert_eq!(
-            summarise_mcp_result("### Result\na\nb"),
-            "Result (3 lines)"
-        );
+        assert_eq!(summarise_mcp_result("### Result\na\nb"), "Result (3 lines)");
         assert_eq!(summarise_mcp_result("### Error\nboom"), "Error (2 lines)");
         // A `#` with no following space (shell shebang / comment) is untouched.
         assert_eq!(summarise_mcp_result("#!/bin/sh"), "#!/bin/sh");
@@ -9392,6 +9500,55 @@ pub(crate) fn handle_loop_decision(
     }
 }
 
+/// 处理一次后台 OpenRouter 连接事件。抽出来供 Unix/Windows 两个 `select!` 块
+/// 共用,避免 Ready/Failed/AwaitingBrowser 逻辑复制两份、改一处漏另一处。
+fn handle_openrouter_connect_event(
+    ctx: &mut LoopCtx,
+    ev: openrouter_connect::OpenRouterConnectEvent,
+    renderer: &mut dyn Renderer,
+) {
+    use openrouter_connect::OpenRouterConnectEvent;
+    match ev {
+        OpenRouterConnectEvent::AwaitingBrowser { auth_url } => {
+            renderer.render(UiLine::Muted(format!(
+                "浏览器未自动打开?手动访问完成授权:{auth_url}"
+            )));
+            renderer.flush();
+        }
+        OpenRouterConnectEvent::Ready { api_key, models } => {
+            let mut added_count = 0usize;
+            match ctx.config_store.update(|latest| {
+                let out = openrouter_connect::provision_openrouter(latest, &api_key, &models);
+                added_count = out.added.len();
+                Ok(())
+            }) {
+                Ok(commit) => {
+                    apply_persisted_config(
+                        ctx,
+                        commit.snapshot.config,
+                        commit.snapshot.revision,
+                        renderer,
+                    );
+                    renderer.render(UiLine::CommandOutput(format!(
+                        "已接入 OpenRouter,新增 {added_count} 个免费模型。/model 可切换。"
+                    )));
+                    renderer.flush();
+                }
+                Err(e) => {
+                    renderer.render(UiLine::Error(format!("OpenRouter 配置保存失败: {e}")));
+                    renderer.flush();
+                }
+            }
+        }
+        OpenRouterConnectEvent::Failed(reason) => {
+            renderer.render(UiLine::Error(format!(
+                "OpenRouter 接入失败: {reason}。可重试 /openrouter,或 /openrouter <你的key> 直接接入。"
+            )));
+            renderer.flush();
+        }
+    }
+}
+
 pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<ExitReason> {
     let mut app = App::new(&ctx.caps);
     // The active runtime/model owns the context-window denominator. Seed it
@@ -9589,6 +9746,15 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 &session,
                 false,
             );
+            // Restore the session-cumulative token totals (incl. cache) from the
+            // persisted meta so the status-row cache% shows immediately on `-c`/
+            // `--continue` — this startup path bypasses `commit_native_session_changed`,
+            // so without this the tallies stay 0 until the next turn.
+            // `None` bucket → `for_project(working_dir)`, which is exactly where
+            // `-c`/`--continue` loaded this session from (incl. a contention fork,
+            // stored in the same project bucket) — robust regardless of whether
+            // `current_session_project_bucket` is populated this early at startup.
+            seed_session_token_totals(&mut app.state, None, &ctx.working_dir, &session.id);
             // The runtime was prepared against this exact external session id and
             // snapshot before the TUI started; replay here is display-only.
             // Continue accumulating into the runtime-owned session file. That
@@ -9636,6 +9802,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
         }
         wizard.draw(&app.buf, &app.state, &ctx, renderer);
         app.active_modal = Some(Box::new(wizard));
+        // Mark that the onboarding wizard is open so the ModalAction::Close
+        // handler knows to evaluate the /openrouter nudge when it closes.
+        ctx.pending_onboarding_nudge = true;
     } else {
         // One-shot legacy-conhost scroll hint. The classic Windows console
         // host snaps the viewport back to the bottom on every write, so the
@@ -9907,6 +10076,21 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // Preserve an active `/` command menu — don't blindly call
             // `redraw_idle_plain(menu: None)` which would erase it.
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
+                // 额度用尽一次性提示:usage_slot 刚被 spawn_check 写入时触发。
+                if !app.state.openrouter_quota_nudge_shown {
+                    if let Some((usage_info, _)) =
+                        ctx.usage_slot.lock().ok().as_deref().and_then(|g| g.clone())
+                    {
+                        if crate::event_loop::openrouter_connect::quota_exhausted(&usage_info) {
+                            app.state.openrouter_quota_nudge_shown = true;
+                            render_or_defer_background_notice(
+                                &mut app.state,
+                                renderer,
+                                "CodingPlan 额度已用尽 —— 输入 /openrouter 一键接入 OpenRouter 免费模型".to_string(),
+                            );
+                        }
+                    }
+                }
                 if let Some(modal) = app.active_modal.as_mut() {
                     if modal.poll_background() {
                         modal.draw(&app.buf, &app.state, &ctx, renderer);
@@ -9939,6 +10123,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // extension (as_any_mut + downcast) we don't yet have.
             Some(ev) = ctx.oauth_event_rx.recv() => {
                 use oauth_poll::OauthEvent;
+                // QR 登录经此臂关闭 onboarding 向导(绕过 ModalAction::Close),
+                // 清掉 nudge 标记,否则它会泄漏到下一个无关 modal 的关闭时误弹。
+                ctx.pending_onboarding_nudge = false;
                 let was_modal_open = app.active_modal.is_some();
                 if was_modal_open {
                     app.active_modal = None;
@@ -9988,6 +10175,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         renderer.flush();
                     }
                 }
+            }
+
+            // ── OpenRouter 后台连接结果 ──
+            Some(ev) = ctx.openrouter_event_rx.recv() => {
+                handle_openrouter_connect_event(&mut ctx, ev, renderer);
             }
 
             // ── /upgrade progress ──
@@ -10332,6 +10524,21 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // `redraw_idle_plain` — otherwise the menu gets erased when
             // this fires a second or two after the user types `/`.
             Some(()) = ctx.wake_rx.recv(), if matches!(app.state.phase, UiPhase::Idle) => {
+                // 额度用尽一次性提示:usage_slot 刚被 spawn_check 写入时触发。
+                if !app.state.openrouter_quota_nudge_shown {
+                    if let Some((usage_info, _)) =
+                        ctx.usage_slot.lock().ok().as_deref().and_then(|g| g.clone())
+                    {
+                        if crate::event_loop::openrouter_connect::quota_exhausted(&usage_info) {
+                            app.state.openrouter_quota_nudge_shown = true;
+                            render_or_defer_background_notice(
+                                &mut app.state,
+                                renderer,
+                                "CodingPlan 额度已用尽 —— 输入 /openrouter 一键接入 OpenRouter 免费模型".to_string(),
+                            );
+                        }
+                    }
+                }
                 if let Some(modal) = app.active_modal.as_mut() {
                     if modal.poll_background() {
                         modal.draw(&app.buf, &app.state, &ctx, renderer);
@@ -10364,6 +10571,9 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
             // extension (as_any_mut + downcast) we don't yet have.
             Some(ev) = ctx.oauth_event_rx.recv() => {
                 use oauth_poll::OauthEvent;
+                // QR 登录经此臂关闭 onboarding 向导(绕过 ModalAction::Close),
+                // 清掉 nudge 标记,否则它会泄漏到下一个无关 modal 的关闭时误弹。
+                ctx.pending_onboarding_nudge = false;
                 let was_modal_open = app.active_modal.is_some();
                 if was_modal_open {
                     app.active_modal = None;
@@ -10413,6 +10623,11 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                         renderer.flush();
                     }
                 }
+            }
+
+            // ── OpenRouter 后台连接结果 ──
+            Some(ev) = ctx.openrouter_event_rx.recv() => {
+                handle_openrouter_connect_event(&mut ctx, ev, renderer);
             }
 
             // ── /upgrade progress ──
@@ -13374,6 +13589,64 @@ fn coalesce_drag_events(
     (latest, None)
 }
 
+/// A key/paste is proof the terminal is focused NOW. When we AFFIRMATIVELY believe we
+/// are unfocused (`Some(false)` — a `FocusLost` arrived but the matching `FocusGained`
+/// never did, a common Windows-console asymmetry where the diff cache goes stale while
+/// the host drops paints), the deferred flush would repaint against that stale cache and
+/// the just-typed characters wouldn't appear until a later event. Such input means we
+/// must do the same cold `force_repaint` the `FocusChanged(true)` path would have.
+///
+/// Gated to `Some(false)` ONLY: `Some(true)` needs nothing, and `None` (focus reporting
+/// unsupported / unknown) is deliberately left alone so this never becomes a per-keystroke
+/// full repaint. Fires at most once per observed defocus, then `set_terminal_focus_state`
+/// flips us back to focused.
+fn input_recovers_stale_focus(ev: &InputEvent, focus_state: Option<bool>) -> bool {
+    focus_state == Some(false) && matches!(ev, InputEvent::Key(_) | InputEvent::Paste(_))
+}
+
+#[cfg(test)]
+mod focus_recovery_tests {
+    use super::input_recovers_stale_focus;
+    use crate::input::InputEvent;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key() -> InputEvent {
+        InputEvent::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()))
+    }
+
+    #[test]
+    fn recovers_only_when_known_unfocused_on_key_or_paste() {
+        // The bug: a FocusLost was seen (Some(false)) but no matching FocusGained →
+        // the next key/paste must trigger the cold repaint.
+        assert!(input_recovers_stale_focus(&key(), Some(false)));
+        assert!(input_recovers_stale_focus(
+            &InputEvent::Paste("x".into()),
+            Some(false)
+        ));
+    }
+
+    #[test]
+    fn no_repaint_when_focused_or_unknown() {
+        // Already focused → nothing stale; unknown → left to the real focus event so
+        // this never degrades into a per-keystroke full repaint.
+        assert!(!input_recovers_stale_focus(&key(), Some(true)));
+        assert!(!input_recovers_stale_focus(&key(), None));
+    }
+
+    #[test]
+    fn non_input_events_never_trigger_recovery() {
+        // Resize / FocusChanged themselves are not "focus-proof" input.
+        assert!(!input_recovers_stale_focus(
+            &InputEvent::Resize(80, 24),
+            Some(false)
+        ));
+        assert!(!input_recovers_stale_focus(
+            &InputEvent::FocusChanged(true),
+            Some(false)
+        ));
+    }
+}
+
 fn handle_input(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -13454,6 +13727,15 @@ fn handle_input(
     }
     if !matches!(ev, InputEvent::Pointer(_)) {
         app.menu.pointer_cancel();
+    }
+
+    // Windows focus-recovery fallback (issue: input not echoing after Alt+Tab). If we
+    // affirmatively believed we were unfocused and now receive a key/paste, the refocus
+    // was missed (no `FocusGained`); refresh the stale diff cache with the same cold
+    // repaint the focus-event path uses, then mark focused so this fires only once.
+    if input_recovers_stale_focus(&ev, atomcode_capabilities::notify::terminal_focus_state()) {
+        atomcode_capabilities::notify::set_terminal_focus_state(Some(true));
+        renderer.force_repaint();
     }
 
     match ev {
@@ -13837,6 +14119,14 @@ fn handle_input(
                     )?;
                     if matches!(action, ModalAction::Close) {
                         app.active_modal = None;
+                        // Consume the onboarding-nudge marker FIRST: the
+                        // provider-wizard follow-up below returns early, and
+                        // deferring the take until after it would strand the
+                        // flag onto an unrelated modal's later close (e.g. the
+                        // ProviderPanel), firing the nudge at the wrong time.
+                        // Only a clean onboarding dismissal (no login-setup /
+                        // provider-wizard follow-up) should evaluate the nudge.
+                        let onboarding_closed = std::mem::take(&mut ctx.pending_onboarding_nudge);
                         // OnboardingWizard signals its follow-up via two bool
                         // flags. Drain one, execute it here — the
                         // CodingPlan flow (which internally handles
@@ -13858,6 +14148,23 @@ fn handle_input(
                             // The panel owns the next frame now; skip the idle
                             // redraw below so we don't clobber it.
                             return Ok(());
+                        }
+                        // 新用户未领 CodingPlan 时一次性引导接入 OpenRouter。
+                        // 仅在 onboarding 向导关闭时触发——其它 modal(/model、
+                        // /resume、/config 等)关闭不得触发。onboarding_closed 已在
+                        // 本臂顶部消费(见上),这里只是求值,provider-wizard 早 return
+                        // 不会再泄漏该标记。
+                        if onboarding_closed
+                            && !app.state.openrouter_noplan_nudge_shown
+                            && !crate::event_loop::openrouter_connect::has_codingplan(&ctx.config)
+                        {
+                            app.state.openrouter_noplan_nudge_shown = true;
+                            render_or_defer_background_notice(
+                                &mut app.state,
+                                renderer,
+                                "还没有可用模型?输入 /openrouter 一键接入 OpenRouter 免费模型"
+                                    .to_string(),
+                            );
                         }
                         redraw_idle_plain(&app.buf, &app.state, ctx, renderer);
                     }
@@ -15465,7 +15772,15 @@ fn build_menu_items(
     skill_registry: Option<&std::sync::RwLock<atomcode_capabilities::skills::SkillRegistry>>,
     file_index: Option<&file_index::FileIndex>,
 ) -> Option<Vec<(String, String)>> {
-    build_menu_items_with_efforts(buf, cursor, commands, custom, skill_registry, file_index, None)
+    build_menu_items_with_efforts(
+        buf,
+        cursor,
+        commands,
+        custom,
+        skill_registry,
+        file_index,
+        None,
+    )
 }
 
 /// Like [`build_menu_items`], but the `/effort ` dropdown lists exactly
@@ -15680,11 +15995,30 @@ fn idle_menu_confirmation_allowed(commit_gate_pending: bool) -> bool {
 /// Main-composer execution-mode shortcut. Crossterm normally reports
 /// Shift+Tab as `BackTab`, while a few terminals preserve it as `Tab + SHIFT`.
 /// Plain Tab is deliberately excluded so it remains dedicated to completion.
-fn is_mode_cycle_key(code: KeyCode, modifiers: crossterm::event::KeyModifiers) -> bool {
+fn is_mode_cycle_key(
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+    key_pref: atomcode_config::config::ModeSwitchKey,
+) -> bool {
     let shift = crossterm::event::KeyModifiers::SHIFT;
-    let has_no_other_modifiers = modifiers.difference(shift).is_empty();
-    has_no_other_modifiers
-        && (code == KeyCode::BackTab || (code == KeyCode::Tab && modifiers.contains(shift)))
+    // Only bare or Shift-modified chords qualify — Ctrl/Alt+Tab never cycles.
+    if !modifiers.difference(shift).is_empty() {
+        return false;
+    }
+    // BackTab (how most terminals encode Shift+Tab) and the Tab+SHIFT variant
+    // always cycle, on every platform, so no terminal loses the gesture even
+    // when the user switches the preference to plain Tab.
+    if code == KeyCode::BackTab || (code == KeyCode::Tab && modifiers.contains(shift)) {
+        return true;
+    }
+    // With the `tab` preference (HarmonyOS default, where Shift+Tab is
+    // undeliverable), plain Tab cycles too. The callers guard this with
+    // `menu_items.is_none()`, so an open completion menu still accepts on Tab;
+    // plain Tab only reaches mode-cycling when no menu is up (→ / Enter remain
+    // the completion-accept keys in this mode).
+    matches!(key_pref, atomcode_config::config::ModeSwitchKey::Tab)
+        && code == KeyCode::Tab
+        && !modifiers.contains(shift)
 }
 
 fn streaming_top_level_slash_selection(
@@ -15848,6 +16182,12 @@ fn handle_idle_key(
     code: KeyCode,
     modifiers: crossterm::event::KeyModifiers,
 ) -> Result<()> {
+    // ESC 取消后台 OpenRouter 连接任务(幂等:未在跑时置位无副作用,
+    // 每次 /openrouter 分派前已复位为 false)。
+    if code == KeyCode::Esc {
+        ctx.openrouter_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let cancel_resume = code == KeyCode::Esc && modifiers.is_empty()
         || code == KeyCode::Char('c')
             && modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
@@ -16270,8 +16610,9 @@ fn handle_idle_key(
     }
 
     // Shift+Tab cycles execution mode when no completion menu is up. Plain Tab
-    // is reserved for slash-command, skill, and @file completion.
-    if is_mode_cycle_key(code, modifiers) && menu_items.is_none() {
+    // is reserved for completion — unless `ui.mode_switch_key = "tab"` (the
+    // HarmonyOS default), where plain Tab cycles and → / Enter accept.
+    if is_mode_cycle_key(code, modifiers, ctx.config.ui.mode_switch_key) && menu_items.is_none() {
         let next = app.state.agent_mode.next();
         set_agent_mode(app, ctx, renderer, next);
         return Ok(());
@@ -17115,10 +17456,50 @@ fn shell_mode_hint(buf: &str) -> Option<(crate::i18n::Msg<'static>, crate::rende
     Some((msg, crate::render::HintSeverity::Shell))
 }
 
+/// A faint composer hint advertising a command's accepted arguments, shown while
+/// the buffer is JUST the command with no argument typed yet. `/worklog`'s example
+/// date is resolved from `today` (injected for testing) so it never looks stale
+/// and makes clear a bare `/worklog` means today. `None` otherwise.
+fn command_arg_hint_with(buf: &str, today: chrono::NaiveDate) -> Option<String> {
+    let rest = buf.trim_start().strip_prefix('/')?;
+    let (name, arg) = match rest.split_once(char::is_whitespace) {
+        Some((n, a)) => (n, a.trim()),
+        None => (rest, ""),
+    };
+    if name.eq_ignore_ascii_case("worklog") && arg.is_empty() {
+        return Some(format!("today | yesterday | {}", today.format("%-m/%-d")));
+    }
+    None
+}
+
+fn command_arg_hint(buf: &str) -> Option<String> {
+    command_arg_hint_with(buf, chrono::Local::now().date_naive())
+}
+
 #[cfg(test)]
 mod bash_input_hint_tests {
-    use super::{bash_input_hint, shell_mode_hint};
+    use super::{bash_input_hint, command_arg_hint_with, shell_mode_hint};
     use crate::render::HintSeverity;
+
+    #[test]
+    fn worklog_arg_hint_shows_forms_with_todays_date_only_before_an_arg() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
+        // Bare command (and with the trailing space after menu selection) → hint
+        // advertising the accepted forms, with TODAY as the example date.
+        for buf in ["/worklog", "/worklog ", "/WorkLog"] {
+            let h = command_arg_hint_with(buf, today).expect("hint before arg");
+            assert!(
+                h.contains("today") && h.contains("yesterday") && h.contains("8/28"),
+                "{h}"
+            );
+        }
+        // Once an argument is present, the affordance disappears.
+        assert_eq!(command_arg_hint_with("/worklog 8/27", today), None);
+        assert_eq!(command_arg_hint_with("/worklog yesterday", today), None);
+        // Other commands / plain text get no worklog hint.
+        assert_eq!(command_arg_hint_with("/model", today), None);
+        assert_eq!(command_arg_hint_with("hello", today), None);
+    }
 
     // Resolve to (text, severity) — `Msg` has no PartialEq/Debug, so compare the
     // observable output instead (locale-agnostic: we assert bare ≠ runnable, not
@@ -17281,6 +17662,12 @@ fn redraw_idle_plain(buf: &Buffer, state: &UiState, ctx: &LoopCtx, renderer: &mu
         let slot_is_free = status.hint.is_none();
         if slot_is_free {
             status.hint = Some((crate::i18n::t(msg).into_owned(), severity));
+        }
+    } else if status.hint.is_none() {
+        // Faint arg affordance for a bare arg-accepting command (e.g. `/worklog`),
+        // yielding to any higher-priority hint already in the slot.
+        if let Some(hint) = command_arg_hint(&buf.text) {
+            status.hint = Some((hint, crate::render::HintSeverity::Info));
         }
     }
     renderer.render(UiLine::InputPrompt {
@@ -17946,10 +18333,22 @@ pub(crate) fn save_proxy_and_reload(
         };
     let desired = desired_config_from_snapshot(ctx, commit.snapshot.config.clone(), false);
 
-    // First-run `/proxy` commonly runs before any provider exists. There is no
-    // HTTP client to rebuild yet; `/login` creates its client after this method
-    // applies the process proxy environment.
-    if desired.providers.is_empty() {
+    // Skip the live-client rebuild ONLY when there is genuinely no running
+    // provider client yet — first-run `/proxy` before `/login`, where `/login`
+    // builds the client afterwards against the env we publish here.
+    //
+    // The previous guard keyed on `desired.providers.is_empty()`, but that
+    // LEGACY table is always empty under the new-schema / CodingPlan setup
+    // (providers live in `config.models` / accounts). So for a logged-in
+    // CodingPlan user it wrongly took this short path: it published the new
+    // proxy env but never rebuilt the live reqwest client, which had baked the
+    // old proxy in at build time — leaving every request tunnelling through a
+    // now-dead proxy until a full restart. Key on the actual runtime instead: a
+    // `Ready` runtime has a client to rebuild; a Deferred/Starting/Failed one
+    // (true first-run) does not, so it correctly falls through to the env-only
+    // path. Schema-agnostic, and matches how `stage_committed_config_reload`
+    // already reads the runtime generation.
+    if ctx.runtime.current_generation().is_none() {
         atomcode_config::proxy::apply_process_proxy_config(&desired.network.proxy);
         ctx.config = desired;
         ctx.observed_config_revision = Some(commit.snapshot.revision);
@@ -18506,6 +18905,10 @@ fn handle_streaming_key(
     // Placed before menu navigation because stopping the stream is the higher
     // value action mid-turn (Ctrl+U remains available for clearing input).
     if code == KeyCode::Esc {
+        // 若在回合进行中还有后台 OpenRouter 连接在等授权(用户开了 /openrouter 后又
+        // 发了 prompt),这里的 ESC 也一并取消它——幂等,无在跑任务时是 no-op。
+        ctx.openrouter_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let had_active_turn = ctx.runtime.has_active_turn();
         let send_ok = if app.state.goal_condition.is_some()
             && app.state.goal_phase == atomcode_coding::GoalPhase::Pursuing
@@ -18565,7 +18968,7 @@ fn handle_streaming_key(
     // this turn (matching Claude Code's mid-run Shift+Tab). Already-surfaced
     // approvals are not retroactively changed — only later tool calls see the new
     // mode. Repaint the spinner footer so the mode badge updates immediately.
-    if is_mode_cycle_key(code, modifiers) && menu_items.is_none() {
+    if is_mode_cycle_key(code, modifiers, ctx.config.ui.mode_switch_key) && menu_items.is_none() {
         let next = app.state.agent_mode.next();
         set_agent_mode(app, ctx, renderer, next);
         draw_spinner_now(
@@ -19053,18 +19456,35 @@ fn pause_active_goal(ctx: &LoopCtx) -> bool {
 enum ApprovalChoice {
     Allow,
     AllowAlways,
+    /// Session-wide "allow ALL Bash" — produces
+    /// `{"decision":"allow","remember":true,"grant_scope":"all"}`.
+    AllowAlwaysAll,
     Deny,
 }
 
 fn deliver_approval(ctx: &mut LoopCtx, choice: ApprovalChoice) {
     if let Some(id) = ctx.pending_runtime_request_id.take() {
         use atomcode_capabilities::tools::ApprovalResponse;
-        let response = match choice {
-            ApprovalChoice::Allow => ApprovalResponse::allow(),
-            ApprovalChoice::AllowAlways => ApprovalResponse::allow_always(),
-            ApprovalChoice::Deny => ApprovalResponse::deny(),
+        let value = match choice {
+            ApprovalChoice::AllowAlwaysAll => {
+                // `PermissionDecision::from_value` requires
+                // `{"decision":"allow","remember":true,"grant_scope":"all"}`.
+                serde_json::json!({
+                    "decision": "allow",
+                    "remember": true,
+                    "grant_scope": "all"
+                })
+            }
+            other => {
+                let response = match other {
+                    ApprovalChoice::Allow => ApprovalResponse::allow(),
+                    ApprovalChoice::AllowAlways => ApprovalResponse::allow_always(),
+                    ApprovalChoice::Deny => ApprovalResponse::deny(),
+                    ApprovalChoice::AllowAlwaysAll => unreachable!(),
+                };
+                serde_json::to_value(response).unwrap_or(serde_json::Value::Null)
+            }
         };
-        let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
         if ctx.live_binding.is_some() {
             if let Err(error) = atomcode_daemon::native_live::respond(id, value) {
                 crate::tuix_trace!("LIVE", "approval response failed: {error:?}");
@@ -19197,45 +19617,62 @@ fn approval_choice_to_decision(
     match choice {
         ApprovalChoice::Allow => PermissionDecision::AllowOnce,
         ApprovalChoice::AllowAlways => PermissionDecision::AllowAlways,
+        ApprovalChoice::AllowAlwaysAll => PermissionDecision::AllowAlwaysAll,
         ApprovalChoice::Deny => PermissionDecision::Deny,
     }
 }
 
-fn get_approval_cache_key(tool: &str, args: &str) -> String {
-    if tool == "bash" {
-        let command = if let Ok(val) = serde_json::from_str::<serde_json::Value>(args) {
-            val.get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        } else {
-            args.to_string()
-        };
-        let normalized = atomcode_capabilities::tools::normalize_command_for_grant(&command);
-        format!("bash::{normalized}")
-    } else {
-        format!("{tool}::")
+/// The shell-executing tools (`bash`, `bash_start` — a backgrounded command is exactly as
+/// dangerous as a foreground one) all take `{"command": …}` and share ONE grant-scope rule.
+/// `None` for anything else, whose approval is tool-wide.
+///
+/// Accepts either spelling of the name: the approval event carries the WIRE name, the panel
+/// the PascalCase display name.
+fn shell_grant_scope(tool: &str, args: &str) -> Option<String> {
+    let normalized = tool.to_ascii_lowercase().replace('_', "");
+    if !matches!(normalized.as_str(), "bash" | "bashstart") {
+        return None;
     }
+    let command = serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(String::from))
+        .unwrap_or_default();
+    Some(atomcode_capabilities::tools::shell_always_grant_scope(
+        args, &command,
+    ))
 }
 
-/// The three approval options for `tool`, in display order (Allow once is the
-/// default selection). The "Always allow" label carries the tool name because
-/// `AgentEvent::ApprovalNeeded` does not carry the grant scope — except for the
-/// single-file write tools (`WriteFile`/`EditFile`), whose grant `WriteApprovalGate`
-/// scopes to the target's DIRECTORY, so their label names the folder instead.
-pub(crate) fn build_approval_options(tool: &str) -> Vec<crate::state::ApprovalOption> {
+/// The three approval options for `tool`, in display order (Allow once is the default
+/// selection). The "Always allow" label must state the scope the store will ACTUALLY record:
+///
+/// * `WriteFile`/`EditFile` — `WriteApprovalGate` grants per target DIRECTORY → name the folder.
+/// * `bash` / `bash_start` — [`shell_grant_scope`] decides, and this label is derived from it: an
+///   empty scope is session-wide ("Always allow Bash"), a non-empty one is pinned to this
+///   command (the sensitive-path floor) and says so. Deriving the label from the same function
+///   that computes the grant is the point: the previous code decided the wording separately and
+///   compared `tool == "bash"` against a PascalCase display name, so the branch never fired and
+///   every user was promised a session-wide grant while the store recorded one command.
+/// * everything else — tool-wide, so the tool name is accurate.
+///
+/// `args` is the call's raw arguments (`AgentEvent::ApprovalNeeded` carries them); it is what
+/// makes the scope decision available here at all.
+pub(crate) fn build_approval_options(tool: &str, args: &str) -> Vec<crate::state::ApprovalOption> {
     use crate::state::{ApprovalKind, ApprovalOption};
     // Display names (snake→Pascal) of the directory-scoped write tools.
     let always_label = if matches!(tool, "WriteFile" | "EditFile") {
         crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowFolder).into_owned()
-    } else if tool == "bash" {
-        // bash's grant is scoped to THIS COMMAND (not the whole tool), so don't imply
-        // "Always allow bash" — say "this command".
+    } else if shell_grant_scope(tool, args).is_some_and(|scope| !scope.is_empty()) {
+        // Non-empty scope ⇒ this grant covers only THIS command (sensitive target).
         crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowCommand).into_owned()
     } else {
         crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool }).into_owned()
     };
-    vec![
+    // Determine whether this is a Bash call (either wire name or display name).
+    let is_bash = matches!(
+        tool.to_ascii_lowercase().replace('_', "").as_str(),
+        "bash" | "bashstart"
+    );
+    let mut opts = vec![
         ApprovalOption {
             label: crate::i18n::t(crate::i18n::Msg::ApprovalAllowOnce).into_owned(),
             kind: ApprovalKind::AllowOnce,
@@ -19246,12 +19683,21 @@ pub(crate) fn build_approval_options(tool: &str) -> Vec<crate::state::ApprovalOp
             kind: ApprovalKind::AlwaysAllow,
             accel: 'a',
         },
-        ApprovalOption {
-            label: crate::i18n::t(crate::i18n::Msg::ApprovalDeny).into_owned(),
-            kind: ApprovalKind::Deny,
-            accel: 'n',
-        },
-    ]
+    ];
+    // For Bash only: add a danger "allow ALL Bash" option between AlwaysAllow and Deny.
+    if is_bash {
+        opts.push(ApprovalOption {
+            label: crate::i18n::t(crate::i18n::Msg::ApprovalAllowAllBash).into_owned(),
+            kind: ApprovalKind::AllowAlwaysAll,
+            accel: '!',
+        });
+    }
+    opts.push(ApprovalOption {
+        label: crate::i18n::t(crate::i18n::Msg::ApprovalDeny).into_owned(),
+        kind: ApprovalKind::Deny,
+        accel: 'n',
+    });
+    opts
 }
 
 /// The `AgentCommand` for a chosen approval option kind. Pure seam so the
@@ -19261,6 +19707,7 @@ fn approval_kind_to_choice(kind: crate::state::ApprovalKind) -> ApprovalChoice {
     match kind {
         ApprovalKind::AllowOnce => ApprovalChoice::Allow,
         ApprovalKind::AlwaysAllow => ApprovalChoice::AllowAlways,
+        ApprovalKind::AllowAlwaysAll => ApprovalChoice::AllowAlwaysAll,
         ApprovalKind::Deny => ApprovalChoice::Deny,
     }
 }
@@ -19326,30 +19773,135 @@ mod bypass_approval_tests {
             PermissionDecision::AllowAlways
         ));
         assert!(matches!(
+            approval_choice_to_decision(ApprovalChoice::AllowAlwaysAll),
+            PermissionDecision::AllowAlwaysAll
+        ));
+        assert!(matches!(
             approval_choice_to_decision(ApprovalChoice::Deny),
             PermissionDecision::Deny
         ));
     }
 
+    fn bash_args(command: &str) -> String {
+        serde_json::json!({ "command": command }).to_string()
+    }
+
     #[test]
     fn build_approval_options_shape() {
         use crate::state::ApprovalKind;
-        let opts = super::build_approval_options("bash");
-        assert_eq!(opts.len(), 3);
-        assert_eq!(
-            (opts[0].kind, opts[0].accel),
-            (ApprovalKind::AllowOnce, 'y')
-        );
-        assert_eq!(
-            (opts[1].kind, opts[1].accel),
-            (ApprovalKind::AlwaysAllow, 'a')
-        );
+        // Production calls this with the PascalCase DISPLAY name (`display_tool_name`),
+        // never the wire name — assert on both so the label can't silently regress again.
+        for name in ["Bash", "bash"] {
+            let opts = super::build_approval_options(name, &bash_args("rm -rf victim"));
+            // Bash gets 4 options: AllowOnce / AlwaysAllow / AllowAlwaysAll (danger) / Deny.
+            assert_eq!(opts.len(), 4, "bash must have 4 options ({name})");
+            assert_eq!(
+                (opts[0].kind, opts[0].accel),
+                (ApprovalKind::AllowOnce, 'y')
+            );
+            assert_eq!(
+                (opts[1].kind, opts[1].accel),
+                (ApprovalKind::AlwaysAllow, 'a')
+            );
+            assert_eq!(
+                opts[1].label,
+                crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool: name }).into_owned(),
+                "an ordinary bash grant is session-wide, so the label names the tool ({name})"
+            );
+            assert_eq!(
+                (opts[2].kind, opts[2].accel),
+                (ApprovalKind::AllowAlwaysAll, '!')
+            );
+            assert_eq!(
+                opts[2].label,
+                crate::i18n::t(crate::i18n::Msg::ApprovalAllowAllBash).into_owned(),
+                "allow-all-bash option must carry the danger label ({name})"
+            );
+            assert_eq!((opts[3].kind, opts[3].accel), (ApprovalKind::Deny, 'n'));
+        }
+    }
+
+    /// The label must track the scope the store will actually record: a sensitive target keeps
+    /// a COMMAND-scoped grant, so it must not be offered as a session-wide "Always allow Bash".
+    #[test]
+    fn build_approval_options_sensitive_bash_says_this_command() {
+        let opts = super::build_approval_options("Bash", &bash_args("cat ~/.ssh/id_rsa"));
         assert_eq!(
             opts[1].label,
             crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowCommand).into_owned(),
-            "bash grants are command-scoped and must not imply tool-wide approval"
+            "a sensitive-target grant is command-scoped and must say so"
         );
-        assert_eq!((opts[2].kind, opts[2].accel), (ApprovalKind::Deny, 'n'));
+    }
+
+    /// The label is the ONLY driver-side rendering of the grant scope now that the driver
+    /// keeps no grant cache of its own, so it must track [`shell_grant_scope`] exactly — the
+    /// original bug was precisely a label that decided the scope separately from the store.
+    #[test]
+    fn approval_label_tracks_the_grant_scope() {
+        // Ordinary command: session-wide grant (empty scope) ⇒ tool-named label.
+        let ordinary = bash_args("rm -rf victim");
+        assert_eq!(
+            super::shell_grant_scope("bash", &ordinary).as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            super::build_approval_options("Bash", &ordinary)[1].label,
+            crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool: "Bash" }).into_owned()
+        );
+        // A DIFFERENT ordinary command lands on the same scope — this is the whole fix: one
+        // "Always" stops the next command from re-prompting.
+        assert_eq!(
+            super::shell_grant_scope("bash", &ordinary),
+            super::shell_grant_scope("bash", &bash_args("python3 x.py > out.json"))
+        );
+        // Sensitive command: command-scoped ⇒ "this command" label.
+        let sensitive = bash_args("cat ~/.ssh/id_rsa");
+        assert_ne!(
+            super::shell_grant_scope("bash", &sensitive).as_deref(),
+            Some(""),
+            "a sensitive target must not take the session-wide scope"
+        );
+        assert_eq!(
+            super::build_approval_options("Bash", &sensitive)[1].label,
+            crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowCommand).into_owned()
+        );
+        // The scope must be spelling-independent: the approval event carries the WIRE name,
+        // the panel the PascalCase display name.
+        assert_eq!(
+            super::shell_grant_scope("Bash", &sensitive),
+            super::shell_grant_scope("bash", &sensitive)
+        );
+        assert_eq!(
+            super::shell_grant_scope("BashStart", &ordinary),
+            super::shell_grant_scope("bash_start", &ordinary)
+        );
+    }
+
+    /// `bash_start` backgrounds a command that is "exactly as dangerous as a foreground one"
+    /// (its own `risk`), so its label must state the same scope the foreground tool records.
+    #[test]
+    fn bash_start_shares_the_foreground_bash_scope() {
+        let ordinary = bash_args("rm -rf victim");
+        let sensitive = bash_args("cat ~/.ssh/id_rsa");
+        assert_eq!(
+            super::shell_grant_scope("bash_start", &ordinary),
+            super::shell_grant_scope("bash", &ordinary)
+        );
+        assert_eq!(
+            super::shell_grant_scope("bash_start", &sensitive),
+            super::shell_grant_scope("bash", &sensitive)
+        );
+        assert_eq!(
+            super::build_approval_options("BashStart", &sensitive)[1].label,
+            crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllowCommand).into_owned()
+        );
+        assert_eq!(
+            super::build_approval_options("BashStart", &ordinary)[1].label,
+            crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool: "BashStart" })
+                .into_owned()
+        );
+        // A non-shell tool is not the shell rule's business at all.
+        assert_eq!(super::shell_grant_scope("bash_poll", "{}"), None);
     }
 
     #[test]
@@ -19357,7 +19909,7 @@ mod bypass_approval_tests {
         // WriteFile/EditFile grants are directory-scoped, so their "always" label
         // must name the folder — NOT the tool (which would mislead as tool-wide).
         for tool in ["WriteFile", "EditFile"] {
-            let opts = super::build_approval_options(tool);
+            let opts = super::build_approval_options(tool, "{}");
             let label = &opts[1].label;
             assert!(
                 !label.contains(tool),
@@ -19365,7 +19917,7 @@ mod bypass_approval_tests {
             );
         }
         // A tool-wide write tool (no single target) keeps the tool-named label.
-        let opts = super::build_approval_options("SearchReplace");
+        let opts = super::build_approval_options("SearchReplace", "{}");
         assert!(opts[1].label.contains("SearchReplace"), "{}", opts[1].label);
     }
 
@@ -19381,9 +19933,68 @@ mod bypass_approval_tests {
             ApprovalChoice::AllowAlways
         ));
         assert!(matches!(
+            super::approval_kind_to_choice(ApprovalKind::AllowAlwaysAll),
+            ApprovalChoice::AllowAlwaysAll
+        ));
+        assert!(matches!(
             super::approval_kind_to_choice(ApprovalKind::Deny),
             ApprovalChoice::Deny
         ));
+    }
+
+    /// Bash MUST offer an `AllowAlwaysAll` option whose payload round-trips through
+    /// `PermissionDecision::from_value` as `AllowAlwaysAll`. Non-bash tools MUST NOT
+    /// get this option.
+    #[test]
+    fn bash_approval_offers_allow_all_danger_option() {
+        use crate::state::ApprovalKind;
+        use atomcode_capabilities::tools::approval::PermissionDecision;
+
+        let bash_cmd = bash_args("rm -rf /tmp/x");
+
+        // Bash (both wire and display name spellings) must include AllowAlwaysAll.
+        for name in ["Bash", "bash"] {
+            let opts = super::build_approval_options(name, &bash_cmd);
+            let allow_all_opt = opts
+                .iter()
+                .find(|o| o.kind == ApprovalKind::AllowAlwaysAll)
+                .unwrap_or_else(|| panic!("bash ({name}) must have an AllowAlwaysAll option"));
+
+            // The response payload must parse to AllowAlwaysAll.
+            let payload = serde_json::json!({
+                "decision": "allow",
+                "remember": true,
+                "grant_scope": "all"
+            });
+            assert_eq!(
+                PermissionDecision::from_value(&payload),
+                PermissionDecision::AllowAlwaysAll,
+                "allow-all payload must parse to AllowAlwaysAll"
+            );
+
+            // The choice produced by the kind must map to AllowAlwaysAll decision.
+            let choice = super::approval_kind_to_choice(allow_all_opt.kind);
+            assert_eq!(
+                approval_choice_to_decision(choice),
+                PermissionDecision::AllowAlwaysAll,
+                "AllowAlwaysAll kind → choice → decision must round-trip ({name})"
+            );
+        }
+
+        // Non-bash tools MUST NOT get this option.
+        for tool in [
+            "ReadFile",
+            "WriteFile",
+            "EditFile",
+            "SearchReplace",
+            "read_file",
+        ] {
+            let opts = super::build_approval_options(tool, "{}");
+            assert!(
+                opts.iter().all(|o| o.kind != ApprovalKind::AllowAlwaysAll),
+                "{tool} must NOT have an AllowAlwaysAll option"
+            );
+        }
     }
 }
 
@@ -19917,6 +20528,19 @@ fn handle_approval_key(
             redraw_idle_plain(&app.buf, &mut app.state, ctx, renderer);
             return Ok(());
         }
+        // Tab toggles the full-command expansion (Bash only). A no-op falls through so
+        // Tab on a non-expandable panel does nothing (never resolves a decision).
+        KeyCode::Tab | KeyCode::BackTab => {
+            let toggled = app
+                .state
+                .approval_panel
+                .as_mut()
+                .is_some_and(|p| p.toggle_expand());
+            if toggled {
+                redraw_idle_plain(&app.buf, &mut app.state, ctx, renderer);
+                return Ok(());
+            }
+        }
         _ => {}
     }
 
@@ -19947,14 +20571,11 @@ fn handle_approval_key(
         return Ok(());
     };
     let choice = approval_kind_to_choice(kind);
-    if choice == ApprovalChoice::AllowAlways {
-        if let Some(p) = &app.state.approval_panel {
-            if !p.cache_key.is_empty() {
-                let mut guard = ctx.allowed_always.lock().unwrap();
-                guard.insert(p.cache_key.clone());
-            }
-        }
-    }
+    // The decision is NOT cached here. Each gate records its own grant at the scope it
+    // actually enforces (per directory, per path, per command, or deliberately not at all),
+    // and those stores already survive re-assembly via `CodingParts::inherit_runtime_continuity`.
+    // A driver-side cache could only guess a scope from the tool name, and the guess was
+    // tool-wide for everything except bash — silently widening every narrower gate.
     deliver_approval(ctx, choice);
     app.state.on_approval_resolved(); // clears approval_panel + phase → Streaming
                                       // Repaint the footer NOW so the approval panel disappears immediately, the
@@ -22010,6 +22631,8 @@ fn subtask_progress_from_args(
                 model: String::new(),
                 activity: String::new(),
                 started_at: None,
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: crate::render::SubtaskStatus::Pending,
             }
@@ -22108,6 +22731,15 @@ fn update_subtask_progress(
     if started && item.started_at.is_none() {
         item.started_at = Some(std::time::Instant::now());
     }
+    // Freeze elapsed at the terminal transition. Without this, a done member's
+    // row keeps ticking with `now` because the group re-renders live while its
+    // sibling members are still running.
+    if matches!(
+        status,
+        SubtaskStatus::Completed | SubtaskStatus::Stopped | SubtaskStatus::Failed
+    ) {
+        item.finished_at.get_or_insert_with(std::time::Instant::now);
+    }
     if let Some(model) = model.filter(|model| !model.is_empty()) {
         item.model = model.to_string();
     }
@@ -22120,6 +22752,14 @@ fn update_subtask_progress(
         .and_then(|tokens| tokens.parse::<u64>().ok())
     {
         item.output_tokens = item.output_tokens.max(tokens);
+    }
+    if let Some(tools) = parts
+        .iter()
+        .find_map(|part| part.strip_prefix("tools="))
+        .and_then(|tools| tools.parse::<u64>().ok())
+    {
+        // Monotonic: a reordered/late chunk can't lower the count.
+        item.tool_uses = item.tool_uses.max(tools);
     }
     let terminal_line = if matches!(
         status,
@@ -22381,6 +23021,8 @@ mod subtask_progress_projection_tests {
                     model: "model".into(),
                     activity: "done".into(),
                     started_at: None,
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 10,
                     status: SubtaskStatus::Completed,
                 }],
@@ -23425,7 +24067,7 @@ fn handle_runtime_event(
                     handle_agent_event(
                         AgentEvent::ApprovalNeeded {
                             tool_name: approval.tool.clone(),
-                            reason: "Requires approval".into(),
+                            reason: approval.reason,
                             call: atomcode_kernel::tool::ToolCall {
                                 id: approval.call_id,
                                 name: approval.tool,
@@ -23805,15 +24447,15 @@ fn handle_runtime_event(
                 CodingRuntimeEvent::ContextStatsRefreshed(result) => {
                     match result {
                         Ok(stats) => {
-                            state.on_context_stats(
-                                0,
+                            // Gauge-only: update live occupancy + window, but PRESERVE
+                            // the fine-grained breakdown (system/tool/cold/message
+                            // counts) from the last rich emission — the runtime refresh
+                            // does not carry them, and feeding 0s here used to zero out
+                            // "Messages in window" the moment the user ran /context.
+                            state.on_context_gauge_refresh(
                                 stats.used_tokens as usize,
-                                0,
-                                0,
-                                0,
                                 stats.context_window as usize,
                                 "coding-runtime",
-                                "",
                             );
                             if let Some(show_prompt) = state.pending_context_render.take() {
                                 renderer.render(UiLine::CommandOutput(
@@ -24698,6 +25340,48 @@ fn apply_native_session_changed(
     commit_native_session_changed(session, working_dir, state, renderer, ctx)
 }
 
+/// Sum a persisted session cost report into `(prompt, completion, cached)` token
+/// totals for seeding `UiState`'s session-cumulative tallies on load. `prompt` is
+/// TOTAL input (uncached `input` + `cached_input`) to match the live accumulation
+/// at the Usage-event site, so the status-row cache ratio (`cached / prompt`)
+/// stays consistent before and after a `-c`/resume.
+fn session_token_totals_from_cost(
+    report: &atomcode_capabilities::session::SessionCostReport,
+) -> (usize, usize, usize) {
+    let mut prompt = 0usize;
+    let mut completion = 0usize;
+    let mut cached = 0usize;
+    for model in &report.models {
+        prompt += (model.tokens.input + model.tokens.cached_input) as usize;
+        completion += model.tokens.output as usize;
+        cached += model.tokens.cached_input as usize;
+    }
+    (prompt, completion, cached)
+}
+
+/// Seed `state`'s session-cumulative token totals (incl. cache) from the persisted
+/// meta for `session_id`, so the status-row cache% survives a resume/`-c`/switch
+/// instead of blanking until the next turn (mirrors how `ctx` usage is restored).
+/// Live Usage events accumulate on top of this seed. Best-effort: a missing/
+/// unreadable meta (fresh session, legacy import) leaves the totals untouched.
+fn seed_session_token_totals(
+    state: &mut UiState,
+    project_bucket: Option<&str>,
+    working_dir: &std::path::Path,
+    session_id: &str,
+) {
+    let manager = commands::session_manager_for_cost(project_bucket, working_dir);
+    if let Ok(meta) = manager.read_meta(session_id) {
+        let report = atomcode_capabilities::session::aggregate_session_cost(&meta);
+        let (prompt, completion, cached) = session_token_totals_from_cost(&report);
+        state.prompt_tokens = prompt;
+        state.completion_tokens = completion;
+        state.cached_tokens = cached;
+        // Live path does `total_tokens += u.completion`, so mirror it here.
+        state.total_tokens = completion;
+    }
+}
+
 fn commit_native_session_changed(
     session: Session,
     working_dir: PathBuf,
@@ -24741,6 +25425,15 @@ fn commit_native_session_changed(
     state.prompt_tokens = 0;
     state.completion_tokens = 0;
     state.cached_tokens = 0;
+    // Restore the session-cumulative token totals (incl. cache) from the persisted
+    // meta so the status-row cache% survives a resume/switch instead of blanking
+    // until the next turn — mirroring how `ctx` usage is restored.
+    seed_session_token_totals(
+        state,
+        ctx.current_session_project_bucket.as_deref(),
+        &ctx.working_dir,
+        &session_id,
+    );
     state.last_context = None;
     // Session history can outlive the model that produced it. Establish the
     // current runtime/model window before replay restores persisted usage, so
@@ -26082,6 +26775,7 @@ fn handle_agent_event(
                                 } else {
                                     crate::render::SubtaskStatus::Failed
                                 };
+                                item.finished_at.get_or_insert_with(std::time::Instant::now);
                                 item.activity = if success { "done" } else { "failed" }.into();
                             }
                         }
@@ -26396,19 +27090,14 @@ fn handle_agent_event(
         }
         AgentEvent::ApprovalNeeded {
             tool_name,
+            reason: approval_reason,
             call,
             snapshot,
-            ..
         } => {
-            let cache_key = get_approval_cache_key(&tool_name, &call.arguments);
-            let already_allowed = {
-                let guard = ctx.allowed_always.lock().unwrap();
-                guard.contains(&cache_key)
-            };
-            if already_allowed {
-                deliver_approval(ctx, ApprovalChoice::AllowAlways);
-                return;
-            }
+            // No driver-side grant lookup: a gate that already granted this call never asks
+            // again (it checks its own store before round-tripping), so reaching here means
+            // some gate genuinely wants an answer. Short-circuiting on a name-derived key
+            // here used to answer on behalf of gates whose grants are far narrower.
             // BYPASS mode (`--dangerously-skip-permissions`): auto-approve and
             // skip the prompt. The response goes through the hub when shared, so
             // all views observe the same pending request lifecycle.
@@ -26481,13 +27170,17 @@ fn handle_agent_event(
                     *rendered = true;
                 }
             } else {
-                // No entry from ToolCallStarted, render and insert (pre-result).
-                renderer.render(UiLine::ToolCall {
-                    name: display.clone(),
-                    detail: detail.clone(),
-                    outcome: None,
-                });
-                pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), true));
+                // Approval precedes ToolStarted in v2, so there is no transcript
+                // row yet. DON'T commit a neutral `● Tool(detail)` row here:
+                // nothing recolours a pre-result committed bullet — the
+                // result-time `ToolCallCommit` finds no inflight to freeze, and
+                // `commit_inflight_tool` is a no-op — so a committed row would
+                // strand white even on success (bash-approval green-dot bug).
+                // Defer the row exactly like task/team (`rendered = false`): the
+                // approval panel already restates `Allow Tool(detail)?`, and once
+                // approved ToolCallStarted renders the live inflight whose result
+                // greens the bullet through the normal path.
+                pending_tools.insert(call.id.clone(), (display.clone(), detail.clone(), false));
             }
 
             // Warn when the command about to be approved would trip the credential
@@ -26497,13 +27190,30 @@ fn handle_agent_event(
                     &call.arguments,
                 ))
             .then(|| crate::i18n::t(crate::i18n::Msg::CredentialApprovalNote).into_owned());
+            // Full, untruncated command for a shell approval — the security boundary must
+            // let the user read the EXACT command (Tab expands it multi-line). `None` for
+            // non-shell tools, which keep only the compact `detail`.
+            let full_command = matches!(call.name.as_str(), "bash" | "bash_start")
+                .then(|| {
+                    serde_json::from_str::<serde_json::Value>(&call.arguments)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(str::to_string)
+                        })
+                })
+                .flatten()
+                .filter(|c| !c.trim().is_empty());
             state.approval_panel = Some(crate::state::ApprovalPanel {
                 tool: display.clone(),
                 detail: detail.clone(),
-                options: build_approval_options(&display),
+                options: build_approval_options(&display, &call.arguments),
                 selected: 0,
-                cache_key,
                 note,
+                reason: approval_reason,
+                full_command,
+                expanded: false,
             });
             renderer.flush();
             atomcode_capabilities::notify::notify(
@@ -26764,6 +27474,7 @@ fn handle_agent_event(
                                 | crate::render::SubtaskStatus::Running
                         ) {
                             item.status = crate::render::SubtaskStatus::Stopped;
+                            item.finished_at.get_or_insert_with(std::time::Instant::now);
                             item.activity = "cancelled".into();
                         }
                     }
@@ -28470,6 +29181,15 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     } else {
         ctx.model_name.clone()
     };
+    // Channel (account) suffix, ONLY when the bare model name is ambiguous across
+    // configured accounts — so a multi-channel user can see which budget/channel
+    // is live (mirrors the webui picker's `model (Channel)` disambiguation).
+    let model_channel = if no_provider {
+        None
+    } else {
+        ctx.config
+            .disambiguating_channel_label(&ctx.provider_selection)
+    };
     // Mode badge (`ModeBadge`): a single left-aligned badge that covers all
     // non-default modes. The badge carries both its label and its colour slot
     // (`BadgeColour`), so the renderer just maps the slot to a `CellStyle`.
@@ -28540,6 +29260,26 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // has this session burned in total". See render::StatusLine docs.
     let (ctx_used, ctx_window) =
         status_context_usage(state, ctx.config.default_context_window(), !no_provider);
+    // Cache-hit indicator for the status row: the SESSION-cumulative share of
+    // prompt tokens served from the provider's prompt cache (`cached / prompt`
+    // over the whole session). Uses the session-level tallies — which, unlike the
+    // per-turn `turn_*` ones, are NOT cleared at turn end — so the indicator is
+    // stable across turns and never blanks at idle. These tallies accumulate
+    // live in THIS runtime (reset on session switch, not restored from disk), so
+    // after a resume the figure rebuilds from the next turn — it is NOT sourced
+    // from the persisted session meta that `/cost` aggregates, and the two can
+    // differ until this runtime re-accumulates. Reuses `turn_token_summary`'s
+    // cached-pct math for a consistent denominator/rounding; `None` until the
+    // first cached round lands, so providers that never report cached tokens keep
+    // the row clean.
+    let cache_indicator = {
+        let (_, cached_pct) = crate::state::turn_token_summary(
+            state.prompt_tokens,
+            state.completion_tokens,
+            state.cached_tokens,
+        );
+        cached_pct.map(|pct| format!("cache {}%", pct))
+    };
     // Session-name badge: surfaced only when the user has explicitly
     // renamed the conversation. Auto-named sessions (default /
     // session-* / first-message-derived) intentionally stay badge-less
@@ -28601,6 +29341,9 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             options: p.options.iter().map(|o| o.label.clone()).collect(),
             selected: p.selected,
             note: p.note.clone(),
+            reason: p.reason.clone(),
+            full_command: p.full_command.clone(),
+            expanded: p.expanded,
         });
     // A pending batch takes precedence over a single panel (mutually exclusive in
     // practice). The view carries the CURRENT question's fields plus batch navigator
@@ -28671,6 +29414,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     };
     crate::render::StatusLine {
         model,
+        model_channel,
         cwd,
         pending_messages: state
             .pending_steers
@@ -28686,6 +29430,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         hint,
         mode_indicator,
         bypass_indicator,
+        cache_indicator,
         reasoning_effort: if reasoning_effort_applicable_on_provider(ctx) {
             ctx.reasoning_effort.clone()
         } else {
@@ -28960,8 +29705,26 @@ fn format_spinner_label(
         let elapsed = fmt_elapsed(d.as_millis() as u64);
         let tokens = state.turn_output_token_estimate();
         if tokens > 0 {
+            // Live throughput as a "still moving, not hung" signal — the rate of the
+            // CURRENT generation phase: tokens produced THIS phase over the SAME
+            // `phase_elapsed` window shown in the clock. Scoping to the phase (not the
+            // whole turn) keeps earlier tool-execution / idle time out of the
+            // denominator, so a tool-heavy turn no longer reads a diluted "1 tok/s"
+            // and the number doesn't swing as phases alternate. Omitted under 1s (to
+            // avoid divide-by-zero / wild early numbers) and when this phase has
+            // produced no output yet (e.g. mid tool execution — show the clock only).
+            let phase_tokens = state.phase_output_token_estimate();
+            // Fractional seconds (not integer `as_secs()`) so the rate doesn't step /
+            // jump as the whole-second boundary ticks over at low elapsed. Gate at 1s
+            // to avoid divide-by-zero / wild early numbers; round for a clean integer.
+            let secs = d.as_secs_f64();
+            let rate = if secs >= 1.0 && phase_tokens > 0 {
+                format!(" · {} tok/s", (phase_tokens as f64 / secs).round() as usize)
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
-                " ({elapsed} · \u{2191} {} tokens)",
+                " ({elapsed} · \u{2191} {} tokens{rate})",
                 crate::i18n::fmt_tokens(tokens)
             ));
         } else {
@@ -29737,9 +30500,7 @@ pub(crate) fn build_replay_tool_batch(
                 // `└ • Tool … → result` (matches live); the `•` is coloured by the
                 // stored outcome so a resumed batch keeps its green success dots.
                 text: format!("  {} \u{2022} {}{}", child_glyph, body, suffix),
-                outcome: result_of
-                    .get(&c.id)
-                    .map(|(ok, _)| tool_bullet_outcome(*ok)),
+                outcome: result_of.get(&c.id).map(|(ok, _)| tool_bullet_outcome(*ok)),
             }
         })
         .collect();
@@ -30942,7 +31703,10 @@ mod format_shell_command_tests {
         let out = format_shell_command(cmd, 100);
         assert_eq!(out.len(), 3, "one row per logical line: {out:?}");
         assert!(out[0].contains("<<'EOF'"), "{out:?}");
-        assert!(out[1].contains("import urllib.request, json, base64"), "{out:?}");
+        assert!(
+            out[1].contains("import urllib.request, json, base64"),
+            "{out:?}"
+        );
         assert!(out[2].contains("def gh(url):"), "{out:?}");
         assert!(
             !out.iter().any(|l| l.contains("base64def")),
@@ -31208,6 +31972,61 @@ mod tool_bullet_outcome_tests {
         // No failure-class distinction: only success is coloured, so every
         // failure is the same neutral `Failure`.
         assert_eq!(tool_bullet_outcome(false), ToolOutcome::Failure);
+    }
+}
+
+#[cfg(test)]
+mod session_token_seed_tests {
+    use super::session_token_totals_from_cost;
+    use atomcode_capabilities::session::{ModelCostSummary, SessionCostReport, TokenBreakdown};
+
+    #[test]
+    fn sums_prompt_as_uncached_plus_cached_across_models() {
+        let report = SessionCostReport {
+            models: vec![
+                ModelCostSummary {
+                    provider_id: "p".into(),
+                    model_id: "a".into(),
+                    // 20 uncached input + 80 cached input, 10 output.
+                    tokens: TokenBreakdown {
+                        input: 20,
+                        output: 10,
+                        cached_input: 80,
+                    },
+                },
+                ModelCostSummary {
+                    provider_id: "p".into(),
+                    model_id: "b".into(),
+                    tokens: TokenBreakdown {
+                        input: 100,
+                        output: 5,
+                        cached_input: 0,
+                    },
+                },
+            ],
+            unattributed_tokens: 0,
+            total_tokens: 0,
+        };
+        let (prompt, completion, cached) = session_token_totals_from_cost(&report);
+        // prompt = (20+80) + (100+0) = 200; cached = 80; completion = 10+5 = 15.
+        assert_eq!(prompt, 200);
+        assert_eq!(cached, 80);
+        assert_eq!(completion, 15);
+        // Ratio the status row shows on resume: 80 / 200 = 40%.
+        assert_eq!(
+            crate::state::turn_token_summary(prompt, completion, cached).1,
+            Some(40)
+        );
+    }
+
+    #[test]
+    fn empty_report_seeds_zero() {
+        let report = SessionCostReport {
+            models: Vec::new(),
+            unattributed_tokens: 0,
+            total_tokens: 0,
+        };
+        assert_eq!(session_token_totals_from_cost(&report), (0, 0, 0));
     }
 }
 

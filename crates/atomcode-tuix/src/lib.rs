@@ -611,6 +611,11 @@ pub async fn run(
     // empty here.
     let (oauth_event_tx, oauth_event_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::event_loop::oauth_poll::OauthEvent>();
+    // Channel for OpenRouter background connect results. Unbounded — at most one
+    // event per `/openrouter` invocation (network thread, can't await).
+    let (openrouter_event_tx, openrouter_event_rx) = tokio::sync::mpsc::unbounded_channel::<
+        crate::event_loop::openrouter_connect::OpenRouterConnectEvent,
+    >();
 
     // Seed the hint from any prior-session staged upgrade so the user
     // sees the pending status on the very first frame rather than
@@ -822,9 +827,6 @@ pub async fn run(
         pending_provider_deactivation: false,
         runtime,
         pending_runtime_request_id: None,
-        allowed_always: std::sync::Arc::new(
-            std::sync::Mutex::new(std::collections::HashSet::new()),
-        ),
         native_tools: std::collections::HashMap::new(),
         shutdown_deadline: None,
         runtime_spawn_override,
@@ -856,6 +858,9 @@ pub async fn run(
         wake_tx: wake_tx.clone(),
         oauth_event_rx,
         oauth_event_tx,
+        openrouter_event_rx,
+        openrouter_event_tx,
+        openrouter_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         reader: reader_handle,
         upgrade_tx,
         upgrade_rx,
@@ -863,6 +868,7 @@ pub async fn run(
         plugin_job_rx,
         pending_run_login_setup: false,
         pending_open_provider_wizard: false,
+        pending_onboarding_nudge: false,
         telemetry,
         worktree_original_dir: None,
         custom_commands,
@@ -967,9 +973,7 @@ pub async fn run(
 
 #[cfg(test)]
 mod panic_restore_tests {
-    use super::{
-        kitty_keyboard_flags, panic_restore_sequence, resolve_history_replay_max_rows,
-    };
+    use super::{kitty_keyboard_flags, panic_restore_sequence, resolve_history_replay_max_rows};
     use crossterm::event::KeyboardEnhancementFlags;
 
     fn test_caps() -> crate::terminal::TerminalCaps {
@@ -993,8 +997,9 @@ mod panic_restore_tests {
 
     #[test]
     fn automatic_history_replay_cap_is_below_retained_memory_limit() {
-        let cap = resolve_history_replay_max_rows(&atomcode_config::Config::default(), &test_caps())
-            .expect("automatic replay must stay bounded");
+        let cap =
+            resolve_history_replay_max_rows(&atomcode_config::Config::default(), &test_caps())
+                .expect("automatic replay must stay bounded");
         assert!(cap < crate::render::retained::MAX_SCROLLBACK_ROWS);
     }
 

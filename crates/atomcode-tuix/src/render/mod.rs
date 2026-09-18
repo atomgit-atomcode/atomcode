@@ -614,6 +614,12 @@ pub struct ModeBadge {
 #[derive(Debug, Clone, Default)]
 pub struct StatusLine {
     pub model: String,
+    /// Channel (provider account) label shown as `model (Channel)` — ONLY when
+    /// the bare model name is ambiguous across configured accounts (mirrors the
+    /// webui picker's disambiguation). `None` when the name is unique, so the
+    /// common single-channel case stays clean. See
+    /// `Config::disambiguating_channel_label`.
+    pub model_channel: Option<String>,
     pub cwd: String, // HOME replaced with "~"
     /// Messages submitted during the active turn but not yet accepted at a
     /// model/tool boundary. Rendered as a transient panel above the composer.
@@ -655,6 +661,13 @@ pub struct StatusLine {
     /// from `mode_indicator` (left-aligned PLAN badge) so it does not
     /// displace the mode indicator.
     pub bypass_indicator: Option<String>,
+    /// Cache-hit indicator for the current turn, rendered in the left info
+    /// group after the ctx-usage segment (e.g. `cache 70%`).
+    /// Derived from the per-turn prompt/cached token tallies; `None` while
+    /// no cached usage has been reported this turn (cold start, providers
+    /// that don't report cached tokens), so the status row stays quiet.
+    /// Language-neutral format — no i18n entry needed.
+    pub cache_indicator: Option<String>,
     /// Current session display name, shown as a right-aligned cyan
     /// pill overlaid on the input box's top rule. `Some` only after
     /// the user has explicitly run `/rename` (Session::user_renamed) —
@@ -733,6 +746,14 @@ pub struct ApprovalPanelView {
     pub selected: usize,
     /// Optional advisory line rendered under the header (e.g. a credential warning).
     pub note: Option<String>,
+    /// Optional "why is this being asked" line from `ApprovalRequest.reason`. Shown
+    /// above the options in a muted style; `None` for ordinary first-time approvals.
+    pub reason: Option<String>,
+    /// Full, UNTRUNCATED Bash command; rendered multi-line (shell-aware wrap, height-
+    /// clamped so the options stay on-screen) only when `expanded`. `None` for non-Bash.
+    pub full_command: Option<String>,
+    /// Whether to render the full-command block. Default collapsed.
+    pub expanded: bool,
 }
 
 /// Renderer-facing snapshot of the `request_user_input` panel (mirrors
@@ -911,8 +932,30 @@ pub struct SubtaskItem {
     pub model: String,
     pub activity: String,
     pub started_at: Option<std::time::Instant>,
+    /// Wall-clock instant the subtask reached a terminal status (Completed/
+    /// Stopped/Failed). `None` while pending or running. Stamped at the
+    /// terminal transition so a done row's elapsed FREEZES instead of ticking
+    /// with `now` — a live agent-group re-renders every frame while OTHER
+    /// members still run, and without this a finished row kept counting up.
+    pub finished_at: Option<std::time::Instant>,
     pub output_tokens: u64,
+    /// Cumulative count of tool calls this member has started — the "N tool
+    /// uses" progress signal. Monotonic; a late/reordered event can't lower it.
+    pub tool_uses: u64,
     pub status: SubtaskStatus,
+}
+
+impl SubtaskItem {
+    /// Wall-clock the subtask has been (running) or was (terminal) active.
+    /// FROZEN once `finished_at` is stamped, so a completed row stops ticking;
+    /// a still-running row (no `finished_at`) reads live elapsed.
+    pub fn elapsed(&self) -> std::time::Duration {
+        match (self.started_at, self.finished_at) {
+            (Some(start), Some(end)) => end.saturating_duration_since(start),
+            (Some(start), None) => start.elapsed(),
+            _ => std::time::Duration::ZERO,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1042,6 +1085,49 @@ pub fn fmt_dur(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn subtask(
+        started: Option<std::time::Instant>,
+        finished: Option<std::time::Instant>,
+        status: SubtaskStatus,
+    ) -> SubtaskItem {
+        SubtaskItem {
+            label: "worker".into(),
+            description: String::new(),
+            model: String::new(),
+            activity: String::new(),
+            started_at: started,
+            finished_at: finished,
+            tool_uses: 0,
+            output_tokens: 0,
+            status,
+        }
+    }
+
+    #[test]
+    fn subtask_elapsed_freezes_once_finished() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        // A terminal item with a stamped finish reads the FROZEN span, not `now`.
+        let done = subtask(
+            Some(start),
+            Some(start + Duration::from_secs(90)),
+            SubtaskStatus::Completed,
+        );
+        assert_eq!(done.elapsed(), Duration::from_secs(90));
+        // Re-reading later must NOT grow (the whole point of the freeze).
+        assert_eq!(done.elapsed(), Duration::from_secs(90));
+
+        // A running item (no finish) still reads live elapsed (≈ time since start).
+        let running = subtask(Some(start), None, SubtaskStatus::Running);
+        assert!(running.elapsed() >= Duration::ZERO);
+
+        // No start yet → zero, never a panic.
+        assert_eq!(
+            subtask(None, None, SubtaskStatus::Pending).elapsed(),
+            Duration::ZERO
+        );
+    }
 
     #[test]
     fn shell_mode_is_a_leading_bang_including_bare() {

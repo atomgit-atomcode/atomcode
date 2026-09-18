@@ -46,6 +46,10 @@ pub fn build_coding_agent(cfg: CodingAgentConfig) -> Result<Agent, String> {
     // (default 300s), so propagating it here makes the documented tunable actually
     // govern the L1 watchdog end-to-end.
     provider_cfg.idle_timeout = cfg.stream_timeout;
+    // Prefill (TTFB) gets the SEPARATE, larger first-token budget so a slow local model
+    // that is silent for minutes before its first byte is not cut off at the inter-token
+    // `stream_timeout`. Mirrors the kernel-level `first_token_timeout`; see config.rs.
+    provider_cfg.first_token_timeout = cfg.first_token_timeout;
     // Text-only models must NOT receive image content — a resumed conversation whose
     // history contains an image would otherwise 400 every turn. SAME canonical detector
     // as the tool-mount / read_file vision gate above.
@@ -127,10 +131,19 @@ fn build_coding_agent_from_tools(
         .middleware(Arc::new(
             atomcode_capabilities::tools::CredentialBashGate::new(cfg.credential_shell_policy),
         ));
-    #[cfg(feature = "atomgit")]
-    let builder = builder.middleware(Arc::new(
-        atomcode_capabilities::tools::AtomgitBashGate::new(),
-    ));
+    // User-declared `[permissions]` allow/deny — after the hard credential boundary above,
+    // before the convenience gates and the approval prompt below. This path pins an immutable
+    // working_dir, so relative path rules resolve against the same root.
+    let builder = if cfg.permission_rules.is_empty() {
+        builder
+    } else {
+        builder.middleware(Arc::new(
+            atomcode_capabilities::tools::PermissionRuleGate::new(
+                cfg.permission_rules.clone(),
+                Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
+            ),
+        ))
+    };
     let mut builder = builder
         // Auto-approve in-workspace open_file (it's Risky → would otherwise prompt on every
         // preview). This path pins an immutable working_dir, so the gate pins the same root.
@@ -192,7 +205,7 @@ fn build_coding_agent_from_tools(
     // CodingAgentConfig doesn't carry ui.todo, so we use the config default (true) here;
     // the env var ATOMCODE_TODO=0 / =false / =off can disable it without a config change.
     if todo_enabled {
-        builder = builder.hook(Arc::new(crate::todo::TodoHook));
+        builder = builder.hook(Arc::new(crate::todo::TodoHook::new(&cfg.working_dir)));
         builder = builder.hook(Arc::new(crate::todo::TodoEagerHook::new(
             &cfg.model,
             &cfg.provider_type,

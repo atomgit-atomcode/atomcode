@@ -80,6 +80,43 @@ pub fn resolve_daemon_token(
     }
 }
 
+/// Resolves daemon authentication state for an entrypoint.
+///
+/// When authentication is disabled, neither token enforcement nor the local
+/// token file is enabled. Otherwise the returned store contains the resolved
+/// token and the same token is returned for persistence.
+pub fn resolve_daemon_auth(
+    no_auth: bool,
+    env_token: Option<String>,
+) -> (Option<auth_token::WebuiTokenStore>, Option<String>) {
+    if no_auth {
+        return (None, None);
+    }
+
+    let store = auth_token::WebuiTokenStore::new();
+    let token = resolve_daemon_token(env_token, &store);
+    (Some(store), Some(token))
+}
+
+#[cfg(test)]
+mod daemon_auth_tests {
+    use super::*;
+
+    #[test]
+    fn no_auth_disables_enforcement_and_token_file() {
+        let (store, token_file) = resolve_daemon_auth(true, Some("ignored".into()));
+        assert!(store.is_none() && token_file.is_none());
+    }
+
+    #[test]
+    fn auth_uses_the_configured_token() {
+        let (store, token_file) = resolve_daemon_auth(false, Some("fixed-token".into()));
+        let store = store.expect("authentication should create a token store");
+        assert!(store.is_valid("fixed-token"));
+        assert_eq!(token_file.as_deref(), Some("fixed-token"));
+    }
+}
+
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, request::Parts as RequestParts, HeaderValue, Method, StatusCode},
@@ -387,6 +424,12 @@ pub struct SessionDetail {
     pub updated_at: u64,
     pub message_count: usize,
     pub messages: Vec<MessageInfo>,
+    /// Persisted todo list (from the `<id>.todos.json` sidecar). Empty when the
+    /// session has no sidecar or it is stale (a rollback truncated history) —
+    /// vscode then falls back to deriving todos from the messages. This survives
+    /// a compaction that drained the transcript's todowrite calls (issue #1503).
+    #[serde(default)]
+    pub todos: Vec<atomcode_capabilities::session::manager::TodoSidecarItem>,
 }
 
 /// Global project state store (current working directory)
@@ -1293,9 +1336,88 @@ fn is_loopback_authority(authority: &str) -> bool {
     if let Some(rest) = authority.strip_prefix("[::1]") {
         return rest.is_empty() || rest.starts_with(':');
     }
+    // Bare IPv6 loopback (`--host ::1`, no brackets/port). The `split(':')` below
+    // treats the IPv6 separators as a host:port boundary and yields "", so match
+    // it explicitly — otherwise a legit loopback bind is classified as remote.
+    if authority == "::1" {
+        return true;
+    }
 
     let host = authority.split(':').next().unwrap_or(authority);
     matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Env var an operator sets to acknowledge that an unauthenticated daemon bound
+/// to a remote-reachable address is intentional AND network-isolated.
+pub(crate) const ALLOW_REMOTE_NO_AUTH_ENV: &str = "ATOMCODE_DANGEROUSLY_ALLOW_REMOTE_NO_AUTH";
+
+/// Verdict for the "unauthenticated + remotely reachable" startup guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteNoAuthGuard {
+    /// Safe combination — proceed silently (auth enforced, or loopback-only).
+    Safe,
+    /// Dangerous combination, but the operator explicitly opted in — proceed
+    /// with a loud runtime warning.
+    AllowedWithWarning,
+    /// Dangerous combination with no opt-in — refuse to start (fail closed).
+    Refuse,
+}
+
+/// Fail-closed guard against the cross-tenant footgun: an UNAUTHENTICATED daemon
+/// (`--no-auth`, i.e. `enforce_token == false`) bound to a NON-loopback address
+/// (`0.0.0.0` / a routable IP) exposes the full agent-control + `/fs/*` +
+/// `/config` (API keys) surface to anyone who can reach the port — e.g. sibling
+/// pods in a shared cluster. Only that exact combination is gated; a
+/// token-enforcing daemon, or a loopback-only bind, is always `Safe`. An
+/// operator with real network isolation opts back in via
+/// [`ALLOW_REMOTE_NO_AUTH_ENV`] (`=1`/`true`), which downgrades to a warning.
+fn evaluate_remote_no_auth_guard(
+    enforce_token: bool,
+    bind_host: &str,
+    allow_override: Option<&str>,
+) -> RemoteNoAuthGuard {
+    if enforce_token || is_loopback_authority(bind_host) {
+        return RemoteNoAuthGuard::Safe;
+    }
+    let opted_in = matches!(allow_override, Some(v) if v == "1" || v.eq_ignore_ascii_case("true"));
+    if opted_in {
+        RemoteNoAuthGuard::AllowedWithWarning
+    } else {
+        RemoteNoAuthGuard::Refuse
+    }
+}
+
+/// The address the guard should judge — the prebound listener's REAL `local_addr`
+/// when present (authoritative over the `host` string, which is a config/display
+/// value that could diverge from the actual socket), else the `host` string.
+fn effective_bind_host(host: &str, prebound: Option<&tokio::net::TcpListener>) -> String {
+    prebound
+        .and_then(|l| l.local_addr().ok())
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| host.to_string())
+}
+
+/// Refuse-to-start message for the unauthenticated-remote guard. `bound` is the
+/// address that triggered it (see [`effective_bind_host`]).
+fn remote_no_auth_refuse_message(bound: &str) -> String {
+    format!(
+        "拒绝启动:--no-auth(未鉴权)+ 绑定到非本机地址({bound})会把完整的 agent 控制 / \
+         文件系统 / 配置(含 API key)接口暴露给任何能访问该端口的人(如共享集群里的其他 Pod),\
+         属跨租户 RCE 风险。请任选其一:① 去掉 --no-auth 改用 token 鉴权(推荐);\
+         ② 绑定回 127.0.0.1;③ 若确有网络隔离(K8s NetworkPolicy/私网),\
+         设 {ALLOW_REMOTE_NO_AUTH_ENV}=1 显式放行。"
+    )
+}
+
+/// Loud runtime warning when the operator opted in to unauthenticated-remote.
+fn remote_no_auth_warn_message(bound: &str) -> String {
+    format!(
+        "⚠ SECURITY: starting UNAUTHENTICATED (--no-auth) on {bound} — the full agent-control \
+         / filesystem / config API is reachable with NO auth. {ALLOW_REMOTE_NO_AUTH_ENV} is set, \
+         so this is allowed; ensure real network isolation (K8s NetworkPolicy / private network), \
+         else anyone who can reach this port can read/write files, steal API keys, and run tasks \
+         as you."
+    )
 }
 
 /// Whether this client can receive interactive approval prompts.
@@ -2044,6 +2166,10 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
                         return (StatusCode::NOT_FOUND, Json(msg)).into_response();
                     }
                 };
+            // Read the todo sidecar BEFORE moving fields out of `session` below.
+            // (Survives compaction that drained the transcript's todowrite calls;
+            // the stale marker check happens inside `read_todo_sidecar`.)
+            let todos = read_todo_sidecar_for_detail(&session);
             let detail = SessionDetail {
                 id: session.meta.id,
                 name: session.meta.name,
@@ -2052,6 +2178,7 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
                 updated_at: u64::try_from(session.meta.updated_at.max(0)).unwrap_or(0),
                 message_count: messages.len(),
                 messages,
+                todos,
             };
             Json(detail).into_response()
         }
@@ -2060,6 +2187,59 @@ async fn get_session_detail(Path((hash, id)): Path<(String, String)>) -> impl In
             let msg = format!("Failed to load session: {}", e);
             (StatusCode::NOT_FOUND, Json(msg)).into_response()
         }
+    }
+}
+
+/// The full, never-compacted per-turn trajectory of a session — the same ground
+/// truth the `recall` tool reads (`<id>.jsonl`), turn-granular and UNAFFECTED by
+/// compaction, so a UI can surface history the runtime snapshot dropped.
+#[derive(serde::Serialize)]
+struct SessionTranscript {
+    session_id: String,
+    turns: Vec<atomcode_capabilities::session::TurnRecord>,
+}
+
+/// GET /projects/:hash/sessions/:id/transcript - Full never-compacted per-turn
+/// trajectory. READ-ONLY: it does not touch the runtime snapshot, compaction, or
+/// what the model sees — it only exposes the transcript that is already written on
+/// every turn. Serves the UI's "view compacted history" affordance.
+async fn get_session_transcript(Path((hash, id)): Path<(String, String)>) -> impl IntoResponse {
+    // Gate on the session resolving, mirroring `get_session_detail`'s 404 semantics.
+    match crate::legacy_convert::load_catalog_session_view_in_project(&hash, &id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, Json("Session not found")).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(format!("Failed to load session: {e}")),
+            )
+                .into_response();
+        }
+    }
+    let task_hash = hash.clone();
+    let task_id = id.clone();
+    let loaded = tokio::task::spawn_blocking(move || {
+        let manager =
+            NativeSessionManager::with_root(NativeSessionManager::sessions_root().join(&task_hash));
+        manager.load_transcript_records(&task_id)
+    })
+    .await;
+    match loaded {
+        Ok(Ok(turns)) => Json(SessionTranscript {
+            session_id: id,
+            turns,
+        })
+        .into_response(),
+        Ok(Err(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(format!("transcript unavailable: {error}")),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(format!("transcript task failed: {error}")),
+        )
+            .into_response(),
     }
 }
 
@@ -2251,6 +2431,25 @@ pub(crate) fn attach_snapshot_message_timestamps(
     {
         info.created_at = snapshot_message_timestamp(meta, message, index, turn_timestamps);
     }
+}
+
+/// Read the persisted todo-list sidecar for a catalog session detail response.
+/// `current_message_count` is the snapshot message count: the sidecar's own
+/// `message_count` marker must be ≤ it, otherwise a rollback/undo truncated the
+/// history and the stale list is discarded (vscode falls back to transcript
+/// derivation). Returns an empty vec on absence / staleness / any error.
+fn read_todo_sidecar_for_detail(
+    session: &crate::legacy_convert::CatalogSessionView,
+) -> Vec<atomcode_capabilities::session::manager::TodoSidecarItem> {
+    let manager = atomcode_capabilities::session::SessionManager::for_project(
+        std::path::Path::new(&session.meta.working_dir),
+    );
+    manager
+        .read_todo_sidecar(&session.meta.id)
+        .ok()
+        .flatten()
+        .map(|sidecar| sidecar.todos)
+        .unwrap_or_default()
 }
 
 fn merge_catalog_session_messages_for_display(
@@ -6107,7 +6306,7 @@ pub struct ServerOpts {
     pub idle_timeout_secs: u64,
     /// Session mode reported to telemetry on startup.
     pub startup_mode: SessionMode,
-    /// webui token 存储；进程内启动器传入以共享同一 store，独立二进制传 None。
+    /// WebUI token store. `None` disables API token authentication.
     pub webui_tokens: Option<auth_token::WebuiTokenStore>,
     /// 启动时的工作目录覆盖。进程内 `atomcode webui` 传入其启动 cwd，使 daemon
     /// 初始项目目录为用户实际运行命令的目录，而非 config 里陈旧的 default_workdir。
@@ -6138,6 +6337,28 @@ pub struct ServerOpts {
 /// Note: early bootstrap that is process-global (panic hook, Windows console
 /// attach, legacy session migration) is handled by the binary's `main()` before
 /// calling this; see `src/main.rs`.
+/// Actionable message for a daemon bind failure. `atomcode daemon --port X` binds
+/// the exact port (it does NOT scan), so `AddrInUse` means the daemon simply did
+/// not start — most often because a JetBrains/VSCode plugin's daemon already holds
+/// the conventional 13456. Point at the likely cause + the fix (`--port`), and flag
+/// the `&`-backgrounding gotcha that hides this line (the user thinks it started
+/// while it exited). Non-collision errors keep the plain form.
+fn daemon_bind_failure_message(addr: &str, port: u16, err: &std::io::Error) -> String {
+    if err.kind() == std::io::ErrorKind::AddrInUse {
+        format!(
+            "Fatal: 端口 {addr} 已被占用,daemon 未能启动。\n\
+             很可能是 JetBrains/VSCode 插件的 daemon 已占用该端口(常驻 13456)。\n\
+             处理:改用其它端口 `--port <PORT>`(并让客户端 / 飞书 daemonBaseUrl 指向同一端口),\n\
+             或退出占用 {port} 的程序后重试。\n\
+             提示:若用 `&` 后台启动,这行报错会被吞掉——请确认 `~/.atomcode/daemon-{port}.json` \
+             是否真的生成,以判断 daemon 是否启动成功。\n\
+             (底层错误:{err})"
+        )
+    } else {
+        format!("Fatal: failed to bind to {addr}: {err}")
+    }
+}
+
 pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
     use axum::routing::patch;
 
@@ -6154,6 +6375,32 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         daemon_token_file: token_file_token,
         ..
     } = opts;
+
+    // Step 0: Security guardrail — refuse to start an UNAUTHENTICATED daemon on a
+    // remotely-reachable bind. `--no-auth` + `0.0.0.0` exposes the full
+    // agent-control / filesystem / config(API-key) API to anyone who can reach
+    // the port (e.g. sibling pods), a cross-tenant RCE footgun. Fail closed; an
+    // operator with real network isolation opts back in via the env var. The
+    // prebound listener's REAL address wins over the `host` string so the guard
+    // can't be fooled by a config value that diverges from the actual socket.
+    let bound = effective_bind_host(&host, prebound_listener.as_ref());
+    match evaluate_remote_no_auth_guard(
+        webui_tokens.is_some(),
+        &bound,
+        std::env::var(ALLOW_REMOTE_NO_AUTH_ENV).ok().as_deref(),
+    ) {
+        RemoteNoAuthGuard::Safe => {}
+        RemoteNoAuthGuard::AllowedWithWarning => {
+            let msg = remote_no_auth_warn_message(&bound);
+            tracing::warn!("{msg}");
+            if !quiet {
+                eprintln!("{msg}");
+            }
+        }
+        RemoteNoAuthGuard::Refuse => {
+            anyhow::bail!(remote_no_auth_refuse_message(&bound));
+        }
+    }
 
     // Step 1: Load config (R1.1, R1.5) — tolerate errors, fallback to default.
     // Also seed the offline verdict + note ONCE from config + env here, before
@@ -6287,6 +6534,10 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         .route(
             "/projects/:hash/sessions/:id",
             get(get_session_detail).delete(delete_session),
+        )
+        .route(
+            "/projects/:hash/sessions/:id/transcript",
+            get(get_session_transcript),
         )
         .route("/projects/:hash/sessions/:id/rename", patch(rename_session))
         .route("/projects/:hash/sessions/:id/repair", post(repair_session))
@@ -6503,7 +6754,7 @@ pub async fn run_server(opts: ServerOpts) -> anyhow::Result<()> {
         None => match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("Fatal: failed to bind to {}: {}", addr, e);
+                eprintln!("{}", daemon_bind_failure_message(&addr, port, &e));
                 // Step 12: On bind failure, still emit OpenAtomcode (R4.4) then exit
                 CurrentContext::scope(
                     CurrentContext {
@@ -8832,8 +9083,7 @@ mod tests {
     // as `{path, is_dir}` relative to the search dir. Mirrors the CLI popup.
     #[test]
     fn search_at_mention_finds_cross_level_and_skips_gitignored() {
-        let tmp =
-            std::env::temp_dir().join(format!("atomcode_fs_search_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("atomcode_fs_search_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let deep = tmp.join("src/main/java/cn");
         std::fs::create_dir_all(&deep).unwrap();
@@ -8848,7 +9098,9 @@ mod tests {
             .map(|m| m["path"].as_str().unwrap_or_default().to_string())
             .collect();
         assert!(
-            paths.iter().any(|p| p.ends_with("ApplyStockController.java")),
+            paths
+                .iter()
+                .any(|p| p.ends_with("ApplyStockController.java")),
             "must find the deep controller across levels: {paths:?}"
         );
         assert!(
@@ -8859,6 +9111,34 @@ mod tests {
         assert!(matches.iter().all(|m| m["is_dir"].is_boolean()));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn daemon_bind_failure_message_is_actionable_on_addr_in_use() {
+        // Port collision (the JetBrains/VSCode-on-13456 case): name the likely cause,
+        // the fix (`--port`), and how to tell whether the daemon actually started.
+        let busy = std::io::Error::new(std::io::ErrorKind::AddrInUse, "address already in use");
+        let m = daemon_bind_failure_message("127.0.0.1:13456", 13456, &busy);
+        assert!(m.contains("被占用"), "must say the port is occupied: {m}");
+        assert!(m.contains("--port"), "must suggest --port: {m}");
+        assert!(m.contains("13456"), "must name the conflicting port: {m}");
+        assert!(
+            m.contains("daemon-13456.json"),
+            "must point at the token file to verify startup: {m}"
+        );
+
+        // A non-collision error (perms, bad address) can't be fixed by changing the
+        // port, so it keeps the plain form — no misleading --port advice.
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let plain = daemon_bind_failure_message("0.0.0.0:80", 80, &denied);
+        assert!(
+            plain.starts_with("Fatal: failed to bind"),
+            "plain form: {plain}"
+        );
+        assert!(
+            !plain.contains("--port"),
+            "no port advice for non-collision: {plain}"
+        );
     }
 
     #[tokio::test]
@@ -9021,6 +9301,99 @@ mod channel_mode_tests {
             false,
             "127.0.0.1"
         ));
+    }
+
+    #[test]
+    fn remote_no_auth_guard_only_gates_unauth_plus_remote_bind() {
+        use RemoteNoAuthGuard::*;
+        // Token-enforcing daemon is always safe, even bound to 0.0.0.0.
+        assert_eq!(evaluate_remote_no_auth_guard(true, "0.0.0.0", None), Safe);
+        // Unauthenticated but loopback-only is safe (VSCode / standalone local),
+        // including bare + bracketed IPv6 loopback.
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "127.0.0.1", None),
+            Safe
+        );
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "localhost:17321", None),
+            Safe
+        );
+        assert_eq!(evaluate_remote_no_auth_guard(false, "::1", None), Safe);
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "[::1]:13456", None),
+            Safe
+        );
+        // `::` (all IPv6 interfaces) is NOT loopback → still gated.
+        assert_eq!(evaluate_remote_no_auth_guard(false, "::", None), Refuse);
+        // The dangerous combo — unauthenticated + remotely reachable — refuses…
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "0.0.0.0", None),
+            Refuse
+        );
+        // …including a bind to a specific routable IP (peers can still reach it).
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "10.247.58.157", None),
+            Refuse
+        );
+    }
+
+    #[test]
+    fn remote_no_auth_guard_env_opt_in_downgrades_to_warning() {
+        use RemoteNoAuthGuard::*;
+        // Explicit opt-in (for operators with real network isolation) → warn, not refuse.
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "0.0.0.0", Some("1")),
+            AllowedWithWarning
+        );
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "0.0.0.0", Some("true")),
+            AllowedWithWarning
+        );
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "0.0.0.0", Some("TRUE")),
+            AllowedWithWarning
+        );
+        // A non-affirmative value is NOT an opt-in — still refuse.
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "0.0.0.0", Some("0")),
+            Refuse
+        );
+        assert_eq!(
+            evaluate_remote_no_auth_guard(false, "0.0.0.0", Some("")),
+            Refuse
+        );
+        // The override never loosens a safe combo (stays Safe, no spurious warning).
+        assert_eq!(
+            evaluate_remote_no_auth_guard(true, "0.0.0.0", Some("1")),
+            Safe
+        );
+    }
+
+    #[test]
+    fn remote_no_auth_messages_interpolate_bound_addr_and_env_name() {
+        // Guards against a `bail!`/`format!` capture regression: the real address
+        // and env-var name must appear, never the literal `{bound}` placeholder.
+        let refuse = remote_no_auth_refuse_message("10.247.58.157");
+        assert!(refuse.contains("10.247.58.157"), "{refuse}");
+        assert!(refuse.contains(ALLOW_REMOTE_NO_AUTH_ENV), "{refuse}");
+        assert!(!refuse.contains("{bound}"), "{refuse}");
+
+        let warn = remote_no_auth_warn_message("0.0.0.0");
+        assert!(warn.contains("0.0.0.0"), "{warn}");
+        assert!(warn.contains(ALLOW_REMOTE_NO_AUTH_ENV), "{warn}");
+    }
+
+    #[tokio::test]
+    async fn effective_bind_host_prefers_the_prebound_listeners_real_addr() {
+        // No prebound listener → the `host` string is used verbatim.
+        assert_eq!(effective_bind_host("127.0.0.1", None), "127.0.0.1");
+        // A listener bound to 0.0.0.0 is authoritative even if `host` LIES
+        // "127.0.0.1" — this is what closes the guard-bypass gap.
+        let public = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        assert_eq!(effective_bind_host("127.0.0.1", Some(&public)), "0.0.0.0");
+        // A loopback listener reports loopback regardless of the host string.
+        let loopback = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        assert_eq!(effective_bind_host("0.0.0.0", Some(&loopback)), "127.0.0.1");
     }
 
     #[test]

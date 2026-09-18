@@ -74,7 +74,9 @@ fn render(path: &Path, display: &str) -> ToolResult {
                      file type. Read it with read_file instead."
                 ))
             } else {
-                err(format!("list_symbols: cannot read {display}: file not found"))
+                err(format!(
+                    "list_symbols: cannot read {display}: file not found"
+                ))
             }
         }
     };

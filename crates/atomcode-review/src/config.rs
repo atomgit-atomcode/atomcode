@@ -18,8 +18,13 @@ pub struct ReviewAgentConfig {
     pub working_dir: PathBuf,
     /// Model context window in tokens (forwarded to the provider). Default 128k.
     pub context_window: u32,
-    /// Liveness: max wait for the next stream event. Default 120s.
+    /// Liveness: max byte-idle wait for the next stream event AFTER the first content
+    /// byte (inter-token). Default 120s.
     pub stream_timeout: Duration,
+    /// Liveness: max wait for the FIRST content byte (prefill / TTFB). Separate from (and
+    /// ≥) `stream_timeout` so a slow local model is not cut off mid-prefill. Default 120s
+    /// (seeded from the coding-layer `first_token_timeout` in production).
+    pub first_token_timeout: Duration,
     /// Liveness: max wait for a driver response before degrade-to-deny. Default 300s.
     pub request_timeout: Duration,
     /// FULL system-prompt override. `None` (default) ⇒ the built-in
@@ -82,6 +87,16 @@ pub struct ReviewAgentConfig {
 }
 
 impl ReviewAgentConfig {
+    /// The prefill (first-token) idle budget, floored at `stream_timeout` so it can
+    /// never be SHORTER than the inter-token budget — a first-token window below the
+    /// inter-token one inverts the intent (mirrors the coding config's `.max()` guard).
+    /// A caller that raises `stream_timeout` (e.g. a 700s deep review) thus keeps at
+    /// least that much prefill tolerance even if `first_token_timeout` was left at its
+    /// default.
+    pub fn effective_first_token_timeout(&self) -> Duration {
+        self.first_token_timeout.max(self.stream_timeout)
+    }
+
     /// Construct with the required fields and sane defaults for the rest.
     pub fn new(
         api_key: impl Into<String>,
@@ -96,6 +111,7 @@ impl ReviewAgentConfig {
             working_dir: working_dir.into(),
             context_window: 128_000,
             stream_timeout: Duration::from_secs(120),
+            first_token_timeout: Duration::from_secs(120),
             request_timeout: Duration::from_secs(300),
             persona: None,
             persona_append: None,
@@ -106,8 +122,8 @@ impl ReviewAgentConfig {
             progress_label: None,
             no_web: false,
             graph_max_indexed_files: usize::MAX, // no degrade by default (bare-CLI behavior)
-            skill_dirs: Vec::new(), // no skills by default (bare-CLI behavior)
-            review_paths: Vec::new(), // no file allowlist by default (root-only confine)
+            skill_dirs: Vec::new(),              // no skills by default (bare-CLI behavior)
+            review_paths: Vec::new(),            // no file allowlist by default (root-only confine)
         }
     }
 

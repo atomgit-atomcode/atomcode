@@ -38,8 +38,6 @@ pub mod ast_grep;
 /// AtomGit REST tools (repo / pr / issue). Opt-in `atomgit` feature.
 #[cfg(feature = "atomgit")]
 pub mod atomgit;
-#[cfg(feature = "atomgit")]
-pub mod atomgit_bash_gate;
 pub mod bash;
 pub mod bash_workspace_gate;
 pub mod cd;
@@ -55,6 +53,7 @@ mod memory;
 pub mod open_file;
 pub mod output_artifact;
 pub mod parallel_edit;
+pub mod permission_rules;
 pub mod read;
 pub mod repair;
 pub mod report_finding;
@@ -70,6 +69,18 @@ pub mod web_fetch;
 pub mod web_search;
 pub mod write;
 pub mod write_approval;
+
+/// Tool names that execute an ARBITRARY shell command and must therefore face the same
+/// name-keyed middlewares as the foreground `bash` tool: the workspace-boundary gate, the
+/// credential-exfil gate, and git-push labeling. `bash_start` backgrounds a command — it
+/// runs exactly what `bash` runs — so it belongs here; `bash_poll` / `bash_kill` only read
+/// or stop an existing job and carry no command. Single source of truth so a newly added
+/// command-running tool can't silently slip past these gates (this exists because a review
+/// caught `bash_start` bypassing all three when they hard-coded the literal `"bash"`).
+pub(crate) fn is_command_shell_tool(name: &str) -> bool {
+    matches!(name, "bash" | "bash_start")
+}
+
 #[cfg(feature = "memory")]
 pub use memory::MemoryTool;
 
@@ -88,11 +99,9 @@ pub use ast_grep::AstGrepTool;
 pub use atomgit::{
     atomgit_tool_names, register_atomgit_tools, AtomgitIssueTool, AtomgitPrTool, AtomgitRepoTool,
 };
-#[cfg(feature = "atomgit")]
-pub use atomgit_bash_gate::AtomgitBashGate;
 pub use bash::{
-    bash_invocations, normalize_command_for_grant, run_shell, BashInvocation, BashTool, ShellExit,
-    ShellOutcome,
+    bash_invocations, normalize_command_for_grant, run_shell, shell_always_grant_scope,
+    BashInvocation, BashTool, ShellExit, ShellOutcome,
 };
 pub use bash_workspace_gate::BashWorkspaceGate;
 pub use cd::ChangeDirTool;
@@ -109,6 +118,7 @@ pub use output_artifact::{
     ARTIFACT_TRUNCATION_MARKER_PREFIX, THRESHOLD_BYTES,
 };
 pub use parallel_edit::ParallelEditTool;
+pub use permission_rules::{PermissionRule, PermissionRuleGate, PermissionRules, RuleDecision};
 pub use read::ReadFileTool;
 pub use repair::{repair_tool_args, RepairToolArgsMiddleware};
 pub use report_finding::{Finding, ReportFindingTool};
@@ -195,6 +205,11 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
     reg.register(Arc::new(ListDirTool));
     reg.register(Arc::new(OpenFileTool));
     reg.register(Arc::new(BashTool));
+    // Background job path for long-running commands (start/poll/kill) — the reference-
+    // informed alternative to an ever-larger `timeout` (see tools::bash::background).
+    reg.register(Arc::new(bash::BashStartTool));
+    reg.register(Arc::new(bash::BashPollTool));
+    reg.register(Arc::new(bash::BashKillTool));
     reg.register(Arc::new(GrepTool));
     reg.register(Arc::new(GlobTool));
     reg.register(Arc::new(SearchReplaceTool));
@@ -268,6 +283,26 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
 /// crate-shared [`crate::process_utils`] so there is ONE implementation (this module's
 /// local copy was deduped into that home, which also carries the `std` `_sync` variant).
 pub(crate) use crate::process_utils::suppress_console_window;
+
+/// Argument keys whose value names the THING a call acts on, in probe order. Covers every
+/// current target-taking tool (`file_path` for read/write/edit, `path` for list/glob,
+/// `pattern` for glob/grep, `url` for web_fetch).
+pub(crate) const TARGET_ARG_KEYS: &[&str] = &["file_path", "path", "pattern", "url", "query"];
+
+/// The target values a call names, as written. Used to build grant keys and to match
+/// permission rules — both need "what does this call act on?" to be stable against argument
+/// NOISE that does not change the answer (a different `offset`/`limit` window over the same
+/// file must not look like a different target). Empty when the call names no target, in which
+/// case callers fall back to the raw arguments.
+pub(crate) fn target_arg_values(args: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(args) else {
+        return Vec::new();
+    };
+    TARGET_ARG_KEYS
+        .iter()
+        .filter_map(|key| value.get(*key).and_then(|v| v.as_str()).map(String::from))
+        .collect()
+}
 
 /// Resolve a model-supplied path: leading `~`/`~/` → home dir; absolute → as-is;
 /// relative → joined to `working_dir`. NO escape enforcement (see the module
@@ -414,35 +449,10 @@ pub(crate) fn is_absolute_path(raw: &str) -> bool {
     b.len() >= 2 && b[0] == b'\\' && b[1] == b'\\'
 }
 
-/// Directories never descended into during a walk (build artifacts / VCS / caches).
-/// Mirrors the production walkers so a grep/glob/list does not drown in `target/`
-/// or `node_modules/`.
-pub(crate) const SKIP_DIRS: &[&str] = &[
-    "node_modules",
-    ".git",
-    "target",
-    "__pycache__",
-    ".next",
-    "dist",
-    "build",
-    ".cache",
-    "vendor",
-    ".venv",
-    "venv",
-    ".idea",
-    ".vscode",
-    "datalog",
-    "logs",
-    "log",
-    ".atomcode",
-    ".claude",
-    "runs",
-];
-
-/// Should a directory with this name be skipped during a walk?
-pub(crate) fn is_skip_dir(name: &str) -> bool {
-    SKIP_DIRS.contains(&name) || name.starts_with(".venv-")
-}
+// The walk-exclusion list lives in the ungated `pathutil` module so the `codeintel`
+// index walk (independent of the `tools` feature) shares the SAME list — re-exported
+// here so the in-crate walkers keep referring to it as `is_skip_dir` / `SKIP_DIRS`.
+pub(crate) use crate::pathutil::is_skip_dir;
 
 /// Heuristic binary sniff over the first 8 KiB: any NUL byte ⇒ binary (the `file(1)`
 /// heuristic); otherwise >30% non-text control bytes ⇒ binary. The 30% threshold
@@ -524,6 +534,17 @@ where
 mod tests {
     use super::*;
     use atomcode_kernel::tool::ToolRegistry;
+
+    #[test]
+    fn command_shell_tools_are_bash_and_bash_start_only() {
+        // The name-keyed gates (workspace / credential / push-label) route through this, so a
+        // command-running tool is gated and a read/stop tool (or anything else) is not.
+        assert!(is_command_shell_tool("bash"));
+        assert!(is_command_shell_tool("bash_start"));
+        assert!(!is_command_shell_tool("bash_poll"));
+        assert!(!is_command_shell_tool("bash_kill"));
+        assert!(!is_command_shell_tool("read_file"));
+    }
 
     #[tokio::test]
     async fn run_bounded_yields_default_when_blocking_exceeds_timeout() {

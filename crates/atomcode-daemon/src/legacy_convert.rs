@@ -1112,6 +1112,31 @@ fn catalog_for_project_in_root(
     Ok(entries)
 }
 
+/// Fast, single-bucket catalog for the `-c`/resume RESOLUTION path: scans only the
+/// bucket that hashes from `working_dir` — no cross-project walk. Nearly every
+/// session lives in that bucket, so this is the common-case fast path. It does NOT
+/// see legacy sessions parked in a different bucket whose working_dir happens to
+/// match (import/migration edge cases); the `-c`/resume resolver falls back to the
+/// full [`catalog_for_project`] scan when a lookup misses here.
+pub fn catalog_for_bucket(
+    working_dir: &std::path::Path,
+) -> anyhow::Result<Vec<atomcode_capabilities::session::CatalogEntry>> {
+    catalog_for_bucket_in_root(&SessionManager::sessions_root(), working_dir)
+}
+
+fn catalog_for_bucket_in_root(
+    sessions_root: &std::path::Path,
+    working_dir: &std::path::Path,
+) -> anyhow::Result<Vec<atomcode_capabilities::session::CatalogEntry>> {
+    let bucket = SessionManager::project_hash(working_dir);
+    let scan = SessionManager::scan_catalog_bucket(sessions_root, &bucket);
+    report_catalog_diagnostics(&scan.diagnostics);
+    let mut entries = scan.entries;
+    SessionManager::collapse_fork_lineages(&mut entries);
+    repair_catalog_names_for_display_in_root(sessions_root, &mut entries);
+    Ok(entries)
+}
+
 /// Hydrate only placeholder names for catalog display. Native repairs are
 /// persisted by the strict aggregate loader; legacy-only views stay read-only.
 /// A damaged entry keeps its scanned name and never hides healthy sessions.
@@ -1774,12 +1799,26 @@ fn validate_project_bucket(project_bucket: &str) -> anyhow::Result<()> {
 }
 
 fn report_catalog_diagnostics(diagnostics: &[atomcode_capabilities::session::CatalogDiagnostic]) {
-    for diagnostic in diagnostics {
+    // Cap the per-entry detail: a large history with orphaned sidecars / corrupt
+    // legacy files can produce THOUSANDS of these, and each `tracing::warn!` is a
+    // synchronous write to the log file — that alone was a measurable chunk of
+    // `-c`/resume startup. Log a bounded sample, then one summary line.
+    const MAX_DETAIL: usize = 20;
+    for diagnostic in diagnostics.iter().take(MAX_DETAIL) {
         tracing::warn!(
             path = %diagnostic.path.display(),
             kind = ?diagnostic.kind,
             message = %diagnostic.message,
             "session catalog entry was skipped"
+        );
+    }
+    if diagnostics.len() > MAX_DETAIL {
+        tracing::warn!(
+            skipped = diagnostics.len(),
+            shown = MAX_DETAIL,
+            "session catalog skipped {} entries ({} shown above)",
+            diagnostics.len(),
+            MAX_DETAIL,
         );
     }
 }

@@ -252,6 +252,8 @@ export interface SessionDetail {
   updated_at: number;
   message_count: number;
   messages: MessageInfo[];
+  /** Persisted todo list (sidecar). Empty when absent/stale — derive from messages. */
+  todos?: Array<{ content: string; status: string }>;
 }
 
 export interface MessageInfo {

@@ -510,6 +510,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           type: 'sessionMessages',
           messages,
           terminal: this._terminalForWebview(targetRuntime.terminal),
+          todos: detail.todos,
         }, targetRuntime.streamGeneration ?? 0);
         return messages;
       })
@@ -1062,6 +1063,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     rt.terminalSeen = true;
     rt.abortController?.abort();
     rt.abortController = undefined;
+    this._restoreQueuedMessagesToInput(sid, rt.queuedMessages);
     rt.queuedMessages = [];
     rt.isGenerating = false;
     rt.recoveryLocked = true;
@@ -1444,6 +1446,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         };
         const completedNormally = !stopReason || stopReason === 'stopped';
         if (!completedNormally) {
+          this._restoreQueuedMessagesToInput(doneSessionId, srt.queuedMessages);
           srt.queuedMessages = [];
           this._postTerminalForSession(doneSessionId, { type: 'clearQueuedMessages' }, streamGeneration);
         }
@@ -1470,6 +1473,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         srt.isGenerating = false;
         srt.recoveryLocked = false;
         srt.abortController = undefined;
+        this._restoreQueuedMessagesToInput(streamSessionId, srt.queuedMessages);
         srt.queuedMessages = [];
         srt.terminal = { type: 'stopped', generation: streamGeneration };
         this._postTerminalForSession(streamSessionId, { type: 'stopped' }, streamGeneration);
@@ -1481,6 +1485,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         srt.isGenerating = false;
         srt.recoveryLocked = true;
         srt.abortController = undefined;
+        this._restoreQueuedMessagesToInput(streamSessionId, srt.queuedMessages);
         srt.queuedMessages = [];
         srt.terminal = { type: 'error', generation: streamGeneration, message };
         this._postTerminalForSession(streamSessionId, { type: 'error', message }, streamGeneration);
@@ -2938,6 +2943,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (this._panelReady.get(sessionId)) {
       this._postMessageToPanel(sessionId, msg);
     }
+    if (this._activeSessionId === sessionId) {
+      this._view?.webview.postMessage(msg);
+    }
+  }
+
+  // A stop / error / abnormal-done must NOT silently discard the messages the user
+  // queued while the turn was running: they were never sent to the backend and are not
+  // bound to the cancelled turn. Restore their text to the input box — non-destructively
+  // (`insertText` inserts at the cursor and preserves any draft) — so the user can
+  // edit/resend instead of losing what they typed. Text-only: queued image attachments
+  // are not restored (they're a rare edge; the text is the recovery value).
+  private _restoreQueuedMessagesToInput(sessionId: string, queued: QueuedChatMessage[]) {
+    const text = queued
+      .map((m) => (m.text ?? '').trim())
+      .filter((t) => t.length > 0)
+      .join('\n\n');
+    if (!text) return;
+    const msg = { type: 'insertText', text };
+    this._postMessageToPanel(sessionId, msg);
     if (this._activeSessionId === sessionId) {
       this._view?.webview.postMessage(msg);
     }

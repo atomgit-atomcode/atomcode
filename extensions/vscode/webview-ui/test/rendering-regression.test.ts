@@ -130,6 +130,32 @@ function testDoneMarksRunningToolsIncompleteWithoutResult() {
   assert.equal(state.messages[0].blocks?.[0].type === 'tool' ? state.messages[0].blocks[0].tool.status : undefined, 'incomplete');
 }
 
+// Issue #1561: a rate_limited terminal must read as "progress preserved, resumable" (the
+// kernel keeps the partial content) — NOT the old "The turn ended before completion" wording
+// that made users think progress was lost. Covers the replay path (mergeTerminalIntoHistory).
+function testRateLimitedTerminalShowsPreservedResumableMessage() {
+  const state = chatReducer(
+    { ...initialState, messages: [], queuedMessages: [], locale: 'en' },
+    {
+      type: 'LOAD_SESSION_MESSAGES',
+      messages: [
+        { role: 'user', content: 'do a long task' },
+        { role: 'assistant', content: 'partial progress so far' },
+      ],
+      terminal: { type: 'done', stopReason: 'rate_limited' },
+    },
+  );
+  const dump = JSON.stringify(state.messages);
+  assert.ok(
+    dump.includes('preserved') && dump.includes('continue'),
+    `rate_limited terminal must say progress preserved + resumable: ${dump}`,
+  );
+  assert.ok(
+    !dump.includes('ended before completion'),
+    `must not use the old data-loss wording: ${dump}`,
+  );
+}
+
 function testResumeStreamingReplayIsIdempotent() {
   let state = startAssistantState();
   state = chatReducer(state, { type: 'APPEND_TEXT', content: 'already streamed' });
@@ -1305,6 +1331,7 @@ testToolDurationFormattingUsesMillisecondsBelowOneSecond();
 testWarningAddsStatusBlockToStreamingAssistantMessage();
 testRateLimitedStatusBlockIsUpdatedInPlace();
 testDoneMarksRunningToolsIncompleteWithoutResult();
+testRateLimitedTerminalShowsPreservedResumableMessage();
 testResumeStreamingReplayIsIdempotent();
 testToolBatchReplayUpsertsCallsById();
 testErrorMarksRunningToolsError();

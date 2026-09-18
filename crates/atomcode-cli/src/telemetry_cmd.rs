@@ -191,7 +191,18 @@ pub fn recover(atomcode_dir: &std::path::Path) -> Result<()> {
 fn write_flag(cfg_path: &std::path::Path, enabled: bool) -> Result<()> {
     let mut doc = if cfg_path.exists() {
         let s = std::fs::read_to_string(cfg_path)?;
-        s.parse::<toml_edit::DocumentMut>().unwrap_or_default()
+        // REFUSE to overwrite a corrupt config. `unwrap_or_default()` here silently
+        // discarded the parse error and started from an EMPTY document, so a single
+        // TOML syntax error anywhere in `~/.atomcode/config.toml` (providers, keys,
+        // …) meant `telemetry enable/disable` would replace the whole file with just
+        // `[telemetry] enabled = …` — nuking every other setting without a word.
+        s.parse::<toml_edit::DocumentMut>().map_err(|e| {
+            anyhow::anyhow!(
+                "{} is not valid TOML, so I won't rewrite it and risk losing your other \
+                 settings: {e}\nFix the syntax error (or move the file aside) and re-run.",
+                cfg_path.display()
+            )
+        })?
     } else {
         toml_edit::DocumentMut::new()
     };
@@ -218,5 +229,44 @@ mod tests {
         let lines = collect_tail_lines(&qdir, 2).unwrap();
 
         assert_eq!(lines, vec!["three".to_string(), "four".to_string()]);
+    }
+
+    #[test]
+    fn write_flag_refuses_to_overwrite_a_corrupt_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        let corrupt = "this is = not [valid toml";
+        std::fs::write(&cfg, corrupt).unwrap();
+
+        let err = write_flag(&cfg, true).expect_err("must refuse a corrupt config");
+        assert!(
+            err.to_string().contains("not valid TOML"),
+            "error must name the cause; got: {err}"
+        );
+        // The corrupt file is left UNTOUCHED — no silent nuke.
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn write_flag_preserves_other_settings_on_a_valid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "[providers.foo]\nmodel = \"m\"\n").unwrap();
+
+        write_flag(&cfg, true).unwrap();
+
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        assert!(
+            after.contains("[providers.foo]"),
+            "other settings kept: {after}"
+        );
+        assert!(
+            after.contains("model = \"m\""),
+            "other values kept: {after}"
+        );
+        assert!(
+            after.contains("enabled = true"),
+            "telemetry flag written: {after}"
+        );
     }
 }

@@ -498,7 +498,10 @@ impl CCExternalHooks {
     /// Build from an explicit hook list (used by tests + a future plugin source).
     pub fn new(hooks: Vec<HookConfig>, cwd: impl Into<String>) -> Self {
         let has_post_tool_hooks = hooks.iter().any(|h| {
-            matches!(h.event, HookEvent::PostToolUse | HookEvent::PostToolUseFailure)
+            matches!(
+                h.event,
+                HookEvent::PostToolUse | HookEvent::PostToolUseFailure
+            )
         });
         Self {
             hooks,
@@ -740,11 +743,13 @@ impl CCExternalHooks {
     async fn resolve_ask(&self, call: &ToolCall, rt: &RequestCtx) -> BeforeOutcome {
         match request_approval_decision(rt, APPROVAL_KIND, call, &call.name).await {
             Err(degraded) => degraded, // Null → fail closed (shared channel-failure deny).
-            Ok(PermissionDecision::AllowOnce | PermissionDecision::AllowAlways) => {
-                BeforeOutcome::Allow {
-                    reason: Some("approved (hook ask)".into()),
-                }
-            }
+            Ok(
+                PermissionDecision::AllowOnce
+                | PermissionDecision::AllowAlways
+                | PermissionDecision::AllowAlwaysAll,
+            ) => BeforeOutcome::Allow {
+                reason: Some("approved (hook ask)".into()),
+            },
             Ok(PermissionDecision::Deny) => BeforeOutcome::deny(format!(
                 "denied by approval prompt (hook ask): {}",
                 call.name
@@ -901,9 +906,11 @@ impl ToolMiddleware for CCExternalHooks {
         // deterministically (the per-tool path typically has 0-1 hooks, so there is
         // little to gain from the session_*-style concurrency here).
         let mut outcome = AfterOutcome::Proceed;
-        for hook in self.hooks.iter().filter(|h| {
-            h.event == event && post_tool_matches(&h.matcher, tool_name.as_deref())
-        }) {
+        for hook in self
+            .hooks
+            .iter()
+            .filter(|h| h.event == event && post_tool_matches(&h.matcher, tool_name.as_deref()))
+        {
             let Some((_code, stdout, _stderr)) = run_command_hook(hook, &payload).await else {
                 continue;
             };
@@ -919,10 +926,7 @@ impl ToolMiddleware for CCExternalHooks {
                 }
                 if d.decision.as_deref() == Some("block") {
                     outcome = AfterOutcome::Block {
-                        reason: d
-                            .reason
-                            .clone()
-                            .unwrap_or_else(|| "blocked by hook".into()),
+                        reason: d.reason.clone().unwrap_or_else(|| "blocked by hook".into()),
                     };
                 }
             }
@@ -1164,8 +1168,12 @@ mod tests {
             event: HookEvent::Stop,
             matcher: None,
             command: format!(
-                "cd '{cwd}' && grep -q '\"transcript_path\":\"{transcript_s}\"' \
-                 && grep -q '\"stop_hook_active\":false' && touch '{m1_s}'"
+                // Land the payload before grepping it: two chained `grep -q` share one
+                // stdin, and the first drains the pipe when it exits on its match, so
+                // the second always sees EOF and the `touch` never runs.
+                "cd '{cwd}' && cat > payload.json \
+                 && grep -q '\"transcript_path\":\"{transcript_s}\"' payload.json \
+                 && grep -q '\"stop_hook_active\":false' payload.json && touch '{m1_s}'"
             ),
             timeout_ms: 5_000,
             plugin_root: None,
@@ -1713,7 +1721,10 @@ mod tests {
             images: vec![],
         };
         cc.after(&mut ok, None).await;
-        assert_eq!(ok.content, "OK-REWRITE", "success must fire PostToolUse, not PostToolUseFailure");
+        assert_eq!(
+            ok.content, "OK-REWRITE",
+            "success must fire PostToolUse, not PostToolUseFailure"
+        );
 
         // A FAILED call: only the PostToolUseFailure hook may rewrite.
         let mut call = ToolCall {

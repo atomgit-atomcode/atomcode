@@ -116,9 +116,13 @@ mod tests {
             return; // nothing configured — nothing to match
         };
         assert!(is_managed_https_url(&format!("https://{domain}")));
-        assert!(is_managed_https_url(&format!("https://sub.{domain}/some/path")));
+        assert!(is_managed_https_url(&format!(
+            "https://sub.{domain}/some/path"
+        )));
         assert!(!is_managed_https_url(&format!("https://evil{domain}")));
-        assert!(!is_managed_https_url(&format!("https://{domain}.evil.example")));
+        assert!(!is_managed_https_url(&format!(
+            "https://{domain}.evil.example"
+        )));
     }
 
     #[test]

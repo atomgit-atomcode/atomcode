@@ -88,11 +88,25 @@ fn default_auto_install_urls() -> &'static [String] {
 /// introducing a future bootstrap step (e.g. a second default marketplace).
 const BOOTSTRAP_MARKER_FILENAME: &str = ".plugin_bootstrap_v2";
 
+/// Throttle marker for marketplace auto-update. Holds an RFC3339 timestamp of
+/// the last refresh cycle so we don't re-`git pull` every marketplace on every
+/// single launch — a burst of `git.exe` spawns at startup that wastes work and
+/// trips Windows AV heuristics ("remote thread injection"). Mirrors how
+/// oh-my-pi throttles its marketplace catalog refresh to a 24h staleness window.
+const MARKETPLACE_REFRESH_MARKER_FILENAME: &str = ".marketplaces_refreshed_at";
+/// How stale the marker may get before another auto-refresh is allowed.
+const MARKETPLACE_REFRESH_INTERVAL_HOURS: i64 = 24;
+
 /// Entry point for both Plan A (auto-install default skills) and
-/// Plan B (sync marketplaces on every startup). Call once at
-/// startup AFTER `Config::load` and AFTER any pending self-upgrade has
-/// re-exec'd. Synchronous — runs `git` subprocesses inline; budget
-/// roughly 1-3 s on a warm path, longer on first install.
+/// Plan B (sync installed marketplaces). Call once at startup AFTER
+/// `Config::load` and AFTER any pending self-upgrade has re-exec'd.
+/// Synchronous — runs `git` subprocesses inline; budget roughly 1-3 s
+/// on a warm path, longer on first install.
+///
+/// Plan B is throttled: the marketplace refresh runs at most once per
+/// [`MARKETPLACE_REFRESH_INTERVAL_HOURS`] (tracked via
+/// [`MARKETPLACE_REFRESH_MARKER_FILENAME`]), so most launches spawn no
+/// per-marketplace `git` at all — see [`marketplace_refresh_due_now`].
 ///
 /// Returns the list of `PluginJobEvent`s the caller should forward to
 /// the TUI event loop so the user sees a toast (e.g. "marketplace
@@ -124,8 +138,12 @@ pub fn run_startup_hooks(config: &Config) -> Vec<PluginJobEvent> {
     }
     if config.plugin.auto_update_marketplaces
         && !atomcode_config::config::offline::is_offline_active()
+        && marketplace_refresh_due_now()
     {
         events.extend(refresh_installed_marketplaces());
+        // Stamp after the attempt so the next launch inside the throttle
+        // window skips the per-marketplace `git` spawns entirely.
+        touch_marketplace_refresh_marker();
     }
     events
 }
@@ -148,6 +166,55 @@ fn touch_marker() {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(&path, b"");
+}
+
+fn marketplace_refresh_marker_path() -> std::path::PathBuf {
+    Config::config_dir().join(MARKETPLACE_REFRESH_MARKER_FILENAME)
+}
+
+/// Pure throttle decision for marketplace auto-update: is a refresh due?
+///
+/// - `None` (never refreshed, or an unreadable/garbled marker) → due.
+/// - Elapsed ≥ `interval` → due.
+/// - A timestamp in the FUTURE (clock skew, or a marker copied from a machine
+///   with a wrong clock) is ALSO treated as due, so a bad marker can never
+///   wedge auto-update off forever.
+fn refresh_is_due(
+    last: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    interval: chrono::Duration,
+) -> bool {
+    match last {
+        None => true,
+        Some(t) => {
+            let elapsed = now.signed_duration_since(t);
+            elapsed >= interval || elapsed < chrono::Duration::zero()
+        }
+    }
+}
+
+/// Read the last-refresh marker and decide whether a refresh is due now.
+fn marketplace_refresh_due_now() -> bool {
+    let last = std::fs::read_to_string(marketplace_refresh_marker_path())
+        .ok()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    refresh_is_due(
+        last,
+        chrono::Utc::now(),
+        chrono::Duration::hours(MARKETPLACE_REFRESH_INTERVAL_HOURS),
+    )
+}
+
+/// Stamp "we just ran an auto-refresh cycle". Written AFTER the attempt (even a
+/// partial/failed one) — the point is to throttle the git-spawn cadence, and a
+/// failed attempt still spawned git, so we don't want to retry it next launch.
+fn touch_marketplace_refresh_marker() {
+    let path = marketplace_refresh_marker_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, chrono::Utc::now().to_rfc3339().as_bytes());
 }
 
 fn should_auto_install(source_url: &str) -> bool {
@@ -300,6 +367,7 @@ fn refresh_installed_marketplaces() -> Vec<PluginJobEvent> {
     if list.is_empty() {
         return events;
     }
+    let mut failures: Vec<(String, String)> = Vec::new();
     for entry in list {
         match update_marketplace(&entry.name) {
             Ok(info) => {
@@ -332,16 +400,51 @@ fn refresh_installed_marketplaces() -> Vec<PluginJobEvent> {
                 }
             }
             Err(e) => {
-                let msg = format!("auto-update of marketplace `{}` failed: {e:#}", entry.name);
-                log_to_file(&format!("⚠ {msg}"));
-                events.push(PluginJobEvent::Failed {
-                    op: "auto-update".into(),
-                    msg,
-                });
+                // Full detail ALWAYS to the log for troubleshooting; the user-facing
+                // surface is collapsed below so N simultaneous failures (offline / host
+                // down hits every marketplace in the same pass) don't fan out to N
+                // near-identical "sync skipped" warnings (issue #1368).
+                log_to_file(&format!(
+                    "⚠ auto-update of marketplace `{}` failed: {e:#}",
+                    entry.name
+                ));
+                failures.push((entry.name.clone(), format!("{e:#}")));
             }
         }
     }
+    if let Some(msg) = collapse_auto_update_failures(&failures) {
+        events.push(PluginJobEvent::Failed {
+            op: "auto-update".into(),
+            msg,
+        });
+    }
     events
+}
+
+/// Collapse the per-marketplace auto-update failures from ONE refresh pass into a
+/// single user-facing message. N separate warnings are noise — offline / host-down
+/// hits every installed marketplace at once, and the full per-marketplace detail is
+/// already in the log. `None` when nothing failed; a lone failure keeps its detailed
+/// one-liner; multiple collapse to `count + names + the first (representative) reason`
+/// (all failures usually share the same cause, so the first stands in for the rest).
+fn collapse_auto_update_failures(failures: &[(String, String)]) -> Option<String> {
+    match failures {
+        [] => None,
+        [(name, reason)] => Some(format!(
+            "auto-update of marketplace `{name}` failed: {reason}"
+        )),
+        [(_, first_reason), ..] => {
+            let names = failures
+                .iter()
+                .map(|(name, _)| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!(
+                "auto-update skipped for {} marketplaces ({names}) — {first_reason} (see log for details)",
+                failures.len()
+            ))
+        }
+    }
 }
 
 fn short_commit(sha: &str) -> &str {
@@ -359,6 +462,92 @@ mod tests {
     #[test]
     fn short_commit_truncates_long_shas() {
         assert_eq!(short_commit("0123456789abcdef"), "0123456");
+    }
+
+    #[test]
+    fn collapse_auto_update_failures_none_when_empty() {
+        assert_eq!(collapse_auto_update_failures(&[]), None);
+    }
+
+    #[test]
+    fn collapse_auto_update_failures_single_keeps_detail() {
+        let f = [(
+            "skills".to_string(),
+            "git pull failed: fatal: boom".to_string(),
+        )];
+        let msg = collapse_auto_update_failures(&f).expect("one failure → a message");
+        // A lone failure keeps its full detailed one-liner (no count/summary framing).
+        assert_eq!(
+            msg,
+            "auto-update of marketplace `skills` failed: git pull failed: fatal: boom"
+        );
+    }
+
+    #[test]
+    fn collapse_auto_update_failures_multiple_collapse_to_one_summary() {
+        let f = [
+            (
+                "atomcode-plugins-official".to_string(),
+                "git pull failed: fatal: unable to access: Could not connect".to_string(),
+            ),
+            (
+                "atomcode-skills".to_string(),
+                "git pull failed: fatal: unable to access: Could not connect".to_string(),
+            ),
+        ];
+        let msg = collapse_auto_update_failures(&f).expect("failures → a message");
+        // ONE summary: count + BOTH names + the first (representative) reason.
+        assert!(msg.contains("2 marketplaces"), "{msg}");
+        assert!(msg.contains("`atomcode-plugins-official`"), "{msg}");
+        assert!(msg.contains("`atomcode-skills`"), "{msg}");
+        assert!(
+            msg.contains("Could not connect"),
+            "representative reason kept: {msg}"
+        );
+        assert!(
+            msg.contains("see log"),
+            "points at the log for the rest: {msg}"
+        );
+    }
+
+    #[test]
+    fn refresh_due_when_never_refreshed() {
+        let now = chrono::Utc::now();
+        assert!(refresh_is_due(None, now, chrono::Duration::hours(24)));
+    }
+
+    #[test]
+    fn refresh_due_after_interval_elapsed() {
+        let now = chrono::Utc::now();
+        let last = now - chrono::Duration::hours(25);
+        assert!(refresh_is_due(Some(last), now, chrono::Duration::hours(24)));
+    }
+
+    #[test]
+    fn refresh_due_exactly_at_interval_boundary() {
+        let now = chrono::Utc::now();
+        let last = now - chrono::Duration::hours(24);
+        assert!(refresh_is_due(Some(last), now, chrono::Duration::hours(24)));
+    }
+
+    #[test]
+    fn refresh_not_due_within_interval() {
+        let now = chrono::Utc::now();
+        let last = now - chrono::Duration::hours(1);
+        assert!(!refresh_is_due(
+            Some(last),
+            now,
+            chrono::Duration::hours(24)
+        ));
+    }
+
+    #[test]
+    fn refresh_due_on_future_marker_never_wedges() {
+        // Clock skew / a marker copied from a machine with a wrong clock must
+        // not disable auto-update forever — a future timestamp is "due".
+        let now = chrono::Utc::now();
+        let last = now + chrono::Duration::hours(5);
+        assert!(refresh_is_due(Some(last), now, chrono::Duration::hours(24)));
     }
 
     #[test]

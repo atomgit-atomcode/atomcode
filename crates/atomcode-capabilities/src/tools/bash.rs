@@ -105,6 +105,13 @@ unsafe fn detach_child_from_controlling_tty() {
     }
 }
 
+/// Background job path (`bash_start` / `bash_poll` / `bash_kill`) for long-running
+/// commands that would exceed the foreground `timeout` ceiling. A submodule of `bash` so
+/// it can reuse the private spawn/reaper primitives (`build_command`, `PgroupChild`,
+/// `detach_child_from_controlling_tty`) without widening their visibility.
+pub(crate) mod background;
+pub(crate) use background::{BashKillTool, BashPollTool, BashStartTool};
+
 #[derive(Default)]
 pub struct BashTool;
 
@@ -157,14 +164,28 @@ impl Tool for BashTool {
             Err(_) => RiskLevel::Risky,
         }
     }
-    /// "Always allow" scope: the NORMALIZED command (comments stripped, whitespace collapsed),
-    /// keeping the DEFAULT per-command scope. Every bash approval is for a destructive command
-    /// (see `risk`), so a command-family prefix (`rm *`) would over-approve — per-command is
-    /// deliberate. Normalizing means a cosmetic re-emit of the SAME command (changed trailing
-    /// `# comment`, added whitespace) keeps the grant instead of re-prompting every turn.
+    /// "Always allow" scope — TOOL-WIDE for an ordinary command, PINNED TO THIS COMMAND when
+    /// the arguments name a sensitive path.
+    ///
+    /// This used to be per-command unconditionally, which made the approval panel's "Always"
+    /// useless in practice: a bash call that differed by one argument re-prompted, so users
+    /// answered the same question all session ("bash 总是询问"). A session-wide grant is what
+    /// the option has always claimed to give, and what the user is actually deciding — they
+    /// are trusting this session's shell, not one exact byte string.
+    ///
+    /// The exception is the hard floor shared with [`PermissionRuleGate`] and
+    /// [`WriteApprovalGate`](super::write_approval::WriteApprovalGate): a command touching
+    /// `~/.ssh`, `.env`, a credential file, … keeps a COMMAND-scoped grant, so approving one
+    /// ordinary `rm` can never silently pre-approve a later secret access. Callers that render
+    /// the approval label MUST derive it from this function (see the TUI's
+    /// `build_approval_options`) rather than re-deciding the scope — the two drifting apart is
+    /// exactly how the label came to promise a session-wide grant the store never recorded.
+    ///
+    /// Normalizing (comments stripped, whitespace collapsed) means a cosmetic re-emit of the
+    /// SAME command still matches an existing command-scoped grant.
     fn always_grant_scope(&self, args: &str) -> String {
         match serde_json::from_str::<Args>(args) {
-            Ok(a) => normalize_command_for_grant(&a.command),
+            Ok(a) => shell_always_grant_scope(args, &a.command),
             Err(_) => args.to_string(),
         }
     }
@@ -186,11 +207,17 @@ impl Tool for BashTool {
                 ))
             }
         };
-        let secs = a
-            .timeout
+        // Keep the RAW request so we can (a) avoid telling a caller that already asked for
+        // more than the ceiling to "pass a larger timeout", and (b) surface the clamp up
+        // front — the model otherwise believes its larger request was honored and only
+        // discovers the silent cap when a later step depends on it (mirrors the clamp notice
+        // shells like oh-my-pi emit at run time rather than only at the timeout).
+        let requested_timeout = a.timeout;
+        let secs = requested_timeout
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
         let dur = Duration::from_secs(secs);
+        let clamp_notice = timeout_clamp_notice(secs, requested_timeout);
 
         // macOS sudo (and some Linux configs) needs explicit `-A` to use SUDO_ASKPASS —
         // rewrite `sudo` → `sudo -A` so a plain `sudo` pops our password modal. Only when
@@ -303,7 +330,7 @@ impl Tool for BashTool {
             }
         };
 
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             // Cooperative cancel: returning drops `wait` → kill_on_drop SIGKILLs the child.
             _ = ctx.cancel.cancelled() => {
@@ -318,16 +345,32 @@ impl Tool for BashTool {
                 Ok(Ok(output)) => format_output(&output),
                 Ok(Err(e)) => err(format!("bash: error running command: {e}")),
                 // Timed out: the timeout future drops `wait` → kill_on_drop SIGKILLs the child.
-                // Don't echo the command (see the cancel arm); point at the actionable
-                // knob — a larger `timeout` — the way the core bash tool does.
+                // Don't echo the command (see the cancel arm); point at the actionable knob —
+                // a larger `timeout` — BUT only while that knob still has room. Once the run
+                // was already at MAX_TIMEOUT_SECS, "pass a larger timeout" is advice that
+                // provably cannot work, and the model reads tool output as ground truth and
+                // retries it. At the ceiling `timeout_message` names the ceiling and points at
+                // the one escape that ACTUALLY works on THIS platform: background+file on Unix
+                // (a detached child survives our reap — we only killpg on cancel/timeout), but
+                // split-into-steps on Windows, where the KILL_ON_JOB_CLOSE job reaps anything
+                // left running the moment we return (this tool has no background path there —
+                // see the job-object comment above the spawn).
                 Err(_) => {
                     kill_tree();
-                    err(format!(
-                        "bash: timed out after {secs}s — pass a larger `timeout` if this command \
-                         legitimately needs longer."
-                    ))
+                    err(timeout_message(secs))
                 }
             }
+        };
+        // Surface a silent `timeout` clamp on EVERY outcome (not just the timeout), so a
+        // caller that asked for more than the ceiling learns the real limit here instead of
+        // carrying a wrong mental model into its next step.
+        match clamp_notice {
+            Some(note) => {
+                let mut result = result;
+                result.content.push_str(&note);
+                result
+            }
+            None => result,
         }
     }
 }
@@ -773,6 +816,50 @@ fn detect_windows_bash() -> Option<std::path::PathBuf> {
         .clone()
 }
 
+/// One-line note appended to the tool output whenever the caller's `timeout` was clamped
+/// into range, so the model learns the real ceiling instead of silently believing its
+/// (larger) request was honored — mirrors oh-my-pi's run-time clamp notice. `None` when the
+/// effective value equals the request (default, or an in-range explicit value): don't add
+/// noise to the common case. Pure ⇒ unit-testable without a real run.
+fn timeout_clamp_notice(secs: u64, requested: Option<u64>) -> Option<String> {
+    match requested {
+        Some(r) if r != secs => Some(format!(
+            "\n\n(note: `timeout` clamped to {secs}s — this tool allows 1–{MAX_TIMEOUT_SECS}s; \
+             you requested {r}s.)"
+        )),
+        _ => None,
+    }
+}
+
+/// The message for a command killed by the timeout.
+///
+/// Pure so both branches are unit-testable without actually waiting `MAX_TIMEOUT_SECS`.
+///
+/// The `timeout` knob only gets named while it still has room. `timeout` is clamped to
+/// `MAX_TIMEOUT_SECS`, so a run that already sat at the ceiling cannot be helped by
+/// "pass a larger `timeout`" — the model treats tool output as ground truth, so an
+/// instruction that provably cannot work is worse than none. At the ceiling, point at the
+/// escape that exists on EVERY platform: `bash_start` backgrounds the command and returns
+/// immediately (Unix keeps the detached tree via its pgroup, Windows via a per-job Job
+/// Object), so a >ceiling command finally has somewhere to go. (The clamp itself — "you
+/// asked for 330, got 300" — is surfaced separately by [`timeout_clamp_notice`], appended to
+/// every outcome, so it isn't repeated here.)
+fn timeout_message(secs: u64) -> String {
+    if secs >= MAX_TIMEOUT_SECS {
+        format!(
+            "bash: timed out after {secs}s, which is this tool's maximum. A longer single \
+             command is not available — run it with `bash_start` (it backgrounds the command \
+             and returns immediately), then collect output with `bash_poll` and stop it with \
+             `bash_kill`."
+        )
+    } else {
+        format!(
+            "bash: timed out after {secs}s — pass a larger `timeout` (up to {MAX_TIMEOUT_SECS}s) \
+             if this command legitimately needs longer, or run it with `bash_start` to background it."
+        )
+    }
+}
+
 /// Detect bash constructs that cmd.exe cannot interpret. When bash is absent and we must
 /// fall back to cmd.exe, returning a clear error here (instead of letting cmd.exe silently
 /// corrupt the script) lets the model rewrite instead of retrying blindly. Returns
@@ -799,10 +886,91 @@ fn unsupported_bash_construct(command: &str) -> Option<&'static str> {
         return Some("here-string `<<<` — cmd.exe does not support here-strings");
     }
     // Process substitution `< <(...)` / `>(...)` — cmd.exe has no /dev/fd.
-    if command.contains("< <(") || command.contains(">(") {
+    if command.contains("< <(") || has_operator_position_process_substitution(command) {
         return Some("process substitution `< <(...)` / `>(...)` — cmd.exe has no /dev/fd");
     }
     None
+}
+
+/// Whether the command contains a `>(` that is actually SHELL SYNTAX (output process
+/// substitution) rather than two characters sitting next to each other inside ordinary text.
+///
+/// A bare `contains(">(")` is not usable here: the two commonest JavaScript one-liners a
+/// model writes both carry it inside a quoted literal —
+/// `s.match(/<script>([\s\S]*?)<\/script>/)` (the `<script>(` in an HTML-scraping regex)
+/// and the arrow-function-returning-an-object idiom `()=>({ .. })`. On a Windows box with
+/// no Git Bash that misfire HARD-FAILS a perfectly valid `node -e` / `python -c` command
+/// (field case: 5 of 6 cmd.exe rejections in one user's session were exactly this, all
+/// from the same `node -e` HTML syntax check the user ran after every edit).
+///
+/// Real process substitution is a WORD-level operator: `>` sits at an operator position
+/// (preceded by whitespace or standing at the very start) AND is UNQUOTED. Both conditions
+/// are checked in one quote-aware pass, using the same single-quote-is-literal /
+/// backslash-escapes-in-double-quotes model as [`rewrite_nul_redirect`]:
+///   * quoted — `python -c "print('a >(b)')"`, the `node -e` cases above — never flagged
+///     (process substitution does not occur inside quotes);
+///   * unquoted no-space — `tee>(cat)` — not flagged, falls through to cmd.exe mangled, the
+///     same treatment every other un-flagged construct already gets (this is "只减不增":
+///     strictly fewer hard-fails than the old bare substring match).
+/// Pure / platform-independent (scans bytes; ASCII operators never collide with UTF-8
+/// continuation bytes) so it is unit-testable off Windows.
+fn has_operator_position_process_substitution(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    // Start-of-command counts as an operator boundary, same as the old `next_back() == None`.
+    let mut prev_is_boundary = true;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            // Single quotes are fully literal in bash — only a closing `'` ends them, and
+            // nothing inside is an operator or a boundary.
+            if b == b'\'' {
+                in_single = false;
+            }
+            prev_is_boundary = false;
+            i += 1;
+        } else if in_double {
+            // Inside double quotes a backslash escapes the next byte (so `\"` doesn't close);
+            // otherwise a `"` ends the span. Nothing inside is a process-substitution operator.
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+            } else {
+                if b == b'"' {
+                    in_double = false;
+                }
+                i += 1;
+            }
+            prev_is_boundary = false;
+        } else {
+            match b {
+                // An unquoted backslash escapes the next byte: neither is an operator/boundary.
+                b'\\' if i + 1 < bytes.len() => {
+                    prev_is_boundary = false;
+                    i += 2;
+                }
+                b'\'' => {
+                    in_single = true;
+                    prev_is_boundary = false;
+                    i += 1;
+                }
+                b'"' => {
+                    in_double = true;
+                    prev_is_boundary = false;
+                    i += 1;
+                }
+                b'>' if prev_is_boundary && bytes.get(i + 1) == Some(&b'(') => {
+                    return true;
+                }
+                _ => {
+                    prev_is_boundary = b.is_ascii_whitespace();
+                    i += 1;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Rewrite a bash redirect whose target is the bare Windows device name `nul`
@@ -1640,6 +1808,22 @@ pub fn strip_bash_comments(cmd: &str) -> String {
 /// cosmetic re-emit of the SAME command (a changed trailing `# comment`, extra spaces) keeps the
 /// grant instead of re-prompting. Stays PER-COMMAND (not a `rm *` family prefix): every bash
 /// approval is for a destructive command, so a family prefix would over-approve.
+/// The "Always allow" grant scope shared by EVERY shell-executing tool (`bash`, `bash_start`):
+/// TOOL-WIDE (`""`) for an ordinary command, PINNED TO THIS COMMAND when the arguments name a
+/// sensitive path.
+///
+/// This lives here, as one function, on purpose. "Always" was previously decided in three
+/// places that drifted — the tool, the approval label, and the driver's session cache — which
+/// is how the panel came to offer a session-wide grant that nothing recorded. A backgrounded
+/// command is exactly as dangerous as a foreground one, so `bash_start` must reach the same
+/// verdict as `bash` by CALLING this, not by keeping its own copy.
+pub fn shell_always_grant_scope(args: &str, command: &str) -> String {
+    if !super::sensitive_path::references_sensitive_path(args) {
+        return String::new(); // tool-wide: one "Always" covers this session's shell
+    }
+    normalize_command_for_grant(command)
+}
+
 pub fn normalize_command_for_grant(command: &str) -> String {
     strip_bash_comments(command)
         .split_whitespace()
@@ -2464,6 +2648,25 @@ impl PgroupChild {
         }
     }
 
+    /// The child's process-group id (== pid; `setsid` made it the leader). Copyable, so a
+    /// caller can kill the group (see [`sigkill_pgroup`]) WITHOUT borrowing the child —
+    /// letting a background reader kill from one `select!` arm while another arm holds a
+    /// `&mut` for [`PgroupChild::wait_and_disarm`].
+    pub(crate) fn pgid(&self) -> i32 {
+        self.pgid
+    }
+
+    /// Reap the child on its OWN exit and DISARM the `Drop` SIGKILL. A bare `wait()` would
+    /// leave `terminated == false`, so `Drop` would then fire `killpg` at a pgid whose
+    /// leader is already reaped — into the exact PID-reuse window this type guards. Setting
+    /// `terminated` after the reap closes it. Used by the background reader task, whose
+    /// natural-exit path detects termination via `wait` rather than via `terminate()`.
+    pub(crate) async fn wait_and_disarm(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await;
+        self.terminated = true;
+        status
+    }
+
     /// Graceful pgroup shutdown: SIGTERM → 200ms grace → SIGKILL → reap.
     /// Call from explicit cleanup paths (timeout/idle) where we can await.
     async fn terminate(&mut self) {
@@ -2525,6 +2728,16 @@ extern "C" {
 const SIGTERM: i32 = 15;
 #[cfg(not(target_os = "windows"))]
 const SIGKILL: i32 = 9;
+
+/// SIGKILL an entire process group (a [`PgroupChild`]'s whole tree) WITHOUT borrowing the
+/// child — so a background reader can kill from one `select!` arm while another arm holds a
+/// `&mut` for `wait_and_disarm`. ESRCH (already-empty group) is ignored by the kernel.
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn sigkill_pgroup(pgid: i32) {
+    unsafe {
+        killpg(pgid, SIGKILL);
+    }
+}
 
 /// Result of running a shell command, decoupled from tool-result framing.
 /// `bash_execute` (model-invoked Bash tool) and `handle_local_shell`
@@ -3289,6 +3502,40 @@ mod tests {
         assert!(unsupported_bash_construct(r#"python -c "print(1<<4)""#).is_none()); // << bit-shift
         assert!(unsupported_bash_construct("dir && echo ok").is_none()); // && chain
     }
+
+    /// `>(` inside a quoted literal is not process substitution. Both shapes below were
+    /// observed hard-failing on a Windows machine without Git Bash, and both are ordinary
+    /// cmd.exe-runnable one-liners.
+    #[test]
+    fn unsupported_construct_no_false_positive_on_angle_paren_inside_literals() {
+        // HTML-scraping regex: `<script>(` carries `>(`.
+        assert!(unsupported_bash_construct(
+            r#"node -e "const m=s.match(/<script>([\s\S]*?)<\/script>/);""#
+        )
+        .is_none());
+        // Arrow function returning an object literal: `()=>({...})` carries `>(`.
+        assert!(unsupported_bash_construct(r#"node -e "const o={init:()=>({s:1})};""#).is_none());
+        // The operator-position form is still flagged, with and without a redirect prefix.
+        assert!(unsupported_bash_construct("tee >(cat)").is_some());
+        assert!(unsupported_bash_construct("cmd 2> >(logger)").is_some());
+        assert!(unsupported_bash_construct(">(cat)").is_some());
+    }
+
+    /// Quote-awareness: an OPERATOR-position `>(` that nonetheless sits inside a quoted
+    /// literal is still not process substitution (it's argument text handed to a child
+    /// program). This is the residual FP the plain operator-position check could not catch.
+    #[test]
+    fn unsupported_construct_quote_aware_operator_position() {
+        // `>(` preceded by a space but INSIDE double quotes → argument text, not an operator.
+        assert!(unsupported_bash_construct(r#"python -c "print('a >(b)')""#).is_none());
+        assert!(unsupported_bash_construct(r#"echo "x >(y) z""#).is_none());
+        // …and inside single quotes.
+        assert!(unsupported_bash_construct(r#"echo 'pipe into >(cat)'"#).is_none());
+        // An escaped inner quote must not prematurely end the double-quoted span.
+        assert!(unsupported_bash_construct(r#"node -e "const s=\"a >(b)\";""#).is_none());
+        // Real, unquoted operator-position substitution is still flagged after quoted text.
+        assert!(unsupported_bash_construct(r#"echo "safe" | tee >(cat)"#).is_some());
+    }
     use tokio_util::sync::CancellationToken;
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
@@ -3726,17 +3973,31 @@ mod tests {
     }
 
     #[test]
-    fn always_grant_scope_is_stable_across_cosmetic_variation() {
+    fn always_grant_scope_is_tool_wide_for_ordinary_commands() {
         let key = |cmd: &str| BashTool.always_grant_scope(&json!({ "command": cmd }).to_string());
-        // Same command, different trailing comment + whitespace → SAME grant key (so "always" sticks).
+        // "Always" is a decision about this session's shell, not one byte string: an ordinary
+        // command grants TOOL-WIDE, so the next (different) command does not re-prompt. This is
+        // the fix for "点了总是允许，bash 还是每次都问".
+        assert_eq!(key("rm foo.txt"), "");
+        assert_eq!(key("rm bar.txt"), "");
+        assert_eq!(key("taskkill //F //IM X.exe # attempt 1"), "");
+        assert_eq!(key("rm foo.txt"), key("rm bar.txt"));
+    }
+
+    /// The hard floor: a sensitive target keeps a COMMAND-scoped grant, so one blanket
+    /// "Always" can never pre-approve a later secret access.
+    #[test]
+    fn always_grant_scope_stays_command_scoped_for_sensitive_targets() {
+        let key = |cmd: &str| BashTool.always_grant_scope(&json!({ "command": cmd }).to_string());
+        assert_eq!(key("cat ~/.ssh/id_rsa"), "cat ~/.ssh/id_rsa");
+        assert_ne!(key("cat ~/.ssh/id_rsa"), key("cat ~/.ssh/id_ed25519"));
+        // Never collapses to the tool-wide key, which would make it match an ordinary grant.
+        assert_ne!(key("cat ~/.ssh/id_rsa"), "");
+        // Cosmetic re-emit of the SAME sensitive command still matches its existing grant.
         assert_eq!(
-            key("taskkill //F //IM X.exe  # attempt 1"),
-            key("taskkill //F //IM X.exe # attempt 2")
+            key("cat  ~/.ssh/id_rsa   # a"),
+            key("cat ~/.ssh/id_rsa # b")
         );
-        assert_eq!(key("rm  foo.txt   # a"), key("rm foo.txt # b"));
-        assert_eq!(key("rm foo.txt # a"), "rm foo.txt");
-        // A genuinely different command → different key (stays per-command, no family blanket).
-        assert_ne!(key("rm foo.txt"), key("rm bar.txt"));
     }
 
     #[test]
@@ -4053,6 +4314,59 @@ mod tests {
             .await;
         assert!(r.is_error, "{}", r.content);
         assert!(r.content.contains("timed out after 1s"), "{}", r.content);
+    }
+
+    /// Below the ceiling the message still points at the `timeout` knob, and now names the
+    /// ceiling so the caller cannot ask for something that will be silently clamped.
+    #[tokio::test]
+    async fn timeout_message_below_ceiling_points_at_the_knob() {
+        let d = tempfile::tempdir().unwrap();
+        let r = BashTool
+            .execute(r#"{"command":"sleep 30","timeout":1}"#, &ctx(d.path()))
+            .await;
+        assert!(
+            r.content.contains("pass a larger `timeout`"),
+            "{}",
+            r.content
+        );
+        assert!(
+            r.content.contains(&format!("{MAX_TIMEOUT_SECS}s")),
+            "the message must name the ceiling: {}",
+            r.content
+        );
+    }
+
+    /// At the ceiling the `timeout` knob is gone (it's clamped there), so the message must not
+    /// point back at it and must point at the cross-platform escape that actually exists now:
+    /// `bash_start`.
+    #[test]
+    fn timeout_message_at_ceiling_points_at_bash_start() {
+        let m = timeout_message(MAX_TIMEOUT_SECS);
+        assert!(
+            !m.contains("pass a larger"),
+            "must not point at a maxed knob: {m}"
+        );
+        assert!(
+            m.contains("bash_start"),
+            "must point at the background tool: {m}"
+        );
+    }
+
+    /// A silently-clamped `timeout` is surfaced (real limit + what was asked); an honored
+    /// value — default or in-range — stays silent so the common case isn't noisy.
+    #[test]
+    fn timeout_clamp_notice_only_fires_when_clamped() {
+        let n = timeout_clamp_notice(MAX_TIMEOUT_SECS, Some(330)).expect("over-ceiling clamps");
+        assert!(n.contains("requested 330s"), "{n}");
+        assert!(
+            n.contains(&format!("{MAX_TIMEOUT_SECS}s")),
+            "names the ceiling: {n}"
+        );
+        assert!(timeout_clamp_notice(1, Some(0))
+            .unwrap()
+            .contains("requested 0s")); // low clamp
+        assert!(timeout_clamp_notice(60, Some(60)).is_none()); // honored → silent
+        assert!(timeout_clamp_notice(60, None).is_none()); // default → silent
     }
 
     #[test]

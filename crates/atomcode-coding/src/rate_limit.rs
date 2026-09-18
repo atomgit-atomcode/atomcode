@@ -39,7 +39,9 @@ pub struct RateLimitWindow {
 pub fn binding_window_call_limit(windows: &[RateLimitWindow]) -> Option<i64> {
     windows
         .iter()
-        .filter(|w| w.window_size_seconds > 0 && w.window_size_seconds <= 18_000 && w.call_limit > 0)
+        .filter(|w| {
+            w.window_size_seconds > 0 && w.window_size_seconds <= 18_000 && w.call_limit > 0
+        })
         .map(|w| w.call_limit)
         .min()
 }
@@ -283,8 +285,8 @@ mod tests {
 
     #[tokio::test]
     async fn configured_attempt_limit_bounds_kernel_owned_429_retries() {
-        let hook = RateLimitHook::new("https://api.openai.com/v1".to_string())
-            .with_max_attempts(Some(2));
+        let hook =
+            RateLimitHook::new("https://api.openai.com/v1".to_string()).with_max_attempts(Some(2));
         let first = RateLimitHint {
             http_status: Some(429),
             retry_after_secs: Some(30),
@@ -361,7 +363,10 @@ mod tests {
     #[test]
     fn binding_call_limit_picks_the_tightest_known_window() {
         // Pro's single 5h window.
-        assert_eq!(binding_window_call_limit(&[win_limit(18000, 1000)]), Some(1000));
+        assert_eq!(
+            binding_window_call_limit(&[win_limit(18000, 1000)]),
+            Some(1000)
+        );
         // Two rolling windows (1000 and a looser 16000) → the tighter 1000 is what a
         // runaway goal exhausts first.
         assert_eq!(
@@ -376,7 +381,10 @@ mod tests {
         // longer than the 5h rolling band all yield None → caller uses the flat default.
         assert_eq!(binding_window_call_limit(&[]), None);
         assert_eq!(binding_window_call_limit(&[win_limit(18000, 0)]), None);
-        assert_eq!(binding_window_call_limit(&[win_limit(2_592_000, 800)]), None);
+        assert_eq!(
+            binding_window_call_limit(&[win_limit(2_592_000, 800)]),
+            None
+        );
     }
 
     fn win_sized(size: i64, secs_until_reset: i64, exhausted: bool) -> RateLimitWindow {

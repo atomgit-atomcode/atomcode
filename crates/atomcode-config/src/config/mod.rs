@@ -112,6 +112,39 @@ impl Default for TodoToolConfig {
 pub struct ToolsConfig {
     pub todo: TodoToolConfig,
 }
+
+/// `[permissions]` — user-declared pre-authorization for tool calls, so the common
+/// commands in a project stop prompting without reaching for the all-or-nothing
+/// `--dangerously-skip-permissions`.
+///
+/// Rules are Claude Code compatible (`Bash(git *)`, `Read(~/.zshrc)`, bare `Bash`,
+/// `mcp__server__tool`, `*`); `deny` wins over `allow`, and an `allow` never applies to a
+/// call whose arguments reference a sensitive path. See
+/// `atomcode_capabilities::tools::permission_rules` for the full matching contract.
+///
+/// ```toml
+/// [permissions]
+/// allow = ["Bash(git *)", "Bash(cargo test*)", "Read(src/**)"]
+/// deny  = ["Bash(rm -rf *)"]
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PermissionsConfig {
+    /// Calls matching any of these run WITHOUT an approval prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// Calls matching any of these are blocked outright. Checked before `allow`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+}
+
+impl PermissionsConfig {
+    /// No rules declared — the table carries nothing and is omitted on save.
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_empty() && self.deny.is_empty()
+    }
+}
+
 impl Default for CodingConfig {
     fn default() -> Self {
         Self {
@@ -308,6 +341,13 @@ pub struct Config {
     /// model-aware automatic eagerness.
     #[serde(default)]
     pub tools: ToolsConfig,
+    /// `[permissions]` allow/deny pre-authorization. Empty in older configs, which
+    /// leaves every existing approval gate exactly as it was. Skipped when empty so a
+    /// config save does not sprinkle a meaningless `[permissions]` header into every
+    /// user's file — the table is opt-in, and an empty one reads as if something is
+    /// configured when nothing is.
+    #[serde(default, skip_serializing_if = "PermissionsConfig::is_empty")]
+    pub permissions: PermissionsConfig,
     /// Provider key (matches a key in `Config.providers`) of a vision-language
     /// model used to preprocess images before forwarding to a non-vision main
     /// provider. When `None` or empty, image preprocessing is disabled — pasted
@@ -502,6 +542,13 @@ pub struct UiConfig {
     /// `"OA OAuth"`) via config or env `ATOMCODE_OAUTH_PROVIDER_NAME`.
     #[serde(default = "default_oauth_provider_name")]
     pub oauth_provider_name: String,
+    /// Which key cycles the execution mode (Plan/Build/Auto/AcceptEdits).
+    /// Defaults to `shift_tab` on most platforms and `tab` on HarmonyOS
+    /// (`target_env = "ohos"`), where terminals cannot deliver Shift+Tab.
+    /// See [`ModeSwitchKey`]. Read live on each keypress, so a `/config`
+    /// change takes effect immediately.
+    #[serde(default)]
+    pub mode_switch_key: ModeSwitchKey,
 }
 
 impl Default for UiConfig {
@@ -515,6 +562,35 @@ impl Default for UiConfig {
             truncate_resumed_history: true,
             brand_name: default_brand_name(),
             oauth_provider_name: default_oauth_provider_name(),
+            mode_switch_key: ModeSwitchKey::default(),
+        }
+    }
+}
+
+/// Which key cycles the execution mode (Plan → Build → Auto → AcceptEdits),
+/// the footer mode badge. This is NOT model selection (that is `/model`).
+///
+/// - `ShiftTab` (default on most platforms): Shift+Tab (or `BackTab`) cycles
+///   the mode; plain Tab stays reserved for slash/@/skill completion.
+/// - `Tab` (default on HarmonyOS / `target_env = "ohos"`, where the terminal
+///   cannot deliver Shift+Tab): plain Tab cycles the mode; completion is
+///   accepted with → (inline suggestion) or Enter (menu). `BackTab` and
+///   Shift+Tab keep cycling too, so no terminal loses the gesture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModeSwitchKey {
+    ShiftTab,
+    Tab,
+}
+
+impl Default for ModeSwitchKey {
+    fn default() -> Self {
+        // HarmonyOS terminals don't deliver Shift+Tab, so default that platform
+        // to plain Tab; every other platform keeps the Shift+Tab gesture.
+        if cfg!(target_env = "ohos") {
+            ModeSwitchKey::Tab
+        } else {
+            ModeSwitchKey::ShiftTab
         }
     }
 }
@@ -665,6 +741,7 @@ impl Default for Config {
             loop_config: Default::default(),
             coding: CodingConfig::default(),
             tools: ToolsConfig::default(),
+            permissions: PermissionsConfig::default(),
             vision_preprocessor_provider: None,
             language: None,
             init_prompt_file: None,
@@ -847,6 +924,35 @@ impl Config {
             out.insert(id.clone(), model);
         }
         out
+    }
+
+    /// Channel (account) label that disambiguates the active model in compact UI
+    /// like the TUI footer — returns `Some(label)` ONLY when the active model's
+    /// wire name collides with another configured model (the same rule the webui
+    /// model picker uses), and `None` when the name is unique so nothing is shown.
+    ///
+    /// The label is the owning account's `display_name`, falling back to the
+    /// account id — which for a legacy `[providers.*]` entry is the provider name
+    /// itself, so both schemas yield a sensible channel name. Returns `None` for
+    /// an unknown/empty selection.
+    pub fn disambiguating_channel_label(&self, selection: &str) -> Option<String> {
+        if selection.is_empty() {
+            return None;
+        }
+        let models = self.logical_models();
+        let active = models.get(selection)?;
+        // Only disambiguate when the wire model NAME is shared by 2+ configured
+        // models (i.e. the bare name alone can't tell the user which channel).
+        let shares_name = models.values().filter(|m| m.model == active.model).count() > 1;
+        if !shares_name {
+            return None;
+        }
+        let label = self
+            .logical_accounts()
+            .get(&active.account)
+            .and_then(|a| a.display_name.clone())
+            .unwrap_or_else(|| active.account.clone());
+        (!label.is_empty()).then_some(label)
     }
 
     /// Diagnostics for exact id collisions between new-schema entries and
@@ -1114,6 +1220,7 @@ fn resolve_account_api_key(
         provider_preset::ProviderType::Anthropic => "ANTHROPIC_API_KEY",
         provider_preset::ProviderType::Ollama => "OLLAMA_API_KEY",
         provider_preset::ProviderType::OpenAi => "OPENAI_API_KEY",
+        provider_preset::ProviderType::Responses => "OPENAI_API_KEY",
     };
     for env in [preset.api_key_env, Some(wire_env), Some("ATOMCODE_API_KEY")]
         .into_iter()
@@ -1137,6 +1244,9 @@ fn legacy_provider_to_preset_id(provider_type: &str) -> &'static str {
     match provider_type {
         "claude" | "anthropic" => "anthropic",
         "ollama" => "ollama",
+        // OpenAI Responses API wire — distinct protocol from chat/completions,
+        // so it must resolve to the Responses preset, not the generic OpenAI one.
+        "responses" => "openai-responses",
         // Preserve the vendor preset for legacy OpenCode Zen entries. Falling
         // through to the generic OpenAI preset would resolve OPENAI_API_KEY
         // instead of OPENCODE_API_KEY even though the wire protocol is the same.
@@ -1482,6 +1592,14 @@ pub struct NotificationConfig {
 pub struct NetworkConfig {
     #[serde(default)]
     pub proxy: ProxyConfig,
+    /// Max attempts for the VISIBLE kernel provider-retry tier (the `重试(N/M)`
+    /// re-opens that fire on a transient 5xx / dropped connection at OPEN, with
+    /// patient exponential backoff that honors a server `Retry-After`). `None`
+    /// keeps the built-in default (3). Raise it for a flaky gateway/relay whose
+    /// transient "no upstream available" 503 takes longer than the default
+    /// window to clear. `0` disables the tier. Read when the agent is assembled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_retry_max_attempts: Option<u32>,
 }
 
 /// Controls LSP (Language Server Protocol) integration.
@@ -2193,7 +2311,10 @@ kind = "claude-code"
         assert!(a.timeout_secs.is_none());
         let b = &cfg.subagent.external[1];
         assert_eq!(b.kind, "claude-code");
-        assert_eq!(b.permission, None, "absent permission stays None (→ read-only downstream)");
+        assert_eq!(
+            b.permission, None,
+            "absent permission stays None (→ read-only downstream)"
+        );
     }
 
     #[test]
@@ -2209,10 +2330,9 @@ kind = "claude-code"
         assert_eq!(cfg.subagent.codex, "off");
         assert_eq!(cfg.subagent.claude, "off");
         // Explicit levels round-trip.
-        let cfg: Config = toml::from_str(
-            "[subagent]\ncodex = \"read-only\"\nclaude = \"accept-edits\"\n",
-        )
-        .unwrap();
+        let cfg: Config =
+            toml::from_str("[subagent]\ncodex = \"read-only\"\nclaude = \"accept-edits\"\n")
+                .unwrap();
         assert_eq!(cfg.subagent.codex, "read-only");
         assert_eq!(cfg.subagent.claude, "accept-edits");
     }
@@ -2337,13 +2457,46 @@ kind = "claude-code"
     // server list is authoritative: it must override the client-side builtin (which knew
     // only `deepseek-v4-flash -> [high, max]`). With NO server list the builtin remains
     // the fallback for older/production servers that don't send the field yet.
+    /// An empty `[permissions]` table must not be written back into every user's config:
+    /// a header with nothing under it reads as if something is configured.
+    #[test]
+    fn empty_permissions_table_is_not_serialized() {
+        let cfg = Config::default();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(
+            !text.contains("[permissions]"),
+            "an empty permissions table must be omitted on save:\n{text}"
+        );
+        let mut with_rules = Config::default();
+        with_rules.permissions.allow = vec!["Bash(git *)".to_string()];
+        let text = toml::to_string(&with_rules).unwrap();
+        assert!(
+            text.contains("[permissions]"),
+            "a non-empty table must persist"
+        );
+    }
+
+    /// `[permissions]` must parse from TOML and default to empty when absent — an older
+    /// config file has to keep behaving exactly as it did.
+    #[test]
+    fn permissions_table_parses_and_defaults_to_empty() {
+        let cfg: Config = toml::from_str(
+            "[permissions]\n\
+             allow = [\"Bash(git *)\", \"Read(src/**)\"]\n\
+             deny = [\"Bash(rm -rf *)\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.permissions.allow, ["Bash(git *)", "Read(src/**)"]);
+        assert_eq!(cfg.permissions.deny, ["Bash(rm -rf *)"]);
+
+        let absent: Config = toml::from_str("[coding]\nmax_rounds = 0\n").unwrap();
+        assert!(absent.permissions.allow.is_empty());
+        assert!(absent.permissions.deny.is_empty());
+    }
+
     #[test]
     fn server_declared_effort_levels_win_over_the_client_builtin() {
-        let declared = [
-            "low".to_string(),
-            "medium".to_string(),
-            "xhigh".to_string(),
-        ];
+        let declared = ["low".to_string(), "medium".to_string(), "xhigh".to_string()];
         assert_eq!(
             effective_reasoning_effort_levels(true, "deepseek-v4-flash", Some(&declared)),
             Some(declared.to_vec()),
@@ -3166,6 +3319,7 @@ model = "missing-type"
             ui: Default::default(),
             plugin: Default::default(),
             web_search: Default::default(),
+            permissions: Default::default(),
             keep_interrupted_context: false,
             offline_mode: Default::default(),
             offline_note: None,
@@ -4354,6 +4508,71 @@ context_window = 131072
         let toml = "default_model = \"acc/ds\"\n\n[provider_accounts.acc]\nprovider = \"deepseek\"\napi_key = \"sk-x\"\n\n[models.\"acc/ds\"]\naccount = \"acc\"\nmodel = \"deepseek-chat\"\ncontext_window = 200000\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.default_context_window(), 200000);
+    }
+
+    #[test]
+    fn disambiguating_channel_label_only_fires_on_a_shared_model_name() {
+        // Two accounts expose the SAME wire model name; a third is unique.
+        let toml = r#"
+default_model = "atomgit/ds"
+[provider_accounts.atomgit]
+provider = "openai"
+display_name = "AtomGit"
+[provider_accounts.taotoken]
+provider = "openai"
+[models."atomgit/ds"]
+account = "atomgit"
+model = "deepseek-v4-flash"
+[models."taotoken/ds"]
+account = "taotoken"
+model = "deepseek-v4-flash"
+[models."atomgit/glm"]
+account = "atomgit"
+model = "glm-5.1"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+
+        // Shared name → the owning account's display_name.
+        assert_eq!(
+            cfg.disambiguating_channel_label("atomgit/ds").as_deref(),
+            Some("AtomGit")
+        );
+        // Shared name, account WITHOUT display_name → fall back to the account id.
+        assert_eq!(
+            cfg.disambiguating_channel_label("taotoken/ds").as_deref(),
+            Some("taotoken")
+        );
+        // Unique wire name → no suffix.
+        assert_eq!(cfg.disambiguating_channel_label("atomgit/glm"), None);
+        // Unknown / empty selection → no suffix (never panics).
+        assert_eq!(cfg.disambiguating_channel_label("nope"), None);
+        assert_eq!(cfg.disambiguating_channel_label(""), None);
+    }
+
+    #[test]
+    fn disambiguating_channel_label_handles_legacy_providers() {
+        // Legacy `[providers.*]` with the same model name → the provider key is
+        // the channel label (there is no separate account for legacy entries).
+        let toml = r#"
+default_provider = "AtomGit"
+[providers.AtomGit]
+type = "openai"
+model = "deepseek-v4-flash"
+base_url = "https://a.invalid/v1"
+[providers.TaoToken]
+type = "openai"
+model = "deepseek-v4-flash"
+base_url = "https://b.invalid/v1"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.disambiguating_channel_label("AtomGit").as_deref(),
+            Some("AtomGit")
+        );
+        assert_eq!(
+            cfg.disambiguating_channel_label("TaoToken").as_deref(),
+            Some("TaoToken")
+        );
     }
 
     #[test]

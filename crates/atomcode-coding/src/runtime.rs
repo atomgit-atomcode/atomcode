@@ -186,6 +186,10 @@ pub struct McpToolsSnapshot {
     pub server: String,
     pub status: Option<atomcode_capabilities::mcp::ServerStatus>,
     pub tools: Vec<String>,
+    /// Every configured server key (sorted), so a caller can tell an UNKNOWN key
+    /// (`status == None`) apart from a configured-but-empty one and suggest the
+    /// real names — shell-style "not found → here's what exists".
+    pub available: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3126,8 +3130,17 @@ fn spawn_runtime_owner_with_optional_agent(
                             keep_goal_on_eval = true;
                         }
                         GoalResult::NotMet(verdict) => {
+                            // A round that made ZERO tool calls did nothing but talk. When the
+                            // evaluator ALSO judges the goal unmet, re-injecting "keep working"
+                            // just spins — usually because the goal isn't a concrete, verifiable
+                            // objective (e.g. an empty/vague goal like "需要"). Stop after
+                            // MAX_STALLED_ROUNDS such rounds instead of burning every round up to
+                            // max_rounds.
+                            let made_progress = held_turn
+                                .as_ref()
+                                .map(|(_, _, _, stats)| stats.tool_call_count > 0)
+                                .unwrap_or(false);
                             if let Some(state) = goal.as_mut() {
-                                state.round = state.round.saturating_add(1);
                                 state.last_reason = Some(verdict.clone());
                                 if let Some((_, _, snapshot, _)) = held_turn.as_ref() {
                                     state.update_progress_recap(summarize_for_goal(
@@ -3135,9 +3148,24 @@ fn spawn_runtime_owner_with_optional_agent(
                                         Some(&verdict),
                                     ));
                                 }
-                                continuation =
-                                    Some(goal_continuation_message(&verdict, &state.condition));
-                                let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                if state.note_not_met(made_progress) {
+                                    // Terminal stall — finish WITHOUT bumping `round` (mirrors the
+                                    // Inconclusive/Error arms; the stalled round isn't a new run).
+                                    let note = format!(
+                                        "stopped: no tool calls for {} consecutive rounds and the goal is still unmet — it likely isn't a concrete, verifiable objective. Give a specific goal and run /loop again.",
+                                        state.no_progress
+                                    );
+                                    state.finish(GoalTerminal::Stopped, note.clone());
+                                    finish_reason = Some(StopReason::Stopped);
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::ControllerWarning(format!("goal {note}")));
+                                } else {
+                                    // A new round begins — count it, then re-inject continuation.
+                                    state.round = state.round.saturating_add(1);
+                                    continuation =
+                                        Some(goal_continuation_message(&verdict, &state.condition));
+                                    let _ = runtime_event_tx.send(CodingRuntimeEvent::GoalChanged(state.progress()));
+                                }
                             }
                         }
                         GoalResult::Inconclusive(reason) => {
@@ -4213,17 +4241,19 @@ fn spawn_runtime_owner_with_optional_agent(
                             continue;
                         };
                         let tools = runtime.parts.mcp_tools_for_server(&server);
-                        let status = runtime
-                            .parts
-                            .mcp_statuses()
-                            .await
-                            .into_iter()
-                            .find_map(|(name, status)| (name == server).then_some(status));
+                        let statuses = runtime.parts.mcp_statuses().await;
+                        let status = statuses
+                            .iter()
+                            .find_map(|(name, status)| (*name == server).then(|| status.clone()));
+                        let mut available: Vec<String> =
+                            statuses.into_iter().map(|(name, _)| name).collect();
+                        available.sort();
                         let _ = done.send(Ok(McpToolsSnapshot {
                             generation: RuntimeGeneration(generation),
                             server,
                             status,
                             tools,
+                            available,
                         }));
                     }
                     Some(CodingRuntimeControl::WithdrawMcpTools {
@@ -5032,7 +5062,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     let _ = done.send(Err(RuntimeError::Busy));
                                     continue;
                                 }
-                                let health_error = native_session_health_error(&runtime);
+                                let health_error = native_session_health_error(&runtime).await;
                                 if error.requires_fail_close() || health_error.is_some() {
                                     let detail = health_error
                                         .as_deref()
@@ -7302,13 +7332,29 @@ fn current_runtime_snapshot(runtime: &RuntimeResources) -> Option<SessionSnapsho
     binding.manager.load_snapshot(&binding.id).ok()
 }
 
-fn native_session_health_error(runtime: &RuntimeResources) -> Option<String> {
-    let binding = runtime.parts.session.as_ref()?;
-    binding
-        .manager
-        .load_native_session(&binding.id)
-        .err()
-        .map(|error| error.to_string())
+async fn native_session_health_error(runtime: &RuntimeResources) -> Option<String> {
+    // Extract cheap owned handles (Arc + String) and END the borrow before awaiting.
+    let (manager, id) = {
+        let binding = runtime.parts.session.as_ref()?;
+        (binding.manager.clone(), binding.id.clone())
+    };
+    // `load_native_session` takes an OS meta-lock and can `thread::sleep`-poll for up to
+    // 10s under cross-process contention (session/manager `acquire_file_lock_until`). Run
+    // it on the BLOCKING pool so it never stalls this tokio worker — and every other task
+    // scheduled on it — during the fail-close error path.
+    match tokio::task::spawn_blocking(move || {
+        manager
+            .load_native_session(&id)
+            .err()
+            .map(|error| error.to_string())
+    })
+    .await
+    {
+        Ok(health) => health,
+        // The probe panicked on the blocking pool — treat as a health failure so the
+        // caller fail-closes rather than proceeding past an unverified session.
+        Err(_join) => Some("native session health probe panicked".to_string()),
+    }
 }
 
 struct RuntimeUndoPlan {
@@ -14137,7 +14183,10 @@ mod tests {
         assert!(catalog
             .code_unavailable
             .as_deref()
-            .is_some_and(|reason| reason.contains("temporarily disabled")));
+            // "off by default" is UNIQUE to the disabled reason; the
+            // opted-in-setup-failed error also mentions ATOMCODE_CODE_REWIND, so
+            // that substring can't prove we're in the disabled state.
+            .is_some_and(|reason| reason.contains("off by default")));
 
         let code_error = runtime
             .handle

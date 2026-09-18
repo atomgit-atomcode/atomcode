@@ -20,6 +20,9 @@ url = "2"
 atomcode-config = { path = "../atomcode-config" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 atomcode-codingplan-crypto = { path = "../atomcode-codingplan-crypto", optional = true }
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
 
 [features]
 default = []

@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 
 pub mod gateway_crypto;
 pub mod oauth;
+pub mod openrouter;
 
 pub use oauth::*;
 

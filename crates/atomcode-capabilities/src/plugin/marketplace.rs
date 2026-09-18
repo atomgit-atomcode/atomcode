@@ -351,7 +351,7 @@ pub(super) fn auth_retry_args(url: &str) -> Option<[String; 2]> {
 /// - trusted host + not logged in → /login (auto-creds) or SSH.
 /// `verb` is 克隆 / 更新. Shared by clone + pull so the wording can't drift.
 fn auth_required_message(verb: &str, url: &str, stderr: &str) -> String {
-    let stderr = stderr.trim();
+    let stderr = summarize_git_stderr(stderr);
     if !super::url::host_is_trusted(url) {
         return format!(
             "{verb}失败：该仓库需要认证（私有仓库）。请改用 SSH 地址（git@…）\
@@ -404,12 +404,12 @@ pub(super) fn clone_with_optional_auth(
             bail!(
                 "克隆失败：使用已登录凭证仍无法访问该私有仓库（可能无权限或登录已过期，\
                  可 /login 重新登录后重试）。\n原始错误：{}",
-                String::from_utf8_lossy(&out2.stderr).trim()
+                summarize_git_stderr(&String::from_utf8_lossy(&out2.stderr))
             );
         }
         bail!("{}", auth_required_message("克隆", url, &stderr));
     }
-    bail!("git clone failed: {}", stderr);
+    bail!("git clone failed: {}", summarize_git_stderr(&stderr));
 }
 
 /// `git pull --ff-only` in `repo`, anonymously first; on auth failure for a
@@ -440,12 +440,12 @@ pub(super) fn git_pull_ff(repo: &Path, source_url: &str) -> Result<()> {
             bail!(
                 "更新失败：使用已登录凭证仍无法访问（无权限或登录已过期，可 /login 重新登录）。\
                  \n原始错误：{}",
-                String::from_utf8_lossy(&out2.stderr).trim()
+                summarize_git_stderr(&String::from_utf8_lossy(&out2.stderr))
             );
         }
         bail!("{}", auth_required_message("更新", source_url, &stderr));
     }
-    bail!("git pull failed: {}", stderr);
+    bail!("git pull failed: {}", summarize_git_stderr(&stderr));
 }
 
 /// True when `git`'s stderr indicates it failed because it needed interactive
@@ -455,6 +455,89 @@ fn is_git_auth_failure(stderr: &str) -> bool {
         || stderr.contains("could not read Username")
         || stderr.contains("could not read Password")
         || stderr.contains("Authentication failed")
+}
+
+/// Collapse `git`'s raw stderr into a short, readable summary for
+/// user-facing messages. `git clone`/`pull` failures print progress banners
+/// (`remote: Enumerating objects…`, `Counting objects…`) and very long
+/// one-line `fatal:` diagnostics; dumping the whole blob into the TUI
+/// warning makes it wrap into unreadable fragments (issue #1368). Progress
+/// lines are dropped, the meaningful lines (fatal/error/auth) are kept in
+/// order, and each is capped so the message stays on a couple of terminal
+/// lines. Key failure info (auth failures, network errors) is preserved.
+fn summarize_git_stderr(stderr: &str) -> String {
+    const MAX_KEPT_LINES: usize = 3;
+    const MAX_LINE_CHARS: usize = 160;
+
+    // Split on BOTH '\n' and a bare '\r': git overwrites in-place progress with a
+    // carriage return, so "Receiving objects: …\rfatal: …" is a SINGLE `str::lines()`
+    // line whose `starts_with` matches the progress marker — which would drop the
+    // appended `fatal:` along with the noise. Splitting on '\r' too keeps them apart.
+    // ('\r\n' yields an empty middle segment, dropped by the `is_empty` filter.)
+    let meaningful: Vec<&str> = stderr
+        .split(|c| c == '\n' || c == '\r')
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !is_git_progress_line(t))
+        .collect();
+
+    if meaningful.is_empty() {
+        return "git 未返回错误详情".to_string();
+    }
+
+    // The `fatal:` line is git's actual root cause and is usually printed LAST, after
+    // an `error:`/`remote:` preamble. When there are more meaningful lines than we
+    // keep, a naive "first N" would push that fatal out and leave only the preamble.
+    // So anchor on the LAST `fatal:` (or the last line if none) and always keep it,
+    // filling the remaining slots with the leading context lines — in source order.
+    let root = meaningful
+        .iter()
+        .rposition(|l| l.starts_with("fatal:") || l.starts_with("remote: fatal:"))
+        .unwrap_or(meaningful.len() - 1);
+
+    let mut idxs: Vec<usize> = (0..meaningful.len().min(MAX_KEPT_LINES)).collect();
+    if !idxs.contains(&root) {
+        idxs.pop(); // drop the last leading line to make room for the root cause
+        idxs.push(root);
+        idxs.sort_unstable();
+    }
+    idxs.into_iter()
+        .map(|i| truncate_line(meaningful[i], MAX_LINE_CHARS))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// True for `git` progress/statistics banners that carry no failure
+/// information (both the local and the `remote:`-prefixed variants).
+fn is_git_progress_line(line: &str) -> bool {
+    const PROGRESS_MARKERS: &[&str] = &[
+        "Enumerating objects",
+        "Counting objects",
+        "Compressing objects",
+        "Receiving objects",
+        "Resolving deltas",
+        "Unpacking objects",
+        "Updating files",
+        "Total ",
+    ];
+    let body = line.strip_prefix("remote: ").unwrap_or(line);
+    PROGRESS_MARKERS.iter().any(|m| body.starts_with(m))
+}
+
+/// Cap a single line to `max_chars` display characters. Keeps both the head
+/// (which holds `fatal: … 'URL'`) and the tail (the actual reason, which git
+/// prints AFTER the URL) with a `…` in the middle, so a root cause that sits
+/// past a very long URL still survives truncation.
+fn truncate_line(line: &str, max_chars: usize) -> String {
+    let count = line.chars().count();
+    if count <= max_chars {
+        return line.to_string();
+    }
+    let head = max_chars * 3 / 4;
+    let tail = max_chars - head - 1; // room for the ellipsis
+    let mut s: String = line.chars().take(head).collect();
+    s.push('…');
+    s.extend(line.chars().skip(count - tail));
+    s
 }
 
 pub(super) fn git_clone(url: &str, target: &Path) -> Result<()> {
@@ -478,6 +561,45 @@ fn git_rev_parse(repo: &Path) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Parse `git ls-remote <url> HEAD` stdout → the SHA that HEAD points to.
+///
+/// Output is one ref per line, `"<sha>\t<refname>"`. We want the `HEAD` line
+/// specifically. Returns `None` when there's no HEAD line (caller then falls
+/// back to a real `git pull` rather than guessing off some other ref).
+fn parse_ls_remote_head(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        let mut cols = line.split_whitespace();
+        let sha = match cols.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        if cols.next() == Some("HEAD") {
+            return Some(sha.to_string());
+        }
+    }
+    None
+}
+
+/// Cheap network probe: the SHA the remote's HEAD points at, WITHOUT fetching
+/// any objects. This is ONE `git ls-remote` process rather than the whole
+/// `git pull` tree (fetch → git-remote-https → credential helper) — so the
+/// once-a-day auto-refresh can skip pulling marketplaces that haven't moved.
+fn git_ls_remote_head(url: &str) -> Result<String> {
+    let git = find_git()?;
+    let out = git_command(&git)
+        .args(["ls-remote", url, "HEAD"])
+        .output()
+        .context("spawn git ls-remote")?;
+    if !out.status.success() {
+        bail!(
+            "git ls-remote failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    parse_ls_remote_head(&String::from_utf8_lossy(&out.stdout))
+        .ok_or_else(|| anyhow!("git ls-remote returned no HEAD sha"))
 }
 
 fn now_rfc3339() -> String {
@@ -525,7 +647,23 @@ pub fn update_marketplace(name: &str) -> Result<MarketplaceInfo> {
         git_clone(&entry.source, &target)
             .with_context(|| format!("re-clone marketplace `{}`", name))?;
     } else {
-        git_pull_ff(&target, &entry.source)?;
+        // Cheap remote check first: if the remote HEAD already matches the SHA
+        // we recorded last time, nothing upstream changed — return early and
+        // skip the heavy `git pull` process tree (fetch → git-remote-https →
+        // credential helper). That per-startup burst is what trips Windows AV
+        // heuristics. On any ls-remote error, or a moved HEAD, fall through to
+        // a real pull so we never miss a genuine update.
+        match git_ls_remote_head(&entry.source) {
+            Ok(remote_sha) if remote_sha == entry.git_commit => {
+                return Ok(MarketplaceInfo {
+                    name: name.to_string(),
+                    source: entry.source.clone(),
+                    git_commit: entry.git_commit.clone(),
+                    plugins: entry.plugins.clone(),
+                });
+            }
+            _ => git_pull_ff(&target, &entry.source)?,
+        }
     }
     let commit = git_rev_parse(&target)?;
     let manifest = load_marketplace_manifest(&target)?;
@@ -648,6 +786,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_ls_remote_head_extracts_sha() {
+        assert_eq!(
+            parse_ls_remote_head("abc123def\tHEAD\n").as_deref(),
+            Some("abc123def")
+        );
+    }
+
+    #[test]
+    fn parse_ls_remote_head_picks_head_among_refs() {
+        // `git ls-remote <url> HEAD` yields the HEAD line; be robust if extra
+        // ref lines ever appear — pick HEAD, not the first line blindly.
+        let out = "aaa111\tHEAD\nbbb222\trefs/heads/main\n";
+        assert_eq!(parse_ls_remote_head(out).as_deref(), Some("aaa111"));
+    }
+
+    #[test]
+    fn parse_ls_remote_head_none_when_no_head_line() {
+        // No HEAD → None → caller falls back to a real `git pull` (safe).
+        assert_eq!(parse_ls_remote_head(""), None);
+        assert_eq!(parse_ls_remote_head("bbb222\trefs/heads/main\n"), None);
+        assert_eq!(parse_ls_remote_head("garbage\n"), None);
+    }
+
+    #[test]
     fn git_command_runs_noninteractively() {
         // The whole point of git_command: git must never open the tty for a
         // credential prompt — that deadlocks the raw-mode TUI (the private-repo
@@ -683,6 +845,200 @@ mod tests {
         assert!(!is_git_auth_failure(
             "fatal: unable to access 'https://x/y': Could not resolve host"
         ));
+    }
+
+    #[test]
+    fn summarize_git_stderr_keeps_fatal_and_drops_progress() {
+        // A realistic failed clone: progress banners plus the real fatal line.
+        // The summary must keep the failure and drop the progress noise.
+        let stderr = "\
+Cloning into 'x'...\n\
+remote: Enumerating objects: 12, done.\n\
+remote: Counting objects: 100% (12/12), done.\n\
+remote: Compressing objects: 100% (6/6), done.\n\
+remote: Total 12 (delta 3), reused 0\n\
+fatal: unable to access 'https://atomgit.com/x/y.git/': Failed to connect to atomgit.com port 443\n";
+        let s = summarize_git_stderr(stderr);
+        assert!(
+            s.contains("fatal: unable to access"),
+            "fatal line must survive: {s:?}"
+        );
+        assert!(s.contains("port 443"), "key detail kept: {s:?}");
+        assert!(!s.contains("Enumerating objects"), "{s:?}");
+        assert!(!s.contains("Counting objects"), "{s:?}");
+        assert!(!s.contains("Compressing objects"), "{s:?}");
+        assert!(!s.contains("remote: Total"), "{s:?}");
+    }
+
+    #[test]
+    fn summarize_git_stderr_keeps_auth_lines() {
+        // The `remote: HTTP Basic: Access denied` banner is meaningful (not a
+        // progress line) and must survive next to the fatal auth line.
+        let stderr =
+            "remote: HTTP Basic: Access denied\nfatal: Authentication failed for 'https://x/y'\n";
+        let s = summarize_git_stderr(stderr);
+        assert!(s.contains("Access denied"), "{s:?}");
+        assert!(s.contains("Authentication failed"), "{s:?}");
+    }
+
+    #[test]
+    fn summarize_git_stderr_truncates_long_lines() {
+        let long = format!("fatal: {}", "x".repeat(400));
+        let s = summarize_git_stderr(&long);
+        assert_eq!(s.chars().count(), 160, "capped at MAX_LINE_CHARS");
+        assert!(s.contains('…'), "truncated line has ellipsis: {s:?}");
+        // Head (the `fatal:` marker) and tail (the reason after a very long
+        // URL) both survive middle-ellipsis truncation.
+        let url_with_reason = format!(
+            "fatal: unable to access '{}': Couldn't connect to server",
+            "x".repeat(220)
+        );
+        let s2 = summarize_git_stderr(&url_with_reason);
+        assert!(s2.starts_with("fatal: unable"), "head kept: {s2:?}");
+        assert!(
+            s2.contains("Couldn't connect to server"),
+            "tail/root cause kept: {s2:?}"
+        );
+    }
+
+    #[test]
+    fn summarize_git_stderr_preserves_real_root_causes() {
+        // Real-world git failure stderr samples. Each keeps enough of the
+        // root cause for the user to act on it; progress noise is dropped.
+        let cases: &[(&str, &str)] = &[
+            (
+                "Authentication failed",
+                "fatal: Authentication failed for 'https://atomgit.com/x/y.git/'\n",
+            ),
+            (
+                "Permission denied",
+                "git@github.com: Permission denied (publickey).\n\
+                 fatal: Could not read from remote repository.\n\
+                 Please make sure you have the correct access rights\n",
+            ),
+            (
+                "Could not resolve host",
+                "fatal: unable to access 'https://atomgit.com/x/y.git/': \
+                 Could not resolve host: atomgit.com\n",
+            ),
+            (
+                "Couldn't connect to server",
+                "fatal: unable to access 'https://atomgit.com/x/y.git/': \
+                 Failed to connect to atomgit.com port 443 after 21048 ms: \
+                 Couldn't connect to server\n",
+            ),
+            (
+                "Connection refused",
+                "fatal: unable to access 'https://atomgit.com/x/y.git/': \
+                 Connection refused\n",
+            ),
+            (
+                "SSL certificate problem",
+                "fatal: unable to access 'https://atomgit.com/x/y.git/': \
+                 SSL certificate problem: unable to get local issuer certificate\n",
+            ),
+            (
+                "not found",
+                "remote: Repository not found.\n\
+                 fatal: repository 'https://atomgit.com/x/y.git/' not found\n",
+            ),
+            (
+                "Host key verification failed",
+                "Host key verification failed.\nfatal: Could not read from remote repository.\n",
+            ),
+            ("", ""),
+        ];
+        for (needle, stderr) in cases {
+            let s = summarize_git_stderr(stderr);
+            if needle.is_empty() {
+                assert_eq!(s, "git 未返回错误详情", "empty stderr case");
+            } else {
+                assert!(
+                    s.contains(needle),
+                    "root cause `{needle}` lost from {stderr:?}: {s:?}"
+                );
+            }
+        }
+        // 大量 progress + 一个 fatal root cause：噪音丢弃，根因保留。
+        let noisy = "\
+remote: Enumerating objects: 512, done.\n\
+remote: Counting objects: 100% (512/512), done.\n\
+remote: Compressing objects: 100% (256/256), done.\n\
+remote: Total 512 (delta 128), reused 0\n\
+fatal: unable to access 'https://atomgit.com/x/y.git/': \
+Failed to connect to atomgit.com port 443 after 21048 ms: Couldn't connect to server\n";
+        let s = summarize_git_stderr(noisy);
+        assert!(s.contains("fatal: unable to access"), "{s:?}");
+        assert!(s.contains("port 443"), "{s:?}");
+        assert!(!s.contains("Enumerating"), "{s:?}");
+        assert!(!s.contains("Counting"), "{s:?}");
+    }
+
+    #[test]
+    fn summarize_git_stderr_caps_kept_lines() {
+        let stderr = (1..=10)
+            .map(|i| format!("error line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let s = summarize_git_stderr(&stderr);
+        assert_eq!(s.matches("error line").count(), 3, "{s:?}");
+    }
+
+    #[test]
+    fn summarize_git_stderr_keeps_fatal_past_the_line_cap() {
+        // A network-interrupted clone prints several `error:`/`fetch-pack:` lines
+        // BEFORE the real `fatal:` root cause. Keeping the naive first-3 would drop
+        // the fatal; the summary must still carry it (issue #1368 follow-up).
+        let stderr = "\
+error: RPC failed; curl 56 Receive error: Connection reset by peer\n\
+error: 1234 bytes of body are still expected\n\
+fetch-pack: unexpected disconnect while reading sideband packet\n\
+fatal: early EOF\n\
+fatal: fetch-pack: invalid index-pack output\n";
+        let s = summarize_git_stderr(stderr);
+        // The root-cause fatal (git prints it LAST) survives the 3-line cap...
+        assert!(
+            s.contains("fatal: fetch-pack: invalid index-pack output"),
+            "the last fatal (root cause) must survive the 3-line cap: {s:?}"
+        );
+        // ...alongside the two LEADING context lines...
+        assert!(s.contains("RPC failed"), "leading context kept: {s:?}");
+        assert!(s.contains("1234 bytes"), "leading context kept: {s:?}");
+        // ...while the middle lines that didn't fit the 3-line budget are dropped
+        // (can't split on "; " to count — a kept line has its own internal "; ").
+        assert!(
+            !s.contains("unexpected disconnect"),
+            "middle line dropped: {s:?}"
+        );
+        assert!(!s.contains("early EOF"), "middle line dropped: {s:?}");
+    }
+
+    #[test]
+    fn summarize_git_stderr_splits_bare_cr_progress_from_fatal() {
+        // git overwrites in-place progress with a bare '\r'; `str::lines()` does NOT
+        // split on lone '\r', so the fatal appended after the last progress refresh
+        // would be dropped WITH the progress. Splitting on '\r' keeps the fatal.
+        let stderr = "Receiving objects:  50% (256/512)\rfatal: early EOF\n";
+        let s = summarize_git_stderr(stderr);
+        assert!(
+            s.contains("fatal: early EOF"),
+            "fatal after \\r must survive: {s:?}"
+        );
+        assert!(
+            !s.contains("Receiving objects"),
+            "the \\r-prefixed progress must still be dropped: {s:?}"
+        );
+    }
+
+    #[test]
+    fn summarize_git_stderr_empty_stderr_returns_placeholder() {
+        assert_eq!(summarize_git_stderr(""), "git 未返回错误详情");
+        // Whitespace-only and progress-only stderr also fall back.
+        assert_eq!(summarize_git_stderr("  \n\t\n"), "git 未返回错误详情");
+        assert_eq!(
+            summarize_git_stderr("remote: Enumerating objects: 3, done.\n"),
+            "git 未返回错误详情"
+        );
     }
 
     #[test]

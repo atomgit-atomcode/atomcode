@@ -7,6 +7,16 @@ const DEFAULT_CHAR_LIMIT: usize = 4000;
 
 pub struct MemoryStore {
     path: PathBuf,
+    /// Marks the machine-local store: `append` drops a wildcard-only `.gitignore`
+    /// sentinel into the store's directory on first write, so machine-specific entries
+    /// never reach version control — parity with the capabilities-side store. This copy
+    /// stays dependency-free (no `ignore`-crate gitignore-semantics check) to keep this
+    /// foundational config leaf light; it may therefore write a harmless redundant
+    /// sentinel in a repo whose root `.gitignore` already covers `.atomcode/local/`
+    /// (the capabilities store skips that). The daemon only reads/forgets local memory
+    /// today, so that divergence is not currently observable — the field exists so a
+    /// FUTURE write through this store can never create an unprotected file.
+    local: bool,
 }
 
 /// Resolve the project-scope memory file. `override_dir` = the value of
@@ -14,13 +24,41 @@ pub struct MemoryStore {
 /// nests under `project_root`; an absolute value is used as-is (std `Path::join`
 /// semantics). `memory.md` is appended in either case.
 fn project_memory_path(project_root: &Path, override_dir: Option<&str>) -> PathBuf {
-    let dir = override_dir.filter(|s| !s.is_empty()).unwrap_or(".atomcode");
+    let dir = override_dir
+        .filter(|s| !s.is_empty())
+        .unwrap_or(".atomcode");
     project_root.join(dir).join("memory.md")
+}
+
+/// Resolve the machine-local, project-scoped memory file. `override_dir` = the value of
+/// `ATOMCODE_LOCAL_MEMORY_DIR` (None/empty → default ".atomcode/local"). A relative value
+/// nests under `project_root`; an absolute value is used as-is — the same path-join
+/// semantics as `project_memory_path`. `memory.md` is appended in either case.
+fn local_memory_path(project_root: &Path, override_dir: Option<&str>) -> PathBuf {
+    let dir = override_dir
+        .filter(|s| !s.is_empty())
+        .unwrap_or(".atomcode/local");
+    project_root.join(dir).join("memory.md")
+}
+
+/// Drop a wildcard-only `.gitignore` next to a machine-local store so its entries never
+/// reach version control — even in repos where `atomcode setup` never appended the
+/// repo-root marker. Never clobbers an existing `.gitignore`. Propagates a genuine write
+/// failure: for a local store, "couldn't protect" must surface rather than silently leave
+/// the memory committable.
+fn ensure_gitignore_sentinel(store_path: &Path) -> io::Result<()> {
+    if let Some(dir) = store_path.parent() {
+        let sentinel = dir.join(".gitignore");
+        if !sentinel.exists() {
+            fs::write(sentinel, "*\n")?;
+        }
+    }
+    Ok(())
 }
 
 impl MemoryStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, local: false }
     }
 
     pub fn global() -> Self {
@@ -33,6 +71,18 @@ impl MemoryStore {
     pub fn project(project_root: &Path) -> Self {
         let override_dir = std::env::var("ATOMCODE_PROJECT_MEMORY_DIR").ok();
         Self::new(project_memory_path(project_root, override_dir.as_deref()))
+    }
+
+    /// Machine-local, project-scoped store. Honors `ATOMCODE_LOCAL_MEMORY_DIR` (host
+    /// rebrand parity with the project scope's `ATOMCODE_PROJECT_MEMORY_DIR`); default
+    /// `.atomcode/local` is unchanged. Best home for facts unique to this machine that
+    /// should not be committed (`.atomcode/local/` is gitignored).
+    pub fn local(project_root: &Path) -> Self {
+        let override_dir = std::env::var("ATOMCODE_LOCAL_MEMORY_DIR").ok();
+        Self {
+            path: local_memory_path(project_root, override_dir.as_deref()),
+            local: true,
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -74,6 +124,9 @@ impl MemoryStore {
     pub fn append(&self, content: &str) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
+        }
+        if self.local {
+            ensure_gitignore_sentinel(&self.path)?;
         }
 
         // Read existing content to check if we need a leading newline
@@ -128,12 +181,14 @@ impl MemoryStore {
     pub fn merged_for_prompt(
         global: &MemoryStore,
         project: &MemoryStore,
+        local: &MemoryStore,
         project_name: &str,
     ) -> String {
         let global_entries = global.load();
         let project_entries = project.load();
+        let local_entries = local.load();
 
-        if global_entries.is_empty() && project_entries.is_empty() {
+        if global_entries.is_empty() && project_entries.is_empty() && local_entries.is_empty() {
             return String::new();
         }
 
@@ -151,6 +206,13 @@ impl MemoryStore {
         if !project_entries.is_empty() {
             result.push_str(&format!("\n[Project: {}]\n", project_name));
             for entry in &project_entries {
+                result.push_str(&format!("- {}\n", entry));
+            }
+        }
+
+        if !local_entries.is_empty() {
+            result.push_str("\n[Local]\n");
+            for entry in &local_entries {
                 result.push_str(&format!("- {}\n", entry));
             }
         }
@@ -257,6 +319,61 @@ mod tests {
     }
 
     #[test]
+    fn local_memory_path_resolves_override() {
+        use std::path::Path;
+        let root = Path::new("/proj");
+        assert_eq!(
+            super::local_memory_path(root, None),
+            Path::new("/proj/.atomcode/local/memory.md")
+        );
+        assert_eq!(
+            super::local_memory_path(root, Some("")),
+            Path::new("/proj/.atomcode/local/memory.md")
+        );
+        assert_eq!(
+            super::local_memory_path(root, Some(".myapp/local")),
+            Path::new("/proj/.myapp/local/memory.md")
+        );
+        assert_eq!(
+            super::local_memory_path(root, Some("/opt/brand/mem")),
+            Path::new("/opt/brand/mem/memory.md")
+        );
+    }
+
+    #[test]
+    fn local_append_writes_gitignore_sentinel() {
+        // Parity with the capabilities store: a local write must protect itself with a
+        // wildcard `.gitignore` so machine-specific memory never reaches version control,
+        // even if the store is created through the daemon's copy.
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::local(dir.path());
+        store.append("machine only").unwrap();
+        let sentinel = store.path().parent().unwrap().join(".gitignore");
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "*\n");
+        // Idempotent: an existing (possibly user-customized) sentinel is never clobbered.
+        fs::write(&sentinel, "# custom\n").unwrap();
+        store.append("more").unwrap();
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "# custom\n");
+    }
+
+    #[test]
+    fn non_local_append_writes_no_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        MemoryStore::project(dir.path())
+            .append("committed fact")
+            .unwrap();
+        let sentinel = MemoryStore::project(dir.path())
+            .path()
+            .parent()
+            .unwrap()
+            .join(".gitignore");
+        assert!(
+            !sentinel.exists(),
+            "project/global stores must not grow a gitignore sentinel"
+        );
+    }
+
+    #[test]
     fn test_merged_for_prompt_truncation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("memory.md");
@@ -264,8 +381,39 @@ mod tests {
         fs::write(&path, format!("- {}\n", long_entry)).unwrap();
         let store = MemoryStore::new(path);
         let empty = MemoryStore::new(PathBuf::from("/none"));
-        let result = MemoryStore::merged_for_prompt(&store, &empty, "p");
+        let result = MemoryStore::merged_for_prompt(&store, &empty, &empty, "p");
         assert!(result.contains("[...truncated"));
         assert!(result.chars().count() < 5000);
+    }
+
+    #[test]
+    fn test_merged_for_prompt_three_tiers_ordered_and_omitted_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let new_store = |name: &str, entry: Option<&str>| {
+            let s = MemoryStore::new(dir.path().join(name));
+            if let Some(e) = entry {
+                s.append(e).unwrap();
+            }
+            s
+        };
+        let g = new_store("g.md", Some("g1"));
+        let p = new_store("p.md", Some("p1"));
+        let l = new_store("l.md", Some("l1"));
+
+        // All three tiers present, in order.
+        let merged = MemoryStore::merged_for_prompt(&g, &p, &l, "myproj");
+        let g_pos = merged.find("[Global]\n- g1").unwrap();
+        let p_pos = merged.find("[Project: myproj]\n- p1").unwrap();
+        let l_pos = merged.find("[Local]\n- l1").unwrap();
+        assert!(g_pos < p_pos && p_pos < l_pos);
+
+        // Local empty → `[Local]` section omitted; global/project still present.
+        let empty = new_store("empty.md", None);
+        let merged2 = MemoryStore::merged_for_prompt(&g, &p, &empty, "myproj");
+        assert!(merged2.contains("[Global]") && merged2.contains("[Project: myproj]"));
+        assert!(!merged2.contains("[Local]"));
+
+        // All empty → empty string.
+        assert!(MemoryStore::merged_for_prompt(&empty, &empty, &empty, "myproj").is_empty());
     }
 }

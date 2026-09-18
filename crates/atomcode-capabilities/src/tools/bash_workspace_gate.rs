@@ -20,7 +20,7 @@
 //! | destructive, all targets IN workspace | `Proceed` (unchanged: single-file rm stays Safe→runs; recursive rm still Risky→ApprovalMiddleware) |
 //! | destructive, target is SENSITIVE (any location) | prompt EVERY time, never remembered |
 //! | destructive, target OUT of workspace | prompt; "Always" grants PER canonical directory |
-//! | destructive but targets UNRESOLVABLE (`cd`-then-relative, `$()`, unexpanded `$var`, no clean target) | prompt EVERY time, never remembered (fail-closed) |
+//! | destructive but targets UNRESOLVABLE (`cd`-then-relative, `$()`, unexpanded `$var`, no clean target) | prompt (fail-closed: we cannot prove it stays in-workspace); "Always" IS remembered for the session |
 //!
 //! Mode independence: this gate is about WORKSPACE SCOPE, not edit-accept, so it fires
 //! regardless of the accept-edits flag. In full `Auto` (免审批) mode the driver auto-answers
@@ -46,9 +46,10 @@ use serde::Deserialize;
 
 use super::approval::{
     ApprovalRequest, InMemoryPermissionStore, PermissionDecision, PermissionStore, APPROVAL_KIND,
+    BASH_ALLOW_ALL_KEY,
 };
 use super::resolve_path;
-use super::sensitive_path::path_is_sensitive;
+use super::sensitive_path::{path_is_sensitive, references_sensitive_path};
 use super::write_approval::{canonical_dir_key, path_in_temp_dir, path_in_workspace};
 
 /// A token that contains an unexpanded shell expansion (`$var`, `$(...)`, backtick) whose value —
@@ -670,6 +671,10 @@ pub(crate) fn scan_destructive_bash(command: &str) -> BashScan {
 /// cwd handle).
 pub struct BashWorkspaceGate {
     store: Arc<dyn PermissionStore>,
+    /// Shared session-scoped "allow all Bash" store. If `BASH_ALLOW_ALL_KEY` is granted here,
+    /// any non-sensitive destructive bash is allowed without a round-trip. Sensitive targets
+    /// bypass this check and always go through `prompt_unremembered`.
+    allow_all: Arc<dyn PermissionStore>,
     /// LIVE working dir — the same handle the kernel reads per call, so a `/cd` moves the
     /// in-workspace boundary with it. Grant keys are canonicalized to ABSOLUTE paths, so a
     /// remembered out-of-workspace grant survives a `/cd`.
@@ -680,8 +685,10 @@ pub struct BashWorkspaceGate {
 impl BashWorkspaceGate {
     /// Gate over the LIVE (mutable) working dir handle.
     pub fn new(cwd: Arc<RwLock<PathBuf>>) -> Self {
+        let store: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
         Self {
-            store: Arc::new(InMemoryPermissionStore::new()),
+            allow_all: Arc::new(InMemoryPermissionStore::new()),
+            store,
             cwd,
             kind: APPROVAL_KIND.to_string(),
         }
@@ -695,6 +702,23 @@ impl BashWorkspaceGate {
     /// Use a caller-supplied grant store (tests).
     pub fn with_store(cwd: Arc<RwLock<PathBuf>>, store: Arc<dyn PermissionStore>) -> Self {
         Self {
+            allow_all: Arc::new(InMemoryPermissionStore::new()),
+            store,
+            cwd,
+            kind: APPROVAL_KIND.to_string(),
+        }
+    }
+
+    /// Use a caller-supplied per-target store AND a shared session-scoped allow-all store.
+    /// When the allow-all store holds [`BASH_ALLOW_ALL_KEY`], any non-sensitive out-of-workspace
+    /// destructive bash is allowed without a round-trip.
+    pub fn with_allow_all_store(
+        cwd: Arc<RwLock<PathBuf>>,
+        store: Arc<dyn PermissionStore>,
+        allow_all: Arc<dyn PermissionStore>,
+    ) -> Self {
+        Self {
+            allow_all,
             store,
             cwd,
             kind: APPROVAL_KIND.to_string(),
@@ -709,27 +733,115 @@ impl BashWorkspaceGate {
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
     ) -> PermissionDecision {
+        self.prompt_with_reason(
+            call,
+            tool,
+            rt,
+            Some("此命令会写到工作区外 — 需要单独确认。".into()),
+        )
+        .await
+    }
+
+    /// Round-trip the driver with an explicit reason string.
+    async fn prompt_with_reason(
+        &self,
+        call: &ToolCall,
+        tool: &Arc<dyn Tool>,
+        rt: &RequestCtx,
+        reason: Option<String>,
+    ) -> PermissionDecision {
         let payload = serde_json::to_value(ApprovalRequest {
             call_id: call.id.clone(),
             tool: tool.name().to_string(),
             args: call.arguments.clone(),
+            reason,
         })
         .unwrap_or(serde_json::Value::Null);
         PermissionDecision::from_value(&rt.request(&self.kind, payload).await)
     }
 
-    /// Prompt and NEVER remember it — every call re-prompts (used for sensitive targets and for
-    /// unresolvable destructive commands). Both allow-once and allow-always proceed without storing.
+    /// Prompt and NEVER remember it — every call re-prompts. Reserved for SENSITIVE targets:
+    /// no answer to one prompt may pre-approve a later secret access. Both allow-once,
+    /// allow-always, and allow-always-all proceed without storing — the sensitive floor must
+    /// NEVER be weakened to blanket-allow, so AllowAlwaysAll is treated like AllowOnce here.
     async fn prompt_unremembered(
         &self,
         call: &ToolCall,
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
     ) -> BeforeOutcome {
-        match self.prompt(call, tool, rt).await {
-            PermissionDecision::AllowOnce | PermissionDecision::AllowAlways => {
+        let reason = Some("此命令触及敏感路径 — 每次都需确认(不会记住)。".into());
+        match self.prompt_with_reason(call, tool, rt, reason).await {
+            PermissionDecision::AllowOnce
+            | PermissionDecision::AllowAlways
+            | PermissionDecision::AllowAlwaysAll => BeforeOutcome::Allow {
+                reason: Some("destructive bash approved (not remembered)".into()),
+            },
+            PermissionDecision::Deny => BeforeOutcome::deny(
+                "a destructive bash command needs approval and was denied".to_string(),
+            ),
+        }
+    }
+
+    /// A destructive command whose TARGET cannot be resolved statically (`cd`-then-relative,
+    /// `$(...)`, an unexpanded `$var`, no clean operand). The call still needs approval — we
+    /// cannot prove it stays in the workspace — but the ANSWER is now remembered.
+    ///
+    /// It used to route through [`prompt_unremembered`](Self::prompt_unremembered), which made
+    /// the approval panel's "Always" a literal no-op for this whole class: a
+    /// `cd '/some/dir' && python3 x.py > out.json` re-prompted on every single call no matter
+    /// what the user picked. That is the reported "点了总是允许，bash 还是每次都问". Fail-closed
+    /// applies to whether we ASK, not to whether we honour the answer.
+    ///
+    /// The grant key is [`Tool::always_grant_scope`], the SAME scope the approval panel renders
+    /// its label from, so "Always" means one thing everywhere. Sensitive arguments are routed to
+    /// the unremembered prompt above before we get here — that floor is unchanged.
+    ///
+    /// On `AllowAlwaysAll`, ALSO records the shared session sentinel so the allow-all bypass
+    /// fires on future calls.
+    async fn prompt_unresolvable(
+        &self,
+        call: &ToolCall,
+        tool: &Arc<dyn Tool>,
+        rt: &RequestCtx,
+    ) -> BeforeOutcome {
+        if references_sensitive_path(&call.arguments) {
+            return self.prompt_unremembered(call, tool, rt).await;
+        }
+        // Session-scoped allow-all bypass: if the user already approved "allow all Bash" this
+        // session, an unresolvable-target command is also covered (modulo the sensitive floor
+        // above which MUST remain first). We cannot verify the target is in-workspace, but the
+        // user explicitly opted in to session-wide trust for all destructive bash.
+        if self.allow_all.is_granted(BASH_ALLOW_ALL_KEY) {
+            return BeforeOutcome::Allow {
+                reason: Some("previously approved all bash this session".into()),
+            };
+        }
+        let key = format!(
+            "bash-unresolvable::{}",
+            tool.always_grant_scope(&call.arguments)
+        );
+        if self.store.is_granted(&key) {
+            return BeforeOutcome::Allow {
+                reason: Some("destructive bash previously approved for this session".into()),
+            };
+        }
+        let reason = Some("此命令目标无法确定是否在工作区内 — 仍需单独确认。".into());
+        match self.prompt_with_reason(call, tool, rt, reason).await {
+            PermissionDecision::AllowOnce => BeforeOutcome::Allow {
+                reason: Some("destructive bash approved (this call)".into()),
+            },
+            PermissionDecision::AllowAlways => {
+                self.store.grant(&key);
                 BeforeOutcome::Allow {
-                    reason: Some("destructive bash approved (not remembered)".into()),
+                    reason: Some("destructive bash approved for this session".into()),
+                }
+            }
+            PermissionDecision::AllowAlwaysAll => {
+                self.store.grant(&key);
+                self.allow_all.grant(BASH_ALLOW_ALL_KEY);
+                BeforeOutcome::Allow {
+                    reason: Some("destructive bash approved for this session".into()),
                 }
             }
             PermissionDecision::Deny => BeforeOutcome::deny(
@@ -747,8 +859,8 @@ impl ToolMiddleware for BashWorkspaceGate {
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
     ) -> BeforeOutcome {
-        if tool.name() != "bash" {
-            return BeforeOutcome::Proceed; // not ours
+        if !super::is_command_shell_tool(tool.name()) {
+            return BeforeOutcome::Proceed; // not a command-running shell tool (bash / bash_start)
         }
         let Some(command) = bash_command(&call.arguments) else {
             return BeforeOutcome::Proceed; // unparseable args — bash tool / risk flow handles it
@@ -756,7 +868,7 @@ impl ToolMiddleware for BashWorkspaceGate {
 
         let targets = match scan_destructive_bash(&command) {
             BashScan::NotDestructive => return BeforeOutcome::Proceed,
-            BashScan::Unresolvable => return self.prompt_unremembered(call, tool, rt).await,
+            BashScan::Unresolvable => return self.prompt_unresolvable(call, tool, rt).await,
             BashScan::Targets(t) => t,
         };
 
@@ -777,11 +889,22 @@ impl ToolMiddleware for BashWorkspaceGate {
         // Sensitive TARGET → prompt EVERY time, never remembered (mirror WriteApprovalGate).
         // Classified on the resolved target (not a substring of the whole command) so a benign
         // command that merely MENTIONS a secret name (`echo id_rsa >> ./notes.txt`) isn't blocked.
+        // This check runs BEFORE the allow-all bypass: sensitive targets are NEVER covered by the
+        // session-wide allow-all grant — the sensitive floor must not be weakened.
         if targets
             .iter()
             .any(|t| path_is_sensitive(&resolve_path(t, &cwd)))
         {
             return self.prompt_unremembered(call, tool, rt).await;
+        }
+
+        // Session-scoped allow-all bypass: if the user previously approved "allow all Bash
+        // (incl. destructive)" for this session, short-circuit without a round-trip. Sensitive
+        // targets are excluded above; unresolvable commands are handled before we reach here.
+        if self.allow_all.is_granted(BASH_ALLOW_ALL_KEY) {
+            return BeforeOutcome::Allow {
+                reason: Some("previously approved all bash this session".into()),
+            };
         }
 
         // Classification canonicalizes paths (filesystem I/O) — run OFF the async worker, bounded,
@@ -855,6 +978,15 @@ impl ToolMiddleware for BashWorkspaceGate {
                 for k in &out_keys {
                     self.store.grant(k);
                 }
+                BeforeOutcome::Allow {
+                    reason: Some("approved always (this folder)".into()),
+                }
+            }
+            PermissionDecision::AllowAlwaysAll => {
+                for k in &out_keys {
+                    self.store.grant(k);
+                }
+                self.allow_all.grant(BASH_ALLOW_ALL_KEY);
                 BeforeOutcome::Allow {
                     reason: Some("approved always (this folder)".into()),
                 }
@@ -1281,6 +1413,28 @@ mod tests {
         );
     }
 
+    /// Regression: `bash_start` runs arbitrary commands too, so it must face THIS gate exactly
+    /// like `bash` — an out-of-workspace delete backgrounded via `bash_start` prompts, it does
+    /// not slip through as "not ours" (the bug this gate's `is_command_shell_tool` check fixes).
+    #[tokio::test]
+    async fn out_of_workspace_rm_via_bash_start_prompts() {
+        let ws = tempfile::tempdir().unwrap();
+        let target = std::path::PathBuf::from("/atomcode-test-outside-rm/x.txt");
+        let gate = BashWorkspaceGate::pinned(ws.path().to_path_buf());
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::bash::BashStartTool);
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "bash_start".into(),
+            arguments: serde_json::json!({ "command": format!("rm {}", target.to_str().unwrap()) })
+                .to_string(),
+        };
+        let out = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(
+            out.is_deny(),
+            "out-of-workspace rm via bash_start must prompt (fail closed when silent), got {out:?}"
+        );
+    }
+
     #[tokio::test]
     async fn sensitive_target_prompts_unremembered() {
         // A pre-granted key must NOT let a sensitive delete through.
@@ -1541,6 +1695,105 @@ mod tests {
         assert!(
             out.is_deny(),
             "a target that escapes /tmp via .. must still prompt, got {out:?}"
+        );
+    }
+
+    // ---- allow-all bypass tests -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn allow_all_grant_bypasses_out_of_workspace_prompt() {
+        // A pre-granted BASH_ALLOW_ALL_KEY must short-circuit the gate WITHOUT a round-trip:
+        // an out-of-workspace rm must Allow immediately (silent driver never consulted).
+        let ws = tempfile::tempdir().unwrap();
+        let allow_all: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
+        allow_all.grant(BASH_ALLOW_ALL_KEY);
+        let gate = BashWorkspaceGate::with_allow_all_store(
+            Arc::new(RwLock::new(ws.path().to_path_buf())),
+            Arc::new(InMemoryPermissionStore::new()),
+            allow_all,
+        );
+        let tool = bash_tool();
+        let mut call = bash_call("rm /atomcode-test-allow-all/x.txt");
+        let out = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(
+            matches!(out, BeforeOutcome::Allow { .. }),
+            "allow-all grant must bypass the out-of-workspace prompt, got {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sensitive_target_not_bypassed_by_allow_all_grant() {
+        // Even with BASH_ALLOW_ALL_KEY pre-granted, a sensitive target must still prompt
+        // (fail closed with silent driver) — the sensitive floor must NEVER be weakened.
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("id_rsa");
+        std::fs::write(&secret, "k").unwrap();
+
+        let allow_all: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
+        allow_all.grant(BASH_ALLOW_ALL_KEY);
+        let gate = BashWorkspaceGate::with_allow_all_store(
+            Arc::new(RwLock::new(ws.path().to_path_buf())),
+            Arc::new(InMemoryPermissionStore::new()),
+            allow_all,
+        );
+        let tool = bash_tool();
+        let mut call = bash_call(&format!("rm {}", secret.to_str().unwrap()));
+        let out = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(
+            out.is_deny(),
+            "sensitive delete must still prompt even with allow-all grant (fail closed when silent), got {out:?}"
+        );
+    }
+
+    /// BUG 2 regression: a pre-granted allow-all sentinel must bypass an UNRESOLVABLE-target
+    /// bash (e.g. `rm $(...)`, `cd /x && rm ./y`) without a round-trip.
+    #[tokio::test]
+    async fn allow_all_grant_bypasses_unresolvable_bash() {
+        let ws = tempfile::tempdir().unwrap();
+        let allow_all: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
+        allow_all.grant(BASH_ALLOW_ALL_KEY);
+        let gate = BashWorkspaceGate::with_allow_all_store(
+            Arc::new(RwLock::new(ws.path().to_path_buf())),
+            Arc::new(InMemoryPermissionStore::new()),
+            allow_all,
+        );
+        let tool = bash_tool();
+        // Both classic unresolvable forms: cd-then-relative and command-substitution target.
+        let mut call = bash_call("cd /somewhere/else && rm data.bin");
+        let out = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(
+            matches!(out, BeforeOutcome::Allow { .. }),
+            "allow-all grant must bypass unresolvable bash without a round-trip, got {out:?}"
+        );
+        let mut call2 = bash_call("rm $(cat list.txt)");
+        let out2 = gate.before(&mut call2, &tool, &silent_rt()).await;
+        assert!(
+            matches!(out2, BeforeOutcome::Allow { .. }),
+            "allow-all grant must bypass command-substitution unresolvable bash, got {out2:?}"
+        );
+    }
+
+    /// BUG 2 regression (sensitive floor): a SENSITIVE unresolvable target must still prompt
+    /// even with the allow-all sentinel granted — the sensitive floor MUST remain first.
+    #[tokio::test]
+    async fn allow_all_grant_does_not_bypass_sensitive_unresolvable_bash() {
+        let ws = tempfile::tempdir().unwrap();
+        let allow_all: Arc<dyn PermissionStore> = Arc::new(InMemoryPermissionStore::new());
+        allow_all.grant(BASH_ALLOW_ALL_KEY);
+        let gate = BashWorkspaceGate::with_allow_all_store(
+            Arc::new(RwLock::new(ws.path().to_path_buf())),
+            Arc::new(InMemoryPermissionStore::new()),
+            allow_all,
+        );
+        let tool = bash_tool();
+        // A command referencing a sensitive path is still unresolvable (dynamic token), but the
+        // sensitive floor fires first: it must still prompt (fail closed with silent driver).
+        let mut call = bash_call("cat ~/.ssh/id_rsa > $OUTFILE");
+        let out = gate.before(&mut call, &tool, &silent_rt()).await;
+        assert!(
+            out.is_deny(),
+            "sensitive unresolvable bash must still prompt even with allow-all grant, got {out:?}"
         );
     }
 }

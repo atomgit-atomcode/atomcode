@@ -53,6 +53,19 @@ fn is_cjk_locale() -> bool {
 /// terminal actually paints. Keeping model and host on the same width
 /// rule is what stops the direct-write / cell-diff drift described above.
 pub(crate) fn cell_char_width(ch: char) -> Option<usize> {
+    // U+26A0 WARNING SIGN defaults to TEXT presentation (Emoji_Presentation=No), so a
+    // bare `⚠` (no VS16 — which is how the `⚠ ` warning prefix is emitted) is painted
+    // as a NARROW 1-cell glyph by conhost / Windows Terminal / most fonts. The emoji-wide
+    // table below now excludes it (only ⚡ U+26A1 stays), but `width_cjk` still reports
+    // Ambiguous → 2 for CJK-locale users — which over-counts by 1, drifts the retained
+    // cell grid, and leaves a ghost char right after the prefix (issue #1368: the "⚠g" /
+    // "⚠d" artifact). Pin it to 1 up front so the model matches what the host paints, in
+    // every locale. A terminal that DOES paint `⚠` wide only mildly overlaps the next
+    // cell — far less jarring than a phantom letter, and far rarer than the narrow-paint
+    // hosts where this was reported.
+    if ch == '\u{26A0}' {
+        return Some(1);
+    }
     let base = if is_cjk_locale() {
         UnicodeWidthChar::width_cjk(ch)
     } else {
@@ -190,7 +203,10 @@ fn is_wide_emoji_symbol(ch: char) -> bool {
         (0x2692, 0x2697),
         (0x2699, 0x2699),
         (0x269B, 0x269C),
-        (0x26A0, 0x26A1),
+        // U+26A0 ⚠ is Emoji_Presentation=No (text-default → painted NARROW, like ✓ which
+        // is likewise excluded) — only U+26A1 ⚡ (Emoji_Presentation=Yes) belongs here.
+        // `cell_char_width` also pins ⚠ to 1 up front to cover the CJK-Ambiguous path.
+        (0x26A1, 0x26A1),
         (0x26A7, 0x26A7),
         (0x26AA, 0x26AB),
         (0x26B0, 0x26B1),
@@ -387,7 +403,11 @@ pub(crate) fn cluster_width(g: &str) -> usize {
             max_w = w;
         }
     }
-    if has_emoji_marker { 2 } else { max_w }
+    if has_emoji_marker {
+        2
+    } else {
+        max_w
+    }
 }
 
 /// Terminal column width of a string, CJK- and emoji-cluster-aware.
@@ -747,14 +767,27 @@ pub fn truncate_with_ellipsis(s: &str, max_cols: usize) -> String {
 /// must be on a UTF-8 boundary; callers that edit by grapheme naturally satisfy
 /// that invariant.
 pub fn editable_value_projection(value: &str, cursor_byte: usize, max_cols: usize) -> String {
+    editable_value_projection_with_caret(value, cursor_byte, max_cols).0
+}
+
+/// Like [`editable_value_projection`], but also returns the 0-indexed DISPLAY
+/// COLUMN of the `│` caret within the returned string. Callers park the real
+/// terminal cursor there so an OS IME anchors its preedit at the exact glyph
+/// the user sees — the raw byte offset can't give this once the value is
+/// windowed/ellipsized, so the column must come from the same projection.
+pub fn editable_value_projection_with_caret(
+    value: &str,
+    cursor_byte: usize,
+    max_cols: usize,
+) -> (String, usize) {
     const CARET: &str = "│";
     const ELLIPSIS: &str = "…";
 
     if max_cols == 0 {
-        return String::new();
+        return (String::new(), 0);
     }
     if max_cols == 1 {
-        return CARET.to_string();
+        return (CARET.to_string(), 0);
     }
 
     // The caller's byte offset may not land on a char boundary of `value` — e.g.
@@ -770,7 +803,8 @@ pub fn editable_value_projection(value: &str, cursor_byte: usize, max_cols: usiz
     let after_width = display_width(after);
     let text_budget = max_cols - 1;
     if before_width + after_width <= text_budget {
-        return format!("{before}{CARET}{after}");
+        // Caret sits right after `before`, at column `before_width`.
+        return (format!("{before}{CARET}{after}"), before_width);
     }
 
     let mut left_budget = text_budget / 2;
@@ -805,14 +839,18 @@ pub fn editable_value_projection(value: &str, cursor_byte: usize, max_cols: usiz
     }
     let left = left_parts.into_iter().rev().collect::<String>();
     let right = truncate_to_width(after, right_budget);
-    format!(
+    // Caret column = leading ellipsis (1 col when the left is clipped) + the
+    // visible-left width. `left_width` is the exact display width of `left`.
+    let caret_col = if left_hidden { 1 } else { 0 } + left_width;
+    let projected = format!(
         "{}{}{}{}{}",
         if left_hidden { ELLIPSIS } else { "" },
         left,
         CARET,
         right,
         if right_hidden { ELLIPSIS } else { "" }
-    )
+    );
+    (projected, caret_col)
 }
 
 /// Truncate a file-system path to `max_cols` display columns, using a
@@ -869,6 +907,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn editable_value_projection_caret_col_matches_glyph_position() {
+        // The returned caret column MUST equal the display column of the `│`
+        // caret in the projected string — that's what lets the footer park the
+        // real terminal cursor on the exact glyph the user sees (IME anchor),
+        // for fits, windowed, and ellipsized cases alike.
+        let cases = [
+            ("hello", 5, 20),                // fits, cursor at end
+            ("hello", 2, 20),                // fits, cursor mid
+            ("", 0, 20),                     // empty
+            ("aaaaaaaaaaaaaaaaaaaa", 20, 8), // overflow, cursor at end (left clipped)
+            ("aaaaaaaaaaaaaaaaaaaa", 10, 8), // overflow, cursor mid (both clipped)
+            ("你好世界你好世界", 6, 7),      // CJK overflow
+        ];
+        for (val, cur, max) in cases {
+            let (proj, col) = editable_value_projection_with_caret(val, cur, max);
+            let caret_byte = proj.find('│').expect("caret present in projection");
+            assert_eq!(
+                col,
+                display_width(&proj[..caret_byte]),
+                "caret col must match `│` position — val={val:?} cur={cur} max={max} proj={proj:?}"
+            );
+        }
+    }
+
+    #[test]
     fn ascii_width_equals_len() {
         assert_eq!(display_width("hello"), 5);
     }
@@ -896,9 +959,22 @@ mod tests {
         assert_eq!(cell_char_width('⑳'), Some(2));
         assert_eq!(display_width("③的"), 4); // 2 + 2
         assert_eq!(display_width("①②③"), 6); // each 2 cols
-        // Ⓜ stays wide (pre-existing), and a plain ASCII digit stays narrow.
+                                             // Ⓜ stays wide (pre-existing), and a plain ASCII digit stays narrow.
         assert_eq!(cell_char_width('Ⓜ'), Some(2));
         assert_eq!(cell_char_width('3'), Some(1));
+    }
+
+    #[test]
+    fn warning_sign_is_width_one() {
+        // U+26A0 defaults to TEXT presentation and is painted NARROW by conhost /
+        // Windows Terminal / most fonts. It must model as 1 cell — NOT the `width_cjk`
+        // Ambiguous=2 nor the emoji-wide=2 — or the retained grid drifts and leaves a
+        // ghost char after the `⚠ ` warning prefix (#1368: "⚠g"/"⚠d"). Fixed regardless
+        // of locale (the override precedes the CJK/emoji branches).
+        assert_eq!(cell_char_width('\u{26A0}'), Some(1));
+        // The prefix the TUI actually emits ("⚠ ") is 2 cols (glyph + space), so the
+        // message body starts at column 2 — matching a narrow-painting host.
+        assert_eq!(display_width("⚠ "), 2);
     }
 
     #[test]
@@ -912,9 +988,10 @@ mod tests {
         assert!(is_wide_emoji_symbol('❄')); // U+2744 snowflake
         assert!(is_wide_emoji_symbol('⭐')); // U+2B50 star
         assert!(is_wide_emoji_symbol('⚡')); // U+26A1 high voltage
-        // NOT emoji — must stay narrow, or we'd regress ordinary ambiguous
-        // text symbols (the whole point of scoping to the Emoji set).
+                                             // NOT emoji — must stay narrow, or we'd regress ordinary ambiguous
+                                             // text symbols (the whole point of scoping to the Emoji set).
         assert!(!is_wide_emoji_symbol('✓')); // U+2713 check mark (Emoji=No)
+        assert!(!is_wide_emoji_symbol('\u{26A0}')); // ⚠ Emoji_Presentation=No — excluded like ✓ (#1368)
         assert!(!is_wide_emoji_symbol('°')); // U+00B0 degree sign
         assert!(!is_wide_emoji_symbol('◆')); // U+25C6 black diamond
         assert!(!is_wide_emoji_symbol('×')); // U+00D7 multiplication
@@ -931,7 +1008,7 @@ mod tests {
         let sun = if emoji_wide_enabled() { 2 } else { 1 };
         assert_eq!(display_width("☀"), sun);
         assert_eq!(display_width("☀ 晴"), sun + 1 + 2); // sun + space + CJK
-        // Ambiguous-but-not-emoji content is never widened by this path.
+                                                        // Ambiguous-but-not-emoji content is never widened by this path.
         assert_eq!(display_width("✓"), 1);
         assert_eq!(display_width("20°C"), 4);
     }
@@ -944,13 +1021,13 @@ mod tests {
         assert!(is_narrow_emoji_1f000('\u{1F396}')); // 🎖 military medal
         assert!(is_narrow_emoji_1f000('\u{1F5FA}')); // 🗺 world map
         assert!(is_narrow_emoji_1f000('\u{1F700}')); // 🜀 alchemical symbol
-        // U+1F1E6..=U+1F1FF (Regional Indicator) are excluded.
+                                                     // U+1F1E6..=U+1F1FF (Regional Indicator) are excluded.
         assert!(!is_narrow_emoji_1f000('\u{1F1E6}')); // 🇦 Regional Indicator A
         assert!(!is_narrow_emoji_1f000('\u{1F1FF}')); // 🇿 Regional Indicator Z
-        // Wide emoji (EA=W) are NOT in this set — they're already width 2.
+                                                      // Wide emoji (EA=W) are NOT in this set — they're already width 2.
         assert!(!is_narrow_emoji_1f000('\u{1F4C5}')); // 📅 calendar (EA=W)
         assert!(!is_narrow_emoji_1f000('\u{1F4A7}')); // 💧 droplet (EA=W)
-        // Outside range.
+                                                      // Outside range.
         assert!(!is_narrow_emoji_1f000('a'));
         assert!(!is_narrow_emoji_1f000('你'));
     }

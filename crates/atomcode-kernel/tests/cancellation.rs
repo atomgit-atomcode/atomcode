@@ -717,6 +717,123 @@ async fn cancel_preserves_turn_when_keep_interrupted_context() {
     );
 }
 
+/// A provider that HANGS on its first `chat_stream` (the OPEN never resolves, so the
+/// first turn is cancellable with ZERO assistant output), then responds normally on
+/// every later call. Drives the "empty cancel, then a fresh unrelated message".
+struct HangFirstThenRespondProvider {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl atomcode_kernel::provider::LlmProvider for HangFirstThenRespondProvider {
+    fn model_name(&self) -> &str {
+        "hang-first-then-respond"
+    }
+    async fn chat_stream(
+        &self,
+        _: &[Message],
+        _: &[atomcode_kernel::tool::ToolDef],
+        _: &atomcode_kernel::provider::ChatOptions,
+    ) -> Result<
+        futures::stream::BoxStream<'static, StreamEvent>,
+        atomcode_kernel::stream::ProviderError,
+    > {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            futures::future::pending().await // first turn: hang → cancelled empty
+        } else {
+            use futures::StreamExt;
+            Ok(futures::stream::iter(vec![
+                StreamEvent::TextDelta("second turn done".into()),
+                StreamEvent::Done { truncated: false },
+            ])
+            .boxed())
+        }
+    }
+}
+
+// REGRESSION (empty-cancel contamination): in PRESERVE mode, a turn cancelled BEFORE the
+// assistant produced any output (the user mistyped and immediately cancelled) must still
+// be rolled back. Preserving the bare abandoned prompt leaks it into the NEXT turn — the
+// reported bug where a cancelled "commit + push to release/x" contaminated an unrelated
+// follow-up. A cancel WITH work is still preserved (see
+// `cancel_preserves_turn_when_keep_interrupted_context`).
+#[tokio::test]
+async fn empty_cancel_rolls_back_even_in_preserve_mode() {
+    let provider = Arc::new(HangFirstThenRespondProvider {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut handle = atomcode_kernel::agent::Agent::builder()
+        .provider(provider)
+        .tools(ToolRegistry::new().mount(&[]))
+        .keep_interrupted_context(true)
+        .build()
+        .spawn();
+
+    // Turn 1: a wrong prompt, cancelled the instant it hits the (hanging) open.
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "wrong: commit + push to release/x".into(),
+            images: vec![],
+        })
+        .unwrap();
+    let drive1 = async {
+        let mut sent = false;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::TurnStarted if !sent => {
+                    sent = true;
+                    handle.commands.send(AgentCommand::Cancel).unwrap();
+                }
+                AgentEvent::TurnComplete { .. } => break,
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), drive1)
+        .await
+        .expect("empty cancel must terminate the hung open, not hang");
+
+    // Turn 2: a fresh, unrelated message that completes normally.
+    handle
+        .commands
+        .send(AgentCommand::SendMessage {
+            text: "real task".into(),
+            images: vec![],
+        })
+        .unwrap();
+    while let Some(ev) = handle.events.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete { .. }) {
+            break;
+        }
+    }
+
+    handle.commands.send(AgentCommand::Snapshot).unwrap();
+    let snap = loop {
+        match handle.events.recv().await {
+            Some(AgentEvent::Snapshot { snapshot }) => break snapshot,
+            Some(_) => continue,
+            None => panic!("channel closed before Snapshot reply"),
+        }
+    };
+    assert!(
+        !snap
+            .messages
+            .iter()
+            .any(|m| m.text.contains("commit + push to release/x")),
+        "empty-cancelled prompt must be rolled back, not leaked into the next turn: {:?}",
+        snap.messages
+    );
+    assert!(
+        snap.messages.iter().any(|m| m.text == "real task"),
+        "the follow-up message must be present: {:?}",
+        snap.messages
+    );
+
+    handle.commands.send(AgentCommand::Shutdown).unwrap();
+    let _ = handle.task.await;
+}
+
 // CLAIM 17f: in preserve mode, finish_cancelled appends a synthetic USER-role marker so
 // the next turn's request explicitly tells the model the prior turn was user-interrupted.
 // User role is wire-safe on all adapters (non-leading system messages are rejected/dropped

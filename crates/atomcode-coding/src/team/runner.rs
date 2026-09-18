@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use atomcode_capabilities::team::{
     role_by_id, TeamDifficulty, TeamPermission, TeamRoleProfile, TeamTaskSpec,
 };
-use atomcode_capabilities::tools::team_child_middlewares_for_policy;
 #[cfg(test)]
 use atomcode_capabilities::tools::team_child_middlewares;
+use atomcode_capabilities::tools::team_child_middlewares_for_policy;
 use atomcode_kernel::agent::{Agent, AutoRespond, ToolLoopPolicy};
 use atomcode_kernel::event::StopReason;
 use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
@@ -31,6 +31,9 @@ pub struct TeamRunnerFactory {
     max_rounds: Option<u32>,
     tool_loop_policy: Option<ToolLoopPolicy>,
     stream_timeout: Option<Duration>,
+    /// Per-member FIRST-token (prefill / TTFB) idle cap (parity with the parent /
+    /// TaskTool). `None` ⇒ the member falls back to `stream_timeout` for both phases.
+    first_token_timeout: Option<Duration>,
     request_timeout: Option<Duration>,
     inherited_worker_middlewares: Vec<Arc<dyn ToolMiddleware>>,
     credential_shell_policy: atomcode_capabilities::tools::CredentialShellPolicy,
@@ -49,6 +52,7 @@ impl TeamRunnerFactory {
             max_rounds: None,
             tool_loop_policy: None,
             stream_timeout: None,
+            first_token_timeout: None,
             request_timeout: None,
             inherited_worker_middlewares: Vec::new(),
             credential_shell_policy: Default::default(),
@@ -60,11 +64,13 @@ impl TeamRunnerFactory {
         max_rounds: Option<u32>,
         tool_loop_policy: Option<ToolLoopPolicy>,
         stream_timeout: Option<Duration>,
+        first_token_timeout: Option<Duration>,
         request_timeout: Option<Duration>,
     ) -> Self {
         self.max_rounds = max_rounds.filter(|rounds| *rounds > 0);
         self.tool_loop_policy = tool_loop_policy;
         self.stream_timeout = stream_timeout;
+        self.first_token_timeout = first_token_timeout;
         self.request_timeout = request_timeout;
         self
     }
@@ -132,6 +138,9 @@ impl TeamRunnerFactory {
         }
         if let Some(timeout) = self.stream_timeout {
             builder = builder.stream_timeout(timeout);
+        }
+        if let Some(timeout) = self.first_token_timeout {
+            builder = builder.first_token_timeout(timeout);
         }
         if let Some(timeout) = self.request_timeout {
             builder = builder.request_timeout(timeout);
@@ -234,13 +243,17 @@ impl LifecycleHooks for TeamProgressHook {
             .as_ref()
             .map(|meta| meta.tokens.completion as u64)
             .unwrap_or(0);
-        self.total_tokens.fetch_add(reported.max(estimated), Relaxed);
+        self.total_tokens
+            .fetch_add(reported.max(estimated), Relaxed);
         // Only surface an activity when the model is about to use a tool. A
         // response WITHOUT a tool call ends the turn — emitting "thinking" here
         // would just overwrite the last real activity and double the event rate;
         // the final token total is carried out via the member outcome instead.
         if let Some(call) = response.tool_calls.first() {
-            (self.activity)(format!("using {}", call.name), self.total_tokens.load(Relaxed));
+            (self.activity)(
+                format!("using {}", call.name),
+                self.total_tokens.load(Relaxed),
+            );
         }
     }
 }
@@ -366,9 +379,13 @@ mod tests {
             apply(&middleware, "write_file", r#"{"file_path":"src/ok.rs"}"#).await,
             BeforeOutcome::Proceed
         );
-        assert!(apply(&middleware, "read_file", r#"{"file_path":"tests/outside.rs"}"#)
-            .await
-            .is_deny());
+        assert!(apply(
+            &middleware,
+            "read_file",
+            r#"{"file_path":"tests/outside.rs"}"#
+        )
+        .await
+        .is_deny());
         assert_eq!(
             apply(&middleware, "read_file", r#"{"file_path":"src/ok.rs"}"#).await,
             BeforeOutcome::Proceed

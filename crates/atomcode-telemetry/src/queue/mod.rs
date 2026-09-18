@@ -1063,7 +1063,11 @@ mod tests {
         let d = TempDir::new().unwrap();
         // Fill ready segments up to the cap.
         for i in 0..roll::MAX_SEGMENT_FILES {
-            fs::write(d.path().join(format!("20260101-000000-{i:08x}.ndjson")), b"{}\n").unwrap();
+            fs::write(
+                d.path().join(format!("20260101-000000-{i:08x}.ndjson")),
+                b"{}\n",
+            )
+            .unwrap();
         }
         // Quarantined segments must not open a second, independent budget.
         let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");

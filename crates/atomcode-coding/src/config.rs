@@ -38,11 +38,18 @@ pub struct CodingAgentConfig {
     pub working_dir: PathBuf,
     /// Model context window in tokens (forwarded to the provider). Default 128k.
     pub context_window: u32,
-    /// Liveness: max byte-idle wait for the next stream event (first-token + inter-token).
-    /// Default 300s, override via `ATOMCODE_STREAM_TIMEOUT_SECS`. Thinking models go quiet
-    /// for a long stretch after a large (~200K) prompt before the first reasoning byte; the
-    /// old 120s cut them off mid-think and surfaced as a spurious "stream timeout".
+    /// Liveness: max byte-idle wait BETWEEN stream events, once the first content byte
+    /// has arrived (inter-token). Default 300s, override via `ATOMCODE_STREAM_TIMEOUT_SECS`.
+    /// The prefill / first-token wait is governed separately by `first_token_timeout`.
     pub stream_timeout: Duration,
+    /// Liveness: max wait for the FIRST content byte (prefill / time-to-first-token).
+    /// A slow local model on a large prompt can churn far longer before the first byte
+    /// than between subsequent tokens, so this budget is separate from — and usually
+    /// larger than — `stream_timeout`. Env `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS` (explicit
+    /// value wins), else `max(600s, stream_timeout)` so it never drops below the
+    /// inter-token budget. Once the first byte arrives, `stream_timeout` takes over.
+    /// Reconnecting on a slow-but-progressing prefill just restarts it, so we wait longer.
+    pub first_token_timeout: Duration,
     /// Liveness: max wait for a driver approval response before it degrades to deny.
     /// `Some(d)` ⇒ fail-closed after `d` — for HEADLESS / no-human drivers where a never-
     /// answered approval must not park a turn forever. `None` ⇒ PARK: block until the driver
@@ -140,6 +147,11 @@ pub struct CodingAgentConfig {
     /// (`keep_interrupted_context`). Sourced from `Config::keep_interrupted_context`.
     pub keep_interrupted_context: bool,
     pub credential_shell_policy: atomcode_capabilities::tools::CredentialShellPolicy,
+    /// User-declared `[permissions]` allow/deny rules. Empty (the default) leaves every
+    /// approval gate untouched; a non-empty set registers `PermissionRuleGate` ahead of the
+    /// convenience gates so a matched rule skips (or blocks) the prompt. Shared, so a
+    /// `/model` swap re-assembling the agent keeps the same parsed rules.
+    pub permission_rules: std::sync::Arc<atomcode_capabilities::tools::PermissionRules>,
     /// Per-provider User-Agent override (`ProviderConfig::user_agent`). `None` ⇒
     /// `build_provider` falls back to the product `atomcode/<version>` so the gateway
     /// can attribute/slice traffic by version. Restores parity with v1's
@@ -153,6 +165,13 @@ pub struct CodingAgentConfig {
     /// each layer's default.
     /// Sourced from `ProviderConfig::retry_max_attempts`.
     pub retry_max_attempts: Option<u32>,
+    /// Global cap on the VISIBLE kernel provider-retry tier (the `重试(N/M)`
+    /// re-opens, now with patient exponential backoff that honors `Retry-After`).
+    /// Sourced from `[network] upstream_retry_max_attempts`. `None` keeps the
+    /// kernel default. When set it takes precedence over the `retry_max_attempts`
+    /// → disable-kernel coupling, so a user on a flaky gateway can keep the fast
+    /// adapter budget small AND make the patient tier more persistent.
+    pub upstream_retry_max_attempts: Option<u32>,
     /// Full provider registry used to resolve task-tool fast/capable tiers.
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
     /// Swap-aware, lazily-built FAST-tier provider for the `task` tool. `None` ⇒ the fast
@@ -198,12 +217,18 @@ pub struct CodingRuntimeConfig {
     pub interactive: bool,
     pub keep_interrupted_context: bool,
     pub credential_shell_policy: atomcode_capabilities::tools::CredentialShellPolicy,
+    /// Parsed `[permissions]` allow/deny rules (see `CodingAgentConfig::permission_rules`).
+    pub permission_rules: std::sync::Arc<atomcode_capabilities::tools::PermissionRules>,
     pub user_agent: Option<String>,
     pub skip_tls_verify: bool,
     /// Max attempts (including the first request) for provider OPEN retries;
     /// when set, also caps kernel-owned HTTP 429 recovery. `None` preserves
     /// each layer's default.
     pub retry_max_attempts: Option<u32>,
+    /// Global cap on the visible kernel provider-retry tier (`[network]
+    /// upstream_retry_max_attempts`). `None` keeps the kernel default; takes
+    /// precedence over the `retry_max_attempts`→disable-kernel coupling.
+    pub upstream_retry_max_attempts: Option<u32>,
     pub loop_max_rounds: u32,
     pub turn_max_rounds: u32,
     pub subagent_config: Option<Arc<atomcode_config::config::Config>>,
@@ -241,6 +266,23 @@ pub fn lsp_settings_from_config(
             })
             .collect(),
     }
+}
+
+/// Parse `[permissions] allow/deny` into the neutral capabilities rule set. Malformed rules
+/// are skipped and reported on stderr rather than silently widening or narrowing the policy —
+/// a typo in a permission rule is exactly the kind of mistake that must not pass unnoticed.
+pub fn permission_rules_from_config(
+    permissions: &atomcode_config::config::PermissionsConfig,
+) -> atomcode_capabilities::tools::PermissionRules {
+    let (rules, invalid) =
+        atomcode_capabilities::tools::PermissionRules::parse(&permissions.allow, &permissions.deny);
+    for raw in &invalid {
+        eprintln!(
+            "[permissions] ignoring malformed rule {raw:?} \
+             (expected `Tool` or `Tool(pattern)`, e.g. `Bash(git *)`)"
+        );
+    }
+    rules
 }
 
 pub fn credential_shell_policy_from_config(
@@ -319,9 +361,13 @@ impl CodingRuntimeConfig {
             credential_shell_policy: credential_shell_policy_from_config(
                 config.coding.shell_guard_policy,
             ),
+            permission_rules: std::sync::Arc::new(permission_rules_from_config(
+                &config.permissions,
+            )),
             user_agent: r.and_then(|r| r.user_agent.clone()),
             skip_tls_verify: r.map(|r| r.skip_tls_verify).unwrap_or(false),
             retry_max_attempts: r.and_then(|r| r.retry_max_attempts),
+            upstream_retry_max_attempts: config.network.upstream_retry_max_attempts,
             loop_max_rounds: resolve_loop_max_rounds(
                 config.loop_config.max_rounds,
                 std::env::var("ATOMCODE_LOOP_MAX_ROUNDS").ok().as_deref(),
@@ -371,6 +417,7 @@ impl CodingRuntimeConfig {
         config.user_agent = self.user_agent.clone();
         config.skip_tls_verify = self.skip_tls_verify;
         config.retry_max_attempts = self.retry_max_attempts;
+        config.upstream_retry_max_attempts = self.upstream_retry_max_attempts;
         config.loop_max_rounds = self.loop_max_rounds;
         config.max_rounds = self.turn_max_rounds;
         config.subagent_config = self.subagent_config.clone();
@@ -380,6 +427,7 @@ impl CodingRuntimeConfig {
         }
         config.keep_interrupted_context = self.keep_interrupted_context;
         config.credential_shell_policy = self.credential_shell_policy;
+        config.permission_rules = self.permission_rules.clone();
         config.round_cap_checkpoint = self.round_cap_checkpoint;
         config.next_prompt_suggestions = self.next_prompt_suggestions;
         config.lsp = self.lsp.clone();
@@ -628,15 +676,32 @@ impl TierProvider {
     }
 }
 
-/// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
-/// positive integer, else 300s. Ported from core's env-configurable liveness knob.
-fn default_stream_timeout() -> Duration {
-    std::env::var("ATOMCODE_STREAM_TIMEOUT_SECS")
+/// A positive-integer-seconds duration read from env var `var`: `None` when unset,
+/// non-numeric, or ≤ 0 (so a bogus/zero value falls back to the caller's default
+/// rather than silently disabling the timeout).
+fn env_duration_secs(var: &str) -> Option<Duration> {
+    std::env::var(var)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
         .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(300))
+}
+/// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
+/// positive integer, else 300s. Ported from core's env-configurable liveness knob.
+fn default_stream_timeout() -> Duration {
+    env_duration_secs("ATOMCODE_STREAM_TIMEOUT_SECS").unwrap_or_else(|| Duration::from_secs(300))
+}
+/// The default first-token (prefill / TTFB) timeout. An explicit
+/// `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS` (valid positive integer) wins as-is — a
+/// deliberate user choice, even if shorter than `stream_timeout`. Otherwise it
+/// defaults to 600s but is NEVER shorter than `stream_timeout`: prefill on a slow
+/// local model legitimately exceeds inter-token latency, so a first-token budget
+/// below the inter-token one inverts the intent. In particular a user who raised
+/// `ATOMCODE_STREAM_TIMEOUT_SECS` (e.g. following the reconnect hint) must not end
+/// up with a SHORTER prefill window than inter-token — hence the `.max()`.
+fn default_first_token_timeout() -> Duration {
+    env_duration_secs("ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS")
+        .unwrap_or_else(|| default_stream_timeout().max(Duration::from_secs(600)))
 }
 /// Share of the CodingPlan 5h rolling `call_limit` a single `/goal` may consume
 /// (percent). A goal that eats more than this starves the user's interactive work
@@ -787,6 +852,7 @@ impl CodingAgentConfig {
             working_dir: working_dir.into(),
             context_window: 128_000,
             stream_timeout: default_stream_timeout(),
+            first_token_timeout: default_first_token_timeout(),
             request_timeout: Some(Duration::from_secs(300)),
             max_continuations: 50,
             max_rounds: default_turn_max_rounds(),
@@ -810,9 +876,11 @@ impl CodingAgentConfig {
             lsp: Default::default(),
             keep_interrupted_context: false,
             credential_shell_policy: Default::default(),
+            permission_rules: Default::default(),
             user_agent: None,
             skip_tls_verify: false,
             retry_max_attempts: None,
+            upstream_retry_max_attempts: None,
             subagent_config: None,
             subagent_fast_provider: None,
             subagent_capable_provider: None,
@@ -824,6 +892,37 @@ impl CodingAgentConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of the `[permissions]` table is that it reaches the GATE. Assert the
+    /// full TOML → `CodingRuntimeConfig` → `CodingAgentConfig` path, because a config that
+    /// parses but is dropped somewhere in the middle looks exactly like a config that works.
+    #[test]
+    fn permission_rules_survive_the_toml_to_agent_config_path() {
+        let mut config = atomcode_config::config::Config::default();
+        config.permissions.allow = vec!["Bash(git *)".to_string()];
+        config.permissions.deny = vec!["Bash(rm -rf *)".to_string()];
+
+        let runtime = CodingRuntimeConfig::from_config(
+            &config,
+            std::path::Path::new("/work"),
+            None,
+            None,
+            false,
+            false,
+        );
+        let agent = runtime.agent_config();
+        let cwd = std::path::Path::new("/work");
+        let git = serde_json::json!({ "command": "git status" }).to_string();
+        let rm = serde_json::json!({ "command": "rm -rf /" }).to_string();
+        assert_eq!(
+            agent.permission_rules.decide("bash", &git, cwd),
+            atomcode_capabilities::tools::RuleDecision::Allow
+        );
+        assert_eq!(
+            agent.permission_rules.decide("bash", &rm, cwd),
+            atomcode_capabilities::tools::RuleDecision::Deny
+        );
+    }
 
     #[test]
     fn shell_guard_policy_maps_at_the_coding_boundary() {
@@ -1373,6 +1472,7 @@ impl std::fmt::Debug for CodingAgentConfig {
             .field("working_dir", &self.working_dir)
             .field("context_window", &self.context_window)
             .field("stream_timeout", &self.stream_timeout)
+            .field("first_token_timeout", &self.first_token_timeout)
             .field("request_timeout", &self.request_timeout)
             .field("interactive", &self.interactive)
             .field("max_continuations", &self.max_continuations)

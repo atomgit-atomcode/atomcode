@@ -1362,7 +1362,10 @@ mod tests {
                 .join("src/main/java/cn/ApplyStockController.java"),
             "x",
         );
-        write_file(&tmp.path().join("src/convert/ApplyStockConverter.java"), "y");
+        write_file(
+            &tmp.path().join("src/convert/ApplyStockConverter.java"),
+            "y",
+        );
         write_file(&tmp.path().join("README.md"), "z");
 
         // Deep files matched by a cross-level substring, from root scope, on the
@@ -1372,7 +1375,8 @@ mod tests {
             .map(|e| e.rel_path.clone())
             .collect();
         assert!(
-            hits.iter().any(|p| p.ends_with("ApplyStockController.java")),
+            hits.iter()
+                .any(|p| p.ends_with("ApplyStockController.java")),
             "cross-level substring must find the deep controller: {hits:?}"
         );
         assert!(

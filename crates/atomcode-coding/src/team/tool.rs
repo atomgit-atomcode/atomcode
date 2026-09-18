@@ -370,7 +370,10 @@ mod tests {
         let tool = tool(100);
         // 未知 run：wait/result/stop 都应报错。
         let waited = tool
-            .execute(r#"{"action":"wait","run_id":"missing","timeout_secs":1}"#, &ctx())
+            .execute(
+                r#"{"action":"wait","run_id":"missing","timeout_secs":1}"#,
+                &ctx(),
+            )
             .await;
         assert!(waited.is_error);
         assert!(waited.content.contains("unknown team run"));

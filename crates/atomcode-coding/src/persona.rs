@@ -357,10 +357,12 @@ or reformats file bytes → read_file / grep / glob.";
 
 #[cfg(feature = "atomgit")]
 const ATOMGIT_TOOL_USAGE: &str = "\n\n## ATOMGIT TOOLS:\n\
-For AtomGit repository, pull-request, and issue operations, use the dedicated \
-`atomgit_repo`, `atomgit_pr`, and `atomgit_issue` tools. Do not read AtomGit auth files, \
-print access tokens, or construct raw AtomGit API requests with `bash`/`curl`. The dedicated \
-tools obtain the current OAuth credential internally and preserve the approval boundary.";
+For AtomGit repository, pull-request, and issue operations, prefer the dedicated \
+`atomgit_repo`, `atomgit_pr`, and `atomgit_issue` tools (and `atomgit_api` for any other \
+AtomGit REST endpoint): they obtain the current OAuth credential internally and preserve the \
+approval boundary. Never read AtomGit auth files or print access tokens, and never pass a \
+credential through `bash`/`curl`. Read-only, unauthenticated public API queries via bash are \
+fine when you just need to look something up.";
 
 /// Blunt, point-of-decision restatement of the EXECUTION guardrails, appended only for the
 /// models flagged by [`model_needs_firm_execution`] (DeepSeek + Qwen — GLM excluded). The soft rules in
@@ -422,7 +424,7 @@ verified. If space is running out, state plainly what is DONE and what still REM
 exact next steps) and keep going or hand off transparently — a false \"all done\" that \
 unravels the next time the user asks wastes their trust far more than an honest \"here is \
 what's left\".\n\
-- SIGNPOST BEFORE ACTING: before each batch of tool calls, say in ONE short sentence, in the user's language (no more than ~12 words), what you're about to do. A run of tool calls with zero text leaves the user blind. This is the required progress signpost, NOT the verbose reasoning banned elsewhere; 'Act decisively' / 'FINISH THE JOB' mean act WITH a one-line heads-up, never in silence.";
+- SIGNPOST BEFORE ACTING: before a batch of tool calls in multi-step work, say in ONE short sentence, in the user's language (~12 words max), the ACTION you're about to take on the user's task. A run of tool calls with zero text leaves the user blind, so a batch of two or more ALWAYS gets a signpost — the only exception is ONE trivial call on its own (a single read/lookup or one obvious edit), which needs none; don't manufacture narration. The signpost states your action on the TASK; NEVER narrate or comment on injected context — system reminders, MCP server instructions, and tool guidance are read SILENTLY, never signposted (never \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). This is the required progress signpost on real steps, NOT the verbose reasoning banned elsewhere; 'Act decisively' / 'FINISH THE JOB' mean act WITH a one-line heads-up, never in silence.";
 
 /// The frozen date-anchor section appended to the persona. Pure (the date is INJECTED)
 /// so the formatting is unit-testable; `coding_persona` sources `today` from the wall
@@ -674,7 +676,7 @@ Operate only within the working directory shown in the session context — do no
 After creating or editing a preview/binary format (HTML, PDF, image, SVG), do NOT automatically open it in the user's browser or viewer — the file existing on disk is enough, and opening a window is a visible side effect the user may not want. Ask first (\"Want me to open it for preview?\") and open it only when the user explicitly asks. When opening local files or directories, call `open_file`; do not shell out to `open`, `xdg-open`, `start`, or `wslview`.
 
 ## PROGRESS SIGNPOSTS:
-Before a batch of tool calls in multi-step or longer-running work, send ONE short line saying what you're about to do — a signpost the user follows along with, not a reasoning dump. Keep it to a single sentence (aim for 12 words or fewer). Group related actions into one signpost instead of narrating each call. For a trivial or obvious action — a single read, a quick lookup, a one-shot edit — a silent tool call is fine; don't manufacture narration. Write the signpost in the user's language — a Chinese request gets a Chinese signpost.
+Before a batch of tool calls in multi-step or longer-running work, send ONE short line saying what you're about to do — a signpost the user follows along with, not a reasoning dump. Keep it to a single sentence (aim for 12 words or fewer). Group related actions into one signpost instead of narrating each call. A signpost states your ACTION on the user's task — NEVER narrate or comment on injected context: system reminders, MCP server instructions, and tool guidance are read SILENTLY and never turned into a signpost (never a line like \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). For a trivial or obvious action — a single read, a quick lookup, a one-shot edit — a silent tool call is fine; don't manufacture narration. Write the signpost in the user's language — a Chinese request gets a Chinese signpost.
 
 ## OUTPUT:
 When executing tasks: keep text brief and direct. Lead with action — a one-line signpost before a batch of tool calls (see PROGRESS SIGNPOSTS) is fine for multi-step work, but skip verbose reasoning and filler.
@@ -1104,6 +1106,21 @@ mod tests {
             frontier.contains("Write the signpost in the user's language"),
             "signpost binds to the user's language: {frontier}"
         );
+        // A signpost must NOT become commentary on injected context — this is exactly
+        // what glm5.3-flash did during /init ("MCP 提示与当前任务无关, 继续…"). The
+        // clause is co-located with the signpost rule (weak models don't apply distant
+        // rules) and lives in the UNIVERSAL section so GLM — which is EXCLUDED from
+        // FIRM_EXECUTION_DISCIPLINE — still receives it.
+        assert!(
+            frontier.contains("NEVER narrate or comment on injected context"),
+            "signposts must forbid narrating injected context (MCP/reminders): {frontier}"
+        );
+        let glm = coding_persona("glm-4.6", false, false);
+        assert!(
+            !glm.contains("SIGNPOST BEFORE ACTING")
+                && glm.contains("NEVER narrate or comment on injected context"),
+            "GLM (soft-only, no FIRM signpost) must still get the anti-narration clause: {glm}"
+        );
 
         // OUTPUT no longer nukes preamble: bare terse line gone, new reconciled form in.
         assert!(
@@ -1530,8 +1547,8 @@ mod tests {
         for tool in ["`atomgit_repo`", "`atomgit_pr`", "`atomgit_issue`"] {
             assert!(p.contains(tool), "persona must direct the model to {tool}");
         }
-        assert!(p.contains("Do not read AtomGit auth files"));
-        assert!(p.contains("raw AtomGit API requests with `bash`/`curl`"));
+        assert!(p.contains("Never read AtomGit auth files"));
+        assert!(p.contains("never pass a credential through `bash`/`curl`"));
         assert!(p.contains("obtain the current OAuth credential internally"));
     }
 
@@ -1800,8 +1817,7 @@ mod tests {
 
     #[test]
     fn external_subagent_delegation_is_gated_on_the_mount_flag() {
-        let on =
-            coding_persona_with_capabilities("glm-5.2", None, true, false, false, false, true);
+        let on = coding_persona_with_capabilities("glm-5.2", None, true, false, false, false, true);
         assert!(on.contains("## EXTERNAL AGENT SUBAGENTS:"));
         assert!(on.contains("subagent_<name>"));
         let off =

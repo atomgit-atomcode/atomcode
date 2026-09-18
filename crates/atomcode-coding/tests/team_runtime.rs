@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use atomcode_capabilities::team::{TeamDifficulty, TeamPermission, TeamRoleId, TeamTaskSpec};
 use atomcode_coding::team::{
-    TeamActivitySink, TeamRunManager, TeamRuntimeConfig, TeamRunnerFactory, TeamTool,
+    TeamActivitySink, TeamRunManager, TeamRunnerFactory, TeamRuntimeConfig, TeamTool,
 };
 use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::testkit::AlwaysStopProvider;
@@ -17,14 +17,15 @@ use tokio_util::sync::CancellationToken;
 
 /// Provider factory that always stops with the given text — every difficulty
 /// routes to the same scripted provider, so no network and no flaky timing.
-fn always_stop_providers(text: &'static str) -> Arc<dyn Fn(TeamDifficulty) -> Arc<dyn LlmProvider> + Send + Sync> {
-    Arc::new(move |_difficulty| {
-        Arc::new(AlwaysStopProvider::new(text)) as Arc<dyn LlmProvider>
-    })
+fn always_stop_providers(
+    text: &'static str,
+) -> Arc<dyn Fn(TeamDifficulty) -> Arc<dyn LlmProvider> + Send + Sync> {
+    Arc::new(move |_difficulty| Arc::new(AlwaysStopProvider::new(text)) as Arc<dyn LlmProvider>)
 }
 
 /// Empty tool mount — the scripted provider never calls tools.
-fn empty_tools() -> Arc<dyn Fn(TeamPermission) -> atomcode_kernel::tool::MountedTools + Send + Sync> {
+fn empty_tools() -> Arc<dyn Fn(TeamPermission) -> atomcode_kernel::tool::MountedTools + Send + Sync>
+{
     Arc::new(|_permission| ToolRegistry::new().mount(&[]))
 }
 
@@ -73,7 +74,11 @@ async fn runner_completes_a_single_member_task() {
     )
     .await;
 
-    assert!(outcome.success, "member should complete, got stop={:?}", outcome.stop);
+    assert!(
+        outcome.success,
+        "member should complete, got stop={:?}",
+        outcome.stop
+    );
     assert!(
         outcome.output.contains("member report"),
         "output should carry the provider text: {:?}",
@@ -106,7 +111,11 @@ async fn runner_worker_role_completes_with_scope() {
         scope: vec!["src/**".into()],
     };
     let outcome = job(spec, CancellationToken::new(), Arc::new(|_, _| {})).await;
-    assert!(outcome.success, "worker member should complete: {:?}", outcome.stop);
+    assert!(
+        outcome.success,
+        "worker member should complete: {:?}",
+        outcome.stop
+    );
     assert!(outcome.output.contains("worker done"));
 }
 
@@ -135,7 +144,11 @@ async fn team_tool_delegates_waits_and_aggregates_end_to_end() {
             &ctx,
         )
         .await;
-    assert!(!delegated.is_error, "delegate failed: {}", delegated.content);
+    assert!(
+        !delegated.is_error,
+        "delegate failed: {}",
+        delegated.content
+    );
     let run_id = serde_json::from_str::<serde_json::Value>(&delegated.content).unwrap()["run_id"]
         .as_str()
         .unwrap()
@@ -154,7 +167,10 @@ async fn team_tool_delegates_waits_and_aggregates_end_to_end() {
 
     // result 聚合：completed=2，两个成员都在。
     let resulted = tool
-        .execute(&format!(r#"{{"action":"result","run_id":"{run_id}"}}"#), &ctx)
+        .execute(
+            &format!(r#"{{"action":"result","run_id":"{run_id}"}}"#),
+            &ctx,
+        )
         .await;
     assert!(!resulted.is_error, "result failed: {}", resulted.content);
     let result_value = serde_json::from_str::<serde_json::Value>(&resulted.content).unwrap();
@@ -193,7 +209,11 @@ async fn concurrent_cap_queues_and_completes_all_members() {
             &ctx,
         )
         .await;
-    assert!(!delegated.is_error, "delegate failed: {}", delegated.content);
+    assert!(
+        !delegated.is_error,
+        "delegate failed: {}",
+        delegated.content
+    );
     let run_id = serde_json::from_str::<serde_json::Value>(&delegated.content).unwrap()["run_id"]
         .as_str()
         .unwrap()
@@ -210,7 +230,10 @@ async fn concurrent_cap_queues_and_completes_all_members() {
     assert_eq!(waited_value["terminal"], true);
 
     let resulted = tool
-        .execute(&format!(r#"{{"action":"result","run_id":"{run_id}"}}"#), &ctx)
+        .execute(
+            &format!(r#"{{"action":"result","run_id":"{run_id}"}}"#),
+            &ctx,
+        )
         .await;
     let result_value = serde_json::from_str::<serde_json::Value>(&resulted.content).unwrap();
     assert_eq!(result_value["completed"], 5, "all queued members complete");

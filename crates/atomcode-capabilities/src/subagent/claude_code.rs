@@ -126,7 +126,10 @@ struct ClaudeOutcome {
 fn parse_result(buf: &str) -> ClaudeOutcome {
     let trimmed = buf.trim();
     if trimmed.is_empty() {
-        return ClaudeOutcome { text: String::new(), is_error: false };
+        return ClaudeOutcome {
+            text: String::new(),
+            is_error: false,
+        };
     }
     match serde_json::from_str::<serde_json::Value>(trimmed) {
         Ok(v) => {
@@ -145,12 +148,18 @@ fn parse_result(buf: &str) -> ClaudeOutcome {
                 });
             ClaudeOutcome { text, is_error }
         }
-        Err(_) => ClaudeOutcome { text: trimmed.to_string(), is_error: false },
+        Err(_) => ClaudeOutcome {
+            text: trimmed.to_string(),
+            is_error: false,
+        },
     }
 }
 
 fn result(output: String, stop_reason: SubagentStopReason) -> SubagentResult {
-    SubagentResult { output, stop_reason }
+    SubagentResult {
+        output,
+        stop_reason,
+    }
 }
 
 #[async_trait]
@@ -183,12 +192,13 @@ impl SubagentBackend for ClaudeCodeBackend {
         // `--output-format json` emits a single result object; buffer stdout and
         // parse at the end (do NOT stream raw JSON as activity).
         let mut buf = String::new();
-        let (outcome, stderr_tail) = drain_and_wait(&mut child, self.timeout, &req.cancel, |line| {
-            buf.push_str(&line);
-            buf.push('\n');
-        })
-        .await
-        .map_err(|e| SubagentError::SpawnFailed(e.to_string()))?;
+        let (outcome, stderr_tail) =
+            drain_and_wait(&mut child, self.timeout, &req.cancel, |line| {
+                buf.push_str(&line);
+                buf.push('\n');
+            })
+            .await
+            .map_err(|e| SubagentError::SpawnFailed(e.to_string()))?;
 
         match outcome {
             WaitOutcome::Exited(status) if status.success() => {
@@ -208,9 +218,10 @@ impl SubagentBackend for ClaudeCodeBackend {
             WaitOutcome::TimedOut => {
                 Ok(result(parse_result(&buf).text, SubagentStopReason::Timeout))
             }
-            WaitOutcome::Cancelled => {
-                Ok(result(parse_result(&buf).text, SubagentStopReason::Cancelled))
-            }
+            WaitOutcome::Cancelled => Ok(result(
+                parse_result(&buf).text,
+                SubagentStopReason::Cancelled,
+            )),
         }
     }
 }
@@ -258,7 +269,9 @@ mod tests {
         assert!(!ok.is_error);
         // is_error true with a null result → surfaces the subtype, flags error,
         // does NOT dump the raw JSON envelope.
-        let e = parse_result(r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":null}"#);
+        let e = parse_result(
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":null}"#,
+        );
         assert!(e.is_error);
         assert_eq!(e.text, "error_max_turns");
         // Non-JSON → raw passthrough, not an error.

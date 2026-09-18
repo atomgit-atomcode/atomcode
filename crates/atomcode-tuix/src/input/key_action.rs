@@ -40,7 +40,10 @@ pub enum Action {
 /// event loop applies this once at the modal-dispatch boundary so every modal —
 /// current and future — gets consistent backspace/delete behavior. No modal binds
 /// `^H`/`^?` for anything else, so the remap is unambiguous.
-pub(crate) fn normalize_edit_key(code: KeyCode, modifiers: KeyModifiers) -> (KeyCode, KeyModifiers) {
+pub(crate) fn normalize_edit_key(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> (KeyCode, KeyModifiers) {
     match (code, modifiers.contains(KeyModifiers::CONTROL)) {
         (KeyCode::Char('h'), true) => (KeyCode::Backspace, KeyModifiers::NONE),
         (KeyCode::Char('?'), true) => (KeyCode::Delete, KeyModifiers::NONE),
@@ -261,7 +264,10 @@ mod tests {
             Action::HistorySearch
         );
         // Bare r still inserts a character.
-        assert_eq!(k(KeyCode::Char('r'), KeyModifiers::NONE), Action::Insert('r'));
+        assert_eq!(
+            k(KeyCode::Char('r'), KeyModifiers::NONE),
+            Action::Insert('r')
+        );
     }
 
     #[test]

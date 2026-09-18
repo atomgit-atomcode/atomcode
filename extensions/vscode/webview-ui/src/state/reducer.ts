@@ -12,10 +12,13 @@ import type {
   AuthStatus,
   ProviderInfo,
   SessionTerminalState,
+  TodoItemData,
+  TodoStatus,
 } from './types';
 import { blocksFromLegacyMessage } from './blocks';
 import { applyTodoCall, reduceTodosFromMessages } from './todo';
 import { buildSearchMatches } from '../utils/search';
+import { createTranslator } from '../i18n';
 
 let _msgCounter = 0;
 function nextId(): string {
@@ -299,6 +302,7 @@ function settleOpenTools(
 function mergeTerminalIntoHistory(
   messages: ChatMessage[],
   terminal?: SessionTerminalState,
+  locale?: string,
 ): ChatMessage[] {
   if (!terminal) return messages;
   const next = [...messages];
@@ -306,12 +310,18 @@ function mergeTerminalIntoHistory(
   const assistant = assistantIndex >= 0 ? next[assistantIndex] : undefined;
 
   if (terminal.type === 'done') {
+    // An incomplete turn (e.g. rate_limited) is NOT a failure: the kernel keeps the
+    // already-produced content, so the turn is resumable. Use the localized
+    // "已保留当前结果，可在新一轮中继续" message instead of the old hardcoded "The turn
+    // ended before completion (...)" — which read as if progress was lost (issue #1561).
+    const incompleteNotice = (reason: string) =>
+      terminal.message || createTranslator(locale)('stream.incomplete', { reason });
     if (assistant) {
       let settled = settleOpenTools({ ...assistant, streaming: false }, 'incomplete');
       if (terminal.stopReason && terminal.stopReason !== 'stopped') {
         settled = upsertStatusBlock(settled, {
           kind: 'warning',
-          message: terminal.message || `The turn ended before completion (${terminal.stopReason}).`,
+          message: incompleteNotice(terminal.stopReason),
         });
       }
       next[assistantIndex] = settled;
@@ -319,7 +329,7 @@ function mergeTerminalIntoHistory(
       next.push({
         id: nextId(),
         role: 'error',
-        text: terminal.message || `The turn ended before completion (${terminal.stopReason}).`,
+        text: incompleteNotice(terminal.stopReason),
         timestamp: Date.now(),
       });
     }
@@ -1132,11 +1142,23 @@ function chatReducerInner(state: ChatState, action: ChatAction): ChatState {
         };
         messages.push({ ...message, blocks: role === 'assistant' ? blocksFromLegacyMessage(message) : undefined });
       }
-      const mergedMessages = mergeTerminalIntoHistory(messages, action.terminal);
+      const mergedMessages = mergeTerminalIntoHistory(messages, action.terminal, state.locale);
+      // Derive todos from the transcript FIRST (authoritative while the todowrite
+      // calls are still present); fall back to the persisted sidecar list only
+      // when the transcript yields none (a compaction drained the plan calls —
+      // issue #1503). Sidecar statuses are the canonical strings, so they map
+      // directly onto TodoStatus.
+      const derivedTodos = reduceTodosFromMessages(mergedMessages);
+      const todos: TodoItemData[] = derivedTodos.length > 0
+        ? derivedTodos
+        : (action.todos ?? []).map((item) => ({
+            content: item.content,
+            status: item.status as TodoStatus,
+          }));
       return {
         ...state,
         messages: mergedMessages,
-        activeTodos: reduceTodosFromMessages(mergedMessages),
+        activeTodos: todos,
         isGenerating: false,
         persistenceWarning: undefined,
       };

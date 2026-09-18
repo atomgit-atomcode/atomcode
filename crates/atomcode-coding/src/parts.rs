@@ -27,8 +27,8 @@ use atomcode_capabilities::mcp::{self, McpConnectEvent, McpRegistry, McpServerCo
 use atomcode_capabilities::memory::MemoryHook;
 use atomcode_capabilities::session::snapshot::SnapshotPersistenceStatus;
 use atomcode_capabilities::session::{
-    PresentationFile, RecallTool, SessionContextHook, SessionLease, SessionManager, SessionMeta,
-    SnapshotHook, StorageOwner, TranscriptHook,
+    ListSessionsTool, PresentationFile, RecallTool, SessionContextHook, SessionLease,
+    SessionManager, SessionMeta, SnapshotHook, StorageOwner, TranscriptHook,
 };
 use atomcode_capabilities::skills::{
     register_skill_tools, runtime_skill_dirs, SkillCatalogHook, SkillRegistry,
@@ -37,6 +37,7 @@ use atomcode_capabilities::tools::{
     register_coding_tools_with_vision, ApprovalMiddleware, ArtifactMiddleware, ArtifactStore,
     BashWorkspaceGate, FetchOutputTool, OpenFileWorkspaceGate, ReadFileTool,
     RepairToolArgsMiddleware, SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
+    APPROVAL_KIND,
 };
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::checkpoint::CompactionCheckpoint;
@@ -403,6 +404,10 @@ pub struct CodingParts {
     /// credential command survives a model swap / capability re-prepare (mirrors the
     /// sibling gates above); otherwise the user re-approves it every time.
     pub credential_shell_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
+    /// Shared allow-all store for both bash gates (workspace gate + generic approval
+    /// middleware). Allows the user to grant "always approve bash" across both gates
+    /// with a single decision, persisting across model swaps.
+    pub bash_allow_all_grants: std::sync::Arc<dyn atomcode_capabilities::tools::PermissionStore>,
     /// Provider slot for the `code_review` sub-agent tool, FILLED by [`assemble`] (the tool
     /// is built in `prepare` before the provider exists). Shared so a respawn/model-swap
     /// updates the reviewer's provider too. `None` when `opts.review` was false.
@@ -550,6 +555,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                     model: cfg.model.clone(),
                     context_window: cfg.context_window,
                     stream_timeout: cfg.stream_timeout,
+                    first_token_timeout: cfg.first_token_timeout,
                     request_timeout: cfg
                         .request_timeout
                         .unwrap_or_else(|| std::time::Duration::from_secs(300)),
@@ -678,6 +684,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         .with_max_concurrent(subagent_max_concurrent)
         .with_max_rounds(subagent_max_rounds)
         .with_stream_timeout(cfg.stream_timeout)
+        .with_first_token_timeout(cfg.first_token_timeout)
         .with_tool_loop_policy(cfg.tool_loop_policy)
         .with_credential_shell_policy(cfg.credential_shell_policy)
         .with_worker_middleware(turn_execution_policy.clone())
@@ -739,6 +746,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                 (subagent_max_rounds > 0).then_some(subagent_max_rounds),
                 cfg.tool_loop_policy,
                 Some(cfg.stream_timeout),
+                Some(cfg.first_token_timeout),
                 cfg.request_timeout,
             )
             .with_credential_shell_policy(cfg.credential_shell_policy)
@@ -890,6 +898,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
             RecallTool::new().with_sessions_dir(b.manager.root()),
         ));
         names.push("recall".into());
+        registry.register(Arc::new(
+            ListSessionsTool::new().with_sessions_dir(b.manager.root()),
+        ));
+        names.push("list_sessions".into());
     }
 
     // Hooks in the CANONICAL ORDER (registration order = HookChain execution order):
@@ -983,7 +995,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
     // through prepare()/assemble() here; `assemble.rs::build_coding_agent` (which also registers
     // it) is reachable only from tests + examples, so there is no double-registration.
     if todo_enabled {
-        hooks.push(Arc::new(crate::todo::TodoHook));
+        hooks.push(Arc::new(crate::todo::TodoHook::new(&cfg.working_dir)));
     }
     // DeepSeek-only opening-turn skill-first reminder. A weak model (deepseek) skips
     // use_skill and dives straight into exploring/solutioning; a static persona line did
@@ -1048,6 +1060,10 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         names.clear();
     }
 
+    // Shared allow-all store for both bash gates (workspace gate + generic approval middleware).
+    let bash_allow_all: Arc<dyn atomcode_capabilities::tools::PermissionStore> =
+        Arc::new(atomcode_capabilities::tools::InMemoryPermissionStore::new());
+
     Ok(CodingParts {
         shared_cwd: std::sync::Arc::new(std::sync::RwLock::new(cfg.working_dir.clone())),
         plan_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1069,6 +1085,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         credential_shell_grants: std::sync::Arc::new(
             atomcode_capabilities::tools::InMemoryPermissionStore::new(),
         ),
+        bash_allow_all_grants: bash_allow_all.clone(),
         registry,
         tool_names: names,
         todo_enabled,
@@ -1082,7 +1099,11 @@ async fn prepare_with_plugin_hooks_reusing_lease(
         mcp_publication_enabled,
         mcp_catalog_ready: tokio::sync::watch::channel(mcp_registry.is_none()).0,
         _mcp_work_guard: mcp_work_guard,
-        approval: Arc::new(ApprovalMiddleware::in_memory()),
+        approval: Arc::new(ApprovalMiddleware::with_allow_all_store(
+            Arc::new(atomcode_capabilities::tools::InMemoryPermissionStore::new()),
+            bash_allow_all.clone(),
+            APPROVAL_KIND.to_string(),
+        )),
         hooks,
         compaction_checkpoint,
         snapshot_hook: snapshot_hook_handle,
@@ -1209,6 +1230,7 @@ impl CodingParts {
         self.bash_workspace_grants = Arc::clone(&previous.bash_workspace_grants);
         self.sensitive_path_grants = Arc::clone(&previous.sensitive_path_grants);
         self.credential_shell_grants = Arc::clone(&previous.credential_shell_grants);
+        self.bash_allow_all_grants = Arc::clone(&previous.bash_allow_all_grants);
     }
 
     /// Preserve the exact current conversation across a sessionless provider reassembly.
@@ -1739,14 +1761,11 @@ pub fn assemble(
         .middleware(Arc::new(SensitivePathGate::with_store(
             parts.sensitive_path_grants.clone(),
         )));
-    #[cfg(feature = "atomgit")]
-    {
-        // Typed AtomGit tools are the only supported API path: they keep credentials
-        // outside model-visible arguments and retain action-aware approval semantics.
-        builder = builder.middleware(Arc::new(
-            atomcode_capabilities::tools::AtomgitBashGate::new(),
-        ));
-    }
+    // NOTE: raw AtomGit API calls through bash are intentionally NOT blocked —
+    // read-only/public queries are legitimate, and credential exposure (the real
+    // risk) is already caught by CredentialBashGate above (its `*_token` detection
+    // covers `$ATOMGIT_TOKEN`). The typed AtomGit tools remain available and are
+    // steered by the persona for credential-bearing / write operations.
     // CC external hooks (PreToolUse gate). Runs AFTER the hard PlanMode/SensitivePath gates
     // (which must stay un-bypassable by a hook `allow`) but BEFORE every auto-approve
     // convenience gate — OpenFileWorkspaceGate and especially WriteApprovalGate, which
@@ -1759,6 +1778,20 @@ pub fn assemble(
     // middleware overhead).
     if let Some(cc) = &parts.cc_external_hooks {
         builder = builder.middleware(cc.clone());
+    }
+    // User-declared `[permissions]` allow/deny rules. Registered only when the user wrote
+    // some (zero middleware overhead otherwise). Placement is the whole contract: AFTER every
+    // hard boundary (turn policy, plan mode, CredentialBashGate, SensitivePathGate, CC
+    // PreToolUse hooks) so a user rule can never unlock a security gate, and BEFORE the
+    // convenience gates + the generic approval prompt so a matched `allow` actually skips the
+    // prompt. Reads the SAME live cwd handle, so a /cd moves what a relative path rule means.
+    if !cfg.permission_rules.is_empty() {
+        builder = builder.middleware(Arc::new(
+            atomcode_capabilities::tools::PermissionRuleGate::new(
+                cfg.permission_rules.clone(),
+                parts.shared_cwd.clone(),
+            ),
+        ));
     }
     let mut builder = builder
         // open_file is Risky (launches a GUI), so approval would prompt on EVERY preview.
@@ -1788,9 +1821,10 @@ pub fn assemble(
         // BEFORE the generic approval gate so its `Allow` short-circuits the prompt; reads the
         // SAME live cwd handle, so /cd moves the boundary. Mode-independent (accept-edits is for
         // edits only); full Auto bypasses it via the driver auto-answering.
-        .middleware(Arc::new(BashWorkspaceGate::with_store(
+        .middleware(Arc::new(BashWorkspaceGate::with_allow_all_store(
             parts.shared_cwd.clone(),
             parts.bash_workspace_grants.clone(),
+            parts.bash_allow_all_grants.clone(),
         )))
         // Approval AFTER the CC PreToolUse gate + the write/open auto-approve gates — every
         // arg-rewrite (CC `updatedInput`) has already applied, so the user approves the exact
@@ -1810,6 +1844,7 @@ pub fn assemble(
         ))
         .compact_threshold(cfg.compact_threshold)
         .stream_timeout(cfg.stream_timeout)
+        .first_token_timeout(cfg.first_token_timeout)
         .max_continuations(cfg.max_continuations)
         // Ctrl-C semantics: false = UNDO (default), true = PRESERVE the interrupted turn.
         .keep_interrupted_context(cfg.keep_interrupted_context);
@@ -1821,10 +1856,16 @@ pub fn assemble(
     if cfg.max_rounds != 0 {
         builder = builder.max_rounds(cfg.max_rounds);
     }
-    // An explicit retry_max_attempts value is the TOTAL adapter OPEN budget.
-    // Do not multiply it by the kernel's historical outer same-round retries;
-    // the neutral kernel default remains unchanged when the setting is absent.
-    if cfg.retry_max_attempts.is_some() {
+    // Provider-retry tiers. `upstream_retry_max_attempts` (global `[network]`) is
+    // the explicit knob for the VISIBLE kernel tier and WINS when set — it lets a
+    // flaky-gateway user keep the fast adapter budget small AND make the patient
+    // tier more persistent. Otherwise the legacy coupling holds: an explicit
+    // per-model `retry_max_attempts` is the TOTAL adapter OPEN budget, so the
+    // kernel's outer same-round retries are disabled to avoid multiplying it.
+    // With neither set, the neutral kernel default (patient) stands.
+    if let Some(n) = cfg.upstream_retry_max_attempts {
+        builder = builder.max_provider_retries(n);
+    } else if cfg.retry_max_attempts.is_some() {
         builder = builder.max_provider_retries(0);
     }
     builder = builder.round_cap_checkpoint(cfg.round_cap_checkpoint);
@@ -2982,6 +3023,10 @@ mod tests {
             &candidate.credential_shell_grants,
             &previous.credential_shell_grants,
         ));
+        assert!(Arc::ptr_eq(
+            &candidate.bash_allow_all_grants,
+            &previous.bash_allow_all_grants,
+        ));
         assert!(candidate
             .plan_mode
             .load(std::sync::atomic::Ordering::Acquire));
@@ -3280,16 +3325,33 @@ mod tests {
             .iter()
             .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
             .expect("turn markdown");
+        // `.cas.jsonl` shares the `jsonl` extension, so match on the full name.
+        let name_ends = |path: &&std::path::PathBuf, suffix: &str| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(suffix))
+        };
         let jsonl = files
             .iter()
-            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+            .find(|p| name_ends(p, ".jsonl") && !name_ends(p, ".cas.jsonl"))
             .expect("per-round request jsonl");
+        let cas = files
+            .iter()
+            .find(|p| name_ends(p, ".cas.jsonl"))
+            .expect("content-addressed store");
         assert!(std::fs::read_to_string(markdown)
             .unwrap()
             .contains("**Response:**\nlooks good"));
         let request = std::fs::read_to_string(jsonl).unwrap();
         assert!(request.contains("\"model\":\"logged-model\""));
-        assert!(request.contains("record this turn"));
+        // v2 records reference message bodies by hash; the prompt text lives once
+        // in the cas store. Rehydrate to confirm the full request is recoverable.
+        let record: serde_json::Value =
+            serde_json::from_str(request.lines().next().unwrap()).unwrap();
+        let index =
+            atomcode_capabilities::datalog::build_cas_index(&std::fs::read_to_string(cas).unwrap());
+        let full = atomcode_capabilities::datalog::rehydrate_record(&record, &index);
+        assert!(full["messages"].to_string().contains("record this turn"));
     }
 
     #[tokio::test]

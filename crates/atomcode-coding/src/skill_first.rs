@@ -105,10 +105,12 @@ mod tests {
                 3,
                 "{model}: opening turn appends exactly one reminder"
             );
-            assert!(msgs[2].synthetic, "{model}: reminders must carry provenance");
             assert!(
-                msgs[2].text.starts_with("<system-reminder>")
-                    && msgs[2].text.contains("use_skill"),
+                msgs[2].synthetic,
+                "{model}: reminders must carry provenance"
+            );
+            assert!(
+                msgs[2].text.starts_with("<system-reminder>") && msgs[2].text.contains("use_skill"),
                 "{model}: wrapped skill-first reminder: {:?}",
                 msgs[2].text
             );

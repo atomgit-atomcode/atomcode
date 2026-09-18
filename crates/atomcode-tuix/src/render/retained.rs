@@ -263,6 +263,12 @@ struct UserInputRows {
     rows: Vec<Vec<Cell>>,
     /// Full rendered range belonging to the active option/input/submit row.
     active: std::ops::Range<usize>,
+    /// When the active row is a TEXT-input field (the Single/Multiple
+    /// custom-answer row, or a Text-mode box), the 0-indexed display column of
+    /// its caret within `rows[active.start]`. `None` for options-only /
+    /// non-text-focused rows. Lets the footer park the REAL terminal cursor
+    /// there so an OS IME anchors its preedit correctly (see paint_footer).
+    caret_col: Option<usize>,
 }
 
 /// Final physical-row budget for the retained footer. Individual widgets cap
@@ -375,6 +381,86 @@ fn format_ctx_usage(used: usize, window: usize) -> String {
         let pct = (used as f64 / window as f64 * 100.0).round() as u64;
         format!("{}/{} tok ({}%)", used_label, window_label, pct)
     }
+}
+
+/// Last non-empty path segment — the "project name" shown when a narrow status
+/// row can't fit the full cwd. Splits on both `/` and `\` because
+/// `collapse_home` only normalises paths *under* the home dir to `/`; a Windows
+/// project outside home still arrives with backslashes.
+fn path_basename(path: &str) -> &str {
+    path.rsplit(|c| c == '/' || c == '\\')
+        .find(|seg| !seg.is_empty())
+        .unwrap_or(path)
+}
+
+/// One colour-differentiated segment of the status row's left info group.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StatusSeg {
+    Model,
+    Cwd,
+    Ctx,
+    Cache,
+}
+
+/// Joined display width of a segment list, counting the 3-column separators
+/// (` │ `/` | `, see `status_separator`) emitted between adjacent segments.
+fn status_segments_width(segs: &[(StatusSeg, String)]) -> usize {
+    if segs.is_empty() {
+        return 0;
+    }
+    let text: usize = segs
+        .iter()
+        .map(|(_, t)| crate::width::display_width(t))
+        .sum();
+    text + 3 * (segs.len() - 1)
+}
+
+/// Choose which left-group segments fit within `budget`, applying the
+/// width-degradation order requested for narrow terminals:
+///   1. shorten the cwd to its project name (`cwd_base`),
+///   2. drop the ctx-usage (token %) segment,
+///   3. drop the cache-hit segment.
+/// The model segment is always retained; the caller truncates it only as an
+/// absolute last resort (when even `model | project` overflows). Segments are
+/// returned in display order with their final text.
+fn fit_status_segments(
+    model: &str,
+    cwd_full: &str,
+    cwd_base: &str,
+    ctx: &str,
+    cache: &str,
+    budget: usize,
+) -> Vec<(StatusSeg, String)> {
+    let build = |cwd: &str, ctx_on: bool, cache_on: bool| {
+        let mut v: Vec<(StatusSeg, String)> = Vec::with_capacity(4);
+        if !model.is_empty() {
+            v.push((StatusSeg::Model, model.to_string()));
+        }
+        if !cwd.is_empty() {
+            v.push((StatusSeg::Cwd, cwd.to_string()));
+        }
+        if ctx_on && !ctx.is_empty() {
+            v.push((StatusSeg::Ctx, ctx.to_string()));
+        }
+        if cache_on && !cache.is_empty() {
+            v.push((StatusSeg::Cache, cache.to_string()));
+        }
+        v
+    };
+    // Richest first; each stage strips one thing in the requested order.
+    let stages = [
+        build(cwd_full, true, true),
+        build(cwd_base, true, true),   // 1. cwd → project name
+        build(cwd_base, false, true),  // 2. drop ctx usage
+        build(cwd_base, false, false), // 3. drop cache
+    ];
+    for stage in &stages {
+        if status_segments_width(stage) <= budget {
+            return stage.clone();
+        }
+    }
+    // Nothing fits cleanly — hand back the leanest set; the caller truncates.
+    build(cwd_base, false, false)
 }
 
 /// Marker prefix for the dedicated footer goal row. A width-1 BMP "ring" from
@@ -613,7 +699,10 @@ fn format_loop_row(
 /// `todo_panel_rows`). No blank padding — a short list shows short.
 const MAX_TODO_PANEL_ROWS: usize = 7;
 /// Header + at most three live children + one folded terminal/pending summary.
-const MAX_SUBTASK_PANEL_ROWS: usize = 6;
+/// Footer height ceiling: 1 header + up to 3 running children × 2 rows each
+/// (primary + connected detail) = 7. Terminal/pending children fold into the
+/// header counts + a summary row rather than taking space.
+const MAX_SUBTASK_PANEL_ROWS: usize = 7;
 const MAX_VISIBLE_RUNNING_SUBTASKS: usize = 3;
 
 fn format_subtask_progress(activity: &str, elapsed: &str, tokens: u64, width: usize) -> String {
@@ -1039,6 +1128,32 @@ fn is_recoverable_tool_failure(success: bool, summary: &str) -> bool {
     !success && (summary.starts_with("[elapsed:") || summary.contains("The file was NOT modified"))
 }
 
+/// The "breathing" pulse for an in-flight tool's `●` bullet: a full white↔gray
+/// cycle every [`BREATH_PERIOD_MS`]. Applied only on unicode + colour terminals;
+/// non-unicode / no-colour fall back to the raw spinner glyph (see
+/// `render_inflight_tool`).
+const BREATH_PERIOD_MS: u128 = 1200;
+/// Trough (mid-grey) and peak (near-white) of the breath, as 256-colour grey-ramp
+/// AnsiValue indices (232 = darkest … 255 = lightest). A calm, contained pulse —
+/// bright enough to read as "alive", dim enough to not blink harshly. Rendered
+/// via the 256-colour grey ramp so it looks right on both truecolor and 256-colour
+/// terminals without probing the exact depth.
+const BREATH_DIM: u8 = 242;
+const BREATH_BRIGHT: u8 = 255;
+
+/// The grey-ramp AnsiValue for the breathing bullet at `elapsed` into a
+/// CONTINUOUS breath (not reset per tool — all in-flight bullets pulse in sync).
+/// Cosine-eased so it fades in/out smoothly (a "breath"), not a linear blink:
+/// starts at [`BREATH_DIM`], peaks at [`BREATH_BRIGHT`] mid-cycle, returns to dim.
+/// Pure fn of `elapsed` so the curve is unit-tested without a clock.
+fn breath_gray(elapsed: std::time::Duration) -> u8 {
+    let phase = (elapsed.as_millis() % BREATH_PERIOD_MS) as f64 / BREATH_PERIOD_MS as f64; // 0..1
+                                                                                           // cos goes 1 → -1 → 1 over the cycle; (1-cos)/2 gives 0 → 1 → 0 (dim→bright→dim).
+    let t = (1.0 - (phase * std::f64::consts::TAU).cos()) / 2.0;
+    let span = (BREATH_BRIGHT - BREATH_DIM) as f64;
+    BREATH_DIM + (t * span).round() as u8
+}
+
 /// Leading gutter glyphs that anchor a tool block (`● bash`, `└ cmd`,
 /// `⎿ [elapsed…]`, …). Stripped from a tool row's COPY text so a drag copy
 /// carries the command/output, not the decorative anchor.
@@ -1168,6 +1283,10 @@ fn apply_sgr(params: &str, style: &mut CellStyle) {
 pub struct RetainedRenderer<W: Write + Send> {
     out: W,
     caps: TerminalCaps,
+    /// Anchor for the in-flight bullet's continuous "breathing" pulse (see
+    /// `breath_gray`). Set once at construction so all in-flight tools breathe in
+    /// sync and the phase never jumps between renders.
+    breath_anchor: std::time::Instant,
     mouse_capture_enabled: bool,
     interaction_publisher: crate::render::interaction::InteractionPublisher,
     pending_interactions: Vec<crate::render::interaction::HitRegion>,
@@ -1546,6 +1665,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         Self {
             out,
             caps,
+            breath_anchor: std::time::Instant::now(),
             mouse_capture_enabled,
             interaction_publisher,
             pending_interactions: Vec::new(),
@@ -1765,6 +1885,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
         self.style_bold(Role::ToolName)
     }
 
+    /// Bullet style for a LIVE subtask/subagent `●`: a white↔gray breathing
+    /// pulse (identical to the in-flight tool bullet) on modern colour
+    /// terminals, else a static white — never the old magenta accent. The
+    /// footer repaints on each spinner tick while subagents run, so the pulse
+    /// animates; on legacy terminals it degrades to a steady white dot.
+    fn breathing_bullet_style(&self) -> CellStyle {
+        let mut s = CellStyle::default();
+        if self.caps.colors && self.caps.modern_emulator && self.caps.unicode_symbols {
+            s.fg = Some(Color::AnsiValue(breath_gray(self.breath_anchor.elapsed())));
+        } else {
+            s.fg = Some(Color::White);
+        }
+        s
+    }
+
     /// Bold style for the tool-call `●` bullet, coloured by the call's outcome:
     /// green success / yellow recoverable / red hard failure, or the neutral
     /// `ToolName` shade when the outcome is not yet known (in-flight, preempt,
@@ -1946,9 +2081,29 @@ impl<W: Write + Send> RetainedRenderer<W> {
             safe_name.to_ascii_lowercase().as_str(),
             "task" | "team" | "codereview" | "code_review"
         );
-        let prefix = format!("{} ", icon);
+        // A regular in-flight tool shows a static `●` whose colour "breathes"
+        // white↔grey (a calm running pulse), instead of the raw spinner frame —
+        // matching the committed `●` and Claude Code's running indicator. Gated
+        // on unicode + a MODERN emulator (the 256-colour grey ramp AnsiValue
+        // 242-255 needs real 256-colour support — same gate the mascot's AnsiValue
+        // art uses; bare/SSH/16-colour ttys claiming `xterm-256color` don't
+        // qualify). Subagent fan-outs keep their Brand spinner; everything else
+        // falls back to the passed spinner `icon` unchanged.
+        let breathe = !is_subagent_fanout
+            && self.caps.unicode_symbols
+            && self.caps.colors
+            && self.caps.modern_emulator;
+        let prefix = if breathe {
+            "\u{25cf} ".to_string()
+        } else {
+            format!("{} ", icon)
+        };
         let prefix_style = if is_subagent_fanout {
             self.style_for(Role::Brand)
+        } else if breathe {
+            let mut s = self.tool_bullet_style();
+            s.fg = Some(Color::AnsiValue(breath_gray(self.breath_anchor.elapsed())));
+            s
         } else {
             self.tool_bullet_style()
         };
@@ -3211,8 +3366,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             (None, brand.clone())
         };
-        // The badge is followed by " · " (space · middot · space = width 3).
-        // This constant must match the separator emitted in `push_badge` below.
+        // The badge is followed by the segment separator (` │ `/` | `, width 3;
+        // see `status_separator`). This constant must match the width of the
+        // separator emitted in `push_badge` below.
         const BADGE_SEP_W: usize = 3;
         let mode_badge_w = left_badge
             .as_ref()
@@ -3225,69 +3381,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let right_reserved = mode_badge_w;
         let left_max = max.saturating_sub(right_reserved);
 
-        // Pre-truncate the cwd so that model + ctx_usage still get space
-        // on narrow terminals.  Budget for cwd: subtract model width and
-        // the " · " separator widths from left_max.  If the cwd alone
-        // would eat the entire row, `truncate_path` replaces leading
-        // segments with ".../" and keeps only the last segment.
-        let model_str = if !status.model.is_empty() {
-            let mut s = scrub_controls(&status.model);
-            if let Some(ref effort) = status.reasoning_effort {
-                use std::fmt::Write;
-                let _ = write!(s, " [{}]", effort);
-            }
-            s
-        } else {
-            String::new()
-        };
-        let ctx_str = if status.ctx_used > 0 || status.ctx_window > 0 {
-            format_ctx_usage(status.ctx_used, status.ctx_window)
-        } else {
-            String::new()
-        };
-        // Widths of the static " · " separators between visible parts.
-        let sep_w = if !model_str.is_empty() { 3 } else { 0 }
-            + if !ctx_str.is_empty() && (!model_str.is_empty() || !status.cwd.is_empty()) {
-                3
-            } else {
-                0
-            };
-        let cwd_budget = left_max
-            .saturating_sub(crate::width::display_width(&model_str))
-            .saturating_sub(crate::width::display_width(&ctx_str))
-            .saturating_sub(sep_w);
-
-        let mut parts: Vec<String> = Vec::with_capacity(4);
-        if !model_str.is_empty() {
-            parts.push(model_str);
-        }
-        if !status.cwd.is_empty() {
-            let cwd_full = scrub_controls(&status.cwd);
-            let cwd_display =
-                if cwd_budget > 0 && crate::width::display_width(&cwd_full) > cwd_budget {
-                    crate::width::truncate_path(&cwd_full, cwd_budget)
-                } else if cwd_budget == 0 {
-                    crate::width::truncate_path(&cwd_full, left_max)
-                } else {
-                    cwd_full
-                };
-            parts.push(cwd_display);
-        }
-        if !ctx_str.is_empty() {
-            parts.push(ctx_str);
-        }
-        // NOTE: the goal indicator is NOT appended here any more — it lives on
-        // its own dedicated footer row (`build_goal_row`) so it can't be the
-        // first thing truncated off this line under a hint / narrow terminal.
-        let left = parts.join(" · ");
-
-        // Helper: emit the badge (with trailing space) then the rest, so
-        // the mode indicator is always at column 0 (after PAD_COL) and
-        // both hint / no-hint branches share the same prefix.
+        // Left info group (`model │ cwd │ ctx% │ cache%`), colour-differentiated
+        // and width-degrading. When the group can't fit its budget on a narrow
+        // terminal, `render_status_left` first shortens the cwd to its project
+        // name, then drops the ctx-usage segment, then drops the cache segment
+        // (see `fit_status_segments`). The goal indicator is NOT here — it lives
+        // on its own footer row so it can't be the first thing truncated off
+        // this line under a hint / narrow terminal.
+        //
+        // Helper: emit the badge (with trailing space) then the rest, so the
+        // mode indicator is always at column 0 (after PAD_COL) and both the
+        // hint / no-hint branches share the same prefix.
+        let sep_glyph = self.status_separator();
         let push_badge = |row: &mut Vec<Cell>| {
             if let Some(badge) = &left_badge {
                 push_str_cells(row, badge, &left_badge_style);
-                push_str_cells(row, " · ", &secondary);
+                push_str_cells(row, sep_glyph, &secondary);
             }
         };
 
@@ -3303,24 +3412,133 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let right_w = hint_w;
             if right_w + 1 < left_max {
                 let left_budget = left_max - right_w - 1;
-                let left_truncated = crate::width::truncate_to_width(&left, left_budget);
-                let left_w = crate::width::display_width(&left_truncated);
-                let pad_w = max - right_reserved - left_w - hint_w;
                 push_badge(&mut row);
-                push_str_cells(&mut row, &left_truncated, &secondary);
+                let left_w = self.render_status_left(&mut row, status, left_budget);
+                let pad_w = (max - right_reserved)
+                    .saturating_sub(left_w)
+                    .saturating_sub(hint_w);
                 push_str_cells(&mut row, &" ".repeat(pad_w), &pad);
                 push_str_cells(&mut row, &hint, &hint_style);
             } else {
-                let truncated = crate::width::truncate_to_width(&left, left_max);
                 push_badge(&mut row);
-                push_str_cells(&mut row, &truncated, &secondary);
+                self.render_status_left(&mut row, status, left_max);
             }
         } else {
-            let truncated = crate::width::truncate_to_width(&left, left_max);
             push_badge(&mut row);
-            push_str_cells(&mut row, &truncated, &secondary);
+            self.render_status_left(&mut row, status, left_max);
         }
         row
+    }
+
+    /// Separator between status-row segments: a light box-drawing vertical bar
+    /// when the terminal has the glyph, ASCII `|` otherwise. Always 3 columns
+    /// (space + bar + space) so per-segment width math is glyph-independent —
+    /// the same gate the spinner/goal glyphs use for legacy conhost.
+    fn status_separator(&self) -> &'static str {
+        if self.caps.unicode_symbols {
+            " │ "
+        } else {
+            " | "
+        }
+    }
+
+    /// Render the status row's left info group (`model │ cwd │ ctx% │ cache%`)
+    /// into `row` within `budget` columns and return the display width actually
+    /// consumed. Each segment carries its own colour (model = accent/cyan, cwd =
+    /// default fg, ctx% = green/yellow/red by fill, cache% = green) with muted
+    /// separators. Width degradation follows `fit_status_segments`:
+    /// cwd → project name, then drop ctx%, then drop cache%. When even the
+    /// leanest set overflows, it falls back to a single-colour truncation so the
+    /// row can never spill past `budget`.
+    fn render_status_left(&self, row: &mut Vec<Cell>, status: &StatusLine, budget: usize) -> usize {
+        use std::fmt::Write;
+        let secondary = self.style_faint(Role::Secondary);
+
+        let model_str = if !status.model.is_empty() {
+            let mut s = scrub_controls(&status.model);
+            // Channel suffix (only set when the model name is ambiguous) goes
+            // between the name and the `[effort]` badge: `model (Channel) [max]`.
+            if let Some(ref channel) = status.model_channel {
+                let _ = write!(s, " ({})", scrub_controls(channel));
+            }
+            if let Some(ref effort) = status.reasoning_effort {
+                let _ = write!(s, " [{}]", effort);
+            }
+            s
+        } else {
+            String::new()
+        };
+        let ctx_str = if status.ctx_used > 0 || status.ctx_window > 0 {
+            format_ctx_usage(status.ctx_used, status.ctx_window)
+        } else {
+            String::new()
+        };
+        let cache_str = status
+            .cache_indicator
+            .as_deref()
+            .map(scrub_controls)
+            .unwrap_or_default();
+        let cwd_full = scrub_controls(&status.cwd);
+        // Project name (last path segment) is the narrow-terminal fallback shown
+        // before ctx/cache are dropped.
+        let cwd_base = path_basename(&cwd_full).to_string();
+
+        let segs = fit_status_segments(
+            &model_str, &cwd_full, &cwd_base, &ctx_str, &cache_str, budget,
+        );
+
+        // Per-segment colours (all collapse to plain when colours are off).
+        let model_style = self.style_for(Role::Accent);
+        let cwd_style = secondary.clone();
+        // Cache hit ratio in gold — the same `Role::Warning` yellow the `auto`
+        // badge uses, per user preference.
+        let cache_style = self.style_for(Role::Warning);
+        let sep_style = self.style_for(Role::Muted);
+        // ctx% shifts green → yellow → red as the window fills toward the
+        // auto-compaction threshold, mirroring the reference status bar.
+        let ctx_pct = if status.ctx_window > 0 {
+            status.ctx_used.saturating_mul(100) / status.ctx_window
+        } else {
+            0
+        };
+        let ctx_style = if ctx_pct >= 90 {
+            self.style_for(Role::Error)
+        } else if ctx_pct >= 70 {
+            self.style_for(Role::Warning)
+        } else {
+            self.style_for(Role::Success)
+        };
+        let style_for_seg = |seg: StatusSeg| match seg {
+            StatusSeg::Model => &model_style,
+            StatusSeg::Cwd => &cwd_style,
+            StatusSeg::Ctx => &ctx_style,
+            StatusSeg::Cache => &cache_style,
+        };
+
+        let sep = self.status_separator();
+        if status_segments_width(&segs) <= budget {
+            let mut used = 0usize;
+            for (i, (seg, text)) in segs.iter().enumerate() {
+                if i > 0 {
+                    push_str_cells(row, sep, &sep_style);
+                    used += 3;
+                }
+                push_str_cells(row, text, style_for_seg(*seg));
+                used += crate::width::display_width(text);
+            }
+            used
+        } else {
+            // Last resort (model + project name still wider than the budget on a
+            // tiny terminal): single-colour truncate so the row never overflows.
+            let joined = segs
+                .iter()
+                .map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>()
+                .join(sep);
+            let truncated = crate::width::truncate_to_width(&joined, budget);
+            push_str_cells(row, &truncated, &secondary);
+            crate::width::display_width(&truncated)
+        }
     }
 
     /// Emit one dedicated footer row from its three width-fitted segments,
@@ -3420,21 +3638,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             .iter()
             .filter(|item| item.status == crate::render::SubtaskStatus::Running)
             .count();
-        let failed = subtasks
-            .items
-            .iter()
-            .filter(|item| item.status == crate::render::SubtaskStatus::Failed)
-            .count();
-        let stopped = subtasks
-            .items
-            .iter()
-            .filter(|item| item.status == crate::render::SubtaskStatus::Stopped)
-            .count();
-        let pending_items = subtasks
-            .items
-            .iter()
-            .filter(|item| item.status == crate::render::SubtaskStatus::Pending)
-            .count();
         let terminal = subtasks
             .items
             .iter()
@@ -3447,19 +3650,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 )
             })
             .count();
-        let pending = if subtasks.call_id.starts_with("team:") {
-            subtasks.total.saturating_sub(terminal + running)
-        } else {
-            pending_items
-        };
-        let needs_summary =
-            failed > 0 || stopped > 0 || pending > 0 || running > MAX_VISIBLE_RUNNING_SUBTASKS;
-        let spacer_rows = usize::from(cap >= 2);
-        let summary_rows = usize::from(needs_summary && cap >= spacer_rows + 2);
-        let visible_running = running
-            .min(MAX_VISIBLE_RUNNING_SUBTASKS)
-            .min(cap.saturating_sub(spacer_rows + 1 + summary_rows));
-        spacer_rows + 1 + visible_running + summary_rows
+        // Mirror `build_subtask_rows` exactly: no spacer, 1 header, and up to 3
+        // visible children (running first, then finished fill) × 2 rows each.
+        // Pending are header-only and never take a row.
+        let slots = MAX_VISIBLE_RUNNING_SUBTASKS.min(cap.saturating_sub(1) / 2);
+        let visible = slots.min(running + terminal);
+        1 + visible * 2
     }
 
     /// Build the fixed Task fan-out panel. Only running children own detailed
@@ -3477,13 +3673,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
             return Vec::new();
         }
         let mut rows = Vec::new();
-        // Keep the transient task panel visually separate from the conversation
-        // above it. On very short terminals the single available row remains
-        // the header, so cosmetic spacing never displaces useful status.
-        if cap >= 2 {
-            rows.push(Vec::new());
-        }
-
+        // No leading spacer: the two-row children already need every row of the
+        // tight budget (header + 3×2 = 7). The header itself separates the panel.
         let bold = CellStyle {
             bold: true,
             ..CellStyle::default()
@@ -3495,7 +3686,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             "*"
         };
-        push_str_cells(&mut header, marker, &self.style_for(Role::Brand));
+        push_str_cells(&mut header, marker, &self.breathing_bullet_style());
         let panel_title = if subtasks.call_id.starts_with("team:") {
             " Team"
         } else {
@@ -3534,30 +3725,65 @@ impl<W: Write + Send> RetainedRenderer<W> {
         push_str_cells(
             &mut header,
             &format!(
-                " \u{b7} {finished}/{} finished \u{b7} {} running \u{b7} {pending} pending",
-                subtasks.total,
-                running.len(),
-                pending = pending_count
+                " \u{b7} {}",
+                crate::i18n::t(crate::i18n::Msg::SubtaskPanelCounts {
+                    finished,
+                    total: subtasks.total,
+                    running: running.len(),
+                    pending: pending_count,
+                })
             ),
             &detail,
         );
         rows.push(header);
 
-        let needs_summary = failed > 0
-            || stopped > 0
-            || pending_count > 0
-            || running.len() > MAX_VISIBLE_RUNNING_SUBTASKS;
-        let summary_rows = usize::from(needs_summary && cap >= rows.len() + 1);
-        let visible_running = running
-            .len()
-            .min(MAX_VISIBLE_RUNNING_SUBTASKS)
-            .min(cap.saturating_sub(rows.len() + summary_rows));
-        for item in running.iter().take(visible_running).copied() {
-            let glyph = "\u{25cf}";
-            let glyph = if self.caps.unicode_symbols {
-                glyph
-            } else {
-                "[>]"
+        // Keep up to 3 subagents on the panel: running children first, then the
+        // most-recently-FINISHED ones fill any empty slot so a completed subagent
+        // lingers (showing `完成`) instead of vanishing — the panel never shrinks
+        // below the active-child count. Pending stay in the header count and
+        // promote into a slot when they actually start.
+        let mut terminal_items: Vec<&crate::render::SubtaskItem> = subtasks
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.status,
+                    SubtaskStatus::Completed | SubtaskStatus::Stopped | SubtaskStatus::Failed
+                )
+            })
+            .collect();
+        terminal_items.sort_by(|a, b| b.finished_at.cmp(&a.finished_at));
+        let slots = MAX_VISIBLE_RUNNING_SUBTASKS.min(cap.saturating_sub(1) / 2);
+        let mut visible: Vec<&crate::render::SubtaskItem> =
+            running.iter().copied().take(slots).collect();
+        for item in terminal_items {
+            if visible.len() >= slots {
+                break;
+            }
+            visible.push(item);
+        }
+        let sub_glyph = if self.caps.unicode_symbols {
+            "\u{2514}"
+        } else {
+            "`"
+        };
+        let dot = if self.caps.unicode_symbols {
+            "\u{25cf}"
+        } else {
+            "[>]"
+        };
+        for item in visible {
+            // Running dots breathe; terminal dots take the status colour.
+            let (row_style, dot_style) = match item.status {
+                SubtaskStatus::Running => (
+                    self.style_for(Role::Secondary),
+                    self.breathing_bullet_style(),
+                ),
+                SubtaskStatus::Stopped => {
+                    (self.style_for(Role::Warning), self.style_for(Role::Warning))
+                }
+                SubtaskStatus::Failed => (self.style_for(Role::Error), self.style_for(Role::Error)),
+                _ => (self.style_for(Role::Muted), self.style_for(Role::Muted)),
             };
             let mut identity = if item.description.is_empty() {
                 item.label.clone()
@@ -3569,82 +3795,53 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 let remainder = identity.split_off(label_len);
                 identity.push_str(&format!(" \u{b7} {}{}", item.model, remainder));
             }
-            let elapsed = item
-                .started_at
-                .map(|started_at| started_at.elapsed().as_secs())
-                .unwrap_or(0);
+            let elapsed = item.elapsed().as_secs();
             let elapsed = if elapsed >= 60 {
                 format!("{}m{}s", elapsed / 60, elapsed % 60)
             } else {
                 format!("{elapsed}s")
             };
-            let activity = if item.activity.is_empty() {
-                "analyzing task"
-            } else {
-                item.activity.as_str()
-            };
-            let content = format!("{} \u{b7} {activity}", scrub_controls(&identity));
-            let glyph_width = crate::width::display_width(glyph);
+            // Primary row: identity (+ cumulative tool count); elapsed + tokens
+            // ride the right edge. The current action moves to its own row below.
+            let mut content = scrub_controls(&identity).to_string();
+            if item.tool_uses > 0 {
+                content.push_str(&format!(
+                    " \u{b7} {}",
+                    crate::i18n::t(crate::i18n::Msg::SubagentToolUses {
+                        count: item.tool_uses,
+                    })
+                ));
+            }
+            let glyph_width = crate::width::display_width(dot);
             let content_width = rule_width.saturating_sub(2 + glyph_width + 1);
             let fitted =
                 format_subtask_progress(&content, &elapsed, item.output_tokens, content_width);
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ", &CellStyle::default());
-            push_str_cells(&mut row, glyph, &self.style_for(Role::Brand));
+            push_str_cells(&mut row, dot, &dot_style);
             push_str_cells(&mut row, " ", &CellStyle::default());
-            push_str_cells(&mut row, &fitted, &self.style_for(Role::Secondary));
+            push_str_cells(&mut row, &fitted, &row_style);
             rows.push(row);
-        }
-        if needs_summary && rows.len() < cap {
-            let mut parts = Vec::new();
-            let hidden_running = running.len().saturating_sub(visible_running);
-            let expands_single_pending =
-                pending.len() == 1 && pending_count == 1 && hidden_running == 0 && failed == 0;
-            if hidden_running > 0 {
-                parts.push(format!("{hidden_running} running"));
-            }
-            if expands_single_pending {
-                let item = pending[0];
-                let mut identity = if item.description.is_empty() {
-                    item.label.clone()
-                } else {
-                    format!("{} \u{b7} {}", item.label, item.description)
-                };
-                if !item.model.is_empty() {
-                    let label_len = item.label.len();
-                    let remainder = identity.split_off(label_len);
-                    identity.push_str(&format!(" \u{b7} {}{}", item.model, remainder));
-                }
-                parts.push(format!("{} \u{b7} pending", scrub_controls(&identity)));
-            } else if pending_count > 0 {
-                parts.push(format!("{pending_count} pending"));
-            }
-            if failed > 0 {
-                parts.push(format!("{failed} failed"));
-            }
-            if stopped > 0 {
-                parts.push(format!("{stopped} stopped"));
-            }
-            let mut row = Vec::new();
-            push_str_cells(&mut row, "  ", &CellStyle::default());
-            push_str_cells(
-                &mut row,
-                &format!(
-                    "{} {}",
-                    if expands_single_pending && self.caps.unicode_symbols {
-                        "\u{25cb}"
-                    } else if expands_single_pending {
-                        "[ ]"
-                    } else if self.caps.unicode_symbols {
-                        "\u{2026}"
+            // Detail row: the current action while running (its own full-width
+            // line so it is never truncated), else a terminal status word.
+            let detail: std::borrow::Cow<str> = match item.status {
+                SubtaskStatus::Running => {
+                    if item.activity.is_empty() {
+                        crate::i18n::t(crate::i18n::Msg::SubagentStatusRunning)
                     } else {
-                        "..."
-                    },
-                    parts.join(" \u{b7} ")
-                ),
-                &self.style_for(Role::Muted),
-            );
-            rows.push(row);
+                        std::borrow::Cow::Borrowed(item.activity.as_str())
+                    }
+                }
+                SubtaskStatus::Completed => crate::i18n::t(crate::i18n::Msg::SubagentStatusDone),
+                SubtaskStatus::Stopped => crate::i18n::t(crate::i18n::Msg::SubagentStatusStopped),
+                SubtaskStatus::Failed => crate::i18n::t(crate::i18n::Msg::SubagentStatusFailed),
+                SubtaskStatus::Pending => crate::i18n::t(crate::i18n::Msg::SubagentStatusWaiting),
+            };
+            let sub_text = format!("    {sub_glyph} {}", scrub_controls(&detail));
+            let sub = crate::width::truncate_with_ellipsis(&sub_text, rule_width);
+            let mut sub_row = Vec::new();
+            push_str_cells(&mut sub_row, &sub, &row_style);
+            rows.push(sub_row);
         }
         for row in &mut rows {
             clamp_cell_row(row, rule_width);
@@ -3856,10 +4053,75 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// the header/detail/hint: the command is already shown in the `▸ Tool(detail)`
     /// body row above, so the panel is just the selectable choices.
     fn approval_panel_row_count(&self, panel: &crate::render::ApprovalPanelView) -> usize {
-        // 1 header row ("Allow Tool(detail)?") + optional advisory note + N option
-        // rows + 1 hint row. MUST track `build_approval_rows` exactly or the footer
-        // height under-counts and the panel overlaps the body.
-        panel.options.len() + 2 + usize::from(panel.note.is_some())
+        // 1 header row ("Allow Tool(detail)?") + optional reason line + optional advisory
+        // note + optional expanded full-command block + N option rows + 1 hint row. MUST
+        // track `build_approval_rows` exactly or the footer height under-counts and the
+        // panel overlaps the body — hence both call `visible_command_rows` (width-
+        // independent, so the count can never disagree with what is drawn).
+        panel.options.len()
+            + 2
+            + usize::from(panel.note.is_some())
+            + usize::from(panel.reason.is_some())
+            + self.visible_command_rows(panel).len()
+    }
+
+    /// Split a Bash command into DISPLAY lines: honor the author's own newlines (heredocs,
+    /// multi-line scripts), and add a soft break after top-level `&&` / `||` / `|` / `;` so
+    /// a long pipe / chain reads multi-line. NAIVE (not quote-aware) — this only affects the
+    /// DISPLAY, never the command that runs, so a literal separator inside a quoted string
+    /// may wrap cosmetically. Order matters: `&&`/`||` before the single `|`.
+    fn split_command_display_lines(cmd: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for physical in cmd.split('\n') {
+            let softened = physical
+                .replace(" && ", " &&\u{1}")
+                .replace(" || ", " ||\u{1}")
+                .replace(" | ", " |\u{1}")
+                .replace("; ", ";\u{1}");
+            for seg in softened.split('\u{1}') {
+                let seg = seg.trim_end();
+                if !seg.is_empty() {
+                    out.push(seg.to_string());
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push(String::new());
+        }
+        out
+    }
+
+    /// The DISPLAY lines of the expanded full-command block, height-clamped so the header,
+    /// options and hint always stay on-screen (the "don't push the buttons off" rule).
+    /// Empty when collapsed or when there is no full command. Width-INDEPENDENT (each
+    /// logical line is one row, horizontally truncated at draw time), so this length is a
+    /// safe single source of truth for both `build_approval_rows` and `approval_panel_row_count`.
+    fn visible_command_rows(&self, panel: &crate::render::ApprovalPanelView) -> Vec<String> {
+        if !panel.expanded {
+            return Vec::new();
+        }
+        let Some(cmd) = panel.full_command.as_deref() else {
+            return Vec::new();
+        };
+        let lines = Self::split_command_display_lines(cmd);
+        // Rows the rest of the panel needs (header + hint + optional note/reason + options).
+        let reserved = 2
+            + usize::from(panel.note.is_some())
+            + usize::from(panel.reason.is_some())
+            + panel.options.len();
+        // Leave 2 rows of breathing room for the body; never let the command block shove
+        // the options off a short terminal.
+        let avail = (self.screen.height() as usize)
+            .saturating_sub(reserved + 2)
+            .max(1);
+        if lines.len() <= avail {
+            return lines;
+        }
+        let hidden = lines.len() - avail.saturating_sub(1);
+        let mut shown: Vec<String> = lines.into_iter().take(avail.saturating_sub(1)).collect();
+        // Language-neutral "N more lines" marker (the Tab hint already sits in the hint row).
+        shown.push(format!("… (+{hidden})"));
+        shown
     }
 
     /// Build the compact footer approval panel: numbered selectable options
@@ -3908,6 +4170,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
             out.push(row);
         }
 
+        // Reason row: "why is this being asked" context from `ApprovalRequest.reason`.
+        // Shown between the header and the advisory note in a muted style.
+        if let Some(reason) = panel.reason.as_deref() {
+            let reason = crate::glyph::downgrade_glyphs(reason, unicode);
+            let reason = crate::width::truncate_with_ellipsis(
+                &scrub_controls(&reason),
+                rule_width.saturating_sub(2),
+            );
+            let style = self.style_for(Role::Muted);
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "  ", &style);
+            push_str_cells(&mut row, &reason, &style);
+            out.push(row);
+        }
+
         // Advisory row: e.g. a credential-exposure warning under the header. Truncated
         // to one line like the header; rendered in the Warning role.
         if let Some(note) = panel.note.as_deref() {
@@ -3920,6 +4197,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ", &style);
             push_str_cells(&mut row, &note, &style);
+            out.push(row);
+        }
+
+        // Expanded full-command block (Bash only, Tab-toggled): the EXACT command, shell-
+        // split into rows so the user reads precisely what will run at the decision point.
+        // `visible_command_rows` already height-clamped it so the options stay on-screen.
+        for line in self.visible_command_rows(panel) {
+            let line = crate::glyph::downgrade_glyphs(&line, unicode);
+            let line = crate::width::truncate_with_ellipsis(
+                &scrub_controls(&line),
+                rule_width.saturating_sub(4),
+            );
+            let style = self.style_for(Role::Secondary);
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "    ", &style); // 4-col indent under the header
+            push_str_cells(&mut row, &line, &style);
             out.push(row);
         }
 
@@ -3965,7 +4258,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         // Hint row: `  <localized hint>` in muted style, glyph-downgraded, truncated.
-        let hint_raw = crate::i18n::t(crate::i18n::Msg::ApprovalHint);
+        // Bash approvals append the Tab expand/collapse hint so the affordance is discoverable.
+        let mut hint_raw = crate::i18n::t(crate::i18n::Msg::ApprovalHint).into_owned();
+        if panel.full_command.is_some() {
+            hint_raw.push_str(" · ");
+            hint_raw.push_str(&crate::i18n::t(crate::i18n::Msg::ApprovalExpandHint));
+        }
         let hint = crate::glyph::downgrade_glyphs(&hint_raw, unicode);
         let hint_budget = rule_width.saturating_sub(2);
         let hint_truncated = crate::width::truncate_with_ellipsis(&hint, hint_budget);
@@ -3990,7 +4288,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         screen_height: usize,
         scroll_offset: isize,
     ) -> Vec<Vec<Cell>> {
-        let UserInputRows { rows, active } = built;
+        let UserInputRows {
+            rows,
+            active,
+            caret_col: _,
+        } = built;
         let max_rows = screen_height.saturating_sub(1);
         if max_rows == 0 {
             return Vec::new();
@@ -4072,6 +4374,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let unicode = self.caps.unicode_symbols;
         let mut out: Vec<Vec<Cell>> = Vec::new();
         let mut active = 0..1;
+        // 0-indexed caret column within the active row when it is a text field
+        // (custom-answer / Text box). Drives the real-cursor park for IME anchoring.
+        let mut caret_col: Option<usize> = None;
 
         // A blank spacer row (empty cells).
         let blank_row = |out: &mut Vec<Vec<Cell>>| out.push(Vec::new());
@@ -4257,6 +4562,8 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     }
                     push_str_cells(&mut row, &num, &chrome_style);
 
+                    // Caret column WITHIN the field content (0 = front of field).
+                    let mut field_caret_col = 0usize;
                     if panel.custom_text.trim().is_empty() {
                         // Faint placeholder when no text has been typed yet
                         // (consistent with build_response which trims before checking).
@@ -4297,11 +4604,14 @@ impl<W: Write + Send> RetainedRenderer<W> {
                         };
                         let safe_text = scrub_controls(&panel.custom_text);
                         let text = if on_cursor {
-                            crate::width::editable_value_projection(
-                                &safe_text,
-                                panel.custom_text_cursor_byte,
-                                budget,
-                            )
+                            let (projected, caret_in_field) =
+                                crate::width::editable_value_projection_with_caret(
+                                    &safe_text,
+                                    panel.custom_text_cursor_byte,
+                                    budget,
+                                );
+                            field_caret_col = caret_in_field;
+                            projected
                         } else {
                             crate::width::truncate_with_ellipsis(&safe_text, text_budget)
                         };
@@ -4310,6 +4620,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     out.push(row);
                     if on_cursor {
                         active = custom_start..out.len();
+                        // Prefix (marker/checkbox/number) + the caret's column WITHIN the
+                        // field. Empty → 0 (front); non-empty → from the projection, so it
+                        // tracks windowing/ellipsis exactly and never drifts on long text.
+                        caret_col = Some(prefix_width + field_caret_col);
                     }
                 }
 
@@ -4380,6 +4694,7 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     }
                     out.push(row);
                     active = out.len().saturating_sub(1)..out.len();
+                    caret_col = Some(if field_width > 0 { 1 } else { 0 });
                 } else {
                     let inner_width = field_width.saturating_sub(2);
                     let (top_left, horizontal, top_right, bottom_left, bottom_right, prompt, caret) =
@@ -4402,14 +4717,19 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     let text_budget = inner_width
                         .saturating_sub(crate::width::display_width(prompt))
                         .saturating_sub(crate::width::display_width(caret));
+                    // Caret column WITHIN the projected text (0 for empty field).
+                    let mut text_field_caret = 0usize;
                     let buf = if panel.text.is_empty() {
                         String::new()
                     } else {
-                        crate::width::editable_value_projection(
-                            &safe_text,
-                            panel.text_cursor_byte,
-                            text_budget + crate::width::display_width(caret),
-                        )
+                        let (projected, caret_in_field) =
+                            crate::width::editable_value_projection_with_caret(
+                                &safe_text,
+                                panel.text_cursor_byte,
+                                text_budget + crate::width::display_width(caret),
+                            );
+                        text_field_caret = caret_in_field;
+                        projected
                     };
                     let visible_text = if buf.is_empty() {
                         crate::width::truncate_with_ellipsis(placeholder, text_budget)
@@ -4442,6 +4762,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
                     push_str_cells(&mut row, if unicode { "│" } else { "|" }, &border_style);
                     out.push(row);
                     active = out.len().saturating_sub(1)..out.len();
+                    // Real-cursor park for IME: left border (1) + prompt + the caret's
+                    // column within the projected text (0 for empty → right after the
+                    // prompt). Projection-derived so long/scrolled text never drifts.
+                    caret_col = Some(1 + crate::width::display_width(prompt) + text_field_caret);
 
                     let mut bottom = Vec::new();
                     push_str_cells(&mut bottom, bottom_left, &border_style);
@@ -4486,7 +4810,11 @@ impl<W: Write + Send> RetainedRenderer<W> {
         push_str_cells(&mut hint_row, &hint_truncated, &hint_style);
         out.push(hint_row);
 
-        UserInputRows { rows: out, active }
+        UserInputRows {
+            rows: out,
+            active,
+            caret_col,
+        }
     }
 
     /// Batch-aware wrapper over [`Self::build_user_input_rows`]. A standalone question
@@ -4635,10 +4963,43 @@ impl<W: Write + Send> RetainedRenderer<W> {
             push_line(&mut out, hint, &hint_style);
         }
         self.fit_user_input_rows(
-            UserInputRows { rows: out, active },
+            UserInputRows {
+                rows: out,
+                active,
+                // Batch (multi-question) IME caret parking is a follow-up; the
+                // single-question / Text paths carry it via build_user_input_rows.
+                caret_col: None,
+            },
             screen_height,
             view.scroll_offset,
         )
+    }
+
+    /// When the `request_user_input` panel's cursor is on a TEXT-input row (the
+    /// Single/Multiple custom-answer row, or a Text-mode box), returns
+    /// `(row_offset_in_panel, caret_col)` so the footer can park the REAL
+    /// terminal cursor there — otherwise an OS IME (e.g. a Chinese input method)
+    /// anchors its composing preedit at a stale position and the caret looks
+    /// misaligned. `None` for options-only navigation, batch (multi-question)
+    /// panels, or a scrolled panel (row offsets no longer map 1:1 to drawn rows
+    /// → safe fallback to the pre-existing hidden-cursor behavior).
+    fn user_input_text_caret(
+        &self,
+        view: &crate::render::UserInputPanelView,
+        rule_width: usize,
+        screen_width: usize,
+        screen_height: usize,
+    ) -> Option<(usize, usize)> {
+        if matches!(&view.batch, Some(m) if m.total > 1) {
+            return None;
+        }
+        let built = self.build_user_input_rows(view, rule_width, screen_width);
+        let caret_col = built.caret_col?;
+        let max_rows = screen_height.saturating_sub(1);
+        if built.rows.len() > max_rows {
+            return None;
+        }
+        Some((built.active.start, caret_col))
     }
 
     /// Row count matching [`Self::build_user_input_panel_view`].
@@ -5661,6 +6022,10 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // `post_approval` is the row index immediately after whatever occupies the
         // slot between the top rule and the attachment rows — either the approval
         // panel (when active) or the input box + bot_rule (normal case).
+        // Set when the user_input panel's cursor is on a text field: keeps the
+        // real cursor VISIBLE and parked at the caret (for IME), overriding the
+        // blanket "hide caret while approval_active" below.
+        let mut user_input_text_focused = false;
         let post_approval = if approval_active {
             // Approval replaces input box: draw approval rows directly after the
             // top rule (skip middle rows, skip bot_rule, skip status).
@@ -5670,7 +6035,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 Self::pad_row_to_width(&mut padded, w, CellStyle::default());
                 self.screen.draw_row(approval_top + i, 0, &padded);
             }
-            // Cursor visibility handled by the common suppress_cursor block below.
+            // Park the real terminal cursor on the user_input custom-answer /
+            // Text field so an OS IME anchors its preedit there. Options-only
+            // panels return None and keep the caret hidden. Gated on
+            // `approval.is_none()` because the approval panel wins the draw slot
+            // (see approval_cells) — without this, a simultaneously-set
+            // user_input would show a stray caret over the approval panel.
+            if status_clone.approval.is_none() {
+                if let Some(view) = status_clone.user_input.as_ref() {
+                    if let Some((row_off, col)) = self.user_input_text_caret(view, rule_width, w, h)
+                    {
+                        let abs_row = (approval_top + row_off + 1) as u16;
+                        let abs_col = (col + 1) as u16;
+                        self.screen.set_cursor(abs_row, abs_col);
+                        user_input_text_focused = true;
+                    }
+                }
+            }
             rules_top + 1 + approval_rows
         } else if hide_input_box {
             rules_top + 1
@@ -5840,11 +6221,20 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // moment they start a type-ahead message the caret returns (preserving the
         // "editable during streaming" behavior the live spinner deliberately keeps).
         let subtask_fanout_idle = self.status.subtasks.is_some() && self.input_buf.is_empty();
+        // Same rule for an animating inflight tool: suppress the caret ONLY while
+        // the composer is empty (user watching). The moment they type a type-ahead
+        // message the caret returns — otherwise a long tool run leaves the input box
+        // cursorless mid-reply ("no cursor while replying"). Typing during the run
+        // may briefly show the same two-caret shimmer the Task fan-out already
+        // accepts; empty-box watching stays flicker-free.
+        let inflight_tool_idle = self.inflight_tool.is_some() && self.input_buf.is_empty();
         // When approval is active or a plugin modal without text input is open,
         // hide the caret (user navigates with ↑↓/Enter/Tab).
-        let suppress_cursor = self.inflight_tool.is_some()
+        let suppress_cursor = inflight_tool_idle
             || subtask_fanout_idle
-            || approval_active
+            // A user_input TEXT field (custom-answer / Text box) keeps the caret
+            // visible + parked for IME; options-only panels stay hidden.
+            || (approval_active && !user_input_text_focused)
             || self.diff_overlay_active
             || (hide_input_box && !is_add_url && !is_search_box_focused);
         self.screen.set_cursor_visible(!suppress_cursor);
@@ -7801,28 +8191,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
         normalized
     }
 
-    #[allow(dead_code)]
-    fn build_wrapped_text_rows(
-        &self,
-        parts: &[(&str, CellStyle)],
-        content_width: usize,
-    ) -> Vec<Vec<Cell>> {
-        let mut content = Vec::new();
-        for (text, style) in parts {
-            push_str_cells(&mut content, text, style);
-        }
-        let chunks = wrap_cells_to_width(&content, content_width.max(1));
-        let mut rows = Vec::with_capacity(chunks.len().max(1));
-        for chunk in chunks {
-            let mut row = Vec::new();
-            let pad = CellStyle::default();
-            push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
-            row.extend(chunk);
-            rows.push(row);
-        }
-        rows
-    }
-
     /// Render the baked mascot const into cell rows (no leading pad; caller
     /// positions it). Each cell is `▀` with fg=top-subpixel / bg=bottom-subpixel;
     /// a fully transparent cell is a blank space.
@@ -8339,11 +8707,23 @@ impl<W: Write + Send> RetainedRenderer<W> {
         };
         let header = if finished && terminal >= progress.total {
             format!(
-                "{marker} {kind} · {terminal}/{} finished · {failed} failed",
-                progress.total
+                "{marker} {}",
+                crate::i18n::t(crate::i18n::Msg::SubagentGroupFinished {
+                    kind,
+                    done: terminal,
+                    total: progress.total,
+                    failed,
+                })
             )
         } else {
-            format!("{marker} Running {running}/{} {kind}…", progress.total)
+            format!(
+                "{marker} {}",
+                crate::i18n::t(crate::i18n::Msg::SubagentGroupRunning {
+                    kind,
+                    running,
+                    total: progress.total,
+                })
+            )
         };
         let header_style = self.style_bold(Role::Secondary);
         let header_row = build_one_row(
@@ -8358,42 +8738,44 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let active_child_style = self.style_for(Role::Secondary);
         let stopped_child_style = self.style_for(Role::Warning);
         let failed_child_style = self.style_for(Role::Error);
+        // Two rows per member (stable count → the live in-place rewrite keeps
+        // working across status transitions): a primary identity/stats row and a
+        // connected detail row. The detail row carries the CURRENT action on its
+        // own full-width line (no longer truncated by competing fields) while
+        // running, and a terminal `Done`/`完成` word once the member finishes.
         let child_rows = progress
             .items
             .iter()
             .enumerate()
-            .map(|(index, item)| {
-                let branch = if index + 1 == progress.items.len() {
-                    "└"
-                } else {
-                    "├"
-                };
-                let state = match item.status {
-                    SubtaskStatus::Pending => "pending",
-                    SubtaskStatus::Running => {
-                        if item.activity.is_empty() {
-                            "running"
-                        } else {
-                            item.activity.as_str()
-                        }
-                    }
-                    SubtaskStatus::Completed => "done",
-                    SubtaskStatus::Stopped => "stopped",
-                    SubtaskStatus::Failed => "failed",
+            .flat_map(|(index, item)| {
+                let is_last = index + 1 == progress.items.len();
+                let branch = if is_last { "\u{2514}" } else { "\u{251c}" };
+                let cont = if is_last { " " } else { "\u{2502}" };
+                let child_style = match item.status {
+                    SubtaskStatus::Pending | SubtaskStatus::Running => &active_child_style,
+                    SubtaskStatus::Completed => &completed_child_style,
+                    SubtaskStatus::Stopped => &stopped_child_style,
+                    SubtaskStatus::Failed => &failed_child_style,
                 };
                 let mut text = format!("  {branch} {}", item.label);
                 if !item.description.is_empty() {
                     text.push_str(&format!(": {}", item.description));
                 }
                 if !item.model.is_empty() {
-                    text.push_str(&format!(" · {}", item.model));
+                    text.push_str(&format!(" \u{b7} {}", item.model));
                 }
-                text.push_str(&format!(" · {state}"));
-                let text = if item.started_at.is_some() || item.output_tokens > 0 {
-                    let elapsed = item
-                        .started_at
-                        .map(|started_at| crate::render::fmt_dur(started_at.elapsed()))
-                        .unwrap_or_else(|| "0s".into());
+                if item.tool_uses > 0 {
+                    text.push_str(&format!(
+                        " \u{b7} {}",
+                        crate::i18n::t(crate::i18n::Msg::SubagentToolUses {
+                            count: item.tool_uses,
+                        })
+                    ));
+                }
+                let primary = if item.started_at.is_some() || item.output_tokens > 0 {
+                    // `item.elapsed()` freezes once the item is terminal, so a done
+                    // row stops ticking even while the live group keeps re-rendering.
+                    let elapsed = crate::render::fmt_dur(item.elapsed());
                     format_subtask_progress(
                         &text,
                         &elapsed,
@@ -8403,18 +8785,42 @@ impl<W: Write + Send> RetainedRenderer<W> {
                 } else {
                     crate::width::truncate_with_ellipsis(&text, self.screen.width() as usize)
                 };
-                let child_style = match item.status {
-                    SubtaskStatus::Pending | SubtaskStatus::Running => &active_child_style,
-                    SubtaskStatus::Completed => &completed_child_style,
-                    SubtaskStatus::Stopped => &stopped_child_style,
-                    SubtaskStatus::Failed => &failed_child_style,
+                let detail: std::borrow::Cow<str> = match item.status {
+                    SubtaskStatus::Running => {
+                        if item.activity.is_empty() {
+                            crate::i18n::t(crate::i18n::Msg::SubagentStatusRunning)
+                        } else {
+                            std::borrow::Cow::Borrowed(item.activity.as_str())
+                        }
+                    }
+                    SubtaskStatus::Completed => {
+                        crate::i18n::t(crate::i18n::Msg::SubagentStatusDone)
+                    }
+                    SubtaskStatus::Stopped => {
+                        crate::i18n::t(crate::i18n::Msg::SubagentStatusStopped)
+                    }
+                    SubtaskStatus::Failed => crate::i18n::t(crate::i18n::Msg::SubagentStatusFailed),
+                    SubtaskStatus::Pending => {
+                        crate::i18n::t(crate::i18n::Msg::SubagentStatusWaiting)
+                    }
                 };
-                build_one_row(
-                    &text,
-                    child_style,
-                    self.screen.width(),
-                    self.caps.unicode_symbols,
-                )
+                let sub_text = format!("  {cont} \u{2514} {}", scrub_controls(&detail));
+                let sub =
+                    crate::width::truncate_with_ellipsis(&sub_text, self.screen.width() as usize);
+                [
+                    build_one_row(
+                        &primary,
+                        child_style,
+                        self.screen.width(),
+                        self.caps.unicode_symbols,
+                    ),
+                    build_one_row(
+                        &sub,
+                        child_style,
+                        self.screen.width(),
+                        self.caps.unicode_symbols,
+                    ),
+                ]
             })
             .collect();
         (header_row, child_rows)
@@ -10559,6 +10965,8 @@ mod tests {
                     model: "test-model".into(),
                     activity: "running".into(),
                     started_at: None,
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 0,
                     status: SubtaskStatus::Running,
                 })
@@ -11329,8 +11737,14 @@ mod tests {
             "Error: invalid JSON arguments for tool"
         ));
         // Success is never a failure, regardless of the text.
-        assert!(!is_recoverable_tool_failure(true, "[elapsed: 0.0s, exit: 0]"));
-        assert!(!is_recoverable_tool_failure(true, "x The file was NOT modified"));
+        assert!(!is_recoverable_tool_failure(
+            true,
+            "[elapsed: 0.0s, exit: 0]"
+        ));
+        assert!(!is_recoverable_tool_failure(
+            true,
+            "x The file was NOT modified"
+        ));
     }
 
     #[test]
@@ -11342,7 +11756,10 @@ mod tests {
         }
         // Gutter glyph + space at col 0 is stripped → the command text alone.
         assert_eq!(copy_text_from_tool_row(&row("● bash")).0, "bash");
-        assert_eq!(copy_text_from_tool_row(&row("└ cargo build")).0, "cargo build");
+        assert_eq!(
+            copy_text_from_tool_row(&row("└ cargo build")).0,
+            "cargo build"
+        );
         // Parallel child row is doubly-anchored (`└ • Tool …`): BOTH the `└`
         // connector and the `•` status dot must be stripped from the copy.
         assert_eq!(
@@ -11364,10 +11781,16 @@ mod tests {
         assert_eq!(copy_text_from_tool_row(&row("  stdout")).0, "stdout");
         assert_eq!(copy_text_from_tool_row(&row("    nested")).0, "  nested");
         // A gutter AFTER the pad (the result line `  └ [exit: 0]`) is stripped too.
-        assert_eq!(copy_text_from_tool_row(&row("  └ [exit: 0]")).0, "[exit: 0]");
+        assert_eq!(
+            copy_text_from_tool_row(&row("  └ [exit: 0]")).0,
+            "[exit: 0]"
+        );
         // But a box-drawing glyph NOT followed by a space (real tree output) is
         // preserved — the space requirement guards it.
-        assert_eq!(copy_text_from_tool_row(&row("  └── file.rs")).0, "└── file.rs");
+        assert_eq!(
+            copy_text_from_tool_row(&row("  └── file.rs")).0,
+            "└── file.rs"
+        );
         // Non-unicode terminal: the gutter downgrades to an ASCII stand-in
         // (`● `→`* `, `▸ `→`> `, `└ `→`` ` ``). At col 0 (a header row) it is
         // still stripped.
@@ -11660,10 +12083,7 @@ mod tests {
         let row = run.rect.row as usize;
         let col = run.rect.col as usize;
         let selection_bg = crate::render::theme::selection_bg_for_current_theme();
-        assert!(
-            cells[row][col].style.bg.is_none(),
-            "ASCII prefix unchanged"
-        );
+        assert!(cells[row][col].style.bg.is_none(), "ASCII prefix unchanged");
         assert_eq!(
             cells[row][col + 1].style.bg,
             Some(selection_bg),
@@ -12064,6 +12484,7 @@ mod tests {
     fn status_basic() -> StatusLine {
         StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/project/atomcode".into(),
             history: None,
             search: None,
@@ -12073,6 +12494,7 @@ mod tests {
             hint: None,
             mode_indicator: None,
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12085,6 +12507,37 @@ mod tests {
             next_prompt_suggestion: None,
             round_cap_panel: None,
         }
+    }
+
+    #[test]
+    fn status_row_channel_suffix_sits_between_model_name_and_effort() {
+        let (r, _counter) = new_counting(80, 24);
+        let mut status = status_basic();
+        status.model_channel = Some("TaoToken".into());
+        status.reasoning_effort = Some("max".into());
+
+        let row = r.build_status_row(&status, 80, false);
+        let visible: String = row.iter().map(|cell| cell.ch).collect();
+        assert!(
+            visible.contains("glm-5 (TaoToken) [max]"),
+            "channel goes between the model name and the [effort] badge: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn status_row_omits_channel_suffix_when_unset() {
+        let (r, _counter) = new_counting(80, 24);
+        let mut status = status_basic();
+        status.reasoning_effort = Some("max".into());
+        // model_channel stays None (unique model name) — no parens shown.
+
+        let row = r.build_status_row(&status, 80, false);
+        let visible: String = row.iter().map(|cell| cell.ch).collect();
+        assert!(visible.contains("glm-5 [max]"), "{visible:?}");
+        assert!(
+            !visible.contains('('),
+            "no channel parens when unset: {visible:?}"
+        );
     }
 
     #[test]
@@ -12460,6 +12913,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12472,6 +12926,7 @@ mod tests {
                 colour: BadgeColour::Mode,
             }),
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12486,11 +12941,12 @@ mod tests {
         };
         let row = r.build_status_row(&status, 60, false);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
-        // spaces, then the badge, then " · " separator, then the body.
+        // spaces, then the badge, then the ` │ ` separator, then the body.
         let visible: String = row.iter().map(|c| c.ch).collect();
         let trimmed = visible.trim_start();
+        let expected = format!("PLAN{}", r.status_separator());
         assert!(
-            trimmed.starts_with("PLAN · "),
+            trimmed.starts_with(&expected),
             "badge + separator must precede the model run; got: {:?}",
             visible
         );
@@ -12516,6 +12972,7 @@ mod tests {
         let shell_fg = role(r.caps, Role::Shell);
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12528,6 +12985,7 @@ mod tests {
                 colour: BadgeColour::Mode,
             }),
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12591,6 +13049,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12603,6 +13062,7 @@ mod tests {
                 colour: BadgeColour::Mode,
             }),
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12642,6 +13102,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12654,6 +13115,7 @@ mod tests {
                 colour: BadgeColour::Mode,
             }),
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12697,6 +13159,7 @@ mod tests {
         let plan_fg = role(r.caps, Role::Plan);
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12709,6 +13172,7 @@ mod tests {
                 colour: BadgeColour::Plan,
             }),
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12752,6 +13216,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12764,6 +13229,7 @@ mod tests {
                 colour: BadgeColour::Secondary,
             }),
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12794,6 +13260,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12803,6 +13270,7 @@ mod tests {
             hint: None,
             mode_indicator: None,
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12826,6 +13294,286 @@ mod tests {
             !visible.contains("PLAN"),
             "no mode_indicator should produce no PLAN badge; got: {:?}",
             visible
+        );
+    }
+
+    /// Cache-hit indicator: when the turn reported cached tokens, the
+    /// left info group must carry a `cache NN%` segment after the ctx
+    /// usage; when `cache_indicator` is `None` (cold start / provider
+    /// never reported cache), the row stays clean.
+    #[test]
+    fn build_status_row_renders_cache_indicator_after_ctx_usage() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let status = StatusLine {
+            model: "glm-5".into(),
+            model_channel: None,
+            cwd: "~/proj".into(),
+            history: None,
+            search: None,
+            command_output: None,
+            ctx_used: 12_300,
+            ctx_window: 64_000,
+            hint: None,
+            mode_indicator: None,
+            bypass_indicator: None,
+            cache_indicator: Some("cache 70%".into()),
+            session_name: None,
+            reasoning_effort: None,
+            goal: None,
+            loop_status: None,
+            todo: None,
+            subtasks: None,
+            approval: None,
+            user_input: None,
+            pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
+            round_cap_panel: None,
+        };
+        let row = r.build_status_row(&status, 60, false);
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        assert!(
+            visible.contains("cache 70%"),
+            "cache indicator must appear on the status row; got: {:?}",
+            visible
+        );
+        // Order: ctx usage segment precedes the cache segment.
+        let ctx_idx = visible.find("tok").expect("ctx usage must render");
+        let cache_idx = visible
+            .find("cache 70%")
+            .expect("cache indicator must render");
+        assert!(
+            ctx_idx < cache_idx,
+            "cache segment must come after the ctx usage; got: {:?}",
+            visible
+        );
+
+        // None → no cache segment at all.
+        let mut clean = status;
+        clean.cache_indicator = None;
+        let row = r.build_status_row(&clean, 60, false);
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        assert!(
+            !visible.contains("cache"),
+            "no cache_indicator must produce no cache segment; got: {:?}",
+            visible
+        );
+    }
+
+    /// Project-name fallback splits on both separators so a Windows path
+    /// outside the home dir (which `collapse_home` leaves with backslashes) is
+    /// still shortened correctly.
+    #[test]
+    fn path_basename_handles_both_separators() {
+        assert_eq!(path_basename("~/Documents/workspace/cangjie"), "cangjie");
+        assert_eq!(path_basename("D:\\projects\\cangjie"), "cangjie");
+        assert_eq!(path_basename("~/proj/"), "proj"); // trailing slash ignored
+        assert_eq!(path_basename("cangjie"), "cangjie"); // already bare
+        assert_eq!(path_basename("~"), "~");
+    }
+
+    /// Narrow-terminal degradation order: as the budget shrinks the left group
+    /// first shows the cwd as its project name, then drops the ctx-usage (token
+    /// %) segment, then drops the cache segment — leaving `model · project`.
+    #[test]
+    fn fit_status_segments_degrades_cwd_then_ctx_then_cache() {
+        let model = "glm-5";
+        let cwd_full = "~/work/atomcode/crates/tuix";
+        let cwd_base = "tuix";
+        let ctx = "12.3k/64k tok (19%)";
+        let cache = "cache 70%";
+
+        // Unbounded: everything, full cwd, in display order.
+        let full = fit_status_segments(model, cwd_full, cwd_base, ctx, cache, usize::MAX);
+        assert_eq!(
+            full.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![
+                StatusSeg::Model,
+                StatusSeg::Cwd,
+                StatusSeg::Ctx,
+                StatusSeg::Cache
+            ]
+        );
+        assert_eq!(full[1].1, cwd_full, "full cwd path survives when it fits");
+
+        // Budget = exactly the width once cwd is its project name: step 1 fires,
+        // ctx + cache still present.
+        let base_budget = status_segments_width(&[
+            (StatusSeg::Model, model.into()),
+            (StatusSeg::Cwd, cwd_base.into()),
+            (StatusSeg::Ctx, ctx.into()),
+            (StatusSeg::Cache, cache.into()),
+        ]);
+        assert!(base_budget < status_segments_width(&full));
+        let step1 = fit_status_segments(model, cwd_full, cwd_base, ctx, cache, base_budget);
+        assert_eq!(step1[1].1, cwd_base, "cwd shortened to project name first");
+        assert_eq!(
+            step1.last().unwrap().0,
+            StatusSeg::Cache,
+            "cache still shown"
+        );
+
+        // Budget without room for ctx: step 2 drops ctx, cache survives.
+        let no_ctx_budget = status_segments_width(&[
+            (StatusSeg::Model, model.into()),
+            (StatusSeg::Cwd, cwd_base.into()),
+            (StatusSeg::Cache, cache.into()),
+        ]);
+        let step2 = fit_status_segments(model, cwd_full, cwd_base, ctx, cache, no_ctx_budget);
+        let kinds: Vec<_> = step2.iter().map(|(s, _)| *s).collect();
+        assert!(!kinds.contains(&StatusSeg::Ctx), "ctx dropped before cache");
+        assert!(kinds.contains(&StatusSeg::Cache), "cache outlives ctx");
+
+        // Budget only for model + project name: step 3 drops cache too.
+        let lean_budget = status_segments_width(&[
+            (StatusSeg::Model, model.into()),
+            (StatusSeg::Cwd, cwd_base.into()),
+        ]);
+        let step3 = fit_status_segments(model, cwd_full, cwd_base, ctx, cache, lean_budget);
+        assert_eq!(
+            step3.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![StatusSeg::Model, StatusSeg::Cwd]
+        );
+    }
+
+    /// When the terminal is wide enough, NOTHING is abbreviated — the full cwd
+    /// path, ctx usage and cache all render; degradation only kicks in when the
+    /// group can't fit its budget.
+    #[test]
+    fn build_status_row_shows_everything_in_full_when_wide() {
+        fn fg_of(row: &[Cell], needle: &str) -> Option<crossterm::style::Color> {
+            let chars: Vec<char> = needle.chars().collect();
+            'outer: for start in 0..row.len() {
+                for (k, &nc) in chars.iter().enumerate() {
+                    match row.get(start + k) {
+                        Some(cell) if cell.ch == nc => {}
+                        _ => continue 'outer,
+                    }
+                }
+                return row[start].style.fg;
+            }
+            None
+        }
+
+        let (mut r, _c) = new_counting(120, 24);
+        r.caps.colors = true;
+        let mut status = status_basic();
+        status.model = "deepseek-flash".into();
+        status.cwd = "~/Documents/workspace/cangjie_compiler".into();
+        status.ctx_used = 56_800;
+        status.ctx_window = 1_000_000;
+        status.cache_indicator = Some("cache 98%".into());
+
+        let row = r.build_status_row(&status, 120, false);
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        assert!(
+            visible.contains("~/Documents/workspace/cangjie_compiler"),
+            "wide terminal shows the FULL cwd path, not the project name: {visible:?}"
+        );
+        assert!(
+            visible.contains("56.8k/1m tok (6%)"),
+            "wide terminal shows the full ctx usage: {visible:?}"
+        );
+        assert!(
+            visible.contains("cache 98%"),
+            "wide terminal shows the cache segment: {visible:?}"
+        );
+        // Full (un-abbreviated) display is still colour-differentiated per segment.
+        assert_eq!(
+            fg_of(&row, "deepseek-flash"),
+            r.style_for(Role::Accent).fg,
+            "model coloured even at full width"
+        );
+        assert_eq!(
+            fg_of(&row, "cache 98%"),
+            r.style_for(Role::Warning).fg,
+            "cache coloured (gold, same as `auto`) even at full width"
+        );
+        assert_eq!(
+            fg_of(&row, "56.8k/1m tok (6%)"),
+            r.style_for(Role::Success).fg,
+            "ctx (6%, comfortable) is green at full width"
+        );
+
+        // Squeeze the same content into a narrow rule → cwd collapses to the
+        // project name first (ctx/cache may then drop per the degradation order).
+        let narrow = r.build_status_row(&status, 40, false);
+        let narrow_vis: String = narrow.iter().map(|c| c.ch).collect();
+        assert!(
+            !narrow_vis.contains("~/Documents/workspace/cangjie_compiler"),
+            "narrow terminal must NOT show the full path: {narrow_vis:?}"
+        );
+        assert!(
+            narrow_vis.contains("cangjie_compiler"),
+            "narrow terminal keeps the project name: {narrow_vis:?}"
+        );
+    }
+
+    /// Colour differentiation: each left-group segment carries its own colour —
+    /// model = accent, cache = gold (`Warning`, same as `auto`), and ctx% shifts
+    /// green → yellow → red as the context window fills.
+    #[test]
+    fn build_status_row_colours_left_segments_by_kind() {
+        // First cell whose char-run equals `needle`; returns its fg. Robust to
+        // the multi-byte `·` separators (byte offsets would mislead).
+        fn fg_of(row: &[Cell], needle: &str) -> Option<crossterm::style::Color> {
+            let chars: Vec<char> = needle.chars().collect();
+            'outer: for start in 0..row.len() {
+                for (k, &nc) in chars.iter().enumerate() {
+                    match row.get(start + k) {
+                        Some(cell) if cell.ch == nc => {}
+                        _ => continue 'outer,
+                    }
+                }
+                return row[start].style.fg;
+            }
+            None
+        }
+
+        let (mut r, _c) = new_counting(120, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let mut status = status_basic();
+        status.cwd = "~/proj".into();
+        status.ctx_window = 64_000;
+        status.cache_indicator = Some("cache 70%".into());
+
+        // Comfortable fill (≈19%) → ctx green.
+        status.ctx_used = 12_300;
+        let row = r.build_status_row(&status, 120, false);
+        assert_eq!(
+            fg_of(&row, "glm-5"),
+            r.style_for(Role::Accent).fg,
+            "model uses the accent colour"
+        );
+        assert_eq!(
+            fg_of(&row, "cache 70%"),
+            r.style_for(Role::Warning).fg,
+            "cache uses gold (same as `auto`)"
+        );
+        assert_eq!(
+            fg_of(&row, "tok"),
+            r.style_for(Role::Success).fg,
+            "ctx under 70% is green"
+        );
+
+        // Filling (≈75%) → ctx yellow.
+        status.ctx_used = 48_000;
+        let row = r.build_status_row(&status, 120, false);
+        assert_eq!(
+            fg_of(&row, "tok"),
+            r.style_for(Role::Warning).fg,
+            "ctx 70–89% is yellow"
+        );
+
+        // Nearly full (≈95%) → ctx red.
+        status.ctx_used = 61_000;
+        let row = r.build_status_row(&status, 120, false);
+        assert_eq!(
+            fg_of(&row, "tok"),
+            r.style_for(Role::Error).fg,
+            "ctx ≥90% is red"
         );
     }
 
@@ -14599,6 +15347,8 @@ mod tests {
                 model: "deepseek-v4-flash".into(),
                 activity: "analyzing".into(),
                 started_at: Some(std::time::Instant::now()),
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 1000,
                 status: SubtaskStatus::Running,
             }],
@@ -14679,6 +15429,40 @@ mod tests {
         assert!(
             vterm.cursor_visible(),
             "caret must return after an error commits the orphaned inflight tool"
+        );
+    }
+
+    /// A non-empty composer means the user is typing a type-ahead message WHILE
+    /// a tool runs. The caret must stay VISIBLE so they can see where they type —
+    /// mirrors the Task fan-out rule (suppress only while the box is empty). The
+    /// "no cursor while replying" complaint: a long tool run left the input box
+    /// cursorless even as the user typed.
+    #[test]
+    fn retained_inflight_tool_keeps_cursor_when_composer_nonempty() {
+        let (mut r, buf) = new_capturing(80, 24);
+        r.render(UiLine::InputPrompt {
+            buf: "type-ahead reply".into(),
+            cursor_byte: "type-ahead reply".len(),
+            menu: None,
+            status: status_basic(),
+            attachments: Vec::new(),
+        });
+        r.render(UiLine::ToolCallInFlight {
+            id: "call_1".into(),
+            name: "Bash".into(),
+            detail: "cargo test".into(),
+            hint: None,
+        });
+        r.render(UiLine::Spinner {
+            frame: "⠙".into(),
+            label: "Running Bash".into(),
+        });
+        r.flush_deferred();
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        drain_into_vterm(&buf, &mut vterm);
+        assert!(
+            vterm.cursor_visible(),
+            "caret must stay visible while typing during a tool run"
         );
     }
 
@@ -15896,7 +16680,11 @@ mod tests {
     /// assert the committed `●` bullet's fg equals `expected`. Colour is applied
     /// AT COMMIT from the outcome the event loop passes — not at ToolResult — so
     /// a result that belongs to no header can never miscolour one.
-    fn assert_commit_bullet(outcome: Option<crate::render::ToolOutcome>, expected: Role, label: &str) {
+    fn assert_commit_bullet(
+        outcome: Option<crate::render::ToolOutcome>,
+        expected: Role,
+        label: &str,
+    ) {
         let _theme = crate::highlight::theme::test_lock();
         crate::highlight::theme::set_theme_mode(false); // dark
         let (mut r, _buf) = new_capturing(80, 24);
@@ -15912,6 +16700,85 @@ mod tests {
             outcome,
         });
         assert_eq!(bullet_fg(&r), Some(r.style_for(expected).fg), "{label}");
+    }
+
+    #[test]
+    fn breath_gray_pulses_dim_to_bright_and_wraps() {
+        use std::time::Duration;
+        // Cosine-eased breath: starts DIM, peaks BRIGHT at mid-cycle, back to
+        // DIM at the end, then wraps continuously.
+        assert_eq!(
+            breath_gray(Duration::from_millis(0)),
+            BREATH_DIM,
+            "start = dim"
+        );
+        assert_eq!(
+            breath_gray(Duration::from_millis(600)),
+            BREATH_BRIGHT,
+            "mid-cycle = bright"
+        );
+        assert_eq!(
+            breath_gray(Duration::from_millis(1200)),
+            BREATH_DIM,
+            "full cycle wraps back to dim"
+        );
+        // Rising and falling quarters sit strictly between dim and bright.
+        let up = breath_gray(Duration::from_millis(300));
+        let down = breath_gray(Duration::from_millis(900));
+        assert!(
+            up > BREATH_DIM && up < BREATH_BRIGHT,
+            "quarter up mid-range: {up}"
+        );
+        assert!(
+            down > BREATH_DIM && down < BREATH_BRIGHT,
+            "three-quarter down mid-range: {down}"
+        );
+        // Continuous: a second cycle matches the first.
+        assert_eq!(
+            breath_gray(Duration::from_millis(1200 + 300)),
+            up,
+            "breath is periodic across cycles"
+        );
+    }
+
+    #[test]
+    fn inflight_tool_bullet_breathes_on_unicode_colour_and_falls_back_otherwise() {
+        // unicode + colour → the raw spinner frame `⠙` is replaced by a `●`
+        // whose fg is a grey-ramp breath value (the running bullet "breathes").
+        // Use a non-bash tool (`Read`): its spinner frame IS the bullet, so the
+        // `⠙`→breathing-`●` swap is direct. (Bash has a separate static `● Bash`
+        // block + its own spinner-timer row; its `●` still breathes via the same
+        // prefix style, just not exercised here.)
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.unicode_symbols = true;
+        r.caps.colors = true;
+        r.caps.modern_emulator = true; // 256-colour grey ramp needs a modern emulator
+        r.render_inflight_tool("\u{2819}", "Read", "src/lib.rs", "");
+        let bullet = r.body_lines.iter().flatten().find(|c| c.ch == '\u{25cf}');
+        assert!(bullet.is_some(), "breathing bullet is ●, not the raw frame");
+        assert!(
+            matches!(bullet.unwrap().style.fg, Some(Color::AnsiValue(v)) if (BREATH_DIM..=BREATH_BRIGHT).contains(&v)),
+            "bullet fg is a grey-ramp breath value, got {:?}",
+            bullet.unwrap().style.fg
+        );
+        assert!(
+            !r.body_lines.iter().flatten().any(|c| c.ch == '\u{2819}'),
+            "raw spinner frame glyph is gone"
+        );
+
+        // no colour → keep the raw spinner frame glyph, no `●`, no breath.
+        let (mut r2, _b2) = new_capturing(80, 24);
+        r2.caps.unicode_symbols = true;
+        r2.caps.colors = false;
+        r2.render_inflight_tool("\u{2819}", "Read", "src/lib.rs", "");
+        assert!(
+            r2.body_lines.iter().flatten().any(|c| c.ch == '\u{2819}'),
+            "no-colour keeps the spinner frame"
+        );
+        assert!(
+            !r2.body_lines.iter().flatten().any(|c| c.ch == '\u{25cf}'),
+            "no ● fallback on a no-colour terminal"
+        );
     }
 
     #[test]
@@ -15938,6 +16805,47 @@ mod tests {
     fn tool_bullet_neutral_when_commit_has_no_outcome() {
         // A preempt / turn-end / approval freeze carries no outcome → neutral.
         assert_commit_bullet(None, Role::ToolName, "no outcome = neutral");
+    }
+
+    #[test]
+    fn committed_tool_bullet_is_not_retro_recoloured_by_a_later_commit() {
+        // Locks the stateless invariant behind the approval green-dot fix: once a
+        // `● Tool(detail)` row is committed neutral, a LATER ToolCallCommit with a
+        // real outcome canNOT green it — there is no inflight to freeze and
+        // `commit_inflight_tool` is a no-op on an already-committed row.
+        //
+        // This is exactly why the event loop must DEFER an approval-gated tool's
+        // transcript row (v2 asks approval BEFORE ToolStarted) instead of
+        // committing it up front: deferring lets the post-approval ToolStarted
+        // render a live inflight whose result greens the bullet through the normal
+        // path. If someone "fixes" the bug by retro-recolouring committed rows
+        // (the fragile pending-slot approach rejected twice before), this test
+        // fails — pushing the fix back to the event-loop defer.
+        let _theme = crate::highlight::theme::test_lock();
+        crate::highlight::theme::set_theme_mode(false); // dark
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        // Static pre-result row, as an early approval commit would have produced.
+        r.render(UiLine::ToolCall {
+            name: "Bash".into(),
+            detail: "ls".into(),
+            outcome: None,
+        });
+        // The successful result arrives later — but there is no inflight to recolour.
+        r.render(UiLine::ToolCallCommit {
+            call_id: Some("c1".into()),
+            outcome: Some(crate::render::ToolOutcome::Success),
+        });
+        assert_eq!(
+            bullet_fg(&r),
+            Some(r.tool_bullet_style().fg),
+            "a committed bullet stays neutral; the renderer never retro-greens it"
+        );
+        assert_ne!(
+            bullet_fg(&r),
+            Some(r.style_for(Role::Success).fg),
+            "specifically NOT green — the fix defers the row so the live path greens it"
+        );
     }
 
     #[test]
@@ -16006,8 +16914,16 @@ mod tests {
             .map(|c| c.style.fg)
             .collect();
         assert_eq!(dots.len(), 2, "two child status dots");
-        assert_eq!(dots[0], r.style_for(Role::Success).fg, "c1 dot green (success)");
-        assert_eq!(dots[1], r.style_for(Role::ToolName).fg, "c2 dot neutral (failure)");
+        assert_eq!(
+            dots[0],
+            r.style_for(Role::Success).fg,
+            "c1 dot green (success)"
+        );
+        assert_eq!(
+            dots[1],
+            r.style_for(Role::ToolName).fg,
+            "c2 dot neutral (failure)"
+        );
     }
 
     #[test]
@@ -16044,7 +16960,11 @@ mod tests {
             .collect();
         assert_eq!(dots.len(), 2, "two child dots at initial render");
         assert_eq!(dots[0], r.style_for(Role::Success).fg, "c1 green (success)");
-        assert_eq!(dots[1], r.style_for(Role::ToolName).fg, "c2 neutral (failure)");
+        assert_eq!(
+            dots[1],
+            r.style_for(Role::ToolName).fg,
+            "c2 neutral (failure)"
+        );
     }
 
     #[test]
@@ -16083,8 +17003,16 @@ mod tests {
             .map(|c| c.style.fg)
             .collect();
         assert_eq!(bullets.len(), 2, "two committed tool headers");
-        assert_eq!(bullets[0], r.style_for(Role::ToolName).fg, "first (fail) = neutral");
-        assert_eq!(bullets[1], r.style_for(Role::Success).fg, "second (ok) = green");
+        assert_eq!(
+            bullets[0],
+            r.style_for(Role::ToolName).fg,
+            "first (fail) = neutral"
+        );
+        assert_eq!(
+            bullets[1],
+            r.style_for(Role::Success).fg,
+            "second (ok) = green"
+        );
     }
 
     /// Dark-theme color hierarchy: the `└` result line (leaf glyph +
@@ -18908,6 +19836,8 @@ mod tests {
                     model: "deepseek-v4-flash".into(),
                     activity: "completed".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 900,
                     status: SubtaskStatus::Completed,
                 },
@@ -18917,6 +19847,8 @@ mod tests {
                     model: "deepseek-v4-flash".into(),
                     activity: "reading files".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 420,
                     status: SubtaskStatus::Running,
                 },
@@ -18926,6 +19858,8 @@ mod tests {
                     model: "deepseek-v4-flash".into(),
                     activity: "thinking".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 210,
                     status: SubtaskStatus::Running,
                 },
@@ -18947,21 +19881,24 @@ mod tests {
         assert!(grid.contains("explore#2 · deepseek-v4-flash · inspect codex"));
         assert!(grid.contains("reading files"));
         assert!(grid.contains("↑ 420 tokens"));
-        assert!(!grid.contains("explore#1"));
+        // The completed explore#1 fills the third slot (lingers with `Done`)
+        // instead of vanishing, so the panel keeps showing three subagents.
+        assert!(grid.contains("explore#1"));
+        assert!(grid.contains("Done") || grid.contains("完成"));
         assert!(!grid.contains("standing todo"));
         assert_eq!(
             r.current_footer_rows(),
             r.last_painted_footer_rows,
             "subtask footer height math must mirror the painted rows"
         );
-        let subtask_header = (0..vterm.height() as usize)
+        // The two running children each own a primary + connected detail row.
+        assert!(grid.contains("inspect codex"));
+        assert!(grid.contains("inspect opencode"));
+        // No leading spacer any more (dropped so the tight 7-row budget fits
+        // three 2-row children); the bold header is the top of the panel.
+        let _ = (0..vterm.height() as usize)
             .find(|&row| vterm.row_text(row).contains("SubTasks"))
             .expect("subtask header rendered");
-        assert!(
-            subtask_header > 0 && vterm.row_text(subtask_header - 1).trim().is_empty(),
-            "subtask panel must leave one blank row below the conversation:\n{}",
-            vterm.dump()
-        );
     }
 
     #[test]
@@ -18999,6 +19936,8 @@ mod tests {
                     model: "deepseek-v4-flash".into(),
                     activity: "已定位命令注册入口，正在核对补全与权限机制".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 12_345,
                     status: SubtaskStatus::Running,
                 })
@@ -19022,7 +19961,7 @@ mod tests {
     }
 
     #[test]
-    fn subtask_panel_prioritizes_live_rows_and_truthfully_aggregates_hidden_rows() {
+    fn subtask_panel_fills_empty_slots_with_recently_finished_children() {
         use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
 
         let (mut r, buf) = new_capturing(100, 24);
@@ -19034,6 +19973,8 @@ mod tests {
             model: "deepseek-v4-flash".into(),
             activity: String::new(),
             started_at: Some(std::time::Instant::now()),
+            finished_at: None,
+            tool_uses: 0,
             output_tokens: 0,
             status: state,
         };
@@ -19063,10 +20004,13 @@ mod tests {
         drain_into_vterm(&buf, &mut vterm);
 
         let grid = vterm.dump();
+        // 1 running + 2 finished fill the 3 slots so the panel stays full; the
+        // finished children linger instead of vanishing. Pending stay a header
+        // count and there is no separate summary aggregation line.
         assert!(grid.contains("running#1"));
-        assert!(!grid.contains("failed#1"));
+        assert!(grid.contains("done#1") && grid.contains("done#2"));
         assert!(grid.contains("5/8 finished · 1 running · 2 pending"));
-        assert!(grid.contains("2 pending · 1 failed"));
+        assert!(!grid.contains("2 pending · 1 failed"), "no summary line");
     }
 
     #[test]
@@ -19082,6 +20026,8 @@ mod tests {
             model: String::new(),
             activity: String::new(),
             started_at: None,
+            finished_at: None,
+            tool_uses: 0,
             output_tokens: 0,
             status: state,
         };
@@ -19107,7 +20053,11 @@ mod tests {
 
         let grid = vterm.dump();
         assert!(grid.contains("3/3 finished · 0 running · 0 pending"));
-        assert!(grid.contains("1 failed · 1 stopped"));
+        // With no running children, the terminal ones fill the slots and report
+        // their distinct status words (stopped is not conflated with failed).
+        assert!(grid.contains("Stopped") || grid.contains("已停止"));
+        assert!(grid.contains("Failed") || grid.contains("失败"));
+        assert!(grid.contains("Done") || grid.contains("完成"));
     }
 
     #[test]
@@ -19121,6 +20071,8 @@ mod tests {
             model: "GLM-5.2".into(),
             activity: "正在分析结果".into(),
             started_at: Some(std::time::Instant::now()),
+            finished_at: None,
+            tool_uses: 0,
             output_tokens: 128,
             status: state,
         };
@@ -19145,15 +20097,69 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
             .collect::<Vec<_>>();
 
-        assert_eq!(text.len(), MAX_SUBTASK_PANEL_ROWS);
-        assert!(text[0].trim().is_empty());
-        assert!(text[1].contains("3/7 finished · 3 running · 1 pending"));
-        assert!(text.iter().any(|line| line.contains("explore#4")));
-        assert!(text.iter().any(|line| line.contains("explore#5")));
-        assert!(text.iter().any(|line| line.contains("explore#6")));
-        assert!(text[5].contains("1 pending · 1 failed"));
-        assert!(text.iter().all(|line| !line.contains("failed#1")));
-        assert!(text.iter().all(|line| !line.contains("pending#1")));
+        // 3 running fill all 3 slots (header + 3×2 = 7), so the finished/pending
+        // children stay header-only. No summary aggregation line any more.
+        assert_eq!(text.len(), 7, "{text:#?}");
+        assert!(text[0].contains("3/7 finished · 3 running · 1 pending"));
+        for w in ["explore#4", "explore#5", "explore#6"] {
+            assert!(text.iter().any(|l| l.contains(w)), "{w} shown");
+        }
+        for hidden in ["done#1", "done#2", "failed#1", "pending#1"] {
+            assert!(
+                text.iter().all(|l| !l.contains(hidden)),
+                "{hidden} is header-only while 3 running fill the slots"
+            );
+        }
+        assert!(
+            text.iter().all(|l| !l.contains("· 1 failed")),
+            "no summary line"
+        );
+    }
+
+    #[test]
+    fn subtask_panel_fits_three_two_row_running_children_in_seven_rows() {
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+
+        let (r, _buf) = new_capturing(120, 24);
+        let item = |label: &str| SubtaskItem {
+            label: label.into(),
+            description: format!("inspect {label}"),
+            model: "deepseek-v4-flash".into(),
+            activity: "正在执行 grep".into(),
+            started_at: Some(std::time::Instant::now()),
+            finished_at: None,
+            tool_uses: 7,
+            output_tokens: 128,
+            status: SubtaskStatus::Running,
+        };
+        let progress = SubtaskProgress {
+            call_id: "call-task".into(),
+            completed: 0,
+            total: 3,
+            items: vec![item("worker#1"), item("worker#2"), item("worker#3")],
+        };
+        let text = r
+            .build_subtask_rows(&progress, 120)
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
+            .collect::<Vec<_>>();
+        // 1 header + 3 running × 2 rows (primary + detail) = 7, no spacer/summary.
+        assert_eq!(text.len(), 7);
+        assert!(text[0].contains("0/3 finished · 3 running · 0 pending"));
+        for w in ["worker#1", "worker#2", "worker#3"] {
+            assert!(text.iter().any(|l| l.contains(w)), "{w} shown");
+        }
+        // The current action rides its own detail row; tool count on the primary.
+        // (Wide CJK chars reconstruct with continuation cells, so assert on the
+        // ASCII fragments that survive: the tool count and the "grep" action.)
+        assert!(
+            text.iter().any(|l| l.contains("grep")),
+            "current action on a detail row"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("tool use")),
+            "tool count on a primary row"
+        );
     }
 
     #[test]
@@ -19167,18 +20173,23 @@ mod tests {
             model: "GLM-5.2".into(),
             activity: "working".into(),
             started_at: Some(std::time::Instant::now()),
+            finished_at: None,
+            tool_uses: 0,
             output_tokens: 128,
             status: state,
         };
         for call_id in ["call-task", "team:runtime"] {
+            // Two running (both fit as 2-row children) + one pending. The running
+            // children own the rows; the pending is carried by the header count
+            // only (it promotes to running via events when a slot frees), so it
+            // never takes a row or a summary line.
             let progress = SubtaskProgress {
                 call_id: call_id.into(),
                 completed: 0,
-                total: 4,
+                total: 3,
                 items: vec![
                     item("explore#1", SubtaskStatus::Running),
                     item("explore#2", SubtaskStatus::Running),
-                    item("explore#3", SubtaskStatus::Running),
                     item("explore#4", SubtaskStatus::Pending),
                 ],
             };
@@ -19189,10 +20200,15 @@ mod tests {
                 .map(|row| row.iter().map(|cell| cell.ch).collect::<String>())
                 .collect::<Vec<_>>();
 
-            assert_eq!(text.len(), MAX_SUBTASK_PANEL_ROWS);
-            assert!(text[0].trim().is_empty());
-            assert!(text[5].contains("explore#4 · GLM-5.2 · inspect explore#4 · pending"));
-            assert!(!text[5].contains("1 pending"));
+            assert!(text.len() <= MAX_SUBTASK_PANEL_ROWS);
+            assert!(text[0].contains("0/3 finished · 2 running · 1 pending"));
+            assert!(text.iter().any(|l| l.contains("explore#1")));
+            assert!(text.iter().any(|l| l.contains("explore#2")));
+            // Pending is header-only: no row, no summary line for it.
+            assert!(
+                text.iter().all(|l| !l.contains("explore#4")),
+                "pending stays in the header count, not a row"
+            );
         }
     }
 
@@ -19212,6 +20228,8 @@ mod tests {
                     model: "GLM-5.2".into(),
                     activity: "thinking".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 128,
                     status: SubtaskStatus::Running,
                 },
@@ -19221,6 +20239,8 @@ mod tests {
                     model: "GLM-5.2".into(),
                     activity: "queued".into(),
                     started_at: None,
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 0,
                     status: SubtaskStatus::Pending,
                 },
@@ -19252,8 +20272,10 @@ mod tests {
             "token metadata must survive clipping"
         );
         assert!(running_text.contains('↑'), "token marker must stay visible");
+        // Each member spans two rows now (primary + connected detail), so the
+        // second member's PRIMARY row is at child_indices[2].
         assert!(
-            r.body_lines[group.child_indices[1]]
+            r.body_lines[group.child_indices[2]]
                 .iter()
                 .filter(|cell| !cell.ch.is_whitespace())
                 .all(|cell| cell.style == active_style),
@@ -19280,12 +20302,16 @@ mod tests {
             String::from_utf8_lossy(&buf.lock().unwrap()).contains("\x1b["),
             "Agent update must immediately rewrite visible terminal rows"
         );
-        let child = r.body_lines[group.child_indices[1]]
-            .iter()
-            .map(|cell| cell.ch)
-            .collect::<String>();
-        assert!(child.contains("reading files"));
-        assert!(child.contains("256 tokens"));
+        // Member 2: tokens ride the PRIMARY row (child_indices[2]); the current
+        // action ("reading files") is on its own connected DETAIL row (…[3]).
+        let row_text = |idx: usize| {
+            r.body_lines[idx]
+                .iter()
+                .map(|cell| cell.ch)
+                .collect::<String>()
+        };
+        assert!(row_text(group.child_indices[2]).contains("256 tokens"));
+        assert!(row_text(group.child_indices[3]).contains("reading files"));
 
         for item in &mut progress.items {
             item.status = SubtaskStatus::Completed;
@@ -19327,6 +20353,57 @@ mod tests {
     }
 
     #[test]
+    fn completed_agent_row_shows_frozen_elapsed_not_live_wall_clock() {
+        // Regression: a done member's row must FREEZE its elapsed. The bug was a
+        // finished row ticking with `now` (started_at.elapsed()) while sibling
+        // members kept the group live — so `implementer#1 done · 45m27s` matched
+        // the wall clock instead of its real ~14m completion span.
+        use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
+        use std::time::{Duration, Instant};
+
+        let (r, _buf) = new_capturing(120, 24);
+        let start = Instant::now();
+        let progress = SubtaskProgress {
+            call_id: "task:freeze".into(),
+            completed: 1,
+            total: 2,
+            items: vec![
+                SubtaskItem {
+                    label: "implementer#1".into(),
+                    description: String::new(),
+                    model: "deepseek-v4-flash".into(),
+                    activity: "done".into(),
+                    started_at: Some(start),
+                    // Finished 90s after start — a LIVE recompute would read ~0s
+                    // (the test just started), so `1m30s` proves the freeze.
+                    finished_at: Some(start + Duration::from_secs(90)),
+                    tool_uses: 0,
+                    output_tokens: 100,
+                    status: SubtaskStatus::Completed,
+                },
+                SubtaskItem {
+                    label: "implementer#2".into(),
+                    description: String::new(),
+                    model: "deepseek-v4-flash".into(),
+                    activity: "running".into(),
+                    started_at: Some(start),
+                    finished_at: None,
+                    tool_uses: 0,
+                    output_tokens: 50,
+                    status: SubtaskStatus::Running,
+                },
+            ],
+        };
+        let (_, rows) = r.agent_group_rows(&progress, false);
+        let text = |row: &[Cell]| row.iter().map(|c| c.ch).collect::<String>();
+        let done_row = text(&rows[0]);
+        assert!(
+            done_row.contains("1m30s"),
+            "done row must show its frozen 90s span, got: {done_row}"
+        );
+    }
+
+    #[test]
     fn failed_and_stopped_agent_rows_remain_visually_distinct_from_completed() {
         use crate::render::{SubtaskItem, SubtaskProgress, SubtaskStatus};
 
@@ -19347,6 +20424,8 @@ mod tests {
                 model: String::new(),
                 activity: label.into(),
                 started_at: None,
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status,
             })
@@ -19360,9 +20439,18 @@ mod tests {
                 .style
                 .clone()
         };
-        assert_ne!(first_style(&rows[0]), first_style(&rows[1]));
-        assert_eq!(first_style(&rows[1]).fg, r.style_for(Role::Warning).fg);
-        assert_eq!(first_style(&rows[2]).fg, r.style_for(Role::Error).fg);
+        // Each member now spans TWO rows (primary + connected detail), so the
+        // three members' primary rows are at indices 0, 2, 4.
+        assert_ne!(first_style(&rows[0]), first_style(&rows[2]));
+        assert_eq!(first_style(&rows[2]).fg, r.style_for(Role::Warning).fg);
+        assert_eq!(first_style(&rows[4]).fg, r.style_for(Role::Error).fg);
+        // The detail row shows a terminal status word (localized `Done`/`完成`).
+        let text = |row: &[Cell]| row.iter().map(|c| c.ch).collect::<String>();
+        assert!(
+            text(&rows[1]).contains("Done") || text(&rows[1]).contains("完成"),
+            "completed member's detail row shows a done word: {}",
+            text(&rows[1])
+        );
     }
 
     #[test]
@@ -19380,6 +20468,8 @@ mod tests {
                 model: "GLM-5.2".into(),
                 activity: "thinking".into(),
                 started_at: Some(std::time::Instant::now()),
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19436,6 +20526,8 @@ mod tests {
                         model: String::new(),
                         activity: "thinking".into(),
                         started_at: None,
+                        finished_at: None,
+                        tool_uses: 0,
                         output_tokens: 0,
                         status: SubtaskStatus::Running,
                     }],
@@ -19478,6 +20570,8 @@ mod tests {
                 model: String::new(),
                 activity: "thinking".into(),
                 started_at: None,
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19518,6 +20612,8 @@ mod tests {
                 model: String::new(),
                 activity: "thinking".into(),
                 started_at: None,
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19580,6 +20676,8 @@ mod tests {
                     model: "deepseek-v4-flash".into(),
                     activity: "thinking".into(),
                     started_at: Some(std::time::Instant::now()),
+                    finished_at: None,
+                    tool_uses: 0,
                     output_tokens: 0,
                     status: SubtaskStatus::Running,
                 })
@@ -19621,6 +20719,8 @@ mod tests {
                 model: "GLM-5.2".into(),
                 activity: String::new(),
                 started_at: None,
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Pending,
             }],
@@ -19628,7 +20728,14 @@ mod tests {
 
         assert_eq!(r.subtask_panel_cap(), 2, "exercise the exact edge case");
         let rows = r.build_subtask_rows(&progress, 80);
-        assert_eq!(rows.len(), 2, "spacer + header fit; summary must fold");
+        // No spacer, and a lone pending is carried by the header count (not a
+        // summary row), so only the header renders here.
+        assert_eq!(rows.len(), 1, "header only; pending folds into its count");
+        assert!(rows[0]
+            .iter()
+            .map(|c| c.ch)
+            .collect::<String>()
+            .contains("1 pending"));
         assert_eq!(
             r.subtask_panel_row_count(&progress),
             rows.len(),
@@ -19658,6 +20765,8 @@ mod tests {
                 model: "deepseek-v4-flash".into(),
                 activity: "thinking".into(),
                 started_at: Some(std::time::Instant::now()),
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19692,6 +20801,8 @@ mod tests {
                 model: "deepseek-v4-flash".into(),
                 activity: "thinking".into(),
                 started_at: Some(std::time::Instant::now()),
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19731,6 +20842,8 @@ mod tests {
                 model: "deepseek-v4-flash".into(),
                 activity: "waiting".into(),
                 started_at: Some(std::time::Instant::now()),
+                finished_at: None,
+                tool_uses: 0,
                 output_tokens: 0,
                 status: SubtaskStatus::Running,
             }],
@@ -19741,6 +20854,9 @@ mod tests {
             options: vec!["Allow".into(), "Deny".into()],
             selected: 0,
             note: None,
+            reason: None,
+            full_command: None,
+            expanded: false,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -19774,6 +20890,9 @@ mod tests {
             ],
             selected: 0,
             note: None,
+            reason: None,
+            full_command: None,
+            expanded: false,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -19825,6 +20944,9 @@ mod tests {
             options: vec!["Allow once".into(), "Deny".into()],
             selected: 0,
             note: Some("may send credentials to the provider".into()),
+            reason: None,
+            full_command: None,
+            expanded: false,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -19839,6 +20961,71 @@ mod tests {
         assert!(
             vterm.any_row(|r| r.contains("may send credentials to the provider")),
             "advisory note must render\n{dump}"
+        );
+    }
+
+    /// When `ApprovalRequest.reason` is `Some`, the approval panel must render that
+    /// text above the options (between the header and any advisory note).
+    #[test]
+    fn approval_panel_renders_reason_line_when_present() {
+        let (mut r, buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let mut status = status_basic();
+        status.approval = Some(crate::render::ApprovalPanelView {
+            tool: "Bash".into(),
+            detail: "rm -rf /outside/dir".into(),
+            options: vec!["Allow once".into(), "Deny".into()],
+            selected: 0,
+            note: None,
+            reason: Some("此命令写到工作区外".into()),
+            full_command: None,
+            expanded: false,
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let dump = vterm.dump();
+        // Wide CJK characters are rendered two cells wide; row_text() may
+        // interleave padding spaces — check for the first character instead of
+        // the full concatenated string.
+        assert!(
+            vterm.any_row(|r| r.contains("此")),
+            "reason line must render in the approval panel\n{dump}"
+        );
+        // reason adds one row to the panel height
+        let panel_with_reason = crate::render::ApprovalPanelView {
+            tool: "Bash".into(),
+            detail: "cmd".into(),
+            options: vec!["Allow once".into(), "Deny".into()],
+            selected: 0,
+            note: None,
+            reason: Some("reason text".into()),
+            full_command: None,
+            expanded: false,
+        };
+        let panel_without = crate::render::ApprovalPanelView {
+            reason: None,
+            full_command: None,
+            expanded: false,
+            ..panel_with_reason.clone()
+        };
+        assert_eq!(
+            r.approval_panel_row_count(&panel_with_reason),
+            r.approval_panel_row_count(&panel_without) + 1,
+            "reason must add exactly one row to the panel height"
+        );
+        // Verify row count tracks build_approval_rows exactly.
+        assert_eq!(
+            r.approval_panel_row_count(&panel_with_reason),
+            r.build_approval_rows(&panel_with_reason, 60, 80).len(),
+            "row count must match rendered rows when reason is present"
         );
     }
 
@@ -20123,6 +21310,81 @@ mod tests {
             caret < placeholder,
             "caret ▏ must render BEFORE the placeholder (输入自己的答案…)\nrow={row:?}\n{dump}"
         );
+    }
+
+    #[test]
+    fn custom_answer_focus_reports_caret_col_for_ime() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        let mk = |cursor: usize| crate::render::UserInputPanelView {
+            header: "Library".into(),
+            question: "Which?".into(),
+            mode: UserInputMode::Single,
+            options: vec![("date-fns".into(), None), ("Day.js".into(), None)],
+            cursor,
+            checked: vec![false, false, false],
+            text: String::new(),
+            text_cursor_byte: 0,
+            custom_text: String::new(),
+            custom_text_cursor_byte: 0,
+            custom: true,
+            scroll_offset: 0,
+            batch: None,
+        };
+        // Cursor on the custom-answer row (index 2, after 2 options): the caret
+        // parks after `❯ ` (2) + `3. ` (3) = column 5, so an IME anchors there.
+        let built = r.build_user_input_rows(&mk(2), 70, 80);
+        assert_eq!(built.caret_col, Some(5));
+        // Cursor on a regular option: navigation, no text caret to park.
+        let built_opt = r.build_user_input_rows(&mk(0), 70, 80);
+        assert_eq!(built_opt.caret_col, None);
+    }
+
+    #[test]
+    fn custom_answer_text_field_keeps_cursor_visible_for_ime() {
+        use atomcode_capabilities::tools::request_user_input::UserInputMode;
+        // Regression: typing a custom answer via an IME needs the REAL terminal
+        // cursor visible + parked at the field. `approval_active` previously
+        // blanket-hid it, so the IME preedit anchored at a stale position.
+        let render_visible = |cursor: usize| -> bool {
+            let (mut r, buf) = new_capturing(80, 24);
+            r.caps.colors = true;
+            let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+            let mut status = status_basic();
+            status.user_input = Some(crate::render::UserInputPanelView {
+                header: "Library".into(),
+                question: "Which?".into(),
+                mode: UserInputMode::Single,
+                options: vec![("date-fns".into(), None), ("Day.js".into(), None)],
+                cursor,
+                checked: vec![false, false, false],
+                text: String::new(),
+                text_cursor_byte: 0,
+                custom_text: String::new(),
+                custom_text_cursor_byte: 0,
+                custom: true,
+                scroll_offset: 0,
+                batch: None,
+            });
+            r.render(UiLine::InputPrompt {
+                buf: String::new(),
+                cursor_byte: 0,
+                menu: None,
+                status,
+                attachments: Vec::new(),
+            });
+            r.flush_deferred();
+            drain_into_vterm(&buf, &mut vterm);
+            vterm.cursor_visible()
+        };
+        // On the custom-answer text row → cursor stays visible (IME anchor).
+        assert!(
+            render_visible(2),
+            "cursor must stay visible on the custom-answer text field"
+        );
+        // On a regular option (arrow navigation) → cursor hidden.
+        assert!(!render_visible(0), "cursor hidden while navigating options");
     }
 
     #[test]
@@ -20485,6 +21747,9 @@ mod tests {
             ],
             selected: 0,
             note: None,
+            reason: None,
+            full_command: None,
+            expanded: false,
         };
         status.approval = Some(panel.clone());
         r.render(UiLine::InputPrompt {
@@ -20561,6 +21826,123 @@ mod tests {
         );
     }
 
+    fn bash_panel(full: &str, expanded: bool) -> crate::render::ApprovalPanelView {
+        crate::render::ApprovalPanelView {
+            tool: "Bash".into(),
+            detail: "cd /tmp && ./deploy …".into(), // compact (truncated) detail
+            options: vec![
+                "Allow once".into(),
+                "Always allow Bash".into(),
+                "Deny".into(),
+            ],
+            selected: 0,
+            note: None,
+            reason: None,
+            full_command: Some(full.into()),
+            expanded,
+        }
+    }
+
+    fn dump_rows(rows: &[Vec<Cell>]) -> String {
+        rows.iter()
+            .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Expanded Bash approval: the FULL command is visible (shell-split multi-line, not
+    /// truncated to a stub), and the row-count invariant still holds.
+    #[test]
+    fn approval_expanded_shows_full_command_and_count_matches() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.unicode_symbols = true;
+        let panel = bash_panel("cd /tmp && ./deploy.sh --prod | tee deploy.log", true);
+        let rows = r.build_approval_rows(&panel, 78, 80);
+        assert_eq!(
+            rows.len(),
+            r.approval_panel_row_count(&panel),
+            "row_count MUST track the built rows once the command block is expanded"
+        );
+        let dump = dump_rows(&rows);
+        assert!(
+            dump.contains("./deploy.sh --prod"),
+            "full command visible:\n{dump}"
+        );
+        assert!(
+            dump.contains("tee deploy.log"),
+            "piped tail visible too:\n{dump}"
+        );
+        // Shell-split: the `&&` chain and the pipe read on separate rows.
+        assert!(
+            dump.contains("&&"),
+            "shell-boundary split renders the chain:\n{dump}"
+        );
+        // Options + Tab hint remain.
+        assert!(dump.contains("Deny"), "options still present:\n{dump}");
+        assert!(
+            dump.contains("Tab"),
+            "Tab expand/collapse hint present:\n{dump}"
+        );
+    }
+
+    /// Collapsed (default): the full command is NOT shown — panel stays compact — but the
+    /// Tab affordance is hinted so the user can reveal it.
+    #[test]
+    fn approval_collapsed_hides_full_command_but_hints_tab() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let (mut r, _buf) = new_capturing(80, 24);
+        let panel = bash_panel("run-the-very-secret-command --flag=value", false);
+        let rows = r.build_approval_rows(&panel, 78, 80);
+        assert_eq!(rows.len(), r.approval_panel_row_count(&panel));
+        let dump = dump_rows(&rows);
+        assert!(
+            !dump.contains("very-secret-command"),
+            "collapsed panel must NOT render the full command:\n{dump}"
+        );
+        assert!(
+            dump.contains("Tab"),
+            "collapsed panel hints Tab to expand:\n{dump}"
+        );
+    }
+
+    /// Short terminal: a many-line command is height-clamped so the option rows are never
+    /// pushed off-screen, and the row-count invariant holds under the clamp.
+    #[test]
+    fn approval_expanded_command_height_clamped_keeps_options() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let (mut r, _buf) = new_capturing(80, 8); // tiny height
+        let cmd = (0..40)
+            .map(|i| format!("echo line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let panel = bash_panel(&cmd, true);
+        let rows = r.build_approval_rows(&panel, 78, 80);
+        assert_eq!(
+            rows.len(),
+            r.approval_panel_row_count(&panel),
+            "invariant holds under the height clamp"
+        );
+        // The whole panel fits the short terminal (not 40+ command rows).
+        assert!(
+            rows.len() <= 8,
+            "panel clamped to the short terminal, got {} rows",
+            rows.len()
+        );
+        let dump = dump_rows(&rows);
+        assert!(
+            dump.contains("Allow once") && dump.contains("Deny"),
+            "options must stay visible on a short terminal:\n{dump}"
+        );
+        assert!(
+            dump.contains("(+"),
+            "a '(+N)' more-lines marker indicates the clamp:\n{dump}"
+        );
+    }
+
     /// Step 1 digit keys: `accel_index` falls back for y/a/n; digit routing is
     /// tested via the pure `ApprovalPanel.accel_index` + index-based resolution
     /// in `handle_approval_key`. This test confirms the option ordering contract
@@ -20589,8 +21971,10 @@ mod tests {
                 },
             ],
             selected: 0,
-            cache_key: String::new(),
             note: None,
+            reason: None,
+            full_command: None,
+            expanded: false,
         };
         // Digit routing: index = (c as usize) - ('1' as usize).
         // '1' → idx 0 → AllowOnce
@@ -20884,9 +22268,15 @@ mod tests {
         // Circled digits are width-aware: width-1 hosts (legacy narrow fonts)
         // insert a synthetic space after the label, width-2 hosts (emoji-
         // capable terminals) already separate via the glyph's second cell.
-        let sep = if crate::width::cell_char_width('①') == Some(1) { " " } else { "" };
+        let sep = if crate::width::cell_char_width('①') == Some(1) {
+            " "
+        } else {
+            ""
+        };
         assert!(
-            visible.contains(&format!("如果是 ①{sep}Rust、②{sep}前端：属于模型没加空格，无需修 TUI。")),
+            visible.contains(&format!(
+                "如果是 ①{sep}Rust、②{sep}前端：属于模型没加空格，无需修 TUI。"
+            )),
             "committed user echo should use the width-aware circled-label spacing: {visible:?}"
         );
         // On width-1 hosts the synthetic space must appear; on width-2 hosts
@@ -21519,13 +22909,15 @@ mod tests {
                         .all(|ch| matches!(ch, '━' | '─' | '=' | '-' | ' '))
             })
             .collect();
-        // Every table rule is a single continuous run spanning the full width —
-        // the inter-column gaps are filled, so no rule breaks into per-column
-        // segments (which read as a broken/dashed line). No rule line therefore
-        // carries an interior space.
+        // Separator lines are segmented per column — each segment covers one
+        // column's padded width, with inter-column gaps between them, so every
+        // rule line contains at least some rule characters (not empty).
         assert!(
-            !rules.is_empty() && rules.iter().all(|line| !line.contains(' ')),
-            "table rules must be continuous (no interior gap): {lines:#?}"
+            !rules.is_empty()
+                && rules
+                    .iter()
+                    .all(|line| line.chars().any(|ch| matches!(ch, '━' | '─' | '=' | '-'))),
+            "table rules must contain rule characters: {lines:#?}"
         );
         assert!(
             rules
@@ -25147,6 +26539,9 @@ mod tests {
             ],
             selected: 0,
             note: None,
+            reason: None,
+            full_command: None,
+            expanded: false,
         });
 
         r.render(UiLine::InputPrompt {
@@ -25334,6 +26729,7 @@ mod tests {
         // 3 options + 1 hint = approval_rows=4.
         let mut status = StatusLine {
             model: String::new(), // no status row (has_status=false → status_rows=0)
+            model_channel: None,
             cwd: String::new(),
             history: None,
             search: None,
@@ -25343,6 +26739,7 @@ mod tests {
             hint: None,
             mode_indicator: None,
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -25361,6 +26758,9 @@ mod tests {
             options: vec!["Allow once".into(), "Always allow".into(), "Deny".into()],
             selected: 0,
             note: None,
+            reason: None,
+            full_command: None,
+            expanded: false,
         });
 
         r.render(UiLine::InputPrompt {

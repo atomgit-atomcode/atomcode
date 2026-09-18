@@ -580,7 +580,11 @@ mod tests {
         // become the session title.
         assert_eq!(derive_title("/nope do the thing"), None);
         assert_eq!(derive_title("/foo"), None);
-        assert_eq!(derive_title("  /bar baz"), None, "leading space still a command");
+        assert_eq!(
+            derive_title("  /bar baz"),
+            None,
+            "leading space still a command"
+        );
         // A leading filesystem path is real content and still titles.
         assert_eq!(
             derive_title("/usr/bin/x is missing").as_deref(),
@@ -588,7 +592,10 @@ mod tests {
         );
         // A bare slash or non-identifier after the slash is not command-shaped.
         assert_eq!(derive_title("/ and then").as_deref(), Some("/ and then"));
-        assert_eq!(derive_title("/123 numbers").as_deref(), Some("/123 numbers"));
+        assert_eq!(
+            derive_title("/123 numbers").as_deref(),
+            Some("/123 numbers")
+        );
     }
 
     #[test]

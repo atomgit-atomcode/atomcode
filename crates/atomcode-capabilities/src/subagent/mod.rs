@@ -266,7 +266,10 @@ pub enum SubagentError {
     /// Spawning the child process failed.
     SpawnFailed(String),
     /// The child exited non-zero.
-    NonZeroExit { code: Option<i32>, stderr_tail: String },
+    NonZeroExit {
+        code: Option<i32>,
+        stderr_tail: String,
+    },
     /// The agent's output stream/protocol could not be parsed.
     ProtocolError(String),
     /// The agent ran to exit but reported its OWN failure (e.g. Claude Code
@@ -287,7 +290,8 @@ impl fmt::Display for SubagentError {
             Self::NonZeroExit { code, stderr_tail } => write!(
                 f,
                 "external agent exited with {} (stderr: {stderr_tail})",
-                code.map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
+                code.map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into())
             ),
             Self::ProtocolError(e) => write!(f, "external agent protocol error: {e}"),
             Self::AgentError(e) => write!(f, "external agent reported failure: {e}"),
@@ -339,7 +343,10 @@ mod tests {
             PermissionMode::from_config_str("Accept_Edits"),
             Some(PermissionMode::AcceptEdits)
         );
-        assert_eq!(PermissionMode::from_config_str("readonly"), Some(PermissionMode::ReadOnly));
+        assert_eq!(
+            PermissionMode::from_config_str("readonly"),
+            Some(PermissionMode::ReadOnly)
+        );
         // Unknown → None (caller rejects, does not silently default).
         assert_eq!(PermissionMode::from_config_str("yolo"), None);
         // Only Bypass is dangerous.
@@ -349,12 +356,18 @@ mod tests {
 
     #[test]
     fn subagent_kind_parse_and_binary() {
-        assert_eq!(SubagentKind::from_config_str("codex"), Some(SubagentKind::Codex));
+        assert_eq!(
+            SubagentKind::from_config_str("codex"),
+            Some(SubagentKind::Codex)
+        );
         assert_eq!(
             SubagentKind::from_config_str("Claude_Code"),
             Some(SubagentKind::ClaudeCode)
         );
-        assert_eq!(SubagentKind::from_config_str("cc"), Some(SubagentKind::ClaudeCode));
+        assert_eq!(
+            SubagentKind::from_config_str("cc"),
+            Some(SubagentKind::ClaudeCode)
+        );
         assert_eq!(SubagentKind::from_config_str("gemini"), None);
         assert_eq!(SubagentKind::Codex.binary(), "codex");
         assert_eq!(SubagentKind::ClaudeCode.binary(), "claude");
@@ -391,8 +404,12 @@ mod tests {
 
     #[test]
     fn error_display_is_human_readable() {
-        let e = SubagentError::BinaryNotFound { binary: "codex".into() };
+        let e = SubagentError::BinaryNotFound {
+            binary: "codex".into(),
+        };
         assert!(e.to_string().contains("codex"));
-        assert!(SubagentError::DangerousModeRefused.to_string().contains("bypass"));
+        assert!(SubagentError::DangerousModeRefused
+            .to_string()
+            .contains("bypass"));
     }
 }

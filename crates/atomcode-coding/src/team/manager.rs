@@ -535,6 +535,9 @@ impl TeamRunManager {
                 member_id: member_id.clone(),
                 activity,
                 output_tokens,
+                // The Team runtime does not yet track per-member tool counts;
+                // the `task` fan-out path populates this. 0 here = "unknown".
+                tool_uses: 0,
             },
         );
     }
@@ -626,7 +629,11 @@ impl TeamRunManager {
             // events in seq order; otherwise a lower-seq event that lost the send
             // race is dropped by the consumer's monotonic filter. The send is
             // non-blocking (unbounded), so the critical section stays short.
-            let _emit_guard = self.inner.emit_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let _emit_guard = self
+                .inner
+                .emit_lock
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let event =
                 TeamEvent::new(run_id.clone(), seq.fetch_add(1, Ordering::Relaxed), payload);
             let _ = sender.send(GenerationTeamEvent { generation, event });
@@ -1316,10 +1323,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let outcome = manager
-            .wait(&run, Duration::from_millis(20))
-            .await
-            .unwrap();
+        let outcome = manager.wait(&run, Duration::from_millis(20)).await.unwrap();
         assert!(!outcome.terminal);
         manager.stop_all().await; // 清理
     }
@@ -1385,7 +1389,7 @@ mod tests {
                 .terminal
         );
         while rx.try_recv().is_ok() {} // 排空
-        // 成员已终态（Completed），activity 必须被忽略：不发布事件、不更新 token。
+                                       // 成员已终态（Completed），activity 必须被忽略：不发布事件、不更新 token。
         let member = manager.snapshot(Some(&run)).unwrap().runs[0].members[0].clone();
         manager.member_activity(&run, &member.id, "late".into(), 999);
         assert!(rx.try_recv().is_err());
