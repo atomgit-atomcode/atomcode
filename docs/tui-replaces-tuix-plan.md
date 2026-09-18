@@ -154,6 +154,7 @@ serde 往返 + adapter 行为判据。
 | 5.6b | **A** | 13 条能力面缺口:模式切换、`/cd`、`/config`、会话改名、5 种事实上屏、轮次上限、`/mcp tools`,以及两条契约缺口(列模型、用量额度) |
 | 5.6c | **B1** | 6 组由**能力行自己登记目录命令**(`/review`、记忆三条、`/skills`、`/init`、`/worklog`、`/setup` 与 `/guide`)——tui 侧零改动,可与 5.6b 并行 |
 | 5.6d | **B2** | 16 条屏幕自己的活:`/diff` 浏览器、多会话、`/model` 选择器、`/provider`、`/copy` / `/save` / `/view`、`/think on\|off`、`/paste`、上沿 rule、goal / loop 状态行、@ 与 $ 补全、ghost 提示、终端标题等 |
+| 5.6e | **O** | 开放性:把「一切都是插件」补齐到 tui 最后几处硬编码。清单见 [`docs/plans/2026-09-18-tui-openness-inventory.md`](plans/2026-09-18-tui-openness-inventory.md) |
 
 已判定**不做或归 CLI**:`/upgrade`(与 CLI 完全重复)、`/app` / `/desktop`(零屏幕依赖)、
 `/webui` 起服务那半、`/think budget N`(字段在 v2 已被丢弃,做了是假的)、`/schedule`(执行靠 OS
@@ -164,6 +165,10 @@ serde 往返 + adapter 行为判据。
 
 **依赖**:B2 的多会话依赖「后续」里的「换会话不重建 App」;`/sync` 与 6.3 同批;
 **6.4 删 tuix 必须排在本节之后**——B2 多条是照 tuix 的交互形态补的。
+
+**5.6e 为什么要赶在 6.4 前面做完**:下游 fork 的三份测绘结论是它们 90% 的定制
+是「上游把本该是数据的东西写成了常量」。欢迎块与 mascot 刚落地就已经重犯了一次
+tuix 的老毛病——现在改是十几行,等下游移植完再改就是他们再扫一遍 165 处字符串。
 
 ### M6 翻默认、迁移、删 tuix
 
