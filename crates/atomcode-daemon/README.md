@@ -66,7 +66,7 @@ cargo run -p atomcode-daemon -- --no-auth
 ```json
 {
   "status": "ok",
-  "version": "5.0.9",
+  "version": "5.1.0",
   "service": "atomcode-daemon"
 }
 ```

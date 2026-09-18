@@ -8,7 +8,7 @@
       {
         "id": "atomcode-documentation",
         "heading": "AtomCode Documentation",
-        "body": "An AI coding agent that lives in your terminal. Hand it a natural-language task and it will autonomously read, edit, run, and self-verify. These docs walk you from a fresh install to every feature AtomCode offers. v5.0.9 许可证 MIT 语言 Rust 1.88+ 平台 macOS · Linux · HarmonyOS PC · Windows 100% AI 生成"
+        "body": "An AI coding agent that lives in your terminal. Hand it a natural-language task and it will autonomously read, edit, run, and self-verify. These docs walk you from a fresh install to every feature AtomCode offers. v5.1.0 许可证 MIT 语言 Rust 1.88+ 平台 macOS · Linux · HarmonyOS PC · Windows 100% AI 生成"
       },
       {
         "id": "three-steps-to-start",
@@ -151,7 +151,7 @@
       {
         "id": "step-13-welcome",
         "heading": "Step 1/3 · Welcome",
-        "body": "███ █████ ███ █ █ ████ ███ ████ █████ █ █ █ █ █ ██ ██ █ █ █ █ █ █ █████ █ █ █ █ █ █ █ █ █ █ █ █ ████ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ ███ █ █ ████ ███ ████ █████ AtomCode Version 5.0.9 · AI coding agent in your terminal • Multi-step agent loop · built-in code-graph tools • Compatible with any OpenAI-style API • Free tokens via CodingPlan Press Enter to continue. Ctrl+C exits at any point."
+        "body": "███ █████ ███ █ █ ████ ███ ████ █████ █ █ █ █ █ ██ ██ █ █ █ █ █ █ █████ █ █ █ █ █ █ █ █ █ █ █ █ ████ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ █ ███ █ █ ████ ███ ████ █████ AtomCode Version 5.1.0 · AI coding agent in your terminal • Multi-step agent loop · built-in code-graph tools • Compatible with any OpenAI-style API • Free tokens via CodingPlan Press Enter to continue. Ctrl+C exits at any point."
       },
       {
         "id": "step-23-language-choose-your-language-选择语言",
