@@ -2494,6 +2494,7 @@ async fn run() -> Result<i32> {
                     coding_cfg,
                     Some(host_config),
                     &screen,
+                    config_path.clone(),
                 )
                 .await
                 .map(|()| 0)

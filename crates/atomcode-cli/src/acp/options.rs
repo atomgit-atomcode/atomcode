@@ -662,7 +662,6 @@ mod tests {
         std::sync::Arc::new(tokio::sync::Mutex::new(map))
     }
 
-
     /// Drive one rejected `set_config_option` request through the wired handler
     /// over an in-memory channel; returns the JSON-RPC error.
     async fn drive_set_config_option(

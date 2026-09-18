@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use atomcode_harness::seams::{UiSvc, UserInterface};
 use atomcode_host_api::HostConnection;
-use atomcode_plexus::{App, ConfigTree, Layer, PluginRegistry};
+use atomcode_plexus::{App, ConfigTree, Layer, Plugin, PluginRegistry};
 
 use crate::plugin::{
     Connection, ConnectionSvc, HeadlessSurfacePlugin, ModulesSvc, SurfaceSvc,
@@ -45,7 +45,27 @@ impl Default for Screen {
 }
 
 /// Every row the screen can mount.
+///
+/// This is the screen's own rows. A launcher that has rows of its own adds them
+/// through [`catalog_with`] — the screen does not know, and must not have to,
+/// which product is in front of it (`docs/adr/0022` §3).
 pub fn catalog() -> PluginRegistry {
+    catalog_with(&[])
+}
+
+/// [`catalog`] plus the launcher's own rows.
+///
+/// The opening a launcher needs is a *row*, not a call: a plugin registered here
+/// takes its place in the tree like every other one, so it can be `[[remove]]`d,
+/// shows up in `--audit`, and reaches the screen only through the services the
+/// tree provides. A launcher that reached past this into `Modules` and
+/// `add_view`ed would be the hard-coded panel that `crate::rows` exists to
+/// replace.
+///
+/// A duplicate name panics inside `register`, which is deliberate: two
+/// implementations answering to one name is a build-time mistake, not a runtime
+/// condition.
+pub fn catalog_with(extra: &[Arc<dyn Plugin>]) -> PluginRegistry {
     let mut registry = PluginRegistry::new();
     registry
         .register(Arc::new(TuiUiPlugin))
@@ -53,6 +73,9 @@ pub fn catalog() -> PluginRegistry {
         .register(Arc::new(HeadlessSurfacePlugin));
     for row in crate::rows::catalog() {
         registry.register(row);
+    }
+    for row in extra {
+        registry.register(row.clone());
     }
     registry
 }
@@ -108,12 +131,45 @@ pub async fn mount(
     extra: &[&str],
     connection: HostConnection,
 ) -> Result<Mounted, String> {
-    let mut app = App::new(catalog(), tree(screen, extra)?);
+    mount_with(screen, extra, &[], None, connection).await
+}
+
+/// [`mount`], with the launcher's own rows registered and its settings port.
+///
+/// `plugins` go in beside the screen's own (see [`catalog_with`]), which is what
+/// lets a layer in `extra` name one of them: `[[insert]] name = "…"` resolves
+/// against the registry, so a row that is not registered is a row the tree
+/// refuses to mount, by name, at startup.
+///
+/// `settings` is the configuration, as the launcher reads it. `None` is a
+/// launcher with none to offer — a test, or a product with no settings file —
+/// and the panel is then a row that draws an empty list, which is honest about
+/// what it has rather than a claim that there is nothing to configure.
+///
+/// The launcher supplies the rows; the screen still mounts an empty UI and the
+/// tree fills it. Nothing here reaches into `Modules` to `add_view`, which is
+/// the difference between adding a panel and hard-coding one.
+pub async fn mount_with(
+    screen: &Screen,
+    extra: &[&str],
+    plugins: &[Arc<dyn Plugin>],
+    settings: Option<Arc<dyn crate::settings::Settings>>,
+    connection: HostConnection,
+) -> Result<Mounted, String> {
+    let mut app = App::new(catalog_with(plugins), tree(screen, extra)?);
     app.start().await.map_err(|e| e.to_string())?;
     let ctx = app.context();
     let _ = ctx
         .provide::<ConnectionSvc>(Arc::new(Connection::new(connection)))
         .map_err(|e| e.to_string())?;
+    // Provided after the tree is up, like the connection: the rows that want it
+    // look it up when they run, and a screen mounted without one simply has no
+    // settings to show.
+    if let Some(settings) = settings {
+        let _ = ctx
+            .provide::<crate::plugin::SettingsSvc>(settings)
+            .map_err(|e| e.to_string())?;
+    }
     let ui = ctx
         .service::<UiSvc>()
         .ok_or("the screen's tree has no `ui` row")?;
@@ -126,7 +182,23 @@ pub async fn run(
     connection: HostConnection,
     initial: Option<String>,
 ) -> Result<(), String> {
-    let mounted = mount(screen, &[], connection).await?;
+    run_with(screen, &[], &[], None, connection, initial).await
+}
+
+/// [`run`], with the launcher's own rows, its settings port, and extra layers.
+///
+/// The one a product launcher calls: it is [`mount_with`] plus the loop, so a
+/// launcher gets its rows mounted on the same path the tests and `--audit` take
+/// rather than a second assembly written for the product.
+pub async fn run_with(
+    screen: &Screen,
+    extra: &[&str],
+    plugins: &[Arc<dyn Plugin>],
+    settings: Option<Arc<dyn crate::settings::Settings>>,
+    connection: HostConnection,
+    initial: Option<String>,
+) -> Result<(), String> {
+    let mounted = mount_with(screen, extra, plugins, settings, connection).await?;
     let ctx = mounted.app.context();
     mounted.ui.run(&ctx, initial).await
 }

@@ -4,6 +4,7 @@ pub mod ask;
 pub mod input;
 pub mod live;
 pub mod raster;
+pub mod settings;
 pub mod status;
 pub mod steering;
 pub mod team;

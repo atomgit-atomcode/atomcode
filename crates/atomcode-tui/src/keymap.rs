@@ -79,6 +79,14 @@ pub enum Action {
     /// typed. A no-op when there is none — the key is also how a person finds
     /// out that there is none.
     AttachImage,
+    /// Pull the settings panel up over the composer, or put it away if it is
+    /// already up.
+    ///
+    /// An action rather than something the command does itself, for the reason
+    /// every other command that changes the screen is: `/config` and whatever
+    /// key is bound to it later are one implementation, and the panel is
+    /// screen state, which only the screen may write.
+    ToggleSettings,
 }
 
 /// A set of bindings contributed by one row.

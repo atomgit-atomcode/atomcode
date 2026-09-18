@@ -68,6 +68,7 @@ pub mod raster;
 pub mod region;
 pub mod rows;
 pub mod secret;
+pub mod settings;
 pub mod surface;
 pub mod text;
 pub mod theme;

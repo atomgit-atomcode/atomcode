@@ -35,6 +35,10 @@ atomcode-tuix = { path = "../atomcode-tuix" }
 # `atomcode --tui`: the full-screen UI assembled from rows, driving the same runtime
 # through the two front-end contracts (docs/adr/0021, docs/adr/0022).
 atomcode-tui = { path = "../atomcode-tui" }
+# Writing a row. `rows.rs` says a third crate adds a panel with a `View` impl and a
+# row — the row is a `Plugin`, so the launcher that owns one names the trait. Same
+# version the screen builds against (already in this graph through `atomcode-tui`).
+atomcode-plexus = { path = "../atomcode-plexus" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 # `atomcode review`:一次性评审一份 diff。原来是 `atomcode-clix` 那个独立二进制,
 # 它的另外两个子命令与这里完全重复,所以整个 crate 删掉、review 搬了过来。
@@ -52,7 +56,6 @@ atomcode-host-api = { path = "../atomcode-host-api" }
 # Direct now that the host-control adapter lives here: it speaks the feed and
 # the plugin tree itself, rather than reaching them through `atomcode-coding`.
 atomcode-harness = { path = "../atomcode-harness" }
-atomcode-plexus = { path = "../atomcode-plexus" }
 atomcode-coding = { path = "../atomcode-coding", features = ["atomgit"] }
 atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify", "setup", "plugin", "mcp", "atomgit", "cc-hooks"] }
 atomcode-auth = { path = "../atomcode-auth" }

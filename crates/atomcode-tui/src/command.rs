@@ -192,6 +192,17 @@ impl Commands {
             .collect()
     }
 
+    /// The command this name would run, as the registry would run it.
+    ///
+    /// Asked by the menu's completion, which has to know whether the name it is
+    /// about to put on the line wants an argument: completing `/effort` without
+    /// the space that says "something goes here" leaves the caret in the wrong
+    /// place. The registry is the only thing that knows, and `all` is where the
+    /// menu already reads it from.
+    pub fn find(&self, name: &str) -> Option<Command> {
+        self.all().into_iter().find(|c| c.name == name)
+    }
+
     fn owner(&self, name: &str) -> Option<Arc<dyn CommandSet>> {
         self.sets
             .read()

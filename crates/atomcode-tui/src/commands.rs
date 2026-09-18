@@ -42,6 +42,7 @@ const SCREEN: &[Command] = &[
         "[路径]",
         "把剪贴板(或一个文件)的内容放进输入框;Ctrl+V 被终端或系统拦下时用它",
     ),
+    Command::new("config", "拉出设置面板:搜索、改值;esc 关"),
 ];
 
 #[async_trait]
@@ -91,6 +92,7 @@ impl CommandSet for ScreenCommands {
                     Err(error) => Outcome::Refused(format!("读不了 {path}:{error}")),
                 },
             },
+            "config" => Outcome::Do(Action::ToggleSettings),
             "keys" => Outcome::Said(
                 "enter 发送 · shift+enter 换行(或 ctrl-j) · ctrl-d 退出 · ctrl-w 删词\n\
                  esc 依次:取消选中 -> 清空输入 -> 停止当轮 · ctrl-c 直接停止当轮\n\
@@ -331,11 +333,6 @@ const SESSION: &[Command] = &[
     Command::new("cost", "这次会话用掉多少 token(等于 /context)"),
     Command::new("usage", "账号还剩多少额度,哪个窗口用完了、什么时候回来"),
     Command::taking(
-        "config",
-        "[项 值]",
-        "看设置;带上项和值就改它。改的是配置文件,不是运行中的行",
-    ),
-    Command::taking(
         "mcp",
         "[tools <服务器>|withdraw]",
         "MCP 服务器的状态;tools 列某个服务器挂上来的工具;withdraw 立刻撤下全部 MCP 工具",
@@ -357,7 +354,12 @@ const SESSION: &[Command] = &[
 ];
 
 /// A host's refusal, in words a person can act on.
-fn refusal(error: HostError) -> String {
+///
+/// `pub(crate)` because a host command is not only a command's business: the
+/// settings seam hands one to the runtime after writing a file, and its failure
+/// has to read the same as every other host failure. One renderer, so one error
+/// does not get two wordings depending on which path it came back along.
+pub(crate) fn refusal(error: HostError) -> String {
     match error {
         HostError::Busy { reason } => format!("现在不行:{reason}"),
         HostError::NotFound => "找不到:会话已经换过,或者没有这个会话".into(),
@@ -552,16 +554,37 @@ impl CommandSet for SessionCommands {
                 // One vocabulary, taken from the place that defines it, so this
                 // command cannot offer a level nothing parses.
                 let levels = atomcode_harness::REASONING_EFFORT_LEVELS;
+                // With nothing after it, the command asks rather than reports:
+                // the levels are a closed set this command already knows, so the
+                // answer is a list to pick from, and picking one dispatches the
+                // command it stands for. A pick is expressed as a command, so
+                // this and a typed `/effort high` reach one implementation.
                 if wanted.is_empty() {
                     let current = client
                         .described()
                         .and_then(|d| d.reasoning_effort)
-                        .map(|level| level.as_str().to_string())
-                        .unwrap_or_else(|| "端点默认".into());
-                    return Outcome::Said(format!(
-                        "当前思考强度:{current}\n可选:{}, default",
-                        levels.join(", ")
-                    ));
+                        .map(|level| level.as_str().to_string());
+                    let mut choices: Vec<crate::overlay::Choice> = levels
+                        .iter()
+                        .map(|level| {
+                            crate::overlay::Choice::new(
+                                format!("/effort {level}"),
+                                (*level).to_string(),
+                            )
+                            .about("这个会话的思考强度")
+                            .marked(current.as_deref() == Some(*level))
+                        })
+                        .collect();
+                    choices.push(
+                        crate::overlay::Choice::new("/effort default", "default")
+                            .about("交给端点决定")
+                            .marked(current.is_none()),
+                    );
+                    let title = match &current {
+                        Some(level) => format!("思考强度 · 现在 {level} · enter 改"),
+                        None => "思考强度 · 现在交给端点 · enter 改".to_string(),
+                    };
+                    return Outcome::Open(crate::overlay::Picker::new("effort", title, choices));
                 }
                 let level = if wanted == "default" {
                     None
@@ -886,125 +909,6 @@ impl CommandSet for SessionCommands {
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
-            "config" => {
-                let control = match host(control) {
-                    Ok(control) => control,
-                    Err(refused) => return refused,
-                };
-                let (id, value) = match args.trim().split_once(char::is_whitespace) {
-                    Some((id, value)) => (id.trim(), value.trim()),
-                    None => (args.trim(), ""),
-                };
-                // Nothing typed: the settings as a picker. tuix had a
-                // half-screen editor for this (`modals/config_panel.rs`, 565
-                // lines); what it really did was filter a list, move a cursor
-                // and write one value — which is what `Picker` already is. The
-                // catalog (`atomcode_config::settings::SETTINGS`) and the write
-                // (`HostConfig::set_setting`) were shared all along, so this is
-                // two things that exist put together rather than a third one.
-                if id.is_empty() {
-                    return match control.call(HostCommand::Settings { session: root }).await {
-                        Ok(HostReply::Settings { settings }) if settings.is_empty() => {
-                            Outcome::Said("这个宿主没有可改的设置".into())
-                        }
-                        Ok(HostReply::Settings { settings }) if !args.contains("--list") => {
-                            let choices = settings
-                                .into_iter()
-                                .map(|s| {
-                                    // Picking a setting opens its values —
-                                    // `/config <id>` below — so one gesture
-                                    // leads to the next without a second menu
-                                    // implementation.
-                                    crate::overlay::Choice::new(
-                                        format!("/config {}", s.id),
-                                        format!("{} = {}", s.id, s.value),
-                                    )
-                                    .about(format!("{} · {} · {}", s.label, s.accepts, s.applies))
-                                })
-                                .collect();
-                            Outcome::Open(crate::overlay::Picker::new(
-                                "config",
-                                "改哪一项 · 打字筛选 · enter 看它能填什么",
-                                choices,
-                            ))
-                        }
-                        Ok(HostReply::Settings { settings }) => Outcome::Said(
-                            settings
-                                .into_iter()
-                                .map(|s| {
-                                    format!(
-                                        "{} = {}  · {} · {} · {}",
-                                        s.id, s.value, s.label, s.accepts, s.applies
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        ),
-                        Ok(other) => Outcome::Refused(format!("{other:?}")),
-                        Err(error) => Outcome::Refused(refusal(error)),
-                    };
-                }
-                // A setting named but no value: what it accepts, as a
-                // picker. `accepts` is the catalog's own wording (`true |
-                // false`, `auto | dark | light`), so the choices are the
-                // catalog's, not a second list to keep in step.
-                if value.is_empty() {
-                    return match control
-                        .call(HostCommand::Settings {
-                            session: root.clone(),
-                        })
-                        .await
-                    {
-                        Ok(HostReply::Settings { settings }) => {
-                            let Some(setting) = settings.into_iter().find(|s| s.id == id) else {
-                                return Outcome::Refused(format!("没有 `{id}` 这一项"));
-                            };
-                            let offered: Vec<&str> = setting
-                                .accepts
-                                .split('|')
-                                .map(str::trim)
-                                .filter(|v| !v.is_empty() && !v.contains('–'))
-                                .collect();
-                            if offered.is_empty() {
-                                // A number or free text: nothing to pick from,
-                                // so say what it takes and let them type it.
-                                return Outcome::Said(format!(
-                                    "{id} = {} · 要 {} · `/config {id} <值>` 改它",
-                                    setting.value, setting.accepts
-                                ));
-                            }
-                            let choices = offered
-                                .into_iter()
-                                .map(|v| {
-                                    crate::overlay::Choice::new(
-                                        format!("/config {id} {v}"),
-                                        v.to_string(),
-                                    )
-                                    .marked(v == setting.value)
-                                })
-                                .collect();
-                            Outcome::Open(crate::overlay::Picker::new(
-                                "config-value",
-                                format!("{id} 改成什么 · {}生效", setting.applies),
-                                choices,
-                            ))
-                        }
-                        Ok(other) => Outcome::Refused(format!("宿主答了别的:{other:?}")),
-                        Err(error) => Outcome::Refused(refusal(error)),
-                    };
-                }
-                match control
-                    .call(HostCommand::SetSetting {
-                        session: root,
-                        id: id.to_string(),
-                        value: value.to_string(),
-                    })
-                    .await
-                {
-                    Ok(_) => Outcome::Said(format!("{id} = {value}")),
-                    Err(error) => Outcome::Refused(refusal(error)),
-                }
-            }
             // Two levels, one command: the list, then one file's diff. The
             // most-asked question of a coding session is "what did it do to my
             // code", and before this the only way to ask it was to leave for
@@ -1099,12 +1003,15 @@ impl CommandSet for SessionCommands {
                     return Outcome::Refused("这个宿主没有语言这一项".into());
                 };
                 let wanted = args.trim();
-                // Pick it rather than read it out: `/language` is one setting,
-                // and `/config <id>` already knows how to offer a setting's
-                // values. One implementation, reached by the name people look
-                // for.
+                // With nothing after it, say what it is and what it takes.
+                // `/config` is the settings panel now — a screen command with
+                // its own search and editing — and a session command cannot
+                // open it for one row, so this names the row instead.
                 if wanted.is_empty() {
-                    return Box::pin(self.run("config", "language", ctx)).await;
+                    return Outcome::Said(format!(
+                        "语言:{} · 可选 {} · `/language <值>` 改它",
+                        setting.value, setting.accepts
+                    ));
                 }
                 match control
                     .call(HostCommand::SetSetting {
@@ -2013,77 +1920,6 @@ mod tests {
         ));
     }
 
-    /// `/config` is an editor, not a printout: pick a setting, pick a value,
-    /// it is written. Three steps, each one reaching the next through the same
-    /// command — so there is no second menu to keep in step with the first.
-    #[tokio::test]
-    async fn config_picks_a_setting_then_a_value_then_writes_it() {
-        let host = Arc::new(Recording::default());
-        let settings = || {
-            vec![
-                atomcode_host_api::Setting {
-                    id: "ui.theme".into(),
-                    label: "主题".into(),
-                    value: "auto".into(),
-                    accepts: "auto | dark | light".into(),
-                    applies: "下次启动".into(),
-                },
-                atomcode_host_api::Setting {
-                    id: "coding.max_rounds".into(),
-                    label: "轮数上限".into(),
-                    value: "40".into(),
-                    accepts: "1–200".into(),
-                    applies: "下一回合".into(),
-                },
-            ]
-        };
-        host.replies.lock().unwrap().extend([
-            Ok(HostReply::Settings {
-                settings: settings(),
-            }),
-            Ok(HostReply::Settings {
-                settings: settings(),
-            }),
-            Ok(HostReply::Settings {
-                settings: settings(),
-            }),
-            Ok(HostReply::Done),
-        ]);
-        let (app, _client, all) = following(&host);
-
-        // 1. the settings, to pick from
-        match all.dispatch("/config", &app.context()).await {
-            Outcome::Open(picker) => assert_eq!(picker.id(), "config"),
-            other => panic!("{other:?}"),
-        }
-        // 2. one setting, its values to pick from
-        match all.dispatch("/config ui.theme", &app.context()).await {
-            Outcome::Open(picker) => assert_eq!(picker.id(), "config-value"),
-            other => panic!("{other:?}"),
-        }
-        // A number has nothing to pick from, so it says what it takes.
-        match all
-            .dispatch("/config coding.max_rounds", &app.context())
-            .await
-        {
-            Outcome::Said(text) => assert!(text.contains("1–200"), "{text}"),
-            other => panic!("{other:?}"),
-        }
-        // 3. a value, written
-        match all.dispatch("/config ui.theme dark", &app.context()).await {
-            Outcome::Said(text) => assert!(text.contains("dark"), "{text}"),
-            other => panic!("{other:?}"),
-        }
-        assert_eq!(
-            host.asked.lock().unwrap().last(),
-            Some(&HostCommand::SetSetting {
-                session: "lead".into(),
-                id: "ui.theme".into(),
-                value: "dark".into(),
-            })
-        );
-    }
-
     /// The words people type for a mode reach the one mode switch — they are
     /// not a second implementation that would drift from it.
     #[tokio::test]
@@ -2231,13 +2067,8 @@ mod tests {
             accepts: "zh | en".into(),
             applies: "下一回合".into(),
         };
-        // Three readings, then the write, then a host that has no such
-        // setting: `/language` with nothing after it reads once for itself and
-        // once through `/config`, which is the point — one implementation.
+        // Two readings, then the write, then a host that has no such setting.
         host.replies.lock().unwrap().extend([
-            Ok(HostReply::Settings {
-                settings: vec![language()],
-            }),
             Ok(HostReply::Settings {
                 settings: vec![language()],
             }),
@@ -2251,10 +2082,14 @@ mod tests {
         ]);
         let (app, _client, all) = following(&host);
 
-        // With nothing after it, `/language` offers the values — it used to
-        // print them, which made a person read a line and then type it back.
+        // With nothing after it, `/language` says what it is and what it
+        // takes. It used to open `/config`'s value picker; `/config` is the
+        // screen's settings panel now, and a session command cannot open a
+        // screen panel for one row.
         match all.dispatch("/language", &app.context()).await {
-            Outcome::Open(picker) => assert_eq!(picker.id(), "config-value"),
+            Outcome::Said(text) => {
+                assert!(text.contains("zh") && text.contains("zh | en"), "{text}")
+            }
             other => panic!("{other:?}"),
         }
         match all.dispatch("/language en", &app.context()).await {
@@ -2273,7 +2108,6 @@ mod tests {
             vec![
                 HostCommand::Settings { session: lead() },
                 HostCommand::Settings { session: lead() },
-                HostCommand::Settings { session: lead() },
                 HostCommand::SetSetting {
                     session: lead(),
                     id: "language".into(),
@@ -2281,7 +2115,7 @@ mod tests {
                 },
                 HostCommand::Settings { session: lead() },
             ],
-            "the named door and `/config` ask the same host the same things"
+            "the named door reads the setting, then writes it"
         );
     }
 
@@ -2686,6 +2520,13 @@ mod tests {
         assert_eq!(
             c.dispatch("/reasoning", &app.context()).await,
             Outcome::Do(Action::ToggleFold("reasoning"))
+        );
+        // `/config` is the settings panel, and it reaches the screen the same
+        // way every other screen command does: as an action, so the command and
+        // any key bound to it later are one implementation.
+        assert_eq!(
+            c.dispatch("/config", &app.context()).await,
+            Outcome::Do(Action::ToggleSettings)
         );
     }
 

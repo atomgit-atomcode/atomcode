@@ -14,6 +14,7 @@ fn _isolate_atomcode_home() {
 
 #[cfg(unix)]
 pub mod askpass;
+pub mod tui_settings;
 pub mod uninstall;
 
 /// ACP (Agent Client Protocol) stdio server — lets atomcode be driven by Zed /
@@ -38,6 +39,14 @@ pub mod tui_front {
     use atomcode_coding::{CodingAgentConfig, CodingRuntime};
     use atomcode_tui::launch::{self, Screen};
 
+    /// The settings panel: the row, and the port behind it.
+    ///
+    /// Both, from one place, because they are one decision: the row exists
+    /// because this launcher has settings to show, so a launcher that mounted the
+    /// row without the port would be a panel drawing an empty list, and the port
+    /// without the row is never reached. `atomcode-tui` names neither — the view
+    /// is the screen's, the row is the product's.
+    ///
     /// The screen, mounted and connected to `runtime` — which was started with
     /// `front_end` in its prepare options — and not yet running.
     pub async fn mount(
@@ -46,9 +55,22 @@ pub mod tui_front {
         config: CodingAgentConfig,
         host_config: Option<Arc<dyn crate::host::HostConfig>>,
         screen: &Screen,
+        config_path: std::path::PathBuf,
     ) -> Result<launch::Mounted, String> {
+        // Both additions belong: the host configuration is what makes
+        // `HostCommand::Settings`/`SwitchModel` answerable, and the settings row
+        // is the panel `/config` pulls up. They are not alternatives — one is
+        // what a host can be asked, the other is what this screen can show.
         let connection = connect(runtime, front_end, config, host_config)?;
-        launch::mount(screen, &[], connection).await
+        let layer = crate::tui_settings::row_layer();
+        launch::mount_with(
+            screen,
+            &[&layer],
+            &[Arc::new(crate::tui_settings::SettingsRow)],
+            Some(crate::tui_settings::ConfigSettings::new(config_path)),
+            connection,
+        )
+        .await
     }
 
     /// What host control resolves configuration with for `atomcode --tui`: the
@@ -437,8 +459,9 @@ model = "vendor-b"
         config: CodingAgentConfig,
         host_config: Option<Arc<dyn crate::host::HostConfig>>,
         screen: &Screen,
+        config_path: std::path::PathBuf,
     ) -> Result<(), String> {
-        let mounted = mount(runtime, front_end, config, host_config, screen).await?;
+        let mounted = mount(runtime, front_end, config, host_config, screen, config_path).await?;
         let ctx = mounted.app.context();
         mounted.ui.run(&ctx, None).await
     }

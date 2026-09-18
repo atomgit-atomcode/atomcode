@@ -250,6 +250,221 @@ impl Menu {
     }
 }
 
+/// The slash menu: what a `/` is offering, and which of it is pointed at.
+///
+/// The same vocabulary as [`Menu`] — one cursor, a row under the pointer, a
+/// panel that covers what it is drawn over — and deliberately not the same
+/// struct. This one hangs off the composer's top edge rather than off a cell,
+/// and it **scrolls**: there are more commands than rows that read well, and a
+/// list whose tail is off the screen is a list whose tail cannot be reached.
+///
+/// What a lit name *means* is kept out of here for the same reason it is in
+/// [`Menu`]: completing a command and running one are two different things, and
+/// which one a keystroke asks for is the composer's business. This module knows
+/// how to lay a list out and which row a cell is on, and nothing else.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Slash {
+    items: Vec<Item>,
+    cursor: usize,
+}
+
+impl Slash {
+    /// A list whose first row is lit.
+    ///
+    /// The first row and not "no row": the list exists to be chosen from, and a
+    /// menu that opens with nothing pointed at it makes the person press a key
+    /// before it will say what it is about to do.
+    pub fn new(items: Vec<Item>) -> Self {
+        Self { items, cursor: 0 }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Whether a key is one the list answers for itself.
+    ///
+    /// The list is open for the whole time a command is being *typed* — that is
+    /// what a discovery surface is — so "the menu is open" cannot be the same
+    /// question as "the menu takes this key". Letters and backspace belong to
+    /// the composer; these five belong to the list, and they are the same keys
+    /// every list in this UI speaks.
+    ///
+    /// **Enter is the list's**, and the caller decides what taking the row means
+    /// for the line underneath: with the menu open the return key acts on the
+    /// row that is lit rather than on whatever half-typed prefix happens to be
+    /// there. A menu you must complete with tab before the return key will
+    /// respect it is a menu that argues with the person who can see the row.
+    ///
+    /// Shift+enter and alt+enter are deliberately not here: they are a newline
+    /// inside what is being typed, and a list that swallowed them would make
+    /// `/command` impossible to write on two lines.
+    pub fn owns(press: KeyPress) -> bool {
+        match press.key {
+            // Modifiers are ignored on the arrows, the same as the question
+            // panel's: a terminal that reports ctrl+up for a plain up would
+            // otherwise leave the list unmovable.
+            Key::Up | Key::Down | Key::Esc => true,
+            // Tab completes and enter takes, and only the bare forms of each:
+            // shift-tab is the mode cycle elsewhere in this UI, and
+            // shift/alt-enter is a newline here.
+            Key::Tab | Key::Enter => press.mods == crate::surface::Mods::NONE,
+            _ => false,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// What is lit, when anything is.
+    pub fn selected(&self) -> Option<&Item> {
+        self.items.get(self.cursor)
+    }
+
+    /// Move the cursor by `delta`, clamped to the list.
+    ///
+    /// Returns whether it moved, so a caller can tell a key that changed the
+    /// highlight from one that had nowhere to go. Clamped and not wrapped, the
+    /// same as [`Menu::key`] and for the same reason: past the end of a list
+    /// this short there is nowhere to fall off to, and wrapping reads as a jump.
+    pub fn move_by(&mut self, delta: i32) -> bool {
+        let last = self.items.len().saturating_sub(1) as i32;
+        let row = (self.cursor as i32 + delta).clamp(0, last) as usize;
+        let moved = row != self.cursor;
+        self.cursor = row;
+        moved
+    }
+
+    /// The first item of the window, given how many rows are on screen.
+    ///
+    /// The cursor is always inside the window — a highlight that has scrolled
+    /// off is a list that has lost the thing it was pointing at — and the
+    /// window moves by the least it can, one row at a time. A list that
+    /// recentres itself under the cursor jumps under the eye, and the eye is
+    /// reading the row next to the one that moved.
+    pub fn window(&self, rows: usize) -> usize {
+        let rows = rows.max(1);
+        if self.items.len() <= rows {
+            return 0;
+        }
+        self.cursor
+            .saturating_sub(rows - 1)
+            .min(self.items.len() - rows)
+    }
+
+    /// The item a screen cell is on, when it is on one.
+    ///
+    /// Read off the rect the list was **drawn** in and the same window it was
+    /// drawn with, so a pointer and the highlight cannot disagree about which
+    /// row is which: a second formula for one layout is a whole list answering
+    /// to the wrong one. The same rule [`Menu::click`] follows.
+    fn row_at(&self, x: u16, y: u16, rect: Rect, rows: usize) -> Option<usize> {
+        if !rect.contains(x, y) {
+            return None;
+        }
+        let row = (y - rect.y) as usize;
+        if row >= rows {
+            return None;
+        }
+        let index = self.window(rows) + row;
+        (index < self.items.len()).then_some(index)
+    }
+
+    /// The pointer moved over the list: light the row it is over.
+    ///
+    /// Returns whether a frame is owed — `false` both when the pointer is not
+    /// on the list and when it is on the row already lit. A move inside one row
+    /// is not news, and the terminal sends a move for every cell the pointer
+    /// crosses, so the cheap answer is the one that matters.
+    ///
+    /// Unlike [`Menu::hover`] there is nothing to re-anchor: this panel is
+    /// pinned to the composer's top edge, so a pointer travelling over it moves
+    /// the highlight and not the panel.
+    pub fn hover(&mut self, x: u16, y: u16, rect: Rect, rows: usize) -> bool {
+        match self.row_at(x, y, rect, rows) {
+            Some(row) if row != self.cursor => {
+                self.cursor = row;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A press landed on the list, if it landed on the list at all.
+    ///
+    /// `None` means the press was outside — the caller decides what that means,
+    /// because only the caller knows what else is on screen under the pointer.
+    /// The value is the item's own, the same as [`Step::Picked`] carries: what
+    /// a name means is not this module's business.
+    pub fn click(&mut self, x: u16, y: u16, rect: Rect, rows: usize) -> Option<String> {
+        let row = self.row_at(x, y, rect, rows)?;
+        self.cursor = row;
+        Some(self.items[row].value.clone())
+    }
+
+    /// The rows of the window, filling the rect's width.
+    ///
+    /// The row under the cursor is the same panel one step brighter — not
+    /// reverse, for the reason [`Menu::render`] gives — and every row is filled
+    /// to the rect with the panel's own colour, so the list is a surface over
+    /// the conversation rather than words with the conversation around them.
+    pub fn render(&self, rect: Rect, rows: usize) -> Vec<Line> {
+        let w = rect.w as usize;
+        if w == 0 || rows == 0 {
+            return Vec::new();
+        }
+        let panel = theme::bg(Role::PanelBg).under(theme::fg(Role::PanelFg));
+        let start = self.window(rows);
+        let mut out: Vec<Line> = Vec::with_capacity(rows);
+        for i in 0..rows {
+            let index = start + i;
+            let (line, base) = match self.items.get(index) {
+                Some(item) => {
+                    let here = index == self.cursor;
+                    let base = if here {
+                        theme::bg(Role::PanelSelBg).under(theme::fg(Role::PanelFg))
+                    } else {
+                        panel
+                    };
+                    let mut spans = vec![
+                        Span::styled("  /".to_string(), base),
+                        Span::styled(
+                            item.label.clone(),
+                            if here {
+                                base
+                            } else {
+                                theme::fg(Role::Accent).under(panel)
+                            },
+                        ),
+                    ];
+                    if !item.about.is_empty() {
+                        spans.push(Span::styled(
+                            format!("  {}", item.about),
+                            if here {
+                                base
+                            } else {
+                                theme::fg(Role::Muted).under(panel)
+                            },
+                        ));
+                    }
+                    (Line::from_spans(spans), base)
+                }
+                // Never reached in practice: the rect is sized to the window,
+                // and this is what keeps a short list from showing the screen
+                // through its own panel.
+                None => (Line::empty(), panel),
+            };
+            out.push(pad(line, w, base));
+        }
+        out
+    }
+}
+
 /// A line widened to the rect with the panel's own style.
 ///
 /// The same rule as the slash menu's: a floating part covers what it is drawn
@@ -577,6 +792,171 @@ mod tests {
         assert!(
             rows[0].contains("复制全文") && rows[0].contains("放剪贴板"),
             "{rows:?}"
+        );
+    }
+
+    // ---- the slash menu --------------------------------------------------
+
+    fn commands(n: usize) -> Vec<Item> {
+        (0..n)
+            .map(|i| Item::new(format!("cmd{i}"), format!("command {i}")))
+            .collect()
+    }
+
+    fn slash_rows(list: &Slash, w: u16, rows: usize) -> Vec<String> {
+        let rect = Rect::new(0, 0, w, rows as u16);
+        list.render(rect, rows).iter().map(|l| l.plain()).collect()
+    }
+
+    #[test]
+    fn a_new_list_has_its_first_row_lit() {
+        // The requirement in one line: a menu opens with something pointed at
+        // it, so Enter does the obvious thing without an arrow press first.
+        let list = Slash::new(commands(3));
+        assert_eq!(list.cursor(), 0);
+        assert_eq!(list.selected().map(|i| i.value.as_str()), Some("cmd0"));
+    }
+
+    #[test]
+    fn the_cursor_is_clamped_at_both_ends() {
+        let mut list = Slash::new(commands(3));
+        assert!(!list.move_by(-1), "there is nothing above the first row");
+        assert_eq!(list.cursor(), 0);
+        assert!(list.move_by(2));
+        assert_eq!(list.cursor(), 2);
+        assert!(!list.move_by(1), "and nothing below the last");
+        assert_eq!(list.cursor(), 2);
+    }
+
+    #[test]
+    fn the_window_follows_the_cursor_by_the_least_it_can() {
+        // A highlight that scrolls off the panel is a list that has lost the
+        // thing it was pointing at; one that recentres jumps under the eye.
+        let mut list = Slash::new(commands(10));
+        assert_eq!(list.window(3), 0);
+        list.move_by(2);
+        assert_eq!(list.window(3), 0, "the cursor is still inside the window");
+        list.move_by(1);
+        assert_eq!(list.window(3), 1, "it moved by exactly one row");
+        for _ in 0..6 {
+            list.move_by(1);
+        }
+        assert_eq!(list.cursor(), 9);
+        assert_eq!(list.window(3), 7, "and the tail is on screen");
+        assert!(list.window(3) + 3 <= 10);
+    }
+
+    #[test]
+    fn a_list_that_fits_never_scrolls() {
+        let mut list = Slash::new(commands(3));
+        list.move_by(2);
+        assert_eq!(list.window(10), 0);
+    }
+
+    #[test]
+    fn the_window_is_drawn_so_the_lit_row_is_the_one_the_cursor_is_on() {
+        // The claim the window has to earn: what is lit on screen is the row
+        // Enter would take. Read off the drawn rows, not off the arithmetic.
+        let mut list = Slash::new(commands(6));
+        for _ in 0..5 {
+            list.move_by(1);
+        }
+        let rows = slash_rows(&list, 40, 3);
+        let lit = rows
+            .iter()
+            .position(|r| r.contains("command 5"))
+            .expect("the lit row is inside the window");
+        assert_eq!(
+            list.window(3) + lit,
+            list.cursor(),
+            "the row drawn as lit is not the row the cursor is on: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_pointer_lights_the_row_it_is_over_and_only_that_row() {
+        let mut list = Slash::new(commands(6));
+        let rect = Rect::new(5, 10, 40, 3);
+        assert!(
+            list.hover(6, 11, rect, 3),
+            "row 1 is a row the pointer moved onto"
+        );
+        assert_eq!(list.cursor(), 1);
+        assert!(
+            !list.hover(6, 11, rect, 3),
+            "a move inside the row is not news"
+        );
+        assert!(
+            !list.hover(0, 0, rect, 3),
+            "and a pointer off the panel is not either"
+        );
+        assert_eq!(list.cursor(), 1, "the highlight was cleared from off-panel");
+    }
+
+    #[test]
+    fn a_press_takes_the_row_the_pointer_was_over() {
+        // The whole point of the highlight: the row a click lands on is the row
+        // that was lit, and it is the row's own value that comes back.
+        let mut list = Slash::new(commands(6));
+        let rect = Rect::new(5, 10, 40, 3);
+        assert_eq!(list.click(6, 12, rect, 3).as_deref(), Some("cmd2"));
+        assert_eq!(list.cursor(), 2, "and the press moved the highlight to it");
+    }
+
+    #[test]
+    fn a_press_off_the_panel_is_not_the_list_s_business() {
+        let mut list = Slash::new(commands(6));
+        let rect = Rect::new(5, 10, 40, 3);
+        assert_eq!(list.click(0, 0, rect, 3), None);
+        assert_eq!(list.cursor(), 0, "and it did not move the highlight");
+    }
+
+    #[test]
+    fn a_click_is_read_off_the_same_window_that_was_drawn() {
+        // Scrolled list: the third row of the panel is *not* the third command.
+        // A second formula here would make every row below the fold answer to
+        // the wrong command.
+        let mut list = Slash::new(commands(6));
+        for _ in 0..5 {
+            list.move_by(1);
+        }
+        let rect = Rect::new(5, 10, 40, 3);
+        let start = list.window(3);
+        assert!(
+            start > 0,
+            "the list has to be scrolled for this to mean anything"
+        );
+        assert_eq!(
+            list.click(6, 10, rect, 3).as_deref(),
+            Some(format!("cmd{start}").as_str()),
+            "the top row of a scrolled panel is the window's first item"
+        );
+    }
+
+    #[test]
+    fn the_lit_row_is_a_brighter_panel_and_the_rest_are_not() {
+        let list = Slash::new(commands(3));
+        let rect = Rect::new(0, 0, 40, 3);
+        let lines = list.render(rect, 3);
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(line.width(), rect.w as usize, "row {i} is not filled");
+            assert!(
+                line.spans.iter().all(|s| !s.style.reverse),
+                "row {i} is drawn inverted"
+            );
+        }
+        let plain = Some(crate::frame::Color::role(Role::PanelBg));
+        let pointed = Some(crate::frame::Color::role(Role::PanelSelBg));
+        assert_eq!(
+            lines[0].spans[0].style.bg, pointed,
+            "the first row is not lit"
+        );
+        assert_eq!(lines[1].spans[0].style.bg, plain, "row 1 is lit too");
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.spans.iter().all(|s| s.style.bg.is_some())),
+            "a row shows the screen through its own panel"
         );
     }
 }

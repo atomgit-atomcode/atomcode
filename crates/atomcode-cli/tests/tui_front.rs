@@ -137,7 +137,13 @@ async fn a_session_the_product_wrote_comes_back_on_the_row_assembled_screen() {
         headless: Some((100, 30)),
         ..Screen::default()
     };
-    let mounted = tui_front::mount(second, front_end, config, None, &screen)
+    // The settings the screen shows come from this file. Passed explicitly
+    // rather than resolved inside, because "which config" is the launcher's
+    // decision — the same one the binary makes from `--config`.
+    let config_path = home.path().join("config.toml");
+    // `None` for the host configuration: this criterion is about mounting the
+    // screen, and a host that resolves nothing is the honest stand-in.
+    let mounted = tui_front::mount(second, front_end, config, None, &screen, config_path)
         .await
         .expect("the screen mounts");
     let term = mounted

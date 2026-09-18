@@ -133,6 +133,12 @@ name = "tui-panel-ask"
 [[insert]]
 name = "tui-keys-default"
 
+# The settings, pulled up over the composer by `/config`. Not here: the row that
+# mounts it is the launcher's, because the launcher is what has settings to show.
+# A screen with no `tui-settings` has no settings, so there is nothing for this
+# tree to switch on — the panel's place is `host::TAIL`, and its row arrives as
+# an `extra` layer from whoever provides the port.
+
 [[insert]]
 name = "tui-commands-screen"
 
