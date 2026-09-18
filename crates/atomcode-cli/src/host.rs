@@ -427,6 +427,27 @@ fn persistence_failure(completion: &TurnCompletion) -> Option<String> {
     }
 }
 
+/// What the staleness guard can conclude when there is no App to read a log
+/// from (`RuntimeControl::fresh`).
+///
+/// Two situations look identical from the call site and must not be answered
+/// the same way. A front end that **has** fed an App and is not feeding one now
+/// is between Apps: its caller's position cannot be checked, and letting the
+/// command through would assume exactly what the guard exists to verify. A
+/// front end that has **never** fed one keeps no log at all — a protocol server
+/// with no screen — so there is nothing for a caller to be stale against, which
+/// is the same situation as a session the feed has never seen and is allowed
+/// for the same reason.
+///
+/// Before this was distinguished, such a front end could never undo anything.
+fn without_a_log(apps_fed: u64) -> Result<(), HostError> {
+    if apps_fed == 0 {
+        Ok(())
+    } else {
+        Err(HostError::Unavailable)
+    }
+}
+
 /// A goal, as the contract says a self-driving session.
 fn running_of_goal(goal: atomcode_coding::GoalProgress) -> atomcode_host_api::Running {
     atomcode_host_api::Running {
@@ -539,13 +560,28 @@ impl RuntimeControl {
 
     /// Refuse a command based on a fact older than a message or a turn the
     /// session has had since (`docs/adr/0021` §9).
+    ///
+    /// The guard compares against the front end's own log, so it can only be
+    /// applied to a front end that keeps one. Two different things look the
+    /// same from here and must not be answered the same way:
+    ///
+    /// - **Not fed right now**, but it has been (`apps_fed() > 0`): the host is
+    ///   between Apps. A caller's position cannot be checked, and letting the
+    ///   command through would be assuming what this guard exists to verify.
+    ///   Refused.
+    /// - **Never fed at all**: this front end keeps no log — a protocol server
+    ///   driving sessions with no screen, say. There is nothing for the caller
+    ///   to be stale against, which is the same situation as a session this
+    ///   feed has never seen, two lines below, and it is allowed for the same
+    ///   reason. Refusing instead would mean such a front end could never undo
+    ///   anything, which is what it did before this was distinguished.
     fn fresh(
         &self,
         session: &str,
         based_on: atomcode_kernel::session::SeqNo,
     ) -> Result<(), HostError> {
         let Some(app) = self.front_end.app() else {
-            return Err(HostError::Unavailable);
+            return without_a_log(self.front_end.apps_fed());
         };
         let Some(agent) = Feed::find(&app, session) else {
             return Ok(());
@@ -1154,7 +1190,28 @@ pub fn refused(error: RuntimeError) -> HostError {
 
 #[cfg(test)]
 mod completion_tests {
-    use super::persistence_failure;
+    use super::{persistence_failure, without_a_log};
+
+    /// "No log right now" and "no log, ever" are different answers.
+    ///
+    /// The guard compares a caller's position against the front end's own log.
+    /// A screen between Apps has one and cannot be read — refuse. A protocol
+    /// server that never had one has nothing to be stale against — allow, the
+    /// same answer the guard already gives for a session its feed has never
+    /// seen. Answering both with "unavailable" meant a front end with no screen
+    /// could never undo anything, which is what this fixed.
+    #[test]
+    fn a_front_end_that_never_kept_a_log_is_not_stale() {
+        assert!(without_a_log(0).is_ok());
+        assert!(matches!(
+            without_a_log(1),
+            Err(atomcode_host_api::HostError::Unavailable)
+        ));
+        assert!(matches!(
+            without_a_log(7),
+            Err(atomcode_host_api::HostError::Unavailable)
+        ));
+    }
     use atomcode_coding::{RuntimeSnapshotError, RuntimeTurnStats, TurnCompletion};
     use atomcode_kernel::event::StopReason;
 

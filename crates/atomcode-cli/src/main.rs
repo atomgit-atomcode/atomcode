@@ -1966,49 +1966,12 @@ async fn run() -> Result<i32> {
                         );
                         Some(resolver)
                     };
-                let session_effort_resolver: Option<Arc<atomcode::acp::SessionModelResolver>> =
-                    Some({
-                        let base = config.clone();
-                        let provider = cli.provider.clone();
-                        let dir = working_dir.clone();
-                        let skip = cli.dangerously_skip_permissions;
-                        let resolver: Arc<atomcode::acp::SessionModelResolver> = Arc::new(
-                            move |effort: &str| -> Option<atomcode_coding::CodingAgentConfig> {
-                                let mut cfg = base.clone();
-                                let selection = cfg.effective_model_selection()?;
-                                cfg.update_selection_reasoning(&selection, |fields| {
-                                    *fields.reasoning_effort = match effort {
-                                        "off" => None,
-                                        other => Some(other.to_string()),
-                                    };
-                                });
-                                let runtime = runtime_config_from(
-                                    &cfg,
-                                    &dir,
-                                    provider.as_deref(),
-                                    None,
-                                    skip,
-                                    true,
-                                );
-                                if runtime.model.is_empty() {
-                                    return None;
-                                }
-                                Some(runtime.agent_config())
-                            },
-                        );
-                        resolver
-                    });
-                // Flush telemetry before the long-running stdio loop.
-                telemetry
-                    .shutdown(std::time::Duration::from_millis(500))
-                    .await;
                 return atomcode::acp::serve_stdio(atomcode::acp::AcpServeOptions {
                     engine: Some(engine),
                     provider_factory: Some(provider_factory),
                     auto_approve,
                     session_config_options,
                     session_model_resolver,
-                    session_effort_resolver,
                 })
                 .await
                 .map(|_| 0);

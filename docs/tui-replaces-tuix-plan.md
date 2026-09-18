@@ -306,72 +306,19 @@ tuix 的老毛病——现在改是十几行,等下游移植完再改就是他�
   `HostCommand::SwitchModel` 去解析。思考强度更简单:契约有专门的旋钮
   (`SetReasoningEffort`),这个频道的三档 `off | high | max` 就是 `None | High | Max`,
   那个重建整份配置的闭包根本不需要
-- ⬜ **只剩 `undo_to_prompt` 一处,而且是被挡住的,不是没做**:契约的
-  `Undo { turn, based_on }` 里 `based_on` 要过 `fresh()` 这道防陈旧的关,而
-  `fresh()`(`cli/src/host.rs:547`)读的是**前端自己的会话日志**,经
-  `front_end.app()`。ACP 的 `FrontEnd` 没有挂进任何 plexus App,`app()` 恒为 `None`,
-  于是 `fresh()` 直接回 `HostError::Unavailable` —— **ACP 走契约 undo 会永远失败**。
-  这是查实的(`front_end.rs:92`),不是猜的。
+- ✅ **`undo_to_prompt` 换完,那道关也修对了**。契约的 `Undo` 要过 `fresh()`,而
+  `fresh()` 在拿不到 App 时一律回 `Unavailable` —— ACP 的 `FrontEnd` 从来不挂 App,
+  于是永远 undo 不了。查下去发现那行**没有任何注释**,而隔壁"找不到这个 agent 就放行"
+  是同样的逻辑却给了相反答案:**这是漏考虑了没有屏幕的前端,不是深思熟虑**。
+  判别依据现成就有(`FrontEnd::apps_fed()`):**从来没喂过 App** = 这个前端不记日志、
+  无从陈旧、放行;**喂过但现在没有** = 宿主正在换 App、无法核对、拒绝。
+  提成 `without_a_log()` 并带判据
 
-  要定的是:一个**没有屏幕、也就没有"我看到哪儿了"的前端**,这道防陈旧的关对它
-  应该意味着什么。三条路:`fresh()` 把"没有 App"当成"无从判断→放行"(与"没有这个
-  agent→放行"同一条规矩);或者让 ACP 也挂一个最小 App 好让它有日志;或者契约上
-  承认有一类前端不带 `based_on`。**没拍板之前 `undo` 留在 handle 上**,
-  `SessionState::runtime` 也因此留着
-
-###### 把剩下三步读完之后:**其中两处不是机械搬运**(2026-09-18 更正)
-
-补完 `Context` 当时写的是"剩下的是纯机械搬运"。**那句话是错的**,把七个方法逐个
-读过之后有两处不是:
-
-| 方法 | 契约对应 | 是不是机械 |
-|---|---|---|
-| `respond` / `cancel` / `compact` / `shutdown` | `AgentCommand::Respond` / `Cancel` / `Compact` / `Shutdown` —— 四个全有 | ✅ 直换 |
-| `context_stats` | `HostCommand::Context` | ✅ 刚补 |
-| **`reprepare_config(next)`** | `SwitchModel` / `SetReasoningEffort` | ⚠️ **不是** |
-| **`undo_to_prompt(nth)`** | `Undo { turn, based_on }` | ⚠️ **不是** |
-
-**① `reprepare_config` 收的是一份已经解析好的 `CodingAgentConfig`**,由 ACP 自己
-持有的两个闭包(`model_resolver` / `effort_resolver`,见 `options.rs:233`、`:250`)
-算出来。契约这边收的是 `model` 名字或 `level`,由**宿主**去解析
-(`RuntimeControl::reconfigure` 经 `HostConfig::for_model`)。换过去等于把模型解析
-从 ACP 挪回宿主 —— 方向是对的(那本来就是宿主的活),但 `SessionModelResolver`
-那条注入链要跟着拆,不是替换一行。
-
-**② `undo_to_prompt(nth)` 的 `nth` 是"往回第几个",契约的 `Undo` 收的是 `turn` 号。**
-契约里没有"往回数 N 个"这个说法 —— 这是故意的,`cli/src/host.rs:680` 那段会先查
-`rewind_points()` 把 turn 号换成 prompt 序号。所以 ACP 的 `/undo 3` 要变成:
-先 `RewindPoints` 拿列表 → 取第 N 新的那个 turn → `Undo { turn: Some(它) }`。
-
-  外加 `based_on: SeqNo`(防的是"你看到的还是不是现在的状态")。`fresh()` 读的是
-  **前端自己的会话日志**(`host.rs:547` 的 `front_end.app()`),tui 传的是
-  `client.root_high()`。**ACP 今天不跟踪任何 seq**,要开始跟。
-
-**结论**:剩下三步仍然该一次做完(七个文件是一体的),但动手前要先认下这两件事 ——
-一件是把模型解析还给宿主并拆掉 `SessionModelResolver` 的注入链,一件是让 ACP 开始
-记"我看到的最后一条事实是第几号"。把它们当成机械替换去做,会在半路上才发现。
-
-#### 6.5 测绘(2026-09-18)：今天能删的只有一半,另一半卡在 6.3/6.4 后面
-
-三块逐个追了构造点(不是按名字匹配),结论:
-
-| 块 | 规模 | 生产调用方 | 判定 |
-|---|---|---|---|
-| **runtime 驱动协议** | `coding/src/runtime.rs` 17,529 行(协议面 ~1,650) | **~440 处**:cli(含 `host.rs` adapter 与 `main.rs:3023/3025`)、acp(6 文件)、daemon(~170)、clix(20)、tuix(~240) | **仍被挂载**。`atomcode --tui` 今天也是经 `cli/src/host.rs` 坐在它上面 —— `tui/tests/guards.rs:101` 那道守卫只保证 tui **crate 内**不出现这三个名字,证明不了协议不可达 |
-| `coding/src/team/runner.rs` + `tool.rs` | 919 | **0** —— `TeamTool::new` / `TeamRunnerFactory::new` 只在各自 `cfg(test)` 与 `tests/team_runtime.rs`;`parts.rs:646` 写死 `None`,而那个字段除结构体初始化外无人读 | **已删** |
-| `manager.rs` 的 run-store 半边 | ~400 | 0(`store.runs` 只由 `delegate` 填,`delegate` 无生产调用方 ⇒ 生产下 store 恒空) | **不单独删**。`stop_all` 还有 3 处调用且读这个 store,摘它要连带拆 `quiesce_current_agent` / `stop_current_agent` 的 `team_manager` 参数 —— 为 400 行去动回合循环,不划算。随 6.4 整块走 |
-| `manager.rs` 的事件中继半边 + `team_progress.rs` | ~320 | `parts.rs:633` + runtime.rs 21 处 | **仍被挂载**:唯一目的是喂 tuix 的 team 面板,随 6.4 走 |
-| `capabilities/tools/task.rs` 的委派部分 | ~2,590(含测试) | **0** —— `TaskTool::new` 全部构造点都在 `:1762` 之后的 `cfg(test)` 里;产品挂的是 harness 自己的同名私有工具(`plugins/subagent.rs:458`,经 `subagent-in-process` 挂上) | **已删**,文件 3,190 → 597 |
-| `task.rs` 的 `WorkerScopeGate` + `delegated_write_violation` + 路径 helper | ~290 | `harness/src/plugins/policy.rs:450`(`DelegationBoundsPlugin`) | **必留** |
-
-顺带发现:`SUBAGENT_ACTIVITY_MARKER` 留着(tuix 在 strip 它),但**发它的两处都在已删的委派里**,
-所以 tuix 那两处 `strip_prefix` 今天已经匹配不到 subagent 活动了 —— 它还能匹配
-`review_tool.rs:50` 发的同一个字符,所以前端那段代码本身不算死。
-
-Cargo 影响:无 feature / profile 牵连。唯一陈旧的是
-`capabilities/Cargo.toml:35-37` 那条注释——它用"`task` 工具的 `CancellationToken`"
-论证 `tokio-util`,现在理由不成立了,但**依赖必须留**(`mcp/transport_stdio.rs:16`、
-`codeintel/lsp_tool.rs:262` 都是生产用户)。
+**6.3 完成。** ACP 现在一个产品句柄都不持有:`SessionState` 里只有契约的命令通道、
+宿主控制与 `AgentEvent` 流。顺带把 `SessionModelResolver` 整条注入链拆干净了 ——
+`AcpChains` 两个字段、`AcpServeOptions.session_effort_resolver`、main.rs 里 36 行
+构造、五个文件的参数穿透,全没了;思考强度那个"重建整份配置"的闭包不需要,
+契约有专门的旋钮。
 
 ### 后续(不挡替换)
 

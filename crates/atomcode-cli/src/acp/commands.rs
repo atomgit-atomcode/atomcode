@@ -38,7 +38,6 @@ use crate::acp::options::{
     handle_set_session_config_option, MODEL_CONFIG_ID, MODE_CONFIG_ID, REASONING_EFFORT_CONFIG_ID,
 };
 use crate::acp::sessions::Sessions;
-use crate::acp::SessionModelResolver;
 
 /// One command this channel advertises and runs itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,8 +197,6 @@ pub async fn execute_slash_command(
     sessions: &Sessions,
     cx: &ConnectionTo<Client>,
     sid: &SessionId,
-    model_resolver: Option<&SessionModelResolver>,
-    effort_resolver: Option<&SessionModelResolver>,
 ) -> Option<String> {
     let out = match cmd {
         "status" => status_text(sessions, sid).await,
@@ -210,7 +207,7 @@ pub async fn execute_slash_command(
         "compact" => compact_text(sessions, sid).await,
         "diff" => diff_text(sessions, sid, arg).await,
         "model" | "effort" | "build" | "auto" | "plan" => {
-            set_config_text(cmd, arg, sessions, cx, sid, model_resolver, effort_resolver).await
+            set_config_text(cmd, arg, sessions, cx, sid).await
         }
         "help" => Some(help_text()),
         "config" => Some(config_text()),
@@ -322,23 +319,66 @@ async fn todo_text(sessions: &Sessions, sid: &SessionId) -> Option<String> {
     }
 }
 
+/// `/undo` and `/undo N`.
+///
+/// The contract names a turn; this command counts backwards. So it asks for the
+/// turns first and picks the Nth newest — the same two steps the host would
+/// have to do anyway, done where the "Nth" lives. `/undo` with nothing after it
+/// is the newest, which the contract expresses as no turn at all.
+///
+/// `based_on` is `0`: this channel keeps no log of its own, so it has no
+/// position to claim. A host whose front end never kept one has nothing for the
+/// caller to be stale against and says so (`RuntimeControl::fresh`).
 async fn undo_text(sessions: &Sessions, sid: &SessionId, arg: &str) -> Option<String> {
-    let runtime = {
+    let (control, session) = {
         let map = sessions.lock().await;
-        map.get(sid.0.as_ref())?.runtime.clone()
+        let state = map.get(sid.0.as_ref())?;
+        (state.control.clone(), state.native_id.clone())
     };
-    let nth = if arg.is_empty() {
+    let turn = if arg.is_empty() {
         None
     } else {
-        Some(arg.trim().parse::<usize>().ok()?)
+        let nth = arg.trim().parse::<usize>().ok()?;
+        if nth == 0 {
+            return Some("undo: N must be 1 or more".to_string());
+        }
+        let points = match control
+            .call(HostCommand::RewindPoints {
+                session: session.clone(),
+            })
+            .await
+        {
+            Ok(HostReply::RewindPoints { points, .. }) => points,
+            other => return Some(format!("undo failed: {other:?}")),
+        };
+        match points.get(nth - 1) {
+            Some(point) => Some(point.turn),
+            None => return Some(format!("undo: only {} turn(s) to go back to", points.len())),
+        }
     };
-    match runtime.undo_to_prompt(nth).await {
-        Ok(result) => Some(format!(
-            "undo: reverted to prompt {} ({} prompt(s) before the current turn)",
-            result.target_n, result.prompts_before
-        )),
-        Err(e) => Some(format!("undo failed: {e}")),
+    match control
+        .call(HostCommand::Undo {
+            session,
+            turn,
+            based_on: 0,
+        })
+        .await
+    {
+        Ok(HostReply::Undone { prompt, .. }) => Some(match prompt {
+            Some(text) => format!("undo: back to before `{}`", first_line_capped(&text, 60)),
+            None => "undo: back one turn".to_string(),
+        }),
+        other => Some(format!("undo failed: {other:?}")),
     }
+}
+
+/// A prompt's first line, short enough for one line of output.
+fn first_line_capped(text: &str, max: usize) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= max {
+        return line.to_string();
+    }
+    line.chars().take(max).collect::<String>() + "…"
 }
 
 async fn compact_text(sessions: &Sessions, sid: &SessionId) -> Option<String> {
@@ -387,8 +427,6 @@ async fn set_config_text(
     sessions: &Sessions,
     cx: &ConnectionTo<Client>,
     sid: &SessionId,
-    model_resolver: Option<&SessionModelResolver>,
-    effort_resolver: Option<&SessionModelResolver>,
 ) -> Option<String> {
     let (config_id, value) = match cmd {
         "model" => (MODEL_CONFIG_ID, arg),
@@ -405,9 +443,7 @@ async fn set_config_text(
         config_id,
         SessionConfigOptionValue::value_id(value.to_string()),
     );
-    match handle_set_session_config_option(sessions, cx, &req, model_resolver, effort_resolver)
-        .await
-    {
+    match handle_set_session_config_option(sessions, cx, &req).await {
         Ok(_) => Some(format!("/{cmd}: {value} applied")),
         Err(e) => Some(format!("/{cmd}: {e}")),
     }

@@ -776,24 +776,6 @@ async fn session_config_options_mode_and_effort() {
     ]])
     .with_ctx_window(200_000);
 
-    let effort_resolver: Arc<atomcode::acp::SessionModelResolver> = Arc::new(|effort: &str| {
-        use atomcode_kernel::provider::ReasoningEffort;
-        let mut cfg = atomcode_coding::CodingAgentConfig::new(
-            "test-key",
-            "http://127.0.0.1:1",
-            "stub-model",
-            ".",
-        );
-        cfg.context_window = 200_000;
-        cfg.chat_options.max_tokens = Some(8192);
-        cfg.chat_options.reasoning_effort = match effort {
-            "off" => None,
-            "high" => Some(ReasoningEffort::High),
-            _ => Some(ReasoningEffort::Max),
-        };
-        Some(cfg)
-    });
-
     let (agent_channel, client_channel) = Channel::duplex();
     let opts = AcpServeOptions {
         engine: Some(dummy_engine()),
@@ -837,7 +819,6 @@ async fn session_config_options_mode_and_effort() {
             .category(SessionConfigOptionCategory::ThoughtLevel),
         ],
         session_model_resolver: None,
-        session_effort_resolver: Some(effort_resolver),
     };
     let agent_task = tokio::spawn(async move { serve_over(opts, agent_channel).await });
 
@@ -1937,7 +1918,6 @@ async fn v2_config_options_and_available_commands() {
             .category(SessionConfigOptionCategory::ThoughtLevel),
         ],
         session_model_resolver: None,
-        session_effort_resolver: None,
     };
     let agent_task = tokio::spawn(async move { serve_over(opts, agent_channel).await });
 

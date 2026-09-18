@@ -610,8 +610,6 @@ pub(crate) fn build_v2_agent(state: SharedState) -> impl ConnectTo<Client> + 'st
         msg_ids,
         client_elicitation_form,
         config_options,
-        model_resolver,
-        effort_resolver,
     } = state;
     // Each `async move` handler closure captures the shared counter binding by
     // value; hand every handler its own Arc clone so the later handlers still
@@ -901,8 +899,6 @@ pub(crate) fn build_v2_agent(state: SharedState) -> impl ConnectTo<Client> + 'st
         .on_receive_request(
             {
                 let sessions = Arc::clone(&sessions);
-                let model_resolver = model_resolver.clone();
-                let effort_resolver = effort_resolver.clone();
                 async move |req: SetSessionConfigOptionRequest,
                             responder,
                             cx: ConnectionTo<Client>| {
@@ -922,13 +918,9 @@ pub(crate) fn build_v2_agent(state: SharedState) -> impl ConnectTo<Client> + 'st
                             req.config_id.0.clone(),
                             v1_value,
                         );
-                    let resolver = model_resolver.as_deref();
-                    let effort = effort_resolver.as_deref();
                     let (catalog, _switched_mode) =
-                        crate::acp::options::apply_session_config_option(
-                            &sessions, &v1_req, resolver, effort,
-                        )
-                        .await?;
+                        crate::acp::options::apply_session_config_option(&sessions, &v1_req)
+                            .await?;
                     // v2 has no separate current_mode_update; the mode switch
                     // (if any) is reflected by the `config_option_update` carrying
                     // the full updated catalog.

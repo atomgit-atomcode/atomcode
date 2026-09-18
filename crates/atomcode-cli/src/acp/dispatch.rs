@@ -37,7 +37,6 @@ use crate::acp::sessions::{
     Sessions,
 };
 use crate::acp::turn::TurnWire;
-use crate::acp::SessionModelResolver;
 
 fn prompt_terminal(
     stop: StopReason,
@@ -421,8 +420,6 @@ pub async fn run_prompt_turn(
     has_attachments: bool,
     responder: Responder<PromptResponse>,
     auto_approve: bool,
-    model_resolver: Option<&SessionModelResolver>,
-    effort_resolver: Option<&SessionModelResolver>,
     msg_ids: Arc<std::sync::atomic::AtomicU64>,
     elicitation_form: &std::sync::atomic::AtomicBool,
 ) -> Result<(), agent_client_protocol::Error> {
@@ -432,8 +429,6 @@ pub async fn run_prompt_turn(
         sessions: sessions.clone(),
         sid: sid.clone(),
         responder: Some(responder),
-        model_resolver,
-        effort_resolver,
         announced: HashSet::new(),
     };
     crate::acp::turn::run_turn(
@@ -457,15 +452,13 @@ pub async fn run_prompt_turn(
 ///
 /// Owns the v1 `SessionId`, the deferred [`Responder`] (answered exactly once
 /// per turn — on an intercepted slash, an unknown session, a dead kernel, or
-/// the turn terminal), the slash-command resolvers, and the set of tool calls
-/// already announced as `pending` by the approval round-trip.
-struct V1Wire<'a> {
+/// the turn terminal) and the set of tool calls already announced as `pending`
+/// by the approval round-trip.
+struct V1Wire {
     cx: ConnectionTo<Client>,
     sessions: Sessions,
     sid: SessionId,
     responder: Option<Responder<PromptResponse>>,
-    model_resolver: Option<&'a SessionModelResolver>,
-    effort_resolver: Option<&'a SessionModelResolver>,
     /// Tool calls already announced as `pending` by the approval round-trip.
     /// Their `ToolStarted` must UPDATE the pending record to `in_progress`
     /// instead of creating a second one (protocol flow: tool_call pending →
@@ -473,7 +466,7 @@ struct V1Wire<'a> {
     announced: HashSet<String>,
 }
 
-impl TurnWire for V1Wire<'_> {
+impl TurnWire for V1Wire {
     type Update = SessionUpdate;
 
     fn notify(&self, update: Self::Update) -> Result<(), agent_client_protocol::Error> {
@@ -504,8 +497,6 @@ impl TurnWire for V1Wire<'_> {
                     &self.sessions,
                     &self.cx,
                     &self.sid,
-                    self.model_resolver,
-                    self.effort_resolver,
                 )
                 .await
                 {

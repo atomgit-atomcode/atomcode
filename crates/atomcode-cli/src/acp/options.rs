@@ -19,8 +19,6 @@ use atomcode_coding::RuntimeMode;
 use crate::acp::sessions::Sessions;
 use atomcode_host_api::HostCommand;
 
-use crate::acp::SessionModelResolver;
-
 // ── session modes / config option catalog helpers ────────────────────────────
 
 /// The four kernel operating modes, advertised as ACP session modes.
@@ -99,18 +97,28 @@ async fn switch_runtime_mode(
     let mode = runtime_mode_from_id(mode_id).ok_or_else(|| {
         AcpError::invalid_params().data(format!("unknown session mode `{mode_id}`"))
     })?;
-    let runtime = {
+    let (control, session) = {
         let map = sessions.lock().await;
         match map.get(session_id.0.as_ref()) {
-            Some(state) => state.runtime.clone(),
+            Some(state) => (state.control.clone(), state.native_id.clone()),
             None => return Err(AcpError::invalid_params().data("unknown session")),
         }
     };
 
-    runtime
-        .set_mode(mode)
+    control
+        .call(HostCommand::SetMode {
+            session,
+            mode: match mode {
+                RuntimeMode::Plan => atomcode_host_api::Mode::Plan,
+                // The contract names what a person chooses; the runtime names
+                // what it does. `Ask` is this runtime's `Build`.
+                RuntimeMode::Build => atomcode_host_api::Mode::Ask,
+                RuntimeMode::AcceptEdits => atomcode_host_api::Mode::AcceptEdits,
+                RuntimeMode::Auto => atomcode_host_api::Mode::Auto,
+            },
+        })
         .await
-        .map_err(|e| AcpError::internal_error().data(format!("set mode failed: {e}")))?;
+        .map_err(|e| AcpError::internal_error().data(format!("set mode failed: {e:?}")))?;
 
     {
         let mut map = sessions.lock().await;
@@ -187,8 +195,6 @@ pub const REASONING_EFFORT_TIERS: [&str; 3] = ["off", "high", "max"];
 pub(super) async fn apply_session_config_option(
     sessions: &Sessions,
     req: &SetSessionConfigOptionRequest,
-    model_resolver: Option<&SessionModelResolver>,
-    effort_resolver: Option<&SessionModelResolver>,
 ) -> Result<(Vec<SessionConfigOption>, Option<RuntimeMode>), AcpError> {
     let (control, session, mut catalog) = {
         let map = sessions.lock().await;
@@ -299,11 +305,8 @@ pub async fn handle_set_session_config_option(
     sessions: &Sessions,
     cx: &ConnectionTo<Client>,
     req: &SetSessionConfigOptionRequest,
-    model_resolver: Option<&SessionModelResolver>,
-    effort_resolver: Option<&SessionModelResolver>,
 ) -> Result<SetSessionConfigOptionResponse, AcpError> {
-    let (catalog, switched_mode) =
-        apply_session_config_option(sessions, req, model_resolver, effort_resolver).await?;
+    let (catalog, switched_mode) = apply_session_config_option(sessions, req).await?;
     if let Some(mode) = switched_mode {
         cx.send_notification(SessionNotification::new(
             req.session_id.clone(),
@@ -406,15 +409,13 @@ mod tests {
     #[tokio::test]
     async fn set_mode_switches_runtime_and_broadcasts() {
         use agent_client_protocol::schema::v1::SessionNotification;
-        use atomcode_coding::runtime::{coding_runtime_control_channel, CodingRuntimeControl};
-        let (runtime, mut controls) = coding_runtime_control_channel();
         let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
         let (commands, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let host = std::sync::Arc::new(crate::acp::sessions::RecordingHost::default());
         let state = SessionState {
             commands,
-            control: std::sync::Arc::new(crate::acp::sessions::SilentHost),
+            control: host.clone(),
             events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
-            runtime,
             _front_end: atomcode_coding::front_end::FrontEnd::new(),
             persistence_failure: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             native_id: "test-native".to_string(),
@@ -429,18 +430,6 @@ mod tests {
         let sessions: crate::acp::sessions::Sessions =
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         sessions.lock().await.insert("acp-1".into(), state);
-
-        // Control loop: answer SetMode (the handler awaits `done`).
-        let control_task = tokio::spawn(async move {
-            match controls.recv().await {
-                Some(CodingRuntimeControl::SetMode { mode, done, .. }) => {
-                    assert_eq!(mode, RuntimeMode::Plan);
-                    let _ = done.send(Ok(()));
-                    true
-                }
-                _ => false,
-            }
-        });
 
         // Minimal agent side: the exact handler under test, wired over an
         // in-memory channel. The client side sends the request and captures the
@@ -489,7 +478,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(control_task.await.unwrap());
+        assert!(
+            matches!(
+                host.asked.lock().unwrap().first(),
+                Some(atomcode_host_api::HostCommand::SetMode { .. })
+            ),
+            "the mode switch reaches the host"
+        );
         server_task.abort();
 
         assert_eq!(
@@ -511,8 +506,6 @@ mod tests {
     /// commit state without disturbing the turn.
     #[tokio::test]
     async fn mode_and_config_switches_complete_while_a_turn_is_running() {
-        use atomcode_coding::runtime::{coding_runtime_control_channel, CodingRuntimeControl};
-        let (runtime, mut controls) = coding_runtime_control_channel();
         let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
         let (commands, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let host = std::sync::Arc::new(crate::acp::sessions::RecordingHost::default());
@@ -520,7 +513,6 @@ mod tests {
             commands,
             control: host.clone(),
             events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
-            runtime,
             _front_end: atomcode_coding::front_end::FrontEnd::new(),
             persistence_failure: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             native_id: "test-native".to_string(),
@@ -536,18 +528,6 @@ mod tests {
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([
                 ("acp-1".to_string(), state),
             ])));
-
-        // The mode switch still goes to the runtime directly; answer it.
-        let control_task = tokio::spawn(async move {
-            while let Some(ctrl) = controls.recv().await {
-                if let CodingRuntimeControl::SetMode { mode, done, .. } = ctrl {
-                    let set = mode == RuntimeMode::Plan;
-                    let _ = done.send(Ok(()));
-                    return set;
-                }
-            }
-            false
-        });
 
         // A running prompt turn holds the session's events receiver for its
         // whole duration (see `run_prompt_turn`). Hold it here across both
@@ -567,19 +547,32 @@ mod tests {
             REASONING_EFFORT_CONFIG_ID,
             SessionConfigOptionValue::value_id("high"),
         );
-        let (_catalog, switched_mode) = apply_session_config_option(&sessions, &req, None, None)
+        let (_catalog, switched_mode) = apply_session_config_option(&sessions, &req)
             .await
             .expect("config switch completes while a turn is running");
         assert!(switched_mode.is_none());
 
         drop(_held);
-        assert!(control_task.await.unwrap(), "SetMode reached the runtime");
-        // And the effort switch reached the host, not the runtime: it is the
-        // contract's own knob now.
-        assert!(matches!(
-            host.asked.lock().unwrap().first(),
-            Some(atomcode_host_api::HostCommand::SetReasoningEffort { .. })
-        ));
+        // Both switches reached the host, in order, while a turn held this
+        // session's events receiver — which is the point of the criterion:
+        // neither switch needs the turn's stream, so neither can deadlock
+        // behind it. They used to go to the runtime's own control channel.
+        let asked = host.asked.lock().unwrap();
+        assert!(
+            matches!(
+                asked.first(),
+                Some(atomcode_host_api::HostCommand::SetMode { .. })
+            ),
+            "{asked:?}"
+        );
+        assert!(
+            matches!(
+                asked.get(1),
+                Some(atomcode_host_api::HostCommand::SetReasoningEffort { .. })
+            ),
+            "{asked:?}"
+        );
+        drop(asked);
 
         // Both switches committed to the session state.
         let map = sessions.lock().await;
@@ -644,8 +637,6 @@ mod tests {
         let map: std::collections::HashMap<String, SessionState> = entries
             .into_iter()
             .map(|(id, cwd)| {
-                let (runtime, _controls) =
-                    atomcode_coding::runtime::coding_runtime_control_channel();
                 let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
                 let (commands, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
                 (
@@ -654,7 +645,6 @@ mod tests {
                         commands,
                         control: std::sync::Arc::new(crate::acp::sessions::SilentHost),
                         events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
-                        runtime,
                         _front_end: atomcode_coding::front_end::FrontEnd::new(),
                         persistence_failure: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
                         native_id: id.strip_prefix("acp-").unwrap_or(id).to_string(),
@@ -699,9 +689,7 @@ mod tests {
                 async move |req: SetSessionConfigOptionRequest,
                             responder: Responder<SetSessionConfigOptionResponse>,
                             cx| {
-                    match handle_set_session_config_option(&agent_sessions, &cx, &req, None, None)
-                        .await
-                    {
+                    match handle_set_session_config_option(&agent_sessions, &cx, &req).await {
                         Ok(resp) => responder.respond(resp),
                         Err(err) => responder.respond_with_error(err),
                     }
@@ -760,15 +748,13 @@ mod tests {
     #[tokio::test]
     async fn set_config_option_mode_switches_runtime_and_broadcasts() {
         use agent_client_protocol::schema::v1::SessionNotification;
-        use atomcode_coding::runtime::{coding_runtime_control_channel, CodingRuntimeControl};
-        let (runtime, mut controls) = coding_runtime_control_channel();
         let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
         let (commands, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let host = std::sync::Arc::new(crate::acp::sessions::RecordingHost::default());
         let state = SessionState {
             commands,
-            control: std::sync::Arc::new(crate::acp::sessions::SilentHost),
+            control: host.clone(),
             events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
-            runtime,
             _front_end: atomcode_coding::front_end::FrontEnd::new(),
             persistence_failure: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             native_id: "test-native".to_string(),
@@ -785,17 +771,6 @@ mod tests {
                 ("acp-1".to_string(), state),
             ])));
 
-        let control_task = tokio::spawn(async move {
-            match controls.recv().await {
-                Some(CodingRuntimeControl::SetMode { mode, done, .. }) => {
-                    assert_eq!(mode, RuntimeMode::Plan);
-                    let _ = done.send(Ok(()));
-                    true
-                }
-                _ => false,
-            }
-        });
-
         let (agent_endpoint, client_endpoint) = Channel::duplex();
         let agent_sessions = Arc::clone(&sessions);
         let server = Agent
@@ -804,9 +779,7 @@ mod tests {
                 async move |req: SetSessionConfigOptionRequest,
                             responder: Responder<SetSessionConfigOptionResponse>,
                             cx| {
-                    match handle_set_session_config_option(&agent_sessions, &cx, &req, None, None)
-                        .await
-                    {
+                    match handle_set_session_config_option(&agent_sessions, &cx, &req).await {
                         Ok(resp) => responder.respond(resp),
                         Err(err) => responder.respond_with_error(err),
                     }
@@ -847,7 +820,13 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(control_task.await.unwrap(), "SetMode control received");
+        assert!(
+            matches!(
+                host.asked.lock().unwrap().first(),
+                Some(atomcode_host_api::HostCommand::SetMode { .. })
+            ),
+            "the mode switch reaches the host"
+        );
         server_task.abort();
 
         assert_eq!(
@@ -872,11 +851,8 @@ mod tests {
 
     #[tokio::test]
     async fn set_config_option_reasoning_effort_reaches_the_host() {
-        use atomcode_coding::runtime::coding_runtime_control_channel;
-        let (runtime, controls) = coding_runtime_control_channel();
         // Nothing owns the runtime: the effort switch must not need it any
         // more — it is the host's, and that is the point of this criterion.
-        drop(controls);
         let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
         let host = std::sync::Arc::new(crate::acp::sessions::RecordingHost::default());
         let (commands, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -884,7 +860,6 @@ mod tests {
             commands,
             control: host.clone(),
             events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
-            runtime,
             _front_end: atomcode_coding::front_end::FrontEnd::new(),
             persistence_failure: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             native_id: "test-native".to_string(),
@@ -909,9 +884,7 @@ mod tests {
                 async move |req: SetSessionConfigOptionRequest,
                             responder: Responder<SetSessionConfigOptionResponse>,
                             cx| {
-                    match handle_set_session_config_option(&agent_sessions, &cx, &req, None, None)
-                        .await
-                    {
+                    match handle_set_session_config_option(&agent_sessions, &cx, &req).await {
                         Ok(resp) => responder.respond(resp),
                         Err(err) => responder.respond_with_error(err),
                     }
