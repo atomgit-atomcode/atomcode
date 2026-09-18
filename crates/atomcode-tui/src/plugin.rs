@@ -625,17 +625,18 @@ impl UserInterface for Tui {
             // foot of the loop because the pointer paths `continue` past
             // anything down there.
             //
-            // **Two** things follow the pointer, and either one is a reason for
-            // the terminal to report every cell it crosses: the composer's menu,
-            // and a question on screen — where the row under the pointer is the
-            // row a click would take, so a panel that did not follow would point
-            // at its first answer while the hand is on its third.
+            // **Three** things follow the pointer now, and any one of them is a
+            // reason for the terminal to report every cell it crosses: the
+            // composer's menu, a question on screen — where the row under the
+            // pointer is the row a click would take — and the slash menu, which
+            // lights the row the pointer is over for the same reason.
             //
             // This is a request to the terminal, not a redraw: it changes what
             // the terminal *sends*, not what is on the screen, which is why it
             // is not folded into `stale`.
             self.surface.set_motion(
                 self.host.context_menu_open()
+                    || self.host.menu_open()
                     || self.host.asks.is_waiting()
                     || self.team_on_screen(),
             );
@@ -809,8 +810,15 @@ impl UserInterface for Tui {
                 // on the tip row and, worse, hand the pointer back the next time
                 // the question is answered. The question's own hover is a
                 // request, same as the menu's.
+                //
+                // Every thing that asked for motion has to be listed here, or the
+                // hover it asked for is read as a terminal taking the mouse back:
+                // the slash menu is the fourth such thing, and it is the one that
+                // is up while a person is typing — the moment a spurious "the
+                // terminal took your mouse" notice would be most visible.
                 Wake::Input(Input::Mouse(Click::Hover, ..))
                     if !self.host.context_menu_open()
+                        && !self.host.menu_open()
                         && !self.host.asks.is_waiting()
                         && !self.team_on_screen() =>
                 {
@@ -840,6 +848,22 @@ impl UserInterface for Tui {
                 // so a wheel the terminal keeps would scroll the wrong thing.
                 Wake::Input(Input::Mouse(click, x, y)) => {
                     use crate::surface::Click;
+                    // The slash menu, before anything else looks at the pointer.
+                    // A list with a lit row is something a press can choose from
+                    // and a pointer can travel over, and both of those are the
+                    // menu's while it is up. A press that lands *off* it is not
+                    // swallowed: it falls through, and the composer recomputes
+                    // the menu from whatever the press did.
+                    if matches!(click, Click::Press) {
+                        if let Some(name) = self.host.menu_click(x, y) {
+                            quit = self.take_command(&name, &client);
+                            stale = true;
+                            continue;
+                        }
+                    }
+                    if matches!(click, Click::Hover) && self.host.menu_open() {
+                        stale |= self.host.menu_hover(x, y);
+                    }
                     // The composer's menu, before anything else looks at the
                     // pointer. A menu that is up takes the press: choosing from
                     // it is what a press means while it is there. A press
@@ -964,6 +988,20 @@ impl UserInterface for Tui {
                 // not composition: exactly one thing can hold it.
                 Wake::Input(Input::Key(press)) if self.host.asks.is_waiting() => {
                     quit = self.answer_question(press);
+                    stale = true;
+                }
+                // The slash menu, above the ordinary bindings for the keys it
+                // owns — and only those. It is a list with a lit row, so up/down
+                // walk it, tab completes onto the line, and esc puts it away.
+                // Everything else, **enter included**, stays the composer's: the
+                // menu puts a command on the line and enter sends what is on the
+                // line, which is what keeps `/effort` reporting the current
+                // level and a half-typed `/comp` reaching the dispatcher that
+                // suggests `/compact`.
+                Wake::Input(Input::Key(press))
+                    if self.host.menu_open() && crate::menu::Slash::owns(press) =>
+                {
+                    quit = self.slash_menu_key(press, &client);
                     stale = true;
                 }
                 // The team panel, once Tab gave it the keyboard.
@@ -1831,7 +1869,14 @@ impl Tui {
         false
     }
 
-    fn refresh_menu(&self) {
+    /// What has been typed after the slash, while a command is being named.
+    ///
+    /// `None` when the line is not a command being typed: no slash, or one with
+    /// a space after it (the name is settled and the argument has begun). One
+    /// reader for the two questions that depend on it — what the menu should
+    /// list, and whether the return key has been told anything yet — so those
+    /// two cannot disagree about what is on the line.
+    fn slash_prefix(&self) -> Option<String> {
         let typed = self
             .host
             .moment
@@ -1839,23 +1884,150 @@ impl Tui {
             .expect("moment poisoned")
             .input
             .clone();
-        let menu = match typed.strip_prefix('/') {
-            Some(rest) if !rest.contains(char::is_whitespace) => self
+        let rest = typed.strip_prefix('/')?;
+        if rest.contains(char::is_whitespace) {
+            return None;
+        }
+        Some(rest.to_string())
+    }
+
+    /// Recompute the slash menu from what is being typed.
+    ///
+    /// The list's *contents* are a question about commands and this is the row
+    /// that owns the composer, so the registry is read here; where the panel is
+    /// drawn and which row is lit are the host's. That split is what makes the
+    /// menu's cursor survive: this recomputes the items, and the host resets the
+    /// cursor to the first of them — the row that was lit a keystroke ago is not
+    /// the same command once the list has narrowed.
+    fn refresh_menu(&self) {
+        let menu = match self.slash_prefix() {
+            Some(rest) => self
                 .host
                 .commands
-                .matching(rest)
+                .matching(&rest)
                 .into_iter()
                 .map(|c| {
                     let name = match &c.takes {
                         Some(t) => format!("{} {t}", c.name),
                         None => c.name.to_string(),
                     };
-                    (name, c.about.to_string())
+                    crate::menu::Item::new(c.name.to_string(), name).about(c.about.to_string())
                 })
                 .collect(),
-            _ => Vec::new(),
+            None => Vec::new(),
         };
         self.host.set_menu(menu);
+    }
+
+    /// Route one key to the slash menu. Returns `true` to quit.
+    ///
+    /// Only the keys the list owns come here — [`crate::menu::Slash::owns`] —
+    /// and the caller has already asked that. Everything else falls through to
+    /// the composer, which is what lets `/com` keep narrowing while the highlight
+    /// sits on its first row.
+    ///
+    /// **Tab completes and enter takes.** Tab puts the lit name on the line so
+    /// its argument can be typed; enter dispatches the lit name outright, and a
+    /// command that needs an argument answers with a panel to pick it from —
+    /// which is where the second level of a command comes from, not from this
+    /// screen knowing what the arguments are.
+    fn slash_menu_key(&self, press: crate::surface::KeyPress, client: &AgentClient) -> bool {
+        use crate::surface::Key;
+        match press.key {
+            Key::Up => {
+                let _ = self.host.menu_move_by(-1);
+            }
+            Key::Down => {
+                let _ = self.host.menu_move_by(1);
+            }
+            // Esc puts the list away and leaves what is typed alone. It is not
+            // "clear the line" — the slash is still there, and the menu comes
+            // back on the next keystroke that changes it. The one way to say
+            // "not that list, this line" without losing the line.
+            Key::Esc => {
+                self.host.close_menu();
+            }
+            Key::Tab => {
+                if let Some(name) = self.host.menu_selected() {
+                    self.complete_command(&name);
+                }
+            }
+            Key::Enter => {
+                // Taken, always, whenever the list is up. The lit row is on
+                // screen and says what it would do, and the return key acts on
+                // what the screen shows — the same contract the question panel
+                // keeps ("a stray return takes what the screen shows it would
+                // take, never a hidden default").
+                //
+                // It used to refuse a bare `/`, on the reasoning that its first
+                // row is `cancel-all` and nothing had been aimed at. That was
+                // wrong twice over: it made the key *dead* — the list keeps
+                // enter, so a refusal is not a fall-through to the composer, it
+                // is a keystroke that does nothing at all and is indistinguishable
+                // from a freeze — and it invented a rule the rest of this UI does
+                // not have. If a row should not be taken, the row should not be
+                // offered; a bare `/` offering everything is the list doing its
+                // job.
+                if let Some(name) = self.host.menu_selected() {
+                    return self.take_command(&name, client);
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// Take the command on the lit row — what enter and a press on a row share.
+    ///
+    /// One implementation, so the return key and a click cannot disagree about
+    /// what the lit row means. The command is dispatched **by name with no
+    /// argument**: what a command wants after its name is the command's own
+    /// business, and a row that answers with a picker is the command saying so.
+    /// This screen knows how to lay a list out; it does not know that `/effort`
+    /// takes a level.
+    ///
+    /// The line is cleared first, because the line is where the *prefix* was —
+    /// leaving `/comp` behind a command that just ran is a composer still holding
+    /// half a name, and it would recompute the menu from it.
+    fn take_command(&self, name: &str, client: &AgentClient) -> bool {
+        {
+            let mut m = self.host.moment.write().expect("moment poisoned");
+            m.input.clear();
+            m.caret = 0;
+            m.history_at = None;
+        }
+        self.host.close_menu();
+        if name == "quit" || name == "exit" {
+            return self.act(crate::keymap::Action::Quit, client);
+        }
+        self.run_command(&format!("/{name}"));
+        false
+    }
+
+    /// Put a command's name on the line, with a space if it wants an argument.
+    ///
+    /// The registry is asked rather than the menu: whether `/effort` wants
+    /// something after it is a fact about the command, and the menu's label
+    /// only *shows* it. A name completed without that space leaves the caret
+    /// against the name, which is where a person would type the space
+    /// themselves — the difference between a completion and a spell-check.
+    fn complete_command(&self, name: &str) {
+        let takes = self
+            .host
+            .commands
+            .find(name)
+            .is_some_and(|c| c.takes.is_some());
+        let text = if takes {
+            format!("/{name} ")
+        } else {
+            format!("/{name}")
+        };
+        let mut m = self.host.moment.write().expect("moment poisoned");
+        m.caret = text.len();
+        m.input = text;
+        m.history_at = None;
+        drop(m);
+        self.refresh_menu();
     }
 
     /// Handle a pointer press against the composer's context menu.
