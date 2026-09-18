@@ -3483,7 +3483,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         // before ctx/cache are dropped.
         let cwd_base = path_basename(&cwd_full).to_string();
 
-        let segs = fit_status_segments(&model_str, &cwd_full, &cwd_base, &ctx_str, &cache_str, budget);
+        let segs = fit_status_segments(
+            &model_str, &cwd_full, &cwd_base, &ctx_str, &cache_str, budget,
+        );
 
         // Per-segment colours (all collapse to plain when colours are off).
         let model_style = self.style_for(Role::Accent);
@@ -12532,7 +12534,10 @@ mod tests {
         let row = r.build_status_row(&status, 80, false);
         let visible: String = row.iter().map(|cell| cell.ch).collect();
         assert!(visible.contains("glm-5 [max]"), "{visible:?}");
-        assert!(!visible.contains('('), "no channel parens when unset: {visible:?}");
+        assert!(
+            !visible.contains('('),
+            "no channel parens when unset: {visible:?}"
+        );
     }
 
     #[test]
@@ -13403,7 +13408,11 @@ mod tests {
         assert!(base_budget < status_segments_width(&full));
         let step1 = fit_status_segments(model, cwd_full, cwd_base, ctx, cache, base_budget);
         assert_eq!(step1[1].1, cwd_base, "cwd shortened to project name first");
-        assert_eq!(step1.last().unwrap().0, StatusSeg::Cache, "cache still shown");
+        assert_eq!(
+            step1.last().unwrap().0,
+            StatusSeg::Cache,
+            "cache still shown"
+        );
 
         // Budget without room for ctx: step 2 drops ctx, cache survives.
         let no_ctx_budget = status_segments_width(&[
@@ -21821,7 +21830,11 @@ mod tests {
         crate::render::ApprovalPanelView {
             tool: "Bash".into(),
             detail: "cd /tmp && ./deploy …".into(), // compact (truncated) detail
-            options: vec!["Allow once".into(), "Always allow Bash".into(), "Deny".into()],
+            options: vec![
+                "Allow once".into(),
+                "Always allow Bash".into(),
+                "Deny".into(),
+            ],
             selected: 0,
             note: None,
             reason: None,
@@ -21853,13 +21866,25 @@ mod tests {
             "row_count MUST track the built rows once the command block is expanded"
         );
         let dump = dump_rows(&rows);
-        assert!(dump.contains("./deploy.sh --prod"), "full command visible:\n{dump}");
-        assert!(dump.contains("tee deploy.log"), "piped tail visible too:\n{dump}");
+        assert!(
+            dump.contains("./deploy.sh --prod"),
+            "full command visible:\n{dump}"
+        );
+        assert!(
+            dump.contains("tee deploy.log"),
+            "piped tail visible too:\n{dump}"
+        );
         // Shell-split: the `&&` chain and the pipe read on separate rows.
-        assert!(dump.contains("&&"), "shell-boundary split renders the chain:\n{dump}");
+        assert!(
+            dump.contains("&&"),
+            "shell-boundary split renders the chain:\n{dump}"
+        );
         // Options + Tab hint remain.
         assert!(dump.contains("Deny"), "options still present:\n{dump}");
-        assert!(dump.contains("Tab"), "Tab expand/collapse hint present:\n{dump}");
+        assert!(
+            dump.contains("Tab"),
+            "Tab expand/collapse hint present:\n{dump}"
+        );
     }
 
     /// Collapsed (default): the full command is NOT shown — panel stays compact — but the
@@ -21877,7 +21902,10 @@ mod tests {
             !dump.contains("very-secret-command"),
             "collapsed panel must NOT render the full command:\n{dump}"
         );
-        assert!(dump.contains("Tab"), "collapsed panel hints Tab to expand:\n{dump}");
+        assert!(
+            dump.contains("Tab"),
+            "collapsed panel hints Tab to expand:\n{dump}"
+        );
     }
 
     /// Short terminal: a many-line command is height-clamped so the option rows are never
@@ -21899,13 +21927,20 @@ mod tests {
             "invariant holds under the height clamp"
         );
         // The whole panel fits the short terminal (not 40+ command rows).
-        assert!(rows.len() <= 8, "panel clamped to the short terminal, got {} rows", rows.len());
+        assert!(
+            rows.len() <= 8,
+            "panel clamped to the short terminal, got {} rows",
+            rows.len()
+        );
         let dump = dump_rows(&rows);
         assert!(
             dump.contains("Allow once") && dump.contains("Deny"),
             "options must stay visible on a short terminal:\n{dump}"
         );
-        assert!(dump.contains("(+"), "a '(+N)' more-lines marker indicates the clamp:\n{dump}");
+        assert!(
+            dump.contains("(+"),
+            "a '(+N)' more-lines marker indicates the clamp:\n{dump}"
+        );
     }
 
     /// Step 1 digit keys: `accel_index` falls back for y/a/n; digit routing is

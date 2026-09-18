@@ -131,7 +131,10 @@ mod tests {
         assert_eq!(Lang::detect(Path::new("a.tsx")), Some(Lang::Tsx));
         assert_eq!(Lang::detect(Path::new("a.hpp")), Some(Lang::Cpp));
         assert_eq!(Lang::detect(Path::new("Main.kt")), Some(Lang::Kotlin));
-        assert_eq!(Lang::detect(Path::new("build.gradle.kts")), Some(Lang::Kotlin));
+        assert_eq!(
+            Lang::detect(Path::new("build.gradle.kts")),
+            Some(Lang::Kotlin)
+        );
         assert_eq!(Lang::detect(Path::new("a.unknownext")), None);
         assert_eq!(Lang::detect(Path::new("noext")), None);
     }

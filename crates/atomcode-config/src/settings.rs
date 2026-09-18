@@ -168,7 +168,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         path: &["ui", "mode_switch_key"],
         label_en: "Mode switch key",
         label_zh: "模式切换键",
-        aliases: &["tab", "shift", "shift+tab", "键位", "补全", "harmony", "鸿蒙"],
+        aliases: &[
+            "tab",
+            "shift",
+            "shift+tab",
+            "键位",
+            "补全",
+            "harmony",
+            "鸿蒙",
+        ],
         kind: SettingKind::Choice(MODE_SWITCH_KEYS),
         apply: ApplyPolicy::ImmediateUi,
     },
@@ -734,7 +742,10 @@ mod tests {
             .iter()
             .find(|s| s.id == "network.upstream_retry_max_attempts")
             .expect("upstream_retry_max_attempts is in the catalog");
-        assert!(matches!(setting.kind, SettingKind::Integer { min: 0, max: 20 }));
+        assert!(matches!(
+            setting.kind,
+            SettingKind::Integer { min: 0, max: 20 }
+        ));
 
         // Absent from config → None → empty rendered value (not "0").
         let empty: Config = toml::from_str("").unwrap();

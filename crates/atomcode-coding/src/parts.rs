@@ -34,9 +34,10 @@ use atomcode_capabilities::skills::{
     register_skill_tools, runtime_skill_dirs, SkillCatalogHook, SkillRegistry,
 };
 use atomcode_capabilities::tools::{
-    register_coding_tools_with_vision, APPROVAL_KIND, ApprovalMiddleware, ArtifactMiddleware,
-    ArtifactStore, BashWorkspaceGate, FetchOutputTool, OpenFileWorkspaceGate, ReadFileTool,
+    register_coding_tools_with_vision, ApprovalMiddleware, ArtifactMiddleware, ArtifactStore,
+    BashWorkspaceGate, FetchOutputTool, OpenFileWorkspaceGate, ReadFileTool,
     RepairToolArgsMiddleware, SensitivePathGate, WebFetchTool, WebSearchTool, WriteApprovalGate,
+    APPROVAL_KIND,
 };
 use atomcode_kernel::agent::Agent;
 use atomcode_kernel::checkpoint::CompactionCheckpoint;
@@ -3347,9 +3348,8 @@ mod tests {
         // in the cas store. Rehydrate to confirm the full request is recoverable.
         let record: serde_json::Value =
             serde_json::from_str(request.lines().next().unwrap()).unwrap();
-        let index = atomcode_capabilities::datalog::build_cas_index(
-            &std::fs::read_to_string(cas).unwrap(),
-        );
+        let index =
+            atomcode_capabilities::datalog::build_cas_index(&std::fs::read_to_string(cas).unwrap());
         let full = atomcode_capabilities::datalog::rehydrate_record(&record, &index);
         assert!(full["messages"].to_string().contains("record this turn"));
     }

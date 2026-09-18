@@ -733,7 +733,13 @@ impl BashWorkspaceGate {
         tool: &Arc<dyn Tool>,
         rt: &RequestCtx,
     ) -> PermissionDecision {
-        self.prompt_with_reason(call, tool, rt, Some("此命令会写到工作区外 — 需要单独确认。".into())).await
+        self.prompt_with_reason(
+            call,
+            tool,
+            rt,
+            Some("此命令会写到工作区外 — 需要单独确认。".into()),
+        )
+        .await
     }
 
     /// Round-trip the driver with an explicit reason string.

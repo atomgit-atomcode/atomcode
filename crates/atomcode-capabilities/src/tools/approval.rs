@@ -190,8 +190,16 @@ impl ApprovalMiddleware {
         Self::new(Arc::new(InMemoryPermissionStore::new()))
     }
     /// Like [`new`] but with a shared allow-all store consulted for `bash` calls.
-    pub fn with_allow_all_store(store: Arc<dyn PermissionStore>, allow_all: Arc<dyn PermissionStore>, kind: String) -> Self {
-        Self { store, allow_all, kind }
+    pub fn with_allow_all_store(
+        store: Arc<dyn PermissionStore>,
+        allow_all: Arc<dyn PermissionStore>,
+        kind: String,
+    ) -> Self {
+        Self {
+            store,
+            allow_all,
+            kind,
+        }
     }
     /// Override the round-trip request `kind`.
     pub fn with_kind(mut self, kind: impl Into<String>) -> Self {
@@ -273,7 +281,9 @@ impl ToolMiddleware for ApprovalMiddleware {
         }
         // Shared allow-all short-circuit: if the user has granted "allow all Bash" this
         // session, skip the round-trip entirely for any command-shell tool (bash / bash_start).
-        if crate::tools::is_command_shell_tool(&call.name) && self.allow_all.is_granted(BASH_ALLOW_ALL_KEY) {
+        if crate::tools::is_command_shell_tool(&call.name)
+            && self.allow_all.is_granted(BASH_ALLOW_ALL_KEY)
+        {
             return BeforeOutcome::Proceed;
         }
         // Session grant cache: an identical risky call already approved-always.
@@ -490,10 +500,17 @@ mod tests {
         );
         // A risky bash call is allowed WITHOUT any round-trip (rt would panic if used).
         let tool: Arc<dyn Tool> = Arc::new(crate::tools::bash::BashTool::default());
-        let mut call = ToolCall { id: "1".into(), name: "bash".into(), arguments: r#"{"command":"git push --force origin main"}"#.into() };
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"git push --force origin main"}"#.into(),
+        };
         let (tx, _rx) = unbounded_channel();
         let rt = RequestCtx::new(tx, Some(Duration::from_millis(1)));
-        assert!(matches!(mw.before(&mut call, &tool, &rt).await, BeforeOutcome::Proceed));
+        assert!(matches!(
+            mw.before(&mut call, &tool, &rt).await,
+            BeforeOutcome::Proceed
+        ));
     }
 
     /// BUG 1 regression: `bash_start` (background shell) must be covered by the allow-all
@@ -518,19 +535,30 @@ mod tests {
         let (tx, _rx) = unbounded_channel();
         let rt = RequestCtx::new(tx, Some(Duration::from_millis(1)));
         assert!(
-            matches!(mw.before(&mut call, &tool, &rt).await, BeforeOutcome::Proceed),
+            matches!(
+                mw.before(&mut call, &tool, &rt).await,
+                BeforeOutcome::Proceed
+            ),
             "allow-all grant must bypass risky bash_start just like bash"
         );
     }
 
     #[test]
     fn approval_request_serializes_reason_only_when_present() {
-        let mut req = ApprovalRequest { call_id: "c".into(), tool: "bash".into(), args: "{}".into(), reason: None };
+        let mut req = ApprovalRequest {
+            call_id: "c".into(),
+            tool: "bash".into(),
+            args: "{}".into(),
+            reason: None,
+        };
         let v = serde_json::to_value(&req).unwrap();
         assert!(v.get("reason").is_none(), "reason omitted when None: {v}");
         req.reason = Some("此命令写到工作区外".into());
         let v = serde_json::to_value(&req).unwrap();
-        assert_eq!(v.get("reason").and_then(|r| r.as_str()), Some("此命令写到工作区外"));
+        assert_eq!(
+            v.get("reason").and_then(|r| r.as_str()),
+            Some("此命令写到工作区外")
+        );
     }
 
     #[test]
@@ -538,7 +566,9 @@ mod tests {
         use serde_json::json;
         // New: allow + remember + grant_scope:"all" → AllowAlwaysAll.
         assert_eq!(
-            PermissionDecision::from_value(&json!({"decision":"allow","remember":true,"grant_scope":"all"})),
+            PermissionDecision::from_value(
+                &json!({"decision":"allow","remember":true,"grant_scope":"all"})
+            ),
             PermissionDecision::AllowAlwaysAll
         );
         // Back-compat: remember without scope stays AllowAlways.
@@ -548,7 +578,9 @@ mod tests {
         );
         // Unknown scope → AllowAlways (not AllowAlwaysAll).
         assert_eq!(
-            PermissionDecision::from_value(&json!({"decision":"allow","remember":true,"grant_scope":"tool"})),
+            PermissionDecision::from_value(
+                &json!({"decision":"allow","remember":true,"grant_scope":"tool"})
+            ),
             PermissionDecision::AllowAlways
         );
         // grant_scope only upgrades an allow: deny stays deny.

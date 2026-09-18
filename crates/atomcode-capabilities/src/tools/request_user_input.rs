@@ -85,7 +85,10 @@ fn fill_default_mode(value: &mut serde_json::Value) {
     let serde_json::Value::Object(map) = value else {
         return;
     };
-    let missing = map.get("mode").map(serde_json::Value::is_null).unwrap_or(true);
+    let missing = map
+        .get("mode")
+        .map(serde_json::Value::is_null)
+        .unwrap_or(true);
     if !missing {
         return;
     }
@@ -381,10 +384,9 @@ mod tests {
     fn omitted_mode_with_options_infers_single() {
         // Weak models drop the required `mode`; a call carrying `options` clearly wants
         // a choice → infer `single` instead of hard-failing with `missing field 'mode'`.
-        let r = parse_args(
-            r#"{"header":"H","question":"Q?","options":[{"label":"A"},{"label":"B"}]}"#,
-        )
-        .unwrap();
+        let r =
+            parse_args(r#"{"header":"H","question":"Q?","options":[{"label":"A"},{"label":"B"}]}"#)
+                .unwrap();
         assert_eq!(r.mode, UserInputMode::Single);
         assert_eq!(r.options.len(), 2);
     }
@@ -399,11 +401,13 @@ mod tests {
     fn explicit_mode_is_never_overridden_by_inference() {
         // Explicit `text` alongside options stays text (options are ignored per
         // `parse_text_ignores_options`), and null is treated as omitted.
-        let r = parse_args(r#"{"header":"H","question":"Q?","mode":"text","options":[{"label":"A"}]}"#)
-            .unwrap();
+        let r =
+            parse_args(r#"{"header":"H","question":"Q?","mode":"text","options":[{"label":"A"}]}"#)
+                .unwrap();
         assert_eq!(r.mode, UserInputMode::Text);
-        let r = parse_args(r#"{"header":"H","question":"Q?","mode":null,"options":[{"label":"A"}]}"#)
-            .unwrap();
+        let r =
+            parse_args(r#"{"header":"H","question":"Q?","mode":null,"options":[{"label":"A"}]}"#)
+                .unwrap();
         assert_eq!(r.mode, UserInputMode::Single);
     }
 

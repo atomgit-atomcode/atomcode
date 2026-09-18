@@ -504,7 +504,10 @@ mod tests {
         // shell expansion so a template shell block can reference bundled files. The
         // test helper's `skill_dir` is "/sk", so `!`echo ${CLAUDE_SKILL_DIR}`` → "/sk".
         let out = skill("out=!`echo ${CLAUDE_SKILL_DIR}`").expand("", "sess");
-        assert_eq!(out, "out=/sk", "skill dir must resolve in a shell block: {out}");
+        assert_eq!(
+            out, "out=/sk",
+            "skill dir must resolve in a shell block: {out}"
+        );
     }
 
     #[test]

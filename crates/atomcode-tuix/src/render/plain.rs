@@ -1186,7 +1186,9 @@ mod tests {
             "plain backend must still render panel.note; got: {s:?}"
         );
         // reason must precede note (mirrors retained backend order)
-        let reason_pos = s.find("此命令会写到工作区外").expect("reason must be present");
+        let reason_pos = s
+            .find("此命令会写到工作区外")
+            .expect("reason must be present");
         let note_pos = s.find("advisory note").expect("note must be present");
         assert!(
             reason_pos < note_pos,

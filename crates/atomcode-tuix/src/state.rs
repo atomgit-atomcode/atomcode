@@ -3048,7 +3048,10 @@ mod tests {
         s.on_turn_complete();
         s.on_thinking();
         let label = s.display_spinner_label().to_string();
-        assert_ne!(label, FIRST_THINKING_LABEL, "stale first-thinking leaked: {label:?}");
+        assert_ne!(
+            label, FIRST_THINKING_LABEL,
+            "stale first-thinking leaked: {label:?}"
+        );
         assert!(THINKING_LABELS.contains(&label.as_str()), "got {label:?}");
     }
 

@@ -2209,7 +2209,10 @@ async fn get_session_transcript(Path((hash, id)): Path<(String, String)>) -> imp
         Ok(Some(_)) => {}
         Ok(None) => return (StatusCode::NOT_FOUND, Json("Session not found")).into_response(),
         Err(e) => {
-            return (StatusCode::NOT_FOUND, Json(format!("Failed to load session: {e}")))
+            return (
+                StatusCode::NOT_FOUND,
+                Json(format!("Failed to load session: {e}")),
+            )
                 .into_response();
         }
     }
@@ -9128,8 +9131,14 @@ mod tests {
         // port, so it keeps the plain form — no misleading --port advice.
         let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
         let plain = daemon_bind_failure_message("0.0.0.0:80", 80, &denied);
-        assert!(plain.starts_with("Fatal: failed to bind"), "plain form: {plain}");
-        assert!(!plain.contains("--port"), "no port advice for non-collision: {plain}");
+        assert!(
+            plain.starts_with("Fatal: failed to bind"),
+            "plain form: {plain}"
+        );
+        assert!(
+            !plain.contains("--port"),
+            "no port advice for non-collision: {plain}"
+        );
     }
 
     #[tokio::test]
@@ -9298,10 +9307,7 @@ mod channel_mode_tests {
     fn remote_no_auth_guard_only_gates_unauth_plus_remote_bind() {
         use RemoteNoAuthGuard::*;
         // Token-enforcing daemon is always safe, even bound to 0.0.0.0.
-        assert_eq!(
-            evaluate_remote_no_auth_guard(true, "0.0.0.0", None),
-            Safe
-        );
+        assert_eq!(evaluate_remote_no_auth_guard(true, "0.0.0.0", None), Safe);
         // Unauthenticated but loopback-only is safe (VSCode / standalone local),
         // including bare + bracketed IPv6 loopback.
         assert_eq!(

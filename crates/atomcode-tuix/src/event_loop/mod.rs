@@ -5682,7 +5682,10 @@ mod buffer_tests {
             "expected `(0s · ↑ 12.40K tokens)`, got {active:?}"
         );
         // Under 1s elapsed, no throughput is shown (avoids div-by-zero / wild rates).
-        assert!(!active.contains("tok/s"), "no rate under 1s, got {active:?}");
+        assert!(
+            !active.contains("tok/s"),
+            "no rate under 1s, got {active:?}"
+        );
     }
 
     #[test]
@@ -6533,7 +6536,11 @@ mod menu_tests {
         use crossterm::event::KeyModifiers;
 
         // Default (shift_tab) preference: plain Tab stays a completion key.
-        assert!(!is_mode_cycle_key(KeyCode::Tab, KeyModifiers::NONE, ShiftTab));
+        assert!(!is_mode_cycle_key(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+            ShiftTab
+        ));
         assert!(is_mode_cycle_key(
             KeyCode::BackTab,
             KeyModifiers::SHIFT,
@@ -6544,7 +6551,11 @@ mod menu_tests {
             KeyModifiers::NONE,
             ShiftTab
         ));
-        assert!(is_mode_cycle_key(KeyCode::Tab, KeyModifiers::SHIFT, ShiftTab));
+        assert!(is_mode_cycle_key(
+            KeyCode::Tab,
+            KeyModifiers::SHIFT,
+            ShiftTab
+        ));
         assert!(!is_mode_cycle_key(
             KeyCode::BackTab,
             KeyModifiers::SHIFT | KeyModifiers::CONTROL,
@@ -6565,13 +6576,13 @@ mod menu_tests {
         assert!(is_mode_cycle_key(KeyCode::BackTab, KeyModifiers::NONE, Tab));
         // Modified Tab never cycles regardless of preference (would collide
         // with terminal chords / newline aliases).
+        assert!(!is_mode_cycle_key(KeyCode::Tab, KeyModifiers::CONTROL, Tab));
+        // Sanity: the same plain Tab is NOT a cycle key under shift_tab.
         assert!(!is_mode_cycle_key(
             KeyCode::Tab,
-            KeyModifiers::CONTROL,
-            Tab
+            KeyModifiers::NONE,
+            ShiftTab
         ));
-        // Sanity: the same plain Tab is NOT a cycle key under shift_tab.
-        assert!(!is_mode_cycle_key(KeyCode::Tab, KeyModifiers::NONE, ShiftTab));
     }
 
     #[test]
@@ -13608,7 +13619,10 @@ mod focus_recovery_tests {
         // The bug: a FocusLost was seen (Some(false)) but no matching FocusGained →
         // the next key/paste must trigger the cold repaint.
         assert!(input_recovers_stale_focus(&key(), Some(false)));
-        assert!(input_recovers_stale_focus(&InputEvent::Paste("x".into()), Some(false)));
+        assert!(input_recovers_stale_focus(
+            &InputEvent::Paste("x".into()),
+            Some(false)
+        ));
     }
 
     #[test]
@@ -19968,7 +19982,13 @@ mod bypass_approval_tests {
         }
 
         // Non-bash tools MUST NOT get this option.
-        for tool in ["ReadFile", "WriteFile", "EditFile", "SearchReplace", "read_file"] {
+        for tool in [
+            "ReadFile",
+            "WriteFile",
+            "EditFile",
+            "SearchReplace",
+            "read_file",
+        ] {
             let opts = super::build_approval_options(tool, "{}");
             assert!(
                 opts.iter().all(|o| o.kind != ApprovalKind::AllowAlwaysAll),
@@ -27178,7 +27198,9 @@ fn handle_agent_event(
                     serde_json::from_str::<serde_json::Value>(&call.arguments)
                         .ok()
                         .and_then(|v| {
-                            v.get("command").and_then(|c| c.as_str()).map(str::to_string)
+                            v.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(str::to_string)
                         })
                 })
                 .flatten()
@@ -31956,9 +31978,7 @@ mod tool_bullet_outcome_tests {
 #[cfg(test)]
 mod session_token_seed_tests {
     use super::session_token_totals_from_cost;
-    use atomcode_capabilities::session::{
-        ModelCostSummary, SessionCostReport, TokenBreakdown,
-    };
+    use atomcode_capabilities::session::{ModelCostSummary, SessionCostReport, TokenBreakdown};
 
     #[test]
     fn sums_prompt_as_uncached_plus_cached_across_models() {

@@ -599,14 +599,20 @@ async fn inter_token_stall_uses_stream_timeout_not_first_token_timeout() {
         (recovered, completed)
     })
     .await
-    .expect("an inter-token stall must time out on the FAST stream budget, not the slow prefill budget");
+    .expect(
+        "an inter-token stall must time out on the FAST stream budget, not the slow prefill budget",
+    );
 
     assert!(
         recovered,
         "a post-content stall must fire stream_timeout (50ms), not first_token_timeout (30s)"
     );
     assert!(completed, "the turn must recover and complete");
-    assert_eq!(provider.calls(), 2, "one stalled request plus one continuation");
+    assert_eq!(
+        provider.calls(),
+        2,
+        "one stalled request plus one continuation"
+    );
 }
 
 // ── (2) REQUEST ROUND-TRIP TIMEOUT ───────────────────────────────────────────

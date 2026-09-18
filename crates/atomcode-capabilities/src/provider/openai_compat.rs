@@ -3018,7 +3018,9 @@ mod tests {
         let mut ev = Vec::new();
         ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":999_999_999u64,"id":"evil","function":{"name":"x","arguments":"{}"}}]}}]})).as_bytes()));
         ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ok","function":{"name":"read","arguments":"{\"path\":\"a\"}"}}]}}]})).as_bytes()));
-        ev.extend(d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()));
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()),
+        );
         let calls: Vec<_> = ev
             .iter()
             .filter_map(|e| {
@@ -3029,7 +3031,11 @@ mod tests {
                 }
             })
             .collect();
-        assert_eq!(calls.len(), 1, "only the in-range call is emitted: {calls:?}");
+        assert_eq!(
+            calls.len(),
+            1,
+            "only the in-range call is emitted: {calls:?}"
+        );
         assert_eq!(calls[0].name, "read");
         assert_eq!(calls[0].id, "call_ok");
     }

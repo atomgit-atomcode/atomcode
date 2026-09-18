@@ -430,7 +430,9 @@ fn refresh_installed_marketplaces() -> Vec<PluginJobEvent> {
 fn collapse_auto_update_failures(failures: &[(String, String)]) -> Option<String> {
     match failures {
         [] => None,
-        [(name, reason)] => Some(format!("auto-update of marketplace `{name}` failed: {reason}")),
+        [(name, reason)] => Some(format!(
+            "auto-update of marketplace `{name}` failed: {reason}"
+        )),
         [(_, first_reason), ..] => {
             let names = failures
                 .iter()
@@ -469,7 +471,10 @@ mod tests {
 
     #[test]
     fn collapse_auto_update_failures_single_keeps_detail() {
-        let f = [("skills".to_string(), "git pull failed: fatal: boom".to_string())];
+        let f = [(
+            "skills".to_string(),
+            "git pull failed: fatal: boom".to_string(),
+        )];
         let msg = collapse_auto_update_failures(&f).expect("one failure → a message");
         // A lone failure keeps its full detailed one-liner (no count/summary framing).
         assert_eq!(
@@ -495,8 +500,14 @@ mod tests {
         assert!(msg.contains("2 marketplaces"), "{msg}");
         assert!(msg.contains("`atomcode-plugins-official`"), "{msg}");
         assert!(msg.contains("`atomcode-skills`"), "{msg}");
-        assert!(msg.contains("Could not connect"), "representative reason kept: {msg}");
-        assert!(msg.contains("see log"), "points at the log for the rest: {msg}");
+        assert!(
+            msg.contains("Could not connect"),
+            "representative reason kept: {msg}"
+        );
+        assert!(
+            msg.contains("see log"),
+            "points at the log for the rest: {msg}"
+        );
     }
 
     #[test]

@@ -167,7 +167,8 @@ impl CodingProviderFactory for DefaultCodingProviderFactory {
                     pc.request_signer = authenticator.request_signer(&cfg.base_url)?;
                 }
                 Arc::new(
-                    ResponsesProvider::new(pc).map_err(|e| ProviderBuildError::Adapter(e.message))?,
+                    ResponsesProvider::new(pc)
+                        .map_err(|e| ProviderBuildError::Adapter(e.message))?,
                 )
             }
             _ => {

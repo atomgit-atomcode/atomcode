@@ -335,8 +335,7 @@ impl OverflowCompaction {
                 // Kept span `[drain_to, len)` IS the recent-keep window, so every read in
                 // it is recent → exempt (pass `drain_to` as the boundary). Non-read tools
                 // in the kept span still stub to reclaim more.
-                let rewrites =
-                    Self::aggressive_stub_rewrites(msgs, drain_to, msgs.len(), drain_to);
+                let rewrites = Self::aggressive_stub_rewrites(msgs, drain_to, msgs.len(), drain_to);
                 if !span_has_non_anchor(&msgs[floor..drain_to]) {
                     // Only a prior anchor is drainable — don't re-drain/summarize it; still
                     // apply the aggressive stub rewrites to the kept span.
@@ -1245,7 +1244,8 @@ mod tests {
         let exempt_from = 5; // reads at idx >= 5 are recent
         let rw = OverflowCompaction::aggressive_stub_rewrites(&msgs, 0, msgs.len(), exempt_from);
         assert!(
-            rw.iter().any(|(i, s)| *i == 2 && s.starts_with("[read_file ")),
+            rw.iter()
+                .any(|(i, s)| *i == 2 && s.starts_with("[read_file ")),
             "old read (below boundary) must stub: {rw:?}"
         );
         assert!(

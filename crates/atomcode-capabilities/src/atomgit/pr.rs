@@ -429,7 +429,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
             .and(path("/api/v5/repos/o/r/pulls/7"))
-            .and(body_json(json!({"title":"NT","draft":false,"squash_merge":true})))
+            .and(body_json(
+                json!({"title":"NT","draft":false,"squash_merge":true}),
+            ))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"number":7,"title":"NT","state":"open"})),

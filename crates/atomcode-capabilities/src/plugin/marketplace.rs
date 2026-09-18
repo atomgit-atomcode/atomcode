@@ -1006,7 +1006,10 @@ fatal: fetch-pack: invalid index-pack output\n";
         assert!(s.contains("1234 bytes"), "leading context kept: {s:?}");
         // ...while the middle lines that didn't fit the 3-line budget are dropped
         // (can't split on "; " to count — a kept line has its own internal "; ").
-        assert!(!s.contains("unexpected disconnect"), "middle line dropped: {s:?}");
+        assert!(
+            !s.contains("unexpected disconnect"),
+            "middle line dropped: {s:?}"
+        );
         assert!(!s.contains("early EOF"), "middle line dropped: {s:?}");
     }
 
@@ -1017,7 +1020,10 @@ fatal: fetch-pack: invalid index-pack output\n";
         // would be dropped WITH the progress. Splitting on '\r' keeps the fatal.
         let stderr = "Receiving objects:  50% (256/512)\rfatal: early EOF\n";
         let s = summarize_git_stderr(stderr);
-        assert!(s.contains("fatal: early EOF"), "fatal after \\r must survive: {s:?}");
+        assert!(
+            s.contains("fatal: early EOF"),
+            "fatal after \\r must survive: {s:?}"
+        );
         assert!(
             !s.contains("Receiving objects"),
             "the \\r-prefixed progress must still be dropped: {s:?}"

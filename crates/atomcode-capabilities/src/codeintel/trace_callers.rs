@@ -137,7 +137,11 @@ mod tests {
         // End-to-end proof the Kotlin call graph works: .kt files are walked,
         // symbols + call edges extracted, and trace_callers resolves cross-file.
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("Target.kt"), "fun target() {}\nclass Widget {}\n").unwrap();
+        std::fs::write(
+            d.path().join("Target.kt"),
+            "fun target() {}\nclass Widget {}\n",
+        )
+        .unwrap();
         // callerA does a plain call; makeWidget does a constructor call `Widget()`
         // (Kotlin constructors parse as a plain call → must produce a callee edge).
         std::fs::write(

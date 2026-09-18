@@ -101,10 +101,7 @@ pub fn build_cas_index(cas_contents: &str) -> HashMap<u32, serde_json::Value> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if let (Some(id), Some(body)) = (
-            value.get("i").and_then(|v| v.as_u64()),
-            value.get("c"),
-        ) {
+        if let (Some(id), Some(body)) = (value.get("i").and_then(|v| v.as_u64()), value.get("c")) {
             index.insert(id as u32, body.clone());
         }
     }
@@ -387,10 +384,20 @@ impl LifecycleHooks for DatalogHook {
         // empty ref rather than aborting the record (rehydration tolerates it).
         let mut cas_lines = String::new();
         let log = &mut *state;
-        let message_refs =
-            intern_bodies(&mut log.blob_ids, &mut log.next_blob_id, "m", messages, &mut cas_lines);
-        let tool_refs =
-            intern_bodies(&mut log.blob_ids, &mut log.next_blob_id, "t", tools, &mut cas_lines);
+        let message_refs = intern_bodies(
+            &mut log.blob_ids,
+            &mut log.next_blob_id,
+            "m",
+            messages,
+            &mut cas_lines,
+        );
+        let tool_refs = intern_bodies(
+            &mut log.blob_ids,
+            &mut log.next_blob_id,
+            "t",
+            tools,
+            &mut cas_lines,
+        );
         let record = serde_json::json!({
             "v": RECORD_FORMAT_VERSION,
             "step": ctx.round,
@@ -962,7 +969,8 @@ mod tests {
         // refs in the record, no inline `messages`.
         let jsonl = fs::read_to_string(jsonl_path).unwrap();
         assert_eq!(jsonl.lines().count(), 2);
-        let record: serde_json::Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
         assert_eq!(record["v"], RECORD_FORMAT_VERSION);
         assert!(record.get("messages").is_none());
         assert_eq!(record["message_refs"].as_array().unwrap().len(), 1);
@@ -987,8 +995,20 @@ mod tests {
         let mut cas = String::new();
         let a = serde_json::json!({"role":"user","text":"a"});
         let b = serde_json::json!({"role":"user","text":"b"});
-        let refs1 = intern_bodies(&mut seen, &mut next_id, "m", std::slice::from_ref(&a), &mut cas);
-        let refs2 = intern_bodies(&mut seen, &mut next_id, "m", &[a.clone(), b.clone()], &mut cas);
+        let refs1 = intern_bodies(
+            &mut seen,
+            &mut next_id,
+            "m",
+            std::slice::from_ref(&a),
+            &mut cas,
+        );
+        let refs2 = intern_bodies(
+            &mut seen,
+            &mut next_id,
+            "m",
+            &[a.clone(), b.clone()],
+            &mut cas,
+        );
         assert_eq!(refs2[0], refs1[0], "identical body → same blob id");
         assert_eq!(cas.lines().count(), 2, "a interned once despite two sends");
 

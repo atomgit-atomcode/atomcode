@@ -863,7 +863,10 @@ mod tests {
         let text_tool = ReadFileTool::new(false);
         let vision = vision_tool.description();
         let text_only = text_tool.description();
-        assert!(vision.contains("You can see images"), "vision desc: {vision}");
+        assert!(
+            vision.contains("You can see images"),
+            "vision desc: {vision}"
+        );
         assert!(vision.contains("proactively"), "vision desc: {vision}");
         assert!(
             text_only.contains("cannot display image"),
@@ -875,7 +878,10 @@ mod tests {
         );
         // Both keep the shared base and are actually different.
         assert!(vision.starts_with("Read a file") && text_only.starts_with("Read a file"));
-        assert_ne!(vision, text_only, "the two descriptions must differ by capability");
+        assert_ne!(
+            vision, text_only,
+            "the two descriptions must differ by capability"
+        );
     }
 
     #[tokio::test]

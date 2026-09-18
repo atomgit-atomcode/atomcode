@@ -6216,12 +6216,16 @@ mod tests {
         assert_eq!(full.entries.len(), 2);
 
         // Missing / invalid buckets are empty and quiet (caller falls back).
-        assert!(SessionManager::scan_catalog_bucket(root.path(), "3333333333333333")
-            .entries
-            .is_empty());
-        assert!(SessionManager::scan_catalog_bucket(root.path(), "not-a-bucket")
-            .entries
-            .is_empty());
+        assert!(
+            SessionManager::scan_catalog_bucket(root.path(), "3333333333333333")
+                .entries
+                .is_empty()
+        );
+        assert!(
+            SessionManager::scan_catalog_bucket(root.path(), "not-a-bucket")
+                .entries
+                .is_empty()
+        );
     }
 
     #[test]
