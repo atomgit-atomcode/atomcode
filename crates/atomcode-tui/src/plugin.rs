@@ -914,6 +914,28 @@ impl UserInterface for Tui {
                                 stale = true;
                                 continue;
                             }
+                            // A press on a settings row arms it and takes it,
+                            // which is the rule the question and team panels
+                            // keep: the row a press lands on is the row that
+                            // acts, never a hidden default. It goes through the
+                            // return key's own path rather than a second
+                            // "confirm the pointed row", so a click and a
+                            // keypress cannot come to mean different things.
+                            if self.host.settings_open() {
+                                if let Some(row) = self.host.settings_row_at(x, y) {
+                                    let _ = self.host.point_settings_at(row);
+                                    // The key's own path, so a click and a
+                                    // keypress cannot come to mean different
+                                    // things. Either way a frame is owed: the
+                                    // press moved the highlight even when the
+                                    // setting did not move.
+                                    self.run_settings_key(crate::surface::KeyPress::plain(
+                                        crate::surface::Key::Enter,
+                                    ));
+                                    stale = true;
+                                    continue;
+                                }
+                            }
                             Some(Action::SelectFrom(x, y))
                         }
                         Click::Drag => Some(Action::SelectTo(x, y)),
@@ -958,6 +980,15 @@ impl UserInterface for Tui {
                             if let Some(row) = self.host.team_row_at(x, y) {
                                 stale |= self.host.point_team_at(row);
                             }
+                            // And the settings panel, for the same reason: the
+                            // row under the pointer is the row a press would arm,
+                            // and a highlight somewhere else while the pointer is
+                            // somewhere is the panel lying about its own state.
+                            if self.host.settings_open() {
+                                if let Some(row) = self.host.settings_row_at(x, y) {
+                                    stale |= self.host.point_settings_at(row);
+                                }
+                            }
                             continue;
                         }
                         // Handled above, and never reached.
@@ -996,18 +1027,7 @@ impl UserInterface for Tui {
                 // right now. Below the modal, because a modal is a question the
                 // screen cannot answer for the person.
                 Wake::Input(Input::Key(press)) if self.host.settings_open() => {
-                    let (changed, set) = self.host.settings_key(press);
-                    if changed {
-                        stale = true;
-                    }
-                    if let Some((id, value)) = set {
-                        if let Err(why) = self.apply_setting(&id, &value) {
-                            self.host.say(&why, true);
-                        } else {
-                            self.refresh_settings();
-                        }
-                        stale = true;
-                    }
+                    stale |= self.run_settings_key(press);
                 }
                 // A question on screen gets first refusal on every key. It is a
                 // panel riding the tail now, not a modal, so this is the only
@@ -1124,6 +1144,29 @@ impl Tui {
         }
         moment.settings = view;
         true
+    }
+
+    /// Run one key against the settings panel, and act on what it asked for.
+    ///
+    /// One implementation for two callers, which is the point: the keyboard path
+    /// and a click both end up here. A pointer press that reached a setting has
+    /// the row armed and then runs *this* with a return, rather than a second
+    /// copy of "confirm the pointed row" that would agree with the keyboard
+    /// until one of them was changed.
+    ///
+    /// **True when a frame is owed.**
+    fn run_settings_key(&self, press: crate::surface::KeyPress) -> bool {
+        let (changed, set) = self.host.settings_key(press);
+        if let Some((id, value)) = set {
+            match self.apply_setting(&id, &value) {
+                Ok(()) => {
+                    self.refresh_settings();
+                }
+                Err(why) => self.host.say(&why, true),
+            }
+            return true;
+        }
+        changed
     }
 
     /// Send one change over the settings seam, then tell the runtime about it.

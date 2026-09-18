@@ -737,6 +737,16 @@ pub struct Hits {
     /// Where the team panel was drawn, so a press or the pointer on a row finds
     /// the agent it switches to.
     team: Option<Rect>,
+    /// Where the settings panel was drawn, so a press or the pointer on a row
+    /// finds the setting it changes.
+    ///
+    /// The rect the panel was **drawn** in, not one re-derived at the press: the
+    /// panel rides the tail, so where it sits depends on how tall the modules
+    /// below it turned out to be. The panel's own rect and not a per-row table,
+    /// for the reason the question panel's is not one either — which screen row
+    /// holds which setting is a fact about how the list was laid out at this
+    /// width, and the panel already worked it out.
+    settings: Option<Rect>,
     /// Where the slash menu was drawn, so a press or the pointer on a row finds
     /// the command it is on.
     ///
@@ -1532,6 +1542,59 @@ impl Host {
         geom.answer_at((y - rect.y) as usize)
     }
 
+    /// Point the settings panel at a row, by index. True when it moved.
+    ///
+    /// Clamped to the rows the *filtered* list has, because that is what
+    /// `settings_row_at` returns an index into: a pointer on the last row of a
+    /// search that matched two settings means the second of those two, not the
+    /// second of the catalog.
+    pub fn point_settings_at(&self, row: usize) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        // Both reads first, because the borrow of `settings_panel` has to end
+        // before it can be borrowed mutably: with no panel up, or no row to
+        // point at, there is nothing to move and the answer is `false`.
+        let rows = match m.settings_panel.as_ref() {
+            Some(panel) => m.settings.matching(&panel.query).len(),
+            None => return false,
+        };
+        match m.settings_panel.as_mut() {
+            Some(panel) => panel.point_at(row, rows),
+            None => false,
+        }
+    }
+
+    /// Which setting a screen row belongs to, when it belongs to one.
+    ///
+    /// The same rule as [`Host::answer_row_at`], and for the same reason: read
+    /// off the rect the panel was **drawn** in, so a click and the drawn
+    /// highlight cannot come from two different arrangements of one list. The
+    /// panel floats at the tail, so where it sits is a consequence of how tall
+    /// everything below it turned out — re-deriving that at the press would be a
+    /// second layout to keep in step with the frame.
+    ///
+    /// `None` when the panel is not up, when the point is not on it, or when it
+    /// is on a row that is not a setting — the search box, the blank above the
+    /// list, the legend. An edit in progress answers `None` too: the keyboard is
+    /// already in that field, and a press would only move the highlight out from
+    /// under the person's hands.
+    ///
+    /// "The panel is not up" is not checked here, and that is deliberate rather
+    /// than an omission: [`crate::modules::settings::geometry`] lays out no rows
+    /// at all without a panel to lay out, so it already answers `None` for a
+    /// rect left over from an older frame — and a second check here would be the
+    /// same fact stated twice, which is how the two come to disagree. The
+    /// criterion that pins it is `a_click_missing_the_panel_hits_nothing`.
+    pub fn settings_row_at(&self, x: u16, y: u16) -> Option<usize> {
+        let rect = *self.hits.lock().expect("hits poisoned").settings.as_ref()?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        let m = self.moment.read().expect("moment poisoned");
+        let vp = crate::moment::Viewport::new(rect, &m);
+        let geom = crate::modules::settings::geometry(&m, &vp);
+        geom.setting_at((y - rect.y) as usize)
+    }
+
     /// Run `change`, keeping the reader's place across whatever it did.
     ///
     /// **Measure, change, measure again** — one shape, because the arithmetic is
@@ -2284,6 +2347,7 @@ impl Host {
                         field: None,
                         ask: None,
                         team: None,
+                        settings: None,
                         menu: None,
                     };
                     *self.last_room.lock().expect("room poisoned") = rect;
@@ -2319,6 +2383,14 @@ impl Host {
                         // have to reproduce the tail's split.
                         if id == crate::modules::ask::ID {
                             self.hits.lock().expect("hits poisoned").ask = Some(*tail_rect);
+                        }
+                        // And the same for the settings panel, which rides the
+                        // same tail: where it sits depends on how tall the
+                        // modules below it turned out, so the press has to be
+                        // answered from this frame's rect rather than from a
+                        // formula that re-splits the tail.
+                        if id == crate::modules::settings::ID {
+                            self.hits.lock().expect("hits poisoned").settings = Some(*tail_rect);
                         }
                         frame.place(id.clone(), *tail_rect, lines);
                     }
@@ -3601,6 +3673,155 @@ mod tests {
             h.moment.read().unwrap().input,
             "half a sentence",
             "standing aside is not clearing — the draft is where it was"
+        );
+    }
+
+    /// A host with the settings panel mounted, and two settings in it.
+    fn host_with_settings() -> Host {
+        use crate::settings::{Applies, SettingKind, SettingRow, SettingsView};
+
+        let mods = Arc::new(Modules::new());
+        mods.add_producer(transcript::Transcript::new()).unwrap();
+        mods.add_view(Arc::new(
+            Mounted::<crate::modules::settings::Settings>::new(),
+        ))
+        .unwrap();
+        mods.add_view(Arc::new(Mounted::<input::Input>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<status::Status>::new()))
+            .unwrap();
+        let h = Host::new(mods, default_layout());
+        {
+            let row = |id: &str, label: &str, value: &str| SettingRow {
+                id: id.into(),
+                label: label.into(),
+                value: value.into(),
+                kind: SettingKind::Boolean,
+                applies: Applies::Reload,
+            };
+            h.moment.write().unwrap().settings = SettingsView::new(vec![
+                row("a.first", "第一", "true"),
+                row("b.second", "第二", "true"),
+            ]);
+        }
+        h
+    }
+
+    /// A click reads the row the frame drew: the pointed row is the one the
+    /// pointer is over, and pressing takes it.
+    ///
+    /// The property is the question panel's, checked the same way: the row a
+    /// press lands on is decided by the rect the panel was **drawn** in, so a
+    /// click and the highlight cannot come from two arrangements of one list.
+    #[test]
+    fn a_click_on_a_setting_reads_the_row_the_frame_drew() {
+        let h = host_with_settings();
+        let size = (60u16, 30u16);
+        h.toggle_settings();
+
+        let frame = h.compose(size);
+        let part = frame
+            .part(crate::modules::settings::ID)
+            .expect("the panel is drawn");
+        let rect = part.rect;
+        let drawn: Vec<String> = part.lines.iter().map(|l| l.plain()).collect();
+
+        // Every drawn row that holds a setting answers with the index of the
+        // setting it draws, and no row holds two.
+        let mut seen: Vec<usize> = Vec::new();
+        for (row, text) in drawn.iter().enumerate() {
+            if let Some(i) = h.settings_row_at(rect.x + 1, rect.y + row as u16) {
+                assert!(!seen.contains(&i), "row {row} answers {i}, already seen");
+                seen.push(i);
+                let wanted = if i == 0 { "第一" } else { "第二" };
+                assert!(
+                    text.contains(wanted),
+                    "row {row} answers setting {i} but draws {text:?}"
+                );
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            2,
+            "both settings are reachable by click:\n{}",
+            drawn.join("\n")
+        );
+
+        // And a press on one arms it.
+        let row_of_second = drawn
+            .iter()
+            .position(|t| t.contains("第二"))
+            .expect("the second row is drawn");
+        assert_eq!(
+            h.settings_row_at(rect.x + 1, rect.y + row_of_second as u16),
+            Some(1)
+        );
+        assert!(h.point_settings_at(1), "the press moved the highlight");
+        assert_eq!(
+            h.moment
+                .read()
+                .unwrap()
+                .settings_panel
+                .as_ref()
+                .unwrap()
+                .cursor,
+            1
+        );
+    }
+
+    /// Nothing is drawn, nothing is clickable.
+    ///
+    /// The negative control for the criterion above. The interesting half is the
+    /// *stale* rect: closing the panel leaves the last frame's rect in `hits`
+    /// until the next `compose`, and a pointer press can arrive in between —
+    /// which is exactly why `settings_row_at` asks whether a panel is up before
+    /// it asks what row a point is on. Composing after the close would paper
+    /// over that (the frame rebuilds `hits`), so this deliberately does not.
+    #[test]
+    fn a_click_missing_the_panel_hits_nothing() {
+        let h = host_with_settings();
+        let size = (60u16, 30u16);
+
+        // Never opened: no rect has ever been recorded.
+        assert_eq!(h.settings_row_at(1, 1), None);
+        assert_eq!(h.settings_row_at(30, 15), None);
+
+        // Opened and drawn: the point now lands on a setting.
+        h.toggle_settings();
+        let frame = h.compose(size);
+        let rect = frame
+            .part(crate::modules::settings::ID)
+            .expect("the panel is drawn")
+            .rect;
+        let on_a_setting = (rect.x + 1, rect.y + 3);
+        assert!(
+            h.settings_row_at(on_a_setting.0, on_a_setting.1).is_some(),
+            "the point is on the panel while it is up"
+        );
+
+        // Closed, and **not composed**: the rect is still in `hits` and the
+        // place it was drawn must not answer.
+        assert!(h.close_settings());
+        assert_eq!(
+            h.settings_row_at(on_a_setting.0, on_a_setting.1),
+            None,
+            "the place it used to be is not a place it is"
+        );
+
+        // A compose does clear the rect — the other half of the same story, and
+        // the reason the check above cannot be replaced by "compose first".
+        assert!(h.compose(size).part(crate::modules::settings::ID).is_none());
+        assert_eq!(h.settings_row_at(on_a_setting.0, on_a_setting.1), None);
+
+        // And a point on the panel but not on a setting — the top margin above
+        // the search box — is not a row either.
+        h.toggle_settings();
+        let frame = h.compose(size);
+        let rect = frame.part(crate::modules::settings::ID).unwrap().rect;
+        assert_eq!(
+            h.settings_row_at(rect.x + 1, rect.y),
+            None,
+            "the top margin holds no setting"
         );
     }
 
