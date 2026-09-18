@@ -266,9 +266,26 @@ gates/layers.sh                                      # 用 cargo metadata 断言
   - `config` 里有一半是真该走的(`model_source.rs` 读用户配置、`plugins/llm.rs`
     找配置文件路径),它们是宿主的事。
 
-  **正确的下一步不是逐条摘,是把 `plugins/` 拆成两半**:机制自己的行留在 harness,
-  挂能力的行进一个能力行层的 crate。那一刀同时了结 `capabilities` 与 `review`,
-  债 5 → 3(下限 2 + `config`)。在那之前逐条摘只会把 `catalog()` 改三遍。
+  **"把 `plugins/` 拆成两半"这个方案是错的**(2026-09-18 晚测绘推翻)。拆的前提是
+  "挂能力的行"能和"机制自己的行"分开,而实际不能:`atomcode_capabilities` 被
+  **16 个行文件**引用,其中包括 `handle.rs`(命令泵)、`world.rs` / `world_tools.rs` /
+  `tools.rs` / `opener.rs`(世界与工具的缝)、`compaction.rs`、`loop_policy.rs`、
+  `recall.rs`、`team.rs` —— 这些**就是机制自己的行**,没有一个能归到"挂能力的那半"。
+
+  按引用去向数,它们要的东西高度集中在一处:`atomcode_capabilities::tools` 下的
+  **审批与安全闸**——`write_approval`、`sensitive_path`、`credential_bash_gate`、
+  `bash_workspace_gate`、`delegated_write_violation`、`approval`、`repair_tool_args`、
+  `request_user_input`、`todo`。`plugins/policy.rs`(审批梯度那一行,15 处引用)整个
+  建在它们上面。
+
+  **所以债的真实形状是:审批闸放在能力行层,而用它们的是机制层的行。** 正确的方向
+  是把那几个闸**往下**搬(kernel 已经有 `RiskLevel`、`ToolMiddleware`、
+  `PolicyIntervention`,它们是同一族东西),而不是把行**往上**搬。
+
+  **这一步要先定一件事**:kernel 的稳定性约束是"除了 Agent 核心的事件,功能型内容
+  不能进入"。审批闸算不算 Agent 核心?`PolicyIntervention` 已经在 kernel 里,这是
+  支持算的证据;但那是**一个事件类型**,而这些是**九个带策略的函数**。
+  **没定之前不要动** —— 划错了就是往极稳的那层里灌功能。
 
 **待办,按这张表该动但还没动的:**
 
