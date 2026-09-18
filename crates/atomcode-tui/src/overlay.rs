@@ -145,6 +145,117 @@ impl Picker {
     }
 }
 
+/// A file, read-only, scrollable, one key from gone.
+///
+/// The gap it fills: to look at a file during a session you either ask the
+/// model to read it — which costs a turn and puts the whole file in the
+/// conversation for good — or you leave for another window. This is neither:
+/// nothing is sent, nothing is logged, and closing it leaves no trace.
+///
+/// It holds the text rather than the path. Reading is IO, and an overlay draws
+/// under the same rule a view module does — pure, no IO — so the read happens
+/// once, in the command that opens this.
+pub struct Reading {
+    what: String,
+    lines: Vec<String>,
+    at: RwLock<usize>,
+}
+
+impl Reading {
+    /// `what` is what the frame says it is showing — a path, usually.
+    pub fn new(what: impl Into<String>, text: &str) -> Arc<Self> {
+        Arc::new(Self {
+            what: what.into(),
+            lines: text.lines().map(str::to_string).collect(),
+            at: RwLock::new(0),
+        })
+    }
+
+    /// Where the window starts, for a criterion.
+    pub fn top(&self) -> usize {
+        *self.at.read().expect("reading poisoned")
+    }
+
+    fn scroll(&self, by: isize) {
+        let mut at = self.at.write().expect("reading poisoned");
+        let last = self.lines.len().saturating_sub(1);
+        *at = at.saturating_add_signed(by).min(last);
+    }
+}
+
+impl Overlay for Reading {
+    fn id(&self) -> &'static str {
+        "view"
+    }
+
+    fn title(&self) -> String {
+        self.what.clone()
+    }
+
+    fn render(&self, vp: &Viewport<'_>) -> Vec<Line> {
+        let w = vp.rect.w as usize;
+        if w == 0 || vp.rect.h == 0 {
+            return Vec::new();
+        }
+        if self.lines.is_empty() {
+            return vec![Line::styled(
+                "  (空文件)".to_string(),
+                Style::new().fg(Color::role(Role::Muted)),
+            )];
+        }
+        let room = vp.rect.h as usize;
+        let at = (*self.at.read().expect("reading poisoned")).min(self.lines.len() - 1);
+        // Numbered, because the reason to open a file mid-session is usually to
+        // say a line number out loud. Dim, so the text reads as the text.
+        let width = self.lines.len().to_string().len();
+        self.lines
+            .iter()
+            .enumerate()
+            .skip(at)
+            .take(room)
+            .map(|(i, text)| {
+                Line::from_spans(vec![
+                    Span::styled(
+                        format!("{:>width$}  ", i + 1, width = width),
+                        Style::new().fg(Color::role(Role::Muted)),
+                    ),
+                    Span::raw(crate::text::for_screen(text).into_owned()),
+                ])
+                .truncate(w)
+            })
+            .collect()
+    }
+
+    fn key(&self, press: KeyPress) -> Step {
+        match press.key {
+            Key::Up => {
+                self.scroll(-1);
+                Step::Stay
+            }
+            Key::Down => {
+                self.scroll(1);
+                Step::Stay
+            }
+            Key::PageUp => {
+                self.scroll(-20);
+                Step::Stay
+            }
+            Key::PageDown => {
+                self.scroll(20);
+                Step::Stay
+            }
+            // Closed with nothing, always: looking at a file picks nothing and
+            // runs nothing. An overlay that answered with a value here would
+            // dispatch that value as a command.
+            _ => Step::Cancelled,
+        }
+    }
+
+    fn size(&self) -> (u8, u8) {
+        (80, 80)
+    }
+}
+
 impl Overlay for Picker {
     fn id(&self) -> &'static str {
         self.id
@@ -424,6 +535,66 @@ mod tests {
                 Choice::new("c", "gamma").about("third"),
             ],
         )
+    }
+
+    /// A file can be looked at without spending a turn on it, and looking
+    /// picks nothing.
+    ///
+    /// The second half matters: an overlay that closed with a value would have
+    /// that value dispatched as a command. Reading a file runs nothing.
+    #[test]
+    fn a_file_is_read_without_spending_a_turn_and_picks_nothing() {
+        let text = (1..=50)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let r = Reading::new("src/main.rs", &text);
+        let m = Moment::default();
+        let drawn = |r: &Reading| {
+            r.render(&Viewport::new(Rect::sized(30, 5), &m))
+                .iter()
+                .map(|l| l.plain())
+                .collect::<Vec<_>>()
+        };
+
+        let top = drawn(&r);
+        assert_eq!(top.len(), 5, "as many rows as it was given: {top:?}");
+        assert!(top[0].contains("line 1"), "{top:?}");
+        // Numbered, because the reason to open a file mid-session is usually to
+        // say a line number out loud. Right-aligned to the file's own width.
+        assert!(top[0].starts_with(" 1  "), "{top:?}");
+        assert!(top[4].starts_with(" 5  "), "{top:?}");
+
+        assert_eq!(r.key(KeyPress::plain(Key::Down)), Step::Stay);
+        assert_eq!(r.top(), 1);
+        assert_eq!(r.key(KeyPress::plain(Key::PageDown)), Step::Stay);
+        assert_eq!(r.top(), 21);
+        // It does not run off the end.
+        for _ in 0..5 {
+            r.key(KeyPress::plain(Key::PageDown));
+        }
+        assert_eq!(r.top(), 49, "the last line, not past it");
+        for _ in 0..5 {
+            r.key(KeyPress::plain(Key::PageUp));
+        }
+        assert_eq!(r.top(), 0, "nor before the first");
+
+        // Anything else closes it, and always with nothing.
+        for press in [
+            KeyPress::plain(Key::Enter),
+            KeyPress::plain(Key::Esc),
+            KeyPress::ch('a'),
+        ] {
+            assert_eq!(
+                Reading::new("f", "x").key(press),
+                Step::Cancelled,
+                "{press:?}"
+            );
+        }
+
+        // An empty file says so rather than drawing nothing at all.
+        let empty = Reading::new("empty.txt", "");
+        assert!(drawn(&empty)[0].contains("空文件"), "{:?}", drawn(&empty));
     }
 
     #[test]

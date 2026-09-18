@@ -20,6 +20,36 @@ pub struct State {
     pub spoke: bool,
 }
 
+/// What the upper rule says, or `None` for a bare one.
+///
+/// The session's name, and where in the history the field is being browsed
+/// from. Nothing when there is neither: an unnamed session that nobody is
+/// arrowing through has nothing to say here, and a rule that always carries
+/// words is decoration.
+///
+/// A free function so it can be judged without a terminal — the interesting
+/// part is which of the four combinations says what.
+fn caption(moment: &crate::moment::Moment) -> Option<String> {
+    let named = moment
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    // 1-based and counted from the newest, which is the direction a person
+    // arrows: the first press is 1, not `history.len()`.
+    let browsing = moment.history_at.map(|at| {
+        let total = moment.history.len();
+        let nth = total.saturating_sub(at);
+        format!("历史 {nth}/{total}")
+    });
+    match (named, browsing) {
+        (None, None) => None,
+        (Some(name), None) => Some(name.to_string()),
+        (None, Some(where_)) => Some(where_),
+        (Some(name), Some(where_)) => Some(format!("{name} · {where_}")),
+    }
+}
+
 /// Rows the rules above and below the field eat, and cells the prompt eats.
 /// Named because `render`, `height` and `caret` must all agree about them, and
 /// three magic numbers would eventually not.
@@ -214,7 +244,27 @@ impl View for Input {
         .bold();
 
         let rule = || El::text(crate::el::plain_rule(w as usize, theme::fg(Role::Muted)));
-        let mut rows: Vec<El> = vec![rule()];
+        // The upper rule carries what is true about the field right now: which
+        // session this is, and — while arrowing back — where in the history the
+        // text came from. Both were otherwise unanswerable from the screen: the
+        // session's name appeared nowhere, and browsing history looked exactly
+        // like having typed the same words yourself.
+        //
+        // In the rule rather than on a row of its own, because it is only
+        // sometimes there and a reserved row that is usually blank is a row of
+        // chrome. A caption that does not fit falls back to a bare rule
+        // (`captioned_rule`), so a narrow terminal loses the words, not the
+        // boundary.
+        let top = match caption(vp.moment) {
+            Some(caption) => El::text(crate::el::captioned_rule(
+                &caption,
+                w as usize,
+                theme::fg(Role::Muted),
+                theme::fg(Role::Muted),
+            )),
+            None => rule(),
+        };
+        let mut rows: Vec<El> = vec![top];
 
         // The typed text wraps rather than scrolling sideways, and the field
         // grows to hold it. Past `MAX_ROWS` it scrolls instead, keeping the
@@ -299,6 +349,50 @@ mod tests {
             .iter()
             .map(|l| l.plain())
             .collect()
+    }
+
+    /// The upper rule says which session this is and, while arrowing back,
+    /// where the words came from.
+    ///
+    /// Both were unanswerable from the screen before: the session's name
+    /// appeared nowhere at all, and browsing the history looked exactly like
+    /// having typed the same words again. Counted from the newest and 1-based,
+    /// because that is the direction a person arrows — the first press is 1.
+    #[test]
+    fn the_upper_rule_says_which_session_and_where_in_the_history() {
+        let mut m = Moment::default();
+        assert_eq!(caption(&m), None, "nothing to say, so a bare rule");
+
+        m.title = Some("修解析器".into());
+        assert_eq!(caption(&m).as_deref(), Some("修解析器"));
+        // A name of spaces is no name.
+        m.title = Some("   ".into());
+        assert_eq!(caption(&m), None);
+
+        m.title = Some("修解析器".into());
+        m.history = vec!["one".into(), "two".into(), "three".into()];
+        m.history_at = Some(2); // the first press back: the newest entry
+        assert_eq!(caption(&m).as_deref(), Some("修解析器 · 历史 1/3"));
+        m.history_at = Some(0); // the oldest
+        assert_eq!(caption(&m).as_deref(), Some("修解析器 · 历史 3/3"));
+        m.title = None;
+        assert_eq!(caption(&m).as_deref(), Some("历史 3/3"));
+
+        // And it reaches the rule, rather than only the function.
+        m.title = Some("修解析器".into());
+        let out = draw(&State::default(), &m, 40, 3);
+        assert!(
+            out[0].contains("修解析器") && out[0].contains("3/3"),
+            "{out:?}"
+        );
+        // Too narrow for the words: the boundary survives, the caption goes.
+        let narrow = draw(&State::default(), &m, 12, 3);
+        assert!(!narrow[0].contains("修解析器"), "{narrow:?}");
+        assert_eq!(
+            narrow[0].chars().count(),
+            12,
+            "still a full-width rule: {narrow:?}"
+        );
     }
 
     #[test]

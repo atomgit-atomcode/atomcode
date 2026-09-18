@@ -3360,8 +3360,23 @@ async fn the_screen_moves_between_sessions_without_repeating_or_freezing() {
     assert_eq!(back, first);
     s.quiet().await;
     let resumed = s.screen();
+    // The conversation, not the whole screen: the composer's upper rule also
+    // carries the session's name, and the name of a session resumed from its
+    // first prompt *is* that prompt. What this is about is the history being
+    // folded once rather than twice.
+    let conversation = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("stream")
+        .expect("the conversation")
+        .lines
+        .iter()
+        .map(|l| l.plain())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert_eq!(
-        resumed.matches("first question").count(),
+        conversation.matches("first question").count(),
         1,
         "its history, drawn once:\n{resumed}"
     );

@@ -159,6 +159,11 @@ const TAKE_AWAY: &[Command] = &[
         "复制模型最后一条回复里的代码块;N 指定第几块,all 全要",
     ),
     Command::taking("save", "[文件名]", "把这段对话存成 markdown"),
+    Command::taking(
+        "view",
+        "<路径>",
+        "开一个只读浮层看文件;不花一个回合,也不进对话",
+    ),
 ];
 
 #[async_trait]
@@ -233,6 +238,30 @@ impl CommandSet for TakeAwayCommands {
                 match std::fs::write(&path, text) {
                     Ok(()) => Outcome::Said(format!("存到 {}", path.display())),
                     Err(error) => Outcome::Refused(format!("存不下:{error}")),
+                }
+            }
+            // Looking at a file costs a turn otherwise — and puts the whole
+            // file in the conversation for good. This sends nothing and logs
+            // nothing.
+            "view" => {
+                let path = args.trim();
+                if path.is_empty() {
+                    return Outcome::Refused("要看哪个文件?`/view 路径`".into());
+                }
+                let full = std::path::Path::new(path);
+                let full = if full.is_absolute() {
+                    full.to_path_buf()
+                } else {
+                    std::path::Path::new(&client.root()).join(full)
+                };
+                match std::fs::read_to_string(&full) {
+                    // Read here rather than in the overlay: an overlay draws
+                    // under the same rule a view module does — pure, no IO.
+                    Ok(text) => Outcome::Open(crate::overlay::Reading::new(
+                        crate::text::collapse_home(&full.display().to_string()),
+                        &text,
+                    )),
+                    Err(error) => Outcome::Refused(format!("读不了 {path}:{error}")),
                 }
             }
             _ => Outcome::Quiet,
@@ -1418,6 +1447,31 @@ mod tests {
             Outcome::Refused(_)
         ));
         assert_eq!(surface.clipboard_text(), None);
+    }
+
+    /// `/view` opens the file beside the code, without sending anything.
+    #[tokio::test]
+    async fn view_opens_a_file_without_putting_it_in_the_conversation() {
+        let (app, all, _surface) = answered("好了");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}\n").expect("write");
+        match all
+            .dispatch(&format!("/view {}", file.display()), &app.context())
+            .await
+        {
+            Outcome::Open(overlay) => assert_eq!(overlay.id(), "view"),
+            other => panic!("{other:?}"),
+        }
+        // Nothing was said to the model and nothing was written.
+        assert!(matches!(
+            all.dispatch("/view", &app.context()).await,
+            Outcome::Refused(_)
+        ));
+        assert!(matches!(
+            all.dispatch("/view /nowhere/at/all", &app.context()).await,
+            Outcome::Refused(_)
+        ));
     }
 
     /// `/save` writes the conversation as markdown, beside the code the session

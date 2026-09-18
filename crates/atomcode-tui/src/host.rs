@@ -1052,6 +1052,11 @@ impl Host {
         let mut m = self.moment.write().expect("moment poisoned");
         m.members.clear();
         m.team_cursor = None;
+        // A name belongs to the session that was named. Left behind it would be
+        // the previous conversation's name over the new one's composer — and
+        // over the window, which is worse, because a window is what a person
+        // picks between.
+        m.title = None;
     }
 
     /// The screen, emptied to draw another agent of the same session — the lead
