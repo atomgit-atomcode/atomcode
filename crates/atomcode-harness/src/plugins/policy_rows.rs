@@ -64,8 +64,11 @@ impl Plugin for TodoPlugin {
              `todowrite {\"action\":\"update\",\"id\":N,\"status\":\"in_progress\"}` when you \
              start #N, and `completed` the moment it is actually verified — never on intent, and \
              never batch-completing several at the end. Keep exactly one item in_progress. \
-             Unless you need approval, hit the stop-when-stuck limit, or the request is \
-             ambiguous, do not declare done or hand back while any item is still open. If the \
+             The list is there to show where the work actually stands, so keep it true: if the \
+             plan changed and an item is no longer part of the task, replace or drop it rather \
+             than leaving it open. Do not declare done or hand back while an item is still open \
+             and still wanted — finish it, or say plainly which are open and why (blocked, \
+             needing a decision, ambiguous, or no longer wanted). If the \
              user pivots to unrelated multi-step work, call it with the new full list to REPLACE \
              the old one instead of carrying stale items forward. Not for a single quick edit, a \
              one-off command, or a purely informational reply.",

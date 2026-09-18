@@ -552,10 +552,12 @@ when you start item #N, and `status\":\"completed\"` the moment it is actually v
 in_progress at a time (this is enforced for you) and \
 mark an item done only after that step is actually verified (never on intent) — in the same \
 turn you finish it, before moving on, and never \
-batch-complete several items at the end. Unless you genuinely need approval, hit the STOP \
-WHEN STUCK limit, or the request is ambiguous, do NOT declare done, summarize as if \
-finished, or hand back to the user while any item is still pending or in_progress — keep \
-working through them. Keep each \
+batch-complete several items at the end. The list exists to reflect where the work actually \
+stands, so keep it TRUE: if the plan changed and an item is no longer part of the task, replace \
+or drop it rather than leaving it open. Do not declare done, summarize as if \
+finished, or hand back while an item in the list is still open and still wanted — finish those \
+first, or say plainly which ones are open and why (blocked, needing approval or a decision, \
+ambiguous, or no longer wanted). Keep each \
 item specific and verifiable (`add retry to fetch_user`, not `fix networking`). It keeps you \
 and the user aligned and avoids losing the thread across turns. If the user pivots to clearly \
 unrelated multi-step work, call `todowrite` with the new full list to REPLACE the old one rather \
@@ -1006,6 +1008,23 @@ mod tests {
         assert!(
             p.contains("Do NOT use it for a single quick edit"),
             "must keep the trivial-task skip clause: {p}"
+        );
+        // The list must be about being TRUE, not about being LONG: the earlier wording
+        // ("keep working through them") read as an order to keep executing, so a model
+        // ground on items the task had outgrown instead of reconciling them. Reconciling
+        // — replace or drop what the plan left behind — is now stated, and the stop clause
+        // asks it to SAY which items are open rather than forbidding the stop outright.
+        assert!(
+            p.contains("keep it TRUE") && p.contains("replace or drop it"),
+            "must ask for a list that matches reality: {p}"
+        );
+        assert!(
+            !p.contains("keep working through them") && !p.contains("still pending or in_progress"),
+            "must not order the model to keep executing past a changed plan: {p}"
+        );
+        assert!(
+            p.contains("say plainly which ones are open and why"),
+            "stopping with open items must be allowed when it is explained: {p}"
         );
     }
 

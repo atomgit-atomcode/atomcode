@@ -21,11 +21,21 @@ use atomcode_config::config::TodoEagerness;
 /// (e.g. the closing summary) then ends WITHOUT marking it completed. Mirrors
 /// `VerifyCadenceHook`'s `offer_continuation` cadence; nudges at most ONCE per real-user turn
 /// (and the kernel `max_continuations` fuse bounds it), so it can never spin.
+///
+/// The nudge asks for a TRUE LIST, not for more work: the list exists to show where the work
+/// actually stands, so an item that is finished gets closed, one the plan outgrew gets replaced
+/// or dropped, and one still ahead stays open. An earlier wording ("If some are NOT done, keep
+/// working through them") read as a demand to keep executing — it pushed models to grind on
+/// items the task no longer needed instead of reconciling the list, which is the opposite of
+/// what the list is for. Stopping is legitimate; stopping with a list that lies is not.
 const TODO_COMPLETION_NUDGE: &str = "Before you finish: the task list still has open items. \
-If you have actually completed them, mark each one done now with `todowrite` \
-(`{\"action\":\"update\",\"id\":<id>,\"status\":\"completed\"}`). If some are NOT done, keep working \
-through them. Only stop with open items if you genuinely need approval/input, are stuck, or the \
-request is ambiguous — in that case say so briefly.";
+Take a moment to make it match where the work actually stands — the list is there to reflect \
+reality, not to keep you working. \
+If an item is done, mark it completed with `todowrite` \
+(`{\"action\":\"update\",\"id\":<id>,\"status\":\"completed\"}`). If the plan changed and an item \
+is no longer part of the task, replace or drop it rather than leaving it open. If it is genuinely \
+still ahead of you, keep going — and if you are stopping, say briefly which items are open and why \
+(blocked, needs approval, ambiguous, or simply no longer wanted).";
 
 pub struct TodoHook {
     /// Project root for locating the session todo sidecar
@@ -345,11 +355,15 @@ the list, and never repeat it back to the user.";
 /// after it (re)plans — so re-sending them on every execution round is pure wasted
 /// cache (~170 tokens/round of never-cached tail). Rides the reminder only when the
 /// model JUST wrote a full list (see `just_wrote_full_list`).
+///
+/// The last rule asks for a TRUE LIST rather than more work: the list records where the
+/// work stands, so reconciliation (close / replace / drop) is the duty, not grinding on
+/// every open item. A task that changed should change the list with it.
 const TODO_DRIVE_RULES: &str = "\n\
 - The MOMENT you START an item: `todowrite` with `{\"action\":\"update\",\"id\":<id>,\"status\":\"in_progress\"}`.\n\
 - The MOMENT you FINISH an item: `todowrite` with `{\"action\":\"update\",\"id\":<id>,\"status\":\"completed\"}` (do not leave a done item showing incomplete).\n\
 - Update ONE item at a time (the `{\"action\":...}` shape) — do NOT resend the whole `todos` list for a single status change (the full list is only for the initial plan or a full re-plan).\n\
-- Do NOT stop, summarize, or hand back while ANY item is still pending or in_progress — keep working through them, unless you truly need approval, are genuinely stuck, or the request is ambiguous.";
+- Keep the list TRUE as the work moves: an item you finished is marked completed, an item the task outgrew is replaced or dropped (`todowrite` with the new full list), and an item still ahead stays open. If the work changed shape, change the list with it — a stale or inflated list is worse than a short one. Stopping is allowed; stopping with a list that no longer matches reality is not.";
 
 /// True iff the model's most recent tool-using action was a FULL `todowrite` list
 /// (re)plan, as opposed to a single `todo` status update or a non-todo action. Used to
