@@ -802,3 +802,60 @@ async fn inter_token_gap_uses_idle_budget_not_first_token() {
          a large first-token budget; got {events:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// OOM guard: hostile tool_call index (issue #762)
+// ---------------------------------------------------------------------------
+
+/// END-TO-END (real HTTP → SSE decode → StreamEvent) regression for #762: a hostile
+/// server sending `tool_calls[].index: 999_999_999` must NOT make the adapter pad its
+/// per-index buffer up to ~1e9 slots (OOM). The out-of-range delta is dropped and a
+/// legitimate index-0 call in the SAME stream still assembles and is emitted.
+///
+/// Before the `MAX_TOOL_CALLS` bound this test did not merely fail — the decoder
+/// allocated ~a billion slots (`while tool_calls.len() <= idx { push }`) and the
+/// process OOM'd/hung, which is exactly the reported bug.
+#[tokio::test]
+async fn hostile_tool_call_index_does_not_oom_and_legit_call_survives() {
+    const HOSTILE_SSE: &str = "data: {\"id\":\"resp-evil\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":999999999,\"id\":\"evil\",\"function\":{\"name\":\"pwn\",\"arguments\":\"{}\"}}]}}]}\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_ok\",\"function\":{\"name\":\"get_time\",\"arguments\":\"{}\"}}]}}]}\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\
+data: [DONE]\n";
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(HOSTILE_SSE))
+        .mount(&server)
+        .await;
+
+    let provider = provider_for(&server.uri(), "glm-test");
+    let mut stream = provider
+        .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+        .await
+        .expect("open should succeed");
+
+    let mut calls = Vec::new();
+    let mut done = false;
+    while let Some(ev) = stream.next().await {
+        match ev {
+            StreamEvent::ToolCall(t) => calls.push(t),
+            StreamEvent::Done { .. } => done = true,
+            StreamEvent::Error(e) => panic!("unexpected stream error: {}", e.message),
+            _ => {}
+        }
+    }
+
+    assert!(done, "stream must terminate despite the hostile index");
+    assert_eq!(
+        calls.len(),
+        1,
+        "only the in-range call is assembled/emitted: {calls:?}"
+    );
+    assert_eq!(calls[0].name, "get_time");
+    assert_eq!(calls[0].id, "call_ok");
+    assert!(
+        calls.iter().all(|c| c.name != "pwn"),
+        "the out-of-range (hostile) call must be dropped, not executed"
+    );
+}
