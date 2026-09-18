@@ -138,6 +138,31 @@ pub fn basename(path: &str) -> &str {
     }
 }
 
+/// The path being typed after an `@`, when one is.
+///
+/// The **last** `@` that opens a word, and only when the caret is still in that
+/// word — a person writes `看一下 @src/ma` and means the thing at the end. An
+/// `@` in the middle of a word is an email address or a decorator, not a path
+/// somebody is reaching for, so it takes a boundary in front of it.
+///
+/// `Some("")` — a bare `@` at the end — is a real answer: it lists the working
+/// directory, which is how a person finds out what is there.
+pub fn being_pathed(typed: &str) -> Option<&str> {
+    let at = typed.rfind('@')?;
+    let opens = at == 0
+        || typed[..at]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace);
+    if !opens {
+        return None;
+    }
+    let rest = &typed[at + 1..];
+    // Still one word: a space after it means the path was finished and
+    // something else is being written now.
+    (!rest.contains(char::is_whitespace)).then_some(rest)
+}
+
 /// What the window should be called: the session's name, or where it is
 /// working when it has none.
 ///
@@ -234,6 +259,28 @@ fn eat_escape(chars: &mut Peekable<Chars<'_>>) {
 
 #[cfg(test)]
 mod tests {
+    /// `@` opens a path only where a path could start.
+    ///
+    /// The last one that opens a word, because a person writes the thing they
+    /// mean at the end; an `@` inside a word is an email address or a
+    /// decorator, not somebody reaching for a file.
+    #[test]
+    fn an_at_sign_opens_a_path_only_where_one_could_start() {
+        use super::being_pathed;
+        assert_eq!(being_pathed("@src/ma"), Some("src/ma"));
+        assert_eq!(being_pathed("看一下 @src/ma"), Some("src/ma"));
+        // A bare `@` lists where you are, which is how you find out.
+        assert_eq!(being_pathed("@"), Some(""));
+        // The last one wins.
+        assert_eq!(being_pathed("@a/b 和 @c/d"), Some("c/d"));
+        // Not an email, not a decorator.
+        assert_eq!(being_pathed("写信给 li@example.com"), None);
+        assert_eq!(being_pathed("#[serde(default)] x@y"), None);
+        // Finished: a space after it means something else is being written.
+        assert_eq!(being_pathed("@src/main.rs 改一下"), None);
+        assert_eq!(being_pathed("没有 at 符号"), None);
+    }
+
     /// The window says the session's name when it has one, and where it is
     /// working when it does not.
     #[test]

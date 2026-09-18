@@ -72,20 +72,20 @@ withdraw、reload、cancel-all。**加目录投影 5**:goal、loop、queue、pol
 
 | # | 做什么 | 为什么 |
 |---|---|---|
-| B2-1 | `/diff` 两级浏览器(文件列表 → 详情) | 看 agent 改了什么,编码会话里最高频 |
+| B2-1 | `/diff` 两级浏览器(文件列表 → 详情) | 看 agent 改了什么,编码会话里最高频  ✅ d8fb3429(工作区快照出 numstat 与单文件 diff;`HostCommand::Changes` 一条命令两个深度) |
 | B2-2 | 多会话:人自己开一条、切回来 | 按 0022 §6 + 0023 realm 做,**不照搬** tuix 的槽位号。**依赖**:计划页「后续」的「换会话不重建 App」——今天换会话仍重建 App(0022 §2 允许),所以这条先做「能开、能切回」,realm 化留给那条后续,别当成顺带做掉了 |
 | B2-3 | `/model` 选择器(依赖 A12) | 现在要打全名 |
 | B2-4 | `/provider` 管理面板 | 增改删 provider;现在只能改配置文件 |
 | B2-5 | `/plugin` 市场面板 | 装/卸插件(CLI 已有,面板是体验) |
-| B2-6 | `/copy`、`/save`、`/view` | 复制代码块、存 markdown、看文件浮层  —— `/copy` `/save` ✅(c7f87718,自成一行 `tui-commands-take-away`);`/view` 未做 |
-| B2-7 | `/language` | 设置键的一种(可并进 A3) |
+| B2-6 | `/copy`、`/save`、`/view` | 复制代码块、存 markdown、看文件浮层  —— `/copy` `/save` ✅(c7f87718,自成一行 `tui-commands-take-away`);`/view` 未做  `/view` 亦 ✅ 722fb501 |
+| B2-7 | `/language` | 设置键的一种(可并进 A3)  ✅ 下一个提交(是 `/config language` 的具名入口,同一段实现) |
 | B2-8 | `/whoami`、`/worktree` | 当前登录用户;worktree 隔离  —— `/whoami` ✅(c7f87718,宿主契约 `WhoAmI` + `HostConfig::identity`);`/worktree` 未做 |
 | B2-9 | `/sync` | 把当前终端会话共享给 webui/App——**本质依赖屏幕在场**。**依赖**:碰 daemon 的 live hub,与 M6.3(daemon / ACP / clix 迁到两份契约)同一片区域,排在 6.3 之后或同批做,否则适配要写两遍 |
 | B2-10 | `/think on\|off` | 与 `/effort` 是两个旋钮:要不要思考 vs 思考多狠  ✅ c7f87718 |
 | B2-11 | `/paste [路径]` | 兜 Windows 下 Ctrl+V 被按键层拦截、ohos 读不到剪贴板  ✅ 下一个提交 |
-| B2-12 | 输入框上沿 rule | 会话名、历史位置、反向搜索指示 |
+| B2-12 | 输入框上沿 rule | 会话名、历史位置、反向搜索指示  ✅ 722fb501 |
 | B2-13 | goal / loop 状态行 | 自主循环在跑时的轮次与耗时 |
-| B2-14 | @文件 / $skill 补全菜单 | tui 只有斜杠菜单 |
+| B2-14 | @文件 / $skill 补全菜单 | tui 只有斜杠菜单  @文件 ✅ 下一个提交;**$skill 不做**——本前端每个可被人调用的 skill 已经是一条 `/` 命令(B1),再开一套 `$` 语法是第二个入口 |
 | B2-15 | ghost 提示 | 空输入框里的下一步建议,右方向键接受 |
 | B2-16 | 终端标题 | 会话名进窗口标题  ✅ 下一个提交(顺带:`SessionEvent::Titled` 之前 tui 里没人消费) |
 

@@ -417,6 +417,60 @@ impl AgentClient {
     }
 }
 
+/// What is on disk under `cwd` matching `prefix`, for the `@` menu.
+///
+/// IO, and deliberately here rather than in a module: a module may not touch
+/// the world (`gates/tui-layers.sh`), and the composer's menu is filled by the
+/// loop, which already reads the environment for the working directory.
+///
+/// A directory is listed with its separator so the next keystroke continues
+/// into it. Bounded, because a repository root can hold thousands of entries
+/// and a menu is a hint, not a file manager.
+fn paths_under(cwd: &str, prefix: &str) -> Vec<(String, String)> {
+    const MOST: usize = 20;
+    let (dir, leaf) = match prefix.rsplit_once('/') {
+        Some((dir, leaf)) => (dir.to_string(), leaf.to_string()),
+        None => (String::new(), prefix.to_string()),
+    };
+    let root = std::path::Path::new(cwd).join(&dir);
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // A dot file only when the typist asked for one: `@` in a repository
+        // root would otherwise open with `.git` and `.gitignore`.
+        if name.starts_with('.') && !leaf.starts_with('.') {
+            continue;
+        }
+        if !name.starts_with(&leaf) {
+            continue;
+        }
+        let folder = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let shown = if dir.is_empty() {
+            name.clone()
+        } else {
+            format!("{dir}/{name}")
+        };
+        out.push((
+            if folder {
+                format!("@{shown}/")
+            } else {
+                format!("@{shown}")
+            },
+            if folder {
+                "目录".into()
+            } else {
+                String::new()
+            },
+        ));
+    }
+    out.sort();
+    out.truncate(MOST);
+    out
+}
+
 /// Lines the conversation moves per wheel notch.
 ///
 /// One, not three. The terminal already sends one event per notch, so three
@@ -2032,13 +2086,10 @@ impl Tui {
     }
 
     fn refresh_menu(&self) {
-        let typed = self
-            .host
-            .moment
-            .read()
-            .expect("moment poisoned")
-            .input
-            .clone();
+        let (typed, cwd) = {
+            let m = self.host.moment.read().expect("moment poisoned");
+            (m.input.clone(), m.cwd.clone())
+        };
         let menu = match typed.strip_prefix('/') {
             Some(rest) if !rest.contains(char::is_whitespace) => self
                 .host
@@ -2053,7 +2104,14 @@ impl Tui {
                     (name, c.about.to_string())
                 })
                 .collect(),
-            _ => Vec::new(),
+            // A path being typed after `@`. The same discovery surface the
+            // slash menu is, for the other thing people type by name and get
+            // wrong: a path. It lists and nothing more — finishing the word is
+            // still the typist's, exactly as it is for a command.
+            _ => match crate::text::being_pathed(&typed) {
+                Some(prefix) => paths_under(&cwd, prefix),
+                None => Vec::new(),
+            },
         };
         self.host.set_menu(menu);
     }

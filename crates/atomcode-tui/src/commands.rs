@@ -324,6 +324,11 @@ const SESSION: &[Command] = &[
         "[tools <服务器>|withdraw]",
         "MCP 服务器的状态;tools 列某个服务器挂上来的工具;withdraw 立刻撤下全部 MCP 工具",
     ),
+    Command::taking(
+        "language",
+        "[语言]",
+        "模型用哪种语言回答;不带参数则说现在是哪个,以及可选哪些",
+    ),
     Command::new("reload", "重新读取 skills、MCP 与配置,会话不变"),
     Command::new("logout", "把凭据拿出进程;会话留着"),
     Command::new("login", "用现在配置的凭据重新登录"),
@@ -872,6 +877,46 @@ impl CommandSet for SessionCommands {
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
+            // A named way in to one setting, because it is the one people
+            // look for by name. It is `/config language <x>` underneath — one
+            // implementation, so the two cannot drift.
+            "language" => {
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refusal) => return refusal,
+                };
+                let settings = match control
+                    .call(HostCommand::Settings {
+                        session: root.clone(),
+                    })
+                    .await
+                {
+                    Ok(HostReply::Settings { settings }) => settings,
+                    Ok(other) => return Outcome::Refused(format!("宿主答了别的:{other:?}")),
+                    Err(error) => return Outcome::Refused(refusal(error)),
+                };
+                let Some(setting) = settings.into_iter().find(|s| s.id == "language") else {
+                    return Outcome::Refused("这个宿主没有语言这一项".into());
+                };
+                let wanted = args.trim();
+                if wanted.is_empty() {
+                    return Outcome::Said(format!(
+                        "现在:{} · 可选:{} · {}生效",
+                        setting.value, setting.accepts, setting.applies
+                    ));
+                }
+                match control
+                    .call(HostCommand::SetSetting {
+                        session: root.clone(),
+                        id: "language".into(),
+                        value: wanted.to_string(),
+                    })
+                    .await
+                {
+                    Ok(_) => Outcome::Said(format!("语言:{wanted}({}生效)", setting.applies)),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
             "whoami" => {
                 let control = match host(control) {
                     Ok(control) => control,
@@ -1383,6 +1428,64 @@ mod tests {
             ]
         );
     }
+    /// `/language` is a named way in to one setting, and it is that setting —
+    /// not a second copy of it.
+    #[tokio::test]
+    async fn language_reads_and_writes_the_one_setting_it_names() {
+        let host = Arc::new(Recording::default());
+        let language = || atomcode_kernel::host::Setting {
+            id: "language".into(),
+            label: "语言".into(),
+            value: "zh".into(),
+            accepts: "zh | en".into(),
+            applies: "下一回合".into(),
+        };
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::Settings {
+                settings: vec![language()],
+            }),
+            Ok(HostReply::Settings {
+                settings: vec![language()],
+            }),
+            Ok(HostReply::Done),
+            Ok(HostReply::Settings {
+                settings: Vec::new(),
+            }),
+        ]);
+        let (app, _client, all) = following(&host);
+
+        match all.dispatch("/language", &app.context()).await {
+            Outcome::Said(text) => {
+                assert!(text.contains("zh") && text.contains("zh | en"), "{text}")
+            }
+            other => panic!("{other:?}"),
+        }
+        match all.dispatch("/language en", &app.context()).await {
+            Outcome::Said(text) => assert!(text.contains("en"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        // A host with no such setting says so rather than pretending.
+        assert!(matches!(
+            all.dispatch("/language en", &app.context()).await,
+            Outcome::Refused(_)
+        ));
+
+        let lead = || "lead".to_string();
+        assert_eq!(
+            *host.asked.lock().unwrap(),
+            vec![
+                HostCommand::Settings { session: lead() },
+                HostCommand::Settings { session: lead() },
+                HostCommand::SetSetting {
+                    session: lead(),
+                    id: "language".into(),
+                    value: "en".into(),
+                },
+                HostCommand::Settings { session: lead() },
+            ]
+        );
+    }
+
     /// `/diff` answers the most-asked question of a coding session at two
     /// depths: which files, then what changed in one.
     ///
