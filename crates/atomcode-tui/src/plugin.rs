@@ -423,6 +423,79 @@ impl AgentClient {
 /// which is exactly when precision beats speed.
 const WHEEL_LINES: i32 = 1;
 
+/// Answer the password prompts `sudo` and `ssh` make, for as long as the screen
+/// is up.
+///
+/// `sudo` and `ssh` read a password from the tty — and this screen owns the tty,
+/// so a `sudo` inside a tool call waits forever for keys it will never get. Both
+/// programs prefer an `*_ASKPASS` helper when one is set; the `bash` tool sets
+/// those for every child it spawns, and this is the other end: the server they
+/// reach, and a modal that asks the person.
+///
+/// What comes back is returned rather than dropped: the guard removes the socket,
+/// and the pump ends with it. A screen that has gone away must not keep a socket
+/// that promises an answer.
+#[cfg(unix)]
+fn serve_askpass(
+    host: Arc<crate::host::Host>,
+    wake: mpsc::UnboundedSender<Wake>,
+) -> Option<atomcode_capabilities::askpass::server::AskpassServerGuard> {
+    use atomcode_capabilities::askpass;
+
+    // Five minutes, as the cache was built for: long enough that a `sudo` per
+    // tool call in one stretch of work asks once, short enough that a screen
+    // left open overnight does not still hold it.
+    let cache = Arc::new(askpass::cache::PasswordCache::new(
+        std::time::Duration::from_secs(300),
+    ));
+    let (mut env, prompts, guard) = askpass::server::start(cache).ok()?;
+    // Without the wrapper script there is nothing for sudo to exec, so the env
+    // is left unset and the whole thing degrades to what it is today: no
+    // askpass. Degrading beats a half-set environment that sends sudo to a
+    // script that is not there.
+    let script = std::env::current_exe().ok().and_then(|exe| {
+        env.sock_path
+            .parent()
+            .and_then(|dir| askpass::wrapper::write_askpass_script(&exe, dir).ok())
+    })?;
+    env.askpass_script = script;
+    askpass::set_env(env);
+    tokio::spawn(answer_prompts(host, wake, prompts));
+    Some(guard)
+}
+
+/// Put each prompt on screen and hand back what the person typed.
+///
+/// Split from [`serve_askpass`] so it can be judged without a socket: what is
+/// worth judging is that a prompt becomes a modal, that the answer reaches the
+/// one waiting for it, and that esc reaches them as a refusal.
+#[cfg(unix)]
+async fn answer_prompts(
+    host: Arc<crate::host::Host>,
+    wake: mpsc::UnboundedSender<Wake>,
+    mut prompts: tokio::sync::mpsc::Receiver<atomcode_capabilities::askpass::server::AskpassPrompt>,
+) {
+    while let Some(prompt) = prompts.recv().await {
+        let asking = Arc::new(crate::secret::SecretPrompt::new(prompt.prompt));
+        let reply = Mutex::new(Some(prompt.reply));
+        host.overlays.open(
+            asking,
+            Box::new(move |answer| {
+                if let Some(reply) = reply.lock().expect("askpass reply poisoned").take() {
+                    // `None` is a refusal — the person pressed esc — and every
+                    // reader downstream must take it as one.
+                    let _ = reply.send(answer);
+                }
+            }),
+        );
+        // The prompt arrives while nothing else is waking the loop: a turn is
+        // running and the screen is idle between frames.
+        if wake.send(Wake::Fact).is_err() {
+            break;
+        }
+    }
+}
+
 /// How many wakes are answered before a frame is owed regardless.
 ///
 /// The loop paints when the queue has run dry, so a burst of wakes — a turn
@@ -558,6 +631,13 @@ impl UserInterface for Tui {
                 }
             }
         });
+
+        // A password `sudo` or `ssh` wants, asked of the person instead of the
+        // tty this screen owns (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md`
+        // P0-1). Held to the end of this function: dropping the guard removes
+        // the socket, so a screen that is gone stops answering.
+        #[cfg(unix)]
+        let _askpass = serve_askpass(self.host.clone(), wake_tx.clone());
 
         // The session on screen, from its first fact: a resumed session and a
         // live one produce the same picture, because the history is facts too.
@@ -2545,5 +2625,142 @@ mod history_tests {
         recall_back(&mut m);
         recall_forward(&mut m);
         assert_eq!(m.input, "mine");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod askpass_tests {
+    use super::*;
+    use crate::module::Mounted;
+    use crate::modules::{input, status, transcript};
+    use crate::surface::{Key, KeyPress, Mods};
+    use atomcode_capabilities::askpass::server::AskpassPrompt;
+
+    fn screen() -> Arc<crate::host::Host> {
+        let mods = Arc::new(crate::module::Modules::new());
+        mods.add_producer(transcript::Transcript::new()).unwrap();
+        mods.add_view(Arc::new(Mounted::<status::Status>::new()))
+            .unwrap();
+        mods.add_view(Arc::new(Mounted::<input::Input>::new()))
+            .unwrap();
+        Arc::new(crate::host::Host::new(mods, crate::host::default_layout()))
+    }
+
+    fn press(key: Key) -> KeyPress {
+        KeyPress {
+            key,
+            mods: Mods::NONE,
+        }
+    }
+
+    fn typed(host: &crate::host::Host, text: &str) {
+        for c in text.chars() {
+            assert!(
+                !host.overlays.key(press(Key::Char(c))),
+                "typing does not close the prompt"
+            );
+        }
+    }
+
+    /// A password `sudo` asks for reaches the screen as a modal, and what the
+    /// person types reaches the one waiting for it — which is what makes a
+    /// `sudo` inside a tool call finish instead of hanging on a tty this screen
+    /// owns (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` P0-1).
+    #[tokio::test]
+    async fn a_password_sudo_asks_for_is_answered_from_the_screen() {
+        let host = screen();
+        let (wake, mut woken) = mpsc::unbounded_channel();
+        let (asking, prompts) = tokio::sync::mpsc::channel(4);
+        let pump = tokio::spawn(answer_prompts(host.clone(), wake, prompts));
+
+        let (reply, answered) = tokio::sync::oneshot::channel();
+        asking
+            .send(AskpassPrompt {
+                prompt: "[sudo] password for lichao:".into(),
+                key: "sudo".into(),
+                reply,
+            })
+            .await
+            .unwrap();
+        // The loop is woken: the prompt arrives mid-turn, when nothing else is
+        // waking it, and a modal nobody repaints is a modal nobody sees.
+        // With a deadline: a screen that is never told to repaint would
+        // otherwise make this judgement hang, and a hang reports as slow rather
+        // than as wrong.
+        let woke = tokio::time::timeout(std::time::Duration::from_secs(5), woken.recv()).await;
+        assert!(
+            matches!(woke, Ok(Some(Wake::Fact))),
+            "the screen is told to repaint (timed out or wrong wake)"
+        );
+        let open = host.overlays.current().expect("a modal is up");
+        assert_eq!(open.id(), "secret");
+        assert!(
+            open.title().contains("password for lichao"),
+            "asked in the words the program used: {}",
+            open.title()
+        );
+
+        typed(&host, "hunter2");
+        assert!(
+            host.overlays.key(press(Key::Enter)),
+            "enter closes the prompt"
+        );
+        assert_eq!(answered.await.unwrap().as_deref(), Some("hunter2"));
+        drop(asking);
+        pump.await.unwrap();
+    }
+
+    /// Esc reaches the asking program as a refusal, never as an empty password:
+    /// `sudo` given an empty one *tries* it and burns an attempt.
+    #[tokio::test]
+    async fn esc_reaches_sudo_as_a_refusal_not_as_an_empty_password() {
+        let host = screen();
+        let (wake, _woken) = mpsc::unbounded_channel();
+        let (asking, prompts) = tokio::sync::mpsc::channel(4);
+        let pump = tokio::spawn(answer_prompts(host.clone(), wake, prompts));
+
+        let (reply, answered) = tokio::sync::oneshot::channel();
+        asking
+            .send(AskpassPrompt {
+                prompt: "password:".into(),
+                key: "sudo".into(),
+                reply,
+            })
+            .await
+            .unwrap();
+        while host.overlays.current().is_none() {
+            tokio::task::yield_now().await;
+        }
+        typed(&host, "half a password");
+        assert!(host.overlays.key(press(Key::Esc)), "esc closes the prompt");
+        assert_eq!(answered.await.unwrap(), None, "a refusal, not a blank");
+        drop(asking);
+        pump.await.unwrap();
+    }
+
+    /// The other half: a child process can find the server. Without the env
+    /// vars and a script to exec, `sudo` never asks at all — it goes to the tty
+    /// and hangs, which is the state this replaced.
+    #[tokio::test]
+    async fn a_child_process_can_find_the_prompt_we_would_answer() {
+        let host = screen();
+        let (wake, _woken) = mpsc::unbounded_channel();
+        let guard = serve_askpass(host, wake).expect("the server starts");
+        let env = atomcode_capabilities::askpass::current_env()
+            .expect("the environment a child is given");
+        assert!(env.sock_path.exists(), "the socket is there to connect to");
+        assert!(
+            env.askpass_script.is_file(),
+            "and a script for sudo to exec: {:?}",
+            env.askpass_script
+        );
+        assert!(!env.token.is_empty(), "with a token to authenticate");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&env.askpass_script)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert!(mode & 0o111 != 0, "executable: {mode:o}");
+        drop(guard);
     }
 }

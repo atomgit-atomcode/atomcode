@@ -20,6 +20,10 @@ atomcode-kernel = { path = "../atomcode-kernel" }
 atomcode-capabilities = { path = "../atomcode-capabilities", default-features = false, features = [
     "tools",
 ] }
+# Wiping a typed password when the prompt closes (`secret.rs`). The same crate
+# the askpass server holds its cache in, so the secret is zeroized on both ends
+# of the one hop it makes.
+zeroize = "1"
 crossterm = { version = "0.29", features = ["event-stream"] }
 # Reading the clipboard. The surface is the only row allowed to talk to the
 # terminal, and the clipboard is the terminal's — so the platform lives here,
