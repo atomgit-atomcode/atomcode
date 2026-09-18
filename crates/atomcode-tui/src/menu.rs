@@ -28,7 +28,8 @@ use crate::width;
 pub struct Item {
     pub value: String,
     pub label: String,
-    /// Shown dimmed after the label. Empty for an item that needs no gloss.
+    /// Shown dimmed after the label, in the column every other gloss is in.
+    /// Empty for an item that needs no gloss.
     pub about: String,
 }
 
@@ -75,6 +76,21 @@ pub struct Menu {
 /// Cells of runway to the right of the words, so the panel does not look
 /// pinched against its own text.
 const TRAILING: usize = 2;
+
+/// The tab stop the glosses line up on, in cells.
+///
+/// A stop and not "as wide as the widest name in the table": the widest label
+/// the command surface ships is `effort <low|medium|high|xhigh|max|default>` at
+/// 42 cells, and one command's argument list must not push every gloss in the
+/// table to the right of the panel. A name that runs past the stop is simply not
+/// padded, so it keeps the plain gap and its gloss starts late — on the handful
+/// of rows whose argument list is a sentence that reads as intended, and
+/// everywhere else the second column *is* a column.
+///
+/// Sixteen because that is where the names people actually type end: every
+/// `name + argument` in the table is inside it but for `effort`, `mode`, `mcp`
+/// and `rewind`, whose argument lists are a sentence.
+const NAME_STOP: usize = 16;
 
 impl Menu {
     pub fn new(at: (u16, u16), items: Vec<Item>) -> Option<Self> {
@@ -413,6 +429,10 @@ impl Slash {
     /// reverse, for the reason [`Menu::render`] gives — and every row is filled
     /// to the rect with the panel's own colour, so the list is a surface over
     /// the conversation rather than words with the conversation around them.
+    ///
+    /// The names are widened to one column so the glosses line up — see
+    /// [`name_column`] — which is what makes this read as a table of commands
+    /// rather than as a ragged list that happens to have two parts per line.
     pub fn render(&self, rect: Rect, rows: usize) -> Vec<Line> {
         let w = rect.w as usize;
         if w == 0 || rows == 0 {
@@ -420,6 +440,7 @@ impl Slash {
         }
         let panel = theme::bg(Role::PanelBg).under(theme::fg(Role::PanelFg));
         let start = self.window(rows);
+        let column = name_column(&self.items);
         let mut out: Vec<Line> = Vec::with_capacity(rows);
         for i in 0..rows {
             let index = start + i;
@@ -434,7 +455,7 @@ impl Slash {
                     let mut spans = vec![
                         Span::styled("  /".to_string(), base),
                         Span::styled(
-                            item.label.clone(),
+                            widen(&item.label, column),
                             if here {
                                 base
                             } else {
@@ -479,6 +500,41 @@ fn pad(line: Line, w: usize, style: Style) -> Line {
     let mut spans = line.spans;
     spans.push(Span::styled(" ".repeat(w - used), style));
     Line::from_spans(spans).truncate(w)
+}
+
+/// The cell the glosses start at: one past the widest name, up to the stop.
+///
+/// A list of names and what they do reads as a table only if the second column
+/// is a column. Ragged glosses — the difference between `/copy` and `/resume` is
+/// four cells — make the eye jump to the start of every line to find the left
+/// edge again, which is the work a discovery surface exists to save.
+///
+/// Measured over the items that **have** a gloss, so a list with none comes out
+/// exactly as it was drawn before, and over the whole list rather than the rows
+/// on screen: the column holds still while the window scrolls under the cursor,
+/// and a column that moved with the highlight would be worse than a ragged one.
+///
+/// Cells, not bytes, and through the same authority the rest of the layout
+/// measures with — a name with a CJK argument spec (`cd <目录>`) is wider than it
+/// looks, and this is the one place where getting that wrong shifts a column.
+fn name_column(items: &[Item]) -> usize {
+    items
+        .iter()
+        .filter(|i| !i.about.is_empty())
+        .map(|i| width::str_width(&i.label))
+        .max()
+        .unwrap_or(0)
+        .min(NAME_STOP)
+}
+
+/// A name widened to the column with blanks, so the gloss after it starts at the
+/// same cell on every row. A name past the column is left alone.
+fn widen(label: &str, column: usize) -> String {
+    let used = width::str_width(label);
+    if used >= column {
+        return label.to_string();
+    }
+    format!("{label}{}", " ".repeat(column - used))
 }
 
 #[cfg(test)]
@@ -792,6 +848,43 @@ mod tests {
         assert!(
             rows[0].contains("复制全文") && rows[0].contains("放剪贴板"),
             "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_glosses_start_in_one_column() {
+        // The point of the alignment: the second column is a column, so the eye
+        // reads the names down one edge and the glosses down another.
+        let list = Slash::new(vec![
+            Item::new("a", "a").about("短的"),
+            Item::new("bb", "bbbb").about("短的"),
+            Item::new("c", "cc").about("短的"),
+        ]);
+        let drawn: Vec<String> = slash_rows(&list, 40, 3)
+            .into_iter()
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        assert_eq!(drawn, ["  /a     短的", "  /bbbb  短的", "  /cc    短的"]);
+    }
+
+    #[test]
+    fn a_name_past_the_stop_keeps_the_plain_gap() {
+        // One command's argument list must not move every other gloss: the stop
+        // is where the column is, and a name that runs past it starts its gloss
+        // where its own width puts it. The names that fit are still aligned.
+        let long = "x".repeat(NAME_STOP + 4);
+        let list = Slash::new(vec![
+            Item::new("a", long.clone()).about("长的"),
+            Item::new("b", "bb").about("短的"),
+        ]);
+        let drawn: Vec<String> = slash_rows(&list, 40, 2)
+            .into_iter()
+            .map(|r| r.trim_end().to_string())
+            .collect();
+        assert_eq!(drawn[0], format!("  /{long}  长的"));
+        assert_eq!(
+            drawn[1],
+            format!("  /bb{}  短的", " ".repeat(NAME_STOP - 2))
         );
     }
 
