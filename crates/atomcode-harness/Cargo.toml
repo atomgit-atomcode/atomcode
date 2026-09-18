@@ -5,10 +5,6 @@ edition = "2021"
 description = "Spike: AtomCode's coding agent reassembled as a plugin tree on atomcode-plexus — no privileged core, every part a config row"
 publish = false
 
-[[bin]]
-name = "harness"
-path = "src/bin/harness.rs"
-
 [dependencies]
 atomcode-plexus = { path = "../atomcode-plexus" }
 # Value types only (Message/ToolCall/ToolDef/LlmProvider/Tool). The kernel's own

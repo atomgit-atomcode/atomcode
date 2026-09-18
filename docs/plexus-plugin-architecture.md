@@ -7,64 +7,40 @@
 
 ## 一、30 秒看到它跑起来
 
+> **`harness` 这个二进制已经删掉了**(2026-09-19)。它是这个 spike 的自用启动器 ——
+> 一个住在**机制** crate 里的产品入口,而机制层不该有自己的产品。下面那些命令行
+> 因此不再能跑,留在这里只为说明当初它长什么样。
+>
+> 现在要看这套东西跑起来,走真正的产品入口:
+>
+> ```sh
+> atomcode --tui          # 全屏前端
+> atomcode -p "修一下构建"  # 一次性
+> atomcode acp            # 给编辑器用的 ACP 服务端
+> ```
+>
+> 装配本身仍然是同一套:`atomcode-coding` 的 `CODING_DEFAULTS` + `CODING_ROWS`
+> 叠在 `atomcode-harness::bundle::INFRA` 上,一行一行地列出来,和下面描述的机制
+> 完全一致 —— 变的只是**谁**来列这张单子。
+
+<details>
+<summary>删掉之前它是这样跑的(仅作记录)</summary>
+
 ```sh
-# 不需要 API key：`llm` 那一行被换成脚本化的假 provider
 cargo run -p atomcode-harness --bin harness -- --offline "看看这个目录"
-
-# 打印实际挂载的插件树、fiber 状态、被填上的服务槽
 cargo run -p atomcode-harness --bin harness -- --offline --dump-config
-
-# 真实模型（真实 OpenAI 兼容适配器，就是 atomcode-capabilities 里那个）
-ATOMCODE_API_KEY=… ATOMCODE_BASE_URL=… ATOMCODE_MODEL=… \
-  cargo run -p atomcode-harness --bin harness -- "修一下构建"
-```
-
-随附 9 个 profile。每个都是「有序 bundle 列表 + 自己的 patch」，不是代码分支：
-
-```sh
 harness --list-profiles
-
-profiles:
-  embed      no front end; a library caller drives
-  full       everything on: code graph, web access, delegation
-  headless   one prompt, no rendering, no persistence — for evals and CI
-  oneshot    one prompt, one turn, exit
-  plan       read-only exploration: investigate and produce a plan
-  repl       an interactive terminal session that can ask questions
-  sdk        line-delimited JSON-RPC on stdio
-  web        an HTTP server with a live event stream
-
-bundles: base, embed-app, handle-app, oneshot-app, repl-app, sdk-app, web-app
-
-layer order: bundles -> the profile's patch -> ~/.atomcode/harness.patch.toml -> --patch overlays
+harness --profile repl                  # 行式终端会话
+harness --profile web                   # HTTP + SSE
+harness --profile sdk                   # stdio 上的 JSON-RPC
 ```
 
-四个前端，同一个 agent：
+`launch.rs` / `profile.rs` / `plugins/ui*.rs` 这几块还在 crate 里 —— 它们仍被
+若干判据当作被测对象。清掉它们是另一步,要先回答"harness 拿什么验证自己的行能
+装到一起"。
 
-```sh
-harness --profile repl                  # 行式终端会话，能问人、能 steering
-atui                                    # 全屏终端 UI（atomcode-tui 自己的 launcher）
-harness --profile web                   # HTTP + SSE 事件流 + 一个页面
-harness --profile sdk                   # stdio 上的 JSON-RPC，给程序用
-```
+</details>
 
-`sdk` 那条真的跑起来长这样：
-
-```
-$ echo '{"jsonrpc":"2.0","id":2,"method":"agent/send","params":{"text":"look"}}' | harness --profile sdk
-{"jsonrpc":"2.0","method":"session/event","params":{"event":{"kind":"user_message",…},"seq":3}}
-{"jsonrpc":"2.0","method":"session/event","params":{"event":{"kind":"step_start","step":1,…},"seq":4}}
-{"id":2,"jsonrpc":"2.0","result":{"steps":3,"stop":"Stopped","tool_calls":2,"turn":1,…}}
-```
-
-叠加层跟 profile 正交，任意组合：
-
-```sh
-harness --profile web --plan            # 浏览器里的只读探索
-harness --profile sdk --read-only       # 只读世界里的 JSON-RPC
-atui --full                             # 全屏 UI + 代码图 + 联网 + 委派
-harness --profile repl --patch mine.toml
-```
 
 ## 二、现在的规模
 
