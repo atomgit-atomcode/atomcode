@@ -207,15 +207,16 @@ pub struct Edit {
 pub struct Panel {
     /// What is typed in the search box.
     pub query: String,
-    /// Whether the search box has the keyboard, as opposed to the list.
-    pub searching: bool,
     /// The row the arrows are on, as an index into the *filtered* rows.
     pub cursor: usize,
-    /// The measure typed into the search box, when the search box is focused.
+    /// The measure typed into the search box.
     ///
-    /// Held separately from [`Panel::query`] because it is a different caret:
-    /// the search box and an edit are two fields, and one byte offset shared
-    /// between them puts the caret in the wrong place the moment both exist.
+    /// There is one field and one caret. An earlier version had a `searching`
+    /// flag and a caret that moved between two boxes, and it was wrong in the
+    /// way a panel cannot afford: the key that opened the search box ate the
+    /// character that opened it, so searching for a path lost its leading slash
+    /// and the list went blank under the person's hands. A panel whose whole
+    /// point is a filter does not need a mode for the filter — it is *in* it.
     pub query_caret: usize,
     /// The row being typed into, when one is.
     pub editing: Option<Edit>,
@@ -275,6 +276,21 @@ impl Panel {
         };
         self.query.remove(at);
         self.query_caret = at;
+        self.cursor = 0;
+        true
+    }
+
+    /// Empty the search box, and put the highlight back on the first row.
+    ///
+    /// What Escape does before it closes the panel: the unfiltered list is what
+    /// a person who has searched themselves into a corner wants back, and
+    /// closing would take the panel away with the search.
+    pub fn clear_search(&mut self) -> bool {
+        if self.query.is_empty() && self.query_caret == 0 {
+            return false;
+        }
+        self.query.clear();
+        self.query_caret = 0;
         self.cursor = 0;
         true
     }
@@ -345,10 +361,13 @@ pub fn key(view: &SettingsView, panel: &mut Panel, press: crate::surface::KeyPre
     let shown = view.matching(&panel.query);
     match (press.key, press.mods) {
         // Escape does the innermost thing, the same rule the composer's Escape
-        // follows: out of the search box, then out of the panel.
+        // follows: out of what is typed, then out of the panel. Clearing first
+        // is what makes a filter recoverable — a person who has narrowed the
+        // list to nothing wants the unfiltered list back, and closing the panel
+        // would throw the panel away with the search.
         (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => {
-            if panel.searching {
-                panel.searching = false;
+            if !panel.query.is_empty() {
+                panel.clear_search();
                 Step::Stay
             } else {
                 Step::Close
@@ -370,32 +389,23 @@ pub fn key(view: &SettingsView, panel: &mut Panel, press: crate::surface::KeyPre
             panel.move_by(10, shown.len());
             Step::Stay
         }
-        // `/` opens the search box only from a clean one: with a query already
-        // typed, a slash is a slash, and a person searching for a path should
-        // be able to type one.
-        //
-        // The key goes into the box on the way in. Swallowing it would mean a
-        // search for `/usr/local` could never match a path, because the one
-        // character that says "path" is the one the panel ate — and a box that
-        // drops what was typed is a box that lies about what it is searching
-        // for.
-        (Key::Char('/'), Mods::NONE) if !panel.searching && panel.query.is_empty() => {
-            panel.searching = true;
-            panel.type_into_search('/');
-            Step::Stay
-        }
-        (Key::Backspace, _) if panel.searching => {
+        (Key::Backspace, _) => {
             panel.backspace_search();
             Step::Stay
         }
-        (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) if panel.searching => {
+        // An ordinary character goes into the search box, and the list narrows
+        // as it is typed. **Every** ordinary character, and that is the point:
+        // there is no "key that opens the search box", so there is no key whose
+        // own character has to be swallowed to open it. `/` is a slash here
+        // like anywhere else — which is what makes searching for a path
+        // possible at all.
+        (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) => {
             panel.type_into_search(c);
             Step::Stay
         }
         // Confirm the highlighted row: cycle it, or open an editor when the kind
-        // has no cycle to offer. Space does the same thing, because the legend
-        // says so and a legend that lies is worse than no legend.
-        (Key::Enter, _) | (Key::Char(' '), Mods::NONE) if !panel.searching => {
+        // has no cycle to offer.
+        (Key::Enter, _) => {
             let Some(row) = shown.get(panel.cursor) else {
                 return Step::Stay;
             };
@@ -690,34 +700,66 @@ mod tests {
     }
 
     #[test]
-    fn slash_opens_the_search_box_and_escape_leaves_it_before_the_panel() {
+    fn the_panel_opens_in_the_search_box_and_typing_filters_it() {
+        // There is no key that opens the search box: the panel *is* in it, and
+        // an ordinary character is a search character. The version this replaced
+        // bound `/` to "start searching" and ate the slash doing it, so a person
+        // searching for a path lost the character that says "path" and watched
+        // the list go blank.
         let view = view();
         let mut panel = Panel::new();
-        assert_eq!(key(&view, &mut panel, KeyPress::ch('/')), Step::Stay);
-        assert!(panel.searching, "the search box has the keyboard");
+        assert_eq!(panel.query, "", "nothing typed yet");
+        assert_eq!(view.matching(&panel.query).len(), 3, "and everything shows");
 
-        // Escape does the innermost thing: out of the box, not out of the panel.
+        for c in "第一".chars() {
+            assert_eq!(key(&view, &mut panel, KeyPress::ch(c)), Step::Stay);
+        }
+        assert_eq!(panel.query, "第一");
         assert_eq!(
-            key(&view, &mut panel, KeyPress::plain(Key::Esc)),
-            Step::Stay
-        );
-        assert!(!panel.searching);
-        assert_eq!(
-            key(&view, &mut panel, KeyPress::plain(Key::Esc)),
-            Step::Close,
-            "and now, with nothing inner left, it closes"
+            view.matching(&panel.query).len(),
+            1,
+            "and the list narrowed as it was typed, with no key pressed first"
         );
     }
 
     #[test]
-    fn a_slash_is_a_slash_once_a_query_is_being_typed() {
-        // Searching for a path has to be possible, so the key that opened the box
-        // stops being special the moment there is something in it.
+    fn a_slash_is_a_slash_and_searching_for_a_path_is_possible() {
+        // The regression this whole change is about, pinned: `/` is a character
+        // like any other. It used to be the key that opened the box and was
+        // swallowed doing it, so `/usr` searched for `usr`.
         let view = view();
         let mut panel = Panel::new();
-        key(&view, &mut panel, KeyPress::ch('/'));
-        key(&view, &mut panel, KeyPress::ch('/'));
-        assert_eq!(panel.query, "//", "both went into the box");
+        for c in "/usr/local".chars() {
+            key(&view, &mut panel, KeyPress::ch(c));
+        }
+        assert_eq!(panel.query, "/usr/local", "every character arrived");
+    }
+
+    #[test]
+    fn escape_clears_what_is_typed_before_it_closes_the_panel() {
+        // A filter is recoverable: someone who has narrowed the list to nothing
+        // wants the unfiltered list back, and closing would take the panel away
+        // with the search.
+        let view = view();
+        let mut panel = Panel::new();
+        for c in "zzz".chars() {
+            key(&view, &mut panel, KeyPress::ch(c));
+        }
+        assert!(view.matching(&panel.query).is_empty());
+
+        assert_eq!(
+            key(&view, &mut panel, KeyPress::plain(Key::Esc)),
+            Step::Stay,
+            "the first escape clears"
+        );
+        assert_eq!(panel.query, "", "and the list is whole again");
+        assert_eq!(view.matching(&panel.query).len(), 3);
+
+        assert_eq!(
+            key(&view, &mut panel, KeyPress::plain(Key::Esc)),
+            Step::Close,
+            "and now, with nothing left to clear, it closes"
+        );
     }
 
     #[test]
@@ -727,29 +769,47 @@ mod tests {
         let view = view();
         let mut panel = Panel::new();
         panel.cursor = 2;
-        key(&view, &mut panel, KeyPress::ch('/'));
         key(&view, &mut panel, KeyPress::ch('第'));
         assert_eq!(panel.cursor, 0);
+    }
+
+    #[test]
+    fn enter_still_takes_the_highlighted_row_while_the_search_box_has_the_keyboard() {
+        // The thing that would break if the box "had focus" in the modal sense:
+        // enter must go on confirming the row. A panel where typing filters and
+        // enter does nothing is a panel nobody can change anything in.
+        let view = view();
+        let mut panel = Panel::new();
+        for c in "第一".chars() {
+            key(&view, &mut panel, KeyPress::ch(c));
+        }
+        assert_eq!(
+            key(&view, &mut panel, KeyPress::plain(Key::Enter)),
+            Step::Set {
+                id: "a.first".into(),
+                value: "false".into()
+            },
+            "the filtered, highlighted row is the one enter takes"
+        );
     }
 
     #[test]
     fn backspace_in_the_search_box_takes_a_character_not_a_byte() {
         let view = view();
         let mut panel = Panel::new();
-        key(&view, &mut panel, KeyPress::ch('/'));
         for c in "第一".chars() {
             key(&view, &mut panel, KeyPress::ch(c));
         }
-        // The slash that opened the box went into it, so it is part of the query.
-        assert_eq!(panel.query, "/第一");
+        assert_eq!(panel.query, "第一");
         key(&view, &mut panel, KeyPress::plain(Key::Backspace));
-        assert_eq!(panel.query, "/第", "one character, not one byte");
-        key(&view, &mut panel, KeyPress::plain(Key::Backspace));
-        assert_eq!(panel.query, "/");
+        assert_eq!(panel.query, "第", "one character, not one byte");
         key(&view, &mut panel, KeyPress::plain(Key::Backspace));
         assert_eq!(panel.query, "");
-        // And at the start it is a no-op rather than a panic.
-        key(&view, &mut panel, KeyPress::plain(Key::Backspace));
+        // And at the start it is a no-op rather than a panic — and not a close.
+        assert_eq!(
+            key(&view, &mut panel, KeyPress::plain(Key::Backspace)),
+            Step::Stay
+        );
         assert_eq!(panel.query, "");
     }
 
@@ -759,7 +819,6 @@ mod tests {
         // something anyway would be changing a setting nobody can see.
         let view = view();
         let mut panel = Panel::new();
-        key(&view, &mut panel, KeyPress::ch('/'));
         for c in "zzzz".chars() {
             key(&view, &mut panel, KeyPress::ch(c));
         }
@@ -768,5 +827,25 @@ mod tests {
             key(&view, &mut panel, KeyPress::plain(Key::Enter)),
             Step::Stay
         );
+    }
+
+    #[test]
+    fn the_search_box_and_a_rows_field_do_not_both_type() {
+        // One keyboard, one destination: with a row's field open, characters go
+        // there — and the search box keeps what it had.
+        let view = view();
+        let mut panel = Panel::new();
+        key(&view, &mut panel, KeyPress::ch('第'));
+        panel.cursor = 1;
+        key(&view, &mut panel, KeyPress::plain(Key::Enter));
+        assert!(panel.editing.is_some(), "the number's field is open");
+
+        key(&view, &mut panel, KeyPress::ch('9'));
+        assert_eq!(
+            panel.editing.as_ref().map(|e| e.value.as_str()),
+            Some("509"),
+            "the 9 went into the field"
+        );
+        assert_eq!(panel.query, "第", "and the search box is untouched");
     }
 }

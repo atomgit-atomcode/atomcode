@@ -61,8 +61,11 @@ impl View for Settings {
         let rows = layout(&vp.moment.settings, panel, w, vp.rect.h as usize);
         rows.into_iter()
             .map(|row| match row {
+                Row::Top | Row::Bottom => panel_edge(w, vp.moment.caps),
                 Row::Blank => Line::empty(),
-                Row::Search { caret } => search_line(&panel.query, caret, w, panel.searching),
+                Row::BoxTop => box_edge(w, vp.moment.caps, true),
+                Row::Search { caret } => search_line(&panel.query, caret, w, vp.moment.caps),
+                Row::BoxBottom => box_edge(w, vp.moment.caps, false),
                 Row::Setting { index } => {
                     setting_line(&vp.moment.settings, panel, index, w, vp.moment.caps)
                 }
@@ -91,15 +94,23 @@ impl View for Settings {
     /// about the width it is asked at, and one long label wraps to two rows
     /// where a short one takes one. A box that reports a height it does not then
     /// draw is how a panel cuts its own end off.
+    ///
+    /// **Counted with the query empty, whatever is typed.** The panel is the
+    /// newest thing on the tail, so the tail's split is measured from the bottom
+    /// up and the panel's *bottom* edge is the fixed one; a height that followed
+    /// the filtered list would move the top edge — and the search box lives
+    /// there, so it would slide down the screen under the person's fingers as
+    /// the list narrowed. One character shortening the list would be the box
+    /// jumping a row. So the height is the one the panel opened with, and a
+    /// shorter list is drawn as a shorter list inside it, with the difference
+    /// left blank.
     fn height(_state: &State, moment: &Moment, width: u16) -> Height {
-        let Some(panel) = moment.settings_panel.as_ref() else {
-            return Height::Hug(0);
-        };
-        if width == 0 {
+        if moment.settings_panel.is_none() || width == 0 {
             return Height::Hug(0);
         }
-        let rows = layout(&moment.settings, panel, width as usize, usize::MAX).len();
-        Height::Hug(rows.min(u16::MAX as usize) as u16)
+        // The same number [`layout`] pads to, from the same function, so the
+        // report and the drawing cannot disagree about how tall the panel is.
+        Height::Hug(anchor(&moment.settings).min(u16::MAX as usize) as u16)
     }
 }
 
@@ -112,13 +123,25 @@ impl View for Settings {
 /// step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Row {
+    /// The panel's top edge: where the panel begins.
+    Top,
+    /// A margin row, above the box or above the list.
     Blank,
-    /// The search box. `caret` is the gap to draw, or `None` when the box does
-    /// not have the keyboard — a caret blinking in a field nobody is typing
-    /// into is a lie about where the next character goes.
+    /// The search box's top edge.
+    BoxTop,
+    /// What is typed into the search box. `caret` is the gap to draw, or `None`
+    /// while a row's field has the keyboard instead — a caret blinking in a box
+    /// nobody is typing into is a lie about where the next character goes.
+    ///
+    /// The box is drawn as a frame rather than as a bare line, which is what
+    /// makes it *look* like something that takes keys: the panel opens with the
+    /// keyboard already in it (see [`crate::settings::Panel`]), and a person
+    /// should be able to see that without being told.
     Search {
         caret: Option<usize>,
     },
+    /// The search box's bottom edge.
+    BoxBottom,
     /// A setting, by index into the *filtered* rows.
     Setting {
         index: usize,
@@ -136,7 +159,18 @@ enum Row {
     /// The filtered list is empty.
     Nothing,
     Legend,
+    /// The panel's bottom edge: where it ends.
+    Bottom,
 }
+
+/// Where the border of the panel and of the search box stands.
+///
+/// **One number, one place.** The corners of the box, its walls, and the pointer
+/// on every row below it are the same column — a `┌` one cell to the right of
+/// the `│` under it is the misalignment this constant exists to make impossible.
+/// Content therefore starts at [`LEAD`], which is one cell of wall and one of
+/// air.
+const BORDER_COL: usize = 0;
 
 /// The rows this panel makes at this width, cut down to `h`.
 ///
@@ -147,11 +181,74 @@ fn layout(settings: &SettingsView, panel: &Panel, w: usize, h: usize) -> Vec<Row
     if w == 0 || h == 0 {
         return Vec::new();
     }
+    let mut rows = rows_for(settings, panel);
+    // A shorter list is a shorter list inside the same box, not a shorter box.
+    //
+    // The height is anchored when the panel opens ([`anchor`]), so the rows a
+    // filter took away are filled in **above the closing rule**: both edges of
+    // the outer frame stay put, the search box stays where the hand left it, and
+    // only the list inside gets shorter. Without this the closing rule would
+    // float up under a two-item result and the panel would look cut off.
+    //
+    // Filled to the *anchor* and not to the rect: the rect may be taller than
+    // the panel ever asks for, and drawing into rows nobody asked for would be a
+    // report about itself the panel then contradicts.
+    let anchor = anchor(settings);
+    if rows.len() < anchor {
+        let at = rows.len() - 1;
+        rows.splice(at..at, std::iter::repeat_n(Row::Blank, anchor - rows.len()));
+    }
+    fit(rows, h)
+}
+
+/// The height the panel opened with, in rows — the one it keeps.
+///
+/// Counted by laying out the rows with the query *empty*, so a filter changes
+/// what is inside the panel and never how tall it is. This is the single
+/// definition of the anchor: [`layout`] pads up to it and
+/// [`Settings::height`](crate::module::View::height) reports it, so the two
+/// cannot disagree about how tall the panel is.
+///
+/// **Neither the query nor the width changes it.** The query is held empty for
+/// the reason above; the width is not a parameter because every row this panel
+/// draws is *truncated* to its rect rather than wrapped into it (`width::take_width`
+/// in the drawing functions), so a label too long for one width is cut short,
+/// not given a second row. One row per setting, always — which is also what
+/// makes the anchor a number that can be computed once.
+fn anchor(settings: &SettingsView) -> usize {
+    rows_for(settings, &Panel::new()).len()
+}
+
+/// The panel's rows as the query leaves them, before any padding or cutting.
+///
+/// Takes no width: which rows are drawn is decided by the query, and how tall
+/// each of them is at a given width is the caller's business — [`anchor`] counts
+/// them for a width it is given. A width parameter here would be accepted and
+/// ignored, which is the shape of a bug waiting for someone to rely on it.
+fn rows_for(settings: &SettingsView, panel: &Panel) -> Vec<Row> {
     let shown = settings.matching(&panel.query);
-    let mut rows = vec![Row::Blank];
+    // The panel's own rule first, then the box, then the list, then the rule
+    // that closes it. A frame around the whole thing is what separates a panel
+    // from the conversation it was pulled up over: without it the last setting
+    // and the first line of what was said before run together.
+    let mut rows = vec![Row::Top];
+    // The box is three rows — two edges and the text — because that is what
+    // says "keys go here" without a caption saying it. The caret is drawn unless
+    // a row's own field has the keyboard: two carets would be two answers to
+    // where the next character goes.
+    rows.push(Row::BoxTop);
     rows.push(Row::Search {
-        caret: panel.searching.then_some(panel.query_caret),
+        caret: panel.editing.is_none().then_some(panel.query_caret),
     });
+    rows.push(Row::BoxBottom);
+    // The legend goes here, against the box, and not at the foot of the panel.
+    //
+    // It is about the search box — what the arrows and the return key would do
+    // to the list right under it — so putting it *at* the list's head makes it
+    // read as that list's footer. At the panel's foot it was a screen away from
+    // the thing it explains, and on a full panel it was the row most easily
+    // pushed off the end by a short rect.
+    rows.push(Row::Legend);
     rows.push(Row::Blank);
 
     if shown.is_empty() {
@@ -171,44 +268,121 @@ fn layout(settings: &SettingsView, panel: &Panel, w: usize, h: usize) -> Vec<Row
         }
     }
 
-    rows.extend([Row::Blank, Row::Legend]);
-    fit(rows, h)
+    // Only the margin and the closing rule are left at the foot: the legend
+    // moved up under the search box (see above), so nothing here explains the
+    // list from a screen away.
+    rows.extend([Row::Blank, Row::Bottom]);
+    rows
 }
 
 /// Cut the layout down to the height it was given, least important row first.
 ///
-/// The same order and the same reason as the question panel's `fit`: the margin
-/// above goes, then the legend, and only then the tail of what is left.
+/// What gives way is the furniture that sits *lowest on the screen* — the
+/// panel's closing rule, the legend, the margins, the opening rule — and the
+/// order falls out of the layout rather than being listed again here: the last
+/// furniture row in the vector is the one furthest down, so removing
+/// `rposition`-wise takes them from the bottom up.
+///
 /// Truncating the end instead would take the settings first — the one thing the
-/// panel is for — and leave a search box explaining how to work it.
+/// panel is for — and leave a box explaining how to work an empty list. That is
+/// the same bargain the question panel strikes; what changed with the frame is
+/// which rows *are* furniture, so the search box and its two edges are never
+/// sacrificed: they are where the typing goes.
 fn fit(mut rows: Vec<Row>, h: usize) -> Vec<Row> {
     if rows.len() <= h {
         return rows;
     }
-    if rows.first() == Some(&Row::Blank) {
-        rows.remove(0);
-    }
-    if rows.last() == Some(&Row::Legend) {
-        rows.pop();
-        if rows.last() == Some(&Row::Blank) {
-            rows.pop();
-        }
+    while rows.len() > h {
+        let Some(at) = rows
+            .iter()
+            .rposition(|r| matches!(r, Row::Bottom | Row::Legend | Row::Blank | Row::Top))
+        else {
+            break;
+        };
+        rows.remove(at);
     }
     rows.truncate(h);
     rows
 }
 
-/// The search box, with a caret when it has the keyboard.
-fn search_line(query: &str, caret: Option<usize>, w: usize, focused: bool) -> Line {
-    let base = theme::fg(if focused { Role::Warning } else { Role::Muted });
-    let mut spans = vec![Span::styled("  ", Style::new())];
-    if query.is_empty() && caret.is_none() {
-        spans.push(Span::styled(
-            "按 / 搜索".to_string(),
-            theme::fg(Role::Muted),
-        ));
-        return Line::from_spans(spans).truncate(w);
+/// One edge of the search box: `┌───┐` above, `└───┘` below.
+///
+/// Drawn through [`Caps`] rather than with literal box characters, so a terminal
+/// that cannot show them gets `+---+` instead of a row of question marks. The
+/// panel is a frame in the shape it draws, not a claim about the font.
+///
+/// The corners stand in [`BORDER_COL`] and the run carries out to the last cell,
+/// which is what makes them line up with the walls of the rows between them.
+/// They used to be pushed one cell right by a leading space, so the top-left
+/// corner sat over the `│` under it by exactly that cell — the misalignment the
+/// `BORDER_COL` constant is here to stop happening again.
+fn box_edge(w: usize, caps: crate::caps::Caps, top: bool) -> Line {
+    use crate::caps::Glyph;
+    if w == 0 {
+        return Line::empty();
     }
+    // Narrower than a frame is not a frame: below this there is no room for two
+    // corners and a run between them, and half a box reads as damage. A plain
+    // rule instead, which still reads as "a box is here, it just does not fit".
+    if w < 4 {
+        return Line::styled(caps.g(Glyph::Horizontal).repeat(w), theme::fg(Role::Border))
+            .truncate(w);
+    }
+    let (left, right) = match top {
+        true => (Glyph::TopLeft, Glyph::TopRight),
+        false => (Glyph::BottomLeft, Glyph::BottomRight),
+    };
+    let run = w.saturating_sub(2 + BORDER_COL);
+    let mut spans = vec![Span::styled(" ".repeat(BORDER_COL), Style::new())];
+    spans.push(Span::styled(
+        format!("{}{}", caps.g(left), caps.g(Glyph::Horizontal).repeat(run)),
+        theme::fg(Role::Border),
+    ));
+    spans.push(Span::styled(
+        caps.g(right).to_string(),
+        theme::fg(Role::Border),
+    ));
+    Line::from_spans(spans).truncate(w)
+}
+
+/// The panel's own top or bottom rule: a straight line, all the way across.
+///
+/// **No corners.** The frame it draws had them, and on a terminal the pair of
+/// them at the left read as a second box around the panel — a `┌` over a `┌`,
+/// which says "here is another container" when what it means is "the panel
+/// starts here". A rule is enough to say that, and it does not compete with the
+/// one box the panel actually has: the search field's.
+///
+/// Drawn through [`Caps`], so an ASCII terminal gets `-` rather than `─`.
+fn panel_edge(w: usize, caps: crate::caps::Caps) -> Line {
+    use crate::caps::Glyph;
+    if w == 0 {
+        return Line::empty();
+    }
+    Line::styled(caps.g(Glyph::Horizontal).repeat(w), theme::fg(Role::Border)).truncate(w)
+}
+
+/// The search box's text, with a caret while the box has the keyboard.
+///
+/// No placeholder caption. The box is drawn as a box and the caret is in it,
+/// which says "type here" better than a sentence about a key — and the key that
+/// sentence used to name is gone: it was the character it ate.
+fn search_line(query: &str, caret: Option<usize>, w: usize, caps: crate::caps::Caps) -> Line {
+    use crate::caps::Glyph;
+    if w == 0 {
+        return Line::empty();
+    }
+    // Too narrow for a frame: the text stands alone rather than behind a
+    // one-cell wall that would eat it.
+    let (lead, base) = if w < 4 {
+        (String::new(), theme::fg(Role::Muted))
+    } else {
+        (
+            format!("{} ", caps.g(Glyph::Vertical)),
+            theme::fg(Role::Warning),
+        )
+    };
+    let mut spans = vec![Span::styled(lead, theme::fg(Role::Border))];
     match caret {
         Some(at) => spans.extend(caret_spans(query, at, base, w.saturating_sub(2))),
         None => spans.push(Span::styled(query.to_string(), base)),
@@ -358,15 +532,17 @@ fn kind_hint(kind: &SettingKind) -> Option<&'static str> {
 }
 
 /// What the legend says, which depends on what the keys would do right now.
+///
+/// No longer brands a key for the search box: there is none. Typing goes to the
+/// box, so the legend says what Escape would do *instead* — the only thing about
+/// the box a person has to be told.
 fn legend(panel: &Panel) -> Vec<(&'static str, &'static str)> {
     if panel.editing.is_some() {
         return vec![("⏎", "保存"), ("esc", "取消")];
     }
     let mut out = vec![("↑↓", "选择"), ("⏎", "修改")];
-    if panel.searching {
-        out.push(("esc", "退出搜索"));
-    } else {
-        out.push(("/", "搜索"));
+    if !panel.query.is_empty() {
+        out.push(("esc", "清空搜索"));
     }
     out.push(("esc", "关闭"));
     out
@@ -441,6 +617,7 @@ mod tests {
     use crate::frame::Rect;
     use crate::module::{Mounted, ViewObject};
     use crate::settings::{Applies, Edit, SettingRow};
+    use crate::surface::Key;
 
     fn row(id: &str, label: &str, value: &str, kind: SettingKind) -> SettingRow {
         SettingRow {
@@ -491,6 +668,16 @@ mod tests {
     }
     use std::sync::Arc;
 
+    /// Whether a row is one of the panel's rules: a run of `─` and nothing else.
+    ///
+    /// The panel's own rules are straight lines ([`panel_edge`]), so this is the
+    /// shape they have — as opposed to the search box's edges, which carry
+    /// corners, and the rows in between. Used by several criteria that have to
+    /// tell "the panel starts here" from "a setting is drawn here".
+    fn is_rule(line: &str) -> bool {
+        !line.is_empty() && line.chars().all(|c| c == '─')
+    }
+
     #[test]
     fn nothing_open_is_not_a_panel() {
         let m = moment(None, two());
@@ -532,34 +719,316 @@ mod tests {
     }
 
     #[test]
-    fn a_short_rect_loses_the_legend_before_it_loses_a_setting() {
+    fn the_panel_keeps_its_height_while_the_list_narrows() {
+        // The complaint this was written for: the panel rides the tail, the tail
+        // is measured from the bottom, so a height that followed the filter
+        // would move the panel's *top* — where the search box is. Typing one
+        // character would slide the box down the screen under the person's
+        // fingers.
+        let m = moment(Some(Panel::new()), two());
+        let base = match <Settings as View>::height(&State, &m, 70) {
+            Height::Hug(n) => n,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        for query in ["主", "单回合", "zzz", "zzzzzz", "a"] {
+            let mut panel = Panel::new();
+            for c in query.chars() {
+                panel.type_into_search(c);
+            }
+            let narrowed = moment(Some(panel.clone()), two());
+            let now = match <Settings as View>::height(&State, &narrowed, 70) {
+                Height::Hug(n) => n,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(
+                now,
+                base,
+                "`{query}` narrowed the list to {} rows and the panel changed height",
+                two().matching(&panel.query).len()
+            );
+
+            // And it still draws exactly that many rows — the anchor is not a
+            // report the drawing then contradicts.
+            assert_eq!(
+                drawn(&narrowed, 70, 40).len(),
+                base as usize,
+                "the panel draws the height it reports, for `{query}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrowed_list_keeps_the_box_and_both_edges_where_they_were() {
+        // The point of anchoring, asserted on the rows rather than on the count:
+        // the search box and the two rules around the panel do not move. A list
+        // that got shorter is drawn shorter *inside* them.
+        let m = moment(Some(Panel::new()), two());
+        let full = drawn(&m, 70, 40);
+
+        let mut panel = Panel::new();
+        for c in "zzz".chars() {
+            panel.type_into_search(c);
+        }
+        let narrowed = drawn(&moment(Some(panel), two()), 70, 40);
+
+        assert_eq!(
+            full.len(),
+            narrowed.len(),
+            "same height, so the frame is where it was:\n{}\n---\n{}",
+            full.join("\n"),
+            narrowed.join("\n")
+        );
+
+        // Compared by *row position*, not by guessing at the content. The panel's
+        // shape is fixed: the outer rule, the box's top edge, the query, the
+        // box's bottom edge, a margin, the list, then a margin, the legend and
+        // the closing rule. Anchoring the height is what keeps every one of
+        // those rows at the index it had.
+        //
+        // Two earlier versions of this assertion were wrong in instructive ways:
+        // classifying rows by looking for `│` made the *query* row furniture and
+        // forbade typing from changing anything; taking the last three rows as
+        // fixed forbade the legend from saying `esc 清空搜索` — which is exactly
+        // what it is for.
+        let fixed = [0, 1, 3, full.len() - 1];
+        for i in fixed {
+            assert_eq!(
+                full[i], narrowed[i],
+                "row {i} is the frame's, so it must not move:\n{:?}\n{:?}",
+                full[i], narrowed[i]
+            );
+        }
+        assert!(
+            narrowed[2].contains("zzz"),
+            "and the row that *did* change is the query's: {:?}",
+            narrowed[2]
+        );
+        assert_eq!(
+            full[2].chars().position(|c| c == '│'),
+            narrowed[2].chars().position(|c| c == '│'),
+            "whose wall is still in the column it was"
+        );
+        assert!(
+            narrowed.join("\n").contains("没有匹配"),
+            "and the shorter list says so rather than going blank:\n{}",
+            narrowed.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_short_rect_loses_the_furniture_before_it_loses_a_setting() {
         // The order `fit` cuts in, asserted rather than assumed: this is the
         // difference between a cramped panel and a useless one.
         let m = moment(Some(Panel::new()), two());
         let full = drawn(&m, 70, 40);
+        let joined = full.join("\n");
+        assert!(joined.contains("选择"), "the legend is up:\n{joined}");
+        assert!(joined.contains("主题"), "and so is a setting:\n{joined}");
         assert!(
-            full.last().is_some_and(|l| l.contains("选择")),
-            "the legend is up"
+            full.first().is_some_and(|l| is_rule(l)) && full.last().is_some_and(|l| is_rule(l)),
+            "and the panel is ruled top and bottom:\n{joined}"
         );
-        assert!(full.iter().any(|l| l.contains("主题")));
 
-        // Two rows of room for the search box and nothing else.
+        // Six rows of room: the rules and the legend are furniture and go
+        // before what the panel is for.
         let tight = drawn(&m, 70, 6);
-        let joined = tight.join("\n");
+        let cramped = tight.join("\n");
         assert!(
-            joined.contains("主题"),
-            "what the panel is for comes first:\n{joined}"
+            cramped.contains("主题"),
+            "what the panel is for comes first:\n{cramped}"
         );
         assert!(
-            !joined.contains("选择"),
-            "and the legend is what goes:\n{joined}"
+            !cramped.contains("选择"),
+            "and the legend is furniture, so it goes:\n{cramped}"
         );
+    }
+
+    /// The panel's rules are straight lines with no corners at their ends.
+    ///
+    /// A corner here drew a `┌` directly above the search box's own `┌`, which
+    /// reads as a second box around the panel — a container that is not there.
+    /// The rule alone says where the panel starts and stops.
+    #[test]
+    fn the_panels_rules_have_no_corners() {
+        let m = moment(Some(Panel::new()), two());
+        let lines = drawn(&m, 70, 40);
+        let top = lines.first().expect("the panel has a top rule");
+        let bottom = lines.last().expect("the panel has a bottom rule");
+
+        for (edge, line) in [("top", top), ("bottom", bottom)] {
+            assert!(
+                is_rule(line),
+                "the {edge} rule is a straight line: {line:?}"
+            );
+            for corner in ['┌', '┐', '└', '┘'] {
+                assert!(
+                    !line.contains(corner),
+                    "the {edge} rule has no `{corner}`: {line:?}"
+                );
+            }
+        }
+    }
+
+    /// The legend sits against the search box, where it describes the list.
+    ///
+    /// It used to be the panel's last row — a screen away from the thing it
+    /// explains, and the first furniture a short rect pushed off the end.
+    #[test]
+    fn the_legend_is_under_the_search_box_and_not_at_the_foot() {
+        let m = moment(Some(Panel::new()), two());
+        let lines = drawn(&m, 70, 40);
+
+        let legend = lines
+            .iter()
+            .position(|l| l.contains("选择"))
+            .expect("the legend is drawn");
+        let box_bottom = lines
+            .iter()
+            .position(|l| l.starts_with('└'))
+            .expect("the search box has a bottom edge");
+        let first_setting = lines
+            .iter()
+            .position(|l| l.contains("主题"))
+            .expect("a setting is drawn");
+
+        assert!(
+            legend > box_bottom,
+            "the legend is below the box, not inside or above it: {legend} vs {box_bottom}"
+        );
+        assert!(
+            legend < first_setting,
+            "and above the list it describes: {legend} vs {first_setting}"
+        );
+        assert!(
+            is_rule(lines.last().expect("a bottom rule")),
+            "so the panel's last row is the rule, not the legend: {:?}",
+            lines.last()
+        );
+    }
+
+    /// The box's corners stand over its own walls, and the text starts in the
+    /// column the labels below it start in.
+    ///
+    /// This is the misalignment that was reported from a terminal: the corners
+    /// were pushed one cell right by a leading space, so the frame was drawn
+    /// against a column its own walls did not use.
+    ///
+    /// **The box is located from its own text row, not from the first `┌` in
+    /// the panel.** The first version of this criterion looked for the first
+    /// line starting with `┌` and the first starting with `└` — but the panel
+    /// has a frame too, so those two are the panel's top edge and the *inner*
+    /// box's bottom edge: two different boxes, both at column 0, and the
+    /// assertion held whatever the box did. Found by falsification, which is
+    /// what it is for.
+    #[test]
+    fn the_boxs_corners_line_up_with_its_walls_and_the_labels_below() {
+        // Something typed, so the box's text column holds a visible character:
+        // with an empty query the caret is a reversed *space* and there is
+        // nothing to locate. This is also the case the complaint was about — a
+        // query jogging the answer to a column of its own.
+        let mut panel = Panel::new();
+        for c in "主".chars() {
+            panel.type_into_search(c);
+        }
+        let m = moment(Some(panel), two());
+        let lines = drawn(&m, 70, 40);
+
+        let col_of = |needle: char, line: &str| line.chars().position(|c| c == needle);
+        let text_row = lines
+            .iter()
+            .position(|l| l.contains('主'))
+            .expect("the typed query is drawn");
+        let (top, bottom) = (text_row - 1, text_row + 1);
+
+        // The two edges immediately around the text are the box's, and their
+        // corners are in the wall's column — the same one the panel's own frame
+        // uses, which is what makes the nested frames line up rather than
+        // nearly line up.
+        assert_eq!(
+            col_of('┌', &lines[top]),
+            Some(BORDER_COL),
+            "the box's top-left corner is in the border column: {:?}",
+            lines[top]
+        );
+        assert_eq!(
+            col_of('└', &lines[bottom]),
+            Some(BORDER_COL),
+            "and its bottom-left corner agrees: {:?}",
+            lines[bottom]
+        );
+        assert_eq!(
+            col_of('│', &lines[text_row]),
+            Some(BORDER_COL),
+            "and the wall between them stands under both: {:?}",
+            lines[text_row]
+        );
+
+        // The panel's own rule uses the same column, so the rule and the box
+        // below it start together rather than one cell apart.
+        let panel_top = lines.first().expect("the panel has a first row");
+        assert!(
+            is_rule(panel_top),
+            "the panel's top row is its rule: {panel_top:?}"
+        );
+        assert_eq!(
+            col_of('|', panel_top).or_else(|| col_of('─', panel_top)),
+            Some(BORDER_COL),
+            "and the rule starts in the same column as the box's wall: {panel_top:?}"
+        );
+
+        // And what the box holds starts in the same column as the labels it
+        // filters — otherwise typing would jog the answer to a different column
+        // from the row it is about.
+        let label_line = lines
+            .iter()
+            .find(|l| l.contains("主题"))
+            .expect("a label is drawn")
+            .clone();
+        assert_eq!(
+            col_of('主', &lines[text_row]),
+            col_of('主', &label_line),
+            "the box's text and the labels share a column:\n{:?}\n{:?}",
+            lines[text_row],
+            label_line
+        );
+    }
+
+    /// Every row of the frame is the full width, and none of it overflows.
+    ///
+    /// A frame whose top rule stops short of its own walls is not a frame — it
+    /// is the ragged edge this asks about, and a terminal shows it as a panel
+    /// that appears to have been cut off.
+    #[test]
+    fn the_frame_spans_the_rect_and_never_overflows_it() {
+        let m = moment(Some(Panel::new()), two());
+        for w in [4usize, 5, 8, 20, 40, 79, 80] {
+            let lines = drawn(&m, w as u16, 40);
+            let top = lines
+                .iter()
+                .find(|l| l.starts_with('┌'))
+                .expect("a top rule");
+            assert_eq!(
+                top.chars().count(),
+                w,
+                "the rule fills the rect at {w}: {top:?}"
+            );
+            assert!(
+                top.ends_with('┐'),
+                "and closes on the right at {w}: {top:?}"
+            );
+            for line in &lines {
+                assert!(
+                    line.chars().count() <= w,
+                    "no row is wider than the rect at {w}: {line:?}"
+                );
+            }
+        }
     }
 
     #[test]
     fn the_search_box_says_the_query_and_the_list_follows_it() {
         let mut panel = Panel::new();
-        panel.searching = true;
         for c in "rounds".chars() {
             panel.type_into_search(c);
         }
@@ -573,7 +1042,6 @@ mod tests {
     #[test]
     fn an_empty_result_says_so_rather_than_going_blank() {
         let mut panel = Panel::new();
-        panel.searching = true;
         for c in "zzz".chars() {
             panel.type_into_search(c);
         }
@@ -583,31 +1051,39 @@ mod tests {
 
     #[test]
     fn the_caret_is_drawn_only_where_the_next_character_would_go() {
-        // A caret in a box nobody is typing into is a lie about focus, and this
-        // is the one place that decides. The caret is the only reversed cell the
-        // panel draws, so counting them across the whole panel is the assertion:
-        // one when the search box has the keyboard, none when it does not.
+        // A caret in a box nobody is typing into is a lie about where the next
+        // character goes. There are exactly two places it can be: the search box
+        // (the panel's resting state) and a row's field. The caret is the only
+        // reversed cell the panel draws, so counting them is the assertion —
+        // one, never two.
         let carets = |m: &Moment| {
-            lines(m, 70, 12)
+            lines(m, 70, 14)
                 .iter()
                 .map(|l| l.spans.iter().filter(|s| s.style.reverse).count())
                 .sum::<usize>()
         };
 
         let mut panel = Panel::new();
-        panel.searching = true;
         panel.type_into_search('a');
         assert_eq!(
             carets(&moment(Some(panel.clone()), two())),
             1,
-            "focused: one caret"
+            "resting: the caret is in the search box"
         );
 
-        panel.searching = false;
+        // A row's field takes the keyboard, and the caret with it. Still one:
+        // the search box does not keep a second one blinking.
+        panel.cursor = 1;
+        crate::settings::key(
+            &two(),
+            &mut panel,
+            crate::surface::KeyPress::plain(Key::Enter),
+        );
+        assert!(panel.editing.is_some(), "the number's field is open");
         assert_eq!(
             carets(&moment(Some(panel), two())),
-            0,
-            "blurred: no caret, because the next character would not go there"
+            1,
+            "and there is still exactly one caret on screen"
         );
     }
 
@@ -630,19 +1106,26 @@ mod tests {
 
     #[test]
     fn the_legend_says_what_the_keys_would_do_right_now() {
+        // With nothing typed there is no `/` entry, because there is no such key:
+        // letters go straight into the box.
         let closed = legend(&Panel::new());
-        assert!(closed.iter().any(|(k, _)| *k == "/"), "{closed:?}");
+        assert!(
+            !closed.iter().any(|(k, _)| *k == "/"),
+            "no key opens the search box, so none is offered: {closed:?}"
+        );
+        assert!(closed.iter().any(|(k, w)| *k == "esc" && *w == "关闭"));
 
+        // With something typed, Escape is spent on the search first, and the
+        // legend says so rather than promising a close that will not happen.
         let mut searching = Panel::new();
-        searching.searching = true;
+        searching.type_into_search('第');
         let in_search = legend(&searching);
         assert!(
-            !in_search.iter().any(|(k, _)| *k == "/"),
-            "no point offering the key that is already on: {in_search:?}"
+            in_search
+                .iter()
+                .any(|(k, w)| *k == "esc" && *w == "清空搜索"),
+            "{in_search:?}"
         );
-        assert!(in_search
-            .iter()
-            .any(|(k, w)| *k == "esc" && *w == "退出搜索"));
 
         let mut editing = Panel::new();
         editing.editing = Some(Edit {
@@ -715,7 +1198,6 @@ mod tests {
         // The containment check the whole crate is held to, at the sizes a
         // terminal actually hands over.
         let mut panel = Panel::new();
-        panel.searching = true;
         panel.type_into_search('设');
         for w in [0u16, 1, 3, 8, 20, 40, 120, 200] {
             for h in [0u16, 1, 3, 8, 24, 60] {

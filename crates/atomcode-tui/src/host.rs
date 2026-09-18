@@ -3642,7 +3642,6 @@ mod tests {
         {
             let mut m = h.moment.write().unwrap();
             let panel = m.settings_panel.as_mut().unwrap();
-            panel.searching = true;
             panel.type_into_search('主');
         }
         assert!(h.settings_open());
@@ -3786,17 +3785,25 @@ mod tests {
         assert_eq!(h.settings_row_at(1, 1), None);
         assert_eq!(h.settings_row_at(30, 15), None);
 
-        // Opened and drawn: the point now lands on a setting.
+        // Opened and drawn: the point now lands on a setting. The row is read
+        // off what was drawn rather than assumed from an offset — the panel's
+        // own layout decides how many rows the search box takes, and a constant
+        // here would be a second copy of that decision.
         h.toggle_settings();
         let frame = h.compose(size);
-        let rect = frame
+        let part = frame
             .part(crate::modules::settings::ID)
-            .expect("the panel is drawn")
-            .rect;
-        let on_a_setting = (rect.x + 1, rect.y + 3);
+            .expect("the panel is drawn");
+        let rect = part.rect;
+        let first = part
+            .lines
+            .iter()
+            .position(|l| l.plain().contains("第一"))
+            .expect("the first setting is drawn");
+        let on_a_setting = (rect.x + 1, rect.y + first as u16);
         assert!(
             h.settings_row_at(on_a_setting.0, on_a_setting.1).is_some(),
-            "the point is on the panel while it is up"
+            "the point is on a setting while the panel is up"
         );
 
         // Closed, and **not composed**: the rect is still in `hits` and the
