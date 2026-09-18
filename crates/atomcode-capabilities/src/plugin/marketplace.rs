@@ -351,7 +351,7 @@ pub(super) fn auth_retry_args(url: &str) -> Option<[String; 2]> {
 /// - trusted host + not logged in → /login (auto-creds) or SSH.
 /// `verb` is 克隆 / 更新. Shared by clone + pull so the wording can't drift.
 fn auth_required_message(verb: &str, url: &str, stderr: &str) -> String {
-    let stderr = stderr.trim();
+    let stderr = summarize_git_stderr(stderr);
     if !super::url::host_is_trusted(url) {
         return format!(
             "{verb}失败：该仓库需要认证（私有仓库）。请改用 SSH 地址（git@…）\
@@ -404,12 +404,12 @@ pub(super) fn clone_with_optional_auth(
             bail!(
                 "克隆失败：使用已登录凭证仍无法访问该私有仓库（可能无权限或登录已过期，\
                  可 /login 重新登录后重试）。\n原始错误：{}",
-                String::from_utf8_lossy(&out2.stderr).trim()
+                summarize_git_stderr(&String::from_utf8_lossy(&out2.stderr))
             );
         }
         bail!("{}", auth_required_message("克隆", url, &stderr));
     }
-    bail!("git clone failed: {}", stderr);
+    bail!("git clone failed: {}", summarize_git_stderr(&stderr));
 }
 
 /// `git pull --ff-only` in `repo`, anonymously first; on auth failure for a
@@ -440,12 +440,12 @@ pub(super) fn git_pull_ff(repo: &Path, source_url: &str) -> Result<()> {
             bail!(
                 "更新失败：使用已登录凭证仍无法访问（无权限或登录已过期，可 /login 重新登录）。\
                  \n原始错误：{}",
-                String::from_utf8_lossy(&out2.stderr).trim()
+                summarize_git_stderr(&String::from_utf8_lossy(&out2.stderr))
             );
         }
         bail!("{}", auth_required_message("更新", source_url, &stderr));
     }
-    bail!("git pull failed: {}", stderr);
+    bail!("git pull failed: {}", summarize_git_stderr(&stderr));
 }
 
 /// True when `git`'s stderr indicates it failed because it needed interactive
@@ -455,6 +455,69 @@ fn is_git_auth_failure(stderr: &str) -> bool {
         || stderr.contains("could not read Username")
         || stderr.contains("could not read Password")
         || stderr.contains("Authentication failed")
+}
+
+/// Collapse `git`'s raw stderr into a short, readable summary for
+/// user-facing messages. `git clone`/`pull` failures print progress banners
+/// (`remote: Enumerating objects…`, `Counting objects…`) and very long
+/// one-line `fatal:` diagnostics; dumping the whole blob into the TUI
+/// warning makes it wrap into unreadable fragments (issue #1368). Progress
+/// lines are dropped, the meaningful lines (fatal/error/auth) are kept in
+/// order, and each is capped so the message stays on a couple of terminal
+/// lines. Key failure info (auth failures, network errors) is preserved.
+fn summarize_git_stderr(stderr: &str) -> String {
+    const MAX_KEPT_LINES: usize = 3;
+    const MAX_LINE_CHARS: usize = 160;
+
+    let mut kept: Vec<String> = Vec::new();
+    for line in stderr.lines() {
+        let t = line.trim();
+        if t.is_empty() || is_git_progress_line(t) {
+            continue;
+        }
+        kept.push(truncate_line(t, MAX_LINE_CHARS));
+        if kept.len() == MAX_KEPT_LINES {
+            break;
+        }
+    }
+    if kept.is_empty() {
+        return "git 未返回错误详情".to_string();
+    }
+    kept.join("; ")
+}
+
+/// True for `git` progress/statistics banners that carry no failure
+/// information (both the local and the `remote:`-prefixed variants).
+fn is_git_progress_line(line: &str) -> bool {
+    const PROGRESS_MARKERS: &[&str] = &[
+        "Enumerating objects",
+        "Counting objects",
+        "Compressing objects",
+        "Receiving objects",
+        "Resolving deltas",
+        "Unpacking objects",
+        "Updating files",
+        "Total ",
+    ];
+    let body = line.strip_prefix("remote: ").unwrap_or(line);
+    PROGRESS_MARKERS.iter().any(|m| body.starts_with(m))
+}
+
+/// Cap a single line to `max_chars` display characters. Keeps both the head
+/// (which holds `fatal: … 'URL'`) and the tail (the actual reason, which git
+/// prints AFTER the URL) with a `…` in the middle, so a root cause that sits
+/// past a very long URL still survives truncation.
+fn truncate_line(line: &str, max_chars: usize) -> String {
+    let count = line.chars().count();
+    if count <= max_chars {
+        return line.to_string();
+    }
+    let head = max_chars * 3 / 4;
+    let tail = max_chars - head - 1; // room for the ellipsis
+    let mut s: String = line.chars().take(head).collect();
+    s.push('…');
+    s.extend(line.chars().skip(count - tail));
+    s
 }
 
 pub(super) fn git_clone(url: &str, target: &Path) -> Result<()> {
@@ -762,6 +825,154 @@ mod tests {
         assert!(!is_git_auth_failure(
             "fatal: unable to access 'https://x/y': Could not resolve host"
         ));
+    }
+
+    #[test]
+    fn summarize_git_stderr_keeps_fatal_and_drops_progress() {
+        // A realistic failed clone: progress banners plus the real fatal line.
+        // The summary must keep the failure and drop the progress noise.
+        let stderr = "\
+Cloning into 'x'...\n\
+remote: Enumerating objects: 12, done.\n\
+remote: Counting objects: 100% (12/12), done.\n\
+remote: Compressing objects: 100% (6/6), done.\n\
+remote: Total 12 (delta 3), reused 0\n\
+fatal: unable to access 'https://atomgit.com/x/y.git/': Failed to connect to atomgit.com port 443\n";
+        let s = summarize_git_stderr(stderr);
+        assert!(
+            s.contains("fatal: unable to access"),
+            "fatal line must survive: {s:?}"
+        );
+        assert!(s.contains("port 443"), "key detail kept: {s:?}");
+        assert!(!s.contains("Enumerating objects"), "{s:?}");
+        assert!(!s.contains("Counting objects"), "{s:?}");
+        assert!(!s.contains("Compressing objects"), "{s:?}");
+        assert!(!s.contains("remote: Total"), "{s:?}");
+    }
+
+    #[test]
+    fn summarize_git_stderr_keeps_auth_lines() {
+        // The `remote: HTTP Basic: Access denied` banner is meaningful (not a
+        // progress line) and must survive next to the fatal auth line.
+        let stderr =
+            "remote: HTTP Basic: Access denied\nfatal: Authentication failed for 'https://x/y'\n";
+        let s = summarize_git_stderr(stderr);
+        assert!(s.contains("Access denied"), "{s:?}");
+        assert!(s.contains("Authentication failed"), "{s:?}");
+    }
+
+    #[test]
+    fn summarize_git_stderr_truncates_long_lines() {
+        let long = format!("fatal: {}", "x".repeat(400));
+        let s = summarize_git_stderr(&long);
+        assert_eq!(s.chars().count(), 160, "capped at MAX_LINE_CHARS");
+        assert!(s.contains('…'), "truncated line has ellipsis: {s:?}");
+        // Head (the `fatal:` marker) and tail (the reason after a very long
+        // URL) both survive middle-ellipsis truncation.
+        let url_with_reason = format!(
+            "fatal: unable to access '{}': Couldn't connect to server",
+            "x".repeat(220)
+        );
+        let s2 = summarize_git_stderr(&url_with_reason);
+        assert!(s2.starts_with("fatal: unable"), "head kept: {s2:?}");
+        assert!(
+            s2.contains("Couldn't connect to server"),
+            "tail/root cause kept: {s2:?}"
+        );
+    }
+
+    #[test]
+    fn summarize_git_stderr_preserves_real_root_causes() {
+        // Real-world git failure stderr samples. Each keeps enough of the
+        // root cause for the user to act on it; progress noise is dropped.
+        let cases: &[(&str, &str)] = &[
+            (
+                "Authentication failed",
+                "fatal: Authentication failed for 'https://atomgit.com/x/y.git/'\n",
+            ),
+            (
+                "Permission denied",
+                "git@github.com: Permission denied (publickey).\n\
+                 fatal: Could not read from remote repository.\n\
+                 Please make sure you have the correct access rights\n",
+            ),
+            (
+                "Could not resolve host",
+                "fatal: unable to access 'https://atomgit.com/x/y.git/': \
+                 Could not resolve host: atomgit.com\n",
+            ),
+            (
+                "Couldn't connect to server",
+                "fatal: unable to access 'https://atomgit.com/x/y.git/': \
+                 Failed to connect to atomgit.com port 443 after 21048 ms: \
+                 Couldn't connect to server\n",
+            ),
+            (
+                "Connection refused",
+                "fatal: unable to access 'https://atomgit.com/x/y.git/': \
+                 Connection refused\n",
+            ),
+            (
+                "SSL certificate problem",
+                "fatal: unable to access 'https://atomgit.com/x/y.git/': \
+                 SSL certificate problem: unable to get local issuer certificate\n",
+            ),
+            (
+                "not found",
+                "remote: Repository not found.\n\
+                 fatal: repository 'https://atomgit.com/x/y.git/' not found\n",
+            ),
+            (
+                "Host key verification failed",
+                "Host key verification failed.\nfatal: Could not read from remote repository.\n",
+            ),
+            ("", ""),
+        ];
+        for (needle, stderr) in cases {
+            let s = summarize_git_stderr(stderr);
+            if needle.is_empty() {
+                assert_eq!(s, "git 未返回错误详情", "empty stderr case");
+            } else {
+                assert!(
+                    s.contains(needle),
+                    "root cause `{needle}` lost from {stderr:?}: {s:?}"
+                );
+            }
+        }
+        // 大量 progress + 一个 fatal root cause：噪音丢弃，根因保留。
+        let noisy = "\
+remote: Enumerating objects: 512, done.\n\
+remote: Counting objects: 100% (512/512), done.\n\
+remote: Compressing objects: 100% (256/256), done.\n\
+remote: Total 512 (delta 128), reused 0\n\
+fatal: unable to access 'https://atomgit.com/x/y.git/': \
+Failed to connect to atomgit.com port 443 after 21048 ms: Couldn't connect to server\n";
+        let s = summarize_git_stderr(noisy);
+        assert!(s.contains("fatal: unable to access"), "{s:?}");
+        assert!(s.contains("port 443"), "{s:?}");
+        assert!(!s.contains("Enumerating"), "{s:?}");
+        assert!(!s.contains("Counting"), "{s:?}");
+    }
+
+    #[test]
+    fn summarize_git_stderr_caps_kept_lines() {
+        let stderr = (1..=10)
+            .map(|i| format!("error line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let s = summarize_git_stderr(&stderr);
+        assert_eq!(s.matches("error line").count(), 3, "{s:?}");
+    }
+
+    #[test]
+    fn summarize_git_stderr_empty_stderr_returns_placeholder() {
+        assert_eq!(summarize_git_stderr(""), "git 未返回错误详情");
+        // Whitespace-only and progress-only stderr also fall back.
+        assert_eq!(summarize_git_stderr("  \n\t\n"), "git 未返回错误详情");
+        assert_eq!(
+            summarize_git_stderr("remote: Enumerating objects: 3, done.\n"),
+            "git 未返回错误详情"
+        );
     }
 
     #[test]
