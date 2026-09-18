@@ -63,6 +63,17 @@ impl CommandCatalog {
             .retain(|c| c.describe().name != name);
     }
 
+    /// Whether a command of this name is registered — for a row that generates
+    /// commands from what it finds on disk and must not take a name that is
+    /// already somebody's.
+    pub fn has(&self, name: &str) -> bool {
+        self.commands
+            .read()
+            .expect("commands poisoned")
+            .iter()
+            .any(|c| c.describe().name == name)
+    }
+
     /// What is on offer for `agent`, by name.
     pub fn offered_for(&self, agent: &Agent) -> Vec<CommandDescription> {
         let mut offered: Vec<CommandDescription> = self

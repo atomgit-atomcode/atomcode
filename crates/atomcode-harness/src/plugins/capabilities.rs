@@ -111,7 +111,26 @@ impl Plugin for SkillsPlugin {
         // (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` B1,
         // `docs/adr/0021` §10). The row that owns the capability registers it;
         // nothing in the screen knows this command exists.
-        crate::commands::register(ctx, Arc::new(ListSkills(registry)))?;
+        crate::commands::register(ctx, Arc::new(ListSkills(registry.clone())))?;
+        // And one command per skill a person may invoke, so `/init`, `/setup`
+        // and anything they wrote themselves are in the menu without this row
+        // — or the screen — knowing their names
+        // (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` B1).
+        //
+        // Per skill rather than four hard-coded commands: what is installed is
+        // the person's choice, and a fixed list would offer `/init` on a
+        // machine that does not have it and nothing for the skill they wrote
+        // this morning.
+        for skill in registry.user_invocable() {
+            // A name a command already has is left alone rather than refused:
+            // a skill called `compact` must not take the host's `/compact`
+            // away, and a mount that failed over it would take the whole tree
+            // down for a file someone dropped in a directory.
+            if catalog_has(ctx, &bare_name(&skill.name)) {
+                continue;
+            }
+            crate::commands::register(ctx, Arc::new(RunSkill(skill)))?;
+        }
         // Only advertise skills when some exist: a catalog line promising
         // capabilities that resolve to nothing is worse than no line.
         if count > 0 {
@@ -359,6 +378,54 @@ struct ReviewRow {
 /// way `task` is. It reuses the host's provider on purpose: a reviewer that
 /// built its own would miss a signing gateway and fail where the conversation
 /// around it works.
+/// `review`: the reviewer over the current changes, run by a person.
+///
+/// The same tool the row mounted, with the same rules and the same provider
+/// slot. What "the current changes" means — staged, a base, a range — is the
+/// tool's own argument, passed through as typed.
+struct ReviewCommand(Arc<ReviewTool>);
+
+#[async_trait]
+impl crate::commands::CatalogCommand for ReviewCommand {
+    fn describe(&self) -> atomcode_kernel::agent::CommandDescription {
+        atomcode_kernel::agent::CommandDescription {
+            name: "review".into(),
+            usage: Some("[staged | <base>]".into()),
+            summary: "让评审员看一遍现在的改动;只读,不改".into(),
+            target: atomcode_kernel::agent::CommandTarget::Session,
+        }
+    }
+
+    async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
+        use atomcode_kernel::tool::{Tool, ToolContext};
+        let scope = args.trim();
+        let mut call = serde_json::Map::new();
+        if !scope.is_empty() {
+            call.insert("scope".into(), serde_json::Value::String(scope.to_string()));
+        }
+        let result = self
+            .0
+            .execute(
+                &serde_json::Value::Object(call).to_string(),
+                &ToolContext {
+                    working_dir: agent
+                        .ctx()
+                        .service::<crate::seams::FsSvc>()
+                        .map(|fs| fs.root())
+                        .unwrap_or_else(|| PathBuf::from(".")),
+                    cancel: Default::default(),
+                    progress: atomcode_kernel::tool::ProgressSink::noop(),
+                    requester: None,
+                },
+            )
+            .await;
+        if result.is_error {
+            return Err(result.content);
+        }
+        Ok(result.content)
+    }
+}
+
 pub struct ReviewToolPlugin;
 
 #[async_trait]
@@ -368,6 +435,11 @@ impl Plugin for ReviewToolPlugin {
     }
     fn inject(&self) -> &'static [&'static str] {
         &["tools", "llm"]
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        // `commands` carries the `/review` a person runs; `fs` says which
+        // directory the reviewer reads.
+        &["commands", "fs"]
     }
     fn description(&self) -> &'static str {
         "the `code_review` tool: a read-only reviewer over the current changes, \
@@ -393,10 +465,15 @@ impl Plugin for ReviewToolPlugin {
             ..defaults
         };
         let slot: SharedReviewProvider = Arc::new(std::sync::RwLock::new(Some(provider)));
-        mount(
-            ctx,
-            vec![Arc::new(ReviewTool::new(slot, cfg)) as Arc<dyn Tool>],
-        )?;
+        let tool = Arc::new(ReviewTool::new(slot, cfg));
+        mount(ctx, vec![tool.clone() as Arc<dyn Tool>])?;
+        // And as a command a person runs, through the same tool
+        // (`docs/adr/0021` §10,
+        // `docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` B1):
+        // "review what I changed" is a thing a person asks for directly, and
+        // asking the model to call a tool on their behalf spends a turn to
+        // reach the same reviewer.
+        crate::commands::register(ctx, Arc::new(ReviewCommand(tool)))?;
         // This row's guidance for this row's tool. It lived in the coding persona as
         // `## CODE REVIEW`, which described the tool on BOTH assemblies — and stayed describing
         // it after this row was patched out of the tree.
@@ -442,6 +519,48 @@ impl Default for MemoryRow {
 
 fn yes() -> bool {
     true
+}
+
+/// The name a person types for a skill: `skills:init` is typed `/init`.
+///
+/// The namespace is how the registry keeps two skills of the same name apart;
+/// it is not something anyone wants to type.
+fn bare_name(name: &str) -> String {
+    name.rsplit(':').next().unwrap_or(name).to_string()
+}
+
+/// Whether the catalog already offers this name.
+fn catalog_has(ctx: &Context, name: &str) -> bool {
+    ctx.service::<crate::seams::CommandsSvc>()
+        .is_some_and(|catalog| catalog.has(name))
+}
+
+/// One skill, as a command a person runs.
+///
+/// Running it queues the expanded skill as **the person's own message**: a
+/// skill is a prompt someone wrote to send, and sending it is a turn like any
+/// other — logged as theirs, answerable, undoable.
+struct RunSkill(Arc<atomcode_capabilities::skills::Skill>);
+
+#[async_trait]
+impl crate::commands::CatalogCommand for RunSkill {
+    fn describe(&self) -> atomcode_kernel::agent::CommandDescription {
+        atomcode_kernel::agent::CommandDescription {
+            name: bare_name(&self.0.name),
+            usage: Some("[给它的话]".into()),
+            summary: self.0.description.clone(),
+            target: atomcode_kernel::agent::CommandTarget::Session,
+        }
+    }
+
+    async fn run(&self, agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
+        let text = self.0.expand(args.trim(), agent.session_id());
+        if text.trim().is_empty() {
+            return Err(format!("`{}` 展开之后是空的", bare_name(&self.0.name)));
+        }
+        agent.send(text);
+        Ok(format!("按 `{}` 开始", bare_name(&self.0.name)))
+    }
 }
 
 /// `skills`: what is installed, for a person rather than for the model.

@@ -274,6 +274,63 @@ async fn a_capability_row_offers_its_own_commands_and_they_do_the_work() {
         .run(agent.clone(), "   ")
         .await
         .is_err());
+
+    // A skill a person may invoke is a command too: `greet` is installed, so
+    // `/greet` is in the menu — and running it queues the skill's prompt as
+    // the person's own message, which is what makes it a turn they can answer,
+    // undo and read back.
+    assert!(
+        offered.contains(&"greet".to_string()),
+        "an installed skill is a command: {offered:?}"
+    );
+    let started = catalog
+        .find("greet", &agent)
+        .expect("offered")
+        .run(agent.clone(), "世界")
+        .await
+        .expect("running a skill");
+    assert!(
+        started.contains("greet"),
+        "it says what it started: {started}"
+    );
+    // Queued as the person's own message — waiting in the inbox for the turn
+    // that will answer it. Not a hidden prepend and not the harness's voice:
+    // `MessageOrigin::User`, so the turn it starts is theirs to undo.
+    assert!(
+        agent
+            .inbox()
+            .waiting_from(atomcode_harness::agent::MessageOrigin::User),
+        "the skill's prompt is waiting as the person's own message"
+    );
+
+    // The reviewer is on offer too, from the row that mounts it. Inserted
+    // explicitly, because that row is part of the coding assembly rather than
+    // of this bundle — what is judged is that the row registers what it owns,
+    // wherever it is mounted. Not run: it would spend a model round, and the
+    // question here is the registration.
+    drop(app);
+    let reviewing = start(tree(
+        &dir,
+        STOP,
+        &["[[insert]]\nname = \"tool-code-review\"\n"],
+    ))
+    .await;
+    let review_agent = atomcode_harness::create_agent(&reviewing)
+        .await
+        .expect("an agent");
+    let offered_now: Vec<String> = reviewing
+        .context()
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .expect("the catalog")
+        .offered_for(&review_agent)
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    assert!(
+        offered_now.contains(&"review".to_string()),
+        "the review row offers `/review`: {offered_now:?}"
+    );
+    drop(reviewing);
 }
 
 #[tokio::test]
