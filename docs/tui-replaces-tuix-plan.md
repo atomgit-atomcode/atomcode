@@ -299,10 +299,25 @@ tuix 的老毛病——现在改是十几行,等下游移植完再改就是他�
   与工具定义,屏幕一条都没见过
 - ✅ **五个方法换完**:`submit` / `respond` / `cancel` / `compact` / `shutdown`
   → `AgentCommand`,`context_stats` → `HostCommand::Context`
-- ⬜ **还剩那两处非机械的**:`options.rs` 的 `reprepare_config`(要把模型解析还给宿主、
-  拆 `SessionModelResolver` 的注入链)、`commands.rs` 的 `undo_to_prompt`(要先
-  `RewindPoints` 再 `Undo`,并开始跟踪 `SeqNo`)。`SessionState` 暂时同时留着
-  `runtime` handle 给这两处,注释里写明了
+- ✅ **`reprepare_config` 换完了**。模型解析没被删掉,是**搬到了宿主契约后面**:
+  `SessionModelResolver` 那个闭包成了 `sessions::AcpHost` 的 `for_model`,
+  而闭包本身从会话处理器挪进 `EngineConfig`(它本来就是"给会话创建用的 provider +
+  模型配置",解析模型是服务器的属性不是某个会话的)。屏幕这边只说模型名字,
+  `HostCommand::SwitchModel` 去解析。思考强度更简单:契约有专门的旋钮
+  (`SetReasoningEffort`),这个频道的三档 `off | high | max` 就是 `None | High | Max`,
+  那个重建整份配置的闭包根本不需要
+- ⬜ **只剩 `undo_to_prompt` 一处,而且是被挡住的,不是没做**:契约的
+  `Undo { turn, based_on }` 里 `based_on` 要过 `fresh()` 这道防陈旧的关,而
+  `fresh()`(`cli/src/host.rs:547`)读的是**前端自己的会话日志**,经
+  `front_end.app()`。ACP 的 `FrontEnd` 没有挂进任何 plexus App,`app()` 恒为 `None`,
+  于是 `fresh()` 直接回 `HostError::Unavailable` —— **ACP 走契约 undo 会永远失败**。
+  这是查实的(`front_end.rs:92`),不是猜的。
+
+  要定的是:一个**没有屏幕、也就没有"我看到哪儿了"的前端**,这道防陈旧的关对它
+  应该意味着什么。三条路:`fresh()` 把"没有 App"当成"无从判断→放行"(与"没有这个
+  agent→放行"同一条规矩);或者让 ACP 也挂一个最小 App 好让它有日志;或者契约上
+  承认有一类前端不带 `based_on`。**没拍板之前 `undo` 留在 handle 上**,
+  `SessionState::runtime` 也因此留着
 
 ###### 把剩下三步读完之后:**其中两处不是机械搬运**(2026-09-18 更正)
 

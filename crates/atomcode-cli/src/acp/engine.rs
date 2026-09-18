@@ -20,14 +20,49 @@ use atomcode_coding::{
 ///
 /// Constructed by the session dispatcher from the ACP `initialize` handshake and
 /// the global provider configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EngineConfig {
     config: CodingAgentConfig,
+    /// How a model id becomes a configuration, when this server was given a way
+    /// to do it.
+    ///
+    /// Here rather than threaded through the session handlers because it is a
+    /// property of the server, not of one session: every session this engine
+    /// spawns resolves models the same way. It reaches the contract as the
+    /// host's `for_model` (`sessions::AcpHost`), which is what
+    /// `HostCommand::SwitchModel` asks of a host.
+    resolve_model: Option<Arc<crate::acp::SessionModelResolver>>,
+}
+
+impl std::fmt::Debug for EngineConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineConfig")
+            .field("config", &self.config)
+            .field("resolve_model", &self.resolve_model.is_some())
+            .finish()
+    }
 }
 
 impl EngineConfig {
     pub fn from_coding_config(config: CodingAgentConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            resolve_model: None,
+        }
+    }
+
+    /// Give this engine a way to turn a model id into a configuration.
+    pub fn with_model_resolver(
+        mut self,
+        resolve: Option<Arc<crate::acp::SessionModelResolver>>,
+    ) -> Self {
+        self.resolve_model = resolve;
+        self
+    }
+
+    /// What a session registered from this engine hands the host.
+    pub fn model_resolver(&self) -> Option<Arc<crate::acp::SessionModelResolver>> {
+        self.resolve_model.clone()
     }
 
     /// Build the `CodingAgentConfig` for this session's working directory.

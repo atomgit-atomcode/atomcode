@@ -101,6 +101,31 @@ pub struct SessionState {
 /// (all are freed when the process exits / the client disconnects).
 pub type Sessions = Arc<Mutex<HashMap<String, SessionState>>>;
 
+/// A host that says yes and remembers what it was asked.
+///
+/// For criteria about *what the screen asks of a host* — which is what the
+/// option handlers do now that resolving a model is the host's job.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingHost {
+    pub asked: std::sync::Mutex<Vec<atomcode_host_api::HostCommand>>,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl HostControl for RecordingHost {
+    async fn call(
+        &self,
+        command: atomcode_host_api::HostCommand,
+    ) -> Result<atomcode_host_api::HostReply, atomcode_host_api::HostError> {
+        self.asked.lock().expect("poisoned").push(command);
+        Ok(atomcode_host_api::HostReply::Done)
+    }
+    fn subscribe(&self) -> mpsc::UnboundedReceiver<HostEvent> {
+        mpsc::unbounded_channel().1
+    }
+}
+
 /// A host that answers nothing, for criteria whose sessions are never asked.
 ///
 /// Test-only: a session built by hand has no runtime behind it, and a criterion
@@ -119,6 +144,43 @@ impl HostControl for SilentHost {
     }
     fn subscribe(&self) -> mpsc::UnboundedReceiver<HostEvent> {
         mpsc::unbounded_channel().1
+    }
+}
+
+/// The host ACP presents to the contract.
+///
+/// The model-resolving closure was already here — it is what `session/new` was
+/// given so `/model` could re-resolve a session's configuration. It used to be
+/// called from the option handler, which then handed a finished
+/// `CodingAgentConfig` to the runtime. That is the host's job, and
+/// `HostCommand::SwitchModel` asks for it by name: the closure did not go away,
+/// it moved behind the contract where every front end reaches it the same way.
+///
+/// The rest is deliberately empty. ACP has no settings file of its own, no
+/// provider table to list and nobody signed in — `HostConfig`'s defaults say
+/// exactly that, and saying it by default is better than inventing answers.
+pub(crate) struct AcpHost {
+    resolve_model: Option<std::sync::Arc<crate::acp::SessionModelResolver>>,
+    /// What this session runs on now, so `current()` and the working directory
+    /// survive a model switch.
+    current: CodingAgentConfig,
+}
+
+impl crate::host::HostConfig for AcpHost {
+    fn for_model(&self, model: &str) -> Result<CodingAgentConfig, String> {
+        let resolve = self
+            .resolve_model
+            .as_ref()
+            .ok_or("this host does not resolve models")?;
+        let mut next = resolve(model).ok_or_else(|| format!("model `{model}` is not available"))?;
+        // The session's working directory stays authoritative across a switch —
+        // the same rule the option handler kept when it resolved configs itself.
+        next.working_dir = self.current.working_dir.clone();
+        Ok(next)
+    }
+
+    fn current(&self) -> Result<CodingAgentConfig, String> {
+        Ok(self.current.clone())
     }
 }
 
@@ -237,6 +299,7 @@ pub async fn register_session(
     sessions: &Sessions,
     runtime: CodingRuntime,
     config: CodingAgentConfig,
+    resolve_model: Option<std::sync::Arc<crate::acp::SessionModelResolver>>,
     cwd: std::path::PathBuf,
     config_options: &[SessionConfigOption],
     additional_directories: Vec<std::path::PathBuf>,
@@ -257,7 +320,11 @@ pub async fn register_session(
     // the product's own event enum here: what it sees from now on is what the
     // contract says, which is what every other front end sees.
     let front_end = FrontEnd::new();
-    let connection = crate::host::connect(runtime, front_end.clone(), config, None)
+    let host: Arc<dyn crate::host::HostConfig> = Arc::new(AcpHost {
+        resolve_model,
+        current: config.clone(),
+    });
+    let connection = crate::host::connect(runtime, front_end.clone(), config, Some(host))
         .map_err(agent_client_protocol::util::internal_error)?;
     let atomcode_host_api::HostConnection {
         commands,

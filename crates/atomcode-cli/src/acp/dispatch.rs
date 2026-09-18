@@ -24,9 +24,7 @@ use agent_client_protocol::{Client, ConnectionTo, Error as AcpError, Responder};
 use atomcode_capabilities::mcp::McpServerConfig;
 use atomcode_capabilities::session::CatalogScan;
 use atomcode_capabilities::tools::todo::TodoItem;
-use atomcode_coding::{
-    CodingProviderFactory, RuntimeStartError, SessionMode as CodingSessionMode, TurnCompletion,
-};
+use atomcode_coding::{CodingProviderFactory, RuntimeStartError, SessionMode as CodingSessionMode};
 use atomcode_kernel::event::{AgentEvent, StopReason};
 use atomcode_kernel::message::ImageContent;
 use atomcode_kernel::tool::ToolCall;
@@ -134,6 +132,7 @@ pub async fn spawn_and_register_session(
         sessions,
         runtime,
         engine.to_coding_config(cwd.clone()),
+        engine.model_resolver(),
         cwd,
         config_options,
         additional_directories,
@@ -239,6 +238,7 @@ pub async fn handle_resume_session(
                 sessions,
                 runtime,
                 engine.to_coding_config(cwd.clone()),
+                engine.model_resolver(),
                 cwd,
                 config_options,
                 additional_directories,

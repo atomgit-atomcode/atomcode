@@ -176,7 +176,10 @@ where
     // One shared-state bundle, handed to both handler chains.
     let state = SharedState {
         sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        engine: Arc::new(opts.engine),
+        engine: Arc::new(
+            opts.engine
+                .map(|engine| engine.with_model_resolver(opts.session_model_resolver.clone())),
+        ),
         provider_factory: opts.provider_factory,
         auto_approve: opts.auto_approve,
         config_options: Arc::new(opts.session_config_options),

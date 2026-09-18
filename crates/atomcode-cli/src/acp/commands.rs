@@ -31,6 +31,8 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::{Client, ConnectionTo};
 use atomcode_capabilities::tools::todo::{TodoItem, TodoStatus};
 use atomcode_coding::RuntimeMode;
+use atomcode_host_api::{HostCommand, HostReply};
+use atomcode_kernel::event::AgentCommand;
 
 use crate::acp::options::{
     handle_set_session_config_option, MODEL_CONFIG_ID, MODE_CONFIG_ID, REASONING_EFFORT_CONFIG_ID,
@@ -228,24 +230,39 @@ fn select_current(catalog: &[SessionConfigOption], id: &str) -> Option<String> {
         })
 }
 
-/// One line: used/window tokens + utilization + model, from `context_stats`.
+/// One line: used/window tokens + utilization + model, from the host.
 async fn context_text(sessions: &Sessions, sid: &SessionId) -> Option<String> {
-    let runtime = {
+    let (control, session) = {
         let map = sessions.lock().await;
-        map.get(sid.0.as_ref())?.runtime.clone()
+        let state = map.get(sid.0.as_ref())?;
+        (state.control.clone(), state.native_id.clone())
     };
-    let stats = runtime.context_stats().await.ok()?;
+    let HostReply::Context {
+        window,
+        used,
+        model,
+        ..
+    } = control.call(HostCommand::Context { session }).await.ok()?
+    else {
+        return None;
+    };
     Some(format!(
-        "context: {}/{} tokens ({:.1}%)\nmodel: {}",
-        stats.used_tokens,
-        stats.context_window,
-        stats.utilization * 100.0,
-        stats.model,
+        "context: {used}/{window} tokens ({:.1}%)\nmodel: {model}",
+        percent(used, window),
     ))
 }
 
+/// How full a window is, without dividing by a window nobody knows.
+fn percent(used: u32, window: u32) -> f32 {
+    if window == 0 {
+        0.0
+    } else {
+        used as f32 / window as f32 * 100.0
+    }
+}
+
 async fn status_text(sessions: &Sessions, sid: &SessionId) -> Option<String> {
-    let (cwd, mode, effort, model, usage, runtime) = {
+    let (cwd, mode, effort, model, usage, control, session) = {
         let map = sessions.lock().await;
         let state = map.get(sid.0.as_ref())?;
         (
@@ -256,22 +273,17 @@ async fn status_text(sessions: &Sessions, sid: &SessionId) -> Option<String> {
             select_current(&state.config_options, MODEL_CONFIG_ID)
                 .unwrap_or_else(|| "(default)".to_string()),
             state.usage,
-            state.runtime.clone(),
+            state.control.clone(),
+            state.native_id.clone(),
         )
     };
-    let ctx_note = runtime
-        .context_stats()
-        .await
-        .ok()
-        .map(|s| {
-            format!(
-                "\ncontext: {}/{} tokens ({:.1}%)",
-                s.used_tokens,
-                s.context_window,
-                s.utilization * 100.0
-            )
-        })
-        .unwrap_or_default();
+    let ctx_note = match control.call(HostCommand::Context { session }).await {
+        Ok(HostReply::Context { window, used, .. }) => format!(
+            "\ncontext: {used}/{window} tokens ({:.1}%)",
+            percent(used, window)
+        ),
+        _ => String::new(),
+    };
     Some(format!(
         "mode: {mode}\nmodel: {model}\ncwd: {cwd}\nreasoning effort: {effort}\nusage: {} prompt + {} completion tokens{ctx_note}",
         usage.0, usage.1,
@@ -330,14 +342,14 @@ async fn undo_text(sessions: &Sessions, sid: &SessionId, arg: &str) -> Option<St
 }
 
 async fn compact_text(sessions: &Sessions, sid: &SessionId) -> Option<String> {
-    let (runtime, cwd) = {
+    let (commands, cwd) = {
         let map = sessions.lock().await;
         let state = map.get(sid.0.as_ref())?;
-        (state.runtime.clone(), state.cwd.clone())
+        (state.commands.clone(), state.cwd.clone())
     };
     // The kernel compacts the session snapshot; focus is provider-specific and
     // rarely used — default to the whole conversation.
-    match runtime.compact(None) {
+    match commands.send(AgentCommand::Compact { focus: None }) {
         Ok(()) => Some(format!(
             "compact requested for {}; the next request continues on the compacted context",
             cwd.display()

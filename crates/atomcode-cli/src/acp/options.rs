@@ -17,6 +17,8 @@ use agent_client_protocol::{Client, ConnectionTo, Error as AcpError};
 use atomcode_coding::RuntimeMode;
 
 use crate::acp::sessions::Sessions;
+use atomcode_host_api::HostCommand;
+
 use crate::acp::SessionModelResolver;
 
 // ── session modes / config option catalog helpers ────────────────────────────
@@ -188,12 +190,12 @@ pub(super) async fn apply_session_config_option(
     model_resolver: Option<&SessionModelResolver>,
     effort_resolver: Option<&SessionModelResolver>,
 ) -> Result<(Vec<SessionConfigOption>, Option<RuntimeMode>), AcpError> {
-    let (runtime, cwd, mut catalog) = {
+    let (control, session, mut catalog) = {
         let map = sessions.lock().await;
         match map.get(req.session_id.0.as_ref()) {
             Some(state) => (
-                state.runtime.clone(),
-                state.cwd.clone(),
+                state.control.clone(),
+                state.native_id.clone(),
                 state.config_options.clone(),
             ),
             None => return Err(AcpError::invalid_params().data("unknown session")),
@@ -230,35 +232,47 @@ pub(super) async fn apply_session_config_option(
                     REASONING_EFFORT_TIERS.join(", ")
                 )));
             }
-            let Some(resolved) = effort_resolver.and_then(|resolve| resolve(effort)) else {
-                return Err(AcpError::internal_error().data(format!(
-                    "reasoning effort `{effort}` cannot be applied to this session"
-                )));
+            // The contract has a knob for exactly this, so the resolver that
+            // used to rebuild a whole configuration for it is not needed: the
+            // three tiers this channel offers are the contract's `None`, `High`
+            // and `Max`.
+            let level = match effort {
+                "off" => None,
+                "high" => Some(atomcode_kernel::provider::ReasoningEffort::High),
+                "max" => Some(atomcode_kernel::provider::ReasoningEffort::Max),
+                other => {
+                    return Err(AcpError::invalid_params()
+                        .data(format!("unknown reasoning effort `{other}`")))
+                }
             };
-            let mut next = resolved;
-            // Keep this session's working directory authoritative.
-            next.working_dir = cwd;
-            runtime.reprepare_config(next).await.map_err(|e| {
-                AcpError::internal_error().data(format!("reasoning effort reload failed: {e}"))
-            })?;
+            control
+                .call(HostCommand::SetReasoningEffort {
+                    session: session.clone(),
+                    level,
+                })
+                .await
+                .map_err(|e| {
+                    AcpError::internal_error()
+                        .data(format!("reasoning effort reload failed: {e:?}"))
+                })?;
             None
         }
         // Model selector: reload the kernel provider from a freshly resolved
         // config so subsequent turns run on the selected model.
         MODEL_CONFIG_ID => {
             if let Some(value_id) = req.value.as_value_id() {
-                let value_id = value_id.0.as_ref().to_string();
-                let Some(resolved) = model_resolver.and_then(|resolve| resolve(&value_id)) else {
-                    return Err(AcpError::internal_error().data(format!(
-                        "model `{value_id}` is not available for session reload"
-                    )));
-                };
-                let mut next = resolved;
-                // Keep this session's working directory authoritative.
-                next.working_dir = cwd;
-                runtime.reprepare_config(next).await.map_err(|e| {
-                    AcpError::internal_error().data(format!("model reload failed: {e}"))
-                })?;
+                // The name, not a configuration: resolving a model id is the
+                // host's job (`HostConfig::for_model`), and this channel used to
+                // do it here only because it had nowhere to send the name.
+                control
+                    .call(HostCommand::SwitchModel {
+                        session: session.clone(),
+                        model: value_id.0.as_ref().to_string(),
+                    })
+                    .await
+                    .map_err(|e| {
+                        AcpError::internal_error().data(format!("model reload failed: {e:?}"))
+                    })?;
             } else {
                 return Err(AcpError::invalid_params().data("model option requires a value id"));
             }
@@ -392,9 +406,7 @@ mod tests {
     #[tokio::test]
     async fn set_mode_switches_runtime_and_broadcasts() {
         use agent_client_protocol::schema::v1::SessionNotification;
-        use atomcode_coding::runtime::{
-            coding_runtime_control_channel, CodingRuntimeControl, RuntimeExit, RuntimeExitReason,
-        };
+        use atomcode_coding::runtime::{coding_runtime_control_channel, CodingRuntimeControl};
         let (runtime, mut controls) = coding_runtime_control_channel();
         let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
         let (commands, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -499,16 +511,14 @@ mod tests {
     /// commit state without disturbing the turn.
     #[tokio::test]
     async fn mode_and_config_switches_complete_while_a_turn_is_running() {
-        use atomcode_coding::runtime::{
-            coding_runtime_control_channel, CodingRuntimeControl, RuntimeExit, RuntimeExitReason,
-            RuntimeGeneration, SessionChanged,
-        };
+        use atomcode_coding::runtime::{coding_runtime_control_channel, CodingRuntimeControl};
         let (runtime, mut controls) = coding_runtime_control_channel();
         let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
         let (commands, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let host = std::sync::Arc::new(crate::acp::sessions::RecordingHost::default());
         let state = SessionState {
             commands,
-            control: std::sync::Arc::new(crate::acp::sessions::SilentHost),
+            control: host.clone(),
             events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
             runtime,
             _front_end: atomcode_coding::front_end::FrontEnd::new(),
@@ -527,34 +537,16 @@ mod tests {
                 ("acp-1".to_string(), state),
             ])));
 
-        // Control loop answers both switch commands while the "turn" runs.
+        // The mode switch still goes to the runtime directly; answer it.
         let control_task = tokio::spawn(async move {
-            let mut set_mode = false;
-            let mut reprepare = false;
             while let Some(ctrl) = controls.recv().await {
-                match ctrl {
-                    CodingRuntimeControl::SetMode { mode, done, .. } => {
-                        set_mode = mode == RuntimeMode::Plan;
-                        let _ = done.send(Ok(()));
-                    }
-                    CodingRuntimeControl::Reprepare { done, .. } => {
-                        reprepare = true;
-                        let _ = done.send(Ok(SessionChanged {
-                            generation: RuntimeGeneration(0),
-                            session_id: None,
-                            working_dir: std::path::PathBuf::from("/work"),
-                        }));
-                    }
-                    _ => {}
-                }
-                // Both switch kinds observed → the control loop may exit; the
-                // handle lives on in the session state, so the channel never
-                // closes on its own.
-                if set_mode && reprepare {
-                    break;
+                if let CodingRuntimeControl::SetMode { mode, done, .. } = ctrl {
+                    let set = mode == RuntimeMode::Plan;
+                    let _ = done.send(Ok(()));
+                    return set;
                 }
             }
-            (set_mode, reprepare)
+            false
         });
 
         // A running prompt turn holds the session's events receiver for its
@@ -575,18 +567,19 @@ mod tests {
             REASONING_EFFORT_CONFIG_ID,
             SessionConfigOptionValue::value_id("high"),
         );
-        let resolver = |effort: &str| effort_resolver_fn(effort);
-        let effort: &SessionModelResolver = &resolver;
-        let (_catalog, switched_mode) =
-            apply_session_config_option(&sessions, &req, None, Some(effort))
-                .await
-                .expect("config switch completes while a turn is running");
+        let (_catalog, switched_mode) = apply_session_config_option(&sessions, &req, None, None)
+            .await
+            .expect("config switch completes while a turn is running");
         assert!(switched_mode.is_none());
 
         drop(_held);
-        let (set_mode, reprepare) = control_task.await.unwrap();
-        assert!(set_mode, "SetMode control reached the runtime");
-        assert!(reprepare, "Reprepare control reached the runtime");
+        assert!(control_task.await.unwrap(), "SetMode reached the runtime");
+        // And the effort switch reached the host, not the runtime: it is the
+        // contract's own knob now.
+        assert!(matches!(
+            host.asked.lock().unwrap().first(),
+            Some(atomcode_host_api::HostCommand::SetReasoningEffort { .. })
+        ));
 
         // Both switches committed to the session state.
         let map = sessions.lock().await;
@@ -767,9 +760,7 @@ mod tests {
     #[tokio::test]
     async fn set_config_option_mode_switches_runtime_and_broadcasts() {
         use agent_client_protocol::schema::v1::SessionNotification;
-        use atomcode_coding::runtime::{
-            coding_runtime_control_channel, CodingRuntimeControl, RuntimeExit, RuntimeExitReason,
-        };
+        use atomcode_coding::runtime::{coding_runtime_control_channel, CodingRuntimeControl};
         let (runtime, mut controls) = coding_runtime_control_channel();
         let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
         let (commands, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -880,19 +871,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_config_option_reasoning_effort_reloads_provider() {
-        use atomcode_coding::runtime::{
-            coding_runtime_control_channel, RuntimeExit, RuntimeExitReason,
-        };
+    async fn set_config_option_reasoning_effort_reaches_the_host() {
+        use atomcode_coding::runtime::coding_runtime_control_channel;
         let (runtime, controls) = coding_runtime_control_channel();
-        // No runtime owner: the provider reload fails fast (the control channel
-        // send is rejected) instead of parking the turn waiting for a reply.
+        // Nothing owns the runtime: the effort switch must not need it any
+        // more — it is the host's, and that is the point of this criterion.
         drop(controls);
         let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let host = std::sync::Arc::new(crate::acp::sessions::RecordingHost::default());
         let (commands, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = SessionState {
             commands,
-            control: std::sync::Arc::new(crate::acp::sessions::SilentHost),
+            control: host.clone(),
             events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
             runtime,
             _front_end: atomcode_coding::front_end::FrontEnd::new(),
@@ -913,34 +903,14 @@ mod tests {
 
         let (agent_endpoint, client_endpoint) = Channel::duplex();
         let agent_sessions = Arc::clone(&sessions);
-        // Records the value the resolver was asked to apply. The stub runtime
-        // cannot complete a real reassemble, so the handler surfaces an error
-        // *from the reload step* — which is exactly the contract under test:
-        // a legal effort is accepted, forwarded to the resolver, and reaches
-        // the provider reload (it is not rejected by value validation).
-        let seen_effort: Arc<std::sync::Mutex<Option<String>>> =
-            Arc::new(std::sync::Mutex::new(None));
-        let seen_for_handler = Arc::clone(&seen_effort);
         let server = Agent
             .builder()
             .on_receive_request(
                 async move |req: SetSessionConfigOptionRequest,
                             responder: Responder<SetSessionConfigOptionResponse>,
                             cx| {
-                    let seen = Arc::clone(&seen_for_handler);
-                    let resolver = move |effort: &str| -> Option<CodingAgentConfig> {
-                        *seen.lock().unwrap() = Some(effort.to_string());
-                        effort_resolver_fn(effort)
-                    };
-                    let effort: &SessionModelResolver = &resolver;
-                    match handle_set_session_config_option(
-                        &agent_sessions,
-                        &cx,
-                        &req,
-                        None,
-                        Some(effort),
-                    )
-                    .await
+                    match handle_set_session_config_option(&agent_sessions, &cx, &req, None, None)
+                        .await
                     {
                         Ok(resp) => responder.respond(resp),
                         Err(err) => responder.respond_with_error(err),
@@ -951,35 +921,33 @@ mod tests {
             .connect_to(agent_endpoint);
         let server_task = tokio::spawn(server);
 
-        let err: agent_client_protocol::schema::v1::Error = Client
+        Client
             .builder()
             .connect_with(client_endpoint, |cx: ConnectionTo<Agent>| async move {
-                let err = cx
-                    .send_request(SetSessionConfigOptionRequest::new(
-                        SessionId::new("acp-1"),
-                        REASONING_EFFORT_CONFIG_ID,
-                        SessionConfigOptionValue::value_id("max"),
-                    ))
-                    .block_task()
-                    .await
-                    .expect_err("stub runtime cannot complete the reload");
-                Ok(err)
+                cx.send_request(SetSessionConfigOptionRequest::new(
+                    SessionId::new("acp-1"),
+                    REASONING_EFFORT_CONFIG_ID,
+                    SessionConfigOptionValue::value_id("max"),
+                ))
+                .block_task()
+                .await
+                .expect("a legal effort the host accepts goes through");
+                Ok(())
             })
             .await
             .unwrap();
         server_task.abort();
 
-        // The value passed validation and reached the resolver; the failure is
-        // the stub runtime's, not an "unknown effort" / "cannot be applied"
-        // rejection along the way.
+        // What the wire asked for reached the host as the contract's own knob,
+        // with the tier mapped: this channel offers `off | high | max`, and
+        // `max` is `ReasoningEffort::Max`. It used to be a whole configuration
+        // rebuilt here from a resolver closure; resolving is the host's job.
         assert_eq!(
-            *seen_effort.lock().unwrap(),
-            Some("max".to_string()),
-            "resolver must be asked for the requested effort"
-        );
-        assert!(
-            err_data(&err).contains("reasoning effort reload failed"),
-            "{err:?}"
+            *host.asked.lock().unwrap(),
+            vec![atomcode_host_api::HostCommand::SetReasoningEffort {
+                session: "test-native".to_string(),
+                level: Some(atomcode_kernel::provider::ReasoningEffort::Max),
+            }]
         );
     }
 
