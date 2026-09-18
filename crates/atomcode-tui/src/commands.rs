@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use atomcode_kernel::host::{HostCommand, HostError, HostReply};
+use atomcode_host_api::{HostCommand, HostError, HostReply};
 use atomcode_kernel::message::Role;
 use atomcode_kernel::provider::ReasoningEffort;
 use atomcode_kernel::session::{derive_messages, SessionEvent};
@@ -302,6 +302,7 @@ const SESSION: &[Command] = &[
         "[模型 id]",
         "这个会话从现在起用哪个模型;不带 id 则挑一个",
     ),
+    Command::new("provider", "配置里有哪些 provider,现在用的是哪个;挑一个就换过去"),
     Command::taking("rename", "<名字>", "给这个会话改个名字"),
     Command::taking(
         "diff",
@@ -314,11 +315,6 @@ const SESSION: &[Command] = &[
         "改要不要问:plan 只看不动、ask 动手前问、edits 改文件不问、auto 全不问;不带参数则说现在是哪个",
     ),
     Command::taking("cd", "<目录>", "换到另一个目录干活;会开一条新会话"),
-    Command::taking(
-        "worktree",
-        "<名字>",
-        "开一个同名分支的 worktree 并换过去干活;已经有就直接过去",
-    ),
     Command::taking(
         "config",
         "[项 值]",
@@ -374,7 +370,7 @@ impl CommandSet for SessionCommands {
         // What host control acts on is the session this screen follows, whoever
         // is on screen.
         let root = client.root();
-        let host = |control: Option<std::sync::Arc<dyn atomcode_kernel::host::HostControl>>| {
+        let host = |control: Option<std::sync::Arc<dyn atomcode_host_api::HostControl>>| {
             control.ok_or_else(|| Outcome::Refused("这块屏幕没接上宿主".into()))
         };
         match name {
@@ -707,7 +703,7 @@ impl CommandSet for SessionCommands {
                 }
             }
             "mode" => {
-                use atomcode_kernel::host::Mode;
+                use atomcode_host_api::Mode;
                 let wanted = match args.trim() {
                     "" => {
                         return Outcome::Said(
@@ -922,30 +918,48 @@ impl CommandSet for SessionCommands {
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
-            // A branch of one's own with a checkout of its own — what a person
-            // reaches for before letting an agent loose on something they are
-            // not sure of. It ends in a change of directory, so it ends in a
-            // new session, and says so the same way `/cd` does.
-            "worktree" => {
+            // Listing only. Adding, editing and removing a provider stays with
+            // the configuration file on purpose: a provider entry carries an
+            // `api_key`, and a screen that edited those tables would be a screen
+            // that handles credentials.
+            //
+            // Switching is `/model <id>` — a provider and a model are resolved
+            // by the same call, so the picked value is that command rather than
+            // a second switch that would have to agree with it.
+            "provider" => {
                 let control = match host(control) {
                     Ok(control) => control,
                     Err(refusal) => return refusal,
                 };
-                let name = args.trim();
-                if name.is_empty() {
-                    return Outcome::Refused("要一个名字:`/worktree 试一下`".into());
-                }
                 match control
-                    .call(HostCommand::Worktree {
+                    .call(HostCommand::Providers {
                         session: root.clone(),
-                        name: name.to_string(),
                     })
                     .await
                 {
-                    Ok(HostReply::SessionChanged { session }) => {
-                        Outcome::Said(format!("在 worktree `{name}` 里开了新会话 {session}"))
+                    Ok(HostReply::Providers { providers, .. }) if providers.is_empty() => {
+                        Outcome::Said("配置里没有 provider".into())
                     }
-                    Ok(_) => Outcome::Said(format!("换到 worktree `{name}`")),
+                    Ok(HostReply::Providers { providers, current }) => {
+                        let choices = providers
+                            .into_iter()
+                            .map(|p| {
+                                let here = current.as_deref() == Some(p.id.as_str());
+                                crate::overlay::Choice::new(
+                                    format!("/model {}", p.id),
+                                    p.id.clone(),
+                                )
+                                .about(p.about)
+                                .marked(here)
+                            })
+                            .collect();
+                        Outcome::Open(crate::overlay::Picker::new(
+                            "provider",
+                            "换成哪个 provider · enter 换过去",
+                            choices,
+                        ))
+                    }
+                    Ok(other) => Outcome::Refused(format!("宿主答了别的:{other:?}")),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
@@ -1055,7 +1069,7 @@ impl CommandSet for SessionCommands {
                             servers
                                 .into_iter()
                                 .map(|server| {
-                                    use atomcode_kernel::host::McpServerState as S;
+                                    use atomcode_host_api::McpServerState as S;
                                     let state = match server.state {
                                         S::Connecting => "连接中".to_string(),
                                         S::Connected => "已连接".to_string(),
@@ -1286,7 +1300,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl atomcode_kernel::host::HostControl for Recording {
+    impl atomcode_host_api::HostControl for Recording {
         async fn call(&self, command: HostCommand) -> Result<HostReply, HostError> {
             self.asked.lock().unwrap().push(command);
             self.replies
@@ -1295,9 +1309,7 @@ mod tests {
                 .pop_front()
                 .unwrap_or(Ok(HostReply::Done))
         }
-        fn subscribe(
-            &self,
-        ) -> tokio::sync::mpsc::UnboundedReceiver<atomcode_kernel::host::HostEvent> {
+        fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<atomcode_host_api::HostEvent> {
             tokio::sync::mpsc::unbounded_channel().1
         }
     }
@@ -1380,7 +1392,7 @@ mod tests {
             .lock()
             .unwrap()
             .push_back(Ok(HostReply::RewindPoints {
-                points: vec![atomcode_kernel::host::RewindPoint {
+                points: vec![atomcode_host_api::RewindPoint {
                     turn: 2,
                     prompt: "two".into(),
                     files: 1,
@@ -1460,36 +1472,51 @@ mod tests {
             ]
         );
     }
-    /// `/worktree` asks the host to open one and ends where `/cd` ends: in a
-    /// new session, said out loud.
+    /// `/provider` lists what is configured and hands a pick to `/model`, which
+    /// is the one switch — and the list never carries a credential.
     #[tokio::test]
-    async fn worktree_is_asked_of_the_host_and_lands_in_a_new_session() {
+    async fn provider_lists_what_is_configured_and_picks_through_the_one_switch() {
         let host = Arc::new(Recording::default());
-        host.replies
-            .lock()
-            .unwrap()
-            .push_back(Ok(HostReply::SessionChanged {
-                session: "lead-2".into(),
-            }));
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::Providers {
+                providers: vec![
+                    atomcode_host_api::ProviderChoice {
+                        id: "zhipu".into(),
+                        about: "openai_compat · glm-5".into(),
+                    },
+                    atomcode_host_api::ProviderChoice {
+                        id: "local".into(),
+                        about: "ollama · qwen".into(),
+                    },
+                ],
+                current: Some("zhipu".into()),
+            }),
+            Ok(HostReply::Providers {
+                providers: Vec::new(),
+                current: None,
+            }),
+        ]);
         let (app, _client, all) = following(&host);
 
-        match all.dispatch("/worktree 试一下", &app.context()).await {
-            Outcome::Said(text) => {
-                assert!(text.contains("试一下") && text.contains("lead-2"), "{text}")
-            }
+        match all.dispatch("/provider", &app.context()).await {
+            Outcome::Open(picker) => assert_eq!(picker.id(), "provider"),
             other => panic!("{other:?}"),
         }
-        // Without a name there is nothing to open, and nothing is asked.
-        assert!(matches!(
-            all.dispatch("/worktree", &app.context()).await,
-            Outcome::Refused(_)
-        ));
+        // Nothing configured is said, not refused.
+        match all.dispatch("/provider", &app.context()).await {
+            Outcome::Said(text) => assert!(text.contains("没有 provider"), "{text}"),
+            other => panic!("{other:?}"),
+        }
         assert_eq!(
             *host.asked.lock().unwrap(),
-            vec![HostCommand::Worktree {
-                session: "lead".into(),
-                name: "试一下".into(),
-            }]
+            vec![
+                HostCommand::Providers {
+                    session: "lead".into(),
+                },
+                HostCommand::Providers {
+                    session: "lead".into(),
+                },
+            ]
         );
     }
 
@@ -1498,7 +1525,7 @@ mod tests {
     #[tokio::test]
     async fn language_reads_and_writes_the_one_setting_it_names() {
         let host = Arc::new(Recording::default());
-        let language = || atomcode_kernel::host::Setting {
+        let language = || atomcode_host_api::Setting {
             id: "language".into(),
             label: "语言".into(),
             value: "zh".into(),
@@ -1564,13 +1591,13 @@ mod tests {
         host.replies.lock().unwrap().extend([
             Ok(HostReply::Changes {
                 files: vec![
-                    atomcode_kernel::host::ChangedFile {
+                    atomcode_host_api::ChangedFile {
                         path: "src/parser.rs".into(),
                         added: 12,
                         removed: 3,
                         binary: false,
                     },
-                    atomcode_kernel::host::ChangedFile {
+                    atomcode_host_api::ChangedFile {
                         path: "logo.png".into(),
                         added: 0,
                         removed: 0,
@@ -1661,7 +1688,7 @@ mod tests {
                 detail: None,
             }),
             Ok(HostReply::Settings {
-                settings: vec![atomcode_kernel::host::Setting {
+                settings: vec![atomcode_host_api::Setting {
                     id: "thinking".into(),
                     label: "思考".into(),
                     value: "off".into(),

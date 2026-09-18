@@ -11,8 +11,8 @@ use atomcode_harness::host::{open, Opening, Registry, Trees};
 use atomcode_harness::plugins;
 use atomcode_harness::profile::Profiles;
 use atomcode_harness::session::SessionEvent;
+use atomcode_host_api::{HostCommand, HostConnection, HostError, HostEvent, HostReply};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
-use atomcode_kernel::host::{HostCommand, HostConnection, HostError, HostEvent, HostReply};
 use atomcode_kernel::provider::ReasoningEffort;
 
 #[ctor::ctor]

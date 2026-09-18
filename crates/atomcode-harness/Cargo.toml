@@ -11,6 +11,7 @@ path = "src/bin/harness.rs"
 
 [dependencies]
 atomcode-plexus = { path = "../atomcode-plexus" }
+atomcode-host-api = { path = "../atomcode-host-api" }
 # Value types only (Message/ToolCall/ToolDef/LlmProvider/Tool). The kernel's own
 # agent loop is deliberately NOT used: the loop is a plugin here, which is the
 # whole point of the experiment.

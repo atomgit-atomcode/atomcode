@@ -6,15 +6,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use atomcode_coding::front_end::{connect, FrontEnd};
+use atomcode::host::{connect, HostConfig};
+use atomcode_coding::front_end::FrontEnd;
 use atomcode_coding::{
     CodingAgentConfig, CodingProviderFactory, CodingRuntime, CodingRuntimeStart, PrepareOptions,
     ProviderBuildError, ProviderUnavailableReason, RuntimeError, SessionMode,
     StaticPluginHookSource, SubagentPolicy,
 };
 use atomcode_harness::session::SessionEvent;
+use atomcode_host_api::{HostCommand, HostConnection, HostError, HostEvent, HostReply};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
-use atomcode_kernel::host::{HostCommand, HostConnection, HostError, HostEvent, HostReply};
 use atomcode_kernel::message::{Message, Role};
 use atomcode_kernel::provider::{ChatOptions, LlmProvider, ReasoningEffort};
 use atomcode_kernel::stream::{ProviderError, StreamEvent, TokenUsage};
@@ -159,7 +160,7 @@ async fn connected_with(env: &Env, subagents: SubagentPolicy) -> HostConnection 
 async fn connected_as(
     env: &Env,
     subagents: SubagentPolicy,
-    config: Option<Arc<dyn atomcode_coding::front_end::HostConfig>>,
+    config: Option<Arc<dyn atomcode::host::HostConfig>>,
 ) -> (HostConnection, Arc<FrontEnd>) {
     connected_full(env, subagents, config, Vec::new()).await
 }
@@ -169,13 +170,13 @@ async fn connected_as(
 async fn connected_full(
     env: &Env,
     subagents: SubagentPolicy,
-    config: Option<Arc<dyn atomcode_coding::front_end::HostConfig>>,
+    config: Option<Arc<dyn atomcode::host::HostConfig>>,
     skill_dirs: Vec<std::path::PathBuf>,
 ) -> (HostConnection, Arc<FrontEnd>) {
-    let front_end = match config {
-        Some(config) => FrontEnd::new().with_config(config),
-        None => FrontEnd::new(),
-    };
+    // The configuration source goes to `connect`, not onto the front end: the
+    // front end no longer carries it (2026-09-18, the adapter moved here).
+    let host_config = config;
+    let front_end = FrontEnd::new();
     let mut agent = CodingAgentConfig::new(
         "key",
         "https://example.test/v1",
@@ -209,7 +210,7 @@ async fn connected_full(
         .await
         .expect("the runtime starts");
     (
-        connect(runtime, front_end.clone(), agent).expect("connects once"),
+        connect(runtime, front_end.clone(), agent, host_config).expect("connects once"),
         front_end,
     )
 }
@@ -828,7 +829,7 @@ fn runtime_errors_are_host_errors_by_the_table() {
         (
             RuntimeError::ProviderUnavailable(ProviderUnavailableReason::AuthenticationRequired),
             HostError::ProviderUnavailable {
-                reason: atomcode_kernel::host::ProviderUnavailableReason::AuthenticationRequired,
+                reason: atomcode_host_api::ProviderUnavailableReason::AuthenticationRequired,
             },
         ),
         (
@@ -863,10 +864,14 @@ fn runtime_errors_are_host_errors_by_the_table() {
         ),
     ];
     for (runtime, host) in cases {
-        assert_eq!(HostError::from(runtime.clone()), host, "{runtime:?}");
+        assert_eq!(
+            atomcode::host::refused(runtime.clone()),
+            host,
+            "{runtime:?}"
+        );
     }
     assert!(matches!(
-        HostError::from(RuntimeError::ReconfigureFailed("broke".into())),
+        atomcode::host::refused(RuntimeError::ReconfigureFailed("broke".into())),
         HostError::Failed { message } if message.contains("broke")
     ));
 }
@@ -1316,7 +1321,7 @@ impl Editable {
     }
 }
 
-impl atomcode_coding::front_end::HostConfig for Editable {
+impl HostConfig for Editable {
     fn for_model(&self, model: &str) -> Result<CodingAgentConfig, String> {
         let mut config = CodingAgentConfig::new("key", "https://example.test/v1", model, &self.dir);
         config.interactive = true;
@@ -1400,7 +1405,7 @@ async fn a_reload_after_the_configuration_changed_runs_on_what_it_says_now() {
 /// file would.
 struct Models(std::path::PathBuf);
 
-impl atomcode_coding::front_end::HostConfig for Models {
+impl HostConfig for Models {
     fn for_model(&self, model: &str) -> Result<CodingAgentConfig, String> {
         if model == "missing" {
             return Err("no model `missing` is configured".into());
@@ -1652,7 +1657,7 @@ async fn the_mode_a_person_picks_is_the_one_the_session_runs_in() {
             .control
             .call(HostCommand::SetMode {
                 session: session.clone(),
-                mode: atomcode_kernel::host::Mode::Plan,
+                mode: atomcode_host_api::Mode::Plan,
             })
             .await,
         Ok(HostReply::Done)
@@ -1681,7 +1686,7 @@ async fn the_mode_a_person_picks_is_the_one_the_session_runs_in() {
             .control
             .call(HostCommand::SetMode {
                 session: session.clone(),
-                mode: atomcode_kernel::host::Mode::Auto,
+                mode: atomcode_host_api::Mode::Auto,
             })
             .await,
         Ok(HostReply::Done)

@@ -137,7 +137,7 @@ async fn a_session_the_product_wrote_comes_back_on_the_row_assembled_screen() {
         headless: Some((100, 30)),
         ..Screen::default()
     };
-    let mounted = tui_front::mount(second, front_end, config, &screen)
+    let mounted = tui_front::mount(second, front_end, config, None, &screen)
         .await
         .expect("the screen mounts");
     let term = mounted

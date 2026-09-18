@@ -22,12 +22,19 @@ pub mod uninstall;
 /// live here. Does not depend on `atomcode-core` (v2 stack only).
 pub mod acp;
 
+/// Host control for the coding runtime: the adapter behind `HostControl`.
+/// Lives here because this binary is the host (`docs/architecture-target.md`
+/// §2.4), and a Product crate must not carry a front-end contract.
+pub mod host;
+
 /// `atomcode --tui`: the full-screen UI of `atomcode-tui`, in an App of its own,
 /// driving the product runtime through the handle protocol and host control.
 pub mod tui_front {
     use std::sync::Arc;
 
-    use atomcode_coding::front_end::{connect, FrontEnd};
+    use atomcode_coding::front_end::FrontEnd;
+
+    use crate::host::connect;
     use atomcode_coding::{CodingAgentConfig, CodingRuntime};
     use atomcode_tui::launch::{self, Screen};
 
@@ -37,9 +44,10 @@ pub mod tui_front {
         runtime: CodingRuntime,
         front_end: Arc<FrontEnd>,
         config: CodingAgentConfig,
+        host_config: Option<Arc<dyn crate::host::HostConfig>>,
         screen: &Screen,
     ) -> Result<launch::Mounted, String> {
-        let connection = connect(runtime, front_end, config)?;
+        let connection = connect(runtime, front_end, config, host_config)?;
         launch::mount(screen, &[], connection).await
     }
 
@@ -112,7 +120,7 @@ pub mod tui_front {
         }
     }
 
-    impl atomcode_coding::front_end::HostConfig for ConfigFile {
+    impl crate::host::HostConfig for ConfigFile {
         fn for_model(&self, model: &str) -> Result<CodingAgentConfig, String> {
             self.resolve(Some(model))
         }
@@ -125,7 +133,7 @@ pub mod tui_front {
         /// The same catalog `/config` in the settings UI reads and the one the
         /// agent is told about, so three readers cannot disagree about what is
         /// editable.
-        fn settings(&self) -> Vec<atomcode_kernel::host::Setting> {
+        fn settings(&self) -> Vec<atomcode_host_api::Setting> {
             use atomcode_config::config::Config;
             use atomcode_config::settings::{ApplyPolicy, SettingKind, SETTINGS};
             let config = if self.path.exists() {
@@ -135,7 +143,7 @@ pub mod tui_front {
             };
             SETTINGS
                 .iter()
-                .map(|spec| atomcode_kernel::host::Setting {
+                .map(|spec| atomcode_host_api::Setting {
                     id: spec.id.to_string(),
                     label: spec.label_zh.to_string(),
                     value: spec.value(&config),
@@ -179,13 +187,38 @@ pub mod tui_front {
             std::fs::write(&self.path, document.to_string()).map_err(|e| e.to_string())
         }
 
+        /// The configured providers, as choices — id, kind, model.
+        ///
+        /// **The key is not read.** A `ProviderConfig` carries an `api_key`, and
+        /// this answer is printed on a screen and kept in a log; the only defence
+        /// that holds is that the credential never enters the value, which is
+        /// why `about` is built field by field rather than from the struct.
+        fn providers(&self) -> Vec<atomcode_host_api::ProviderChoice> {
+            use atomcode_config::config::Config;
+            let Ok(config) = Config::load(&self.path) else {
+                return Vec::new();
+            };
+            let mut out: Vec<atomcode_host_api::ProviderChoice> = config
+                .providers
+                .iter()
+                .map(|(id, p)| atomcode_host_api::ProviderChoice {
+                    id: id.clone(),
+                    about: format!("{} · {}", p.provider_type, p.model),
+                })
+                .collect();
+            // By name, so the list is the same list every time it is opened —
+            // a `HashMap`'s order is not.
+            out.sort_by(|a, b| a.id.cmp(&b.id));
+            out
+        }
+
         /// Who is signed in, from the stored credentials.
         ///
         /// The name and the email, never the token — this answer is printed on
         /// a screen and kept in a log.
-        fn identity(&self) -> Option<atomcode_coding::front_end::Identity> {
+        fn identity(&self) -> Option<crate::host::Identity> {
             let auth = atomcode_auth::get_stored_auth()?;
-            Some(atomcode_coding::front_end::Identity {
+            Some(crate::host::Identity {
                 who: auth.user.name.unwrap_or(auth.user.username),
                 detail: auth.user.email,
             })
@@ -217,7 +250,7 @@ pub mod tui_front {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use atomcode_coding::front_end::HostConfig;
+        use crate::host::HostConfig;
 
         const CONFIG: &str = r#"
 default_model = "custom/a"
@@ -245,7 +278,7 @@ model = "vendor-b"
         /// place, which is what a person's config file deserves.
         #[test]
         fn a_setting_is_read_from_the_file_and_written_back_into_it() {
-            use atomcode_coding::front_end::HostConfig;
+            use crate::host::HostConfig;
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("config.toml");
             std::fs::write(&path, "# 我自己写的注释\n[ui]\ntheme = \"dark\"\n").unwrap();
@@ -402,9 +435,10 @@ model = "vendor-b"
         runtime: CodingRuntime,
         front_end: Arc<FrontEnd>,
         config: CodingAgentConfig,
+        host_config: Option<Arc<dyn crate::host::HostConfig>>,
         screen: &Screen,
     ) -> Result<(), String> {
-        let mounted = mount(runtime, front_end, config, screen).await?;
+        let mounted = mount(runtime, front_end, config, host_config, screen).await?;
         let ctx = mounted.app.context();
         mounted.ui.run(&ctx, None).await
     }

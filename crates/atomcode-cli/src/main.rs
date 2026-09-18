@@ -2508,18 +2508,26 @@ async fn run() -> Result<i32> {
                     total_ms = run_start.elapsed().as_millis() as u64,
                     "handing control to the row-assembled TUI"
                 );
-                let front_end =
-                    front_end.with_config(std::sync::Arc::new(atomcode::tui_front::ConfigFile {
+                // Handed to the adapter rather than stashed on the front end:
+                // the front end was only carrying it for host control's benefit.
+                let host_config: std::sync::Arc<dyn atomcode::host::HostConfig> =
+                    std::sync::Arc::new(atomcode::tui_front::ConfigFile {
                         path: config_path.clone(),
                         working_dir: working_dir.clone(),
                         telemetry: Some(telemetry.clone()),
                         skip_permissions: cli.dangerously_skip_permissions,
                         provider_override: cli.provider.clone(),
-                    }));
-                let result = atomcode::tui_front::run(runtime, front_end, coding_cfg, &screen)
-                    .await
-                    .map(|()| 0)
-                    .map_err(|why| anyhow::anyhow!(why));
+                    });
+                let result = atomcode::tui_front::run(
+                    runtime,
+                    front_end,
+                    coding_cfg,
+                    Some(host_config),
+                    &screen,
+                )
+                .await
+                .map(|()| 0)
+                .map_err(|why| anyhow::anyhow!(why));
                 if let Some(id) = &active_session_id {
                     println!("\n{}", resume_hint_line(id, false, hint_zh));
                 }

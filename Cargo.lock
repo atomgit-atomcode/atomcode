@@ -326,7 +326,10 @@ dependencies = [
  "atomcode-codingplan",
  "atomcode-config",
  "atomcode-daemon",
+ "atomcode-harness",
+ "atomcode-host-api",
  "atomcode-kernel",
+ "atomcode-plexus",
  "atomcode-telemetry",
  "atomcode-tui",
  "atomcode-tuix",
@@ -578,6 +581,7 @@ dependencies = [
  "async-trait",
  "atomcode-capabilities",
  "atomcode-config",
+ "atomcode-host-api",
  "atomcode-kernel",
  "atomcode-plexus",
  "atomcode-review",
@@ -589,6 +593,17 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "atomcode-host-api"
+version = "5.0.9"
+dependencies = [
+ "async-trait",
+ "atomcode-kernel",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -662,6 +677,7 @@ dependencies = [
  "async-trait",
  "atomcode-capabilities",
  "atomcode-harness",
+ "atomcode-host-api",
  "atomcode-kernel",
  "atomcode-plexus",
  "base64",

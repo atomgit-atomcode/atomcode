@@ -20,11 +20,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use atomcode_kernel::agent::AgentHandle;
-use atomcode_kernel::event::{AgentCommand, AgentEvent};
-use atomcode_kernel::host::{
+use atomcode_host_api::{
     HostCommand, HostConnection, HostControl, HostError, HostEvent, HostReply, StoredSession,
 };
+use atomcode_kernel::agent::AgentHandle;
+use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::provider::ReasoningEffort;
 use atomcode_plexus::{App, ConfigTree, Layer, PluginRegistry};
 use tokio::sync::mpsc;

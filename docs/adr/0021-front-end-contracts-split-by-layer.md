@@ -230,6 +230,68 @@ loop、策略干预、本地上下文排队(第 3 条)与人停成员(0023 第 8
 - **切模型要宿主解析配置**:「换到模型 X」要按宿主此刻的配置把 X 解析成完整的 provider 设置,这是宿主的事,
   前端不递配置。宿主不提供解析时 `SwitchModel` 回 `Failed`;`SignIn` 用宿主此刻的配置重新签入。
 
+## 落地时的修订(2026-09-18,M5.6 执行中):契约搬出 kernel,适配器搬进 Host
+
+**推翻 §6 的「不建新 crate」与「契约类型放 kernel」。** 两处落点都改了,按
+`docs/architecture-target.md` §2 的五层重新归位。
+
+### 一、契约:`kernel::host` → `atomcode-host-api`
+
+§6 当时的理由是 `AGENTS.md:54` 拆纯协议叶子的三条(稳定跨进程 schema、非 Rust
+codegen、独立版本契约)一条都不满足。这个判断没错,但它问错了问题:它问的是
+「值不值得为这份契约单开一个 crate」,而该问的是**「kernel 能不能承受这份契约的
+变动速度」**。
+
+证据是这一天长出来的。M5.6 里它新增了 `SetMode`、`ChangeDirectory`、`Settings`、
+`SetSetting`、`Models`、`Rename`、`McpTools`、`WhoAmI`、`Thinking`、`SetThinking`、
+`Changes`、`Providers`、`Worktree` —— 十三条,一天之内,全是功能面。kernel 不该
+为此动版本。
+
+**kernel 只留 agent 核心**:句柄协议(`event`)、会话事实(`session`)、agent 对外
+契约(`agent`)、中立值类型(`message`、`provider`)。功能型的内容一律不进。
+
+`atomcode-host-api` **属 Agent 机制层**(§2.1),不是新开的第六层:§2.5 写着 UI
+「允许依赖 Agent 机制的缝与协议」,这份东西就是那个「协议」。它只依赖
+`atomcode-kernel` 取三个值类型(`ReasoningEffort`、`SeqNo`、`RewindScope`),方向是
+host-api → kernel,kernel 不反向依赖,所以 kernel 仍然不为它动。
+
+名字不叫 `control`:`HostControl` 只是它的一半,`HostConnection` 与十一个载荷类型不在
+「控制」这个词里。也不叫 `capability`:§2.2 的「能力行」和 §3 的「归能力行」已经占住
+了这个词,而这两者恰恰是这份契约的**对面**。
+
+### 二、适配器:`coding::front_end` → `atomcode-cli`
+
+`impl HostControl for RuntimeControl` 与 `connect` 原来住在 `atomcode-coding` 里。
+§5 自己管它叫「**宿主侧** adapter」,而 §2.3 的 Product「不装前端」、§9 更把 coding
+列在 `legacy/`「只删不加」—— 它住在那儿,就把一份面向前端的契约拽进了 Product 层。
+
+搬到 `atomcode-cli`,因为**今天的 cli 就是 Host**:`lib.rs` 的 `tui_front` 模块自己
+写着「driving the product runtime through the handle protocol and host control」,
+里面就是 §2.4 的三样活 —— 挂 UI 行、起 App、读配置。§9 的清单里 cli 也在 `host/` 组。
+
+**不另开宿主共享库**,依据 §9 的「拆 crate 痛点驱动」:`connect()` 今天只有一个调用方。
+daemon 不是第三个宿主 —— cli 的 `main.rs` 本来就直接起它(`run_server`),它应当是同一个
+宿主的另一个 `[[bin]]`。真要抽的痛点,等 M6.3 迁 ACP 时再说。
+
+连带的两件事:
+
+- `FrontEnd` 留在 coding(它是 feed,coding 内部三处在用),但不再**寄存**宿主配置 ——
+  原来 cli 把 `Arc<dyn HostConfig>` 塞给它、适配器再取回来,它是个袋子不是持有者。现在
+  适配器自己持有,`FrontEnd` 开四个访问器给宿主用。
+- `impl From<RuntimeError> for HostError` 变成函数 `refused()`:两个类型对 cli 都是外部
+  的,孤儿规则挡住了 —— 挡得对,这个映射是这个宿主的判断,不该由哪个 crate 替所有人背。
+
+### 三、判别法与闸门
+
+一条命令进不进宿主契约,先问「一个**不驱动仓库**的宿主(daemon、测试)拿它有意义吗」。
+没有就归能力行(§3 给 goal / loop / 策略干预 / 本地上下文排队定的那条路)。`Worktree`
+因此在同一批里从契约撤出,改成能力行登记的目录命令;`Changes` 留着但记为边缘 ——
+两级浏览器要结构化数据,而目录命令的 `run` 只能回字符串。
+
+方向这件事在调用处是看不见的:把 `atomcode-host-api` 加进 `atomcode-coding`,编得过、
+跑得过、判据全绿,它只对一条没人执行的规矩是错的。所以补 `gates/layers.sh`,用各
+Cargo.toml 的**直接**依赖断言四条,并把 harness 今天欠的混层债(6 条)钉成只能变小的基线。
+
 ## 权衡过、没做的
 
 - **驱动协议当契约。** 覆盖全、零迁移;不取的理由是背景里的四条。

@@ -1799,7 +1799,7 @@ impl Plugin for CapabilityCommandsPlugin {
         &["commands"]
     }
     fn description(&self) -> &'static str {
-        "goal, loop, the local-context queue and the policy intervention, as commands"
+        "goal, loop, the local-context queue, the policy intervention and `worktree`, as commands"
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         for command in [
@@ -1808,6 +1808,7 @@ impl Plugin for CapabilityCommandsPlugin {
             Arc::new(LoopCommand(self.0.clone())),
             Arc::new(QueueCommand(self.0.clone())),
             Arc::new(PolicyCommand(self.0.clone())),
+            Arc::new(WorktreeCommand),
         ] {
             atomcode_harness::commands::register(ctx, command)?;
         }
@@ -1831,6 +1832,96 @@ fn on_the_session(name: &str, usage: Option<&str>, summary: &str) -> CommandDesc
 /// and these drive the runtime.
 fn the_conversation_itself(agent: &atomcode_harness::agent::Agent) -> bool {
     agent.parent().is_none()
+}
+
+/// `worktree <name>`: a branch of one's own with a checkout of its own.
+///
+/// **A catalog command rather than a host command** (`docs/adr/0021` §3, the
+/// same place goal and loop live). Host control is a *neutral* contract — a
+/// front end asks it for things that mean something to any host, a coding
+/// runtime or a daemon or a test — and `git worktree` means nothing to a host
+/// that is not driving a repository. `ChangeDirectory` is the neutral verb and
+/// stays in the contract; this is the product-specific way of producing a
+/// directory to point it at, so it says where it made one and lets the person
+/// take the neutral step.
+struct WorktreeCommand;
+
+#[async_trait]
+impl atomcode_harness::commands::CatalogCommand for WorktreeCommand {
+    fn describe(&self) -> CommandDescription {
+        on_the_session(
+            "worktree",
+            Some("<名字>"),
+            "开一个同名分支的 worktree;开好告诉你怎么过去。已经有就直接说在哪",
+        )
+    }
+    fn offered_for(&self, agent: &atomcode_harness::agent::Agent) -> bool {
+        the_conversation_itself(agent)
+    }
+    async fn run(
+        &self,
+        agent: Arc<atomcode_harness::agent::Agent>,
+        args: &str,
+    ) -> Result<String, String> {
+        let name = args.trim();
+        if name.is_empty() {
+            return Err("要一个名字:`/worktree 试一下`".into());
+        }
+        let root = agent
+            .ctx()
+            .service::<atomcode_harness::seams::FsSvc>()
+            .map(|fs| fs.root())
+            .ok_or_else(|| "这个会话没有工作区".to_string())?;
+        let at = worktree(&root, name)?;
+        Ok(format!(
+            "worktree `{name}` 在 {} —— `/cd {}` 过去",
+            at.display(),
+            at.display()
+        ))
+    }
+}
+
+/// Make (or find) the worktree `name` under `root`, and say where it is.
+///
+/// `.worktrees/<name>` inside the repository, which is where this repository
+/// already puts them — a worktree beside the checkout instead would land in
+/// whatever directory happens to be the parent, which on a machine with several
+/// checkouts is somebody else's.
+///
+/// An existing one is *found*, not an error: `/worktree x` twice is a person
+/// going back to what they opened, and refusing the second would make the
+/// command something you have to remember whether you already ran.
+fn worktree(root: &std::path::Path, name: &str) -> Result<std::path::PathBuf, String> {
+    // A name, not a path: it becomes both a directory under `.worktrees` and a
+    // branch, and a `..` in it would put the checkout outside the repository.
+    if name.is_empty()
+        || name.contains(['/', '\\'])
+        || name.starts_with('-')
+        || name.starts_with('.')
+    {
+        return Err(format!(
+            "`{name}` 不能当 worktree 的名字:要一个不带路径分隔符的名字"
+        ));
+    }
+    let at = root.join(".worktrees").join(name);
+    if at.is_dir() {
+        return Ok(at);
+    }
+    let mut git = std::process::Command::new("git");
+    git.arg("-C")
+        .arg(root)
+        .args(["worktree", "add", "-B", name])
+        .arg(&at)
+        .stdin(std::process::Stdio::null());
+    atomcode_capabilities::process_utils::suppress_console_window_sync(&mut git);
+    let out = git.output().map_err(|e| format!("起不了 git:{e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git 拒绝了:{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(at)
 }
 
 struct GoalCommand(Arc<dyn crate::runtime::RuntimeCommands>);
@@ -1999,5 +2090,57 @@ impl atomcode_harness::commands::CatalogCommand for PolicyCommand {
             .ok_or_else(|| format!("`{word}` 不是这次的走法;可以选:{choices}"))?;
         self.0.resolve_policy(pending.id, action).await?;
         Ok(format!("按 `{word}` 往下走。"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::worktree;
+
+    /// A worktree name becomes both a directory and a branch, so it is checked
+    /// before either: a name with a separator in it would put the checkout
+    /// outside the repository it belongs to.
+    ///
+    /// Against a real repository, because what this is really asserting is that
+    /// git made one — a check that only looked at the string would pass while
+    /// the command did nothing.
+    #[test]
+    fn a_worktree_is_made_under_the_repository_and_only_under_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(root.join("a.txt"), "a").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "first"]);
+
+        let at = worktree(root, "try-it").expect("a worktree");
+        assert_eq!(at, root.join(".worktrees").join("try-it"));
+        assert!(at.join("a.txt").is_file(), "git checked the tree out");
+
+        // Asking again finds the one that is there rather than refusing: going
+        // back to what you opened must not depend on remembering that you did.
+        assert_eq!(worktree(root, "try-it").expect("again"), at);
+
+        for bad in ["", "../escape", "a/b", "-x", ".hidden"] {
+            let refused = worktree(root, bad);
+            assert!(refused.is_err(), "`{bad}` must be refused: {refused:?}");
+        }
+        assert!(
+            !root
+                .parent()
+                .map(|p| p.join("escape").exists())
+                .unwrap_or(false),
+            "nothing was made outside the repository"
+        );
     }
 }

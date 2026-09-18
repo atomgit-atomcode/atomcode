@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use atomcode_harness::seams::{UiSvc, UserInterface};
-use atomcode_kernel::host::HostConnection;
+use atomcode_host_api::HostConnection;
 use atomcode_plexus::{App, ConfigTree, Layer, PluginRegistry};
 
 use crate::plugin::{

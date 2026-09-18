@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use atomcode_harness::seams::{UiSvc, UserInterface};
+use atomcode_host_api::{HostConnection, HostControl, HostEvent};
 use atomcode_kernel::agent::{AgentDescription, AgentStatus};
 use atomcode_kernel::event::{AgentCommand, AgentEvent, CommandId, RequestId};
-use atomcode_kernel::host::{HostConnection, HostControl, HostEvent};
 use atomcode_kernel::session::{Committed, LoggedEvent, SeqNo};
 use atomcode_plexus::{plexus_service, Context, Plugin};
 use serde::Deserialize;

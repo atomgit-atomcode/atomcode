@@ -45,6 +45,11 @@ atomcode-daemon = { path = "../atomcode-daemon" }
 # protocol router keeps the stable v1 chain as the default path.
 agent-client-protocol = { workspace = true, features = ["unstable_protocol_v2", "unstable_elicitation"] }
 atomcode-kernel = { path = "../atomcode-kernel" }
+atomcode-host-api = { path = "../atomcode-host-api" }
+# Direct now that the host-control adapter lives here: it speaks the feed and
+# the plugin tree itself, rather than reaching them through `atomcode-coding`.
+atomcode-harness = { path = "../atomcode-harness" }
+atomcode-plexus = { path = "../atomcode-plexus" }
 atomcode-coding = { path = "../atomcode-coding", features = ["atomgit"] }
 atomcode-capabilities = { path = "../atomcode-capabilities", features = ["notify", "setup", "plugin", "mcp", "atomgit", "cc-hooks"] }
 atomcode-auth = { path = "../atomcode-auth" }

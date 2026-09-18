@@ -12,7 +12,11 @@ pub mod conformance;
 pub mod event;
 pub use event::{OUTPUT_TRUNCATION_CHECKPOINT_KIND, ROUND_CAP_CHECKPOINT_KIND};
 pub mod hook;
-pub mod host;
+// `host` moved out to the `atomcode-host-api` crate on 2026-09-18. The kernel keeps
+// the agent's core — the handle protocol, session facts, the neutral value
+// types — and nothing that grows with the product surface: host control took
+// thirteen new commands in a single day, and the kernel must not move for that
+// (`docs/adr/0021`, the 2026-09-18 revision).
 pub mod message;
 pub mod middleware;
 pub mod provider;

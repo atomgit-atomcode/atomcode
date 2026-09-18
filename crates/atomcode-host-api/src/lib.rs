@@ -1,7 +1,7 @@
 //! Host control: what a front end asks of whatever hosts its agents
 //! (`docs/adr/0021` §2).
 //!
-//! The handle protocol ([`crate::event`]) speaks to one agent about its own
+//! The handle protocol ([`atomcode_kernel::event`]) speaks to one agent about its own
 //! conversation. What is here is above any one agent: which session is live, and
 //! settings a person expects to outlive the agent that carries them today. A
 //! front end reaches it through [`HostControl`] and never learns who the host is
@@ -22,8 +22,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::provider::ReasoningEffort;
-use crate::session::SeqNo;
+use atomcode_kernel::provider::ReasoningEffort;
+use atomcode_kernel::session::SeqNo;
 
 /// What a front end asks the host to do.
 #[non_exhaustive]
@@ -61,7 +61,7 @@ pub enum HostCommand {
     Rewind {
         session: String,
         turn: u64,
-        scope: crate::session::RewindScope,
+        scope: atomcode_kernel::session::RewindScope,
         based_on: SeqNo,
     },
     /// The model `session`'s requests go to from now on, by the id a person
@@ -113,13 +113,12 @@ pub enum HostCommand {
     SignIn { session: String },
     /// Who is signed in, as the host knows it.
     WhoAmI { session: String },
-    /// Open a git worktree of `session`'s repository and work there instead.
+    /// The providers this host is configured with.
     ///
-    /// A branch of one's own with a checkout of its own, which is what a person
-    /// reaches for before letting an agent loose on something they are not sure
-    /// of. Answered like [`HostCommand::ChangeDirectory`], because that is what
-    /// it ends in.
-    Worktree { session: String, name: String },
+    /// Switching to one is [`HostCommand::SwitchModel`] with its id — a provider
+    /// and a model are resolved by the same call, so there is one switch rather
+    /// than two that must agree.
+    Providers { session: String },
     /// What `session` has changed in the workspace. `file` asks for that one
     /// file's diff instead of the list.
     ///
@@ -166,7 +165,7 @@ impl HostCommand {
             | Self::SignIn { session }
             | Self::WhoAmI { session }
             | Self::Changes { session, .. }
-            | Self::Worktree { session, .. }
+            | Self::Providers { session }
             | Self::Thinking { session }
             | Self::SetThinking { session, .. } => Some(session),
             Self::ListSessions { .. } => None,
@@ -223,6 +222,13 @@ pub enum HostReply {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         current: Option<String>,
     },
+    /// The providers a person may switch between. `current` is the one this
+    /// conversation runs on, when the host knows it.
+    Providers {
+        providers: Vec<ProviderChoice>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current: Option<String>,
+    },
     /// What a session has done to the workspace.
     ///
     /// `unavailable` is why there is no answer, when there is none — a session
@@ -250,6 +256,17 @@ pub enum HostReply {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+}
+
+/// One provider a person may switch to.
+///
+/// `about` is what it is — its kind and its model — and **never a credential**.
+/// A provider entry in a configuration file carries an `api_key`; this type is
+/// what a screen prints and a log keeps, so the key has no field to travel in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderChoice {
+    pub id: String,
+    pub about: String,
 }
 
 /// One file a session changed.
@@ -455,8 +472,8 @@ pub trait HostControl: Send + Sync {
 pub struct HostConnection {
     /// The session live when the connection was made.
     pub session: String,
-    pub commands: mpsc::UnboundedSender<crate::event::AgentCommand>,
-    pub events: mpsc::UnboundedReceiver<crate::event::AgentEvent>,
+    pub commands: mpsc::UnboundedSender<atomcode_kernel::event::AgentCommand>,
+    pub events: mpsc::UnboundedReceiver<atomcode_kernel::event::AgentEvent>,
     pub control: std::sync::Arc<dyn HostControl>,
 }
 
@@ -494,7 +511,7 @@ mod tests {
             HostCommand::Rewind {
                 session: "a".into(),
                 turn: 2,
-                scope: crate::session::RewindScope::Both,
+                scope: atomcode_kernel::session::RewindScope::Both,
                 based_on: 40,
             },
             HostCommand::SwitchModel {
@@ -550,9 +567,8 @@ mod tests {
                 session: "a".into(),
                 file: Some("src/parser.rs".into()),
             },
-            HostCommand::Worktree {
+            HostCommand::Providers {
                 session: "a".into(),
-                name: "try-it".into(),
             },
             HostCommand::Thinking {
                 session: "a".into(),
@@ -586,7 +602,7 @@ mod tests {
                 | HostCommand::SignIn { .. }
                 | HostCommand::WhoAmI { .. }
                 | HostCommand::Changes { .. }
-                | HostCommand::Worktree { .. }
+                | HostCommand::Providers { .. }
                 | HostCommand::Thinking { .. }
                 | HostCommand::SetThinking { .. } => {}
             }
@@ -675,6 +691,13 @@ mod tests {
                 ],
                 current: Some("glm-5".into()),
             },
+            HostReply::Providers {
+                providers: vec![ProviderChoice {
+                    id: "zhipu".into(),
+                    about: "openai_compat · glm-5".into(),
+                }],
+                current: Some("zhipu".into()),
+            },
             HostReply::Changes {
                 files: vec![ChangedFile {
                     path: "src/parser.rs".into(),
@@ -703,6 +726,7 @@ mod tests {
                 | HostReply::Settings { .. }
                 | HostReply::Models { .. }
                 | HostReply::Changes { .. }
+                | HostReply::Providers { .. }
                 | HostReply::Identity { .. } => {}
             }
         }

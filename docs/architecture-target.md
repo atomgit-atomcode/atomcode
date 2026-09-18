@@ -229,7 +229,7 @@ auth / updater / telemetry 在 Host 层,按需换。插件编译期链接,装插
 
 ```text
 crates/
-  agent/    kernel  plexus  harness
+  agent/    kernel  plexus  harness  host-api
   rows/     capabilities  review  team  discipline
   product/  atomcode
   host/     config  auth  codingplan  updater  telemetry  store  cli  daemon
@@ -237,6 +237,25 @@ crates/
   legacy/   coding  tuix  cli-old  daemon-old        # 绞杀中:只删不加
 gates/layers.sh                                      # 用 cargo metadata 断言依赖方向
 ```
+
+**2026-09-18 落地的两处**(`docs/adr/0021` 的同日修订):
+
+- `host-api` 是宿主控制契约,从 `kernel::host` 搬出来的 —— kernel 只留 agent 核心,
+  而这份契约一天长了十三条功能命令。它属 **Agent 机制**(§2.5:UI「允许依赖机制的缝与
+  **协议**」),只依赖 kernel 取三个值类型,零实现。
+- 宿主侧 adapter(`impl HostControl`、`connect`)从 `coding` 搬进 `cli` —— cli 今天
+  就是 Host(§2.4),而 coding 在下面的 `legacy/` 里,只删不加。不另开宿主共享库,依据
+  本节的「拆 crate 痛点驱动」:今天只有一个调用方。
+- `gates/layers.sh` 用各 Cargo.toml 的**直接**依赖断言方向,并把 harness 的混层债
+  钉成只能变小的基线(`gates/harness-layer.baseline`)。
+
+**待办,按这张表该动但还没动的:**
+
+| 欠的 | 事实 | 归到哪 |
+|---|---|---|
+| `harness` 依赖 `capabilities` | 6 条直接依赖、18 个文件用到 | §2.1 说机制「无 atomcode 内部依赖」。多半是 harness 里混进了本该是能力行的东西,逐个归位 |
+| `daemon` 是独立 crate | 27k 行,而 cli 的 `main.rs` 本来就直接起它(`run_server`) | 它应当是 Host 的一个 `[[bin]]`,不是第三个宿主 |
+| `auth` 整个在 Host 组 | 3,010 行里 31 处 `atomgit`、15 处 `codingplan`;`gateway_crypto.rs` 的模块文档就是「AtomGit LLM gateway … request-signing」 | §2.3 的 Product 清单里逐字写着「AtomGit 网关签名」。该拆:网关签名 / OAuth / openrouter 归 **Product**,只有凭据文件的读写(路径、权限、原子写)是 Host |
 
 今天要处理的混层:`capabilities` 的 provider / atomgit / marketplace 反向依赖 `auth`;
 它内部的 session(14k,harness 刻意不用)、plugin marketplace、setup、askpass、datalog、

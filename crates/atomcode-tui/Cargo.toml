@@ -11,6 +11,7 @@ atomcode-plexus = { path = "../atomcode-plexus" }
 atomcode-harness = { path = "../atomcode-harness" }
 # Value types only: SessionEvent carries kernel messages and tool calls.
 atomcode-kernel = { path = "../atomcode-kernel" }
+atomcode-host-api = { path = "../atomcode-host-api" }
 # The `tools` feature only, and only for the todo fold: the panel must derive the
 # list the *same* way the tool does (`reduce_todos`), or live, replay and resumed
 # views of the same session would disagree. Already in this build's graph — the

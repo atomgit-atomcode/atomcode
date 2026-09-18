@@ -163,27 +163,3 @@ fn the_agent_description_is_defined_once_in_the_kernel() {
         );
     }
 }
-
-/// Host control carries intents, never the host's implementation: no
-/// generation, no whole conversation, no agent configuration (`docs/adr/0021`
-/// §2 and its failure conditions). Comments may say what is kept out; code may
-/// not carry it.
-#[test]
-fn host_control_names_no_implementation() {
-    let host = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/host.rs");
-    let text = std::fs::read_to_string(&host).expect("kernel::host");
-    let offenders: Vec<&str> = text
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .filter(|line| {
-            let lower = line.to_lowercase();
-            ["generation", "sessionsnapshot", "codingagentconfig"]
-                .iter()
-                .any(|word| lower.contains(word))
-        })
-        .collect();
-    assert!(
-        offenders.is_empty(),
-        "host control must not carry the host's implementation: {offenders:#?}"
-    );
-}
