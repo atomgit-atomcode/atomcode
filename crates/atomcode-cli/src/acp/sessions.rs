@@ -18,7 +18,11 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::Error as AcpError;
 use atomcode_capabilities::session::{CatalogScan, SessionManager, SessionStoreError};
-use atomcode_coding::{CodingRuntime, CodingRuntimeEvents, CodingRuntimeHandle, RuntimeMode};
+use atomcode_coding::front_end::FrontEnd;
+use atomcode_coding::{CodingAgentConfig, CodingRuntime, CodingRuntimeHandle, RuntimeMode};
+use atomcode_host_api::{HostControl, HostEvent};
+use atomcode_kernel::event::{AgentCommand, AgentEvent};
+use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
 // ── Session table ─────────────────────────────────────────────────────────────
@@ -35,9 +39,30 @@ use tokio::sync::Mutex;
 /// lock only this session's receiver for the turn's duration. One prompt runs
 /// per session at a time, so that lock is uncontended in practice.
 pub struct SessionState {
+    /// What this session is driven with: the handle protocol
+    /// (`docs/adr/0021` §1), the same one the full-screen UI uses.
+    pub commands: mpsc::UnboundedSender<AgentCommand>,
+    /// And what is asked of the host above it (§2).
+    pub control: Arc<dyn HostControl>,
+    /// The turn's facts, as the contract says them.
+    pub events: Arc<Mutex<mpsc::UnboundedReceiver<AgentEvent>>>,
+    /// Still the runtime handle, for the two callers not yet on the contract:
+    /// `options.rs`'s `reprepare_config` (it hands over a resolved
+    /// `CodingAgentConfig`; the contract hands over a model name and lets the
+    /// host resolve it) and `commands.rs`'s `undo_to_prompt` (it counts turns
+    /// backwards; the contract names a turn). Both are recorded in the plan as
+    /// the two spots that are not mechanical, and both go next.
     pub runtime: CodingRuntimeHandle,
-    pub events: Arc<Mutex<CodingRuntimeEvents>>,
-    pub _task: tokio::task::JoinHandle<atomcode_coding::RuntimeExit>,
+    /// Kept alive because the connection borrows it: it holds the session log
+    /// the host reads to answer "is what you saw still current".
+    pub _front_end: Arc<FrontEnd>,
+    /// The last "the turn finished but its record did not", when there was one.
+    ///
+    /// Pushed by the host (`HostEvent::PersistenceFailed`) rather than read off
+    /// the turn's terminal: the turn did complete, and whether it was written
+    /// down is a separate fact about the store (see `docs/adr/0024` and the
+    /// plan's 6.3 note). Read once at the end of a turn and cleared.
+    pub persistence_failure: Arc<Mutex<Option<String>>>,
     /// Native session id (the single persistence owner's key). The ACP wire id
     /// is `acp-<native_id>`; resume/delete/list all round-trip through it.
     pub native_id: String,
@@ -75,6 +100,27 @@ pub struct SessionState {
 /// the table until the client closes/deletes it or the whole connection ends
 /// (all are freed when the process exits / the client disconnects).
 pub type Sessions = Arc<Mutex<HashMap<String, SessionState>>>;
+
+/// A host that answers nothing, for criteria whose sessions are never asked.
+///
+/// Test-only: a session built by hand has no runtime behind it, and a criterion
+/// that needed one would be testing the runtime instead of the thing it names.
+#[cfg(test)]
+pub(crate) struct SilentHost;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl HostControl for SilentHost {
+    async fn call(
+        &self,
+        _command: atomcode_host_api::HostCommand,
+    ) -> Result<atomcode_host_api::HostReply, atomcode_host_api::HostError> {
+        Err(atomcode_host_api::HostError::Unavailable)
+    }
+    fn subscribe(&self) -> mpsc::UnboundedReceiver<HostEvent> {
+        mpsc::unbounded_channel().1
+    }
+}
 
 // ── ID helpers ────────────────────────────────────────────────────────────────
 
@@ -190,29 +236,60 @@ pub fn validate_additional_directories(additional: &[std::path::PathBuf]) -> Res
 pub async fn register_session(
     sessions: &Sessions,
     runtime: CodingRuntime,
+    config: CodingAgentConfig,
     cwd: std::path::PathBuf,
     config_options: &[SessionConfigOption],
     additional_directories: Vec<std::path::PathBuf>,
 ) -> Result<SessionId, agent_client_protocol::Error> {
-    let CodingRuntime {
-        handle,
-        events,
-        task,
-        session,
-    } = runtime;
     // The runtime owns session identity: a session-bearing prepare always
     // reports its native id. Missing it means the prepare ran session-less,
     // which cannot round-trip through the ACP lifecycle — fail closed.
-    let native_id = session.map(|info| info.id).ok_or_else(|| {
-        agent_client_protocol::util::internal_error("acp: runtime reported no session id")
-    })?;
+    let native_id = runtime
+        .session
+        .as_ref()
+        .map(|info| info.id.clone())
+        .ok_or_else(|| {
+            agent_client_protocol::util::internal_error("acp: runtime reported no session id")
+        })?;
+    // Kept for the two callers still on the handle; see `SessionState::runtime`.
+    let handle = runtime.handle.clone();
+    // The same `connect()` the full-screen UI goes through. ACP stops reading
+    // the product's own event enum here: what it sees from now on is what the
+    // contract says, which is what every other front end sees.
+    let front_end = FrontEnd::new();
+    let connection = crate::host::connect(runtime, front_end.clone(), config, None)
+        .map_err(agent_client_protocol::util::internal_error)?;
+    let atomcode_host_api::HostConnection {
+        commands,
+        events,
+        control,
+        ..
+    } = connection;
+    // One watcher per session for what the host pushes. Only one kind matters
+    // to this channel today, and it matters at the end of a turn.
+    let persistence_failure = Arc::new(Mutex::new(None));
+    {
+        let mut watch = control.subscribe();
+        let seen = persistence_failure.clone();
+        tokio::spawn(async move {
+            while let Some(event) = watch.recv().await {
+                if let HostEvent::PersistenceFailed { message, .. } = event {
+                    *seen.lock().await = Some(message);
+                }
+            }
+        });
+    }
+
     let id = wire_session_id(&native_id);
     sessions.lock().await.insert(
         id.0.to_string(),
         SessionState {
-            runtime: handle,
+            commands,
+            control,
             events: Arc::new(Mutex::new(events)),
-            _task: task,
+            runtime: handle,
+            _front_end: front_end,
+            persistence_failure,
             native_id,
             cwd,
             current_mode: RuntimeMode::Build,
@@ -237,15 +314,15 @@ pub async fn register_session(
 /// The map lock is held only for the synchronous `.get` + `.send` pair; it is
 /// released before any `await`, satisfying the hard constraint in the task brief.
 pub async fn handle_cancel(sessions: &Sessions, session_id: &str) {
-    let runtime = {
+    let commands = {
         sessions
             .lock()
             .await
             .get(session_id)
-            .map(|state| state.runtime.clone())
+            .map(|state| state.commands.clone())
     };
-    if let Some(runtime) = runtime {
-        let _ = runtime.cancel().await;
+    if let Some(commands) = commands {
+        let _ = commands.send(AgentCommand::Cancel);
     }
 }
 
@@ -260,15 +337,16 @@ pub async fn handle_close_session(
     sessions: &Sessions,
     session_id: &SessionId,
 ) -> CloseSessionResponse {
-    let runtime = {
+    let commands = {
         let mut map = sessions.lock().await;
-        map.remove(session_id.0.as_ref()).map(|state| state.runtime)
+        map.remove(session_id.0.as_ref())
+            .map(|state| state.commands.clone())
     };
-    if let Some(runtime) = runtime {
+    if let Some(commands) = commands {
         // Cancel ongoing work first, then shut the runtime down. Both are
         // best-effort: the kernel may already be gone (e.g. a prior error).
-        let _ = runtime.cancel().await;
-        let _ = runtime.shutdown().await;
+        let _ = commands.send(AgentCommand::Cancel);
+        let _ = commands.send(AgentCommand::Shutdown);
     }
     CloseSessionResponse::new()
 }
@@ -334,20 +412,19 @@ pub(crate) mod test_support {
     use super::*;
     use atomcode_capabilities::session::{CatalogEntry, CatalogPresence};
 
-    /// Build a stub session state (live handle + empty events channel) without
+    /// Build a stub session state (live channels + a silent host) without
     /// spawning a real kernel agent.
     pub(crate) fn stub_session(native_id: &str, cwd: &str) -> SessionState {
         let (runtime, _controls) = atomcode_coding::runtime::coding_runtime_control_channel();
-        let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, _cmd_rx) = mpsc::unbounded_channel();
+        let (_ev_tx, events) = mpsc::unbounded_channel();
         SessionState {
-            runtime,
+            commands,
+            control: Arc::new(super::SilentHost),
             events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
-            _task: tokio::spawn(async {
-                atomcode_coding::runtime::RuntimeExit {
-                    reason: atomcode_coding::runtime::RuntimeExitReason::ShutdownRequested,
-                    forced: false,
-                }
-            }),
+            runtime,
+            _front_end: FrontEnd::new(),
+            persistence_failure: Arc::new(Mutex::new(None)),
             native_id: native_id.to_string(),
             cwd: std::path::PathBuf::from(cwd),
             current_mode: RuntimeMode::Build,
@@ -483,22 +560,24 @@ mod tests {
         assert!(err.to_string().contains("unknown session"));
     }
 
+    /// `session/cancel` stops the turn through the handle protocol.
+    ///
+    /// It used to reach into the product runtime's own control channel. What it
+    /// sends now is `AgentCommand::Cancel` — the same command the full-screen
+    /// UI sends for the same gesture, which is the point of 6.3: one way to
+    /// stop a turn, not one per front end.
     #[tokio::test]
-    async fn cancel_sends_cancel_command() {
-        use atomcode_coding::runtime::{
-            coding_runtime_control_channel, CodingRuntimeControl, RuntimeExit, RuntimeExitReason,
-        };
-        let (runtime, mut controls) = coding_runtime_control_channel();
-        let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
+    async fn cancel_sends_the_contracts_cancel() {
+        let (runtime, _controls) = atomcode_coding::runtime::coding_runtime_control_channel();
+        let (commands, mut sent) = mpsc::unbounded_channel();
+        let (_ev_tx, events) = mpsc::unbounded_channel();
         let state = SessionState {
-            runtime,
+            commands,
+            control: Arc::new(super::SilentHost),
             events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
-            _task: tokio::spawn(async {
-                RuntimeExit {
-                    reason: RuntimeExitReason::ShutdownRequested,
-                    forced: false,
-                }
-            }),
+            runtime,
+            _front_end: FrontEnd::new(),
+            persistence_failure: Arc::new(Mutex::new(None)),
             native_id: "test-native".to_string(),
             cwd: std::path::PathBuf::from("/work"),
             current_mode: RuntimeMode::Build,
@@ -512,19 +591,9 @@ mod tests {
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         sessions.lock().await.insert("acp-1".into(), state);
 
-        let control_task = tokio::spawn(async move {
-            match controls.recv().await {
-                Some(CodingRuntimeControl::Cancel { done, .. }) => {
-                    let _ = done.send(Ok(()));
-                    true
-                }
-                _ => false,
-            }
-        });
-
         handle_cancel(&sessions, "acp-1").await;
 
-        assert!(control_task.await.unwrap());
+        assert!(matches!(sent.recv().await, Some(AgentCommand::Cancel)));
     }
 
     #[tokio::test]

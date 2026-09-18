@@ -16,8 +16,10 @@
 //! `v1_elicitation_wire_deserializes_into_v2_shape`). Not emitted: the v2
 //! display-only terminal surface (`terminal_update`/`terminal_output_chunk`).
 
+use atomcode_kernel::event::AgentCommand;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use agent_client_protocol::schema::v2::{
     AgentCapabilities, AgentMessage, AgentThought, AvailableCommandsUpdate,
@@ -44,7 +46,6 @@ use atomcode_capabilities::mcp::config::McpConfigSource;
 use atomcode_capabilities::mcp::{McpServerConfig, McpTransportConfig};
 use atomcode_capabilities::session::SessionManager;
 use atomcode_capabilities::tools::todo::TodoItem;
-use atomcode_coding::{CodingRuntimeHandle, TurnCompletion};
 use atomcode_kernel::event::{AgentEvent, StopReason as KernelStop};
 use atomcode_kernel::message::ImageContent;
 use atomcode_kernel::tool::ToolCall;
@@ -476,7 +477,7 @@ impl TurnWire for V2Wire {
 
     async fn handle_approval_request(
         &mut self,
-        runtime: &CodingRuntimeHandle,
+        commands: &mpsc::UnboundedSender<AgentCommand>,
         req_id: u64,
         payload: serde_json::Value,
         auto_approve: bool,
@@ -505,23 +506,25 @@ impl TurnWire for V2Wire {
             ));
         }
         if auto_approve {
-            let _ = runtime
-                .respond(req_id, serde_json::json!({"decision": "allow"}))
-                .await;
+            let _ = commands.send(AgentCommand::Respond {
+                id: req_id,
+                value: serde_json::json!({"decision": "allow"}),
+            });
         } else if let Err(e) =
-            permission::handle_approval_v2(&self.cx, &self.sid, runtime, req_id, payload).await
+            permission::handle_approval_v2(&self.cx, &self.sid, commands, req_id, payload).await
         {
             eprintln!("acp: v2 approval handling errored ({e}); denying this call, turn continues");
-            let _ = runtime
-                .respond(req_id, serde_json::json!({"decision": "deny"}))
-                .await;
+            let _ = commands.send(AgentCommand::Respond {
+                id: req_id,
+                value: serde_json::json!({"decision": "deny"}),
+            });
         }
         Ok(())
     }
 
     async fn handle_user_input_request(
         &mut self,
-        runtime: &CodingRuntimeHandle,
+        commands: &mpsc::UnboundedSender<AgentCommand>,
         req_id: u64,
         payload: serde_json::Value,
         form_supported: bool,
@@ -533,7 +536,7 @@ impl TurnWire for V2Wire {
         crate::acp::elicitation::handle_request_user_input(
             &self.cx,
             &agent_client_protocol::schema::v1::SessionId::new(self.sid.0.clone()),
-            runtime,
+            commands,
             req_id,
             payload,
             form_supported,
@@ -574,17 +577,17 @@ impl TurnWire for V2Wire {
 
     fn finish(
         &mut self,
-        terminal: Result<TurnCompletion, KernelStop>,
+        terminal: Result<KernelStop, KernelStop>,
         last_error: Option<String>,
         msg_id: &str,
     ) -> Result<(), agent_client_protocol::Error> {
-        let (stop, error_text) = match terminal {
-            Ok(TurnCompletion::Completed { reason, .. }) => (v2_stop_reason(reason), last_error),
-            Ok(TurnCompletion::SnapshotUnavailable { reason, error, .. }) => {
-                (v2_stop_reason(reason), Some(error.message))
-            }
-            Err(stop) => (v2_stop_reason(stop), last_error),
-        };
+        // A terminal is a reason either way; `Err` is the loop giving up on
+        // hearing one. "Finished but not written down" now arrives as
+        // `last_error`, folded in by the driver from what the host pushed.
+        let (stop, error_text) = (
+            v2_stop_reason(terminal.unwrap_or_else(|stop| stop)),
+            last_error,
+        );
         if let Some(text) = error_text {
             let _ = self.notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
                 ContentBlock::Text(TextContent::new(text)),

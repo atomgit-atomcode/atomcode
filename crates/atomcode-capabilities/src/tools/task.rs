@@ -1,24 +1,16 @@
-//! `task` — 把子任务派发给隔离上下文的子 agent(subagent-by-composition)。
-//! 主 agent 按难度选档位(fast/capable)、按类型(explore 只读 / worker 可编辑)
-//! 选子工具集。子 agent 跑在独立内核会话里,结果用 <task_result> 包回。
+//! 派发给子 agent 时给它划的**写入范围**,以及判断某次写入越没越界。
+//!
+//! 这个文件曾经装着整个 `task` 工具(按难度选档位、按类型选子工具集、跑子 agent、
+//! 聚合结果)。那套东西没有任何生产调用方了 —— 今天叫 `task` 的工具是 harness 自己的
+//! (`plugins/subagent.rs`),已随 M6.5 删掉。留下的是 harness 的 `DelegationBoundsPlugin`
+//! 还在用的那一小块:`WorkerScopeGate` 与 `delegated_write_violation`。
 
 use async_trait::async_trait;
-use atomcode_kernel::agent::{Agent, AutoRespond, Outcome, ToolLoopPolicy};
-use atomcode_kernel::event::{AgentCommand, AgentEvent, PolicyIntervention, StopReason};
-use atomcode_kernel::hook::{LifecycleHooks, TurnCtx};
-use atomcode_kernel::message::Message;
 use atomcode_kernel::middleware::{BeforeOutcome, ToolMiddleware};
-use atomcode_kernel::provider::LlmProvider;
 use atomcode_kernel::request::RequestCtx;
-use atomcode_kernel::tool::{
-    MountedTools, ProgressSink, RiskLevel, Tool, ToolCall, ToolContext, ToolResult,
-};
-use serde::Deserialize;
-use serde_json::json;
-use std::collections::BTreeMap;
+use atomcode_kernel::tool::{Tool, ToolCall};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Sentinel prefix on a `ctx.progress` line that marks it as EPHEMERAL live activity
 /// (current action of a running subtask) rather than a committed ↻/✓/✗ scrollback line.
@@ -326,16 +318,15 @@ impl ToolMiddleware for WorkerScopeGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atomcode_kernel::event::PolicyInterventionCode;
+    use atomcode_kernel::event::PolicyIntervention;
     use atomcode_kernel::message::Message;
     use atomcode_kernel::middleware::BeforeOutcome;
     use atomcode_kernel::provider::ChatOptions;
+    use atomcode_kernel::provider::LlmProvider;
     use atomcode_kernel::stream::{ProviderError, StreamEvent};
-    use atomcode_kernel::testkit::{EchoTool, ScriptedProvider};
-    use atomcode_kernel::tool::{ProgressSink, ToolDef, ToolRegistry};
+    use atomcode_kernel::tool::ToolDef;
     use futures::stream::{self, BoxStream};
     use futures::StreamExt;
-    use tokio_util::sync::CancellationToken;
 
     /// Scripted provider: `Some(reply)` → one text turn then clean stop;
     /// `None` → a terminal open error (simulates a failed child).

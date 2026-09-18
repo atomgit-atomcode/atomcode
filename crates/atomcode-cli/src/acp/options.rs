@@ -397,15 +397,14 @@ mod tests {
         };
         let (runtime, mut controls) = coding_runtime_control_channel();
         let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = SessionState {
-            runtime,
+            commands,
+            control: std::sync::Arc::new(crate::acp::sessions::SilentHost),
             events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
-            _task: tokio::spawn(async {
-                RuntimeExit {
-                    reason: RuntimeExitReason::ShutdownRequested,
-                    forced: false,
-                }
-            }),
+            runtime,
+            _front_end: atomcode_coding::front_end::FrontEnd::new(),
+            persistence_failure: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             native_id: "test-native".to_string(),
             cwd: std::path::PathBuf::from("/work"),
             current_mode: RuntimeMode::Build,
@@ -506,15 +505,14 @@ mod tests {
         };
         let (runtime, mut controls) = coding_runtime_control_channel();
         let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = SessionState {
-            runtime,
+            commands,
+            control: std::sync::Arc::new(crate::acp::sessions::SilentHost),
             events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
-            _task: tokio::spawn(async {
-                RuntimeExit {
-                    reason: RuntimeExitReason::ShutdownRequested,
-                    forced: false,
-                }
-            }),
+            runtime,
+            _front_end: atomcode_coding::front_end::FrontEnd::new(),
+            persistence_failure: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             native_id: "test-native".to_string(),
             cwd: std::path::PathBuf::from("/work"),
             current_mode: RuntimeMode::Build,
@@ -656,18 +654,16 @@ mod tests {
                 let (runtime, _controls) =
                     atomcode_coding::runtime::coding_runtime_control_channel();
                 let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
+                let (commands, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
                 (
                     id.to_string(),
                     SessionState {
-                        runtime,
+                        commands,
+                        control: std::sync::Arc::new(crate::acp::sessions::SilentHost),
                         events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
-                        _task: tokio::spawn(async {
-                            atomcode_coding::runtime::RuntimeExit {
-                                reason:
-                                    atomcode_coding::runtime::RuntimeExitReason::ShutdownRequested,
-                                forced: false,
-                            }
-                        }),
+                        runtime,
+                        _front_end: atomcode_coding::front_end::FrontEnd::new(),
+                        persistence_failure: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
                         native_id: id.strip_prefix("acp-").unwrap_or(id).to_string(),
                         cwd: std::path::PathBuf::from(cwd),
                         current_mode: RuntimeMode::Build,
@@ -776,15 +772,14 @@ mod tests {
         };
         let (runtime, mut controls) = coding_runtime_control_channel();
         let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = SessionState {
-            runtime,
+            commands,
+            control: std::sync::Arc::new(crate::acp::sessions::SilentHost),
             events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
-            _task: tokio::spawn(async {
-                RuntimeExit {
-                    reason: RuntimeExitReason::ShutdownRequested,
-                    forced: false,
-                }
-            }),
+            runtime,
+            _front_end: atomcode_coding::front_end::FrontEnd::new(),
+            persistence_failure: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             native_id: "test-native".to_string(),
             cwd: std::path::PathBuf::from("/work"),
             current_mode: RuntimeMode::Build,
@@ -894,15 +889,14 @@ mod tests {
         // send is rejected) instead of parking the turn waiting for a reply.
         drop(controls);
         let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let state = SessionState {
-            runtime,
+            commands,
+            control: std::sync::Arc::new(crate::acp::sessions::SilentHost),
             events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
-            _task: tokio::spawn(async {
-                RuntimeExit {
-                    reason: RuntimeExitReason::ShutdownRequested,
-                    forced: false,
-                }
-            }),
+            runtime,
+            _front_end: atomcode_coding::front_end::FrontEnd::new(),
+            persistence_failure: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             native_id: "test-native".to_string(),
             cwd: std::path::PathBuf::from("/work"),
             current_mode: RuntimeMode::Build,

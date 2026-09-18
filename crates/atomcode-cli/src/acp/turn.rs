@@ -21,12 +21,10 @@ use std::sync::Arc;
 use agent_client_protocol::{Client, ConnectionTo, RequestCancellation};
 use atomcode_capabilities::tools::request_user_input::REQUEST_USER_INPUT_KIND;
 use atomcode_capabilities::tools::todo::{reduce_todos, TodoItem};
-use atomcode_coding::{
-    CodingRuntimeEvent, CodingRuntimeEvents, CodingRuntimeHandle, TurnCompletion, UserInput,
-};
-use atomcode_kernel::event::{AgentEvent, StopReason};
+use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
 use atomcode_kernel::message::ImageContent;
 use atomcode_kernel::tool::ToolCall;
+use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
 use crate::acp::sessions::{derive_title, next_message_id, Sessions};
@@ -78,7 +76,7 @@ pub(crate) trait TurnWire {
     /// only genuine transport failures during the announcement propagate.
     async fn handle_approval_request(
         &mut self,
-        runtime: &CodingRuntimeHandle,
+        commands: &mpsc::UnboundedSender<AgentCommand>,
         req_id: u64,
         payload: serde_json::Value,
         auto_approve: bool,
@@ -89,7 +87,7 @@ pub(crate) trait TurnWire {
     /// propagates an error (same rule as approval).
     async fn handle_user_input_request(
         &mut self,
-        runtime: &CodingRuntimeHandle,
+        commands: &mpsc::UnboundedSender<AgentCommand>,
         req_id: u64,
         payload: serde_json::Value,
         form_supported: bool,
@@ -120,14 +118,20 @@ pub(crate) trait TurnWire {
     /// chunk `msg_id` + idle(`other`).
     fn kernel_dead(&mut self, msg_id: &str) -> Result<(), agent_client_protocol::Error>;
 
-    /// Map the final `TurnFinished` terminal to the chain's response:
-    /// v1 answers the deferred responder with a `PromptResponse` carrying the
-    /// mapped stop reason (or an internal error when the terminal is abnormal
-    /// and no usable stop reason exists); v2 emits a message chunk for the
-    /// last error (if any) then idle with the mapped stop reason.
+    /// Map the final terminal to the chain's response: v1 answers the deferred
+    /// responder with a `PromptResponse` carrying the mapped stop reason (or an
+    /// internal error when no usable stop reason exists); v2 emits a message
+    /// chunk for the last error (if any) then idle with the mapped reason.
+    ///
+    /// `Ok` is the turn's own terminal, `Err` is the loop giving up on it (the
+    /// stream ended first). Both carry a reason now: under the contract a turn
+    /// completes with a reason and nothing else — whether its record was
+    /// written is a separate fact the host pushes
+    /// (`HostEvent::PersistenceFailed`), which is why this no longer takes the
+    /// product's completion enum.
     fn finish(
         &mut self,
-        terminal: Result<TurnCompletion, StopReason>,
+        terminal: Result<StopReason, StopReason>,
         last_error: Option<String>,
         msg_id: &str,
     ) -> Result<(), agent_client_protocol::Error>;
@@ -173,10 +177,13 @@ pub(crate) async fn run_turn<W: TurnWire>(
     // Arc), then release the map lock so it is never held across the turn.
     // The message id is allocated AFTER the lookup: an unknown-session prompt
     // never consumes an id (v2 already ordered it this way).
-    let (runtime, events): (CodingRuntimeHandle, Arc<Mutex<CodingRuntimeEvents>>) = {
+    let (commands, events): (
+        mpsc::UnboundedSender<AgentCommand>,
+        Arc<Mutex<mpsc::UnboundedReceiver<AgentEvent>>>,
+    ) = {
         let map = sessions.lock().await;
         match map.get(sid) {
-            Some(st) => (st.runtime.clone(), Arc::clone(&st.events)),
+            Some(st) => (st.commands.clone(), Arc::clone(&st.events)),
             None => return wire.unknown_session(),
         }
     };
@@ -205,12 +212,11 @@ pub(crate) async fn run_turn<W: TurnWire>(
     // on the events mutex and cannot interleave its `SendMessage` into the
     // kernel ahead of this turn's recv loop.
     let mut rx = events.lock().await;
-    if runtime
-        .submit(UserInput {
+    if commands
+        .send(AgentCommand::SendMessage {
             text: text.clone(),
             images,
         })
-        .await
         .is_err()
     {
         // The kernel agent is gone (panicked / cancelled / session torn down):
@@ -229,11 +235,11 @@ pub(crate) async fn run_turn<W: TurnWire>(
     // `cancelled` stop reason — never an error. The watcher exits via
     // `done_tx` when the turn ends, so it never leaks into a later turn.
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-    let cancel_runtime = runtime.clone();
+    let cancel_commands = commands.clone();
     cx.spawn(async move {
         tokio::select! {
             _ = cancellation.cancelled() => {
-                let _ = cancel_runtime.cancel().await;
+                let _ = cancel_commands.send(AgentCommand::Cancel);
             }
             _ = done_rx => {}
         }
@@ -250,37 +256,38 @@ pub(crate) async fn run_turn<W: TurnWire>(
     let mut todo_started: HashMap<String, (String, String)> = HashMap::new();
 
     let terminal = loop {
-        match rx.recv().await.map(|event| event.event) {
-            Some(CodingRuntimeEvent::Request(request)) if request.kind == "approval" => {
-                wire.handle_approval_request(&runtime, request.id, request.payload, auto_approve)
+        match rx.recv().await {
+            Some(AgentEvent::Request { id, kind, payload }) if kind == "approval" => {
+                wire.handle_approval_request(&commands, id, payload, auto_approve)
                     .await?;
             }
-            Some(CodingRuntimeEvent::Request(request))
-                if request.kind == REQUEST_USER_INPUT_KIND =>
-            {
+            Some(AgentEvent::Request { id, kind, payload }) if kind == REQUEST_USER_INPUT_KIND => {
                 wire.handle_user_input_request(
-                    &runtime,
-                    request.id,
-                    request.payload,
+                    &commands,
+                    id,
+                    payload,
                     elicitation_form.load(Ordering::Relaxed),
                 )
                 .await;
             }
-            Some(CodingRuntimeEvent::Request(request)) => {
+            Some(AgentEvent::Request { id, .. }) => {
                 // Unknown (non-approval) kernel request kind: we cannot satisfy
                 // it. Respond with null (fail-closed) so the kernel unparks and
                 // the turn cannot hang waiting for a reply we will never
                 // produce.
                 eprintln!("acp: unhandled kernel request kind; responding null");
-                let _ = runtime.respond(request.id, serde_json::Value::Null).await;
+                let _ = commands.send(AgentCommand::Respond {
+                    id,
+                    value: serde_json::Value::Null,
+                });
             }
-            Some(CodingRuntimeEvent::TurnFinished(completion)) => break Ok(completion),
-            Some(CodingRuntimeEvent::Agent(AgentEvent::Error { message, .. })) => {
+            Some(AgentEvent::TurnComplete { reason, .. }) => break Ok(reason),
+            Some(AgentEvent::Error { message, .. }) => {
                 // Do NOT break — keep looping so the trailing `TurnComplete`
                 // is consumed and cannot poison the next turn on this session.
                 last_error = Some(message);
             }
-            Some(CodingRuntimeEvent::Agent(ev)) => {
+            Some(ev) => {
                 // Todo/plan bookkeeping before the generic translation: a
                 // completed `todowrite`/`todo` call mutates the session's
                 // derived todo state and re-emits the full plan update
@@ -344,11 +351,6 @@ pub(crate) async fn run_turn<W: TurnWire>(
                     wire.notify(update)?;
                 }
             }
-            Some(CodingRuntimeEvent::RuntimeStopped(_)) => {
-                last_error = Some("acp: coding runtime stopped before turn terminal".into());
-                break Err(StopReason::ProviderError);
-            }
-            Some(_) => {}
             None => {
                 last_error =
                     Some("acp: coding runtime event stream closed before turn terminal".into());
@@ -384,5 +386,67 @@ pub(crate) async fn run_turn<W: TurnWire>(
             let _ = wire.notify(wire.session_info_update(&title));
         }
     }
+    // "The turn finished but its record did not" reaches here as a fact the
+    // host pushed, not as a variant of the terminal — the turn did finish. It
+    // is reported once and cleared, so the next turn on this session does not
+    // inherit it.
+    let persisted = {
+        let map = sessions.lock().await;
+        match map.get(sid) {
+            Some(state) => state.persistence_failure.lock().await.take(),
+            None => None,
+        }
+    };
+    let last_error = fold_persistence_failure(last_error, persisted);
     wire.finish(terminal, last_error, &msg_id)
+}
+
+/// Fold "the turn finished but its record did not" into what the turn reports.
+///
+/// It used to be a variant of the terminal, and the v1 chain turned it into a
+/// protocol error: a turn that had run, produced output and stopped normally
+/// was reported to the client as a failure. Under the contract the terminal
+/// carries a reason and nothing else — the turn did finish — and the store's
+/// trouble arrives separately (`HostEvent::PersistenceFailed`). So it is said
+/// rather than thrown: the client hears its normal stop reason, and the text
+/// tells the person their turn was not written down.
+fn fold_persistence_failure(
+    last_error: Option<String>,
+    persisted: Option<String>,
+) -> Option<String> {
+    match persisted {
+        None => last_error,
+        Some(why) => Some(match last_error {
+            Some(had) => format!("{had}\n这一回合没能存下来:{why}"),
+            None => format!("这一回合没能存下来:{why}"),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fold_persistence_failure;
+
+    /// A turn that ran and a turn that was written down are two facts.
+    ///
+    /// Before 6.3 the second one made the first one a protocol error — a client
+    /// was told the prompt failed when it had not. Now the turn keeps its own
+    /// terminal and the store's trouble is said alongside whatever else went
+    /// wrong, never instead of it.
+    #[test]
+    fn a_turn_that_was_not_written_down_still_finished() {
+        assert_eq!(fold_persistence_failure(None, None), None);
+        // Nothing else went wrong: the person still hears about the store.
+        assert_eq!(
+            fold_persistence_failure(None, Some("磁盘满了".into())).as_deref(),
+            Some("这一回合没能存下来:磁盘满了")
+        );
+        // Something else did: both, in that order — the turn's own trouble
+        // first, because that is what the person was watching.
+        let both = fold_persistence_failure(Some("模型断了".into()), Some("磁盘满了".into()));
+        assert_eq!(
+            both.as_deref(),
+            Some("模型断了\n这一回合没能存下来:磁盘满了")
+        );
+    }
 }

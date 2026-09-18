@@ -291,13 +291,18 @@ tuix 的老毛病——现在改是十几行,等下游移植完再改就是他�
   并补了一条判据(advertise 的每一条都得有人能跑;跨 crate 那套写法根本保证不了这件事)。
   搬的过程中既有判据抓到一个真回归:老的 `find` **大小写不敏感**,`/Status` 要认作
   `/status`,我写成了精确匹配
-- ⬜ ACP 拿 `HostConnection`
-- ⬜ `turn.rs` 换流(7 处 4 种事件;`translate()` 已经把这 4 种映射好了,是换流不是重写)
+- ✅ **ACP 拿到 `HostConnection` 了**
+- ✅ **`turn.rs` 换流完成**(4 种事件;`RuntimeStopped` 那一支没了 —— 契约里流关掉就是关掉)
 - ✅ **`context_stats` 的契约缺口补上了**:`HostCommand::Context` /
   `HostReply::Context { window, used, model, working_dir }`。顺带 tui 的 `/context`
   第一次能说出预算 —— 它以前只能数自己看见的,而宿主还打包了系统提示、instructions
   与工具定义,屏幕一条都没见过
-- ⬜ 7 个方法换契约(12 + 3 处)
+- ✅ **五个方法换完**:`submit` / `respond` / `cancel` / `compact` / `shutdown`
+  → `AgentCommand`,`context_stats` → `HostCommand::Context`
+- ⬜ **还剩那两处非机械的**:`options.rs` 的 `reprepare_config`(要把模型解析还给宿主、
+  拆 `SessionModelResolver` 的注入链)、`commands.rs` 的 `undo_to_prompt`(要先
+  `RewindPoints` 再 `Undo`,并开始跟踪 `SeqNo`)。`SessionState` 暂时同时留着
+  `runtime` handle 给这两处,注释里写明了
 
 ###### 把剩下三步读完之后:**其中两处不是机械搬运**(2026-09-18 更正)
 
