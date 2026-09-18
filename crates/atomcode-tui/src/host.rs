@@ -254,6 +254,15 @@ impl Presentation {
 /// moves is still a selection, and ctrl-r still does them all at once.
 const CLICKABLE: [&str; 2] = ["tool_call", "reasoning"];
 
+/// How many rows the slash menu may take, margin aside.
+///
+/// Well short of the screen, so it reads as something that rose out of the
+/// prompt rather than as a second transcript. It is a **window** rather than a
+/// truncation — [`crate::menu::Slash::window`] keeps the lit row inside it and
+/// scrolls by the least it can — so the cap costs no reachability, which is
+/// what it did when the list was drawn from the top and simply cut off.
+const MENU_ROWS: u16 = 10;
+
 /// Which foldable block, and what kind, owns a painted row.
 ///
 /// `None` for a row that belongs to nobody — a blank, or a question not yet in
@@ -728,6 +737,14 @@ pub struct Hits {
     /// Where the team panel was drawn, so a press or the pointer on a row finds
     /// the agent it switches to.
     team: Option<Rect>,
+    /// Where the slash menu was drawn, so a press or the pointer on a row finds
+    /// the command it is on.
+    ///
+    /// The rect the panel was **drawn** in, not one re-derived at the press:
+    /// the menu hangs off the field's top edge and its window scrolls with the
+    /// cursor, so a second computation here is a whole list answering to the
+    /// wrong rows. The same rule the ask panel follows.
+    menu: Option<Rect>,
 }
 
 impl Hits {
@@ -767,22 +784,6 @@ pub enum ContextClick {
     Picked(crate::menu::Step),
 }
 
-/// A line widened to the rect with the panel's own style.
-///
-/// A floating part covers what it is drawn over only where it puts a cell down,
-/// and a text span ends where its text ends. Filling the rest of the row is what
-/// makes the menu a surface over the conversation rather than words with the
-/// conversation visible through them.
-fn pad(line: Line, w: usize, style: Style) -> Line {
-    let used = line.width();
-    if used >= w {
-        return line.truncate(w);
-    }
-    let mut spans = line.spans;
-    spans.push(Span::styled(" ".repeat(w - used), style));
-    Line::from_spans(spans).truncate(w)
-}
-
 /// Everything the screen is composed from.
 pub struct Host {
     pub stream: RwLock<Stream>,
@@ -796,7 +797,12 @@ pub struct Host {
     /// owned it would have to be told, and a module that draws it inside its
     /// own rect is a module that resizes the conversation when a slash is
     /// typed. Empty means nothing to suggest.
-    menu: RwLock<Vec<(String, String)>>,
+    ///
+    /// A [`crate::menu::Slash`] and not a bare `Vec`: the list has a cursor
+    /// now, and a cursor has to survive the redraws a keystroke causes. The
+    /// host holds it for the same reason it holds the items — it is the thing
+    /// that draws the panel, and what is pointed at is part of the picture.
+    menu: RwLock<crate::menu::Slash>,
     /// The composer's context menu, when the secondary button opened one.
     ///
     /// Beside the slash menu and for the same reason: it is drawn *over* the
@@ -1010,7 +1016,7 @@ impl Host {
             // rows (`crate::rows`); a Host that pre-filled this would make
             // `[[remove]] id = "tui-commands-session"` a lie.
             commands: Arc::new(crate::command::Commands::new()),
-            menu: RwLock::new(Vec::new()),
+            menu: RwLock::new(crate::menu::Slash::default()),
             context_menu: RwLock::new(None),
             overlays: Arc::new(crate::overlay::Overlays::new()),
             asks: crate::ask::Asks::new(),
@@ -1524,8 +1530,88 @@ impl Host {
     /// Set by whoever owns the command registry — the front end — because the
     /// menu's *contents* are a question about commands, not about the screen.
     /// Where it is drawn is this struct's business, not the caller's.
-    pub fn set_menu(&self, menu: Vec<(String, String)>) {
-        *self.menu.write().expect("menu poisoned") = menu;
+    ///
+    /// **The cursor resets to the first row**, and that is the point: a list
+    /// that narrowed under a typing hand has a different row 0 than it did a
+    /// keystroke ago, and a cursor carried across that is pointing at whatever
+    /// happens to be in that slot now. The requirement — a menu opens with its
+    /// first row lit — is this line.
+    pub fn set_menu(&self, items: Vec<crate::menu::Item>) {
+        *self.menu.write().expect("menu poisoned") = crate::menu::Slash::new(items);
+    }
+
+    /// Whether the slash menu has anything to offer.
+    pub fn menu_open(&self) -> bool {
+        !self.menu.read().expect("menu poisoned").is_empty()
+    }
+
+    /// What the slash menu has lit, as it would be handed over.
+    ///
+    /// One reader for the return key, tab, and a click on a row, so completing
+    /// and running cannot disagree about which command is meant. Nothing lit —
+    /// the list is empty — is `None`, and the caller falls through to the
+    /// ordinary keys.
+    pub fn menu_selected(&self) -> Option<String> {
+        self.menu
+            .read()
+            .expect("menu poisoned")
+            .selected()
+            .map(|i| i.value.clone())
+    }
+
+    /// Move the slash menu's cursor. Returns whether a frame is owed.
+    pub fn menu_move_by(&self, delta: i32) -> bool {
+        let mut menu = self.menu.write().expect("menu poisoned");
+        if menu.is_empty() {
+            return false;
+        }
+        menu.move_by(delta)
+    }
+
+    /// Close the slash menu, if it is open. Returns whether there was one.
+    ///
+    /// Closing is *not* clearing the registry — the next keystroke recomputes
+    /// the list from what is typed, which is why the caller can put it away
+    /// without anything having to put it back.
+    pub fn close_menu(&self) -> bool {
+        let mut menu = self.menu.write().expect("menu poisoned");
+        let had = !menu.is_empty();
+        *menu = crate::menu::Slash::default();
+        had
+    }
+
+    /// The pointer moved over the slash menu: light the row it is over.
+    ///
+    /// `false` when the menu is closed or the pointer is not on it, so the
+    /// caller can tell a move that changed the picture from one that did not.
+    pub fn menu_hover(&self, x: u16, y: u16) -> bool {
+        let rect = match self.hits.lock().expect("hits poisoned").menu {
+            Some(rect) => rect,
+            None => return false,
+        };
+        let mut menu = self.menu.write().expect("menu poisoned");
+        if menu.is_empty() {
+            return false;
+        }
+        let rows = (rect.h as usize).saturating_sub(1);
+        menu.hover(x, y, rect, rows)
+    }
+
+    /// A pointer press against the slash menu.
+    ///
+    /// `Some(value)` when the press landed on a row — the caller completes or
+    /// runs it, the same as if the return key had been pressed on that row.
+    /// `None` when the menu is closed or the press was off it: a press beside
+    /// the list is not the list's business, and only the caller knows what else
+    /// is under the pointer.
+    pub fn menu_click(&self, x: u16, y: u16) -> Option<String> {
+        let rect = *self.hits.lock().expect("hits poisoned").menu.as_ref()?;
+        let mut menu = self.menu.write().expect("menu poisoned");
+        if menu.is_empty() {
+            return None;
+        }
+        let rows = (rect.h as usize).saturating_sub(1);
+        menu.click(x, y, rect, rows)
     }
 
     /// Open the composer's context menu at a cell. Empty items opens nothing.
@@ -1636,9 +1722,11 @@ impl Host {
     /// How tall the slash menu would like to be, and at most what it may be.
     ///
     /// Capped well short of the screen so it reads as something that rose out
-    /// of the prompt rather than as a second transcript.
-    fn menu_rows(&self, menu: &[(String, String)]) -> u16 {
-        (menu.len() as u16).clamp(1, 10)
+    /// of the prompt rather than as a second transcript. The cap is a **window**
+    /// now rather than a truncation: the list scrolls with its cursor, so a cap
+    /// costs no reachability — see [`crate::menu::Slash::window`].
+    fn menu_rows(&self, menu: &crate::menu::Slash) -> u16 {
+        (menu.len() as u16).clamp(1, MENU_ROWS)
     }
 
     /// Where the menu rises to, over the layout.
@@ -1668,39 +1756,21 @@ impl Host {
     }
 
     /// The menu's rows, top to bottom in `rect`, with its margin last.
-    fn menu_lines(&self, rect: Rect, menu: &[(String, String)]) -> Vec<Line> {
+    ///
+    /// The list's own rows come from [`crate::menu::Slash::render`], which is
+    /// also what decides which row is lit and which row a cell is on — one
+    /// layout, so the highlight and the pointer cannot disagree. What is left
+    /// here is the margin, which is this panel's and not the list's.
+    fn menu_lines(&self, rect: Rect, menu: &crate::menu::Slash) -> Vec<Line> {
         let w = rect.w as usize;
-        let mut out: Vec<Line> = Vec::with_capacity(rect.h as usize);
         let room = (rect.h as usize).saturating_sub(1);
-        let style = crate::theme::bg(crate::theme::Role::PanelBg)
-            .under(crate::theme::fg(crate::theme::Role::PanelFg));
-        for i in 0..room {
-            let line = match menu.get(i) {
-                Some((name, about)) => {
-                    let mut spans = vec![
-                        Span::styled("  /".to_string(), style),
-                        Span::styled(
-                            name.clone(),
-                            crate::theme::fg(crate::theme::Role::Accent).under(style),
-                        ),
-                    ];
-                    if !about.is_empty() {
-                        spans.push(Span::styled(
-                            format!("  {about}"),
-                            crate::theme::fg(crate::theme::Role::Muted).under(style),
-                        ));
-                    }
-                    Line::from_spans(spans)
-                }
-                // Never reached in practice: the rect is sized to the list, and
-                // this is what keeps a short list from showing the screen
-                // through its own panel.
-                None => Line::empty(),
-            };
-            out.push(pad(line, w, style));
-        }
+        let list = Rect::new(rect.x, rect.y, rect.w, room as u16);
+        let mut out = menu.render(list, room);
+        out.truncate(room);
         // The margin: one blank row of the panel's colour, so the list reads as
         // a surface lifted off the prompt rather than as text floating on it.
+        let style = crate::theme::bg(crate::theme::Role::PanelBg)
+            .under(crate::theme::fg(crate::theme::Role::PanelFg));
         out.push(Line::styled(" ".repeat(w), style).truncate(w));
         out
     }
@@ -2138,6 +2208,7 @@ impl Host {
                         field: None,
                         ask: None,
                         team: None,
+                        menu: None,
                     };
                     *self.last_room.lock().expect("room poisoned") = rect;
                     // The **blocks'** rect, not the pane's. The badge reports
@@ -2208,10 +2279,17 @@ impl Host {
         // after every region has its rect, so it composes as an overlay rather
         // than as a region: nothing above the field is resized to make room,
         // and the rows it covers are covered rather than taken away.
+        //
+        // Its rect is left behind in `hits` for the same reason the question
+        // panel's is: a pointer has to be answered from the picture that was on
+        // screen. The panel hangs off the field's top edge and its window
+        // scrolls with the cursor, so re-deriving either at the press is a
+        // second layout to keep in step with this one.
         let menu = self.menu.read().expect("menu poisoned").clone();
         if !menu.is_empty() {
             if let Some(rect) = self.menu_rect(&frame, Rect::sized(w, h), self.menu_rows(&menu)) {
                 frame.place("menu", rect, self.menu_lines(rect, &menu));
+                self.hits.lock().expect("hits poisoned").menu = Some(rect);
             }
         }
 
@@ -6589,8 +6667,8 @@ mod tests {
         let status = before.part("status").expect("the status line").rect;
 
         h.set_menu(vec![
-            ("help".into(), "看命令".into()),
-            ("compact".into(), "压缩上下文".into()),
+            crate::menu::Item::new("help", "help").about("看命令"),
+            crate::menu::Item::new("compact", "compact").about("压缩上下文"),
         ]);
         let after = h.compose(size);
 
@@ -6625,16 +6703,22 @@ mod tests {
             "the menu's own contents are drawn: {drawn:?}"
         );
         // The point of it being a panel rather than a list of words: every row
-        // is filled to the rect with the panel's background, so what it covers
-        // is covered. A row of text spans that stopped at the last word would
-        // let the conversation show through on the right.
-        let want = Some(crate::frame::Color::role(crate::theme::Role::PanelBg));
+        // is filled to the rect with a panel background, so what it covers is
+        // covered. A row of text spans that stopped at the last word would let
+        // the conversation show through on the right.
+        //
+        // Two backgrounds are legitimate and no third one is: the plain panel,
+        // and the one step brighter patch that says "this is the row a return
+        // would take". The margin row at the foot is the plain one.
+        let plain = Some(crate::frame::Color::role(crate::theme::Role::PanelBg));
+        let lit = Some(crate::frame::Color::role(crate::theme::Role::PanelSelBg));
         for (i, line) in drawn.iter().enumerate() {
             assert_eq!(
                 line.width(),
                 menu.rect.w as usize,
                 "menu row {i} does not fill the panel: {line:?}"
             );
+            let want = if i == 0 { lit } else { plain };
             let bg = menu
                 .lines
                 .iter()
@@ -6643,7 +6727,7 @@ mod tests {
                 .unwrap();
             assert!(
                 line.spans.iter().all(|s| s.style.bg == want),
-                "menu row {i} has cells with no background ({bg:?}): {line:?}"
+                "menu row {i} has cells with the wrong background ({bg:?}): {line:?}"
             );
         }
 
@@ -6652,6 +6736,165 @@ mod tests {
             h.compose(size).part("menu").is_none(),
             "closing the menu takes its part away"
         );
+    }
+
+    /// A menu of `n` commands, as the composer's row would build it.
+    fn menu_of(n: usize) -> Vec<crate::menu::Item> {
+        (0..n)
+            .map(|i| crate::menu::Item::new(format!("cmd{i}"), format!("cmd{i}")).about("does it"))
+            .collect()
+    }
+
+    #[test]
+    fn the_slash_menu_opens_with_its_first_row_lit() {
+        // The requirement, at the level the host owns it: whatever narrowed the
+        // list, the picture that comes out has row 0 highlighted. A cursor
+        // carried across a narrowing would be pointing at whatever happens to
+        // be in that slot now.
+        let h = fed();
+        let size = (80, 24);
+        h.set_menu(menu_of(3));
+        let frame = h.compose(size);
+        let menu = frame.part("menu").expect("the menu is on screen");
+        let lit = bright_rows(&menu.lines);
+        assert_eq!(
+            lit,
+            vec![0],
+            "the first row is the one that should be lit: {:?}",
+            menu.lines.iter().map(|l| l.plain()).collect::<Vec<_>>()
+        );
+
+        // Narrowing recomputes the list, and the cursor starts over: the row
+        // that was lit is not the same command once the list has changed.
+        h.set_menu(menu_of(2));
+        let menu = h.compose(size).part("menu").expect("still open").clone();
+        assert_eq!(bright_rows(&menu.lines), vec![0]);
+    }
+
+    /// Which rows of a drawn panel are the brighter one.
+    fn bright_rows(lines: &[Line]) -> Vec<usize> {
+        let bright = Some(crate::frame::Color::role(crate::theme::Role::PanelSelBg));
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.spans.first().is_some_and(|s| s.style.bg == bright))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    #[test]
+    fn moving_the_menu_cursor_moves_the_highlight_and_not_the_panel() {
+        // Up/down walk the list; the panel stays where it grew out of. This is
+        // the difference between a list and a thing that slides.
+        let h = fed();
+        let size = (80, 24);
+        h.set_menu(menu_of(4));
+        let before = h.compose(size).part("menu").expect("open").rect;
+
+        assert!(h.menu_move_by(1), "there is a row below the first");
+        let menu = h.compose(size).part("menu").expect("open").clone();
+        assert_eq!(bright_rows(&menu.lines), vec![1]);
+        assert_eq!(menu.rect, before, "the panel moved with the cursor");
+
+        assert!(h.menu_move_by(-1));
+        let menu = h.compose(size).part("menu").expect("open").clone();
+        assert_eq!(bright_rows(&menu.lines), vec![0]);
+        assert!(!h.menu_move_by(-1), "and there is nothing above the first");
+    }
+
+    #[test]
+    fn a_long_list_is_a_window_that_follows_the_cursor_rather_than_a_cut_off_one() {
+        // The bug this fixes: the panel is capped at ten rows, and the list was
+        // drawn from the top, so command eleven was unreachable — visible
+        // nowhere and selectable nowhere. The window scrolls with the cursor, so
+        // the cap costs no reachability.
+        let h = fed();
+        let size = (80, 24);
+        h.set_menu(menu_of(15));
+        let menu = h.compose(size).part("menu").expect("open").clone();
+        // The last row of the panel is the margin, so the list has ten rows.
+        assert_eq!(
+            menu.lines.len(),
+            11,
+            "the panel is the window plus its margin"
+        );
+
+        for _ in 0..14 {
+            assert!(h.menu_move_by(1));
+        }
+        let menu = h.compose(size).part("menu").expect("open").clone();
+        let drawn: Vec<String> = menu.lines.iter().map(|l| l.plain()).collect();
+        assert!(
+            drawn.iter().any(|l| l.contains("/cmd14")),
+            "the last command is on screen: {drawn:?}"
+        );
+        assert!(
+            !drawn.iter().any(|l| l.contains("/cmd0 ")),
+            "and the window moved off the top: {drawn:?}"
+        );
+        assert_eq!(
+            bright_rows(&menu.lines),
+            vec![9],
+            "the lit row is the last of the window"
+        );
+    }
+
+    #[test]
+    fn a_press_on_the_slash_menu_hands_back_the_row_it_was_drawn_on() {
+        // Answered from the frame that was painted, not from a second layout:
+        // the row a press lands on has to be the row that was under it.
+        let h = fed();
+        let size = (80, 24);
+        h.set_menu(menu_of(4));
+        let menu = h.compose(size).part("menu").expect("open").clone();
+        let rect = menu.rect;
+        // The second row of the list — the margin is the last row of the panel.
+        let y = rect.y + 1;
+        assert_eq!(
+            h.menu_click(rect.x + 3, y).as_deref(),
+            Some("cmd1"),
+            "the press picked the row it was drawn on"
+        );
+        // And it is the highlight that moved, not just the return value.
+        let menu = h.compose(size).part("menu").expect("open").clone();
+        assert_eq!(bright_rows(&menu.lines), vec![1]);
+    }
+
+    #[test]
+    fn a_press_beside_the_slash_menu_is_not_its_business() {
+        let h = fed();
+        let size = (80, 24);
+        h.set_menu(menu_of(4));
+        h.compose(size);
+        assert_eq!(h.menu_click(0, 0), None, "the corner is not a menu row");
+        assert_eq!(
+            h.menu_selected().as_deref(),
+            Some("cmd0"),
+            "and nothing moved"
+        );
+    }
+
+    #[test]
+    fn the_pointer_lights_the_row_it_is_over_on_the_slash_menu() {
+        let h = fed();
+        let size = (80, 24);
+        h.set_menu(menu_of(4));
+        let menu = h.compose(size).part("menu").expect("open").clone();
+        let rect = menu.rect;
+        assert!(
+            h.menu_hover(rect.x + 3, rect.y + 2),
+            "the third row is a row the pointer moved onto"
+        );
+        assert_eq!(h.menu_selected().as_deref(), Some("cmd2"));
+        assert!(
+            !h.menu_hover(rect.x + 3, rect.y + 2),
+            "a move inside the row it is already on is not news"
+        );
+        assert!(
+            !h.menu_hover(0, 0),
+            "and a move off the panel is not either"
+        );
+        assert_eq!(h.menu_selected().as_deref(), Some("cmd2"));
     }
 
     #[test]

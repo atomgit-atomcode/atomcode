@@ -1107,6 +1107,429 @@ async fn typing_a_slash_shows_what_is_available_and_narrows_as_you_type() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// Which row of the slash menu is the lit one, read off the drawn frame.
+///
+/// Read off the part's own lines rather than re-derived: the claim under test
+/// is "the panel that is on screen lights this row", and a row computed some
+/// other way would pass even if the panel painted a different one.
+fn lit_slash_row(s: &Session) -> Option<u16> {
+    let bright = Some(atomcode_tui::Color::role(
+        atomcode_tui::theme::Role::PanelSelBg,
+    ));
+    let part = s.term.last()?.part("menu")?.clone();
+    (0..part.lines.len())
+        .find(|i| part.lines[*i].spans[0].style.bg == bright)
+        .map(|i| part.rect.y + i as u16)
+}
+
+#[tokio::test]
+async fn a_slash_menu_opens_with_its_first_row_lit_and_the_arrows_walk_it() {
+    // The requirement, through the whole machine: type a slash and something is
+    // already pointed at, so a return does the obvious thing without an arrow
+    // press first. Then down/up move the highlight without moving the panel.
+    let dir = scratch("menu-lit");
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "ok" }"#),
+        &["[[remove]]\nid = \"tui-panel-welcome\"\n"],
+    ))
+    .await;
+    let task = s.open().await;
+
+    s.term.type_text("/");
+    until(&s, "/help").await;
+    let panel = s.term.last().unwrap().part("menu").expect("open").rect;
+    assert_eq!(
+        lit_slash_row(&s),
+        Some(panel.y),
+        "the first row is lit the moment the menu opens:\n{}",
+        s.screen()
+    );
+
+    // Down walks the highlight one row at a time, and the panel stays put.
+    s.term.press(KeyPress::plain(Key::Down));
+    s.quiet().await;
+    assert_eq!(
+        lit_slash_row(&s),
+        Some(panel.y + 1),
+        "down lit the next row"
+    );
+    assert_eq!(
+        s.term.last().unwrap().part("menu").unwrap().rect,
+        panel,
+        "and the panel moved with the cursor"
+    );
+
+    // Up comes back, and stops at the top rather than wrapping.
+    s.term.press(KeyPress::plain(Key::Up));
+    s.quiet().await;
+    s.term.press(KeyPress::plain(Key::Up));
+    s.quiet().await;
+    assert_eq!(
+        lit_slash_row(&s),
+        Some(panel.y),
+        "up came back to the first"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn enter_runs_the_lit_command_without_its_name_being_typed_out() {
+    // The other half of the highlight: once something has been named, one
+    // keystroke runs it. The name never has to be typed in full, which is what
+    // a list with a lit row is for.
+    let dir = scratch("menu-run");
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "ok" }"#),
+        &["[[remove]]\nid = \"tui-panel-welcome\"\n"],
+    ))
+    .await;
+    let task = s.open().await;
+
+    s.term.type_text("/cont");
+    until(&s, "/context").await;
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+    assert!(
+        s.screen().contains("条事实"),
+        "enter ran the lit command:\n{}",
+        s.screen()
+    );
+    // And the prefix did not stay behind on the line.
+    assert!(
+        !s.screen().contains("/cont "),
+        "the prefix outlived the command that ran:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+/// The lit row of the slash menu, as it was drawn.
+///
+/// The name is read off the frame rather than assumed, so a claim about "the
+/// row that is lit" does not quietly become a claim about the sort order.
+fn lit_slash_name(s: &Session) -> Option<String> {
+    let bright = Some(atomcode_tui::Color::role(
+        atomcode_tui::theme::Role::PanelSelBg,
+    ));
+    let part = s.term.last()?.part("menu")?.clone();
+    let row = (0..part.lines.len()).find(|i| part.lines[*i].spans[0].style.bg == bright)?;
+    part.lines[row]
+        .plain()
+        .trim()
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+}
+
+#[tokio::test]
+async fn enter_takes_the_lit_row_even_before_a_name_is_typed() {
+    // The key belongs to the list whenever the list is up. It is **taken**, not
+    // swallowed: a menu that keeps the return key and then does nothing with it
+    // is a dead key, and the person pressing it cannot tell that from a freeze.
+    //
+    // Nothing is special-cased about a bare `/`. The lit row is on screen and
+    // says what it would do, and that is the contract every list here keeps —
+    // the question panel's words for it are "a stray return takes what the
+    // screen shows it would take, never a hidden default".
+    let dir = scratch("menu-bare-slash");
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "ok" }"#),
+        &["[[remove]]\nid = \"tui-panel-welcome\"\n"],
+    ))
+    .await;
+    let task = s.open().await;
+
+    s.term.type_text("/");
+    until(&s, "/cancel-all").await;
+    let lit = lit_slash_name(&s).expect("a lit row");
+    assert!(
+        !lit.is_empty(),
+        "the list is up with a lit row:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+    assert!(
+        s.term.last().unwrap().part("menu").is_none(),
+        "enter was swallowed — the list is still up:\n{}",
+        s.screen()
+    );
+    assert!(
+        !s.screen().contains("❯ /"),
+        "the line still holds the slash, so nothing was taken:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn the_arrows_choose_the_row_that_enter_then_takes() {
+    // What a highlight is *for*: the row the arrows walked to is the row the
+    // return key acts on. Two matches, so "the second one" is a real choice and
+    // not the first row by another name.
+    let dir = scratch("menu-arrows-take");
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "ok" }"#),
+        &["[[remove]]\nid = \"tui-panel-welcome\"\n"],
+    ))
+    .await;
+    let task = s.open().await;
+
+    s.term.type_text("/co");
+    until(&s, "/compact").await;
+    assert_eq!(lit_slash_name(&s).as_deref(), Some("compact"));
+
+    s.term.press(KeyPress::plain(Key::Down));
+    s.quiet().await;
+    assert_eq!(
+        lit_slash_name(&s).as_deref(),
+        Some("context"),
+        "the arrow moved the highlight:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+    assert!(
+        s.screen().contains("条事实"),
+        "enter took the row the arrows chose, not the first one:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn tab_completes_the_lit_command_onto_the_line() {
+    // Tab *completes*: the lit name goes onto the line so its argument can be
+    // typed. It does not run — that is enter's job, and the two are different
+    // for exactly this reason.
+    let dir = scratch("menu-complete");
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "ok" }"#),
+        &["[[remove]]\nid = \"tui-panel-welcome\"\n"],
+    ))
+    .await;
+    let task = s.open().await;
+
+    s.term.type_text("/comp");
+    until(&s, "/compact").await;
+    s.term.press(KeyPress::plain(Key::Tab));
+    s.quiet().await;
+
+    // The command is now what is typed, and the menu has narrowed to it — the
+    // point being that the line holds the whole name rather than the prefix.
+    assert!(
+        s.screen().contains("/compact"),
+        "the name was put on the line:\n{}",
+        s.screen()
+    );
+    // And it did not run: nothing has been compacted.
+    assert!(
+        !s.screen().contains("已压缩") && !s.screen().contains("暂时没有值得压缩的"),
+        "tab ran the command instead of completing it:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn enter_takes_the_lit_row_and_a_command_that_wants_an_argument_asks() {
+    // The return key belongs to the list while the list is up: the row that is
+    // lit is the row that is taken. What "taken" means is the command's own
+    // business — `/effort` has a closed set of levels and answers with a panel
+    // to pick from, which is where the second level comes from rather than from
+    // the composer knowing what an argument looks like.
+    let dir = scratch("menu-enter");
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "ok" }"#),
+        &["[[remove]]\nid = \"tui-panel-welcome\"\n"],
+    ))
+    .await;
+    let task = s.open().await;
+
+    // Half a name, a lit row, and one keystroke: the command runs.
+    s.term.type_text("/effo");
+    until(&s, "/effort").await;
+    s.term.press(KeyPress::plain(Key::Enter));
+    s.quiet().await;
+    let screen = s.screen();
+    assert!(
+        s.term.last().unwrap().part("effort").is_some(),
+        "enter did not open the level panel:\n{screen}"
+    );
+    assert!(
+        screen.contains("medium") || screen.contains("high"),
+        "the panel lists the levels:\n{screen}"
+    );
+    // And the line was cleared rather than left holding the prefix.
+    assert!(
+        !screen.contains("/effo "),
+        "the prefix stayed on the line behind the command that ran:\n{screen}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn tab_completes_a_command_that_takes_an_argument_and_leaves_a_space() {
+    // What the registry is asked for and the label only shows: a name completed
+    // without the space that says "something goes here" leaves the caret in the
+    // wrong place, and the person has to type the separator the menu knew about.
+    let dir = scratch("menu-takes");
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "ok" }"#),
+        &["[[remove]]\nid = \"tui-panel-welcome\"\n"],
+    ))
+    .await;
+    let task = s.open().await;
+
+    s.term.type_text("/effo");
+    until(&s, "/effort").await;
+    s.term.press(KeyPress::plain(Key::Tab));
+    s.quiet().await;
+    assert!(
+        !s.screen().contains("思考强度"),
+        "tab ran a command that wants an argument:\n{}",
+        s.screen()
+    );
+
+    // Which leaves the name and a space on the line, so the argument can be
+    // typed and sent the ordinary way.
+    s.term.type_text("high");
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, "思考强度 → high").await;
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn the_pointer_lights_and_chooses_a_slash_menu_row() {
+    // A menu only the keyboard can drive is a menu half the people who reach for
+    // the mouse cannot use. The row the pointer is over is the row that is lit,
+    // and the row a press lands on is the row that was drawn there.
+    let dir = scratch("menu-mouse");
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "ok" }"#),
+        &["[[remove]]\nid = \"tui-panel-welcome\"\n"],
+    ))
+    .await;
+    let task = s.open().await;
+
+    s.term.type_text("/re");
+    until(&s, "/resume").await;
+    let panel = s.term.last().unwrap().part("menu").expect("open").rect;
+    assert_eq!(lit_slash_row(&s), Some(panel.y));
+
+    // Hover the third row: the highlight follows the pointer. Three rows, and
+    // the third is `/resume` — read off the drawn frame rather than assumed, so
+    // this is a claim about the pointer and not about the sort order.
+    s.term.pointer(
+        atomcode_tui::surface::Click::Hover,
+        panel.x + 3,
+        panel.y + 2,
+    );
+    s.quiet().await;
+    assert_eq!(
+        lit_slash_row(&s),
+        Some(panel.y + 2),
+        "the pointer lit the row it is over:\n{}",
+        s.screen()
+    );
+    let drawn = s.term.last().unwrap().part("menu").unwrap().lines[2].plain();
+    let name = drawn
+        .trim()
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .expect("a command name")
+        .to_string();
+    assert_eq!(name, "resume", "the row under the pointer: {drawn:?}");
+
+    // And a press there takes *that* row. `/resume` wants an argument and has no
+    // closed set to offer, so taking it dispatches the bare command, which opens
+    // the session picker — the row under the pointer, not the first row.
+    s.term.pointer(
+        atomcode_tui::surface::Click::Press,
+        panel.x + 3,
+        panel.y + 2,
+    );
+    s.term.pointer(
+        atomcode_tui::surface::Click::Release,
+        panel.x + 3,
+        panel.y + 2,
+    );
+    s.quiet().await;
+    assert!(
+        s.term.last().unwrap().part("resume").is_some()
+            || s.screen().contains("没有别的存下的会话"),
+        "the press did not take the row it landed on:\n{}",
+        s.screen()
+    );
+    assert!(
+        s.term.last().unwrap().part("menu").is_none(),
+        "and taking it put the list away:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
+async fn esc_puts_the_slash_menu_away_without_losing_the_line() {
+    // Esc is "not that list, this line". It is not clear-the-line: the slash is
+    // still there, and the menu stays away until something changes what is
+    // typed.
+    let dir = scratch("menu-esc-slash");
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "ok" }"#),
+        &["[[remove]]\nid = \"tui-panel-welcome\"\n"],
+    ))
+    .await;
+    let task = s.open().await;
+
+    s.term.type_text("/comp");
+    until(&s, "/compact").await;
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
+    assert!(
+        s.term.last().unwrap().part("menu").is_none(),
+        "the menu is still up:\n{}",
+        s.screen()
+    );
+    assert!(
+        s.screen().contains("/comp"),
+        "esc cleared the line instead of the list:\n{}",
+        s.screen()
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 // ---- right-click on the composer ----------------------------------------
 
 /// The surface is the only thing that can put a pointer event in, so a test
@@ -1870,11 +2293,22 @@ async fn an_unknown_command_suggests_instead_of_vanishing() {
     let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
     let task = s.open().await;
 
-    s.term.type_line("/comp");
+    // The menu has to be out of the way first. With it open, enter takes the lit
+    // row — that is the whole point of the highlight — so the dispatcher's
+    // suggestion is the path a half-typed name takes when the list is not
+    // standing in front of it. Esc is the one keystroke that says so, and it
+    // leaves the line alone.
+    s.term.type_text("/comp");
+    until(&s, "/compact").await;
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
+    s.term.press(KeyPress::plain(Key::Enter));
     s.quiet().await;
     let screen = s.screen();
     assert!(screen.contains("/compact"), "it suggests:\n{screen}");
 
+    // `/wat` matches nothing, so no menu opens at all and enter goes straight to
+    // the dispatcher.
     s.term.type_line("/wat");
     s.quiet().await;
     assert!(
@@ -2968,14 +3402,51 @@ async fn the_effort_command_changes_what_requests_ask_for_while_the_screen_runs(
         s.screen()
     );
 
-    // With no argument it reports the current setting rather than changing it.
+    // With no argument it asks rather than reports: the levels are a closed set
+    // the command knows, so the answer is a list to pick from — and picking one
+    // dispatches the command it stands for, which is the same path the typed
+    // form above took.
     s.term.type_line("/effort");
     s.quiet().await;
+    let panel = s.screen();
     assert!(
-        s.screen().contains("当前思考强度:high"),
-        "the current level is shown:\n{}",
-        s.screen()
+        s.term.last().unwrap().part("effort").is_some(),
+        "the bare command opened the level panel:\n{panel}"
     );
+    // The level already in force is the one marked, so the list says where the
+    // session stands before anything is picked.
+    assert!(
+        panel.contains('●'),
+        "the panel marks the level in force:\n{panel}"
+    );
+
+    // Down to the next level and take it. Which one that is depends on the
+    // order of the table, so the level is read off the drawn row rather than
+    // assumed — the claim is that a pick reaches the same implementation a
+    // typed argument does. The row carries the frame, the cursor and the on/off
+    // mark around its label, so the label is found by asking which known level
+    // the row names rather than by slicing the decoration off the front.
+    s.term.press(KeyPress::plain(Key::Down));
+    s.quiet().await;
+    let row = s
+        .term
+        .last()
+        .unwrap()
+        .part("effort")
+        .unwrap()
+        .lines
+        .iter()
+        .find(|l| l.plain().contains('▸'))
+        .map(|l| l.plain())
+        .expect("a lit row");
+    let level = atomcode_harness::REASONING_EFFORT_LEVELS
+        .iter()
+        .find(|level| row.contains(**level))
+        .copied()
+        .unwrap_or("default")
+        .to_string();
+    s.term.press(KeyPress::plain(Key::Enter));
+    until(&s, &format!("思考强度 → {level}")).await;
 
     // A value nothing parses is refused.
     s.term.type_line("/effort bogus");
@@ -2990,8 +3461,8 @@ async fn the_effort_command_changes_what_requests_ask_for_while_the_screen_runs(
     s.quiet().await;
     assert_eq!(
         EFFORTS.lock().unwrap().last().copied().flatten(),
-        Some(atomcode_kernel::provider::ReasoningEffort::High),
-        "the next request carries the level the command set"
+        atomcode_kernel::provider::ReasoningEffort::from_config(Some(level.as_str())),
+        "the next request carries the level the panel picked"
     );
 
     s.term.press(KeyPress::ctrl('d'));

@@ -314,16 +314,37 @@ impl CommandSet for SessionCommands {
                 // One vocabulary, taken from the place that defines it, so this
                 // command cannot offer a level nothing parses.
                 let levels = atomcode_harness::REASONING_EFFORT_LEVELS;
+                // With nothing after it, the command asks rather than reports:
+                // the levels are a closed set this command already knows, so the
+                // answer is a list to pick from, and picking one dispatches the
+                // command it stands for. A pick is expressed as a command, so
+                // this and a typed `/effort high` reach one implementation.
                 if wanted.is_empty() {
                     let current = client
                         .described()
                         .and_then(|d| d.reasoning_effort)
-                        .map(|level| level.as_str().to_string())
-                        .unwrap_or_else(|| "端点默认".into());
-                    return Outcome::Said(format!(
-                        "当前思考强度:{current}\n可选:{}, default",
-                        levels.join(", ")
-                    ));
+                        .map(|level| level.as_str().to_string());
+                    let mut choices: Vec<crate::overlay::Choice> = levels
+                        .iter()
+                        .map(|level| {
+                            crate::overlay::Choice::new(
+                                format!("/effort {level}"),
+                                (*level).to_string(),
+                            )
+                            .about("这个会话的思考强度")
+                            .marked(current.as_deref() == Some(*level))
+                        })
+                        .collect();
+                    choices.push(
+                        crate::overlay::Choice::new("/effort default", "default")
+                            .about("交给端点决定")
+                            .marked(current.is_none()),
+                    );
+                    let title = match &current {
+                        Some(level) => format!("思考强度 · 现在 {level} · enter 改"),
+                        None => "思考强度 · 现在交给端点 · enter 改".to_string(),
+                    };
+                    return Outcome::Open(crate::overlay::Picker::new("effort", title, choices));
                 }
                 let level = if wanted == "default" {
                     None
