@@ -281,6 +281,20 @@ tuix 的老毛病——现在改是十几行,等下游移植完再改就是他�
 **顺序**：ACP 先拿 `HostConnection`(`connect()` 已在 cli 里，和 tui 用的是同一个)→
 `turn.rs` 换流 → 7 个方法换契约 → `commands.rs` 改从目录投影、删 tuix 那一行。
 
+##### 进度(2026-09-18)
+
+- ✅ **`SnapshotUnavailable` 定了**:`HostEvent::PersistenceFailed`,见上一节。卡点解开
+- ✅ **`commands.rs` 不再认 tuix**。原打算放在最后,提前做了,因为它是 6.4 唯一的
+  非 `--classic` 卡点。**但只做了一半**:表搬进了 `acp/commands.rs` 自己(16 行常量),
+  **还没有**改成从 `AgentDescription` 的命令目录投影 —— 那要 ACP 先拿到
+  `HostConnection`,也就是下面那三步。搬的时候按原样固定了 wire 可见的 15 条,
+  并补了一条判据(advertise 的每一条都得有人能跑;跨 crate 那套写法根本保证不了这件事)。
+  搬的过程中既有判据抓到一个真回归:老的 `find` **大小写不敏感**,`/Status` 要认作
+  `/status`,我写成了精确匹配
+- ⬜ ACP 拿 `HostConnection`
+- ⬜ `turn.rs` 换流(7 处 4 种事件;`translate()` 已经把这 4 种映射好了,是换流不是重写)
+- ⬜ 7 个方法换契约(12 + 3 处),`context_stats` 那 1 处契约里仍然没有对应项
+
 #### 6.5 测绘(2026-09-18)：今天能删的只有一半,另一半卡在 6.3/6.4 后面
 
 三块逐个追了构造点(不是按名字匹配),结论:

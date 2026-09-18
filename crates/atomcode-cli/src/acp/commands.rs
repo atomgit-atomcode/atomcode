@@ -1,9 +1,22 @@
 //! ACP slash commands: `available_commands_update` advertisement and local
-//! execution, sourced from the single built-in command table
-//! (`atomcode_tuix::commands`). Mirrors qwen-code's channel-filtered registry:
-//! commands are defined once with an `acp: true` flag, the ACP channel
-//! advertises that subset and runs its handlers against session-local state,
-//! and unknown `/…` inputs fall through to the model (supervised turn).
+//! execution.
+//!
+//! **The table lives here now** (2026-09-18, plan M6.3). It used to be the
+//! `acp: true` subset of `atomcode_tuix::commands` — the last thing outside
+//! `main.rs`'s deliberate `--classic` hatch that reached into the old front
+//! end, and so the last thing standing between the plan and 6.4.
+//!
+//! Sourcing it there never bought what the old comment claimed. The handlers
+//! were always ACP's own; what came across was 16 names and 16 sentences, and
+//! a flag on a table belonging to a front end that ACP does not run. What is
+//! advertised on this channel is this channel's business.
+//!
+//! **Interim, on purpose.** The end state in the plan is to project this from
+//! the command catalog that travels with `AgentDescription`, which needs the
+//! rest of 6.3 (this session holding a `HostConnection` rather than a
+//! `CodingRuntimeHandle`). Until then the table is here, pinned by a criterion
+//! against the set ACP advertised before the move, so the wire does not shift
+//! under a client while the plumbing changes.
 //!
 //! Handlers never render TUI chrome; they return plain text that the turn loop
 //! replies with before ending the turn (no model round-trip). Mode / effort /
@@ -18,13 +31,85 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::{Client, ConnectionTo};
 use atomcode_capabilities::tools::todo::{TodoItem, TodoStatus};
 use atomcode_coding::RuntimeMode;
-use atomcode_tuix::commands::CommandRegistry;
 
 use crate::acp::options::{
     handle_set_session_config_option, MODEL_CONFIG_ID, MODE_CONFIG_ID, REASONING_EFFORT_CONFIG_ID,
 };
 use crate::acp::sessions::Sessions;
 use crate::acp::SessionModelResolver;
+
+/// One command this channel advertises and runs itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AcpCommand {
+    pub name: &'static str,
+    pub desc: &'static str,
+}
+
+/// What the ACP channel offers. Identical to the set that used to come from
+/// the old front end's table, name for name and word for word — see
+/// `the_advertised_commands_are_the_ones_acp_can_actually_run`.
+const ACP_COMMANDS: &[AcpCommand] = &[
+    AcpCommand {
+        name: "model",
+        desc: "Switch provider / model",
+    },
+    AcpCommand {
+        name: "status",
+        desc: "Show session status",
+    },
+    AcpCommand {
+        name: "config",
+        desc: "Show config path",
+    },
+    AcpCommand {
+        name: "diff",
+        desc: "Show git diff",
+    },
+    AcpCommand {
+        name: "usage",
+        desc: "Show CodingPlan usage (tabs: current / overview / models)",
+    },
+    AcpCommand {
+        name: "cost",
+        desc: "Show this session's token usage (any model)",
+    },
+    AcpCommand {
+        name: "context",
+        desc: "Show context budget breakdown",
+    },
+    AcpCommand {
+        name: "compact",
+        desc: "Compact conversation history",
+    },
+    AcpCommand {
+        name: "undo",
+        desc: "Undo a turn (memory rollback): /undo or /undo N",
+    },
+    AcpCommand {
+        name: "plan",
+        desc: "Switch to Plan mode (read-only exploration)",
+    },
+    AcpCommand {
+        name: "build",
+        desc: "Switch to Build mode (full execution)",
+    },
+    AcpCommand {
+        name: "auto",
+        desc: "Switch to Auto mode (auto-approve all tools)",
+    },
+    AcpCommand {
+        name: "effort",
+        desc: "Model reasoning effort control (low / medium / high / xhigh / max / default)",
+    },
+    AcpCommand {
+        name: "help",
+        desc: "Show this help",
+    },
+    AcpCommand {
+        name: "todo",
+        desc: "Show the todo list; /todo add <task> appends one, /todo clear wipes it",
+    },
+];
 
 /// The commands advertised on the ACP channel, mapped from the one command
 /// table (`acp: true`, not hidden) and sorted by name.
@@ -34,9 +119,9 @@ pub fn available_acp_commands() -> Vec<AvailableCommand> {
         ("effort", "high | max | off"),
         ("model", "<model id>"),
     ];
-    let mut out: Vec<AvailableCommand> = CommandRegistry::builtin()
-        .acp_commands()
-        .into_iter()
+    let mut out: Vec<AvailableCommand> = ACP_COMMANDS
+        .iter()
+        .copied()
         .map(|c| {
             let mut advert = AvailableCommand::new(c.name, c.desc);
             if let Some((_, hint)) = hints.iter().find(|(name, _)| *name == c.name) {
@@ -63,9 +148,9 @@ pub fn available_acp_commands_v2() -> Vec<agent_client_protocol::schema::v2::Ava
         ("effort", "high | max | off"),
         ("model", "<model id>"),
     ];
-    let mut out: Vec<AvailableCommand> = CommandRegistry::builtin()
-        .acp_commands()
-        .into_iter()
+    let mut out: Vec<AvailableCommand> = ACP_COMMANDS
+        .iter()
+        .copied()
         .map(|c| {
             let mut advert = AvailableCommand::new(c.name, c.desc);
             if let Some((_, hint)) = hints.iter().find(|(name, _)| *name == c.name) {
@@ -92,9 +177,12 @@ pub fn parse_slash_command(text: &str) -> Option<(&'static str, &str)> {
         Some(i) => (&rest[..i], rest[i..].trim()),
         None => (rest, ""),
     };
-    CommandRegistry::builtin()
-        .find(name)
-        .filter(|c| c.acp)
+    // Case-insensitive, as the table it came from was: a client that sends
+    // `/Status` means `/status`, and the criterion below has pinned that since
+    // before the table moved here.
+    ACP_COMMANDS
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(name))
         .map(|c| (c.name, arg))
 }
 
@@ -366,7 +454,7 @@ pub fn plan_update_from_todos_v2(
 /// `/help` output — the ACP-usable subset of the single command table.
 fn help_text() -> String {
     let mut out = String::from("available commands:\n");
-    for c in CommandRegistry::builtin().acp_commands() {
+    for c in ACP_COMMANDS {
         out.push_str(&format!("  /{} - {}\n", c.name, c.desc));
     }
     out
@@ -445,5 +533,55 @@ mod tests {
         assert_eq!(entries[1]["status"], "in_progress");
         assert_eq!(entries[2]["status"], "completed");
         assert_eq!(entries[0]["priority"], "low");
+    }
+
+    /// What this channel advertises is what it can actually run.
+    ///
+    /// The table moved here from the old front end's `acp: true` column
+    /// (plan M6.3). Two things had to survive the move and neither was checked
+    /// before: the wire-visible set must not shift under a client, and an
+    /// advertisement must correspond to a handler — the old arrangement could
+    /// flag a row `acp: true` in one crate while the arm that runs it lives in
+    /// another, and nothing would have noticed.
+    #[test]
+    fn the_advertised_commands_are_the_ones_acp_can_actually_run() {
+        // The set as it was advertised before the table moved, in wire order.
+        let before = [
+            "auto", "build", "compact", "config", "context", "cost", "diff", "effort", "help",
+            "model", "plan", "status", "todo", "undo", "usage",
+        ];
+        let advertised = available_acp_commands();
+        let now: Vec<&str> = advertised.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(now, before, "the advertised set moved crates, not contents");
+        // v1 and v2 advertise the same commands; only the input shape differs.
+        let v2: Vec<String> = available_acp_commands_v2()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(v2, before, "v1 and v2 must advertise the same set");
+
+        // And every one of them parses back to a name this file dispatches.
+        // `execute_slash_command` needs a session, so this asserts the arm
+        // exists by name rather than by running it — which is the half the
+        // cross-crate arrangement could get wrong.
+        let dispatched = [
+            "status", "usage", "cost", "context", "todo", "undo", "compact", "diff", "model",
+            "effort", "build", "auto", "plan", "help", "config",
+        ];
+        for name in before {
+            let typed = format!("/{name} x");
+            assert_eq!(
+                parse_slash_command(&typed).map(|(n, _)| n),
+                Some(name),
+                "`/{name}` is advertised but does not parse"
+            );
+            assert!(
+                dispatched.contains(&name),
+                "`/{name}` is advertised with no arm to run it"
+            );
+        }
+        // Something nobody advertises falls through to the model rather than
+        // being swallowed.
+        assert_eq!(parse_slash_command("/nope"), None);
     }
 }
