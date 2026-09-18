@@ -36,22 +36,26 @@ use std::time::Duration;
 /// App-attribution headers sent to OpenRouter so real user traffic is credited
 /// to a public "AtomCode" app entry on openrouter.ai (rankings / app page).
 ///
-/// Per OpenRouter's app-attribution contract:
-///   - `HTTP-Referer` is the app's STABLE identifier (primary domain) — it alone
-///     creates the app page;
-///   - `X-OpenRouter-Title` is the display name on the rankings;
-///   - `X-OpenRouter-Categories` places the app in the marketplace categories.
+/// Per OpenRouter's documented app-attribution contract these are the ONLY two
+/// header names it reads (https://openrouter.ai/docs/api-reference/overview):
+///   - `HTTP-Referer` is the app's STABLE identifier (primary URL) — it creates
+///     the app page and is how the request is matched to a listed app;
+///   - `X-Title` is the display name on the rankings / app leaderboard.
 ///
-/// These are sent ONLY when the request actually targets `openrouter.ai` (see
+/// These two together are what identify the request as coming from a recognized
+/// agentic harness. Free models gated to "agentic harnesses" 403 without them —
+/// earlier we sent `X-OpenRouter-Title` / `X-OpenRouter-Categories`, header names
+/// OpenRouter does NOT read, so the app was never recognized and the gate failed.
+///
+/// Sent ONLY when the request actually targets `openrouter.ai` (see
 /// [`is_openrouter_url`]) so other OpenAI-compatible endpoints — including
 /// AtomGit's own signing gateway — never receive them.
-pub const OPENROUTER_ATTRIBUTION_HEADERS: &[(&str, &str); 3] = &[
+pub const OPENROUTER_ATTRIBUTION_HEADERS: &[(&str, &str); 2] = &[
     (
         "HTTP-Referer",
         "https://gitcode.com/atomgit_atomcode/atomcode",
     ),
-    ("X-OpenRouter-Title", "AtomCode"),
-    ("X-OpenRouter-Categories", "cli-agent"),
+    ("X-Title", "AtomCode"),
 ];
 
 /// True when `url` targets the OpenRouter API (any path under the `openrouter.ai`
@@ -153,7 +157,13 @@ pub struct OpenAiCompatConfig {
     /// Kimi K2.6 preserved thinking: `thinking.keep` in the request body.
     pub thinking_keep: Option<String>,
     /// Per-chunk stream-idle watchdog: no bytes for this long ⇒ terminal error.
+    /// Governs the INTER-token phase (after the first byte of a stream).
     pub idle_timeout: Duration,
+    /// FIRST-byte (prefill / TTFB) idle watchdog: no bytes for this long BEFORE the
+    /// first byte of a (re)opened stream ⇒ terminal error. Separate from (and ≥)
+    /// `idle_timeout` because prefill on a slow local model can be silent far longer
+    /// than inter-token gaps. Wired from the coding-layer `first_token_timeout`.
+    pub first_token_timeout: Duration,
     pub connect_timeout: Duration,
     /// Per-ATTEMPT first-byte (TTFB) watchdog for the OPEN call. A gateway that
     /// accepts the connection but never responds would otherwise hang FOREVER —
@@ -246,6 +256,7 @@ impl OpenAiCompatConfig {
             thinking_type: None,
             thinking_keep: None,
             idle_timeout: Duration::from_secs(120),
+            first_token_timeout: Duration::from_secs(120),
             open_timeout: Duration::from_secs(90),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
@@ -312,8 +323,9 @@ impl OpenAiCompatProvider {
 
 /// Build a fresh streaming HTTP client from the process's current proxy env.
 /// Extracted so [`SwappableClient`] can rebuild an identical client with an EMPTY
-/// connection pool when a pooled connection goes stale.
-fn build_http_client(
+/// connection pool when a pooled connection goes stale. `pub(crate)`: the
+/// Responses-API adapter reuses the identical client policy.
+pub(crate) fn build_http_client(
     connect_timeout: std::time::Duration,
     skip_tls_verify: bool,
     user_agent: Option<String>,
@@ -482,7 +494,7 @@ pub(crate) struct SwappableClient {
 }
 
 impl SwappableClient {
-    fn new(
+    pub(crate) fn new(
         force_tls12: bool,
         build: impl Fn(bool) -> Result<reqwest::Client, ProviderError> + Send + Sync + 'static,
     ) -> Result<Self, ProviderError> {
@@ -590,6 +602,7 @@ impl LlmProvider for OpenAiCompatProvider {
         // the initial open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
+        let first_token = self.cfg.first_token_timeout;
         let open_timeout = self.cfg.open_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
         let resp = match open_stream(
@@ -640,8 +653,23 @@ impl LlmProvider for OpenAiCompatProvider {
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
+                // PHASE-AWARE byte-idle watchdog: before the first byte of THIS (re)opened
+                // stream we are in prefill (TTFB) — a slow local model can be silent for
+                // minutes — so allow up to `first_token`; once any byte has arrived, tighten
+                // to the inter-token `idle`. Keep-alive bytes flip us early but also keep
+                // resetting the watchdog, so it won't fire spuriously; a fully-silent prefill
+                // gets the full first-token budget, matching the kernel first_token_timeout.
+                // Reset per (re)open: a transparent reconnect restarts prefill on the server.
+                let mut first_byte_seen = false;
                 loop {
-                    match tokio::time::timeout(idle, byte_stream.next()).await {
+                    match retry::next_chunk_phased(
+                        &mut byte_stream,
+                        first_token,
+                        idle,
+                        &mut first_byte_seen,
+                    )
+                    .await
+                    {
                         Err(_elapsed) => {
                             // Mid-stream idle: non-recoverable (partial deltas may already
                             // have reached the consumer), so not retryable.
@@ -795,8 +823,10 @@ fn authentication_expired_error(code: u16) -> ProviderError {
 /// transport) per `policy`. Builds the request fresh each attempt so a signer
 /// (if any) re-auths with a new nonce/timestamp. Returns the live `Response` on
 /// a 2xx, or a terminal `ProviderError`. Shared by the initial open and the
-/// mid-stream re-open so both paths behave identically.
-async fn open_stream(
+/// mid-stream re-open so both paths behave identically. `pub(crate)`: the
+/// Responses-API adapter reuses the identical open/retry/idle semantics — only
+/// the URL and body bytes differ.
+pub(crate) async fn open_stream(
     client: &SwappableClient,
     url: &str,
     body_bytes: &[u8],
@@ -1231,6 +1261,10 @@ fn normalize_openai_tool_schema(schema: &Value) -> Value {
     normalized
 }
 
+pub(crate) fn shared_normalize_tool_schema(schema: &Value) -> Value {
+    normalize_openai_tool_schema(schema)
+}
+
 fn normalize_openai_tool_schema_in_place(schema: &mut Value) {
     let Value::Object(map) = schema else {
         return;
@@ -1389,7 +1423,7 @@ fn truncate_msg(s: &str) -> String {
 /// `atomcode_core::provider::extract_error_message`'s shape list (kept LOCAL — L1 must
 /// not depend on core). Previously only the `error` object was handled, so GLM-style
 /// top-level `message` bodies dumped raw JSON into the user-facing error.
-fn extract_error_detail(text: &str) -> String {
+pub(crate) fn extract_error_detail(text: &str) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
         if let Some(detail) = v.get("detail") {
             if detail.is_object() {
@@ -1416,7 +1450,7 @@ fn extract_error_detail(text: &str) -> String {
 
 /// Format an OpenAI-compatible error OBJECT (`{"message","type","code"}`) as a readable
 /// "[type/code] message" one-liner carrying BOTH the error CODE and the REASON.
-fn parse_error_obj(err: &serde_json::Value) -> String {
+pub(crate) fn parse_error_obj(err: &serde_json::Value) -> String {
     let msg = err
         .get("message")
         .and_then(|m| m.as_str())
@@ -1451,7 +1485,7 @@ fn error_code_value(code: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn error_code(err: &serde_json::Value) -> Option<String> {
+pub(crate) fn error_code(err: &serde_json::Value) -> Option<String> {
     err.get("code").and_then(error_code_value).or_else(|| {
         err.get("type")
             .and_then(|t| t.as_str())
@@ -1476,7 +1510,7 @@ fn provider_error_code(envelope: &serde_json::Value) -> Option<String> {
 /// the upstream HTTP status. Only treat it as one when it is a plausible HTTP status
 /// (100–599), so vendor-specific numeric codes (e.g. billing `1113`) are not
 /// mislabeled. Returns `None` for string codes that are not pure HTTP status numbers.
-fn inband_error_http_status(err: &serde_json::Value) -> Option<u16> {
+pub(crate) fn inband_error_http_status(err: &serde_json::Value) -> Option<u16> {
     let n = match err.get("code")? {
         serde_json::Value::Number(n) => n.as_u64()?,
         serde_json::Value::String(s) => s.trim().parse::<u64>().ok()?,
@@ -1494,6 +1528,14 @@ fn inband_error_http_status(err: &serde_json::Value) -> Option<u16> {
 // ---------------------------------------------------------------------------
 
 const MAX_TOOL_CALL_DELTAS: usize = 20000;
+
+/// Upper bound on a streamed tool-call `index`. The index pads `tool_calls` up to
+/// its value, so an out-of-range one from a buggy/malicious server (e.g.
+/// `index: 999_999_999`) would allocate a gigantic vector → OOM. Real responses
+/// index parallel tool calls densely from 0 and never approach this; a larger index
+/// is malformed and its delta is dropped. Generous so legitimate high fan-out is
+/// never rejected, while keeping the buffer trivially small.
+const MAX_TOOL_CALLS: usize = 256;
 
 /// Stateful Server-Sent-Events decoder. Feed it raw byte chunks; it returns whole
 /// kernel `StreamEvent`s. Splitting tool-call assembly + usage buffering out here (vs
@@ -1682,6 +1724,13 @@ impl SseDecoder {
             for tc in tcs {
                 self.tool_call_delta_count += 1;
                 let idx = tc.index.unwrap_or(0);
+                // Bound the index BEFORE it pads the vector: an out-of-range value
+                // (e.g. `index: 999_999_999`) would otherwise push ~a billion slots →
+                // OOM. Real responses index densely from 0; a huge sparse index is
+                // malformed, so drop that delta rather than allocate for it.
+                if idx >= MAX_TOOL_CALLS {
+                    continue;
+                }
                 while self.tool_calls.len() <= idx {
                     self.tool_calls
                         .push((String::new(), String::new(), String::new()));
@@ -3067,6 +3116,38 @@ mod tests {
     }
 
     #[test]
+    fn sse_tool_call_out_of_range_index_is_dropped_not_oom() {
+        // A buggy/malicious server sending a huge `index` must NOT pad the buffer up
+        // to that value (which would allocate ~a billion slots → OOM). The
+        // out-of-range delta is dropped; a legitimate index-0 call in the same stream
+        // still assembles. If the bound were missing this test would OOM/hang.
+        let mut d = SseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":999_999_999u64,"id":"evil","function":{"name":"x","arguments":"{}"}}]}}]})).as_bytes()));
+        ev.extend(d.feed(line(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ok","function":{"name":"read","arguments":"{\"path\":\"a\"}"}}]}}]})).as_bytes()));
+        ev.extend(
+            d.feed(line(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})).as_bytes()),
+        );
+        let calls: Vec<_> = ev
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "only the in-range call is emitted: {calls:?}"
+        );
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].id, "call_ok");
+    }
+
+    #[test]
     fn sse_empty_string_finish_reason_does_not_drop_tool_calls() {
         // SenseNova's free `deepseek-v4-flash` sends `"finish_reason":""` (EMPTY
         // STRING, not null) on EVERY streaming chunk — reasoning AND tool_call
@@ -4250,7 +4331,7 @@ mod tests {
     fn apply_openrouter_attribution_only_targets_openrouter() {
         let client = reqwest::Client::new();
 
-        // OpenRouter endpoint → all three attribution headers present.
+        // OpenRouter endpoint → the attribution headers present.
         let req = client
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header(reqwest::header::CONTENT_TYPE, "application/json");
@@ -4265,6 +4346,19 @@ mod tests {
                 "{name} must be set on openrouter.ai"
             );
         }
+        // Pin OpenRouter's exact documented header names — these are what identify
+        // the app and unlock "agentic harness" free models. A rename here (e.g. the
+        // old `X-OpenRouter-Title`) silently reintroduces the 403 gate, so assert
+        // the wire names directly rather than only looping the constant.
+        assert_eq!(
+            built.headers().get("X-Title").and_then(|v| v.to_str().ok()),
+            Some("AtomCode"),
+            "OpenRouter reads `X-Title` (not `X-OpenRouter-Title`) for the app name"
+        );
+        assert!(
+            built.headers().contains_key("HTTP-Referer"),
+            "OpenRouter reads `HTTP-Referer` to match the listed app"
+        );
 
         // Non-OpenRouter endpoint → NONE of the attribution headers leak.
         let req = client

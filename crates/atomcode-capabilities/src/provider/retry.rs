@@ -19,6 +19,33 @@ pub(crate) enum StreamReadRecovery {
     PartialResponse,
 }
 
+/// Await the next chunk from a provider byte stream with a PHASE-AWARE idle watchdog:
+/// `first_token` before the first DATA byte of this (re)opened stream (prefill / TTFB —
+/// a slow local model can be silent for minutes), then the tighter inter-token `idle`.
+/// Flips `*first_byte_seen` on the first `Ok` chunk ONLY — a transport `Err` does not
+/// count (it triggers a reopen, which resets the flag). Returns the `timeout` result for
+/// the caller to match: `Err(_)` = idle timeout, `Ok(None)` = stream end, `Ok(Some(_))`
+/// = a data chunk or a transport error.
+///
+/// Shared by all four provider byte loops (openai_compat / responses / anthropic /
+/// ollama) so the phase-aware liveness policy lives in exactly one place.
+pub(crate) async fn next_chunk_phased<S, T, E>(
+    byte_stream: &mut S,
+    first_token: Duration,
+    idle: Duration,
+    first_byte_seen: &mut bool,
+) -> Result<Option<Result<T, E>>, tokio::time::error::Elapsed>
+where
+    S: futures::Stream<Item = Result<T, E>> + Unpin,
+{
+    let watchdog = if *first_byte_seen { idle } else { first_token };
+    let next = tokio::time::timeout(watchdog, futures::StreamExt::next(byte_stream)).await;
+    if matches!(&next, Ok(Some(Ok(_)))) {
+        *first_byte_seen = true;
+    }
+    next
+}
+
 /// Whether replaying the whole provider request could duplicate user-visible output
 /// or a tool side effect. Observational metadata is deliberately replay-safe.
 pub(crate) fn is_replay_sensitive_event(event: &StreamEvent) -> bool {
@@ -266,7 +293,7 @@ pub(crate) fn stream_read_error_message(
                 format!("网络连接中断:远端关闭或重置了连接,自动重连 {attempts} 次后仍失败,可重试。")
             }
             StreamReadRecovery::PartialResponse => {
-                "响应中断:为避免重复输出或工具执行,未自动重放;已保留可安全保存的部分回复,可继续。"
+                "响应中断:为避免重复输出或工具执行,未自动重放;已保留可安全保存的部分回复。无需重开会话——直接回复(例如「继续」)即可,模型会带着已保留的部分接着往下。"
                     .to_string()
             }
         };
@@ -863,6 +890,13 @@ mod tests {
         let partial = stream_read_error_message(&e, StreamReadRecovery::PartialResponse);
         assert!(partial.contains("为避免重复输出或工具执行"));
         assert!(partial.contains("已保留可安全保存的部分回复"));
+        // Recovery is now ACTIONABLE (the report's gap: "可继续" told users nothing,
+        // so they reopened the session). It must point at replying to continue, and
+        // that no session reopen is needed.
+        assert!(
+            partial.contains("直接回复") && partial.contains("无需重开会话"),
+            "PartialResponse must give an actionable recovery entry: {partial}"
+        );
         assert!(!partial.contains("自动重连仍失败"));
         // The PartialResponse lead is self-contained — no "网络连接中断" double-中断.
         assert!(!partial.contains("网络连接中断"));

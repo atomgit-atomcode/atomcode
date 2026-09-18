@@ -277,6 +277,32 @@ mod tests {
             ),
             (CSharp, "class C {\n  void M() {}\n}\n", &["C", "M"]),
             (Php, "<?php\nfunction f() {}\nclass C {}\n", &["f", "C"]),
+            (
+                // Real-world Kotlin shapes: interface, class + method + property,
+                // companion object + its member, enum class, top-level fun. (A
+                // top-level named `object Foo` is a known tree-sitter-kotlin-sg
+                // mis-parse — its members index but its own name doesn't; companion
+                // objects parse cleanly, so the object case is covered via Factory.)
+                Kotlin,
+                "package a\n\
+                 interface Repo { fun find(): String }\n\
+                 class LoginRiskGate(val repo: Repo) {\n\
+                 \x20   val threshold = 3\n\
+                 \x20   fun evaluate(): Boolean = true\n\
+                 \x20   companion object Factory { fun boot() {} }\n\
+                 }\n\
+                 enum class Kind { A, B }\n\
+                 fun topLevel() {}\n",
+                &[
+                    "Repo",
+                    "LoginRiskGate",
+                    "evaluate",
+                    "Factory",
+                    "boot",
+                    "Kind",
+                    "topLevel",
+                ],
+            ),
         ];
         for (lang, src, expected) in cases {
             let syms = extract_symbols(src, *lang).unwrap_or_default();
@@ -290,6 +316,52 @@ mod tests {
         }
         // HTML "symbols" are element-ish; just assert the query runs without error.
         assert!(extract_symbols("<div id=\"app\"></div>\n", Lang::Html).is_some());
+    }
+
+    #[test]
+    fn kotlin_generics_and_extensions_capture_exactly_one_name() {
+        let names = |src: &str| -> Vec<String> {
+            extract_symbols(src, Lang::Kotlin)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.name)
+                .collect()
+        };
+        // Extension function: the receiver `String` must NOT become a symbol.
+        let ext = names("fun String.trimx(): String = this\n");
+        assert!(ext.contains(&"trimx".to_string()), "{ext:?}");
+        assert!(
+            !ext.contains(&"String".to_string()),
+            "extension receiver leaked as a symbol: {ext:?}"
+        );
+        // Generic class with a constraint: only `Box`, not the type param/constraint.
+        let gen = names("class Box<T : Comparable<T>>(val v: T)\n");
+        assert!(gen.contains(&"Box".to_string()), "{gen:?}");
+        assert!(
+            !gen.contains(&"T".to_string()) && !gen.contains(&"Comparable".to_string()),
+            "generic param/constraint leaked as a symbol: {gen:?}"
+        );
+    }
+
+    #[test]
+    fn kotlin_class_supertype_is_not_over_captured() {
+        // `class Sub : Base()` — only the class NAME (Sub) is a direct
+        // type_identifier child; the supertype `Base` lives in a delegation
+        // specifier deeper down, so it must NOT be captured as a second symbol
+        // for `Sub`. Base appears exactly once (its own declaration).
+        let src = "open class Base\nclass Sub : Base() {\n    fun run() {}\n}\n";
+        let names: Vec<String> = extract_symbols(src, Lang::Kotlin)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(names.contains(&"Sub".to_string()), "{names:?}");
+        assert!(names.contains(&"run".to_string()), "{names:?}");
+        assert_eq!(
+            names.iter().filter(|n| *n == "Base").count(),
+            1,
+            "supertype Base must not be double-captured: {names:?}"
+        );
     }
 
     #[test]

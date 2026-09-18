@@ -39,6 +39,11 @@ pub struct ApprovalRequest {
     pub tool: String,
     /// The EXACT argument bytes that will execute (approve-what-runs contract).
     pub args: String,
+    /// Human-readable "why is this being asked" line shown above the options.
+    /// `None` for a plain approval; set by gates that re-confirm despite a session
+    /// grant (destructive / out-of-workspace / sensitive path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// The driver's answer. `decision` is `"allow"` / `"allow_always"` / `"deny"`
@@ -72,6 +77,10 @@ impl ApprovalResponse {
     }
 }
 
+/// Sentinel key for the session-scoped "allow all Bash (incl. destructive)" grant,
+/// stored in the shared allow-all `PermissionStore` and checked by both Bash gates.
+pub const BASH_ALLOW_ALL_KEY: &str = "bash::*";
+
 /// The decision a driver returns for an approval round-trip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionDecision {
@@ -80,6 +89,10 @@ pub enum PermissionDecision {
     /// Allow AND remember — the store caches the grant so the identical call is not
     /// asked again this session.
     AllowAlways,
+    /// Allow AND remember for ALL Bash this session (the explicit "allow all Bash,
+    /// incl. destructive" option). Recorded in the shared allow-all store under
+    /// [`BASH_ALLOW_ALL_KEY`]; honored by both BashWorkspaceGate and ApprovalMiddleware.
+    AllowAlwaysAll,
     /// Deny — the middleware blocks the call with `Err`.
     Deny,
 }
@@ -91,7 +104,9 @@ impl PermissionDecision {
     pub fn from_value(v: &serde_json::Value) -> Self {
         let decision = v.get("decision").and_then(|x| x.as_str()).unwrap_or("deny");
         let remember = v.get("remember").and_then(|x| x.as_bool()).unwrap_or(false);
+        let scope = v.get("grant_scope").and_then(|x| x.as_str()).unwrap_or("");
         match decision {
+            "allow" if remember && scope == "all" => PermissionDecision::AllowAlwaysAll,
             "allow_always" => PermissionDecision::AllowAlways,
             "allow" if remember => PermissionDecision::AllowAlways,
             "allow" => PermissionDecision::AllowOnce,
@@ -154,6 +169,9 @@ impl PermissionStore for InMemoryPermissionStore {
 /// The generic approval gate. Clone-cheap (Arc-backed store).
 pub struct ApprovalMiddleware {
     store: Arc<dyn PermissionStore>,
+    /// Shared session-scoped allow-all store — checked before the per-call store for `bash`.
+    /// Defaults to the same instance as `store` when not explicitly injected.
+    allow_all: Arc<dyn PermissionStore>,
     kind: String,
 }
 
@@ -162,6 +180,7 @@ impl ApprovalMiddleware {
     /// matches `AgentEvent::Request.kind` on it).
     pub fn new(store: Arc<dyn PermissionStore>) -> Self {
         Self {
+            allow_all: store.clone(),
             store,
             kind: APPROVAL_KIND.to_string(),
         }
@@ -175,6 +194,18 @@ impl ApprovalMiddleware {
     /// approval seam) remembers into the same set — the key shape is the same.
     pub fn store(&self) -> Arc<dyn PermissionStore> {
         Arc::clone(&self.store)
+    }
+    /// Like [`new`] but with a shared allow-all store consulted for `bash` calls.
+    pub fn with_allow_all_store(
+        store: Arc<dyn PermissionStore>,
+        allow_all: Arc<dyn PermissionStore>,
+        kind: String,
+    ) -> Self {
+        Self {
+            store,
+            allow_all,
+            kind,
+        }
     }
     /// Override the round-trip request `kind`.
     pub fn with_kind(mut self, kind: impl Into<String>) -> Self {
@@ -232,6 +263,7 @@ pub async fn request_approval_decision(
         call_id: call.id.clone(),
         tool: tool_name.to_string(),
         args: call.arguments.clone(),
+        reason: None,
     })
     .unwrap_or(serde_json::Value::Null);
     let response = rt.request(kind, payload).await;
@@ -253,6 +285,13 @@ impl ToolMiddleware for ApprovalMiddleware {
         if tool.risk(&call.arguments) == RiskLevel::Safe {
             return BeforeOutcome::Proceed;
         }
+        // Shared allow-all short-circuit: if the user has granted "allow all Bash" this
+        // session, skip the round-trip entirely for any command-shell tool (bash / bash_start).
+        if crate::tools::is_command_shell_tool(&call.name)
+            && self.allow_all.is_granted(BASH_ALLOW_ALL_KEY)
+        {
+            return BeforeOutcome::Proceed;
+        }
         // Session grant cache: an identical risky call already approved-always.
         let key = Self::grant_key(call, tool.as_ref());
         if self.store.is_granted(&key) {
@@ -263,6 +302,10 @@ impl ToolMiddleware for ApprovalMiddleware {
             Ok(PermissionDecision::AllowOnce) => BeforeOutcome::Proceed,
             Ok(PermissionDecision::AllowAlways) => {
                 self.store.grant(&key);
+                BeforeOutcome::Proceed
+            }
+            Ok(PermissionDecision::AllowAlwaysAll) => {
+                self.allow_all.grant(BASH_ALLOW_ALL_KEY);
                 BeforeOutcome::Proceed
             }
             Ok(PermissionDecision::Deny) => {
@@ -452,6 +495,107 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn approval_allows_all_bash_after_allow_all_grant() {
+        let allow_all = std::sync::Arc::new(InMemoryPermissionStore::new());
+        allow_all.grant(BASH_ALLOW_ALL_KEY);
+        let mw = ApprovalMiddleware::with_allow_all_store(
+            std::sync::Arc::new(InMemoryPermissionStore::new()),
+            allow_all.clone(),
+            APPROVAL_KIND.to_string(),
+        );
+        // A risky bash call is allowed WITHOUT any round-trip (rt would panic if used).
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::bash::BashTool::default());
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"git push --force origin main"}"#.into(),
+        };
+        let (tx, _rx) = unbounded_channel();
+        let rt = RequestCtx::new(tx, Some(Duration::from_millis(1)));
+        assert!(matches!(
+            mw.before(&mut call, &tool, &rt).await,
+            BeforeOutcome::Proceed
+        ));
+    }
+
+    /// BUG 1 regression: `bash_start` (background shell) must be covered by the allow-all
+    /// bypass — `is_command_shell_tool` returns true for both "bash" and "bash_start".
+    #[tokio::test]
+    async fn approval_allows_all_bash_start_after_allow_all_grant() {
+        let allow_all = std::sync::Arc::new(InMemoryPermissionStore::new());
+        allow_all.grant(BASH_ALLOW_ALL_KEY);
+        let mw = ApprovalMiddleware::with_allow_all_store(
+            std::sync::Arc::new(InMemoryPermissionStore::new()),
+            allow_all.clone(),
+            APPROVAL_KIND.to_string(),
+        );
+        // A risky bash_start call is allowed WITHOUT any round-trip (rt would time out → Deny
+        // if the bypass did NOT fire — asserting Proceed proves the bypass covers bash_start).
+        let tool: Arc<dyn Tool> = Arc::new(crate::tools::bash::BashStartTool::default());
+        let mut call = ToolCall {
+            id: "2".into(),
+            name: "bash_start".into(),
+            arguments: r#"{"command":"rm -rf /tmp/danger"}"#.into(),
+        };
+        let (tx, _rx) = unbounded_channel();
+        let rt = RequestCtx::new(tx, Some(Duration::from_millis(1)));
+        assert!(
+            matches!(
+                mw.before(&mut call, &tool, &rt).await,
+                BeforeOutcome::Proceed
+            ),
+            "allow-all grant must bypass risky bash_start just like bash"
+        );
+    }
+
+    #[test]
+    fn approval_request_serializes_reason_only_when_present() {
+        let mut req = ApprovalRequest {
+            call_id: "c".into(),
+            tool: "bash".into(),
+            args: "{}".into(),
+            reason: None,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(v.get("reason").is_none(), "reason omitted when None: {v}");
+        req.reason = Some("此命令写到工作区外".into());
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            v.get("reason").and_then(|r| r.as_str()),
+            Some("此命令写到工作区外")
+        );
+    }
+
+    #[test]
+    fn from_value_maps_grant_scope_all_to_allow_always_all() {
+        use serde_json::json;
+        // New: allow + remember + grant_scope:"all" → AllowAlwaysAll.
+        assert_eq!(
+            PermissionDecision::from_value(
+                &json!({"decision":"allow","remember":true,"grant_scope":"all"})
+            ),
+            PermissionDecision::AllowAlwaysAll
+        );
+        // Back-compat: remember without scope stays AllowAlways.
+        assert_eq!(
+            PermissionDecision::from_value(&json!({"decision":"allow","remember":true})),
+            PermissionDecision::AllowAlways
+        );
+        // Unknown scope → AllowAlways (not AllowAlwaysAll).
+        assert_eq!(
+            PermissionDecision::from_value(
+                &json!({"decision":"allow","remember":true,"grant_scope":"tool"})
+            ),
+            PermissionDecision::AllowAlways
+        );
+        // grant_scope only upgrades an allow: deny stays deny.
+        assert_eq!(
+            PermissionDecision::from_value(&json!({"decision":"deny","grant_scope":"all"})),
+            PermissionDecision::Deny
+        );
+    }
+
     /// The exported typed contract must stay byte-compatible with the wire shapes
     /// the middleware actually sends / the parser actually accepts.
     #[test]
@@ -461,6 +605,7 @@ mod tests {
             call_id: "call_1".into(),
             tool: "bash".into(),
             args: "{\"cmd\":\"ls\"}".into(),
+            reason: None,
         })
         .unwrap();
         assert_eq!(

@@ -5681,6 +5681,52 @@ mod buffer_tests {
             active.contains("(0s \u{b7} \u{2191} 12.40K tokens)"),
             "expected `(0s · ↑ 12.40K tokens)`, got {active:?}"
         );
+        // Under 1s elapsed, no throughput is shown (avoids div-by-zero / wild rates).
+        assert!(
+            !active.contains("tok/s"),
+            "no rate under 1s, got {active:?}"
+        );
+    }
+
+    #[test]
+    fn spinner_shows_tok_per_sec_once_a_second_elapses() {
+        let mut s = UiState::new();
+        s.on_submit();
+        // Backdate the PHASE clock so `phase_elapsed >= 1s`; baseline is captured at
+        // stamp time (0 chars), then 40_000 chars ≈ 10K tokens produced this phase
+        // over 10s → 1000 tok/s.
+        s.stamp_phase_start(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        s.turn_output_chars = 40_000;
+        let active = format_spinner_label(&s, 0, None);
+        assert!(
+            active.contains("1000 tok/s"),
+            "expected `1000 tok/s` throughput, got {active:?}"
+        );
+    }
+
+    #[test]
+    fn spinner_tok_per_sec_is_current_phase_not_diluted_by_whole_turn() {
+        // Regression: the rate must reflect the CURRENT generation phase, not the
+        // whole turn. A long, tool-heavy turn used to divide cumulative output by
+        // total wall time → a diluted "1 tok/s" that swung wildly.
+        let mut s = UiState::new();
+        s.on_submit();
+        // Whole turn has run 600s (mostly tool execution) — the OLD formula would
+        // report ~2 tok/s (1500 tokens / 600s).
+        s.turn_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(600));
+        // A fresh generation phase started 3s ago and produced 6000 chars (1500
+        // tokens): baseline is snapshotted at stamp time (0), delta = 6000.
+        s.stamp_phase_start(std::time::Instant::now() - std::time::Duration::from_secs(3));
+        s.turn_output_chars = 6_000;
+        let active = format_spinner_label(&s, 0, None);
+        assert!(
+            active.contains("500 tok/s"),
+            "expected phase-scoped 500 tok/s (1500 tokens / 3s), got {active:?}"
+        );
+        assert!(
+            !active.contains("2 tok/s"),
+            "must NOT use the diluted whole-turn rate, got {active:?}"
+        );
     }
 
     #[test]
@@ -9700,6 +9746,15 @@ pub async fn run_loop(mut ctx: LoopCtx, renderer: &mut dyn Renderer) -> Result<E
                 &session,
                 false,
             );
+            // Restore the session-cumulative token totals (incl. cache) from the
+            // persisted meta so the status-row cache% shows immediately on `-c`/
+            // `--continue` — this startup path bypasses `commit_native_session_changed`,
+            // so without this the tallies stay 0 until the next turn.
+            // `None` bucket → `for_project(working_dir)`, which is exactly where
+            // `-c`/`--continue` loaded this session from (incl. a contention fork,
+            // stored in the same project bucket) — robust regardless of whether
+            // `current_session_project_bucket` is populated this early at startup.
+            seed_session_token_totals(&mut app.state, None, &ctx.working_dir, &session.id);
             // The runtime was prepared against this exact external session id and
             // snapshot before the TUI started; replay here is display-only.
             // Continue accumulating into the runtime-owned session file. That
@@ -13534,6 +13589,64 @@ fn coalesce_drag_events(
     (latest, None)
 }
 
+/// A key/paste is proof the terminal is focused NOW. When we AFFIRMATIVELY believe we
+/// are unfocused (`Some(false)` — a `FocusLost` arrived but the matching `FocusGained`
+/// never did, a common Windows-console asymmetry where the diff cache goes stale while
+/// the host drops paints), the deferred flush would repaint against that stale cache and
+/// the just-typed characters wouldn't appear until a later event. Such input means we
+/// must do the same cold `force_repaint` the `FocusChanged(true)` path would have.
+///
+/// Gated to `Some(false)` ONLY: `Some(true)` needs nothing, and `None` (focus reporting
+/// unsupported / unknown) is deliberately left alone so this never becomes a per-keystroke
+/// full repaint. Fires at most once per observed defocus, then `set_terminal_focus_state`
+/// flips us back to focused.
+fn input_recovers_stale_focus(ev: &InputEvent, focus_state: Option<bool>) -> bool {
+    focus_state == Some(false) && matches!(ev, InputEvent::Key(_) | InputEvent::Paste(_))
+}
+
+#[cfg(test)]
+mod focus_recovery_tests {
+    use super::input_recovers_stale_focus;
+    use crate::input::InputEvent;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key() -> InputEvent {
+        InputEvent::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()))
+    }
+
+    #[test]
+    fn recovers_only_when_known_unfocused_on_key_or_paste() {
+        // The bug: a FocusLost was seen (Some(false)) but no matching FocusGained →
+        // the next key/paste must trigger the cold repaint.
+        assert!(input_recovers_stale_focus(&key(), Some(false)));
+        assert!(input_recovers_stale_focus(
+            &InputEvent::Paste("x".into()),
+            Some(false)
+        ));
+    }
+
+    #[test]
+    fn no_repaint_when_focused_or_unknown() {
+        // Already focused → nothing stale; unknown → left to the real focus event so
+        // this never degrades into a per-keystroke full repaint.
+        assert!(!input_recovers_stale_focus(&key(), Some(true)));
+        assert!(!input_recovers_stale_focus(&key(), None));
+    }
+
+    #[test]
+    fn non_input_events_never_trigger_recovery() {
+        // Resize / FocusChanged themselves are not "focus-proof" input.
+        assert!(!input_recovers_stale_focus(
+            &InputEvent::Resize(80, 24),
+            Some(false)
+        ));
+        assert!(!input_recovers_stale_focus(
+            &InputEvent::FocusChanged(true),
+            Some(false)
+        ));
+    }
+}
+
 fn handle_input(
     app: &mut App,
     ctx: &mut LoopCtx,
@@ -13614,6 +13727,15 @@ fn handle_input(
     }
     if !matches!(ev, InputEvent::Pointer(_)) {
         app.menu.pointer_cancel();
+    }
+
+    // Windows focus-recovery fallback (issue: input not echoing after Alt+Tab). If we
+    // affirmatively believed we were unfocused and now receive a key/paste, the refocus
+    // was missed (no `FocusGained`); refresh the stale diff cache with the same cold
+    // repaint the focus-event path uses, then mark focused so this fires only once.
+    if input_recovers_stale_focus(&ev, atomcode_capabilities::notify::terminal_focus_state()) {
+        atomcode_capabilities::notify::set_terminal_focus_state(Some(true));
+        renderer.force_repaint();
     }
 
     match ev {
@@ -19334,18 +19456,35 @@ fn pause_active_goal(ctx: &LoopCtx) -> bool {
 enum ApprovalChoice {
     Allow,
     AllowAlways,
+    /// Session-wide "allow ALL Bash" — produces
+    /// `{"decision":"allow","remember":true,"grant_scope":"all"}`.
+    AllowAlwaysAll,
     Deny,
 }
 
 fn deliver_approval(ctx: &mut LoopCtx, choice: ApprovalChoice) {
     if let Some(id) = ctx.pending_runtime_request_id.take() {
         use atomcode_capabilities::tools::ApprovalResponse;
-        let response = match choice {
-            ApprovalChoice::Allow => ApprovalResponse::allow(),
-            ApprovalChoice::AllowAlways => ApprovalResponse::allow_always(),
-            ApprovalChoice::Deny => ApprovalResponse::deny(),
+        let value = match choice {
+            ApprovalChoice::AllowAlwaysAll => {
+                // `PermissionDecision::from_value` requires
+                // `{"decision":"allow","remember":true,"grant_scope":"all"}`.
+                serde_json::json!({
+                    "decision": "allow",
+                    "remember": true,
+                    "grant_scope": "all"
+                })
+            }
+            other => {
+                let response = match other {
+                    ApprovalChoice::Allow => ApprovalResponse::allow(),
+                    ApprovalChoice::AllowAlways => ApprovalResponse::allow_always(),
+                    ApprovalChoice::Deny => ApprovalResponse::deny(),
+                    ApprovalChoice::AllowAlwaysAll => unreachable!(),
+                };
+                serde_json::to_value(response).unwrap_or(serde_json::Value::Null)
+            }
         };
-        let value = serde_json::to_value(response).unwrap_or(serde_json::Value::Null);
         if ctx.live_binding.is_some() {
             if let Err(error) = atomcode_daemon::native_live::respond(id, value) {
                 crate::tuix_trace!("LIVE", "approval response failed: {error:?}");
@@ -19478,6 +19617,7 @@ fn approval_choice_to_decision(
     match choice {
         ApprovalChoice::Allow => PermissionDecision::AllowOnce,
         ApprovalChoice::AllowAlways => PermissionDecision::AllowAlways,
+        ApprovalChoice::AllowAlwaysAll => PermissionDecision::AllowAlwaysAll,
         ApprovalChoice::Deny => PermissionDecision::Deny,
     }
 }
@@ -19527,7 +19667,12 @@ pub(crate) fn build_approval_options(tool: &str, args: &str) -> Vec<crate::state
     } else {
         crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool }).into_owned()
     };
-    vec![
+    // Determine whether this is a Bash call (either wire name or display name).
+    let is_bash = matches!(
+        tool.to_ascii_lowercase().replace('_', "").as_str(),
+        "bash" | "bashstart"
+    );
+    let mut opts = vec![
         ApprovalOption {
             label: crate::i18n::t(crate::i18n::Msg::ApprovalAllowOnce).into_owned(),
             kind: ApprovalKind::AllowOnce,
@@ -19538,12 +19683,21 @@ pub(crate) fn build_approval_options(tool: &str, args: &str) -> Vec<crate::state
             kind: ApprovalKind::AlwaysAllow,
             accel: 'a',
         },
-        ApprovalOption {
-            label: crate::i18n::t(crate::i18n::Msg::ApprovalDeny).into_owned(),
-            kind: ApprovalKind::Deny,
-            accel: 'n',
-        },
-    ]
+    ];
+    // For Bash only: add a danger "allow ALL Bash" option between AlwaysAllow and Deny.
+    if is_bash {
+        opts.push(ApprovalOption {
+            label: crate::i18n::t(crate::i18n::Msg::ApprovalAllowAllBash).into_owned(),
+            kind: ApprovalKind::AllowAlwaysAll,
+            accel: '!',
+        });
+    }
+    opts.push(ApprovalOption {
+        label: crate::i18n::t(crate::i18n::Msg::ApprovalDeny).into_owned(),
+        kind: ApprovalKind::Deny,
+        accel: 'n',
+    });
+    opts
 }
 
 /// The `AgentCommand` for a chosen approval option kind. Pure seam so the
@@ -19553,6 +19707,7 @@ fn approval_kind_to_choice(kind: crate::state::ApprovalKind) -> ApprovalChoice {
     match kind {
         ApprovalKind::AllowOnce => ApprovalChoice::Allow,
         ApprovalKind::AlwaysAllow => ApprovalChoice::AllowAlways,
+        ApprovalKind::AllowAlwaysAll => ApprovalChoice::AllowAlwaysAll,
         ApprovalKind::Deny => ApprovalChoice::Deny,
     }
 }
@@ -19618,6 +19773,10 @@ mod bypass_approval_tests {
             PermissionDecision::AllowAlways
         ));
         assert!(matches!(
+            approval_choice_to_decision(ApprovalChoice::AllowAlwaysAll),
+            PermissionDecision::AllowAlwaysAll
+        ));
+        assert!(matches!(
             approval_choice_to_decision(ApprovalChoice::Deny),
             PermissionDecision::Deny
         ));
@@ -19634,7 +19793,8 @@ mod bypass_approval_tests {
         // never the wire name — assert on both so the label can't silently regress again.
         for name in ["Bash", "bash"] {
             let opts = super::build_approval_options(name, &bash_args("rm -rf victim"));
-            assert_eq!(opts.len(), 3);
+            // Bash gets 4 options: AllowOnce / AlwaysAllow / AllowAlwaysAll (danger) / Deny.
+            assert_eq!(opts.len(), 4, "bash must have 4 options ({name})");
             assert_eq!(
                 (opts[0].kind, opts[0].accel),
                 (ApprovalKind::AllowOnce, 'y')
@@ -19648,7 +19808,16 @@ mod bypass_approval_tests {
                 crate::i18n::t(crate::i18n::Msg::ApprovalAlwaysAllow { tool: name }).into_owned(),
                 "an ordinary bash grant is session-wide, so the label names the tool ({name})"
             );
-            assert_eq!((opts[2].kind, opts[2].accel), (ApprovalKind::Deny, 'n'));
+            assert_eq!(
+                (opts[2].kind, opts[2].accel),
+                (ApprovalKind::AllowAlwaysAll, '!')
+            );
+            assert_eq!(
+                opts[2].label,
+                crate::i18n::t(crate::i18n::Msg::ApprovalAllowAllBash).into_owned(),
+                "allow-all-bash option must carry the danger label ({name})"
+            );
+            assert_eq!((opts[3].kind, opts[3].accel), (ApprovalKind::Deny, 'n'));
         }
     }
 
@@ -19764,9 +19933,68 @@ mod bypass_approval_tests {
             ApprovalChoice::AllowAlways
         ));
         assert!(matches!(
+            super::approval_kind_to_choice(ApprovalKind::AllowAlwaysAll),
+            ApprovalChoice::AllowAlwaysAll
+        ));
+        assert!(matches!(
             super::approval_kind_to_choice(ApprovalKind::Deny),
             ApprovalChoice::Deny
         ));
+    }
+
+    /// Bash MUST offer an `AllowAlwaysAll` option whose payload round-trips through
+    /// `PermissionDecision::from_value` as `AllowAlwaysAll`. Non-bash tools MUST NOT
+    /// get this option.
+    #[test]
+    fn bash_approval_offers_allow_all_danger_option() {
+        use crate::state::ApprovalKind;
+        use atomcode_capabilities::tools::approval::PermissionDecision;
+
+        let bash_cmd = bash_args("rm -rf /tmp/x");
+
+        // Bash (both wire and display name spellings) must include AllowAlwaysAll.
+        for name in ["Bash", "bash"] {
+            let opts = super::build_approval_options(name, &bash_cmd);
+            let allow_all_opt = opts
+                .iter()
+                .find(|o| o.kind == ApprovalKind::AllowAlwaysAll)
+                .unwrap_or_else(|| panic!("bash ({name}) must have an AllowAlwaysAll option"));
+
+            // The response payload must parse to AllowAlwaysAll.
+            let payload = serde_json::json!({
+                "decision": "allow",
+                "remember": true,
+                "grant_scope": "all"
+            });
+            assert_eq!(
+                PermissionDecision::from_value(&payload),
+                PermissionDecision::AllowAlwaysAll,
+                "allow-all payload must parse to AllowAlwaysAll"
+            );
+
+            // The choice produced by the kind must map to AllowAlwaysAll decision.
+            let choice = super::approval_kind_to_choice(allow_all_opt.kind);
+            assert_eq!(
+                approval_choice_to_decision(choice),
+                PermissionDecision::AllowAlwaysAll,
+                "AllowAlwaysAll kind → choice → decision must round-trip ({name})"
+            );
+        }
+
+        // Non-bash tools MUST NOT get this option.
+        for tool in [
+            "ReadFile",
+            "WriteFile",
+            "EditFile",
+            "SearchReplace",
+            "read_file",
+        ] {
+            let opts = super::build_approval_options(tool, "{}");
+            assert!(
+                opts.iter().all(|o| o.kind != ApprovalKind::AllowAlwaysAll),
+                "{tool} must NOT have an AllowAlwaysAll option"
+            );
+        }
     }
 }
 
@@ -20299,6 +20527,19 @@ fn handle_approval_key(
             }
             redraw_idle_plain(&app.buf, &mut app.state, ctx, renderer);
             return Ok(());
+        }
+        // Tab toggles the full-command expansion (Bash only). A no-op falls through so
+        // Tab on a non-expandable panel does nothing (never resolves a decision).
+        KeyCode::Tab | KeyCode::BackTab => {
+            let toggled = app
+                .state
+                .approval_panel
+                .as_mut()
+                .is_some_and(|p| p.toggle_expand());
+            if toggled {
+                redraw_idle_plain(&app.buf, &mut app.state, ctx, renderer);
+                return Ok(());
+            }
         }
         _ => {}
     }
@@ -23827,7 +24068,7 @@ fn handle_runtime_event(
                     handle_agent_event(
                         AgentEvent::ApprovalNeeded {
                             tool_name: approval.tool.clone(),
-                            reason: "Requires approval".into(),
+                            reason: approval.reason,
                             call: atomcode_kernel::tool::ToolCall {
                                 id: approval.call_id,
                                 name: approval.tool,
@@ -25109,6 +25350,48 @@ fn apply_native_session_changed(
     commit_native_session_changed(session, working_dir, state, renderer, ctx)
 }
 
+/// Sum a persisted session cost report into `(prompt, completion, cached)` token
+/// totals for seeding `UiState`'s session-cumulative tallies on load. `prompt` is
+/// TOTAL input (uncached `input` + `cached_input`) to match the live accumulation
+/// at the Usage-event site, so the status-row cache ratio (`cached / prompt`)
+/// stays consistent before and after a `-c`/resume.
+fn session_token_totals_from_cost(
+    report: &atomcode_capabilities::session::SessionCostReport,
+) -> (usize, usize, usize) {
+    let mut prompt = 0usize;
+    let mut completion = 0usize;
+    let mut cached = 0usize;
+    for model in &report.models {
+        prompt += (model.tokens.input + model.tokens.cached_input) as usize;
+        completion += model.tokens.output as usize;
+        cached += model.tokens.cached_input as usize;
+    }
+    (prompt, completion, cached)
+}
+
+/// Seed `state`'s session-cumulative token totals (incl. cache) from the persisted
+/// meta for `session_id`, so the status-row cache% survives a resume/`-c`/switch
+/// instead of blanking until the next turn (mirrors how `ctx` usage is restored).
+/// Live Usage events accumulate on top of this seed. Best-effort: a missing/
+/// unreadable meta (fresh session, legacy import) leaves the totals untouched.
+fn seed_session_token_totals(
+    state: &mut UiState,
+    project_bucket: Option<&str>,
+    working_dir: &std::path::Path,
+    session_id: &str,
+) {
+    let manager = commands::session_manager_for_cost(project_bucket, working_dir);
+    if let Ok(meta) = manager.read_meta(session_id) {
+        let report = atomcode_capabilities::session::aggregate_session_cost(&meta);
+        let (prompt, completion, cached) = session_token_totals_from_cost(&report);
+        state.prompt_tokens = prompt;
+        state.completion_tokens = completion;
+        state.cached_tokens = cached;
+        // Live path does `total_tokens += u.completion`, so mirror it here.
+        state.total_tokens = completion;
+    }
+}
+
 fn commit_native_session_changed(
     session: Session,
     working_dir: PathBuf,
@@ -25152,6 +25435,15 @@ fn commit_native_session_changed(
     state.prompt_tokens = 0;
     state.completion_tokens = 0;
     state.cached_tokens = 0;
+    // Restore the session-cumulative token totals (incl. cache) from the persisted
+    // meta so the status-row cache% survives a resume/switch instead of blanking
+    // until the next turn — mirroring how `ctx` usage is restored.
+    seed_session_token_totals(
+        state,
+        ctx.current_session_project_bucket.as_deref(),
+        &ctx.working_dir,
+        &session_id,
+    );
     state.last_context = None;
     // Session history can outlive the model that produced it. Establish the
     // current runtime/model window before replay restores persisted usage, so
@@ -26979,9 +27271,9 @@ fn handle_agent_event(
         }
         AgentEvent::ApprovalNeeded {
             tool_name,
+            reason: approval_reason,
             call,
             snapshot,
-            ..
         } => {
             // No driver-side grant lookup: a gate that already granted this call never asks
             // again (it checks its own store before round-tripping), so reaching here means
@@ -27079,12 +27371,30 @@ fn handle_agent_event(
                     &call.arguments,
                 ))
             .then(|| crate::i18n::t(crate::i18n::Msg::CredentialApprovalNote).into_owned());
+            // Full, untruncated command for a shell approval — the security boundary must
+            // let the user read the EXACT command (Tab expands it multi-line). `None` for
+            // non-shell tools, which keep only the compact `detail`.
+            let full_command = matches!(call.name.as_str(), "bash" | "bash_start")
+                .then(|| {
+                    serde_json::from_str::<serde_json::Value>(&call.arguments)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(str::to_string)
+                        })
+                })
+                .flatten()
+                .filter(|c| !c.trim().is_empty());
             state.approval_panel = Some(crate::state::ApprovalPanel {
                 tool: display.clone(),
                 detail: detail.clone(),
                 options: build_approval_options(&display, &call.arguments),
                 selected: 0,
                 note,
+                reason: approval_reason,
+                full_command,
+                expanded: false,
             });
             renderer.flush();
             atomcode_capabilities::notify::notify(
@@ -29088,6 +29398,15 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     } else {
         ctx.model_name.clone()
     };
+    // Channel (account) suffix, ONLY when the bare model name is ambiguous across
+    // configured accounts — so a multi-channel user can see which budget/channel
+    // is live (mirrors the webui picker's `model (Channel)` disambiguation).
+    let model_channel = if no_provider {
+        None
+    } else {
+        ctx.config
+            .disambiguating_channel_label(&ctx.provider_selection)
+    };
     // Mode badge (`ModeBadge`): a single left-aligned badge that covers all
     // non-default modes. The badge carries both its label and its colour slot
     // (`BadgeColour`), so the renderer just maps the slot to a `CellStyle`.
@@ -29158,6 +29477,26 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     // has this session burned in total". See render::StatusLine docs.
     let (ctx_used, ctx_window) =
         status_context_usage(state, ctx.config.default_context_window(), !no_provider);
+    // Cache-hit indicator for the status row: the SESSION-cumulative share of
+    // prompt tokens served from the provider's prompt cache (`cached / prompt`
+    // over the whole session). Uses the session-level tallies — which, unlike the
+    // per-turn `turn_*` ones, are NOT cleared at turn end — so the indicator is
+    // stable across turns and never blanks at idle. These tallies accumulate
+    // live in THIS runtime (reset on session switch, not restored from disk), so
+    // after a resume the figure rebuilds from the next turn — it is NOT sourced
+    // from the persisted session meta that `/cost` aggregates, and the two can
+    // differ until this runtime re-accumulates. Reuses `turn_token_summary`'s
+    // cached-pct math for a consistent denominator/rounding; `None` until the
+    // first cached round lands, so providers that never report cached tokens keep
+    // the row clean.
+    let cache_indicator = {
+        let (_, cached_pct) = crate::state::turn_token_summary(
+            state.prompt_tokens,
+            state.completion_tokens,
+            state.cached_tokens,
+        );
+        cached_pct.map(|pct| format!("cache {}%", pct))
+    };
     // Session-name badge: surfaced only when the user has explicitly
     // renamed the conversation. Auto-named sessions (default /
     // session-* / first-message-derived) intentionally stay badge-less
@@ -29219,6 +29558,9 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
             options: p.options.iter().map(|o| o.label.clone()).collect(),
             selected: p.selected,
             note: p.note.clone(),
+            reason: p.reason.clone(),
+            full_command: p.full_command.clone(),
+            expanded: p.expanded,
         });
     // A pending batch takes precedence over a single panel (mutually exclusive in
     // practice). The view carries the CURRENT question's fields plus batch navigator
@@ -29289,6 +29631,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
     };
     crate::render::StatusLine {
         model,
+        model_channel,
         cwd,
         pending_messages: state
             .pending_steers
@@ -29304,6 +29647,7 @@ pub(crate) fn build_status(state: &UiState, ctx: &LoopCtx) -> crate::render::Sta
         hint,
         mode_indicator,
         bypass_indicator,
+        cache_indicator,
         reasoning_effort: if reasoning_effort_applicable_on_provider(ctx) {
             ctx.reasoning_effort.clone()
         } else {
@@ -29578,8 +29922,26 @@ fn format_spinner_label(
         let elapsed = fmt_elapsed(d.as_millis() as u64);
         let tokens = state.turn_output_token_estimate();
         if tokens > 0 {
+            // Live throughput as a "still moving, not hung" signal — the rate of the
+            // CURRENT generation phase: tokens produced THIS phase over the SAME
+            // `phase_elapsed` window shown in the clock. Scoping to the phase (not the
+            // whole turn) keeps earlier tool-execution / idle time out of the
+            // denominator, so a tool-heavy turn no longer reads a diluted "1 tok/s"
+            // and the number doesn't swing as phases alternate. Omitted under 1s (to
+            // avoid divide-by-zero / wild early numbers) and when this phase has
+            // produced no output yet (e.g. mid tool execution — show the clock only).
+            let phase_tokens = state.phase_output_token_estimate();
+            // Fractional seconds (not integer `as_secs()`) so the rate doesn't step /
+            // jump as the whole-second boundary ticks over at low elapsed. Gate at 1s
+            // to avoid divide-by-zero / wild early numbers; round for a clean integer.
+            let secs = d.as_secs_f64();
+            let rate = if secs >= 1.0 && phase_tokens > 0 {
+                format!(" · {} tok/s", (phase_tokens as f64 / secs).round() as usize)
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
-                " ({elapsed} · \u{2191} {} tokens)",
+                " ({elapsed} · \u{2191} {} tokens{rate})",
                 crate::i18n::fmt_tokens(tokens)
             ));
         } else {
@@ -31827,6 +32189,61 @@ mod tool_bullet_outcome_tests {
         // No failure-class distinction: only success is coloured, so every
         // failure is the same neutral `Failure`.
         assert_eq!(tool_bullet_outcome(false), ToolOutcome::Failure);
+    }
+}
+
+#[cfg(test)]
+mod session_token_seed_tests {
+    use super::session_token_totals_from_cost;
+    use atomcode_capabilities::session::{ModelCostSummary, SessionCostReport, TokenBreakdown};
+
+    #[test]
+    fn sums_prompt_as_uncached_plus_cached_across_models() {
+        let report = SessionCostReport {
+            models: vec![
+                ModelCostSummary {
+                    provider_id: "p".into(),
+                    model_id: "a".into(),
+                    // 20 uncached input + 80 cached input, 10 output.
+                    tokens: TokenBreakdown {
+                        input: 20,
+                        output: 10,
+                        cached_input: 80,
+                    },
+                },
+                ModelCostSummary {
+                    provider_id: "p".into(),
+                    model_id: "b".into(),
+                    tokens: TokenBreakdown {
+                        input: 100,
+                        output: 5,
+                        cached_input: 0,
+                    },
+                },
+            ],
+            unattributed_tokens: 0,
+            total_tokens: 0,
+        };
+        let (prompt, completion, cached) = session_token_totals_from_cost(&report);
+        // prompt = (20+80) + (100+0) = 200; cached = 80; completion = 10+5 = 15.
+        assert_eq!(prompt, 200);
+        assert_eq!(cached, 80);
+        assert_eq!(completion, 15);
+        // Ratio the status row shows on resume: 80 / 200 = 40%.
+        assert_eq!(
+            crate::state::turn_token_summary(prompt, completion, cached).1,
+            Some(40)
+        );
+    }
+
+    #[test]
+    fn empty_report_seeds_zero() {
+        let report = SessionCostReport {
+            models: Vec::new(),
+            unattributed_tokens: 0,
+            total_tokens: 0,
+        };
+        assert_eq!(session_token_totals_from_cost(&report), (0, 0, 0));
     }
 }
 

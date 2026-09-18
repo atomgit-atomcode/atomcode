@@ -64,6 +64,9 @@ pub enum UiPhase {
 pub enum ApprovalKind {
     AllowOnce,
     AlwaysAllow,
+    /// Session-wide "allow ALL Bash (incl. destructive)" — sends
+    /// `{"decision":"allow","remember":true,"grant_scope":"all"}`. Only offered for Bash.
+    AllowAlwaysAll,
     Deny,
 }
 
@@ -87,9 +90,30 @@ pub struct ApprovalPanel {
     /// Optional advisory line rendered under the header (e.g. a credential-exposure
     /// warning). `None` for ordinary approvals.
     pub note: Option<String>,
+    /// Optional "why is this being asked" line from `ApprovalRequest.reason` — shown
+    /// above the options in a muted style so the user knows the context for re-approval.
+    /// `None` for first-time approvals where no gate added a reason.
+    pub reason: Option<String>,
+    /// Full, UNTRUNCATED command text for a Bash approval — the security-boundary needs
+    /// the exact command visible at the decision. Shown multi-line (shell-aware wrap) only
+    /// when `expanded`. `None` for non-Bash tools, which keep the compact `detail` only.
+    pub full_command: Option<String>,
+    /// Whether the full-command block is expanded. Default collapsed (panel stays compact,
+    /// matching current look); toggled by Tab. Only meaningful when `full_command.is_some()`.
+    pub expanded: bool,
 }
 
 impl ApprovalPanel {
+    /// Toggle the full-command expansion. Returns `false` (a no-op) when there is nothing
+    /// to expand, so the caller can skip the redraw and let the key fall through.
+    pub fn toggle_expand(&mut self) -> bool {
+        if self.full_command.is_none() {
+            return false;
+        }
+        self.expanded = !self.expanded;
+        true
+    }
+
     pub fn move_up(&mut self) {
         if self.options.is_empty() {
             return;
@@ -970,6 +994,13 @@ pub fn stream_stalled_for(
 /// the spinner blurs at token rate. See [`UiState::tick_spinner_at`].
 pub const SPINNER_MIN_ADVANCE: std::time::Duration = std::time::Duration::from_millis(80);
 
+/// The FIRST thinking phase of every turn shows this fixed, unambiguous word
+/// instead of a random playful verb. The post-submit wait is exactly where a
+/// reasoning-heavy model (streaming minutes of hidden reasoning) looks "hung", so
+/// the initial spinner states plainly what it's doing; later thinking phases keep
+/// the playful [`THINKING_LABELS`]. English (no i18n) to match that pool.
+pub const FIRST_THINKING_LABEL: &str = "Thinking";
+
 /// Rotating pool of "thinking" labels — CC-style playful verbs.
 /// Advances once per turn so consecutive turns vary.
 pub const THINKING_LABELS: &[&str] = &[
@@ -1232,6 +1263,15 @@ pub struct UiState {
     pub round_cap_panel: Option<RoundCapPanel>,
     /// Round-robin index into THINKING_LABELS; bumped on each on_submit.
     pub thinking_idx: usize,
+    /// True from turn start until the first `on_thinking` consumes it — gates the
+    /// once-per-turn [`FIRST_THINKING_LABEL`] treatment.
+    pub(crate) turn_first_thinking_pending: bool,
+    /// Whether the CURRENTLY displayed thinking phase is the turn's first one.
+    /// Display-only: `display_spinner_label` swaps the shown word to
+    /// `FIRST_THINKING_LABEL` (masking both a playful THINKING_LABEL and any tool
+    /// label the first phase spawns). The STORED `spinner_label` is never changed,
+    /// so stall detection + phase-clock logic are untouched. Reset at turn end.
+    pub(crate) showing_first_thinking: bool,
     /// When the current turn started. Set by on_submit, cleared on
     /// turn-complete / turn-cancelled. Used to surface the
     /// total wall-clock duration in the TurnComplete event payload.
@@ -1244,6 +1284,13 @@ pub struct UiState {
     /// turn-complete / turn-cancelled so the idle spinner
     /// (rare) doesn't tick a stale duration.
     pub phase_started_at: Option<std::time::Instant>,
+    /// `turn_output_chars` at the moment the current phase clock started. The spinner's
+    /// `tok/s` throughput is computed over the CURRENT generation phase only —
+    /// `(turn_output_chars - phase_start_output_chars) / 4 ÷ phase_elapsed` — so an
+    /// earlier phase's tool-execution / idle time can't dilute the rate toward 0 (the
+    /// old whole-turn average did, reading e.g. "1 tok/s" on tool-heavy turns). Stamped
+    /// alongside `phase_started_at`; zeroed with `turn_output_chars` at turn start/end.
+    pub phase_start_output_chars: usize,
     /// When the last stream activity (any foreground agent event) was observed.
     /// Set on submit and refreshed on every received event; the spinner reads its
     /// elapsed to warn the user when the stream has gone silent (e.g. network drop)
@@ -1562,8 +1609,11 @@ impl UiState {
             user_input_batch: None,
             round_cap_panel: None,
             thinking_idx: 0,
+            turn_first_thinking_pending: false,
+            showing_first_thinking: false,
             turn_started_at: None,
             phase_started_at: None,
+            phase_start_output_chars: 0,
             last_stream_activity: None,
             last_context: None,
             post_compaction_used_tokens: None,
@@ -1817,6 +1867,23 @@ impl UiState {
         self.turn_output_chars / 4
     }
 
+    /// Estimated output tokens produced during the CURRENT phase only (since the
+    /// phase clock last started). Numerator for the spinner's `tok/s` so the rate
+    /// reflects live generation speed rather than a whole-turn average diluted by
+    /// earlier tool-execution / idle time.
+    pub fn phase_output_token_estimate(&self) -> usize {
+        self.turn_output_chars
+            .saturating_sub(self.phase_start_output_chars)
+            / 4
+    }
+
+    /// Start the phase clock at `at` and snapshot the output baseline so
+    /// [`phase_output_token_estimate`] measures only this phase's generation.
+    pub fn stamp_phase_start(&mut self, at: std::time::Instant) {
+        self.phase_started_at = Some(at);
+        self.phase_start_output_chars = self.turn_output_chars;
+    }
+
     /// Stamp "the stream is alive" — called on submit and on every received
     /// foreground agent event. Resets the stall clock read by [`Self::stream_stalled`].
     pub fn note_stream_activity(&mut self) {
@@ -1866,9 +1933,17 @@ impl UiState {
     /// `Waiting approval`, …) passes through unchanged. Display-only: the stored
     /// `spinner_label` and all phase-clock timing logic are untouched.
     pub(crate) fn display_spinner_label(&self) -> &str {
-        if self.spinner_label.starts_with("Running ")
-            || self.spinner_label.starts_with("Preparing ")
+        let is_tool_label = self.spinner_label.starts_with("Running ")
+            || self.spinner_label.starts_with("Preparing ");
+        // The turn's first thinking phase says plainly "Thinking" — and stays
+        // "Thinking" through any tool it spawns, so the footer word never flips
+        // mid-phase (tool labels already map to the turn word, not the tool name).
+        // Other labels (approval / sub-agent) pass through unchanged.
+        if self.showing_first_thinking
+            && (is_tool_label || THINKING_LABELS.contains(&self.spinner_label.as_str()))
         {
+            FIRST_THINKING_LABEL
+        } else if is_tool_label {
             self.active_thinking_word()
         } else {
             &self.spinner_label
@@ -1881,11 +1956,15 @@ impl UiState {
         self.spinner_label = self.current_thinking().to_string();
         self.spinner_frame = 0;
         self.thinking_idx = self.thinking_idx.wrapping_add(1);
+        // Fresh turn: the first thinking phase (the post-submit wait) shows the fixed
+        // `FIRST_THINKING_LABEL`; arm it here and from the very first frame.
+        self.turn_first_thinking_pending = true;
+        self.showing_first_thinking = true;
         // A fresh turn hasn't dispatched team work yet.
         self.team_dispatched_this_turn = false;
         let now = std::time::Instant::now();
         self.turn_started_at = Some(now);
-        self.phase_started_at = Some(now);
+        self.stamp_phase_start(now);
         // Fresh turn: no visible text or reasoning seen yet (drives the
         // blank-turn notice on TurnComplete).
         self.turn_rendered_visible_text = false;
@@ -1894,6 +1973,7 @@ impl UiState {
         // won't wrongly suppress its reason based on a prior turn's error line.
         self.turn_error_line_shown = false;
         self.turn_output_chars = 0;
+        self.phase_start_output_chars = 0;
         // Seed the stall clock so the first silent stretch is measured from submit,
         // not a stale stamp from the previous turn (which would flash the warning).
         self.last_stream_activity = Some(now);
@@ -1932,13 +2012,21 @@ impl UiState {
         self.turn_started_at = None;
         self.phase_started_at = None;
         // Per-turn token tallies are consumed by the separator that renders just
-        // before this; clear them so the next turn starts fresh.
+        // before this; clear them so the next turn starts fresh. (The status-row
+        // cache indicator reads the SESSION-cumulative tallies, which are not
+        // touched here, so it stays visible across turns.)
         self.turn_prompt_tokens = 0;
         self.turn_completion_tokens = 0;
         self.turn_cached_tokens = 0;
         self.turn_output_chars = 0;
+        self.phase_start_output_chars = 0;
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
+        // Disarm the first-thinking latch so a later `/goal` continuation (which
+        // re-enters `on_thinking` WITHOUT an `on_submit`) can't inherit a stale
+        // "first phase" and mislabel its spinner "Thinking".
+        self.turn_first_thinking_pending = false;
+        self.showing_first_thinking = false;
         // Turn finished normally — no need to offer resubmit of the
         // message any more. (On cancel, the streaming-key handler
         // already took() the Option before the TurnCancelled event
@@ -1981,8 +2069,12 @@ impl UiState {
         self.turn_completion_tokens = 0;
         self.turn_cached_tokens = 0;
         self.turn_output_chars = 0;
+        self.phase_start_output_chars = 0;
         self.turn_rendered_visible_text = false;
         self.turn_saw_reasoning = false;
+        // Disarm the first-thinking latch (see `on_turn_complete`).
+        self.turn_first_thinking_pending = false;
+        self.showing_first_thinking = false;
         self.subagent_activity = None;
         self.active_subtasks = None;
         // A cancelled turn tears down any still-"running" Team members; the
@@ -2083,7 +2175,7 @@ impl UiState {
         // batch anchors the clock once (`on_tool_batch_started`); only a
         // standalone tool call resets it here.
         if self.active_tool_batches.is_empty() {
-            self.phase_started_at = Some(std::time::Instant::now());
+            self.stamp_phase_start(std::time::Instant::now());
         }
     }
 
@@ -2097,7 +2189,7 @@ impl UiState {
         let entering = !self.spinner_label.starts_with("Preparing");
         self.spinner_label = format!("Preparing {}", name);
         if entering && self.active_tool_batches.is_empty() {
-            self.phase_started_at = Some(std::time::Instant::now());
+            self.stamp_phase_start(std::time::Instant::now());
         }
     }
 
@@ -2105,7 +2197,7 @@ impl UiState {
     /// the elapsed-ms ticks steadily for the whole batch, instead of being reset
     /// by every interleaved per-tool event (the "Preparing … · 0ms" flicker).
     pub fn on_tool_batch_started(&mut self) {
-        self.phase_started_at = Some(std::time::Instant::now());
+        self.stamp_phase_start(std::time::Instant::now());
     }
 
     pub fn on_thinking(&mut self) {
@@ -2125,6 +2217,10 @@ impl UiState {
         // on submit, one rotation per turn not per state transition).
         let idx = self.thinking_idx.saturating_sub(1) % THINKING_LABELS.len();
         self.spinner_label = THINKING_LABELS[idx].to_string();
+        // First thinking phase of the turn keeps `FIRST_THINKING_LABEL`; subsequent
+        // phases fall back to the playful pool. Consume the once-per-turn latch.
+        self.showing_first_thinking = self.turn_first_thinking_pending;
+        self.turn_first_thinking_pending = false;
         // New LLM round-trip → new phase clock. Without this reset the
         // displayed time keeps growing across consecutive thinks/tools
         // and ends up showing "Noodling… 1301s" mid-turn.
@@ -2135,7 +2231,7 @@ impl UiState {
         // elapsed-ms flicker 0→N→0. The batch anchors the clock once
         // (`on_tool_batch_started`); leave it alone until the batch finishes.
         if self.active_tool_batches.is_empty() {
-            self.phase_started_at = Some(std::time::Instant::now());
+            self.stamp_phase_start(std::time::Instant::now());
         }
     }
 
@@ -2153,7 +2249,7 @@ impl UiState {
         self.sub_agent_done = 0;
         self.sub_agent_failed = 0;
         self.spinner_label = format!("SubAgents 0/{}", tasks.len());
-        self.phase_started_at = Some(std::time::Instant::now());
+        self.stamp_phase_start(std::time::Instant::now());
         self.sub_agent_started_at = Some(std::time::Instant::now());
         self.sub_agent_tasks = tasks;
     }
@@ -2219,7 +2315,7 @@ impl UiState {
         // Reset the phase clock so the elapsed suffix tracks how long
         // we've been waiting on the user, not how long the prior phase
         // (often the just-emitted ToolCallStarted) had been running.
-        self.phase_started_at = Some(std::time::Instant::now());
+        self.stamp_phase_start(std::time::Instant::now());
     }
 
     pub fn on_approval_resolved(&mut self) {
@@ -2230,7 +2326,7 @@ impl UiState {
             // The tool is about to actually start running now (hook +
             // bash_execute). Restart the clock so the spinner suffix
             // reflects that, not the cumulative wait-then-run time.
-            self.phase_started_at = Some(std::time::Instant::now());
+            self.stamp_phase_start(std::time::Instant::now());
         }
     }
 
@@ -2711,6 +2807,27 @@ mod tests {
     }
 
     #[test]
+    fn on_turn_complete_keeps_session_cumulative_tallies() {
+        // The status-row cache indicator reads the SESSION-level tallies, so
+        // `on_turn_complete` must clear only the per-turn ones — leaving the
+        // cumulative prompt/cached counts (hence the ratio) intact at idle.
+        let mut s = UiState::new();
+        s.prompt_tokens = 100;
+        s.cached_tokens = 80;
+        s.turn_prompt_tokens = 100;
+        s.turn_cached_tokens = 80;
+        s.on_turn_complete();
+        assert_eq!(s.turn_cached_tokens, 0, "per-turn tally cleared");
+        assert_eq!(s.prompt_tokens, 100, "session prompt tally survives");
+        assert_eq!(s.cached_tokens, 80, "session cache tally survives");
+        // Session ratio the status row will show: 80 / 100 = 80%.
+        assert_eq!(
+            turn_token_summary(s.prompt_tokens, s.completion_tokens, s.cached_tokens).1,
+            Some(80)
+        );
+    }
+
+    #[test]
     fn turn_token_summary_no_cache_info_omits_pct() {
         // Provider didn't report cached tokens → no annotation, billable = prompt+completion.
         let (billable, pct) = turn_token_summary(100, 10, 0);
@@ -2897,6 +3014,45 @@ mod tests {
         assert_eq!(s.phase, UiPhase::Streaming);
         // Label is one of the rotating pool entries.
         assert!(THINKING_LABELS.contains(&s.spinner_label.as_str()));
+    }
+
+    #[test]
+    fn first_thinking_phase_shows_thinking_then_playful_verbs() {
+        let mut s = UiState::new();
+        s.on_submit();
+        s.on_thinking();
+        // The turn's FIRST thinking phase (the post-submit wait) shows the fixed word.
+        assert_eq!(s.display_spinner_label(), FIRST_THINKING_LABEL);
+
+        // A later thinking phase (e.g. the model thinks again after a tool ran) falls
+        // back to a playful verb — NOT the fixed word.
+        s.on_thinking();
+        let later = s.display_spinner_label().to_string();
+        assert_ne!(later, FIRST_THINKING_LABEL);
+        assert!(THINKING_LABELS.contains(&later.as_str()), "got {later:?}");
+
+        // The next turn re-arms the first-phase label.
+        s.on_submit();
+        s.on_thinking();
+        assert_eq!(s.display_spinner_label(), FIRST_THINKING_LABEL);
+    }
+
+    #[test]
+    fn turn_end_disarms_first_thinking_latch() {
+        let mut s = UiState::new();
+        s.on_submit();
+        // Turn ends WITHOUT ever entering a thinking phase (e.g. straight to a tool,
+        // then complete). The latch must be disarmed so a later `on_thinking` — a
+        // `/goal` continuation that re-enters WITHOUT an `on_submit` — does not
+        // inherit a stale "first phase" and mislabel its spinner "Thinking".
+        s.on_turn_complete();
+        s.on_thinking();
+        let label = s.display_spinner_label().to_string();
+        assert_ne!(
+            label, FIRST_THINKING_LABEL,
+            "stale first-thinking leaked: {label:?}"
+        );
+        assert!(THINKING_LABELS.contains(&label.as_str()), "got {label:?}");
     }
 
     #[test]
@@ -3363,6 +3519,9 @@ mod tests {
             ],
             selected: 0,
             note: None,
+            reason: None,
+            full_command: None,
+            expanded: false,
         };
         p.move_up();
         assert_eq!(p.selected, 2, "up from 0 wraps to last");
@@ -3373,6 +3532,35 @@ mod tests {
         assert_eq!(p.accel_index('A'), Some(1), "accel is case-insensitive");
         assert_eq!(p.accel_index('n'), Some(2));
         assert_eq!(p.accel_index('z'), None);
+    }
+
+    #[test]
+    fn toggle_expand_only_when_full_command_present() {
+        use crate::state::{ApprovalKind, ApprovalOption, ApprovalPanel};
+        let mk = |full: Option<&str>| ApprovalPanel {
+            tool: "bash".into(),
+            detail: "x".into(),
+            options: vec![ApprovalOption {
+                label: "Allow once".into(),
+                kind: ApprovalKind::AllowOnce,
+                accel: 'y',
+            }],
+            selected: 0,
+            note: None,
+            reason: None,
+            full_command: full.map(String::from),
+            expanded: false,
+        };
+        // No full command (e.g. non-Bash tool) → Tab is a no-op, panel stays collapsed.
+        let mut none = mk(None);
+        assert!(!none.toggle_expand(), "no full command → toggle is a no-op");
+        assert!(!none.expanded);
+        // With a full command → Tab flips expand, again collapses.
+        let mut some = mk(Some("rm -rf a && rm -rf b"));
+        assert!(some.toggle_expand());
+        assert!(some.expanded, "first Tab expands");
+        assert!(some.toggle_expand());
+        assert!(!some.expanded, "second Tab collapses");
     }
 
     #[test]

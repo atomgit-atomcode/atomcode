@@ -731,6 +731,10 @@ impl ApprovalPolicy for Asker {
             // call and running a different one is the whole failure this
             // contract exists to prevent.
             args: call.arguments.clone(),
+            // The panel's own "why is this being asked" line. This round-trip
+            // is a plain approval — a gate that re-confirms despite a session
+            // grant is the one with something to explain — so there is none.
+            reason: None,
         };
         let answer = self
             .request(
@@ -743,7 +747,14 @@ impl ApprovalPolicy for Asker {
         let decision = PermissionDecision::from_value(&answer.unwrap_or(Value::Null));
         let value = match decision {
             PermissionDecision::AllowOnce => crate::seams::ANSWER_ALLOW,
-            PermissionDecision::AllowAlways => crate::seams::ANSWER_ALWAYS,
+            // A "yes, and every one like it" is an `always` as far as the record
+            // goes: which scope it was granted for is the gate's business, and a
+            // second word for it here would be this row's vocabulary leaking
+            // into a log that outlives it. The allow-all sentinel is recorded by
+            // the bash gate that owns it, not by this generic round-trip.
+            PermissionDecision::AllowAlways | PermissionDecision::AllowAlwaysAll => {
+                crate::seams::ANSWER_ALWAYS
+            }
             PermissionDecision::Deny => crate::seams::ANSWER_DENY,
         };
         // The answer as a value the log can hold, not the decision: `allow` is
@@ -753,7 +764,7 @@ impl ApprovalPolicy for Asker {
         crate::agent::record_answered(&self.ctx, Some(value.to_string()));
         match decision {
             PermissionDecision::AllowOnce => Decision::Allow,
-            PermissionDecision::AllowAlways => {
+            PermissionDecision::AllowAlways | PermissionDecision::AllowAlwaysAll => {
                 // An "always" for something un-grantable is honoured as an
                 // allow-once rather than refused: the person did say yes. It is
                 // simply not remembered, which is the whole meaning of

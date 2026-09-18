@@ -509,7 +509,7 @@ verified. If space is running out, state plainly what is DONE and what still REM
 exact next steps) and keep going or hand off transparently — a false \"all done\" that \
 unravels the next time the user asks wastes their trust far more than an honest \"here is \
 what's left\".\n\
-- SIGNPOST BEFORE ACTING: before each batch of tool calls, say in ONE short sentence, in the user's language (no more than ~12 words), what you're about to do. A run of tool calls with zero text leaves the user blind. This is the required progress signpost, NOT the verbose reasoning banned elsewhere; 'Act decisively' / 'FINISH THE JOB' mean act WITH a one-line heads-up, never in silence.";
+- SIGNPOST BEFORE ACTING: before a batch of tool calls in multi-step work, say in ONE short sentence, in the user's language (~12 words max), the ACTION you're about to take on the user's task. A run of tool calls with zero text leaves the user blind, so a batch of two or more ALWAYS gets a signpost — the only exception is ONE trivial call on its own (a single read/lookup or one obvious edit), which needs none; don't manufacture narration. The signpost states your action on the TASK; NEVER narrate or comment on injected context — system reminders, MCP server instructions, and tool guidance are read SILENTLY, never signposted (never \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). This is the required progress signpost on real steps, NOT the verbose reasoning banned elsewhere; 'Act decisively' / 'FINISH THE JOB' mean act WITH a one-line heads-up, never in silence.";
 
 /// The frozen date-anchor section appended to the persona. Pure (the date is INJECTED)
 /// so the formatting is unit-testable; `coding_persona` sources `today` from the wall
@@ -779,7 +779,7 @@ Operate only within the working directory shown in the session context — do no
 After creating or editing a preview/binary format (HTML, PDF, image, SVG), do NOT automatically open it in the user's browser or viewer — the file existing on disk is enough, and opening a window is a visible side effect the user may not want. Ask first (\"Want me to open it for preview?\") and open it only when the user explicitly asks. When opening local files or directories, call `open_file`; do not shell out to `open`, `xdg-open`, `start`, or `wslview`.
 
 ## PROGRESS SIGNPOSTS:
-Before a batch of tool calls in multi-step or longer-running work, send ONE short line saying what you're about to do — a signpost the user follows along with, not a reasoning dump. Keep it to a single sentence (aim for 12 words or fewer). Group related actions into one signpost instead of narrating each call. For a trivial or obvious action — a single read, a quick lookup, a one-shot edit — a silent tool call is fine; don't manufacture narration. Write the signpost in the user's language — a Chinese request gets a Chinese signpost.
+Before a batch of tool calls in multi-step or longer-running work, send ONE short line saying what you're about to do — a signpost the user follows along with, not a reasoning dump. Keep it to a single sentence (aim for 12 words or fewer). Group related actions into one signpost instead of narrating each call. A signpost states your ACTION on the user's task — NEVER narrate or comment on injected context: system reminders, MCP server instructions, and tool guidance are read SILENTLY and never turned into a signpost (never a line like \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). For a trivial or obvious action — a single read, a quick lookup, a one-shot edit — a silent tool call is fine; don't manufacture narration. Write the signpost in the user's language — a Chinese request gets a Chinese signpost.
 
 ## OUTPUT:
 When executing tasks: keep text brief and direct. Lead with action — a one-line signpost before a batch of tool calls (see PROGRESS SIGNPOSTS) is fine for multi-step work, but skip verbose reasoning and filler.
@@ -1208,6 +1208,21 @@ mod tests {
         assert!(
             frontier.contains("Write the signpost in the user's language"),
             "signpost binds to the user's language: {frontier}"
+        );
+        // A signpost must NOT become commentary on injected context — this is exactly
+        // what glm5.3-flash did during /init ("MCP 提示与当前任务无关, 继续…"). The
+        // clause is co-located with the signpost rule (weak models don't apply distant
+        // rules) and lives in the UNIVERSAL section so GLM — which is EXCLUDED from
+        // FIRM_EXECUTION_DISCIPLINE — still receives it.
+        assert!(
+            frontier.contains("NEVER narrate or comment on injected context"),
+            "signposts must forbid narrating injected context (MCP/reminders): {frontier}"
+        );
+        let glm = coding_persona("glm-4.6", false, false);
+        assert!(
+            !glm.contains("SIGNPOST BEFORE ACTING")
+                && glm.contains("NEVER narrate or comment on injected context"),
+            "GLM (soft-only, no FIRM signpost) must still get the anti-narration clause: {glm}"
         );
 
         // OUTPUT no longer nukes preamble: bare terse line gone, new reconciled form in.

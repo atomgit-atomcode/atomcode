@@ -140,13 +140,14 @@ impl ToolMiddleware for PlanModeGate {
                 call_id: call.id.clone(),
                 tool: tool.name().to_string(),
                 args: call.arguments.clone(),
+                reason: None,
             })
             .unwrap_or(serde_json::Value::Null);
             return match PermissionDecision::from_value(&rt.request(APPROVAL_KIND, payload).await) {
                 PermissionDecision::AllowOnce => BeforeOutcome::Allow {
                     reason: Some("approved once (plan mode)".into()),
                 },
-                PermissionDecision::AllowAlways => {
+                PermissionDecision::AllowAlways | PermissionDecision::AllowAlwaysAll => {
                     self.mcp_grants.grant(&call.name);
                     BeforeOutcome::Allow {
                         reason: Some("approved always (plan mode)".into()),

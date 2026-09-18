@@ -5650,7 +5650,7 @@ fn build_session_cost_text(ctx: &LoopCtx, state: &UiState) -> String {
     build_cost_report_text(report, &ctx.config, &provider, &ctx.model_name)
 }
 
-fn session_manager_for_cost(
+pub(crate) fn session_manager_for_cost(
     project_bucket: Option<&str>,
     working_dir: &std::path::Path,
 ) -> atomcode_capabilities::session::SessionManager {
@@ -8186,9 +8186,9 @@ mod tests {
     fn review_prompt_uses_explicit_tool_scopes() {
         assert!(review_prompt("").contains(r#"{"scope":{"kind":"working_tree"}}"#));
         assert!(review_prompt("staged").contains(r#"{"scope":{"kind":"staged"}}"#));
-        let range = review_prompt("release/v5.0.9");
+        let range = review_prompt("release/v5.1.0");
         assert!(
-            range.contains(r#"{"scope":{"kind":"range","base":"release/v5.0.9","head":"HEAD"}}"#)
+            range.contains(r#"{"scope":{"kind":"range","base":"release/v5.1.0","head":"HEAD"}}"#)
         );
         assert!(!range.contains(r#"{"base":"#));
     }

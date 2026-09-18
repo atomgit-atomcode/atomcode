@@ -38,11 +38,18 @@ pub struct CodingAgentConfig {
     pub working_dir: PathBuf,
     /// Model context window in tokens (forwarded to the provider). Default 128k.
     pub context_window: u32,
-    /// Liveness: max byte-idle wait for the next stream event (first-token + inter-token).
-    /// Default 300s, override via `ATOMCODE_STREAM_TIMEOUT_SECS`. Thinking models go quiet
-    /// for a long stretch after a large (~200K) prompt before the first reasoning byte; the
-    /// old 120s cut them off mid-think and surfaced as a spurious "stream timeout".
+    /// Liveness: max byte-idle wait BETWEEN stream events, once the first content byte
+    /// has arrived (inter-token). Default 300s, override via `ATOMCODE_STREAM_TIMEOUT_SECS`.
+    /// The prefill / first-token wait is governed separately by `first_token_timeout`.
     pub stream_timeout: Duration,
+    /// Liveness: max wait for the FIRST content byte (prefill / time-to-first-token).
+    /// A slow local model on a large prompt can churn far longer before the first byte
+    /// than between subsequent tokens, so this budget is separate from — and usually
+    /// larger than — `stream_timeout`. Env `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS` (explicit
+    /// value wins), else `max(600s, stream_timeout)` so it never drops below the
+    /// inter-token budget. Once the first byte arrives, `stream_timeout` takes over.
+    /// Reconnecting on a slow-but-progressing prefill just restarts it, so we wait longer.
+    pub first_token_timeout: Duration,
     /// Liveness: max wait for a driver approval response before it degrades to deny.
     /// `Some(d)` ⇒ fail-closed after `d` — for HEADLESS / no-human drivers where a never-
     /// answered approval must not park a turn forever. `None` ⇒ PARK: block until the driver
@@ -753,15 +760,32 @@ impl TierProvider {
     }
 }
 
-/// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
-/// positive integer, else 300s. Ported from core's env-configurable liveness knob.
-fn default_stream_timeout() -> Duration {
-    std::env::var("ATOMCODE_STREAM_TIMEOUT_SECS")
+/// A positive-integer-seconds duration read from env var `var`: `None` when unset,
+/// non-numeric, or ≤ 0 (so a bogus/zero value falls back to the caller's default
+/// rather than silently disabling the timeout).
+fn env_duration_secs(var: &str) -> Option<Duration> {
+    std::env::var(var)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
         .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(300))
+}
+/// The default byte-idle stream timeout: `ATOMCODE_STREAM_TIMEOUT_SECS` if set to a valid
+/// positive integer, else 300s. Ported from core's env-configurable liveness knob.
+fn default_stream_timeout() -> Duration {
+    env_duration_secs("ATOMCODE_STREAM_TIMEOUT_SECS").unwrap_or_else(|| Duration::from_secs(300))
+}
+/// The default first-token (prefill / TTFB) timeout. An explicit
+/// `ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS` (valid positive integer) wins as-is — a
+/// deliberate user choice, even if shorter than `stream_timeout`. Otherwise it
+/// defaults to 600s but is NEVER shorter than `stream_timeout`: prefill on a slow
+/// local model legitimately exceeds inter-token latency, so a first-token budget
+/// below the inter-token one inverts the intent. In particular a user who raised
+/// `ATOMCODE_STREAM_TIMEOUT_SECS` (e.g. following the reconnect hint) must not end
+/// up with a SHORTER prefill window than inter-token — hence the `.max()`.
+fn default_first_token_timeout() -> Duration {
+    env_duration_secs("ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS")
+        .unwrap_or_else(|| default_stream_timeout().max(Duration::from_secs(600)))
 }
 /// Share of the CodingPlan 5h rolling `call_limit` a single `/goal` may consume
 /// (percent). A goal that eats more than this starves the user's interactive work
@@ -912,6 +936,7 @@ impl CodingAgentConfig {
             working_dir: working_dir.into(),
             context_window: 128_000,
             stream_timeout: default_stream_timeout(),
+            first_token_timeout: default_first_token_timeout(),
             request_timeout: Some(Duration::from_secs(300)),
             max_continuations: 50,
             max_rounds: default_turn_max_rounds(),
@@ -1532,6 +1557,7 @@ impl std::fmt::Debug for CodingAgentConfig {
             .field("working_dir", &self.working_dir)
             .field("context_window", &self.context_window)
             .field("stream_timeout", &self.stream_timeout)
+            .field("first_token_timeout", &self.first_token_timeout)
             .field("request_timeout", &self.request_timeout)
             .field("interactive", &self.interactive)
             .field("max_continuations", &self.max_continuations)

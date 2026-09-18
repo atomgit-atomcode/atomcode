@@ -383,6 +383,86 @@ fn format_ctx_usage(used: usize, window: usize) -> String {
     }
 }
 
+/// Last non-empty path segment — the "project name" shown when a narrow status
+/// row can't fit the full cwd. Splits on both `/` and `\` because
+/// `collapse_home` only normalises paths *under* the home dir to `/`; a Windows
+/// project outside home still arrives with backslashes.
+fn path_basename(path: &str) -> &str {
+    path.rsplit(|c| c == '/' || c == '\\')
+        .find(|seg| !seg.is_empty())
+        .unwrap_or(path)
+}
+
+/// One colour-differentiated segment of the status row's left info group.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StatusSeg {
+    Model,
+    Cwd,
+    Ctx,
+    Cache,
+}
+
+/// Joined display width of a segment list, counting the 3-column separators
+/// (` │ `/` | `, see `status_separator`) emitted between adjacent segments.
+fn status_segments_width(segs: &[(StatusSeg, String)]) -> usize {
+    if segs.is_empty() {
+        return 0;
+    }
+    let text: usize = segs
+        .iter()
+        .map(|(_, t)| crate::width::display_width(t))
+        .sum();
+    text + 3 * (segs.len() - 1)
+}
+
+/// Choose which left-group segments fit within `budget`, applying the
+/// width-degradation order requested for narrow terminals:
+///   1. shorten the cwd to its project name (`cwd_base`),
+///   2. drop the ctx-usage (token %) segment,
+///   3. drop the cache-hit segment.
+/// The model segment is always retained; the caller truncates it only as an
+/// absolute last resort (when even `model | project` overflows). Segments are
+/// returned in display order with their final text.
+fn fit_status_segments(
+    model: &str,
+    cwd_full: &str,
+    cwd_base: &str,
+    ctx: &str,
+    cache: &str,
+    budget: usize,
+) -> Vec<(StatusSeg, String)> {
+    let build = |cwd: &str, ctx_on: bool, cache_on: bool| {
+        let mut v: Vec<(StatusSeg, String)> = Vec::with_capacity(4);
+        if !model.is_empty() {
+            v.push((StatusSeg::Model, model.to_string()));
+        }
+        if !cwd.is_empty() {
+            v.push((StatusSeg::Cwd, cwd.to_string()));
+        }
+        if ctx_on && !ctx.is_empty() {
+            v.push((StatusSeg::Ctx, ctx.to_string()));
+        }
+        if cache_on && !cache.is_empty() {
+            v.push((StatusSeg::Cache, cache.to_string()));
+        }
+        v
+    };
+    // Richest first; each stage strips one thing in the requested order.
+    let stages = [
+        build(cwd_full, true, true),
+        build(cwd_base, true, true),   // 1. cwd → project name
+        build(cwd_base, false, true),  // 2. drop ctx usage
+        build(cwd_base, false, false), // 3. drop cache
+    ];
+    for stage in &stages {
+        if status_segments_width(stage) <= budget {
+            return stage.clone();
+        }
+    }
+    // Nothing fits cleanly — hand back the leanest set; the caller truncates.
+    build(cwd_base, false, false)
+}
+
 /// Marker prefix for the dedicated footer goal row. A width-1 BMP "ring" from
 /// the Geometric Shapes block when the terminal's font has it, ASCII `*`
 /// otherwise — the SAME `unicode_symbols` gate the spinner (`◐`→`|/-\`) and
@@ -3286,8 +3366,9 @@ impl<W: Write + Send> RetainedRenderer<W> {
         } else {
             (None, brand.clone())
         };
-        // The badge is followed by " · " (space · middot · space = width 3).
-        // This constant must match the separator emitted in `push_badge` below.
+        // The badge is followed by the segment separator (` │ `/` | `, width 3;
+        // see `status_separator`). This constant must match the width of the
+        // separator emitted in `push_badge` below.
         const BADGE_SEP_W: usize = 3;
         let mode_badge_w = left_badge
             .as_ref()
@@ -3300,69 +3381,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
         let right_reserved = mode_badge_w;
         let left_max = max.saturating_sub(right_reserved);
 
-        // Pre-truncate the cwd so that model + ctx_usage still get space
-        // on narrow terminals.  Budget for cwd: subtract model width and
-        // the " · " separator widths from left_max.  If the cwd alone
-        // would eat the entire row, `truncate_path` replaces leading
-        // segments with ".../" and keeps only the last segment.
-        let model_str = if !status.model.is_empty() {
-            let mut s = scrub_controls(&status.model);
-            if let Some(ref effort) = status.reasoning_effort {
-                use std::fmt::Write;
-                let _ = write!(s, " [{}]", effort);
-            }
-            s
-        } else {
-            String::new()
-        };
-        let ctx_str = if status.ctx_used > 0 || status.ctx_window > 0 {
-            format_ctx_usage(status.ctx_used, status.ctx_window)
-        } else {
-            String::new()
-        };
-        // Widths of the static " · " separators between visible parts.
-        let sep_w = if !model_str.is_empty() { 3 } else { 0 }
-            + if !ctx_str.is_empty() && (!model_str.is_empty() || !status.cwd.is_empty()) {
-                3
-            } else {
-                0
-            };
-        let cwd_budget = left_max
-            .saturating_sub(crate::width::display_width(&model_str))
-            .saturating_sub(crate::width::display_width(&ctx_str))
-            .saturating_sub(sep_w);
-
-        let mut parts: Vec<String> = Vec::with_capacity(4);
-        if !model_str.is_empty() {
-            parts.push(model_str);
-        }
-        if !status.cwd.is_empty() {
-            let cwd_full = scrub_controls(&status.cwd);
-            let cwd_display =
-                if cwd_budget > 0 && crate::width::display_width(&cwd_full) > cwd_budget {
-                    crate::width::truncate_path(&cwd_full, cwd_budget)
-                } else if cwd_budget == 0 {
-                    crate::width::truncate_path(&cwd_full, left_max)
-                } else {
-                    cwd_full
-                };
-            parts.push(cwd_display);
-        }
-        if !ctx_str.is_empty() {
-            parts.push(ctx_str);
-        }
-        // NOTE: the goal indicator is NOT appended here any more — it lives on
-        // its own dedicated footer row (`build_goal_row`) so it can't be the
-        // first thing truncated off this line under a hint / narrow terminal.
-        let left = parts.join(" · ");
-
-        // Helper: emit the badge (with trailing space) then the rest, so
-        // the mode indicator is always at column 0 (after PAD_COL) and
-        // both hint / no-hint branches share the same prefix.
+        // Left info group (`model │ cwd │ ctx% │ cache%`), colour-differentiated
+        // and width-degrading. When the group can't fit its budget on a narrow
+        // terminal, `render_status_left` first shortens the cwd to its project
+        // name, then drops the ctx-usage segment, then drops the cache segment
+        // (see `fit_status_segments`). The goal indicator is NOT here — it lives
+        // on its own footer row so it can't be the first thing truncated off
+        // this line under a hint / narrow terminal.
+        //
+        // Helper: emit the badge (with trailing space) then the rest, so the
+        // mode indicator is always at column 0 (after PAD_COL) and both the
+        // hint / no-hint branches share the same prefix.
+        let sep_glyph = self.status_separator();
         let push_badge = |row: &mut Vec<Cell>| {
             if let Some(badge) = &left_badge {
                 push_str_cells(row, badge, &left_badge_style);
-                push_str_cells(row, " · ", &secondary);
+                push_str_cells(row, sep_glyph, &secondary);
             }
         };
 
@@ -3378,24 +3412,133 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let right_w = hint_w;
             if right_w + 1 < left_max {
                 let left_budget = left_max - right_w - 1;
-                let left_truncated = crate::width::truncate_to_width(&left, left_budget);
-                let left_w = crate::width::display_width(&left_truncated);
-                let pad_w = max - right_reserved - left_w - hint_w;
                 push_badge(&mut row);
-                push_str_cells(&mut row, &left_truncated, &secondary);
+                let left_w = self.render_status_left(&mut row, status, left_budget);
+                let pad_w = (max - right_reserved)
+                    .saturating_sub(left_w)
+                    .saturating_sub(hint_w);
                 push_str_cells(&mut row, &" ".repeat(pad_w), &pad);
                 push_str_cells(&mut row, &hint, &hint_style);
             } else {
-                let truncated = crate::width::truncate_to_width(&left, left_max);
                 push_badge(&mut row);
-                push_str_cells(&mut row, &truncated, &secondary);
+                self.render_status_left(&mut row, status, left_max);
             }
         } else {
-            let truncated = crate::width::truncate_to_width(&left, left_max);
             push_badge(&mut row);
-            push_str_cells(&mut row, &truncated, &secondary);
+            self.render_status_left(&mut row, status, left_max);
         }
         row
+    }
+
+    /// Separator between status-row segments: a light box-drawing vertical bar
+    /// when the terminal has the glyph, ASCII `|` otherwise. Always 3 columns
+    /// (space + bar + space) so per-segment width math is glyph-independent —
+    /// the same gate the spinner/goal glyphs use for legacy conhost.
+    fn status_separator(&self) -> &'static str {
+        if self.caps.unicode_symbols {
+            " │ "
+        } else {
+            " | "
+        }
+    }
+
+    /// Render the status row's left info group (`model │ cwd │ ctx% │ cache%`)
+    /// into `row` within `budget` columns and return the display width actually
+    /// consumed. Each segment carries its own colour (model = accent/cyan, cwd =
+    /// default fg, ctx% = green/yellow/red by fill, cache% = green) with muted
+    /// separators. Width degradation follows `fit_status_segments`:
+    /// cwd → project name, then drop ctx%, then drop cache%. When even the
+    /// leanest set overflows, it falls back to a single-colour truncation so the
+    /// row can never spill past `budget`.
+    fn render_status_left(&self, row: &mut Vec<Cell>, status: &StatusLine, budget: usize) -> usize {
+        use std::fmt::Write;
+        let secondary = self.style_faint(Role::Secondary);
+
+        let model_str = if !status.model.is_empty() {
+            let mut s = scrub_controls(&status.model);
+            // Channel suffix (only set when the model name is ambiguous) goes
+            // between the name and the `[effort]` badge: `model (Channel) [max]`.
+            if let Some(ref channel) = status.model_channel {
+                let _ = write!(s, " ({})", scrub_controls(channel));
+            }
+            if let Some(ref effort) = status.reasoning_effort {
+                let _ = write!(s, " [{}]", effort);
+            }
+            s
+        } else {
+            String::new()
+        };
+        let ctx_str = if status.ctx_used > 0 || status.ctx_window > 0 {
+            format_ctx_usage(status.ctx_used, status.ctx_window)
+        } else {
+            String::new()
+        };
+        let cache_str = status
+            .cache_indicator
+            .as_deref()
+            .map(scrub_controls)
+            .unwrap_or_default();
+        let cwd_full = scrub_controls(&status.cwd);
+        // Project name (last path segment) is the narrow-terminal fallback shown
+        // before ctx/cache are dropped.
+        let cwd_base = path_basename(&cwd_full).to_string();
+
+        let segs = fit_status_segments(
+            &model_str, &cwd_full, &cwd_base, &ctx_str, &cache_str, budget,
+        );
+
+        // Per-segment colours (all collapse to plain when colours are off).
+        let model_style = self.style_for(Role::Accent);
+        let cwd_style = secondary.clone();
+        // Cache hit ratio in gold — the same `Role::Warning` yellow the `auto`
+        // badge uses, per user preference.
+        let cache_style = self.style_for(Role::Warning);
+        let sep_style = self.style_for(Role::Muted);
+        // ctx% shifts green → yellow → red as the window fills toward the
+        // auto-compaction threshold, mirroring the reference status bar.
+        let ctx_pct = if status.ctx_window > 0 {
+            status.ctx_used.saturating_mul(100) / status.ctx_window
+        } else {
+            0
+        };
+        let ctx_style = if ctx_pct >= 90 {
+            self.style_for(Role::Error)
+        } else if ctx_pct >= 70 {
+            self.style_for(Role::Warning)
+        } else {
+            self.style_for(Role::Success)
+        };
+        let style_for_seg = |seg: StatusSeg| match seg {
+            StatusSeg::Model => &model_style,
+            StatusSeg::Cwd => &cwd_style,
+            StatusSeg::Ctx => &ctx_style,
+            StatusSeg::Cache => &cache_style,
+        };
+
+        let sep = self.status_separator();
+        if status_segments_width(&segs) <= budget {
+            let mut used = 0usize;
+            for (i, (seg, text)) in segs.iter().enumerate() {
+                if i > 0 {
+                    push_str_cells(row, sep, &sep_style);
+                    used += 3;
+                }
+                push_str_cells(row, text, style_for_seg(*seg));
+                used += crate::width::display_width(text);
+            }
+            used
+        } else {
+            // Last resort (model + project name still wider than the budget on a
+            // tiny terminal): single-colour truncate so the row never overflows.
+            let joined = segs
+                .iter()
+                .map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>()
+                .join(sep);
+            let truncated = crate::width::truncate_to_width(&joined, budget);
+            push_str_cells(row, &truncated, &secondary);
+            crate::width::display_width(&truncated)
+        }
     }
 
     /// Emit one dedicated footer row from its three width-fitted segments,
@@ -3910,10 +4053,75 @@ impl<W: Write + Send> RetainedRenderer<W> {
     /// the header/detail/hint: the command is already shown in the `▸ Tool(detail)`
     /// body row above, so the panel is just the selectable choices.
     fn approval_panel_row_count(&self, panel: &crate::render::ApprovalPanelView) -> usize {
-        // 1 header row ("Allow Tool(detail)?") + optional advisory note + N option
-        // rows + 1 hint row. MUST track `build_approval_rows` exactly or the footer
-        // height under-counts and the panel overlaps the body.
-        panel.options.len() + 2 + usize::from(panel.note.is_some())
+        // 1 header row ("Allow Tool(detail)?") + optional reason line + optional advisory
+        // note + optional expanded full-command block + N option rows + 1 hint row. MUST
+        // track `build_approval_rows` exactly or the footer height under-counts and the
+        // panel overlaps the body — hence both call `visible_command_rows` (width-
+        // independent, so the count can never disagree with what is drawn).
+        panel.options.len()
+            + 2
+            + usize::from(panel.note.is_some())
+            + usize::from(panel.reason.is_some())
+            + self.visible_command_rows(panel).len()
+    }
+
+    /// Split a Bash command into DISPLAY lines: honor the author's own newlines (heredocs,
+    /// multi-line scripts), and add a soft break after top-level `&&` / `||` / `|` / `;` so
+    /// a long pipe / chain reads multi-line. NAIVE (not quote-aware) — this only affects the
+    /// DISPLAY, never the command that runs, so a literal separator inside a quoted string
+    /// may wrap cosmetically. Order matters: `&&`/`||` before the single `|`.
+    fn split_command_display_lines(cmd: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for physical in cmd.split('\n') {
+            let softened = physical
+                .replace(" && ", " &&\u{1}")
+                .replace(" || ", " ||\u{1}")
+                .replace(" | ", " |\u{1}")
+                .replace("; ", ";\u{1}");
+            for seg in softened.split('\u{1}') {
+                let seg = seg.trim_end();
+                if !seg.is_empty() {
+                    out.push(seg.to_string());
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push(String::new());
+        }
+        out
+    }
+
+    /// The DISPLAY lines of the expanded full-command block, height-clamped so the header,
+    /// options and hint always stay on-screen (the "don't push the buttons off" rule).
+    /// Empty when collapsed or when there is no full command. Width-INDEPENDENT (each
+    /// logical line is one row, horizontally truncated at draw time), so this length is a
+    /// safe single source of truth for both `build_approval_rows` and `approval_panel_row_count`.
+    fn visible_command_rows(&self, panel: &crate::render::ApprovalPanelView) -> Vec<String> {
+        if !panel.expanded {
+            return Vec::new();
+        }
+        let Some(cmd) = panel.full_command.as_deref() else {
+            return Vec::new();
+        };
+        let lines = Self::split_command_display_lines(cmd);
+        // Rows the rest of the panel needs (header + hint + optional note/reason + options).
+        let reserved = 2
+            + usize::from(panel.note.is_some())
+            + usize::from(panel.reason.is_some())
+            + panel.options.len();
+        // Leave 2 rows of breathing room for the body; never let the command block shove
+        // the options off a short terminal.
+        let avail = (self.screen.height() as usize)
+            .saturating_sub(reserved + 2)
+            .max(1);
+        if lines.len() <= avail {
+            return lines;
+        }
+        let hidden = lines.len() - avail.saturating_sub(1);
+        let mut shown: Vec<String> = lines.into_iter().take(avail.saturating_sub(1)).collect();
+        // Language-neutral "N more lines" marker (the Tab hint already sits in the hint row).
+        shown.push(format!("… (+{hidden})"));
+        shown
     }
 
     /// Build the compact footer approval panel: numbered selectable options
@@ -3962,6 +4170,21 @@ impl<W: Write + Send> RetainedRenderer<W> {
             out.push(row);
         }
 
+        // Reason row: "why is this being asked" context from `ApprovalRequest.reason`.
+        // Shown between the header and the advisory note in a muted style.
+        if let Some(reason) = panel.reason.as_deref() {
+            let reason = crate::glyph::downgrade_glyphs(reason, unicode);
+            let reason = crate::width::truncate_with_ellipsis(
+                &scrub_controls(&reason),
+                rule_width.saturating_sub(2),
+            );
+            let style = self.style_for(Role::Muted);
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "  ", &style);
+            push_str_cells(&mut row, &reason, &style);
+            out.push(row);
+        }
+
         // Advisory row: e.g. a credential-exposure warning under the header. Truncated
         // to one line like the header; rendered in the Warning role.
         if let Some(note) = panel.note.as_deref() {
@@ -3974,6 +4197,22 @@ impl<W: Write + Send> RetainedRenderer<W> {
             let mut row = Vec::new();
             push_str_cells(&mut row, "  ", &style);
             push_str_cells(&mut row, &note, &style);
+            out.push(row);
+        }
+
+        // Expanded full-command block (Bash only, Tab-toggled): the EXACT command, shell-
+        // split into rows so the user reads precisely what will run at the decision point.
+        // `visible_command_rows` already height-clamped it so the options stay on-screen.
+        for line in self.visible_command_rows(panel) {
+            let line = crate::glyph::downgrade_glyphs(&line, unicode);
+            let line = crate::width::truncate_with_ellipsis(
+                &scrub_controls(&line),
+                rule_width.saturating_sub(4),
+            );
+            let style = self.style_for(Role::Secondary);
+            let mut row = Vec::new();
+            push_str_cells(&mut row, "    ", &style); // 4-col indent under the header
+            push_str_cells(&mut row, &line, &style);
             out.push(row);
         }
 
@@ -4019,7 +4258,12 @@ impl<W: Write + Send> RetainedRenderer<W> {
         }
 
         // Hint row: `  <localized hint>` in muted style, glyph-downgraded, truncated.
-        let hint_raw = crate::i18n::t(crate::i18n::Msg::ApprovalHint);
+        // Bash approvals append the Tab expand/collapse hint so the affordance is discoverable.
+        let mut hint_raw = crate::i18n::t(crate::i18n::Msg::ApprovalHint).into_owned();
+        if panel.full_command.is_some() {
+            hint_raw.push_str(" · ");
+            hint_raw.push_str(&crate::i18n::t(crate::i18n::Msg::ApprovalExpandHint));
+        }
         let hint = crate::glyph::downgrade_glyphs(&hint_raw, unicode);
         let hint_budget = rule_width.saturating_sub(2);
         let hint_truncated = crate::width::truncate_with_ellipsis(&hint, hint_budget);
@@ -7945,28 +8189,6 @@ impl<W: Write + Send> RetainedRenderer<W> {
             }
         }
         normalized
-    }
-
-    #[allow(dead_code)]
-    fn build_wrapped_text_rows(
-        &self,
-        parts: &[(&str, CellStyle)],
-        content_width: usize,
-    ) -> Vec<Vec<Cell>> {
-        let mut content = Vec::new();
-        for (text, style) in parts {
-            push_str_cells(&mut content, text, style);
-        }
-        let chunks = wrap_cells_to_width(&content, content_width.max(1));
-        let mut rows = Vec::with_capacity(chunks.len().max(1));
-        for chunk in chunks {
-            let mut row = Vec::new();
-            let pad = CellStyle::default();
-            push_str_cells(&mut row, &" ".repeat(PAD_COL), &pad);
-            row.extend(chunk);
-            rows.push(row);
-        }
-        rows
     }
 
     /// Render the baked mascot const into cell rows (no leading pad; caller
@@ -12262,6 +12484,7 @@ mod tests {
     fn status_basic() -> StatusLine {
         StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/project/atomcode".into(),
             history: None,
             search: None,
@@ -12271,6 +12494,7 @@ mod tests {
             hint: None,
             mode_indicator: None,
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12283,6 +12507,37 @@ mod tests {
             next_prompt_suggestion: None,
             round_cap_panel: None,
         }
+    }
+
+    #[test]
+    fn status_row_channel_suffix_sits_between_model_name_and_effort() {
+        let (r, _counter) = new_counting(80, 24);
+        let mut status = status_basic();
+        status.model_channel = Some("TaoToken".into());
+        status.reasoning_effort = Some("max".into());
+
+        let row = r.build_status_row(&status, 80, false);
+        let visible: String = row.iter().map(|cell| cell.ch).collect();
+        assert!(
+            visible.contains("glm-5 (TaoToken) [max]"),
+            "channel goes between the model name and the [effort] badge: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn status_row_omits_channel_suffix_when_unset() {
+        let (r, _counter) = new_counting(80, 24);
+        let mut status = status_basic();
+        status.reasoning_effort = Some("max".into());
+        // model_channel stays None (unique model name) — no parens shown.
+
+        let row = r.build_status_row(&status, 80, false);
+        let visible: String = row.iter().map(|cell| cell.ch).collect();
+        assert!(visible.contains("glm-5 [max]"), "{visible:?}");
+        assert!(
+            !visible.contains('('),
+            "no channel parens when unset: {visible:?}"
+        );
     }
 
     #[test]
@@ -12658,6 +12913,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12670,6 +12926,7 @@ mod tests {
                 colour: BadgeColour::Mode,
             }),
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12684,11 +12941,12 @@ mod tests {
         };
         let row = r.build_status_row(&status, 60, false);
         // Concatenate visible chars from the cells. `PAD_COL` of leading
-        // spaces, then the badge, then " · " separator, then the body.
+        // spaces, then the badge, then the ` │ ` separator, then the body.
         let visible: String = row.iter().map(|c| c.ch).collect();
         let trimmed = visible.trim_start();
+        let expected = format!("PLAN{}", r.status_separator());
         assert!(
-            trimmed.starts_with("PLAN · "),
+            trimmed.starts_with(&expected),
             "badge + separator must precede the model run; got: {:?}",
             visible
         );
@@ -12714,6 +12972,7 @@ mod tests {
         let shell_fg = role(r.caps, Role::Shell);
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12726,6 +12985,7 @@ mod tests {
                 colour: BadgeColour::Mode,
             }),
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12789,6 +13049,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12801,6 +13062,7 @@ mod tests {
                 colour: BadgeColour::Mode,
             }),
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12840,6 +13102,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12852,6 +13115,7 @@ mod tests {
                 colour: BadgeColour::Mode,
             }),
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12895,6 +13159,7 @@ mod tests {
         let plan_fg = role(r.caps, Role::Plan);
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12907,6 +13172,7 @@ mod tests {
                 colour: BadgeColour::Plan,
             }),
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12950,6 +13216,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -12962,6 +13229,7 @@ mod tests {
                 colour: BadgeColour::Secondary,
             }),
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -12992,6 +13260,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let status = StatusLine {
             model: "glm-5".into(),
+            model_channel: None,
             cwd: "~/proj".into(),
             history: None,
             search: None,
@@ -13001,6 +13270,7 @@ mod tests {
             hint: None,
             mode_indicator: None,
             bypass_indicator: Some("\u{26a0} BYPASS".into()),
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -13024,6 +13294,286 @@ mod tests {
             !visible.contains("PLAN"),
             "no mode_indicator should produce no PLAN badge; got: {:?}",
             visible
+        );
+    }
+
+    /// Cache-hit indicator: when the turn reported cached tokens, the
+    /// left info group must carry a `cache NN%` segment after the ctx
+    /// usage; when `cache_indicator` is `None` (cold start / provider
+    /// never reported cache), the row stays clean.
+    #[test]
+    fn build_status_row_renders_cache_indicator_after_ctx_usage() {
+        let (mut r, _counter) = new_counting(80, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let status = StatusLine {
+            model: "glm-5".into(),
+            model_channel: None,
+            cwd: "~/proj".into(),
+            history: None,
+            search: None,
+            command_output: None,
+            ctx_used: 12_300,
+            ctx_window: 64_000,
+            hint: None,
+            mode_indicator: None,
+            bypass_indicator: None,
+            cache_indicator: Some("cache 70%".into()),
+            session_name: None,
+            reasoning_effort: None,
+            goal: None,
+            loop_status: None,
+            todo: None,
+            subtasks: None,
+            approval: None,
+            user_input: None,
+            pending_messages: Vec::new(),
+            next_prompt_suggestion: None,
+            round_cap_panel: None,
+        };
+        let row = r.build_status_row(&status, 60, false);
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        assert!(
+            visible.contains("cache 70%"),
+            "cache indicator must appear on the status row; got: {:?}",
+            visible
+        );
+        // Order: ctx usage segment precedes the cache segment.
+        let ctx_idx = visible.find("tok").expect("ctx usage must render");
+        let cache_idx = visible
+            .find("cache 70%")
+            .expect("cache indicator must render");
+        assert!(
+            ctx_idx < cache_idx,
+            "cache segment must come after the ctx usage; got: {:?}",
+            visible
+        );
+
+        // None → no cache segment at all.
+        let mut clean = status;
+        clean.cache_indicator = None;
+        let row = r.build_status_row(&clean, 60, false);
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        assert!(
+            !visible.contains("cache"),
+            "no cache_indicator must produce no cache segment; got: {:?}",
+            visible
+        );
+    }
+
+    /// Project-name fallback splits on both separators so a Windows path
+    /// outside the home dir (which `collapse_home` leaves with backslashes) is
+    /// still shortened correctly.
+    #[test]
+    fn path_basename_handles_both_separators() {
+        assert_eq!(path_basename("~/Documents/workspace/cangjie"), "cangjie");
+        assert_eq!(path_basename("D:\\projects\\cangjie"), "cangjie");
+        assert_eq!(path_basename("~/proj/"), "proj"); // trailing slash ignored
+        assert_eq!(path_basename("cangjie"), "cangjie"); // already bare
+        assert_eq!(path_basename("~"), "~");
+    }
+
+    /// Narrow-terminal degradation order: as the budget shrinks the left group
+    /// first shows the cwd as its project name, then drops the ctx-usage (token
+    /// %) segment, then drops the cache segment — leaving `model · project`.
+    #[test]
+    fn fit_status_segments_degrades_cwd_then_ctx_then_cache() {
+        let model = "glm-5";
+        let cwd_full = "~/work/atomcode/crates/tuix";
+        let cwd_base = "tuix";
+        let ctx = "12.3k/64k tok (19%)";
+        let cache = "cache 70%";
+
+        // Unbounded: everything, full cwd, in display order.
+        let full = fit_status_segments(model, cwd_full, cwd_base, ctx, cache, usize::MAX);
+        assert_eq!(
+            full.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![
+                StatusSeg::Model,
+                StatusSeg::Cwd,
+                StatusSeg::Ctx,
+                StatusSeg::Cache
+            ]
+        );
+        assert_eq!(full[1].1, cwd_full, "full cwd path survives when it fits");
+
+        // Budget = exactly the width once cwd is its project name: step 1 fires,
+        // ctx + cache still present.
+        let base_budget = status_segments_width(&[
+            (StatusSeg::Model, model.into()),
+            (StatusSeg::Cwd, cwd_base.into()),
+            (StatusSeg::Ctx, ctx.into()),
+            (StatusSeg::Cache, cache.into()),
+        ]);
+        assert!(base_budget < status_segments_width(&full));
+        let step1 = fit_status_segments(model, cwd_full, cwd_base, ctx, cache, base_budget);
+        assert_eq!(step1[1].1, cwd_base, "cwd shortened to project name first");
+        assert_eq!(
+            step1.last().unwrap().0,
+            StatusSeg::Cache,
+            "cache still shown"
+        );
+
+        // Budget without room for ctx: step 2 drops ctx, cache survives.
+        let no_ctx_budget = status_segments_width(&[
+            (StatusSeg::Model, model.into()),
+            (StatusSeg::Cwd, cwd_base.into()),
+            (StatusSeg::Cache, cache.into()),
+        ]);
+        let step2 = fit_status_segments(model, cwd_full, cwd_base, ctx, cache, no_ctx_budget);
+        let kinds: Vec<_> = step2.iter().map(|(s, _)| *s).collect();
+        assert!(!kinds.contains(&StatusSeg::Ctx), "ctx dropped before cache");
+        assert!(kinds.contains(&StatusSeg::Cache), "cache outlives ctx");
+
+        // Budget only for model + project name: step 3 drops cache too.
+        let lean_budget = status_segments_width(&[
+            (StatusSeg::Model, model.into()),
+            (StatusSeg::Cwd, cwd_base.into()),
+        ]);
+        let step3 = fit_status_segments(model, cwd_full, cwd_base, ctx, cache, lean_budget);
+        assert_eq!(
+            step3.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![StatusSeg::Model, StatusSeg::Cwd]
+        );
+    }
+
+    /// When the terminal is wide enough, NOTHING is abbreviated — the full cwd
+    /// path, ctx usage and cache all render; degradation only kicks in when the
+    /// group can't fit its budget.
+    #[test]
+    fn build_status_row_shows_everything_in_full_when_wide() {
+        fn fg_of(row: &[Cell], needle: &str) -> Option<crossterm::style::Color> {
+            let chars: Vec<char> = needle.chars().collect();
+            'outer: for start in 0..row.len() {
+                for (k, &nc) in chars.iter().enumerate() {
+                    match row.get(start + k) {
+                        Some(cell) if cell.ch == nc => {}
+                        _ => continue 'outer,
+                    }
+                }
+                return row[start].style.fg;
+            }
+            None
+        }
+
+        let (mut r, _c) = new_counting(120, 24);
+        r.caps.colors = true;
+        let mut status = status_basic();
+        status.model = "deepseek-flash".into();
+        status.cwd = "~/Documents/workspace/cangjie_compiler".into();
+        status.ctx_used = 56_800;
+        status.ctx_window = 1_000_000;
+        status.cache_indicator = Some("cache 98%".into());
+
+        let row = r.build_status_row(&status, 120, false);
+        let visible: String = row.iter().map(|c| c.ch).collect();
+        assert!(
+            visible.contains("~/Documents/workspace/cangjie_compiler"),
+            "wide terminal shows the FULL cwd path, not the project name: {visible:?}"
+        );
+        assert!(
+            visible.contains("56.8k/1m tok (6%)"),
+            "wide terminal shows the full ctx usage: {visible:?}"
+        );
+        assert!(
+            visible.contains("cache 98%"),
+            "wide terminal shows the cache segment: {visible:?}"
+        );
+        // Full (un-abbreviated) display is still colour-differentiated per segment.
+        assert_eq!(
+            fg_of(&row, "deepseek-flash"),
+            r.style_for(Role::Accent).fg,
+            "model coloured even at full width"
+        );
+        assert_eq!(
+            fg_of(&row, "cache 98%"),
+            r.style_for(Role::Warning).fg,
+            "cache coloured (gold, same as `auto`) even at full width"
+        );
+        assert_eq!(
+            fg_of(&row, "56.8k/1m tok (6%)"),
+            r.style_for(Role::Success).fg,
+            "ctx (6%, comfortable) is green at full width"
+        );
+
+        // Squeeze the same content into a narrow rule → cwd collapses to the
+        // project name first (ctx/cache may then drop per the degradation order).
+        let narrow = r.build_status_row(&status, 40, false);
+        let narrow_vis: String = narrow.iter().map(|c| c.ch).collect();
+        assert!(
+            !narrow_vis.contains("~/Documents/workspace/cangjie_compiler"),
+            "narrow terminal must NOT show the full path: {narrow_vis:?}"
+        );
+        assert!(
+            narrow_vis.contains("cangjie_compiler"),
+            "narrow terminal keeps the project name: {narrow_vis:?}"
+        );
+    }
+
+    /// Colour differentiation: each left-group segment carries its own colour —
+    /// model = accent, cache = gold (`Warning`, same as `auto`), and ctx% shifts
+    /// green → yellow → red as the context window fills.
+    #[test]
+    fn build_status_row_colours_left_segments_by_kind() {
+        // First cell whose char-run equals `needle`; returns its fg. Robust to
+        // the multi-byte `·` separators (byte offsets would mislead).
+        fn fg_of(row: &[Cell], needle: &str) -> Option<crossterm::style::Color> {
+            let chars: Vec<char> = needle.chars().collect();
+            'outer: for start in 0..row.len() {
+                for (k, &nc) in chars.iter().enumerate() {
+                    match row.get(start + k) {
+                        Some(cell) if cell.ch == nc => {}
+                        _ => continue 'outer,
+                    }
+                }
+                return row[start].style.fg;
+            }
+            None
+        }
+
+        let (mut r, _c) = new_counting(120, 24);
+        r.caps.colors = true;
+        r.caps.unicode_symbols = true;
+        let mut status = status_basic();
+        status.cwd = "~/proj".into();
+        status.ctx_window = 64_000;
+        status.cache_indicator = Some("cache 70%".into());
+
+        // Comfortable fill (≈19%) → ctx green.
+        status.ctx_used = 12_300;
+        let row = r.build_status_row(&status, 120, false);
+        assert_eq!(
+            fg_of(&row, "glm-5"),
+            r.style_for(Role::Accent).fg,
+            "model uses the accent colour"
+        );
+        assert_eq!(
+            fg_of(&row, "cache 70%"),
+            r.style_for(Role::Warning).fg,
+            "cache uses gold (same as `auto`)"
+        );
+        assert_eq!(
+            fg_of(&row, "tok"),
+            r.style_for(Role::Success).fg,
+            "ctx under 70% is green"
+        );
+
+        // Filling (≈75%) → ctx yellow.
+        status.ctx_used = 48_000;
+        let row = r.build_status_row(&status, 120, false);
+        assert_eq!(
+            fg_of(&row, "tok"),
+            r.style_for(Role::Warning).fg,
+            "ctx 70–89% is yellow"
+        );
+
+        // Nearly full (≈95%) → ctx red.
+        status.ctx_used = 61_000;
+        let row = r.build_status_row(&status, 120, false);
+        assert_eq!(
+            fg_of(&row, "tok"),
+            r.style_for(Role::Error).fg,
+            "ctx ≥90% is red"
         );
     }
 
@@ -13086,7 +13636,7 @@ mod tests {
         r.caps.unicode_symbols = true;
         let row = r.build_top_rule_with_context(
             80,
-            Some("release/v5.0.9"),
+            Some("release/v5.1.0"),
             Some(crate::render::HistoryPosition {
                 current: 999,
                 total: 1000,
@@ -13100,7 +13650,7 @@ mod tests {
             .map(|cell| cell.ch)
             .collect();
         assert!(visible.contains("History 999/1000"), "{visible:?}");
-        assert!(visible.contains("release/v5.0.9"), "{visible:?}");
+        assert!(visible.contains("release/v5.1.0"), "{visible:?}");
     }
 
     #[test]
@@ -20304,6 +20854,9 @@ mod tests {
             options: vec!["Allow".into(), "Deny".into()],
             selected: 0,
             note: None,
+            reason: None,
+            full_command: None,
+            expanded: false,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -20337,6 +20890,9 @@ mod tests {
             ],
             selected: 0,
             note: None,
+            reason: None,
+            full_command: None,
+            expanded: false,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -20388,6 +20944,9 @@ mod tests {
             options: vec!["Allow once".into(), "Deny".into()],
             selected: 0,
             note: Some("may send credentials to the provider".into()),
+            reason: None,
+            full_command: None,
+            expanded: false,
         });
         r.render(UiLine::InputPrompt {
             buf: String::new(),
@@ -20402,6 +20961,71 @@ mod tests {
         assert!(
             vterm.any_row(|r| r.contains("may send credentials to the provider")),
             "advisory note must render\n{dump}"
+        );
+    }
+
+    /// When `ApprovalRequest.reason` is `Some`, the approval panel must render that
+    /// text above the options (between the header and any advisory note).
+    #[test]
+    fn approval_panel_renders_reason_line_when_present() {
+        let (mut r, buf) = new_capturing(80, 24);
+        r.caps.colors = true;
+        let mut vterm = crate::test_term::VirtualTerminal::new(80, 24);
+        let mut status = status_basic();
+        status.approval = Some(crate::render::ApprovalPanelView {
+            tool: "Bash".into(),
+            detail: "rm -rf /outside/dir".into(),
+            options: vec!["Allow once".into(), "Deny".into()],
+            selected: 0,
+            note: None,
+            reason: Some("此命令写到工作区外".into()),
+            full_command: None,
+            expanded: false,
+        });
+        r.render(UiLine::InputPrompt {
+            buf: String::new(),
+            cursor_byte: 0,
+            menu: None,
+            status,
+            attachments: Vec::new(),
+        });
+        r.flush_deferred();
+        drain_into_vterm(&buf, &mut vterm);
+        let dump = vterm.dump();
+        // Wide CJK characters are rendered two cells wide; row_text() may
+        // interleave padding spaces — check for the first character instead of
+        // the full concatenated string.
+        assert!(
+            vterm.any_row(|r| r.contains("此")),
+            "reason line must render in the approval panel\n{dump}"
+        );
+        // reason adds one row to the panel height
+        let panel_with_reason = crate::render::ApprovalPanelView {
+            tool: "Bash".into(),
+            detail: "cmd".into(),
+            options: vec!["Allow once".into(), "Deny".into()],
+            selected: 0,
+            note: None,
+            reason: Some("reason text".into()),
+            full_command: None,
+            expanded: false,
+        };
+        let panel_without = crate::render::ApprovalPanelView {
+            reason: None,
+            full_command: None,
+            expanded: false,
+            ..panel_with_reason.clone()
+        };
+        assert_eq!(
+            r.approval_panel_row_count(&panel_with_reason),
+            r.approval_panel_row_count(&panel_without) + 1,
+            "reason must add exactly one row to the panel height"
+        );
+        // Verify row count tracks build_approval_rows exactly.
+        assert_eq!(
+            r.approval_panel_row_count(&panel_with_reason),
+            r.build_approval_rows(&panel_with_reason, 60, 80).len(),
+            "row count must match rendered rows when reason is present"
         );
     }
 
@@ -21123,6 +21747,9 @@ mod tests {
             ],
             selected: 0,
             note: None,
+            reason: None,
+            full_command: None,
+            expanded: false,
         };
         status.approval = Some(panel.clone());
         r.render(UiLine::InputPrompt {
@@ -21199,6 +21826,123 @@ mod tests {
         );
     }
 
+    fn bash_panel(full: &str, expanded: bool) -> crate::render::ApprovalPanelView {
+        crate::render::ApprovalPanelView {
+            tool: "Bash".into(),
+            detail: "cd /tmp && ./deploy …".into(), // compact (truncated) detail
+            options: vec![
+                "Allow once".into(),
+                "Always allow Bash".into(),
+                "Deny".into(),
+            ],
+            selected: 0,
+            note: None,
+            reason: None,
+            full_command: Some(full.into()),
+            expanded,
+        }
+    }
+
+    fn dump_rows(rows: &[Vec<Cell>]) -> String {
+        rows.iter()
+            .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Expanded Bash approval: the FULL command is visible (shell-split multi-line, not
+    /// truncated to a stub), and the row-count invariant still holds.
+    #[test]
+    fn approval_expanded_shows_full_command_and_count_matches() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let (mut r, _buf) = new_capturing(80, 24);
+        r.caps.unicode_symbols = true;
+        let panel = bash_panel("cd /tmp && ./deploy.sh --prod | tee deploy.log", true);
+        let rows = r.build_approval_rows(&panel, 78, 80);
+        assert_eq!(
+            rows.len(),
+            r.approval_panel_row_count(&panel),
+            "row_count MUST track the built rows once the command block is expanded"
+        );
+        let dump = dump_rows(&rows);
+        assert!(
+            dump.contains("./deploy.sh --prod"),
+            "full command visible:\n{dump}"
+        );
+        assert!(
+            dump.contains("tee deploy.log"),
+            "piped tail visible too:\n{dump}"
+        );
+        // Shell-split: the `&&` chain and the pipe read on separate rows.
+        assert!(
+            dump.contains("&&"),
+            "shell-boundary split renders the chain:\n{dump}"
+        );
+        // Options + Tab hint remain.
+        assert!(dump.contains("Deny"), "options still present:\n{dump}");
+        assert!(
+            dump.contains("Tab"),
+            "Tab expand/collapse hint present:\n{dump}"
+        );
+    }
+
+    /// Collapsed (default): the full command is NOT shown — panel stays compact — but the
+    /// Tab affordance is hinted so the user can reveal it.
+    #[test]
+    fn approval_collapsed_hides_full_command_but_hints_tab() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let (mut r, _buf) = new_capturing(80, 24);
+        let panel = bash_panel("run-the-very-secret-command --flag=value", false);
+        let rows = r.build_approval_rows(&panel, 78, 80);
+        assert_eq!(rows.len(), r.approval_panel_row_count(&panel));
+        let dump = dump_rows(&rows);
+        assert!(
+            !dump.contains("very-secret-command"),
+            "collapsed panel must NOT render the full command:\n{dump}"
+        );
+        assert!(
+            dump.contains("Tab"),
+            "collapsed panel hints Tab to expand:\n{dump}"
+        );
+    }
+
+    /// Short terminal: a many-line command is height-clamped so the option rows are never
+    /// pushed off-screen, and the row-count invariant holds under the clamp.
+    #[test]
+    fn approval_expanded_command_height_clamped_keeps_options() {
+        let _locale = crate::i18n::test_lock();
+        crate::i18n::set_locale(crate::i18n::Locale::En);
+        let (mut r, _buf) = new_capturing(80, 8); // tiny height
+        let cmd = (0..40)
+            .map(|i| format!("echo line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let panel = bash_panel(&cmd, true);
+        let rows = r.build_approval_rows(&panel, 78, 80);
+        assert_eq!(
+            rows.len(),
+            r.approval_panel_row_count(&panel),
+            "invariant holds under the height clamp"
+        );
+        // The whole panel fits the short terminal (not 40+ command rows).
+        assert!(
+            rows.len() <= 8,
+            "panel clamped to the short terminal, got {} rows",
+            rows.len()
+        );
+        let dump = dump_rows(&rows);
+        assert!(
+            dump.contains("Allow once") && dump.contains("Deny"),
+            "options must stay visible on a short terminal:\n{dump}"
+        );
+        assert!(
+            dump.contains("(+"),
+            "a '(+N)' more-lines marker indicates the clamp:\n{dump}"
+        );
+    }
+
     /// Step 1 digit keys: `accel_index` falls back for y/a/n; digit routing is
     /// tested via the pure `ApprovalPanel.accel_index` + index-based resolution
     /// in `handle_approval_key`. This test confirms the option ordering contract
@@ -21228,6 +21972,9 @@ mod tests {
             ],
             selected: 0,
             note: None,
+            reason: None,
+            full_command: None,
+            expanded: false,
         };
         // Digit routing: index = (c as usize) - ('1' as usize).
         // '1' → idx 0 → AllowOnce
@@ -25792,6 +26539,9 @@ mod tests {
             ],
             selected: 0,
             note: None,
+            reason: None,
+            full_command: None,
+            expanded: false,
         });
 
         r.render(UiLine::InputPrompt {
@@ -25979,6 +26729,7 @@ mod tests {
         // 3 options + 1 hint = approval_rows=4.
         let mut status = StatusLine {
             model: String::new(), // no status row (has_status=false → status_rows=0)
+            model_channel: None,
             cwd: String::new(),
             history: None,
             search: None,
@@ -25988,6 +26739,7 @@ mod tests {
             hint: None,
             mode_indicator: None,
             bypass_indicator: None,
+            cache_indicator: None,
             session_name: None,
             reasoning_effort: None,
             goal: None,
@@ -26006,6 +26758,9 @@ mod tests {
             options: vec!["Allow once".into(), "Always allow".into(), "Deny".into()],
             selected: 0,
             note: None,
+            reason: None,
+            full_command: None,
+            expanded: false,
         });
 
         r.render(UiLine::InputPrompt {

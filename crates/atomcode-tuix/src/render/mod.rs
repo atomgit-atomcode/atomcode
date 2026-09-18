@@ -614,6 +614,12 @@ pub struct ModeBadge {
 #[derive(Debug, Clone, Default)]
 pub struct StatusLine {
     pub model: String,
+    /// Channel (provider account) label shown as `model (Channel)` — ONLY when
+    /// the bare model name is ambiguous across configured accounts (mirrors the
+    /// webui picker's disambiguation). `None` when the name is unique, so the
+    /// common single-channel case stays clean. See
+    /// `Config::disambiguating_channel_label`.
+    pub model_channel: Option<String>,
     pub cwd: String, // HOME replaced with "~"
     /// Messages submitted during the active turn but not yet accepted at a
     /// model/tool boundary. Rendered as a transient panel above the composer.
@@ -655,6 +661,13 @@ pub struct StatusLine {
     /// from `mode_indicator` (left-aligned PLAN badge) so it does not
     /// displace the mode indicator.
     pub bypass_indicator: Option<String>,
+    /// Cache-hit indicator for the current turn, rendered in the left info
+    /// group after the ctx-usage segment (e.g. `cache 70%`).
+    /// Derived from the per-turn prompt/cached token tallies; `None` while
+    /// no cached usage has been reported this turn (cold start, providers
+    /// that don't report cached tokens), so the status row stays quiet.
+    /// Language-neutral format — no i18n entry needed.
+    pub cache_indicator: Option<String>,
     /// Current session display name, shown as a right-aligned cyan
     /// pill overlaid on the input box's top rule. `Some` only after
     /// the user has explicitly run `/rename` (Session::user_renamed) —
@@ -733,6 +746,14 @@ pub struct ApprovalPanelView {
     pub selected: usize,
     /// Optional advisory line rendered under the header (e.g. a credential warning).
     pub note: Option<String>,
+    /// Optional "why is this being asked" line from `ApprovalRequest.reason`. Shown
+    /// above the options in a muted style; `None` for ordinary first-time approvals.
+    pub reason: Option<String>,
+    /// Full, UNTRUNCATED Bash command; rendered multi-line (shell-aware wrap, height-
+    /// clamped so the options stay on-screen) only when `expanded`. `None` for non-Bash.
+    pub full_command: Option<String>,
+    /// Whether to render the full-command block. Default collapsed.
+    pub expanded: bool,
 }
 
 /// Renderer-facing snapshot of the `request_user_input` panel (mirrors

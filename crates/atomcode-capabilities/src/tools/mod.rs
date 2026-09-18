@@ -454,35 +454,10 @@ pub(crate) fn is_absolute_path(raw: &str) -> bool {
     b.len() >= 2 && b[0] == b'\\' && b[1] == b'\\'
 }
 
-/// Directories never descended into during a walk (build artifacts / VCS / caches).
-/// Mirrors the production walkers so a grep/glob/list does not drown in `target/`
-/// or `node_modules/`.
-pub(crate) const SKIP_DIRS: &[&str] = &[
-    "node_modules",
-    ".git",
-    "target",
-    "__pycache__",
-    ".next",
-    "dist",
-    "build",
-    ".cache",
-    "vendor",
-    ".venv",
-    "venv",
-    ".idea",
-    ".vscode",
-    "datalog",
-    "logs",
-    "log",
-    ".atomcode",
-    ".claude",
-    "runs",
-];
-
-/// Should a directory with this name be skipped during a walk?
-pub(crate) fn is_skip_dir(name: &str) -> bool {
-    SKIP_DIRS.contains(&name) || name.starts_with(".venv-")
-}
+// The walk-exclusion list lives in the ungated `pathutil` module so the `codeintel`
+// index walk (independent of the `tools` feature) shares the SAME list — re-exported
+// here so the in-crate walkers keep referring to it as `is_skip_dir` / `SKIP_DIRS`.
+pub(crate) use crate::pathutil::is_skip_dir;
 
 /// Heuristic binary sniff over the first 8 KiB: any NUL byte ⇒ binary (the `file(1)`
 /// heuristic); otherwise >30% non-text control bytes ⇒ binary. The 30% threshold

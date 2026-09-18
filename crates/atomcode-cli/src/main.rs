@@ -2135,8 +2135,21 @@ async fn run() -> Result<i32> {
     // TUI.
     let resume_session_id = match &resume_selector {
         Some(ResumeSelector::Specific(sel)) => {
-            let catalog = atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)?;
-            match resolve_in_catalog(&catalog, sel) {
+            // Fast path: scan only this project's bucket first (nearly every
+            // session lives in the bucket that hashes from its working dir). Fall
+            // back to the full in-project scan on a miss — that catches a legacy
+            // session parked in a different bucket for this same directory.
+            let mut resolved = resolve_in_catalog(
+                &atomcode_daemon::legacy_convert::catalog_for_bucket(&working_dir)?,
+                sel,
+            );
+            if resolved.is_none() {
+                resolved = resolve_in_catalog(
+                    &atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)?,
+                    sel,
+                );
+            }
+            match resolved {
                 Some(id) => Some(id),
                 // Not in THIS project — a session is anchored to its own directory,
                 // so look across every project and adopt that directory (Plan A),
@@ -2178,10 +2191,21 @@ async fn run() -> Result<i32> {
             }
         }
         Some(ResumeSelector::Latest) => {
-            atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)?
+            // Fast path: this project's bucket only — avoids the full cross-project
+            // walk on every `-c`. Fall back to the full in-project scan only when
+            // the bucket has nothing resumable (e.g. a legacy session parked in a
+            // different bucket for this same directory).
+            let from_bucket = atomcode_daemon::legacy_convert::catalog_for_bucket(&working_dir)?
                 .into_iter()
                 .find(|entry| entry.message_count > 0)
-                .map(|entry| entry.id)
+                .map(|entry| entry.id);
+            match from_bucket {
+                Some(id) => Some(id),
+                None => atomcode_daemon::legacy_convert::catalog_for_project(&working_dir)?
+                    .into_iter()
+                    .find(|entry| entry.message_count > 0)
+                    .map(|entry| entry.id),
+            }
         }
         None => None,
     };

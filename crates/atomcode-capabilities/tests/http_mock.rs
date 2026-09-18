@@ -683,3 +683,179 @@ async fn open_gives_up_on_a_hung_gateway_within_the_open_timeout() {
         "a TTFB timeout is transient, so it must be retryable"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PHASE-AWARE byte-idle watchdog: prefill (first byte) uses `first_token_timeout`,
+// inter-token (after the first byte) uses `idle_timeout`. Modeled with a gateway
+// that sends the SSE HEADERS immediately (so the OPEN succeeds) but controls the
+// timing of the BODY bytes.
+// ---------------------------------------------------------------------------
+
+/// Accepts, replies with SSE headers at once, then sleeps `prefill_delay` before the
+/// first body byte, writes `head`, sleeps `inter_delay`, writes `tail`, and closes.
+fn timed_body_gateway(
+    prefill_delay: Duration,
+    head: &'static str,
+    inter_delay: Duration,
+    tail: &'static str,
+) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 8192];
+            let _ = s.read(&mut buf);
+            // Headers only — the body stream (`bytes_stream()`) starts empty, so the
+            // first `next()` the byte loop awaits is the FIRST BODY BYTE below.
+            let _ = s.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            let _ = s.flush();
+            std::thread::sleep(prefill_delay);
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.flush();
+            std::thread::sleep(inter_delay);
+            let _ = s.write_all(tail.as_bytes());
+            let _ = s.flush();
+        }
+    });
+    format!("http://{addr}")
+}
+
+fn phased_provider(base: &str, idle: Duration, first_token: Duration) -> OpenAiCompatProvider {
+    let mut cfg = OpenAiCompatConfig::new("k", base, "test-model");
+    cfg.idle_timeout = idle;
+    cfg.first_token_timeout = first_token;
+    cfg.retry = RetryPolicy::none(); // single attempt → timing is unambiguous
+    OpenAiCompatProvider::new(cfg).unwrap()
+}
+
+const SSE_HI: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+const SSE_DONE: &str = "data: [DONE]\n\n";
+
+/// PREFILL: the first body byte is delayed LONGER than `idle_timeout` but shorter than
+/// `first_token_timeout`. The phase-aware watchdog must use the first-token budget, so
+/// the stream survives and delivers content. (With a single uniform `idle` budget this
+/// would spuriously fire "stream idle timeout" during a slow prefill.)
+#[tokio::test]
+async fn prefill_first_byte_uses_first_token_budget_not_idle() {
+    // idle 100ms, first-token 5s, first byte at ~400ms (> idle, < first-token).
+    let base = timed_body_gateway(
+        Duration::from_millis(400),
+        SSE_HI,
+        Duration::from_millis(0),
+        SSE_DONE,
+    );
+    let provider = phased_provider(&base, Duration::from_millis(100), Duration::from_secs(5));
+    let msgs = vec![Message::user("hi")];
+
+    let stream = provider
+        .chat_stream(&msgs, &[], &ChatOptions::default())
+        .await
+        .expect("open succeeds — headers arrive immediately");
+    let events: Vec<StreamEvent> = stream.collect().await;
+
+    let saw_content = events
+        .iter()
+        .any(|e| matches!(e, StreamEvent::TextDelta(t) if t.contains("hi")));
+    let idle_err = events
+        .iter()
+        .any(|e| matches!(e, StreamEvent::Error(err) if err.message.contains("idle timeout")));
+    assert!(
+        saw_content && !idle_err,
+        "a slow prefill within the first-token budget must NOT idle-timeout; got {events:?}"
+    );
+}
+
+/// INTER-TOKEN: after the first body byte arrives, a subsequent gap LONGER than
+/// `idle_timeout` (but shorter than `first_token_timeout`) must still fire the idle
+/// watchdog — the large first-token budget applies only to the FIRST byte.
+#[tokio::test]
+async fn inter_token_gap_uses_idle_budget_not_first_token() {
+    // idle 100ms, first-token 5s; first byte immediate, SECOND byte at ~400ms.
+    let base = timed_body_gateway(
+        Duration::from_millis(0),
+        SSE_HI,
+        Duration::from_millis(400),
+        SSE_DONE,
+    );
+    let provider = phased_provider(&base, Duration::from_millis(100), Duration::from_secs(5));
+    let msgs = vec![Message::user("hi")];
+
+    let stream = provider
+        .chat_stream(&msgs, &[], &ChatOptions::default())
+        .await
+        .expect("open succeeds");
+    let events: Vec<StreamEvent> = stream.collect().await;
+
+    let saw_content = events
+        .iter()
+        .any(|e| matches!(e, StreamEvent::TextDelta(t) if t.contains("hi")));
+    let idle_err = events
+        .iter()
+        .any(|e| matches!(e, StreamEvent::Error(err) if err.message.contains("idle timeout")));
+    assert!(
+        saw_content && idle_err,
+        "after the first byte, an inter-token gap past `idle` must idle-timeout even with \
+         a large first-token budget; got {events:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// OOM guard: hostile tool_call index (issue #762)
+// ---------------------------------------------------------------------------
+
+/// END-TO-END (real HTTP → SSE decode → StreamEvent) regression for #762: a hostile
+/// server sending `tool_calls[].index: 999_999_999` must NOT make the adapter pad its
+/// per-index buffer up to ~1e9 slots (OOM). The out-of-range delta is dropped and a
+/// legitimate index-0 call in the SAME stream still assembles and is emitted.
+///
+/// Before the `MAX_TOOL_CALLS` bound this test did not merely fail — the decoder
+/// allocated ~a billion slots (`while tool_calls.len() <= idx { push }`) and the
+/// process OOM'd/hung, which is exactly the reported bug.
+#[tokio::test]
+async fn hostile_tool_call_index_does_not_oom_and_legit_call_survives() {
+    const HOSTILE_SSE: &str = "data: {\"id\":\"resp-evil\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":999999999,\"id\":\"evil\",\"function\":{\"name\":\"pwn\",\"arguments\":\"{}\"}}]}}]}\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_ok\",\"function\":{\"name\":\"get_time\",\"arguments\":\"{}\"}}]}}]}\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\
+data: [DONE]\n";
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string(HOSTILE_SSE))
+        .mount(&server)
+        .await;
+
+    let provider = provider_for(&server.uri(), "glm-test");
+    let mut stream = provider
+        .chat_stream(&[Message::user("hi")], &[], &ChatOptions::default())
+        .await
+        .expect("open should succeed");
+
+    let mut calls = Vec::new();
+    let mut done = false;
+    while let Some(ev) = stream.next().await {
+        match ev {
+            StreamEvent::ToolCall(t) => calls.push(t),
+            StreamEvent::Done { .. } => done = true,
+            StreamEvent::Error(e) => panic!("unexpected stream error: {}", e.message),
+            _ => {}
+        }
+    }
+
+    assert!(done, "stream must terminate despite the hostile index");
+    assert_eq!(
+        calls.len(),
+        1,
+        "only the in-range call is assembled/emitted: {calls:?}"
+    );
+    assert_eq!(calls[0].name, "get_time");
+    assert_eq!(calls[0].id, "call_ok");
+    assert!(
+        calls.iter().all(|c| c.name != "pwn"),
+        "the out-of-range (hostile) call must be dropped, not executed"
+    );
+}

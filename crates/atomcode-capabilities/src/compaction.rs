@@ -213,9 +213,27 @@ impl OverflowCompaction {
         }
     }
 
-    /// Aggressive stub of every tool result in `[from, to)` over `AGGRESSIVE_STUB_MIN`
-    /// (no read_file exemption). Monotonic: an already-stubbed result is left alone.
-    fn aggressive_stub_rewrites(msgs: &[Message], from: usize, to: usize) -> Vec<(usize, String)> {
+    /// Aggressive stub of every tool result in `[from, to)` over `AGGRESSIVE_STUB_MIN`.
+    /// Monotonic: an already-stubbed result is left alone.
+    ///
+    /// `read_exempt_from` preserves the gentle path's `read_file` exemption (compaction
+    /// line 44) for RECENT reads only: a `read_file` result at index `>= read_exempt_from`
+    /// is kept FULL, so the model does not go blind on a file it just read (the overflow
+    /// path used to stub every read to a first-line stub → the agent's "all my reads
+    /// folded to first line, so I switched to node scripts" report). OLD reads (below the
+    /// boundary) still stub — they are stale. Pass `usize::MAX` to disable the exemption
+    /// (stub every read). Convergence is owned by tier 2, whose SPLITTING boundary caps the
+    /// kept span at `recent_keep_budget` (`<= window/2`), so draining everything older
+    /// always fits regardless of which reads are exempt. Tier 0 uses the NON-splitting
+    /// `recent_keep_boundary` (it may keep a whole oversized active turn, so its exempt span
+    /// is not bounded by `window/2`) — its exemption is therefore best-effort: if it sheds
+    /// too little it simply escalates to tier 1/2, which do the fitting.
+    fn aggressive_stub_rewrites(
+        msgs: &[Message],
+        from: usize,
+        to: usize,
+        read_exempt_from: usize,
+    ) -> Vec<(usize, String)> {
         let id_to_tool = call_id_to_tool(msgs);
         let mut out = Vec::new();
         for (i, m) in msgs.iter().enumerate().take(to).skip(from) {
@@ -228,6 +246,9 @@ impl OverflowCompaction {
                 .and_then(|id| id_to_tool.get(id))
                 .map(String::as_str)
                 .unwrap_or("tool");
+            if tool == "read_file" && i >= read_exempt_from {
+                continue; // recent read → keep full (working context)
+            }
             out.push((i, build_compact_stub(tool, &m.text, !m.is_error)));
         }
         out
@@ -263,7 +284,21 @@ impl OverflowCompaction {
         let floor = view.sacred_floor;
         match attempt {
             0 => {
-                let rewrites = Self::aggressive_stub_rewrites(msgs, floor, msgs.len());
+                // Exempt RECENT reads (within the recent-keep span) from the aggressive
+                // stub so the model keeps the files it just read; older reads still stub.
+                let read_exempt_from =
+                    recent_keep_boundary(msgs, recent_keep_budget(view.ctx_window), floor);
+                let mut rewrites =
+                    Self::aggressive_stub_rewrites(msgs, floor, msgs.len(), read_exempt_from);
+                if rewrites.is_empty() {
+                    // The exemption left nothing to shed: the recent reads ARE the only
+                    // thing over the line (a one-turn session whose whole content is what
+                    // it just read, or a provider whose overflow we cannot see the shape
+                    // of). Stub them rather than strand the turn — a stubbed read is
+                    // something the model can re-read, a failed request is not. When
+                    // anything else can shed, the exemption above still holds.
+                    rewrites = Self::aggressive_stub_rewrites(msgs, floor, msgs.len(), usize::MAX);
+                }
                 if rewrites.is_empty() {
                     return CompactionPlan::noop();
                 }
@@ -306,7 +341,10 @@ impl OverflowCompaction {
                 if drain_to <= floor {
                     return CompactionPlan::noop(); // nothing older than the kept window
                 }
-                let rewrites = Self::aggressive_stub_rewrites(msgs, drain_to, msgs.len());
+                // Kept span `[drain_to, len)` IS the recent-keep window, so every read in
+                // it is recent → exempt (pass `drain_to` as the boundary). Non-read tools
+                // in the kept span still stub to reclaim more.
+                let rewrites = Self::aggressive_stub_rewrites(msgs, drain_to, msgs.len(), drain_to);
                 if !span_has_non_anchor(&msgs[floor..drain_to]) {
                     // Only a prior anchor is drainable — don't re-drain/summarize it; still
                     // apply the aggressive stub rewrites to the kept span.
@@ -1205,13 +1243,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn aggressive_stub_exempts_recent_reads_but_stubs_old_reads() {
+        // Core of the fix: a read BELOW the exempt boundary is stale → stub it; a read
+        // AT/ABOVE the boundary is recent → keep it full. Non-read tools always stub.
+        let msgs = vec![
+            Message::user("u"),
+            asst_call("r_old", "read_file"),
+            Message::tool_result("r_old", &big("old file"), false), // idx 2: OLD read
+            asst_call("b1", "bash"),
+            Message::tool_result("b1", &big("bash out"), false), // idx 4: recent bash
+            asst_call("r_new", "read_file"),
+            Message::tool_result("r_new", &big("new file"), false), // idx 6: RECENT read
+        ];
+        let exempt_from = 5; // reads at idx >= 5 are recent
+        let rw = OverflowCompaction::aggressive_stub_rewrites(&msgs, 0, msgs.len(), exempt_from);
+        assert!(
+            rw.iter()
+                .any(|(i, s)| *i == 2 && s.starts_with("[read_file ")),
+            "old read (below boundary) must stub: {rw:?}"
+        );
+        assert!(
+            rw.iter().any(|(i, s)| *i == 4 && s.starts_with("[bash ")),
+            "recent bash still stubs (only reads are exempt): {rw:?}"
+        );
+        assert!(
+            !rw.iter().any(|(i, _)| *i == 6),
+            "recent read (at/above boundary) must be exempt: {rw:?}"
+        );
+    }
+
     #[tokio::test]
-    async fn overflow_tier0_stubs_all_tool_results_even_read_file() {
-        // Aggressive: read_file is NOT exempt under overflow, and active-turn results stub too.
+    async fn overflow_tier0_exempts_recent_read_but_stubs_other_tools() {
+        // Regression for the report: under overflow, a RECENT read_file must stay full
+        // (the model must not go blind on a file it just read); other recent tools still
+        // stub aggressively so tier 0 keeps shedding.
         let msgs = vec![
             Message::system("persona"),
             Message::user("u1"),
-            asst_call("r1", "read_file"),
+            asst_call("b1", "bash").also(asst_call("r1", "read_file")),
+            Message::tool_result("b1", &big("bash out"), false),
             Message::tool_result("r1", &big("file body"), false),
         ];
         let mut conv = Conversation::new();
@@ -1221,14 +1292,16 @@ mod tests {
             .plan(&overflow_view(&conv.messages, floor, 0, 8000))
             .await;
         let report = conv.apply_plan(plan, floor);
+        assert!(report.committed, "tier 0 must still stub the bash result");
         assert!(
-            report.committed,
-            "tier 0 must stub the read_file result under overflow"
+            conv.messages[3].text.starts_with("[bash "),
+            "recent bash → stub: {:?}",
+            conv.messages[3].text
         );
         assert!(
-            conv.messages[3].text.starts_with("[read_file "),
-            "read_file stubbed: {:?}",
-            conv.messages[3].text
+            conv.messages[4].text.len() > MIN_COLLAPSE_SIZE,
+            "recent read_file → exempt, stays full: {:?}",
+            conv.messages[4].text
         );
     }
 

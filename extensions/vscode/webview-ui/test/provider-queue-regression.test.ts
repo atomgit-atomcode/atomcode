@@ -2570,7 +2570,66 @@ async function testPollActiveSessionRecoveryCancellationDoesNotForceReset() {
     'isGenerating should remain true after timeout (no force reset)');
 }
 
+// Bug A2: stopping a turn (or an error / abnormal completion) must NOT silently discard
+// the messages the user queued while it ran — restore their text to the input box so the
+// user can edit/resend, instead of losing it with no confirmation or recovery.
+async function testStopRestoresQueuedMessagesToInputInsteadOfDiscarding() {
+  const posted: Array<{ type?: string; text?: string }> = [];
+  const provider = new ChatViewProvider(
+    { fsPath: '/extension' } as never,
+    { stopGeneration: async () => ({ success: true }) } as never,
+  );
+  const unsafeProvider = provider as unknown as {
+    _sessionRuntimes: Map<string, Record<string, unknown>>;
+    _view: unknown;
+    _activeSessionId?: string;
+  };
+  unsafeProvider._view = { webview: { postMessage: (m: { type?: string; text?: string }) => posted.push(m) } };
+  unsafeProvider._activeSessionId = 'session-a';
+  unsafeProvider._sessionRuntimes.set('session-a', {
+    isGenerating: true,
+    recoveryLocked: false,
+    streamGeneration: 3,
+    abortController: { abort() {} },
+    terminalSeen: false,
+    queuedMessages: [{ text: 'queued one' }, { text: 'queued two' }],
+    eventBuffer: [],
+  });
+
+  provider.stopGeneration('session-a');
+  await new Promise((r) => setTimeout(r, 0));
+
+  const restore = posted.find((m) => m?.type === 'insertText');
+  assert.ok(restore, 'stop must restore queued text to the input box, not silently discard it');
+  assert.equal(restore?.text, 'queued one\n\nqueued two');
+  assert.equal(
+    (unsafeProvider._sessionRuntimes.get('session-a')?.queuedMessages as unknown[]).length,
+    0,
+    'the queue cards are cleared once their text is back in the input box',
+  );
+}
+
+// Invariant guard: EVERY site that clears queuedMessages on a stop/error/abnormal path
+// must restore-to-input FIRST, so a future edit can't reintroduce a silent-discard.
+function testEveryQueueClearRestoresToInputFirst() {
+  const source = readFileSync(join(process.cwd(), 'src/chat/provider.ts'), 'utf8');
+  const clearRe = /\b\w+\.queuedMessages = \[\];/g;
+  let m: RegExpExecArray | null;
+  let count = 0;
+  while ((m = clearRe.exec(source)) !== null) {
+    count += 1;
+    const preceding = source.slice(Math.max(0, m.index - 200), m.index);
+    assert.ok(
+      preceding.includes('_restoreQueuedMessagesToInput'),
+      `queuedMessages cleared at index ${m.index} without first restoring it to the input box (bug A2 regression)`,
+    );
+  }
+  assert.ok(count >= 4, `expected the 4 stop/error/abnormal clear sites, found ${count}`);
+}
+
 Promise.resolve()
+  .then(testStopRestoresQueuedMessagesToInputInsteadOfDiscarding)
+  .then(testEveryQueueClearRestoresToInputFirst)
   .then(testReadyMarksPanelOnlyAfterInitialReplay)
   .then(testPanelReadyHandlerIsInstalledBeforeWebviewBoots)
   .then(testOpeningAnExistingUnhydratedSessionTabLoadsItsHistory)

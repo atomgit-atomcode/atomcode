@@ -2,13 +2,13 @@ import assert from 'node:assert/strict';
 import { daemonIdentityMatches } from '../../src/daemon/identity';
 
 const expected = {
-  version: '5.0.9',
+  version: '5.1.0',
   binaryHash: 'bundled-build-sha256',
 };
 
 assert.equal(
   daemonIdentityMatches(
-    { version: '5.0.9', binary_hash: 'bundled-build-sha256' },
+    { version: '5.1.0', binary_hash: 'bundled-build-sha256' },
     expected,
   ),
   true,

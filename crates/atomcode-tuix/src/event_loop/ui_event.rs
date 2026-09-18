@@ -58,7 +58,9 @@ pub enum UiEvent {
     PolicyIntervention(atomcode_kernel::event::PolicyIntervention),
     ApprovalNeeded {
         tool_name: String,
-        reason: String,
+        /// Human-readable "why is this being asked" from `ApprovalRequest.reason`.
+        /// `None` for first-time approvals or events that don't carry a request reason.
+        reason: Option<String>,
         call: ToolCall,
         snapshot: SessionSnapshot,
     },

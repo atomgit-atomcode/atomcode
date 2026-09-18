@@ -945,10 +945,15 @@ pub struct Agent {
     /// Optional durable writer for committed manual compactions. `None` is an
     /// explicitly ephemeral agent; session-bound production assembly injects one.
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
-    /// LIVENESS: max time to wait for the NEXT stream event (bounds both
-    /// first-token and inter-token latency). `None` (default) = unbounded. See
+    /// LIVENESS: max wait for the NEXT stream event AFTER the first content byte
+    /// (inter-token latency). `None` (default) = unbounded. See
     /// `AgentBuilder::stream_timeout`.
     stream_timeout: Option<std::time::Duration>,
+    /// LIVENESS: max wait for the FIRST content byte (prefill / time-to-first-token),
+    /// which can far exceed inter-token latency on a slow local model with a large
+    /// prompt. `None` ⇒ fall back to `stream_timeout`. See
+    /// `AgentBuilder::first_token_timeout`.
+    first_token_timeout: Option<std::time::Duration>,
     /// LIVENESS: max time a mid-turn `rt.request(...)` round-trip waits for the
     /// driver's `Respond` before degrading to `Value::Null`. `None` (default) =
     /// unbounded. See `AgentBuilder::request_timeout`.
@@ -1054,6 +1059,7 @@ impl Agent {
             compact_threshold: self.compact_threshold,
             compaction_checkpoint: self.compaction_checkpoint,
             stream_timeout: self.stream_timeout,
+            first_token_timeout: self.first_token_timeout,
             chat_options: self.chat_options,
             // Resolve the effective working dir into a single shared handle: an explicit
             // `shared_cwd` wins; else wrap the immutable `working_dir` pin so the snapshot
@@ -1166,8 +1172,12 @@ struct RunningAgent {
     compaction: Arc<dyn CompactionStrategy>,
     compact_threshold: Option<f32>,
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
-    /// LIVENESS: per-stream-event wait bound. `None` = unbounded (no timer arm).
+    /// LIVENESS: per-stream-event wait bound AFTER the first content byte. `None` =
+    /// unbounded (no timer arm).
     stream_timeout: Option<std::time::Duration>,
+    /// LIVENESS: wait bound for the FIRST content byte (prefill). `None` ⇒ use
+    /// `stream_timeout`.
+    first_token_timeout: Option<std::time::Duration>,
     /// NEUTRAL per-call provider request knobs forwarded to `chat_stream` every
     /// round (see `Agent::chat_options`). Default = a neutral request.
     chat_options: ChatOptions,
@@ -1935,15 +1945,35 @@ impl RunningAgent {
         ctx: &TurnCtx,
         internal_cancel: bool,
     ) {
-        if self.keep_interrupted_context {
+        // PRESERVE mode keeps WORK, not an abandoned prompt. A turn cancelled before the
+        // assistant produced anything (persisted no assistant/tool message) has no progress
+        // to keep — preserving its bare user message only contaminates the NEXT turn: a weak
+        // model reads the abandoned prompt as live intent (the reported bug where a cancelled
+        // "commit + push to release/x" leaked into an unrelated follow-up). So an EMPTY
+        // cancelled turn rolls back even in preserve mode; the TUI still restores the prompt
+        // to the input box for edit-and-resend. Mirrors oh-my-pi dropping interrupted turns
+        // that produced nothing before the next prompt.
+        // `get(rollback_len..)` not direct indexing: a mid-turn overflow compaction can shrink
+        // history BELOW `rollback_len` (documented on the truncate below), and a bare slice
+        // would panic there. None ⇒ no tail ⇒ no work ⇒ undo (the truncate stays a safe no-op).
+        let turn_did_work = convo.messages.get(rollback_len..).is_some_and(|tail| {
+            tail.iter().any(|m| {
+                matches!(
+                    m.role,
+                    crate::message::Role::Assistant | crate::message::Role::Tool
+                )
+            })
+        });
+        if self.keep_interrupted_context && turn_did_work {
             // PRESERVE: keep this turn's partial assistant/tool work; backfill a
             // `(cancelled)` result for every dangling tool_call so the wire stays
             // API-valid. APPEND-ONLY — prefix-cache safe. Mirrors v1's
             // `Conversation::cancel_current_turn`.
             convo.backfill_cancelled_tool_results();
         } else {
-            // CANCEL = UNDO (default): roll back to before the user message so the
-            // cancelled prompt + partial work leaves NO trace.
+            // CANCEL = UNDO: roll back to before the user message so the cancelled prompt +
+            // partial work leaves NO trace. Taken for the kernel-default undo mode AND for an
+            // empty cancel in preserve mode (nothing worth keeping).
             convo.messages.truncate(rollback_len);
         }
         if !internal_cancel {
@@ -2549,6 +2579,18 @@ impl RunningAgent {
                 // mid-stream StreamEvent::Error: on_error + Error + TurnComplete +
                 // return (no partial assistant pushed, no fake success). `biased`
                 // keeps cancel first; the timer is tried before the (silent) stream.
+                //
+                // PHASE-AWARE bound: before the first content byte, use the (typically
+                // longer) `first_token_timeout` — prefill on a slow local model with a
+                // large prompt can take minutes before the first byte; once content has
+                // streamed, `stream_timeout` bounds inter-token latency. Recomputed each
+                // loop turn so it flips the instant the first byte lands.
+                // `first_token_timeout: None` ⇒ `stream_timeout` bounds both (prior behaviour).
+                let idle_timeout = if saw_stream_content {
+                    self.stream_timeout
+                } else {
+                    self.first_token_timeout.or(self.stream_timeout)
+                };
                 let ev = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
@@ -2561,7 +2603,7 @@ impl RunningAgent {
                         .await;
                         return;
                     }
-                    _ = async { tokio::time::sleep(self.stream_timeout.unwrap()).await }, if self.stream_timeout.is_some() => {
+                    _ = async { tokio::time::sleep(idle_timeout.unwrap()).await }, if idle_timeout.is_some() => {
                         // STREAM IDLE TIMEOUT: no event for `stream_timeout`. Rather than
                         // fail the turn outright, RECONNECT up to MAX_STREAM_RETRIES times
                         // (codex parity) — re-issue the SAME round from history (the
@@ -2575,8 +2617,26 @@ impl RunningAgent {
                         // stays capped by `partial_stream_recoveries` below.
                         if !saw_stream_content && stream_retry < MAX_STREAM_RETRIES {
                             stream_retry += 1;
+                            // Surface the tuning knob ONCE (first reconnect only, no spam): a
+                            // slow local / large-context model whose prefill legitimately
+                            // exceeds the idle window should RAISE the timeout, not reconnect
+                            // (a reconnect re-issues the round and restarts that same prefill).
+                            // This branch is content-free (`!saw_stream_content`), i.e. the
+                            // PREFILL phase, so the knob that actually governs it is
+                            // `first_token_timeout` when set — point users at THAT one, else
+                            // fall back to naming the `stream_timeout` knob (the None-first_token
+                            // case where prefill is bounded by stream_timeout).
+                            let tuning_hint = if stream_retry == 1 {
+                                if self.first_token_timeout.is_some() {
+                                    " · 慢的本地/大 context 模型 prefill 慢可调高 ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS(默认 600s)"
+                                } else {
+                                    " · 慢的本地/大 context 模型可调高 ATOMCODE_STREAM_TIMEOUT_SECS(默认 300s)"
+                                }
+                            } else {
+                                ""
+                            };
                             self.rt.emit(AgentEvent::Warning(format!(
-                                "stream idle timeout — reconnecting ({stream_retry}/{MAX_STREAM_RETRIES})"
+                                "stream idle timeout — reconnecting ({stream_retry}/{MAX_STREAM_RETRIES}){tuning_hint}"
                             )));
                             // Exponential backoff: 200ms, 400, 800, 1600, 3200 (cap 8s).
                             let backoff = std::time::Duration::from_millis(
@@ -4115,6 +4175,7 @@ pub struct AgentBuilder {
     compact_threshold: Option<f32>,
     compaction_checkpoint: Option<Arc<dyn CompactionCheckpoint>>,
     stream_timeout: Option<std::time::Duration>,
+    first_token_timeout: Option<std::time::Duration>,
     request_timeout: Option<std::time::Duration>,
     chat_options: ChatOptions,
     /// SEAM 1: optional per-agent working dir (see `Agent::working_dir`).
@@ -4170,6 +4231,7 @@ impl Default for AgentBuilder {
             // Production SHOULD set both (see the builder methods) so a turn can
             // never park forever on a stalled provider or a silent driver.
             stream_timeout: None,
+            first_token_timeout: None,
             request_timeout: None,
             // NEUTRAL default: a no-opinion request (all None + ToolChoice::Auto).
             // The provider receives `ChatOptions::default()` unless a specialization
@@ -4350,6 +4412,15 @@ impl AgentBuilder {
         self.stream_timeout = Some(d);
         self
     }
+    /// LIVENESS: the FIRST-content-byte (prefill / time-to-first-token) wait bound. A
+    /// slow local model with a large prompt can take minutes before its first byte —
+    /// far longer than the inter-token `stream_timeout` — so set this LONGER, otherwise
+    /// the prefill is cut off and RE-ISSUED mid-way (restarting the same slow prefill).
+    /// `None` ⇒ `stream_timeout` bounds both phases (prior behaviour).
+    pub fn first_token_timeout(mut self, d: std::time::Duration) -> Self {
+        self.first_token_timeout = Some(d);
+        self
+    }
     /// LIVENESS: bound how long a mid-turn `rt.request(...)` round-trip (e.g. an
     /// approval middleware awaiting the driver) waits for the driver's `Respond`.
     /// When set and the driver does not answer within `d` (a crashed/silent/
@@ -4469,6 +4540,7 @@ impl AgentBuilder {
             compact_threshold: self.compact_threshold,
             compaction_checkpoint: self.compaction_checkpoint,
             stream_timeout: self.stream_timeout,
+            first_token_timeout: self.first_token_timeout,
             request_timeout: self.request_timeout,
             chat_options: self.chat_options,
             working_dir: self.working_dir,

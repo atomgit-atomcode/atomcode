@@ -22,7 +22,7 @@ use serde::{de::IgnoredAny, Deserialize, Serialize};
 use super::presentation::{
     DisplayAnchor, PresentationEntry, PresentationFile, PresentationRole, MAX_PRESENTATION_BYTES,
 };
-use super::transcript::{TurnTimestamp, RECORD_VERSION};
+use super::transcript::{TurnRecord, TurnTimestamp, RECORD_VERSION};
 
 /// Fast-listing metadata for ONE session — read to populate a `/resume` picker WITHOUT
 /// parsing the (large) snapshot / transcript files. Persisted as `<id>.meta`.
@@ -2940,6 +2940,14 @@ impl SessionManager {
         scan_catalog_cached(sessions_root)
     }
 
+    /// Scan ONLY one project bucket under `sessions_root` (no cross-bucket walk).
+    /// The `-c`/resume fast path uses this to avoid walking every project on a
+    /// large history; see [`scan_catalog_single_bucket`]. Not cached (a single
+    /// bucket is already cheap, and it must not collide with the full-root cache).
+    pub fn scan_catalog_bucket(sessions_root: &Path, bucket: &str) -> CatalogScan {
+        scan_catalog_single_bucket(sessions_root, bucket)
+    }
+
     /// Collapse automatic fork aggregates into one newest logical conversation
     /// row per project. Exact-ID loading and the raw catalog remain unchanged.
     pub fn collapse_fork_lineages(entries: &mut Vec<CatalogEntry>) {
@@ -3140,6 +3148,50 @@ impl SessionManager {
             Ok(())
         })?;
         Ok(timestamps)
+    }
+
+    /// Load the FULL per-turn transcript for `id` from `<id>.jsonl` — the same
+    /// never-compacted ground truth the `recall` tool reads. Unlike the runtime
+    /// snapshot, this is UNAFFECTED by compaction, so a UI can show the complete
+    /// session trajectory (including turns compaction dropped from the snapshot).
+    /// A missing file is an empty transcript (the session may not have completed a
+    /// turn yet); memory is bounded by the same `MAX_JSONL_*` caps recall uses.
+    pub fn load_transcript_records(&self, id: &str) -> SessionResult<Vec<TurnRecord>> {
+        let path = self.jsonl_path(id)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(io_at(&path, error)),
+        }
+        // `for_each_jsonl_line` already gates the file at `MAX_JSONL_BYTES` before reading,
+        // so no separate byte pre-check is needed. The per-line count cap below is the one
+        // guard we add over the sibling `load_transcript_timestamps`: we accumulate a `Vec`
+        // of full records (it only builds a turn-keyed map), so bound the record count too.
+        let mut out = Vec::new();
+        for_each_jsonl_line(&path, |line| {
+            if out.len() >= MAX_JSONL_LINES {
+                return Err(SessionStoreError::TooLarge {
+                    kind: "session transcript lines",
+                    limit: MAX_JSONL_LINES,
+                    actual: out.len() + 1,
+                });
+            }
+            let record: TurnRecord =
+                serde_json::from_slice(line).map_err(|error| SessionStoreError::Corrupt {
+                    kind: "transcript record",
+                    message: format!("{}: {error}", path.display()),
+                })?;
+            if record.v > RECORD_VERSION {
+                return Err(SessionStoreError::FutureSchema {
+                    kind: "transcript record",
+                    found: record.v,
+                    supported: RECORD_VERSION,
+                });
+            }
+            out.push(record);
+            Ok(())
+        })?;
+        Ok(out)
     }
 
     fn ensure_native_writable(&self, id: &str, operation: &'static str) -> SessionResult<()> {
@@ -3381,6 +3433,13 @@ fn scan_bucket_into(bucket: &str, bucket_path: &Path, out: &mut BucketPartial) {
             .or_else(|| name.strip_suffix(".index"))
         {
             Some((id, false))
+        } else if name.ends_with(".images.json") || name.ends_with(".todos.json") {
+            // Per-session sidecars (image payloads / todo lists), NOT catalog
+            // sources. Skip by NAME so we never read + JSON-parse them: an images
+            // sidecar can be hundreds of KB, and previously every one was fully
+            // parsed as a legacy session, rejected, and logged — once per file,
+            // per bucket. On a large history that dominated `-c`/resume startup.
+            None
         } else if let Some(id) = name.strip_suffix(".json") {
             if let Some(presentation_id) = name.strip_suffix(".ui.json") {
                 let has_native_companion = ["meta", "snapshot", "jsonl", "index", "events"]
@@ -3581,10 +3640,37 @@ pub(super) fn scan_catalog_root(sessions_root: &Path) -> CatalogScan {
         })
     };
 
-    // Phase 3 (serial merge): fold the per-worker partials together. Session keys are
-    // bucket-scoped and each bucket is scanned by exactly one worker, so a given key
-    // appears in at most one partial — `or_insert`/field-set never actually conflict;
-    // the combine is defensive. The single deterministic sort below fixes ordering.
+    finalize_catalog_scan(partials, scan)
+}
+
+/// Scan ONLY one project bucket under `sessions_root` (no cross-bucket walk).
+/// The `-c`/resume fast path uses this: nearly every session lives in the bucket
+/// that hashes from its working dir, so scanning that single bucket avoids walking
+/// all projects (hundreds of buckets / thousands of files on a large history).
+/// A missing/non-dir bucket returns an empty scan (no diagnostics) — the caller
+/// falls back to the full cross-project scan when nothing matches there.
+fn scan_catalog_single_bucket(sessions_root: &Path, bucket: &str) -> CatalogScan {
+    let scan = CatalogScan::default();
+    if !valid_project_bucket(bucket) {
+        return scan;
+    }
+    let bucket_path = sessions_root.join(bucket);
+    match fs::symlink_metadata(&bucket_path) {
+        Ok(meta) if meta.is_dir() => {}
+        _ => return scan,
+    }
+    let mut partial = BucketPartial::default();
+    scan_bucket_into(bucket, &bucket_path, &mut partial);
+    finalize_catalog_scan(vec![partial], scan)
+}
+
+/// Phase 3 of a catalog scan: fold per-bucket partials into sorted entries and
+/// diagnostics. Session keys are bucket-scoped and each bucket is scanned by
+/// exactly one worker, so a given key appears in at most one partial —
+/// `or_insert`/field-set never actually conflict; the combine is defensive. The
+/// single deterministic sort fixes ordering. Shared by the full-root and
+/// single-bucket scanners so both produce identical `CatalogEntry` shapes.
+fn finalize_catalog_scan(partials: Vec<BucketPartial>, mut scan: CatalogScan) -> CatalogScan {
     let mut sessions: BTreeMap<(String, String), CatalogAggregate> = BTreeMap::new();
     let mut native_meta_ids: BTreeSet<(String, String)> = BTreeSet::new();
     let mut native_sidecars: BTreeMap<(String, String), PathBuf> = BTreeMap::new();
@@ -4656,6 +4742,42 @@ mod tests {
         assert_eq!(timestamps[&7].completed_at, 1_700_000_000_123);
         assert_eq!(timestamps[&8].started_at, None);
         assert_eq!(timestamps[&8].completed_at, 1_700_000_001_123);
+    }
+
+    #[test]
+    fn transcript_records_load_full_bodies_and_missing_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_root(dir.path());
+        // Missing transcript → empty, not an error.
+        assert!(mgr.load_transcript_records("missing").unwrap().is_empty());
+
+        for turn in 1..=3u64 {
+            let line = serde_json::json!({
+                "v": 1,
+                "ts": 1_700_000_000_000_i64 + turn as i64,
+                "iso": "2023-11-14T22:13:20.000Z",
+                "session_id": "s1",
+                "turn_id": turn,
+                "undone": false,
+                "user": format!("question {turn}"),
+                "assistant": format!("answer {turn}"),
+                "tools": [],
+                "usage": { "prompt": 1, "completion": 2, "cached": 0 }
+            });
+            let mut bytes = serde_json::to_vec(&line).unwrap();
+            bytes.push(b'\n');
+            mgr.append_jsonl_line("s1", &bytes).unwrap();
+        }
+
+        // The FULL trajectory comes back — every turn with its raw bodies, including
+        // the early turns a snapshot compaction would have dropped. This is the read
+        // the daemon transcript endpoint serves to the UI.
+        let records = mgr.load_transcript_records("s1").unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].turn_id, 1);
+        assert_eq!(records[0].user, "question 1");
+        assert_eq!(records[0].assistant, "answer 1");
+        assert_eq!(records[2].user, "question 3");
     }
 
     fn presentation_entry(anchor: DisplayAnchor, text: &str) -> PresentationEntry {
@@ -6209,6 +6331,67 @@ mod tests {
             scan.diagnostics.is_empty(),
             "rewind sidecars must not be parsed as legacy session JSON: {:?}",
             scan.diagnostics
+        );
+    }
+
+    #[test]
+    fn catalog_skips_images_and_todos_sidecars_without_parsing_them() {
+        let root = tempfile::tempdir().unwrap();
+        let bucket = root.path().join("0123456789abcdef");
+        let manager = SessionManager::with_root(&bucket);
+        let id = "sidecar-skip";
+        manager
+            .write_meta(&SessionMeta::new(id, "/project", 1))
+            .unwrap();
+        // Per-session sidecars that are NOT valid session JSON (no `id` field);
+        // the images payload is large enough that parsing it would be wasteful.
+        // Before the fix these were read + JSON-parsed as legacy sessions, then
+        // rejected + logged once per file, per bucket — a big `-c`/resume cost.
+        std::fs::write(
+            bucket.join(format!("{id}.images.json")),
+            format!("{{\"data\":\"{}\"}}", "x".repeat(200_000)),
+        )
+        .unwrap();
+        std::fs::write(bucket.join(format!("{id}.todos.json")), "{\"items\":[]}").unwrap();
+
+        let scan = SessionManager::scan_catalog(root.path());
+
+        assert_eq!(scan.entries.len(), 1, "only the real session is cataloged");
+        assert_eq!(scan.entries[0].id, id);
+        assert!(
+            scan.diagnostics.is_empty(),
+            "images/todos sidecars must be skipped by name, not parsed + rejected: {:?}",
+            scan.diagnostics
+        );
+    }
+
+    #[test]
+    fn scan_catalog_bucket_reads_only_the_target_bucket() {
+        let root = tempfile::tempdir().unwrap();
+        let target = "1111111111111111";
+        let other = "2222222222222222";
+        write_legacy_catalog_session(&root.path().join(target), "mine", "/mine", 1);
+        write_legacy_catalog_session(&root.path().join(other), "theirs", "/theirs", 2);
+
+        // Single-bucket scan sees ONLY the target bucket's session.
+        let scan = SessionManager::scan_catalog_bucket(root.path(), target);
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].id, "mine");
+
+        // Full-root scan still sees both — the fast path is a subset, not a change.
+        let full = SessionManager::scan_catalog(root.path());
+        assert_eq!(full.entries.len(), 2);
+
+        // Missing / invalid buckets are empty and quiet (caller falls back).
+        assert!(
+            SessionManager::scan_catalog_bucket(root.path(), "3333333333333333")
+                .entries
+                .is_empty()
+        );
+        assert!(
+            SessionManager::scan_catalog_bucket(root.path(), "not-a-bucket")
+                .entries
+                .is_empty()
         );
     }
 

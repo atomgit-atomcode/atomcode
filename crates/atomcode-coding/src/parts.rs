@@ -592,6 +592,7 @@ async fn prepare_with_plugin_hooks_reusing_lease(
                     model: cfg.model.clone(),
                     context_window: cfg.context_window,
                     stream_timeout: cfg.stream_timeout,
+                    first_token_timeout: cfg.first_token_timeout,
                     request_timeout: cfg
                         .request_timeout
                         .unwrap_or_else(|| std::time::Duration::from_secs(300)),

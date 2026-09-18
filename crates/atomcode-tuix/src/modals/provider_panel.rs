@@ -61,9 +61,14 @@ struct AddForm {
 }
 
 /// Protocol presets the fully-custom add/edit form cycles through with `←/→`,
-/// in display order. Each id resolves to a real `PRESETS` entry: the two generic
+/// in display order. Each id resolves to a real `PRESETS` entry: the generic
 /// `*-compatible` custom endpoints plus the keyless local `ollama` preset.
-const CYCLE_PROTOCOL_IDS: [&str; 3] = ["openai-compatible", "anthropic-compatible", "ollama"];
+const CYCLE_PROTOCOL_IDS: [&str; 4] = [
+    "openai-compatible",
+    "anthropic-compatible",
+    "ollama",
+    "openai-responses",
+];
 
 /// `PRESETS` index for a preset id (falls back to the first entry).
 fn preset_idx_by_id(id: &str) -> usize {
@@ -82,6 +87,7 @@ fn protocol_preset_idx(ty: provider_preset::ProviderType) -> usize {
         provider_preset::ProviderType::Anthropic => "anthropic-compatible",
         provider_preset::ProviderType::Ollama => "ollama",
         provider_preset::ProviderType::OpenAi => "openai-compatible",
+        provider_preset::ProviderType::Responses => "openai-responses",
     })
 }
 
@@ -92,6 +98,7 @@ fn protocol_label(ty: provider_preset::ProviderType) -> &'static str {
         provider_preset::ProviderType::Anthropic => "Anthropic",
         provider_preset::ProviderType::Ollama => "Ollama",
         provider_preset::ProviderType::OpenAi => "OpenAI",
+        provider_preset::ProviderType::Responses => "OpenAI Responses",
     }
 }
 
@@ -2422,13 +2429,17 @@ mod tests {
         );
         assert!(f.base_url.is_empty());
         assert_eq!(f.protocol_label(), "OpenAI");
-        // ←→ cycles OpenAI → Anthropic → Ollama → OpenAI (never a vendor list).
+        // ←→ cycles OpenAI → Anthropic → Ollama → Responses → OpenAI (never a
+        // vendor list).
         f.cycle_preset(true);
         assert_eq!(f.protocol_label(), "Anthropic");
         assert_eq!(f.preset().id, "anthropic-compatible");
         f.cycle_preset(true);
         assert_eq!(f.protocol_label(), "Ollama");
         assert_eq!(f.preset().id, "ollama");
+        f.cycle_preset(true);
+        assert_eq!(f.protocol_label(), "OpenAI Responses");
+        assert_eq!(f.preset().id, "openai-responses");
         f.cycle_preset(true);
         assert_eq!(f.protocol_label(), "OpenAI");
         assert_eq!(f.preset().id, "openai-compatible");
@@ -2437,6 +2448,8 @@ mod tests {
     #[test]
     fn add_form_protocol_toggle_cycles_backward() {
         let mut f = AddForm::new(); // OpenAI
+        f.cycle_preset(false);
+        assert_eq!(f.preset().id, "openai-responses");
         f.cycle_preset(false);
         assert_eq!(f.preset().id, "ollama");
         f.cycle_preset(false);
@@ -2459,6 +2472,7 @@ mod tests {
         );
         // The field is never silently wiped when cycling away — the value stays
         // visible and editable (auto-fill only ever fills a blank field).
+        f.cycle_preset(true); // Responses
         f.cycle_preset(true); // OpenAI
         assert_eq!(f.preset().id, "openai-compatible");
         assert_eq!(f.base_url, "http://localhost:11434");
@@ -2496,7 +2510,8 @@ mod tests {
         .unwrap();
         let mut edit = ProviderPanel::open_edit(&cfg, "local");
         assert_eq!(edit.base_url, "http://localhost:11434");
-        edit.cycle_preset(true); // Ollama → OpenAI
+        edit.cycle_preset(true); // Ollama → Responses
+        edit.cycle_preset(true); // Responses → OpenAI
         assert_eq!(edit.preset().id, "openai-compatible");
         assert_eq!(
             edit.base_url, "http://localhost:11434",

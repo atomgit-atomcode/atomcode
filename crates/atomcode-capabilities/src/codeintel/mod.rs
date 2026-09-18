@@ -45,7 +45,7 @@ pub use blast_radius::BlastRadiusTool;
 pub use file_deps::FileDependenciesTool;
 pub use find_references::FindReferencesTool;
 pub use graph::{CodeGraph, Edge, EdgeKind, SymbolId, SymbolKind, SymbolNode, Visibility};
-pub use index::{build_graph, CodeIndex};
+pub use index::{build_graph, CodeIndex, IndexError, IndexLimits};
 pub use lang::Lang;
 pub use list_symbols::ListSymbolsTool;
 pub use read_symbol::ReadSymbolTool;

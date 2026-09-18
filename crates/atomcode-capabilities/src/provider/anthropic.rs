@@ -66,7 +66,12 @@ pub struct AnthropicConfig {
     /// with `thinking`.
     pub send_sampling_params: bool,
     /// Per-chunk stream-idle watchdog: no bytes for this long ⇒ terminal error.
+    /// Governs the INTER-token phase (after the first byte of a stream).
     pub idle_timeout: Duration,
+    /// FIRST-byte (prefill / TTFB) idle watchdog: no bytes for this long BEFORE the
+    /// first byte of a (re)opened stream ⇒ terminal error. Separate from (and ≥)
+    /// `idle_timeout`; wired from the coding-layer `first_token_timeout`.
+    pub first_token_timeout: Duration,
     pub connect_timeout: Duration,
     /// Per-ATTEMPT first-byte (TTFB) watchdog for the OPEN call — see the matching
     /// field on `OpenAiCompatConfig`. A gateway that accepts the connection but never
@@ -101,6 +106,7 @@ impl AnthropicConfig {
             thinking: false,
             send_sampling_params: false,
             idle_timeout: Duration::from_secs(120),
+            first_token_timeout: Duration::from_secs(120),
             open_timeout: Duration::from_secs(90),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
@@ -188,6 +194,7 @@ impl LlmProvider for AnthropicProvider {
         // Snapshot the session id once; reused across the open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
+        let first_token = self.cfg.first_token_timeout;
         let open_timeout = self.cfg.open_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
         let resp = open_stream(
@@ -219,8 +226,20 @@ impl LlmProvider for AnthropicProvider {
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
+                // PHASE-AWARE byte-idle watchdog: prefill (before the first byte of this
+                // (re)opened stream) waits up to `first_token`; after the first byte we
+                // tighten to the inter-token `idle`. See openai_compat for the rationale.
+                // Reset per (re)open — a transparent reconnect restarts prefill.
+                let mut first_byte_seen = false;
                 loop {
-                    match tokio::time::timeout(idle, byte_stream.next()).await {
+                    match retry::next_chunk_phased(
+                        &mut byte_stream,
+                        first_token,
+                        idle,
+                        &mut first_byte_seen,
+                    )
+                    .await
+                    {
                         Err(_elapsed) => {
                             yield StreamEvent::Error(ProviderError {
                                 retryable: false,
@@ -764,6 +783,13 @@ fn error_type(err: &serde_json::Value) -> Option<String> {
 // SSE decoding (unit-testable, no network)
 // ---------------------------------------------------------------------------
 
+/// Upper bound on a streamed content-block `index`. `block_mut` pads `blocks` up to the
+/// index, so an out-of-range one from a buggy/malicious server (e.g. `index: 999_999_999`)
+/// would allocate a gigantic vector → OOM. Real responses index blocks densely from 0 and
+/// never approach this; a larger index is malformed and its event is dropped. Same guard
+/// (and same rationale) as `openai_compat`'s `MAX_TOOL_CALLS`.
+const MAX_BLOCKS: usize = 256;
+
 /// In-flight state for one content block (by index).
 #[derive(Default)]
 struct BlockState {
@@ -863,11 +889,21 @@ impl AnthropicSseDecoder {
         }
     }
 
-    fn block_mut(&mut self, index: usize) -> &mut BlockState {
+    /// Grow `blocks` so slot `index` exists, then return it. Returns `None` (allocating
+    /// nothing) for a pathological `index` so a buggy/hostile server can't OOM us — see
+    /// [`MAX_BLOCKS`]. Never silently dropped: a refused index is traced so a broken
+    /// upstream is diagnosable rather than an invisible lost block.
+    fn block_mut(&mut self, index: usize) -> Option<&mut BlockState> {
+        if index >= MAX_BLOCKS {
+            tracing::warn!(
+                "anthropic: refusing content block at pathological index {index} (>= {MAX_BLOCKS})"
+            );
+            return None;
+        }
         while self.blocks.len() <= index {
             self.blocks.push(BlockState::default());
         }
-        &mut self.blocks[index]
+        Some(&mut self.blocks[index])
     }
 
     fn process_line(&mut self, line: &str, out: &mut Vec<StreamEvent>) {
@@ -926,11 +962,12 @@ impl AnthropicSseDecoder {
                     .and_then(|s| s.as_str())
                     .unwrap_or("")
                     .to_string();
-                let b = self.block_mut(index);
-                b.kind = kind;
-                b.id = id;
-                b.name = name;
-                b.redacted_data = data;
+                if let Some(b) = self.block_mut(index) {
+                    b.kind = kind;
+                    b.id = id;
+                    b.name = name;
+                    b.redacted_data = data;
+                }
             }
             "content_block_delta" => {
                 let index = usize_at(&v, "index");
@@ -963,7 +1000,9 @@ impl AnthropicSseDecoder {
                             .and_then(|d| d.get("signature"))
                             .and_then(|s| s.as_str())
                         {
-                            self.block_mut(index).signature.push_str(s);
+                            if let Some(b) = self.block_mut(index) {
+                                b.signature.push_str(s);
+                            }
                         }
                     }
                     "input_json_delta" => {
@@ -972,14 +1011,16 @@ impl AnthropicSseDecoder {
                             .and_then(|s| s.as_str())
                             .unwrap_or("")
                             .to_string();
-                        self.block_mut(index).input_json.push_str(&frag);
-                        // Live display fragment; the WHOLE call is emitted at stop.
-                        out.push(StreamEvent::ToolCallDelta {
-                            index: index as u32,
-                            id: None,
-                            name: None,
-                            arguments: frag,
-                        });
+                        if let Some(b) = self.block_mut(index) {
+                            b.input_json.push_str(&frag);
+                            // Live display fragment; the WHOLE call is emitted at stop.
+                            out.push(StreamEvent::ToolCallDelta {
+                                index: index as u32,
+                                id: None,
+                                name: None,
+                                arguments: frag,
+                            });
+                        }
                     }
                     _ => {}
                 }
@@ -1619,6 +1660,67 @@ mod tests {
     }
 
     // ---- SSE decoding ----
+
+    #[test]
+    fn sse_hostile_content_block_index_is_dropped_not_oom() {
+        // A buggy/malicious server sending a huge `index` must NOT pad `blocks` up to
+        // that value (`while blocks.len() <= index { push }`) — index 999_999_999 would
+        // allocate ~a billion slots → OOM. The events that ADDRESS a block by index
+        // (`content_block_start` / `signature_delta` / `input_json_delta`, all via
+        // `block_mut`) are dropped; a legitimate index-0 block in the same stream still
+        // assembles. (`text_delta`/`thinking_delta` never index a block, so they allocate
+        // nothing and are out of scope for this guard.)
+        let mut d = AnthropicSseDecoder::new();
+        let mut ev = Vec::new();
+        ev.extend(d.feed(line("content_block_start", json!({"type":"content_block_start","index":999999999,"content_block":{"type":"tool_use","id":"evil","name":"pwn","input":{}}})).as_bytes()));
+        ev.extend(d.feed(line("content_block_delta", json!({"type":"content_block_delta","index":999999999,"delta":{"type":"input_json_delta","partial_json":"{\"x\":1}"}})).as_bytes()));
+        // legit block at index 0 in the SAME stream
+        ev.extend(d.feed(line("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_ok","name":"read","input":{}}})).as_bytes()));
+        ev.extend(d.feed(line("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a\"}"}})).as_bytes()));
+        ev.extend(
+            d.feed(
+                line(
+                    "content_block_stop",
+                    json!({"type":"content_block_stop","index":0}),
+                )
+                .as_bytes(),
+            ),
+        );
+        ev.extend(d.feed(line("message_stop", json!({"type":"message_stop"})).as_bytes()));
+
+        assert!(
+            d.blocks.len() <= MAX_BLOCKS,
+            "blocks must stay bounded by MAX_BLOCKS, got {}",
+            d.blocks.len()
+        );
+        let calls: Vec<_> = ev
+            .iter()
+            .filter_map(|e| {
+                if let StreamEvent::ToolCall(t) = e {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "only the in-range call is emitted: {calls:?}"
+        );
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].id, "tu_ok");
+        assert!(
+            calls.iter().all(|c| c.name != "pwn"),
+            "the out-of-range (hostile) block must be dropped, not executed"
+        );
+        assert!(
+            !ev.iter().any(
+                |e| matches!(e, StreamEvent::ToolCallDelta { index, .. } if *index == 999999999)
+            ),
+            "no live fragment may be emitted for the out-of-range index"
+        );
+    }
 
     fn kinds(ev: &[StreamEvent]) -> Vec<&'static str> {
         ev.iter()

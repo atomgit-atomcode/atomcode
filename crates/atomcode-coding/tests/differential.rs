@@ -3214,27 +3214,40 @@ async fn a_strong_model_is_not_nudged_and_the_pointer_is_not_doubled() {
 // `~/.atomcode/datalog`, and a rig that writes to the developer's home is not a
 // rig.
 
-/// Everything the datalog wrote, markdown and jsonl, as (markdown, jsonl).
-fn datalog_files(root: &std::path::Path) -> (String, String) {
+/// Everything the datalog wrote: markdown, the per-round request jsonl, and the
+/// content-addressed store those records reference their bodies by.
+///
+/// The cas file shares the `jsonl` extension, so it is matched on the full name
+/// and kept apart: its lines are interned bodies (`{"i":…,"c":…}`), not request
+/// records. Counting it in with the records would report one "record" per
+/// message body.
+fn datalog_files(root: &std::path::Path) -> (String, String, String) {
     let mut markdown = String::new();
     let mut jsonl = String::new();
-    fn walk(dir: &std::path::Path, markdown: &mut String, jsonl: &mut String) {
+    let mut cas = String::new();
+    fn walk(dir: &std::path::Path, markdown: &mut String, jsonl: &mut String, cas: &mut String) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                walk(&path, markdown, jsonl);
+                walk(&path, markdown, jsonl, cas);
             } else if path.extension().is_some_and(|e| e == "md") {
                 markdown.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
-            } else if path.extension().is_some_and(|e| e == "jsonl") {
-                jsonl.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            } else {
+                let name = path.file_name().and_then(|name| name.to_str());
+                let Some(name) = name else { continue };
+                if name.ends_with(".cas.jsonl") {
+                    cas.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+                } else if name.ends_with(".jsonl") {
+                    jsonl.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+                }
             }
         }
     }
-    walk(root, &mut markdown, &mut jsonl);
-    (markdown, jsonl)
+    walk(root, &mut markdown, &mut jsonl, &mut cas);
+    (markdown, jsonl, cas)
 }
 
 #[tokio::test]
@@ -3277,7 +3290,7 @@ async fn the_datalog_records_the_same_turn_on_both_engines() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     for (who, root) in [("行式", logs.join("rows"))] {
-        let (markdown, jsonl) = datalog_files(&root);
+        let (markdown, jsonl, cas) = datalog_files(&root);
         assert!(
             !markdown.is_empty() && !jsonl.is_empty(),
             "{who}: 什么都没写 —— 这条场景对空目录和对满目录一样绿,所以先验这个"
@@ -3306,14 +3319,19 @@ async fn the_datalog_records_the_same_turn_on_both_engines() {
             .map(|l| serde_json::from_str(l).expect("每行都得是 JSON"))
             .collect();
         assert_eq!(records.len(), 2, "{who}: 两轮模型调用,两条记录");
+        // v2 records reference message/tool bodies by integer id; the bodies live
+        // once in the cas store. Rehydrate before reading them — the raw record has
+        // `message_refs`, not `messages`.
+        let index = atomcode_capabilities::datalog::build_cas_index(&cas);
         for record in &records {
+            let full = atomcode_capabilities::datalog::rehydrate_record(record, &index);
             assert!(
-                record["messages"].as_array().is_some_and(|m| !m.is_empty()),
-                "{who}: 记录里必须有发出去的那组消息 —— 这正是它唯一的存在理由\n{record}"
+                full["messages"].as_array().is_some_and(|m| !m.is_empty()),
+                "{who}: 记录里必须有发出去的那组消息 —— 这正是它唯一的存在理由\n{full}"
             );
             assert!(
-                record["tools"].as_array().is_some_and(|t| !t.is_empty()),
-                "{who}: 工具清单也要在\n{record}"
+                full["tools"].as_array().is_some_and(|t| !t.is_empty()),
+                "{who}: 工具清单也要在\n{full}"
             );
         }
     }

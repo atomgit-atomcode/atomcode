@@ -68,7 +68,12 @@ pub struct OllamaConfig {
     /// Enable thinking (`think: true`) for thinking-capable models. A per-call
     /// `reasoning_effort` overrides this with a level string (`think: "high"`).
     pub think: bool,
+    /// Inter-token stream-idle watchdog (after the first byte of a stream).
     pub idle_timeout: Duration,
+    /// FIRST-byte (prefill / TTFB) idle watchdog: no bytes for this long BEFORE the
+    /// first byte of a (re)opened stream ⇒ terminal error. Separate from (and ≥)
+    /// `idle_timeout`; wired from the coding-layer `first_token_timeout`.
+    pub first_token_timeout: Duration,
     pub connect_timeout: Duration,
     pub retry: RetryPolicy,
     /// User-Agent sent on every request. `None` ⇒ [`super::DEFAULT_USER_AGENT`]; the
@@ -92,6 +97,7 @@ impl OllamaConfig {
             num_ctx: None,
             think: false,
             idle_timeout: Duration::from_secs(120),
+            first_token_timeout: Duration::from_secs(120),
             connect_timeout: Duration::from_secs(30),
             retry: RetryPolicy::default(),
             user_agent: None,
@@ -177,6 +183,7 @@ impl LlmProvider for OllamaProvider {
         // Snapshot the session id once; reused across the open and any mid-stream reopen.
         let session_id = self.session_id.get().cloned().unwrap_or_default();
         let idle = self.cfg.idle_timeout;
+        let first_token = self.cfg.first_token_timeout;
         let rate_limit_retry_owner = options.rate_limit_retry_owner;
         let resp = open_stream(
             &client,
@@ -205,8 +212,20 @@ impl LlmProvider for OllamaProvider {
                 let mut pending_metadata = Vec::new();
                 let byte_stream = resp.bytes_stream();
                 futures::pin_mut!(byte_stream);
+                // PHASE-AWARE byte-idle watchdog: prefill (before the first byte of this
+                // (re)opened stream) waits up to `first_token`; after the first byte we
+                // tighten to the inter-token `idle`. See openai_compat for the rationale.
+                // Reset per (re)open — a transparent reconnect restarts prefill.
+                let mut first_byte_seen = false;
                 loop {
-                    match tokio::time::timeout(idle, byte_stream.next()).await {
+                    match retry::next_chunk_phased(
+                        &mut byte_stream,
+                        first_token,
+                        idle,
+                        &mut first_byte_seen,
+                    )
+                    .await
+                    {
                         Err(_elapsed) => {
                             yield StreamEvent::Error(ProviderError {
                                 retryable: false,

@@ -46,7 +46,7 @@ debug = "line-tables-only"
 debug = 0
 
 [workspace.package]
-version = "5.0.9"
+version = "5.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://atomgit.com/atomgit_atomcode/atomcode"

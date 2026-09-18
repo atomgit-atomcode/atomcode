@@ -82,25 +82,32 @@ async fn stream_timeout_reconnects_then_recovers() {
 
     handle.commands.send(send("go")).unwrap();
 
-    let (saw_reconnect, error_msg, completed) = tokio::time::timeout(OUTER_GUARD, async {
-        let mut saw_reconnect = false;
-        let mut error_msg: Option<String> = None;
-        let mut completed = false;
-        while let Some(ev) = handle.events.recv().await {
-            match ev {
-                AgentEvent::Warning(m) if m.contains("reconnecting") => saw_reconnect = true,
-                AgentEvent::Error { message, .. } => error_msg = Some(message),
-                AgentEvent::TurnComplete { .. } => {
-                    completed = true;
-                    break;
+    let (saw_reconnect, first_reconnect_msg, error_msg, completed) =
+        tokio::time::timeout(OUTER_GUARD, async {
+            let mut saw_reconnect = false;
+            let mut first_reconnect_msg: Option<String> = None;
+            let mut error_msg: Option<String> = None;
+            let mut completed = false;
+            while let Some(ev) = handle.events.recv().await {
+                match ev {
+                    AgentEvent::Warning(m) if m.contains("reconnecting") => {
+                        if first_reconnect_msg.is_none() {
+                            first_reconnect_msg = Some(m);
+                        }
+                        saw_reconnect = true;
+                    }
+                    AgentEvent::Error { message, .. } => error_msg = Some(message),
+                    AgentEvent::TurnComplete { .. } => {
+                        completed = true;
+                        break;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-        (saw_reconnect, error_msg, completed)
-    })
-    .await
-    .expect("reconnect-and-recover must finish within the outer guard, not hang");
+            (saw_reconnect, first_reconnect_msg, error_msg, completed)
+        })
+        .await
+        .expect("reconnect-and-recover must finish within the outer guard, not hang");
 
     assert!(
         completed,
@@ -109,6 +116,14 @@ async fn stream_timeout_reconnects_then_recovers() {
     assert!(
         saw_reconnect,
         "a `reconnecting` Warning must be emitted on the idle timeout"
+    );
+    // The FIRST reconnect surfaces the tuning knob so a slow-local-model user can raise
+    // the idle window instead of filing a bug (discoverability, not a default change).
+    assert!(
+        first_reconnect_msg
+            .as_deref()
+            .is_some_and(|m| m.contains("ATOMCODE_STREAM_TIMEOUT_SECS")),
+        "first reconnect Warning must name the tuning env var: {first_reconnect_msg:?}"
     );
     assert!(
         error_msg.is_none(),
@@ -459,6 +474,144 @@ async fn stream_timeout_exhausts_retries_then_fails() {
     assert!(
         !log.contains(&"on_model_response".to_string()),
         "an exhausted-timeout turn must NOT run the success path"
+    );
+}
+
+// A timeout large enough that, if the WRONG phase-timeout were selected, the
+// OUTER_GUARD (5s) would trip before it fired. Paired with a LIVENESS (50ms)
+// timeout on the OTHER phase, this makes phase selection observable: the fast
+// timer wins iff the code picked it for that phase.
+const LONG_TIMEOUT: Duration = Duration::from_secs(30);
+
+// ── (1c) PHASE-AWARE: PREFILL uses first_token_timeout, not stream_timeout ────
+//
+// A content-free stall (before the first byte) must be governed by
+// `first_token_timeout`. Here first-token is FAST (50ms) and stream (inter-token)
+// is SLOW (30s). The first stream stalls before emitting anything; the second
+// recovers. If prefill wrongly used `stream_timeout` (30s), no reconnect would
+// fire inside the 5s guard → the test trips. Firing proves prefill picked the
+// first-token budget.
+#[tokio::test]
+async fn prefill_stall_uses_first_token_timeout_not_stream_timeout() {
+    let reg = ToolRegistry::new();
+    let provider = Arc::new(StallThenProvider::new(
+        1,
+        vec![
+            StreamEvent::TextDelta("recovered".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ));
+
+    let mut handle = Agent::builder()
+        .provider(provider)
+        .tools(reg.mount(&[] as &[&str]))
+        .stream_timeout(LONG_TIMEOUT)
+        .first_token_timeout(LIVENESS)
+        .build()
+        .spawn();
+
+    handle.commands.send(send("go")).unwrap();
+
+    let (first_reconnect_msg, completed) = tokio::time::timeout(OUTER_GUARD, async {
+        let mut first_reconnect_msg: Option<String> = None;
+        let mut completed = false;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::Warning(m) if m.contains("reconnecting") => {
+                    if first_reconnect_msg.is_none() {
+                        first_reconnect_msg = Some(m);
+                    }
+                }
+                AgentEvent::TurnComplete { .. } => {
+                    completed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        (first_reconnect_msg, completed)
+    })
+    .await
+    .expect("prefill must time out on the FAST first-token budget, not the slow stream budget");
+
+    assert!(
+        first_reconnect_msg.is_some(),
+        "a content-free prefill stall must fire first_token_timeout (50ms), \
+         not stream_timeout (30s)"
+    );
+    // When `first_token_timeout` is set, the prefill-reconnect hint must name the knob
+    // that actually governs this phase (ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS), NOT the
+    // inter-token ATOMCODE_STREAM_TIMEOUT_SECS — raising the latter would not help.
+    let msg = first_reconnect_msg.unwrap();
+    assert!(
+        msg.contains("ATOMCODE_FIRST_TOKEN_TIMEOUT_SECS"),
+        "with first_token_timeout set, the prefill hint must name the first-token knob: {msg:?}"
+    );
+    assert!(
+        !msg.contains("ATOMCODE_STREAM_TIMEOUT_SECS"),
+        "the prefill hint must not misdirect to the inter-token knob: {msg:?}"
+    );
+    assert!(completed, "the turn must recover and complete");
+}
+
+// ── (1d) PHASE-AWARE: INTER-TOKEN uses stream_timeout, not first_token_timeout ─
+//
+// The mirror image: once a content byte has arrived, an inter-token stall must be
+// governed by `stream_timeout`. Here stream is FAST (50ms) and first-token is SLOW
+// (30s). The first stream emits "partial" THEN stalls; the continuation recovers.
+// If the post-content stall wrongly used `first_token_timeout` (30s), no recovery
+// would fire inside the 5s guard. Recovering proves inter-token picked the stream
+// budget.
+#[tokio::test]
+async fn inter_token_stall_uses_stream_timeout_not_first_token_timeout() {
+    let reg = ToolRegistry::new();
+    let provider = Arc::new(PartialStallThenProvider::new(
+        vec![StreamEvent::TextDelta("partial".into())],
+        vec![
+            StreamEvent::TextDelta(" recovered".into()),
+            StreamEvent::Done { truncated: false },
+        ],
+    ));
+
+    let mut handle = Agent::builder()
+        .provider(provider.clone())
+        .tools(reg.mount(&[] as &[&str]))
+        .stream_timeout(LIVENESS)
+        .first_token_timeout(LONG_TIMEOUT)
+        .build()
+        .spawn();
+
+    handle.commands.send(send("go")).unwrap();
+
+    let (recovered, completed) = tokio::time::timeout(OUTER_GUARD, async {
+        let mut recovered = false;
+        let mut completed = false;
+        while let Some(ev) = handle.events.recv().await {
+            match ev {
+                AgentEvent::StreamRecovery { .. } => recovered = true,
+                AgentEvent::TurnComplete { .. } => {
+                    completed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        (recovered, completed)
+    })
+    .await
+    .expect(
+        "an inter-token stall must time out on the FAST stream budget, not the slow prefill budget",
+    );
+
+    assert!(
+        recovered,
+        "a post-content stall must fire stream_timeout (50ms), not first_token_timeout (30s)"
+    );
+    assert!(completed, "the turn must recover and complete");
+    assert_eq!(
+        provider.calls(),
+        2,
+        "one stalled request plus one continuation"
     );
 }
 

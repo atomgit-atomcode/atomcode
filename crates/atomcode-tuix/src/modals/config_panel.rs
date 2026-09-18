@@ -555,11 +555,15 @@ mod tests {
 
     #[test]
     fn retry_setting_is_searchable_in_both_languages() {
+        // "retry" now legitimately surfaces TWO settings — the per-selection
+        // adapter budget (RETRY_SETTING_ID) AND the global kernel tier
+        // `network.upstream_retry_max_attempts` — so assert the per-selection one
+        // is PRESENT rather than pinned to a specific position.
         let mut panel = ConfigPanel::open();
         panel.query = "retry".into();
-        assert_eq!(panel.filtered()[0].id(), RETRY_SETTING_ID);
+        assert!(panel.filtered().iter().any(|s| s.id() == RETRY_SETTING_ID));
 
         panel.query = "重试".into();
-        assert_eq!(panel.filtered()[0].id(), RETRY_SETTING_ID);
+        assert!(panel.filtered().iter().any(|s| s.id() == RETRY_SETTING_ID));
     }
 }
