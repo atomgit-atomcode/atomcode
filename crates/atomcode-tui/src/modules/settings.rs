@@ -20,7 +20,7 @@
 use crate::frame::{Line, Span, Style};
 use crate::module::{Height, View};
 use crate::moment::{Moment, Viewport};
-use crate::settings::{Panel, SettingKind, SettingsView};
+use crate::settings::{Panel, SettingKind, SettingsView, Tab};
 use crate::theme::{self, Role};
 use crate::width;
 
@@ -61,7 +61,12 @@ impl View for Settings {
         let rows = layout(&vp.moment.settings, panel, w, vp.rect.h as usize);
         rows.into_iter()
             .map(|row| match row {
-                Row::Top | Row::Bottom => panel_edge(w, vp.moment.caps),
+                Row::Header => header_line(panel.tab, w, vp.moment.caps),
+                Row::Rule => panel_edge(w, vp.moment.caps),
+                Row::Elsewhere { tab } => Line::styled(
+                    width::take_width(&format!("  {}", elsewhere(tab)), w),
+                    theme::fg(Role::Muted),
+                ),
                 Row::Blank => Line::empty(),
                 Row::BoxTop => box_edge(w, vp.moment.caps, true),
                 Row::Search { caret } => search_line(&panel.query, caret, w, vp.moment.caps),
@@ -123,8 +128,23 @@ impl View for Settings {
 /// step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Row {
-    /// The panel's top edge: where the panel begins.
-    Top,
+    /// The panel's name and its pages, on one row: `设置  Config  Status …`.
+    ///
+    /// One row, not two. The name and the pages answer the same question —
+    /// which panel, and which page of it — and stacking them costs a row of
+    /// screen to say what a person reads as one line anyway.
+    Header,
+    /// A straight rule across the panel.
+    Rule,
+    /// A page other than the settings, and everything it has to say.
+    ///
+    /// Carries its own lines rather than an index, because a page that is not
+    /// the settings list has nothing in common with it: no cursor, no filter, no
+    /// row to edit. One row per line is what [`fit`] already understands, so a
+    /// page of prose costs nothing to add.
+    Elsewhere {
+        tab: crate::settings::Tab,
+    },
     /// A margin row, above the box or above the list.
     Blank,
     /// The search box's top edge.
@@ -159,8 +179,6 @@ enum Row {
     /// The filtered list is empty.
     Nothing,
     Legend,
-    /// The panel's bottom edge: where it ends.
-    Bottom,
 }
 
 /// Where the border of the panel and of the search box stands.
@@ -227,11 +245,21 @@ fn anchor(settings: &SettingsView) -> usize {
 /// ignored, which is the shape of a bug waiting for someone to rely on it.
 fn rows_for(settings: &SettingsView, panel: &Panel) -> Vec<Row> {
     let shown = settings.matching(&panel.query);
-    // The panel's own rule first, then the box, then the list, then the rule
-    // that closes it. A frame around the whole thing is what separates a panel
-    // from the conversation it was pulled up over: without it the last setting
-    // and the first line of what was said before run together.
-    let mut rows = vec![Row::Top];
+    // The name and the pages on one row, then the rule that closes the header —
+    // what the panel is, and which page of it, before anything it has to say.
+    let mut rows = vec![Row::Header];
+    rows.push(Row::Rule);
+
+    // The other pages are not the settings list, so the search box goes with
+    // them: a filter with nothing to filter would be a box that collects
+    // characters and changes nothing.
+    if panel.tab != Tab::Config {
+        rows.push(Row::Blank);
+        rows.push(Row::Elsewhere { tab: panel.tab });
+        rows.extend([Row::Blank, Row::Rule]);
+        return rows;
+    }
+
     // The box is three rows — two edges and the text — because that is what
     // says "keys go here" without a caption saying it. The caret is drawn unless
     // a row's own field has the keyboard: two carets would be two answers to
@@ -271,7 +299,7 @@ fn rows_for(settings: &SettingsView, panel: &Panel) -> Vec<Row> {
     // Only the margin and the closing rule are left at the foot: the legend
     // moved up under the search box (see above), so nothing here explains the
     // list from a screen away.
-    rows.extend([Row::Blank, Row::Bottom]);
+    rows.extend([Row::Blank, Row::Rule]);
     rows
 }
 
@@ -295,7 +323,7 @@ fn fit(mut rows: Vec<Row>, h: usize) -> Vec<Row> {
     while rows.len() > h {
         let Some(at) = rows
             .iter()
-            .rposition(|r| matches!(r, Row::Bottom | Row::Legend | Row::Blank | Row::Top))
+            .rposition(|r| matches!(r, Row::Rule | Row::Legend | Row::Blank))
         else {
             break;
         };
@@ -303,6 +331,110 @@ fn fit(mut rows: Vec<Row>, h: usize) -> Vec<Row> {
     }
     rows.truncate(h);
     rows
+}
+
+/// The panel's name and its pages: `设置  Config  Status  Usage  Stats`.
+///
+/// The name says which panel this is; the pages say which page of it. The one
+/// showing is the one that is lit — the same `PanelSelBg` the pointed-at setting
+/// row uses, so "this is the selected thing" means one thing across the panel
+/// rather than two.
+///
+/// The tabs are drawn **all the time**, including when there is not room for
+/// them: this is the row that says the panel has four pages, and a row that hid
+/// three of them when it got tight would leave a person on a page they cannot
+/// see a way out of.
+fn header_line(tab: crate::settings::Tab, w: usize, caps: crate::caps::Caps) -> Line {
+    let (spans, _) = header_parts(tab);
+    let _ = caps;
+    Line::from_spans(spans).truncate(w)
+}
+
+/// The header's spans **and** where each tab sits in columns.
+///
+/// One function for both, because a pointer has to find the tab that was drawn.
+/// Two computations — one for the spans, one for the ranges — would agree until
+/// a label changed length, and then a click would switch to the tab next to the
+/// one under the pointer. This is the same rule the panel's other clickable
+/// things follow: the hit is read off what was drawn, never re-derived.
+///
+/// The ranges do **not** depend on which page is showing: lighting a tab changes
+/// its style, not its width or its place. A hit-test that took the current page
+/// would be a range that moved under a pointer that had not.
+fn header_parts(
+    tab: crate::settings::Tab,
+) -> (Vec<Span>, Vec<(crate::settings::Tab, usize, usize)>) {
+    // (text, style, the tab this cell belongs to — the padding included, so a
+    // click on the space beside a label takes that label's tab rather than the
+    // one it abuts).
+    let mut pieces: Vec<(String, Style, Option<crate::settings::Tab>)> = vec![
+        // Two cells in, which is where every other thing the panel says starts:
+        // the box's text sits after its `│ ` and a setting's label after its
+        // pointer. A title one cell further left than everything under it reads
+        // as a mistake — and it was one, found by
+        // `the_boxs_corners_line_up_with_its_walls_and_the_labels_below`.
+        ("  ".to_string(), Style::new(), None),
+        ("设置".to_string(), theme::fg(Role::Brand).bold(), None),
+        ("   ".to_string(), Style::new(), None),
+    ];
+    for (i, t) in crate::settings::Tab::ALL.iter().enumerate() {
+        if i > 0 {
+            pieces.push(("  ".to_string(), Style::new(), None));
+        }
+        let here = *t == tab;
+        let style = if here {
+            theme::bg(Role::PanelSelBg).under(theme::fg(Role::PanelFg))
+        } else {
+            theme::fg(Role::Muted)
+        };
+        // The pad goes *inside* the highlight, so the lit tab is a band rather
+        // than a patch behind its letters — the same choice the answer rows make.
+        pieces.push((format!(" {} ", t.label()), style, Some(*t)));
+    }
+
+    let mut spans = Vec::with_capacity(pieces.len());
+    let mut ranges: Vec<(crate::settings::Tab, usize, usize)> = Vec::new();
+    let mut col = 0usize;
+    for (text, style, owner) in pieces {
+        let w = width::str_width(&text);
+        if let Some(t) = owner {
+            ranges.push((t, col, col + w));
+        }
+        col += w;
+        spans.push(Span::styled(text, style));
+    }
+    (spans, ranges)
+}
+
+/// Which tab is under this cell of the header row.
+///
+/// `col` is measured from the panel's left edge, which is what the host knows
+/// and what a click carries.
+pub fn tab_at(col: usize) -> Option<crate::settings::Tab> {
+    header_parts(crate::settings::Tab::ALL[0])
+        .1
+        .into_iter()
+        .find(|(_, from, to)| (*from..*to).contains(&col))
+        .map(|(tab, _, _)| tab)
+}
+
+/// What a page that is not the settings has to say for itself.
+///
+/// One line, and honest about being the only one: these pages exist so the
+/// panel has somewhere to grow, and a page that invented content it does not
+/// have would be worse than one that says what it is waiting for. Each names
+/// the thing that would fill it, so the next person knows where to look.
+fn elsewhere(tab: crate::settings::Tab) -> &'static str {
+    match tab {
+        // Not reachable — the settings page draws the box and the list instead —
+        // but a total function beats a `panic!` for the day someone adds a row.
+        crate::settings::Tab::Config => "",
+        crate::settings::Tab::Status => {
+            "这个会话跑在什么上面(模型、推理档、压缩,来自 agent 的描述)"
+        }
+        crate::settings::Tab::Usage => "本会话用掉的 token(来自会话日志里的事实)",
+        crate::settings::Tab::Stats => "这次会话干了什么(回合数、工具调用、耗时,从日志折出来)",
+    }
 }
 
 /// One edge of the search box: `┌───┐` above, `└───┘` below.
@@ -523,10 +655,16 @@ fn value_text(row: &crate::settings::SettingRow) -> String {
 }
 
 /// A short word for the gesture, shown only on the pointed-at row.
+///
+/// No `←→` for the choice kinds. There never was: nothing bound left and right
+/// to the value, so the hint named a key that did nothing — and now that they
+/// switch pages, it would name a key that does something else. A hint is a
+/// promise about what a key does, and the only key that changes a value here is
+/// the return key.
 fn kind_hint(kind: &SettingKind) -> Option<&'static str> {
     match kind {
         SettingKind::Boolean => Some("回车 切换"),
-        SettingKind::OptionalBoolean | SettingKind::Choice(_) => Some("回车 切换 · ←→ 选"),
+        SettingKind::OptionalBoolean | SettingKind::Choice(_) => Some("回车 切换"),
         SettingKind::Integer { .. } | SettingKind::Text => Some("回车 编辑"),
     }
 }
@@ -780,34 +918,56 @@ mod tests {
             narrowed.join("\n")
         );
 
-        // Compared by *row position*, not by guessing at the content. The panel's
-        // shape is fixed: the outer rule, the box's top edge, the query, the
-        // box's bottom edge, a margin, the list, then a margin, the legend and
-        // the closing rule. Anchoring the height is what keeps every one of
-        // those rows at the index it had.
-        //
-        // Two earlier versions of this assertion were wrong in instructive ways:
-        // classifying rows by looking for `│` made the *query* row furniture and
-        // forbade typing from changing anything; taking the last three rows as
-        // fixed forbade the legend from saying `esc 清空搜索` — which is exactly
-        // what it is for.
-        let fixed = [0, 1, 3, full.len() - 1];
-        for i in fixed {
-            assert_eq!(
-                full[i], narrowed[i],
-                "row {i} is the frame's, so it must not move:\n{:?}\n{:?}",
-                full[i], narrowed[i]
-            );
-        }
+        // Located by *content*, not by a hardcoded index: the header rows were
+        // added above the box and every index below them moved, which is exactly
+        // the brittleness a fixed `[0, 1, 3]` had. What is being asserted is
+        // that the furniture does not move — so the test finds the furniture
+        // rather than remembering where it used to be.
+        assert_eq!(full[0], narrowed[0], "the header is where it was");
         assert!(
-            narrowed[2].contains("zzz"),
-            "and the row that *did* change is the query's: {:?}",
-            narrowed[2]
+            full[0].contains("设置"),
+            "and it is the header: {:?}",
+            full[0]
+        );
+        assert!(
+            full[0].contains("Config") && full[0].contains("Status") && full[0].contains("Stats"),
+            "with every page on it: {:?}",
+            full[0]
+        );
+
+        // The box's own two edges: found by shape, and both still drawn.
+        let box_edge_at = |rows: &[String]| {
+            (
+                rows.iter().position(|l| l.contains('┌')),
+                rows.iter().position(|l| l.contains('└')),
+            )
+        };
+        let (full_top, full_bottom) = box_edge_at(&full);
+        let (narrow_top, narrow_bottom) = box_edge_at(&narrowed);
+        assert_eq!(
+            (full_top, full_bottom),
+            (narrow_top, narrow_bottom),
+            "the box's edges are where they were:\n{}\n---\n{}",
+            full.join("\n"),
+            narrowed.join("\n")
+        );
+
+        // The query row, between them, is the one that changed.
+        let query = full_top.expect("the box is drawn") + 1;
+        assert!(
+            narrowed[query].contains("zzz"),
+            "the row that changed is the query's: {:?}",
+            narrowed[query]
         );
         assert_eq!(
-            full[2].chars().position(|c| c == '│'),
-            narrowed[2].chars().position(|c| c == '│'),
+            full[query].chars().position(|c| c == '│'),
+            narrowed[query].chars().position(|c| c == '│'),
             "whose wall is still in the column it was"
+        );
+        assert!(
+            is_rule(full.last().unwrap_or(&String::new()))
+                && is_rule(narrowed.last().unwrap_or(&String::new())),
+            "and the panel still closes with its rule"
         );
         assert!(
             narrowed.join("\n").contains("没有匹配"),
@@ -825,9 +985,19 @@ mod tests {
         let joined = full.join("\n");
         assert!(joined.contains("选择"), "the legend is up:\n{joined}");
         assert!(joined.contains("主题"), "and so is a setting:\n{joined}");
+        // The header is the panel's first row now, and the rule closes it; the
+        // panel still ends with a rule.
         assert!(
-            full.first().is_some_and(|l| is_rule(l)) && full.last().is_some_and(|l| is_rule(l)),
-            "and the panel is ruled top and bottom:\n{joined}"
+            full.first().is_some_and(|l| l.contains("设置")),
+            "the header is the first row:\n{joined}"
+        );
+        assert!(
+            full.get(1).is_some_and(|l| is_rule(l)),
+            "and the rule closes the header:\n{joined}"
+        );
+        assert!(
+            full.last().is_some_and(|l| is_rule(l)),
+            "and the panel ends with its rule:\n{joined}"
         );
 
         // Six rows of room: the rules and the legend are furniture and go
@@ -853,10 +1023,17 @@ mod tests {
     fn the_panels_rules_have_no_corners() {
         let m = moment(Some(Panel::new()), two());
         let lines = drawn(&m, 70, 40);
-        let top = lines.first().expect("the panel has a top rule");
-        let bottom = lines.last().expect("the panel has a bottom rule");
+        // Found by shape, not by position: the panel's first row is the header
+        // now, and its last is the rule. Both rules — the one under the header
+        // and the one that closes the panel — are what this is about.
+        let rules: Vec<&String> = lines.iter().filter(|l| is_rule(l)).collect();
+        assert!(
+            rules.len() >= 2,
+            "the panel has a rule under its header and one at its foot:\n{}",
+            lines.join("\n")
+        );
 
-        for (edge, line) in [("top", top), ("bottom", bottom)] {
+        for (edge, line) in [("first", rules[0]), ("last", rules[rules.len() - 1])] {
             assert!(
                 is_rule(line),
                 "the {edge} rule is a straight line: {line:?}"
@@ -964,17 +1141,19 @@ mod tests {
             lines[text_row]
         );
 
-        // The panel's own rule uses the same column, so the rule and the box
-        // below it start together rather than one cell apart.
+        // The panel's own header occupies the same column, so the header's text
+        // and the box below it start together rather than one cell apart.
         let panel_top = lines.first().expect("the panel has a first row");
         assert!(
-            is_rule(panel_top),
-            "the panel's top row is its rule: {panel_top:?}"
+            panel_top.contains("设置"),
+            "the panel's first row is its header: {panel_top:?}"
         );
+        // And the header's text is *not* indented past the box's wall: `设置` is
+        // drawn one cell in, the same `BORDER_COL + 1` the box's text column is.
         assert_eq!(
-            col_of('|', panel_top).or_else(|| col_of('─', panel_top)),
-            Some(BORDER_COL),
-            "and the rule starts in the same column as the box's wall: {panel_top:?}"
+            col_of('设', panel_top),
+            col_of('主', &lines[text_row]),
+            "the header and the box's text share a column: {panel_top:?}"
         );
 
         // And what the box holds starts in the same column as the labels it
@@ -1092,15 +1271,64 @@ mod tests {
         let mut panel = Panel::new();
         panel.cursor = 1;
         let m = moment(Some(panel), two());
+        // One surface among the *settings*: the header's lit tab is also drawn
+        // with a background — the same one, which is what makes "selected" mean
+        // one thing across the panel — so the rows below the header are what
+        // this criterion is about.
+        let header = drawn(&m, 70, 14)
+            .iter()
+            .position(|l| l.contains("设置"))
+            .expect("the header is drawn");
         let lit: Vec<Line> = lines(&m, 70, 14)
             .into_iter()
+            .skip(header + 1)
             .filter(|l| l.spans.iter().any(|s| s.style.bg.is_some()))
             .collect();
-        assert_eq!(lit.len(), 1, "exactly one row is a surface");
+        assert_eq!(lit.len(), 1, "exactly one setting row is a surface");
         assert!(
             lit[0].plain().contains("单回合最大轮数"),
             "and it is the one the cursor is on: {}",
             lit[0].plain()
+        );
+    }
+
+    /// The lit tab and the lit setting row are the same surface.
+    ///
+    /// One meaning for "this is selected", so a person does not have to learn
+    /// two. Asserted because it is the kind of thing that drifts the first time
+    /// either is restyled on its own.
+    #[test]
+    fn the_lit_tab_and_the_lit_row_use_the_same_background() {
+        use crate::theme::{self, Role};
+        let m = moment(Some(Panel::new()), two());
+        let lines = lines(&m, 70, 40);
+        let want = theme::bg(Role::PanelSelBg).bg;
+
+        let tab = lines
+            .iter()
+            .find(|l| l.plain().contains("Config"))
+            .expect("the tab row is drawn");
+        let row = lines
+            .iter()
+            .find(|l| l.plain().contains("主题"))
+            .expect("the pointed row is drawn");
+
+        let bg_of = |line: &Line| {
+            line.spans
+                .iter()
+                .filter(|s| s.style.bg == want)
+                .map(|s| s.text.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !bg_of(tab).is_empty(),
+            "the showing tab is lit: {:?}",
+            tab.plain()
+        );
+        assert!(
+            !bg_of(row).is_empty(),
+            "and so is the pointed row: {:?}",
+            row.plain()
         );
     }
 
@@ -1232,5 +1460,182 @@ mod tests {
         // names have to be the same string.
         let view: Arc<dyn ViewObject> = mounted();
         assert_eq!(view.id(), ID);
+    }
+
+    #[test]
+    fn every_page_draws_itself_and_its_own_words() {
+        // The failure this rules out is a blank panel: a page that renders
+        // nothing looks exactly like a panel that failed to load, and every
+        // count-based criterion in this file would stay green while a person
+        // stared at an empty box.
+        //
+        // Written after finding there was *no* criterion on the other pages at
+        // all — `elsewhere` was wired up and nothing asserted it reached the
+        // screen.
+        for tab in Tab::ALL {
+            let mut panel = Panel::new();
+            panel.show(tab);
+            let m = moment(Some(panel), two());
+            let lines = drawn(&m, 70, 40);
+            let joined = lines.join("\n");
+
+            assert!(
+                joined.contains("设置"),
+                "{tab:?}: the header is on every page:\n{joined}"
+            );
+            assert!(
+                joined.contains(tab.label()),
+                "{tab:?}: and its own tab is on the row:\n{joined}"
+            );
+
+            if tab == Tab::Config {
+                assert!(joined.contains("主题"), "the settings are drawn:\n{joined}");
+                assert!(joined.contains('┌'), "and the search box:\n{joined}");
+            } else {
+                let words = elsewhere(tab);
+                assert!(!words.is_empty(), "{tab:?} has something to say");
+                assert!(
+                    joined.contains(words),
+                    "{tab:?} draws its own line:\n{joined}"
+                );
+                assert!(
+                    !joined.contains('┌'),
+                    "{tab:?} draws no search box — it has nothing to filter:\n{joined}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_other_page_says_something_different() {
+        // A page that repeated another page's line would be a page with no
+        // content of its own, drawn as though it had.
+        let mut said: Vec<&str> = Vec::new();
+        for tab in Tab::ALL {
+            if tab == Tab::Config {
+                continue;
+            }
+            let words = elsewhere(tab);
+            assert!(!said.contains(&words), "{tab:?} repeats another page");
+            said.push(words);
+        }
+        assert_eq!(said.len(), Tab::ALL.len() - 1);
+    }
+
+    // ---- clicking the tabs ------------------------------------------------
+
+    /// Clicking a tab lands on the tab that is drawn under the pointer.
+    ///
+    /// Read off the same [`header_parts`] the frame drew with, which is the
+    /// whole point: a hit test with its own arithmetic is a click that switches
+    /// to the tab beside the one under the pointer the first time a label
+    /// changes length.
+    #[test]
+    fn a_press_on_a_tab_switches_to_the_one_under_the_pointer() {
+        for tab in Tab::ALL {
+            // A column inside the tab's own range, found the way a pointer would
+            // — from the widths the header actually occupies.
+            let (_, ranges) = header_parts(tab);
+            let (_, from, to) = ranges
+                .iter()
+                .find(|(t, _, _)| *t == tab)
+                .copied()
+                .unwrap_or_else(|| panic!("{tab:?} has a range on the row"));
+
+            for col in [from, from + (to - from) / 2, to - 1] {
+                assert_eq!(
+                    tab_at(col),
+                    Some(tab),
+                    "{tab:?}: the cell at column {col} is its own"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_press_between_the_tabs_or_on_the_title_is_no_tab() {
+        // The title, and the gaps that space the tabs apart, are not tabs. A
+        // press there is a press on the panel's chrome — it must not switch
+        // pages, or someone aiming at "Status" with a two-cell miss would land
+        // on "Usage" and never know why.
+        assert_eq!(tab_at(0), None, "the title's first cell");
+        assert_eq!(tab_at(1), None);
+
+        let (_, ranges) = header_parts(Tab::Config);
+        for pair in ranges.windows(2) {
+            let gap_start = pair[0].2;
+            let gap_end = pair[1].1;
+            for col in gap_start..gap_end {
+                assert_eq!(
+                    tab_at(col),
+                    None,
+                    "column {col} is the gap between {:?} and {:?}",
+                    pair[0].0,
+                    pair[1].0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_press_past_the_last_tab_is_no_tab() {
+        let (_, ranges) = header_parts(Tab::Config);
+        let end = ranges.last().expect("there are tabs").2;
+        for col in end..end + 20 {
+            assert_eq!(tab_at(col), None, "column {col} is past the row");
+        }
+    }
+
+    #[test]
+    fn the_hit_ranges_do_not_move_with_the_page_that_is_showing() {
+        // Lighting a tab changes its style, not its width or its place. A range
+        // that moved with the current page would be a target that slid out from
+        // under a pointer that had not moved.
+        let base = header_parts(Tab::Config).1;
+        for tab in Tab::ALL {
+            assert_eq!(header_parts(tab).1, base, "{tab:?} moved the tabs around");
+        }
+    }
+
+    /// The drawn row and the hit ranges are one layout.
+    ///
+    /// The property the whole design rests on: for every tab, the cells the hit
+    /// test claims are the cells the label was drawn in. Checked against the
+    /// *rendered* line, not against the ranges again.
+    ///
+    /// Indexed by **display cell**, not by `char`: `设置` is two characters and
+    /// four cells, so a character index is two ahead of the column the pointer
+    /// reports from the moment the title is drawn. The first version of this
+    /// criterion indexed `chars()` and read `"onfig"` — which is the bug it
+    /// caught, in the test rather than in the panel.
+    #[test]
+    fn the_cells_a_tab_claims_are_the_cells_it_was_drawn_in() {
+        let m = moment(Some(Panel::new()), two());
+        let row = drawn(&m, 70, 40)
+            .into_iter()
+            .find(|l| l.contains("设置"))
+            .expect("the header is drawn");
+
+        // One entry per display cell. A wide character's second cell is a
+        // sentinel rather than a space, so it cannot be mistaken for a label.
+        let mut cells: Vec<char> = Vec::new();
+        for c in row.chars() {
+            let w = width::str_width(&c.to_string());
+            if w == 0 {
+                continue;
+            }
+            cells.push(c);
+            cells.extend(std::iter::repeat_n('\u{0}', w.saturating_sub(1)));
+        }
+
+        for tab in Tab::ALL {
+            let (_, ranges) = header_parts(tab);
+            let (_, from, to) = ranges.iter().find(|(t, _, _)| *t == tab).copied().unwrap();
+            let drawn: String = cells[from..to.min(cells.len())].iter().collect();
+            assert!(
+                drawn.contains(tab.label()),
+                "{tab:?}: cells {from}..{to} say {drawn:?}, not its label"
+            );
+        }
     }
 }

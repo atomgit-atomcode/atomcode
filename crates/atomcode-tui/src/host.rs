@@ -1542,6 +1542,41 @@ impl Host {
         geom.answer_at((y - rect.y) as usize)
     }
 
+    /// Which page tab is under this cell, when one is.
+    ///
+    /// Read off the rect the panel was **drawn** in, like every other hit test
+    /// here, and answered only on the panel's **first row**: the tabs live there
+    /// and nowhere else, so a press three rows down must not switch pages
+    /// because the cell happens to line up with a tab's column.
+    ///
+    /// `None` when the panel is down, when the point is not on it, when it is
+    /// not the header row, or when the cell is on the title or the gaps between
+    /// tabs — those are not tabs, and a press on them is a press on the panel.
+    pub fn settings_tab_at(&self, x: u16, y: u16) -> Option<crate::settings::Tab> {
+        let rect = *self.hits.lock().expect("hits poisoned").settings.as_ref()?;
+        if !rect.contains(x, y) {
+            return None;
+        }
+        if y != rect.y {
+            return None;
+        }
+        crate::modules::settings::tab_at((x - rect.x) as usize)
+    }
+
+    /// Show a page. True when it changed.
+    ///
+    /// The same `Panel::show` the keyboard reaches, so a click and a tab press
+    /// cannot come to mean different things — including the part where a page
+    /// switch gives up a field with the keyboard, which is why this goes through
+    /// the panel rather than setting the tab itself.
+    pub fn show_settings_tab(&self, tab: crate::settings::Tab) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        match m.settings_panel.as_mut() {
+            Some(panel) => panel.show(tab),
+            None => false,
+        }
+    }
+
     /// Point the settings panel at a row, by index. True when it moved.
     ///
     /// Clamped to the rows the *filtered* list has, because that is what
@@ -3830,6 +3865,93 @@ mod tests {
             None,
             "the top margin holds no setting"
         );
+    }
+
+    /// A press switches pages only on the header row.
+    ///
+    /// The tabs are drawn on the panel's first row and nowhere else, so a press
+    /// lower down must not switch pages because the cell happens to line up with
+    /// a tab's column. Checked at the column that *does* hold a tab, one row
+    /// down — the point of the criterion is that the row is the answer, not the
+    /// column.
+    #[test]
+    fn a_press_switches_pages_only_on_the_header_row() {
+        let h = host_with_settings();
+        let size = (60u16, 30u16);
+        h.toggle_settings();
+        let frame = h.compose(size);
+        let part = frame
+            .part(crate::modules::settings::ID)
+            .expect("the panel is drawn");
+        let rect = part.rect;
+
+        // A column that holds a tab: found from the drawn row, so the test does
+        // not carry its own copy of where the tabs are.
+        let header = part.lines.first().expect("the header is drawn").plain();
+        let col = header.find("Config").expect("the Config tab is on the row") + 1;
+
+        assert_eq!(
+            h.settings_tab_at(rect.x + col as u16, rect.y),
+            Some(crate::settings::Tab::Config),
+            "on the header row it is that tab"
+        );
+
+        // Every other row of the panel: the same column, and it is not a tab.
+        for row in 1..part.lines.len().min(6) {
+            assert_eq!(
+                h.settings_tab_at(rect.x + col as u16, rect.y + row as u16),
+                None,
+                "row {row} of the panel is not the tab row"
+            );
+        }
+
+        // And off the panel entirely — below it — is not either.
+        assert_eq!(
+            h.settings_tab_at(rect.x + col as u16, rect.y + rect.h),
+            None,
+            "below the panel is not the panel"
+        );
+        assert_eq!(h.settings_tab_at(0, 0), None, "nor is anywhere else");
+    }
+
+    /// A press on a tab shows that page, through the same call the keyboard uses.
+    #[test]
+    fn a_press_on_a_tab_shows_the_page() {
+        let h = host_with_settings();
+        h.toggle_settings();
+        assert_eq!(
+            h.moment
+                .read()
+                .unwrap()
+                .settings_panel
+                .as_ref()
+                .unwrap()
+                .tab,
+            crate::settings::Tab::Config,
+            "it opens on the settings"
+        );
+
+        assert!(h.show_settings_tab(crate::settings::Tab::Usage));
+        assert_eq!(
+            h.moment
+                .read()
+                .unwrap()
+                .settings_panel
+                .as_ref()
+                .unwrap()
+                .tab,
+            crate::settings::Tab::Usage
+        );
+        assert!(
+            !h.show_settings_tab(crate::settings::Tab::Usage),
+            "and asking for the page that is already showing is not a change"
+        );
+
+        // With no panel up there is nothing to show, and it says so rather than
+        // opening one behind the caller's back.
+        h.close_settings();
+        assert!(!h.show_settings_tab(crate::settings::Tab::Stats));
+        assert!(!h.settings_open(), "no panel was opened by asking");
     }
 
     /// A question drawn at the foot of the stream is counted in the scroll.

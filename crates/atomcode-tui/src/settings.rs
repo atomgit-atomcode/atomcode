@@ -197,6 +197,57 @@ pub struct Edit {
     pub value: String,
 }
 
+/// Which page of the panel is showing.
+///
+/// The panel is a *settings* panel, and the settings are one page of it. The
+/// others answer the questions a person has while looking at their settings —
+/// what this session is running as, what it has cost, what it has done — and
+/// they are pages rather than separate commands because a person who has just
+/// opened `/config` is already in the frame of mind to look at them.
+///
+/// Ordered as they are drawn, left to right, with the settings first: that is
+/// what the panel is for and what it opens on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Tab {
+    #[default]
+    Config,
+    Status,
+    Usage,
+    Stats,
+}
+
+impl Tab {
+    /// Every page, in the order they are drawn.
+    pub const ALL: [Tab; 4] = [Tab::Config, Tab::Status, Tab::Usage, Tab::Stats];
+
+    /// What the tab row says on it.
+    ///
+    /// English, and the same word the command is: `config` is what a person
+    /// typed to get here, and a tab whose name does not match the thing they
+    /// typed is a tab they have to translate.
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Config => "Config",
+            Tab::Status => "Status",
+            Tab::Usage => "Usage",
+            Tab::Stats => "Stats",
+        }
+    }
+
+    /// The page `delta` along, **wrapping**.
+    ///
+    /// Wrapping rather than clamping, unlike the list's cursor: there are four
+    /// tabs and they are all visible on the row, so "keep going right and you
+    /// come back to the first" is what the row already looks like. A cursor that
+    /// stops at the last item has to explain itself; a tab row does not.
+    pub fn cycled(self, delta: i32) -> Tab {
+        let all = Self::ALL;
+        let n = all.len() as i32;
+        let at = all.iter().position(|t| *t == self).unwrap_or(0) as i32;
+        all[(((at + delta) % n + n) % n) as usize]
+    }
+}
+
 /// What the panel is doing while it is up.
 ///
 /// Not folded from facts — a panel is not a fact, and the log records what was
@@ -205,6 +256,8 @@ pub struct Edit {
 /// service, which is the same road `asking` travels.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Panel {
+    /// Which page is showing.
+    pub tab: Tab,
     /// What is typed in the search box.
     pub query: String,
     /// The row the arrows are on, as an index into the *filtered* rows.
@@ -223,10 +276,26 @@ pub struct Panel {
 }
 
 impl Panel {
-    /// A panel just opened: no search, first row pointed at, nothing being
-    /// edited.
+    /// A panel just opened: the settings page, no search, first row pointed at,
+    /// nothing being edited.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Show `tab`, and leave its own state behind.
+    ///
+    /// Switching a page gives up an edit in progress: the field belongs to a row
+    /// on the settings page, and a page you cannot see must not be holding the
+    /// keyboard. The search is kept — it is a property of the panel rather than
+    /// of a page, and a person who typed a filter, looked at the status page and
+    /// came back would not expect their filter to have been thrown away.
+    pub fn show(&mut self, tab: Tab) -> bool {
+        if self.tab == tab {
+            return false;
+        }
+        self.tab = tab;
+        self.editing = None;
+        true
     }
 
     /// Move the highlight by `delta` rows, clamped to the ones there are.
@@ -359,14 +428,29 @@ pub fn key(view: &SettingsView, panel: &mut Panel, press: crate::surface::KeyPre
     }
 
     let shown = view.matching(&panel.query);
+    let on_settings = panel.tab == Tab::Config;
     match (press.key, press.mods) {
+        // The tab row. Tab forward, shift-tab back — the keys every other tabbed
+        // thing on a terminal uses, so nothing has to be learned. Left and right
+        // do the same, because the row is drawn horizontally and a person who
+        // sees `Config | Status | Usage | Stats` will reach for them.
+        (Key::Tab, Mods::NONE) | (Key::Right, _) => {
+            let next = panel.tab.cycled(1);
+            panel.show(next);
+            Step::Stay
+        }
+        (Key::BackTab, _) | (Key::Tab, Mods::SHIFT) | (Key::Left, _) => {
+            let next = panel.tab.cycled(-1);
+            panel.show(next);
+            Step::Stay
+        }
         // Escape does the innermost thing, the same rule the composer's Escape
         // follows: out of what is typed, then out of the panel. Clearing first
         // is what makes a filter recoverable — a person who has narrowed the
         // list to nothing wants the unfiltered list back, and closing the panel
         // would throw the panel away with the search.
         (Key::Esc, _) | (Key::Char('c'), Mods::CTRL) => {
-            if !panel.query.is_empty() {
+            if on_settings && !panel.query.is_empty() {
                 panel.clear_search();
                 Step::Stay
             } else {
@@ -374,23 +458,33 @@ pub fn key(view: &SettingsView, panel: &mut Panel, press: crate::surface::KeyPre
             }
         }
         (Key::Up, _) | (Key::Char('k'), Mods::CTRL) => {
-            panel.move_by(-1, shown.len());
+            if on_settings {
+                panel.move_by(-1, shown.len());
+            }
             Step::Stay
         }
         (Key::Down, _) | (Key::Char('j'), Mods::CTRL) => {
-            panel.move_by(1, shown.len());
+            if on_settings {
+                panel.move_by(1, shown.len());
+            }
             Step::Stay
         }
         (Key::PageUp, _) => {
-            panel.move_by(-10, shown.len());
+            if on_settings {
+                panel.move_by(-10, shown.len());
+            }
             Step::Stay
         }
         (Key::PageDown, _) => {
-            panel.move_by(10, shown.len());
+            if on_settings {
+                panel.move_by(10, shown.len());
+            }
             Step::Stay
         }
         (Key::Backspace, _) => {
-            panel.backspace_search();
+            if on_settings {
+                panel.backspace_search();
+            }
             Step::Stay
         }
         // An ordinary character goes into the search box, and the list narrows
@@ -399,13 +493,17 @@ pub fn key(view: &SettingsView, panel: &mut Panel, press: crate::surface::KeyPre
         // own character has to be swallowed to open it. `/` is a slash here
         // like anywhere else — which is what makes searching for a path
         // possible at all.
-        (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) => {
+        //
+        // Only on the settings page: the other pages have no box to draw and
+        // nothing to filter, and a page that quietly collected characters into a
+        // field it is not showing is a page holding state nobody can see.
+        (Key::Char(c), Mods::NONE) | (Key::Char(c), Mods::SHIFT) if on_settings => {
             panel.type_into_search(c);
             Step::Stay
         }
         // Confirm the highlighted row: cycle it, or open an editor when the kind
         // has no cycle to offer.
-        (Key::Enter, _) => {
+        (Key::Enter, _) if on_settings => {
             let Some(row) = shown.get(panel.cursor) else {
                 return Step::Stay;
             };
@@ -551,7 +649,7 @@ mod tests {
 
     // ---- the keys ---------------------------------------------------------
 
-    use crate::surface::{Key, KeyPress};
+    use crate::surface::{Key, KeyPress, Mods};
 
     fn view() -> SettingsView {
         SettingsView::new(vec![
@@ -847,5 +945,195 @@ mod tests {
             "the 9 went into the field"
         );
         assert_eq!(panel.query, "第", "and the search box is untouched");
+    }
+
+    // ---- the tabs ---------------------------------------------------------
+
+    #[test]
+    fn tab_and_shift_tab_walk_the_pages_and_wrap() {
+        // The keys every other tabbed thing on a terminal uses. Wrapping rather
+        // than stopping, because all four are drawn on the row: reaching the end
+        // and going on should land on the first, which is what the row looks
+        // like it would do.
+        //
+        // Written because falsification found it missing: switching pages off
+        // altogether left the whole suite green.
+        let view = view();
+        let mut panel = Panel::new();
+        assert_eq!(panel.tab, Tab::Config, "the settings are what it opens on");
+
+        for want in [Tab::Status, Tab::Usage, Tab::Stats, Tab::Config] {
+            assert_eq!(
+                key(&view, &mut panel, KeyPress::plain(Key::Tab)),
+                Step::Stay
+            );
+            assert_eq!(panel.tab, want, "tab forward walks the row");
+        }
+        for want in [Tab::Stats, Tab::Usage, Tab::Status, Tab::Config] {
+            assert_eq!(
+                key(&view, &mut panel, KeyPress::new(Key::Tab, Mods::SHIFT)),
+                Step::Stay
+            );
+            assert_eq!(panel.tab, want, "shift-tab walks it back");
+        }
+        assert_eq!(
+            key(&view, &mut panel, KeyPress::plain(Key::BackTab)),
+            Step::Stay
+        );
+        assert_eq!(
+            panel.tab,
+            Tab::Stats,
+            "and back-tab goes back from the first to the last, wrapping"
+        );
+    }
+
+    #[test]
+    fn a_field_with_the_keyboard_keeps_tab_too() {
+        // The same rule the arrows keep: while a row's field is open, nothing
+        // else takes a key. Tab included — a page switch mid-edit would leave an
+        // edit for a row on a page that is no longer showing, which is the state
+        // `Panel::show` clears precisely by not being reachable this way.
+        let view = view();
+        let mut panel = Panel::new();
+        panel.cursor = 1;
+        key(&view, &mut panel, KeyPress::plain(Key::Enter));
+        assert!(panel.editing.is_some(), "the number's field is open");
+
+        assert_eq!(
+            key(&view, &mut panel, KeyPress::plain(Key::Tab)),
+            Step::Stay
+        );
+        assert_eq!(panel.tab, Tab::Config, "the page did not move");
+        assert!(
+            panel.editing.is_some(),
+            "and the field still has the keyboard"
+        );
+
+        // Escape gives the field up, and *then* Tab moves the page.
+        key(&view, &mut panel, KeyPress::plain(Key::Esc));
+        assert_eq!(panel.editing, None);
+        key(&view, &mut panel, KeyPress::plain(Key::Tab));
+        assert_eq!(panel.tab, Tab::Status);
+    }
+
+    #[test]
+    fn left_and_right_also_walk_the_pages_because_that_is_what_the_row_looks_like() {
+        // The row is drawn horizontally. Someone who sees it will reach for the
+        // arrows; telling them to use tab instead would be a row that does not
+        // do what it looks like.
+        let view = view();
+        let mut panel = Panel::new();
+        key(&view, &mut panel, KeyPress::plain(Key::Right));
+        assert_eq!(panel.tab, Tab::Status);
+        key(&view, &mut panel, KeyPress::plain(Key::Left));
+        assert_eq!(panel.tab, Tab::Config);
+    }
+
+    #[test]
+    fn a_page_other_than_the_settings_takes_no_typing_and_no_enter() {
+        // The other pages have no box and nothing to filter. A page that quietly
+        // collected characters into a field it is not showing would be holding
+        // state nobody can see, and an enter that changed an invisible row would
+        // be worse.
+        let view = view();
+        let mut panel = Panel::new();
+        key(&view, &mut panel, KeyPress::plain(Key::Tab));
+        assert_eq!(panel.tab, Tab::Status);
+
+        for c in "abc".chars() {
+            assert_eq!(key(&view, &mut panel, KeyPress::ch(c)), Step::Stay);
+        }
+        assert_eq!(panel.query, "", "nothing was collected");
+        assert_eq!(
+            key(&view, &mut panel, KeyPress::plain(Key::Enter)),
+            Step::Stay,
+            "and enter has nothing to take"
+        );
+        assert_eq!(panel.editing, None);
+    }
+
+    #[test]
+    fn the_search_survives_a_trip_to_another_page() {
+        // The filter belongs to the panel rather than to a page: someone who
+        // typed one, looked at the status page and came back would not expect it
+        // thrown away.
+        //
+        // The edit case is not in here because it cannot arise: while a field has
+        // the keyboard no key moves the page (see
+        // `a_field_with_the_keyboard_keeps_tab_too`), so there is no trip that
+        // could leave one behind.
+        let view = view();
+        let mut panel = Panel::new();
+        // `第一` and not just `第`: all three labels start with `第`, so the
+        // shorter query narrows nothing and would let this pass without the
+        // filter doing any work.
+        for c in "第一".chars() {
+            key(&view, &mut panel, KeyPress::ch(c));
+        }
+        assert_eq!(panel.query, "第一");
+        assert_eq!(view.matching(&panel.query).len(), 1, "and it filters");
+
+        key(&view, &mut panel, KeyPress::plain(Key::Tab));
+        assert_eq!(panel.query, "第一", "the search came along");
+        assert_eq!(panel.tab, Tab::Status);
+
+        // Status → Usage → Stats → Config: three more, wrapping at the end.
+        for want in [Tab::Usage, Tab::Stats, Tab::Config] {
+            key(&view, &mut panel, KeyPress::plain(Key::Tab));
+            assert_eq!(panel.tab, want);
+        }
+        assert_eq!(panel.query, "第一", "with the filter still typed");
+        assert_eq!(view.matching(&panel.query).len(), 1, "and it still filters");
+    }
+
+    #[test]
+    fn escape_still_closes_from_a_page_that_has_nothing_to_clear() {
+        // Escape's innermost thing is the search, and there is none on the other
+        // pages — so the first escape closes rather than being swallowed.
+        let view = view();
+        let mut panel = Panel::new();
+        key(&view, &mut panel, KeyPress::plain(Key::Tab));
+        assert_eq!(
+            key(&view, &mut panel, KeyPress::plain(Key::Esc)),
+            Step::Close
+        );
+
+        // And on the settings page with a filter typed, it clears first.
+        let mut panel = Panel::new();
+        key(&view, &mut panel, KeyPress::ch('第'));
+        assert_eq!(
+            key(&view, &mut panel, KeyPress::plain(Key::Esc)),
+            Step::Stay
+        );
+        assert_eq!(panel.query, "");
+        assert_eq!(
+            key(&view, &mut panel, KeyPress::plain(Key::Esc)),
+            Step::Close
+        );
+    }
+
+    #[test]
+    fn every_page_is_reachable_from_every_other_page() {
+        // `cycled` is the whole navigation, so an ordering bug would strand a
+        // page. Walked rather than assumed.
+        for from in Tab::ALL {
+            let mut seen = vec![from];
+            let mut at = from;
+            for _ in 0..Tab::ALL.len() - 1 {
+                at = at.cycled(1);
+                seen.push(at);
+            }
+            for tab in Tab::ALL {
+                assert!(seen.contains(&tab), "{tab:?} unreachable from {from:?}");
+            }
+            assert_eq!(at.cycled(1), from, "and one more wraps to where we began");
+        }
+    }
+
+    #[test]
+    fn showing_the_page_you_are_already_on_changes_nothing() {
+        let mut panel = Panel::new();
+        assert!(!panel.show(Tab::Config), "already there");
+        assert!(panel.show(Tab::Status), "and this is a change");
     }
 }

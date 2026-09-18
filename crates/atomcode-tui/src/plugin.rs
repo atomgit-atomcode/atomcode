@@ -914,6 +914,23 @@ impl UserInterface for Tui {
                                 stale = true;
                                 continue;
                             }
+                            // A press on a page tab shows that page. Tried
+                            // before the settings rows, because the tabs are on
+                            // the header row and a hit test that ran the other
+                            // way round would let a stray row answer first.
+                            //
+                            // Deliberately **not** falling through to the
+                            // selection when it misses: a press on the header is
+                            // a press on the panel's chrome, and starting a text
+                            // selection on a tab row would copy the panel's own
+                            // labels.
+                            if self.host.settings_open() {
+                                if let Some(tab) = self.host.settings_tab_at(x, y) {
+                                    let _ = self.host.show_settings_tab(tab);
+                                    stale = true;
+                                    continue;
+                                }
+                            }
                             // A press on a settings row arms it and takes it,
                             // which is the rule the question and team panels
                             // keep: the row a press lands on is the row that
