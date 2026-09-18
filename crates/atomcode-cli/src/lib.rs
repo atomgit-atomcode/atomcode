@@ -179,6 +179,18 @@ pub mod tui_front {
             std::fs::write(&self.path, document.to_string()).map_err(|e| e.to_string())
         }
 
+        /// Who is signed in, from the stored credentials.
+        ///
+        /// The name and the email, never the token — this answer is printed on
+        /// a screen and kept in a log.
+        fn identity(&self) -> Option<atomcode_coding::front_end::Identity> {
+            let auth = atomcode_auth::get_stored_auth()?;
+            Some(atomcode_coding::front_end::Identity {
+                who: auth.user.name.unwrap_or(auth.user.username),
+                detail: auth.user.email,
+            })
+        }
+
         /// The file's bytes, hashed. A file that has not been edited reads the
         /// same, and a reload then leaves the running graph where it is.
         ///

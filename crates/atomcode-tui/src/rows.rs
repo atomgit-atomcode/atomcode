@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use atomcode_plexus::{Context, Plugin};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::command::Commands;
@@ -54,6 +55,12 @@ pub const SCREEN: &str = r#"
 #
 # Replace the whole thing with `[[patch]] id = "tui-panel-welcome"` and another
 # `name`; `[[remove]]` it and the conversation simply starts with what was said.
+# What this build calls itself. Before the welcome block, which reads it.
+# `[[patch]] id = "tui-brand"` with a `config` is how a downstream build changes
+# its name, its licence and its mascot without touching Rust — see `BrandRow`.
+[[insert]]
+name = "tui-brand"
+
 [[insert]]
 name = "tui-panel-welcome"
 
@@ -119,11 +126,24 @@ disabled = true
 [[insert]]
 name = "tui-panel-ask"
 
+# The keys, as a row. Remove it and the screen still runs — with nothing bound
+# but typing, which is what makes the row worth having rather than a constant.
+# A downstream build mounts its own after this one and names the presses it is
+# taking (`Keymap::overrides`).
+[[insert]]
+name = "tui-keys-default"
+
 [[insert]]
 name = "tui-commands-screen"
 
 [[insert]]
 name = "tui-commands-session"
+
+# Its own row so a downstream build can take the conversation somewhere else:
+# `[[remove]]` this one and mount its own, or override one name and keep the
+# other (`CommandSet::overrides`).
+[[insert]]
+name = "tui-commands-take-away"
 
 # The agent's own commands, from its description. After the screen's and the
 # session's, so a name one of those already has stays theirs.
@@ -140,6 +160,7 @@ name = "tui-commands-help"
 /// A launcher that listed them by hand would silently miss the next one added.
 pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
     vec![
+        Arc::new(BrandRow),
         Arc::new(TranscriptPanel),
         Arc::new(WelcomePanel),
         Arc::new(StatusPanel),
@@ -152,8 +173,10 @@ pub fn catalog() -> Vec<std::sync::Arc<dyn Plugin>> {
         Arc::new(SteeringPanel),
         Arc::new(AskPanel),
         Arc::new(RasterPanel),
+        Arc::new(DefaultKeysRow),
         Arc::new(ScreenCommandsRow),
         Arc::new(SessionCommandsRow),
+        Arc::new(TakeAwayCommandsRow),
         Arc::new(AgentCatalogCommandsRow),
         Arc::new(HelpCommandsRow),
     ]
@@ -255,7 +278,12 @@ impl Plugin for WelcomePanel {
     }
     async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
         let mods = ctx.require::<ModulesSvc>().map_err(|e| e.to_string())?;
-        let producer = welcome::Welcome::new();
+        // Whatever this build calls itself, or the shipped identity when no row
+        // provides one: a screen with no brand row still opens.
+        let brand = ctx
+            .service::<crate::plugin::BrandSvc>()
+            .unwrap_or_else(|| Arc::new(crate::content::Brand::default()));
+        let producer = welcome::Welcome::new(brand);
         let id = producer.id();
         mods.add_producer(producer)?;
         let m: Arc<Modules> = mods.clone();
@@ -505,6 +533,135 @@ impl Plugin for AskPanel {
     }
 }
 
+// ---- what this build calls itself -----------------------------------------
+
+/// `name`, `licence`, and the mascot's art — a build's identity, as a row.
+///
+/// The point of the row is its config: a downstream build patches it in the
+/// config tree and never touches Rust.
+///
+/// ```toml
+/// [[patch]]
+/// id = "tui-brand"
+/// config = { name = "◆ LongCode", licence = "内部使用", mascot = { rows = [
+///   "oo..oo", "..oo..",
+/// ], palette = { o = 40 } } }
+/// ```
+///
+/// `mascot = false` is a build with no art at all. Leaving a field out keeps
+/// the shipped value for that field — a fork usually wants its own name and is
+/// happy with everything else.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrandRowConfig {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    licence: Option<String>,
+    #[serde(default)]
+    mascot: Option<MascotConfig>,
+}
+
+/// Either art, or `false` for none.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum MascotConfig {
+    None(bool),
+    Art {
+        rows: Vec<String>,
+        /// Legend to 256-colour index. TOML keys are strings; a key that is not
+        /// exactly one character is refused rather than silently truncated.
+        palette: std::collections::BTreeMap<String, u8>,
+    },
+}
+
+pub struct BrandRow;
+
+#[async_trait]
+impl Plugin for BrandRow {
+    fn name(&self) -> &'static str {
+        "tui-brand"
+    }
+    fn provides(&self) -> &'static [&'static str] {
+        &["tui-brand"]
+    }
+    fn description(&self) -> &'static str {
+        "what this build calls itself: its name, its licence, its mascot"
+    }
+    async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
+        let row: BrandRowConfig = if config.is_null() {
+            BrandRowConfig::default()
+        } else {
+            serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+        };
+        let shipped = crate::content::Brand::default();
+        let mascot = match row.mascot {
+            None => shipped.mascot,
+            Some(MascotConfig::None(false)) => None,
+            Some(MascotConfig::None(true)) => shipped.mascot,
+            Some(MascotConfig::Art { rows, palette }) => {
+                let mut legend = std::collections::BTreeMap::new();
+                for (key, colour) in palette {
+                    let mut chars = key.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None) => {
+                            legend.insert(c, colour);
+                        }
+                        _ => return Err(format!("palette key `{key}` is not a single character")),
+                    }
+                }
+                Some(crate::content::Mascot {
+                    rows,
+                    palette: legend,
+                })
+            }
+        };
+        let brand = crate::content::Brand {
+            name: row.name.unwrap_or(shipped.name),
+            licence: row.licence.unwrap_or(shipped.licence),
+            mascot,
+        };
+        let _ = ctx
+            .provide::<crate::plugin::BrandSvc>(Arc::new(brand))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+// ---- keys ----------------------------------------------------------------
+
+/// The bindings this build ships, as a row.
+///
+/// The same shape as a command set: the registry is a slot the UI row provides,
+/// this fills it, and unloading empties it again. What makes it worth a row
+/// rather than a line in `assemble` is that a downstream build can drop it —
+/// `[[remove]] id = "tui-keys-default"` — or mount its own after it and take
+/// over the presses it names.
+pub struct DefaultKeysRow;
+
+#[async_trait]
+impl Plugin for DefaultKeysRow {
+    fn name(&self) -> &'static str {
+        "tui-keys-default"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["tui-keys"]
+    }
+    fn description(&self) -> &'static str {
+        "the keys this build ships"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        let keys = ctx
+            .require::<crate::plugin::KeysSvc>()
+            .map_err(|e| e.to_string())?;
+        keys.add(&crate::keymap::Default_)?;
+        let id = crate::keymap::Keymap::id(&crate::keymap::Default_);
+        let k = keys.clone();
+        let _ = ctx.effect(move || k.remove(id));
+        Ok(())
+    }
+}
+
 // ---- command sets --------------------------------------------------------
 
 /// A command set that needs nothing but itself.
@@ -547,6 +704,12 @@ commands!(
     "tui-commands-session",
     crate::commands::SessionCommands,
     "the conversation: compact it, look at it, start another, go back to one"
+);
+commands!(
+    TakeAwayCommandsRow,
+    "tui-commands-take-away",
+    crate::commands::TakeAwayCommands,
+    "copy, save — taking the conversation out of the terminal"
 );
 
 /// The agent's catalog commands. It holds the connection, because what it lists

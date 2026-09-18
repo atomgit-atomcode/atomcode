@@ -96,13 +96,17 @@ fn seed_of(seed: &str) -> u64 {
 
 /// The opening block's producer.
 ///
-/// A unit struct: it holds no state. Everything it says is decided in `opening`
-/// from what it is handed.
-pub struct Welcome;
+/// It holds the brand and nothing else: what this build calls itself is decided
+/// once, by the row that mounts this (`crate::rows::WelcomePanel` reading
+/// `BrandSvc`), rather than read from a constant in the middle of the layout
+/// code. Everything else it says is decided in `opening` from what it is handed.
+pub struct Welcome {
+    brand: Arc<crate::content::Brand>,
+}
 
 impl Welcome {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self)
+    pub fn new(brand: Arc<crate::content::Brand>) -> Arc<Self> {
+        Arc::new(Self { brand })
     }
 }
 
@@ -129,6 +133,7 @@ impl Producer for Welcome {
             model: open.model.clone(),
             version: open.version,
             tips,
+            brand: self.brand.clone(),
         }))
     }
 }
@@ -254,7 +259,7 @@ mod tests {
 
     #[test]
     fn opening_builds_the_block_from_what_it_was_handed() {
-        let welcome = Welcome::new();
+        let welcome = Welcome::new(Arc::new(crate::content::Brand::default()));
         let open = Opening {
             cwd: "~/proj".into(),
             model: Some("a-model".into()),

@@ -36,6 +36,8 @@ plexus_service!(ModulesSvc => Modules, "tui-modules", Core, "Mounted stream prod
 // inside this file, which is precisely why the mascot had to be a special case.
 plexus_service!(LayoutSvc => crate::layout::Layout, "tui-layout", Core, "The region tree on screen");
 plexus_service!(CommandsSvc => crate::command::Commands, "tui-commands", Core, "Slash commands contributed by rows");
+plexus_service!(KeysSvc => crate::keymap::Keys, "tui-keys", Core, "Key bindings contributed by rows");
+plexus_service!(BrandSvc => crate::content::Brand, "tui-brand", Seam, "What this build calls itself: its name, its licence, its mascot");
 plexus_service!(AgentClientSvc => AgentClient, "tui-agent-client", Core, "The screen's end of its connection to the agent");
 // Declared here, by the one that consumes it (`docs/adr/0021` §6): whoever
 // launches the screen fills it with what its host handed over.
@@ -573,7 +575,7 @@ struct Member {
 pub struct Tui {
     client: Arc<AgentClient>,
     host: Arc<Host>,
-    keys: Keys,
+    keys: Arc<Keys>,
     surface: Arc<dyn Surface>,
     /// Set when the loop starts. A command runs against the tree, and the tree
     /// is not known until then.
@@ -2407,8 +2409,10 @@ async fn read_input(wake: mpsc::UnboundedSender<Wake>) {
 pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
     let mods = Arc::new(Modules::new());
     let host = Arc::new(Host::new(mods, default_layout()));
-    let mut keys = Keys::new();
-    keys.add(&crate::keymap::Default_).expect("default keys");
+    // Empty: the bindings come from a row, the way the panels and the commands
+    // do (`tui-keys-default`). A screen assembled here has the slot, not the
+    // contents.
+    let keys = Arc::new(Keys::new());
     (
         host.clone(),
         Tui {
@@ -2444,6 +2448,7 @@ impl Plugin for TuiUiPlugin {
             "tui-modules",
             "tui-rasters",
             "tui-commands",
+            "tui-keys",
             "tui-layout",
         ]
     }
@@ -2478,6 +2483,9 @@ impl Plugin for TuiUiPlugin {
             .provide::<LayoutSvc>(host.layout.clone())
             .map_err(|e| e.to_string())?;
         let _ = ctx
+            .provide::<KeysSvc>(tui.keys.clone())
+            .map_err(|e| e.to_string())?;
+        let _ = ctx
             .provide::<AgentClientSvc>(tui.client.clone())
             .map_err(|e| e.to_string())?;
         let _ = ctx
@@ -2505,6 +2513,20 @@ struct SurfaceRow {
     /// under a modifier (Option on macOS, Shift elsewhere).
     #[serde(default = "yes")]
     mouse: bool,
+    /// What the terminal can do, when this build knows better than detection
+    /// does. All three optional; anything left out is detected as before.
+    ///
+    /// For a fleet: an image whose `TERM` says `xterm` on emulators that do
+    /// 24-bit colour states it once here rather than exporting a variable on
+    /// every machine. `ATOMCODE_ASCII` remains, and still wins — it is the
+    /// per-session escape hatch, and a person on one bad terminal must be able
+    /// to override the tree they share.
+    #[serde(default)]
+    unicode: Option<bool>,
+    #[serde(default)]
+    colors: Option<String>,
+    #[serde(default)]
+    cell_background: Option<bool>,
 }
 
 fn yes() -> bool {
@@ -2513,14 +2535,32 @@ fn yes() -> bool {
 
 /// The configured palette (`None` means "ask the terminal"), and whether to
 /// report the pointer.
-fn surface_row(config: &Value) -> Result<(Option<crate::theme::Theme>, bool), String> {
+fn surface_row(
+    config: &Value,
+) -> Result<(Option<crate::theme::Theme>, bool, crate::caps::Overrides), String> {
     let row: SurfaceRow = if config.is_null() {
         SurfaceRow {
             theme: None,
             mouse: true,
+            unicode: None,
+            colors: None,
+            cell_background: None,
         }
     } else {
         serde_json::from_value(config.clone()).map_err(|e| format!("bad config: {e}"))?
+    };
+    let colors = match row.colors.as_deref() {
+        None => None,
+        Some("none") => Some(crate::caps::Colors::None),
+        Some("16") => Some(crate::caps::Colors::Ansi16),
+        Some("256") => Some(crate::caps::Colors::Ansi256),
+        Some("true") => Some(crate::caps::Colors::True),
+        Some(other) => return Err(format!("colors `{other}` is not none, 16, 256 or true")),
+    };
+    let overrides = crate::caps::Overrides {
+        unicode: row.unicode,
+        colors,
+        cell_background: row.cell_background,
     };
     let mouse = row.mouse && !std::env::var("ATOMCODE_NO_MOUSE").is_ok_and(|v| v != "0");
     // The env var wins: it is how a person overrides one session without
@@ -2535,7 +2575,7 @@ fn surface_row(config: &Value) -> Result<(Option<crate::theme::Theme>, bool), St
         Some("light") => Some(crate::theme::Theme::Light),
         Some(other) => return Err(format!("theme `{other}` is not auto, dark or light")),
     };
-    Ok((theme, mouse))
+    Ok((theme, mouse, overrides))
 }
 
 #[async_trait]
@@ -2550,9 +2590,9 @@ impl Plugin for TerminalSurfacePlugin {
         "the terminal, full screen, restored on the way out"
     }
     async fn apply(&self, ctx: &Context, config: &Value) -> Result<(), String> {
-        let (theme, mouse) = surface_row(config)?;
-        let term =
-            Terminal::enter(theme, mouse).map_err(|e| format!("cannot take the terminal: {e}"))?;
+        let (theme, mouse, overrides) = surface_row(config)?;
+        let term = Terminal::enter(theme, mouse, overrides)
+            .map_err(|e| format!("cannot take the terminal: {e}"))?;
         let _ = ctx
             .provide::<SurfaceSvc>(Arc::new(term))
             .map_err(|e| e.to_string())?;

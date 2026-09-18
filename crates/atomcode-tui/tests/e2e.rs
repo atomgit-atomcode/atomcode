@@ -1068,8 +1068,8 @@ async fn esc_declines_and_the_model_is_told_rather_than_the_turn_dying() {
 #[tokio::test]
 async fn typing_a_slash_shows_what_is_available_and_narrows_as_you_type() {
     let dir = scratch("menu");
-    // Without the welcome block: it lists `/help` among its quick-start tips, and
-    // this test proves the menu narrowed by looking for `/help` being gone from
+    // Without the welcome block: it names commands among its quick-start tips,
+    // and this test proves the menu narrowed by looking for one being gone from
     // the screen. Two rows naming the same command is not this test's subject —
     // the welcome has its own (`a_new_session_opens_with_the_welcome_…`).
     let s = start(tree(
@@ -1083,14 +1083,17 @@ async fn typing_a_slash_shows_what_is_available_and_narrows_as_you_type() {
     s.term.type_text("/");
     s.quiet().await;
     let all = s.screen();
-    assert!(all.contains("/help"), "the menu opens:\n{all}");
+    // Two that are alphabetically near the top, because the menu shows the
+    // first ten of what matches and this one is about opening and narrowing,
+    // not about which commands the build happens to ship.
+    assert!(all.contains("/clear"), "the menu opens:\n{all}");
     assert!(all.contains("/compact"), "{all}");
 
     s.term.type_text("comp");
     s.quiet().await;
     let narrowed = s.screen();
     assert!(narrowed.contains("/compact"), "{narrowed}");
-    assert!(!narrowed.contains("/help"), "it narrows:\n{narrowed}");
+    assert!(!narrowed.contains("/clear"), "it narrows:\n{narrowed}");
 
     // And it closes again when the slash goes away.
     for _ in 0..5 {

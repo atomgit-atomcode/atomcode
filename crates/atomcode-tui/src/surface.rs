@@ -678,8 +678,13 @@ impl Terminal {
 
 impl Terminal {
     /// Take the screen. `theme` forces a palette; `None` means ask the terminal
-    /// what colour it is and follow the answer.
-    pub fn enter(theme: Option<Theme>, mouse: bool) -> std::io::Result<Self> {
+    /// what colour it is and follow the answer. `overrides` is what this build
+    /// says about the terminal over what detection found.
+    pub fn enter(
+        theme: Option<Theme>,
+        mouse: bool,
+        overrides: crate::caps::Overrides,
+    ) -> std::io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
         let mut out = std::io::stdout();
         out.write_all(ansi::ENTER.as_bytes())?;
@@ -690,7 +695,7 @@ impl Terminal {
         };
         out.write_all(pointer.escape().as_bytes())?;
         out.flush()?;
-        let mut caps = crate::caps::Caps::detect();
+        let mut caps = crate::caps::Caps::detect_with(overrides);
         // Inside the alternate screen on purpose: a terminal that does not know
         // the queries may echo them, and here the first frame paints over it.
         //

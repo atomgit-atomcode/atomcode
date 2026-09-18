@@ -234,8 +234,67 @@ pub fn question_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Opti
                 about: None,
             })
         }
-        _ => None,
+        // A kind this screen has never been taught. Drawn from the payload
+        // rather than refused.
+        //
+        // The refusal used to be `None`, which the caller turns into `Null`,
+        // which the asking tool reads as "no driver can present this" and tells
+        // the model **interactive questions are not supported in this
+        // environment** — said by a screen that is sitting in front of somebody
+        // who could have answered. That was reported as a bug once already; the
+        // fix then was to teach this file one more kind, and teaching it one
+        // more kind per asker is not a fix, it is a queue.
+        //
+        // So the contract flips: what a new asker has to do to be askable is
+        // put its question in the payload, not teach this file about itself.
+        other => generic(other, payload),
     }
+}
+
+/// A question from a payload nobody here recognises.
+///
+/// Anything with words in it can be put to a person. `None` only when there are
+/// no words — a payload with nothing to read out is genuinely not a question,
+/// and asking "好 / 不了" about nothing would be worse than refusing.
+fn generic(kind: &str, payload: &Value) -> Option<Question> {
+    let prompt = ["prompt", "question", "message", "text"]
+        .iter()
+        .find_map(|key| payload.get(key).and_then(Value::as_str))
+        .filter(|text| !text.trim().is_empty())?;
+    let offered: Vec<Answer> = payload
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|given| given.iter().filter_map(offered_answer).collect())
+        .unwrap_or_default();
+    Some(Question {
+        prompt: prompt.to_string(),
+        // Yes or no when the asker named no choices: a question with no answers
+        // on screen is a question nobody can answer.
+        options: if offered.is_empty() {
+            vec![
+                Answer::labelled(YES.to_string(), "好".to_string()),
+                Answer::labelled(NO.to_string(), "不了".to_string()),
+            ]
+        } else {
+            offered
+        },
+        asker: Some(kind.to_string()),
+        about: None,
+    })
+}
+
+/// One offered answer: a bare string, or an object with `value`/`label`.
+fn offered_answer(value: &Value) -> Option<Answer> {
+    if let Some(text) = value.as_str() {
+        return Some(Answer::new(text.to_string()));
+    }
+    let object = value.as_object()?;
+    let pick = |key: &str| object.get(key).and_then(Value::as_str);
+    let value = pick("value").or_else(|| pick("label"))?;
+    Some(Answer::labelled(
+        value.to_string(),
+        pick("label").unwrap_or(value).to_string(),
+    ))
 }
 
 /// The questions of a batch request, when the payload is one.
@@ -244,6 +303,13 @@ pub fn question_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Opti
 /// `{"questions": [...]}` and waits for `{"responses": [...]}`. `None` for
 /// every other payload, including a single question — a one-element array is
 /// deliberately *not* a batch on the tool's side either.
+/// What a yes and a no are called on the wire, for a question that offered no
+/// answers of its own. Plain words rather than `allow`/`deny`: this is not an
+/// approval, and an asker reading `allow` back would be entitled to think it
+/// was.
+pub const YES: &str = "yes";
+pub const NO: &str = "no";
+
 pub fn batch_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Vec<Question>> {
     if kind != REQUEST_USER_INPUT_KIND {
         return None;
@@ -306,7 +372,14 @@ pub fn response_for(kind: &str, _question: &Question, answer: Option<String>) ->
         | atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND => {
             serde_json::json!({ "continue": answer.as_deref() == Some(CONTINUE) })
         }
-        _ => Value::Null,
+        // A kind this screen does not know: the value the person picked, as it
+        // was written. `Null` stays what a *declined* question answers with —
+        // an asker has to be able to tell "they said no" from "nobody could
+        // ask", and before this both arrived as `Null`.
+        _ => match answer {
+            Some(chosen) => Value::String(chosen),
+            None => Value::Null,
+        },
     }
 }
 
@@ -612,6 +685,42 @@ mod tests {
         let declined: UserInputResponse =
             serde_json::from_value(response_for(REQUEST_USER_INPUT_KIND, &question, None)).unwrap();
         assert!(declined.declined);
-        assert!(question_for("something-else", &payload, &[]).is_none());
+    }
+
+    /// A kind this screen has never been taught is still asked, and the answer
+    /// gets back to whoever asked.
+    ///
+    /// The alternative is what shipped before: the screen answers `Null`, the
+    /// tool reads that as "no driver can present this", and the model is told
+    /// interactive questions are not supported — by a screen with a question
+    /// panel on it. A new asker should have to put its question in the payload,
+    /// not teach `ask.rs` about itself.
+    #[test]
+    fn a_kind_this_screen_never_heard_of_is_still_asked() {
+        let payload = serde_json::json!({
+            "prompt": "要不要把这条也带上?",
+            "options": ["带上", { "value": "skip", "label": "跳过" }],
+        });
+        let question = question_for("some-future-capability", &payload, &[]).expect("drawn");
+        assert_eq!(question.prompt, "要不要把这条也带上?");
+        assert_eq!(question.values(), vec!["带上", "skip"]);
+        assert_eq!(question.asker.as_deref(), Some("some-future-capability"));
+        assert_eq!(
+            response_for("some-future-capability", &question, Some("skip".into())),
+            serde_json::json!("skip")
+        );
+        // Declined stays distinguishable from "nobody could ask".
+        assert_eq!(
+            response_for("some-future-capability", &question, None),
+            Value::Null
+        );
+
+        // No answers named: yes or no, so there is something to press.
+        let bare = question_for("another", &serde_json::json!({ "message": "继续?" }), &[])
+            .expect("drawn");
+        assert_eq!(bare.values(), vec![YES, NO]);
+
+        // And a payload with no words in it is genuinely not a question.
+        assert!(question_for("another", &serde_json::json!({ "n": 1 }), &[]).is_none());
     }
 }

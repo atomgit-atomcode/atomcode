@@ -79,6 +79,47 @@ pub enum Graphics {
 }
 
 /// What the terminal on the other end can render.
+/// What a build or a person says about the terminal, over what detection found.
+///
+/// Detection reads the environment, and the environment lies in both
+/// directions: a corporate image ships `TERM=xterm` on an emulator that does
+/// 24-bit colour, and a CI runner claims a colour terminal while rendering into
+/// a log file. `ATOMCODE_ASCII` was the only way to say otherwise, and it
+/// answers one of the three questions — which is why a downstream build that
+/// ships to a fixed fleet of terminals ended up patching detection itself.
+///
+/// Empty by default: nothing overridden, detection stands. Set from the surface
+/// row's config (`unicode`, `colors`, `cell_background`), so a fleet states what
+/// its terminals do once, in the tree, rather than per machine in an
+/// environment variable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Overrides {
+    pub unicode: Option<bool>,
+    pub colors: Option<Colors>,
+    pub cell_background: Option<bool>,
+}
+
+impl Overrides {
+    /// Whether anything is overridden at all.
+    pub fn any(&self) -> bool {
+        self.unicode.is_some() || self.colors.is_some() || self.cell_background.is_some()
+    }
+
+    /// Put these over `caps`. A field nobody set keeps what was detected.
+    ///
+    /// `palette` is deliberately not overridable: it is a *measurement* of what
+    /// the terminal rendered, and a build asserting a measurement it never took
+    /// is how both unreadable palettes shipped.
+    pub fn over(&self, caps: Caps) -> Caps {
+        Caps {
+            unicode: self.unicode.unwrap_or(caps.unicode),
+            colors: self.colors.unwrap_or(caps.colors),
+            cell_background: self.cell_background.unwrap_or(caps.cell_background),
+            ..caps
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Caps {
     /// Decorative Unicode (box drawing, `✓`, `▸`) renders rather than tofu.
@@ -142,6 +183,11 @@ impl Caps {
             cell_background: false,
             graphics: Graphics::None,
         }
+    }
+
+    /// Read the environment, then let `overrides` have the last word.
+    pub fn detect_with(overrides: Overrides) -> Self {
+        overrides.over(Self::detect())
     }
 
     /// Read the environment. Called once, by the surface row.
@@ -457,6 +503,46 @@ pub fn glyph(unicode: bool, glyph: Glyph) -> &'static str {
 mod tests {
     use super::*;
     use crate::width;
+
+    /// A build says what its terminals do, and detection does not get a vote on
+    /// the fields it named — nor on the ones it did not.
+    ///
+    /// The case this is for: a fleet whose `TERM` says `xterm` on emulators that
+    /// do 24-bit colour. Before it, the only thing anyone could say was
+    /// `ATOMCODE_ASCII`, which answers one of the three questions.
+    #[test]
+    fn a_build_can_say_what_its_terminals_do() {
+        let detected = Caps::plain();
+        let nothing = Overrides::default();
+        assert!(!nothing.any());
+        assert_eq!(
+            nothing.over(detected),
+            detected,
+            "nothing said, nothing done"
+        );
+
+        let said = Overrides {
+            colors: Some(Colors::True),
+            ..Default::default()
+        };
+        assert!(said.any());
+        let got = said.over(detected);
+        assert_eq!(got.colors, Colors::True, "what the build said");
+        assert!(
+            !got.unicode,
+            "what it did not say is still what was detected"
+        );
+        assert!(!got.cell_background);
+
+        // And in the other direction: a runner that claims a colour terminal
+        // while rendering into a log file.
+        let quiet = Overrides {
+            unicode: Some(false),
+            colors: Some(Colors::None),
+            cell_background: Some(false),
+        };
+        assert_eq!(quiet.over(Caps::default()), Caps::plain());
+    }
 
     #[test]
     fn a_capable_terminal_pays_nothing() {

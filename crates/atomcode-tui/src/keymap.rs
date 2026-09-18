@@ -5,6 +5,7 @@
 //! moment someone presses it.
 
 use std::collections::HashMap;
+use std::sync::RwLock;
 
 use crate::surface::{Key, KeyPress, Mods};
 
@@ -84,12 +85,26 @@ pub enum Action {
 pub trait Keymap: Send + Sync {
     fn id(&self) -> &'static str;
     fn bindings(&self) -> Vec<(KeyPress, Action)>;
+    /// Presses this map takes over from whoever already has them.
+    ///
+    /// The one way a key may be bound twice, and it has to be said out loud —
+    /// the same rule, for the same reason, as [`crate::command::CommandSet::overrides`].
+    /// Without it a downstream build that wants ctrl-r for something else has
+    /// to drop the whole shipped map and re-declare forty bindings to change
+    /// one.
+    fn overrides(&self) -> Vec<KeyPress> {
+        Vec::new()
+    }
 }
 
 /// Every binding mounted, with conflicts refused at mount time.
+///
+/// Behind a lock and reached through `KeysSvc`, because bindings arrive from
+/// rows while the screen is already up: a capability that mounts brings its key
+/// with it and takes it away again when it unloads.
 #[derive(Default)]
 pub struct Keys {
-    map: HashMap<KeyPress, (&'static str, Action)>,
+    map: RwLock<HashMap<KeyPress, (&'static str, Action)>>,
 }
 
 impl Keys {
@@ -99,27 +114,34 @@ impl Keys {
 
     /// Two rows claiming one key is an error, not last-write-wins: the user
     /// would get whichever row happened to mount second, and nothing would say
-    /// so.
-    pub fn add(&mut self, km: &dyn Keymap) -> Result<(), String> {
+    /// so. Unless the second one says it is taking it ([`Keymap::overrides`]).
+    pub fn add(&self, km: &dyn Keymap) -> Result<(), String> {
+        let taken_over = km.overrides();
+        let mut map = self.map.write().expect("keys poisoned");
         for (press, action) in km.bindings() {
-            if let Some((owner, _)) = self.map.get(&press) {
-                return Err(format!(
-                    "`{}` and `{}` both bind {press:?}; disable one",
-                    owner,
-                    km.id()
-                ));
+            if let Some((owner, _)) = map.get(&press) {
+                if !taken_over.contains(&press) {
+                    return Err(format!(
+                        "`{}` and `{}` both bind {press:?}; disable one",
+                        owner,
+                        km.id()
+                    ));
+                }
             }
-            self.map.insert(press, (km.id(), action));
+            map.insert(press, (km.id(), action));
         }
         Ok(())
     }
 
-    pub fn remove(&mut self, id: &str) {
-        self.map.retain(|_, (owner, _)| *owner != id);
+    pub fn remove(&self, id: &str) {
+        self.map
+            .write()
+            .expect("keys poisoned")
+            .retain(|_, (owner, _)| *owner != id);
     }
 
     pub fn resolve(&self, press: KeyPress) -> Option<Action> {
-        if let Some((_, a)) = self.map.get(&press) {
+        if let Some((_, a)) = self.map.read().expect("keys poisoned").get(&press) {
             return Some(a.clone());
         }
         // Typing is the fallthrough, not a binding: binding every printable
@@ -131,15 +153,17 @@ impl Keys {
     }
 
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.map.read().expect("keys poisoned").len()
     }
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.map.read().expect("keys poisoned").is_empty()
     }
     /// For the help panel and for the model's view of what the keys do.
     pub fn describe(&self) -> Vec<(String, String)> {
         let mut out: Vec<_> = self
             .map
+            .read()
+            .expect("keys poisoned")
             .iter()
             .map(|(k, (_, a))| (format!("{k:?}"), format!("{a:?}")))
             .collect();
@@ -222,7 +246,7 @@ mod tests {
 
     #[test]
     fn the_default_bindings_mount_without_conflicting_with_themselves() {
-        let mut keys = Keys::new();
+        let keys = Keys::new();
         keys.add(&Default_).unwrap();
         assert_eq!(keys.len(), Default_.bindings().len());
     }
@@ -238,7 +262,7 @@ mod tests {
                 vec![(KeyPress::ctrl('d'), Action::Clear)]
             }
         }
-        let mut keys = Keys::new();
+        let keys = Keys::new();
         keys.add(&Default_).unwrap();
         let err = keys.add(&Rival).unwrap_err();
         assert!(err.contains("both bind"), "{err}");
@@ -247,7 +271,7 @@ mod tests {
 
     #[test]
     fn typing_falls_through_rather_than_being_bound_per_character() {
-        let mut keys = Keys::new();
+        let keys = Keys::new();
         keys.add(&Default_).unwrap();
         assert_eq!(keys.resolve(KeyPress::ch('x')), Some(Action::Insert('x')));
         assert_eq!(keys.resolve(KeyPress::ch('中')), Some(Action::Insert('中')));
@@ -255,9 +279,41 @@ mod tests {
         assert_eq!(keys.resolve(KeyPress::ctrl('d')), Some(Action::Quit));
     }
 
+    /// A downstream build can rebind one press without re-declaring the other
+    /// forty. The clash test above is this one's negative control: the same
+    /// collision without the declaration is still refused.
+    #[test]
+    fn a_row_takes_over_one_press_only_by_saying_so() {
+        struct Mine;
+        impl Keymap for Mine {
+            fn id(&self) -> &'static str {
+                "mine"
+            }
+            fn bindings(&self) -> Vec<(KeyPress, Action)> {
+                vec![(KeyPress::ctrl('d'), Action::Clear)]
+            }
+            fn overrides(&self) -> Vec<KeyPress> {
+                vec![KeyPress::ctrl('d')]
+            }
+        }
+        let keys = Keys::new();
+        keys.add(&Default_).unwrap();
+        keys.add(&Mine).unwrap();
+        assert_eq!(keys.resolve(KeyPress::ctrl('d')), Some(Action::Clear));
+        // Everything else the shipped map bound is still bound.
+        assert_eq!(keys.resolve(KeyPress::ctrl('w')), Some(Action::DeleteWord));
+        // Unloading the row that took it leaves the press unbound rather than
+        // restoring what it displaced: an override is a replacement, not a
+        // stack, and a screen that quietly resurrected an old binding would be
+        // a third answer to "what does ctrl-d do".
+
+        keys.remove("mine");
+        assert_eq!(keys.resolve(KeyPress::ctrl('d')), None);
+    }
+
     #[test]
     fn unmounting_a_row_takes_its_bindings_with_it() {
-        let mut keys = Keys::new();
+        let keys = Keys::new();
         keys.add(&Default_).unwrap();
         keys.remove("keys-default");
         assert!(keys.is_empty());

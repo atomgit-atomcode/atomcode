@@ -108,58 +108,116 @@ pub struct WelcomeBlock {
     pub version: &'static str,
     /// The tips to show, as `(command, what it does)`.
     pub tips: Vec<(String, String)>,
+    /// What this build calls itself. Handed in by the row that mounts the
+    /// producer, so a downstream build changes it in the config tree rather
+    /// than in this file.
+    pub brand: std::sync::Arc<Brand>,
 }
 
-/// The mascot's source art, **verbatim** from `atomcode-tuix`
-/// (`render/mascot.rs`).
+/// What this build calls itself, as data rather than as constants.
 ///
-/// Four rows of 18 characters: nine cells, and each cell's two characters are its
-/// **upper and lower** half-pixels — tuix draws them as `▀` with the foreground
-/// above and the cell's background below. Legend: `.` transparent, `o` orange,
-/// `e` dark-orange eyebrow, `w` white, `k` black.
+/// A fork's whole visible identity is these few fields. The previous shape —
+/// `let brand = "◆ AtomCode"` in the middle of the layout code and the art in a
+/// `const` beside it — cost the one downstream that tried it a rewrite of the
+/// mascot module, three width calculations that had the cell count baked in,
+/// and a legend whitelist in a test. None of that is a decision about their
+/// product; it is all this file refusing to be told.
 ///
-/// **It is coarse, and that is the art.** 18 × 8 pixels is enough for two ears, two
-/// eyes and a chin — and no whiskers, no nose, no tail. Rendered large it reads as
-/// a rounded blob with a face in it. That was checked before deciding to keep it:
-/// the alternative was redrawing a "better" cat, which would be a second mascot to
-/// keep in step with tuix's, and the two front ends disagreeing about what the
-/// product's cat looks like is a worse outcome than a small one. Kept verbatim on
-/// purpose; see the judgement below about its colours.
-const MASCOT_SOURCE: [&str; 4] = [
-    "oooo.o.o.o.o.ooooo",
-    "ooooooewekooewekoo",
-    "ooooookokoookokooo",
-    "..o.ooooooooooo...",
-];
+/// So: a value, with a `Default` that is what this build ships, reached through
+/// `BrandSvc` and set from the config tree (`crate::rows::BrandRow`). Nothing
+/// below reads a brand constant, and the mascot's width comes from the art.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Brand {
+    /// The word in the welcome block's top-left, mark and all.
+    pub name: String,
+    /// What is shown beside the version, top-right.
+    pub licence: String,
+    /// The art, when there is any. `None` is a build with no mascot — not a
+    /// blank one: the tips then have the whole width.
+    pub mascot: Option<Mascot>,
+}
 
-/// How many cells wide the art is.
-const MASCOT_CELLS: usize = 9;
-
-/// A legend character as its 256-index colour, or `None` for transparent.
-///
-/// **The literal palette, exactly as tuix defines it** (`mascot_color`), and
-/// literal on purpose. I first wrote these as roles and it produced a magenta cat
-/// that read as a bug — the reason is worth keeping: `Role::Brand` resolves to
-/// xterm slot 13 *to mean "the brand"*, and this art is not asking for a meaning,
-/// it is a picture of an orange cat. There is no role in the vocabulary that means
-/// "orange", so the picture states its own colours and the gate below is what
-/// protects a terminal that cannot show them.
-fn mascot_colour(legend: char) -> Option<u8> {
-    match legend {
-        'o' => Some(202), // orange        #ff5f00
-        'e' => Some(166), // eyebrow       #d75f00
-        'w' => Some(231), // highlight     white
-        'k' => Some(232), // pupil         near-black
-        _ => None,        // '.' transparent
+impl Default for Brand {
+    fn default() -> Self {
+        Self {
+            name: "◆ AtomCode".into(),
+            licence: "MIT".into(),
+            mascot: Some(Mascot::default()),
+        }
     }
 }
 
-fn mascot_cell(row: &str, cell: usize) -> (Option<u8>, Option<u8>) {
-    let chars: Vec<char> = row.chars().collect();
-    (
-        chars.get(cell * 2).copied().and_then(mascot_colour),
-        chars.get(cell * 2 + 1).copied().and_then(mascot_colour),
-    )
+/// A mascot: rows of half-pixel cells, and the legend that colours them.
+///
+/// Each row is two characters per cell — the cell's **upper and lower**
+/// half-pixels, drawn as `▀` with the foreground above and the background
+/// below. A legend character the palette does not name is transparent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mascot {
+    pub rows: Vec<String>,
+    /// Legend character -> 256-colour index.
+    pub palette: std::collections::BTreeMap<char, u8>,
+}
+
+impl Mascot {
+    /// How many cells wide the art is — **from the art**, not from a constant
+    /// beside it. The old `MASCOT_CELLS` had to be kept in step by hand with
+    /// three width calculations, which is one of the things a fork had to
+    /// rediscover the hard way.
+    pub fn cells(&self) -> usize {
+        self.rows
+            .iter()
+            .map(|row| row.chars().count() / 2)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// A cell's two pixels, as colours.
+    fn cell(&self, row: &str, cell: usize) -> (Option<u8>, Option<u8>) {
+        let chars: Vec<char> = row.chars().collect();
+        let colour = |c: Option<&char>| c.and_then(|c| self.palette.get(c)).copied();
+        (colour(chars.get(cell * 2)), colour(chars.get(cell * 2 + 1)))
+    }
+}
+
+/// The shipped cat, **verbatim** from `atomcode-tuix` (`render/mascot.rs`).
+///
+/// **It is coarse, and that is the art.** 18 x 8 pixels is enough for two ears,
+/// two eyes and a chin — and no whiskers, no nose, no tail. Rendered large it
+/// reads as a rounded blob with a face in it. That was checked before deciding
+/// to keep it: the alternative was redrawing a "better" cat, which would be a
+/// second mascot to keep in step with tuix's, and the two front ends disagreeing
+/// about what the product's cat looks like is a worse outcome than a small one.
+///
+/// **The palette is literal on purpose.** I first wrote these as roles and it
+/// produced a magenta cat that read as a bug — the reason is worth keeping:
+/// `Role::Brand` resolves to xterm slot 13 *to mean "the brand"*, and this art
+/// is not asking for a meaning, it is a picture of an orange cat. There is no
+/// role in the vocabulary that means "orange", so the picture states its own
+/// colours and the capability gate in `mascot` is what protects a terminal that
+/// cannot show them.
+impl Default for Mascot {
+    fn default() -> Self {
+        Self {
+            rows: [
+                "oooo.o.o.o.o.ooooo",
+                "ooooooewekooewekoo",
+                "ooooookokoookokooo",
+                "..o.ooooooooooo...",
+            ]
+            .iter()
+            .map(|row| (*row).to_string())
+            .collect(),
+            palette: [
+                ('o', 202u8), // orange        #ff5f00
+                ('e', 166),   // eyebrow       #d75f00
+                ('w', 231),   // highlight     white
+                ('k', 232),   // pupil         near-black
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
 }
 
 impl Content for WelcomeBlock {
@@ -202,7 +260,7 @@ impl Content for WelcomeBlock {
         let pad = " ".repeat(PAD);
 
         // ---- The left column: the mascot, then the two bullets ----
-        let mut left: Vec<Line> = mascot(ctx, content_w);
+        let mut left: Vec<Line> = mascot(ctx, content_w, self.brand.mascot.as_ref());
 
         // cwd and model are rendered BELOW the whole block, never zipped into the
         // left column beside the tips. Tuix learned this: when the tips are taller
@@ -270,8 +328,8 @@ impl Content for WelcomeBlock {
         // narrower than the two strings would otherwise be drawn past its own
         // edge, which the frame's containment check catches per block but a reader
         // sees as a row running into its neighbour.
-        let right_txt = format!("v{}  MIT", self.version);
-        let brand = "◆ AtomCode";
+        let right_txt = format!("v{}  {}", self.version, self.brand.licence);
+        let brand = self.brand.name.as_str();
         let brand_w = width::str_width(brand);
         let right_w = width::str_width(&right_txt);
         let brand_style = Style::new().fg(Color::role(Role::Brand));
@@ -307,7 +365,9 @@ impl Content for WelcomeBlock {
         let left_w = if left.is_empty() {
             PAD
         } else {
-            PAD + MASCOT_CELLS
+            // From the art, so a fork's taller or wider mascot lines the tips
+            // up beside it without touching this calculation.
+            PAD + self.brand.mascot.as_ref().map_or(0, Mascot::cells)
         };
         let tips_col = left_w + gap;
         let right_w = right.iter().map(Line::width).max().unwrap_or(0);
@@ -377,26 +437,30 @@ const PAD: usize = 2;
 ///
 /// Cut to `content_w`, like every other row: art wider than the rect it was given
 /// is a row running into its neighbour.
-fn mascot(ctx: &RenderCtx, content_w: usize) -> Vec<Line> {
+fn mascot(ctx: &RenderCtx, content_w: usize, art: Option<&Mascot>) -> Vec<Line> {
+    let Some(art) = art else {
+        return Vec::new();
+    };
     let drawable = ctx.caps.colors != crate::caps::Colors::None
         && ctx.caps.unicode
         && ctx.caps.cell_background;
     if !drawable {
         return Vec::new();
     }
-    // The art needs PAD + nine cells. Showing a sliced cat is worse than showing
-    // none, and the caller's width is the one thing that decides.
-    if content_w < MASCOT_CELLS {
+    // The art needs PAD plus its own width. Showing a sliced cat is worse than
+    // showing none, and the caller's width is the one thing that decides.
+    let cells = art.cells();
+    if cells == 0 || content_w < cells {
         return Vec::new();
     }
-    MASCOT_SOURCE
+    art.rows
         .iter()
         .map(|row| {
             let mut spans: Vec<Span> = vec![Span::raw(" ".repeat(PAD))];
             let mut run = String::new();
             let mut run_style = Style::new();
-            for cell in 0..MASCOT_CELLS {
-                let (top, bottom) = mascot_cell(row, cell);
+            for cell in 0..cells {
+                let (top, bottom) = art.cell(row, cell);
                 // tuix's `mascot_cell`, decision for decision. `▄` where the TOP
                 // pixel is the transparent one, so the ears' empty half does not
                 // paint a default-foreground bar across them — the bug that line
@@ -1554,6 +1618,7 @@ mod tests {
                 ("/resume".into(), "接着上次".into()),
                 ("/help".into(), "列出所有命令".into()),
             ],
+            brand: std::sync::Arc::new(Brand::default()),
         }
     }
 
@@ -1588,34 +1653,104 @@ mod tests {
     #[test]
     fn the_mascot_is_the_same_cat_tuix_draws() {
         // The art and its palette are tuix's, unchanged — a "close enough" redraw
-        // would be a second cat to keep in step. Checked against the constants
-        // rather than against a transcription of them.
-        for (i, row) in MASCOT_SOURCE.iter().enumerate() {
+        // would be a second cat to keep in step. Checked against the shipped
+        // value rather than against a transcription of it.
+        let art = Mascot::default();
+        let cells = art.cells();
+        for (i, row) in art.rows.iter().enumerate() {
             assert_eq!(
                 row.chars().count(),
-                MASCOT_CELLS * 2,
-                "row {i} is not {MASCOT_CELLS} cells of two pixels"
+                cells * 2,
+                "row {i} is not {cells} cells of two pixels"
             );
             assert!(
                 row.chars()
-                    .all(|c| matches!(c, '.' | 'o' | 'e' | 'w' | 'k')),
-                "row {i} has a legend character nobody draws"
+                    .all(|c| c == '.' || art.palette.contains_key(&c)),
+                "row {i} has a legend character the palette does not colour"
             );
         }
-        assert_eq!(mascot_colour('o'), Some(202), "orange, as tuix bakes it");
-        assert_eq!(mascot_colour('e'), Some(166), "dark-orange eyebrow");
-        assert_eq!(mascot_colour('w'), Some(231), "white highlight");
-        assert_eq!(mascot_colour('k'), Some(232), "black pupil");
-        assert_eq!(mascot_colour('.'), None, "transparent, not a colour");
+        assert_eq!(
+            art.palette.get(&'o'),
+            Some(&202),
+            "orange, as tuix bakes it"
+        );
+        assert_eq!(art.palette.get(&'e'), Some(&166), "dark-orange eyebrow");
+        assert_eq!(art.palette.get(&'w'), Some(&231), "white highlight");
+        assert_eq!(art.palette.get(&'k'), Some(&232), "black pupil");
+        assert_eq!(art.palette.get(&'.'), None, "transparent, not a colour");
 
         // tuix's own judgement on the art: one white highlight per eye, eyebrows
         // above them. If the bytes are ever edited, this says what they must keep.
-        let eyes = MASCOT_SOURCE[1];
+        let eyes = &art.rows[1];
         assert_eq!(eyes.matches('w').count(), 2, "one highlight per eye");
         assert_eq!(
             eyes.matches('e').count(),
             4,
             "an eyebrow per eye, 2 cells wide"
+        );
+    }
+
+    /// The identity is data: a build that calls itself something else says so,
+    /// draws its own art, and the tips still line up beside art of another size.
+    ///
+    /// This is the one a fork needs. Before it, changing the name meant editing
+    /// the layout code and the cell count in three places.
+    #[test]
+    fn another_build_can_call_itself_something_else() {
+        let mine = Brand {
+            name: "◆ 龙仔".into(),
+            licence: "内部使用".into(),
+            mascot: Some(Mascot {
+                // Three cells wide rather than nine, to catch a width that was
+                // taken from a constant instead of from the art.
+                rows: vec!["oo..oo".into(), "..oo..".into()],
+                palette: [('o', 40u8)].into_iter().collect(),
+            }),
+        };
+        let block = WelcomeBlock {
+            brand: std::sync::Arc::new(mine.clone()),
+            ..welcome()
+        };
+        let all = lines_of(&block, 80, true).join("\n");
+        assert!(all.contains("龙仔"), "its own name:\n{all}");
+        assert!(all.contains("内部使用"), "its own licence:\n{all}");
+        assert!(!all.contains("AtomCode"), "and not ours:\n{all}");
+        assert!(!all.contains("MIT"), "nor our licence:\n{all}");
+
+        // Its own colour, and none of the shipped cat's.
+        let lines = block.lines(&wctx(80, true));
+        let mut colours: Vec<u8> = Vec::new();
+        let index = |c: Option<Color>| match c {
+            Some(Color::Picture(n)) => Some(n),
+            _ => None,
+        };
+        for span in lines.iter().flat_map(|line| &line.spans) {
+            colours.extend(index(span.style.fg));
+            colours.extend(index(span.style.bg));
+        }
+        assert!(colours.contains(&40), "the new art's colour: {colours:?}");
+        assert!(!colours.contains(&202), "not the cat's orange: {colours:?}");
+
+        // The tips sit beside art of the new width, not of the old one.
+        let tip = lines_of(&block, 80, true)
+            .into_iter()
+            .find(|line| line.contains("/resume"))
+            .expect("a tip");
+        let indent = tip[..tip.find("/resume").expect("found")].chars().count();
+        assert_eq!(indent, PAD + 3 + 4, "PAD + three cells + the gap: {tip:?}");
+
+        // And a build with no mascot at all draws none.
+        let bare = WelcomeBlock {
+            brand: std::sync::Arc::new(Brand {
+                mascot: None,
+                ..mine
+            }),
+            ..welcome()
+        };
+        let drawn = lines_of(&bare, 80, true).join("\n");
+        assert!(
+            !drawn.contains('\u{2580}') && !drawn.contains('\u{2584}'),
+            "{drawn}"
         );
     }
 
@@ -1840,11 +1975,13 @@ mod tests {
     fn the_art_source_is_well_formed() {
         // The constant is borrowed from tuix; if it were ever edited, this says
         // what the reader below assumes.
-        for (i, row) in MASCOT_SOURCE.iter().enumerate() {
+        let art = Mascot::default();
+        let cells = art.cells();
+        for (i, row) in art.rows.iter().enumerate() {
             assert_eq!(
                 row.chars().count(),
-                MASCOT_CELLS * 2,
-                "row {i} is not {MASCOT_CELLS} cells of two pixels"
+                cells * 2,
+                "row {i} is not {cells} cells of two pixels"
             );
             assert!(
                 row.chars()

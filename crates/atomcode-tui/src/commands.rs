@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use atomcode_kernel::host::{HostCommand, HostError, HostReply};
+use atomcode_kernel::message::Role;
 use atomcode_kernel::provider::ReasoningEffort;
 use atomcode_kernel::session::{derive_messages, SessionEvent};
 use atomcode_plexus::Context;
@@ -113,6 +114,103 @@ fn showinject(what: &str) -> Result<Action, String> {
     }
 }
 
+/// Taking the conversation out of the terminal: onto the clipboard, onto disk.
+///
+/// Its own set rather than two more arms in [`SessionCommands`], because it is
+/// the one part of the command surface a downstream build is most likely to
+/// have an opinion about — a house that saves to its own wiki drops this row
+/// and mounts its own, or keeps it and overrides `save` alone
+/// ([`CommandSet::overrides`]).
+pub struct TakeAwayCommands;
+
+const TAKE_AWAY: &[Command] = &[
+    Command::taking(
+        "copy",
+        "[N|all]",
+        "复制模型最后一条回复里的代码块;N 指定第几块,all 全要",
+    ),
+    Command::taking("save", "[文件名]", "把这段对话存成 markdown"),
+];
+
+#[async_trait]
+impl CommandSet for TakeAwayCommands {
+    fn id(&self) -> &'static str {
+        "cmd-take-away"
+    }
+    fn commands(&self) -> Vec<Command> {
+        TAKE_AWAY.to_vec()
+    }
+    async fn run(&self, name: &str, args: &str, ctx: &Context) -> Outcome {
+        let Some(client) = ctx.service::<crate::plugin::AgentClientSvc>() else {
+            return Outcome::Refused("这块屏幕没接上 agent".into());
+        };
+        match name {
+            // Copying a code block is the one thing people do with an answer
+            // that the answer itself cannot do: the model wrote it to be run,
+            // and dragging across a wrapped terminal is how it ends up with
+            // line numbers and gutters in it.
+            "copy" => {
+                let blocks = code_blocks(&last_answer(&client.events()));
+                if blocks.is_empty() {
+                    return Outcome::Refused("最后一条回复里没有代码块".into());
+                }
+                let text = match args.trim() {
+                    "" if blocks.len() == 1 => blocks[0].clone(),
+                    "" => {
+                        return Outcome::Refused(format!(
+                            "有 {} 块;`/copy N` 指定哪一块,`/copy all` 全要",
+                            blocks.len()
+                        ))
+                    }
+                    "all" => blocks.join("\n\n"),
+                    n => match n.parse::<usize>().ok().filter(|n| *n >= 1) {
+                        Some(n) if n <= blocks.len() => blocks[n - 1].clone(),
+                        _ => {
+                            return Outcome::Refused(format!(
+                                "只有 {} 块,没有第 {n} 块",
+                                blocks.len()
+                            ))
+                        }
+                    },
+                };
+                let Some(surface) = ctx.service::<crate::plugin::SurfaceSvc>() else {
+                    return Outcome::Refused("这块屏幕没有剪贴板".into());
+                };
+                let lines = text.lines().count();
+                surface.copy(&text);
+                Outcome::Said(format!("复制了 {lines} 行"))
+            }
+            // Markdown rather than the screen's own rendering: what is saved is
+            // read elsewhere — in an editor, in a review, in an issue — and the
+            // gutters and the fold marks belong to this screen.
+            "save" => {
+                let text = as_markdown(&client.events());
+                if text.trim().is_empty() {
+                    return Outcome::Refused("这段对话还没有内容可存".into());
+                }
+                let name = match args.trim() {
+                    "" => format!("atomcode-{}.md", client.session().replace('/', "-")),
+                    given => given.to_string(),
+                };
+                // Relative to where the session is working, not to wherever the
+                // process happened to be started: a person saying `/save` means
+                // "beside the code I am looking at".
+                let path = std::path::Path::new(&name);
+                let path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    std::path::Path::new(&client.root()).join(path)
+                };
+                match std::fs::write(&path, text) {
+                    Ok(()) => Outcome::Said(format!("存到 {}", path.display())),
+                    Err(error) => Outcome::Refused(format!("存不下:{error}")),
+                }
+            }
+            _ => Outcome::Quiet,
+        }
+    }
+}
+
 /// The conversation: what is in it, what to do with it, and which one it is.
 pub struct SessionCommands;
 
@@ -166,6 +264,12 @@ const SESSION: &[Command] = &[
     Command::new("reload", "重新读取 skills、MCP 与配置,会话不变"),
     Command::new("logout", "把凭据拿出进程;会话留着"),
     Command::new("login", "用现在配置的凭据重新登录"),
+    Command::new("whoami", "现在是谁登录着"),
+    Command::taking(
+        "think",
+        "[on|off]",
+        "要不要思考(与 /effort「思考多狠」是两个旋钮);不带参数则说现在是哪个",
+    ),
 ];
 
 /// A host's refusal, in words a person can act on.
@@ -633,6 +737,78 @@ impl CommandSet for SessionCommands {
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
+            "whoami" => {
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refusal) => return refusal,
+                };
+                match control
+                    .call(HostCommand::WhoAmI {
+                        session: root.clone(),
+                    })
+                    .await
+                {
+                    Ok(HostReply::Identity {
+                        signed_in: true,
+                        who,
+                        detail,
+                    }) => {
+                        let who = who.unwrap_or_else(|| "登录着,但宿主没说是谁".into());
+                        Outcome::Said(match detail {
+                            Some(detail) => format!("{who} · {detail}"),
+                            None => who,
+                        })
+                    }
+                    Ok(HostReply::Identity { .. }) => {
+                        Outcome::Said("没有人登录;这份配置用的是自带的凭据".into())
+                    }
+                    Ok(other) => Outcome::Refused(format!("宿主答了别的:{other:?}")),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
+            // Two knobs, not one: `/effort` is how hard, this is whether at all.
+            "think" => {
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refusal) => return refusal,
+                };
+                let wanted = args.trim().to_ascii_lowercase();
+                let on = match wanted.as_str() {
+                    "" => {
+                        return match control
+                            .call(HostCommand::Thinking {
+                                session: root.clone(),
+                            })
+                            .await
+                        {
+                            Ok(HostReply::Settings { settings }) => match settings.first() {
+                                Some(setting) => Outcome::Said(format!(
+                                    "思考:{};改用 /think on 或 /think off",
+                                    setting.value
+                                )),
+                                None => Outcome::Refused("这个宿主没有思考开关".into()),
+                            },
+                            Ok(other) => Outcome::Refused(format!("宿主答了别的:{other:?}")),
+                            Err(error) => Outcome::Refused(refusal(error)),
+                        }
+                    }
+                    "on" | "true" => true,
+                    "off" | "false" => false,
+                    other => {
+                        return Outcome::Refused(format!("`{other}` 不是 on 或 off"));
+                    }
+                };
+                match control
+                    .call(HostCommand::SetThinking {
+                        session: root.clone(),
+                        on,
+                    })
+                    .await
+                {
+                    Ok(_) => Outcome::Said(format!("思考:{}", if on { "on" } else { "off" })),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
             "rename" => {
                 let title = args.trim();
                 if title.is_empty() {
@@ -821,6 +997,64 @@ impl CommandSet for AgentCatalogCommands {
 
 fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("")
+}
+
+/// The last thing the model said, as text. Empty when it has not said anything
+/// yet — a session that has only been typed into.
+fn last_answer(events: &[atomcode_kernel::session::LoggedEvent]) -> String {
+    derive_messages(events)
+        .into_iter()
+        .rfind(|m| m.role == Role::Assistant)
+        .map(|m| m.text)
+        .unwrap_or_default()
+}
+
+/// The fenced code blocks in `text`, in the order they appear, without their
+/// fences. An unclosed fence still counts: a model that stopped mid-block wrote
+/// the part a person wants to run, and refusing to copy it because the closing
+/// line never arrived is the wrong answer.
+fn code_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in text.lines() {
+        let fence = line.trim_start().starts_with("```");
+        match (&mut current, fence) {
+            (None, true) => current = Some(Vec::new()),
+            (Some(_), true) => {
+                let lines = current.take().unwrap_or_default();
+                blocks.push(lines.join("\n"));
+            }
+            (Some(lines), false) => lines.push(line),
+            (None, false) => {}
+        }
+    }
+    if let Some(lines) = current {
+        blocks.push(lines.join("\n"));
+    }
+    blocks.retain(|b| !b.trim().is_empty());
+    blocks
+}
+
+/// The conversation as markdown: who said what, in order, with tool traffic
+/// left out. What is saved is read somewhere else — an editor, a review, an
+/// issue — so it is the conversation, not this screen's rendering of it.
+fn as_markdown(events: &[atomcode_kernel::session::LoggedEvent]) -> String {
+    let mut out = String::new();
+    for message in derive_messages(events) {
+        let who = match message.role {
+            Role::User => "## 我",
+            Role::Assistant => "## 模型",
+            Role::System | Role::Tool => continue,
+        };
+        if message.text.trim().is_empty() {
+            continue;
+        }
+        out.push_str(who);
+        out.push_str("\n\n");
+        out.push_str(message.text.trim_end());
+        out.push_str("\n\n");
+    }
+    out
 }
 
 // `builtin()` used to live here and mount all five sets at once. It is gone on
@@ -1014,6 +1248,174 @@ mod tests {
             ]
         );
     }
+    /// Who is signed in, and the other thinking knob.
+    ///
+    /// `/think` is not `/effort`: one says whether the model thinks at all, the
+    /// other how hard. Both are asked of the host against the session this
+    /// screen follows.
+    #[tokio::test]
+    async fn who_is_signed_in_and_whether_the_model_thinks_at_all() {
+        let host = Arc::new(Recording::default());
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::Identity {
+                signed_in: true,
+                who: Some("lichao".into()),
+                detail: Some("li@example.com".into()),
+            }),
+            Ok(HostReply::Identity {
+                signed_in: false,
+                who: None,
+                detail: None,
+            }),
+            Ok(HostReply::Settings {
+                settings: vec![atomcode_kernel::host::Setting {
+                    id: "thinking".into(),
+                    label: "思考".into(),
+                    value: "off".into(),
+                    accepts: "on | off".into(),
+                    applies: "下一回合".into(),
+                }],
+            }),
+        ]);
+        let (app, _client, all) = following(&host);
+        assert_eq!(
+            all.dispatch("/whoami", &app.context()).await,
+            Outcome::Said("lichao · li@example.com".into())
+        );
+        // Nobody signed in is an answer, not a refusal.
+        match all.dispatch("/whoami", &app.context()).await {
+            Outcome::Said(text) => assert!(text.contains("没有人登录"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        match all.dispatch("/think", &app.context()).await {
+            Outcome::Said(text) => assert!(text.contains("off"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            all.dispatch("/think on", &app.context()).await,
+            Outcome::Said("思考:on".into())
+        );
+        assert!(matches!(
+            all.dispatch("/think 一点点", &app.context()).await,
+            Outcome::Refused(_)
+        ));
+        let lead = || "lead".to_string();
+        assert_eq!(
+            *host.asked.lock().unwrap(),
+            vec![
+                HostCommand::WhoAmI { session: lead() },
+                HostCommand::WhoAmI { session: lead() },
+                HostCommand::Thinking { session: lead() },
+                HostCommand::SetThinking {
+                    session: lead(),
+                    on: true,
+                },
+            ],
+            "the refused one asked nothing"
+        );
+    }
+
+    /// A screen following a session the model has answered in, with `answer` as
+    /// its last reply.
+    fn answered(answer: &str) -> (App, Arc<Commands>, Arc<crate::surface::Headless>) {
+        let app = bare();
+        let client = Arc::new(crate::plugin::AgentClient::default());
+        let (commands, _agent) = tokio::sync::mpsc::unbounded_channel();
+        client.connect(commands, Arc::new(Recording::default()));
+        client.follow("lead");
+        for (seq, event) in [
+            SessionEvent::UserMessage {
+                turn: 1,
+                text: "写个 hello".into(),
+                images: Vec::new(),
+            },
+            SessionEvent::AssistantMessage {
+                turn: 1,
+                round: 1,
+                text: answer.into(),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+                reasoning_blocks: Vec::new(),
+                meta: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            client.keep(&atomcode_kernel::session::Committed {
+                session: "lead".into(),
+                seq: seq as u64 + 1,
+                at: 0,
+                event,
+            });
+        }
+        let surface = crate::surface::Headless::new(80, 24);
+        let ctx = app.context();
+        let _ = ctx.provide::<crate::plugin::AgentClientSvc>(client);
+        let _ = ctx.provide::<crate::plugin::SurfaceSvc>(surface.clone());
+        let all = Arc::new(Commands::new());
+        let _ = all.add(Arc::new(TakeAwayCommands));
+        (app, all, surface)
+    }
+
+    /// `/copy` takes the code out of the last answer and nothing else — not the
+    /// prose around it, not the fences. With more than one block it asks which,
+    /// rather than guessing.
+    #[tokio::test]
+    async fn copy_takes_the_code_out_of_the_last_answer() {
+        let (app, all, surface) =
+            answered("这样写:\n\n```rust\nfn main() {}\n```\n\n或者:\n\n```sh\necho hi\n```\n");
+        match all.dispatch("/copy", &app.context()).await {
+            Outcome::Refused(why) => assert!(why.contains("2"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(surface.clipboard_text(), None, "nothing was copied yet");
+        let _ = all.dispatch("/copy 2", &app.context()).await;
+        assert_eq!(surface.clipboard_text(), Some("echo hi".into()));
+        let _ = all.dispatch("/copy all", &app.context()).await;
+        assert_eq!(
+            surface.clipboard_text(),
+            Some("fn main() {}\n\necho hi".into())
+        );
+        assert!(matches!(
+            all.dispatch("/copy 9", &app.context()).await,
+            Outcome::Refused(_)
+        ));
+
+        // An answer with no code in it says so rather than copying the prose.
+        let (app, all, surface) = answered("没有代码,就这么说说");
+        assert!(matches!(
+            all.dispatch("/copy", &app.context()).await,
+            Outcome::Refused(_)
+        ));
+        assert_eq!(surface.clipboard_text(), None);
+    }
+
+    /// `/save` writes the conversation as markdown, beside the code the session
+    /// is working on.
+    #[tokio::test]
+    async fn save_writes_the_conversation_as_markdown() {
+        let (app, all, _surface) = answered("写好了");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let into = dir.path().join("聊天.md");
+        match all
+            .dispatch(&format!("/save {}", into.display()), &app.context())
+            .await
+        {
+            Outcome::Said(text) => assert!(text.contains("聊天.md"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        let written = std::fs::read_to_string(&into).expect("written");
+        assert!(
+            written.contains("## 我") && written.contains("写个 hello"),
+            "{written}"
+        );
+        assert!(
+            written.contains("## 模型") && written.contains("写好了"),
+            "{written}"
+        );
+    }
+
     use atomcode_plexus::{App, ConfigTree, PluginRegistry};
 
     fn bare() -> App {
@@ -1031,6 +1433,7 @@ mod tests {
         let c = Arc::new(Commands::new());
         let _ = c.add(Arc::new(ScreenCommands));
         let _ = c.add(Arc::new(SessionCommands));
+        let _ = c.add(Arc::new(TakeAwayCommands));
         let _ = c.add(Arc::new(HelpCommands { all: c.clone() }));
         c
     }

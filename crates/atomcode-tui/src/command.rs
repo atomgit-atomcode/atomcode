@@ -95,6 +95,21 @@ pub trait CommandSet: Send + Sync {
     fn hidden(&self) -> Vec<Command> {
         Vec::new()
     }
+    /// Names this set takes over from whoever already has them.
+    ///
+    /// The one way a name may be claimed twice, and it has to be said out loud.
+    /// Without it a downstream build that wants its own `/copy` has to drop the
+    /// whole set the shipped one lives in and lose the other twenty commands
+    /// with it; with it, it mounts one row that names `copy` and nothing else
+    /// moves. Declared rather than settled by mount order, because the whole
+    /// reason [`Commands::add`] refuses a clash is that last-write-wins leaves
+    /// nothing saying which one you got.
+    ///
+    /// A name nobody has yet is not an error: a set may ship with the override
+    /// declared and be mounted alongside a build that never had that command.
+    fn overrides(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
     /// Run one. `args` is everything after the name, untrimmed of meaning.
     async fn run(&self, name: &str, args: &str, ctx: &Context) -> Outcome;
 }
@@ -114,7 +129,11 @@ impl Commands {
     /// mounted second and nothing would say so.
     pub fn add(&self, set: Arc<dyn CommandSet>) -> Result<(), String> {
         let mut sets = self.sets.write().expect("commands poisoned");
+        let taken_over = set.overrides();
         for c in set.commands() {
+            if taken_over.contains(&c.name.as_ref()) {
+                continue;
+            }
             for existing in sets.iter() {
                 if existing.commands().iter().any(|e| e.name == c.name) {
                     return Err(format!(
@@ -126,7 +145,14 @@ impl Commands {
                 }
             }
         }
-        sets.push(set);
+        // In front, so `owner` and `all` find it before the set it took the
+        // name from. Order is how the override is applied; the declaration
+        // above is what makes it legal.
+        if taken_over.is_empty() {
+            sets.push(set);
+        } else {
+            sets.insert(0, set);
+        }
         Ok(())
     }
 
@@ -229,6 +255,25 @@ mod tests {
         }
     }
 
+    /// A downstream set that says which names it takes over.
+    struct Takeover(&'static str, &'static [Command], &'static [&'static str]);
+
+    #[async_trait]
+    impl CommandSet for Takeover {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+        fn commands(&self) -> Vec<Command> {
+            self.1.to_vec()
+        }
+        fn overrides(&self) -> Vec<&'static str> {
+            self.2.to_vec()
+        }
+        async fn run(&self, name: &str, args: &str, _ctx: &Context) -> Outcome {
+            Outcome::Said(format!("mine:{name}({args})"))
+        }
+    }
+
     const A: &[Command] = &[Command::new("alpha", "a"), Command::new("also", "b")];
     const B: &[Command] = &[Command::new("beta", "c")];
     const CLASH: &[Command] = &[Command::new("alpha", "mine now")];
@@ -246,6 +291,38 @@ mod tests {
         let err = c.add(Arc::new(Fake("rival", CLASH))).unwrap_err();
         assert!(err.contains("/alpha"), "{err}");
         assert!(err.contains("row-a") && err.contains("rival"), "{err}");
+    }
+
+    /// A downstream build can put its own `/alpha` in place of the shipped one
+    /// without losing the rest of the set it lived in, and the menu shows one
+    /// `/alpha` — its own. The clash test above is this one's negative control:
+    /// the same collision without the declaration is still refused.
+    #[tokio::test]
+    async fn a_row_takes_over_one_name_and_leaves_the_rest_of_the_set_standing() {
+        let c = registry();
+        c.add(Arc::new(Takeover("downstream", CLASH, &["alpha"])))
+            .unwrap();
+        let app = atomcode_plexus::App::new(
+            atomcode_plexus::PluginRegistry::new(),
+            atomcode_plexus::ConfigTree::default(),
+        );
+        let ctx = app.context();
+        assert_eq!(
+            c.dispatch("/alpha x", &ctx).await,
+            Outcome::Said("mine:alpha(x)".into())
+        );
+        // The set it took the name from still answers for its other command.
+        assert_eq!(
+            c.dispatch("/also", &ctx).await,
+            Outcome::Said("also()".into())
+        );
+        let menu = c.all();
+        assert_eq!(
+            menu.iter().map(|x| x.name.clone()).collect::<Vec<_>>(),
+            vec!["alpha", "also", "beta"]
+        );
+        let alpha = menu.iter().find(|x| x.name == "alpha").expect("alpha");
+        assert_eq!(alpha.about, "mine now");
     }
 
     #[test]

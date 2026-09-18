@@ -94,6 +94,26 @@ pub trait HostConfig: Send + Sync {
         let _ = (id, value);
         Err("这个宿主的配置不能从屏幕上改".into())
     }
+
+    /// Who is signed in, when anybody is.
+    ///
+    /// `None` is the ordinary answer for a host that runs on a key in a file:
+    /// nobody signed in, nothing wrong. What comes back is what a person would
+    /// put on a name badge — never a token, never a key, not even truncated
+    /// (`docs/adr/0021`; a credential does not belong in an answer a screen
+    /// prints and a log keeps).
+    fn identity(&self) -> Option<Identity> {
+        None
+    }
+}
+
+/// Who is signed in, for [`HostConfig::identity`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identity {
+    /// The name to show. A username, an email, whatever the host signs in with.
+    pub who: String,
+    /// Anything worth showing beside it — an email, an organisation.
+    pub detail: Option<String>,
 }
 
 impl std::fmt::Debug for FrontEnd {
@@ -801,7 +821,6 @@ impl HostControl for RuntimeControl {
                         Mode::Ask => crate::RuntimeMode::Build,
                         Mode::AcceptEdits => crate::RuntimeMode::AcceptEdits,
                         Mode::Auto => crate::RuntimeMode::Auto,
-                        _ => crate::RuntimeMode::Build,
                     })
                     .await?;
                 Ok(HostReply::Done)
@@ -931,6 +950,55 @@ impl HostControl for RuntimeControl {
                     None => self.config.lock().expect("config poisoned").clone(),
                 };
                 self.reconfigure(next).await
+            }
+            HostCommand::WhoAmI { session } => {
+                self.addressed(&session)?;
+                let identity = self
+                    .front_end
+                    .host_config()
+                    .and_then(|source| source.identity());
+                Ok(match identity {
+                    Some(Identity { who, detail }) => HostReply::Identity {
+                        signed_in: true,
+                        who: Some(who),
+                        detail,
+                    },
+                    None => HostReply::Identity {
+                        signed_in: false,
+                        who: None,
+                        detail: None,
+                    },
+                })
+            }
+            // Read as a setting, so a screen that can draw one setting can draw
+            // this one, and `/config` and `/think` are looking at one value.
+            HostCommand::Thinking { session } => {
+                self.addressed(&session)?;
+                let on = self
+                    .config
+                    .lock()
+                    .expect("config poisoned")
+                    .thinking_enabled
+                    .unwrap_or(false);
+                Ok(HostReply::Settings {
+                    settings: vec![atomcode_kernel::host::Setting {
+                        id: "thinking".into(),
+                        label: "思考".into(),
+                        value: if on { "on".into() } else { "off".into() },
+                        accepts: "on | off".into(),
+                        applies: "下一回合".into(),
+                    }],
+                })
+            }
+            // The provider is built with it, so this reassembles — the same
+            // path the thinking *level* takes, for the same reason.
+            HostCommand::SetThinking { session, on } => {
+                self.addressed(&session)?;
+                let mut next = self.config.lock().expect("config poisoned").clone();
+                next.thinking_enabled = Some(on);
+                self.handle.reassemble_provider(next.clone()).await?;
+                *self.config.lock().expect("config poisoned") = next;
+                Ok(HostReply::Done)
             }
             _ => Err(HostError::Failed {
                 message: "this host does not do that yet".into(),

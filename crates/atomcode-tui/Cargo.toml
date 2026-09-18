@@ -58,3 +58,7 @@ libc = "0.2"
 tokio = { version = "1", features = ["test-util"] }
 atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
 ctor = "0.2"
+# A real directory for the one criterion that writes a file (`/save`). The
+# session's working root is a path, and a criterion that faked it would be
+# testing the fake.
+tempfile = "3"

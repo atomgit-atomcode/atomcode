@@ -111,6 +111,16 @@ pub enum HostCommand {
     SignOut { session: String },
     /// Sign `session` back in, with the credentials configured now.
     SignIn { session: String },
+    /// Who is signed in, as the host knows it.
+    WhoAmI { session: String },
+    /// Whether `session`'s requests carry thinking at all, as a setting to read.
+    Thinking { session: String },
+    /// Turn thinking on or off for `session` from now on.
+    ///
+    /// A separate knob from [`HostCommand::SetReasoningEffort`] on purpose: one
+    /// says whether the model thinks before it answers, the other how hard. A
+    /// host whose models have no such switch may refuse it.
+    SetThinking { session: String, on: bool },
 }
 
 impl HostCommand {
@@ -135,7 +145,10 @@ impl HostCommand {
             | Self::WithdrawMcpTools { session }
             | Self::Reload { session }
             | Self::SignOut { session }
-            | Self::SignIn { session } => Some(session),
+            | Self::SignIn { session }
+            | Self::WhoAmI { session }
+            | Self::Thinking { session }
+            | Self::SetThinking { session, .. } => Some(session),
             Self::ListSessions { .. } => None,
         }
     }
@@ -189,6 +202,19 @@ pub enum HostReply {
         models: Vec<ModelChoice>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         current: Option<String>,
+    },
+    /// Who is signed in.
+    ///
+    /// `signed_in: false` is an answer, not a failure — a build that runs on a
+    /// key in a file has nobody signed in and works fine. Never a credential:
+    /// what comes back is what a person would put on a name badge.
+    Identity {
+        signed_in: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        who: Option<String>,
+        /// Anything worth showing beside the name — an email, an organisation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
 }
 
@@ -471,6 +497,16 @@ mod tests {
             HostCommand::SignIn {
                 session: "a".into(),
             },
+            HostCommand::WhoAmI {
+                session: "a".into(),
+            },
+            HostCommand::Thinking {
+                session: "a".into(),
+            },
+            HostCommand::SetThinking {
+                session: "a".into(),
+                on: true,
+            },
         ];
         for c in &all {
             match c {
@@ -493,7 +529,10 @@ mod tests {
                 | HostCommand::WithdrawMcpTools { .. }
                 | HostCommand::Reload { .. }
                 | HostCommand::SignOut { .. }
-                | HostCommand::SignIn { .. } => {}
+                | HostCommand::SignIn { .. }
+                | HostCommand::WhoAmI { .. }
+                | HostCommand::Thinking { .. }
+                | HostCommand::SetThinking { .. } => {}
             }
         }
         all
@@ -580,6 +619,11 @@ mod tests {
                 ],
                 current: Some("glm-5".into()),
             },
+            HostReply::Identity {
+                signed_in: true,
+                who: Some("lichao".into()),
+                detail: Some("atomgit".into()),
+            },
         ];
         for r in &all {
             match r {
@@ -591,7 +635,8 @@ mod tests {
                 | HostReply::McpServers { .. }
                 | HostReply::McpTools { .. }
                 | HostReply::Settings { .. }
-                | HostReply::Models { .. } => {}
+                | HostReply::Models { .. }
+                | HostReply::Identity { .. } => {}
             }
         }
         all
