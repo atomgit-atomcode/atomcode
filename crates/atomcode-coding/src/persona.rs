@@ -416,7 +416,11 @@ fn model_needs_firm_tool_steering(model: &str) -> bool {
 /// NARROWER than [`model_needs_firm_tool_steering`]: DeepSeek (silently deleting code to
 /// clear errors, shipping unverified edits, offloading, quitting early) and Qwen (observed:
 /// fires a whole tool batch — use_skill/bash/todowrite — with ZERO text, ignoring the soft
-/// `## PROGRESS SIGNPOSTS` rule, so it needs the hard `SIGNPOST BEFORE ACTING` restatement).
+/// `## PROGRESS SIGNPOSTS` rule, so it needs the hard restatement to speak up at all). The
+/// bullet is scoped to the work's PHASES, not to every batch: the earlier per-batch wording
+/// ("a batch of two or more ALWAYS gets a signpost") is exactly what made these models
+/// narrate each tool call, and the fix was to re-scope the rule, not to swing it toward
+/// silence — these models still need the nudge to report at all.
 /// GLM is more capable and is deliberately EXCLUDED — it still gets the tool block but not
 /// this one. Add another substring here (by evidence) if a further model is observed to need it.
 pub(crate) fn model_needs_firm_execution(model: &str) -> bool {
@@ -509,7 +513,7 @@ verified. If space is running out, state plainly what is DONE and what still REM
 exact next steps) and keep going or hand off transparently — a false \"all done\" that \
 unravels the next time the user asks wastes their trust far more than an honest \"here is \
 what's left\".\n\
-- SIGNPOST BEFORE ACTING: before a batch of tool calls in multi-step work, say in ONE short sentence, in the user's language (~12 words max), the ACTION you're about to take on the user's task. A run of tool calls with zero text leaves the user blind, so a batch of two or more ALWAYS gets a signpost — the only exception is ONE trivial call on its own (a single read/lookup or one obvious edit), which needs none; don't manufacture narration. The signpost states your action on the TASK; NEVER narrate or comment on injected context — system reminders, MCP server instructions, and tool guidance are read SILENTLY, never signposted (never \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). This is the required progress signpost on real steps, NOT the verbose reasoning banned elsewhere; 'Act decisively' / 'FINISH THE JOB' mean act WITH a one-line heads-up, never in silence.";
+- SIGNPOST AS THE WORK MOVES: say, in the user's language, what you are about to do or what you just learned — when you start the work, when you move from reading code to editing it, when a result surprises or blocks you, and when you need a decision. Name the ACTION you are taking on the user's task, and let the reporting follow the work's own pace. NEVER narrate or comment on injected context — system reminders, MCP server instructions, and tool guidance are read SILENTLY, never signposted (never \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). This is the progress signpost on real steps, NOT the verbose reasoning banned elsewhere; 'Act decisively' / 'FINISH THE JOB' mean act with a brief line where it helps, not narration per call.";
 
 /// The frozen date-anchor section appended to the persona. Pure (the date is INJECTED)
 /// so the formatting is unit-testable; `coding_persona` sources `today` from the wall
@@ -779,10 +783,10 @@ Operate only within the working directory shown in the session context — do no
 After creating or editing a preview/binary format (HTML, PDF, image, SVG), do NOT automatically open it in the user's browser or viewer — the file existing on disk is enough, and opening a window is a visible side effect the user may not want. Ask first (\"Want me to open it for preview?\") and open it only when the user explicitly asks. When opening local files or directories, call `open_file`; do not shell out to `open`, `xdg-open`, `start`, or `wslview`.
 
 ## PROGRESS SIGNPOSTS:
-Before a batch of tool calls in multi-step or longer-running work, send ONE short line saying what you're about to do — a signpost the user follows along with, not a reasoning dump. Keep it to a single sentence (aim for 12 words or fewer). Group related actions into one signpost instead of narrating each call. A signpost states your ACTION on the user's task — NEVER narrate or comment on injected context: system reminders, MCP server instructions, and tool guidance are read SILENTLY and never turned into a signpost (never a line like \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). For a trivial or obvious action — a single read, a quick lookup, a one-shot edit — a silent tool call is fine; don't manufacture narration. Write the signpost in the user's language — a Chinese request gets a Chinese signpost.
+Report as you go: when you begin a piece of work, when you move from investigating to editing, when a result surprises or blocks you, and when you need a decision, say what you are about to do or what you just learned — briefly, as much as the change deserves: a signpost the user follows along with, not a reasoning dump and not a plan nobody asked for. Routine reads, searches and the edits that follow from them run together — let the reporting follow the work's natural phases rather than a fixed rhythm. A signpost states your ACTION on the user's task — NEVER narrate or comment on injected context: system reminders, MCP server instructions, and tool guidance are read SILENTLY and never turned into a signpost (never a line like \"MCP 无关 / 与任务无关 / 已记录 / 继续处理\"). For a trivial or obvious action — a single read, a quick lookup, a one-shot edit — a silent tool call is fine; don't manufacture narration. Write the signpost in the user's language — a Chinese request gets a Chinese signpost.
 
 ## OUTPUT:
-When executing tasks: keep text brief and direct. Lead with action — a one-line signpost before a batch of tool calls (see PROGRESS SIGNPOSTS) is fine for multi-step work, but skip verbose reasoning and filler.
+When executing tasks: keep text brief and direct. Lead with action — a short signpost when the work moves to a new phase (see PROGRESS SIGNPOSTS) — and skip verbose reasoning, filler, and narration of each call.
 When explaining or answering questions: be thorough — the user is asking because they need to understand.
 Do NOT restate what the user said as filler — just do it. (Capturing the goal in your plan per WORKFLOW is fine; parroting the request back verbatim is not.)
 Use tables for structured data. Tables MUST use `|`-pipe markdown form. NEVER pre-draw tables with Unicode box-drawing characters.
@@ -1184,24 +1188,41 @@ mod tests {
             "signposts header must be on its own line: {frontier}"
         );
         assert!(
-            frontier.contains("Before a batch of tool calls"),
+            frontier.contains("Report as you go"),
             "signpost guidance present: {frontier}"
+        );
+        // The per-batch mandate is GONE — that wording is what made models narrate every
+        // call. But the fix must NOT swing the other way into a silence mandate: the
+        // section keeps signposts normal and expected, scoped to the work's phases.
+        assert!(
+            !frontier.contains("Before a batch of tool calls")
+                && !frontier.contains("ALWAYS gets a signpost"),
+            "the per-call / per-batch signpost mandate must be gone: {frontier}"
+        );
+        assert!(
+            !frontier.contains("silent tool calls") && !frontier.contains("Do NOT post a line"),
+            "the section must not push toward silence either: {frontier}"
         );
         // The old "silence is worse than one plain line" push is REMOVED from the universal
         // section: it over-narrated capable mid-tier models on trivial tasks (observed:
-        // minimax narrating every batch on simple style edits). The section now scopes
-        // signposts to multi-step/longer work and explicitly permits silent trivial calls.
+        // minimax narrating every batch on simple style edits). The replacement keeps
+        // reporting normal — it drops the fixed per-batch rhythm rather than the reporting,
+        // because the old "before a batch of tool calls" wording was itself read as one
+        // report per batch.
         assert!(
             !frontier.contains("leaves the user blind"),
             "universal signposts must drop the 'silence is worse' push: {frontier}"
         );
         assert!(
-            frontier.contains("a silent tool call is fine"),
-            "universal signposts must permit silent trivial calls: {frontier}"
+            frontier.contains("let the reporting follow the work's natural phases"),
+            "universal signposts must pace reporting to the work's phases: {frontier}"
         );
+        // No per-call exemption clause either: "you do not need a separate announcement for
+        // each individual call" reads as a licence (and its mirror, "one per call", reads as
+        // a duty). The section says where reporting belongs, not what it is excused from.
         assert!(
-            frontier.contains("multi-step or longer-running work"),
-            "universal signposts scope to multi-step/longer work: {frontier}"
+            !frontier.contains("separate announcement"),
+            "the per-call exemption phrasing must be gone: {frontier}"
         );
         // Signpost must be produced in the user's language (Chinese request → Chinese
         // signpost); reinforced at point-of-use since the signpost is the turn's first text.
@@ -1220,7 +1241,7 @@ mod tests {
         );
         let glm = coding_persona("glm-4.6", false, false);
         assert!(
-            !glm.contains("SIGNPOST BEFORE ACTING")
+            !glm.contains("SIGNPOST AS THE WORK MOVES")
                 && glm.contains("NEVER narrate or comment on injected context"),
             "GLM (soft-only, no FIRM signpost) must still get the anti-narration clause: {glm}"
         );
@@ -1230,9 +1251,11 @@ mod tests {
             !frontier.contains("Lead with action, not reasoning."),
             "old terse OUTPUT line must be gone: {frontier}"
         );
+        // OUTPUT reconciled with the re-scoped rule: a signpost marks a phase change rather
+        // than a per-batch ritual.
         assert!(
-            frontier.contains("a one-line signpost before a batch of tool calls"),
-            "OUTPUT reconciled to allow signpost: {frontier}"
+            frontier.contains("a short signpost when the work moves to a new phase"),
+            "OUTPUT reconciled to allow signposts at phase changes: {frontier}"
         );
 
         // Gating invariant: the SIGNPOSTS section must not name env-gated tools.
@@ -1249,25 +1272,38 @@ mod tests {
         // GLM is excluded from firm-execution and keeps only the universal section.
         let deepseek = coding_persona("deepseek-v4-flash", false, false);
         assert!(
-            deepseek.contains("SIGNPOST BEFORE ACTING"),
+            deepseek.contains("SIGNPOST AS THE WORK MOVES"),
             "deepseek gets the firm signpost bullet: {deepseek}"
         );
         // FIRM-bullet-specific phrase — NOT the bare "in the user's language", which the
         // universal SIGNPOSTS section (also in deepseek's persona) would satisfy on its own.
         assert!(
-            deepseek.contains("in ONE short sentence, in the user's language"),
+            deepseek.contains("in the user's language, what you are about to do"),
             "deepseek firm signpost binds to the user's language: {deepseek}"
         );
-        // Qwen was observed firing a full tool batch with zero text; it now gets the same
-        // hard signpost bullet as deepseek (user request: parity with deepseek).
+        // No word-count cap and no per-call exemption clause: the brief "send ONE short line
+        // (aim for 12 words or fewer)" quota nagged models into a mechanical one-liner per
+        // batch, and its removal is incomplete if "nobody needs a separate announcement
+        // before each individual call" stays — that reads as a licence to skip reporting,
+        // which these models take. Both layers now state when to report and stop there.
+        for (whose, p) in [("universal", &frontier), ("firm", &deepseek)] {
+            assert!(
+                !p.contains("12 words") && !p.contains("separate announcement"),
+                "the {whose} layer must carry no word cap and no per-call exemption: {p}"
+            );
+        }
+        // Qwen was observed firing a full tool batch with zero text; it gets the same hard
+        // bullet as deepseek (user request: parity with deepseek) — re-scoped to phase
+        // changes, since "a batch of two or more ALWAYS gets a signpost" was the wording
+        // that produced a report per batch.
         let qwen = coding_persona("qwen3.8-27b", false, false);
         assert!(
-            qwen.contains("SIGNPOST BEFORE ACTING"),
+            qwen.contains("SIGNPOST AS THE WORK MOVES"),
             "qwen gets the firm signpost bullet: {qwen}"
         );
         let glm = coding_persona("glm-5.2", false, false);
         assert!(
-            !glm.contains("SIGNPOST BEFORE ACTING"),
+            !glm.contains("SIGNPOST AS THE WORK MOVES"),
             "GLM excluded from firm-execution block: {glm}"
         );
         assert!(
@@ -1281,7 +1317,7 @@ mod tests {
             "SIGNPOSTS section must end with a blank line before OUTPUT: {frontier}"
         );
         assert!(
-            deepseek.contains("\n- SIGNPOST BEFORE ACTING"),
+            deepseek.contains("\n- SIGNPOST AS THE WORK MOVES"),
             "firm bullet must be its own line (no weld with prior bullet): {deepseek}"
         );
     }
