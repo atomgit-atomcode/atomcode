@@ -178,6 +178,29 @@ impl Pointer {
     }
 }
 
+/// Name the window (OSC 2).
+///
+/// Which session a window is looking at is the one thing a person needs from
+/// across the room, and the terminal already has somewhere to put it: the tab
+/// label and the window title. Nothing on screen is spent on it.
+///
+/// Control characters are dropped rather than escaped: the string is a session
+/// title, which comes from a model's summary or from what somebody typed, and
+/// an `\x1b` in it would end the escape early and paint the rest of the title
+/// onto the screen as commands.
+pub fn set_title(title: &str) -> String {
+    let clean: String = title.chars().filter(|c| !c.is_control()).collect();
+    format!("\x1b]2;{clean}\x07")
+}
+
+/// Ask the terminal to remember the title it has (XTWINOPS 22;2), so leaving
+/// can put it back. Terminals that do not know it ignore it, and then
+/// [`RESTORE_TITLE`] is ignored too — the window keeps the name this session
+/// gave it, which is the same thing that happened before any of this existed.
+pub const SAVE_TITLE: &str = "\x1b[22;2t";
+/// Put back the title saved on the way in (XTWINOPS 23;2).
+pub const RESTORE_TITLE: &str = "\x1b[23;2t";
+
 /// Put text on the system clipboard, through the terminal (OSC 52).
 ///
 /// The terminal is the right one to ask: it is the process that has a
@@ -548,6 +571,19 @@ pub fn encode(frame: &Frame) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A title is somebody's words — a model's summary, or what they typed —
+    /// so an escape character in it must not end the escape early and paint
+    /// the rest onto the screen as commands.
+    #[test]
+    fn a_title_cannot_carry_control_characters_out_of_its_escape() {
+        use super::set_title;
+        assert_eq!(set_title("fix the parser"), "\x1b]2;fix the parser\x07");
+        let sneaky = set_title("a\x1b]2;b\x07c\nd");
+        assert_eq!(sneaky, "\x1b]2;a]2;bcd\x07");
+        assert_eq!(sneaky.matches('\x1b').count(), 1, "one escape: {sneaky:?}");
+        assert_eq!(sneaky.matches('\x07').count(), 1, "one terminator");
+    }
+
     use super::*;
     use crate::frame::{Rect, Span};
 

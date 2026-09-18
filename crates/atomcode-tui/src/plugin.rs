@@ -585,6 +585,9 @@ pub struct Tui {
     pressed_at: Mutex<Option<(u16, u16)>>,
     /// The session's members, by session id.
     members: Mutex<BTreeMap<String, Member>>,
+    /// What this screen last told the terminal the window is called, so a
+    /// frame that changes nothing writes nothing.
+    named: Mutex<Option<String>>,
 }
 
 #[async_trait]
@@ -1122,8 +1125,35 @@ impl UserInterface for Tui {
 
 impl Tui {
     fn paint(&self) {
+        self.name_the_window();
         let frame = self.host.compose(self.surface.size());
         self.surface.present(&frame);
+    }
+
+    /// Put the session's name in the window title, when it has changed.
+    ///
+    /// Here rather than where the fact is folded, because the fact reaches a
+    /// `Host` and the terminal belongs to the `Tui` — and because "when it
+    /// changed" is a comparison against what this screen last said, which is
+    /// this side's business. Costs one string compare a frame and writes
+    /// nothing in the ordinary case.
+    ///
+    /// The working directory when the session has no name yet: an untitled
+    /// session is the common case for the first minute, and a window called
+    /// `atomcode` tells nobody which of the four they are looking at.
+    fn name_the_window(&self) {
+        let moment = self.host.moment.read().expect("moment poisoned");
+        let wanted = crate::text::window_name(moment.title.as_deref(), &moment.cwd);
+        drop(moment);
+        if wanted.is_empty() {
+            return;
+        }
+        let mut said = self.named.lock().expect("named poisoned");
+        if said.as_deref() == Some(wanted.as_str()) {
+            return;
+        }
+        self.surface.set_title(&wanted);
+        *said = Some(wanted);
     }
 
     /// The session's members, as their events have told them, onto the moment.
@@ -2424,6 +2454,7 @@ pub fn assemble(surface: Arc<dyn Surface>) -> (Arc<Host>, Tui) {
             wake: Mutex::new(None),
             pressed_at: Mutex::new(None),
             members: Mutex::new(BTreeMap::new()),
+            named: Mutex::new(None),
         },
     )
 }

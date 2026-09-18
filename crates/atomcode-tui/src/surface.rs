@@ -229,6 +229,16 @@ pub trait Surface: Send + Sync {
     /// class of damage by brute force. This is the way back from it.
     fn forget(&self) {}
 
+    /// Name the window.
+    ///
+    /// The surface's job for the same reason the clipboard is: only this layer
+    /// may talk to the terminal, and the title belongs to the terminal. Above
+    /// this line it is a string, which is what lets a criterion read back what
+    /// the window would have been called with no terminal in the room.
+    ///
+    /// A surface that has no window ignores it.
+    fn set_title(&self, _title: &str) {}
+
     /// Put text on the system clipboard.
     ///
     /// The surface's job because it is the only layer that may talk to the
@@ -321,6 +331,8 @@ pub struct Headless {
     /// because they are separate clipboard flavours, and a test that says "the
     /// clipboard holds text" must not also be saying "it holds a picture".
     clipboard_text: Mutex<Option<String>>,
+    /// What the window would have been called. `None` until something names it.
+    title: Mutex<Option<String>>,
     /// A weak handle back to the `Arc` this lives in, so a consumer holding
     /// `Arc<dyn Surface>` can get the recorder back without downcasting.
     me: Mutex<Option<std::sync::Weak<Headless>>>,
@@ -355,6 +367,7 @@ impl Headless {
             incoming: Mutex::new(Some(incoming)),
             clipboard: Mutex::new(None),
             clipboard_text: Mutex::new(None),
+            title: Mutex::new(None),
             me: Mutex::new(None),
             grab: std::sync::atomic::AtomicBool::new(true),
             hover: std::sync::atomic::AtomicBool::new(false),
@@ -363,6 +376,11 @@ impl Headless {
         });
         *me.me.lock().expect("headless poisoned") = Some(Arc::downgrade(&me));
         me
+    }
+
+    /// What the window is called, for a criterion about the title.
+    pub fn title(&self) -> Option<String> {
+        self.title.lock().expect("headless poisoned").clone()
     }
 
     /// Put an image on the scripted clipboard — a screenshot, for a test.
@@ -539,6 +557,9 @@ impl Surface for Headless {
     fn take_input(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<Input>> {
         self.incoming.lock().expect("headless poisoned").take()
     }
+    fn set_title(&self, title: &str) {
+        *self.title.lock().expect("headless poisoned") = Some(title.to_string());
+    }
     /// The scripted clipboard is one text buffer: a copy writes it and a paste
     /// reads it, so the round trip a person performs works with no clipboard,
     /// and a test can watch either end.
@@ -688,6 +709,9 @@ impl Terminal {
         crossterm::terminal::enable_raw_mode()?;
         let mut out = std::io::stdout();
         out.write_all(ansi::ENTER.as_bytes())?;
+        // Before anything names the window, so leaving can put back whatever a
+        // person had called it.
+        out.write_all(ansi::SAVE_TITLE.as_bytes())?;
         let pointer = if mouse {
             ansi::Pointer::Buttons
         } else {
@@ -803,6 +827,7 @@ fn emergency_restore() {
     }
     let mut out = std::io::stdout();
     let _ = out.write_all(ansi::MOUSE_OFF.as_bytes());
+    let _ = out.write_all(ansi::RESTORE_TITLE.as_bytes());
     let _ = out.write_all(ansi::LEAVE.as_bytes());
     let _ = out.flush();
     let _ = crossterm::terminal::disable_raw_mode();
@@ -1417,6 +1442,11 @@ impl Surface for Terminal {
     }
     fn forget(&self) {
         self.painted.forget();
+    }
+    fn set_title(&self, title: &str) {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(crate::ansi::set_title(title).as_bytes());
+        let _ = out.flush();
     }
     fn copy(&self, text: &str) {
         if text.is_empty() {

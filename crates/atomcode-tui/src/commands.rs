@@ -35,6 +35,11 @@ const SCREEN: &[Command] = &[
     ),
     Command::new("mouse", "把鼠标交还终端,或收回来"),
     Command::new("keys", "列出快捷键"),
+    Command::taking(
+        "paste",
+        "[路径]",
+        "把剪贴板(或一个文件)的内容放进输入框;Ctrl+V 被终端或系统拦下时用它",
+    ),
 ];
 
 #[async_trait]
@@ -45,7 +50,7 @@ impl CommandSet for ScreenCommands {
     fn commands(&self) -> Vec<Command> {
         SCREEN.to_vec()
     }
-    async fn run(&self, name: &str, args: &str, _ctx: &Context) -> Outcome {
+    async fn run(&self, name: &str, args: &str, ctx: &Context) -> Outcome {
         match name {
             "quit" | "exit" => Outcome::Do(Action::Quit),
             "clear" => Outcome::Do(Action::Clear),
@@ -56,6 +61,30 @@ impl CommandSet for ScreenCommands {
                 Err(why) => Outcome::Refused(why),
             },
             "mouse" => Outcome::Do(Action::ToggleMouse),
+            // A typed way in to the thing ctrl-v does, because ctrl-v does not
+            // always arrive: Windows terminals hand the paste to the key layer
+            // as a keystroke, and some platforms have no clipboard this process
+            // can read at all. With a path it does not need one.
+            "paste" => match args.trim() {
+                "" => {
+                    let Some(surface) = ctx.service::<crate::plugin::SurfaceSvc>() else {
+                        return Outcome::Refused("这块屏幕没有剪贴板".into());
+                    };
+                    match surface.clipboard_text() {
+                        Some(text) if !text.is_empty() => Outcome::Do(Action::Paste(text)),
+                        // Not an error. "There is nothing in it" is how a person
+                        // finds out there is nothing in it.
+                        _ => {
+                            Outcome::Refused("剪贴板里没有文字;`/paste 路径` 可以贴一个文件".into())
+                        }
+                    }
+                }
+                path => match std::fs::read_to_string(path) {
+                    Ok(text) if text.is_empty() => Outcome::Refused(format!("{path} 是空的")),
+                    Ok(text) => Outcome::Do(Action::Paste(text)),
+                    Err(error) => Outcome::Refused(format!("读不了 {path}:{error}")),
+                },
+            },
             "keys" => Outcome::Said(
                 "enter 发送 · shift+enter 换行(或 ctrl-j) · ctrl-d 退出 · ctrl-w 删词\n\
                  esc 依次:取消选中 -> 清空输入 -> 停止当轮 · ctrl-c 直接停止当轮\n\
@@ -1414,6 +1443,49 @@ mod tests {
             written.contains("## 模型") && written.contains("写好了"),
             "{written}"
         );
+    }
+
+    /// `/paste` is the typed way in to what ctrl-v does, for the terminals and
+    /// the platforms where ctrl-v never arrives. With a path it does not need a
+    /// clipboard at all.
+    #[tokio::test]
+    async fn paste_reaches_the_composer_from_the_clipboard_or_from_a_file() {
+        let app = bare();
+        let surface = crate::surface::Headless::new(80, 24);
+        let _ = app
+            .context()
+            .provide::<crate::plugin::SurfaceSvc>(surface.clone());
+        let all = Arc::new(Commands::new());
+        let _ = all.add(Arc::new(ScreenCommands));
+
+        // Nothing in it is an answer, not a failure — and it says what else to
+        // try.
+        match all.dispatch("/paste", &app.context()).await {
+            Outcome::Refused(why) => assert!(why.contains("路径"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+
+        {
+            use crate::surface::Surface as _;
+            surface.copy("从剪贴板来的");
+        }
+        assert_eq!(
+            all.dispatch("/paste", &app.context()).await,
+            Outcome::Do(Action::Paste("从剪贴板来的".into()))
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("note.txt");
+        std::fs::write(&file, "从文件来的").expect("write");
+        assert_eq!(
+            all.dispatch(&format!("/paste {}", file.display()), &app.context())
+                .await,
+            Outcome::Do(Action::Paste("从文件来的".into()))
+        );
+        assert!(matches!(
+            all.dispatch("/paste /nowhere/at/all", &app.context()).await,
+            Outcome::Refused(_)
+        ));
     }
 
     use atomcode_plexus::{App, ConfigTree, PluginRegistry};

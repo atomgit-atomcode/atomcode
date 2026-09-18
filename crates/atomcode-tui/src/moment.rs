@@ -168,6 +168,12 @@ pub struct Moment {
     /// Byte offset of the caret within `input`.
     pub caret: usize,
     pub focus: Option<String>,
+    /// What this session is called, from the newest `Titled` fact.
+    ///
+    /// A name changes — the first-prompt guess, then a model's summary, then
+    /// whatever somebody typed — so it is read off the log rather than kept as
+    /// a header field, and the newest wins. `None` until the session has one.
+    pub title: Option<String>,
     pub scroll: ScrollPos,
     /// What the pointer has selected, if anything. Screen state, not a fact —
     /// which is exactly what this struct is for.

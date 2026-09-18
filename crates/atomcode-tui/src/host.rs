@@ -1233,6 +1233,10 @@ impl Host {
             SessionEvent::TurnEnd { .. } => {
                 self.moment.write().expect("moment poisoned").turn_started = None;
             }
+            // The newest wins, which is the whole rule the fact carries.
+            SessionEvent::Titled { title, .. } => {
+                self.moment.write().expect("moment poisoned").title = Some(title.clone());
+            }
             _ => {}
         }
 
@@ -2870,6 +2874,29 @@ mod tests {
                 event: fact,
             });
         }
+    }
+
+    /// A session's name is read off the log, and the newest one wins — the
+    /// first-prompt guess, then a model's summary, then whatever somebody
+    /// typed. Nothing else keeps a copy of it.
+    #[test]
+    fn the_newest_name_is_the_sessions_name() {
+        let h = host();
+        assert_eq!(h.moment.read().unwrap().title, None, "unnamed to start");
+        h.absorb(&SessionEvent::Titled {
+            turn: 1,
+            title: "修解析器".into(),
+        });
+        assert_eq!(h.moment.read().unwrap().title.as_deref(), Some("修解析器"));
+        h.absorb(&SessionEvent::Titled {
+            turn: 2,
+            title: "重构配置".into(),
+        });
+        assert_eq!(
+            h.moment.read().unwrap().title.as_deref(),
+            Some("重构配置"),
+            "the newest wins"
+        );
     }
 
     /// A turn the person took back stays on the screen — the stream is not

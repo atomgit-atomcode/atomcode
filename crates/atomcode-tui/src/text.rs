@@ -124,6 +124,34 @@ pub fn collapse_home(path: &str) -> String {
     collapse_home_with(path, home_dir().as_deref())
 }
 
+/// The last segment of a path, for a window title.
+///
+/// Separators of both kinds, because a Windows path arrives with backslashes
+/// and a title saying `C:\\work\\thing` when it could say `thing` is the same
+/// waste on either OS. Falls back to the whole string when there is no
+/// separator in it, which is what a bare directory name already is.
+pub fn basename(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    match trimmed.rfind(['/', '\\']) {
+        Some(at) => &trimmed[at + 1..],
+        None => trimmed,
+    }
+}
+
+/// What the window should be called: the session's name, or where it is
+/// working when it has none.
+///
+/// An untitled session is the common case for the first minute, and four
+/// windows all called `atomcode` tell nobody which of the four they are looking
+/// at. A blank name counts as none — a title made of spaces is a title nobody
+/// can read across a room.
+pub fn window_name(title: Option<&str>, cwd: &str) -> String {
+    match title {
+        Some(title) if !title.trim().is_empty() => title.to_string(),
+        _ => basename(cwd).to_string(),
+    }
+}
+
 /// The implementation, with home explicit. See [`collapse_home`].
 pub fn collapse_home_with(path: &str, home: Option<&std::path::Path>) -> String {
     let Some(home) = home else {
@@ -206,6 +234,30 @@ fn eat_escape(chars: &mut Peekable<Chars<'_>>) {
 
 #[cfg(test)]
 mod tests {
+    /// The window says the session's name when it has one, and where it is
+    /// working when it does not.
+    #[test]
+    fn a_window_is_named_after_the_session_or_after_where_it_is() {
+        use super::window_name;
+        assert_eq!(window_name(Some("修解析器"), "/w/atomcode"), "修解析器");
+        assert_eq!(window_name(None, "/w/atomcode"), "atomcode");
+        // A name of spaces is no name.
+        assert_eq!(window_name(Some("   "), "/w/atomcode"), "atomcode");
+    }
+
+    /// A window title says which project, not the whole path to it.
+    #[test]
+    fn a_path_shows_up_as_its_last_segment() {
+        use super::basename;
+        assert_eq!(basename("/Users/me/work/atomcode"), "atomcode");
+        assert_eq!(basename("/Users/me/work/atomcode/"), "atomcode");
+        // Windows arrives with the other separator, and the waste is the same.
+        assert_eq!(basename("C:\\work\\atomcode"), "atomcode");
+        // A bare name is already what this returns.
+        assert_eq!(basename("atomcode"), "atomcode");
+        assert_eq!(basename(""), "");
+    }
+
     use super::*;
 
     #[test]

@@ -1065,6 +1065,32 @@ async fn esc_declines_and_the_model_is_told_rather_than_the_turn_dying() {
 
 // ---- the command surface --------------------------------------------------
 
+/// The window says which project this is.
+///
+/// Four terminals open on four checkouts all say `atomcode` otherwise, and the
+/// one thing a person needs from across the room is which is which. The
+/// directory is the fallback; a session that has been named says its name.
+#[tokio::test]
+async fn the_window_says_which_project_this_is() {
+    let dir = scratch("title");
+    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    let task = s.open().await;
+    s.quiet().await;
+    // The screen's own directory, which is what it puts in the status line —
+    // the agent's root is a separate thing and in this harness they differ.
+    let cwd = std::env::current_dir().expect("a working directory");
+    let here = cwd
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("a directory name");
+    assert_eq!(
+        s.term.title().as_deref(),
+        Some(here),
+        "the window is named after where the session is working"
+    );
+    task.abort();
+}
+
 #[tokio::test]
 async fn typing_a_slash_shows_what_is_available_and_narrows_as_you_type() {
     let dir = scratch("menu");
