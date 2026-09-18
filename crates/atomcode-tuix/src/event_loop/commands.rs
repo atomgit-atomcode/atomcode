@@ -4065,7 +4065,7 @@ fn execute_slash_command_impl(
             // `/worklog [date]`: deterministically gather the day's completed turns
             // across ALL projects (with computed agent-active durations), then hand
             // the model a structured recap to fill the 工作内容/时长/问题与评价 table.
-            use chrono::{Local, TimeZone};
+            use chrono::Local;
             let english = matches!(
                 atomcode_config::i18n::current_locale(),
                 atomcode_config::i18n::Locale::En
@@ -4083,22 +4083,11 @@ fn execute_slash_command_impl(
                 renderer.flush();
                 return Ok(());
             };
-            // Local-day [midnight, next-midnight) → epoch ms. `.earliest()` resolves a
-            // DST-gap midnight; the UTC fallback is only for that rare ambiguity.
-            let to_ms = |ndt: chrono::NaiveDateTime| -> i64 {
-                Local
-                    .from_local_datetime(&ndt)
-                    .earliest()
-                    .map(|dt| dt.timestamp_millis())
-                    .unwrap_or_else(|| ndt.and_utc().timestamp_millis())
-            };
-            let after_ms = to_ms(date.and_hms_opt(0, 0, 0).unwrap());
-            let before_ms = to_ms(
-                date.succ_opt()
-                    .unwrap_or(date)
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap(),
-            );
+            // Local-day [midnight, next-midnight) → epoch ms; a DST-gap midnight
+            // resolves to the earliest instant that exists. Shared with the row
+            // that offers `/worklog` on the row-assembled screen, so the two
+            // front ends cannot disagree about which day they are recapping.
+            let (after_ms, before_ms) = atomcode_capabilities::session::local_day_window_ms(date);
             let sessions_root = atomcode_capabilities::session::SessionManager::sessions_root();
             let turns = atomcode_capabilities::session::collect_day_turns(
                 &sessions_root,

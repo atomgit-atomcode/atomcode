@@ -1386,6 +1386,13 @@ pub struct HostState {
     pub rate_limit_source: Option<Arc<dyn crate::rate_limit::RateLimitWindowSource>>,
     /// The settings file this runtime was configured from, when it was.
     pub config_file: Option<std::path::PathBuf>,
+    /// The language this runtime was configured to speak — `[language]`, as the
+    /// host resolved it. A row that writes words the model reads (the `/worklog`
+    /// template) asks for it here, so it never reaches for the process-wide i18n
+    /// cache: a command is registered by a row, and a row answers from what it was
+    /// configured with. `None` is the ordinary "no preference" — replies follow
+    /// the conversation.
+    pub language: Option<atomcode_config::locale::Locale>,
     /// Rows the host wrote, registered alongside coding's own.
     ///
     /// What `extra_layers` may name. Without this a host could reorder, patch
@@ -1552,6 +1559,11 @@ pub async fn mount_hosted(
         .when(host.runtime_commands.is_some(), |layer| {
             layer.insert(Entry::named("capability-commands"))
         })
+        // Only where sessions are kept: the recap reads the store, so a runtime
+        // with none has nothing for it to say (`WorklogPlugin`).
+        .when(host.session.stored.is_some(), |layer| {
+            layer.insert(Entry::named("worklog"))
+        })
         .when(host.mcp.is_some(), |layer| {
             layer.swap("mcp", "mcp-host").enable("mcp")
         })
@@ -1616,9 +1628,19 @@ pub async fn mount_hosted(
     if let Some(stored) = host.session.stored.clone() {
         registry.register(Arc::new(crate::session_store::SessionStorePlugin(stored)));
     }
+    // Only where a runtime keeps a session store: a day recap is *about* the
+    // store, and one with nothing to read would say "no work" over a history it
+    // never looked at. Read before `host.session` moves below, and the same
+    // condition `session-store` is mounted under, one line away.
+    let keeps_sessions = host.session.stored.is_some();
     registry.register(Arc::new(crate::host_rows::SessionNativePlugin(Arc::new(
         host.session,
     ))));
+    if keeps_sessions {
+        registry.register(Arc::new(crate::host_rows::WorklogPlugin {
+            language: host.language,
+        }));
+    }
     registry.register(Arc::new(crate::host_rows::KernelHooksPlugin(
         host.hooks.unwrap_or_default(),
     )));

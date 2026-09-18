@@ -8036,6 +8036,10 @@ fn harness_host_state(
             .subagent_config
             .is_some()
             .then(atomcode_config::Config::default_path),
+        // The same value the persona is written with (`config.preferred_language`),
+        // so the language a row speaks and the language the model is told to
+        // answer in are one decision, not two.
+        language: config.preferred_language,
         web_search_api_key: config.web_search_api_key.clone(),
         rows: harness_option_rows(parts, config, prepare)
             .map_err(std::io::Error::other)?

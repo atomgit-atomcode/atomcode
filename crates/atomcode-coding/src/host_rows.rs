@@ -1924,6 +1924,138 @@ fn worktree(root: &std::path::Path, name: &str) -> Result<std::path::PathBuf, St
     Ok(at)
 }
 
+/// `worklog [日期]`: the day's work, recapped across every project.
+///
+/// **A catalog command, and here for the reason `/worktree` is** — but with one
+/// more thing behind it. The substance already existed twice over:
+/// [`atomcode_capabilities::session::collect_day_turns`] gathers a local day's
+/// completed turns from the *whole* session store (every project, not this one),
+/// and [`atomcode_capabilities::session::build_worklog_prompt`] pre-computes the
+/// durations and flags so the model only has to fill the template. What was
+/// missing was a registration: the classic front end carried this command in its
+/// own table, and the row-assembled screen reads the command catalog instead, so
+/// on that screen the command had simply never existed
+/// (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` B1-5, and
+/// `docs/adr/0021` §10 for why the row that owns a capability registers it).
+///
+/// Registered only when this runtime keeps a session store — the row is where a
+/// `session-store` exists as much as where a `session` does. A day recap is
+/// *about* the store, and one that had no store to read would inject a
+/// confident "there is no work" over a history it never looked at.
+///
+/// **A person reads the result as their own turn.** `agent.send` queues it with
+/// [`MessageOrigin::User`], so the turn it starts appears in the transcript the
+/// way everything they typed does, and `undo` reaches it
+/// (`docs/adr/0024` — the log is the authority, and this must be in it).
+pub(crate) struct WorklogPlugin {
+    /// The locale the template is written in. Carried in rather than read from
+    /// the process-wide i18n cache: a command is registered by a row, and a row
+    /// decides from its own configuration which language it speaks.
+    pub(crate) language: Option<atomcode_config::locale::Locale>,
+}
+
+#[async_trait]
+impl Plugin for WorklogPlugin {
+    fn name(&self) -> &'static str {
+        "worklog"
+    }
+    fn uses(&self) -> &'static [&'static str] {
+        &["commands"]
+    }
+    fn description(&self) -> &'static str {
+        "`/worklog`: one local day's completed turns across every project, as a recap the model fills in"
+    }
+    async fn apply(&self, ctx: &Context, _config: &Value) -> Result<(), String> {
+        atomcode_harness::commands::register(
+            ctx,
+            Arc::new(WorklogCommand {
+                language: self.language,
+            }),
+        )
+    }
+}
+
+struct WorklogCommand {
+    language: Option<atomcode_config::locale::Locale>,
+}
+
+/// What this command hands the model, and the day it covers — split out so the
+/// whole decision is testable without a store, a tree or a model.
+enum WorklogPrompt {
+    /// The day's turns, as text. Always non-empty; the empty day's text is the
+    /// template's own "there is no work" instruction, deliberately.
+    Prompt(String),
+    /// The argument is not a date. What to say back instead.
+    Unusable(String),
+}
+
+fn worklog_prompt_at(
+    arg: &str,
+    today: chrono::NaiveDate,
+    sessions_root: &std::path::Path,
+    english: bool,
+) -> WorklogPrompt {
+    let Some(date) = atomcode_capabilities::session::resolve_worklog_date(arg, today) else {
+        return WorklogPrompt::Unusable(if english {
+            "Usage: /worklog [date]  (today / yesterday / 8/27 / 2026-08-27)".to_string()
+        } else {
+            "用法:/worklog [日期](默认今天;支持 today / yesterday / 8/27 / 2026-08-27)".to_string()
+        });
+    };
+    let (after_ms, before_ms) = atomcode_capabilities::session::local_day_window_ms(date);
+    let turns =
+        atomcode_capabilities::session::collect_day_turns(sessions_root, after_ms, before_ms);
+    // The label is the one a person would write themselves (`8/27`), and it goes
+    // into the heading the model sees — not a machine date.
+    let label = date.format("%-m/%-d").to_string();
+    WorklogPrompt::Prompt(atomcode_capabilities::session::build_worklog_prompt(
+        &label, &turns, english,
+    ))
+}
+
+#[async_trait]
+impl atomcode_harness::commands::CatalogCommand for WorklogCommand {
+    fn describe(&self) -> CommandDescription {
+        on_the_session(
+            "worklog",
+            Some("[今天|昨天|8/27]"),
+            "跨所有项目翻一天的会话记录,做成一份工作日报",
+        )
+    }
+    fn offered_for(&self, agent: &atomcode_harness::agent::Agent) -> bool {
+        the_conversation_itself(agent)
+    }
+    async fn run(
+        &self,
+        agent: Arc<atomcode_harness::agent::Agent>,
+        args: &str,
+    ) -> Result<String, String> {
+        // The closed label is because the locale may have no opinion: a config
+        // with no `language` key follows the conversation, and the model writes
+        // its reply in whatever language the person is using either way.
+        let english = matches!(
+            self.language,
+            Some(atomcode_config::locale::Locale::En) | None
+        );
+        match worklog_prompt_at(
+            args,
+            chrono::Local::now().date_naive(),
+            &SessionManager::sessions_root(),
+            english,
+        ) {
+            WorklogPrompt::Unusable(usage) => return Err(usage),
+            WorklogPrompt::Prompt(prompt) => {
+                agent.send(prompt);
+                Ok(if english {
+                    "Put the recap of that day in the conversation.".to_string()
+                } else {
+                    "把那天的工作复盘放进对话了。".to_string()
+                })
+            }
+        }
+    }
+}
+
 struct GoalCommand(Arc<dyn crate::runtime::RuntimeCommands>);
 
 #[async_trait]
@@ -2096,6 +2228,7 @@ impl atomcode_harness::commands::CatalogCommand for PolicyCommand {
 #[cfg(test)]
 mod tests {
     use super::worktree;
+    use super::{worklog_prompt_at, WorklogPrompt};
 
     /// A worktree name becomes both a directory and a branch, so it is checked
     /// before either: a name with a separator in it would put the checkout
@@ -2142,5 +2275,133 @@ mod tests {
                 .unwrap_or(false),
             "nothing was made outside the repository"
         );
+    }
+
+    /// The day an argument names, and what the model is told about it.
+    ///
+    /// The assertion that matters is on the *data*: next-midnight's turn is out
+    /// and a turn inside the window is in, which is the whole reason the window
+    /// is half-open and computed here rather than in the prompt.
+    #[test]
+    fn a_recap_is_built_from_the_day_it_names_and_no_other() {
+        use atomcode_capabilities::session::events::storage_id;
+        use atomcode_capabilities::session::{SessionManager, SessionMeta, StorageOwner};
+        use atomcode_kernel::session::{LoggedEvent, SessionEvent, SessionHeader};
+
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 8, 27).expect("a date");
+        let (after, before) = atomcode_capabilities::session::local_day_window_ms(day);
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // A real event session — the only shape the reader accepts as a session,
+        // and the shape production writes.
+        let session = "1756100000000-4242";
+        let bucket = "0123456789abcdef";
+        let manager = SessionManager::with_root(dir.path().join(bucket));
+        let lease = manager.acquire_lease(session).expect("lease");
+        let mut meta = SessionMeta::new(session, "/w/atomcode", 0);
+        meta.owner = StorageOwner::Native;
+        // The index is the cheap pre-filter a day recap reads before it opens any
+        // log — `SnapshotHook` keeps it stamped as the session runs, so a session
+        // is only looked at when its lifetime overlaps the day asked for. This one
+        // spans all three days, which is what lets the assertion below be about
+        // the *turn* timestamps rather than about the catalog.
+        meta.created_at = after - 100_000;
+        meta.updated_at = before + 100_000;
+        manager
+            .create_event_session(&lease, &SessionHeader::new(session), &meta)
+            .expect("create");
+
+        // One turn per day: the day before the window, inside it, and the next
+        // midnight exactly (which is the first instant of the following day).
+        let one_turn = |turn: u64, at: i64, said: &str| {
+            [
+                LoggedEvent {
+                    seq: 0,
+                    at: at as u64,
+                    event: SessionEvent::TurnStart { turn },
+                },
+                LoggedEvent {
+                    seq: 0,
+                    at: at as u64,
+                    event: SessionEvent::UserMessage {
+                        turn,
+                        text: said.to_string(),
+                        images: Vec::new(),
+                    },
+                },
+                LoggedEvent {
+                    seq: 0,
+                    at: at as u64,
+                    event: SessionEvent::AssistantMessage {
+                        turn,
+                        round: 1,
+                        text: "done".into(),
+                        reasoning: String::new(),
+                        tool_calls: Vec::new(),
+                        reasoning_blocks: Vec::new(),
+                        meta: None,
+                    },
+                },
+                LoggedEvent {
+                    seq: 0,
+                    at: at as u64,
+                    event: SessionEvent::TurnEnd {
+                        turn,
+                        stop: atomcode_kernel::event::StopReason::Stopped,
+                        error: None,
+                    },
+                },
+            ]
+        };
+        let mut facts: Vec<LoggedEvent> = Vec::new();
+        for (turn, at, said) in [
+            (1u64, after - 60_000, "yesterday's work"),
+            (2, after + 60_000, "today's work"),
+            (3, before, "tomorrow's work"),
+        ] {
+            facts.extend(one_turn(turn, at, said));
+        }
+        // Sequence numbers as the store requires them: strictly increasing.
+        for (seq, logged) in facts.iter_mut().enumerate() {
+            logged.seq = (seq + 1) as u64;
+        }
+        manager.append_events(&lease, &facts).expect("append");
+
+        let WorklogPrompt::Prompt(prompt) = worklog_prompt_at("8/27", day, dir.path(), false)
+        else {
+            panic!("a usable date builds a prompt");
+        };
+        assert!(
+            prompt.contains("today's work"),
+            "the day's turn is in: {prompt}"
+        );
+        for absent in ["yesterday's work", "tomorrow's work"] {
+            assert!(
+                !prompt.contains(absent),
+                "`{absent}` is outside the window: {prompt}"
+            );
+        }
+        assert_eq!(storage_id(session), session, "the id a log is stored under");
+    }
+
+    #[test]
+    fn an_argument_that_is_not_a_date_comes_back_as_usage() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 8, 27).expect("a date");
+        let root = tempfile::tempdir().expect("tempdir");
+        for unparseable in ["last tuesday", "13/45", "2026"] {
+            let said = worklog_prompt_at(unparseable, day, root.path(), false);
+            assert!(
+                matches!(said, WorklogPrompt::Unusable(_)),
+                "`{unparseable}` is refused rather than recapped"
+            );
+        }
+        // And the words are the person's language, like the template is.
+        let WorklogPrompt::Unusable(zh) = worklog_prompt_at("nope", day, root.path(), false) else {
+            panic!("usage");
+        };
+        let WorklogPrompt::Unusable(en) = worklog_prompt_at("nope", day, root.path(), true) else {
+            panic!("usage");
+        };
+        assert!(zh.contains("用法") && en.contains("Usage"), "{zh} / {en}");
     }
 }
