@@ -5062,7 +5062,7 @@ fn spawn_runtime_owner_with_optional_agent(
                                     let _ = done.send(Err(RuntimeError::Busy));
                                     continue;
                                 }
-                                let health_error = native_session_health_error(&runtime);
+                                let health_error = native_session_health_error(&runtime).await;
                                 if error.requires_fail_close() || health_error.is_some() {
                                     let detail = health_error
                                         .as_deref()
@@ -7332,13 +7332,29 @@ fn current_runtime_snapshot(runtime: &RuntimeResources) -> Option<SessionSnapsho
     binding.manager.load_snapshot(&binding.id).ok()
 }
 
-fn native_session_health_error(runtime: &RuntimeResources) -> Option<String> {
-    let binding = runtime.parts.session.as_ref()?;
-    binding
-        .manager
-        .load_native_session(&binding.id)
-        .err()
-        .map(|error| error.to_string())
+async fn native_session_health_error(runtime: &RuntimeResources) -> Option<String> {
+    // Extract cheap owned handles (Arc + String) and END the borrow before awaiting.
+    let (manager, id) = {
+        let binding = runtime.parts.session.as_ref()?;
+        (binding.manager.clone(), binding.id.clone())
+    };
+    // `load_native_session` takes an OS meta-lock and can `thread::sleep`-poll for up to
+    // 10s under cross-process contention (session/manager `acquire_file_lock_until`). Run
+    // it on the BLOCKING pool so it never stalls this tokio worker — and every other task
+    // scheduled on it — during the fail-close error path.
+    match tokio::task::spawn_blocking(move || {
+        manager
+            .load_native_session(&id)
+            .err()
+            .map(|error| error.to_string())
+    })
+    .await
+    {
+        Ok(health) => health,
+        // The probe panicked on the blocking pool — treat as a health failure so the
+        // caller fail-closes rather than proceeding past an unverified session.
+        Err(_join) => Some("native session health probe panicked".to_string()),
+    }
 }
 
 struct RuntimeUndoPlan {
