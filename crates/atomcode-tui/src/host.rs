@@ -1519,9 +1519,24 @@ impl Host {
 
     /// Render the stream's tail into `rect`.
     ///
-    /// Bottom-anchored: what a person is reading is the newest thing. Blocks
-    /// are rendered newest-first until the rect is full, then reversed — so the
-    /// cost is O(what fits), not O(the conversation).
+    /// Blocks are rendered newest-first until the rect is full, then reversed —
+    /// so the cost is O(what fits), not O(the conversation) — and what is left
+    /// over goes **below** the content rather than above it.
+    ///
+    /// That last part is a choice, and it is the one a terminal makes: a new
+    /// shell prints at the top of the screen and grows downward, and
+    /// `atomcode-tuix` does the same (its footer "sits directly below the last
+    /// body row, not pinned to the screen bottom"). It used to be the other way
+    /// round here — short content pushed to the foot of the pane — which put a
+    /// session's opening block against the input box with the blank rows above
+    /// it, reading as a screen *ending* rather than one that has just started.
+    ///
+    /// Turning the padding around does not turn the *scroll* around: with more
+    /// content than room the rect is full and there is no padding either way,
+    /// and under that threshold `scroll_limit` is zero (see
+    /// [`Self::scroll_limit`]), so the reader is pinned to the bottom of
+    /// nothing. The newest line stops being the last row on screen exactly when
+    /// there is no screenful of conversation yet.
     ///
     /// `scroll` is passed rather than read: the caller is the one that knows how
     /// the pane was split (`pane_geometry` above gives it the blocks' own
@@ -1754,14 +1769,14 @@ impl Host {
         }
         out.reverse();
         owner.reverse();
-        // Push the content to the bottom of the rect when there is not enough
-        // of it, so the newest line is always where the eye expects it.
+        // What is left over is blank rows **under** the content, so the
+        // conversation starts at the top of the pane and grows down into them.
+        // See this function's own doc for why, and for why this is not the same
+        // question as which end the *scroll* is measured from.
         let pad = want.saturating_sub(out.len());
-        let mut padded = vec![Line::empty(); pad];
-        padded.extend(out);
-        let mut owners = vec![None; pad];
-        owners.extend(owner);
-        (padded, owners)
+        out.extend(vec![Line::empty(); pad]);
+        owner.extend(vec![None; pad]);
+        (out, owner)
     }
 
     /// Compose one frame.
@@ -5781,7 +5796,12 @@ mod tests {
     }
 
     #[test]
-    fn the_newest_line_is_at_the_bottom() {
+    fn the_newest_line_is_the_last_one_drawn() {
+        // With more to read than fits, the pane is full and there is no slack
+        // anywhere, so this is about the order the walk fills the rows in — the
+        // *padding* question (which end the slack goes) is the judgement below,
+        // and the two are separate on purpose: a pane that cannot fill itself is
+        // the only place they could be confused.
         let h = fed();
         // Assert on the stream's own part rather than on the whole screen: how
         // many rows the prompt happens to take is the input module's business.
@@ -5795,8 +5815,76 @@ mod tests {
             .expect("something was said");
         assert!(
             last.plain().contains("已中断"),
-            "bottom-anchored, newest last: {:?}",
+            "the newest line is the last one on screen: {:?}",
             last.plain()
+        );
+    }
+
+    #[test]
+    fn a_conversation_shorter_than_its_pane_starts_at_the_top_of_it() {
+        // The padding goes **below** the content. It did not, and nothing said
+        // so: a session's opening block sat against the composer with the blank
+        // rows above it, which reads as a screen ending rather than one that has
+        // just started — and the whole suite stayed green through it, because
+        // every judgement here was about *what* was drawn and none about where
+        // the slack went.
+        let h = host();
+        h.absorb(&SessionEvent::AssistantMessage {
+            turn: 1,
+            round: 0,
+            text: "the one thing said".into(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+        });
+        let frame = h.compose((80, 24));
+        let stream = frame.part("stream").expect("the conversation");
+        assert!(
+            stream.rect.h > 4,
+            "the fixture has to leave room to spare, or there is no slack to \\
+             place and this judgement is about nothing: {:?}",
+            stream.rect
+        );
+
+        let rows: Vec<String> = stream.lines.iter().map(|l| l.plain()).collect();
+        let first = rows
+            .iter()
+            .position(|l| !l.trim().is_empty())
+            .expect("something was said");
+        assert_eq!(
+            first, 0,
+            "the conversation starts at the top of its pane, not against the \\
+             composer: {rows:?}"
+        );
+        assert!(
+            rows[0].contains("the one thing said"),
+            "and it is the thing that was said: {rows:?}"
+        );
+        assert!(
+            rows.last().is_some_and(|l| l.trim().is_empty()),
+            "with the room left over underneath it, where the next line will \\
+             land: {rows:?}"
+        );
+
+        // The control, and the half that keeps the change from being read
+        // backwards: with more than a screenful there is no slack at all, so
+        // moving the padding cannot have moved anything. Without this, "the
+        // padding moved" and "the scroll was reversed" look the same from the
+        // short case above.
+        let full = fed();
+        let frame = full.compose((80, 24));
+        let stream = frame.part("stream").expect("the conversation");
+        let trailing = stream
+            .lines
+            .iter()
+            .rev()
+            .take_while(|l| l.plain().trim().is_empty())
+            .count();
+        assert_eq!(
+            trailing,
+            0,
+            "a pane with more to show than fits has no slack to place, so the \\
+             newest row is the last row: {:?}",
+            stream.lines.iter().map(|l| l.plain()).collect::<Vec<_>>()
         );
     }
 

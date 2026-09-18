@@ -1093,11 +1093,11 @@ impl Tui {
                     return false;
                 };
                 // Anchor the block that was clicked, not the bottom of the
-                // conversation. The stream is bottom-anchored, so a block that
-                // grows pushes its own header off the top — click a tool call
-                // and the line you clicked is the first thing to leave. Moving
-                // the view back by exactly what it gained keeps that line where
-                // it was, and what appears, appears *below* it.
+                // conversation. A block that grows pushes its own header off
+                // the top — click a tool call and the line you clicked is the
+                // first thing to leave. Moving the view back by exactly what it
+                // gained keeps that line where it was, and what appears, appears
+                // *below* it.
                 // `m` was dropped above, so the pin can take the moment it
                 // needs without the caller's write lock in the way. Not a
                 // fourth copy of the arithmetic: folding a block changes how
