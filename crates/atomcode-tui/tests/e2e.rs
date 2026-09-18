@@ -475,6 +475,57 @@ async fn a_resumed_session_does_not_open_with_a_welcome() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
+/// A session started with `/new` opens with the welcome too.
+///
+/// The block is produced by `open_conversation` and by nothing else, and the
+/// loop asks that question through a flag that is *lowered* once it has an
+/// answer — on the reasoning that a stream which was not empty will not become
+/// empty again. `switch_session` is exactly the thing that makes it empty
+/// again (`host.rs` `switch_view`), and it used to leave the flag down: a new
+/// session opened bare, with no welcome and no cat, while every other criterion
+/// stayed green because they all start a session rather than *move to* one.
+#[tokio::test]
+async fn a_new_session_started_from_the_screen_opens_with_the_welcome_too() {
+    let home = scratch("welcome-switch-home");
+    let root = scratch("welcome-switch-work");
+    let s = start(tree_persistent(&root, &home, &replay(r#"{ text = "ok" }"#))).await;
+    let task = s.open().await;
+
+    // The first session opens with it — the property that already held.
+    s.quiet().await;
+    assert!(
+        s.screen().contains("快速上手"),
+        "the session it started with:\n{}",
+        s.screen()
+    );
+
+    let first = s.client().session();
+    s.term.type_line("/new");
+    moved_from(&s, &first).await;
+    s.quiet().await;
+
+    let fresh = s.screen();
+    assert!(
+        fresh.contains("已切换到会话"),
+        "the switch happened:\n{fresh}"
+    );
+    // The same two things the first session showed: the tips heading, and the
+    // cat's art. The cat is not decoration here — it is the reason this
+    // criterion looks at the glyph rather than only at the heading, since the
+    // block's *text* would survive a mascot that stopped being drawn.
+    assert!(
+        fresh.contains("快速上手"),
+        "the session it moved to owes its own first word:\n{fresh}"
+    );
+    assert!(
+        fresh.contains('\u{2580}'),
+        "and the cat came with it — the welcome draws no half-block without it:\n{fresh}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
 #[tokio::test]
 async fn a_person_types_a_question_and_reads_the_answer() {
     let dir = scratch("basic");

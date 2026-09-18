@@ -676,9 +676,12 @@ impl UserInterface for Tui {
                         stale |= self
                             .host
                             .open_conversation(crate::block::Coord::default(), &open);
-                        // Asked once, whatever the answer: a stream that was not
-                        // empty will not become empty again, and one that opened
-                        // is no longer empty.
+                        // Answered once per session, whatever the answer: a
+                        // stream that was not empty will not become empty
+                        // again, and one that opened is no longer empty. It is
+                        // *per session* rather than once in a lifetime because
+                        // the `SessionChanged` arm above raises it again — the
+                        // one thing that can empty the stream under this loop.
                         owes_opening = false;
                     }
                 }
@@ -756,6 +759,14 @@ impl UserInterface for Tui {
                             m.lead = session.clone();
                             m.viewing = session.clone();
                         }
+                        // The session that arrives owes its own first word.
+                        // `switch_session` empties the stream (`host.rs`
+                        // `switch_view`), so the question below is live again —
+                        // and it is asked, not answered, once per session. Left
+                        // down, a session started with `/new` opened bare: the
+                        // welcome block is produced by `open_conversation` alone,
+                        // and nothing else asks.
+                        owes_opening = true;
                         self.host.say(format!("已切换到会话 {session}"), false);
                     }
                     stale = true;
