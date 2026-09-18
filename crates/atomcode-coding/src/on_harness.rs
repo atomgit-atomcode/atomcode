@@ -1244,6 +1244,15 @@ pub fn plugins() -> Vec<Arc<dyn Plugin>> {
         Arc::new(DatalogPlugin),
         Arc::new(CcHooksPlugin),
         Arc::new(ChatOptionsPlugin),
+        // This product's own gate rows. They used to live in the harness's
+        // `plugins/policy.rs` while only this assembly ever mounted them —
+        // judging what counts as out of bounds is the product's call, and the
+        // mechanism's job is the waterfall and the approval seam they hang
+        // from. Here rather than in `mount` because an external assembler takes
+        // this list and expects it to be everything this crate brings.
+        Arc::new(crate::policy_rows::CredentialShellPlugin),
+        Arc::new(crate::policy_rows::WriteApprovalPlugin),
+        Arc::new(crate::policy_rows::BashWorkspacePlugin),
     ]
 }
 

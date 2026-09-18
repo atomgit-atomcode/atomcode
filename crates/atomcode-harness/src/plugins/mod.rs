@@ -98,9 +98,6 @@ pub fn catalog() -> PluginRegistry {
         // middleware calls — so they belong in the catalog rather than in one
         // product's private registry, where only that product could mount them.
         .register(Arc::new(policy::OpenFileWorkspacePlugin))
-        .register(Arc::new(policy::CredentialShellPlugin))
-        .register(Arc::new(policy::WriteApprovalPlugin))
-        .register(Arc::new(policy::BashWorkspacePlugin))
         .register(Arc::new(policy::OutputArtifactPlugin))
         .register(Arc::new(tool_exec::ParallelToolsPlugin))
         .register(Arc::new(loop_policy::RoundCapPlugin))

@@ -55,6 +55,7 @@ pub mod parts;
 pub mod persona;
 pub mod plan_mode;
 pub mod plugin_hooks;
+pub mod policy_rows;
 pub mod provider_factory;
 pub mod runtime;
 pub mod session_store;

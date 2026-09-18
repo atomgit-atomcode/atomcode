@@ -148,6 +148,12 @@ pub const HOST_CONSUMED: &[&str] = &[
     // The handle exists for whoever embeds this harness. Its consumer is
     // outside the tree by construction — that is what makes it a handle.
     "agent-handle",
+    // Already `HOST_PROVIDED`: whoever embeds this harness owns the switches a
+    // person flips. Since the gate rows that read them moved to the product
+    // that owns them (`atomcode-coding`'s `policy_rows`), the reading end is
+    // outside this tree too — both ends of the seam belong to the embedder, and
+    // saying so here is the same statement `agent-handle` makes.
+    "modes",
 ];
 
 /// Build the map by joining the seam definitions with what the registry's
