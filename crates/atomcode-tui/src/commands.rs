@@ -315,6 +315,11 @@ const SESSION: &[Command] = &[
     ),
     Command::taking("cd", "<目录>", "换到另一个目录干活;会开一条新会话"),
     Command::taking(
+        "worktree",
+        "<名字>",
+        "开一个同名分支的 worktree 并换过去干活;已经有就直接过去",
+    ),
+    Command::taking(
         "config",
         "[项 值]",
         "看设置;带上项和值就改它。改的是配置文件,不是运行中的行",
@@ -917,6 +922,33 @@ impl CommandSet for SessionCommands {
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }
+            // A branch of one's own with a checkout of its own — what a person
+            // reaches for before letting an agent loose on something they are
+            // not sure of. It ends in a change of directory, so it ends in a
+            // new session, and says so the same way `/cd` does.
+            "worktree" => {
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refusal) => return refusal,
+                };
+                let name = args.trim();
+                if name.is_empty() {
+                    return Outcome::Refused("要一个名字:`/worktree 试一下`".into());
+                }
+                match control
+                    .call(HostCommand::Worktree {
+                        session: root.clone(),
+                        name: name.to_string(),
+                    })
+                    .await
+                {
+                    Ok(HostReply::SessionChanged { session }) => {
+                        Outcome::Said(format!("在 worktree `{name}` 里开了新会话 {session}"))
+                    }
+                    Ok(_) => Outcome::Said(format!("换到 worktree `{name}`")),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
             "whoami" => {
                 let control = match host(control) {
                     Ok(control) => control,
@@ -1428,6 +1460,39 @@ mod tests {
             ]
         );
     }
+    /// `/worktree` asks the host to open one and ends where `/cd` ends: in a
+    /// new session, said out loud.
+    #[tokio::test]
+    async fn worktree_is_asked_of_the_host_and_lands_in_a_new_session() {
+        let host = Arc::new(Recording::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(HostReply::SessionChanged {
+                session: "lead-2".into(),
+            }));
+        let (app, _client, all) = following(&host);
+
+        match all.dispatch("/worktree 试一下", &app.context()).await {
+            Outcome::Said(text) => {
+                assert!(text.contains("试一下") && text.contains("lead-2"), "{text}")
+            }
+            other => panic!("{other:?}"),
+        }
+        // Without a name there is nothing to open, and nothing is asked.
+        assert!(matches!(
+            all.dispatch("/worktree", &app.context()).await,
+            Outcome::Refused(_)
+        ));
+        assert_eq!(
+            *host.asked.lock().unwrap(),
+            vec![HostCommand::Worktree {
+                session: "lead".into(),
+                name: "试一下".into(),
+            }]
+        );
+    }
+
     /// `/language` is a named way in to one setting, and it is that setting —
     /// not a second copy of it.
     #[tokio::test]

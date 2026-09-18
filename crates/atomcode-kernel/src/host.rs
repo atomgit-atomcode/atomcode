@@ -113,6 +113,13 @@ pub enum HostCommand {
     SignIn { session: String },
     /// Who is signed in, as the host knows it.
     WhoAmI { session: String },
+    /// Open a git worktree of `session`'s repository and work there instead.
+    ///
+    /// A branch of one's own with a checkout of its own, which is what a person
+    /// reaches for before letting an agent loose on something they are not sure
+    /// of. Answered like [`HostCommand::ChangeDirectory`], because that is what
+    /// it ends in.
+    Worktree { session: String, name: String },
     /// What `session` has changed in the workspace. `file` asks for that one
     /// file's diff instead of the list.
     ///
@@ -159,6 +166,7 @@ impl HostCommand {
             | Self::SignIn { session }
             | Self::WhoAmI { session }
             | Self::Changes { session, .. }
+            | Self::Worktree { session, .. }
             | Self::Thinking { session }
             | Self::SetThinking { session, .. } => Some(session),
             Self::ListSessions { .. } => None,
@@ -542,6 +550,10 @@ mod tests {
                 session: "a".into(),
                 file: Some("src/parser.rs".into()),
             },
+            HostCommand::Worktree {
+                session: "a".into(),
+                name: "try-it".into(),
+            },
             HostCommand::Thinking {
                 session: "a".into(),
             },
@@ -574,6 +586,7 @@ mod tests {
                 | HostCommand::SignIn { .. }
                 | HostCommand::WhoAmI { .. }
                 | HostCommand::Changes { .. }
+                | HostCommand::Worktree { .. }
                 | HostCommand::Thinking { .. }
                 | HostCommand::SetThinking { .. } => {}
             }
