@@ -5,7 +5,7 @@
 //! them semantic is exactly what lets presentation stay mutable while content
 //! does not.
 
-use crate::block::{hash_of, Content, ContentHash};
+use crate::block::{hash_of, Content, ContentHash, RenderCtx};
 use crate::caps::{Caps, Glyph};
 use crate::frame::{Color, Line, Span, Style};
 use crate::theme::Role;
@@ -88,6 +88,352 @@ fn wrapped(text: &str, w: u16, style: Style, prefix: &str) -> Vec<Line> {
 #[derive(Debug)]
 pub struct UserSaid(pub String);
 
+/// The opening block of a new session: the brand, the mascot, where you are, and
+/// a few commands worth knowing.
+///
+/// A **stream producer**'s block, not a view module's: it happens once, it has
+/// history, and a reader who scrolls back up should still find it
+/// (`docs/adr/0004`). That is also why it refuses to fold.
+///
+/// The tips are decided when the block is built, never in `lines`: `lines` is
+/// called every frame and must be pure, so a block that rolled its tips there
+/// would change under the reader and its `content_hash` would move every frame.
+/// Tuix needed a persisted `welcome_tip_indices` to work around exactly that;
+/// deciding once is the cheaper way to the same property.
+#[derive(Debug)]
+pub struct WelcomeBlock {
+    /// Already a display string — the caller folds the home directory away.
+    pub cwd: String,
+    pub model: Option<String>,
+    pub version: &'static str,
+    /// The tips to show, as `(command, what it does)`.
+    pub tips: Vec<(String, String)>,
+}
+
+/// The mascot's source art, **verbatim** from `atomcode-tuix`
+/// (`render/mascot.rs`).
+///
+/// Four rows of 18 characters: nine cells, and each cell's two characters are its
+/// **upper and lower** half-pixels — tuix draws them as `▀` with the foreground
+/// above and the cell's background below. Legend: `.` transparent, `o` orange,
+/// `e` dark-orange eyebrow, `w` white, `k` black.
+///
+/// **It is coarse, and that is the art.** 18 × 8 pixels is enough for two ears, two
+/// eyes and a chin — and no whiskers, no nose, no tail. Rendered large it reads as
+/// a rounded blob with a face in it. That was checked before deciding to keep it:
+/// the alternative was redrawing a "better" cat, which would be a second mascot to
+/// keep in step with tuix's, and the two front ends disagreeing about what the
+/// product's cat looks like is a worse outcome than a small one. Kept verbatim on
+/// purpose; see the judgement below about its colours.
+const MASCOT_SOURCE: [&str; 4] = [
+    "oooo.o.o.o.o.ooooo",
+    "ooooooewekooewekoo",
+    "ooooookokoookokooo",
+    "..o.ooooooooooo...",
+];
+
+/// How many cells wide the art is.
+const MASCOT_CELLS: usize = 9;
+
+/// A legend character as its 256-index colour, or `None` for transparent.
+///
+/// **The literal palette, exactly as tuix defines it** (`mascot_color`), and
+/// literal on purpose. I first wrote these as roles and it produced a magenta cat
+/// that read as a bug — the reason is worth keeping: `Role::Brand` resolves to
+/// xterm slot 13 *to mean "the brand"*, and this art is not asking for a meaning,
+/// it is a picture of an orange cat. There is no role in the vocabulary that means
+/// "orange", so the picture states its own colours and the gate below is what
+/// protects a terminal that cannot show them.
+fn mascot_colour(legend: char) -> Option<u8> {
+    match legend {
+        'o' => Some(202), // orange        #ff5f00
+        'e' => Some(166), // eyebrow       #d75f00
+        'w' => Some(231), // highlight     white
+        'k' => Some(232), // pupil         near-black
+        _ => None,        // '.' transparent
+    }
+}
+
+fn mascot_cell(row: &str, cell: usize) -> (Option<u8>, Option<u8>) {
+    let chars: Vec<char> = row.chars().collect();
+    (
+        chars.get(cell * 2).copied().and_then(mascot_colour),
+        chars.get(cell * 2 + 1).copied().and_then(mascot_colour),
+    )
+}
+
+impl Content for WelcomeBlock {
+    fn kind(&self) -> &'static str {
+        "welcome"
+    }
+
+    fn content_hash(&self) -> ContentHash {
+        // Shape is not in the hash — same class as width. `Content` promises the
+        // hash covers what the block *says* and never the bytes it renders, and
+        // "did the cat get drawn" is rendered bytes.
+        let mut parts: Vec<&str> = vec!["welcome", self.version, &self.cwd];
+        if let Some(model) = &self.model {
+            parts.push(model);
+        }
+        for (command, about) in &self.tips {
+            parts.push(command);
+            parts.push(about);
+        }
+        hash_of(&parts)
+    }
+
+    /// It refuses to fold.
+    ///
+    /// Its whole point is "this is how the session started" — a one-line summary
+    /// of that is the point folded away. The same reasoning as a loaded skill's.
+    fn always_open(&self) -> bool {
+        true
+    }
+
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width as usize;
+        // Nothing fits inside the padding, so there is no block — not a block of
+        // blank rows. A zero-row block still occupies a slot and `blank_between`
+        // would leave a blank row for it, so the screen would gain a stray line.
+        if w <= PAD * 2 {
+            return Vec::new();
+        }
+        let content_w = w - PAD * 2;
+        let pad = " ".repeat(PAD);
+
+        // ---- The left column: the mascot, then the two bullets ----
+        let mut left: Vec<Line> = mascot(ctx, content_w);
+
+        // cwd and model are rendered BELOW the whole block, never zipped into the
+        // left column beside the tips. Tuix learned this: when the tips are taller
+        // than the mascot the spare rows landed on these two, and the screen read
+        // `∙ proj` and `set a goal…` on one line.
+        let mut below: Vec<Line> = Vec::new();
+        let bullet = ctx.caps.g(Glyph::Bullet);
+        for text in std::iter::once(Some(self.cwd.as_str()))
+            .chain(std::iter::once(self.model.as_deref()))
+            .flatten()
+        {
+            below.extend(wrapped(
+                text,
+                content_w as u16,
+                muted(),
+                &format!("{bullet} "),
+            ));
+        }
+
+        // ---- The right column: a heading and the tips ----
+        let mut right: Vec<Line> = Vec::new();
+        if !self.tips.is_empty() {
+            right.push(Line::styled(
+                width::take_width("快速上手", content_w),
+                muted(),
+            ));
+            let command_w = self
+                .tips
+                .iter()
+                .map(|(command, _)| width::str_width(command))
+                .max()
+                .unwrap_or(0);
+            for (command, about) in &self.tips {
+                // The columns line up on the widest command, but never at the cost
+                // of the row: command, gap and description together are clipped to
+                // `content_w`. A tip that does not fit is cut, never drawn past the
+                // edge. (The two-column test above already refuses to place these
+                // beside the mascot when they would not fit there.)
+                let command = width::take_width(command, content_w);
+                let command_w_here = width::str_width(&command);
+                let remaining = content_w.saturating_sub(command_w_here);
+                let want_gap = command_w.saturating_sub(command_w_here) + 2;
+                let gap = want_gap.min(remaining);
+                let room = remaining - gap;
+
+                let mut spans = vec![
+                    Span::styled(command, Style::new().fg(Color::role(Role::Accent)).bold()),
+                    Span::raw(" ".repeat(gap)),
+                ];
+                // No span at all when nothing of the description fits: an empty
+                // styled span is a style with no text, which the encoder would
+                // still have to look at.
+                if room > 0 {
+                    spans.push(Span::styled(width::take_width(about, room), muted()));
+                }
+                right.push(Line::from_spans(spans));
+            }
+        }
+
+        let mut rows: Vec<Line> = Vec::new();
+
+        // ---- The header: brand on the left, version · licence on the right ----
+        //
+        // Clipped to `content_w`, and that clipping is not decoration: a rect
+        // narrower than the two strings would otherwise be drawn past its own
+        // edge, which the frame's containment check catches per block but a reader
+        // sees as a row running into its neighbour.
+        let right_txt = format!("v{}  MIT", self.version);
+        let brand = "◆ AtomCode";
+        let brand_w = width::str_width(brand);
+        let right_w = width::str_width(&right_txt);
+        let brand_style = Style::new().fg(Color::role(Role::Brand));
+        if content_w > brand_w + right_w {
+            let fill = content_w - brand_w - right_w;
+            rows.push(Line::from_spans(vec![
+                Span::raw(pad.clone()),
+                Span::styled(brand.to_string(), brand_style),
+                Span::raw(" ".repeat(fill)),
+                Span::styled(right_txt, muted()),
+            ]));
+        } else {
+            // Too narrow for both on one row: two rows beat a truncated line, and
+            // beat the two colliding. Each is still clipped to what there is.
+            rows.push(Line::from_spans(vec![
+                Span::raw(pad.clone()),
+                Span::styled(width::take_width(brand, content_w), brand_style),
+            ]));
+            rows.push(Line::styled(
+                format!("{pad}{}", width::take_width(&right_txt, content_w)),
+                muted(),
+            ));
+        }
+        rows.push(Line::empty());
+
+        // ---- Two columns only when the widest tip actually fits ----
+        //
+        // Tuix's criterion, and its reason: tip rows are not truncated, so two
+        // columns that do not fit get hard-wrapped by the terminal and the
+        // alignment of the column breaks. It used a fixed underestimate once and
+        // that is precisely what happened on a narrow terminal.
+        let gap = 4usize;
+        let left_w = if left.is_empty() {
+            PAD
+        } else {
+            PAD + MASCOT_CELLS
+        };
+        let tips_col = left_w + gap;
+        let right_w = right.iter().map(Line::width).max().unwrap_or(0);
+        let two_columns = !left.is_empty() && !right.is_empty() && content_w >= tips_col + right_w;
+
+        if two_columns {
+            for i in 0..left.len().max(right.len()) {
+                let mut line = left.get(i).cloned().unwrap_or_else(Line::empty);
+                let have = line.width();
+                if have < tips_col {
+                    line.push(Span::raw(" ".repeat(tips_col - have)));
+                }
+                if let Some(row) = right.get(i) {
+                    for span in &row.spans {
+                        line.push(span.clone());
+                    }
+                }
+                rows.push(line);
+            }
+        } else {
+            rows.append(&mut left);
+            for row in right {
+                let mut line = Line::from_spans(vec![Span::raw(pad.clone())]);
+                for span in &row.spans {
+                    line.push(span.clone());
+                }
+                rows.push(line);
+            }
+        }
+        rows.extend(below);
+
+        // A trailing blank, so whatever arrives next (a connection notice, an
+        // upgrade hint) does not butt against the last row. Tuix keeps one too.
+        rows.push(Line::empty());
+
+        // Nothing fit: no block at all, rather than a block of blank rows. A
+        // zero-row block still occupies a slot and `blank_between` would leave a
+        // blank row for it, so the screen would gain a stray empty line.
+        if rows.iter().all(|line| line.plain().trim().is_empty()) {
+            return Vec::new();
+        }
+        rows
+    }
+}
+
+/// How far the block is set in from the rect it was given.
+const PAD: usize = 2;
+
+/// The mascot, as nine cells of two vertical pixels each.
+///
+/// **With `cell_background`** the two pixels are the cell's foreground and
+/// background, which is what makes the cat recognisable: `▀` for a cell with an
+/// upper pixel only, `▀` (fg upper, bg lower) for both, `▄` for a lower pixel
+/// only, blank for neither — tuix's `mascot_cell`, unchanged.
+///
+/// **Without it** the gate below refuses to draw at all, and that is tuix's
+/// behaviour rather than a degradation this code invented. Its condition is
+/// `colors && unicode_symbols && (modern_emulator || jediterm)`, and the comment
+/// next to it says why: on a terminal that drops backgrounds the art **fragments**.
+/// A version of this that "coped" by filling both pixels with the upper colour
+/// drew a solid orange rectangle for weeks and looked like a loading placeholder.
+///
+/// My equivalents: `colors != None` for `colors`, `unicode` for
+/// `unicode_symbols`, and the measured `cell_background` for
+/// `modern_emulator || jediterm` — the same three facts, one of them measured
+/// rather than guessed from an environment variable.
+///
+/// Cut to `content_w`, like every other row: art wider than the rect it was given
+/// is a row running into its neighbour.
+fn mascot(ctx: &RenderCtx, content_w: usize) -> Vec<Line> {
+    let drawable = ctx.caps.colors != crate::caps::Colors::None
+        && ctx.caps.unicode
+        && ctx.caps.cell_background;
+    if !drawable {
+        return Vec::new();
+    }
+    // The art needs PAD + nine cells. Showing a sliced cat is worse than showing
+    // none, and the caller's width is the one thing that decides.
+    if content_w < MASCOT_CELLS {
+        return Vec::new();
+    }
+    MASCOT_SOURCE
+        .iter()
+        .map(|row| {
+            let mut spans: Vec<Span> = vec![Span::raw(" ".repeat(PAD))];
+            let mut run = String::new();
+            let mut run_style = Style::new();
+            for cell in 0..MASCOT_CELLS {
+                let (top, bottom) = mascot_cell(row, cell);
+                // tuix's `mascot_cell`, decision for decision. `▄` where the TOP
+                // pixel is the transparent one, so the ears' empty half does not
+                // paint a default-foreground bar across them — the bug that line
+                // exists to prevent.
+                let (glyph, style) = match (top, bottom) {
+                    (None, None) => (" ", Style::new()),
+                    (Some(t), None) => ("\u{2580}", ink(t)),
+                    (None, Some(b)) => ("\u{2584}", ink(b)),
+                    (Some(t), Some(b)) => ("\u{2580}", ink(t).bg(Color::picture(b))),
+                };
+                if style == run_style {
+                    run.push_str(glyph);
+                } else {
+                    if !run.is_empty() {
+                        spans.push(Span::styled(std::mem::take(&mut run), run_style));
+                    }
+                    run.push_str(glyph);
+                    run_style = style;
+                }
+            }
+            if !run.is_empty() {
+                spans.push(Span::styled(run, run_style));
+            }
+            Line::from_spans(spans)
+        })
+        .collect()
+}
+
+/// `▀`'s foreground: one of the art's own 256-index colours.
+///
+/// [`Color::Picture`], not `Color::Ansi`: the index is *the picture's*, and the
+/// encoder — which is the only part of this that knows what the terminal can show
+/// — resolves it. Same promise [`Color::Role`] keeps for the scheme's colours.
+fn ink(index: u8) -> Style {
+    Style::new().fg(Color::picture(index))
+}
+
 impl Content for UserSaid {
     fn kind(&self) -> &'static str {
         "user"
@@ -105,7 +451,8 @@ impl Content for UserSaid {
     /// nothing else, and the blank row under the bar belongs to the seam between
     /// two blocks — see `host::blank_between`, which is the one place that
     /// decides it for both the painter and the scroll.
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         // Roles, not colours. This used to name `Theme::Dark` outright, which
         // is how the whole transcript stayed dark on a light screen: a module
         // that can resolve is a module that can resolve wrongly.
@@ -147,13 +494,15 @@ impl Content for ModelSaid {
         // width, or with code folded, is the same thing said.
         hash_of(&["assistant", &self.0])
     }
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         crate::markdown::render(&self.0, w, Style::new())
     }
     fn growing_text(&self) -> Option<&str> {
         Some(&self.0)
     }
-    fn summary(&self, w: u16) -> Line {
+    fn summary(&self, ctx: &RenderCtx) -> Line {
+        let w = ctx.width;
         let first = self
             .0
             .lines()
@@ -176,10 +525,12 @@ impl Content for ModelThought {
     fn content_hash(&self) -> ContentHash {
         hash_of(&["reasoning", &self.0])
     }
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         wrapped(&self.0, w, muted(), "· ")
     }
-    fn summary(&self, w: u16) -> Line {
+    fn summary(&self, ctx: &RenderCtx) -> Line {
+        let w = ctx.width;
         let n = self.0.lines().count().max(1);
         Line::styled(
             width::take_width(
@@ -533,7 +884,8 @@ impl Content for ToolCallBlock {
     /// see what actually ran, and a command that ends in `…` is not an answer
     /// to that question — so the whole subject goes on the screen, over as many
     /// rows as it takes, hanging under the marker.
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         if w == 0 {
             return Vec::new();
         }
@@ -575,7 +927,8 @@ impl Content for ToolCallBlock {
     /// note keeps its own style, because it is not the summary — it is the
     /// answer, and a failed call's red is the one thing on a folded line that
     /// has to survive being folded.
-    fn summary(&self, w: u16) -> Line {
+    fn summary(&self, ctx: &RenderCtx) -> Line {
+        let w = ctx.width;
         let style = fold();
         let look = look(&self.name);
         let name = match look.verb {
@@ -661,7 +1014,8 @@ impl Content for NoticeBlock {
     fn content_hash(&self) -> ContentHash {
         hash_of(&["notice", &self.detail])
     }
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         wrapped(&self.detail, w, muted(), "⚑ ")
     }
 }
@@ -686,10 +1040,12 @@ impl Content for InjectedBlock {
     fn content_hash(&self) -> ContentHash {
         hash_of(&[self.kind, &self.origin, &self.text])
     }
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         wrapped(&self.text, w, muted(), &format!("[{}] ", self.origin))
     }
-    fn summary(&self, w: u16) -> Line {
+    fn summary(&self, ctx: &RenderCtx) -> Line {
+        let w = ctx.width;
         Line::styled(
             width::take_width(&format!("[{}]", self.origin), w as usize),
             muted(),
@@ -745,8 +1101,9 @@ impl Content for RewoundBlock {
     fn always_open(&self) -> bool {
         true
     }
-    fn lines(&self, width: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &crate::block::RenderCtx) -> Vec<Line> {
         use atomcode_harness::session::RewindScope;
+        let width = ctx.width;
         let what = match self.scope {
             RewindScope::Conversation => "对话",
             RewindScope::Code => "工作区",
@@ -829,7 +1186,8 @@ impl Content for ChoiceBlock {
             self.answer.as_deref().unwrap_or(""),
         ])
     }
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         if w == 0 {
             return Vec::new();
         }
@@ -863,7 +1221,8 @@ impl Content for ChoiceBlock {
             }
         }
     }
-    fn summary(&self, w: u16) -> Line {
+    fn summary(&self, ctx: &RenderCtx) -> Line {
+        let w = ctx.width;
         let head = match &self.answer {
             Some(a) => format!("? {} → {a}", first_line(&self.question)),
             None => format!("? {}", first_line(&self.question)),
@@ -899,7 +1258,8 @@ impl Content for CommandSaid {
             if self.refused { "no" } else { "ok" },
         ])
     }
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         let style = if self.refused { bad() } else { muted() };
         let mut out = Vec::new();
         for line in self.text.split('\n') {
@@ -907,7 +1267,8 @@ impl Content for CommandSaid {
         }
         out
     }
-    fn summary(&self, w: u16) -> Line {
+    fn summary(&self, ctx: &RenderCtx) -> Line {
+        let w = ctx.width;
         Line::styled(
             width::take_width(first_line(&self.text), w as usize),
             if self.refused { bad() } else { muted() },
@@ -1136,7 +1497,8 @@ impl Content for TurnEndBlock {
     /// line is for. So the caption is built widest-first and falls back to the
     /// outcome alone, with whatever was dropped going under the rule, wrapped —
     /// the same ladder the cause of a failed turn already climbed.
-    fn lines(&self, w: u16) -> Vec<Line> {
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+        let w = ctx.width;
         let caps = Caps::default();
         let (mark, said, style) = turn_end_note(self.stop);
         let short = format!("{} {said}", caps.g(mark));
@@ -1183,10 +1545,319 @@ impl Content for TurnEndBlock {
 mod tests {
     use super::*;
 
+    fn welcome() -> WelcomeBlock {
+        WelcomeBlock {
+            cwd: "~/proj".into(),
+            model: Some("a-model".into()),
+            version: "9.9.9",
+            tips: vec![
+                ("/resume".into(), "接着上次".into()),
+                ("/help".into(), "列出所有命令".into()),
+            ],
+        }
+    }
+
+    /// A render context with the two shape bits a caller cares about.
+    fn wctx(width: u16, cell_background: bool) -> RenderCtx {
+        RenderCtx {
+            width,
+            caps: crate::block::ShapeCaps {
+                unicode: true,
+                colors: crate::caps::Colors::Ansi256,
+                cell_background,
+            },
+        }
+    }
+
+    fn lines_of(block: &WelcomeBlock, width: u16, cell_background: bool) -> Vec<String> {
+        block
+            .lines(&wctx(width, cell_background))
+            .iter()
+            .map(Line::plain)
+            .collect()
+    }
+
+    #[test]
+    fn the_welcome_says_the_four_things_it_has() {
+        let all = lines_of(&welcome(), 80, true).join("\n");
+        for want in ["AtomCode", "9.9.9", "~/proj", "a-model", "/resume", "/help"] {
+            assert!(all.contains(want), "{want} missing from:\n{all}");
+        }
+    }
+
+    #[test]
+    fn the_mascot_is_the_same_cat_tuix_draws() {
+        // The art and its palette are tuix's, unchanged — a "close enough" redraw
+        // would be a second cat to keep in step. Checked against the constants
+        // rather than against a transcription of them.
+        for (i, row) in MASCOT_SOURCE.iter().enumerate() {
+            assert_eq!(
+                row.chars().count(),
+                MASCOT_CELLS * 2,
+                "row {i} is not {MASCOT_CELLS} cells of two pixels"
+            );
+            assert!(
+                row.chars()
+                    .all(|c| matches!(c, '.' | 'o' | 'e' | 'w' | 'k')),
+                "row {i} has a legend character nobody draws"
+            );
+        }
+        assert_eq!(mascot_colour('o'), Some(202), "orange, as tuix bakes it");
+        assert_eq!(mascot_colour('e'), Some(166), "dark-orange eyebrow");
+        assert_eq!(mascot_colour('w'), Some(231), "white highlight");
+        assert_eq!(mascot_colour('k'), Some(232), "black pupil");
+        assert_eq!(mascot_colour('.'), None, "transparent, not a colour");
+
+        // tuix's own judgement on the art: one white highlight per eye, eyebrows
+        // above them. If the bytes are ever edited, this says what they must keep.
+        let eyes = MASCOT_SOURCE[1];
+        assert_eq!(eyes.matches('w').count(), 2, "one highlight per eye");
+        assert_eq!(
+            eyes.matches('e').count(),
+            4,
+            "an eyebrow per eye, 2 cells wide"
+        );
+    }
+
+    #[test]
+    fn the_mascot_states_its_own_colours_rather_than_asking_for_a_role() {
+        // It is a picture of an orange cat, not a request for "the brand colour".
+        // Written with roles it came out magenta (Brand → xterm 13) and read as a
+        // bug: there is no role in the vocabulary that means "orange". So the art
+        // carries literal indices, and the gate below is what protects a terminal
+        // that cannot show them.
+        let lines = welcome().lines(&wctx(80, true));
+        // Both pixels, because which one a colour lands on is the art's business:
+        // the highlight sits *below* the eyebrow in the same cell (`ew`), so it
+        // arrives as a background. Collecting foregrounds only would report the
+        // white as missing when it is right there.
+        let mut colours: Vec<u8> = Vec::new();
+        let mut backgrounds = 0usize;
+        for span in lines.iter().flat_map(|line| &line.spans) {
+            let index = |c: Option<Color>| match c {
+                Some(Color::Picture(n)) => Some(n),
+                _ => None,
+            };
+            if let Some(n) = index(span.style.fg) {
+                colours.push(n);
+            }
+            if let Some(n) = index(span.style.bg) {
+                colours.push(n);
+                backgrounds += 1;
+            }
+        }
+        for want in [202u8, 166, 231, 232] {
+            assert!(
+                colours.contains(&want),
+                "the palette index {want} never reached a cell: {colours:?}"
+            );
+        }
+        assert!(
+            backgrounds > 0,
+            "no cell carried a background pixel — two colours per cell is what makes \
+             this art possible"
+        );
+        // Per **span**, not per line: the mascot shares its rows with the tips
+        // (two columns), and the tips are roles on purpose. So the claim is about
+        // the spans that actually carry block glyphs.
+        let glyph_spans: Vec<&Span> = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.text.contains('\u{2580}') || span.text.contains('\u{2584}'))
+            .collect();
+        assert!(!glyph_spans.is_empty(), "no mascot spans found");
+        assert!(
+            !glyph_spans
+                .iter()
+                .any(|s| matches!(s.style.fg, Some(Color::Role(_)))),
+            "the cat must not be drawn from roles"
+        );
+        // And they do carry the art's own indices.
+        assert!(
+            glyph_spans
+                .iter()
+                .all(|s| matches!(s.style.fg, Some(Color::Picture(_)))),
+            "every block glyph should carry the picture's index: {glyph_spans:?}"
+        );
+    }
+
+    #[test]
+    fn the_mascot_needs_a_background_and_says_so_by_not_drawing() {
+        // tuix's gate, kept exactly: `colors && unicode_symbols && (modern ||
+        // jediterm)`. Everything else **draws nothing**, because on a terminal that
+        // drops backgrounds the half-block art fragments — and a version that
+        // "coped" by filling both pixels with the upper colour drew a solid orange
+        // rectangle that looked like a loading placeholder.
+        let with = lines_of(&welcome(), 80, true).join("\n");
+        assert!(with.contains('▀'), "no mascot at all:\n{with}");
+
+        for (why, ctx) in [
+            (
+                "no cell background",
+                RenderCtx {
+                    width: 80,
+                    caps: crate::block::ShapeCaps {
+                        cell_background: false,
+                        ..wctx(80, true).caps
+                    },
+                },
+            ),
+            (
+                "no colour at all",
+                RenderCtx {
+                    width: 80,
+                    caps: crate::block::ShapeCaps {
+                        colors: crate::caps::Colors::None,
+                        ..wctx(80, true).caps
+                    },
+                },
+            ),
+        ] {
+            let all = welcome()
+                .lines(&ctx)
+                .iter()
+                .map(Line::plain)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !all.contains('▀') && !all.contains('▄'),
+                "half blocks were drawn with {why} — the art would fragment:\n{all}"
+            );
+            // And no solid-block stand-in either: that was the bug.
+            assert!(!all.contains('█'), "a rectangle is not a cat:\n{all}");
+            // The words are still there: only the art is withheld.
+            assert!(all.contains("AtomCode") && all.contains("~/proj"), "{all}");
+        }
+    }
+
+    #[test]
+    fn a_terminal_with_no_unicode_gets_no_mascot() {
+        let none = RenderCtx {
+            width: 80,
+            caps: crate::block::ShapeCaps {
+                unicode: false,
+                ..wctx(80, true).caps
+            },
+        };
+        let all = welcome()
+            .lines(&none)
+            .iter()
+            .map(Line::plain)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !all.contains('█') && !all.contains('▀'),
+            "a grid of tofu is not a picture:\n{all}"
+        );
+        // The words are still there: only the art needs Unicode.
+        assert!(all.contains("AtomCode") && all.contains("~/proj"));
+    }
+
+    #[test]
+    fn cwd_and_model_land_below_the_tips_and_never_on_top_of_them() {
+        // Tuix's bug, kept as a judgement: when the tips are taller than the cat,
+        // the spare rows used to land on these two, and one line read `∙ proj`
+        // and `set a goal…` at once.
+        let lines = lines_of(&welcome(), 80, true);
+        let cwd_row = lines
+            .iter()
+            .position(|l| l.contains("~/proj"))
+            .expect("cwd");
+        let tip_row = lines
+            .iter()
+            .position(|l| l.contains("/resume"))
+            .expect("tips");
+        assert!(
+            cwd_row > tip_row,
+            "the bullets belong under the block, not beside the tips:\n{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn nothing_that_fits_means_no_block_rather_than_a_blank_one() {
+        // A zero-row block still occupies a slot, and `blank_between` would leave a
+        // blank row for it — the screen would gain a stray empty line.
+        for width in [0u16, 1, 2, 3] {
+            assert!(
+                welcome().lines(&wctx(width, true)).is_empty(),
+                "width {width} fits nothing, so there is no block"
+            );
+        }
+    }
+
+    #[test]
+    fn the_welcome_cannot_be_folded_away() {
+        assert!(
+            welcome().always_open(),
+            "its whole point is that it happened"
+        );
+    }
+
+    #[test]
+    fn the_hash_covers_what_it_says_and_not_how_it_draws() {
+        assert_eq!(welcome().content_hash(), welcome().content_hash());
+        assert_ne!(
+            welcome().content_hash(),
+            WelcomeBlock {
+                model: None,
+                ..welcome()
+            }
+            .content_hash(),
+            "a different model is a different block"
+        );
+    }
+
+    #[test]
+    fn no_row_is_wider_than_the_width_it_was_given() {
+        // The invariant every block owes the frame, across widths and both shapes
+        // of terminal.
+        for width in [4u16, 9, 20, 40, 61, 80, 120] {
+            for cell_background in [true, false] {
+                for line in welcome().lines(&wctx(width, cell_background)) {
+                    assert!(
+                        line.width() <= width as usize,
+                        "at {width} (background={cell_background}): {line:?} is {} cells",
+                        line.width()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_tip_list_drops_the_whole_column_and_not_just_the_heading() {
+        // A heading with nothing under it announces nothing.
+        let bare = WelcomeBlock {
+            tips: Vec::new(),
+            ..welcome()
+        };
+        let all = lines_of(&bare, 80, true).join("\n");
+        assert!(!all.contains("快速上手"), "{all}");
+        assert!(all.contains("~/proj"), "the rest is still there: {all}");
+    }
+
+    #[test]
+    fn the_art_source_is_well_formed() {
+        // The constant is borrowed from tuix; if it were ever edited, this says
+        // what the reader below assumes.
+        for (i, row) in MASCOT_SOURCE.iter().enumerate() {
+            assert_eq!(
+                row.chars().count(),
+                MASCOT_CELLS * 2,
+                "row {i} is not {MASCOT_CELLS} cells of two pixels"
+            );
+            assert!(
+                row.chars()
+                    .all(|c| matches!(c, '.' | 'o' | 'e' | 'w' | 'k')),
+                "row {i} has a legend character nobody draws"
+            );
+        }
+    }
+
     /// A block as it reaches the screen, as one string.
     fn drawn(block: &dyn Content, w: u16) -> String {
         block
-            .lines(w)
+            .lines(&crate::block::RenderCtx::bare(w))
             .iter()
             .map(|l| l.plain())
             .collect::<Vec<_>>()
@@ -1206,7 +1877,7 @@ mod tests {
             error: Some(error.into()),
             stats: TurnStats::default(),
         };
-        let lines = block.lines(100);
+        let lines = block.lines(&crate::block::RenderCtx::bare(100));
         let text: String = lines
             .iter()
             .map(|l| l.plain())
@@ -1231,7 +1902,7 @@ mod tests {
             error: Some("by the user".into()),
             stats: TurnStats::default(),
         };
-        let lines = short.lines(100);
+        let lines = short.lines(&crate::block::RenderCtx::bare(100));
         assert_eq!(lines.len(), 1);
         assert!(lines[0].plain().contains("已中断 · by the user"));
     }
@@ -1248,7 +1919,7 @@ mod tests {
                 error: None,
                 stats: TurnStats::default(),
             }
-            .lines(80)
+            .lines(&crate::block::RenderCtx::bare(80))
             .iter()
             .map(|l| l.plain())
             .collect::<Vec<_>>()
@@ -1352,7 +2023,11 @@ mod tests {
         for want in ["完成", "4 步", "入 90.7k", "出 4200", "缓存 99.82%"] {
             assert!(text.contains(want), "{want} missing from {text:?}");
         }
-        assert_eq!(block.lines(100).len(), 1, "one rule, not a paragraph");
+        assert_eq!(
+            block.lines(&crate::block::RenderCtx::bare(100)).len(),
+            1,
+            "one rule, not a paragraph"
+        );
     }
 
     /// A provider that says nothing about caching reports zero, and zero is not
@@ -1384,7 +2059,7 @@ mod tests {
             error: None,
             stats: TurnStats::default(),
         };
-        let lines = block.lines(80);
+        let lines = block.lines(&crate::block::RenderCtx::bare(80));
         assert_eq!(lines.len(), 1, "nothing to say means no extra row");
         let text = drawn(&block, 80);
         assert!(text.contains("已中断"), "{text:?}");
@@ -1422,7 +2097,7 @@ mod tests {
             for want in ["4步", "入90.7k", "出4200", "缓存99.82%"] {
                 assert!(flat.contains(want), "w={w}: {want} lost from {text:?}");
             }
-            for line in block.lines(w) {
+            for line in block.lines(&crate::block::RenderCtx::bare(w)) {
                 assert!(line.width() <= w as usize, "w={w}: {:?}", line.plain());
             }
         }
@@ -1443,7 +2118,7 @@ mod tests {
             },
         };
         for w in 0..160u16 {
-            for line in block.lines(w) {
+            for line in block.lines(&crate::block::RenderCtx::bare(w)) {
                 assert!(line.width() <= w as usize, "w={w}: {:?}", line.plain());
             }
         }
@@ -1535,7 +2210,7 @@ mod tests {
         ];
         for item in &items {
             for w in 0..60u16 {
-                for line in item.lines(w) {
+                for line in item.lines(&crate::block::RenderCtx::bare(w)) {
                     assert!(
                         line.width() <= w as usize,
                         "{} at width {w}: {:?} is {} cells",
@@ -1554,9 +2229,9 @@ mod tests {
         assert_eq!(a.content_hash(), a.content_hash());
         // Rendering at different widths, and asking for the folded form, must
         // not change what the block *says*.
-        let _ = a.lines(10);
-        let _ = a.lines(200);
-        let _ = a.summary(10);
+        let _ = a.lines(&crate::block::RenderCtx::bare(10));
+        let _ = a.lines(&crate::block::RenderCtx::bare(200));
+        let _ = a.summary(&crate::block::RenderCtx::bare(10));
         assert_eq!(a.content_hash(), ModelSaid("hello".into()).content_hash());
         assert_ne!(a.content_hash(), ModelSaid("hellp".into()).content_hash());
     }
@@ -1582,7 +2257,7 @@ mod tests {
 
         let running = ToolCallBlock::pending("c", "read_file", r#"{"file_path":"a.rs"}"#);
         assert_eq!(running.mark().1.fg, warn, "{:?}", running.mark());
-        let head = running.lines(60).remove(0);
+        let head = running.lines(&crate::block::RenderCtx::bare(60)).remove(0);
         let named = head
             .spans
             .iter()
@@ -1602,7 +2277,7 @@ mod tests {
             let block =
                 ToolCallBlock::pending("c", "read_file", r#"{"file_path":"a.rs"}"#).with(done);
             assert_ne!(block.mark().1.fg, warn, "{:?}", block.mark());
-            let head = block.lines(60).remove(0);
+            let head = block.lines(&crate::block::RenderCtx::bare(60)).remove(0);
             let named = head
                 .spans
                 .iter()
@@ -1633,7 +2308,7 @@ mod tests {
             r#"{"file_path":"/Users/x/crates/atomcode-tui/src/content.rs"}"#,
         );
 
-        let folded = pending.summary(80);
+        let folded = pending.summary(&crate::block::RenderCtx::bare(80));
         let named = folded
             .spans
             .iter()
@@ -1658,7 +2333,7 @@ mod tests {
 
         // And the note survives the fold in its own colour.
         let failed = pending.with(Outcome::Failed("no such file".into()));
-        let line = failed.summary(80);
+        let line = failed.summary(&crate::block::RenderCtx::bare(80));
         let note = line
             .spans
             .iter()
@@ -1688,7 +2363,10 @@ mod tests {
     #[test]
     fn a_folded_thought_says_how_much_it_is_hiding() {
         let t = ModelThought("one\ntwo\nthree".into());
-        assert!(t.summary(40).plain().contains("思考 3 行"));
+        assert!(t
+            .summary(&crate::block::RenderCtx::bare(40))
+            .plain()
+            .contains("思考 3 行"));
     }
 
     #[test]
@@ -1699,7 +2377,10 @@ mod tests {
         // tool nobody wrote a rule for still says something.
         let c = ToolCallBlock::pending("c", "read_file", r#"{"file_path":"a.rs"}"#);
         assert_eq!(subject_of(&c.name, &c.args), "a.rs");
-        assert!(c.summary(40).plain().contains("read_file(a.rs)"));
+        assert!(c
+            .summary(&crate::block::RenderCtx::bare(40))
+            .plain()
+            .contains("read_file(a.rs)"));
 
         let unknown = ToolCallBlock::pending("d", "some_new_tool", r#"{"thing":"x.rs"}"#);
         assert!(
@@ -1726,7 +2407,7 @@ mod tests {
             "the sample must reproduce the old panic, or it guards nothing"
         );
         let c = ToolCallBlock::pending("c", "bash", format!(r#"{{"command":"{command}"}}"#));
-        let line = c.summary(60).plain();
+        let line = c.summary(&crate::block::RenderCtx::bare(60)).plain();
         assert!(line.contains('…'), "{line:?} should be abbreviated");
         // Reading the line back is what panicked before: a cut at a byte offset
         // produced a string that could not be sliced again at all.
@@ -1753,7 +2434,7 @@ mod tests {
         let args = serde_json::json!({ "command": command }).to_string();
         let c = ToolCallBlock::pending("c", "bash", &args);
 
-        let lid = c.summary(200).plain();
+        let lid = c.summary(&crate::block::RenderCtx::bare(200)).plain();
         assert!(
             !lid.contains('\n') && !lid.contains('\r'),
             "the lid is more than one row: {lid:?}"
@@ -1763,7 +2444,7 @@ mod tests {
         assert!(lid.ends_with("PY) · 运行中"), "{lid:?}");
 
         // Expanded: over as many rows as it takes, and every one of them one row.
-        let rows = c.lines(200);
+        let rows = c.lines(&crate::block::RenderCtx::bare(200));
         assert!(rows.len() > 1, "the command came out as one row: {rows:#?}");
         for (i, line) in rows.iter().enumerate() {
             let text = line.plain();
@@ -1796,8 +2477,8 @@ mod tests {
             "bash",
             format!(r#"{{"command":"/x/{}"}}"#, "中".repeat(60)),
         );
-        let a = width::str_width(&ascii.summary(60).plain());
-        let c = width::str_width(&cjk.summary(60).plain());
+        let a = width::str_width(&ascii.summary(&crate::block::RenderCtx::bare(60)).plain());
+        let c = width::str_width(&cjk.summary(&crate::block::RenderCtx::bare(60)).plain());
         assert!(
             (a as i64 - c as i64).abs() <= 1,
             "ascii {a} vs cjk {c} cells"
@@ -1815,7 +2496,7 @@ mod tests {
         let mut c = ToolCallBlock::pending("c", "bash", format!(r#"{{"command":"{command}"}}"#));
         c = c.with(Outcome::Ok("a\nb\nc".into()));
         // Narrower than the command, so the line is forced to abbreviate.
-        let line = c.summary(48).plain();
+        let line = c.summary(&crate::block::RenderCtx::bare(48)).plain();
         assert!(line.contains('…'), "nothing was abbreviated: {line:?}");
         assert!(
             line.starts_with("● $(git log"),
@@ -1846,7 +2527,7 @@ mod tests {
         let c = ToolCallBlock::pending("c", "bash", format!(r#"{{"command":"{command}"}}"#));
         for w in [40u16, 72, 120] {
             let head: String = c
-                .lines(w)
+                .lines(&crate::block::RenderCtx::bare(w))
                 .iter()
                 .map(|l| l.plain())
                 .collect::<Vec<_>>()
@@ -1874,7 +2555,7 @@ mod tests {
             format!(r#"{{"command":"{}"}}"#, "中".repeat(80)),
         );
         for w in 1u16..=40 {
-            for line in c.lines(w) {
+            for line in c.lines(&crate::block::RenderCtx::bare(w)) {
                 assert!(
                     width::str_width(&line.plain()) <= w as usize,
                     "at {w}: {:?} is {} cells",
@@ -1953,7 +2634,13 @@ mod tests {
             text: "keep going".into(),
         };
         assert_eq!(b.kind(), "injected:reminder");
-        assert_eq!(b.lines(40)[0].plain(), "[reminder] keep going");
-        assert_eq!(b.summary(40).plain(), "[reminder]");
+        assert_eq!(
+            b.lines(&crate::block::RenderCtx::bare(40))[0].plain(),
+            "[reminder] keep going"
+        );
+        assert_eq!(
+            b.summary(&crate::block::RenderCtx::bare(40)).plain(),
+            "[reminder]"
+        );
     }
 }

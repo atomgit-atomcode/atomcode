@@ -79,6 +79,80 @@ pub fn hash_of(parts: &[&str]) -> ContentHash {
     ContentHash(h)
 }
 
+/// The part of the terminal's capabilities a block may see: **only the bits that
+/// decide shape or existence.**
+///
+/// No `palette`. Colour is not a block's to decide — a block writes
+/// `Color::Role(Role)` and [`crate::ansi::encode_with`] resolves it on the way
+/// out, which is what `frame.rs:143-149` says and why: a block has no idea
+/// whether the terminal is light or dark, and threading that answer through
+/// every `lines` would mean every one of them could get it wrong. There is a
+/// second, sharper reason here: `Palette` is *measured* by `measure_palette()`
+/// and therefore changes with the terminal's theme, so a cache key carrying it
+/// would mean **one theme change invalidates every settled block's render**.
+///
+/// When a bit is added to [`crate::caps::Caps`], ask whether it decides shape:
+/// yes, add it here (and to the caches, which key on this); no, leave it out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShapeCaps {
+    pub unicode: bool,
+    pub colors: crate::caps::Colors,
+    /// Whether a cell's background colour paints.
+    ///
+    /// A *shape* bit, not a colour one, which is why it belongs here: the one
+    /// thing a block does differently when it is false is draw **less** — half of
+    /// a two-pixel-per-cell glyph is exactly the part that would be missing. See
+    /// [`crate::caps::Caps::cell_background`].
+    pub cell_background: bool,
+}
+
+impl ShapeCaps {
+    /// The shape half of what the terminal was measured to be.
+    pub fn of(caps: &crate::caps::Caps) -> Self {
+        Self {
+            unicode: caps.unicode,
+            colors: caps.colors,
+            cell_background: caps.cell_background,
+        }
+    }
+
+    /// A decorative glyph as *this* terminal writes it.
+    ///
+    /// The same table as [`crate::caps::Caps::g`], see the docs there. A block
+    /// that writes a decorative character must come through here rather than
+    /// spell it out — `gates/tui-layers.sh` counts literal ones above the
+    /// shield layer.
+    pub fn g(&self, glyph: crate::caps::Glyph) -> &'static str {
+        crate::caps::glyph(self.unicode, glyph)
+    }
+}
+
+/// Everything rendering one block needs.
+///
+/// Two things, both enumerated: the width, and the capabilities that decide
+/// shape. **Not a `Moment`** — that would drag in the composer's text, the
+/// scroll position and the animation phase, and none of those may influence
+/// what a block draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderCtx {
+    pub width: u16,
+    pub caps: ShapeCaps,
+}
+
+impl RenderCtx {
+    /// Width only, with shape capabilities of a fully capable terminal.
+    ///
+    /// For tests and for the `Content` implementations that do not care about
+    /// shape. The default is not a quiet downgrade: `Caps::default()` is what a
+    /// modern terminal does (`caps.rs`).
+    pub fn bare(width: u16) -> Self {
+        Self {
+            width,
+            caps: ShapeCaps::of(&crate::caps::Caps::default()),
+        }
+    }
+}
+
 /// What a block says, as a semantic value rather than pre-rendered lines.
 ///
 /// Pre-rendering would freeze the width, and then a resize could not rewrap
@@ -93,8 +167,15 @@ pub trait Content: Send + Sync + std::fmt::Debug {
     /// nothing else — not on width, theme, fold state, or wall-clock.
     fn content_hash(&self) -> ContentHash;
 
-    /// Render at a width. Called every frame; must be pure.
-    fn lines(&self, width: u16) -> Vec<Line>;
+    /// Render at a width, on a terminal with these capabilities. Called every
+    /// frame; must be pure.
+    ///
+    /// The capabilities are here for one thing only: a block whose *existence
+    /// or shape* depends on what the terminal can draw. Glyphs that merely need
+    /// downgrading do not need this — [`crate::ansi::write_line`] swaps those on
+    /// the way out, one column in and one column out, so alignment survives.
+    /// See `docs/adr/0021`.
+    fn lines(&self, ctx: &RenderCtx) -> Vec<Line>;
 
     /// The text this block is growing, when it can only ever grow.
     ///
@@ -118,8 +199,8 @@ pub trait Content: Send + Sync + std::fmt::Debug {
     }
 
     /// One line standing in for the whole block when it is folded.
-    fn summary(&self, width: u16) -> Line {
-        self.lines(width).into_iter().next().unwrap_or_default()
+    fn summary(&self, ctx: &RenderCtx) -> Line {
+        self.lines(ctx).into_iter().next().unwrap_or_default()
     }
 
     /// This block as a tool call, when it is one.
@@ -180,7 +261,13 @@ pub(crate) static LIVE_RESUMES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 struct CachedRender {
-    width: u16,
+    /// What these rows were rendered for: the width, and the capabilities that
+    /// decide shape.
+    ///
+    /// Both, because both are "a different question" rather than "a stale
+    /// answer". **No palette** — colour is not decided here (see [`ShapeCaps`]),
+    /// so a theme change does not walk into this branch.
+    key: (u16, ShapeCaps),
     /// The source the lines were rendered from, whole. The prefix check against
     /// it is what makes reuse safe: text that was extended is text the kept
     /// lines still describe, and text that was edited is not.
@@ -209,9 +296,10 @@ struct CachedRender {
 #[derive(Debug)]
 pub struct Settled {
     block: Arc<Block>,
-    /// `(width, rows)`. The width travels with the number, so a resize is a
-    /// different question rather than a stale answer.
-    rows: RwLock<Option<(u16, usize)>>,
+    /// `(width, caps, rows)`. All three travel with the number, so a resize *and*
+    /// a different terminal are each a different question rather than a stale
+    /// answer.
+    rows: RwLock<Option<(u16, ShapeCaps, usize)>>,
 }
 
 impl Settled {
@@ -256,13 +344,14 @@ impl Slot {
     /// takes the window it has room for out of these rather than paying to
     /// duplicate rows it will drop. Held by the caller only for as long as it is
     /// drawing, which is what lets the next render extend them in place.
-    pub fn rows_at(&self, width: u16) -> (usize, Option<Arc<Vec<Line>>>) {
+    pub fn rows_at(&self, ctx: &RenderCtx) -> (usize, Option<Arc<Vec<Line>>>) {
         match self {
             Slot::Live(b, cache) => {
                 let Some(text) = b.content.growing_text() else {
-                    let lines = b.content.lines(width);
+                    let lines = b.content.lines(ctx);
                     return (lines.len(), Some(Arc::new(lines)));
                 };
+                let width = ctx.width;
                 let mut cached = cache.0.write().expect("live cache poisoned");
                 let base = Style::new();
                 let rendered = match cached.take() {
@@ -270,7 +359,7 @@ impl Slot {
                     // and the text is an extension of what did. Anything else — a
                     // resize, an edit, a different block — renders the whole
                     // thing.
-                    Some(mut c) if c.width == width && text.starts_with(&c.source) => {
+                    Some(mut c) if c.key == (width, ctx.caps) && text.starts_with(&c.source) => {
                         #[cfg(test)]
                         LIVE_RESUMES.fetch_add(1, Ordering::Relaxed);
                         // Everything before the last settled boundary is fixed;
@@ -294,7 +383,7 @@ impl Slot {
                     _ => {
                         let r = crate::markdown::render_settled(text, width, base);
                         CachedRender {
-                            width,
+                            key: (width, ctx.caps),
                             source: text.to_string(),
                             lines: Arc::new(r.lines),
                             settled: r.settled,
@@ -309,14 +398,14 @@ impl Slot {
             }
             Slot::Settled(s) => {
                 let mut measured = s.rows.write().expect("rows poisoned");
-                if let Some((w, n)) = *measured {
-                    if w == width {
+                if let Some((w, caps, n)) = *measured {
+                    if w == ctx.width && caps == ctx.caps {
                         return (n, None);
                     }
                 }
-                let lines = s.block.content.lines(width);
+                let lines = s.block.content.lines(ctx);
                 let rows = lines.len();
-                *measured = Some((width, rows));
+                *measured = Some((ctx.width, ctx.caps, rows));
                 (rows, Some(Arc::new(lines)))
             }
         }
@@ -487,13 +576,99 @@ mod tests {
         fn content_hash(&self) -> ContentHash {
             hash_of(&[self.0])
         }
-        fn lines(&self, _w: u16) -> Vec<Line> {
+        fn lines(&self, _ctx: &RenderCtx) -> Vec<Line> {
             vec![Line::raw(self.0)]
         }
     }
 
     fn text(s: &'static str) -> Arc<dyn Content> {
         Arc::new(Text(s))
+    }
+
+    /// A block that draws two rows on a terminal that does Unicode, one otherwise.
+    ///
+    /// Deliberately a *real* capability-dependent block rather than a mock: a
+    /// judgement about the cache key has to fail when the key does not carry the
+    /// capability, and a block that drew the same either way would let it pass.
+    #[derive(Debug)]
+    struct TwoRowsWhenUnicode;
+
+    impl Content for TwoRowsWhenUnicode {
+        fn kind(&self) -> &'static str {
+            "two_rows"
+        }
+        fn content_hash(&self) -> ContentHash {
+            // Shape is not in the hash: same class as width, see `Content`.
+            hash_of(&["two_rows"])
+        }
+        fn lines(&self, ctx: &RenderCtx) -> Vec<Line> {
+            let n = if ctx.caps.unicode { 2 } else { 1 };
+            (0..n).map(|_| Line::raw("x")).collect()
+        }
+    }
+
+    fn shape(unicode: bool) -> ShapeCaps {
+        ShapeCaps {
+            unicode,
+            colors: crate::caps::Colors::Ansi256,
+            cell_background: true,
+        }
+    }
+
+    #[test]
+    fn a_change_of_terminal_capability_is_not_a_cache_hit() {
+        let mut s = Stream::new();
+        let mut w = s.writer("test");
+        let id = w.emit(Coord::default(), Arc::new(TwoRowsWhenUnicode));
+        w.settle_all();
+
+        let unicode = RenderCtx {
+            width: 40,
+            caps: shape(true),
+        };
+        let ascii = RenderCtx {
+            width: 40,
+            caps: shape(false),
+        };
+
+        let slot = s.get(id).expect("the block");
+        assert_eq!(slot.rows_at(&unicode).0, 2);
+        assert_eq!(
+            slot.rows_at(&ascii).0,
+            1,
+            "the same width with different capabilities must render again rather \
+             than hit the cached row count — otherwise a terminal that changed \
+             under us keeps the old answer, and it looks fine"
+        );
+        // Back again, so neither number was reached by accident.
+        assert_eq!(slot.rows_at(&unicode).0, 2);
+    }
+
+    #[test]
+    fn the_same_key_is_a_cache_hit_and_a_resize_is_not() {
+        // The negative control for the judgement above. Without it, "render every
+        // time" would satisfy that one too.
+        let mut s = Stream::new();
+        let mut w = s.writer("test");
+        let id = w.emit(Coord::default(), Arc::new(TwoRowsWhenUnicode));
+        w.settle_all();
+
+        let ctx = RenderCtx {
+            width: 40,
+            caps: shape(true),
+        };
+        let slot = s.get(id).expect("the block");
+        assert_eq!(slot.rows_at(&ctx).0, 2);
+        assert_eq!(
+            slot.rows_at(&ctx).1,
+            None,
+            "a settled block at the same width and the same capabilities must \
+             answer from what it measured"
+        );
+        assert!(
+            slot.rows_at(&RenderCtx { width: 41, ..ctx }).1.is_some(),
+            "a resize is a different question and must render again"
+        );
     }
 
     #[test]
@@ -508,7 +683,12 @@ mod tests {
             "a settled block must refuse, not silently accept"
         );
         assert_eq!(
-            s.get(id).unwrap().block().content.lines(80)[0].plain(),
+            s.get(id)
+                .unwrap()
+                .block()
+                .content
+                .lines(&crate::block::RenderCtx::bare(80))[0]
+                .plain(),
             "better"
         );
     }
@@ -602,7 +782,10 @@ mod tests {
 
         // The first render has nothing to resume from, and is the whole text.
         LIVE_RESUMES.store(0, At::Relaxed);
-        let (n1, l1) = s.get(id).unwrap().rows_at(30);
+        let (n1, l1) = s
+            .get(id)
+            .unwrap()
+            .rows_at(&crate::block::RenderCtx::bare(30));
         assert_eq!(resumes(), 0, "nothing was rendered to resume from");
         assert_eq!(
             *l1.unwrap(),
@@ -616,7 +799,10 @@ mod tests {
             w.amend(id, grew("first line\n\nsecond paragraph, still going\n"));
         }
         LIVE_RESUMES.store(0, At::Relaxed);
-        let (n2, l2) = s.get(id).unwrap().rows_at(30);
+        let (n2, l2) = s
+            .get(id)
+            .unwrap()
+            .rows_at(&crate::block::RenderCtx::bare(30));
         assert_eq!(resumes(), 1, "the growing render resumed from the cache");
         assert_eq!(
             *l2.unwrap(),
@@ -640,14 +826,20 @@ mod tests {
             let mut w = s.writer("model");
             w.open(Coord::new(1, 1), grew("first answer\n"))
         };
-        let _ = s.get(id).unwrap().rows_at(30);
+        let _ = s
+            .get(id)
+            .unwrap()
+            .rows_at(&crate::block::RenderCtx::bare(30));
 
         {
             let mut w = s.writer("model");
             w.amend(id, grew("a completely different answer\n"));
         }
         LIVE_RESUMES.store(0, At::Relaxed);
-        let (_, lines) = s.get(id).unwrap().rows_at(30);
+        let (_, lines) = s
+            .get(id)
+            .unwrap()
+            .rows_at(&crate::block::RenderCtx::bare(30));
         assert_eq!(resumes(), 0, "an edit is not an append");
         assert_eq!(
             *lines.unwrap(),
@@ -670,7 +862,12 @@ mod tests {
             w.open(Coord::new(1, 1), grew("first line\n\n"))
         };
 
-        let first = s.get(id).unwrap().rows_at(30).1.expect("a first render");
+        let first = s
+            .get(id)
+            .unwrap()
+            .rows_at(&crate::block::RenderCtx::bare(30))
+            .1
+            .expect("a first render");
         let rows = first.len();
         let home = Arc::as_ptr(&first) as usize;
         // The frame that took these has been painted and dropped by now, which
@@ -681,7 +878,12 @@ mod tests {
             let mut w = s.writer("model");
             w.amend(id, grew("first line\n\nsecond paragraph, still going\n"));
         }
-        let second = s.get(id).unwrap().rows_at(30).1.expect("a second render");
+        let second = s
+            .get(id)
+            .unwrap()
+            .rows_at(&crate::block::RenderCtx::bare(30))
+            .1
+            .expect("a second render");
         assert!(second.len() > rows, "the block got taller");
         assert_eq!(
             Arc::as_ptr(&second) as usize,
@@ -703,10 +905,16 @@ mod tests {
                 grew("a line long enough to wrap differently\n"),
             )
         };
-        let _ = s.get(id).unwrap().rows_at(30);
+        let _ = s
+            .get(id)
+            .unwrap()
+            .rows_at(&crate::block::RenderCtx::bare(30));
 
         LIVE_RESUMES.store(0, At::Relaxed);
-        let (_, lines) = s.get(id).unwrap().rows_at(12);
+        let (_, lines) = s
+            .get(id)
+            .unwrap()
+            .rows_at(&crate::block::RenderCtx::bare(12));
         assert_eq!(resumes(), 0, "another width is another render");
         assert_eq!(
             *lines.unwrap(),

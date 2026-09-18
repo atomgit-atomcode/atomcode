@@ -333,6 +333,126 @@ impl Session {
 // ---- the flow a person actually performs --------------------------------
 
 #[tokio::test]
+async fn a_new_session_opens_with_the_welcome_and_it_then_scrolls_away() {
+    let dir = scratch("welcome");
+    // One short turn, so the welcome has something to be pushed out by.
+    let script = replay(r#"{ text = "Ready." }"#);
+    let s = start(tree(&dir, &script, &[])).await;
+    let task = s.open().await;
+
+    // 1. It is there at the start, at the top of the conversation.
+    let opening = s.screen();
+    assert!(opening.contains("AtomCode"), "the brand row:\n{opening}");
+    assert!(opening.contains("快速上手"), "the tips heading:\n{opening}");
+    // Where we are, as the block writes it: the same folding the welcome does, so
+    // the assertion does not depend on where the scratch directory happens to be.
+    let here =
+        atomcode_tui::text::collapse_home(&std::env::current_dir().unwrap().to_string_lossy());
+    let here = here.split('/').next_back().unwrap_or("");
+    assert!(
+        opening.contains(here) || opening.contains("~/"),
+        "where we are (expected something like `{here}`):\n{opening}"
+    );
+
+    // 2. A turn happens, which pushes it off the top.
+    s.term.type_line("hello");
+    s.quiet().await;
+    let after = s.screen();
+    assert!(after.contains("Ready."), "the answer:\n{after}");
+
+    // 3. Scrolling back up finds it again — it is stream content, not a panel
+    //    pinned on screen. This is the property the whole shape was chosen for:
+    //    a view module would have been cheaper but could not do this.
+    for _ in 0..8 {
+        s.term
+            .pointer(atomcode_tui::surface::Click::WheelUp, 10, 10);
+    }
+    s.quiet().await;
+    let scrolled = s.screen();
+    assert!(
+        scrolled.contains("AtomCode"),
+        "scrolling back up must find the welcome again:\n{scrolled}"
+    );
+
+    task.abort();
+}
+
+#[tokio::test]
+async fn a_resumed_session_does_not_open_with_a_welcome() {
+    // The judgement behind "the stream is empty is the whole test for a new
+    // session", and the reason `open_conversation` runs **after** the history is
+    // folded in: a resumed conversation already has its log in the stream, so
+    // nothing opens it. The other order would put a welcome block in front of
+    // every resumed conversation, every time.
+    let home = scratch("welcome-resume-home");
+    let root = scratch("welcome-resume-work");
+    let id = "welcomed-once";
+
+    {
+        let s = start(tree_resumable(
+            &root,
+            &home,
+            id,
+            false,
+            &replay(r#"{ text = "It is 42." }"#),
+            &[],
+        ))
+        .await;
+        let task = s.open().await;
+        s.term.type_line("remember the number 42");
+        s.quiet().await;
+        persisted(&home, id, 6).await;
+        s.term.press(KeyPress::ctrl('d'));
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    let s = start(tree_resumable(
+        &root,
+        &home,
+        id,
+        true,
+        &replay(r#"{ text = "still 42." }"#),
+        &[],
+    ))
+    .await;
+    let task = s.open().await;
+    let screen = s.screen();
+    assert!(
+        screen.contains("remember the number 42"),
+        "the resumed screen shows the history:\n{screen}"
+    );
+
+    // **A resumed session has no welcome at all — not even the first one's.**
+    //
+    // That is a consequence of the design, not an accident, and it is worth stating
+    // where a reader will meet it: the block is deliberately **not** a logged fact
+    // (`open_conversation` writes the stream directly, so that a resume does not
+    // replay it and persistence does not record it as something the session said).
+    // So a resumed conversation folds a log that never had it. The alternative —
+    // logging it — would put a "fact" in the log that the model never saw and that
+    // a compaction would have to account for.
+    for _ in 0..40 {
+        s.term
+            .pointer(atomcode_tui::surface::Click::WheelUp, 10, 10);
+    }
+    s.quiet().await;
+    let top = s.screen();
+    assert_eq!(
+        top.matches("快速上手").count(),
+        0,
+        "a resumed session must not open again, and its opening was never a log \
+         fact to begin with:\n{top}"
+    );
+    assert!(
+        top.contains("remember the number 42"),
+        "and the history is still all there:\n{top}"
+    );
+
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
+
+#[tokio::test]
 async fn a_person_types_a_question_and_reads_the_answer() {
     let dir = scratch("basic");
     std::fs::write(dir.join("a.rs"), "fn main() {}").unwrap();
@@ -911,7 +1031,16 @@ async fn esc_declines_and_the_model_is_told_rather_than_the_turn_dying() {
 #[tokio::test]
 async fn typing_a_slash_shows_what_is_available_and_narrows_as_you_type() {
     let dir = scratch("menu");
-    let s = start(tree(&dir, &replay(r#"{ text = "ok" }"#), &[])).await;
+    // Without the welcome block: it lists `/help` among its quick-start tips, and
+    // this test proves the menu narrowed by looking for `/help` being gone from
+    // the screen. Two rows naming the same command is not this test's subject —
+    // the welcome has its own (`a_new_session_opens_with_the_welcome_…`).
+    let s = start(tree(
+        &dir,
+        &replay(r#"{ text = "ok" }"#),
+        &["[[remove]]\nid = \"tui-panel-welcome\"\n"],
+    ))
+    .await;
     let task = s.open().await;
 
     s.term.type_text("/");

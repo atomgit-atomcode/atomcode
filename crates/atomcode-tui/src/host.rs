@@ -582,11 +582,12 @@ fn lid_row(
     lids: &Lids,
     slots: &[crate::block::Slot],
     i: usize,
-    room: u16,
+    ctx: &crate::block::RenderCtx,
     b: &crate::block::Block,
     pres: &Presentation,
 ) -> Option<SlotRows> {
     let kind = b.kind();
+    let room = ctx.width;
     if pres.is_hidden(kind) {
         return None;
     }
@@ -622,7 +623,7 @@ fn lid_row(
             undone: false,
         }),
         None => Some(SlotRows {
-            rows: slots[i].rows_at(room).0,
+            rows: slots[i].rows_at(ctx).0,
             kind,
             lid: None,
             folded: false,
@@ -807,6 +808,10 @@ pub struct Host {
     /// Questions waiting for the person. Rendered as a live block at the foot
     /// of the stream, and given first refusal on every key while it is there.
     pub asks: Arc<crate::ask::Asks>,
+    /// The mounted cell-grid bitmaps. The host holds the table; a row writes
+    /// through `RastersSvc`, and every frame takes a snapshot of it into
+    /// `Moment` for the modules to draw. See `docs/adr/0023`.
+    pub rasters: Arc<crate::raster::Rasters>,
     pub modules: Arc<Modules>,
     pub layout: Arc<crate::layout::Layout>,
     pub moment: RwLock<Moment>,
@@ -861,10 +866,16 @@ pub struct Host {
 /// earlier members, which draw nothing), and whether a blank row separates it
 /// from the slot above.
 struct RowIndex {
-    /// What the measurements below were taken under. A different width, or a
-    /// different idea of which blocks are folded, changes the answer for
-    /// *every* slot — so those invalidate the lot.
+    /// What the measurements below were taken under. A different width, a
+    /// different terminal, or a different idea of which blocks are folded,
+    /// changes the answer for *every* slot — so those invalidate the lot.
     width: u16,
+    /// The other half of the width's key. Without it a block whose row count
+    /// depends on what the terminal can draw would keep answering with the old
+    /// count while the painter drew the new one — a scroll bound that does not
+    /// match the picture, which is the "one number, two answers" failure this
+    /// table exists to avoid. See [`crate::block::ShapeCaps`].
+    caps: crate::block::ShapeCaps,
     presentation: u64,
     /// One entry per slot measured so far, in slot order. May be shorter than
     /// the stream while entries are being added at the end.
@@ -1003,6 +1014,7 @@ impl Host {
             context_menu: RwLock::new(None),
             overlays: Arc::new(crate::overlay::Overlays::new()),
             asks: crate::ask::Asks::new(),
+            rasters: Arc::new(crate::raster::Rasters::new()),
             modules: modules.clone(),
             layout: layout_svc.clone(),
             moment: RwLock::new(Moment::default()),
@@ -1013,6 +1025,7 @@ impl Host {
             pin_gate: Mutex::new(()),
             row_index: Mutex::new(RowIndex {
                 width: 0,
+                caps: crate::block::ShapeCaps::of(&crate::caps::Caps::default()),
                 presentation: 0,
                 measured: Vec::new(),
                 rows: Vec::new(),
@@ -1049,6 +1062,7 @@ impl Host {
         *self.presentation.write().expect("presentation poisoned") = Presentation::default_folds();
         *self.row_index.lock().expect("row index poisoned") = RowIndex {
             width: 0,
+            caps: crate::block::ShapeCaps::of(&crate::caps::Caps::default()),
             presentation: 0,
             measured: Vec::new(),
             rows: Vec::new(),
@@ -1160,6 +1174,44 @@ impl Host {
             at: 0,
             event: fact.clone(),
         });
+    }
+
+    /// Let this conversation say its first word, if any producer will.
+    ///
+    /// **Only when the stream is empty**, and that is the whole test for "a new
+    /// session": a resumed one has its history folded in by `Tui::run` before this
+    /// is called, so its stream is not empty and it opens with nothing. A separate
+    /// "is this new?" flag would be a second source of truth for one fact.
+    ///
+    /// **It does not go through `absorb`.** That path stands for a committed fact
+    /// in the log, and what this synthesises is a way of opening, not a fact:
+    /// going through it would write to `SessionLog` and be replayed on resume. So
+    /// it writes the stream directly — the one place in this crate that does.
+    ///
+    /// The first producer with something to say wins and the loop stops: the rule
+    /// is "when the stream is empty", and once it has spoken the stream is not.
+    /// That is also why no second mechanism is needed to stop a second opener.
+    ///
+    /// `true` when a block was emitted, which is the caller's cue that a frame is
+    /// owed.
+    pub fn open_conversation(
+        &self,
+        at: crate::block::Coord,
+        open: &crate::module::Opening,
+    ) -> bool {
+        let mut stream = self.stream.write().expect("stream poisoned");
+        if !stream.is_empty() {
+            return false;
+        }
+        for producer in self.modules.producers() {
+            if let Some(content) = producer.opening(at, open) {
+                // Under the producer's own id: the block's `producer` field says
+                // who made it, and it is what would have to settle it later.
+                stream.writer(producer.id()).emit(at, content);
+                return true;
+            }
+        }
+        false
     }
 
     /// Deliver one committed fact to every module, as the log carries it.
@@ -1769,7 +1821,12 @@ impl Host {
     /// the pane was split (`pane_geometry` above gives it the blocks' own
     /// share), and a second read of `moment.scroll` here would be a second
     /// answer to a question someone already answered.
-    fn stream_lines(&self, rect: Rect, scroll: usize) -> (Vec<Line>, Vec<RowOwner>) {
+    fn stream_lines(
+        &self,
+        rect: Rect,
+        scroll: usize,
+        caps: crate::block::ShapeCaps,
+    ) -> (Vec<Line>, Vec<RowOwner>) {
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         let mut out: Vec<Line> = Vec::new();
@@ -1802,7 +1859,8 @@ impl Host {
                         .collect(),
                     answer: None,
                 };
-                let mut lines = crate::block::Content::lines(&pending, rect.w);
+                let mut lines =
+                    crate::block::Content::lines(&pending, &crate::block::RenderCtx::bare(rect.w));
                 lines.reverse();
                 for line in lines {
                     if out.len() < want {
@@ -1816,7 +1874,14 @@ impl Host {
         // about how tall anything is. It carries the run table too, so the walk
         // below never builds `lids` of its own — that fold is O(slots) and the
         // index already paid for it.
-        let index = self.row_index(rect.w, stream.slots(), &pres);
+        let index = self.row_index(
+            &crate::block::RenderCtx {
+                width: rect.w,
+                caps,
+            },
+            stream.slots(),
+            &pres,
+        );
 
         // **Start where the window starts.** Everything newer than this is
         // wholly inside the rows the reader has scrolled past, so stepping
@@ -1872,6 +1937,10 @@ impl Host {
             // cells.
             let pad = inset(kind);
             let room = rect.w.saturating_sub(pad);
+            // One ctx for this block, at the width it is drawn at and the
+            // capabilities this frame was composed against. The same two values
+            // `row_index` measured it under, so the count and the picture agree.
+            let ctx = crate::block::RenderCtx { width: room, caps };
             let lines: Arc<Vec<Line>> = if let Some(count) = lid {
                 // A run of folded calls behind one lid. Its rows are owned by
                 // the last call, so a click anywhere on the lid folds the run
@@ -1881,13 +1950,15 @@ impl Host {
             } else if entry.undone {
                 // Dimmed as well as folded: it is still there to read, and it
                 // is no longer what the model sees.
-                let line = block.content.summary(room);
+                let line = block
+                    .content
+                    .summary(&crate::block::RenderCtx { width: room, caps });
                 let width = line.width();
                 Arc::new(vec![line.restyle(0, width, |_| {
                     crate::theme::fg(crate::theme::Role::Muted)
                 })])
             } else if entry.folded {
-                Arc::new(vec![block.content.summary(room)])
+                Arc::new(vec![block.content.summary(&ctx)])
             } else {
                 // The count comes from the index — the same number
                 // `stream_height` summed — rather than from a second measurement
@@ -1926,9 +1997,9 @@ impl Host {
                 // can see this block — and rendering is the one part of this walk
                 // that cannot come from a table. Still through `rows_at`, so a
                 // growing answer extends its live cache in place.
-                match slot.rows_at(room).1 {
+                match slot.rows_at(&ctx).1 {
                     Some(lines) => lines,
-                    None => Arc::new(block.content.lines(room)),
+                    None => Arc::new(block.content.lines(&ctx)),
                 }
             };
             if lines.is_empty() {
@@ -2008,7 +2079,18 @@ impl Host {
     pub fn compose(&self, size: (u16, u16)) -> Frame {
         let (w, h) = size;
         let mut frame = Frame::new(w, h);
-        let moment = self.moment.read().expect("moment poisoned").clone();
+        let mut moment = self.moment.read().expect("moment poisoned").clone();
+        // This frame's bitmaps, as a snapshot. Here because `View::render` cannot
+        // reach a service — the module reads `viewport.moment.rasters`, the same
+        // road `members` travels. One `Arc` bump per frame: the map is rebuilt on
+        // a write, not on a draw.
+        moment.rasters = self.rasters.view();
+        // The shape half of what this terminal can draw, taken once from the
+        // moment this frame was composed against and handed down. Built here
+        // rather than read inside `rows_at` because `stream_height`'s contract is
+        // that the caller may already hold the moment's write lock (two callers
+        // in `plugin.rs` do), so nothing below may take it again.
+        let caps = crate::block::ShapeCaps::of(&moment.caps);
 
         let layout = self.layout.tree();
         let modules = self.modules.clone();
@@ -2032,7 +2114,8 @@ impl Host {
                     // frame it did before the split existed.
                     let heights = self.tail_heights_of(&tail, rect.w, &moment);
                     let pane = Self::pane_geometry(rect, moment.scroll.0, &heights);
-                    let (lines, owners) = self.stream_lines(pane.block_rect, pane.block_scroll);
+                    let (lines, owners) =
+                        self.stream_lines(pane.block_rect, pane.block_scroll, caps);
                     *self.hits.lock().expect("hits poisoned") = Hits {
                         rect: pane.block_rect,
                         rows: owners,
@@ -2288,7 +2371,7 @@ impl Host {
     #[cfg(test)]
     fn rows_by_walk(
         &self,
-        width: u16,
+        ctx: &crate::block::RenderCtx,
         slots: &[crate::block::Slot],
         pres: &Presentation,
     ) -> Vec<Option<SlotRows>> {
@@ -2296,8 +2379,18 @@ impl Host {
         (0..slots.len())
             .map(|i| {
                 let b = slots[i].block();
-                let room = width.saturating_sub(inset(b.kind()));
-                lid_row(&lids, slots, i, room, b, pres)
+                let room = ctx.width.saturating_sub(inset(b.kind()));
+                lid_row(
+                    &lids,
+                    slots,
+                    i,
+                    &crate::block::RenderCtx {
+                        width: room,
+                        ..*ctx
+                    },
+                    b,
+                    pres,
+                )
             })
             .collect()
     }
@@ -2325,15 +2418,16 @@ impl Host {
     /// than arguments somebody passes correctly: see `Presentation::revision`.
     fn row_index<'a>(
         &'a self,
-        width: u16,
+        ctx: &crate::block::RenderCtx,
         slots: &[crate::block::Slot],
         pres: &Presentation,
     ) -> std::sync::MutexGuard<'a, RowIndex> {
         let mut idx = self.row_index.lock().expect("row index poisoned");
-        if idx.width != width || idx.presentation != pres.revision() {
+        if idx.width != ctx.width || idx.caps != ctx.caps || idx.presentation != pres.revision() {
             idx.measured.clear();
             idx.rows.clear();
-            idx.width = width;
+            idx.width = ctx.width;
+            idx.caps = ctx.caps;
             idx.presentation = pres.revision();
         }
         let lids = lids(slots, pres);
@@ -2355,13 +2449,23 @@ impl Host {
             // The same width the painter will use: a row count is only the
             // painter's if it was measured at the width the painter draws at,
             // and a block that is set in draws two cells narrower.
-            let room = width.saturating_sub(inset(b.kind()));
+            let room = ctx.width.saturating_sub(inset(b.kind()));
             // Kept as `Option`, not folded to zero. A slot that draws nothing is
             // not a row AND not a neighbour — the seams around it stay where
             // they were — and collapsing the two made a hidden block add itself
             // to the running kind, which moved every blank below it. The ratchet
             // beside this caught exactly that on its first run.
-            let entry = lid_row(&lids, slots, i, room, b, pres);
+            let entry = lid_row(
+                &lids,
+                slots,
+                i,
+                &crate::block::RenderCtx {
+                    width: room,
+                    ..*ctx
+                },
+                b,
+                pres,
+            );
             let m = Measured { id: b.id, settled };
             if idx.measured.len() <= i {
                 idx.measured.push(m);
@@ -2405,6 +2509,7 @@ impl Host {
     /// until one of them changed.
     fn stream_height_in(&self, room: Rect, moment: &Moment) -> (usize, usize) {
         let width = room.w;
+        let caps = crate::block::ShapeCaps::of(&moment.caps);
         let stream = self.stream.read().expect("stream poisoned");
         let pres = self.presentation.read().expect("presentation poisoned");
         // The sum, from the one place both this and the painter read it — see
@@ -2412,7 +2517,13 @@ impl Host {
         // answer to a question the frame had already asked. On a 1458-slot
         // session the two walks cost 4.1ms here and 13.7ms in `stream_lines`,
         // per wheel notch (measured, debug, 2026-09-15).
-        let total = self.row_index(width, stream.slots(), &pres).total;
+        let total = self
+            .row_index(
+                &crate::block::RenderCtx { width, caps },
+                stream.slots(),
+                &pres,
+            )
+            .total;
         // The tail is content too, so it counts towards what there is to read:
         // leaving it out would put its own rows out of reach at the bottom of
         // the scroll, which is exactly the failure the block walk goes to such
@@ -2444,7 +2555,7 @@ impl Host {
                     .collect(),
                 answer: None,
             };
-            crate::block::Content::lines(&block, width).len()
+            crate::block::Content::lines(&block, &crate::block::RenderCtx::bare(width)).len()
         });
         (total + tail + question, tail)
     }
@@ -2805,6 +2916,313 @@ mod tests {
         }
         // Nothing changed: no second frame is owed.
         assert!(!h.mark_undone(std::collections::BTreeSet::from([2])));
+    }
+
+    /// A block whose row count follows the terminal's capabilities.
+    ///
+    /// A real one, not a mock: the judgement below is about whether the row
+    /// index re-measures when the terminal changes, and a block that drew the
+    /// same either way would let a broken index pass.
+    #[derive(Debug)]
+    struct CapsSized;
+
+    impl crate::block::Content for CapsSized {
+        fn kind(&self) -> &'static str {
+            "caps_sized"
+        }
+        fn content_hash(&self) -> crate::block::ContentHash {
+            crate::block::hash_of(&["caps_sized"])
+        }
+        fn lines(&self, ctx: &crate::block::RenderCtx) -> Vec<Line> {
+            let n = if ctx.caps.unicode { 3 } else { 1 };
+            (0..n).map(|_| Line::raw("sized")).collect()
+        }
+    }
+
+    #[test]
+    fn the_row_index_is_keyed_on_capability_and_not_only_width() {
+        // A row count is what the scroll bound is computed from. If the cache
+        // key carried only the width, a block that changed height when the
+        // terminal changed would keep reporting the old count while the painter
+        // drew the new one — a scroll limit that disagrees with the picture.
+        let mods = Arc::new(Modules::new());
+        mods.add_producer(transcript::Transcript::new()).unwrap();
+        let h = Host::new(mods, default_layout());
+        h.stream
+            .write()
+            .unwrap()
+            .writer("test")
+            .emit(crate::block::Coord::default(), Arc::new(CapsSized));
+
+        let size = (80u16, 24u16);
+        let unicode = h.stream_height(size, &h.moment.read().unwrap().clone());
+        h.moment.write().unwrap().caps.unicode = false;
+        let ascii = h.stream_height(size, &h.moment.read().unwrap().clone());
+
+        assert_eq!(
+            (unicode, ascii),
+            (3, 1),
+            "after the terminal changed, the count must be re-measured — keying \
+             on width alone leaves the second number at 3"
+        );
+    }
+
+    /// A bitmap payload: every cell default-coloured, row 0 in `first`, the rest
+    /// in `rest`.
+    fn raster_payload(columns: u16, rows: u16, first: char, rest: char) -> String {
+        use base64::Engine as _;
+        let mut bytes = Vec::new();
+        for row in 0..rows {
+            for _ in 0..columns {
+                let ch = if row == 0 { first } else { rest };
+                bytes.extend_from_slice(&(ch as u32).to_le_bytes());
+                bytes.extend_from_slice(&0x0100_0000u32.to_le_bytes());
+                bytes.extend_from_slice(&0x0100_0000u32.to_le_bytes());
+            }
+        }
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// A host whose whole screen is one bitmap pane.
+    fn host_with_raster(columns: u16, rows: u16) -> Host {
+        let mods = Arc::new(Modules::new());
+        mods.add_view(Arc::new(
+            Mounted::<crate::modules::raster::RasterPane>::new(),
+        ))
+        .unwrap();
+        let h = Host::new(mods, Region::view(crate::modules::raster::ID));
+        h.rasters
+            .mount(
+                crate::modules::raster::ID,
+                crate::modules::raster::KEY,
+                crate::raster::Raster::decode(
+                    columns,
+                    rows,
+                    &raster_payload(columns, rows, '\u{2588}', '\u{2588}'),
+                )
+                .expect("a valid payload"),
+            )
+            .expect("mount");
+        h
+    }
+
+    #[test]
+    fn an_unchanged_bitmap_encodes_no_row_and_a_write_encodes_only_its_own() {
+        // `ROWS_ENCODED` counts the rows a frame had to *encode*, which equality
+        // of the picture cannot show: re-encoding an unchanged row emits the same
+        // bytes. So this is the only way to assert "only what moved is redrawn".
+        use std::sync::atomic::Ordering;
+        let h = host_with_raster(6, 3);
+        let size = (8u16, 4u16);
+        let caps = crate::caps::Caps::default();
+
+        // A first paint draws everything, and is the baseline.
+        let a = crate::ansi::Lines::of(&h.compose(size), caps, None);
+        let after_first = crate::ansi::ROWS_ENCODED.load(Ordering::Relaxed);
+
+        // Nothing moved: a frame composes the same picture, and encodes no row.
+        let b = crate::ansi::Lines::of(&h.compose(size), caps, Some(&a));
+        assert_eq!(
+            crate::ansi::ROWS_ENCODED.load(Ordering::Relaxed),
+            after_first,
+            "an unchanged bitmap must not re-encode a single row"
+        );
+        assert!(
+            b.patch_from(Some(&a)).is_empty(),
+            "and there is no patch to send"
+        );
+
+        // One row of the bitmap changes: exactly one screen row is re-encoded.
+        h.rasters
+            .write(
+                crate::modules::raster::ID,
+                crate::modules::raster::KEY,
+                &raster_payload(6, 3, '\u{2580}', '\u{2588}'),
+            )
+            .expect("a write of the mounted size");
+        let c = crate::ansi::Lines::of(&h.compose(size), caps, Some(&b));
+        assert_eq!(
+            crate::ansi::ROWS_ENCODED.load(Ordering::Relaxed) - after_first,
+            1,
+            "only the bitmap row that changed may be re-encoded"
+        );
+        assert!(
+            !c.patch_from(Some(&b)).is_empty(),
+            "and that row is what gets sent"
+        );
+    }
+
+    #[test]
+    fn a_bitmap_that_changes_nothing_needs_no_repaint_at_all() {
+        // The other half of the claim: writing the *same* cells is not a change,
+        // because the comparison is on the laid-out lines rather than on the
+        // table's revision. Without this, a widget that repaints itself at 60Hz
+        // with an identical frame would push the whole pane every time.
+        use std::sync::atomic::Ordering;
+        let h = host_with_raster(4, 2);
+        let size = (6u16, 3u16);
+        let caps = crate::caps::Caps::default();
+        let a = crate::ansi::Lines::of(&h.compose(size), caps, None);
+        let before = crate::ansi::ROWS_ENCODED.load(Ordering::Relaxed);
+        h.rasters
+            .write(
+                crate::modules::raster::ID,
+                crate::modules::raster::KEY,
+                &raster_payload(4, 2, '\u{2588}', '\u{2588}'),
+            )
+            .expect("a write of the mounted size");
+        let b = crate::ansi::Lines::of(&h.compose(size), caps, Some(&a));
+        assert_eq!(
+            crate::ansi::ROWS_ENCODED.load(Ordering::Relaxed),
+            before,
+            "the same cells must not cost a repaint"
+        );
+        assert!(b.patch_from(Some(&a)).is_empty());
+    }
+
+    /// A producer that opens with one line naming where we are.
+    ///
+    /// Counts its own asks, so a judgement can tell "the second producer was never
+    /// consulted" from "it was consulted and said nothing".
+    struct Opener {
+        said: std::sync::atomic::AtomicU32,
+    }
+
+    impl crate::module::Producer for Opener {
+        fn id(&self) -> &'static str {
+            "opener"
+        }
+        fn absorb(
+            &self,
+            _logged: &atomcode_harness::session::LoggedEvent,
+            _out: &mut crate::block::StreamWriter<'_>,
+        ) {
+        }
+        fn opening(
+            &self,
+            _at: crate::block::Coord,
+            open: &crate::module::Opening,
+        ) -> Option<Arc<dyn crate::block::Content>> {
+            self.said.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(Arc::new(crate::content::NoticeBlock {
+                detail: format!("hello from {}", open.cwd),
+            }))
+        }
+    }
+
+    #[test]
+    fn the_first_thing_a_conversation_says_happens_once_and_only_when_it_is_empty() {
+        let mods = Arc::new(Modules::new());
+        let opener = Arc::new(Opener {
+            said: std::sync::atomic::AtomicU32::new(0),
+        });
+        mods.add_producer(opener.clone()).unwrap();
+        let h = Host::new(mods, default_layout());
+
+        let open = crate::module::Opening {
+            cwd: "~/proj".into(),
+            ..Default::default()
+        };
+        assert!(
+            h.open_conversation(crate::block::Coord::default(), &open),
+            "an empty stream must be opened"
+        );
+        assert_eq!(h.stream.read().unwrap().len(), 1);
+
+        assert!(
+            !h.open_conversation(crate::block::Coord::default(), &open),
+            "a stream that already has something in it is not opening"
+        );
+        assert_eq!(h.stream.read().unwrap().len(), 1, "still just the one");
+        assert_eq!(
+            opener.said.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the producer must not be asked twice — the stream was not empty, so \
+             the loop should not have turned at all"
+        );
+    }
+
+    #[test]
+    fn the_first_producer_with_something_to_say_wins_and_the_rest_are_not_asked() {
+        // The rule is "when the stream is empty", and the first answer makes it
+        // not-empty. So no second mechanism is needed to stop a helper opener, and
+        // the count proves the second one was never consulted.
+        struct Silent;
+        impl crate::module::Producer for Silent {
+            fn id(&self) -> &'static str {
+                "silent"
+            }
+            fn absorb(
+                &self,
+                _logged: &atomcode_harness::session::LoggedEvent,
+                _out: &mut crate::block::StreamWriter<'_>,
+            ) {
+            }
+            // `opening` keeps its default: `None`.
+        }
+        struct Extra {
+            said: std::sync::atomic::AtomicU32,
+        }
+        impl crate::module::Producer for Extra {
+            fn id(&self) -> &'static str {
+                "extra"
+            }
+            fn absorb(
+                &self,
+                _logged: &atomcode_harness::session::LoggedEvent,
+                _out: &mut crate::block::StreamWriter<'_>,
+            ) {
+            }
+            fn opening(
+                &self,
+                _at: crate::block::Coord,
+                _open: &crate::module::Opening,
+            ) -> Option<Arc<dyn crate::block::Content>> {
+                self.said.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(Arc::new(crate::content::NoticeBlock {
+                    detail: "second".into(),
+                }))
+            }
+        }
+        let mods = Arc::new(Modules::new());
+        mods.add_producer(Arc::new(Silent)).unwrap();
+        let silent_first = Arc::new(Opener {
+            said: std::sync::atomic::AtomicU32::new(0),
+        });
+        mods.add_producer(silent_first.clone()).unwrap();
+        let never = Arc::new(Extra {
+            said: std::sync::atomic::AtomicU32::new(0),
+        });
+        mods.add_producer(never.clone()).unwrap();
+        let h = Host::new(mods, default_layout());
+
+        assert!(h.open_conversation(crate::block::Coord::default(), &Default::default()));
+        assert_eq!(
+            silent_first.said.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first producer that can answer, did"
+        );
+        assert_eq!(
+            never.said.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the third producer was asked even though the stream was already open"
+        );
+    }
+
+    #[test]
+    fn an_opening_block_lands_settled_because_it_is_not_still_growing() {
+        let mods = Arc::new(Modules::new());
+        mods.add_producer(Arc::new(Opener {
+            said: std::sync::atomic::AtomicU32::new(0),
+        }))
+        .unwrap();
+        let h = Host::new(mods, default_layout());
+        h.open_conversation(crate::block::Coord::default(), &Default::default());
+        let stream = h.stream.read().unwrap();
+        assert!(
+            stream.slots()[0].is_settled(),
+            "an opening has no stage at which it is still growing"
+        );
     }
 
     /// A tail module whose height follows `Moment::activity` and nothing else.
@@ -3463,7 +3881,7 @@ mod tests {
         fn content_hash(&self) -> crate::block::ContentHash {
             crate::block::hash_of(&self.lines.iter().map(|l| l.as_str()).collect::<Vec<_>>())
         }
-        fn lines(&self, _w: u16) -> Vec<crate::frame::Line> {
+        fn lines(&self, _ctx: &crate::block::RenderCtx) -> Vec<crate::frame::Line> {
             self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.lines
                 .iter()
@@ -3552,7 +3970,7 @@ mod tests {
         fn content_hash(&self) -> crate::block::ContentHash {
             crate::block::hash_of(&self.lines.iter().map(|l| l.as_str()).collect::<Vec<_>>())
         }
-        fn lines(&self, _w: u16) -> Vec<crate::frame::Line> {
+        fn lines(&self, _ctx: &crate::block::RenderCtx) -> Vec<crate::frame::Line> {
             self.lines
                 .iter()
                 .map(|l| crate::frame::Line::raw(l.as_str()))
@@ -3588,14 +4006,15 @@ mod tests {
     fn the_row_index_says_what_the_walk_says() {
         let h = host();
         let width = 80u16;
+        let ctx = crate::block::RenderCtx::bare(width);
         let check = |label: &str| {
             let stream = h.stream.read().unwrap();
             let pres = h.presentation.read().unwrap();
             let slots = stream.slots();
-            let walk = h.rows_by_walk(width, slots, &pres);
-            let kept = h.row_index(width, slots, &pres).rows.clone();
+            let walk = h.rows_by_walk(&ctx, slots, &pres);
+            let kept = h.row_index(&ctx, slots, &pres).rows.clone();
             h.forget_row_index();
-            let fresh = h.row_index(width, slots, &pres).rows.clone();
+            let fresh = h.row_index(&ctx, slots, &pres).rows.clone();
             assert_eq!(
                 kept, walk,
                 "{label}: the kept index disagrees with a fresh walk — a reuse \
@@ -3677,8 +4096,9 @@ mod tests {
         let stream = h.stream.read().unwrap();
         let pres = h.presentation.read().unwrap();
         let narrow = 40u16;
-        let walk = h.rows_by_walk(narrow, stream.slots(), &pres);
-        let kept = h.row_index(narrow, stream.slots(), &pres).rows.clone();
+        let narrow_ctx = crate::block::RenderCtx::bare(narrow);
+        let walk = h.rows_by_walk(&narrow_ctx, stream.slots(), &pres);
+        let kept = h.row_index(&narrow_ctx, stream.slots(), &pres).rows.clone();
         assert_eq!(kept, walk, "resize: the index was not re-measured");
     }
 

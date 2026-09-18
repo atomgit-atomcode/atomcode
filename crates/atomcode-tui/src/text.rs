@@ -107,6 +107,70 @@ fn needs_sanitising(text: &str) -> bool {
             .any(|pair| pair[0] == 0xc2 && (0x80..=0x9f).contains(&pair[1]))
 }
 
+/// A path under the home directory, written as `~/…` for a person to read.
+///
+/// **Bounded by path segments, not by string prefix.** With home `/home/me`,
+/// `/home/melon` must come back untouched — a prefix match would rewrite it to
+/// `~on`, and that is a bug that only shows up on somebody else's machine.
+///
+/// Here rather than in a module because the caller is `Tui::run`, which already
+/// reads the environment; a module may not (the `os_probes` ratchet and
+/// `docs/adr/0008` both say why). Doing the folding upstream is what lets the
+/// module that draws this stay a pure function.
+///
+/// `collapse_home_with` is the same thing with the home directory passed in, so a
+/// judgement about it does not depend on the machine running the tests.
+pub fn collapse_home(path: &str) -> String {
+    collapse_home_with(path, home_dir().as_deref())
+}
+
+/// The implementation, with home explicit. See [`collapse_home`].
+pub fn collapse_home_with(path: &str, home: Option<&std::path::Path>) -> String {
+    let Some(home) = home else {
+        return path.to_string();
+    };
+    let home = home.to_string_lossy();
+    // A trailing separator would otherwise make every path fail the segment test
+    // below, and collapsing would silently stop working for a person whose `HOME`
+    // happens to end in one.
+    let home = home.trim_end_matches(std::path::MAIN_SEPARATOR);
+    if home.is_empty() {
+        // `home` was just separators — the filesystem root, or malformed. Nothing
+        // to collapse against: rewriting every absolute path to `~/…` would be a
+        // shorter string that says less.
+        return path.to_string();
+    }
+    let rest = if path == home {
+        ""
+    } else if let Some(rest) = path.strip_prefix(home) {
+        // The segment boundary. `/home/melon` starts with `/home/me` but the next
+        // character is not a separator, so it is a different directory.
+        match rest.strip_prefix(std::path::MAIN_SEPARATOR) {
+            Some(rest) => rest,
+            None => return path.to_string(),
+        }
+    } else {
+        return path.to_string();
+    };
+    if rest.is_empty() {
+        "~".to_string()
+    } else {
+        format!("~{}{rest}", std::path::MAIN_SEPARATOR)
+    }
+}
+
+/// The person's home directory, from the two variables that say so.
+///
+/// `HOME` on unix, `USERPROFILE` on Windows. Empty is treated as absent: a set
+/// but blank variable is not an answer, and `~/proj` built from it would be
+/// wrong in a way nobody could see.
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
 /// Consume one escape sequence, if the cursor is sitting on the `ESC` that
 /// begins one.
 ///
@@ -143,6 +207,48 @@ fn eat_escape(chars: &mut Peekable<Chars<'_>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collapse_home_rewrites_the_prefix_and_nothing_else() {
+        let home = std::path::Path::new("/home/me");
+        assert_eq!(
+            collapse_home_with("/home/me/proj/a", Some(home)),
+            "~/proj/a"
+        );
+        // The segment boundary, which is the whole reason this is not a string
+        // prefix check: `/home/melon` must not become `~on`.
+        assert_eq!(
+            collapse_home_with("/home/melon/a", Some(home)),
+            "/home/melon/a"
+        );
+        // Not underneath home: untouched.
+        assert_eq!(collapse_home_with("/tmp/a", Some(home)), "/tmp/a");
+        // Home itself.
+        assert_eq!(collapse_home_with("/home/me", Some(home)), "~");
+        // A home we could not determine is not a home we guess at.
+        assert_eq!(collapse_home_with("/home/me/a", None), "/home/me/a");
+    }
+
+    #[test]
+    fn a_trailing_separator_on_home_does_not_turn_collapsing_off() {
+        // `HOME=/home/me/` is something a shell can hand over, and with the naive
+        // version every path failed the segment test — so the fold silently did
+        // nothing and the welcome block printed the whole path.
+        let home = std::path::Path::new("/home/me/");
+        assert_eq!(collapse_home_with("/home/me/proj", Some(home)), "~/proj");
+        assert_eq!(collapse_home_with("/home/me", Some(home)), "~");
+    }
+
+    #[test]
+    fn a_home_of_only_separators_collapses_nothing() {
+        // The degenerate case: home `/` (or a malformed value). Every absolute
+        // path is "under" it, and returning `~/tmp/a` for the whole filesystem
+        // would be a shorter string that says less. It is left alone instead.
+        assert_eq!(
+            collapse_home_with("/tmp/a", Some(std::path::Path::new("/"))),
+            "/tmp/a"
+        );
+    }
 
     #[test]
     fn an_escape_sequence_in_a_paste_never_reaches_the_terminal() {

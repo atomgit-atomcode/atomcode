@@ -137,7 +137,7 @@ fn bars(moment: &Moment, width: u16) -> Vec<Line> {
         if message.is_empty() {
             continue;
         }
-        out.extend(UserSaid(message.to_string()).lines(width));
+        out.extend(UserSaid(message.to_string()).lines(&crate::block::RenderCtx::bare(width)));
     }
     out
 }
@@ -205,7 +205,7 @@ mod tests {
         let m = waiting(text);
         let panel = draw_at(&m, 60, 6);
         assert_eq!(panel.len(), 2, "margin, then one bar");
-        let settled = UserSaid(text.to_string()).lines(60);
+        let settled = UserSaid(text.to_string()).lines(&crate::block::RenderCtx::bare(60));
         assert_eq!(
             panel[1].spans, settled[0].spans,
             "the panel must draw the same row the transcript draws"
@@ -262,7 +262,9 @@ mod tests {
                     a sixty column screen without wrapping somewhere";
         let m = waiting(text);
         let width = 60u16;
-        let rows = UserSaid(text.to_string()).lines(width).len();
+        let rows = UserSaid(text.to_string())
+            .lines(&crate::block::RenderCtx::bare(width))
+            .len();
         assert!(rows > 1, "the fixture must actually wrap: {rows} rows");
         let lines = draw(&m, width, 20);
         assert_eq!(lines.len(), rows + 1, "margin plus the bar's own rows");

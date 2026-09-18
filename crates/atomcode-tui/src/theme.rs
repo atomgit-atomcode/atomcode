@@ -637,6 +637,44 @@ fn distance((ar, ag, ab): Rgb, (br, bg_, bb): Rgb) -> f32 {
     d(ar, br) + d(ag, bg_) + d(ab, bb)
 }
 
+/// An exact colour, or the nearest one this terminal can actually show.
+///
+/// **The only door an arbitrary RGB enters a frame by.** A bitmap of a photograph
+/// or a rendered chart states colours nobody chose, so — unlike a role — they
+/// cannot come from the palette; but they must still be *resolved against* it.
+/// Two reasons, and the second is the one that has bitten:
+///
+/// 1. A 24-bit sequence on a terminal that only has 256 indices is a colour the
+///    terminal has to guess at, and the guesses differ.
+/// 2. `Color::Rgb` means "an exact colour, from a measured triple … only the
+///    palette resolver produces these" (`frame.rs`). Code that builds one
+///    directly has left the palette behind, and the layering gate exists to
+///    notice exactly that.
+pub fn exact_colour(rgb: Rgb, caps: Caps) -> Color {
+    exact(rgb, caps.colors, &caps.palette)
+}
+
+/// A picture's own 256-index colour, as this terminal can draw it.
+///
+/// The second door, beside [`exact_colour`], for the other way a picture states
+/// colour: baked pixel art says "index 202", not "rgb(255,95,0)". `atomcode-tuix`
+///'s mascot is exactly that (`mascot_color`), and on the terminals tuix supports
+/// this returns the same index, so the same bytes go out.
+///
+/// Narrower than the cube, the index is **resolved against the palette** rather
+/// than passed through. That is the one place this is stricter than tuix, which
+/// gates the art on "has colour at all" and would send `38;5;202` to a sixteen
+/// colour terminal — a sequence such a terminal may map to anything. Resolving
+/// costs nothing on the way in and keeps the promise the layering gate makes.
+pub fn indexed_colour(index: u8, caps: Caps) -> Color {
+    match caps.colors {
+        // The picture asks for this exact index, and this terminal has the cube.
+        Colors::True | Colors::Ansi256 => Color::Ansi(index),
+        // No cube: the nearest index this terminal really has.
+        _ => exact(cube(index), caps.colors, &caps.palette),
+    }
+}
+
 /// One line per role: what it resolved to on this terminal, and how far it
 /// stands out from what it sits on.
 ///
@@ -732,6 +770,7 @@ mod tests {
             Color::Rgb(r, g, b) => Some((r, g, b)),
             Color::Ansi(n) => Some(caps.palette.rendered(n)),
             Color::Role(_) => unreachable!("resolution does not produce a role"),
+            Color::Picture(_) => unreachable!("resolution does not produce a picture colour"),
         }
     }
 
@@ -862,6 +901,38 @@ mod tests {
                 "the step has to be *away* from the ground: {panel:?} / {pointed:?} over {bg:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_pictures_own_index_survives_where_the_cube_exists_and_is_resolved_where_it_does_not() {
+        // The mascot's orange, index 202, as tuix bakes it. On a terminal with the
+        // cube the picture's index is passed through, so the bytes match tuix
+        // exactly; on a narrower one it is resolved, because `38;5;202` to a
+        // sixteen-colour terminal is a colour nobody chose.
+        let cube = Caps {
+            colors: Colors::Ansi256,
+            ..Caps::default()
+        };
+        assert_eq!(indexed_colour(202, cube), Color::Ansi(202));
+        assert_eq!(indexed_colour(166, cube), Color::Ansi(166));
+        assert_eq!(indexed_colour(232, cube), Color::Ansi(232));
+
+        let sixteen = Caps {
+            colors: Colors::Ansi16,
+            ..Caps::default()
+        };
+        match indexed_colour(202, sixteen) {
+            Color::Ansi(n) => assert!(n <= 15, "slot {n} is not one of the sixteen"),
+            other => panic!("expected a real slot, got {other:?}"),
+        }
+
+        // Truecolour keeps the index too: `Ansi` is a sequence every truecolour
+        // terminal still understands, and it is what the art asked for.
+        let true_ = Caps {
+            colors: Colors::True,
+            ..Caps::default()
+        };
+        assert_eq!(indexed_colour(202, true_), Color::Ansi(202));
     }
 
     #[test]

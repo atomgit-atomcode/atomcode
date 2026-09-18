@@ -52,6 +52,10 @@ impl Connection {
         self.0.lock().expect("connection poisoned").take()
     }
 }
+// Mounted cell-grid bitmaps. The host holds the table and puts a snapshot into
+// every frame's `Moment`; a row reaches it here to mount and repaint. See
+// `docs/adr/0023`.
+plexus_service!(RastersSvc => crate::raster::Rasters, "tui-rasters", Core, "Cell-grid bitmaps, addressed by (module id, key)");
 
 /// The session's clock, and the only place this crate reads one.
 ///
@@ -564,6 +568,22 @@ impl UserInterface for Tui {
             m.viewing = session.clone();
         }
 
+        // Whether the conversation still owes its first word. Answered in the
+        // loop below rather than here, and the reason is the whole of it:
+        // `open_conversation` opens **only when the stream is empty**, and a
+        // resumed session's history no longer arrives before this point. It comes
+        // as facts over the subscription just sent (`follow` above), which means
+        // that asking now would find every session empty and put a welcome block
+        // in front of every resumed conversation.
+        //
+        // So the question is asked at the first moment the answer means anything:
+        // the loop about to paint with nothing left in the queue. The ordering
+        // that makes that sound is the feed's (`harness/src/feed.rs`): on
+        // `Subscribe` it sends `Described`, then the status, the members, and
+        // then every fact from `from` on — so a description in hand plus a
+        // drained queue is exactly "the history, if any, is already folded".
+        let mut owes_opening = true;
+
         // Input comes from the surface when it has its own — that is what a
         // headless run is — and from the terminal otherwise.
         let keys_tx = wake_tx.clone();
@@ -619,6 +639,50 @@ impl UserInterface for Tui {
                     || self.host.asks.is_waiting()
                     || self.team_on_screen(),
             );
+            // The conversation's first word, asked for here and once.
+            //
+            // Ahead of the paint below rather than inside it: an opening is the
+            // *reason* for a frame, not something to add to one already owed. A
+            // new session has no facts, so nothing else would mark the screen
+            // stale and the welcome would wait for a frame that never comes.
+            //
+            // Only with the queue actually drained: `described()` says the
+            // subscription has been answered, and an empty queue says its
+            // backfill — a resumed session's whole history — is already folded.
+            {
+                if owes_opening && wake.is_empty() {
+                    if let Some(described) = client.described() {
+                        let cwd = self
+                            .host
+                            .moment
+                            .read()
+                            .expect("moment poisoned")
+                            .cwd
+                            .clone();
+                        let open = crate::module::Opening {
+                            // Folded upstream: reading the environment is this
+                            // function's business, and a module may not.
+                            cwd: crate::text::collapse_home(&cwd),
+                            // From the agent's own description, not from a
+                            // service of the agent: this screen is a separate App
+                            // (`docs/adr/0022`), and reading into the agent's tree
+                            // is what `tests/guards.rs`
+                            // (`the_screen_reads_no_service_of_the_agents`)
+                            // forbids.
+                            model: described.model.clone(),
+                            version: env!("CARGO_PKG_VERSION"),
+                            commands: self.host.commands.all(),
+                        };
+                        stale |= self
+                            .host
+                            .open_conversation(crate::block::Coord::default(), &open);
+                        // Asked once, whatever the answer: a stream that was not
+                        // empty will not become empty again, and one that opened
+                        // is no longer empty.
+                        owes_opening = false;
+                    }
+                }
+            }
             if stale && (coalesced >= COALESCE_LIMIT || wake.is_empty()) {
                 // The reading the frame about to be painted is drawn from. Facts
                 // absorb against whatever the last one was — a frame at most out
@@ -2059,7 +2123,11 @@ impl Tui {
 fn transcript_text(stream: &Stream, width: u16) -> String {
     let mut out = String::new();
     for slot in stream.slots() {
-        for line in slot.block().content.lines(width.max(20)) {
+        for line in slot
+            .block()
+            .content
+            .lines(&crate::block::RenderCtx::bare(width.max(20)))
+        {
             out.push_str(&crate::text::for_screen(&line.plain()));
             out.push('\n');
         }
@@ -2195,6 +2263,7 @@ impl Plugin for TuiUiPlugin {
             "ui",
             "tui-agent-client",
             "tui-modules",
+            "tui-rasters",
             "tui-commands",
             "tui-layout",
         ]
@@ -2219,6 +2288,9 @@ impl Plugin for TuiUiPlugin {
         let (host, tui) = assemble(surface);
         let _ = ctx
             .provide::<ModulesSvc>(host.modules.clone())
+            .map_err(|e| e.to_string())?;
+        let _ = ctx
+            .provide::<RastersSvc>(host.rasters.clone())
             .map_err(|e| e.to_string())?;
         let _ = ctx
             .provide::<CommandsSvc>(host.commands.clone())
@@ -2373,7 +2445,7 @@ mod dump_tests {
         fn content_hash(&self) -> ContentHash {
             hash_of(&[self.0])
         }
-        fn lines(&self, _w: u16) -> Vec<Line> {
+        fn lines(&self, _ctx: &crate::block::RenderCtx) -> Vec<Line> {
             self.0.lines().map(Line::raw).collect()
         }
     }

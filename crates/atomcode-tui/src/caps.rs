@@ -95,6 +95,20 @@ pub struct Caps {
     /// reason. What is stored is a measurement; `theme.rs` does arithmetic on
     /// it.
     pub palette: crate::theme::Palette,
+    /// Whether the terminal paints a cell's **background** colour.
+    ///
+    /// Not the same question as [`colors`](Self::colors): a terminal can have 256
+    /// of them and still drop the background, and when it does, anything drawn
+    /// with one comes apart. Tuix learned this the hard way — its mascot packs two
+    /// vertical pixels per cell (`▀` with fg above, bg below), and on a bare ssh
+    /// client the glyphs arrived but the backgrounds did not, so the art
+    /// fragmented into its top half. It gates on `modern_emulator`/`jediterm` for
+    /// that reason; those two variables are what a shield can honestly read.
+    ///
+    /// False by default, like everything a terminal has not said. A caller that
+    /// needs it can encode its own gate (a plain foreground glyph always works);
+    /// what it must not do is assume.
+    pub cell_background: bool,
     /// Pictures, if any. Nothing draws one yet — the field is here because it
     /// belongs to the shield, and the shield is the thing being built. A
     /// component that wants a picture will ask this rather than the
@@ -110,6 +124,9 @@ impl Default for Caps {
             unicode: true,
             colors: Colors::Ansi256,
             palette: crate::theme::Palette::assumed(crate::theme::Theme::Dark),
+            // What a modern terminal does, which is the whole meaning of this
+            // default. `detect` is where a real answer comes from.
+            cell_background: true,
             graphics: Graphics::None,
         }
     }
@@ -122,6 +139,7 @@ impl Caps {
             unicode: false,
             colors: Colors::None,
             palette: crate::theme::Palette::assumed(crate::theme::Theme::Dark),
+            cell_background: false,
             graphics: Graphics::None,
         }
     }
@@ -183,6 +201,14 @@ impl Caps {
             // here comes from the environment; asking the terminal what colour
             // it is is I/O, and belongs to the row that owns the tty.
             palette: crate::theme::Palette::assumed(crate::theme::Theme::Dark),
+            // The one bit the environment *can* answer, and tuix's answer is kept
+            // verbatim: an emulator that announces itself (or JediTerm, a local
+            // IDE terminal) paints cell backgrounds; a bare ssh client or a
+            // legacy console does not, and art that assumes otherwise fragments.
+            // See the field's docs.
+            cell_background: env("WT_SESSION").is_some()
+                || env("TERM_PROGRAM").is_some()
+                || env("TERM").is_some_and(|t| t.contains("jediterm")),
             graphics,
         }
     }
@@ -191,6 +217,16 @@ impl Caps {
     pub fn text<'a>(&self, text: &'a str) -> Cow<'a, str> {
         downgrade(text, self.unicode)
     }
+}
+
+/// Whether this character survives a terminal that has no Unicode.
+///
+/// `true` for ASCII and for the decorative characters [`ascii_for`] rewrites;
+/// `false` for braille and anything else with no stand-in. A **bitmap** has to
+/// ask this: a grid of tofu is not a picture. It is the same reasoning
+/// [`Caps::spinner`] applies to its own set — see [`SPINNER`].
+pub fn has_ascii_stand_in(ch: char) -> bool {
+    ch.is_ascii() || ascii_for(ch).is_some()
 }
 
 /// The ASCII stand-in for one decorative glyph, or `None` to leave it alone.
@@ -358,48 +394,61 @@ impl Caps {
     }
 
     pub fn g(&self, glyph: Glyph) -> &'static str {
-        use Glyph::*;
-        if self.unicode {
-            match glyph {
-                TopLeft => "┌",
-                TopRight => "┐",
-                BottomLeft => "└",
-                BottomRight => "┘",
-                Horizontal => "─",
-                Vertical => "│",
-                Ok => "✓",
-                Fail => "✗",
-                Pending => "⋯",
-                Interrupted => "—",
-                Bullet => "•",
-                Pointer => "▸",
-                Prompt => "❯",
-                Separator => "·",
-                Thumb => "█",
-                Track => "│",
-                ToolMark => "●",
-                Gutter => "⎿",
-                Down => "↓",
-            }
-        } else {
-            match glyph {
-                TopLeft | TopRight | BottomLeft | BottomRight => "+",
-                Horizontal => "-",
-                Vertical => "|",
-                Ok => "v",
-                Fail => "x",
-                Pending => ".",
-                Interrupted => "-",
-                Bullet => "*",
-                Pointer => ">",
-                Prompt => ">",
-                Separator => ".",
-                Thumb => "#",
-                Track => "|",
-                ToolMark => "*",
-                Gutter => "`",
-                Down => "v",
-            }
+        self::glyph(self.unicode, glyph)
+    }
+}
+
+/// A decorative glyph, as a terminal that does or does not do Unicode writes it.
+///
+/// A free function because [`crate::block::ShapeCaps`] needs the same table: a
+/// block cannot hold a whole `Caps` (it also carries the palette), but a glyph
+/// depends on `unicode` alone.
+///
+/// Both tables are **one column in, one column out** — the property that makes
+/// the swap safe to apply after widths were computed, and the reason this set
+/// holds only narrow characters (see [`ascii_for`]).
+pub fn glyph(unicode: bool, glyph: Glyph) -> &'static str {
+    use Glyph::*;
+    if unicode {
+        match glyph {
+            TopLeft => "┌",
+            TopRight => "┐",
+            BottomLeft => "└",
+            BottomRight => "┘",
+            Horizontal => "─",
+            Vertical => "│",
+            Ok => "✓",
+            Fail => "✗",
+            Pending => "⋯",
+            Interrupted => "—",
+            Bullet => "•",
+            Pointer => "▸",
+            Prompt => "❯",
+            Separator => "·",
+            Thumb => "█",
+            Track => "│",
+            ToolMark => "●",
+            Gutter => "⎿",
+            Down => "↓",
+        }
+    } else {
+        match glyph {
+            TopLeft | TopRight | BottomLeft | BottomRight => "+",
+            Horizontal => "-",
+            Vertical => "|",
+            Ok => "v",
+            Fail => "x",
+            Pending => ".",
+            Interrupted => "-",
+            Bullet => "*",
+            Pointer => ">",
+            Prompt => ">",
+            Separator => ".",
+            Thumb => "#",
+            Track => "|",
+            ToolMark => "*",
+            Gutter => "`",
+            Down => "v",
         }
     }
 }

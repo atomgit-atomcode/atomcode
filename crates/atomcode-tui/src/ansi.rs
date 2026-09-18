@@ -240,6 +240,15 @@ fn sgr(style: &Style, caps: crate::caps::Caps) -> String {
     match style.fg {
         Some(Color::Ansi(n)) => parts.push(format!("38;5;{n}")),
         Some(Color::Rgb(r, g, b)) => parts.push(format!("38;2;{r};{g};{b}")),
+        // A picture's own index: the same resolution the role path does, and the
+        // only other place a colour becomes a sequence. Through the same door as
+        // the resolver, so a terminal without the cube gets the nearest index it
+        // really has instead of one it will map to anything.
+        Some(Color::Picture(n)) => match crate::theme::indexed_colour(n, caps) {
+            Color::Ansi(n) => parts.push(format!("38;5;{n}")),
+            Color::Rgb(r, g, b) => parts.push(format!("38;2;{r};{g};{b}")),
+            _ => {}
+        },
         // The one place a role becomes a colour, against the palette that was
         // actually measured. A role with no colour means "the terminal's own
         // foreground" — the absence of an SGR, not a colour that looks like it.
@@ -252,6 +261,11 @@ fn sgr(style: &Style, caps: crate::caps::Caps) -> String {
     }
     match style.bg {
         Some(Color::Ansi(n)) => parts.push(format!("48;5;{n}")),
+        Some(Color::Picture(n)) => match crate::theme::indexed_colour(n, caps) {
+            Color::Ansi(n) => parts.push(format!("48;5;{n}")),
+            Color::Rgb(r, g, b) => parts.push(format!("48;2;{r};{g};{b}")),
+            _ => {}
+        },
         Some(Color::Role(r)) => match crate::theme::resolve(r, caps) {
             Some(Color::Ansi(n)) => parts.push(format!("48;5;{n}")),
             Some(Color::Rgb(r, g, b)) => parts.push(format!("48;2;{r};{g};{b}")),

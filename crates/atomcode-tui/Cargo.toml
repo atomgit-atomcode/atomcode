@@ -32,6 +32,12 @@ png = "0.17"
 base64 = "0.22"
 unicode-width = "0.2"
 unicode-segmentation = "1"
+# Picking which tips to open a session with. The same version `atomcode-tuix` uses:
+# two front ends on two major versions would put two copies of `rand` in one build
+# and buy nothing. Only the *selection* is random — the seed comes from the working
+# directory, so one directory picks the same tips every render (see
+# `modules::welcome`).
+rand = "0.8"
 async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
