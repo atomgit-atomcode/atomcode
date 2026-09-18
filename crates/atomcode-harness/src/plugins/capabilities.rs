@@ -66,8 +66,9 @@ impl Plugin for SkillsPlugin {
         &["tools"]
     }
     fn uses(&self) -> &'static [&'static str] {
-        // `use_skill` / `list_skills` hold the registry this row provides.
-        &["skills", "operations"]
+        // `use_skill` / `list_skills` hold the registry this row provides;
+        // `commands` is where the `/skills` listing is registered.
+        &["skills", "operations", "commands"]
     }
     fn provides(&self) -> &'static [&'static str] {
         &["skills"]
@@ -102,9 +103,15 @@ impl Plugin for SkillsPlugin {
             ctx,
             vec![
                 Arc::new(UseSkillTool::new(registry.clone())),
-                Arc::new(ListSkillsTool::new(registry)),
+                Arc::new(ListSkillsTool::new(registry.clone())),
             ],
         )?;
+        // And a command, so a person can see what is installed without asking
+        // the model to call a tool on their behalf
+        // (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` B1,
+        // `docs/adr/0021` §10). The row that owns the capability registers it;
+        // nothing in the screen knows this command exists.
+        crate::commands::register(ctx, Arc::new(ListSkills(registry)))?;
         // Only advertise skills when some exist: a catalog line promising
         // capabilities that resolve to nothing is worse than no line.
         if count > 0 {
@@ -437,6 +444,90 @@ fn yes() -> bool {
     true
 }
 
+/// `skills`: what is installed, for a person rather than for the model.
+///
+/// The catalog the row already holds, listed by name and by what each is for.
+/// Not the tool: `list_skills` answers the *model*, and a person asking "what
+/// do I have" should not have to spend a turn to find out.
+struct ListSkills(Arc<SkillRegistry>);
+
+#[async_trait]
+impl crate::commands::CatalogCommand for ListSkills {
+    fn describe(&self) -> atomcode_kernel::agent::CommandDescription {
+        atomcode_kernel::agent::CommandDescription {
+            name: "skills".into(),
+            usage: None,
+            summary: "装了哪些 skill,各是干什么的".into(),
+            target: atomcode_kernel::agent::CommandTarget::Session,
+        }
+    }
+
+    async fn run(&self, _agent: Arc<crate::agent::Agent>, _args: &str) -> Result<String, String> {
+        let listed = self.0.list();
+        if listed.is_empty() {
+            return Ok("一个 skill 都没装".into());
+        }
+        Ok(listed
+            .into_iter()
+            .map(|(name, about)| format!("{name} · {about}"))
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+}
+
+/// One of the memory actions, as a command a person runs.
+///
+/// Carried out by the `memory` tool the row already mounted: which tier a
+/// remembered line goes in, and how a forget matches, are decisions that exist
+/// once. A command that reimplemented them would agree with the tool until one
+/// of the two changed.
+struct MemoryCommand {
+    name: &'static str,
+    usage: Option<&'static str>,
+    summary: &'static str,
+    action: &'static str,
+    project: PathBuf,
+}
+
+#[async_trait]
+impl crate::commands::CatalogCommand for MemoryCommand {
+    fn describe(&self) -> atomcode_kernel::agent::CommandDescription {
+        atomcode_kernel::agent::CommandDescription {
+            name: self.name.into(),
+            usage: self.usage.map(str::to_string),
+            summary: self.summary.into(),
+            target: atomcode_kernel::agent::CommandTarget::Session,
+        }
+    }
+
+    async fn run(&self, _agent: Arc<crate::agent::Agent>, args: &str) -> Result<String, String> {
+        use atomcode_kernel::tool::{Tool, ToolContext};
+        let content = args.trim();
+        if self.action != "list" && content.is_empty() {
+            return Err(format!("要有话可{}", self.summary));
+        }
+        let mut call = serde_json::json!({ "action": self.action });
+        if !content.is_empty() {
+            call["content"] = serde_json::Value::String(content.to_string());
+        }
+        let result = atomcode_capabilities::tools::MemoryTool
+            .execute(
+                &call.to_string(),
+                &ToolContext {
+                    working_dir: self.project.clone(),
+                    cancel: Default::default(),
+                    progress: atomcode_kernel::tool::ProgressSink::noop(),
+                    requester: None,
+                },
+            )
+            .await;
+        if result.is_error {
+            return Err(result.content);
+        }
+        Ok(result.content)
+    }
+}
+
 /// User memory, injected as a **logged fact** rather than a hidden prepend.
 ///
 /// The production stack injects memory through a lifecycle hook, which means the
@@ -453,7 +544,8 @@ impl Plugin for MemoryPlugin {
     fn uses(&self) -> &'static [&'static str] {
         // The tool half is optional: a tree with no catalog still gets the
         // injection, which is the half that works with no model cooperation.
-        &["tools", "operations"]
+        // `commands` carries the three a person runs.
+        &["tools", "operations", "commands"]
     }
     fn description(&self) -> &'static str {
         "inject memory.md on the first turn, and let the agent write it back"
@@ -483,6 +575,37 @@ impl Plugin for MemoryPlugin {
             toolbox.register(Arc::new(atomcode_capabilities::tools::MemoryTool))?;
             let toolbox = toolbox.clone();
             let _ = ctx.effect(move || toolbox.unregister("memory"));
+        }
+
+        // The same three actions as commands a person runs. Through the tool
+        // rather than beside it: what "remember" means — which tier it writes,
+        // how it dedupes — is decided once, and a second implementation would
+        // agree until one of them changed
+        // (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` B1).
+        for command in [
+            Arc::new(MemoryCommand {
+                name: "memory",
+                usage: None,
+                summary: "存下来的那些话",
+                action: "list",
+                project: project.clone(),
+            }) as Arc<dyn crate::commands::CatalogCommand>,
+            Arc::new(MemoryCommand {
+                name: "remember",
+                usage: Some("<要记住的话>"),
+                summary: "记住一句话,以后每个会话都带着",
+                action: "remember",
+                project: project.clone(),
+            }),
+            Arc::new(MemoryCommand {
+                name: "forget",
+                usage: Some("<要忘掉的话>"),
+                summary: "把记住的某句话删掉",
+                action: "forget",
+                project: project.clone(),
+            }),
+        ] {
+            crate::commands::register(ctx, command)?;
         }
 
         crate::plugins::self_knowledge::describes(

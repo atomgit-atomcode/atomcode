@@ -238,6 +238,39 @@ pub fn question_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Opti
     }
 }
 
+/// The questions of a batch request, when the payload is one.
+///
+/// `request_user_input` puts several questions in one round trip as
+/// `{"questions": [...]}` and waits for `{"responses": [...]}`. `None` for
+/// every other payload, including a single question — a one-element array is
+/// deliberately *not* a batch on the tool's side either.
+pub fn batch_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Option<Vec<Question>> {
+    if kind != REQUEST_USER_INPUT_KIND {
+        return None;
+    }
+    let asked = payload.get("questions")?.as_array()?;
+    if asked.len() < 2 {
+        return None;
+    }
+    // Each one through the single-question path, so a batch and a lone question
+    // are drawn by the same code and cannot drift apart.
+    Some(
+        asked
+            .iter()
+            .filter_map(|one| question_for(kind, one, events))
+            .collect(),
+    )
+}
+
+/// One answer of a batch, in the shape the asking tool reads.
+///
+/// `None` — esc — is that question **declined**, which the tool turns into
+/// "no answer was provided, use your own judgement". Not a refusal of the
+/// batch: a person who skips one question has not skipped the others.
+pub fn declinable(question: &Question, answer: Option<String>) -> Value {
+    response_for(REQUEST_USER_INPUT_KIND, question, answer)
+}
+
 /// What the two kernel checkpoints are answered with. Their own words rather
 /// than `allow` / `deny`: this is not an approval, and reusing those would put
 /// "允许" on a question about whether to keep going.
@@ -415,6 +448,72 @@ mod tests {
             at: 0,
             event: SessionEvent::Asked { turn: 1, question },
         }
+    }
+
+    /// Several questions in one request are several questions on screen, and
+    /// the answers go back together.
+    ///
+    /// Found while using it: the model asked two things at once and the person
+    /// was told **「Interactive questions are not supported in this
+    /// environment」** — by a screen with a question panel, sitting right in
+    /// front of them. The payload of a batch is `{"questions": [...]}`, which
+    /// the single-question parse could not read, and a screen that cannot read
+    /// a request answers `Null`, which the asking tool reads as "no driver can
+    /// present this".
+    #[test]
+    fn several_questions_in_one_request_are_several_questions_on_screen() {
+        let two = serde_json::json!({
+            "questions": [
+                {
+                    "header": "Question · 建仓方案",
+                    "question": "git 仓怎么建?",
+                    "mode": "single",
+                    "options": [
+                        { "label": "独立本体仓", "description": "只含本体与证据" },
+                        { "label": "当前目录建仓", "description": "要严格 .gitignore" },
+                    ],
+                },
+                {
+                    "header": "Question · 敏感信息",
+                    "question": "真人姓名怎么处理?",
+                    "mode": "single",
+                    "options": [
+                        { "label": "保留姓名,私仓" },
+                        { "label": "脱敏后再入库" },
+                    ],
+                },
+            ]
+        });
+        let questions = batch_for(REQUEST_USER_INPUT_KIND, &two, &[])
+            .expect("a batch is a batch, not an unreadable payload");
+        assert_eq!(questions.len(), 2, "both are put to the person");
+        assert!(questions[0].prompt.contains("git 仓"), "{:?}", questions[0]);
+        assert_eq!(
+            questions[0].options.len(),
+            2,
+            "with their own options: {:?}",
+            questions[0]
+        );
+        // The header names which question it is, as the single path does.
+        assert_eq!(questions[1].asker.as_deref(), Some("敏感信息"));
+
+        // Answering one and declining the other: the first choice reaches the
+        // tool, and the second is a decline rather than a made-up answer.
+        let answered = declinable(&questions[0], Some("独立本体仓".into()));
+        assert_eq!(answered["selected"][0], "独立本体仓");
+        assert_eq!(answered["declined"], false);
+        let declined = declinable(&questions[1], None);
+        assert_eq!(
+            declined["declined"], true,
+            "skipping one question is not answering it: {declined}"
+        );
+
+        // A single question is not a batch — the tool sends those down the
+        // other wire, and a one-element array on this one would draw an empty
+        // card in the drivers that pick the single question off it.
+        let one = serde_json::json!({ "questions": [two["questions"][0].clone()] });
+        assert!(batch_for(REQUEST_USER_INPUT_KIND, &one, &[]).is_none());
+        assert!(batch_for(APPROVAL_KIND, &two, &[]).is_none());
     }
 
     /// The kernel's own checkpoints are questions this screen can answer

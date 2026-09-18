@@ -1751,10 +1751,16 @@ async fn a_command_the_catalog_does_not_have_is_not_found_under_its_own_id() {
         .unwrap();
     let events = drain_quiet(&mut handle).await;
 
+    // The catalog does not offer `goal` — which is what makes the refusal below
+    // mean something. Not "the catalog is empty": rows that own a capability
+    // register their own commands (`docs/adr/0021` §10), so what is on offer
+    // depends on which rows are mounted, and a judgement that counted them
+    // would break every time one registered something.
     assert!(
         events.iter().any(|e| matches!(
             e,
-            AgentEvent::Described { description } if description.commands.is_empty()
+            AgentEvent::Described { description }
+                if description.commands.iter().all(|c| c.name != "goal")
         )),
         "{events:#?}"
     );

@@ -1241,6 +1241,33 @@ impl Tui {
     /// and one read off the request otherwise. The answer goes back under the
     /// request's id, in the request's own terms.
     fn ask(&self, id: RequestId, kind: &str, payload: Value) {
+        // A batch: several questions in one request
+        // (`{"questions": [...]}` → `{"responses": [...]}`). Asked one at a
+        // time, because a person answers one thing at a time, and answered as
+        // one reply because that is what the asking tool waits for.
+        //
+        // Without this the screen could not parse the payload at all and
+        // answered `Null` — which the tool reads as "no driver can present
+        // this" and tells the model **interactive questions are not supported
+        // in this environment**. A screen that is sitting right there, with a
+        // question panel, saying it cannot ask.
+        if let Some(questions) = crate::ask::batch_for(kind, &payload, &self.client.events()) {
+            let asks = self.host.asks.clone();
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let mut answers = Vec::with_capacity(questions.len());
+                for question in questions {
+                    // One at a time, in the order they were asked. A refusal
+                    // answers *that* question and goes on to the next: the
+                    // batch is several decisions, and declining one is not
+                    // declining the rest.
+                    let answered = asks.push(question.clone()).await.ok().flatten();
+                    answers.push(crate::ask::declinable(&question, answered));
+                }
+                client.respond(id, serde_json::json!({ "responses": answers }));
+            });
+            return;
+        }
         let Some(question) = crate::ask::question_for(kind, &payload, &self.client.events()) else {
             // Nothing this screen knows how to put to a person: refused, never
             // left hanging.

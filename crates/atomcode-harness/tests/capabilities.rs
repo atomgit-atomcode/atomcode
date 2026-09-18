@@ -194,6 +194,88 @@ async fn skills_are_discovered_and_the_prompt_mentions_them_only_when_they_exist
     }
 }
 
+/// A capability row puts its own commands in the catalog, so a front end offers
+/// them without knowing they exist
+/// (`docs/adr/0021` §10, `docs/plans/2026-09-18-tui-panels-and-commands-inventory.md`
+/// B1).
+///
+/// Four of them here: what skills are installed, and the three halves of
+/// memory. Each is carried out by the capability the row already mounted — the
+/// `/remember` command and the `memory` tool write the same file the same way,
+/// because the command *is* the tool.
+#[tokio::test]
+async fn a_capability_row_offers_its_own_commands_and_they_do_the_work() {
+    let dir = scratch("row-commands");
+    let skill_dir = dir.join(".claude/skills/greet");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: greet\ndescription: say hello properly\n---\n\nSay hello.\n",
+    )
+    .unwrap();
+
+    let app = start(tree(&dir, STOP, &[])).await;
+    let ctx = app.context();
+    let catalog = ctx
+        .service::<atomcode_harness::seams::CommandsSvc>()
+        .expect("the catalog is a core row");
+    let agent = atomcode_harness::create_agent(&app)
+        .await
+        .expect("an agent to run commands against");
+
+    let offered: Vec<String> = catalog
+        .offered_for(&agent)
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    for name in ["skills", "memory", "remember", "forget"] {
+        assert!(
+            offered.contains(&name.to_string()),
+            "`{name}` is on offer: {offered:?}"
+        );
+    }
+
+    // What is installed, by the row that loaded it.
+    let listed = catalog
+        .find("skills", &agent)
+        .expect("offered, so findable")
+        .run(agent.clone(), "")
+        .await
+        .expect("listing installed skills");
+    assert!(
+        listed.contains("greet") && listed.contains("say hello properly"),
+        "the listing is what is installed, with what each is for: {listed}"
+    );
+
+    // And the write half does the work rather than describing it: remembering
+    // something puts it where the next session reads it.
+    catalog
+        .find("remember", &agent)
+        .expect("offered")
+        .run(agent.clone(), "我偏好中文回复")
+        .await
+        .expect("remembering");
+    let remembered = catalog
+        .find("memory", &agent)
+        .expect("offered")
+        .run(agent.clone(), "")
+        .await
+        .expect("listing memory");
+    assert!(
+        remembered.contains("我偏好中文回复"),
+        "what was remembered is there afterwards: {remembered}"
+    );
+
+    // An empty `remember` is refused rather than written: a memory of nothing
+    // is a line every later session carries for no reason.
+    assert!(catalog
+        .find("remember", &agent)
+        .expect("offered")
+        .run(agent.clone(), "   ")
+        .await
+        .is_err());
+}
+
 #[tokio::test]
 async fn memory_is_injected_as_a_logged_fact_with_provenance() {
     let dir = scratch("memory");
