@@ -210,9 +210,39 @@ pub fn question_for(kind: &str, payload: &Value, events: &[LoggedEvent]) -> Opti
                 }
             }))
         }
+        // The kernel's own two checkpoints: a turn that hit the round fuse, and
+        // one whose output kept being cut off after the automatic recovery gave
+        // up. Both ask the *driver* — not the model — whether to go on, and
+        // both were arriving at a screen that did not know the kind and so
+        // answered nothing (`docs/plans/2026-09-18-…-inventory.md` A10). What a
+        // screen that says nothing means downstream is "stop", so a turn simply
+        // ended and nobody was told why.
+        atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND
+        | atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND => {
+            let (prompt, asker) = if kind == atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND {
+                ("这一轮已经跑了很多步。继续吗?", "步数上限")
+            } else {
+                ("回答一直被截断,自动接续已经用尽。继续吗?", "输出截断")
+            };
+            Some(Question {
+                prompt: prompt.into(),
+                options: vec![
+                    Answer::labelled(CONTINUE.to_string(), "继续".to_string()),
+                    Answer::labelled(STOP.to_string(), "停下".to_string()),
+                ],
+                asker: Some(asker.into()),
+                about: None,
+            })
+        }
         _ => None,
     }
 }
+
+/// What the two kernel checkpoints are answered with. Their own words rather
+/// than `allow` / `deny`: this is not an approval, and reusing those would put
+/// "允许" on a question about whether to keep going.
+pub const CONTINUE: &str = "continue";
+pub const STOP: &str = "stop";
 
 /// The answer to send back for a request, in the request's own terms. `None` —
 /// declined, or nobody answered — is a refusal, never consent.
@@ -235,6 +265,13 @@ pub fn response_for(kind: &str, _question: &Question, answer: Option<String>) ->
                 None => UserInputResponse::declined(),
             };
             serde_json::to_value(response).unwrap_or(Value::Null)
+        }
+        // `{"continue": bool}`, and anything that is not an explicit "keep
+        // going" is a stop — the kernel degrades a missing or malformed answer
+        // to `false`, and this agrees with it rather than hoping.
+        atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND
+        | atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND => {
+            serde_json::json!({ "continue": answer.as_deref() == Some(CONTINUE) })
         }
         _ => Value::Null,
     }
@@ -377,6 +414,45 @@ mod tests {
             seq: 1,
             at: 0,
             event: SessionEvent::Asked { turn: 1, question },
+        }
+    }
+
+    /// The kernel's own checkpoints are questions this screen can answer
+    /// (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` A10).
+    ///
+    /// Both pause a turn and ask the *driver* whether to go on. A screen that
+    /// does not know the kind answers nothing, and nothing means stop — so the
+    /// turn ended and the person was never asked. Answering "continue" has to
+    /// reach the kernel as `{"continue": true}`, and everything else as `false`,
+    /// because that is what it degrades a missing answer to.
+    #[test]
+    fn the_kernels_own_checkpoints_are_asked_and_answered() {
+        for kind in [
+            atomcode_kernel::event::ROUND_CAP_CHECKPOINT_KIND,
+            atomcode_kernel::event::OUTPUT_TRUNCATION_CHECKPOINT_KIND,
+        ] {
+            let question = question_for(kind, &serde_json::json!({}), &[])
+                .unwrap_or_else(|| panic!("{kind} is a question a person can answer"));
+            assert_eq!(
+                question.options.len(),
+                2,
+                "two ways out, and both named: {question:?}"
+            );
+            assert_eq!(nth(&question, 1).as_deref(), Some(CONTINUE));
+            assert_eq!(nth(&question, 2).as_deref(), Some(STOP));
+
+            assert_eq!(
+                response_for(kind, &question, Some(CONTINUE.into())),
+                serde_json::json!({ "continue": true }),
+                "{kind}: continuing says so"
+            );
+            for answer in [Some(STOP.to_string()), None] {
+                assert_eq!(
+                    response_for(kind, &question, answer.clone()),
+                    serde_json::json!({ "continue": false }),
+                    "{kind}: {answer:?} stops — nothing but an explicit yes goes on"
+                );
+            }
         }
     }
 

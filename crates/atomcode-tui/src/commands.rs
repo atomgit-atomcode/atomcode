@@ -154,6 +154,11 @@ const SESSION: &[Command] = &[
     ),
     Command::taking("cd", "<目录>", "换到另一个目录干活;会开一条新会话"),
     Command::taking(
+        "config",
+        "[项 值]",
+        "看设置;带上项和值就改它。改的是配置文件,不是运行中的行",
+    ),
+    Command::taking(
         "mcp",
         "[tools <服务器>|withdraw]",
         "MCP 服务器的状态;tools 列某个服务器挂上来的工具;withdraw 立刻撤下全部 MCP 工具",
@@ -579,6 +584,52 @@ impl CommandSet for SessionCommands {
                         Outcome::Said(format!("现在在 {directory} 里干活 · 新会话 {session}"))
                     }
                     Ok(_) => Outcome::Said(format!("现在在 {directory} 里干活")),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
+            "config" => {
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refused) => return refused,
+                };
+                let (id, value) = match args.trim().split_once(char::is_whitespace) {
+                    Some((id, value)) => (id.trim(), value.trim()),
+                    None => (args.trim(), ""),
+                };
+                // Nothing typed: what there is, and what each is set to.
+                if id.is_empty() {
+                    return match control.call(HostCommand::Settings { session: root }).await {
+                        Ok(HostReply::Settings { settings }) if settings.is_empty() => {
+                            Outcome::Said("这个宿主没有可改的设置".into())
+                        }
+                        Ok(HostReply::Settings { settings }) => Outcome::Said(
+                            settings
+                                .into_iter()
+                                .map(|s| {
+                                    format!(
+                                        "{} = {}  · {} · {} · {}",
+                                        s.id, s.value, s.label, s.accepts, s.applies
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ),
+                        Ok(other) => Outcome::Refused(format!("{other:?}")),
+                        Err(error) => Outcome::Refused(refusal(error)),
+                    };
+                }
+                if value.is_empty() {
+                    return Outcome::Refused(format!("要一个值:/config {id} <值>"));
+                }
+                match control
+                    .call(HostCommand::SetSetting {
+                        session: root,
+                        id: id.to_string(),
+                        value: value.to_string(),
+                    })
+                    .await
+                {
+                    Ok(_) => Outcome::Said(format!("{id} = {value}")),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
             }

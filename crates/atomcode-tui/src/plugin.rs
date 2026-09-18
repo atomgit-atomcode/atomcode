@@ -423,6 +423,35 @@ impl AgentClient {
 /// which is exactly when precision beats speed.
 const WHEEL_LINES: i32 = 1;
 
+/// The ways out of a policy intervention, as a person reads them.
+///
+/// The intervention's own list, in its order: the kernel says which apply, and
+/// offering one it did not name would be offering something that will be
+/// refused. The words are the same ones the `policy` command takes (M5.5), so
+/// what a person picks is what gets run.
+fn policy_options(
+    intervention: &atomcode_kernel::event::PolicyIntervention,
+) -> Vec<atomcode_harness::seams::Answer> {
+    use atomcode_kernel::event::PolicyRecoveryAction as A;
+    intervention
+        .actions
+        .iter()
+        .filter_map(|action| match action {
+            A::CompleteExternally => Some(("done", "我自己在外面做完")),
+            A::SkipStep => Some(("skip", "跳过这一步")),
+            A::ViewSafeInstructions => Some(("how", "看看安全的做法")),
+            A::EndTask => Some(("end", "到此为止")),
+            // A way out added since this screen was written: left out rather
+            // than guessed at — an unlabelled row is one nobody can choose on
+            // purpose.
+            _ => None,
+        })
+        .map(|(value, label)| {
+            atomcode_harness::seams::Answer::labelled(value.to_string(), label.to_string())
+        })
+        .collect()
+}
+
 /// Answer the password prompts `sudo` and `ssh` make, for as long as the screen
 /// is up.
 ///
@@ -1227,6 +1256,40 @@ impl Tui {
         });
     }
 
+    /// Put a policy intervention to the person, and act on what they pick.
+    ///
+    /// The ways out are the intervention's own — the kernel says which apply,
+    /// and offering one it did not name would be offering something that will
+    /// be refused. The choice is carried out by the `policy` command in the
+    /// catalog (M5.5), which is where the two judgements about it live: whether
+    /// anything is waiting, and whether this is one of its ways out
+    /// (`docs/adr/0021` §8). The screen asks; the row decides.
+    fn ask_about_policy(&self, intervention: atomcode_kernel::event::PolicyIntervention) {
+        let options = policy_options(&intervention);
+        if options.is_empty() {
+            // Nothing to offer is not a question. Say what happened instead, so
+            // the turn ending has a reason on screen.
+            self.say("策略边界挡下了这一步,而这次没有给出可选的走法");
+            return;
+        }
+        let question = atomcode_harness::seams::Question {
+            prompt: "这一步被策略挡下了。接下来怎么走?".into(),
+            options,
+            asker: Some("策略".into()),
+            about: None,
+        };
+        let answer = self.host.asks.push(question);
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            // A refusal — esc — leaves the intervention waiting rather than
+            // picking something on the person's behalf. `/policy` is still
+            // there when they decide.
+            if let Some(chosen) = answer.await.ok().flatten() {
+                client.invoke("policy", &chosen);
+            }
+        });
+    }
+
     /// Put a line of the UI's own into the conversation.
     ///
     /// A block like any other, so it scrolls, folds and is dumped on exit with
@@ -1292,6 +1355,15 @@ impl Tui {
             }
             AgentEvent::Request { id, kind, payload } => {
                 self.ask(id, &kind, payload);
+                true
+            }
+            // A hard policy boundary stopped the turn and the person has to say
+            // how to go on (`docs/adr/0021` §8,
+            // `docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` A7).
+            // It used to arrive and vanish: the turn ended, the screen said
+            // nothing, and the only way on was to know that `/policy` existed.
+            AgentEvent::PolicyIntervention { intervention } => {
+                self.ask_about_policy(intervention);
                 true
             }
             AgentEvent::Invoked { output, .. } => {
@@ -2625,6 +2697,60 @@ mod history_tests {
         recall_back(&mut m);
         recall_forward(&mut m);
         assert_eq!(m.input, "mine");
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::policy_options;
+    use atomcode_kernel::event::{PolicyIntervention, PolicyRecoveryAction as A};
+
+    /// A policy intervention becomes a question with the intervention's own
+    /// ways out — and only those
+    /// (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` A7).
+    ///
+    /// The words are the ones the `policy` command takes, so what a person
+    /// picks is what runs. Offering a way out the kernel did not name would be
+    /// offering something that gets refused after they choose it.
+    #[test]
+    fn a_policy_intervention_offers_its_own_ways_out_and_no_others() {
+        let intervention = PolicyIntervention::credential_shell_blocked();
+        let offered = policy_options(&intervention);
+        assert_eq!(
+            offered.len(),
+            intervention.actions.len(),
+            "one row per way out this intervention actually has: {:?}",
+            intervention.actions
+        );
+        // Every row is named in words a person reads, and valued in the word
+        // the command takes.
+        for answer in &offered {
+            assert!(
+                ["done", "skip", "how", "end"].contains(&answer.value.as_str()),
+                "unexpected value: {answer:?}"
+            );
+            assert!(!answer.label.is_empty(), "a row with no words: {answer:?}");
+        }
+
+        // An intervention with nothing on offer is not a question at all.
+        let empty = PolicyIntervention {
+            actions: Vec::new(),
+            ..PolicyIntervention::credential_shell_blocked()
+        };
+        assert!(policy_options(&empty).is_empty());
+
+        // And the order is the intervention's, not this screen's.
+        let reordered = PolicyIntervention {
+            actions: vec![A::EndTask, A::SkipStep],
+            ..PolicyIntervention::credential_shell_blocked()
+        };
+        assert_eq!(
+            policy_options(&reordered)
+                .iter()
+                .map(|a| a.value.clone())
+                .collect::<Vec<_>>(),
+            vec!["end".to_string(), "skip".to_string()]
+        );
     }
 }
 

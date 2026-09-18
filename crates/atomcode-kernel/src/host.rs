@@ -73,6 +73,21 @@ pub enum HostCommand {
     /// Work in `directory` from now on. A new conversation, because what a
     /// session read and wrote belongs to where it ran (A2).
     ChangeDirectory { session: String, directory: String },
+    /// The settings a person may change, with what each is set to now
+    /// (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` A3).
+    ///
+    /// The host's own configuration, not the running row graph: this is the
+    /// file a person edits, and it is deliberately **not** the development
+    /// commands 0022 §7 removed — those patched live rows and could turn
+    /// approval off under a running turn.
+    Settings { session: String },
+    /// Set one of them. What it takes effect on is the setting's own business:
+    /// some apply now, some at the next start.
+    SetSetting {
+        session: String,
+        id: String,
+        value: String,
+    },
     /// The models a person may pick from, as the host resolves them now.
     ///
     /// The catalog is the host's: only it knows what is configured, and a
@@ -109,6 +124,8 @@ impl HostCommand {
             | Self::RewindPoints { session }
             | Self::Rewind { session, .. }
             | Self::SwitchModel { session, .. }
+            | Self::Settings { session }
+            | Self::SetSetting { session, .. }
             | Self::SetMode { session, .. }
             | Self::ChangeDirectory { session, .. }
             | Self::Models { session }
@@ -162,6 +179,10 @@ pub enum HostReply {
     McpTools {
         tools: Vec<String>,
     },
+    /// The settings a person may change, each with what it is set to now.
+    Settings {
+        settings: Vec<Setting>,
+    },
     /// What a person may switch to — the host's own catalog. `current` is the
     /// one this conversation runs on, when the host knows it.
     Models {
@@ -188,6 +209,24 @@ pub enum Mode {
     AcceptEdits,
     /// Nothing asks. For a sandbox, an eval, a CI run.
     Auto,
+}
+
+/// One setting a person may change.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Setting {
+    /// What `SetSetting` takes.
+    pub id: String,
+    /// What it is called, in the person's own language.
+    pub label: String,
+    /// What it is set to now.
+    pub value: String,
+    /// What it accepts, phrased for a person: `true | false`, a list of words,
+    /// a range. Empty when anything goes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub accepts: String,
+    /// When a change takes effect, in a person's terms — "now", "next start".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub applies: String,
 }
 
 /// One model a person can pick, as the host lists it.
@@ -390,6 +429,14 @@ mod tests {
                 session: "a".into(),
                 model: "glm-5".into(),
             },
+            HostCommand::Settings {
+                session: "a".into(),
+            },
+            HostCommand::SetSetting {
+                session: "a".into(),
+                id: "ui.theme".into(),
+                value: "dark".into(),
+            },
             HostCommand::SetMode {
                 session: "a".into(),
                 mode: Mode::Plan,
@@ -435,6 +482,8 @@ mod tests {
                 | HostCommand::RewindPoints { .. }
                 | HostCommand::Rewind { .. }
                 | HostCommand::SwitchModel { .. }
+                | HostCommand::Settings { .. }
+                | HostCommand::SetSetting { .. }
                 | HostCommand::SetMode { .. }
                 | HostCommand::ChangeDirectory { .. }
                 | HostCommand::Models { .. }
@@ -509,6 +558,15 @@ mod tests {
             HostReply::McpTools {
                 tools: vec!["fs__read".into(), "fs__write".into()],
             },
+            HostReply::Settings {
+                settings: vec![Setting {
+                    id: "ui.theme".into(),
+                    label: "主题".into(),
+                    value: "auto".into(),
+                    accepts: "auto | dark | light".into(),
+                    applies: "下次启动".into(),
+                }],
+            },
             HostReply::Models {
                 models: vec![
                     ModelChoice {
@@ -532,6 +590,7 @@ mod tests {
                 | HostReply::RewindPoints { .. }
                 | HostReply::McpServers { .. }
                 | HostReply::McpTools { .. }
+                | HostReply::Settings { .. }
                 | HostReply::Models { .. } => {}
             }
         }

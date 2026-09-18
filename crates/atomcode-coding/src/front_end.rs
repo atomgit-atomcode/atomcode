@@ -77,6 +77,23 @@ pub trait HostConfig: Send + Sync {
     fn fingerprint(&self) -> Option<String> {
         None
     }
+
+    /// The settings a person may change, with what each is set to now
+    /// (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` A3).
+    ///
+    /// The host's file, not the running graph: a screen that patched rows could
+    /// turn approval off under a running turn, which is what 0022 §7 removed.
+    /// Empty for a host that keeps no such file.
+    fn settings(&self) -> Vec<atomcode_kernel::host::Setting> {
+        Vec::new()
+    }
+
+    /// Set one, by the id [`Self::settings`] gave it. `Err` says why not — an
+    /// id nobody offers, or a value the setting does not accept.
+    fn set_setting(&self, id: &str, value: &str) -> Result<(), String> {
+        let _ = (id, value);
+        Err("这个宿主的配置不能从屏幕上改".into())
+    }
 }
 
 impl std::fmt::Debug for FrontEnd {
@@ -745,6 +762,32 @@ impl HostControl for RuntimeControl {
                         })
                         .collect(),
                 })
+            }
+            HostCommand::Settings { session } => {
+                self.addressed(&session)?;
+                Ok(HostReply::Settings {
+                    settings: self
+                        .front_end
+                        .host_config()
+                        .map(|source| source.settings())
+                        .unwrap_or_default(),
+                })
+            }
+            // Written to the host's file. Whether it takes effect now or at the
+            // next start is the setting's own business — said in the listing, so
+            // a person knows before they change it.
+            HostCommand::SetSetting { session, id, value } => {
+                self.addressed(&session)?;
+                let source = self
+                    .front_end
+                    .host_config()
+                    .ok_or_else(|| HostError::Failed {
+                        message: "这个宿主没有可改的配置".into(),
+                    })?;
+                source
+                    .set_setting(&id, &value)
+                    .map_err(|message| HostError::Failed { message })?;
+                Ok(HostReply::Done)
             }
             // The four a person means, onto the four this runtime has. `Ask` is
             // its `Build`: the names differ because the contract names what a

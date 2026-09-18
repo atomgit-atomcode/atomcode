@@ -120,6 +120,65 @@ pub mod tui_front {
             self.resolve(self.provider_override.as_deref())
         }
 
+        /// The settings catalog, with what the file says each is set to.
+        ///
+        /// The same catalog `/config` in the settings UI reads and the one the
+        /// agent is told about, so three readers cannot disagree about what is
+        /// editable.
+        fn settings(&self) -> Vec<atomcode_kernel::host::Setting> {
+            use atomcode_config::config::Config;
+            use atomcode_config::settings::{ApplyPolicy, SettingKind, SETTINGS};
+            let config = if self.path.exists() {
+                Config::load(&self.path).unwrap_or_default()
+            } else {
+                Config::default()
+            };
+            SETTINGS
+                .iter()
+                .map(|spec| atomcode_kernel::host::Setting {
+                    id: spec.id.to_string(),
+                    label: spec.label_zh.to_string(),
+                    value: spec.value(&config),
+                    accepts: match spec.kind {
+                        SettingKind::Boolean => "true | false".into(),
+                        SettingKind::OptionalBoolean => "true | false | 不设".into(),
+                        SettingKind::Integer { min, max } => format!("{min}–{max}"),
+                        SettingKind::Choice(values) => values.join(" | "),
+                        SettingKind::Text => String::new(),
+                    },
+                    applies: match spec.apply {
+                        ApplyPolicy::ImmediateUi => "立刻".into(),
+                        ApplyPolicy::NextTurn => "下一回合".into(),
+                        ApplyPolicy::AgentReassemble => "重装 agent 之后".into(),
+                        ApplyPolicy::CapabilityReprepare => "重载能力之后".into(),
+                        ApplyPolicy::NextStartup => "下次启动".into(),
+                    },
+                })
+                .collect()
+        }
+
+        /// Write one into the file, in place.
+        ///
+        /// `toml_edit` rather than serialize-the-whole-config: a person's file
+        /// has their comments and their ordering in it, and rewriting it whole
+        /// would quietly throw both away.
+        fn set_setting(&self, id: &str, value: &str) -> Result<(), String> {
+            use atomcode_config::settings::SETTINGS;
+            let spec = SETTINGS
+                .iter()
+                .find(|spec| spec.id == id)
+                .ok_or_else(|| format!("没有 `{id}` 这一项"))?;
+            let text = std::fs::read_to_string(&self.path).unwrap_or_default();
+            let mut document: toml_edit::DocumentMut =
+                text.parse().map_err(|e| format!("配置文件读不动:{e}"))?;
+            spec.patch(&mut document, value)
+                .map_err(|e| format!("`{value}` 不合适:{e}"))?;
+            if let Some(dir) = self.path.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(&self.path, document.to_string()).map_err(|e| e.to_string())
+        }
+
         /// The file's bytes, hashed. A file that has not been edited reads the
         /// same, and a reload then leaves the running graph where it is.
         ///
@@ -164,6 +223,64 @@ model = "vendor-a"
 account = "custom"
 model = "vendor-b"
 "#;
+
+        /// The settings a person may change are read from the file and written
+        /// back into it — keeping their comments and their ordering
+        /// (`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md` A3).
+        ///
+        /// Rewriting the file from a serialized config would pass this if it
+        /// only checked the value; the comment is what proves it was edited in
+        /// place, which is what a person's config file deserves.
+        #[test]
+        fn a_setting_is_read_from_the_file_and_written_back_into_it() {
+            use atomcode_coding::front_end::HostConfig;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, "# 我自己写的注释\n[ui]\ntheme = \"dark\"\n").unwrap();
+            let file = ConfigFile {
+                path: path.clone(),
+                working_dir: dir.path().to_path_buf(),
+                telemetry: None,
+                skip_permissions: false,
+                provider_override: None,
+            };
+
+            let listed = file.settings();
+            let theme = listed
+                .iter()
+                .find(|s| s.id == "ui.theme")
+                .expect("the theme is a setting a person may change");
+            assert_eq!(theme.value, "dark", "read from the file as it is");
+            assert!(
+                theme.accepts.contains("light"),
+                "and says what it accepts: {theme:?}"
+            );
+            assert!(!theme.applies.is_empty(), "and when it takes effect");
+
+            file.set_setting("ui.theme", "light").unwrap();
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(after.contains("\"light\""), "written: {after}");
+            assert!(
+                after.contains("# 我自己写的注释"),
+                "the person's own file survived the edit: {after}"
+            );
+            assert_eq!(
+                file.settings()
+                    .iter()
+                    .find(|s| s.id == "ui.theme")
+                    .map(|s| s.value.clone()),
+                Some("light".into()),
+                "and reading it again says the new value"
+            );
+
+            // A value the setting does not accept, and an id nobody offers, are
+            // both refused rather than written.
+            assert!(file.set_setting("ui.theme", "chartreuse").is_err());
+            assert!(file.set_setting("no.such.setting", "1").is_err());
+            assert!(std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"light\""));
+        }
 
         /// Which screen opens: the flag beats the setting, the setting beats the
         /// build's default, and `--classic` is the escape hatch that keeps
