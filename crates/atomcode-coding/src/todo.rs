@@ -330,6 +330,16 @@ actually working on as in_progress (`{\"action\":\"update\",\"id\":<id>,\"status
     None
 }
 
+/// The silent half of the anchor's demand. Reconciling the pointer can legitimately
+/// conclude "nothing to change", and without permission to say nothing the model reports
+/// the check back as prose ("#3 is accurate — mid-task"), which turns an injected reminder
+/// into part of the conversation. `todo-reminder`'s injection
+/// (`atomcode-harness/src/plugins/todo_reminder.rs`) has closed with
+/// "Do not mention this reminder to the user." all along; this one was missing it.
+const TODO_NO_REPLY: &str = "This is injected context, not a message to answer: if the pointer \
+above is already accurate, say nothing about it and keep working — never report that you checked \
+the list, and never repeat it back to the user.";
+
 /// The static "how to drive the list with `todowrite`" rules. These are CONSTANT
 /// guidance — the model already has them from the persona and from the round right
 /// after it (re)plans — so re-sending them on every execution round is pure wasted
@@ -385,11 +395,14 @@ impl LifecycleHooks for TodoHook {
         // the pretty version). Tail-append so the cached prefix is preserved.
         // The anchor line (mid-work drift backstop) leads, so the current in_progress
         // pointer is the first thing the model sees — above the list and the rules.
+        // The no-reply rule rides with the anchor (and only with it): the anchor is what
+        // asks for a reconcile, so that is where the permission to stay quiet belongs —
+        // a settled list carries neither and says nothing about a check nobody asked for.
         // The anchor + list ride EVERY round (the per-round drift backstop); the static
         // drive rules ride ONLY right after a (re)plan, to stop wasting cache re-sending
         // constant guidance every execution round.
         let anchor = todo_anchor_line(&todos)
-            .map(|a| format!("{a}\n\n"))
+            .map(|a| format!("{a}\n\n{TODO_NO_REPLY}\n\n"))
             .unwrap_or_default();
         let rules = if just_wrote_full_list(messages) {
             TODO_DRIVE_RULES
@@ -648,6 +661,49 @@ mod tests {
             "anchor must come before the list: {}",
             last.text
         );
+    }
+
+    #[tokio::test]
+    async fn a_correct_pointer_is_not_reported_back() {
+        // The anchor asks the model to reconcile its pointer, and "already correct" is a
+        // legitimate outcome — without explicit permission to stay quiet the model answers
+        // anyway, and the answer is a reminder that has become part of the conversation.
+        let mut msgs = vec![
+            Message::user("do it"),
+            todowrite_msg(r#"{"todos":[{"content":"step one","status":"in_progress"}]}"#),
+        ];
+        TodoHook::default()
+            .pre_request(&mut msgs, &TurnCtx::default())
+            .await;
+        let text = &msgs.last().unwrap().text;
+        assert!(
+            text.contains(TODO_NO_REPLY),
+            "the reconcile must come with permission to say nothing: {text}"
+        );
+        // It talks about the anchor's check, so it rides between anchor and list.
+        let anchor_at = text.find("currently ON task").expect("anchor leads");
+        let rule_at = text.find(TODO_NO_REPLY).expect("no-reply rule");
+        let list_at = text.find("Current task list").expect("list follows");
+        assert!(anchor_at < rule_at && rule_at < list_at, "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_settled_list_carries_no_reconcile_rule() {
+        // Every item completed → no anchor, so nothing asked for a check and nothing
+        // needs to excuse one. The rule must not ride along as dead weight.
+        let mut msgs = vec![
+            Message::user("do it"),
+            todowrite_msg(r#"{"todos":[{"content":"done","status":"completed"}]}"#),
+        ];
+        TodoHook::default()
+            .pre_request(&mut msgs, &TurnCtx::default())
+            .await;
+        let text = &msgs.last().unwrap().text;
+        assert!(
+            text.contains("Current task list"),
+            "list still rides: {text}"
+        );
+        assert!(!text.contains(TODO_NO_REPLY), "no check, no rule: {text}");
     }
 
     #[tokio::test]
