@@ -47,7 +47,7 @@ withdraw、reload、cancel-all。**加目录投影 5**:goal、loop、queue、pol
 | A10 | 轮次上限的继续/停止 | `round_cap_checkpoint` 已开,屏幕没有问法 | ask 面板扩展 |
 | A11 | `/mcp tools <server>` | 句柄 `mcp_tools`;`/mcp` 只给状态 | 命令 |
 | A12 | **列出可选模型**(契约缺口) | `ModelsSvc::list`(`harness/model_source.rs:92`)在 agent 树里,契约没有对应命令,屏幕读不到 ⇒ `/model` 只能打全名 | 先补契约,再给 `/model` 选择器 |
-| A13 | **用量与额度**(契约缺口) | `RateLimitWindowSource`(`on_harness.rs:1312`)在 coding 树里,契约既无命令也不在 `Described`;`SessionEvent::Usage` 只有本会话 token | 先补契约,再谈 `/usage`、`/cost` |
+| A13 | **用量与额度**(契约缺口) | `RateLimitWindowSource`(`on_harness.rs:1312`)在 coding 树里,契约既无命令也不在 `Described`;`SessionEvent::Usage` 只有本会话 token | ✅ 2026-09-18 晚:`HostCommand::Usage` + `UsageWindow` + 运行时 `usage()`(3 秒上限、取不到答空表) + tui `/usage`。**面板另算** |
 
 ## B 对照查漏后要做的
 
@@ -84,7 +84,7 @@ withdraw、reload、cancel-all。**加目录投影 5**:goal、loop、queue、pol
 | B2-10 | `/think on\|off` | 与 `/effort` 是两个旋钮:要不要思考 vs 思考多狠  ✅ c7f87718 |
 | B2-11 | `/paste [路径]` | 兜 Windows 下 Ctrl+V 被按键层拦截、ohos 读不到剪贴板  ✅ 下一个提交 |
 | B2-12 | 输入框上沿 rule | 会话名、历史位置、反向搜索指示  ✅ 722fb501 |
-| B2-13 | goal / loop 状态行 | 自主循环在跑时的轮次与耗时  ⏳ 一半:`/autonomy` 能问到「第几轮、跑了多久」(`HostCommand::Autonomy`,与 `McpStatus` 同形状)。**常驻状态行还欠**:那要一条推送通道 |
+| B2-13 | goal / loop 状态行 | 自主循环在跑时的轮次与耗时  ⏳ 通道已通,只剩画:`/autonomy` 问得到(`HostCommand::Autonomy`),`HostEvent::Autonomy` 每轮推,`Moment::autonomy` 存着(`plugin::took_autonomy`,两条判据:同一轮不重画、别人的会话不上自己的行)。**那一行本身归面板那边** |
 | B2-14 | @文件 / $skill 补全菜单 | tui 只有斜杠菜单  @文件 ✅ 下一个提交;**$skill 不做**——本前端每个可被人调用的 skill 已经是一条 `/` 命令(B1),再开一套 `$` 语法是第二个入口 |
 | B2-15 | ghost 提示 | 空输入框里的下一步建议,右方向键接受  ✅ ghost 做完:来源是**本会话历史**(fish/zsh 那种),右方向键接受。不问模型、不发明建议 |
 | B2-16 | 终端标题 | 会话名进窗口标题  ✅ 下一个提交(顺带:`SessionEvent::Titled` 之前 tui 里没人消费) |
@@ -103,7 +103,7 @@ tuix 的富交互全在 `modals/`，**16,824 行**。逐个对：
 | `onboarding_wizard` | 2336 | **无** | P0-2 首启登录引导，一直挂着 |
 | `session_picker` | 2185 | `/resume` Picker（已补时间与目录） | 没搜索、没删除、没预览 |
 | `plugin_manager` | 2102 | 判「归 CLI」 | 判定可辩，但确实没有 |
-| `usage` + `usage_render` | 1782 | **无** | A13，卡在限速缝 |
+| `usage` + `usage_render` | 1782 | `/usage` 一条命令 | 缝已开（`UsageWindow`），**图没画** |
 | `dir_picker` | 981 | `/cd` 已改成可浏览 | 没搜索、没书签 |
 | `file_viewer` | 869 | `/view` 的 `Reading`，约 60 行 | 没搜索、没语法色 |
 | `model_picker` | 735 | `/model` Picker | 没分组、没能力标注 |

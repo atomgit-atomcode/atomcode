@@ -1777,6 +1777,24 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    /// What the account has left to spend, window by window.
+    ///
+    /// Best-effort and bounded: the source is a network call, and a person
+    /// asking "how much have I got left" must not be made to wait on it. No
+    /// source, a slow one or a failing one all answer with an empty list, which
+    /// says "this host does not meter" in the only way a front end can act on.
+    pub async fn usage(&self) -> Result<Vec<crate::rate_limit::RateLimitWindow>, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::Usage {
+                generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     /// What this session has changed in the workspace — every file, or one
     /// file's diff.
     pub async fn workspace_changes(
@@ -2447,6 +2465,11 @@ pub enum CodingRuntimeControl {
     Autonomy {
         generation: u64,
         done: oneshot::Sender<Result<Autonomy, RuntimeError>>,
+    },
+    /// The account's remaining allowance, as rolling windows.
+    Usage {
+        generation: u64,
+        done: oneshot::Sender<Result<Vec<crate::rate_limit::RateLimitWindow>, RuntimeError>>,
     },
     /// What this session has changed in the workspace. `file` asks for one
     /// file's diff text instead of the summary of all of them.
@@ -3936,6 +3959,37 @@ fn spawn_runtime_owner_with_optional_agent(
                             goal: goal.as_ref().map(|state| state.progress()),
                             looping: loop_state.as_ref().map(|state| state.progress()),
                         }));
+                    }
+                    // Bounded, and off the loop: the source is an HTTP call,
+                    // and this loop is what every turn goes through. Three
+                    // seconds is the same budget `resolve_goal_round_cap` gives
+                    // it — a person asking what is left waits no longer than a
+                    // goal starting does.
+                    Some(CodingRuntimeControl::Usage {
+                        generation: request_generation,
+                        done,
+                    }) => {
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let source = resources
+                            .as_ref()
+                            .and_then(|runtime| runtime.parts.rate_limit_source().cloned());
+                        tokio::spawn(async move {
+                            let windows: Vec<crate::rate_limit::RateLimitWindow> = match source {
+                                Some(source) => tokio::time::timeout(
+                                    std::time::Duration::from_secs(3),
+                                    source.fetch_windows(),
+                                )
+                                .await
+                                .ok()
+                                .and_then(|fetched| fetched.ok())
+                                .unwrap_or_default(),
+                                None => Vec::new(),
+                            };
+                            let _ = done.send(Ok(windows));
+                        });
                     }
                     // Reading only: unlike the rewind catalog this does not
                     // refuse while a turn is running. Looking at what has
@@ -7315,6 +7369,9 @@ fn reject_runtime_control(
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::Autonomy { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::Usage { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::BeginRewind { done, .. } => {

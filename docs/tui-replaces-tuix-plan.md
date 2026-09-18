@@ -259,6 +259,23 @@ tuix 的老毛病——现在改是十几行,等下游移植完再改就是他�
 - **回合引擎改名**,解决与 harness `Agent` 撞名(0021 §6)。
 - **可调布局**:想清楚再说(0022 §8)。
 
+## 三点五、一条既有的红:coding 的 datalog 判据在并发下会挂
+
+`atomcode-coding::mount_wiring::the_configured_datalog_records_the_turn`
+(`crates/atomcode-coding/tests/mount_wiring.rs:126`)——断言落盘的 markdown 里有
+`**Response:**`。
+
+**不是本线改出来的,已经核过**:2026-09-18 晚把工作树倒回 `d3591cd1`(本线已推送的
+那个提交)单独重跑,`cargo nextest run -p atomcode-coding` 全量 612 条同样挂这一条;
+而只跑 `mount_wiring` 那一个 binary(4 条)两边都过。**只在并发压力下挂**,单独跑必过
+——所以它是个竞态,不是断言写错。
+
+线索:写的那一段在 `capabilities/src/datalog.rs:290`,`if !state.active { return; }`
+之后按 `response.tool_calls.is_empty()` 分两种写法,只有空工具调用那一支才写
+`**Response:**`。要么是 append 还没落盘测试就读了,要么并发下走到了另一支。
+**没有继续追**:不在本线范围,但别让它烂在这里当"偶尔红一下"——那种红最后会训练所有人
+无视闸门。
+
 ## 四、每步交付前必过的门
 
 ```sh

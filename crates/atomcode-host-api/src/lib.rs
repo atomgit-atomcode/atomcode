@@ -136,6 +136,13 @@ pub enum HostCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         file: Option<String>,
     },
+    /// What the account has left to spend, as rolling windows.
+    ///
+    /// Separate from the token counts a turn reports: those say what this
+    /// conversation cost, this says what the account may still do and when a
+    /// spent window comes back. A host that meters nothing answers with an
+    /// empty list — which is an answer, not a failure.
+    Usage { session: String },
     /// Whether `session`'s requests carry thinking at all, as a setting to read.
     Thinking { session: String },
     /// Turn thinking on or off for `session` from now on.
@@ -173,6 +180,7 @@ impl HostCommand {
             | Self::Changes { session, .. }
             | Self::Providers { session }
             | Self::Autonomy { session }
+            | Self::Usage { session }
             | Self::Thinking { session }
             | Self::SetThinking { session, .. } => Some(session),
             Self::ListSessions { .. } => None,
@@ -233,6 +241,11 @@ pub enum HostReply {
     Autonomy {
         running: Option<Running>,
     },
+    /// What the account has left, window by window. Empty for a host that
+    /// meters nothing.
+    Usage {
+        windows: Vec<UsageWindow>,
+    },
     /// The providers a person may switch between. `current` is the one this
     /// conversation runs on, when the host knows it.
     Providers {
@@ -291,6 +304,29 @@ pub struct Running {
     /// Why it is not running right now, when it is registered but paused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused: Option<String>,
+}
+
+/// One rolling window of an account's allowance.
+///
+/// Phrased as a person reads it rather than as a provider bills it: a name, an
+/// exhausted flag, and how long until it comes back. No money and no
+/// percentages — what a front end needs to say "you are out until 14:30", and
+/// nothing a host would have to invent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageWindow {
+    /// What the window is called, in the person's own terms — "5 小时", "每周".
+    pub label: String,
+    /// Nothing left in it right now.
+    pub exhausted: bool,
+    /// When it comes back, as the host words it. Empty when it is not waiting.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resets_at: String,
+    /// Seconds until then, so a screen can count down without agreeing with the
+    /// host about what time it is (`docs/adr/0008`). `0` when nothing is waiting.
+    pub resets_in_seconds: i64,
+    /// How many model requests the window allows, when the host knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_limit: Option<i64>,
 }
 
 /// One provider a person may switch to.
@@ -430,6 +466,16 @@ pub enum HostEvent {
     SessionChanged {
         session: String,
         previous: Option<String>,
+    },
+    /// What the session is doing on its own changed — a round finished, a goal
+    /// ended, a loop paused.
+    ///
+    /// The same payload [`HostReply::Autonomy`] answers with, so a status line
+    /// that follows this and a `/autonomy` that asks cannot end up saying
+    /// different things. `None` is "not any more".
+    Autonomy {
+        session: String,
+        running: Option<Running>,
     },
 }
 
@@ -572,6 +618,9 @@ mod tests {
             HostCommand::Models {
                 session: "a".into(),
             },
+            HostCommand::Usage {
+                session: "a".into(),
+            },
             HostCommand::Rename {
                 session: "a".into(),
                 title: "配置重构".into(),
@@ -631,6 +680,7 @@ mod tests {
                 | HostCommand::SetMode { .. }
                 | HostCommand::ChangeDirectory { .. }
                 | HostCommand::Models { .. }
+                | HostCommand::Usage { .. }
                 | HostCommand::Rename { .. }
                 | HostCommand::McpStatus { .. }
                 | HostCommand::McpTools { .. }
@@ -762,6 +812,15 @@ mod tests {
                 who: Some("lichao".into()),
                 detail: Some("atomgit".into()),
             },
+            HostReply::Usage {
+                windows: vec![UsageWindow {
+                    label: "5 小时".into(),
+                    exhausted: true,
+                    resets_at: "14:30".into(),
+                    resets_in_seconds: 3600,
+                    call_limit: Some(1000),
+                }],
+            },
         ];
         for r in &all {
             match r {
@@ -777,6 +836,7 @@ mod tests {
                 | HostReply::Changes { .. }
                 | HostReply::Providers { .. }
                 | HostReply::Autonomy { .. }
+                | HostReply::Usage { .. }
                 | HostReply::Identity { .. } => {}
             }
         }
@@ -784,13 +844,26 @@ mod tests {
     }
 
     fn events() -> Vec<HostEvent> {
-        let all = vec![HostEvent::SessionChanged {
-            session: "b".into(),
-            previous: Some("a".into()),
-        }];
+        let all = vec![
+            HostEvent::SessionChanged {
+                session: "b".into(),
+                previous: Some("a".into()),
+            },
+            HostEvent::Autonomy {
+                session: "b".into(),
+                running: Some(Running {
+                    kind: "goal".into(),
+                    what: "测试全绿".into(),
+                    round: 3,
+                    of: Some(40),
+                    elapsed_secs: 90,
+                    paused: None,
+                }),
+            },
+        ];
         for e in &all {
             match e {
-                HostEvent::SessionChanged { .. } => {}
+                HostEvent::SessionChanged { .. } | HostEvent::Autonomy { .. } => {}
             }
         }
         all

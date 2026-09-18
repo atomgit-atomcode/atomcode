@@ -262,6 +262,14 @@ pub struct Moment {
     /// a module that folded "is a question waiting?" from facts would be folding
     /// something that is not in them. See `modules::ask`.
     pub asking: Option<Ask>,
+    /// What the session is doing on its own, as the host last said.
+    ///
+    /// Pushed, not polled: the host announces it when a round lands, so a line
+    /// that draws from this moves on its own. Here rather than folded from the
+    /// log for the reason [`Moment::asking`] is — a goal's round counter is not
+    /// a fact about the conversation, it is the state of something running
+    /// beside it. `None` is "not driving itself".
+    pub autonomy: Option<atomcode_host_api::Running>,
     /// The session this screen follows: the lead, when there is a team.
     pub lead: String,
     /// The session on screen — the lead, or one of its members the person

@@ -157,6 +157,27 @@ pub fn connect(
                         });
                     }
                 }
+                // Pushed, not polled. A status line that has to ask cannot
+                // show a round counter moving, and a screen that polled would
+                // be asking a busy runtime a question it already knows the
+                // answer to. The payload is the one `Autonomy` answers with, so
+                // the line and the command cannot disagree.
+                CodingRuntimeEvent::GoalChanged(progress) => {
+                    let session = watched.session.lock().expect("session poisoned").clone();
+                    let ended = progress.terminal.is_some();
+                    watched.announce(HostEvent::Autonomy {
+                        session,
+                        running: (!ended).then(|| running_of_goal(progress)),
+                    });
+                }
+                CodingRuntimeEvent::LoopChanged(progress) => {
+                    let session = watched.session.lock().expect("session poisoned").clone();
+                    let stopped = !progress.active;
+                    watched.announce(HostEvent::Autonomy {
+                        session,
+                        running: (!stopped).then(|| running_of_loop(progress)),
+                    });
+                }
                 CodingRuntimeEvent::ProviderChanged { .. }
                 | CodingRuntimeEvent::ReasoningEffortChanged { .. } => {
                     if let Some(app) = watched.front_end.app() {
@@ -377,6 +398,30 @@ async fn run(
 
 /// A runtime event in the handle protocol's words, when the front end is owed
 /// one. Session changes and descriptions are handled by the caller.
+/// A goal, as the contract says a self-driving session.
+fn running_of_goal(goal: atomcode_coding::GoalProgress) -> atomcode_host_api::Running {
+    atomcode_host_api::Running {
+        kind: "goal".into(),
+        what: goal.condition,
+        round: goal.round,
+        of: goal.max_rounds,
+        elapsed_secs: goal.elapsed_secs,
+        paused: (!goal.active).then(|| format!("{:?}", goal.phase)),
+    }
+}
+
+/// A loop, the same way. No `of`: a loop repeats until it is stopped.
+fn running_of_loop(looping: atomcode_coding::LoopProgress) -> atomcode_host_api::Running {
+    atomcode_host_api::Running {
+        kind: "loop".into(),
+        what: looping.label,
+        round: looping.round,
+        of: None,
+        elapsed_secs: looping.elapsed_secs,
+        paused: (!looping.active).then(|| "停着".to_string()),
+    }
+}
+
 fn translate(event: CodingRuntimeEvent) -> Option<AgentEvent> {
     match event {
         CodingRuntimeEvent::Agent(event) => Some(event),
@@ -887,25 +932,30 @@ impl HostControl for RuntimeControl {
                 // waiting on the goal.
                 let running = now
                     .goal
-                    .map(|g| atomcode_host_api::Running {
-                        kind: "goal".into(),
-                        what: g.condition,
-                        round: g.round,
-                        of: g.max_rounds,
-                        elapsed_secs: g.elapsed_secs,
-                        paused: (!g.active).then(|| format!("{:?}", g.phase)),
-                    })
-                    .or_else(|| {
-                        now.looping.map(|l| atomcode_host_api::Running {
-                            kind: "loop".into(),
-                            what: l.label,
-                            round: l.round,
-                            of: None,
-                            elapsed_secs: l.elapsed_secs,
-                            paused: (!l.active).then(|| "stopped".to_string()),
-                        })
-                    });
+                    .map(running_of_goal)
+                    .or_else(|| now.looping.map(running_of_loop));
                 Ok(HostReply::Autonomy { running })
+            }
+            // Best-effort by contract: a host that meters nothing, and a source
+            // that is slow or down, both answer with an empty list. "I could not
+            // reach the meter" and "there is no meter" look the same to a person
+            // — neither is a number — and making this fail would make `/usage`
+            // the one command that breaks when the network hiccups.
+            HostCommand::Usage { session } => {
+                self.addressed(&session)?;
+                let windows = self.handle.usage().await.map_err(refused)?;
+                Ok(HostReply::Usage {
+                    windows: windows
+                        .into_iter()
+                        .map(|w| atomcode_host_api::UsageWindow {
+                            label: w.reset_label,
+                            exhausted: w.quota_exhausted,
+                            resets_at: w.reset_at_display,
+                            resets_in_seconds: w.seconds_until_reset,
+                            call_limit: (w.call_limit > 0).then_some(w.call_limit),
+                        })
+                        .collect(),
+                })
             }
             HostCommand::Providers { session } => {
                 self.addressed(&session)?;

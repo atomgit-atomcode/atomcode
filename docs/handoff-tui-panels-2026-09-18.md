@@ -49,12 +49,19 @@
 5. **`/model`**（对面 735 行）——没分组、没能力标注
 6. **`/cd`**（对面 `dir_picker` 981 行）——没搜索、没书签
 
-### P2 —— 被前置卡住，不是忘了做
+### P2 —— 前置已经打通（2026-09-18 晚补）
 
-- **`/usage`**（对面 1782 行）：契约里**没有** `Usage` / `Quota` / `RateLimit`
-  任何一条（`Models` 有了）。缝没开之前做不了。**这条前置由我做**。
-- **常驻 goal / loop 状态行**：runtime 每轮发 `GoalChanged`，但屏幕订阅不到那条流。
-  缺的是**推送通道**不是面板。**这条前置也由我做**。
+这两条原本写的是「被前置卡住」，现在**缝已经开好了**，面板可以直接动手：
+
+- **`/usage`**（对面 1782 行）：契约有了 `HostCommand::Usage` / `HostReply::Usage`
+  与 `UsageWindow`（名字、用完没有、什么时候回来、上限），宿主侧接到
+  `RateLimitWindowSource`，tui 侧已有一条 `/usage` 命令把它说成话。**面板要做的
+  是把这份数据画成 1782 行那种图**，数据不用再找。注意契约是 best-effort 的：
+  取不到和不计额度都答空表，别把空表画成错误。
+- **常驻 goal / loop 状态行**：`HostEvent::Autonomy` 是推送的，宿主每轮announce，
+  `Moment::autonomy` 已经在存了（`plugin::took_autonomy`，带判据）。**面板要做的
+  只剩画那一行**，`Moment` 里读得到，不用订阅任何流。它和 `/autonomy` 共用
+  `Running` 这一个类型，所以行和命令不会说出两套话。
 - **`/plugin` 市场面板**：判归 CLI，理由在清单 B2-5。判定可辩，想推翻就推翻，
   但要连着 `/upgrade` `/webui` 一起重判，别只翻这一条。
 
@@ -103,7 +110,7 @@ bash gates/tui.sh && bash gates/layers.sh
    引用 `capabilities`）；`atomcode-daemon` 该是 cli 的一个 `[[bin]]`；
    `atomcode-auth` 该拆成 Product 的那半（gateway_crypto / oauth / openrouter）和
    Host 的那半（凭据文件读写）。
-3. **两条契约缺口**：用量/额度（挡着 `/usage`）、goal/loop 推送通道（挡着常驻状态行）。
-   这两条是上面 P2 的前置。
+3. ~~**两条契约缺口**~~ **已做**（2026-09-18 晚）：用量/额度、goal/loop 推送通道。
+   见上面 P2。
 4. **M6.5** 删不再挂载的代码：runtime 驱动协议、coding `team/`、
    capabilities `tools/task.rs` 的委派部分。先做可达性测绘再删。

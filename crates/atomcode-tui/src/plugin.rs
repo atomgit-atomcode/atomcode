@@ -928,6 +928,13 @@ impl UserInterface for Tui {
                     }
                     stale = true;
                 }
+                // What the session is doing on its own. Kept, not said: a
+                // round landing is not news to read, it is a number to watch,
+                // and saying it every round would bury the conversation under
+                // its own progress bar.
+                Wake::Host(HostEvent::Autonomy { session, running }) => {
+                    stale |= took_autonomy(&self.host.moment, &session, running);
+                }
                 Wake::Host(_) => {}
                 Wake::Act(action) => {
                     quit = self.act(action, &client);
@@ -2410,6 +2417,30 @@ fn transcript_text(stream: &Stream, width: u16) -> String {
     out
 }
 
+/// Take the host's word for what a session is doing on its own.
+///
+/// A separate function because the loop it is called from cannot be reached
+/// from a criterion, and "did the screen keep what the host pushed" is exactly
+/// the thing worth asserting. Returns whether anything moved.
+///
+/// News about a session nobody is looking at is dropped: a member running a
+/// goal must not overwrite the lead's status line.
+pub fn took_autonomy(
+    moment: &std::sync::RwLock<crate::moment::Moment>,
+    session: &str,
+    running: Option<atomcode_host_api::Running>,
+) -> bool {
+    let mut m = moment.write().expect("moment poisoned");
+    if m.viewing != session && m.lead != session {
+        return false;
+    }
+    if m.autonomy == running {
+        return false;
+    }
+    m.autonomy = running;
+    true
+}
+
 /// Take the ghost into the field, if the caret is at the end and there is one.
 ///
 /// `true` when it took something, which is the caller's cue that right meant
@@ -2902,6 +2933,75 @@ mod history_tests {
         recall_back(&mut m);
         recall_forward(&mut m);
         assert_eq!(m.input, "mine");
+    }
+}
+
+#[cfg(test)]
+mod autonomy_tests {
+    use super::took_autonomy;
+    use crate::moment::Moment;
+    use std::sync::RwLock;
+
+    fn running(round: u32) -> atomcode_host_api::Running {
+        atomcode_host_api::Running {
+            kind: "goal".into(),
+            what: "测试全绿".into(),
+            round,
+            of: Some(40),
+            elapsed_secs: 90,
+            paused: None,
+        }
+    }
+
+    /// A status line can only move on its own if something pushes to it. The
+    /// host announces each round; the screen keeps the latest.
+    ///
+    /// The three answers that matter are different: a new round moved
+    /// something, the same round did not (a screen that redrew on every
+    /// identical announcement would blink for no reason), and the end clears it
+    /// rather than leaving the last round on screen forever.
+    #[test]
+    fn the_screen_keeps_what_the_host_pushes_about_a_running_goal() {
+        let moment = RwLock::new(Moment {
+            lead: "lead".into(),
+            viewing: "lead".into(),
+            ..Moment::default()
+        });
+
+        assert!(took_autonomy(&moment, "lead", Some(running(3))));
+        assert_eq!(
+            moment.read().unwrap().autonomy.as_ref().map(|r| r.round),
+            Some(3)
+        );
+        // The same news again is not news.
+        assert!(!took_autonomy(&moment, "lead", Some(running(3))));
+        assert!(took_autonomy(&moment, "lead", Some(running(4))));
+        // Over: the line goes away rather than freezing on round 4.
+        assert!(took_autonomy(&moment, "lead", None));
+        assert!(moment.read().unwrap().autonomy.is_none());
+    }
+
+    /// A member running a goal must not write on the lead's line.
+    ///
+    /// Sessions are announced by name for this reason: with a team, several are
+    /// running at once, and what is drawn belongs to the one on screen.
+    #[test]
+    fn news_about_a_session_nobody_is_watching_is_dropped() {
+        let moment = RwLock::new(Moment {
+            lead: "lead".into(),
+            viewing: "lead".into(),
+            ..Moment::default()
+        });
+        assert!(!took_autonomy(&moment, "member-2", Some(running(9))));
+        assert!(moment.read().unwrap().autonomy.is_none());
+
+        // Switch to that member and it is that member's line.
+        moment.write().unwrap().viewing = "member-2".into();
+        assert!(took_autonomy(&moment, "member-2", Some(running(9))));
+        assert_eq!(
+            moment.read().unwrap().autonomy.as_ref().map(|r| r.round),
+            Some(9)
+        );
     }
 }
 

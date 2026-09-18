@@ -329,6 +329,7 @@ const SESSION: &[Command] = &[
     Command::new("auto", "全不问(等于 /mode auto)"),
     Command::new("status", "这次会话现在是什么状况:模型、模式、在哪、跑到第几回合"),
     Command::new("cost", "这次会话用掉多少 token(等于 /context)"),
+    Command::new("usage", "账号还剩多少额度,哪个窗口用完了、什么时候回来"),
     Command::taking(
         "config",
         "[项 值]",
@@ -1144,6 +1145,53 @@ impl CommandSet for SessionCommands {
             // is its own and this screen is not on it — so this asks. An
             // always-on status line would want the push instead; that is the
             // part still owed (B2-13's second half).
+            // What `/cost` cannot answer: that one is this conversation's
+            // token bill, this is the account's remaining allowance. Two
+            // questions that sound alike and have different answers — a person
+            // can be cheap this session and still be locked out until 14:30.
+            "usage" => {
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refusal) => return refusal,
+                };
+                match control.call(HostCommand::Usage { session: root }).await {
+                    Ok(HostReply::Usage { windows }) if windows.is_empty() => {
+                        Outcome::Said("这个宿主不计额度".into())
+                    }
+                    Ok(HostReply::Usage { windows }) => Outcome::Said(
+                        windows
+                            .into_iter()
+                            .map(|w| {
+                                let cap = w
+                                    .call_limit
+                                    .map(|n| format!(" · 上限 {n} 次"))
+                                    .unwrap_or_default();
+                                if w.exhausted {
+                                    // The one line a person actually needs, and
+                                    // the reason this is not `/cost`.
+                                    format!(
+                                        "{} 用完了 · {}回来{}",
+                                        w.label,
+                                        if w.resets_at.is_empty() {
+                                            crate::text::spoken_duration(
+                                                w.resets_in_seconds.max(0) as u64
+                                            ) + "后"
+                                        } else {
+                                            format!("{} ", w.resets_at)
+                                        },
+                                        cap
+                                    )
+                                } else {
+                                    format!("{} 还有{cap}", w.label)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                    Ok(other) => Outcome::Refused(format!("宿主答了别的:{other:?}")),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
             "autonomy" => {
                 let control = match host(control) {
                     Ok(control) => control,
@@ -1741,6 +1789,69 @@ mod tests {
             ]
         );
     }
+    /// `/usage` answers what `/cost` cannot: not what this conversation spent,
+    /// but what the account may still do and when a spent window comes back.
+    ///
+    /// The distinction is the point of the command — a person can be cheap this
+    /// session and still be locked out — so the criterion checks the exhausted
+    /// window says *when*, which is the only part they can act on.
+    #[tokio::test]
+    async fn usage_says_what_is_left_and_when_a_spent_window_comes_back() {
+        let host = Arc::new(Recording::default());
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::Usage {
+                windows: vec![
+                    atomcode_host_api::UsageWindow {
+                        label: "5 小时".into(),
+                        exhausted: true,
+                        resets_at: "14:30".into(),
+                        resets_in_seconds: 3600,
+                        call_limit: Some(1000),
+                    },
+                    atomcode_host_api::UsageWindow {
+                        label: "每周".into(),
+                        exhausted: false,
+                        resets_at: String::new(),
+                        resets_in_seconds: 0,
+                        call_limit: None,
+                    },
+                ],
+            }),
+            Ok(HostReply::Usage {
+                windows: Vec::new(),
+            }),
+        ]);
+        let (app, _client, all) = following(&host);
+
+        match all.dispatch("/usage", &app.context()).await {
+            Outcome::Said(text) => {
+                assert!(text.contains("5 小时") && text.contains("用完了"), "{text}");
+                // When it comes back is the only actionable part.
+                assert!(text.contains("14:30"), "{text}");
+                assert!(text.contains("1000"), "{text}");
+                assert!(text.contains("每周") && text.contains("还有"), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A host that meters nothing says so. Not a refusal: there is nothing
+        // wrong, there is just no meter.
+        match all.dispatch("/usage", &app.context()).await {
+            Outcome::Said(text) => assert!(text.contains("不计额度"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            *host.asked.lock().unwrap(),
+            vec![
+                HostCommand::Usage {
+                    session: "lead".into()
+                },
+                HostCommand::Usage {
+                    session: "lead".into()
+                },
+            ]
+        );
+    }
+
     /// `/cd` browses. Before this it took a path a person had to already know,
     /// and tuix had a picker for exactly that reason (`modals/dir_picker.rs`).
     ///
