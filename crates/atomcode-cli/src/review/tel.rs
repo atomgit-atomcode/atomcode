@@ -1,13 +1,12 @@
 //! Telemetry for the standalone CLI.
 //!
-//! `atomcodex` is decoupled from atomcode-core, so it builds its OWN telemetry sink
-//! (mirroring atomcode-cli's resolve → init) and wires it into both subcommands:
-//!   - `code` sets [`CodingAgentConfig::telemetry`](atomcode_coding::CodingAgentConfig),
-//!     lighting up the full host-loop instrumentation (the turn-level TelemetryHook + tool
-//!     middleware + the review-slot `MeteredProvider`);
-//!   - `review` runs a STANDALONE review agent with NO turn-level hook, so its provider is
-//!     wrapped with [`meter_provider`] here — otherwise its LLM rounds emit no telemetry and
-//!     the review's token spend is invisible (the whole point of this module).
+//! `review` runs a STANDALONE review agent with NO turn-level hook, so its provider is
+//! wrapped with [`meter_provider`] here — otherwise its LLM rounds emit no telemetry and
+//! the review's token spend is invisible, which is the whole point of this module.
+//!
+//! It resolves and initialises its own sink rather than reaching for the one the
+//! interactive CLI builds: `atomcode review` is a one-shot that never starts a
+//! session, so there is no host loop whose telemetry it could join.
 //!
 //! Opt-out is honored by `resolve`: `DO_NOT_TRACK=1`, `ATOMCODE_TELEMETRY=0`,
 //! `--no-telemetry`, or `[telemetry] enabled = false` in config.toml. A disabled sink makes
@@ -55,7 +54,7 @@ struct TelFile {
 fn load_telemetry_config(config_override: Option<&Path>) -> TelemetryConfig {
     let path = match config_override {
         Some(p) => p.to_path_buf(),
-        None => match crate::default_config_path() {
+        None => match super::default_config_path() {
             Some(p) => p,
             None => return TelemetryConfig::default(),
         },

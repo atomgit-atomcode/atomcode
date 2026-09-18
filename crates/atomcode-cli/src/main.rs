@@ -15,6 +15,7 @@ use clap::{ArgGroup, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 mod headless_json;
+mod review;
 mod schedule_cmd;
 mod schedule_os;
 mod telemetry_cmd;
@@ -917,6 +918,12 @@ enum Commands {
     /// codingplan` were folded into the unified `/login` flow.
     #[command(hide = true)]
     Codingplan,
+    /// Review a diff and report structured findings, then exit.
+    ///
+    /// The one-shot form: no session, no screen. `/review` inside a session is
+    /// the same agent reached the other way. Takes a git range, a PR, or a diff
+    /// on stdin — `glab mr diff 5 | atomcode review --diff-file -`.
+    Review(review::ReviewArgs),
     /// Manage MCP server entries in `.mcp.json` (similar to `claude mcp add`)
     #[command(subcommand)]
     Mcp(McpCli),
@@ -3623,6 +3630,9 @@ async fn handle_command(cmd: Commands, telemetry: &std::sync::Arc<Telemetry>) ->
         }
         Commands::Telemetry { .. } => {
             unreachable!("Telemetry is handled inline in run() before handle_command")
+        }
+        Commands::Review(args) => {
+            return review::review(args).await;
         }
         Commands::Daemon { .. } => {
             unreachable!("Daemon is handled inline in run() before handle_command")

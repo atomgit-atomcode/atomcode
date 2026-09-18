@@ -25,7 +25,7 @@ UI 只认中立协议;凡是往共享集合里放东西的,**都要能被声明�
 | 贡献写入点 | 2 个 chokepoint + **4 个绕过** + 2 个 projections |
 | `$ATOMCODE_HOME` 被读 | **3 次**(其中 2 次在 L1 `capabilities`) |
 | `expand_env_vars` 实现 | **2 份**(`config/provider.rs:332`、`capabilities/mcp/config.rs:524`) |
-| 入口 | **5 个**:`atomcode`、`atomcode-clix`、`atomcode-daemon`、`atui`、`harness` |
+| 入口 | 曾经 **5 个**:`atomcode`、`atomcode-clix`、`atomcode-daemon`、`atui`、`harness`。2026-09-19 已删两个:`atomcode-clix`(`code`/`sessions` 与主 CLI 重复,`review` 搬成 `atomcode review`)与 `harness`(机制层不该有产品入口) |
 | 闸门 | `gates/tui*.sh`(5 个)、`differential.baseline` |
 | CI | `build.yml`(macos/linux/windows/distro-pm)、`check.yml`(gate + lint) |
 
@@ -146,7 +146,7 @@ W3 贡献可声明 (最小,先验证)
    - (b) 新 crate。
    AGENTS.md 明写「不预设必须先创建 `atomcode-protocol`…否则复用现有 kernel/coding 中立类型」,所以我倾向 **(a)**;但 `SessionLog` 是 harness 的会话模型,搬进 kernel 会让 kernel 知道会话持久化的形状——**这一条要你点头**。
 
-2. **范围**:`atomcode-clix` 与 `atomcode-cli` 里的**旧 tuix 栈**算不算这次「唯一入口」?
+2. **范围**:`atomcode-cli` 里的**旧 tuix 栈**算不算这次「唯一入口」?(`atomcode-clix` 已于 2026-09-19 删除,不再是问题)
    今天 `atomcode` 就是旧栈在跑。若含,工作量与验证面完全不同(旧栈有差分基线要守)。
 
 3. **`harness` 二进制**:删除,还是留成不带产品承诺的 dev 驱动?留着的唯一价值是不必为了

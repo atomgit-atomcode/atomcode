@@ -36,6 +36,9 @@ atomcode-tuix = { path = "../atomcode-tuix" }
 # through the two front-end contracts (docs/adr/0021, docs/adr/0022).
 atomcode-tui = { path = "../atomcode-tui" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
+# `atomcode review`:一次性评审一份 diff。原来是 `atomcode-clix` 那个独立二进制,
+# 它的另外两个子命令与这里完全重复,所以整个 crate 删掉、review 搬了过来。
+atomcode-review = { path = "../atomcode-review" }
 atomcode-daemon = { path = "../atomcode-daemon" }
 # ACP (Agent Client Protocol) stdio server — the `atomcode acp` subcommand's engine
 # lives in `src/acp/`. It composes the v2 stack directly, so cli pulls the layers acp
@@ -107,6 +110,10 @@ futures = "0.3"
 # #[ctor] in main.rs's #[cfg(test)] module + every tests/*.rs binary) so tests
 # never persist into the developer's real ~/.atomcode.
 atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
+# 可捕获的内存 telemetry sink,给 `atomcode review` 的计量判据用
+# (它随 `atomcode-clix` 一起搬过来)。
+atomcode-telemetry = { path = "../atomcode-telemetry", features = ["test-util"] }
+async-trait = "0.1"
 ctor = "0.2"
 predicates = "3"
 tempfile = "3"

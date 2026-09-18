@@ -9,7 +9,7 @@
 - `crates/atomcode-kernel/`；
 - `crates/atomcode-capabilities/`；
 - `crates/atomcode-coding/` 的 runtime、provider、session、controller；
-- CLI、TUI、daemon、ACP、clix 的 runtime、session、command/event 接入；
+- CLI、TUI、daemon、ACP 的 runtime、session、command/event 接入；
 - daemon 中保留的历史 core JSON 单向 importer 与兼容 DTO；
 - 公共协议、持久化格式、审批、安全边界或跨 crate 依赖方向。
 
@@ -20,7 +20,7 @@
 当前 coding agent 的目标调用链是：
 
 ```text
-CLI / TUI / daemon / background / ACP / clix code
+CLI / TUI / daemon / background / ACP code
                     │
                     ▼
        CodingRuntimeHandle / DriverCommand
@@ -100,7 +100,7 @@ wire DTO 展开：
 退役任务必须基于当前代码检查并报告：
 
 - 所有生产发送点、处理方、事件消费者和持久化读写方；
-- CLI、TUI、daemon、headless、background、ACP、clix 中实际受影响的入口；
+- CLI、TUI、daemon、headless、background、ACP 中实际受影响的入口；
 - 旧类型、handler、feature flag、fallback 和依赖是否仍可达；
 - 被删除、迁移或仍保留的测试；
 - 新旧格式或协议的失败、取消、恢复和降级语义。

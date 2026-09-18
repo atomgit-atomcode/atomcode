@@ -4,7 +4,7 @@
 ([`atomcode-capabilities`](../atomcode-capabilities))组装而成 —— 不依赖 `atomcode-core`。
 结构对标 [`atomcode-coding`](../atomcode-coding),但面向评审。
 
-终端用户的 CLI 见 [`atomcode-clix`](../atomcode-clix)(`atomcodex review …`)。本 README 面向
+终端用户的入口是 `atomcode review …`(`atomcode-cli/src/review.rs`)。本 README 面向
 **直接使用本库的嵌入者**。
 
 ---
@@ -42,7 +42,7 @@ agent 只挂载**只读工具集** —— `read_file`、`grep`、`glob`、`list_
 `file_dependencies`)。它无法写入/编辑/运行任何东西。diff 由你作为任务提供,所以 agent 不需要 shell。
 
 > 想要实时轨迹 / 事件流而非 `run_to_completion`?用 `agent.spawn()` 消费 `AgentEvent`
-> (`atomcode-clix` 就是这样打印逐工具进度的)。
+> (`atomcode review` 就是这样打印逐工具进度的)。
 
 ---
 

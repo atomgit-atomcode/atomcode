@@ -1,18 +1,18 @@
-//! `atomcodex` — a standalone, single-capability CLI: code review. It drives the
-//! `atomcode-review` agent (kernel + capabilities, no atomcode-core/atomcode-cli coupling)
-//! over a `git diff`, then prints the structured findings the agent reported.
+//! `atomcode review` —— 一次性评审一份 diff,不开会话。
 //!
-//! Usage:
-//!   atomcodex review [--base <ref>] [--staged] [--repo <dir>] [--model <m>] [--json]
+//! 会话里的 `/review` 是能力行登记的目录命令,要先有一个 agent 在跑;这条是给
+//! CI、钩子、`glab mr diff 5 | atomcode review --diff-file -` 这类用法的:
+//! 给它一份 diff,它报结构化的发现,然后退出。
 //!
-//! Provider creds resolve in precedence order: CLI flags > env (ATOMCODE_API_KEY /
-//! ATOMCODE_BASE_URL / ATOMCODE_MODEL) > `~/.atomcode/config.toml`. From the config file
-//! it reads the `[providers.<name>]` table named by `default_provider` (or `--provider`);
-//! an `api_key` of the form `$VAR` is expanded from the environment. `api_key` is optional
-//! (some gateways need none).
-
-mod code;
-mod tel;
+//! 这些代码原来是 `atomcode-clix` 那个独立二进制(`atomcodex review`)。那个 crate
+//! 的另外两个子命令(`code` / `sessions`)和主 CLI 完全重复,整个删掉了;review
+//! 不重复,所以搬到这里 —— 用户不必再装第二个二进制,而且它现在能用主 CLI 已经有的
+//! provider 解析、配置与 telemetry。
+//!
+//! 凭据的优先级没变:命令行 > 环境变量(ATOMCODE_API_KEY / ATOMCODE_BASE_URL /
+//! ATOMCODE_MODEL)> `~/.atomcode/config.toml`。配置文件里读 `default_provider`
+//! (或 `--provider`)指名的 `[providers.<name>]`;`api_key` 写成 `$VAR` 会从环境展开,
+//! 也允许没有(有些网关不需要)。
 
 use anyhow::{bail, Context, Result};
 use atomcode_kernel::agent::Agent;
@@ -20,31 +20,16 @@ use atomcode_kernel::event::{AgentCommand, AgentEvent, StopReason};
 use atomcode_review::{
     build_review_agent_with_cancel, shared_review_deadline, Finding, ReviewAgentConfig,
 };
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[derive(Parser)]
-#[command(name = "atomcodex", about = "AtomCode standalone CLI (new stack)")]
-struct Cli {
-    #[command(subcommand)]
-    cmd: Cmd,
-}
-
-#[derive(Subcommand)]
-enum Cmd {
-    /// Interactive coding agent (full assembly: tools+codeintel+web+skills+mcp+session+memory).
-    Code(code::CodeArgs),
-    /// List this project's resumable sessions.
-    Sessions(code::SessionsArgs),
-    /// Review the local git diff and report structured findings.
-    Review(ReviewArgs),
-}
+mod tel;
 
 #[derive(Parser)]
-struct ReviewArgs {
+pub struct ReviewArgs {
     /// Base git ref to diff against (reviews `<base>...HEAD`). Omit to review uncommitted
     /// changes (`git diff HEAD`).
     #[arg(long, conflicts_with_all = ["pr", "diff_file"])]
@@ -169,21 +154,7 @@ struct ReviewArgs {
     skill_dirs: Vec<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // `atomcodex` shares the config tree with `atomcode` but is often invoked
-    // directly, so it cannot rely on inheriting the variable from a parent.
-    atomcode_config::distribution::bootstrap_home();
-
-    let cli = Cli::parse();
-    match cli.cmd {
-        Cmd::Code(args) => code::code(args).await,
-        Cmd::Sessions(args) => code::sessions(args),
-        Cmd::Review(args) => review(args).await,
-    }
-}
-
-async fn review(args: ReviewArgs) -> Result<()> {
+pub async fn review(args: ReviewArgs) -> Result<()> {
     // `-` means stdin; only ONE of diff/task/persona/append may read it.
     let stdin_users = [
         ("--diff-file", args.diff_file.as_deref()),
@@ -773,17 +744,20 @@ pub(crate) struct ProviderEntry {
 #[derive(Deserialize, Default)]
 struct FileConfig {
     #[serde(default)]
-    language: Option<String>,
-    #[serde(default)]
     default_provider: Option<String>,
     #[serde(default)]
     providers: HashMap<String, ProviderEntry>,
 }
 
+/// What this one-shot needs out of the config file.
+///
+/// Only the provider. The file's `language` is the interactive CLI's business
+/// (`main.rs` resolves the locale for the screen); a review prints structured
+/// findings and exits, so it has no locale to set. The field used to be here
+/// because the deleted `code` subcommand read it.
 #[derive(Default)]
 pub(crate) struct ConfigSelection {
     pub(crate) provider: Option<ProviderEntry>,
-    pub(crate) language: Option<atomcode_config::locale::Locale>,
 }
 
 /// Parse a config.toml string into the subset we need (ignoring unrelated keys).
@@ -800,15 +774,11 @@ fn pick_provider(fc: &FileConfig, override_name: Option<&str>) -> Option<Provide
 fn select_config(fc: &FileConfig, provider: Option<&str>) -> ConfigSelection {
     ConfigSelection {
         provider: pick_provider(fc, provider),
-        language: fc
-            .language
-            .as_deref()
-            .and_then(|language| language.parse().ok()),
     }
 }
 
 /// `~/.atomcode/config.toml` (honors $ATOMCODE_HOME, else $HOME / %USERPROFILE%).
-fn default_config_path() -> Option<PathBuf> {
+pub(crate) fn default_config_path() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os(atomcode_config::distribution::HOME_ENV) {
         return Some(PathBuf::from(home).join("config.toml"));
     }
@@ -1639,34 +1609,18 @@ base_url = "https://openrouter.ai/api/v1"
         assert!(pick_provider(&fc, Some("x")).is_some());
     }
 
+    /// A config file's unrelated keys do not stop the provider being found.
+    ///
+    /// `language` is the one that used to be read here, for the `code`
+    /// subcommand that is gone; the interactive CLI resolves the locale for
+    /// itself. What this pins now is that its presence is simply ignored.
     #[test]
-    fn selected_config_carries_top_level_language() {
+    fn a_config_with_keys_this_command_ignores_still_yields_its_provider() {
         let fc = parse_file_config(
             "language = \"zh\"\ndefault_provider = \"x\"\n[providers.x]\nmodel=\"m\"\nbase_url=\"u\"\n",
         )
         .unwrap();
-        let selected = select_config(&fc, None);
-
-        assert_eq!(
-            selected.language,
-            Some(atomcode_config::locale::Locale::ZhCn)
-        );
-        assert!(selected.provider.is_some());
-    }
-
-    #[test]
-    fn coding_config_keeps_top_level_language_without_a_provider() {
-        let d = tempfile::tempdir().unwrap();
-        let path = d.path().join("config.toml");
-        std::fs::write(&path, "language = \"zh\"\n").unwrap();
-
-        let selected = load_config_selection(Some(&path), None).unwrap();
-
-        assert!(selected.provider.is_none());
-        assert_eq!(
-            selected.language,
-            Some(atomcode_config::locale::Locale::ZhCn)
-        );
+        assert!(select_config(&fc, None).provider.is_some());
     }
 
     #[test]

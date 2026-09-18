@@ -330,6 +330,7 @@ dependencies = [
  "atomcode-host-api",
  "atomcode-kernel",
  "atomcode-plexus",
+ "atomcode-review",
  "atomcode-telemetry",
  "atomcode-tui",
  "atomcode-tuix",
@@ -451,27 +452,6 @@ dependencies = [
  "wiremock",
  "zeroize",
  "zstd",
-]
-
-[[package]]
-name = "atomcode-clix"
-version = "5.0.9"
-dependencies = [
- "anyhow",
- "async-trait",
- "atomcode-capabilities",
- "atomcode-coding",
- "atomcode-config",
- "atomcode-kernel",
- "atomcode-review",
- "atomcode-telemetry",
- "clap",
- "futures",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml 0.8.23",
 ]
 
 [[package]]

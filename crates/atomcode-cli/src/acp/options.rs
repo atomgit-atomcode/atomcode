@@ -662,18 +662,6 @@ mod tests {
         std::sync::Arc::new(tokio::sync::Mutex::new(map))
     }
 
-    /// Resolve an effort value into a kernel config the way the CLI resolver
-    /// does: `off` clears the override, anything else lands as a
-    /// [`atomcode_kernel::provider::ReasoningEffort`].
-    fn effort_resolver_fn(effort: &str) -> Option<CodingAgentConfig> {
-        let mut cfg = CodingAgentConfig::new("key", "https://example.test/v1", "m", "/work");
-        cfg.chat_options.reasoning_effort = match effort {
-            "off" => None,
-            "high" => Some(atomcode_kernel::provider::ReasoningEffort::High),
-            _ => Some(atomcode_kernel::provider::ReasoningEffort::Max),
-        };
-        Some(cfg)
-    }
 
     /// Drive one rejected `set_config_option` request through the wired handler
     /// over an in-memory channel; returns the JSON-RPC error.
