@@ -35,6 +35,10 @@ atomcode-tuix = { path = "../atomcode-tuix" }
 # `atomcode --tui`: the full-screen UI assembled from rows, driving the same runtime
 # through the two front-end contracts (docs/adr/0021, docs/adr/0022).
 atomcode-tui = { path = "../atomcode-tui" }
+# Writing a row. `rows.rs` says a third crate adds a panel with a `View` impl and a
+# row — the row is a `Plugin`, so the launcher that owns one names the trait. Same
+# version the screen builds against (already in this graph through `atomcode-tui`).
+atomcode-plexus = { path = "../atomcode-plexus" }
 atomcode-telemetry = { path = "../atomcode-telemetry" }
 atomcode-daemon = { path = "../atomcode-daemon" }
 # ACP (Agent Client Protocol) stdio server — the `atomcode acp` subcommand's engine

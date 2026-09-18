@@ -327,6 +327,7 @@ dependencies = [
  "atomcode-config",
  "atomcode-daemon",
  "atomcode-kernel",
+ "atomcode-plexus",
  "atomcode-telemetry",
  "atomcode-tui",
  "atomcode-tuix",
