@@ -367,6 +367,7 @@ fn refresh_installed_marketplaces() -> Vec<PluginJobEvent> {
     if list.is_empty() {
         return events;
     }
+    let mut failures: Vec<(String, String)> = Vec::new();
     for entry in list {
         match update_marketplace(&entry.name) {
             Ok(info) => {
@@ -399,16 +400,49 @@ fn refresh_installed_marketplaces() -> Vec<PluginJobEvent> {
                 }
             }
             Err(e) => {
-                let msg = format!("auto-update of marketplace `{}` failed: {e:#}", entry.name);
-                log_to_file(&format!("⚠ {msg}"));
-                events.push(PluginJobEvent::Failed {
-                    op: "auto-update".into(),
-                    msg,
-                });
+                // Full detail ALWAYS to the log for troubleshooting; the user-facing
+                // surface is collapsed below so N simultaneous failures (offline / host
+                // down hits every marketplace in the same pass) don't fan out to N
+                // near-identical "sync skipped" warnings (issue #1368).
+                log_to_file(&format!(
+                    "⚠ auto-update of marketplace `{}` failed: {e:#}",
+                    entry.name
+                ));
+                failures.push((entry.name.clone(), format!("{e:#}")));
             }
         }
     }
+    if let Some(msg) = collapse_auto_update_failures(&failures) {
+        events.push(PluginJobEvent::Failed {
+            op: "auto-update".into(),
+            msg,
+        });
+    }
     events
+}
+
+/// Collapse the per-marketplace auto-update failures from ONE refresh pass into a
+/// single user-facing message. N separate warnings are noise — offline / host-down
+/// hits every installed marketplace at once, and the full per-marketplace detail is
+/// already in the log. `None` when nothing failed; a lone failure keeps its detailed
+/// one-liner; multiple collapse to `count + names + the first (representative) reason`
+/// (all failures usually share the same cause, so the first stands in for the rest).
+fn collapse_auto_update_failures(failures: &[(String, String)]) -> Option<String> {
+    match failures {
+        [] => None,
+        [(name, reason)] => Some(format!("auto-update of marketplace `{name}` failed: {reason}")),
+        [(_, first_reason), ..] => {
+            let names = failures
+                .iter()
+                .map(|(name, _)| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!(
+                "auto-update skipped for {} marketplaces ({names}) — {first_reason} (see log for details)",
+                failures.len()
+            ))
+        }
+    }
 }
 
 fn short_commit(sha: &str) -> &str {
@@ -426,6 +460,43 @@ mod tests {
     #[test]
     fn short_commit_truncates_long_shas() {
         assert_eq!(short_commit("0123456789abcdef"), "0123456");
+    }
+
+    #[test]
+    fn collapse_auto_update_failures_none_when_empty() {
+        assert_eq!(collapse_auto_update_failures(&[]), None);
+    }
+
+    #[test]
+    fn collapse_auto_update_failures_single_keeps_detail() {
+        let f = [("skills".to_string(), "git pull failed: fatal: boom".to_string())];
+        let msg = collapse_auto_update_failures(&f).expect("one failure → a message");
+        // A lone failure keeps its full detailed one-liner (no count/summary framing).
+        assert_eq!(
+            msg,
+            "auto-update of marketplace `skills` failed: git pull failed: fatal: boom"
+        );
+    }
+
+    #[test]
+    fn collapse_auto_update_failures_multiple_collapse_to_one_summary() {
+        let f = [
+            (
+                "atomcode-plugins-official".to_string(),
+                "git pull failed: fatal: unable to access: Could not connect".to_string(),
+            ),
+            (
+                "atomcode-skills".to_string(),
+                "git pull failed: fatal: unable to access: Could not connect".to_string(),
+            ),
+        ];
+        let msg = collapse_auto_update_failures(&f).expect("failures → a message");
+        // ONE summary: count + BOTH names + the first (representative) reason.
+        assert!(msg.contains("2 marketplaces"), "{msg}");
+        assert!(msg.contains("`atomcode-plugins-official`"), "{msg}");
+        assert!(msg.contains("`atomcode-skills`"), "{msg}");
+        assert!(msg.contains("Could not connect"), "representative reason kept: {msg}");
+        assert!(msg.contains("see log"), "points at the log for the rest: {msg}");
     }
 
     #[test]
