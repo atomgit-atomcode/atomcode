@@ -53,6 +53,18 @@ fn is_cjk_locale() -> bool {
 /// terminal actually paints. Keeping model and host on the same width
 /// rule is what stops the direct-write / cell-diff drift described above.
 pub(crate) fn cell_char_width(ch: char) -> Option<usize> {
+    // U+26A0 WARNING SIGN defaults to TEXT presentation (Emoji_Presentation=No), so a
+    // bare `⚠` (no VS16 — which is how the `⚠ ` warning prefix is emitted) is painted
+    // as a NARROW 1-cell glyph by conhost / Windows Terminal / most fonts. But both
+    // `width_cjk` (Ambiguous → 2, for CJK-locale users) AND the emoji-wide widening below
+    // model it as 2 — over-counting by 1, which drifts the retained cell grid and leaves
+    // a ghost character right after the prefix (issue #1368: the "⚠g" / "⚠d" artifact).
+    // Pin it to 1 so the model matches what the host actually paints. A terminal that DOES
+    // paint `⚠` wide only mildly overlaps the next cell — far less jarring than a phantom
+    // letter, and far rarer than the narrow-paint hosts where this was reported.
+    if ch == '\u{26A0}' {
+        return Some(1);
+    }
     let base = if is_cjk_locale() {
         UnicodeWidthChar::width_cjk(ch)
     } else {
@@ -946,6 +958,19 @@ mod tests {
                                              // Ⓜ stays wide (pre-existing), and a plain ASCII digit stays narrow.
         assert_eq!(cell_char_width('Ⓜ'), Some(2));
         assert_eq!(cell_char_width('3'), Some(1));
+    }
+
+    #[test]
+    fn warning_sign_is_width_one() {
+        // U+26A0 defaults to TEXT presentation and is painted NARROW by conhost /
+        // Windows Terminal / most fonts. It must model as 1 cell — NOT the `width_cjk`
+        // Ambiguous=2 nor the emoji-wide=2 — or the retained grid drifts and leaves a
+        // ghost char after the `⚠ ` warning prefix (#1368: "⚠g"/"⚠d"). Fixed regardless
+        // of locale (the override precedes the CJK/emoji branches).
+        assert_eq!(cell_char_width('\u{26A0}'), Some(1));
+        // The prefix the TUI actually emits ("⚠ ") is 2 cols (glyph + space), so the
+        // message body starts at column 2 — matching a narrow-painting host.
+        assert_eq!(display_width("⚠ "), 2);
     }
 
     #[test]
