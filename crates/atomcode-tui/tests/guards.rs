@@ -119,3 +119,32 @@ fn the_screen_does_not_speak_the_runtime_driver_protocol() {
     }
     assert!(offenders.is_empty(), "{offenders:?}");
 }
+
+/// Nothing is printed once the screen has been given back.
+///
+/// Full screen is given back and the session is over, so whatever is written
+/// next lands in the person's own buffer — next to the shell prompt, with no
+/// repaint diff to bound it. A transcript re-typed down here is also a second
+/// copy of what the session log already owns (`docs/adr/0024`), and the bytes
+/// in it came from tools: `ESC[2J` cleared the scrollback the copy was meant
+/// to hand back. The exit path therefore ends at `restore()`; see
+/// `docs/tui-composability.md` §四 义务 7 and §九.
+#[test]
+fn nothing_is_printed_after_the_screen_is_given_back() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plugin.rs");
+    let text = std::fs::read_to_string(&src).expect("plugin.rs");
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    let at = lines
+        .iter()
+        .position(|line| *line == "self.surface.restore();")
+        .expect("the exit path gives the screen back");
+    let next = lines[at + 1..]
+        .iter()
+        .find(|line| !line.is_empty() && !line.starts_with("//"))
+        .copied();
+    assert_eq!(
+        next,
+        Some("Ok(())"),
+        "the exit stops at the screen: no transcript is printed into the shell's buffer"
+    );
+}
