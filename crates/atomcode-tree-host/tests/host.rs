@@ -7,13 +7,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use atomcode_harness::host::{open, Opening, Registry, Trees};
 use atomcode_harness::plugins;
 use atomcode_harness::profile::Profiles;
 use atomcode_harness::session::SessionEvent;
 use atomcode_host_api::{HostCommand, HostConnection, HostError, HostEvent, HostReply};
 use atomcode_kernel::event::{AgentCommand, AgentEvent};
 use atomcode_kernel::provider::ReasoningEffort;
+use atomcode_tree_host::{open, Opening, Registry, Trees};
 
 #[ctor::ctor]
 fn _isolate_atomcode_home() {

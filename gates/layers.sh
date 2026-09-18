@@ -76,6 +76,11 @@ done
 # mixed layers, "harness 含 UI 行与 launch"). Recorded as a debt with a number
 # rather than asserted, so it can only shrink — the same shape as the criterion
 # ratchet.
+#
+# What the number counts is every direct atomcode edge, `plexus` and `kernel`
+# included — they are the mechanism itself, so the floor is 2 rather than 0.
+# 2026-09-18: 6 → 5, `host.rs` moved out to `atomcode-tree-host` because a host
+# answering the front-end contracts is not the mechanism's job.
 say "harness 欠的混层债只能变小"
 harness_debt="$(deps atomcode-harness | grep -v '^__' | wc -l | tr -d ' ')"
 harness_budget="$(cat gates/harness-layer.baseline 2>/dev/null || echo 99)"

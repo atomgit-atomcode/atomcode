@@ -581,7 +581,6 @@ dependencies = [
  "async-trait",
  "atomcode-capabilities",
  "atomcode-config",
- "atomcode-host-api",
  "atomcode-kernel",
  "atomcode-plexus",
  "atomcode-review",
@@ -670,6 +669,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomcode-tree-host"
+version = "5.0.9"
+dependencies = [
+ "async-trait",
+ "atomcode-harness",
+ "atomcode-host-api",
+ "atomcode-kernel",
+ "atomcode-plexus",
+ "ctor",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "atomcode-tui"
 version = "5.0.9"
 dependencies = [
@@ -680,6 +694,7 @@ dependencies = [
  "atomcode-host-api",
  "atomcode-kernel",
  "atomcode-plexus",
+ "atomcode-tree-host",
  "base64",
  "crossterm",
  "ctor",

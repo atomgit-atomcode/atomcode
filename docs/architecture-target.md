@@ -56,7 +56,7 @@
 | 职责 | 提供缝、跑回合、记日志、把命令翻成动作、把事实投影成事件 |
 | 装什么 | `atomcode-plexus`(App / Context / Plugin / 事件 / realm / 配置树)、`atomcode-kernel`(Message / ToolDef / LlmProvider / AgentCommand / AgentEvent 等中立类型)、`atomcode-harness`(`seams.rs` 24 个缝、`agent-loop` 行、`session.rs` 日志与投影、`handle.rs` 命令泵、`plugins::catalog()`) |
 | 不装什么 | 任何产品判断、任何前端、任何磁盘路径与端口、launcher |
-| 今天 | 已有。harness 里的 `ui*.rs`、`launch.rs`、`bundle.rs` 的 `*_APP` profile 要移出 |
+| 今天 | 已有。harness 里的 `ui*.rs`、`launch.rs`、`bundle.rs` 的 `*_APP` profile 要移出。**`host.rs` 已移出**(2026-09-18 → `atomcode-tree-host`,宿主层):它答的是前端契约,机制层不该答;harness 因此少掉 `atomcode-host-api` 这条边,混层债 6 → 5 |
 | 允许依赖 | 无 atomcode 内部依赖 |
 
 ### 2.2 Agent 能力行
@@ -230,6 +230,7 @@ auth / updater / telemetry 在 Host 层,按需换。插件编译期链接,装插
 ```text
 crates/
   agent/    kernel  plexus  harness  host-api
+  host/     cli  daemon  tree-host
   rows/     capabilities  review  team  discipline
   product/  atomcode
   host/     config  auth  codingplan  updater  telemetry  store  cli  daemon
@@ -247,7 +248,12 @@ gates/layers.sh                                      # 用 cargo metadata 断言
   就是 Host(§2.4),而 coding 在下面的 `legacy/` 里,只删不加。不另开宿主共享库,依据
   本节的「拆 crate 痛点驱动」:今天只有一个调用方。
 - `gates/layers.sh` 用各 Cargo.toml 的**直接**依赖断言方向,并把 harness 的混层债
-  钉成只能变小的基线(`gates/harness-layer.baseline`)。
+  钉成只能变小的基线(`gates/harness-layer.baseline`)。**它数的是全部直接 atomcode
+  依赖**,所以 `plexus` 与 `kernel` 这两条也在里面——它们是机制层自身,债的真实下限
+  是 2,不是 0。现在是 5:`plexus`、`kernel`、`capabilities`(18 文件 54 处)、
+  `config`(6 文件 9 处)、`review`(2 文件 2 处)。**下一个该摘的是 `review`**:
+  `plugins/persona.rs` 取 `review_persona`、`plugins/capabilities.rs` 挂 `ReviewTool`
+  ——机制层认识了一个具体能力行,方向反了,该由产品去挂。
 
 **待办,按这张表该动但还没动的:**
 

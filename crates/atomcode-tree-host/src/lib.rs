@@ -1,6 +1,13 @@
 //! A host for agents built from a config tree, speaking both front-end
 //! contracts (`docs/adr/0021`, `docs/adr/0022`).
 //!
+//! **Why this is not in the harness.** It was, and it was the harness's only
+//! reason to depend on `atomcode-host-api`. The mechanism layer
+//! (`docs/architecture-target.md` §2.1) is supposed to carry no atomcode
+//! dependency at all: it mounts trees, it does not answer a front end's
+//! contract. A host does. So the host moved and the mechanism lost an edge —
+//! `gates/layers.sh` counts what is left.
+//!
 //! A front end that lives in an App of its own — the full-screen UI — does not
 //! build the agent it drives. It is handed a [`HostConnection`]: the handle
 //! protocol to the live agent, and [`HostControl`] over it. This is the host for
@@ -29,7 +36,7 @@ use atomcode_kernel::provider::ReasoningEffort;
 use atomcode_plexus::{App, ConfigTree, Layer, PluginRegistry};
 use tokio::sync::mpsc;
 
-use crate::seams::{AgentHandleSvc, AgentsSvc, SessionPersistenceSvc};
+use atomcode_harness::seams::{AgentHandleSvc, AgentsSvc, SessionPersistenceSvc};
 
 /// Which session a tree is built for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,7 +51,7 @@ pub enum Opening {
 pub type Registry = Arc<dyn Fn() -> PluginRegistry + Send + Sync>;
 
 /// The tree for an opening. The caller decides what resuming means in its tree
-/// — usually [`crate::bundle::resume_overlay`] on top of its layers.
+/// — usually [`atomcode_harness::bundle::resume_overlay`] on top of its layers.
 pub type Trees = Arc<dyn Fn(&Opening) -> Result<ConfigTree, String> + Send + Sync>;
 
 /// The App now running, and how to reach its agent.
@@ -270,7 +277,7 @@ impl TreeHost {
                 turns: u32::try_from(summary.turns).unwrap_or(u32::MAX),
                 needs_newer_version: header
                     .as_ref()
-                    .is_some_and(|h| h.version > crate::session::SESSION_FORMAT_VERSION),
+                    .is_some_and(|h| h.version > atomcode_harness::session::SESSION_FORMAT_VERSION),
             });
         }
         Ok(HostReply::Sessions { sessions })

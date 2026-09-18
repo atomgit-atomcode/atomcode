@@ -57,6 +57,12 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+# End to end means against a host. Only the tests reach for one — the screen
+# itself knows neither Host nor Product (`docs/architecture-target.md` §2.5),
+# which is what `gates/layers.sh` checks — and this is the smallest host there
+# is: a tree the harness mounts, answering the same contract the product's
+# runtime answers.
+atomcode-tree-host = { path = "../atomcode-tree-host" }
 atomcode-kernel = { path = "../atomcode-kernel", features = ["test-support"] }
 ctor = "0.2"
 # A real directory for the one criterion that writes a file (`/save`). The

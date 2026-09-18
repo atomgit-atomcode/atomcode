@@ -17,10 +17,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use atomcode_harness::host::{open, Opening, Registry, Trees};
 use atomcode_harness::seams::UserInterface;
 use atomcode_harness::session::SessionEvent;
 use atomcode_plexus::{App, ConfigTree, Context, Layer, Plugin, PluginRegistry};
+use atomcode_tree_host::{open, Opening, Registry, Trees};
 use atomcode_tui::launch::{self, Screen};
 use atomcode_tui::plugin::{AgentClientSvc, SurfaceSvc};
 use atomcode_tui::surface::{Headless, Key, KeyPress, Surface};
