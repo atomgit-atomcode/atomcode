@@ -271,6 +271,24 @@ pub struct Moment {
     /// on and the row the pointer is over are the same row. An index into
     /// `modules::team::targets`.
     pub team_cursor: Option<usize>,
+    /// The settings, **as of the frame this moment was taken for**.
+    ///
+    /// A snapshot rather than a handle, for the reason [`Moment::rasters`] is
+    /// one: `View::render` takes `&State` and a `&Viewport` and may not reach a
+    /// service, so data a module did not fold from a fact has to arrive through
+    /// here. Settings are not facts — nothing in the log records them — so this
+    /// is the only road they can travel. See `crate::settings`.
+    pub settings: crate::settings::SettingsView,
+    /// The settings panel, while it is up: what is typed in its search box, the
+    /// row the arrows are on, and the edit in progress.
+    ///
+    /// Here rather than in the module's folded state for the reason
+    /// [`Moment::asking`] is: the panel is not a fact in the log, it is what
+    /// *this screen* is doing right now, and a module can neither hold it nor be
+    /// reached from outside to be told about it. `None` is a panel that is not
+    /// up — the open flag and the state in one field, so a panel that is drawn
+    /// and a panel that takes keys cannot disagree.
+    pub settings_panel: Option<crate::settings::Panel>,
 }
 
 /// A question on screen, with the row that is pointed at.

@@ -57,6 +57,14 @@ impl Connection {
 // `docs/adr/0027`.
 plexus_service!(RastersSvc => crate::raster::Rasters, "tui-rasters", Core, "Cell-grid bitmaps, addressed by (module id, key)");
 
+// The settings, as the launcher reads them. A seam rather than a core service,
+// and declared by the one that consumes it (`docs/adr/0021` §6), like
+// `ConnectionSvc`: which file the configuration lives in, and what writing it
+// back means, belong to the product. A screen that read the file itself would be
+// reading the product's own state, which is what makes it a separate App
+// (`docs/adr/0022` §3).
+plexus_service!(SettingsSvc => dyn crate::settings::Settings, "tui-settings", Seam, "The settings a launcher can read and change");
+
 /// The session's clock, and the only place this crate reads one.
 ///
 /// A duration on screen is the difference of two readings the log does not
@@ -982,6 +990,25 @@ impl UserInterface for Tui {
                     }
                     stale = true;
                 }
+                // The settings panel, while it is up. Above the question and
+                // above the ordinary bindings for the reason the modal is: it
+                // was opened deliberately, and what it is for is being worked in
+                // right now. Below the modal, because a modal is a question the
+                // screen cannot answer for the person.
+                Wake::Input(Input::Key(press)) if self.host.settings_open() => {
+                    let (changed, set) = self.host.settings_key(press);
+                    if changed {
+                        stale = true;
+                    }
+                    if let Some((id, value)) = set {
+                        if let Err(why) = self.apply_setting(&id, &value) {
+                            self.host.say(&why, true);
+                        } else {
+                            self.refresh_settings();
+                        }
+                        stale = true;
+                    }
+                }
                 // A question on screen gets first refusal on every key. It is a
                 // panel riding the tail now, not a modal, so this is the only
                 // place its keys are routed — and focus is still arbitration,
@@ -1070,6 +1097,118 @@ impl Tui {
     /// is stopped without this conversation committing a single fact, and it
     /// must stay that way — a member's log is its own. What the screen knows of
     /// one is what the connection pushed about it.
+    /// Bring `Moment::settings` in step with what the launcher reads.
+    ///
+    /// Asked when the panel opens and after every change, never per frame: the
+    /// port may read a file, and a `render` that did filesystem work would
+    /// break the purity the whole crate rests on. Reading through the port is
+    /// the only way to learn the rows — the screen has no other road to the
+    /// configuration, which is what keeps it an App apart (`docs/adr/0022` §3).
+    ///
+    /// **True when the rows changed**, so a caller can tell "read them again"
+    /// from "and they were different".
+    fn refresh_settings(&self) -> bool {
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            return false;
+        };
+        // No port, no panel: a launcher that mounted the row without providing
+        // `tui-settings` gets an empty list rather than a panic — the same
+        // bargain every other absent seam strikes.
+        let Some(port) = ctx.service::<crate::plugin::SettingsSvc>() else {
+            return false;
+        };
+        let view = port.rows();
+        let mut moment = self.host.moment.write().expect("moment poisoned");
+        if moment.settings == view {
+            return false;
+        }
+        moment.settings = view;
+        true
+    }
+
+    /// Send one change over the settings seam, then tell the runtime about it.
+    ///
+    /// `Err` is the launcher's refusal, verbatim: a value the product will not
+    /// take, or a file it cannot write. This end does not second-guess it — the
+    /// screen has no idea what the configuration accepts, which is the whole
+    /// reason the port exists.
+    ///
+    /// **Writing the file is not making it so.** A setting that says `Reload` or
+    /// `Reprepare` is one the running graph has to be told about, and the only
+    /// way to tell it is `HostCommand::Reload` — which reads the configuration
+    /// again and rebuilds what changed (`atomcode-coding/src/front_end.rs`).
+    /// The distinction is the row's `applies`, not a list of ids here: a setting
+    /// whose policy is `Restart` is one a reload would not reach anyway, so
+    /// asking is skipped rather than answered with a lie.
+    fn apply_setting(&self, id: &str, value: &str) -> Result<(), String> {
+        let Some(ctx) = self.ctx.lock().expect("ctx poisoned").clone() else {
+            return Err("屏幕还没接上,改不了设置".into());
+        };
+        let Some(port) = ctx.service::<crate::plugin::SettingsSvc>() else {
+            return Err("这个屏幕没有接设置:启动器没有提供 `tui-settings`".into());
+        };
+        port.set(id, value)?;
+        self.reload_if_a_change_needs_it(id)
+    }
+
+    /// Hand the runtime a reload, when the setting that changed is one it can
+    /// act on.
+    ///
+    /// Fire and forget, on its own task, for the reason every other host command
+    /// is: a reload rebuilds the graph and a screen that blocked on it would
+    /// stop painting while it did. A failure is said out loud rather than
+    /// swallowed — "the file changed but the session did not" is exactly the
+    /// state a person must not be left in silently.
+    fn reload_if_a_change_needs_it(&self, id: &str) -> Result<(), String> {
+        let needs = {
+            let m = self.host.moment.read().expect("moment poisoned");
+            m.settings
+                .rows()
+                .iter()
+                .find(|row| row.id == id)
+                .map(|row| {
+                    matches!(
+                        row.applies,
+                        crate::settings::Applies::Reload | crate::settings::Applies::Reprepare
+                    )
+                })
+                .unwrap_or(false)
+        };
+        if !needs {
+            return Ok(());
+        }
+        let Some(control) = self.client.control() else {
+            return Ok(());
+        };
+        let root = self.client.root();
+        // The host itself, not a wake: the loop owns the wake channel, and a
+        // command's failure has to reach the tip row from a task that is not the
+        // loop. `Host::say` is the one way to say something on the screen, and
+        // it wakes the loop for the frame it lands in.
+        let host = self.host.clone();
+        let keys = self.wake.lock().expect("wake poisoned").clone();
+        tokio::spawn(async move {
+            let outcome = control
+                .call(atomcode_kernel::host::HostCommand::Reload { session: root })
+                .await;
+            if let Err(error) = outcome {
+                // Rendered by the same function the commands use, so one host
+                // error reads the same wherever it surfaces.
+                host.say(
+                    format!(
+                        "设置已写入,但重新加载失败:{}",
+                        crate::commands::refusal(error)
+                    ),
+                    true,
+                );
+                if let Some(keys) = keys {
+                    let _ = keys.send(Wake::Fact);
+                }
+            }
+        });
+        Ok(())
+    }
+
     fn refresh_members(&self) {
         use crate::moment::{Activity, MemberNow};
         let mut members: Vec<MemberNow> = self
@@ -1682,6 +1821,17 @@ impl Tui {
                         .to_string()
                 };
                 self.say(&text);
+                return false;
+            }
+            Action::ToggleSettings => {
+                drop(m);
+                let _ = self.host.toggle_settings();
+                // The rows are read when the panel opens, not once at start-up:
+                // a file edited behind the screen's back is whatever the file
+                // says, and a list frozen at launch would quietly lie.
+                if self.host.settings_open() {
+                    self.refresh_settings();
+                }
                 return false;
             }
 

@@ -34,6 +34,7 @@ const SCREEN: &[Command] = &[
     ),
     Command::new("mouse", "把鼠标交还终端,或收回来"),
     Command::new("keys", "列出快捷键"),
+    Command::new("config", "拉出设置面板:搜索、改值;esc 关"),
 ];
 
 #[async_trait]
@@ -55,6 +56,7 @@ impl CommandSet for ScreenCommands {
                 Err(why) => Outcome::Refused(why),
             },
             "mouse" => Outcome::Do(Action::ToggleMouse),
+            "config" => Outcome::Do(Action::ToggleSettings),
             "keys" => Outcome::Said(
                 "enter 发送 · shift+enter 换行(或 ctrl-j) · ctrl-d 退出 · ctrl-w 删词\n\
                  esc 依次:取消选中 -> 清空输入 -> 停止当轮 · ctrl-c 直接停止当轮\n\
@@ -153,7 +155,12 @@ const SESSION: &[Command] = &[
 ];
 
 /// A host's refusal, in words a person can act on.
-fn refusal(error: HostError) -> String {
+///
+/// `pub(crate)` because a host command is not only a command's business: the
+/// settings seam hands one to the runtime after writing a file, and its failure
+/// has to read the same as every other host failure. One renderer, so one error
+/// does not get two wordings depending on which path it came back along.
+pub(crate) fn refusal(error: HostError) -> String {
     match error {
         HostError::Busy { reason } => format!("现在不行:{reason}"),
         HostError::NotFound => "找不到:会话已经换过,或者没有这个会话".into(),
@@ -914,6 +921,13 @@ mod tests {
         assert_eq!(
             c.dispatch("/reasoning", &app.context()).await,
             Outcome::Do(Action::ToggleFold("reasoning"))
+        );
+        // `/config` is the settings panel, and it reaches the screen the same
+        // way every other screen command does: as an action, so the command and
+        // any key bound to it later are one implementation.
+        assert_eq!(
+            c.dispatch("/config", &app.context()).await,
+            Outcome::Do(Action::ToggleSettings)
         );
     }
 

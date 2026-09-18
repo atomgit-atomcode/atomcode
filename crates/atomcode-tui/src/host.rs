@@ -1434,6 +1434,82 @@ impl Host {
         m.asking.as_mut().is_some_and(|a| a.point_at(row))
     }
 
+    /// Whether the settings panel is up.
+    ///
+    /// Read by everything that has to agree about it: the keys' owner, and
+    /// `asked_height`, which gives the composer's rows away. One question, so
+    /// that a panel drawn over a composer cannot be a panel the arbitration
+    /// does not know about.
+    pub fn settings_open(&self) -> bool {
+        self.moment
+            .read()
+            .expect("moment poisoned")
+            .settings_panel
+            .is_some()
+    }
+
+    /// Pull the settings panel up, or put it away. True when it changed.
+    ///
+    /// Opening is idempotent rather than a toggle-by-accident: the panel keeps
+    /// what was typed if it is already up, so a `/config` typed while it is open
+    /// does not silently clear a search the person is in the middle of.
+    pub fn toggle_settings(&self) -> bool {
+        let mut m = self.moment.write().expect("moment poisoned");
+        match m.settings_panel.take() {
+            Some(_) => true,
+            None => {
+                m.settings_panel = Some(crate::settings::Panel::new());
+                true
+            }
+        }
+    }
+
+    /// Put the settings panel away. True when it was up.
+    pub fn close_settings(&self) -> bool {
+        self.moment
+            .write()
+            .expect("moment poisoned")
+            .settings_panel
+            .take()
+            .is_some()
+    }
+
+    /// Run one key against the settings panel.
+    ///
+    /// The branching lives in [`crate::settings::key`], which is pure and tested
+    /// without a screen; this is the half that needs the moment — the rows the
+    /// key acts on, and the panel it writes back.
+    ///
+    /// Returns the change to send over the seam, when the key was one that
+    /// changes a setting. The caller owns the write: only it can reach the
+    /// [`crate::settings::Settings`] port, and this type may not.
+    pub fn settings_key(
+        &self,
+        press: crate::surface::KeyPress,
+    ) -> (bool, Option<(String, String)>) {
+        let mut m = self.moment.write().expect("moment poisoned");
+        let view = m.settings.clone();
+        let Some(panel) = m.settings_panel.as_mut() else {
+            return (false, None);
+        };
+        let before = panel.clone();
+        let step = crate::settings::key(&view, panel, press);
+        let changed = *panel != before;
+        match step {
+            crate::settings::Step::Set { id, value } => {
+                // The edit closes here rather than in the caller, so the panel
+                // that is drawn is never one still holding a value that has
+                // already been sent.
+                (true, Some((id, value)))
+            }
+            crate::settings::Step::Close => {
+                m.settings_panel = None;
+                (true, None)
+            }
+            crate::settings::Step::Stay => (changed, None),
+        }
+    }
+
     /// Which answer a screen row belongs to, when it belongs to one.
     ///
     /// Read off the rect the panel was **drawn** in, so a click and the drawn
@@ -2770,25 +2846,39 @@ fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16
         })
         .unwrap_or(1);
 
-    // A question waiting takes the composer's place, and the composer gives it
-    // up here rather than in its own `height`.
+    // A question waiting, or the settings panel up, takes the composer's place,
+    // and the composer gives it up here rather than in its own `height`.
     //
     // `height` is a question about the *module* — how many rows does this prompt
     // field need for the text in it — and the field needs the same rows whether
-    // or not a question is waiting. What changes is what the screen does with
-    // them, and that is arbitration: the host's, by the same rule that clips a
-    // module asking for too much. A module that returned zero here because
-    // something else on screen is asking would be a module whose own size
-    // depends on a sibling, which is the thing the tail's `Hug` contract exists
-    // to keep out.
+    // or not a panel is up. What changes is what the screen does with them, and
+    // that is arbitration: the host's, by the same rule that clips a module
+    // asking for too much. A module that returned zero here because something
+    // else on screen is asking would be a module whose own size depends on a
+    // sibling, which is the thing the tail's `Hug` contract exists to keep out.
     //
     // The composer as a whole, not just the field: `tip`'s reserved row is part
     // of it, and a blank row left above a panel is the shadow of a box that is
     // not there.
-    if moment.asking.is_some() && COMPOSER.contains(&id) {
+    //
+    // **One predicate, asked once.** Two `is_some()` checks here would agree
+    // until a third panel was added and one of them was not, and the symptom
+    // would be a composer drawn *under* a panel that covers it.
+    if displaces_composer(moment) && COMPOSER.contains(&id) {
         return 0;
     }
     asked
+}
+
+/// Whether what is on screen stands in the composer's place.
+///
+/// The one question [`asked_height`] arbitrates on, named so that the two
+/// things that can answer yes — a question, and the settings panel — are listed
+/// in a single place. A caller that asked them separately would be a second
+/// answer to one question, and the two would part company the day a third panel
+/// was added.
+pub fn displaces_composer(moment: &Moment) -> bool {
+    moment.asking.is_some() || moment.settings_panel.is_some()
 }
 
 /// The view modules whose rows ride at the foot of the conversation.
@@ -2814,9 +2904,17 @@ fn asked_height(modules: &Modules, id: &str, moment: &Moment, width: u16) -> u16
 /// answer; above the steering bars, because a question is what has to be dealt
 /// with and words not yet sent are what happens next. While it is there it is
 /// also the only thing on the tail that takes keys.
+///
+/// **`settings` rides here too, and directly under the live line** — above the
+/// question, because the two cannot both be up in a way that matters: a question
+/// is the model *waiting*, and a person who opened the settings is answering it
+/// by doing something else. It is placed like `ask` rather than like the
+/// composer because it is the same kind of thing: a panel a hand is working in,
+/// which takes keys while it is up and gives them back when it closes.
 pub const TAIL: &[&str] = &[
     crate::modules::todo::ID,
     crate::modules::live::ID,
+    crate::modules::settings::ID,
     crate::modules::ask::ID,
     crate::modules::steering::ID,
 ];
@@ -3398,6 +3496,111 @@ mod tests {
             h.moment.read().unwrap().input,
             "half a sentence",
             "and it is handed back, not lost"
+        );
+    }
+
+    /// The settings panel stands where the composer does, and gives it back.
+    ///
+    /// The same bargain a question strikes, and checked here for the same
+    /// reason: `asked_height` is the one place that arbitrates, and a panel that
+    /// is drawn over a composer without the arbitration knowing about it is a
+    /// screen with two things on one row — which is what the settings panel
+    /// would be if this were a `Show` op instead.
+    ///
+    /// Measured as a *displacement* rather than as a row count: what the field
+    /// asks for is its own business and may change; what has to hold is that
+    /// while the panel is up it asks for none, and afterwards for what it did
+    /// before.
+    #[test]
+    fn the_settings_panel_takes_the_composers_rows_and_hands_them_back() {
+        let h = host();
+        let size = (60u16, 30u16);
+        let w = size.0;
+
+        let before = {
+            let mods = h.modules.clone();
+            let m = h.moment.read().unwrap().clone();
+            crate::host::asked_height(&mods, crate::modules::input::ID, &m, w)
+        };
+        assert!(before > 0, "the field has rows to give");
+
+        assert!(!h.settings_open(), "nothing is up to begin with");
+        assert!(h.toggle_settings(), "and it opens");
+        assert!(h.settings_open());
+
+        let displaced = {
+            let mods = h.modules.clone();
+            let m = h.moment.read().unwrap().clone();
+            crate::host::asked_height(&mods, crate::modules::input::ID, &m, w)
+        };
+        assert_eq!(displaced, 0, "the composer stood aside");
+        assert!(
+            displaces_composer(&h.moment.read().unwrap()),
+            "and the arbitration agrees that something stands there"
+        );
+
+        // The tip row goes with it: the composer is a whole, and a blank row
+        // left above a panel is the shadow of a box that is not there.
+        let tip = {
+            let mods = h.modules.clone();
+            let m = h.moment.read().unwrap().clone();
+            crate::host::asked_height(&mods, crate::modules::tip::ID, &m, w)
+        };
+        assert_eq!(tip, 0, "the reserved row went too");
+
+        assert!(h.close_settings(), "put it away");
+        let after = {
+            let mods = h.modules.clone();
+            let m = h.moment.read().unwrap().clone();
+            crate::host::asked_height(&mods, crate::modules::input::ID, &m, w)
+        };
+        assert_eq!(after, before, "and the field is exactly as it was");
+        assert!(!displaces_composer(&h.moment.read().unwrap()));
+    }
+
+    /// Opening the panel twice does not throw away what was typed in it.
+    ///
+    /// A toggle that rebuilt the panel each time would clear a search the person
+    /// is in the middle of — `/config` typed twice being an easy accident, since
+    /// the second one is what a person does when they are not sure it worked.
+    #[test]
+    fn asking_for_the_panel_again_does_not_clear_what_is_in_it() {
+        let h = host();
+        assert!(h.toggle_settings());
+        {
+            let mut m = h.moment.write().unwrap();
+            let panel = m.settings_panel.as_mut().unwrap();
+            panel.searching = true;
+            panel.type_into_search('主');
+        }
+        assert!(h.settings_open());
+
+        // The second `/config` closes it — a toggle is a toggle.
+        assert!(h.toggle_settings());
+        assert!(!h.settings_open(), "the second ask puts it away");
+    }
+
+    /// Closing the panel is what Escape does, and it changes nothing else.
+    #[test]
+    fn closing_the_panel_leaves_no_trace_in_the_composer() {
+        let h = host();
+        {
+            let mut m = h.moment.write().unwrap();
+            m.input = "half a sentence".into();
+            m.caret = m.input.len();
+        }
+        h.toggle_settings();
+        assert!(h.settings_open());
+
+        let (changed, set) =
+            h.settings_key(crate::surface::KeyPress::plain(crate::surface::Key::Esc));
+        assert!(changed, "a key that closed it is a change to the screen");
+        assert!(set.is_none(), "and not a setting to write");
+        assert!(!h.settings_open(), "it is down");
+        assert_eq!(
+            h.moment.read().unwrap().input,
+            "half a sentence",
+            "standing aside is not clearing — the draft is where it was"
         );
     }
 

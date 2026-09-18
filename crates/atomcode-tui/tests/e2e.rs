@@ -1329,6 +1329,12 @@ async fn the_arrows_choose_the_row_that_enter_then_takes() {
     // What a highlight is *for*: the row the arrows walked to is the row the
     // return key acts on. Two matches, so "the second one" is a real choice and
     // not the first row by another name.
+    //
+    // The prefix is `/con` and not `/co`, and that is load-bearing: `/co` also
+    // reaches `/compact`, so the row one arrow away is whatever the third name
+    // sorts in as — which moved the day `/config` was added. A criterion about
+    // "the arrow moved it" must not double as a criterion about how many
+    // commands happen to start with two letters.
     let dir = scratch("menu-arrows-take");
     let s = start(tree(
         &dir,
@@ -1338,9 +1344,9 @@ async fn the_arrows_choose_the_row_that_enter_then_takes() {
     .await;
     let task = s.open().await;
 
-    s.term.type_text("/co");
-    until(&s, "/compact").await;
-    assert_eq!(lit_slash_name(&s).as_deref(), Some("compact"));
+    s.term.type_text("/con");
+    until(&s, "/config").await;
+    assert_eq!(lit_slash_name(&s).as_deref(), Some("config"));
 
     s.term.press(KeyPress::plain(Key::Down));
     s.quiet().await;

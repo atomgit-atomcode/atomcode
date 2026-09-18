@@ -2516,10 +2516,16 @@ async fn run() -> Result<i32> {
                         skip_permissions: cli.dangerously_skip_permissions,
                         provider_override: cli.provider.clone(),
                     }));
-                let result = atomcode::tui_front::run(runtime, front_end, coding_cfg, &screen)
-                    .await
-                    .map(|()| 0)
-                    .map_err(|why| anyhow::anyhow!(why));
+                let result = atomcode::tui_front::run(
+                    runtime,
+                    front_end,
+                    coding_cfg,
+                    &screen,
+                    config_path.clone(),
+                )
+                .await
+                .map(|()| 0)
+                .map_err(|why| anyhow::anyhow!(why));
                 if let Some(id) = &active_session_id {
                     println!("\n{}", resume_hint_line(id, false, hint_zh));
                 }
