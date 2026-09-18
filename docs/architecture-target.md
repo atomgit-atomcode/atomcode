@@ -278,14 +278,30 @@ gates/layers.sh                                      # 用 cargo metadata 断言
   `request_user_input`、`todo`。`plugins/policy.rs`(审批梯度那一行,15 处引用)整个
   建在它们上面。
 
-  **所以债的真实形状是:审批闸放在能力行层,而用它们的是机制层的行。** 正确的方向
-  是把那几个闸**往下**搬(kernel 已经有 `RiskLevel`、`ToolMiddleware`、
-  `PolicyIntervention`,它们是同一族东西),而不是把行**往上**搬。
+  **"把闸往下搬"这个说法也太粗了**(2026-09-18 晚再查一层)。把引用逐处打开看,
+  它们其实是**性质完全不同的两类**:
 
-  **这一步要先定一件事**:kernel 的稳定性约束是"除了 Agent 核心的事件,功能型内容
-  不能进入"。审批闸算不算 Agent 核心?`PolicyIntervention` 已经在 kernel 里,这是
-  支持算的证据;但那是**一个事件类型**,而这些是**九个带策略的函数**。
-  **没定之前不要动** —— 划错了就是往极稳的那层里灌功能。
+  | 在哪 | 要的是什么 | 性质 |
+  |---|---|---|
+  | `handle.rs:39` | `ApprovalRequest` / `PermissionDecision` / `APPROVAL_KIND` | **形状**——命令泵拿着传递的请求与裁决 |
+  | `policy.rs` 六处 | `write_verdict`、`credential_shell_verdict`、`bash_workspace_verdict`、`references_sensitive_path`、`delegated_write_violation` | **策略**——函数体里是敏感路径清单、凭据模式、工作区规则 |
+
+  闸本身有 **4,618 行**,全在 `capabilities/src/tools/` 下:`bash_workspace_gate.rs`
+  1746、`credential_bash_gate.rs` 838、`write_approval.rs` 823、`sensitive_path.rs` 710、
+  `approval.rs` 501。而 `approval.rs` 的文件头自己写着:**"The kernel deliberately
+  keeps approval OUT of L0"** —— 当初就是有意不放进去的。
+
+  所以:
+
+  - **形状那一小块**进 kernel 是顺的。kernel 已经有 `PolicyIntervention`、`RiskLevel`、
+    `ToolMiddleware`,这是同一族,而且只是类型。
+  - **4,618 行策略绝不能进 kernel。** 那正是"功能型内容",而且当初就有意排除过。
+
+  **于是真正该问的不是"闸往哪搬",是"`plugins/policy.rs`(审批梯度那一行)算哪一层"。**
+  它不是机制层不小心引用了能力 —— 它是**一整行建在策略之上的行**。如果它属于能力行层,
+  那它就不该在 harness 的 `plugins/` 里,这笔"债"也就不是债,而是这一行放错了位置。
+
+  **没定之前不要动。**
 
 **待办,按这张表该动但还没动的:**
 
