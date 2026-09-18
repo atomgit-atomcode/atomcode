@@ -583,6 +583,129 @@ mod tests {
         assert_eq!(entries[0]["priority"], "low");
     }
 
+    /// `/undo N` counts backwards; the contract names a turn. The translation
+    /// happens here, where "the Nth one back" is said.
+    ///
+    /// The ordering is the whole risk: the host lists rewind points **newest
+    /// first**, so `/undo 1` is the first entry and `/undo 2` the second. Read
+    /// the list the other way round and every undo goes to the wrong turn while
+    /// still looking like it worked.
+    #[tokio::test]
+    async fn undo_counts_backwards_and_the_contract_names_the_turn() {
+        use crate::acp::sessions::{RecordingHost, SessionState};
+        let host = std::sync::Arc::new(RecordingHost::default());
+        let point = |turn: u64, prompt: &str| atomcode_host_api::RewindPoint {
+            turn,
+            prompt: prompt.to_string(),
+            files: 0,
+            code: false,
+        };
+        host.replies.lock().unwrap().extend([
+            atomcode_host_api::HostReply::RewindPoints {
+                // Newest first, as the host lists them.
+                points: vec![point(9, "第三句"), point(7, "第二句"), point(5, "第一句")],
+                code_unavailable: None,
+            },
+            atomcode_host_api::HostReply::Undone {
+                prompt: Some("第三句".into()),
+                restored_files: Vec::new(),
+            },
+        ]);
+        let (commands, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let state = SessionState {
+            commands,
+            control: host.clone(),
+            events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
+            _front_end: atomcode_coding::front_end::FrontEnd::new(),
+            persistence_failure: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            native_id: "n1".into(),
+            cwd: std::path::PathBuf::from("/work"),
+            current_mode: RuntimeMode::Build,
+            config_options: Vec::new(),
+            usage: (0, 0),
+            todo_calls: Vec::new(),
+            title: None,
+            additional_directories: Vec::new(),
+        };
+        let sessions: crate::acp::sessions::Sessions =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([
+                ("acp-n1".to_string(), state),
+            ])));
+
+        // `1` on purpose: with an odd list, "the 2nd from the front" and "the
+        // 2nd from the back" are the same entry, so a criterion written that way
+        // passes whichever way the list is read. The first entry is the one
+        // that tells them apart — newest is 9, oldest is 5.
+        let said = undo_text(&sessions, &SessionId::new("acp-n1"), "1")
+            .await
+            .expect("a live session answers");
+        assert!(said.contains("第三句"), "{said}");
+        let asked = host.asked.lock().unwrap();
+        assert!(matches!(
+            asked.first(),
+            Some(atomcode_host_api::HostCommand::RewindPoints { .. })
+        ));
+        assert_eq!(
+            asked.get(1),
+            Some(&atomcode_host_api::HostCommand::Undo {
+                session: "n1".into(),
+                // The NEWEST. Read the list the other way and this is 5.
+                turn: Some(9),
+                based_on: 0,
+            })
+        );
+    }
+
+    /// `/undo` with nothing after it is the newest turn, which the contract
+    /// says by naming no turn at all — so it does not ask for the list.
+    #[tokio::test]
+    async fn undo_with_no_argument_names_no_turn() {
+        use crate::acp::sessions::{RecordingHost, SessionState};
+        let host = std::sync::Arc::new(RecordingHost::default());
+        host.replies
+            .lock()
+            .unwrap()
+            .push_back(atomcode_host_api::HostReply::Undone {
+                prompt: None,
+                restored_files: Vec::new(),
+            });
+        let (commands, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_ev_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let state = SessionState {
+            commands,
+            control: host.clone(),
+            events: std::sync::Arc::new(tokio::sync::Mutex::new(events)),
+            _front_end: atomcode_coding::front_end::FrontEnd::new(),
+            persistence_failure: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            native_id: "n1".into(),
+            cwd: std::path::PathBuf::from("/work"),
+            current_mode: RuntimeMode::Build,
+            config_options: Vec::new(),
+            usage: (0, 0),
+            todo_calls: Vec::new(),
+            title: None,
+            additional_directories: Vec::new(),
+        };
+        let sessions: crate::acp::sessions::Sessions =
+            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([
+                ("acp-n1".to_string(), state),
+            ])));
+
+        undo_text(&sessions, &SessionId::new("acp-n1"), "")
+            .await
+            .expect("a live session answers");
+        assert_eq!(
+            *host.asked.lock().unwrap(),
+            vec![atomcode_host_api::HostCommand::Undo {
+                session: "n1".into(),
+                turn: None,
+                based_on: 0,
+            }],
+            "no list is asked for when no Nth is named"
+        );
+    }
+
     /// What this channel advertises is what it can actually run.
     ///
     /// The table moved here from the old front end's `acp: true` column

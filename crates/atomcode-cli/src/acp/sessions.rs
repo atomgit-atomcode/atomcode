@@ -102,6 +102,8 @@ pub type Sessions = Arc<Mutex<HashMap<String, SessionState>>>;
 #[derive(Default)]
 pub(crate) struct RecordingHost {
     pub asked: std::sync::Mutex<Vec<atomcode_host_api::HostCommand>>,
+    /// Answers, in order. Empty (or exhausted) answers `Done`.
+    pub replies: std::sync::Mutex<std::collections::VecDeque<atomcode_host_api::HostReply>>,
 }
 
 #[cfg(test)]
@@ -112,7 +114,12 @@ impl HostControl for RecordingHost {
         command: atomcode_host_api::HostCommand,
     ) -> Result<atomcode_host_api::HostReply, atomcode_host_api::HostError> {
         self.asked.lock().expect("poisoned").push(command);
-        Ok(atomcode_host_api::HostReply::Done)
+        Ok(self
+            .replies
+            .lock()
+            .expect("poisoned")
+            .pop_front()
+            .unwrap_or(atomcode_host_api::HostReply::Done))
     }
     fn subscribe(&self) -> mpsc::UnboundedReceiver<HostEvent> {
         mpsc::unbounded_channel().1
