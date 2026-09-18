@@ -55,13 +55,14 @@ fn is_cjk_locale() -> bool {
 pub(crate) fn cell_char_width(ch: char) -> Option<usize> {
     // U+26A0 WARNING SIGN defaults to TEXT presentation (Emoji_Presentation=No), so a
     // bare `⚠` (no VS16 — which is how the `⚠ ` warning prefix is emitted) is painted
-    // as a NARROW 1-cell glyph by conhost / Windows Terminal / most fonts. But both
-    // `width_cjk` (Ambiguous → 2, for CJK-locale users) AND the emoji-wide widening below
-    // model it as 2 — over-counting by 1, which drifts the retained cell grid and leaves
-    // a ghost character right after the prefix (issue #1368: the "⚠g" / "⚠d" artifact).
-    // Pin it to 1 so the model matches what the host actually paints. A terminal that DOES
-    // paint `⚠` wide only mildly overlaps the next cell — far less jarring than a phantom
-    // letter, and far rarer than the narrow-paint hosts where this was reported.
+    // as a NARROW 1-cell glyph by conhost / Windows Terminal / most fonts. The emoji-wide
+    // table below now excludes it (only ⚡ U+26A1 stays), but `width_cjk` still reports
+    // Ambiguous → 2 for CJK-locale users — which over-counts by 1, drifts the retained
+    // cell grid, and leaves a ghost char right after the prefix (issue #1368: the "⚠g" /
+    // "⚠d" artifact). Pin it to 1 up front so the model matches what the host paints, in
+    // every locale. A terminal that DOES paint `⚠` wide only mildly overlaps the next
+    // cell — far less jarring than a phantom letter, and far rarer than the narrow-paint
+    // hosts where this was reported.
     if ch == '\u{26A0}' {
         return Some(1);
     }
@@ -202,7 +203,10 @@ fn is_wide_emoji_symbol(ch: char) -> bool {
         (0x2692, 0x2697),
         (0x2699, 0x2699),
         (0x269B, 0x269C),
-        (0x26A0, 0x26A1),
+        // U+26A0 ⚠ is Emoji_Presentation=No (text-default → painted NARROW, like ✓ which
+        // is likewise excluded) — only U+26A1 ⚡ (Emoji_Presentation=Yes) belongs here.
+        // `cell_char_width` also pins ⚠ to 1 up front to cover the CJK-Ambiguous path.
+        (0x26A1, 0x26A1),
         (0x26A7, 0x26A7),
         (0x26AA, 0x26AB),
         (0x26B0, 0x26B1),
@@ -987,6 +991,7 @@ mod tests {
                                              // NOT emoji — must stay narrow, or we'd regress ordinary ambiguous
                                              // text symbols (the whole point of scoping to the Emoji set).
         assert!(!is_wide_emoji_symbol('✓')); // U+2713 check mark (Emoji=No)
+        assert!(!is_wide_emoji_symbol('\u{26A0}')); // ⚠ Emoji_Presentation=No — excluded like ✓ (#1368)
         assert!(!is_wide_emoji_symbol('°')); // U+00B0 degree sign
         assert!(!is_wide_emoji_symbol('◆')); // U+25C6 black diamond
         assert!(!is_wide_emoji_symbol('×')); // U+00D7 multiplication
