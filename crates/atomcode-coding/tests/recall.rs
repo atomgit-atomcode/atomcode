@@ -52,7 +52,10 @@ fn tree(store: &Path, project: &Path, say: &str, extra: &[&str]) -> ConfigTree {
         home = empty_home.to_string_lossy(),
         store = store.to_string_lossy(),
     );
-    let mut layers = vec![bundle::base().unwrap()];
+    let mut layers = vec![
+        atomcode_coding::on_harness::base_layer(),
+        atomcode_coding::on_harness::headless_patch(),
+    ];
     layers.push(Layer::from_toml(&scoped).unwrap());
     for src in extra {
         layers.push(Layer::from_toml(src).unwrap());

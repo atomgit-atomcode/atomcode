@@ -401,6 +401,45 @@ struct DatalogPatch<'a> {
     dir: Option<&'a str>,
 }
 
+/// The machine plus this product's answer, as one layer.
+///
+/// What `atomcode_harness::bundle::base()` used to be, said by the crate that
+/// owns the answer. That one was `INFRA + bundle::DEFAULTS`, and
+/// `bundle::DEFAULTS` was a second copy of "a coding agent" kept in the
+/// mechanism crate — 29 of its 30 rows are in [`CODING_DEFAULTS`] already, so
+/// the copy could only ever drift from the original.
+pub fn base_layer() -> atomcode_plexus::Layer {
+    // A persona, because an agent without one is not an agent. This product's
+    // own is `persona-atomcode`, and it arrives with [`CODING_ROWS`] — which
+    // also brings `ui-handle`, i.e. a front end. A tree built from this
+    // function has none, so it takes the mechanism's generic coding persona
+    // instead: the same row `bundle::DEFAULTS` mounted, for the same reason.
+    let persona = "\n[[insert]]\nname = \"persona-coding\"\n";
+    atomcode_plexus::Layer::from_toml(&format!(
+        "{}\n{CODING_DEFAULTS}{persona}",
+        atomcode_harness::bundle::INFRA
+    ))
+    .expect("the machine and this product's answer both parse")
+}
+
+/// The rows a tree with **no front end and no host** takes back.
+///
+/// [`CODING_DEFAULTS`] keeps `approval` and `user-questions-unattended` dormant
+/// because `ui-handle` claims both seams when a front end mounts, and a seam has
+/// one provider. With nobody in front they come back — as a patch, not a fork —
+/// or a question nobody can answer is not refused at all.
+///
+/// A separate layer because a patch can only target a row an *earlier* layer
+/// inserted.
+pub fn headless_patch() -> atomcode_plexus::Layer {
+    atomcode_plexus::Layer::from_toml(
+        "[[patch]]\nid = \"approval\"\nconfig = { mode = \"deny-risky\" }\ndisabled = false\n\n\
+         [[patch]]\nid = \"user-questions-unattended\"\nconfig = {}\ndisabled = false\n\n\
+         [[patch]]\nid = \"session-persistence-jsonl\"\ndisabled = false",
+    )
+    .expect("taking the two seams back parses")
+}
+
 /// The rows that are this product, on top of [`CODING_DEFAULTS`].
 ///
 /// The split between the two lists is: `CODING_DEFAULTS` answers the same

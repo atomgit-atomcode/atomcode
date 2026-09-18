@@ -83,7 +83,8 @@ fn layers_with(root: &std::path::Path, lead: &str, member: &str, team: &str) -> 
         "[[patch]]\nid = \"llm\"\nname = \"llm-replay\"\nconfig = {{ script = [ {lead} ] }}"
     );
     vec![
-        bundle::base().unwrap(),
+        atomcode_coding::on_harness::base_layer(),
+        atomcode_coding::on_harness::headless_patch(),
         Layer::from_toml(&lead).unwrap(),
         Layer::from_toml(quiet).unwrap(),
         Layer::from_toml(&scoped).unwrap(),

@@ -38,7 +38,10 @@ fn scratch(tag: &str) -> PathBuf {
 }
 
 fn tree(root: &std::path::Path, extra: &[&str]) -> ConfigTree {
-    let mut layers = vec![bundle::base().unwrap()];
+    let mut layers = vec![
+        atomcode_coding::on_harness::base_layer(),
+        atomcode_coding::on_harness::headless_patch(),
+    ];
     layers.push(Layer::from_toml(&scoped(root)).unwrap());
     for src in extra {
         layers.push(Layer::from_toml(src).unwrap());

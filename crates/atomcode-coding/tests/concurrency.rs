@@ -122,7 +122,8 @@ fn tree(root: &std::path::Path, script: &str, extra: &[&str]) -> ConfigTree {
         home = empty_home.to_string_lossy()
     );
     let mut layers = vec![
-        bundle::base().unwrap(),
+        atomcode_coding::on_harness::base_layer(),
+        atomcode_coding::on_harness::headless_patch(),
         Layer::from_toml(bundle::ONESHOT_APP).unwrap(),
     ];
     for src in [base.as_str(), script, bundle::YOLO] {

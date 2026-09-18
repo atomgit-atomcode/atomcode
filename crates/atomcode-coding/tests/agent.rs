@@ -45,7 +45,10 @@ fn tree(root: &std::path::Path, script: &str, extra: &[&str]) -> ConfigTree {
         root = root.to_string_lossy(),
         home = empty_home.to_string_lossy()
     );
-    let mut layers = vec![bundle::base().unwrap()];
+    let mut layers = vec![
+        atomcode_coding::on_harness::base_layer(),
+        atomcode_coding::on_harness::headless_patch(),
+    ];
     for src in [script, quiet, scoped.as_str()] {
         layers.push(Layer::from_toml(src).unwrap());
     }
@@ -670,7 +673,8 @@ async fn a_message_wakes_the_agent_behind_a_handle_too() {
     use atomcode_kernel::event::AgentEvent;
     let dir = scratch("wake-handle");
     let layers = vec![
-        bundle::base().unwrap(),
+        atomcode_coding::on_harness::base_layer(),
+        atomcode_coding::on_harness::headless_patch(),
         Layer::from_toml(bundle::HANDLE_APP).unwrap(),
         Layer::from_toml(&talker(&["ok"])).unwrap(),
         Layer::from_toml(

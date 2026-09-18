@@ -671,7 +671,10 @@ config = { stream = false, tools = false, summary = false }
         root = sandbox.to_string_lossy(),
         home = sandbox.to_string_lossy()
     );
-    let mut layers = vec![bundle::base().unwrap()];
+    let mut layers = vec![
+        atomcode_coding::on_harness::base_layer(),
+        atomcode_coding::on_harness::headless_patch(),
+    ];
     for src in [script, quiet, scoped.as_str()] {
         layers.push(Layer::from_toml(src).unwrap());
     }
@@ -848,7 +851,10 @@ config = { script = [ { text = "answered" } ] }
             })
             .unwrap_or_default()
     );
-    let mut layers = vec![bundle::base().unwrap()];
+    let mut layers = vec![
+        atomcode_coding::on_harness::base_layer(),
+        atomcode_coding::on_harness::headless_patch(),
+    ];
     for src in [script, quiet, rows.as_str()] {
         layers.push(Layer::from_toml(src).unwrap());
     }

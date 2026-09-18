@@ -802,7 +802,7 @@ async fn candidate_app(script: Arc<Script>, dir: &std::path::Path) -> atomcode_p
         home = empty.to_string_lossy(),
     );
     let tree = ConfigTree::from_layers(vec![
-        atomcode_harness::bundle::base().unwrap(),
+        atomcode_coding::on_harness::base_layer(),
         Layer::from_toml(&scoped).unwrap(),
     ])
     .expect("tree");

@@ -108,7 +108,10 @@ fn tree(root: &Path, script: &str, extra: &[&str]) -> ConfigTree {
         root = root.to_string_lossy(),
         home = empty_home.to_string_lossy()
     );
-    let mut layers = vec![bundle::base().unwrap()];
+    let mut layers = vec![
+        atomcode_coding::on_harness::base_layer(),
+        atomcode_coding::on_harness::headless_patch(),
+    ];
     for src in [
         script,
         quiet,
