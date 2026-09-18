@@ -294,11 +294,42 @@ tuix 的老毛病——现在改是十几行,等下游移植完再改就是他�
 - ⬜ ACP 拿 `HostConnection`
 - ⬜ `turn.rs` 换流(7 处 4 种事件;`translate()` 已经把这 4 种映射好了,是换流不是重写)
 - ✅ **`context_stats` 的契约缺口补上了**:`HostCommand::Context` /
-  `HostReply::Context { window, used, model, working_dir }`。这是 6.3 里最后一个
-  "契约里没有对应项",补掉之后剩下的三步是纯机械搬运。顺带 tui 的 `/context` 第一次
-  能说出预算 —— 它以前只能数自己看见的,而宿主还打包了系统提示、instructions 与工具
-  定义,屏幕一条都没见过
+  `HostReply::Context { window, used, model, working_dir }`。顺带 tui 的 `/context`
+  第一次能说出预算 —— 它以前只能数自己看见的,而宿主还打包了系统提示、instructions
+  与工具定义,屏幕一条都没见过
 - ⬜ 7 个方法换契约(12 + 3 处)
+
+###### 把剩下三步读完之后:**其中两处不是机械搬运**(2026-09-18 更正)
+
+补完 `Context` 当时写的是"剩下的是纯机械搬运"。**那句话是错的**,把七个方法逐个
+读过之后有两处不是:
+
+| 方法 | 契约对应 | 是不是机械 |
+|---|---|---|
+| `respond` / `cancel` / `compact` / `shutdown` | `AgentCommand::Respond` / `Cancel` / `Compact` / `Shutdown` —— 四个全有 | ✅ 直换 |
+| `context_stats` | `HostCommand::Context` | ✅ 刚补 |
+| **`reprepare_config(next)`** | `SwitchModel` / `SetReasoningEffort` | ⚠️ **不是** |
+| **`undo_to_prompt(nth)`** | `Undo { turn, based_on }` | ⚠️ **不是** |
+
+**① `reprepare_config` 收的是一份已经解析好的 `CodingAgentConfig`**,由 ACP 自己
+持有的两个闭包(`model_resolver` / `effort_resolver`,见 `options.rs:233`、`:250`)
+算出来。契约这边收的是 `model` 名字或 `level`,由**宿主**去解析
+(`RuntimeControl::reconfigure` 经 `HostConfig::for_model`)。换过去等于把模型解析
+从 ACP 挪回宿主 —— 方向是对的(那本来就是宿主的活),但 `SessionModelResolver`
+那条注入链要跟着拆,不是替换一行。
+
+**② `undo_to_prompt(nth)` 的 `nth` 是"往回第几个",契约的 `Undo` 收的是 `turn` 号。**
+契约里没有"往回数 N 个"这个说法 —— 这是故意的,`cli/src/host.rs:680` 那段会先查
+`rewind_points()` 把 turn 号换成 prompt 序号。所以 ACP 的 `/undo 3` 要变成:
+先 `RewindPoints` 拿列表 → 取第 N 新的那个 turn → `Undo { turn: Some(它) }`。
+
+  外加 `based_on: SeqNo`(防的是"你看到的还是不是现在的状态")。`fresh()` 读的是
+  **前端自己的会话日志**(`host.rs:547` 的 `front_end.app()`),tui 传的是
+  `client.root_high()`。**ACP 今天不跟踪任何 seq**,要开始跟。
+
+**结论**:剩下三步仍然该一次做完(七个文件是一体的),但动手前要先认下这两件事 ——
+一件是把模型解析还给宿主并拆掉 `SessionModelResolver` 的注入链,一件是让 ACP 开始
+记"我看到的最后一条事实是第几号"。把它们当成机械替换去做,会在半路上才发现。
 
 #### 6.5 测绘(2026-09-18)：今天能删的只有一半,另一半卡在 6.3/6.4 后面
 
