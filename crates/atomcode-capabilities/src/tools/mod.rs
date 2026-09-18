@@ -274,7 +274,7 @@ pub fn register_coding_tools_with_vision(reg: &mut ToolRegistry, vision: bool) {
             })
             .unwrap_or(false);
         if !memory_off {
-            reg.register(Arc::new(MemoryTool));
+            reg.register(Arc::new(MemoryTool::new()));
         }
     }
 }

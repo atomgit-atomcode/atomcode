@@ -422,6 +422,15 @@ struct MemoryRow {
     /// run that must not depend on someone's notes) still wants the first.
     #[serde(default = "yes")]
     inject: bool,
+    /// The global tier's file. Defaults to `$ATOMCODE_HOME/memory.md`.
+    ///
+    /// A file rather than a home directory, and deliberately not called `home`:
+    /// the `skills` row's `home` is the person's `$HOME`, while this file lives
+    /// under AtomCode's own home. One word meaning two directories in two rows is
+    /// how a product built on the harness ends up with its users' memory in the
+    /// wrong place.
+    #[serde(default)]
+    global: Option<String>,
 }
 
 impl Default for MemoryRow {
@@ -429,6 +438,7 @@ impl Default for MemoryRow {
         Self {
             project_root: None,
             inject: true,
+            global: None,
         }
     }
 }
@@ -469,8 +479,14 @@ impl Plugin for MemoryPlugin {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "project".into());
+        // Resolved once, and handed to both halves: the injection that reads the
+        // global tier and the tool that writes it must agree on which file it is.
+        let global = row
+            .global
+            .map(PathBuf::from)
+            .unwrap_or_else(|| MemoryStore::global().path().to_path_buf());
         let merged = MemoryStore::merged_for_prompt(
-            &MemoryStore::global(),
+            &MemoryStore::new(global.clone()),
             &MemoryStore::project(&project),
             &MemoryStore::local(&project),
             &project_name,
@@ -480,7 +496,9 @@ impl Plugin for MemoryPlugin {
         // a human could carry out — in a system whose whole point is that the
         // agent carries things out.
         if let Some(toolbox) = ctx.service::<crate::seams::ToolsSvc>() {
-            toolbox.register(Arc::new(atomcode_capabilities::tools::MemoryTool))?;
+            toolbox.register(Arc::new(
+                atomcode_capabilities::tools::MemoryTool::with_global(global.clone()),
+            ))?;
             let toolbox = toolbox.clone();
             let _ = ctx.effect(move || toolbox.unregister("memory"));
         }
@@ -498,7 +516,7 @@ impl Plugin for MemoryPlugin {
                  `{{action: remember|forget|list, content, scope: project|local|global}}`. \
                  Memory is what someone chose to state; for everything that was \
                  merely *said*, use `recall` instead.",
-                MemoryStore::global().path().display(),
+                global.display(),
                 MemoryStore::project(&project).path().display(),
                 MemoryStore::local(&project).path().display(),
             ),
