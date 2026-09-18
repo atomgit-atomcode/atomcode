@@ -236,7 +236,7 @@ pub struct Moment {
     /// `&State` and a `&Viewport`, so a module cannot reach a service or a
     /// shared table of its own (`module.rs` says why at length). The host puts
     /// the frame's snapshot here and the module reads it — the same road
-    /// `Moment::members` travels. See `docs/adr/0023` decision ①.
+    /// `Moment::members` travels. See `docs/adr/0027` decision ①.
     pub rasters: crate::raster::RastersView,
     /// What the person has said while a turn was running, and the model has not
     /// been handed yet — oldest first, joined by newlines.

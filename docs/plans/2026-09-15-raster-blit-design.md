@@ -1,6 +1,6 @@
 # Raster 与 blit：终端上的字符格位图
 
-状态：设计（未实现）。配套 ADR：[`docs/adr/0023`](../adr/0023-raster-is-a-cell-grid.md)。
+状态：设计（未实现）。配套 ADR：[`docs/adr/0027`](../adr/0027-raster-is-a-cell-grid.md)。
 
 日期：2026-09-15
 
@@ -19,7 +19,7 @@
 
 ## 背景：为什么不是图形协议
 
-`docs/adr/0022` 已经论证过：真图形协议（Sixel / iTerm2 / Kitty）在我们的滚动
+`docs/adr/0026` 已经论证过：真图形协议（Sixel / iTerm2 / Kitty）在我们的滚动
 模型下没有定义好的语义，且 `text::for_screen` 的整体不变量（**我们发出的任何
 字节都不移动光标**）与它们冲突。那条路的重开条件写在那里。
 
@@ -433,7 +433,7 @@ plexus_service!(RastersSvc => crate::raster::Rasters, "tui-rasters", Core,
 - **不做随对话滚动的位图。** 它要求「不冻结的流块」，会碰 ADR 0004 的核心
   不变量。见失效条件。
 - **不做键盘交互。** `Moment.focus` 那条缝是独立工作（见「交互」一节）。
-- **不做图形协议。** ADR 0022 已定，重开条件在那里。
+- **不做图形协议。** ADR 0026 已定，重开条件在那里。
 - **不做 ambiguous-as-wide 的防御。** 那是**全 UI 范围**的既有暴露（框线全是
   Ambiguous），正解是给 `Caps` 加一位并在 `Caps::g` 里退回 ASCII 框线——
   **独立的一件事**，见 5.2。
@@ -453,12 +453,12 @@ plexus_service!(RastersSvc => crate::raster::Rasters, "tui-rasters", Core,
 - **若出现了第二个「外部往已挂载的东西写、模块每帧读」的场景**：`Asks` 与
   `Rasters` 会长成两种同形的东西，那时该抽一个共用的形状，而不是并列第三张表。
 - **若 `Caps` 能力探测升级**（比如真的去探 `[16t` 拿单元格像素尺寸）：
-  Raster 是**字符格**的，不需要像素尺寸；探测升级只对 ADR 0022 那条路有意义。
+  Raster 是**字符格**的，不需要像素尺寸；探测升级只对 ADR 0026 那条路有意义。
 
 ## 相关
 
-- [`docs/adr/0023`](../adr/0023-raster-is-a-cell-grid.md) —— 本条的设计决定
-- [`docs/adr/0022`](../adr/0022-pictures-in-blocks-not-yet.md) —— 图形协议为什么
+- [`docs/adr/0027`](../adr/0027-raster-is-a-cell-grid.md) —— 本条的设计决定
+- [`docs/adr/0026`](../adr/0026-pictures-in-blocks-not-yet.md) —— 图形协议为什么
   不做；本设计是它「路一」的字符格版本
 - [`docs/adr/0004`](../adr/0004-tui-stream-is-an-irreversible-block-sequence.md) ——
   「已结算块内容冻结」是本设计选视图模块的直接原因

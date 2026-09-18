@@ -810,7 +810,7 @@ pub struct Host {
     pub asks: Arc<crate::ask::Asks>,
     /// The mounted cell-grid bitmaps. The host holds the table; a row writes
     /// through `RastersSvc`, and every frame takes a snapshot of it into
-    /// `Moment` for the modules to draw. See `docs/adr/0023`.
+    /// `Moment` for the modules to draw. See `docs/adr/0027`.
     pub rasters: Arc<crate::raster::Rasters>,
     pub modules: Arc<Modules>,
     pub layout: Arc<crate::layout::Layout>,

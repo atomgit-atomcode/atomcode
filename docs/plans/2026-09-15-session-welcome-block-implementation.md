@@ -13,7 +13,7 @@
 **Spec:** `docs/plans/2026-09-15-session-welcome-block-design.md`
 （设计文档放 `docs/plans/` 而非 skill 默认的 `docs/superpowers/plans/`：后者整个目录在 `.gitignore:89` 里，受跟踪的设计文档一直落在 `docs/plans/*-design.md`。）
 
-**ADR:** `docs/adr/0021-blocks-may-shape-by-terminal-capability.md`
+**ADR:** `docs/adr/0025-blocks-may-shape-by-terminal-capability.md`
 
 **每条命令都在 worktree 根目录跑。** 全部命令前面都有 `cd /Users/lichao/project/gitcode/ai/atomcode/.worktrees/session-welcome-block &&` 的隐含前缀。
 
@@ -151,7 +151,7 @@ pub fn glyph(unicode: bool, glyph: Glyph) -> &'static str {
     /// The capabilities are here for one thing only: a block whose *existence or
     /// shape* depends on what the terminal can draw. Glyphs that merely need
     /// downgrading do not need this — [`crate::ansi::write_line`] swaps them on
-    /// the way out, one column in and one column out. See `docs/adr/0021`.
+    /// the way out, one column in and one column out. See `docs/adr/0025`.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line>;
 ```
 
@@ -1840,7 +1840,7 @@ tuix 用 cell background 在格子里塞两层像素,本 UI 只用前景色 —�
 成 `#`(同宽)。
 
 猫的门是 `unicode && colors != None`。两个门都能关掉它,因为整块的存在取决于
-能力 —— 这正是 adr/0021 那条缝的用途;能降级的字形不需要它。
+能力 —— 这正是 adr/0025 那条缝的用途;能降级的字形不需要它。
 
 `always_open()`:它的全部意义就是"这次会话是这样开头的",折成一行摘要正是把
 这个意思折没了。
@@ -1879,7 +1879,7 @@ Task 4 只依赖 Phase 1。Task 5 依赖 Task 4、7、8。Task 6 最后。
 |---|---|
 | 新 session 开局有欢迎块，且随对话滚动 | `tests/e2e.rs` 的那条 e2e |
 | 它是插件化的（可替换/可拿掉） | `tui-panel-welcome` 在 `SCREEN` 里；`[[remove]]` 掉它流就直接开始对话（`open_conversation` 的判据） |
-| 块的形状能按终端能力决定 | `docs/adr/0021`；`ShapeCaps`；两条缓存键判据 |
+| 块的形状能按终端能力决定 | `docs/adr/0025`；`ShapeCaps`；两条缓存键判据 |
 | 换终端能力会重算行数，不命中旧缓存 | `a_change_of_terminal_capability_is_not_a_cache_hit` 与 `the_row_index_is_keyed_on_capability_not_only_width` |
 | 主题变化不击穿缓存 | `ShapeCaps` 的定义（不含 palette）+ `frame.rs:143-149` 的 doc |
 | 窄终端不留莫名其妙的空行 | `nothing_fits_means_no_block_at_all_not_an_empty_one` |

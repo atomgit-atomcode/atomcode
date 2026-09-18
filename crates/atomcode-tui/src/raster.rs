@@ -3,7 +3,7 @@
 //!
 //! **Not a graphics protocol.** Everything here is cells, so scrolling, the
 //! frame diff, glyph downgrading and containment keep working the way they do
-//! for every other thing on screen. See `docs/adr/0023`.
+//! for every other thing on screen. See `docs/adr/0027`.
 //!
 //! Two types, split by who owns what:
 //!
@@ -40,7 +40,7 @@ pub struct Cell {
     /// Ambiguous-width characters are accepted, not refused: this UI's own box
     /// drawing (`─│┌┐└┘`) is ambiguous too, so refusing them here would refuse
     /// the alphabet the rest of the screen already draws with and protect
-    /// nothing. See `docs/adr/0023` decision ③.
+    /// nothing. See `docs/adr/0027` decision ③.
     pub ch: char,
     /// `None` is the terminal's own colour — the payload's `0x0100_0000`.
     ///
@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn braille_and_ambiguous_blocks_are_both_accepted() {
-        // The executable form of the correction in `docs/adr/0023` decision ③:
+        // The executable form of the correction in `docs/adr/0027` decision ③:
         // one cell wide is the whole test. Braille is EAW=N (the safest of the
         // candidates) and `█` is EAW=A — the same class as this UI's box
         // drawing, so refusing it would refuse the alphabet already in use.

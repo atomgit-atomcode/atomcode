@@ -5,7 +5,7 @@
 **Goal:** 在终端里画一块字符格位图，可原地刷新，且**只重画变化的行**。
 
 **Design:** `docs/plans/2026-09-15-raster-blit-design.md`
-**ADR:** `docs/adr/0023-raster-is-a-cell-grid.md`
+**ADR:** `docs/adr/0027-raster-is-a-cell-grid.md`
 
 **Worktree:** `.worktrees/session-welcome-block`，分支 `feat/session-welcome-block`
 
@@ -150,7 +150,7 @@ Expected: 编译失败（`cannot find type Raster`）。
 //! 字符格位图：一块 `(码点, 前景, 背景)` 的网格，可原地刷新。
 //!
 //! 不是图形协议。滚动、diff、能力降级、containment 都按**格子**走，见
-//! `docs/adr/0023`。
+//! `docs/adr/0027`。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -168,7 +168,7 @@ pub const MAX_ROWS: u16 = 64;
 /// 一格。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
-    /// 可打印、**窄约定下宽度 1** 的 BMP 码点（见 ADR 0023 决策③）。
+    /// 可打印、**窄约定下宽度 1** 的 BMP 码点（见 ADR 0027 决策③）。
     pub ch: char,
     /// `None` = 终端默认色（载荷里的 `0x0100_0000`）。
     pub fg: Option<Color>,
@@ -410,7 +410,7 @@ fn swap(&self, module: &str, key: &str, raster: Arc<Raster>) {
     ///
     /// 快照而不是把手：里面的 `Raster` 不可变，所以同一个 `Moment` 渲染两次看到
     /// 同一幅画面——与 `caps`、`cwd` 守的是同一个承诺。位图**不能**由模块自己去
-    /// 表里取：`View::render` 拿不到任何服务（见 `docs/adr/0023` 决策①）。
+    /// 表里取：`View::render` 拿不到任何服务（见 `docs/adr/0027` 决策①）。
     pub rasters: crate::raster::RastersView,
 ```
 
@@ -458,7 +458,7 @@ impl crate::module::View for RasterPane {
             .map(|r| r.lines_in(vp.rect))
             .unwrap_or_default()
     }
-    // height 用默认 (Fill)：矩形由布局树给（见 ADR 0023 决策①）。
+    // height 用默认 (Fill)：矩形由布局树给（见 ADR 0027 决策①）。
 }
 
 #[cfg(test)]
@@ -555,8 +555,8 @@ fn a_terminal_with_no_unicode_gets_no_raster() {
 
 ## 没做的事
 
-- **格级 diff**（ADR 0023 决策⑤：先量化）
+- **格级 diff**（ADR 0027 决策⑤：先量化）
 - **键盘交互**（`Moment.focus` 那条缝是独立工作）
 - **随对话滚动的位图**（要动 ADR 0004）
-- **图形协议**（ADR 0022）
+- **图形协议**（ADR 0026）
 - **ambiguous-as-wide 防御**（UI 级问题，独立一件事）

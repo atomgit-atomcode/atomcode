@@ -174,7 +174,7 @@ pub trait Content: Send + Sync + std::fmt::Debug {
     /// or shape* depends on what the terminal can draw. Glyphs that merely need
     /// downgrading do not need this — [`crate::ansi::write_line`] swaps those on
     /// the way out, one column in and one column out, so alignment survives.
-    /// See `docs/adr/0021`.
+    /// See `docs/adr/0025`.
     fn lines(&self, ctx: &RenderCtx) -> Vec<Line>;
 
     /// The text this block is growing, when it can only ever grow.

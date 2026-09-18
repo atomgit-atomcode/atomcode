@@ -54,7 +54,7 @@ impl Connection {
 }
 // Mounted cell-grid bitmaps. The host holds the table and puts a snapshot into
 // every frame's `Moment`; a row reaches it here to mount and repaint. See
-// `docs/adr/0023`.
+// `docs/adr/0027`.
 plexus_service!(RastersSvc => crate::raster::Rasters, "tui-rasters", Core, "Cell-grid bitmaps, addressed by (module id, key)");
 
 /// The session's clock, and the only place this crate reads one.

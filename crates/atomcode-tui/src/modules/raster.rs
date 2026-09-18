@@ -3,7 +3,7 @@
 //! Stateless and redrawn every frame — which is exactly what a bitmap wants. The
 //! stream's blocks *freeze* (ADR 0004), so a bitmap living in one could not be
 //! repainted after the turn that created it ended; a view module has no history
-//! to freeze, so it can be repainted forever. See `docs/adr/0023` decision ①.
+//! to freeze, so it can be repainted forever. See `docs/adr/0027` decision ①.
 //!
 //! The bitmap reaches it through `viewport.moment.rasters`, not through a
 //! service: `View::render` takes `&State` and a `&Viewport`, so a module cannot

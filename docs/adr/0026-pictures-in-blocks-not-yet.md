@@ -212,8 +212,8 @@ kitty 规范那句"必须随文本一起滚"的实现）。但它是**终端侧*
      `2580..258F`（`█▀▄`）与**全部框线** `2500..254B` 是 **A（Ambiguous）**。
      所以 Braille **不需要**为宽度加 caps 门——它是候选里最安全的一档；
      而 `▀▄█` 与 UI 其余部分同一假设（框线也是 Ambiguous）。详见
-     [`0023`](./0023-raster-is-a-cell-grid.md) 决策③。
-   这三档全部落在 [`0021`](./0021-blocks-may-shape-by-terminal-capability.md)
+     [`0027`](./0027-raster-is-a-cell-grid.md) 决策③。
+   这三档全部落在 [`0025`](./0025-blocks-may-shape-by-terminal-capability.md)
    那条缝里——不碰 `Frame`、不碰 `for_screen`、不碰 diff、不碰滚动。
    **这与业界一致**：ratatui-image 自己的 `Halfblocks` 兜底也是这一档（它注明
    "should work in all terminals, even if the font size could not be detected,
@@ -280,7 +280,7 @@ ratatui 的类型。**能引的是它下面的编码器与探测配方，不是�
 （opencode 的做法）。
 
 **（已落地，2026-09-15）** 这一档做了：`Caps::cell_background` 与
-`ShapeCaps::cell_background` 已加（见 [`0021`](./0021-blocks-may-shape-by-terminal-capability.md)
+`ShapeCaps::cell_background` 已加（见 [`0025`](./0025-blocks-may-shape-by-terminal-capability.md)
 的字段说明），欢迎块的猫用它画一格两像素的半身，缺这一位时退化成"一格一像素"的
 实心块。判断环境的方式照 tuix 原样搬（`WT_SESSION` / `TERM_PROGRAM` / `jediterm`）。
 
@@ -297,7 +297,7 @@ ratatui 的类型。**能引的是它下面的编码器与探测配方，不是�
 
 ## 相关
 
-- [`0021`](./0021-blocks-may-shape-by-terminal-capability.md) —— 本条要的精度，
+- [`0025`](./0025-blocks-may-shape-by-terminal-capability.md) —— 本条要的精度，
   在"字符多像素"这一档上走的就是它那条缝
 - [`0004`](./0004-tui-stream-is-an-irreversible-block-sequence.md) —— `Frame`
   是「行」的序列，本条讨论的正是一个不是行的东西
@@ -308,7 +308,7 @@ ratatui 的类型。**能引的是它下面的编码器与探测配方，不是�
 - `crates/atomcode-tui/src/text.rs` 的 `for_screen` —— 唯一挡住 ESC 的那道门
 - `crates/atomcode-tuix/src/render/qr.rs` —— 字符多像素的两个先例（`▀▄█` 与
   Braille）。**注意它的注释里有一条错的**：它说 Braille 是 Ambiguous 宽度，
-  按 UAX #11 是 N（Neutral）；见 [`0023`](./0023-raster-is-a-cell-grid.md) 决策③
+  按 UAX #11 是 N（Neutral）；见 [`0027`](./0027-raster-is-a-cell-grid.md) 决策③
 - `docs/plans/2026-09-15-session-welcome-block-design.md` §四 —— 猫的形状
 
 查证过的外部件（引用前先读本条"业界怎么做的"）：

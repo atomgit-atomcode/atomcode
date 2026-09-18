@@ -1,11 +1,11 @@
 # 位图是字符格，不是像素
 
-状态: 提议(2026-09-15),未实现。承接 [`0022`](./0022-pictures-in-blocks-not-yet.md),
+状态: 提议(2026-09-15),未实现。承接 [`0026`](./0026-pictures-in-blocks-not-yet.md),
 补它"路一"的字符格版本。
 
-## 背景:0022 否决了图形协议,但没回答"那密集图形怎么办"
+## 背景:0026 否决了图形协议,但没回答"那密集图形怎么办"
 
-0022 的结论是:真图形协议(Sixel / iTerm2 / Kitty)在我们的滚动模型下**没有定义好
+0026 的结论是:真图形协议(Sixel / iTerm2 / Kitty)在我们的滚动模型下**没有定义好
 的语义**——我们从不让终端滚动(`ansi::encode_rows` 是每帧绝对寻址重画),而 Kitty
 规范要求"终端滚文本时图跟着滚";`text::for_screen` 的整体不变量"我们发出的任何
 字节都不移动光标"又和它们直接冲突。
@@ -156,7 +156,7 @@ cannot reach the scrollback**"。做到格级 = 放弃整行擦、改成只覆�
 96 KiB),**且超限是拒绝而不是截断**——截断会让调用方以为自己画上了。
 
 **⑦ 名字不叫 `blit`。** 它是图形学的词(位块传送),而这里没有位块、没有传送,
-只有"换掉一块字符格"。叫 `Rasters::write`。这不是吹毛求疵——[`0021`](./0021-blocks-may-shape-by-terminal-capability.md)
+只有"换掉一块字符格"。叫 `Rasters::write`。这不是吹毛求疵——[`0025`](./0025-blocks-may-shape-by-terminal-capability.md)
 那条缝的存在理由正是"块的存在或形状取决于终端能力",而"blit"会让下一个读代码的
 人以为我们在往终端写像素。
 
@@ -183,7 +183,7 @@ cannot reach the scrollback**"。做到格级 = 放弃整行擦、改成只覆�
 
 ## 放弃了什么
 
-**图形协议(Sixel / Kitty / iTerm2)。** [`0022`](./0022-pictures-in-blocks-not-yet.md)
+**图形协议(Sixel / Kitty / iTerm2)。** [`0026`](./0026-pictures-in-blocks-not-yet.md)
 已论证:没有契约,且与 `for_screen` 的不变量冲突。本 ADR 是那条路的**字符格替代**,
 不是绕过。
 
@@ -216,16 +216,16 @@ cannot reach the scrollback**"。做到格级 = 放弃整行擦、改成只覆�
 - **若出现第二个"外部往已挂载的东西写、模块每帧读"的场景**:`Asks` 与 `Rasters`
   会长成两种同形的东西,那时该抽一个共用的形状,而不是并排第三张表。
 - **若 `Caps` 探测升级到拿单元格像素尺寸**(`[16t`):Raster 是**字符格**的,
-  不需要它;那只对 0022 那条路有意义。**不要把像素尺寸混进这个模型**——它会把
-  "格"变成"格里的坐标",而那正是 0022 那一整套麻烦的开端。
+  不需要它;那只对 0026 那条路有意义。**不要把像素尺寸混进这个模型**——它会把
+  "格"变成"格里的坐标",而那正是 0026 那一整套麻烦的开端。
 
 ## 相关
 
-- [`0022`](./0022-pictures-in-blocks-not-yet.md) —— 图形协议为什么不做;本 ADR 是
+- [`0026`](./0026-pictures-in-blocks-not-yet.md) —— 图形协议为什么不做;本 ADR 是
   它"路一"的字符格版本
 - [`0004`](./0004-tui-stream-is-an-irreversible-block-sequence.md) —— 内容冻结,
   本 ADR 选视图模块的直接原因
-- [`0021`](./0021-blocks-may-shape-by-terminal-capability.md) —— 块的能力缝;
+- [`0025`](./0025-blocks-may-shape-by-terminal-capability.md) —— 块的能力缝;
   本 ADR 的能力门与它同源
 - [`0020`](./0020-view-module-rows-can-join-the-scroll-tail.md) —— 视图模块的行与
   滚动的关系;位图**不进** tail(它有固定矩形)
