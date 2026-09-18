@@ -178,6 +178,24 @@ pub fn connect(
                         running: (!stopped).then(|| running_of_loop(progress)),
                     });
                 }
+                // The turn finished and its record did not. Both are said:
+                // `TurnComplete` because the turn did finish, and this because
+                // the log — the session's only authority — did not get it.
+                // Before this, only ACP heard about it (as an internal error)
+                // and the screen heard nothing at all.
+                CodingRuntimeEvent::TurnFinished(completion) => {
+                    if let Some(message) = persistence_failure(&completion) {
+                        let session = watched.session.lock().expect("session poisoned").clone();
+                        watched.announce(HostEvent::PersistenceFailed { session, message });
+                    }
+                    // The turn's own completion still goes through the one
+                    // mapping, because the turn did complete.
+                    if let Some(event) = translate(CodingRuntimeEvent::TurnFinished(completion)) {
+                        if out.send(event).is_err() {
+                            break;
+                        }
+                    }
+                }
                 CodingRuntimeEvent::ProviderChanged { .. }
                 | CodingRuntimeEvent::ReasoningEffortChanged { .. } => {
                     if let Some(app) = watched.front_end.app() {
@@ -398,6 +416,17 @@ async fn run(
 
 /// A runtime event in the handle protocol's words, when the front end is owed
 /// one. Session changes and descriptions are handled by the caller.
+/// Why the turn's record could not be kept, when it could not be.
+///
+/// A turn that finished and a turn whose record was written are two different
+/// claims, and this is the second one. `None` is the ordinary case.
+fn persistence_failure(completion: &TurnCompletion) -> Option<String> {
+    match completion {
+        TurnCompletion::Completed { .. } => None,
+        TurnCompletion::SnapshotUnavailable { error, .. } => Some(error.message.clone()),
+    }
+}
+
 /// A goal, as the contract says a self-driving session.
 fn running_of_goal(goal: atomcode_coding::GoalProgress) -> atomcode_host_api::Running {
     atomcode_host_api::Running {
@@ -1110,5 +1139,44 @@ pub fn refused(error: RuntimeError) -> HostError {
                 message: other.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::persistence_failure;
+    use atomcode_coding::{RuntimeSnapshotError, RuntimeTurnStats, TurnCompletion};
+    use atomcode_kernel::event::StopReason;
+
+    /// A turn that finished and a turn whose record was kept are two claims,
+    /// and before this only one of them reached a front end.
+    ///
+    /// The screen lost it entirely and ACP reported it as an internal error —
+    /// two different wrong answers to "the log did not get your turn", which is
+    /// the one thing a person has to know, because the log is the session's
+    /// only authority (`docs/adr/0024`).
+    #[test]
+    fn a_turn_that_finished_and_a_turn_that_was_kept_are_two_answers() {
+        let kept = TurnCompletion::Completed {
+            turn_id: 1,
+            reason: StopReason::Stopped,
+            snapshot: std::sync::Arc::new(atomcode_kernel::message::SessionSnapshot::new(
+                Vec::new(),
+            )),
+            stats: RuntimeTurnStats::default(),
+        };
+        assert_eq!(persistence_failure(&kept), None);
+
+        let lost = TurnCompletion::SnapshotUnavailable {
+            turn_id: 1,
+            reason: StopReason::Stopped,
+            error: RuntimeSnapshotError {
+                message: "磁盘满了".into(),
+            },
+            stats: RuntimeTurnStats::default(),
+        };
+        // The reason the turn stopped is the same in both; what differs is
+        // whether anybody will be able to read about it later.
+        assert_eq!(persistence_failure(&lost).as_deref(), Some("磁盘满了"));
     }
 }

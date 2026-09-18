@@ -467,6 +467,24 @@ pub enum HostEvent {
         session: String,
         previous: Option<String>,
     },
+    /// A turn finished but its record could not be written.
+    ///
+    /// Separate from the turn's own completion because they are separate
+    /// things: the turn did finish, and it has a reason for finishing. What
+    /// failed is keeping it. The log is the only authority a session has
+    /// (`docs/adr/0024`), so "the authority did not get it" is exactly the kind
+    /// of thing a person must be told rather than left to discover later.
+    ///
+    /// **Not a fact in the log**, for the reason it exists: writing to the log
+    /// is what just failed. A fact about the failure would need the same write.
+    ///
+    /// On `HostEvent` rather than the handle protocol because persistence is
+    /// the host's job — it owns the store — and the kernel stays as it is.
+    PersistenceFailed {
+        session: String,
+        /// What went wrong, for a person.
+        message: String,
+    },
     /// What the session is doing on its own changed — a round finished, a goal
     /// ended, a loop paused.
     ///
@@ -849,6 +867,10 @@ mod tests {
                 session: "b".into(),
                 previous: Some("a".into()),
             },
+            HostEvent::PersistenceFailed {
+                session: "b".into(),
+                message: "磁盘满了".into(),
+            },
             HostEvent::Autonomy {
                 session: "b".into(),
                 running: Some(Running {
@@ -863,7 +885,9 @@ mod tests {
         ];
         for e in &all {
             match e {
-                HostEvent::SessionChanged { .. } | HostEvent::Autonomy { .. } => {}
+                HostEvent::SessionChanged { .. }
+                | HostEvent::Autonomy { .. }
+                | HostEvent::PersistenceFailed { .. } => {}
             }
         }
         all

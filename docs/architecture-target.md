@@ -250,10 +250,25 @@ gates/layers.sh                                      # 用 cargo metadata 断言
 - `gates/layers.sh` 用各 Cargo.toml 的**直接**依赖断言方向,并把 harness 的混层债
   钉成只能变小的基线(`gates/harness-layer.baseline`)。**它数的是全部直接 atomcode
   依赖**,所以 `plexus` 与 `kernel` 这两条也在里面——它们是机制层自身,债的真实下限
-  是 2,不是 0。现在是 5:`plexus`、`kernel`、`capabilities`(18 文件 54 处)、
-  `config`(6 文件 9 处)、`review`(2 文件 2 处)。**下一个该摘的是 `review`**:
-  `plugins/persona.rs` 取 `review_persona`、`plugins/capabilities.rs` 挂 `ReviewTool`
-  ——机制层认识了一个具体能力行,方向反了,该由产品去挂。
+  是 2,不是 0。现在是 5:`plexus`、`kernel`、`capabilities`、`config`、`review`。
+
+  **剩下这三条不是三笔小债,是同一笔大债的三个出口**——按引用数看它们是 54 / 9 / 2 处,
+  按真实代价看不是。2026-09-18 量过:
+
+  - `review` 那"2 处"背后是 `plugins::catalog()`。摘掉它要 (a) 把
+    `ReviewToolPlugin` / `ReviewPersonaPlugin` 搬进 `atomcode-review`(它因此依赖
+    plexus——方向是对的,能力行可以依赖机制),(b) 二十多处 `catalog()` 调用方各自
+    决定要不要挂,(c) **`bundle.rs:259` 的内置 profile 里有 `tool-code-review`**,
+    所以摘它等于改 `harness` 这个二进制默认装出来的 agent —— 那是个产品决定,
+    不是重构。
+  - `capabilities` 同一个形状,只是大 18 倍:`plugins/` 下挂能力的那些行本就该是
+    **能力行层的目录**,而不是机制层目录里的条目。
+  - `config` 里有一半是真该走的(`model_source.rs` 读用户配置、`plugins/llm.rs`
+    找配置文件路径),它们是宿主的事。
+
+  **正确的下一步不是逐条摘,是把 `plugins/` 拆成两半**:机制自己的行留在 harness,
+  挂能力的行进一个能力行层的 crate。那一刀同时了结 `capabilities` 与 `review`,
+  债 5 → 3(下限 2 + `config`)。在那之前逐条摘只会把 `catalog()` 改三遍。
 
 **待办,按这张表该动但还没动的:**
 

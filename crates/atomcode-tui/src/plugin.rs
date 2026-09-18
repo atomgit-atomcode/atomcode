@@ -935,6 +935,14 @@ impl UserInterface for Tui {
                 Wake::Host(HostEvent::Autonomy { session, running }) => {
                     stale |= took_autonomy(&self.host.moment, &session, running);
                 }
+                // The turn finished; the log did not get it. Said loudly and
+                // at once: the log is the session's only authority
+                // (`docs/adr/0024`), so a person who is not told now will find
+                // out by resuming tomorrow into a conversation missing a turn.
+                Wake::Host(HostEvent::PersistenceFailed { message, .. }) => {
+                    self.host.say(format!("这一回合没能存下来:{message}"), true);
+                    stale = true;
+                }
                 Wake::Host(_) => {}
                 Wake::Act(action) => {
                     quit = self.act(action, &client);
