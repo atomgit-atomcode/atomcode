@@ -46,7 +46,28 @@ fn tree(root: &std::path::Path, script: &str, extra: &[&str]) -> ConfigTree {
         root = root.to_string_lossy(),
         home = empty_home.to_string_lossy()
     );
-    let mut layers = vec![bundle::base().unwrap()];
+    // The machine, plus **this product's** answer — never `bundle::base()`.
+    // That one is `INFRA + bundle::DEFAULTS`, and `bundle::DEFAULTS` is the
+    // harness's own answer to "what can an agent do". `on_harness.rs` states
+    // why this crate does not inherit it: a change there tomorrow must not
+    // silently arrive here. A criterion built on it would be testing this
+    // product's gates inside somebody else's agent.
+    let mut layers = vec![
+        bundle::infra().unwrap(),
+        Layer::from_toml(atomcode_coding::on_harness::CODING_DEFAULTS).unwrap(),
+        // `CODING_DEFAULTS` keeps `approval` and the never-asks row dormant
+        // because a front end claims both seams when it mounts, and says in the
+        // same breath that "an assembly with no front end wants exactly this
+        // row back — and then it is a patch, not a fork". These trees have no
+        // front end, so they take both back as a patch. Without them a question
+        // nobody can answer is not refused at all, and the negative control
+        // below would be testing an open door.
+        Layer::from_toml(
+            "[[patch]]\nid = \"approval\"\nconfig = { mode = \"deny-risky\" }\ndisabled = false\n\n\
+             [[patch]]\nid = \"user-questions-unattended\"\nconfig = {}\ndisabled = false",
+        )
+        .unwrap(),
+    ];
     for src in [script, quiet, scoped.as_str()] {
         layers.push(Layer::from_toml(src).unwrap());
     }

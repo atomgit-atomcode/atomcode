@@ -303,6 +303,25 @@ gates/layers.sh                                      # 用 cargo metadata 断言
 
   **没定之前不要动。**
 
+  **`bundle::DEFAULTS` 的依赖面,查过了(2026-09-18)**:
+
+  | 谁 | 怎么依赖 | 判定 |
+  |---|---|---|
+  | `harness/src/profile.rs:75` | 把 profile 目录里 `base` 这个名字定义成 `INFRA + DEFAULTS` | **兼容层,不是逻辑依赖**。注释写明:`base` 曾经是一个 bundle,磁盘上的 profile 文件可能写着它,名字得继续意味着原来那个东西 |
+  | **`atomcode-coding` 生产侧** | **零** | 它只取 `bundle::infra()`,自带 `CODING_DEFAULTS` + `CODING_ROWS`。`on_harness.rs:58-69` 写明理由:明天 `bundle::DEFAULTS` 变了不能悄悄漏进来 |
+  | 19 个 harness 测试 | `bundle::base()` | **真依赖**。它们测的是机制,却拿一个产品形状的 agent 当被测对象 |
+  | `tui/tests/e2e.rs`、`coding/tests/differential.rs` | `bundle::base()` | 同上 |
+
+  也就是说**产品代码早就不依赖它了**,剩下的全在测试里。所以"`DEFAULTS` 是个临时
+  的东西"这句话现在是准的 —— 它活着只因为 19 个测试文件拿它当脚手架。
+
+  搬那三个闸行时新写的 `coding/tests/policy_rows.rs` 一度也建在 `bundle::base()` 上
+  (helper 是从 harness 抄的),已改成 `infra() + CODING_DEFAULTS`。改完负面对照立刻
+  红了 —— 因为 `CODING_DEFAULTS` 把 `approval` 与 `user-questions-unattended` 都设成
+  dormant(前端会claim那两条缝),而测试树没有前端。两处注释都写着"没有前端的装配
+  要把这一行要回来,那时它是个 patch,不是 fork" —— 照做即可。**这说明那条负面对照
+  原来证的是 harness 树的性质,不是 coding 的。**
+
 **待办,按这张表该动但还没动的:**
 
 | 欠的 | 事实 | 归到哪 |
