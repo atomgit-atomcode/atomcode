@@ -106,7 +106,7 @@ impl View for Status {
             Activity::Working => {
                 row.push(sep());
                 row.push(El::styled(
-                    format!("{} 运行中", vp.moment.caps.spinner(vp.moment.tick)),
+                    working_indicator(vp.moment),
                     theme::fg(Role::Warning),
                 ));
             }
@@ -128,6 +128,39 @@ impl View for Status {
     /// what changed, and nothing changed.
     fn tick() -> Option<std::time::Duration> {
         Some(std::time::Duration::from_millis(110))
+    }
+}
+
+/// The cat's working animation.
+///
+/// One table, because both the strip and the status line draw it: the status
+/// line took the cat where `{spinner} 运行中` used to be, and a second copy of
+/// the frames is exactly how the two would come to disagree about what the
+/// product's cat does while it works.
+///
+/// The frames are why [`working_indicator`] has a fallback at all: neither `·`
+/// nor `ω` is ASCII, and a frame is not something a downgrade table can rewrite
+/// (see [`crate::caps::SPINNER`]).
+pub const WORKING_FRAMES: [&str; 4] = ["(=^·^=)", "(=^-^=)", "(=^ω^=)", "(=^-^=)"];
+
+/// The frame for this tick. The phase is the injected tick and never a clock
+/// read in `render` — the same rule the strip follows (`docs/adr/0008`).
+fn working_frame(tick: u64) -> &'static str {
+    WORKING_FRAMES[(tick as usize) % WORKING_FRAMES.len()]
+}
+
+/// What the status line says while a turn is in flight.
+///
+/// The cat, not the words: it replaced `{spinner} 运行中` wholesale on this row.
+/// Where the terminal said it cannot draw `·` or `ω` the words come back, and
+/// that is not decoration — this row is on every screen, unlike the strip, and
+/// a kaomoji arrives on a bare ssh client as tofu, which indicates nothing
+/// (`Caps::unicode`).
+fn working_indicator(m: &Moment) -> String {
+    if m.caps.unicode {
+        working_frame(m.tick).to_string()
+    } else {
+        format!("{} 运行中", m.caps.spinner(m.tick))
     }
 }
 
@@ -169,7 +202,8 @@ impl View for Mascot {
             // Idle has one frame, so `tick` changes nothing and an idle screen
             // does not repaint — the reason `tick()` below is conditional.
             Mood::Idle => &["(=^·^=)"],
-            Mood::Thinking => &["(=^·^=)", "(=^-^=)", "(=^ω^=)", "(=^-^=)"],
+            // The same frames the status line draws: one cat, not two.
+            Mood::Thinking => &WORKING_FRAMES,
             Mood::Happy => &["(=^▽^=)"],
             Mood::Sad => &["(=；ω；=)"],
         };
@@ -287,7 +321,43 @@ mod tests {
         let busy = Moment::default().working();
         let line =
             Status::render(&State::default(), &Viewport::new(Rect::sized(70, 1), &busy))[0].plain();
-        assert!(line.contains("运行中"), "{line:?}");
+        assert!(line.contains(WORKING_FRAMES[0]), "{line:?}");
+        assert!(
+            !line.contains("运行中"),
+            "the words were replaced, not added to: {line:?}"
+        );
+    }
+
+    #[test]
+    fn the_cat_animates_here_and_the_words_come_back_without_unicode() {
+        let at = |tick: u64| {
+            let m = Moment::default().working().at_tick(tick);
+            Status::render(&State::default(), &Viewport::new(Rect::sized(70, 1), &m))[0].plain()
+        };
+        assert_ne!(at(0), at(1), "it really moves on this row too");
+        assert_eq!(
+            at(0),
+            at(WORKING_FRAMES.len() as u64),
+            "and it loops rather than running off the end of the table"
+        );
+        // The row is on every screen, so a terminal that has said it cannot
+        // draw `·`/`ω` gets the sentence this line used to say — not tofu,
+        // which would indicate nothing at all.
+        let bare = Moment {
+            caps: crate::caps::Caps {
+                unicode: false,
+                ..crate::caps::Caps::default()
+            },
+            ..Moment::default()
+        }
+        .working();
+        let plain =
+            Status::render(&State::default(), &Viewport::new(Rect::sized(70, 1), &bare))[0].plain();
+        assert!(plain.contains("运行中"), "{plain:?}");
+        assert!(
+            !plain.contains("(=^"),
+            "not a cat it cannot draw: {plain:?}"
+        );
     }
 
     #[test]

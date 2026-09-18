@@ -174,6 +174,25 @@ Tui::run（plugin.rs:267）
 `opening` 返回 `None`，**不是返回一个空块**。理由见现状事实：0 行的块仍占一个
 slot，`blank_between` 还会再给它留一行空白，屏幕会多出一条莫名其妙的空行。
 
+**补记（2026-09-16）：开局块落在对话区的哪一行，当时没写，实测与 tuix 不一致。**
+「位置语义对齐 tuix」在本文只写了「随对话滚动」这一维，而二维上 atui 当时是
+**短内容贴底**（`Host::stream_lines` 把剩余空行补在内容**之前**），于是新会话的
+欢迎块贴着输入框、空行全在它上面——tuix 不是这样，它是 inline + 终端 scrollback，
+正文与 footer 从屏幕第一行往下排（`retained.rs` 的「footer sits directly below the
+last body row, not pinned to the screen bottom」）。已改成**空行补在内容之后**，
+即对话从对话区顶部起排、向下生长。
+
+这不是把滚动反过来：内容多于一屏时 rect 本来就是满的，两边都没有空行；而低于
+那个阈值时 `scroll_limit` 为 0，读者本来就无处可滚。**「最新一行永远是屏幕最后
+一行」只在「还没有一屏对话」时不再成立**，而那正是它不该成立的时候。两条判据钉住
+它：`host.rs` 的 `a_conversation_shorter_than_its_pane_starts_at_the_top_of_it`
+（含「满屏时没有空行」的阴性对照）与 e2e 的
+`a_new_session_opens_with_the_welcome_and_it_then_scrolls_away`（欢迎块从对话区
+第一行开始）。
+
+这一维原先**一条判据都没有**，所以它跑偏了而全套仍然全绿——补判据时先验过：把
+补空行改回前置，新判据判红（`left: 19, right: 0`）。
+
 ### 三、`RenderCtx` 与缓存键
 
 ```rust

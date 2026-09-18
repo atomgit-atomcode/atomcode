@@ -354,6 +354,29 @@ async fn a_new_session_opens_with_the_welcome_and_it_then_scrolls_away() {
         "where we are (expected something like `{here}`):\n{opening}"
     );
 
+    // **And it is in the first row of the conversation, not the last.** "At the
+    // top of the conversation" was true of the block's *order* while the screen
+    // said otherwise: short content was pushed to the foot of the pane, so the
+    // opening sat against the composer with the blank rows above it, and a new
+    // session looked like a screen that had ended. Anchored to the empty
+    // conversation's own first row rather than to the pane's, so a layout with
+    // something above the conversation is not what this measures.
+    let stream = s
+        .term
+        .last()
+        .expect("a frame")
+        .part("stream")
+        .expect("the conversation")
+        .rect;
+    let first = opening
+        .lines()
+        .position(|l| !l.trim().is_empty())
+        .expect("the opening is drawn");
+    assert_eq!(
+        first as u16, stream.y,
+        "the opening starts where the conversation does, not at its foot:\n{opening}"
+    );
+
     // 2. A turn happens, which pushes it off the top.
     s.term.type_line("hello");
     s.quiet().await;
@@ -694,7 +717,10 @@ async fn a_line_typed_mid_turn_is_shown_until_the_model_is_handed_it() {
     );
     assert!(
         waiting.contains("运行中"),
-        "…and this is the mid-turn window, not the end of it:\n{waiting}"
+        "…and this is the mid-turn window, not the end of it — the words here \
+         are the in-flight call row's own note. The status line says it with the \
+         cat instead (`status::WORKING_FRAMES`), whose segment is past the right \
+         edge at 80 columns:\n{waiting}"
     );
 
     // Past the round boundary: `sleep 3` is done, the fold has happened, the
@@ -707,7 +733,8 @@ async fn a_line_typed_mid_turn_is_shown_until_the_model_is_handed_it() {
     );
     assert!(
         folded.contains("运行中"),
-        "still inside the turn, so this is the handover and not the end:\n{folded}"
+        "still inside the turn, so this is the handover and not the end — the \
+         in-flight call row again, not the status line:\n{folded}"
     );
     // One copy, not two. This is the assertion the `Steered`-timed clear exists
     // for: the panel leaves as the block arrives.
@@ -755,9 +782,19 @@ async fn a_turn_the_model_never_answers_says_so_and_stops_spinning() {
         screen.contains("nodename nor servname"),
         "the cause, wrapped rather than dropped:\n{screen}"
     );
+    // The status line says "working" with the cat now, so this control names the
+    // cat rather than the words it replaced: `运行中` is *also* what a pending
+    // tool row says (`content.rs`), which would have kept this passing for a
+    // reason that has nothing to do with the status line.
+    for frame in atomcode_tui::modules::status::WORKING_FRAMES {
+        assert!(
+            !screen.contains(frame),
+            "the status line must not claim a finished turn is running:\n{screen}"
+        );
+    }
     assert!(
         !screen.contains("运行中"),
-        "the status line must not claim a finished turn is running:\n{screen}"
+        "and no tool row is left saying it either:\n{screen}"
     );
 
     s.term.press(KeyPress::ctrl('d'));
