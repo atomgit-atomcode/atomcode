@@ -113,6 +113,12 @@ pub enum HostCommand {
     SignIn { session: String },
     /// Who is signed in, as the host knows it.
     WhoAmI { session: String },
+    /// Whether the session is driving itself — a goal or a loop — and how far
+    /// it has got.
+    ///
+    /// Neutral by the rule this contract is kept to: a host that runs an agent
+    /// unattended cares whether it is mid-goal, whatever it is an agent *of*.
+    Autonomy { session: String },
     /// The providers this host is configured with.
     ///
     /// Switching to one is [`HostCommand::SwitchModel`] with its id — a provider
@@ -166,6 +172,7 @@ impl HostCommand {
             | Self::WhoAmI { session }
             | Self::Changes { session, .. }
             | Self::Providers { session }
+            | Self::Autonomy { session }
             | Self::Thinking { session }
             | Self::SetThinking { session, .. } => Some(session),
             Self::ListSessions { .. } => None,
@@ -222,6 +229,10 @@ pub enum HostReply {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         current: Option<String>,
     },
+    /// What the session is doing on its own, if anything. `None` is idle.
+    Autonomy {
+        running: Option<Running>,
+    },
     /// The providers a person may switch between. `current` is the one this
     /// conversation runs on, when the host knows it.
     Providers {
@@ -256,6 +267,30 @@ pub enum HostReply {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+}
+
+/// A session driving itself: what it is working towards, and how far it has got.
+///
+/// One shape for a goal and a loop, because a front end draws them the same way
+/// and the difference is a word. `of` is how many rounds it may take at most,
+/// when there is a cap.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Running {
+    /// `goal` or `loop`. A word rather than an enum: a host with a third kind
+    /// of autonomy should not need this contract changed to say so.
+    pub kind: String,
+    /// The condition being worked towards, or the prompt being repeated.
+    pub what: String,
+    pub round: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub of: Option<u32>,
+    /// Seconds since it started. A duration rather than a start time: the
+    /// screen and the host need not agree about what time it is
+    /// (`docs/adr/0008`).
+    pub elapsed_secs: u64,
+    /// Why it is not running right now, when it is registered but paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<String>,
 }
 
 /// One provider a person may switch to.
@@ -570,6 +605,9 @@ mod tests {
             HostCommand::Providers {
                 session: "a".into(),
             },
+            HostCommand::Autonomy {
+                session: "a".into(),
+            },
             HostCommand::Thinking {
                 session: "a".into(),
             },
@@ -603,6 +641,7 @@ mod tests {
                 | HostCommand::WhoAmI { .. }
                 | HostCommand::Changes { .. }
                 | HostCommand::Providers { .. }
+                | HostCommand::Autonomy { .. }
                 | HostCommand::Thinking { .. }
                 | HostCommand::SetThinking { .. } => {}
             }
@@ -691,6 +730,16 @@ mod tests {
                 ],
                 current: Some("glm-5".into()),
             },
+            HostReply::Autonomy {
+                running: Some(Running {
+                    kind: "goal".into(),
+                    what: "the tests pass".into(),
+                    round: 3,
+                    of: Some(20),
+                    elapsed_secs: 252,
+                    paused: None,
+                }),
+            },
             HostReply::Providers {
                 providers: vec![ProviderChoice {
                     id: "zhipu".into(),
@@ -727,6 +776,7 @@ mod tests {
                 | HostReply::Models { .. }
                 | HostReply::Changes { .. }
                 | HostReply::Providers { .. }
+                | HostReply::Autonomy { .. }
                 | HostReply::Identity { .. } => {}
             }
         }

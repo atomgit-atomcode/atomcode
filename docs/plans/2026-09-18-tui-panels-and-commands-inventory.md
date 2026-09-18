@@ -75,8 +75,8 @@ withdraw、reload、cancel-all。**加目录投影 5**:goal、loop、queue、pol
 | B2-1 | `/diff` 两级浏览器(文件列表 → 详情) | 看 agent 改了什么,编码会话里最高频  ✅ d8fb3429(工作区快照出 numstat 与单文件 diff;`HostCommand::Changes` 一条命令两个深度) |
 | B2-2 | 多会话:人自己开一条、切回来 | 按 0022 §6 + 0023 realm 做,**不照搬** tuix 的槽位号。**依赖**:计划页「后续」的「换会话不重建 App」——今天换会话仍重建 App(0022 §2 允许),所以这条先做「能开、能切回」,realm 化留给那条后续,别当成顺带做掉了 |
 | B2-3 | `/model` 选择器(依赖 A12) | 现在要打全名 |
-| B2-4 | `/provider` 管理面板 | 增改删 provider;现在只能改配置文件 |
-| B2-5 | `/plugin` 市场面板 | 装/卸插件(CLI 已有,面板是体验) |
+| B2-4 | `/provider` 管理面板 | 增改删 provider;现在只能改配置文件  ✅ 列表+切换已做(`/provider` → 挑一个就是 `/model <id>`,一个开关)。**增改删留给配置文件**:provider 条目带 `api_key`,让屏幕编辑那张表就是让屏幕碰凭据 |
+| B2-5 | `/plugin` 市场面板 | 装/卸插件(CLI 已有,面板是体验)  ❌ **判归 CLI**:coding 没开 capabilities 的 `plugin` feature,为它开等于把市场/git 那套拉进 agent 进程,只为重复 CLI 已有的动作 —— 与 `/upgrade`、`/webui` 同一把尺子 |
 | B2-6 | `/copy`、`/save`、`/view` | 复制代码块、存 markdown、看文件浮层  —— `/copy` `/save` ✅(c7f87718,自成一行 `tui-commands-take-away`);`/view` 未做  `/view` 亦 ✅ 722fb501 |
 | B2-7 | `/language` | 设置键的一种(可并进 A3)  ✅ 下一个提交(是 `/config language` 的具名入口,同一段实现) |
 | B2-8 | `/whoami`、`/worktree` | 当前登录用户;worktree 隔离  —— `/whoami` ✅(c7f87718,宿主契约 `WhoAmI` + `HostConfig::identity`);`/worktree` 未做 |
@@ -84,10 +84,80 @@ withdraw、reload、cancel-all。**加目录投影 5**:goal、loop、queue、pol
 | B2-10 | `/think on\|off` | 与 `/effort` 是两个旋钮:要不要思考 vs 思考多狠  ✅ c7f87718 |
 | B2-11 | `/paste [路径]` | 兜 Windows 下 Ctrl+V 被按键层拦截、ohos 读不到剪贴板  ✅ 下一个提交 |
 | B2-12 | 输入框上沿 rule | 会话名、历史位置、反向搜索指示  ✅ 722fb501 |
-| B2-13 | goal / loop 状态行 | 自主循环在跑时的轮次与耗时 |
+| B2-13 | goal / loop 状态行 | 自主循环在跑时的轮次与耗时  ⏳ 一半:`/autonomy` 能问到「第几轮、跑了多久」(`HostCommand::Autonomy`,与 `McpStatus` 同形状)。**常驻状态行还欠**:那要一条推送通道 |
 | B2-14 | @文件 / $skill 补全菜单 | tui 只有斜杠菜单  @文件 ✅ 下一个提交;**$skill 不做**——本前端每个可被人调用的 skill 已经是一条 `/` 命令(B1),再开一套 `$` 语法是第二个入口 |
-| B2-15 | ghost 提示 | 空输入框里的下一步建议,右方向键接受 |
+| B2-15 | ghost 提示 | 空输入框里的下一步建议,右方向键接受  ✅ ghost 做完:来源是**本会话历史**(fish/zsh 那种),右方向键接受。不问模型、不发明建议 |
 | B2-16 | 终端标题 | 会话名进窗口标题  ✅ 下一个提交(顺带:`SessionEvent::Titled` 之前 tui 里没人消费) |
+
+## 按**深度**再对一遍（2026-09-18 晚）—— 前两遍的方法错了
+
+前两遍对照问的都是「这个能力有没有入口」，有就标 ✅。这把尺子是错的：
+`/config` 按它算「做完了」，而 tuix 那边是 `modals/config_panel.rs` **565 行的可搜索
+半屏编辑器**，我这边只是「列出来」。用户当面指出了。
+
+tuix 的富交互全在 `modals/`，**16,824 行**。逐个对：
+
+| tuix modal | 行 | tui 这边 | 差在哪 |
+|---|---|---|---|
+| `provider_panel` | 3234 | `/provider` 列表+切换 | 增改删判了「归配置文件」（带 `api_key`），但 3234 行里不止 CRUD，**没逐行核过** |
+| `onboarding_wizard` | 2336 | **无** | P0-2 首启登录引导，一直挂着 |
+| `session_picker` | 2185 | `/resume` Picker（已补时间与目录） | 没搜索、没删除、没预览 |
+| `plugin_manager` | 2102 | 判「归 CLI」 | 判定可辩，但确实没有 |
+| `usage` + `usage_render` | 1782 | **无** | A13，卡在限速缝 |
+| `dir_picker` | 981 | `/cd` 已改成可浏览 | 没搜索、没书签 |
+| `file_viewer` | 869 | `/view` 的 `Reading`，约 60 行 | 没搜索、没语法色 |
+| `model_picker` | 735 | `/model` Picker | 没分组、没能力标注 |
+| `config_panel` | 565 | `/config` 三级（项 → 值 → 写） | **仍差四样**，逐条见下 |
+| `diff_viewer` | 539 | `/diff` 两级 | 接近 |
+| `rewind` | 404 | `/rewind` Picker | 接近 |
+| `password` | 294 | `secret.rs` | ✅ |
+| `qr` | 249 | 无 | 属 `/app`，判归 CLI |
+| `language_picker` | 155 | `/language` 已改成走 `/config` 的值选择器 | ✅ |
+| `proxy_picker` | 103 | 无 | `/proxy`，写配置 |
+
+### `/config` 差的四样（2026-09-18 逐行读完 565 行后列的）
+
+「三级选择器」不等于「编辑器」。把对面的 key 处理与渲染读完，缺的是：
+
+1. **恢复默认**——对面是 Delete 两次确认（`pending_reset`），调 `SettingSpec::reset`。
+   我这边没有任何入口，契约里也没有 `ResetSetting`，宿主侧 `HostConfig` 也没有
+   `reset_setting`。**这条要动契约，不只是屏幕。**
+2. **文本/数字项预填当前值**——对面 Enter 进入行内编辑，把当前值填进去、首次按键
+   整体替换（`replace_edit_value_on_input`）。我这边只说了一句「要 1–200」，人得
+   从头敲 `/config coding.max_rounds 40`。tui 的对应物应该是**把命令连当前值填进
+   composer**，即 `Action` 需要一个 `Compose(String)`（今天只有 `Insert(char)`）。
+3. **写完不关**——对面写完面板还在，可以连改几项，只渲染一行 `✓ id = value`。
+   我这边写完就关，改三项进三次。
+4. **按模型的 retry 项**——`model.retry_max_attempts` 是随当前 provider 变的动态
+   设置（`selection_retry_max_attempts` / `patch_selection_retry_max_attempts`），
+   不在静态 `SETTINGS` 里。`cli/src/lib.rs` 的 `settings()` 只映射了静态目录，所以
+   这一项在 tui 上根本不存在。
+
+另外两样我这边**已经有**，不用重做：搜索（`Picker` 的过滤同时匹配 label 与 about，
+所以「主题」「retry」都能命中）、生效时机（`applies` 已经显示在每行 about 上）。
+
+**记下这个教训**：“有入口”不等于“接上了”。以后对照要看对面花了多少行、
+那些行在干什么，而不是名字对上就勾。
+
+## 命令表逐名对过一遍（2026-09-18 晚）
+
+前面那轮对照是按「交互形态」看的，这一遍是**把两边的命令名字面 diff**。
+tuix 60 个名字，tui 自己 37 个 + 能力行目录 11 个（`goal` `loop` `queue` `policy`
+`review` `memory` `remember` `forget` `skills` `init` `worktree` …）。差集 22 个，逐个归属：
+
+| 判定 | 名字 | 为什么 |
+|---|---|---|
+| **这一批做了** | `plan` `build` `auto` | 模式的三个叫法，转 `/mode`（一个实现） |
+| | `status` | 一次说完：会话、模型、思考强度、在哪、在不在自己干 |
+| | `cost` | 转 `/context`（同一个实现） |
+| | `todo` `team` | 两个面板的折叠，转已有的 `ToggleFold` |
+| **归 CLI**（与 `/upgrade` 同一把尺子） | `upgrade` `app` `desktop` `webui` `plugin` `schedule` | CLI 已有，或零屏幕依赖 |
+| **排在 6.3 之后** | `sync` | 碰 daemon 的 live hub |
+| **已经有了，只是名字不同** | `session` → `/new`；`welcome` → 欢迎块是流里的一个块，往上滚就在；`usage` → A13（缺限速缝） | |
+| **真缺，但要先开东西** | `bg` `background` | 后台会话槽位；要多会话同时跑，而今天换会话仍重建 App |
+| | `proxy` `openrouter` | 都是写配置文件；`/config` 已经能改扁平设置项，provider 表则故意不给屏幕改（带 `api_key`） |
+
+也就是说：**没有一条是忘了接**，剩下的要么已判归 CLI，要么卡在一个先决条件上。
 
 ## 核实后判定「不做 / 归 CLI / 低优先」
 

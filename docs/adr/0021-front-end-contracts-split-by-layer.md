@@ -281,7 +281,24 @@ daemon 不是第三个宿主 —— cli 的 `main.rs` 本来就直接起它(`run
 - `impl From<RuntimeError> for HostError` 变成函数 `refused()`:两个类型对 cli 都是外部
   的,孤儿规则挡住了 —— 挡得对,这个映射是这个宿主的判断,不该由哪个 crate 替所有人背。
 
-### 三、判别法与闸门
+### 三、§3 的界线划细:命令归能力行,**状态**归宿主契约
+
+§3 说 goal / loop「不进宿主契约」。这条对**命令**成立,今天也是这样:`GoalCommand` 是
+能力行登记的目录命令,`run()` 里就一句 `self.0.start_goal(...)`,一个转发壳子。
+
+但**状态不是它们的**。`controllers.rs` 的模块文档第一句是「**Runtime-owned** autonomous
+controllers used by `/goal` and `/loop`」,两个控制器活在 `runtime.rs` 那个 `select!` 循环
+的局部变量里 —— 它们不是行。而报告运行时拥有的东西,是宿主的活。
+
+**先例是 `McpStatus`**:MCP 服务器由行挂上来,「它们现在什么状态」走宿主控制契约。
+goal / loop 是同一个形状,所以 `HostCommand::Autonomy` 进契约,§3 的「不进宿主契约」
+理解为「它们的**能力**不进」,而不是「关于它们的任何事都不进」。
+
+中立性也过关:一个无人值守跑 agent 的宿主(daemon)同样要知道自己是不是在目标中途 ——
+这跟它是什么 agent 无关。载荷用 `kind: String`(`goal` / `loop`)而不是枚举,第三种自主
+形态不该逼这份契约改版。
+
+### 四、判别法与闸门
 
 一条命令进不进宿主契约,先问「一个**不驱动仓库**的宿主(daemon、测试)拿它有意义吗」。
 没有就归能力行(§3 给 goal / loop / 策略干预 / 本地上下文排队定的那条路)。`Worktree`

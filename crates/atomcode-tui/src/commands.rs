@@ -35,6 +35,8 @@ const SCREEN: &[Command] = &[
     ),
     Command::new("mouse", "把鼠标交还终端,或收回来"),
     Command::new("keys", "列出快捷键"),
+    Command::new("todo", "展开或折叠计划清单"),
+    Command::new("team", "展开或折叠团队面板"),
     Command::taking(
         "paste",
         "[路径]",
@@ -61,6 +63,10 @@ impl CommandSet for ScreenCommands {
                 Err(why) => Outcome::Refused(why),
             },
             "mouse" => Outcome::Do(Action::ToggleMouse),
+            // The two panels a person toggles by name. Same gesture the fold
+            // keys are, so a command and a key share one implementation.
+            "todo" => Outcome::Do(Action::ToggleFold("todo")),
+            "team" => Outcome::Do(Action::ToggleFold("team")),
             // A typed way in to the thing ctrl-v does, because ctrl-v does not
             // always arrive: Windows terminals hand the paste to the key layer
             // as a keystroke, and some platforms have no clipboard this process
@@ -303,6 +309,7 @@ const SESSION: &[Command] = &[
         "这个会话从现在起用哪个模型;不带 id 则挑一个",
     ),
     Command::new("provider", "配置里有哪些 provider,现在用的是哪个;挑一个就换过去"),
+    Command::new("autonomy", "现在有没有在自己干(goal / loop),跑到第几轮、用了多久"),
     Command::taking("rename", "<名字>", "给这个会话改个名字"),
     Command::taking(
         "diff",
@@ -315,6 +322,13 @@ const SESSION: &[Command] = &[
         "改要不要问:plan 只看不动、ask 动手前问、edits 改文件不问、auto 全不问;不带参数则说现在是哪个",
     ),
     Command::taking("cd", "<目录>", "换到另一个目录干活;会开一条新会话"),
+    // The three modes people reach for by name. `/mode` is the one
+    // implementation; these are the words tuix taught everyone to type.
+    Command::new("plan", "只看不动(等于 /mode plan)"),
+    Command::new("build", "动手前问一句(等于 /mode ask)"),
+    Command::new("auto", "全不问(等于 /mode auto)"),
+    Command::new("status", "这次会话现在是什么状况:模型、模式、在哪、跑到第几回合"),
+    Command::new("cost", "这次会话用掉多少 token(等于 /context)"),
     Command::taking(
         "config",
         "[项 值]",
@@ -466,7 +480,19 @@ impl CommandSet for SessionCommands {
                                         if stored.needs_newer_version {
                                             format!("需要更新版本才能打开 · {}", stored.id)
                                         } else {
-                                            format!("{} 轮 · {}", stored.turns, stored.id)
+                                            // When, and where — the two things a
+                                            // person sorts by when several sessions
+                                            // have the same subject. Both were in
+                                            // `StoredSession` and neither was shown.
+                                            let when = crate::text::when(stored.updated_at);
+                                            match &stored.working_dir {
+                                                Some(dir) => format!(
+                                                    "{} 轮 · {when} · {}",
+                                                    stored.turns,
+                                                    crate::text::collapse_home(dir)
+                                                ),
+                                                None => format!("{} 轮 · {when}", stored.turns),
+                                            }
                                         },
                                     )
                                 })
@@ -737,8 +763,85 @@ impl CommandSet for SessionCommands {
             }
             "cd" => {
                 let directory = args.trim();
-                if directory.is_empty() {
-                    return Outcome::Refused("要一个目录:/cd <目录>".into());
+                // Nothing typed, or a directory named but not the last word:
+                // browse from there. tuix had a picker for this
+                // (`modals/dir_picker.rs`); what a person needs of it is to see
+                // what is under here and step into it, which is a list whose
+                // picks are this command again.
+                if directory.is_empty() || directory.ends_with('/') {
+                    let from = if directory.is_empty() {
+                        client.root()
+                    } else if std::path::Path::new(directory).is_absolute() {
+                        directory.to_string()
+                    } else {
+                        std::path::Path::new(&client.root())
+                            .join(directory)
+                            .display()
+                            .to_string()
+                    };
+                    // The trailing slash was the gesture ("browse here"), not
+                    // part of the place. Left on, the row that says "stay here"
+                    // would read as another "browse here" and the browser could
+                    // not be stepped out of. Root keeps its one slash.
+                    let from = {
+                        let trimmed = from.trim_end_matches('/');
+                        if trimmed.is_empty() {
+                            "/".to_string()
+                        } else {
+                            trimmed.to_string()
+                        }
+                    };
+                    let mut choices: Vec<crate::overlay::Choice> = Vec::new();
+                    // Up first: a browser you cannot back out of is a trap.
+                    if let Some(up) = std::path::Path::new(&from).parent() {
+                        choices.push(
+                            crate::overlay::Choice::new(
+                                format!("/cd {}/", up.display()),
+                                "..".to_string(),
+                            )
+                            .about("上一层".to_string()),
+                        );
+                    }
+                    match std::fs::read_dir(&from) {
+                        Ok(entries) => {
+                            let mut here: Vec<String> = entries
+                                .flatten()
+                                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                                .map(|e| e.file_name().to_string_lossy().into_owned())
+                                .filter(|name| !name.starts_with('.'))
+                                .collect();
+                            here.sort();
+                            for name in here {
+                                let at = std::path::Path::new(&from).join(&name);
+                                choices.push(
+                                    crate::overlay::Choice::new(
+                                        format!("/cd {}/", at.display()),
+                                        name,
+                                    )
+                                    .about("进去看看".to_string()),
+                                );
+                            }
+                        }
+                        Err(error) => return Outcome::Refused(format!("读不了 {from}:{error}")),
+                    }
+                    // Staying is a choice too — and the only way to say "this
+                    // one" once you have stepped into it.
+                    choices.insert(
+                        0,
+                        crate::overlay::Choice::new(
+                            format!("/cd {from}"),
+                            "就在这儿干活".to_string(),
+                        )
+                        .about(crate::text::collapse_home(&from)),
+                    );
+                    return Outcome::Open(crate::overlay::Picker::new(
+                        "cd",
+                        format!(
+                            "换到哪个目录 · 现在在 {}",
+                            crate::text::collapse_home(&from)
+                        ),
+                        choices,
+                    ));
                 }
                 let control = match host(control) {
                     Ok(control) => control,
@@ -769,11 +872,38 @@ impl CommandSet for SessionCommands {
                     Some((id, value)) => (id.trim(), value.trim()),
                     None => (args.trim(), ""),
                 };
-                // Nothing typed: what there is, and what each is set to.
+                // Nothing typed: the settings as a picker. tuix had a
+                // half-screen editor for this (`modals/config_panel.rs`, 565
+                // lines); what it really did was filter a list, move a cursor
+                // and write one value — which is what `Picker` already is. The
+                // catalog (`atomcode_config::settings::SETTINGS`) and the write
+                // (`HostConfig::set_setting`) were shared all along, so this is
+                // two things that exist put together rather than a third one.
                 if id.is_empty() {
                     return match control.call(HostCommand::Settings { session: root }).await {
                         Ok(HostReply::Settings { settings }) if settings.is_empty() => {
                             Outcome::Said("这个宿主没有可改的设置".into())
+                        }
+                        Ok(HostReply::Settings { settings }) if !args.contains("--list") => {
+                            let choices = settings
+                                .into_iter()
+                                .map(|s| {
+                                    // Picking a setting opens its values —
+                                    // `/config <id>` below — so one gesture
+                                    // leads to the next without a second menu
+                                    // implementation.
+                                    crate::overlay::Choice::new(
+                                        format!("/config {}", s.id),
+                                        format!("{} = {}", s.id, s.value),
+                                    )
+                                    .about(format!("{} · {} · {}", s.label, s.accepts, s.applies))
+                                })
+                                .collect();
+                            Outcome::Open(crate::overlay::Picker::new(
+                                "config",
+                                "改哪一项 · 打字筛选 · enter 看它能填什么",
+                                choices,
+                            ))
                         }
                         Ok(HostReply::Settings { settings }) => Outcome::Said(
                             settings
@@ -791,8 +921,54 @@ impl CommandSet for SessionCommands {
                         Err(error) => Outcome::Refused(refusal(error)),
                     };
                 }
+                // A setting named but no value: what it accepts, as a
+                // picker. `accepts` is the catalog's own wording (`true |
+                // false`, `auto | dark | light`), so the choices are the
+                // catalog's, not a second list to keep in step.
                 if value.is_empty() {
-                    return Outcome::Refused(format!("要一个值:/config {id} <值>"));
+                    return match control
+                        .call(HostCommand::Settings {
+                            session: root.clone(),
+                        })
+                        .await
+                    {
+                        Ok(HostReply::Settings { settings }) => {
+                            let Some(setting) = settings.into_iter().find(|s| s.id == id) else {
+                                return Outcome::Refused(format!("没有 `{id}` 这一项"));
+                            };
+                            let offered: Vec<&str> = setting
+                                .accepts
+                                .split('|')
+                                .map(str::trim)
+                                .filter(|v| !v.is_empty() && !v.contains('–'))
+                                .collect();
+                            if offered.is_empty() {
+                                // A number or free text: nothing to pick from,
+                                // so say what it takes and let them type it.
+                                return Outcome::Said(format!(
+                                    "{id} = {} · 要 {} · `/config {id} <值>` 改它",
+                                    setting.value, setting.accepts
+                                ));
+                            }
+                            let choices = offered
+                                .into_iter()
+                                .map(|v| {
+                                    crate::overlay::Choice::new(
+                                        format!("/config {id} {v}"),
+                                        v.to_string(),
+                                    )
+                                    .marked(v == setting.value)
+                                })
+                                .collect();
+                            Outcome::Open(crate::overlay::Picker::new(
+                                "config-value",
+                                format!("{id} 改成什么 · {}生效", setting.applies),
+                                choices,
+                            ))
+                        }
+                        Ok(other) => Outcome::Refused(format!("宿主答了别的:{other:?}")),
+                        Err(error) => Outcome::Refused(refusal(error)),
+                    };
                 }
                 match control
                     .call(HostCommand::SetSetting {
@@ -900,11 +1076,12 @@ impl CommandSet for SessionCommands {
                     return Outcome::Refused("这个宿主没有语言这一项".into());
                 };
                 let wanted = args.trim();
+                // Pick it rather than read it out: `/language` is one setting,
+                // and `/config <id>` already knows how to offer a setting's
+                // values. One implementation, reached by the name people look
+                // for.
                 if wanted.is_empty() {
-                    return Outcome::Said(format!(
-                        "现在:{} · 可选:{} · {}生效",
-                        setting.value, setting.accepts, setting.applies
-                    ));
+                    return Box::pin(self.run("config", "language", ctx)).await;
                 }
                 match control
                     .call(HostCommand::SetSetting {
@@ -962,6 +1139,98 @@ impl CommandSet for SessionCommands {
                     Ok(other) => Outcome::Refused(format!("宿主答了别的:{other:?}")),
                     Err(error) => Outcome::Refused(refusal(error)),
                 }
+            }
+            // The runtime publishes `GoalChanged` every round, but that stream
+            // is its own and this screen is not on it — so this asks. An
+            // always-on status line would want the push instead; that is the
+            // part still owed (B2-13's second half).
+            "autonomy" => {
+                let control = match host(control) {
+                    Ok(control) => control,
+                    Err(refusal) => return refusal,
+                };
+                match control
+                    .call(HostCommand::Autonomy {
+                        session: root.clone(),
+                    })
+                    .await
+                {
+                    Ok(HostReply::Autonomy { running: None }) => {
+                        Outcome::Said("现在没有在自己干".into())
+                    }
+                    Ok(HostReply::Autonomy {
+                        running: Some(running),
+                    }) => {
+                        let what = if running.kind == "goal" {
+                            format!("目标:{}", running.what)
+                        } else {
+                            format!("循环:{}", running.what)
+                        };
+                        let rounds = match running.of {
+                            Some(of) => format!("第 {}/{of} 轮", running.round),
+                            None => format!("第 {} 轮", running.round),
+                        };
+                        let took = crate::text::spoken_duration(running.elapsed_secs);
+                        let line = format!("{what} · {rounds} · 已跑 {took}");
+                        Outcome::Said(match running.paused {
+                            Some(why) => format!("{line} · 停着:{why}"),
+                            None => line,
+                        })
+                    }
+                    Ok(other) => Outcome::Refused(format!("宿主答了别的:{other:?}")),
+                    Err(error) => Outcome::Refused(refusal(error)),
+                }
+            }
+            // One implementation, three words. A person who types `/plan`
+            // means the mode, and a second switch that had to agree with
+            // `/mode` is the thing that eventually disagrees.
+            "plan" | "build" | "auto" => {
+                let wanted = match name {
+                    "plan" => "plan",
+                    "build" => "ask",
+                    _ => "auto",
+                };
+                return Box::pin(self.run("mode", wanted, ctx)).await;
+            }
+            // `/cost` is `/context` under the name tuix taught. Same reason.
+            "cost" => return Box::pin(self.run("context", "", ctx)).await,
+            // What a person asks when they come back to a window and cannot
+            // remember which one it is. Everything here is already on screen
+            // somewhere — this is the one place that says it all at once.
+            "status" => {
+                let described = client.described();
+                let model = described
+                    .as_ref()
+                    .and_then(|d| d.model.clone())
+                    .unwrap_or_else(|| "没有挂模型".into());
+                let effort = described
+                    .as_ref()
+                    .and_then(|d| d.reasoning_effort)
+                    .map(|level| level.as_str().to_string())
+                    .unwrap_or_else(|| "端点默认".into());
+                let mut lines = vec![
+                    format!("会话 {}", client.session()),
+                    format!("模型 {model} · 思考强度 {effort}"),
+                    format!("在 {}", crate::text::collapse_home(&client.root())),
+                ];
+                if let Some(control) = control {
+                    if let Ok(HostReply::Autonomy {
+                        running: Some(running),
+                    }) = control
+                        .call(HostCommand::Autonomy {
+                            session: root.clone(),
+                        })
+                        .await
+                    {
+                        lines.push(format!(
+                            "在自己干:{} · 第 {} 轮 · 已跑 {}",
+                            running.what,
+                            running.round,
+                            crate::text::spoken_duration(running.elapsed_secs)
+                        ));
+                    }
+                }
+                Outcome::Said(lines.join("\n"))
             }
             "whoami" => {
                 let control = match host(control) {
@@ -1472,6 +1741,236 @@ mod tests {
             ]
         );
     }
+    /// `/cd` browses. Before this it took a path a person had to already know,
+    /// and tuix had a picker for exactly that reason (`modals/dir_picker.rs`).
+    ///
+    /// What the picks are is the point: stepping in is `/cd <path>/` and
+    /// staying is `/cd <path>` — this same command — so the browser cannot
+    /// drift away from the typed form, because it is the typed form.
+    #[tokio::test]
+    async fn cd_browses_rather_than_demanding_a_path_already_known() {
+        let host = Arc::new(Recording::default());
+        let (app, _client, all) = following(&host);
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Names that a random temp path cannot accidentally contain, so the
+        // assertions below are about the listing and not about luck.
+        std::fs::create_dir_all(dir.path().join("src-alpha")).expect("dir");
+        std::fs::create_dir_all(dir.path().join("docs-beta")).expect("dir");
+        std::fs::create_dir_all(dir.path().join(".hidden-gamma")).expect("dir");
+        std::fs::write(dir.path().join("alpha-file.txt"), "x").expect("file");
+
+        // The trailing slash is "browse from here", which is what picking a row
+        // sends back in.
+        let at = format!("/cd {}/", dir.path().display());
+        let picker = match all.dispatch(&at, &app.context()).await {
+            Outcome::Open(picker) => picker,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(picker.id(), "cd");
+        let text = picker
+            .render(&crate::moment::Viewport::new(
+                crate::frame::Rect::sized(80, 20),
+                &crate::moment::Moment::default(),
+            ))
+            .iter()
+            .map(|l| l.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("src-alpha"), "{text}");
+        assert!(text.contains("docs-beta"), "{text}");
+        // A browser you cannot back out of is a trap.
+        assert!(text.contains("上一层"), "{text}");
+        // And one you cannot stop in is useless: stepping in has to be able to
+        // end somewhere.
+        assert!(text.contains("就在这儿干活"), "{text}");
+        assert!(
+            !text.contains("alpha-file"),
+            "files are not directories: {text}"
+        );
+        assert!(
+            !text.contains("hidden-gamma"),
+            "dot directories stay out: {text}"
+        );
+        // Nothing was asked of the host: browsing is looking, not moving.
+        assert!(
+            host.asked.lock().unwrap().is_empty(),
+            "looking at a directory must not move the session into it"
+        );
+
+        // And the way out. The "stay here" row sends `/cd <from>` with no
+        // trailing slash, which is this — so a browser that could be stepped
+        // into but never out of would fail here. It did: `from` kept the slash
+        // it was browsed with, and the row read as "browse here" again.
+        let stay = format!("/cd {}", dir.path().display());
+        match all.dispatch(&stay, &app.context()).await {
+            Outcome::Said(_) => {}
+            other => panic!("picking a directory must move into it, not reopen: {other:?}"),
+        }
+        assert!(matches!(
+            host.asked.lock().unwrap().first(),
+            Some(HostCommand::ChangeDirectory { .. })
+        ));
+    }
+
+    /// `/config` is an editor, not a printout: pick a setting, pick a value,
+    /// it is written. Three steps, each one reaching the next through the same
+    /// command — so there is no second menu to keep in step with the first.
+    #[tokio::test]
+    async fn config_picks_a_setting_then_a_value_then_writes_it() {
+        let host = Arc::new(Recording::default());
+        let settings = || {
+            vec![
+                atomcode_host_api::Setting {
+                    id: "ui.theme".into(),
+                    label: "主题".into(),
+                    value: "auto".into(),
+                    accepts: "auto | dark | light".into(),
+                    applies: "下次启动".into(),
+                },
+                atomcode_host_api::Setting {
+                    id: "coding.max_rounds".into(),
+                    label: "轮数上限".into(),
+                    value: "40".into(),
+                    accepts: "1–200".into(),
+                    applies: "下一回合".into(),
+                },
+            ]
+        };
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::Settings {
+                settings: settings(),
+            }),
+            Ok(HostReply::Settings {
+                settings: settings(),
+            }),
+            Ok(HostReply::Settings {
+                settings: settings(),
+            }),
+            Ok(HostReply::Done),
+        ]);
+        let (app, _client, all) = following(&host);
+
+        // 1. the settings, to pick from
+        match all.dispatch("/config", &app.context()).await {
+            Outcome::Open(picker) => assert_eq!(picker.id(), "config"),
+            other => panic!("{other:?}"),
+        }
+        // 2. one setting, its values to pick from
+        match all.dispatch("/config ui.theme", &app.context()).await {
+            Outcome::Open(picker) => assert_eq!(picker.id(), "config-value"),
+            other => panic!("{other:?}"),
+        }
+        // A number has nothing to pick from, so it says what it takes.
+        match all
+            .dispatch("/config coding.max_rounds", &app.context())
+            .await
+        {
+            Outcome::Said(text) => assert!(text.contains("1–200"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        // 3. a value, written
+        match all.dispatch("/config ui.theme dark", &app.context()).await {
+            Outcome::Said(text) => assert!(text.contains("dark"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            host.asked.lock().unwrap().last(),
+            Some(&HostCommand::SetSetting {
+                session: "lead".into(),
+                id: "ui.theme".into(),
+                value: "dark".into(),
+            })
+        );
+    }
+
+    /// The words people type for a mode reach the one mode switch — they are
+    /// not a second implementation that would drift from it.
+    #[tokio::test]
+    async fn plan_build_and_auto_are_the_one_mode_switch_under_other_names() {
+        let host = Arc::new(Recording::default());
+        let (app, _client, all) = following(&host);
+        for (typed, wanted) in [
+            ("/plan", atomcode_host_api::Mode::Plan),
+            ("/build", atomcode_host_api::Mode::Ask),
+            ("/auto", atomcode_host_api::Mode::Auto),
+        ] {
+            let _ = all.dispatch(typed, &app.context()).await;
+            assert_eq!(
+                host.asked.lock().unwrap().last(),
+                Some(&HostCommand::SetMode {
+                    session: "lead".into(),
+                    mode: wanted,
+                }),
+                "{typed}"
+            );
+        }
+        // And `/mode plan` still reaches the same place, so the two doors agree.
+        let _ = all.dispatch("/mode plan", &app.context()).await;
+        assert_eq!(
+            host.asked.lock().unwrap().last(),
+            Some(&HostCommand::SetMode {
+                session: "lead".into(),
+                mode: atomcode_host_api::Mode::Plan,
+            })
+        );
+    }
+
+    /// `/autonomy` says whether the session is driving itself, and how far it
+    /// has got — the thing the runtime publishes every round to a stream this
+    /// screen is not on.
+    #[tokio::test]
+    async fn autonomy_says_what_the_session_is_doing_on_its_own() {
+        let host = Arc::new(Recording::default());
+        host.replies.lock().unwrap().extend([
+            Ok(HostReply::Autonomy {
+                running: Some(atomcode_host_api::Running {
+                    kind: "goal".into(),
+                    what: "测试全过".into(),
+                    round: 3,
+                    of: Some(20),
+                    elapsed_secs: 252,
+                    paused: None,
+                }),
+            }),
+            Ok(HostReply::Autonomy {
+                running: Some(atomcode_host_api::Running {
+                    kind: "loop".into(),
+                    what: "再看一遍".into(),
+                    round: 9,
+                    of: None,
+                    elapsed_secs: 40,
+                    paused: Some("PausedAtCap".into()),
+                }),
+            }),
+            Ok(HostReply::Autonomy { running: None }),
+        ]);
+        let (app, _client, all) = following(&host);
+
+        match all.dispatch("/autonomy", &app.context()).await {
+            Outcome::Said(text) => {
+                assert!(text.contains("测试全过"), "{text}");
+                assert!(text.contains("3/20"), "with a cap it says the cap: {text}");
+                assert!(text.contains("4 分 12 秒"), "{text}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match all.dispatch("/autonomy", &app.context()).await {
+            Outcome::Said(text) => {
+                assert!(text.contains("循环") && text.contains("第 9 轮"), "{text}");
+                assert!(!text.contains('/'), "no cap, no slash: {text}");
+                assert!(text.contains("停着"), "a paused one says so: {text}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Idle is said, not refused.
+        match all.dispatch("/autonomy", &app.context()).await {
+            Outcome::Said(text) => assert!(text.contains("没有在自己干"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(host.asked.lock().unwrap().len(), 3);
+    }
+
     /// `/provider` lists what is configured and hands a pick to `/model`, which
     /// is the one switch — and the list never carries a credential.
     #[tokio::test]
@@ -1532,7 +2031,13 @@ mod tests {
             accepts: "zh | en".into(),
             applies: "下一回合".into(),
         };
+        // Three readings, then the write, then a host that has no such
+        // setting: `/language` with nothing after it reads once for itself and
+        // once through `/config`, which is the point — one implementation.
         host.replies.lock().unwrap().extend([
+            Ok(HostReply::Settings {
+                settings: vec![language()],
+            }),
             Ok(HostReply::Settings {
                 settings: vec![language()],
             }),
@@ -1546,10 +2051,10 @@ mod tests {
         ]);
         let (app, _client, all) = following(&host);
 
+        // With nothing after it, `/language` offers the values — it used to
+        // print them, which made a person read a line and then type it back.
         match all.dispatch("/language", &app.context()).await {
-            Outcome::Said(text) => {
-                assert!(text.contains("zh") && text.contains("zh | en"), "{text}")
-            }
+            Outcome::Open(picker) => assert_eq!(picker.id(), "config-value"),
             other => panic!("{other:?}"),
         }
         match all.dispatch("/language en", &app.context()).await {
@@ -1568,13 +2073,15 @@ mod tests {
             vec![
                 HostCommand::Settings { session: lead() },
                 HostCommand::Settings { session: lead() },
+                HostCommand::Settings { session: lead() },
                 HostCommand::SetSetting {
                     session: lead(),
                     id: "language".into(),
                     value: "en".into(),
                 },
                 HostCommand::Settings { session: lead() },
-            ]
+            ],
+            "the named door and `/config` ask the same host the same things"
         );
     }
 

@@ -1745,6 +1745,12 @@ impl Tui {
                 m.caret = at;
             }
             Action::CaretRight => {
+                // At the end of the line, right takes the ghost — the shell
+                // gesture. Anywhere else it is still just a caret move, and
+                // with no ghost it does nothing, so the key never surprises.
+                if accept_ghost(&mut m) {
+                    return false;
+                }
                 let mut at = (m.caret + 1).min(m.input.len());
                 while at < m.input.len() && !m.input.is_char_boundary(at) {
                     at += 1;
@@ -2404,6 +2410,24 @@ fn transcript_text(stream: &Stream, width: u16) -> String {
     out
 }
 
+/// Take the ghost into the field, if the caret is at the end and there is one.
+///
+/// `true` when it took something, which is the caller's cue that right meant
+/// "accept" rather than "move".
+fn accept_ghost(m: &mut crate::moment::Moment) -> bool {
+    if m.caret != m.input.len() {
+        return false;
+    }
+    let Some(rest) =
+        crate::text::ghost(&m.input, &m.history, m.history_at.is_some()).map(str::to_string)
+    else {
+        return false;
+    };
+    m.input.push_str(&rest);
+    m.caret = m.input.len();
+    true
+}
+
 /// Back one entry in the history, stashing the draft on the way in.
 fn recall_back(m: &mut crate::moment::Moment) {
     if m.history.is_empty() {
@@ -2803,7 +2827,7 @@ mod dump_tests {
 
 #[cfg(test)]
 mod history_tests {
-    use super::{recall_back, recall_forward};
+    use super::{accept_ghost, recall_back, recall_forward};
     use crate::moment::Moment;
 
     fn said(entries: &[&str], typing: &str) -> Moment {
@@ -2812,6 +2836,31 @@ mod history_tests {
         m.input = typing.to_string();
         m.caret = m.input.len();
         m
+    }
+
+    /// Right at the end of the line takes the suggestion; everywhere else it is
+    /// still a caret move. A key that sometimes eats the caret gesture without
+    /// saying so is worse than no suggestion.
+    #[test]
+    fn right_takes_the_ghost_only_at_the_end_of_the_line() {
+        let mut m = said(&["cargo test", "cargo nextest run"], "cargo ");
+        assert!(accept_ghost(&mut m), "there is one to take");
+        assert_eq!(m.input, "cargo nextest run");
+        assert_eq!(m.caret, m.input.len());
+
+        // Nothing left: right goes back to being a caret move.
+        assert!(!accept_ghost(&mut m));
+
+        // Mid-line, right moves rather than completing.
+        let mut m = said(&["cargo nextest run"], "cargo ");
+        m.caret = 2;
+        assert!(!accept_ghost(&mut m));
+        assert_eq!(m.input, "cargo ");
+
+        // While arrowing the history the field already shows an entry.
+        let mut m = said(&["cargo nextest run"], "cargo ");
+        m.history_at = Some(0);
+        assert!(!accept_ghost(&mut m));
     }
 
     #[test]

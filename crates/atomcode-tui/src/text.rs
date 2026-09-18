@@ -163,6 +163,65 @@ pub fn being_pathed(typed: &str) -> Option<&str> {
     (!rest.contains(char::is_whitespace)).then_some(rest)
 }
 
+/// The rest of the newest earlier line that starts with what is typed.
+///
+/// What a shell does (fish, zsh's autosuggest) and for the same reason: the
+/// thing a person is most likely to be typing is a thing they typed before.
+/// **Its source is this session's own history** — no model is asked, nothing is
+/// invented. A suggestion with no source behind it is a sentence made up on the
+/// screen, which is why this is the whole of it.
+///
+/// `None` while browsing the history (the field is already showing an entry),
+/// for an empty field (everything would match), and for an exact repeat (there
+/// is nothing left to accept).
+pub fn ghost<'a>(typed: &str, history: &'a [String], browsing: bool) -> Option<&'a str> {
+    if browsing || typed.is_empty() {
+        return None;
+    }
+    history
+        .iter()
+        .rev()
+        .find(|entry| entry.starts_with(typed) && entry.len() > typed.len())
+        .map(|entry| &entry[typed.len()..])
+}
+
+/// A timestamp as "how long ago", for a list a person scans.
+///
+/// Milliseconds since the epoch, which is what the session store keeps. Coarse
+/// on purpose: sorting a list of sessions needs "yesterday" and "just now", not
+/// a clock reading — and a clock reading would also mean this screen and the
+/// store agreeing about a timezone (`docs/adr/0008`).
+pub fn when(at_ms: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(at_ms);
+    let ago = now.saturating_sub(at_ms) / 1000;
+    match ago {
+        0..=59 => "刚刚".into(),
+        60..=3599 => format!("{} 分钟前", ago / 60),
+        3600..=86_399 => format!("{} 小时前", ago / 3600),
+        86_400..=2_591_999 => format!("{} 天前", ago / 86_400),
+        _ => format!("{} 个月前", ago / 2_592_000),
+    }
+}
+
+/// Seconds, as a person would say them.
+///
+/// Two parts at most and the smaller one dropped when it is zero: "4 分 12 秒",
+/// "2 小时 5 分", "8 秒". A running total is glanced at, and a glance does not
+/// parse "7452".
+pub fn spoken_duration(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    match (h, m, s) {
+        (0, 0, s) => format!("{s} 秒"),
+        (0, m, 0) => format!("{m} 分"),
+        (0, m, s) => format!("{m} 分 {s} 秒"),
+        (h, 0, _) => format!("{h} 小时"),
+        (h, m, _) => format!("{h} 小时 {m} 分"),
+    }
+}
+
 /// What the window should be called: the session's name, or where it is
 /// working when it has none.
 ///
@@ -259,6 +318,41 @@ fn eat_escape(chars: &mut Peekable<Chars<'_>>) {
 
 #[cfg(test)]
 mod tests {
+    /// The ghost is the rest of something this session already said — never
+    /// something invented.
+    #[test]
+    fn the_ghost_completes_from_this_sessions_own_history() {
+        use super::ghost;
+        let history: Vec<String> = ["git status", "cargo test", "cargo nextest run"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // The newest match wins: `cargo nextest run` was said after `cargo test`.
+        assert_eq!(ghost("cargo ", &history, false), Some("nextest run"));
+        assert_eq!(ghost("git ", &history, false), Some("status"));
+        // Nothing left to accept.
+        assert_eq!(ghost("git status", &history, false), None);
+        // Nothing matches.
+        assert_eq!(ghost("make", &history, false), None);
+        // An empty field would match everything, which is not a suggestion.
+        assert_eq!(ghost("", &history, false), None);
+        // While arrowing through the history the field already shows an entry.
+        assert_eq!(ghost("cargo ", &history, true), None);
+    }
+
+    /// A running total is glanced at, so it is said the way a person says it.
+    #[test]
+    fn a_duration_is_said_in_words_not_in_seconds() {
+        use super::spoken_duration;
+        assert_eq!(spoken_duration(8), "8 秒");
+        assert_eq!(spoken_duration(252), "4 分 12 秒");
+        // The smaller part goes when it is zero rather than reading "5 分 0 秒".
+        assert_eq!(spoken_duration(300), "5 分");
+        assert_eq!(spoken_duration(7500), "2 小时 5 分");
+        assert_eq!(spoken_duration(7200), "2 小时");
+        assert_eq!(spoken_duration(0), "0 秒");
+    }
+
     /// `@` opens a path only where a path could start.
     ///
     /// The last one that opens a word, because a person writes the thing they

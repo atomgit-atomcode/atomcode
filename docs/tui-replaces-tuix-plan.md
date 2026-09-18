@@ -143,6 +143,12 @@ serde 往返 + adapter 行为判据。
 
 ### M5.6 面板与命令补齐(2026-09-18 新增,排在 M6.1 之前)
 
+> **🔴 2026-09-18 晚:面板这一块已交接出去**,入口是
+> [`docs/handoff-tui-panels-2026-09-18.md`](handoff-tui-panels-2026-09-18.md)。
+> 交接文档里写明了一件要紧事:**本节下面两轮对照用错了尺子**(问「有没有入口」
+> 而不是「深度够不够」),所以那两张表不可信;能用的是清单里「按深度再对一遍」那节。
+> 非 UI 的部分(6.3 迁移、分层债、两条契约缺口)不在交接范围,仍按原计划走。
+
 清单在 [`docs/plans/2026-09-18-tui-panels-and-commands-inventory.md`](plans/2026-09-18-tui-panels-and-commands-inventory.md)
 ——两半来源:**能力面打底**(宿主控制契约 13 个变体、runtime 句柄 43 个方法、设置目录 14 个键、
 会话日志 26 种事实,逐个问「屏幕上有没有入口」)+ **tuix 对照查漏一次**(0012 经本人解禁,只用于
@@ -163,21 +169,32 @@ serde 往返 + adapter 行为判据。
 **判据**:每条一行或一条命令登记(0019),先写判据、摘掉被测代码证伪一次;
 `gates/tui-test-count.baseline` 随判据上抬。
 
-**5.6 的进度**(2026-09-18 晚):5.6a、5.6b、5.6c 已完。5.6e 已完(O0/O1/O2,只剩
-优先级最低的 O3)。5.6d(B2)做完 11 条:`/copy` `/save` `/whoami` `/think` `/paste`
-`/view` `/language` `/diff`、窗口标题、上沿 rule、@文件列表。
+**5.6 的进度**(2026-09-18 晚,收口)。a / b / c / e 已完;d(B2)逐条有了结论:
 
-**剩下的 B2 都不是屏幕自己能完成的**——每一条都要先开宿主契约面:
-
-| 剩下的 | 先要什么 |
+| 做完的 | |
 |---|---|
-| B2-2 多会话 | 「换会话不重建 App」那条后续 |
-| B2-4 `/provider` 面板 | provider 是配置里的一张表,不是一个扁平设置项;要新的宿主命令 |
-| B2-5 `/plugin` 市场面板 | 装/卸是 CLI 已有的动作,要把它们搬上契约面 |
-| B2-8 `/worktree` | 建 worktree 是宿主侧的 git 操作,然后才是 `ChangeDirectory` |
-| B2-13 goal / loop 状态行 | **运行时今天不报自主循环的状态**。`RuntimeCommands` 只能启停,没有 `autonomy()`,也没有事实。靠解析命令返回的人话去猜是脆的,不做 |
-| B2-15 ghost 提示 | 「下一步建议」的**来源没定**。无源而发明一个,就是在屏幕上编一句话 |
-| B2-9 `/sync` | 排在 6.3 之后(原定) |
+| B2-1 `/diff` | 两级浏览器,工作区快照出 numstat 与单文件 diff |
+| B2-2 多会话 | 本来就有(`/new` + `/resume`,有端到端判据);realm 化归「换会话不重建 App」那条后续 |
+| B2-3 `/model` 选择器 | A12 时做掉 |
+| B2-4 `/provider` | 列表 + 挑一个换过去(就是 `/model <id>`,一个开关) |
+| B2-6 `/copy` `/save` `/view` | |
+| B2-7 `/language` | `/config language` 的具名入口,同一段实现 |
+| B2-8 `/whoami` `/worktree` | worktree 是能力行的目录命令（git 不进中立契约） |
+| B2-10 `/think on\|off` | |
+| B2-11 `/paste [路径]` | |
+| B2-12 上沿 rule | 会话名 + 历史第几条 |
+| B2-14 @文件 | `$skill` 判不做:每个可调用 skill 已经是一条 `/` 命令 |
+| B2-15 ghost | 来源是本会话历史(fish/zsh 那种),右键接受 |
+| B2-16 终端标题 | 顺带发现 `SessionEvent::Titled` 之前没人消费 |
+
+| 有结论但不做 / 没做完 | 为什么 |
+|---|---|
+| B2-5 `/plugin` 市场面板 | **归 CLI**。coding 没开 capabilities 的 `plugin` feature,为它开等于把市场/git 那套拉进 agent 进程,只为重复 CLI 已有的动作 —— 与 `/upgrade`、`/webui` 同一把尺子 |
+| B2-13 goal / loop 状态行 | 做了一半。`/autonomy` 能问到「第几轮、跑了多久」;**常驻状态行**要一条推送通道（运行时每轮发 `GoalChanged`,但那条流屏幕不在上面）,单独排 |
+| B2-9 `/sync` | 原定就在 6.3 之后 |
+
+这一轮顺带改对的分层(见 0021 同日修订):宿主控制契约搬出 kernel 成
+`atomcode-host-api`,适配器搬出 coding 进 cli,并加了 `gates/layers.sh` 守依赖方向。
 
 **依赖**:B2 的多会话依赖「后续」里的「换会话不重建 App」;`/sync` 与 6.3 同批;
 **6.4 删 tuix 必须排在本节之后**——B2 多条是照 tuix 的交互形态补的。
@@ -192,9 +209,48 @@ tuix 的老毛病——现在改是十几行,等下游移植完再改就是他�
 |---|---|
 | 6.1 | 自用到「不想切回 tuix」;真模型冒烟(codingplan-crypto 的临时拷贝流程,跑完还原,绝不提交) |
 | 6.2 | 翻默认:`atomcode` 默认进 tui,tuix 留逃生口 soak(**机制已备好**:`[ui] screen = "default" \| "rows" \| "classic"` + `--tui` / `--classic`,`screen_for` 一处判定;`Screen::Default` 现在解析成 classic,翻默认时只动这一处。等 6.1 自用过关再翻) |
-| 6.3 | daemon / ACP / clix 迁到两份契约;ACP 的可用命令改由命令目录投影 |
+| 6.3 | daemon / ACP / clix 迁到两份契约;ACP 的可用命令改由命令目录投影。**测绘见下** |
 | 6.4 | 删 tuix:`cli/src/acp/commands.rs:21` 的 `CommandRegistry`、`cli/Cargo.toml:21` 的 `distro-pm` 转发、`main.rs` 的 tuix 分支、workspace 成员 |
 | 6.5 | 清点并删掉不再被挂载的代码:runtime 驱动协议、coding `team/`、capabilities `tools/task.rs` 的委派部分 |
+
+#### 6.3 测绘(2026-09-18)：比表面小很多
+
+先澄清一件事：**删 tuix(6.4)真正卡的只有一处**。全仓对 `atomcode_tuix`
+的引用只剩四个文件：
+
+| 在哪 | 多少 | 是什么 |
+|---|---|---|
+| `daemon/src/{lib,trace}.rs` | 3 | **全是注释**，零真实依赖 |
+| `cli/src/acp/commands.rs` | 1 | `use atomcode_tuix::commands::CommandRegistry` —— **就这一行** |
+| `cli/src/main.rs` | 26 | `--classic` 逃生口，6.2 特意留的 |
+
+所以 6.3 的 ACP 那一半 = 把那一行换掉，而换掉它要 ACP 能拿到命令目录 ——
+目录是随 `AgentDescription` 走句柄协议来的，而 ACP 今天直接消费 `CodingRuntimeEvent`。
+
+**改动面量过了，不是 7.7k 行：**
+
+| ACP 今天调的 | 迁到哪 | 处数 |
+|---|---|---|
+| `respond`、`cancel`、`compact`、`shutdown` | 句柄协议 `AgentCommand` | 12 |
+| `reprepare_config`、`undo_to_prompt` | 宿主契约 `SwitchModel`/`SetSetting`、`Undo` | 3 |
+| `context_stats` | **契约里没有对应的** —— 要么新开一条，要么走 `AgentDescription` | 1 |
+| 事件循环 | 全在 `turn.rs` 一个 match 里，7 处、4 种事件 | 7 |
+
+`cli/src/host.rs` 的 `translate()` 已经把 ACP 用的那 4 种全映射好了，所以事件那一半
+是换一个流而不是重写。唯一非机械的一处是 `TurnFinished(TurnCompletion)` —— 契约侧是
+`AgentEvent::TurnComplete { turn, reason }`，而 ACP 下游还在用 `TurnCompletion` 本体，要先看它用来干嘛。
+
+**一条真的行为变化，不能悄悄吞掉。** ACP 今天把
+`TurnCompletion::SnapshotUnavailable`（回合跑完了、但快照没写成）报成 internal error
+（`dispatch.rs:57`）；而契约侧的 `AgentEvent::TurnComplete` 只带 `reason`，适配器里两个
+分支已经合并了。也就是说 **tui 今天已经丢了这个信息**，ACP 迁过去也会丢。
+
+三条路：契约里给「回合完了但持久化出了问题」一个位置；或者承认它不该上契约、改成
+一条事实（日志才是权威，0024）；或者明确写下「快照写不成不再向前端报」。
+**做 6.3 之前先定这一条。**
+
+**顺序**：ACP 先拿 `HostConnection`(`connect()` 已在 cli 里，和 tui 用的是同一个)→
+`turn.rs` 换流 → 7 个方法换契约 → `commands.rs` 改从目录投影、删 tuix 那一行。
 
 ### 后续(不挡替换)
 

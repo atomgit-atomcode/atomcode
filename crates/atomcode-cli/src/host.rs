@@ -879,6 +879,34 @@ impl HostControl for RuntimeControl {
                 };
                 self.reconfigure(next).await
             }
+            HostCommand::Autonomy { session } => {
+                self.addressed(&session)?;
+                let now = self.handle.autonomy().await.map_err(refused)?;
+                // A goal wins when both are somehow registered: it is the one
+                // with a condition to report, and a person who set a goal is
+                // waiting on the goal.
+                let running = now
+                    .goal
+                    .map(|g| atomcode_host_api::Running {
+                        kind: "goal".into(),
+                        what: g.condition,
+                        round: g.round,
+                        of: g.max_rounds,
+                        elapsed_secs: g.elapsed_secs,
+                        paused: (!g.active).then(|| format!("{:?}", g.phase)),
+                    })
+                    .or_else(|| {
+                        now.looping.map(|l| atomcode_host_api::Running {
+                            kind: "loop".into(),
+                            what: l.label,
+                            round: l.round,
+                            of: None,
+                            elapsed_secs: l.elapsed_secs,
+                            paused: (!l.active).then(|| "stopped".to_string()),
+                        })
+                    });
+                Ok(HostReply::Autonomy { running })
+            }
             HostCommand::Providers { session } => {
                 self.addressed(&session)?;
                 let providers = self

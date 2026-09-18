@@ -232,6 +232,25 @@ impl RewindScope {
     }
 }
 
+/// Whether this session is driving itself, and how far it has got.
+///
+/// Read rather than pushed: the runtime already publishes `GoalChanged` /
+/// `LoopChanged` every round, but that stream is the runtime's own and the
+/// screen is not on it.
+///
+/// Answered through host control, the way `McpStatus` is. `docs/adr/0021` §3
+/// puts goal and loop with the capability rows and that is where their
+/// *commands* are — `GoalCommand` is a shim over `RuntimeCommands`. The state
+/// is not theirs: these controllers are runtime-owned (`controllers.rs`: "
+/// Runtime-owned autonomous controllers"), they live as locals of the driver
+/// loop, and reporting what the runtime owns is the host's job. MCP is the same
+/// shape: rows mount the servers, host control reports their state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Autonomy {
+    pub goal: Option<GoalProgress>,
+    pub looping: Option<LoopProgress>,
+}
+
 /// What a session has done to the workspace, for a front end to show.
 ///
 /// One shape for both levels of the answer: the list of files, or one file's
@@ -1745,6 +1764,19 @@ impl CodingRuntimeHandle {
         result.await.map_err(|_| RuntimeError::Unavailable)?
     }
 
+    /// Whether this session is driving itself, and how far it has got.
+    pub async fn autonomy(&self) -> Result<Autonomy, RuntimeError> {
+        let state = self.state.load(Ordering::Acquire);
+        let (done, result) = oneshot::channel();
+        self.tx
+            .send(CodingRuntimeControl::Autonomy {
+                generation: runtime_state_generation(state),
+                done,
+            })
+            .map_err(|_| RuntimeError::Unavailable)?;
+        result.await.map_err(|_| RuntimeError::Unavailable)?
+    }
+
     /// What this session has changed in the workspace — every file, or one
     /// file's diff.
     pub async fn workspace_changes(
@@ -2410,6 +2442,11 @@ pub enum CodingRuntimeControl {
     RewindCatalog {
         generation: u64,
         done: oneshot::Sender<Result<RewindCatalog, RuntimeError>>,
+    },
+    /// Whether a goal or a loop is running, and how far it has got.
+    Autonomy {
+        generation: u64,
+        done: oneshot::Sender<Result<Autonomy, RuntimeError>>,
     },
     /// What this session has changed in the workspace. `file` asks for one
     /// file's diff text instead of the summary of all of them.
@@ -3882,6 +3919,22 @@ fn spawn_runtime_owner_with_optional_agent(
                             revision: conversation_revision,
                             points: hook.rewind_points(),
                             code_unavailable: hook.code_rewind_unavailable(),
+                        }));
+                    }
+                    // The two controllers live as locals of this loop, which is
+                    // why this is a message rather than a field somebody reads:
+                    // a second copy of "is a goal running" is a second answer.
+                    Some(CodingRuntimeControl::Autonomy {
+                        generation: request_generation,
+                        done,
+                    }) => {
+                        if request_generation != generation {
+                            let _ = done.send(Err(RuntimeError::Busy));
+                            continue;
+                        }
+                        let _ = done.send(Ok(Autonomy {
+                            goal: goal.as_ref().map(|state| state.progress()),
+                            looping: loop_state.as_ref().map(|state| state.progress()),
                         }));
                     }
                     // Reading only: unlike the rewind catalog this does not
@@ -7259,6 +7312,9 @@ fn reject_runtime_control(
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::WorkspaceChanges { done, .. } => {
+            let _ = done.send(Err(RuntimeError::Unavailable));
+        }
+        CodingRuntimeControl::Autonomy { done, .. } => {
             let _ = done.send(Err(RuntimeError::Unavailable));
         }
         CodingRuntimeControl::BeginRewind { done, .. } => {

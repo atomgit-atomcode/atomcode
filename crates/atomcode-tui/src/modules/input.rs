@@ -281,10 +281,20 @@ impl View for Input {
             // past it had no prompt anywhere — ten rows of bare text between
             // two rules, which does not read as somewhere you can type.
             let lead = if i == 0 { prompt.clone() } else { "  ".into() };
-            rows.push(El::row(vec![
-                El::styled(lead, arrow),
-                El::raw(piece.clone()),
-            ]));
+            let mut row = vec![El::styled(lead, arrow), El::raw(piece.clone())];
+            // The rest of something already said, dim, on the last row of what
+            // is typed — pressing right takes it. Only there, because that is
+            // where the caret is when a completion means anything.
+            if i + first == typed.len().saturating_sub(1) {
+                if let Some(rest) = crate::text::ghost(
+                    &vp.moment.input,
+                    &vp.moment.history,
+                    vp.moment.history_at.is_some(),
+                ) {
+                    row.push(El::styled(rest.to_string(), theme::fg(Role::Muted)));
+                }
+            }
+            rows.push(El::row(row));
         }
 
         rows.push(rule());
