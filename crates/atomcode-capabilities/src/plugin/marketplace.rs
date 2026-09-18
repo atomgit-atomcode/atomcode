@@ -469,21 +469,41 @@ fn summarize_git_stderr(stderr: &str) -> String {
     const MAX_KEPT_LINES: usize = 3;
     const MAX_LINE_CHARS: usize = 160;
 
-    let mut kept: Vec<String> = Vec::new();
-    for line in stderr.lines() {
-        let t = line.trim();
-        if t.is_empty() || is_git_progress_line(t) {
-            continue;
-        }
-        kept.push(truncate_line(t, MAX_LINE_CHARS));
-        if kept.len() == MAX_KEPT_LINES {
-            break;
-        }
-    }
-    if kept.is_empty() {
+    // Split on BOTH '\n' and a bare '\r': git overwrites in-place progress with a
+    // carriage return, so "Receiving objects: …\rfatal: …" is a SINGLE `str::lines()`
+    // line whose `starts_with` matches the progress marker — which would drop the
+    // appended `fatal:` along with the noise. Splitting on '\r' too keeps them apart.
+    // ('\r\n' yields an empty middle segment, dropped by the `is_empty` filter.)
+    let meaningful: Vec<&str> = stderr
+        .split(|c| c == '\n' || c == '\r')
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !is_git_progress_line(t))
+        .collect();
+
+    if meaningful.is_empty() {
         return "git 未返回错误详情".to_string();
     }
-    kept.join("; ")
+
+    // The `fatal:` line is git's actual root cause and is usually printed LAST, after
+    // an `error:`/`remote:` preamble. When there are more meaningful lines than we
+    // keep, a naive "first N" would push that fatal out and leave only the preamble.
+    // So anchor on the LAST `fatal:` (or the last line if none) and always keep it,
+    // filling the remaining slots with the leading context lines — in source order.
+    let root = meaningful
+        .iter()
+        .rposition(|l| l.starts_with("fatal:") || l.starts_with("remote: fatal:"))
+        .unwrap_or(meaningful.len() - 1);
+
+    let mut idxs: Vec<usize> = (0..meaningful.len().min(MAX_KEPT_LINES)).collect();
+    if !idxs.contains(&root) {
+        idxs.pop(); // drop the last leading line to make room for the root cause
+        idxs.push(root);
+        idxs.sort_unstable();
+    }
+    idxs.into_iter()
+        .map(|i| truncate_line(meaningful[i], MAX_LINE_CHARS))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// True for `git` progress/statistics banners that carry no failure
@@ -962,6 +982,46 @@ Failed to connect to atomgit.com port 443 after 21048 ms: Couldn't connect to se
             .join("\n");
         let s = summarize_git_stderr(&stderr);
         assert_eq!(s.matches("error line").count(), 3, "{s:?}");
+    }
+
+    #[test]
+    fn summarize_git_stderr_keeps_fatal_past_the_line_cap() {
+        // A network-interrupted clone prints several `error:`/`fetch-pack:` lines
+        // BEFORE the real `fatal:` root cause. Keeping the naive first-3 would drop
+        // the fatal; the summary must still carry it (issue #1368 follow-up).
+        let stderr = "\
+error: RPC failed; curl 56 Receive error: Connection reset by peer\n\
+error: 1234 bytes of body are still expected\n\
+fetch-pack: unexpected disconnect while reading sideband packet\n\
+fatal: early EOF\n\
+fatal: fetch-pack: invalid index-pack output\n";
+        let s = summarize_git_stderr(stderr);
+        // The root-cause fatal (git prints it LAST) survives the 3-line cap...
+        assert!(
+            s.contains("fatal: fetch-pack: invalid index-pack output"),
+            "the last fatal (root cause) must survive the 3-line cap: {s:?}"
+        );
+        // ...alongside the two LEADING context lines...
+        assert!(s.contains("RPC failed"), "leading context kept: {s:?}");
+        assert!(s.contains("1234 bytes"), "leading context kept: {s:?}");
+        // ...while the middle lines that didn't fit the 3-line budget are dropped
+        // (can't split on "; " to count — a kept line has its own internal "; ").
+        assert!(!s.contains("unexpected disconnect"), "middle line dropped: {s:?}");
+        assert!(!s.contains("early EOF"), "middle line dropped: {s:?}");
+    }
+
+    #[test]
+    fn summarize_git_stderr_splits_bare_cr_progress_from_fatal() {
+        // git overwrites in-place progress with a bare '\r'; `str::lines()` does NOT
+        // split on lone '\r', so the fatal appended after the last progress refresh
+        // would be dropped WITH the progress. Splitting on '\r' keeps the fatal.
+        let stderr = "Receiving objects:  50% (256/512)\rfatal: early EOF\n";
+        let s = summarize_git_stderr(stderr);
+        assert!(s.contains("fatal: early EOF"), "fatal after \\r must survive: {s:?}");
+        assert!(
+            !s.contains("Receiving objects"),
+            "the \\r-prefixed progress must still be dropped: {s:?}"
+        );
     }
 
     #[test]
