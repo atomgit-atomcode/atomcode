@@ -35,6 +35,7 @@ arboard = "3"
 # encode happens once at this boundary rather than in each provider adapter.
 png = "0.17"
 base64 = "0.22"
+qrcode = { version = "0.14", default-features = false }
 unicode-width = "0.2"
 unicode-segmentation = "1"
 # Picking which tips to open a session with. The same version `atomcode-tuix` uses:

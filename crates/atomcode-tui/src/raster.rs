@@ -143,6 +143,51 @@ impl Raster {
         })
     }
 
+    /// Build one in this process, from cells that are already cells.
+    ///
+    /// [`decode`](Self::decode) is the wire: a writer outside this process
+    /// sends base64 and it is validated on the way in. Something drawn *here* —
+    /// a QR code, a chart — has no wire to cross, and encoding it only to
+    /// decode it again would be a round trip whose only product is a chance to
+    /// get the encoding wrong. Same rules either way: the size gate first, then
+    /// every cell one column wide.
+    pub fn from_cells(columns: u16, rows: u16, cells: Vec<Cell>) -> Result<Self, RasterError> {
+        if columns == 0 || rows == 0 || columns > MAX_COLUMNS || rows > MAX_ROWS {
+            return Err(RasterError::TooLarge {
+                columns,
+                rows,
+                max_columns: MAX_COLUMNS,
+                max_rows: MAX_ROWS,
+            });
+        }
+        let want = columns as usize * rows as usize;
+        if cells.len() != want {
+            return Err(RasterError::BadLength {
+                got: cells.len(),
+                want,
+            });
+        }
+        for (index, cell) in cells.iter().enumerate() {
+            if cell.ch.is_control() || (cell.ch as u32) > 0xffff {
+                return Err(RasterError::BadCell {
+                    index,
+                    why: "not a printable BMP character",
+                });
+            }
+            if width::char_width(cell.ch) != 1 {
+                return Err(RasterError::BadCell {
+                    index,
+                    why: "is not one cell wide",
+                });
+            }
+        }
+        Ok(Self {
+            columns,
+            rows,
+            cells,
+        })
+    }
+
     /// The rows `rect` can show, each cut to `rect.w` cells.
     ///
     /// **The cost is the rectangle's, not the bitmap's**: a frame lays out only
@@ -420,6 +465,41 @@ mod tests {
 
     fn solid(columns: u16, rows: u16) -> Raster {
         Raster::decode(columns, rows, &solid_payload(columns, rows)).expect("a solid raster")
+    }
+
+    /// A bitmap built in this process is held to the same rules as one that
+    /// came over the wire.
+    ///
+    /// The shortcut this refuses: `from_cells` skipping validation because "we
+    /// made it ourselves". A two-cell-wide character in a grid whose whole
+    /// premise is one character per cell tears every row after it.
+    #[test]
+    fn a_bitmap_built_here_is_checked_like_one_that_arrived() {
+        let cell = Cell {
+            ch: '\u{2580}',
+            fg: Some((0, 0, 0)),
+            bg: Some((255, 255, 255)),
+        };
+        assert!(Raster::from_cells(2, 1, vec![cell, cell]).is_ok());
+        assert_eq!(
+            Raster::from_cells(2, 1, vec![cell]),
+            Err(RasterError::BadLength { got: 1, want: 2 })
+        );
+        let wide = Cell {
+            ch: '\u{4e2d}',
+            ..cell
+        };
+        assert_eq!(
+            Raster::from_cells(1, 1, vec![wide]),
+            Err(RasterError::BadCell {
+                index: 0,
+                why: "is not one cell wide"
+            })
+        );
+        assert!(matches!(
+            Raster::from_cells(MAX_COLUMNS + 1, 1, vec![cell]),
+            Err(RasterError::TooLarge { .. })
+        ));
     }
 
     #[test]

@@ -27,6 +27,7 @@ use crate::caps::Glyph;
 use crate::frame::{Color, Line, Span, Style};
 use crate::moment::Viewport;
 use crate::overlay::{Choice, Overlay, Step};
+use crate::raster::Raster;
 use crate::surface::{Key, KeyPress, Mods};
 use crate::theme::Role;
 use crate::width;
@@ -61,9 +62,16 @@ pub struct StepDef {
     pub title: String,
     /// The body, already laid out in lines by whoever knows what it says.
     ///
-    /// Lines rather than a paragraph on purpose: a QR code is lines, and this
-    /// is how it gets here without the wizard knowing what it is looking at.
+    /// Lines rather than a paragraph on purpose: whoever writes the step is
+    /// the one who knows how long a line of it should be.
     pub body: Vec<String>,
+    /// A picture under the body, if the step has one.
+    ///
+    /// A [`Raster`] rather than more lines, because a picture is a cell grid
+    /// with colours of its own (`docs/adr/0027`) — a QR code drawn in the
+    /// theme's colours is a QR code that does not scan. Drawn only where the
+    /// terminal paints cell backgrounds; see the render.
+    pub picture: Option<Raster>,
     pub kind: StepKind,
 }
 
@@ -73,12 +81,19 @@ impl StepDef {
             id: id.into(),
             title: title.into(),
             body: Vec::new(),
+            picture: None,
             kind,
         }
     }
 
     pub fn saying(mut self, body: Vec<String>) -> Self {
         self.body = body;
+        self
+    }
+
+    /// Put a picture under the body — [`crate::qr::code`] makes one.
+    pub fn showing(mut self, picture: Raster) -> Self {
+        self.picture = Some(picture);
         self
     }
 }
@@ -333,6 +348,17 @@ impl Overlay for Wizard {
                     .truncate(w),
             );
         }
+        if let Some(picture) = step.picture.as_ref() {
+            // Half of a two-module cell is its background colour, so a terminal
+            // that drops backgrounds would draw half a QR code — worse than
+            // none, because half of one still looks like a thing to scan. The
+            // body says what the picture says; that is what is left.
+            if vp.moment.caps.cell_background {
+                out.push(Line::raw(String::new()));
+                let room = crate::frame::Rect::sized(vp.rect.w, picture.rows);
+                out.extend(picture.lines_in(room, vp.moment.caps));
+            }
+        }
         match &step.kind {
             StepKind::Note => {}
             StepKind::Choose(choices) => {
@@ -474,7 +500,7 @@ impl Overlay for Wizard {
 
     fn rows(&self) -> Option<u16> {
         let step = self.step()?;
-        let body = step.body.len();
+        let body = step.body.len() + step.picture.as_ref().map_or(0, |p| 1 + p.rows as usize);
         let extra = match &step.kind {
             StepKind::Note => 0,
             StepKind::Choose(choices) => 1 + choices.len(),
@@ -693,6 +719,50 @@ mod tests {
         let after = drawn(&w).join("\n");
         assert!(after.contains("码过期了"), "{after}");
         assert!(!after.contains("扫这个码"), "{after}");
+    }
+
+    /// A picture is drawn where it can be read, and left out where it cannot.
+    ///
+    /// Not a nicety: a QR code packs two modules into one cell, the lower one
+    /// being the cell's background, so a terminal that drops backgrounds draws
+    /// the top half of a code — which still looks like something to scan and
+    /// is not. The body carries the same thing in words, and that is what a
+    /// person is left with.
+    #[test]
+    fn a_picture_is_drawn_only_where_the_terminal_paints_backgrounds() {
+        let picture = crate::qr::code("https://example.com/login").expect("it fits");
+        let tall = picture.rows;
+        let (w, _) = wizard(vec![StepDef::new(
+            "login",
+            "登录",
+            StepKind::Wait { skippable: false },
+        )
+        .saying(vec!["或者打开 https://example.com/login".into()])
+        .showing(picture)]);
+
+        let with_backgrounds = Moment::default();
+        assert!(with_backgrounds.caps.cell_background);
+        let drawn = w.render(&Viewport::new(Rect::sized(60, 40), &with_backgrounds));
+        assert!(
+            drawn.len() > tall as usize,
+            "the picture is in there: {} lines for a {tall}-row picture",
+            drawn.len()
+        );
+
+        let mut plain = Moment::default();
+        plain.caps.cell_background = false;
+        let without = w.render(&Viewport::new(Rect::sized(60, 40), &plain));
+        assert_eq!(
+            without.len(),
+            drawn.len() - 1 - tall as usize,
+            "the picture and its blank line are gone, and nothing else changed"
+        );
+        assert!(
+            without
+                .iter()
+                .any(|l| l.plain().contains("https://example.com/login")),
+            "what the picture said is still on screen in words"
+        );
     }
 
     /// The last step being one the host finishes is not a special case.
