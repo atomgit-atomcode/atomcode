@@ -973,6 +973,12 @@ impl HostControl for RuntimeControl {
             }
             HostCommand::SignOut { session } => {
                 self.addressed(&session)?;
+                // Credentials first, then the live provider — the same order
+                // the classic screen's logout uses: a failure below must not
+                // leave the identity file behind saying otherwise.
+                atomcode_auth::logout().map_err(|error| HostError::Failed {
+                    message: error.to_string(),
+                })?;
                 self.handle
                     .deactivate_provider(ProviderUnavailableReason::AuthenticationRequired)
                     .await

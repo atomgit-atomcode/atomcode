@@ -313,16 +313,17 @@ const SKIP: &str = "不想现在弄的话，回车跳过。";
 
 /// Exchange the token, save it, and set up whatever the account is entitled to.
 ///
-/// The same three things `atomcode login` does after the browser comes back,
-/// minus the printing: save the credentials, run the setup, and persist what it
-/// worked out.
+/// The same three things `atomcode login` does after the browser comes back —
+/// save the credentials, run the setup, and persist what it worked out. The
+/// answer carries the setup report rendered the way `/codingplan` renders it
+/// (the same visual contract tuix's login shows), not just a name: what the
+/// account is entitled to is what the confirm step is for.
 fn finish_login(
     session: atomcode_auth::oauth::LoginSession,
     telemetry: Option<&Arc<atomcode_telemetry::Telemetry>>,
     path: &PathBuf,
 ) -> anyhow::Result<String> {
     let auth = session.finish(telemetry)?;
-    let who = auth.user.username.clone();
     atomcode_auth::save_auth(&auth)?;
 
     let mut config = atomcode_config::config::Config::load(path).unwrap_or_default();
@@ -344,7 +345,7 @@ fn finish_login(
         // hint would be miscounted — which the next run corrects.
         let _ = atomcode_codingplan::write_last_sync_now();
     }
-    Ok(format!("登录成了：{who}"))
+    Ok(report.render())
 }
 
 #[async_trait]
