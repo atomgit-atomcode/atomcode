@@ -2017,6 +2017,40 @@ impl Tui {
         self.host.set_activity(activity)
     }
 
+    /// Ask the agent on screen to stop, and say so only if it has something to
+    /// stop.
+    ///
+    /// [`Activity::Stopping`] is a claim about *now*, and it has exactly one
+    /// thing that can take it back: a turn ending, which arrives as
+    /// `TurnComplete`/`Cancelled` — and those are only sent when a turn was
+    /// running. Asking an idle agent to cancel is deliberately a no-op (the
+    /// harness says so where it defines `cancel`), so a front end that writes
+    /// `Stopping` first leaves the claim standing with no fact coming.
+    ///
+    /// What that looked like: pressing esc on an idle screen raised a live line
+    /// reading 正在停止 and a status line reading 停止中, both of which stayed up
+    /// until the next turn. Worse, that state is what a submission is read
+    /// against — "a turn is running, so this line is steering" — so the next
+    /// thing typed appeared in the steering panel as work the model was about to
+    /// be handed, when in fact it opened a fresh turn ([`crate::modules::steering`]).
+    ///
+    /// So the command is always sent (a cancel is never wrong to ask for; it is
+    /// how a turn that just opened and has not yet marked itself working is
+    /// still stoppable), and the *words* are said only while the agent is
+    /// working. Since the status line is the only route that can move `activity`
+    /// to `Working` on this connection, `Working` here means a turn really is in
+    /// flight.
+    ///
+    /// [`Activity::Stopping`]: crate::moment::Activity::Stopping
+    fn stop_turn(&self, client: &AgentClient) {
+        client.cancel();
+        let working = self.host.moment.read().expect("moment poisoned").activity
+            == crate::moment::Activity::Working;
+        if working {
+            self.host.set_activity(crate::moment::Activity::Stopping);
+        }
+    }
+
     fn say_refused(&self, text: &str) {
         let mut stream = self.host.stream.write().expect("stream poisoned");
         let mut w = stream.writer("commands");
@@ -2237,8 +2271,7 @@ impl Tui {
                 // same way a turn's start is: this is the third route that moves
                 // that row, and a pin on two of three jumps on the third.
                 drop(m);
-                self.host.set_activity(crate::moment::Activity::Stopping);
-                client.cancel();
+                self.stop_turn(client);
                 return false;
             }
             Action::Scroll(by) => {
@@ -2372,8 +2405,7 @@ impl Tui {
                     return false;
                 }
                 drop(m);
-                self.host.set_activity(crate::moment::Activity::Stopping);
-                client.cancel();
+                self.stop_turn(client);
                 return false;
             }
             Action::Newline => {

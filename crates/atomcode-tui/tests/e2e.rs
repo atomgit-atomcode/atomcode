@@ -992,7 +992,73 @@ async fn esc_stops_the_turn_and_the_next_one_still_runs() {
     let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
-// ---- approval: the flow that makes it usable without --yolo ---------------
+/// Esc on an idle screen is not a stop, and must not be allowed to say it was.
+///
+/// The claim it used to make could not be taken back. Asking an idle agent to
+/// cancel is a no-op by design — and an unchanged `activity` sends nothing back,
+/// while a changed one would send `StatusChanged`, which on this connection is
+/// only read for a member's screen. So `Stopping` written here stood until the
+/// next turn finished.
+///
+/// Two wrongs came out of that one stale write, and this test is both of them:
+/// the words on the screen and what the *next* submission was read as. That
+/// second one is why this is not a cosmetic test — the front end decides "this
+/// is steering" by asking whether the agent is busy, so an idle screen left
+/// saying `Stopping` put the next question in the steering panel, as work the
+/// model was about to be handed, when it in fact opened a fresh turn.
+///
+/// The negative control is the `stopping` write itself: put
+/// `self.host.set_activity(Activity::Stopping)` back in `Action::Escape` and both
+/// halves go red — the status line reads 停止中, and the steering bar is up while
+/// the turn's tool runs.
+#[tokio::test]
+async fn esc_on_an_idle_screen_stops_nothing_and_says_nothing() {
+    let dir = scratch("esc-idle");
+    // A turn that stays in flight long enough to be looked at: with an in-memory
+    // script the whole thing is over in microseconds and "no steering bar" would
+    // be a claim about a moment that never existed.
+    let script = replay(
+        r#"{ text = "Working.", calls = [ { name = "bash", args = { command = "sleep 0.4" } } ] },
+           { text = "Ready." }"#,
+    );
+    let s = start(tree(&dir, &script, &[])).await;
+    let task = s.open().await;
+
+    s.term.press(KeyPress::plain(Key::Esc));
+    s.quiet().await;
+    let idle = s.term.last().expect("a frame");
+    assert!(
+        idle.part("live").is_none(),
+        "esc on an idle screen raised a live line:\n{}",
+        s.screen()
+    );
+    assert!(
+        !idle
+            .part("status")
+            .expect("the status line")
+            .lines
+            .iter()
+            .any(|l| l.plain().contains("停止中")),
+        "esc on an idle screen left the status line saying 停止中:\n{}",
+        s.screen()
+    );
+
+    // And the next turn is a turn: its words are the first message of it, not a
+    // steering bar for something already on its way to the model.
+    s.term.type_line("hello");
+    until(&s, "正在运行 1 个工具").await;
+    assert!(
+        s.term.last().expect("a frame").part("steering").is_none(),
+        "the words went into the steering panel — the screen still thought the \
+         agent was stopping, so a new turn was read as a follow-up into one:\n{}",
+        s.screen()
+    );
+
+    s.quiet().await;
+    assert!(s.screen().contains("Ready."), "{}", s.screen());
+    s.term.press(KeyPress::ctrl('d'));
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+}
 
 /// The tree the TUI is meant to run in: it asks before a risky call, and it is
 /// the thing being asked.
