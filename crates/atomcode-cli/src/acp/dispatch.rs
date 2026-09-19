@@ -384,10 +384,13 @@ pub fn prompt_text(req: &PromptRequest) -> (String, Vec<ImageContent>, bool) {
         match block {
             ContentBlock::Text(t) => text.push_str(&t.text),
             ContentBlock::Image(i) => {
-                images.push(ImageContent {
-                    media_type: i.mime_type.clone(),
-                    data: i.data.clone(),
-                });
+                // Downscale/re-encode oversized attachments (re-sent every turn).
+                let (media_type, data) =
+                    atomcode_capabilities::image_normalize::normalize_image_base64(
+                        &i.mime_type,
+                        &i.data,
+                    );
+                images.push(ImageContent { media_type, data });
                 has_attachments = true;
             }
             ContentBlock::ResourceLink(link) => {

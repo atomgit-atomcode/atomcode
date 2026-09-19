@@ -321,6 +321,21 @@ fn read_raw_cf_dib() -> Option<Vec<u8>> {
 /// **AltGr** key is delivered as `Ctrl+Alt`, so on the rare keyboard layout
 /// where `AltGr+V` is a printable glyph, that keystroke triggers image-paste
 /// instead of inserting the glyph. Accepted as an inherent cost of the chord.
+/// Build an `ImageContent` from raw image bytes, downscaling/re-encoding oversized
+/// images so a big pasted screenshot can't blow the per-request body (a pasted image is
+/// re-sent on every turn). Falls back to the original bytes/type on any decode failure.
+fn normalized_image_content(media_type: &str, raw: &[u8]) -> ImageContent {
+    let (media_type, data) =
+        match atomcode_capabilities::image_normalize::normalize_image_raw(raw) {
+            Some((mt, out)) => (mt, base64::engine::general_purpose::STANDARD.encode(out)),
+            None => (
+                media_type.to_string(),
+                base64::engine::general_purpose::STANDARD.encode(raw),
+            ),
+        };
+    ImageContent { media_type, data }
+}
+
 fn is_paste_image_chord(
     code: crossterm::event::KeyCode,
     modifiers: crossterm::event::KeyModifiers,
@@ -352,14 +367,7 @@ fn try_paste_clipboard_image() -> Option<(ImageContent, u64)> {
             if let Some(png_data) =
                 encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref())
             {
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
-                return Some((
-                    ImageContent {
-                        media_type: "image/png".into(),
-                        data: b64,
-                    },
-                    hash,
-                ));
+                return Some((normalized_image_content("image/png", &png_data), hash));
             }
         }
         Err(_e) => {
@@ -376,14 +384,7 @@ fn try_paste_clipboard_image() -> Option<(ImageContent, u64)> {
             {
                 let hash = rgba_fingerprint(w as usize, h as usize, &rgba);
                 if let Some(png_data) = encode_rgba_to_png(w, h, &rgba) {
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
-                    return Some((
-                        ImageContent {
-                            media_type: "image/png".into(),
-                            data: b64,
-                        },
-                        hash,
-                    ));
+                    return Some((normalized_image_content("image/png", &png_data), hash));
                 }
             }
         }
@@ -818,14 +819,7 @@ fn try_attach_image_from_path(text: &str) -> Option<(ImageContent, u64)> {
     }
     let bytes = std::fs::read(path).ok()?;
     let hash = rgba_fingerprint(0, 0, &bytes);
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Some((
-        ImageContent {
-            media_type: media_type.into(),
-            data: b64,
-        },
-        hash,
-    ))
+    Some((normalized_image_content(media_type, &bytes), hash))
 }
 
 /// Resolve an explicit `@image` reference against the same path roots users

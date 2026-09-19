@@ -147,6 +147,12 @@ pub mod setup;
 #[cfg(feature = "tools")]
 pub mod tools;
 
+/// Downscale + re-encode oversized user images (read_file attachments + clipboard
+/// paste) before they enter the conversation, so a huge screenshot can't blow the
+/// per-request body and get re-sent every turn.
+#[cfg(feature = "tools")]
+pub mod image_normalize;
+
 /// `@`-mention infrastructure: token detection + a gitignore-aware project file
 /// index with cross-level substring matching. Shared by the TUI popup and the
 /// daemon `/fs/search` endpoint so the webui picker matches CLI behavior.

@@ -4832,9 +4832,15 @@ async fn process_chat_request(
         let images: Vec<ImageContent> = req
             .images
             .iter()
-            .map(|i| ImageContent {
-                media_type: i.media_type.clone(),
-                data: i.data.clone(),
+            .map(|i| {
+                // Downscale/re-encode oversized attachments before they enter the
+                // conversation (a big image is re-sent every turn — see image_normalize).
+                let (media_type, data) =
+                    atomcode_capabilities::image_normalize::normalize_image_base64(
+                        &i.media_type,
+                        &i.data,
+                    );
+                ImageContent { media_type, data }
             })
             .collect();
         let runtime_text = live_api::preprocess_image_caption(
