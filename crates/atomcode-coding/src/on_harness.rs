@@ -2433,6 +2433,12 @@ impl Plugin for DatalogPlugin {
                 tokio::spawn(async move { flushing.flush().await });
             },
         );
+        // And once more when the tree comes down, this time waited for. The
+        // line above spawns the wait, so in a process that ends right after a
+        // turn — `-p`, a criterion reading the file it just asked for — nothing
+        // had made sure the last turn was on disk.
+        let closing = sink.clone();
+        let _ = ctx.effect(move || closing.flush_blocking());
         let _ = ctx.on_waterfall::<atomcode_harness::events::AgentRequest>(
             Arc::new(Datalog { sink }),
             false,

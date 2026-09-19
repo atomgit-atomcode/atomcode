@@ -206,6 +206,15 @@ enum WriteOp {
     Barrier {
         reply: tokio::sync::oneshot::Sender<()>,
     },
+    /// The same wait, for a caller with no `await` to spend.
+    ///
+    /// Tearing a tree down is synchronous (`Context::effect`), and that is the
+    /// last moment anything can make sure what was queued is on disk. Without
+    /// it the final turn's log is whatever the writer thread happened to get
+    /// through before the process went away.
+    BarrierSync {
+        reply: mpsc::Sender<()>,
+    },
 }
 
 impl DatalogHook {
@@ -557,6 +566,18 @@ impl DatalogHook {
         self.writer.barrier().await;
     }
 
+    /// The same, for a caller with no `await` — a teardown, in practice.
+    ///
+    /// The gap this closes: the turn-end listener is synchronous, so the flush
+    /// it asks for is *spawned*, and nothing after that waits for it. In a
+    /// process that keeps running, the writer thread gets there on its own and
+    /// the only cost is when. In one that ends right after a turn — a `-p` run,
+    /// a test reading the file it just asked for — the tail of the log is
+    /// whatever the thread happened to finish first.
+    pub fn flush_blocking(&self) {
+        self.writer.barrier_blocking();
+    }
+
     /// The turn ended; write the stats.
     pub fn finish_turn(&self, reason: &StopReason) {
         self.finish_turn_named(&format!("{reason:?}"));
@@ -681,12 +702,29 @@ impl DatalogWriter {
         let _ = self.tx.send(WriteOp::Append { path, content });
     }
 
+    /// Wait, without an `await`, for at most [`SYNC_BARRIER_WAIT`].
+    ///
+    /// Bounded because this runs while something is being torn down: a writer
+    /// that has gone away must not hold the teardown open, and what is at stake
+    /// is the tail of a log rather than anything the program needs next.
+    fn barrier_blocking(&self) {
+        let (reply, receive) = mpsc::channel();
+        if self.tx.send(WriteOp::BarrierSync { reply }).is_err() {
+            return;
+        }
+        let _ = receive.recv_timeout(SYNC_BARRIER_WAIT);
+    }
+
     async fn barrier(&self) {
         let (reply, receive) = tokio::sync::oneshot::channel();
         let _ = self.tx.send(WriteOp::Barrier { reply });
         let _ = tokio::time::timeout(IO_WAIT_TIMEOUT, receive).await;
     }
 }
+
+/// How long a teardown waits for the log to land. Long enough for a queue of
+/// turn markdown, short enough that a wedged writer cannot hold a shutdown.
+const SYNC_BARRIER_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn writer_loop(rx: mpsc::Receiver<WriteOp>) {
     while let Ok(operation) = rx.recv() {
@@ -708,6 +746,9 @@ fn writer_loop(rx: mpsc::Receiver<WriteOp>) {
                 if let Ok(mut file) = open_private_append(&path) {
                     let _ = file.write_all(content.as_bytes());
                 }
+            }
+            WriteOp::BarrierSync { reply } => {
+                let _ = reply.send(());
             }
             WriteOp::Barrier { reply } => {
                 let _ = reply.send(());

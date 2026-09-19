@@ -233,8 +233,17 @@ G 类七条**刻意排在翻默认之后**：自用会告诉我们哪几条是�
 ### H. 记账与既有的债
 
 - [ ] **H1 更新 `2026-09-18-tui-panels-and-commands-inventory.md`** —— 三处报高，见第四节
-- [ ] **H2 追并发红**：`coding::mount_wiring::the_configured_datalog_records_the_turn`，
-      线索在 `capabilities/src/datalog.rs:290`。「偶尔红一下」会训练所有人无视闸门
+- [x] **H2 追完了，不是竞态写错，是没人等它写完**（2026-09-20）。
+      datalog 的写是**后台 OS 线程 + fire-and-forget**：`append` 只往 channel 里塞，
+      而回合结束的监听器是同步的，所以它要的那次 flush 是 `tokio::spawn` 出去的
+      ——`on_harness.rs` 的注释自己写着「只有 WAIT 被 spawn 了」。并发下线程调度
+      晚一点，判据就先读到了还没写完的文件。
+      **这不止是判据的事**：进程若在回合后立刻结束（`-p` 跑一次、一个读自己刚要的
+      文件的测试），最后一轮的日志就是写线程碰巧赶完的那部分。
+      修法：writer 多一个**同步**屏障（`WriteOp::BarrierSync`），树拆的时候
+      （`Context::effect`——那是最后一个还能保证的时刻）有界地等它一次（2 秒上限：
+      写没了的 writer 不该把收尾拖住，而这里赌的只是一段日志的尾巴）。
+      验证：`cargo nextest run -p atomcode-coding` 连跑三次，各 834 全过。
 - [~] **H3 不做**（2026-09-20 核实）。`parse_version`（`updater/lib.rs:1102`）剥掉
       `-` 之后的部分是**为 `-beta.1` / `-rc.2` 刻意做的**（Issue #596），而上游从
       没发过带 `-N` 的版本——tag 全是 `vX.Y.Z`，`latest.json` 也是。这条是下游 fork
